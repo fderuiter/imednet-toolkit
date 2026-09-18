@@ -407,7 +407,7 @@ def _tabular_export(
             if sanitize:
                 df = _sanitize_df(df)
 
-            sink.write_batch(df, batch_id=f"{study_key}/tabular/{i}")
+            sink.write_batch(cast(Any, df), batch_id=f"{study_key}/tabular/{i}")
 
 
 def export_to_csv(
@@ -508,7 +508,7 @@ def export_to_json(
         import pandas as pd
 
         # Explicitly handle missing values when converting to dict
-        data = df.where(pd.notnull(df), None).to_dict(orient="records")
+        data = cast(Any, df).where(pd.notnull(df), None).to_dict(orient="records")
 
     try:
         from importlib.metadata import entry_points

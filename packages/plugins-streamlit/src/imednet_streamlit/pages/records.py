@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -197,27 +199,30 @@ def _build_heatmap_chart(heatmap_df: pd.DataFrame) -> alt.Chart:
     """Resolve the human-readable name for a form object."""
     unique_subjects = heatmap_df["subject_key"].nunique()
     chart_height = max(240, min(900, unique_subjects * 16))
-    return (
-        alt.Chart(heatmap_df)
-        .mark_rect()
-        .encode(
-            x=alt.X("form_name:N", title="Form", sort=None),
-            y=alt.Y("subject_key:N", title="Subject", sort=None),
-            color=alt.Color(
-                "completion_status:N",
-                title="Completion",
-                scale=alt.Scale(
-                    domain=["Incomplete", "Complete"],
-                    range=[components.PALETTE[3], components.PALETTE[2]],
+    return cast(
+        alt.Chart,
+        (
+            alt.Chart(heatmap_df)
+            .mark_rect()
+            .encode(
+                x=alt.X("form_name:N", title="Form", sort=None),
+                y=alt.Y("subject_key:N", title="Subject", sort=None),
+                color=alt.Color(
+                    "completion_status:N",
+                    title="Completion",
+                    scale=alt.Scale(
+                        domain=["Incomplete", "Complete"],
+                        range=[components.PALETTE[3], components.PALETTE[2]],
+                    ),
                 ),
-            ),
-            tooltip=[
-                alt.Tooltip("subject_key:N", title="Subject"),
-                alt.Tooltip("form_name:N", title="Form"),
-                alt.Tooltip("completion_status:N", title="Status"),
-            ],
-        )
-        .properties(width="container", height=chart_height, title="Subject × Form Completion")  # noqa: RUF001
+                tooltip=[
+                    alt.Tooltip("subject_key:N", title="Subject"),
+                    alt.Tooltip("form_name:N", title="Form"),
+                    alt.Tooltip("completion_status:N", title="Status"),
+                ],
+            )
+            .properties(width="container", height=chart_height, title="Subject × Form Completion")  # noqa: RUF001
+        ),
     )
 
 

@@ -6,7 +6,7 @@ tabular data fallback for accessibility.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import altair as alt
 import pandas as pd
@@ -72,7 +72,7 @@ def bar_chart(
             tooltip=[alt.Tooltip(f"{y}:N"), alt.Tooltip(f"{x}:Q")],
         )
 
-    return chart.properties(width="container", title=title)
+    return cast(alt.Chart, chart.properties(width="container", title=title))
 
 
 def line_chart(
@@ -110,7 +110,7 @@ def line_chart(
             tooltip=[alt.Tooltip(f"{x}:T"), alt.Tooltip(f"{y}:Q")],
         )
 
-    return chart.properties(width="container", title=title)
+    return cast(alt.Chart, chart.properties(width="container", title=title))
 
 
 def pie_chart(
@@ -130,15 +130,18 @@ def pie_chart(
     Returns:
         Configured Altair chart object.
     """
-    return (
-        alt.Chart(df)
-        .mark_arc()
-        .encode(
-            theta=alt.Theta(f"{theta}:Q"),
-            color=_color_encoding(color),
-            tooltip=[alt.Tooltip(f"{color}:N"), alt.Tooltip(f"{theta}:Q")],
-        )
-        .properties(width="container", title=title, description=f"Pie chart for {title}")
+    return cast(
+        alt.Chart,
+        (
+            alt.Chart(df)
+            .mark_arc()
+            .encode(
+                theta=alt.Theta(f"{theta}:Q"),
+                color=_color_encoding(color),
+                tooltip=[alt.Tooltip(f"{color}:N"), alt.Tooltip(f"{theta}:Q")],
+            )
+            .properties(width="container", title=title, description=f"Pie chart for {title}")
+        ),
     )
 
 

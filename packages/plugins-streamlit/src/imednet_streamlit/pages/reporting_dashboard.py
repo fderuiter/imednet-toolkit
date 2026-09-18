@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
+from typing import Any, cast
 
 import pandas as pd
 import streamlit as st
@@ -264,7 +265,9 @@ def _build_site_metrics(_sdk: object, study_key: str, subjects_df: pd.DataFrame)
                 open_queries=("annotation_id", "count"),
                 avg_days_open=(
                     "date_created",
-                    lambda values: (now_utc - pd.to_datetime(values, utc=True)).dt.days.mean(),
+                    lambda values: cast(
+                        Any, now_utc - pd.to_datetime(values, utc=True)
+                    ).dt.days.mean(),
                 ),
             )
             .reset_index()
@@ -281,7 +284,7 @@ def _build_site_metrics(_sdk: object, study_key: str, subjects_df: pd.DataFrame)
     return merged
 
 
-def _highlight_high_rate(value: float) -> str:
+def _highlight_high_rate(value: Any) -> str:
     """Apply CSS highlighting for query rates above the threshold."""
     return f"background-color: {_HIGH_RATE_COLOR}" if value > _HIGH_QUERY_RATE_THRESHOLD else ""
 

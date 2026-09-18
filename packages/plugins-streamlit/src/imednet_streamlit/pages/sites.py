@@ -7,7 +7,7 @@ resolution times across the study.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
 import streamlit as st
@@ -78,7 +78,7 @@ def _fetch_site_metrics(
                 open_queries=("annotation_id", "count"),
                 avg_days_open=(
                     "date_created",
-                    lambda x: (timestamp_now - pd.to_datetime(x, utc=True)).dt.days.mean(),
+                    lambda x: cast(Any, timestamp_now - pd.to_datetime(x, utc=True)).dt.days.mean(),
                 ),
             )
             .reset_index()
@@ -94,7 +94,7 @@ def _fetch_site_metrics(
     return df_metrics
 
 
-def _highlight_high_rate(val: float) -> str:
+def _highlight_high_rate(val: Any) -> str:
     """Apply CSS highlighting for sites with query rates above the threshold."""
     return f"background-color: {_HIGH_RATE_COLOR}" if val > _HIGH_QUERY_RATE_THRESHOLD else ""
 

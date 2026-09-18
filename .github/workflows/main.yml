@@ -682,6 +682,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -706,7 +708,7 @@ jobs:
           hatch run playwright install --with-deps chromium
       - name: Run automated accessibility scan
         env:
-          IMEDNET_VPAT_PATH: "docs/VPAT.md"
+          IMEDNET_VPAT_PATH: "docs/reference/VPAT.rst"
           IMEDNET_A11Y_REPORT_PATH: "packages/plugins-streamlit/src/imednet_streamlit/pages/a11y_report.json"
         run: |
           hatch run test -m a11y tests/browser/test_a11y.py
@@ -714,8 +716,12 @@ jobs:
       - name: Auto-update VPAT
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add docs/VPAT.md packages/plugins-streamlit/src/imednet_streamlit/pages/a11y_report.json
-          git commit -m "docs: auto-update VPAT and conformance report from latest accessibility audit" || echo "No changes to commit"
-          git push
+          if ! git diff --quiet docs/reference/VPAT.rst packages/plugins-streamlit/src/imednet_streamlit/pages/a11y_report.json; then
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+            git add docs/reference/VPAT.rst packages/plugins-streamlit/src/imednet_streamlit/pages/a11y_report.json
+            git commit -m "docs: auto-update VPAT and conformance report from latest accessibility audit"
+            git push
+          else
+            echo "No VPAT or accessibility report changes to commit."
+          fi
