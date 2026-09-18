@@ -1,6 +1,6 @@
 [project]
 name = "imednet-streamlit"
-version = "0.3.0"
+version = "0.3.1"
 description = "Interactive Streamlit reporting dashboards for iMednet EDC."
 authors = [
     { name = "Frederick de Ruiter", email = "127706008+fderuiter@users.noreply.github.com" }

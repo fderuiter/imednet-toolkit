@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/fderuiter/imednet-toolkit/compare/imednet-streamlit-v0.3.0...imednet-streamlit-v0.3.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **ci:** reconcile accessibility workflow permissions, vpat path, and cross-environment mypy rules ([0e9b0f4](https://github.com/fderuiter/imednet-toolkit/commit/0e9b0f4c186c1714e69788141b9488fb3b489033))
+* **streamlit:** modernize type annotations and update a11y audit report ([c108ba3](https://github.com/fderuiter/imednet-toolkit/commit/c108ba31b684be415ed9a5d3d9c9cedaf70feca9))
+
 ## [0.3.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-streamlit-v0.2.0...imednet-streamlit-v0.3.0) (2026-09-10)
 
 

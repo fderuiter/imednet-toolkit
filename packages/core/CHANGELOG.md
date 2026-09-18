@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.9.0...imednet-v0.9.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **ci:** reconcile accessibility workflow permissions, vpat path, and cross-environment mypy rules ([0e9b0f4](https://github.com/fderuiter/imednet-toolkit/commit/0e9b0f4c186c1714e69788141b9488fb3b489033))
+
 ## [0.9.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.8.0...imednet-v0.9.0) (2026-09-10)
 
 
