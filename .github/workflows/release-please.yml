@@ -30,8 +30,10 @@ jobs:
           # so publishing does not depend on tag-triggered workflow runs.
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Sync Lockfile on Release PR
-        if: ${{ steps.release.outputs.pr || steps.release.outputs.prs_created }}
+      - name: Checkout Release PR
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        continue-on-error: true
+        id: checkout-release-pr
         uses: actions/checkout@v4
         with:
           ref: release-please--branches--main
@@ -39,7 +41,7 @@ jobs:
           fetch-depth: 0
 
       - name: Update uv lockfile
-        if: ${{ steps.release.outputs.pr || steps.release.outputs.prs_created }}
+        if: ${{ steps.release.outputs.prs_created == 'true' && steps.checkout-release-pr.outcome == 'success' }}
         run: |
           pip install uv
           uv lock
