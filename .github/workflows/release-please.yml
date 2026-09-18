@@ -29,3 +29,24 @@ jobs:
           # PyPI deployment is handled in main.yml on release commits to main,
           # so publishing does not depend on tag-triggered workflow runs.
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync Lockfile on Release PR
+        if: ${{ steps.release.outputs.pr || steps.release.outputs.prs_created }}
+        uses: actions/checkout@v4
+        with:
+          ref: release-please--branches--main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Update uv lockfile
+        if: ${{ steps.release.outputs.pr || steps.release.outputs.prs_created }}
+        run: |
+          pip install uv
+          uv lock
+          if ! git diff --quiet uv.lock; then
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+            git add uv.lock
+            git commit -m "chore: update uv.lock for release"
+            git push origin release-please--branches--main
+          fi
