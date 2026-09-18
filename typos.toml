@@ -1,4 +1,8 @@
+[files]
+extend-exclude = ["**/CHANGELOG.md", "CHANGELOG.md"]
+
 [default.extend-words]
+ba = "ba"
 Ue = "Ue"
 TrUe = "TrUe"
 ded = "ded"
