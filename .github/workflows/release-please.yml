@@ -24,7 +24,7 @@ jobs:
     steps:
       - name: Run Release Please
         id: release
-        uses: googleapis/release-please-action@d1a8f221d7723166f48a584aebba00ef3f6febec # v4.1.4
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           # Use GITHUB_TOKEN for release-please operations.
           # PyPI deployment is handled in main.yml on release commits to main,
@@ -35,7 +35,7 @@ jobs:
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         continue-on-error: true
         id: checkout-release-pr
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: release-please--branches--main
           token: ${{ secrets.GITHUB_TOKEN }}
