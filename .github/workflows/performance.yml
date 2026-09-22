@@ -14,21 +14,23 @@ on:
       - 'examples/**'
       - '**/*.md'
 
+permissions: read-all
+
 jobs:
   benchmark:
     name: Run Performance Benchmarks
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: '3.10'
 
       - name: Cache Workspace Dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
         with:
           path: |
             ~/.cache/uv
@@ -56,7 +58,7 @@ jobs:
           pytest tests/core/test_performance.py -m performance -v
 
       - name: Save Verification Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: performance-report
           path: performance_report.json

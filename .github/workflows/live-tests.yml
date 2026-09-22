@@ -9,9 +9,7 @@ on:
         required: true
         default: false
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: read-all
 
 jobs:
   live-validation:
@@ -19,17 +17,20 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.approved }}
     runs-on: ubuntu-latest
     environment: live-testing
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.10"
 
       - name: Cache Workspace Dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
         with:
           path: |
             ~/.cache/uv
@@ -82,7 +83,7 @@ jobs:
 
       - name: Post Drift Report
         if: steps.live_tests.outputs.drift_detected == 'true' && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |

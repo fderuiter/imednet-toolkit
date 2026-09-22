@@ -77,6 +77,7 @@ Testing Boundaries
 Commit Messages and Pull Requests
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 - PR titles must follow Conventional Commits. Permitted prefixes: ``feat:``, ``fix:``, ``chore:``, ``docs:``, ``ci:``, ``test:``, ``refactor:``, ``perf:``, ``revert:``. The ``Semantic PR Title`` CI check enforces this.
+- Security updates and CVE remediations must use the ``fix:`` prefix (e.g. ``fix(deps):`` or ``fix(security):``), which directly maps to patch releases in ``release-please``. Do not use unpermitted prefixes such as ``security:``.
 - Merge to ``main`` via **Squash and merge** so the PR title becomes the commit message.
 - Changes that affect the public API, CLI interface, or environment variables must be noted in the PR description for Render deployment review.
 
