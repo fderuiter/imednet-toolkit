@@ -132,6 +132,10 @@ ignore_missing_imports = true
 [tool.ruff.format]
 quote-style = "preserve"
 
+[tool.pytest.ini_options]
+addopts = "-ra --ignore=tests/live --ignore=tests/browser"
+testpaths = ["tests", "packages/plugins-sinks/tests"]
+
 [tool.hatch.build.targets.wheel]
 packages = []
 include = ["CHANGELOG.md"]
