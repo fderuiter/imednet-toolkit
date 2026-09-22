@@ -13,6 +13,27 @@ see `CONTRIBUTING.md <../CONTRIBUTING.md>`__ for complete details.
    project_standards
    triage_playbook
 
+Developer Environment Setup
+---------------------------
+
+We recommend using our interactive setup wizard to configure your environment, credentials, and dependencies:
+
+.. code-block:: bash
+
+   bash scripts/wizards/setup-imednet-env.sh
+
+The wizard configures UTF-8 encoding (preventing Windows console errors), validates your ``uv`` installation, synchronizes all 5 packages in editable mode (``uv sync --extra dev --extra docs``), and configures ``.env`` with EDC credentials and safety flags.
+
+For manual setup:
+
+.. code-block:: bash
+
+   # Configure UTF-8 encoding
+   export PYTHONUTF8=1   # in PowerShell: $env:PYTHONUTF8 = "1"
+
+   # Synchronize workspace dependencies
+   uv sync --extra dev --extra docs
+
 Public API stability
 --------------------
 

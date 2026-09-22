@@ -66,6 +66,31 @@ pip install apache-airflow-providers-imednet
 pip install imednet-streamlit
 ```
 
+## Developer Quickstart & Environment Setup
+
+Contributors and developers can initialize their local environment, credentials, and dependencies using the interactive setup wizard:
+
+```bash
+bash scripts/wizards/setup-imednet-env.sh
+```
+
+The wizard guides you through:
+1. **Tooling Verification**: Ensuring Python (>= 3.10) and `uv` are available in your `PATH`.
+2. **UTF-8 Encoding**: Configuring `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` to prevent Windows console `charmap` encoding errors.
+3. **Workspace Synchronization**: Running `uv sync --extra dev --extra docs` to link all 5 packages in editable mode.
+4. **EDC Credentials**: Safely entering EDC API credentials into `.env` (with optional GitHub Actions secrets sync via `gh`).
+5. **Self-Test**: Validating that the SDK and CLI (`imednet --help`) are fully operational.
+
+To set up manually:
+```bash
+# Set UTF-8 encoding in PowerShell (Windows) or bash (macOS/Linux)
+# PowerShell: $env:PYTHONUTF8 = "1"
+# bash: export PYTHONUTF8=1
+
+# Synchronize monorepo packages with dev and docs tooling
+uv sync --extra dev --extra docs
+```
+
 ## Contributing
 
 Contributions are welcome! Please see our [Contributor Guide](AGENTS.md) and [Verification Loop](docs/how-to/verification.rst) to get started.

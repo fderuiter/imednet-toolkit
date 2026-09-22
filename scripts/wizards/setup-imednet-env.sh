@@ -184,12 +184,132 @@ finish() {
 # Replace the example below. Set TOTAL_STAGES to match the stages you write.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=5
+TOTAL_STAGES=6
 
-banner "iMedNet EDC Environment & Local Credentials (.env)"
+banner "iMedNet EDC Environment & Developer Workspace Setup"
 
-# ── Stage 1: EDC Endpoint Selection ───────────────────────────────────────
-stage "iMedNet EDC Endpoint"
+# ── Stage 1: Tooling & PATH Verification ──────────────────────────────────
+stage "Tooling & PATH Verification"
+say "Checking required developer tooling (Python, uv, and GitHub CLI)..."
+
+# 1. Check Python >= 3.10
+PYTHON_BIN=""
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+fi
+
+if [[ -n "$PYTHON_BIN" ]]; then
+  PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+  say "Found Python $PY_VER ($PYTHON_BIN)"
+else
+  warn "Python not found! Please install Python 3.10+."
+fi
+
+# 2. Check uv and locate if not in PATH
+if ! command -v uv >/dev/null 2>&1; then
+  warn "'uv' is not currently in your system PATH."
+  say "Searching common install locations..."
+
+  FOUND_UV=""
+  # Common Windows locations (Git Bash / MSYS2 syntax and Windows syntax)
+  for candidate in \
+    "$APPDATA/Python/Python"*/Scripts/uv.exe \
+    "$HOME/AppData/Roaming/Python/Python"*/Scripts/uv.exe \
+    "$HOME/.cargo/bin/uv.exe" \
+    "$HOME/.cargo/bin/uv" \
+    "$HOME/.local/bin/uv" \
+    "/c/Python"*/Scripts/uv.exe \
+    "/c/Users/$USER/AppData/Roaming/Python/Python"*/Scripts/uv.exe \
+    "/opt/homebrew/bin/uv"; do
+    if compgen -G "$candidate" >/dev/null 2>&1; then
+      for match in $candidate; do
+        if [[ -x "$match" || -f "$match" ]]; then
+          FOUND_UV="$match"
+          break 2
+        fi
+      done
+    fi
+  done
+
+  if [[ -n "$FOUND_UV" ]]; then
+    UV_DIR=$(dirname "$FOUND_UV")
+    export PATH="$UV_DIR:$PATH"
+    say "✓ Discovered uv at: $FOUND_UV"
+    say "  Temporarily added $UV_DIR to PATH for this session."
+    note "To add permanently on Windows: setx PATH \"%PATH%;$UV_DIR\""
+    note "To add permanently on Unix/macOS: echo 'export PATH=\"$UV_DIR:\$PATH\"' >> ~/.bashrc"
+  else
+    say "uv could not be found automatically."
+    if confirm "Install uv now via pip?"; then
+      "$PYTHON_BIN" -m pip install --user uv || warn "Failed to install uv via pip."
+      # Try finding again
+      for candidate in "$APPDATA/Python/Python"*/Scripts/uv.exe "$HOME/AppData/Roaming/Python/Python"*/Scripts/uv.exe; do
+        if compgen -G "$candidate" >/dev/null 2>&1; then
+          for match in $candidate; do
+            UV_DIR=$(dirname "$match")
+            export PATH="$UV_DIR:$PATH"
+            say "✓ Installed and added uv to PATH: $match"
+            break 2
+          done
+        fi
+      done
+    else
+      note "Install uv manually: https://docs.astral.sh/uv/getting-started/installation/"
+    fi
+  fi
+else
+  say "✓ 'uv' is available in PATH ($(uv --version 2>/dev/null || echo 'uv ready'))"
+fi
+
+# 3. Check GitHub CLI
+if command -v gh >/dev/null 2>&1; then
+  if gh auth status >/dev/null 2>&1; then
+    say "✓ GitHub CLI (gh) is installed and authenticated."
+  else
+    note "GitHub CLI (gh) is installed but not authenticated (run 'gh auth login' to sync secrets)."
+  fi
+else
+  note "GitHub CLI (gh) not detected; CI secret synchronization will be skipped."
+fi
+pause "Press Enter to proceed to encoding configuration..."
+
+# ── Stage 2: Windows Console & UTF-8 Encoding ─────────────────────────────
+stage "Console & UTF-8 Encoding"
+say "Configuring UTF-8 console encoding."
+note "On Windows, consoles default to legacy codepages (cp1252), which can cause"
+note "charmap UnicodeEncodeError / UnicodeDecodeError when tools emit emojis or UTF-8 text."
+say "Setting PYTHONUTF8=1 and PYTHONIOENCODING=utf-8 in .env..."
+write_env PYTHONUTF8 "1"
+write_env PYTHONIOENCODING "utf-8"
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+note "Tip: In PowerShell, also add \$env:PYTHONUTF8 = \"1\" to your \$PROFILE."
+pause "Press Enter to proceed to workspace dependency sync..."
+
+# ── Stage 3: Workspace Dependency Synchronization ─────────────────────────
+stage "Workspace Dependency Sync"
+say "Synchronizing the monorepo workspace virtual environment (.venv)..."
+say "This installs all 5 packages in editable mode along with dev (pytest, ruff, mypy) and docs dependencies."
+if confirm "Run 'uv sync --extra dev --extra docs' now?"; then
+  if command -v uv >/dev/null 2>&1; then
+    say "Running 'uv sync --extra dev --extra docs'..."
+    if uv sync --extra dev --extra docs; then
+      say "✓ Workspace dependencies synchronized successfully."
+    else
+      warn "uv sync encountered issues. You can re-run 'uv sync --extra dev --extra docs' later."
+    fi
+  else
+    warn "uv is not available. Please install uv and run 'uv sync --extra dev --extra docs'."
+  fi
+else
+  say "Skipping dependency sync. Run 'uv sync --extra dev --extra docs' when ready."
+fi
+pause "Press Enter to proceed to EDC credentials configuration..."
+
+# ── Stage 4: EDC Endpoint & Authentication ────────────────────────────────
+stage "iMedNet EDC Endpoint & Authentication"
 say "Specify the base API URL for your iMedNet EDC instance."
 say "Default is production: https://edc.prod.imednetapi.com"
 ask IMEDNET_BASE_URL "Enter IMEDNET_BASE_URL [press Enter for default]:"
@@ -197,12 +317,11 @@ if [[ -z "$IMEDNET_BASE_URL" ]]; then
   IMEDNET_BASE_URL="https://edc.prod.imednetapi.com"
 fi
 write_env IMEDNET_BASE_URL "$IMEDNET_BASE_URL"
+
 step "Opening your EDC portal in the browser..."
 open_url "$IMEDNET_BASE_URL"
-pause "Log in to the EDC portal and press Enter when ready..."
+pause "Log in to the EDC portal, then press Enter..."
 
-# ── Stage 2: API and Security Keys ────────────────────────────────────────
-stage "API & Security Keys"
 say "Retrieve your API credentials from your iMedNet EDC account."
 step "In the EDC portal, navigate to User Profile / Settings → API Access."
 step "Copy the API Key and Security Key."
@@ -212,8 +331,16 @@ write_env IMEDNET_API_KEY "$IMEDNET_API_KEY"
 ask_secret IMEDNET_SECURITY_KEY "Paste your IMEDNET_SECURITY_KEY:"
 write_env IMEDNET_SECURITY_KEY "$IMEDNET_SECURITY_KEY"
 
-# ── Stage 3: Default Study Identifier ─────────────────────────────────────
-stage "Default Study Identifier"
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  if confirm "Sync these credentials to GitHub Actions secrets via gh?"; then
+    set_secret IMEDNET_API_KEY "$IMEDNET_API_KEY"
+    set_secret IMEDNET_SECURITY_KEY "$IMEDNET_SECURITY_KEY"
+    set_var IMEDNET_BASE_URL "$IMEDNET_BASE_URL"
+  fi
+fi
+
+# ── Stage 5: Study Configuration & Safety Guardrails ──────────────────────
+stage "Study Configuration & Safety Guardrails"
 say "Configure a default study key for local queries, CLI operations, and smoke tests."
 step "In the EDC portal, look at the Study list for your trial identifier."
 ask IMEDNET_STUDY_KEY "Enter default IMEDNET_STUDY_KEY (or press Enter to discover dynamically):"
@@ -223,10 +350,8 @@ else
   say "No static study key set; SDK and scripts will discover study keys dynamically."
 fi
 
-# ── Stage 4: Safety & Validation Flags ────────────────────────────────────
-stage "Safety & Validation Flags"
-say "Configure runtime safety guardrails."
-if confirm "Allow write operations during live tests (IMEDNET_ALLOW_MUTATION=1)?"; then
+say "Configure runtime safety guardrails:"
+if confirm "Allow write/mutation operations during tests (IMEDNET_ALLOW_MUTATION=1)?"; then
   write_env IMEDNET_ALLOW_MUTATION "1"
 else
   write_env IMEDNET_ALLOW_MUTATION "0"
@@ -237,14 +362,24 @@ else
   write_env IMEDNET_STRICT_MODE "0"
 fi
 
-# ── Stage 5: Verification & Smoke Test ────────────────────────────────────
-stage "Verification & Self-Test"
-say "Verifying your .env file can be loaded by the SDK..."
+# ── Stage 6: SDK Self-Test & Verification ─────────────────────────────────
+stage "SDK Self-Test & Verification"
+say "Verifying that your .env file can be loaded by the SDK..."
+
 if command -v uv >/dev/null 2>&1; then
   uv run python -c "from imednet.config import load_config; cfg = load_config(); print('  ✓ Config loaded successfully. Base URL:', cfg.base_url)" || warn "Could not run python check via uv. Run 'uv sync' to install dependencies."
+  uv run imednet --help >/dev/null 2>&1 && say "  ✓ imednet CLI is installed and accessible." || true
 elif command -v python >/dev/null 2>&1; then
   python -c "from imednet.config import load_config; cfg = load_config(); print('  ✓ Config loaded successfully. Base URL:', cfg.base_url)" || warn "Could not run python check. Ensure virtual environment is activated."
 fi
+
+say ""
+say "Common Developer Commands Cheatsheet:"
+say "  • Run full CI quality gate:   uv run ruff check . && uv run ruff format --check . && uv run mypy packages/core/src/imednet"
+say "  • Run test suite:             uv run pytest -q"
+say "  • Build documentation:        uv run python scripts/build_docs.py"
+say "  • Run security audit:         uv run --with pip-audit pip-audit -s osv"
+say "  • Launch CLI:                 uv run imednet --help"
 pause "Press Enter to finish setup..."
 
 finish
