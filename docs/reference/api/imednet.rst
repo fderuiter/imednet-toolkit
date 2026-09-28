@@ -13,6 +13,7 @@ Subpackages
 
    imednet.auth
    imednet.cli
+   imednet.datadict
    imednet.endpoints
    imednet.errors
    imednet.form_designer

@@ -1,0 +1,448 @@
+{
+  "$defs": {
+    "BusinessLogicRule": {
+      "additionalProperties": true,
+      "description": "An edit check, workflow trigger, or business logic rule.",
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Unique rule identifier",
+          "title": "Id"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Descriptive name of the rule",
+          "title": "Name"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Rule category: Form, Workflow, Query, Approval, Required",
+          "title": "Type"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Rule status (Active, Inactive)",
+          "title": "Status"
+        },
+        "form": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Form key if rule is form-scoped or attached",
+          "title": "Form"
+        },
+        "sequence": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Execution sequence",
+          "title": "Sequence"
+        },
+        "logic": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Structured parsed AST of the business logic",
+          "title": "Logic"
+        },
+        "logicRawXml": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Verbatim XML string (optional, omitted with --no-raw-xml)",
+          "title": "Logicrawxml"
+        },
+        "extraAttributes": {
+          "additionalProperties": true,
+          "description": "Additional rule properties or unknown columns",
+          "title": "Extraattributes",
+          "type": "object"
+        }
+      },
+      "title": "BusinessLogicRule",
+      "type": "object"
+    },
+    "Choice": {
+      "additionalProperties": true,
+      "description": "A choice option for single-select or multi-select variables.",
+      "properties": {
+        "choiceText": {
+          "description": "Display text of the choice",
+          "title": "Choicetext",
+          "type": "string"
+        },
+        "choiceValue": {
+          "description": "Coded value of the choice",
+          "title": "Choicevalue",
+          "type": "string"
+        },
+        "position": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Display order sequence",
+          "title": "Position"
+        },
+        "extraAttributes": {
+          "additionalProperties": true,
+          "description": "Unknown columns for this choice",
+          "title": "Extraattributes",
+          "type": "object"
+        }
+      },
+      "required": [
+        "choiceText",
+        "choiceValue"
+      ],
+      "title": "Choice",
+      "type": "object"
+    },
+    "Form": {
+      "additionalProperties": true,
+      "description": "An electronic Case Report Form (eCRF).",
+      "properties": {
+        "formKey": {
+          "description": "Unique short code/mnemonic for the form",
+          "title": "Formkey",
+          "type": "string"
+        },
+        "formName": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Human-readable form title",
+          "title": "Formname"
+        },
+        "formId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Unique form identifier",
+          "title": "Formid"
+        },
+        "formType": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Type of form (Patient, Study, Admin, etc.)",
+          "title": "Formtype"
+        },
+        "variables": {
+          "description": "Variables defined on this form",
+          "items": {
+            "$ref": "#/$defs/Variable"
+          },
+          "title": "Variables",
+          "type": "array"
+        },
+        "businessLogic": {
+          "description": "Form-scoped business logic rules",
+          "items": {
+            "$ref": "#/$defs/BusinessLogicRule"
+          },
+          "title": "Businesslogic",
+          "type": "array"
+        },
+        "extraAttributes": {
+          "additionalProperties": true,
+          "description": "Unknown columns for this form",
+          "title": "Extraattributes",
+          "type": "object"
+        }
+      },
+      "required": [
+        "formKey"
+      ],
+      "title": "Form",
+      "type": "object"
+    },
+    "Metadata": {
+      "additionalProperties": true,
+      "description": "Metadata envelope for the study data dictionary.",
+      "properties": {
+        "schemaVersion": {
+          "default": "1.0.0",
+          "description": "Data dictionary schema version",
+          "title": "Schemaversion",
+          "type": "string"
+        },
+        "studyKey": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Clinical trial study key",
+          "title": "Studykey"
+        },
+        "generatedAt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Timestamp of data dictionary generation",
+          "title": "Generatedat"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Source of generation (csv, api)",
+          "title": "Source"
+        },
+        "validationWarnings": {
+          "description": "Warnings generated during loading/validation",
+          "items": {
+            "type": "string"
+          },
+          "title": "Validationwarnings",
+          "type": "array"
+        },
+        "extraAttributes": {
+          "additionalProperties": true,
+          "description": "Unknown metadata columns or properties",
+          "title": "Extraattributes",
+          "type": "object"
+        }
+      },
+      "title": "Metadata",
+      "type": "object"
+    },
+    "Variable": {
+      "additionalProperties": true,
+      "description": "A clinical data variable (data point) on a form.",
+      "properties": {
+        "variableName": {
+          "description": "Unique identifier for variable within form",
+          "title": "Variablename",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Display prompt/label on the eCRF",
+          "title": "Label"
+        },
+        "variableType": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Field type (Text, Radio, Date/Time Precision, etc.)",
+          "title": "Variabletype"
+        },
+        "sequence": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Display order within form",
+          "title": "Sequence"
+        },
+        "required": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required policy (e.g. 'Yes', 'No', 'Auto Query')",
+          "title": "Required"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Format mask or pattern",
+          "title": "Format"
+        },
+        "precision": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Date/Time or number precision",
+          "title": "Precision"
+        },
+        "choices": {
+          "description": "Allowed choices for categorical variables",
+          "items": {
+            "$ref": "#/$defs/Choice"
+          },
+          "title": "Choices",
+          "type": "array"
+        },
+        "extraAttributes": {
+          "additionalProperties": true,
+          "description": "Unknown columns for this variable",
+          "title": "Extraattributes",
+          "type": "object"
+        }
+      },
+      "required": [
+        "variableName"
+      ],
+      "title": "Variable",
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
+  "description": "Canonical root data dictionary container.",
+  "properties": {
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "forms": {
+      "items": {
+        "$ref": "#/$defs/Form"
+      },
+      "title": "Forms",
+      "type": "array"
+    },
+    "unassignedBusinessLogic": {
+      "description": "Business logic not tied to a single form (Workflow, Query, Approval, Required)",
+      "items": {
+        "$ref": "#/$defs/BusinessLogicRule"
+      },
+      "title": "Unassignedbusinesslogic",
+      "type": "array"
+    }
+  },
+  "title": "iMednet Data Dictionary Schema",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": "1.0.0"
+}

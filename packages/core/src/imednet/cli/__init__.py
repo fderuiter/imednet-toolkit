@@ -83,6 +83,7 @@ def get_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
+    from .datadict import setup_parser as datadict_setup
     from .export import setup_parser as export_setup
     from .intervals import setup_parser as intervals_setup
     from .jobs import setup_parser as jobs_setup
@@ -94,6 +95,7 @@ def get_parser() -> argparse.ArgumentParser:
     from .subjects import setup_parser as subjects_setup
     from .variables import setup_parser as variables_setup
 
+    datadict_setup(subparsers)
     studies_setup(subparsers)
     queries_setup(subparsers)
     variables_setup(subparsers)

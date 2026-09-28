@@ -34,11 +34,15 @@ _Avoid_: Phase, window, period
 
 **Variable**:
 An individual clinical data point or field defined within a form.
-_Avoid_: Field, column, parameter
+_Avoid_: Field, column, parameter, question
 
 **Query**:
 A formal data discrepancy flag or clarification request raised against a record or variable.
 _Avoid_: Discrepancy, ticket, flag
+
+**Data Dictionary**:
+A standardized specification of study metadata defining forms, variables, choices, and business logic rules.
+_Avoid_: Codebook, schema definition, CRF specification
 
 **Job**:
 An asynchronous background task executed by the iMednet EDC API, such as a bulk record import or export.
