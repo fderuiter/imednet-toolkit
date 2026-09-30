@@ -1413,7 +1413,7 @@ wheels = [
 
 [[package]]
 name = "imednet"
-version = "0.9.1"
+version = "0.10.0"
 source = { editable = "packages/core" }
 dependencies = [
     { name = "httpx" },
