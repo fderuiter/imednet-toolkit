@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.9.1...imednet-v0.10.0) (2026-09-30)
+
+
+### Features
+
+* **datadict:** standardize canonical data dictionary subsystem ([#1584](https://github.com/fderuiter/imednet-toolkit/issues/1584)) ([e7233ac](https://github.com/fderuiter/imednet-toolkit/commit/e7233aca98d6df74cb08441599ffb4c5e49cbc5c))
+
 ## [0.9.1](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.9.0...imednet-v0.9.1) (2026-09-18)
 
 
