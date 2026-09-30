@@ -9,7 +9,6 @@ requires-python = ">=3.10"
 dependencies = [
     "imednet",
     "imednet-workflows",
-    "imednet-streamlit",
     "imednet-plugins-sinks"
 ]
 
@@ -33,9 +32,8 @@ dev = [
     "pymongo>=4.17.0,<5.0.0",
     "atheris>=3.0.0,<4.0.0; python_version>='3.12' and sys_platform != 'win32'",
     "sphinx-argparse>=0.5.0",
-    "playwright",
-    "axe-playwright-python",
-    "click>=8.3.3"
+    "click>=8.3.3",
+    "jsonschema>=4.20.0"
 ]
 docs = [
     "furo<2026.0.0",
@@ -50,10 +48,10 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 exclude = ["sandbox", "vulture_whitelist.py"]
-src = ["packages/core/src", "packages/plugins-workflows/src", "packages/providers-airflow/src", "packages/plugins-streamlit/src", "tests"]
+src = ["packages/core/src", "packages/plugins-workflows/src", "packages/providers-airflow/src", "tests"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["imednet", "imednet_workflows", "apache_airflow_providers_imednet", "imednet_streamlit"]
+known-first-party = ["imednet", "imednet_workflows", "apache_airflow_providers_imednet"]
 
 [tool.ruff.lint]
 select = ["PL", "PIE", "FURB", "E", "F", "I", "N", "SLF", "D", "S", "B", "C4", "SIM", "UP", "PT", "RET", "RUF"]
@@ -108,10 +106,6 @@ module = [
     "openpyxl.*",
     "duckdb",
     "duckdb.*",
-    "streamlit",
-    "streamlit.*",
-    "altair",
-    "altair.*",
 ]
 ignore_missing_imports = true
 
@@ -133,7 +127,7 @@ ignore_missing_imports = true
 quote-style = "preserve"
 
 [tool.pytest.ini_options]
-addopts = "-ra --ignore=tests/live --ignore=tests/browser"
+addopts = "-ra --ignore=tests/live"
 testpaths = ["tests", "packages/plugins-sinks/tests"]
 
 [tool.hatch.build.targets.wheel]
@@ -147,12 +141,11 @@ dependencies = [
     "imednet @ {root:uri}/packages/core",
     "imednet-workflows @ {root:uri}/packages/plugins-workflows",
     "apache-airflow-providers-imednet @ {root:uri}/packages/providers-airflow",
-    "imednet-streamlit @ {root:uri}/packages/plugins-streamlit",
     "imednet-plugins-sinks @ {root:uri}/packages/plugins-sinks",
 ]
 
 [tool.hatch.envs.default.scripts]
-test = "pytest --ignore=tests/live/ --ignore=tests/browser/ {args:tests/}"
+test = "pytest --ignore=tests/live/ {args:tests/}"
 docs = "python scripts/build_docs.py"
 
 [tool.hatch.envs.lint]
@@ -175,7 +168,6 @@ dependencies = [
     "vulture",
     "imednet @ {root:uri}/packages/core",
     "imednet-workflows @ {root:uri}/packages/plugins-workflows",
-    "imednet-streamlit @ {root:uri}/packages/plugins-streamlit",
     "apache-airflow-providers-imednet @ {root:uri}/packages/providers-airflow",
     "imednet-plugins-sinks @ {root:uri}/packages/plugins-sinks",
 ]
@@ -226,7 +218,6 @@ members = ["packages/*"]
 [tool.uv.sources]
 imednet = { workspace = true }
 imednet-workflows = { workspace = true }
-imednet-streamlit = { workspace = true }
 imednet-plugins-sinks = { workspace = true }
 apache-airflow-providers-imednet = { workspace = true }
 

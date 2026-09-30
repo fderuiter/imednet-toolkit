@@ -93,13 +93,12 @@ def test_workflows_does_not_import_providers():
 
 def test_extensions_use_spi():
     """Ensure extension packages use the SPI or top-level public API and not core internals."""
-    # We will check packages/plugins-workflows, packages/plugins-streamlit, and packages/providers-airflow
+    # We will check packages/plugins-workflows and packages/providers-airflow
     app_dir = Path(imednet.__file__).parent.parent.parent.parent
     packages_dir = app_dir
 
     extension_dirs = [
         packages_dir / "plugins-workflows" / "src",
-        packages_dir / "plugins-streamlit" / "src",
         packages_dir / "providers-airflow" / "src",
     ]
 
@@ -209,22 +208,3 @@ def test_plugin_discovery_failure(monkeypatch):
         match="Workflow 'some_workflow' not found. Please install the required package.",
     ):
         sdk.workflows.some_workflow
-
-
-def test_dashboard_no_direct_db_access():
-    """Ensure that clinical dashboards do not use raw database queries or import sqlite3 directly."""
-    app_dir = Path(imednet.__file__).parent.parent.parent.parent.parent
-    dashboard_dir = (
-        app_dir / "packages" / "plugins-streamlit" / "src" / "imednet_streamlit" / "pages"
-    )
-
-    if not dashboard_dir.exists():
-        pytest.skip("Streamlit pages directory not found")
-
-    for file in get_all_python_files(dashboard_dir):
-        imports = get_imports_from_file(file)
-        for imp in imports:
-            assert imp != "sqlite3", (
-                f"Architectural violation: {file} imports 'sqlite3'. "
-                "Dashboard UI files must route database interactions through the centralized CredentialRepository."
-            )

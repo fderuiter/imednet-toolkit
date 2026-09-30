@@ -23,13 +23,13 @@ body:
         - release
         - workflows-plugin
         - airflow-provider
-        - streamlit
+        - tui
+        - mcp
+        - datadict
         - records
         - mapping
         - standards
         - terminology
-        - dashboard
-        - review-workbench
         - governance
         - performance
         - testing

@@ -19,11 +19,6 @@
       "release-type": "python",
       "package-name": "imednet-plugins-sinks",
       "changelog-path": "CHANGELOG.md"
-    },
-    "packages/plugins-streamlit": {
-      "release-type": "python",
-      "package-name": "imednet-streamlit",
-      "changelog-path": "CHANGELOG.md"
     }
   }
 }

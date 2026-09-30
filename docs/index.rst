@@ -34,7 +34,6 @@ This documentation is organized according to the Diátaxis framework into four m
    how-to/snowflake_export
    how-to/orchestration
    how-to/record_mapping
-   how-to/streamlit_dashboard
    how-to/verification
 
 .. toctree::
@@ -57,7 +56,6 @@ This documentation is organized according to the Diátaxis framework into four m
    reference/configuration
    reference/agent_rules
    reference/refactoring_roadmaps
-   reference/streamlit_reference
    reference/test_skip_conditions
    reference/live_test_charter
    reference/live_test_plan
@@ -70,7 +68,6 @@ This documentation is organized according to the Diátaxis framework into four m
    reference/verification_reports
    reference/api/core
    reference/api/plugins-sinks
-   reference/api/plugins-streamlit
    reference/api/plugins-workflows
    reference/api/providers-airflow
 

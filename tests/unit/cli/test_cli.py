@@ -800,23 +800,6 @@ def test_workflows_stub_uninstalled_mocked(monkeypatch, capsys):
     assert "The workflows plugin is not installed" in err
 
 
-def test_dashboard_stub_uninstalled_mocked(monkeypatch, capsys):
-    monkeypatch.setattr("importlib.metadata.entry_points", lambda **kwargs: [])
-    from imednet.cli import get_parser
-
-    parser = get_parser()
-
-    args = parser.parse_args(["dashboard"])
-
-    import pytest
-
-    with pytest.raises(SystemExit) as e:
-        args.func(args)
-    assert e.value.code == 1
-    _out, err = capsys.readouterr()
-    assert "The dashboard plugin is not installed" in err
-
-
 def test_plugin_load_exception(monkeypatch, capsys):
     class BrokenEntryPoint:
         name = "broken"

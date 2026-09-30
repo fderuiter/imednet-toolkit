@@ -132,21 +132,6 @@ def get_parser() -> argparse.ArgumentParser:
 
         workflows_parser.set_defaults(func=workflows_stub)
 
-    if "dashboard" not in registered_plugins:
-        dashboard_parser = subparsers.add_parser(
-            "dashboard", help="Dashboard plugin (not installed)"
-        )
-        dashboard_parser.add_argument("args", nargs=argparse.REMAINDER)
-
-        def dashboard_stub(args: argparse.Namespace) -> None:
-            print(
-                "The dashboard plugin is not installed. Please pip install imednet-streamlit.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        dashboard_parser.set_defaults(func=dashboard_stub)
-
     return parser
 
 

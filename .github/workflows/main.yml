@@ -7,7 +7,6 @@ on:
       - "imednet-v*.*.*"
       - "imednet-workflows-v*.*.*"
       - "apache-airflow-providers-imednet-v*.*.*"
-      - "imednet-streamlit-v*.*.*"
       - "imednet-plugins-sinks-v*.*.*"
   pull_request:
     branches: [main]
@@ -249,14 +248,6 @@ jobs:
           path: packages/plugins-sinks/dist/
           retention-days: 1
 
-      - name: Upload Streamlit Artifact
-        if: contains(fromJSON(needs.plan.outputs.build_matrix), 'plugins-streamlit')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dist-streamlit
-          path: packages/plugins-streamlit/dist/
-          retention-days: 1
-
       - name: Restore Internal Dependencies
         if: always()
         run: python scripts/tighten_dependencies.py --restore
@@ -314,7 +305,7 @@ jobs:
           IMEDNET_POSTMAN_PATH: ${{ github.workspace }}/imednet.postman_collection.json
         run: |
           if [ "${{ matrix.package }}" = "core" ]; then
-            TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*streamlit* --ignore-glob=*sinks* --ignore-glob=*browser* tests/"
+            TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*sinks* tests/"
             COV_ARGS="--cov=imednet"
           elif [ "${{ matrix.package }}" = "plugins-workflows" ]; then
 
@@ -324,15 +315,12 @@ jobs:
           elif [ "${{ matrix.package }}" = "providers-airflow" ]; then
             TEST_ARGS="tests/unit/test_airflow*.py"
             COV_ARGS="--cov=apache_airflow_providers_imednet"
-          elif [ "${{ matrix.package }}" = "plugins-streamlit" ]; then
-            TEST_ARGS="tests/unit/test_streamlit*.py tests/unit/streamlit/ tests/unit/streamlit_plugin/"
-            COV_ARGS="--cov=imednet_streamlit"
           elif [ "${{ matrix.package }}" = "plugins-sinks" ]; then
             TEST_ARGS="packages/plugins-sinks/tests/"
             COV_ARGS="--cov=imednet_sinks"
           fi
 
-          hatch run test -q $COV_ARGS --cov-report=xml --cov-fail-under=90 -m "not live and not browser" --ignore=tests/live/ --ignore=tests/browser/ $TEST_ARGS || {
+          hatch run test -q $COV_ARGS --cov-report=xml --cov-fail-under=90 -m "not live" --ignore=tests/live/ $TEST_ARGS || {
             RET=$?
             if [ $RET -eq 5 ]; then
               echo "No tests collected for ${{ matrix.package }}. Passing gracefully."
@@ -612,8 +600,6 @@ jobs:
             echo "artifact=dist-providers" >> $GITHUB_OUTPUT
           elif [ "${{ matrix.package }}" = "plugins-sinks" ]; then
             echo "artifact=dist-sinks" >> $GITHUB_OUTPUT
-          elif [ "${{ matrix.package }}" = "plugins-streamlit" ]; then
-            echo "artifact=dist-streamlit" >> $GITHUB_OUTPUT
           fi
 
       - name: Download Artifact
@@ -626,101 +612,3 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           skip-existing: true
-
-  # ------------------------------------------------------------------
-  # JOB X: ACCESSIBILITY AUDIT
-  # ------------------------------------------------------------------
-
-  # ------------------------------------------------------------------
-  # JOB Y: VISUAL REGRESSION
-  # ------------------------------------------------------------------
-  visual-regression:
-    name: Visual Regression Tests
-    needs: plan
-    if: needs.plan.outputs.matrix != '[]'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            uv-venv-${{ runner.os }}-"3.12"-
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install uv hatch
-          uv sync --locked --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
-          hatch run playwright install --with-deps chromium
-
-      - name: Run Visual Tests
-        run: |
-          hatch run pytest tests/browser/test_visual_regression.py
-
-      - name: Upload Visual Diffs
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: visual-diffs
-          path: reports/visual_diffs/
-          retention-days: 5
-          if-no-files-found: ignore
-
-  accessibility-audit:
-    name: WCAG 2.1 Accessibility Audit
-    needs: plan
-    if: needs.plan.outputs.matrix != '[]'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            uv-venv-${{ runner.os }}-"3.12"-
-      - name: Install Dependencies
-        run: |
-          python -m pip install uv hatch
-          uv sync --locked --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
-          hatch run playwright install --with-deps chromium
-      - name: Run automated accessibility scan
-        env:
-          IMEDNET_VPAT_PATH: "docs/reference/VPAT.rst"
-          IMEDNET_A11Y_REPORT_PATH: "packages/plugins-streamlit/src/imednet_streamlit/pages/a11y_report.json"
-        run: |
-          hatch run test -m a11y tests/browser/test_a11y.py
-
-      - name: Auto-update VPAT
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          if ! git diff --quiet docs/reference/VPAT.rst packages/plugins-streamlit/src/imednet_streamlit/pages/a11y_report.json; then
-            git config --local user.email "github-actions[bot]@users.noreply.github.com"
-            git config --local user.name "github-actions[bot]"
-            git add docs/reference/VPAT.rst packages/plugins-streamlit/src/imednet_streamlit/pages/a11y_report.json
-            git commit -m "docs: auto-update VPAT and conformance report from latest accessibility audit"
-            git push
-          else
-            echo "No VPAT or accessibility report changes to commit."
-          fi

@@ -35,12 +35,6 @@ def pytest_addoption(parser):
     parser.addoption(
         "--run-performance", action="store_true", default=False, help="run performance tests"
     )
-    parser.addoption(
-        "--update-visual-baselines",
-        action="store_true",
-        default=False,
-        help="Update visual baseline images",
-    )
 
 
 def pytest_collection_modifyitems(config, items):

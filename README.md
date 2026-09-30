@@ -36,7 +36,6 @@ Our documentation is organized according to the **Diátaxis framework**, which c
 - [UAT Workflow](docs/how-to/workflows/uat_workflow.rst)
 - [Bulk Submission](docs/how-to/workflows/bulk_submission.rst)
 - [Export Destinations](docs/how-to/export_destinations.rst)
-- [Streamlit Dashboard](docs/how-to/streamlit_dashboard.rst)
 
 ### 💡 [Explanation](docs/explanation/)
 *Understanding-oriented concepts and architectural overviews.*
@@ -63,7 +62,6 @@ For extended integrations, you can install optional dependencies:
 pip install "imednet[export]"
 pip install imednet-workflows
 pip install apache-airflow-providers-imednet
-pip install imednet-streamlit
 ```
 
 ## Developer Quickstart & Environment Setup
@@ -77,7 +75,7 @@ bash scripts/wizards/setup-imednet-env.sh
 The wizard guides you through:
 1. **Tooling Verification**: Ensuring Python (>= 3.10) and `uv` are available in your `PATH`.
 2. **UTF-8 Encoding**: Configuring `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` to prevent Windows console `charmap` encoding errors.
-3. **Workspace Synchronization**: Running `uv sync --extra dev --extra docs` to link all 5 packages in editable mode.
+3. **Workspace Synchronization**: Running `uv sync --extra dev --extra docs` to link workspace packages in editable mode.
 4. **EDC Credentials**: Safely entering EDC API credentials into `.env` (with optional GitHub Actions secrets sync via `gh`).
 5. **Self-Test**: Validating that the SDK and CLI (`imednet --help`) are fully operational.
 

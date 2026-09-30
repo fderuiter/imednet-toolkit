@@ -250,20 +250,7 @@ step "  • Environment name:   pypi"
 step "Click 'Add'."
 pause "Press Enter once 'imednet-sinks' publisher is added on PyPI..."
 
-# ── Stage 6: Package 5 - imednet-streamlit ────────────────────────────────
-stage "PyPI Publisher: imednet-streamlit"
-say "Register Trusted Publisher for 'imednet-streamlit' (packages/plugins-streamlit)."
-open_url "https://pypi.org/manage/account/publishing/"
-step "On the PyPI Publishing page, enter:"
-step "  • PyPI Project Name:  imednet-streamlit"
-step "  • Owner:              fderuiter"
-step "  • Repository name:    imednet-toolkit"
-step "  • Workflow name:      main.yml"
-step "  • Environment name:   pypi"
-step "Click 'Add'."
-pause "Press Enter once 'imednet-streamlit' publisher is added on PyPI..."
-
-# ── Stage 7: Optional Fallback Token ──────────────────────────────────────
+# ── Stage 6: Optional Fallback Token ──────────────────────────────────────
 stage "PyPI Fallback: API Token (Optional)"
 say "PyPI Trusted Publishing eliminates the need for long-lived tokens in CI."
 say "However, if you want an emergency fallback token (PYPI_API_TOKEN secret):"

@@ -33,7 +33,7 @@ Background Sync Worker
 
 :class:`~imednet_workflows.sync_worker.SyncWorker` runs incremental record
 synchronisation in a background thread so that the main application thread
-(e.g. a Streamlit rendering loop) never blocks on API calls.
+(e.g. a CLI or TUI event loop) never blocks on API calls.
 
 .. mermaid:: /diagrams/workflow_interactions_12.mmd
 
