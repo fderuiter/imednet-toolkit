@@ -22,7 +22,7 @@ repos:
     hooks:
       # Run linter with safe auto-fix enabled
       - id: ruff
-        args: [--fix, --exit-non-zero-on-fix]
+        args: [--fix, --exit-non-zero-on-fix, --ignore=UP038]
         exclude: ^sandbox/
       # Run formatter
       - id: ruff-format
