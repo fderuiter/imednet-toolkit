@@ -16,8 +16,6 @@ def main():
         ".release-please-manifest.json",
         "release-please-config.json",
         "docker-compose.yml",
-        "a11y_exemptions.json",
-        "a11y_report.json",
         "CONTEXT.md",
         "CONTEXT-MAP.md",
         "imednet.postman_collection.json",

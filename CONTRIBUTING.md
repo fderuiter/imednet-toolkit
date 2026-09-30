@@ -168,7 +168,7 @@ has an independent version and changelog:
 | `imednet` | `packages/core/` | `packages/core` |
 | `imednet-workflows` | `packages/plugins-workflows/` | `packages/plugins-workflows` |
 | `apache-airflow-providers-imednet` | `packages/providers-airflow/` | `packages/providers-airflow` |
-| `imednet-streamlit` | `packages/plugins-streamlit/` | `packages/plugins-streamlit` |
+| `imednet-plugins-sinks` | `packages/plugins-sinks/` | `packages/plugins-sinks` |
 
 **Tag format** — release-please creates package-specific Git tags when a Release PR is merged:
 
@@ -177,10 +177,10 @@ has an independent version and changelog:
 | `imednet` | `imednet-v<version>` | `imednet-v0.7.0` |
 | `imednet-workflows` | `imednet-workflows-v<version>` | `imednet-workflows-v0.5.3` |
 | `apache-airflow-providers-imednet` | `apache-airflow-providers-imednet-v<version>` | `apache-airflow-providers-imednet-v0.5.2` |
-| `imednet-streamlit` | `imednet-streamlit-v<version>` | `imednet-streamlit-v0.2.0` |
+| `imednet-plugins-sinks` | `imednet-plugins-sinks-v<version>` | `imednet-plugins-sinks-v0.2.0` |
 
-**PyPI publishing** — the `Pipeline` workflow in `.github/workflows/main.yml` contains four
-publish jobs (`publish-core`, `publish-workflows`, `publish-providers`, `publish-streamlit`).
+**PyPI publishing** — the `Pipeline` workflow in `.github/workflows/main.yml` contains publish jobs
+(`publish-core`, `publish-workflows`, `publish-providers`, `publish-sinks`).
 Publishing is triggered either by package tags or by the release commit pushed to `main`
 (`chore: release main`). Jobs use `skip-existing` so repeated runs are idempotent.
 
@@ -188,7 +188,7 @@ Publishing is triggered either by package tags or by the release commit pushed t
 imednet-v* tag or release commit         → publish-core       → uploads imednet to PyPI
 imednet-workflows-v* or release commit   → publish-workflows  → uploads imednet-workflows to PyPI
 apache-airflow-*-v* or release commit    → publish-providers  → uploads apache-airflow-providers-imednet to PyPI
-imednet-streamlit-v* or release commit   → publish-streamlit  → uploads imednet-streamlit to PyPI
+imednet-plugins-sinks-v* or release comm → publish-sinks      → uploads imednet-plugins-sinks to PyPI
 ```
 
 Publishing uses PyPI Trusted Publishers (OIDC) via `pypa/gh-action-pypi-publish`. No API token

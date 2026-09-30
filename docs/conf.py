@@ -31,34 +31,11 @@ Note:
 """
 
 
-import sys
-from unittest.mock import MagicMock
-
-sys.modules["streamlit"] = MagicMock()
-sys.modules["streamlit.testing"] = MagicMock()
-sys.modules["streamlit.testing.v1"] = MagicMock()
-
-# Mock get_sdk and get_study_key to prevent autodoc from failing
-import imednet_streamlit.auth
-
-
-def mock_get_sdk():
-    return MagicMock()
-
-
-def mock_get_study_key():
-    return "MOCK_STUDY"
-
-
-imednet_streamlit.auth.get_sdk = mock_get_sdk
-imednet_streamlit.auth.get_study_key = mock_get_study_key
-
 # Add package source roots so API modules can be imported for docs builds.
 sys.path[:0] = [
     os.path.abspath("../packages/core/src"),
     os.path.abspath("../packages/providers-airflow/src"),
     os.path.abspath("../packages/plugins-workflows/src"),
-    os.path.abspath("../packages/plugins-streamlit/src"),
     os.path.abspath("../packages/plugins-sinks/src"),
 ]
 warnings.filterwarnings("ignore", message="duplicate object description*")
@@ -114,7 +91,6 @@ autodoc_mock_imports = [
     "matplotlib",
     "airflow",
     "opentelemetry",
-    "altair",
     "pyarrow",
     "duckdb",
 ]
@@ -258,13 +234,6 @@ def _mock_print(*args, **kwargs):
 
 _print_patcher = patch.object(builtins, 'print', side_effect=_mock_print)
 _print_patcher.start()
-
-sys.modules["streamlit"] = MagicMock()
-sys.modules["streamlit.testing"] = MagicMock()
-sys.modules["streamlit.testing.v1"] = MagicMock()
-_apptest_mock = MagicMock()
-_apptest_mock.sidebar.success = [MagicMock(value="Connected ✓")]
-sys.modules["streamlit.testing.v1"].AppTest.from_file.return_value = _apptest_mock
 
 sys.modules["snowflake"] = MagicMock()
 sys.modules["snowflake.connector"] = MagicMock()

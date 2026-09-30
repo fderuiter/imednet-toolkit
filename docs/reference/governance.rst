@@ -1,20 +1,13 @@
 Governance — Trust, Traceability & Audit Trail
 ===============================================
 
-The governance module provides three core capabilities required for regulated
+The governance module provides core capabilities required for regulated
 clinical data environments:
 
 1. :ref:`config-version-control` — immutable, SHA-256-signed study
    configuration history with diff and rollback.
-2. :ref:`publisher-wizard` — multi-stage validation checklist and
-   security-gated publish workflow.
-3. :ref:`data-lineage` — interactive drill-down from aggregated dashboard
-   metrics to the underlying raw EDC record payloads.
 
-These features are implemented across two packages:
-
-* ``imednet-workflows`` — the backend ``ConfigVersionStore`` class.
-* ``imednet-streamlit`` — the two Streamlit dashboard pages.
+This capability is implemented in ``imednet-workflows`` via the ``ConfigVersionStore`` class.
 
 .. _config-version-control:
 
@@ -84,62 +77,3 @@ versions.
    :members:
    :undoc-members:
    :show-inheritance:
-
-.. _publisher-wizard:
-
-Publisher Wizard (Streamlit page)
-----------------------------------
-
-The **Publisher Wizard** (``imednet_streamlit.pages.publisher_wizard``) is a
-Streamlit dashboard page that wraps the configuration version control system
-with a security-gated publish workflow.
-
-.. rubric:: Workflow stages
-
-1. **Identity** — the user enters a username and selects a role.  Only
-   ``manager`` and ``admin`` roles may proceed to publish.
-2. **History** — a select box lists all committed versions for the active study
-   key.  The user chooses the version to deploy.
-3. **Raw JSON viewer** — the full configuration JSON can be inspected in an
-   expandable panel.
-4. **Historical diff** — a side-by-side diff between any two historical commits
-   is rendered before approval.
-5. **Standards-readiness checklist** — automated checks verify:
-
-   * Field mappings are defined.
-   * Terminology normalisation rules are present.
-   * Dashboard widgets are configured.
-   * The version tag is well-formed (semver-like).
-   * The study key is non-empty.
-
-6. **Approve & Publish** — an authorised user clicks the guarded button.  On
-   success a new commit is recorded in the ledger with a bumped patch version,
-   providing a full audit trail of the publish event.
-
-.. _data-lineage:
-
-Data Lineage Explorer (Streamlit page)
----------------------------------------
-
-The **Data Lineage Explorer** (``imednet_streamlit.pages.data_lineage``) makes
-every aggregated metric traceable back to its source data.
-
-.. rubric:: Three-pane lineage view
-
-Selecting a record index opens a side-by-side view:
-
-* **Left pane** — raw EDC record payload from the local cache database.
-  Sensitive field names (``api_key``, ``token``, ``secret``, etc.) are
-  automatically redacted before display.
-* **Centre pane** — the mapping rules from the active
-  :class:`~imednet.models.study_config.StudyConfiguration` that were applied to
-  this domain.
-* **Right pane** — the structured canonical Pydantic model (``AdverseEvent``,
-  ``ProtocolDeviation``, or ``DeviceDeficiency``).
-
-.. rubric:: Credential safety
-
-The lineage view *never* exposes credentials.  The ``_redact_sensitive``
-helper strips any dict key whose name contains the substrings ``password``,
-``token``, ``secret``, ``api_key``, ``apikey``, ``key``, or ``credential``
-before the raw payload is rendered.

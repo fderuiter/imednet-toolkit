@@ -156,11 +156,6 @@ def main():
                         "expect_fail": True,
                         "contains": "The workflows plugin is not installed.",
                     },
-                    {
-                        "cmd": "imednet dashboard",
-                        "expect_fail": True,
-                        "contains": "pip install imednet-streamlit",
-                    },
                 ],
             },
             {
@@ -179,17 +174,6 @@ def main():
                     {"cmd": "import apache_airflow_providers_imednet"},
                     {"cmd": "from apache_airflow_providers_imednet.hooks import ImednetHook"},
                     {"cmd": "import apache_airflow_providers_imednet.operators.export"},
-                ],
-            },
-            {
-                "name": "streamlit-plugin",
-                "install": ["imednet-streamlit"],
-                "smoke": [
-                    {"cmd": "import imednet_streamlit"},
-                    {
-                        "cmd": "imednet dashboard --help",
-                        "contains": "Suppress automatic browser launch",
-                    },
                 ],
             },
             {

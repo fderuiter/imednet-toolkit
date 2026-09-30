@@ -68,7 +68,6 @@ def main():
             base_dir, "packages", "providers-airflow", "src", "apache_airflow_providers_imednet"
         ),
         os.path.join(base_dir, "packages", "plugins-sinks", "src"),
-        os.path.join(base_dir, "packages", "plugins-streamlit", "src"),
     ]
     code_symbols = get_code_symbols(search_dirs)
     facade_sigs = get_facade_signatures()
