@@ -91,3 +91,7 @@ examples/register_subjects_input/*
 .Jules/
 
 ._*
+
+# Local data dictionary exports
+data_dictionary.json
+data_dictionary_*.json

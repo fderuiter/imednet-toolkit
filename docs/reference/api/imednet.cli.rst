@@ -11,6 +11,7 @@ Subpackages
 .. toctree::
    :maxdepth: 4
 
+   imednet.cli.datadict
    imednet.cli.export
    imednet.cli.intervals
    imednet.cli.jobs
