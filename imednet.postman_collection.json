@@ -46,7 +46,7 @@
                                     "value": "studyKey,asc"
                                 },
                                 {
-                                    "disabled": false,
+                                    "disabled": true,
                                     "description": {
                                         "content": "",
                                         "type": "text/plain"
@@ -61,6 +61,14 @@
                             {
                                 "key": "Accept",
                                 "value": "application/json"
+                            },
+                            {
+                                "key": "x-api-key",
+                                "value": "{{api_key}}"
+                            },
+                            {
+                                "key": "x-imn-security-key",
+                                "value": "{{security_key}}"
                             }
                         ],
                         "method": "GET",
@@ -141,7 +149,22 @@
                             "_postman_previewlanguage": "json"
                         }
                     ],
-                    "event": [],
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test(\"List studies succeeds\", function () {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "pm.test(\"List studies returns a data array\", function () {",
+                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
                     "protocolProfileBehavior": {
                         "disableBodyPruning": true
                     }
@@ -1650,7 +1673,7 @@
                                                     "value": "application/json"
                                                 }
                                             ],
-                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"siteName\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectKey\": \"<string>\",\n            \"formId\": \"<integer>\",\n            \"formName\": \"<string>\",\n            \"formKey\": \"<string>\",\n            \"recordId\": \"<integer>\",\n            \"variable\": \"<string>\",\n            \"value\": \"<string>\",\n            \"codingId\": \"<string>\",\n            \"code\": \"<string>\",\n            \"codedBy\": \"<string>\",\n            \"dictionaryName\": \"<string>\",\n            \"dictionaryVersion\": \"<string>\",\n            \"dateCoded\": \"<string>\",\n            \"reason\": \"\",\n            \"revision\": 1\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"siteName\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectKey\": \"<string>\",\n            \"formId\": \"<integer>\",\n            \"formName\": \"<string>\",\n            \"formKey\": \"<string>\",\n            \"recordId\": \"<integer>\",\n            \"variable\": \"<string>\",\n            \"value\": \"<string>\",\n            \"codingId\": \"<string>\",\n            \"code\": \"<string>\",\n            \"codedBy\": \"<string>\",\n            \"dictionaryName\": \"<string>\",\n            \"dictionaryVersion\": \"<string>\",\n            \"dateCoded\": \"<string>\"\n        }\n    ]\n}",
+                                            "body": "{\n  \"metadata\": {\n    \"status\": \"<string>\",\n    \"method\": \"<string>\",\n    \"path\": \"<string>\",\n    \"timestamp\": \"<string>\",\n    \"error\": {}\n  },\n  \"pagination\": {\n    \"currentPage\": \"<integer>\",\n    \"size\": \"<integer>\",\n    \"totalPages\": \"<integer>\",\n    \"totalElements\": \"<integer>\",\n    \"sort\": [\n      {\n        \"property\": \"<string>\",\n        \"direction\": \"<string>\"\n      },\n      {\n        \"property\": \"<string>\",\n        \"direction\": \"<string>\"\n      }\n    ]\n  },\n  \"data\": [\n    {\n      \"studyKey\": \"<string>\",\n      \"siteName\": \"<string>\",\n      \"siteId\": \"<integer>\",\n      \"subjectId\": \"<integer>\",\n      \"subjectKey\": \"<string>\",\n      \"formId\": \"<integer>\",\n      \"formName\": \"<string>\",\n      \"formKey\": \"<string>\",\n      \"recordId\": \"<integer>\",\n      \"variable\": \"<string>\",\n      \"value\": \"<string>\",\n      \"codingId\": \"<string>\",\n      \"code\": \"<string>\",\n      \"codedBy\": \"<string>\",\n      \"dictionaryName\": \"<string>\",\n      \"dictionaryVersion\": \"<string>\",\n      \"dateCoded\": \"<string>\",\n      \"reason\": \"\",\n      \"revision\": 1,\n      \"lastUpdated\": \"<string>\"\n    },\n    {\n      \"studyKey\": \"<string>\",\n      \"siteName\": \"<string>\",\n      \"siteId\": \"<integer>\",\n      \"subjectId\": \"<integer>\",\n      \"subjectKey\": \"<string>\",\n      \"formId\": \"<integer>\",\n      \"formName\": \"<string>\",\n      \"formKey\": \"<string>\",\n      \"recordId\": \"<integer>\",\n      \"variable\": \"<string>\",\n      \"value\": \"<string>\",\n      \"codingId\": \"<string>\",\n      \"code\": \"<string>\",\n      \"codedBy\": \"<string>\",\n      \"dictionaryName\": \"<string>\",\n      \"dictionaryVersion\": \"<string>\",\n      \"dateCoded\": \"<string>\",\n      \"lastUpdated\": \"<string>\"\n    }\n  ]\n}",
                                             "cookie": [],
                                             "_postman_previewlanguage": "json"
                                         }

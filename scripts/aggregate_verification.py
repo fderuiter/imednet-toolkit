@@ -8,10 +8,19 @@ import sys
 from imednet.models.verification import VerificationReport
 
 
-def main():
+def _write_outputs(has_drift: bool, drift_count: int) -> None:
+    """Publish explicit results, including when no report files were produced."""
+    if "GITHUB_OUTPUT" in os.environ:
+        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"drift_detected={'true' if has_drift else 'false'}\n")
+            f.write(f"drift_count={drift_count}\n")
+
+
+def main() -> None:
     """Run aggregation."""
     report_files = glob.glob("*_report.json")
     if not report_files:
+        _write_outputs(False, 0)
         print("No verification reports found.")
         return
 
@@ -42,10 +51,7 @@ def main():
 
     drift_count = len(drift_violations)
 
-    if "GITHUB_OUTPUT" in os.environ:
-        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write(f"drift_detected={'true' if has_drift else 'false'}\n")
-            f.write(f"drift_count={drift_count}\n")
+    _write_outputs(has_drift, drift_count)
 
     if has_drift:
         with open("drift_report.txt", "w") as f:

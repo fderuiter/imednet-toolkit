@@ -148,6 +148,13 @@ imednet.models.variables module
    :members:
    :show-inheritance:
 
+imednet.models.verification module
+----------------------------------
+
+.. automodule:: imednet.models.verification
+   :members:
+   :show-inheritance:
+
 imednet.models.visits module
 ----------------------------
 

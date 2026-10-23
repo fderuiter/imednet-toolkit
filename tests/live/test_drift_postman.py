@@ -13,12 +13,12 @@ from imednet.sdk import ImednetSDK
 logger = logging.getLogger(__name__)
 
 
-def test_postman_collection_drift(sdk: ImednetSDK, study_key: str):
+def test_postman_collection_drift(sdk: ImednetSDK, study_key: str, monkeypatch: pytest.MonkeyPatch):
     """Reads the Postman collection, identifies API endpoints,.
 
     and compares the live API responses against the SDK's internal models.
     """
-    os.environ["IMEDNET_STRICT_MODE"] = "1"
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "1")
 
     collection_path = str(
         Path(__file__).resolve().parent.parent.parent / "imednet.postman_collection.json"
