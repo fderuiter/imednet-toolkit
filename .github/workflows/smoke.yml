@@ -42,9 +42,10 @@ jobs:
           BASE_URL: ${{ vars.IMEDNET_BASE_URL }}
         run: |
           newman run imednet.postman_collection.json \
+            --folder "List studies" \
             --env-var "api_key=$API_KEY" \
             --env-var "security_key=$SECURITY_KEY" \
-            --env-var "base_url=$BASE_URL" > postman.log 2>&1
+            --env-var "baseUrl=$BASE_URL" > postman.log 2>&1
       - name: Post smoke record
         id: smoke_record
         env:
@@ -81,6 +82,7 @@ jobs:
           IMEDNET_RUN_E2E: "1"
           IMEDNET_POSTMAN_PATH: ${{ github.workspace }}/imednet.postman_collection.json
         run: |
+          set -o pipefail
           pytest -vv -s --log-cli-level=INFO tests/live 2>&1 | tee live_tests.log
       - name: Analyze API Drift
         id: analyze_drift
@@ -107,7 +109,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: '🚨 Scheduled Smoke Test Failed',
-              body: 'The scheduled smoke test job has failed. Please investigate the upstream API drift.'
+              body: `The scheduled smoke test failed. Inspect the failed step and validation-logs artifact: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}. A failure may indicate API drift, test configuration, or tooling errors.`
             });
       - name: Upload logs
         if: always()
@@ -118,3 +120,5 @@ jobs:
             smoke.log
             live_tests.log
             postman.log
+            *_report.json
+            drift_report.txt

@@ -26,5 +26,6 @@ class Coding(ImednetBaseModel):
     dictionary_name: str | None
     dictionary_version: str | None
     date_coded: str | None
+    last_updated: str | None
     reason: Any
     revision: Any
