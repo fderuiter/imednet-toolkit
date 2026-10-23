@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.10.0...imednet-v0.10.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* **smoke:** accept coding timestamps and preserve failure reporting ([#1623](https://github.com/fderuiter/imednet-toolkit/issues/1623)) ([6fb02dc](https://github.com/fderuiter/imednet-toolkit/commit/6fb02dc0c0bca7023076dcf6fed9b7a4bd7f3c68))
+
 ## [0.10.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.9.1...imednet-v0.10.0) (2026-09-30)
 
 
