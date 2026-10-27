@@ -41,11 +41,12 @@ jobs:
           SECURITY_KEY: ${{ secrets.IMEDNET_SECURITY_KEY }}
           BASE_URL: ${{ vars.IMEDNET_BASE_URL }}
         run: |
+          # The SDK adds this prefix itself; Postman's baseUrl must include it.
           newman run imednet.postman_collection.json \
             --folder "List studies" \
             --env-var "api_key=$API_KEY" \
             --env-var "security_key=$SECURITY_KEY" \
-            --env-var "baseUrl=$BASE_URL" > postman.log 2>&1
+            --env-var "baseUrl=${BASE_URL%/}/api/v1/edc" > postman.log 2>&1
       - name: Post smoke record
         id: smoke_record
         env:
