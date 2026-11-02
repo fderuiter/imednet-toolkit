@@ -38,7 +38,7 @@ dev = [
 docs = [
     "furo<2026.0.0",
     "myst-parser>=1.0.0",
-    "mypy>=1.15.0,<2.4.0"
+    "mypy>=1.15.0,<2.5.0"
 ]
 
 [build-system]
@@ -154,7 +154,7 @@ python = "3.10"
 dependencies = [
     "vulture>=2.11",
     "ruff>=0.11.6,<0.16.0",
-    "mypy>=1.15.0,<2.4.0",
+    "mypy>=1.15.0,<2.5.0",
     "typos",
     "semgrep",
     "pip-audit",
