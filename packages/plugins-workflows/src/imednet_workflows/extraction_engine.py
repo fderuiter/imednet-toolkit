@@ -8,6 +8,7 @@ mapping rules.
 from __future__ import annotations
 
 import collections
+import functools
 import logging
 from typing import Any, cast
 
@@ -36,6 +37,11 @@ _DOMAIN_MODEL_MAP = {
     "ADAE": AnalysisAdverseEvent,
     "ADLB": AnalysisLabResult,
 }
+
+_RECORD_FIELD_MAP: dict[str, str] = {name: name for name in Record.model_fields}
+for _name, _field in Record.model_fields.items():
+    if _field.alias:
+        _RECORD_FIELD_MAP[_field.alias] = _name
 
 
 class ExtractionResult(BaseModel):
@@ -73,15 +79,72 @@ def _get_from_path(value: Any, path: str) -> Any:
     return current
 
 
+class _LazyRecordPayload(dict[str, Any]):
+    """Lazy dictionary that serializes a Record only upon first dictionary access.
+
+    Avoids expensive model_dump serialization for records where values
+    can be resolved directly from attributes or raw record data.
+    """
+
+    def __init__(self, record: Record) -> None:
+        """Initialize the lazy record payload.
+
+        Args:
+            record: The raw Record model instance.
+        """
+        super().__init__()
+        self._record = record
+        self._populated = False
+
+    def _ensure_populated(self) -> None:
+        """Populate the dictionary from the record model if not already done."""
+        if not self._populated:
+            self._populated = True
+            self.update(self._record.model_dump(by_alias=False))
+            self.update(self._record.model_dump(by_alias=True))
+
+    def __getitem__(self, key: Any) -> Any:
+        self._ensure_populated()
+        return super().__getitem__(key)
+
+    def __contains__(self, key: Any) -> bool:
+        self._ensure_populated()
+        return super().__contains__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        self._ensure_populated()
+        return super().get(key, default)
+
+    def __iter__(self) -> Any:
+        self._ensure_populated()
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        self._ensure_populated()
+        return super().__len__()
+
+    def items(self) -> Any:
+        self._ensure_populated()
+        return super().items()
+
+    def keys(self) -> Any:
+        self._ensure_populated()
+        return super().keys()
+
+    def values(self) -> Any:
+        self._ensure_populated()
+        return super().values()
+
+
 def _extract_rule_value_from_payload(
-    record: Record, rule: MappingRule, top_level_payload: dict[str, Any]
+    record: Record, rule: MappingRule, top_level_payload: dict[str, Any] | None = None
 ) -> Any:
     """Extract the value for a mapping rule from a record's data or payload.
 
     Args:
         record: The raw Record model.
         rule: The MappingRule to apply.
-        top_level_payload: The flattened payload of the record.
+        top_level_payload: The flattened or lazy payload of the record.
 
     Returns:
         The extracted value or None.
@@ -96,6 +159,28 @@ def _extract_rule_value_from_payload(
     if source_path.startswith("record_data."):
         return _get_from_path(record.record_data, source_path[len("record_data.") :])
 
+    # Direct resolution from record fields or aliases
+    field_name = _RECORD_FIELD_MAP.get(source_path)
+    if field_name is not None and hasattr(record, field_name):
+        val = getattr(record, field_name)
+        if val is not None:
+            return val
+    elif hasattr(record, source_path):
+        val = getattr(record, source_path)
+        if val is not None:
+            return val
+
+    # Direct lookup in record_data for unprefixed identifiers
+    if (
+        "." not in source_path
+        and isinstance(record.record_data, dict)
+        and source_path in record.record_data
+    ):
+        return record.record_data[source_path]
+
+    # Fall back to top-level payload for dotted paths or aliases not present in raw record data
+    if top_level_payload is None:
+        top_level_payload = _LazyRecordPayload(record)
     value = _get_from_path(top_level_payload, source_path)
     if value is not None:
         return value
@@ -141,6 +226,19 @@ class SubjectContext:
         self.baseline: dict[str, Any] = {}
 
 
+@functools.lru_cache(maxsize=1024)
+def _compile_business_logic(logic: str) -> Any:
+    """Compile a business logic Python expression into a code object.
+
+    Args:
+        logic: Python expression string to compile.
+
+    Returns:
+        The compiled code object.
+    """
+    return compile(logic, "<string>", "eval")
+
+
 def _evaluate_business_logic(
     logic: str, record: Record, payload: dict[str, Any], context: SubjectContext, value: Any = None
 ) -> Any:
@@ -157,6 +255,7 @@ def _evaluate_business_logic(
         The result of the evaluation, or None if it fails.
     """
     try:
+        code = _compile_business_logic(logic) if isinstance(logic, str) else logic
         # evaluate safely
         env = {
             "record": record,
@@ -174,7 +273,7 @@ def _evaluate_business_logic(
             "bool": bool,
             "len": len,
         }
-        return eval(logic, {"__builtins__": builtins}, env)  # nosem
+        return eval(code, {"__builtins__": builtins}, env)  # nosem
     except Exception as e:
         logger.warning(f"Derivation logic failed for {context.subject_key}: {e}")
         return None
@@ -203,10 +302,7 @@ def extract_canonical_records(
         has_adsl_rules = False
 
         for record in s_records:
-            top_level_payload = {
-                **record.model_dump(by_alias=False),
-                **record.model_dump(by_alias=True),
-            }
+            top_level_payload = _LazyRecordPayload(record)
 
             for domain, by_form in grouped_mappings.items():
                 rules = by_form.get(record.form_key)  # type: ignore
