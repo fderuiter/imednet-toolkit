@@ -178,3 +178,17 @@ def test_flexible_init_with_xml_and_variable_attributes() -> None:
     assert rule.logic is not None
     assert rule.logic["conditions"]["condition"]["true"] is True
     assert rule.logicRawXml == rule_xml
+
+
+def test_metadata_create() -> None:
+    """Test Metadata.create factory method sets defaults and timestamp."""
+    meta = Metadata.create(
+        study_key="STUDY_123",
+        source="api",
+        validation_warnings=["warning 1"],
+    )
+    assert meta.schemaVersion == "1.0.0"
+    assert meta.studyKey == "STUDY_123"
+    assert meta.source == "api"
+    assert meta.validationWarnings == ["warning 1"]
+    assert meta.generatedAt is not None

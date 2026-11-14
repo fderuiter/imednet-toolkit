@@ -7,7 +7,6 @@ import io
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
@@ -299,13 +298,10 @@ def load_from_csv_files(
                 except ValueError as exc:
                     record_warning(f"{entity_name} attribute '{k}': {exc}")
 
-    now_timestamp = datetime.now(timezone.utc).strftime("%m-%d-%Y %H:%M:%S")
-    metadata = Metadata(
-        schemaVersion="1.0.0",
-        studyKey=study_key,
-        generatedAt=now_timestamp,
+    metadata = Metadata.create(
+        study_key=study_key,
         source="csv",
-        validationWarnings=warnings,
+        validation_warnings=warnings,
     )
 
     return DataDictionary(
