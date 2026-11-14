@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from imednet.spi.models import Job, JobStatus, Subject
+from imednet.spi.utils import JobTimeoutError
 from imednet_workflows.uat import (
     BatchSubmission,
     BulkRecordSubmissionWorkflow,
@@ -219,3 +220,188 @@ def test_skip_existing_subjects_false(mock_sdk):
     assert len(result.registration_batches) == 1
     mock_sdk.get_subjects.assert_not_called()
     mock_sdk.create_record.assert_called_once()
+
+
+def test_concurrent_registration_polling_multi_batch_success(mock_sdk):
+    """Test concurrent polling across multiple registration batches succeeding."""
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+
+    job1 = Job(batch_id="reg_job_1", state="PENDING")
+    job2 = Job(batch_id="reg_job_2", state="PENDING")
+    mock_sdk.create_record.side_effect = [job1, job2]
+
+    def mock_get_job(study_key, batch_id):
+        return JobStatus(batch_id=batch_id, state="COMPLETED")
+
+    mock_sdk.get_job.side_effect = mock_get_job
+
+    rs1 = GeneratedRecordSet(
+        form_key="REG1",
+        form_name="Registration 1",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 1}],
+        subject_keys=["S1"],
+    )
+    rs2 = GeneratedRecordSet(
+        form_key="REG2",
+        form_name="Registration 2",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 2}],
+        subject_keys=["S2"],
+    )
+
+    result = workflow.submit("study1", [rs1, rs2])
+
+    assert len(result.registration_batches) == 2
+    assert result.registration_batches[0].job.state == "COMPLETED"
+    assert result.registration_batches[1].job.state == "COMPLETED"
+    assert mock_sdk.get_job.call_count == 2
+
+
+def test_concurrent_registration_polling_partial_failure(mock_sdk):
+    """Test concurrent polling with one batch succeeding and one batch failing."""
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+
+    job1 = Job(batch_id="reg_job_1", state="PENDING")
+    job2 = Job(batch_id="reg_job_2", state="PENDING")
+    mock_sdk.create_record.side_effect = [job1, job2]
+
+    def mock_get_job(study_key, batch_id):
+        if batch_id == "reg_job_1":
+            return JobStatus(batch_id="reg_job_1", state="COMPLETED")
+        return JobStatus(batch_id="reg_job_2", state="FAILED")
+
+    mock_sdk.get_job.side_effect = mock_get_job
+
+    rs1 = GeneratedRecordSet(
+        form_key="REG1",
+        form_name="Registration 1",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 1}],
+        subject_keys=["S1"],
+    )
+    rs2 = GeneratedRecordSet(
+        form_key="REG2",
+        form_name="Registration 2",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 2}],
+        subject_keys=["S2"],
+    )
+
+    with pytest.raises(BulkSubmissionError) as excinfo:
+        workflow.submit("study1", [rs1, rs2])
+
+    assert "1 registration batches failed." in str(excinfo.value)
+    assert len(excinfo.value.failed_batches) == 1
+    assert excinfo.value.failed_batches[0].job.batch_id == "reg_job_2"
+    assert excinfo.value.failed_batches[0].job.state == "FAILED"
+    assert job1.state == "COMPLETED"
+
+
+def test_concurrent_registration_polling_timeout(mock_sdk):
+    """Test concurrent polling when a batch times out."""
+    workflow = BulkRecordSubmissionWorkflow(
+        mock_sdk,
+        skip_existing_subjects=False,
+        registration_timeout=0.0,
+    )
+
+    job1 = Job(batch_id="reg_job_1", state="PENDING")
+    mock_sdk.create_record.return_value = job1
+    mock_sdk.get_job.return_value = JobStatus(batch_id="reg_job_1", state="PENDING")
+
+    rs = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 1}],
+        subject_keys=["S1"],
+    )
+
+    with pytest.raises(BulkSubmissionError) as excinfo:
+        workflow.submit("study1", [rs])
+
+    assert "1 registration batches failed." in str(excinfo.value)
+    assert len(excinfo.value.failed_batches) == 1
+    assert excinfo.value.failed_batches[0].job.batch_id == "reg_job_1"
+    assert excinfo.value.failed_batches[0].job.state == "TIMEOUT"
+
+
+def test_concurrent_registration_polling_multi_batch_mixed_failures(mock_sdk):
+    """Test concurrent polling with multiple failures including a timeout and a failed job."""
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+
+    job1 = Job(batch_id="reg_job_1", state="PENDING")
+    job2 = Job(batch_id="reg_job_2", state="PENDING")
+    job3 = Job(batch_id="reg_job_3", state="PENDING")
+    mock_sdk.create_record.side_effect = [job1, job2, job3]
+
+    def mock_get_job(study_key, batch_id):
+        if batch_id == "reg_job_1":
+            return JobStatus(batch_id="reg_job_1", state="COMPLETED")
+        if batch_id == "reg_job_2":
+            return JobStatus(batch_id="reg_job_2", state="FAILED")
+        raise JobTimeoutError("Simulated timeout")
+
+    mock_sdk.get_job.side_effect = mock_get_job
+
+    rs1 = GeneratedRecordSet(
+        form_key="REG1",
+        form_name="Registration 1",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 1}],
+        subject_keys=["S1"],
+    )
+    rs2 = GeneratedRecordSet(
+        form_key="REG2",
+        form_name="Registration 2",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 2}],
+        subject_keys=["S2"],
+    )
+    rs3 = GeneratedRecordSet(
+        form_key="REG3",
+        form_name="Registration 3",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 3}],
+        subject_keys=["S3"],
+    )
+
+    with pytest.raises(BulkSubmissionError) as excinfo:
+        workflow.submit("study1", [rs1, rs2, rs3])
+
+    assert "2 registration batches failed." in str(excinfo.value)
+    assert len(excinfo.value.failed_batches) == 2
+    failed_ids = {b.job.batch_id for b in excinfo.value.failed_batches}
+    assert failed_ids == {"reg_job_2", "reg_job_3"}
+    assert job1.state == "COMPLETED"
+    assert job2.state == "FAILED"
+    assert job3.state == "TIMEOUT"
+
+
+def test_concurrent_registration_polling_skips_empty_batch_ids(mock_sdk):
+    """Test that batches with missing or empty batch_id are not polled."""
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+
+    batch_none = BatchSubmission(
+        phase="registration",
+        record_count=1,
+        job=Job(batch_id=None, state="PENDING"),
+    )
+    batch_empty = BatchSubmission(
+        phase="registration",
+        record_count=1,
+        job=Job(batch_id="", state="PENDING"),
+    )
+    batch_valid = BatchSubmission(
+        phase="registration",
+        record_count=1,
+        job=Job(batch_id="valid_job", state="PENDING"),
+    )
+
+    mock_sdk.get_job.return_value = JobStatus(batch_id="valid_job", state="COMPLETED")
+
+    workflow._await_registration_jobs("study1", [batch_none, batch_empty, batch_valid])
+
+    mock_sdk.get_job.assert_called_once_with("study1", "valid_job")
+    assert batch_valid.job.state == "COMPLETED"
