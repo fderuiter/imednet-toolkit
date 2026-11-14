@@ -234,3 +234,30 @@ def test_export_to_hive_parquet_flushes_form_batches(monkeypatch, tmp_path) -> N
     parquet_mod.export_to_hive_parquet(sdk, "STUDY_A", str(tmp_path), chunk_size=2)
 
     assert writes == [[{"age": 1}, {"age": 2}], [{"age": 3}]]
+
+
+def test_hive_parquet_query_trailing_slash_clean_glob() -> None:
+    """Test that hive_parquet_query handles trailing slashes without double slashes."""
+    assert (
+        parquet_mod.hive_parquet_query("/tmp/lake/")
+        == "SELECT * FROM read_parquet('/tmp/lake/**/*.parquet', "
+        "hive_partitioning = true, union_by_name = true)"
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_path",
+    [
+        "/tmp/lake\x00/extra",
+        "/tmp/lake\n/extra",
+        "/tmp/lake\r/extra",
+        "/tmp/lake\x1f/extra",
+        "/tmp/lake\x7f/extra",
+        "",
+        "   ",
+    ],
+)
+def test_hive_parquet_query_rejects_control_chars_and_null_bytes(invalid_path: str) -> None:
+    """Test that hive_parquet_query rejects null bytes, newlines, and control characters."""
+    with pytest.raises(ValueError, match=r"(?i)directory path"):
+        parquet_mod.hive_parquet_query(invalid_path)

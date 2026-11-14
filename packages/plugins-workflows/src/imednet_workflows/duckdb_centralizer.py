@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
@@ -11,6 +12,9 @@ from .data_extraction import DataExtractionWorkflow
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
     from imednet.spi.models import RecordRevision
+
+
+_SAFE_STUDY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 
 
 class DuckDBIngestionWorkflow:
@@ -77,6 +81,10 @@ class DuckDBIngestionWorkflow:
 
     def build_silver_view(self, study_key: str) -> None:
         """Create or replace the silver_current_state view."""
+        if not isinstance(study_key, str) or not _SAFE_STUDY_KEY_PATTERN.fullmatch(study_key):
+            raise ValueError(
+                f"Invalid study key: {study_key!r}. Only alphanumeric characters and ._:- are allowed."
+            )
         self._ensure_bronze_table()
         escaped_study_key = study_key.replace("'", "''")
         query = f"""

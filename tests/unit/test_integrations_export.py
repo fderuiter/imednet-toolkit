@@ -166,11 +166,11 @@ def test_export_to_duckdb(monkeypatch):
     duckdb_module.connect = MagicMock(return_value=conn)
     monkeypatch.setitem(sys.modules, "duckdb", duckdb_module)
 
-    export_mod.export_to_duckdb(sdk, "STUDY", "out.duckdb", "my table")
+    export_mod.export_to_duckdb(sdk, "STUDY", "out.duckdb", "my_table")
 
     duckdb_module.connect.assert_called_once_with("out.duckdb")
     conn.register.assert_called_once_with("df", df)
-    conn.execute.assert_called_once_with('CREATE OR REPLACE TABLE "my table" AS SELECT * FROM "df"')
+    conn.execute.assert_called_once_with('CREATE OR REPLACE TABLE "my_table" AS SELECT * FROM "df"')
     conn.unregister.assert_called_once_with("df")
     conn.close.assert_called_once_with()
 

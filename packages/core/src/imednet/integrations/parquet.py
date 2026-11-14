@@ -160,9 +160,23 @@ def export_to_hive_parquet(
         )
 
 
+def _validate_directory_path(path: str) -> None:
+    """Validate directory path to reject null bytes and control characters."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("Directory path must be a non-empty string.")
+    if any(ord(c) < 32 or ord(c) == 127 for c in path):
+        raise ValueError(
+            f"Invalid directory path: {path!r}. Path must not contain null bytes or control characters."
+        )
+
+
 def hive_parquet_query(base_dir: str) -> str:
     """Return the DuckDB read_parquet query string for the given Hive base directory."""
-    escaped_base_dir = base_dir.replace("'", "''")
+    _validate_directory_path(base_dir)
+    clean_base_dir = base_dir.rstrip("/\\")
+    if not clean_base_dir and base_dir.startswith(("/", "\\")):
+        clean_base_dir = "/"
+    escaped_base_dir = clean_base_dir.replace("'", "''")
     return (
         f"SELECT * FROM read_parquet('{escaped_base_dir}/**/*.parquet', "
         "hive_partitioning = true, union_by_name = true)"
