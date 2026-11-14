@@ -48,32 +48,6 @@ __all__ = [
 ]
 
 
-def _setup_standalone_scripts(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
-    import glob
-
-    script_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "scripts")
-    for script_path in glob.glob(os.path.join(script_dir, "*.py")):
-        name = os.path.basename(script_path)[:-3]
-        if name == "__init__":
-            continue
-
-        # We need a dash format for command names
-        cmd_name = name.replace("_", "-")
-        parser = subparsers.add_parser(cmd_name, help=f"Run {name} script.")
-        parser.add_argument(
-            "args", nargs=argparse.REMAINDER, help="Arguments passed to the script."
-        )
-
-        def run_script(args: argparse.Namespace, script_path: str = script_path) -> None:
-            import subprocess
-
-            res = subprocess.run([sys.executable, script_path] + args.args)  # noqa: RUF005, S603
-            if res.returncode != 0:
-                sys.exit(res.returncode)
-
-        parser.set_defaults(func=run_script)
-
-
 def get_parser() -> argparse.ArgumentParser:
     """Return the main argparse.ArgumentParser for the CLI."""
     parser = argparse.ArgumentParser(description="iMednet SDK Command Line Interface")
@@ -106,7 +80,6 @@ def get_parser() -> argparse.ArgumentParser:
     intervals_setup(subparsers)
     jobs_setup(subparsers)
     records_setup(subparsers)
-    _setup_standalone_scripts(subparsers)
 
     import importlib.metadata
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,10 +29,23 @@ from imednet.utils.security import global_sensitivity_registry, mask_clinical_ph
 from .. import ImednetClient
 from ..sdk import ImednetSDK
 
+_SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _validate_duckdb_identifier(name: str) -> None:
+    if not isinstance(name, str) or not _SAFE_IDENTIFIER_PATTERN.fullmatch(name):
+        raise ValueError(
+            f"Invalid identifier {name!r}. Only alphanumeric characters and underscores are allowed."
+        )
+
 
 def _quote_duckdb_identifier(name: str) -> str:
+    _validate_duckdb_identifier(name)
     escaped_name = name.replace('"', '""')
     return f'"{escaped_name}"'
+
+
+validate_duckdb_identifier = _validate_duckdb_identifier
 
 
 _DUCKDB_DF_ALIAS = "df"
@@ -627,6 +641,8 @@ def export_to_duckdb(
             "Install with `pip install 'imednet[duckdb]'`."
         ) from error
 
+    _validate_duckdb_identifier(table_name)
+
     df = _prepare_export_df(
         sdk,
         study_key,
@@ -695,6 +711,8 @@ def export_to_duckdb_by_form(
                 continue
             if form_whitelist is not None and form.form_id not in form_whitelist:
                 continue
+
+            _validate_duckdb_identifier(form.form_key)
 
             df = _records_df(
                 sdk,

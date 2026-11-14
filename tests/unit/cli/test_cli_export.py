@@ -150,6 +150,35 @@ def test_cli_export_duckdb_vars_forms_passthrough(
     )
 
 
+@pytest.mark.parametrize(
+    "invalid_table",
+    [
+        "my table",
+        "records; DROP TABLE records; --",
+        'records" OR 1=1',
+        "bad-table",
+        "table.name",
+    ],
+)
+def test_cli_export_duckdb_rejects_invalid_table_name(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch, invalid_table: str
+) -> None:
+    """Test that CLI export duckdb rejects invalid table name before db operations."""
+    func = MagicMock()
+    monkeypatch.setattr(export_mod, "export_to_duckdb", func)
+    monkeypatch.setattr(cli, "export_to_duckdb", export_mod.export_to_duckdb)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    result = runner.invoke(
+        cli.app,
+        ["export", "duckdb", "STUDY", invalid_table, "out.duckdb"],
+    )
+
+    assert result.exit_code == 1
+    assert "Invalid identifier" in result.stdout or "Error" in result.stdout
+    func.assert_not_called()
+
+
 def test_cli_export_mongodb_happy_path(
     runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

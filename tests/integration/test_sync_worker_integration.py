@@ -188,7 +188,7 @@ def test_sync_worker_respects_reconcile_false(tmp_path: Path) -> None:
     """When reconcile=False the loader is called with reconcile=False."""
     loader = MagicMock()
     loader.db_path = tmp_path / "records.sqlite3"
-    loader.load_records.return_value = []
+    loader.count_cached_records.return_value = 0
 
     worker = SyncWorker(
         loader,
@@ -196,7 +196,8 @@ def test_sync_worker_respects_reconcile_false(tmp_path: Path) -> None:
     )
     worker.run_once()
 
-    loader.load_records.assert_called_once_with("PROT-01", reconcile=False)
+    loader.sync_records.assert_called_once_with("PROT-01", reconcile=False)
+    loader.count_cached_records.assert_called_once_with("PROT-01")
 
 
 def test_sync_worker_config_defaults() -> None:

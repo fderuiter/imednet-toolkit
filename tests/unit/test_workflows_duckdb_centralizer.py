@@ -135,3 +135,41 @@ def test_ingest_revisions_invalid_mode() -> None:
 
     with pytest.raises(ValueError, match="mode must be one of"):
         workflow.ingest_revisions("STUDY", mode="invalid")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "invalid_key",
+    [
+        "STUDY 01",
+        "STUDY'; DROP TABLE bronze_revisions; --",
+        'STUDY" OR 1=1',
+        "STUDY$KEY",
+        "STUDY\nKEY",
+        "",
+        " ",
+    ],
+)
+def test_build_silver_view_rejects_invalid_study_key(invalid_key: str) -> None:
+    """Test that build_silver_view rejects invalid study keys."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    with pytest.raises(ValueError, match="Invalid study key"):
+        workflow.build_silver_view(invalid_key)
+
+
+@pytest.mark.parametrize(
+    "valid_key",
+    [
+        "STUDY",
+        "STUDY-01",
+        "STUDY_A",
+        "PROT:101",
+        "STUDY.v1",
+    ],
+)
+def test_build_silver_view_accepts_valid_study_keys(valid_key: str) -> None:
+    """Test that build_silver_view accepts valid study keys."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    workflow.build_silver_view(valid_key)

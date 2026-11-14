@@ -97,6 +97,30 @@ class CachedRecordsLoader:
         finally:
             conn.close()
 
+    def count_cached_records(
+        self, study_key: str, *, conn: sqlite3.Connection | None = None
+    ) -> int:
+        """Return the count of cached records for ``study_key`` without materialising rows."""
+        close_conn = False
+        if conn is None:
+            conn = get_sqlite_connection(self.db_path)
+            close_conn = True
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM record_cache
+                WHERE study_key = ?
+                """,
+                (study_key,),
+            ).fetchone()
+            if row is None:
+                return 0
+            return int(row[0])
+        finally:
+            if close_conn:
+                conn.close()
+
     def get_cached_records(
         self, study_key: str, *, conn: sqlite3.Connection | None = None
     ) -> list[Record]:

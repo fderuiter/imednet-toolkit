@@ -153,3 +153,39 @@ def test_sync_records_handles_empty_delta_without_reconciliation(tmp_path: Path)
         "filter": 'dateModified>="2024-01-01 00:00:00+00:00"',
         "record_data_filter": None,
     }
+
+
+def test_count_cached_records_empty_cache(tmp_path: Path) -> None:
+    """Test that count_cached_records returns 0 when cache is empty."""
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    assert loader.count_cached_records("STUDY") == 0
+
+
+def test_count_cached_records_counts_matching_study(tmp_path: Path) -> None:
+    """Test that count_cached_records returns accurate count for the requested study."""
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    record_study_a = _record(1, "2024-01-01 00:00:00+00:00")
+    record_study_a_2 = _record(2, "2024-01-02 00:00:00+00:00")
+    record_study_b = Record(
+        study_key="OTHER",
+        form_id=10,
+        form_key="FORM",
+        record_id=1,
+        subject_key="S1",
+        date_modified=datetime.fromisoformat("2024-01-01 00:00:00+00:00"),
+        record_data={"value": 1},
+    )
+
+    with get_sqlite_connection(loader.db_path) as conn:
+        loader._upsert_records(conn, [record_study_a, record_study_a_2, record_study_b])
+
+    assert loader.count_cached_records("STUDY") == 2
+    assert loader.count_cached_records("OTHER") == 1
+    assert loader.count_cached_records("NONEXISTENT") == 0
+
+    with get_sqlite_connection(loader.db_path) as conn:
+        assert loader.count_cached_records("STUDY", conn=conn) == 2

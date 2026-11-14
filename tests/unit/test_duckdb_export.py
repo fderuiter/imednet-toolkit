@@ -176,3 +176,69 @@ def test_export_to_duckdb_connection_closed_on_error(
         export_mod.export_to_duckdb(sdk, "STUDY", str(tmp_path / "out.duckdb"), "records")
 
     conn.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "valid_name",
+    [
+        "records",
+        "my_table",
+        "Form123",
+        "TABLE_NAME",
+        "_hidden",
+        "v1_2_3",
+    ],
+)
+def test_quote_duckdb_identifier_valid(valid_name: str) -> None:
+    """Test that valid identifiers are properly quoted."""
+    quoted = export_mod._quote_duckdb_identifier(valid_name)
+    assert quoted == f'"{valid_name}"'
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "my table",
+        "table; DROP TABLE users; --",
+        'bad"name',
+        "table-name",
+        "table.name",
+        "table$name",
+        "table\nname",
+        "table\x00name",
+        "",
+        " ",
+    ],
+)
+def test_quote_duckdb_identifier_invalid(invalid_name: str) -> None:
+    """Test that invalid identifiers raise ValueError."""
+    with pytest.raises(ValueError, match="Invalid identifier"):
+        export_mod._quote_duckdb_identifier(invalid_name)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "my table",
+        "records; DROP TABLE records; --",
+        'records" OR 1=1 --',
+        "bad-name",
+    ],
+)
+def test_export_to_duckdb_rejects_invalid_table_name(payload: str, tmp_path: Path) -> None:
+    """Test that export_to_duckdb rejects invalid identifiers before DDL execution."""
+    sdk = MagicMock()
+    with pytest.raises(ValueError, match="Invalid identifier"):
+        export_mod.export_to_duckdb(sdk, "STUDY", str(tmp_path / "out.duckdb"), payload)
+
+
+def test_export_to_duckdb_by_form_rejects_invalid_form_key(tmp_path: Path) -> None:
+    """Test that export_to_duckdb_by_form rejects invalid form_key before DDL execution."""
+    pytest.importorskip("duckdb")
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [
+        SimpleNamespace(form_id=1, form_key="FORM; DROP TABLE users; --")
+    ]
+
+    with pytest.raises(ValueError, match="Invalid identifier"):
+        export_mod.export_to_duckdb_by_form(sdk, "STUDY", str(tmp_path / "out.duckdb"))
