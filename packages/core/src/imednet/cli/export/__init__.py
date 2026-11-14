@@ -121,6 +121,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 "Error: duckdb is required for DuckDB export. Install with \"pip install 'imednet[duckdb]'\""
             )
             sys.exit(1)
+        from ...integrations.export import _validate_duckdb_identifier
+
+        try:
+            _validate_duckdb_identifier(table_name)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+
         from .. import export_to_duckdb
 
         var_list = [v.strip() for v in vars_.split(",")] if vars_ else None
