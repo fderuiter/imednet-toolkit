@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import xml.etree.ElementTree as ET
 from typing import Any
+
+import defusedxml.ElementTree as ET  # noqa: N817
+from defusedxml.common import DefusedXmlException
 
 from .normalize import to_camel_case
 
@@ -75,8 +77,8 @@ def parse_logic_xml(xml_content: str | None) -> dict[str, Any] | None:
 
     stripped = xml_content.strip()
     try:
-        root = ET.fromstring(stripped)  # noqa: S314
-    except ET.ParseError as exc:
+        root = ET.fromstring(stripped)
+    except (ET.ParseError, DefusedXmlException) as exc:
         raise ValueError(f"Malformed business logic XML: {exc}") from exc
 
     parsed = _parse_xml_element(root)
