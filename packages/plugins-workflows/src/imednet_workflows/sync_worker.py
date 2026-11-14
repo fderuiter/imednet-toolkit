@@ -50,18 +50,19 @@ class SyncWorker:
     def run_once(self) -> int:
         """Run one idempotent cache sync cycle."""
         with self._lock:
-            records = self._loader.load_records(
+            self._loader.sync_records(
                 self._config.study_key,
                 reconcile=self._config.reconcile,
             )
+        record_count = self._loader.count_cached_records(self._config.study_key)
         logger.info(
             "sync cycle complete",
             extra={
                 "study_key": self._config.study_key,
-                "record_count": len(records),
+                "record_count": record_count,
             },
         )
-        return len(records)
+        return record_count
 
     def run_forever(self) -> None:
         """Run sync cycles until stopped."""
