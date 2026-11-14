@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
+from unittest.mock import patch
+
+import pytest
 
 from imednet.models import Record
 from imednet.models.study_config import MappingRule, StudyConfiguration
-from imednet_workflows.extraction_engine import extract_canonical_records
+from imednet_workflows.extraction_engine import (
+    SubjectContext,
+    _compile_business_logic,
+    _evaluate_business_logic,
+    _extract_rule_value_from_payload,
+    _LazyRecordPayload,
+    extract_canonical_records,
+)
 
 
 def test_extract_canonical_records_maps_ae_pd_dd_and_collects_row_errors() -> None:
@@ -347,3 +358,218 @@ def test_extract_subject_centric_analysis_datasets() -> None:
     assert adlb2["labTest"] == "ALT"
     assert adlb2["result"] == 55.0
     assert adlb2["changeFromBaseline"] == 15.0
+
+
+def test_compilation_cache_reuses_compiled_business_logic() -> None:
+    """Test that business logic compilation is cached across multiple evaluations."""
+    _compile_business_logic.cache_clear()
+
+    config = StudyConfiguration(
+        study_key="STUDY-CACHE",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                target_field="subjectKey",
+                source_form_key="AE_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeTerm",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.term",
+                businessLogic="str(value).strip().upper()",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeSeverity",
+                source_form_key="AE_FORM",
+                source_variable_name="",
+                fallback_value="MILD",
+            ),
+        ],
+    )
+
+    records = [
+        Record(
+            record_id=i,
+            form_key="AE_FORM",
+            subject_key=f"SUBJ-{i:03d}",
+            date_created=datetime(2024, 1, 1),
+            record_data={"term": f" symptom {i} "},
+        )
+        for i in range(1, 10)
+    ]
+
+    result = extract_canonical_records(records=records, study_configuration=config)
+    assert len(result.adverse_events) == 9
+    assert result.adverse_events[0].ae_term == "SYMPTOM 1"
+    assert result.adverse_events[8].ae_term == "SYMPTOM 9"
+
+    cache_info = _compile_business_logic.cache_info()
+    assert cache_info.currsize >= 1
+    # First record compiles (miss), next 8 records hit the LRU cache
+    assert cache_info.hits >= 8
+
+
+def test_uncompilable_business_logic_logs_warning_and_returns_none(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that invalid business logic syntax logs a warning and returns None without raising."""
+    context = SubjectContext("SUBJ-ERR")
+    record = Record(
+        record_id=1,
+        form_key="AE_FORM",
+        subject_key="SUBJ-ERR",
+        date_created=datetime(2024, 1, 1),
+        record_data={"term": "Rash"},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = _evaluate_business_logic(
+            logic="invalid syntax +++ (((",
+            record=record,
+            payload={},
+            context=context,
+            value="Rash",
+        )
+
+    assert result is None
+    assert any(
+        "Derivation logic failed for SUBJ-ERR" in record.message for record in caplog.records
+    )
+
+
+def test_record_model_dump_not_invoked_during_standard_extraction() -> None:
+    """Test that model_dump is not called in the inner extraction loop for standard mappings."""
+    config = StudyConfiguration(
+        study_key="STUDY-NO-DUMP",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                target_field="subjectKey",
+                source_form_key="AE_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeTerm",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.term",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeSeverity",
+                source_form_key="AE_FORM",
+                source_variable_name="",
+                fallback_value="MILD",
+            ),
+        ],
+    )
+
+    records = [
+        Record(
+            record_id=101,
+            form_key="AE_FORM",
+            subject_key="SUBJ-101",
+            date_created=datetime(2024, 1, 1),
+            record_data={"term": "Fatigue"},
+        ),
+        Record(
+            record_id=102,
+            form_key="AE_FORM",
+            subject_key="SUBJ-101",
+            date_created=datetime(2024, 1, 2),
+            record_data={"term": "Fever"},
+        ),
+    ]
+
+    with patch.object(Record, "model_dump", wraps=Record.model_dump) as mock_dump:
+        result = extract_canonical_records(records=records, study_configuration=config)
+        assert len(result.adverse_events) == 2
+        # Normal extraction loop must not call model_dump on the raw records
+        assert mock_dump.call_count == 0
+
+
+def test_top_level_alias_resolution_and_fallback() -> None:
+    """Test that top-level aliases are resolved directly from Record and fallback operates correctly."""
+    record = Record(
+        record_id=99,
+        form_key="AE_FORM",
+        subject_key="SUBJ-999",
+        date_created=datetime(2024, 5, 10, 12, 0, 0),
+        record_data={"unprefixed_key": "raw_val"},
+    )
+
+    # 1. Alias directly on Record (not in record_data)
+    rule_subject = MappingRule(
+        domain="AE",
+        target_field="subjectKey",
+        source_form_key="AE_FORM",
+        source_variable_name="subjectKey",
+    )
+    val_subject = _extract_rule_value_from_payload(record, rule_subject)
+    assert val_subject == "SUBJ-999"
+
+    # 2. Snake case field on Record
+    rule_rec_id = MappingRule(
+        domain="AE",
+        target_field="subjectKey",
+        source_form_key="AE_FORM",
+        source_variable_name="record_id",
+    )
+    val_rec_id = _extract_rule_value_from_payload(record, rule_rec_id)
+    assert val_rec_id == 99
+
+    # 3. CamelCase alias recordId
+    rule_rec_id_alias = MappingRule(
+        domain="AE",
+        target_field="subjectKey",
+        source_form_key="AE_FORM",
+        source_variable_name="recordId",
+    )
+    val_rec_id_alias = _extract_rule_value_from_payload(record, rule_rec_id_alias)
+    assert val_rec_id_alias == 99
+
+    # 4. Unprefixed key in record_data
+    rule_raw = MappingRule(
+        domain="AE",
+        target_field="aeTerm",
+        source_form_key="AE_FORM",
+        source_variable_name="unprefixed_key",
+    )
+    val_raw = _extract_rule_value_from_payload(record, rule_raw)
+    assert val_raw == "raw_val"
+
+    # 5. Non-existent path returns None
+    rule_missing = MappingRule(
+        domain="AE",
+        target_field="aeTerm",
+        source_form_key="AE_FORM",
+        source_variable_name="nonexistent.field",
+    )
+    val_missing = _extract_rule_value_from_payload(record, rule_missing)
+    assert val_missing is None
+
+
+def test_lazy_record_payload_initializes_on_demand() -> None:
+    """Test that _LazyRecordPayload populates only when dictionary methods are accessed."""
+    record = Record(
+        record_id=42,
+        form_key="TEST_FORM",
+        subject_key="SUBJ-42",
+        date_created=datetime(2024, 1, 1),
+        record_data={"foo": "bar"},
+    )
+    lazy = _LazyRecordPayload(record)
+    assert not lazy._populated
+    assert len(lazy) > 0  # Triggers __len__ -> _ensure_populated
+    assert lazy._populated
+    assert lazy["subjectKey"] == "SUBJ-42"
+    assert lazy["subject_key"] == "SUBJ-42"
+    assert lazy.get("recordId") == 42
+    assert "formKey" in lazy
+    assert list(lazy.keys())
+    assert list(lazy.values())
+    assert list(lazy.items())
+    assert iter(lazy)
