@@ -50,7 +50,19 @@ from imednet.models.studies import Study
 from imednet.models.study_config import MappingRule, StudyConfiguration, WidgetConfig
 from imednet.models.study_structure import FormStructure, IntervalStructure, StudyStructure
 from imednet.models.subjects import Subject, SubjectKeyword
-from imednet.models.triage import TriageAnnotation, TriageHistoryEntry, TriageItem, TriageStatus
+from imednet.models.triage import (
+    ALLOWED_STATUS_TRANSITIONS,
+    ALLOWED_TRANSITIONS,
+    TriageAnnotation,
+    TriageHistoryEntry,
+    TriageItem,
+    TriageStatus,
+    can_transition,
+    is_valid_status_transition,
+    is_valid_transition,
+    validate_status_transition,
+    validate_transition,
+)
 from imednet.models.users import Role, User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
@@ -64,6 +76,8 @@ from imednet.utils.validators import (
 )
 
 __all__: list[str] = [
+    "ALLOWED_STATUS_TRANSITIONS",
+    "ALLOWED_TRANSITIONS",
     "PROFILE_REGISTRY",
     "AdverseEvent",
     "AnalysisAdverseEvent",
@@ -119,10 +133,15 @@ __all__: list[str] = [
     "Variable",
     "Visit",
     "WidgetConfig",
+    "can_transition",
+    "is_valid_status_transition",
+    "is_valid_transition",
     "parse_bool",
     "parse_datetime",
     "parse_dict_or_default",
     "parse_int_or_default",
     "parse_list_or_default",
     "parse_str_or_default",
+    "validate_status_transition",
+    "validate_transition",
 ]
