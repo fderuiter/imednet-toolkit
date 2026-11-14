@@ -11,7 +11,7 @@ from pydantic import Field
 
 from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import ImednetBaseModel, Job
-from imednet.spi.utils import JobPoller
+from imednet.spi.utils import JobFailedError, JobPoller, JobTimeoutError
 
 from .generator import GeneratedRecordSet
 from .models import RecordTestType
@@ -206,32 +206,41 @@ class BulkRecordSubmissionWorkflow:
         )
 
     def _await_registration_jobs(self, study_key: str, batches: list[BatchSubmission]) -> None:
-        """Block until all Phase 1 jobs reach terminal state."""
+        """Block until all Phase 1 jobs reach terminal state concurrently."""
+        batches_to_poll = [b for b in batches if b.job.batch_id]
+        if not batches_to_poll:
+            return
+
         poller = JobPoller(get_job=self.sdk.get_job)
-        failed_batches = []
+        batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
+        summary = poller.poll_many(
+            study_key,
+            batch_ids,
+            timeout=float(self.registration_timeout),
+            fail_fast=False,
+        )
 
-        for batch in batches:
-            if not batch.job.batch_id:
-                continue
-
-            from imednet.spi.utils import JobFailedError, JobTimeoutError
-
-            try:
-                status = poller.run(
-                    study_key,
-                    batch.job.batch_id,
-                    timeout=int(self.registration_timeout),
-                )
+        failed_batches: list[BatchSubmission] = []
+        for batch in batches_to_poll:
+            batch_id = batch.job.batch_id
+            if batch_id in summary.failures:
+                exc = summary.failures[batch_id]
+                if isinstance(exc, JobTimeoutError):
+                    batch.job.state = "TIMEOUT"
+                elif isinstance(exc, JobFailedError):
+                    status = getattr(exc, "status", None)
+                    batch.job.state = getattr(status, "state", "FAILED") or "FAILED"
+                else:
+                    batch.job.state = "FAILED"
+                failed_batches.append(batch)
+            elif batch_id in summary.results:
+                status = summary.results[batch_id]
                 batch.job.state = status.state
-            except JobFailedError as e:
-                batch.job.state = getattr(e, "status", type("S", (), {"state": "FAILED"})).state  # type: ignore
-                failed_batches.append(batch)
-            except JobTimeoutError:
-                batch.job.state = "TIMEOUT"
-                failed_batches.append(batch)
-            else:
                 if not status.state or status.state.upper() not in ("COMPLETED", "SUCCESS"):
                     failed_batches.append(batch)
+            else:
+                batch.job.state = "UNKNOWN"
+                failed_batches.append(batch)
 
         if failed_batches:
             raise BulkSubmissionError(
