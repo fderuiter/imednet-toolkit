@@ -174,3 +174,85 @@ def test_triage_store_masks_sensitive_operational_errors(
 
     assert "supersecret" not in str(exc_info.value)
     assert "***" in str(exc_info.value)
+
+
+def test_triage_store_update_status_transitions_and_edge_cases(tmp_path: Path) -> None:
+    """Test update_status validates transitions, supports no-op, and preserves state on error."""
+    store = TriageStore(tmp_path / "triage.sqlite3")
+    store.upsert_item(_seed_item("AE-TRANS-1"))
+
+    # 1. Non-existent item raises ValueError before transition check
+    with pytest.raises(ValueError, match="Unknown triage item: NONEXISTENT"):
+        store.update_status("NONEXISTENT", TriageStatus.UNDER_REVIEW, "triager", "note")
+
+    # 2. Same status update is a no-op: does not write duplicate history
+    item_before = store.get_triage_item("AE-TRANS-1")
+    assert item_before is not None
+    initial_history_len = len(item_before.history)
+    store.update_status("AE-TRANS-1", TriageStatus.NEW, "triager", "no-op note")
+    item_after_noop = store.get_triage_item("AE-TRANS-1")
+    assert item_after_noop is not None
+    assert item_after_noop.status == TriageStatus.NEW
+    assert len(item_after_noop.history) == initial_history_len
+
+    # 3. Permitted transition sequence: NEW -> UNDER_REVIEW -> RESOLVED -> UNDER_REVIEW -> NEW
+    store.update_status("AE-TRANS-1", TriageStatus.UNDER_REVIEW, "triager", "to under review")
+    item = store.get_triage_item("AE-TRANS-1")
+    assert item is not None and item.status == TriageStatus.UNDER_REVIEW
+
+    store.update_status("AE-TRANS-1", TriageStatus.RESOLVED, "triager", "resolved")
+    item = store.get_triage_item("AE-TRANS-1")
+    assert item is not None and item.status == TriageStatus.RESOLVED
+    resolved_history_len = len(item.history)
+
+    # 4. Forbidden transition: RESOLVED -> NEW raises ValueError and preserves database state
+    with pytest.raises(ValueError, match="Cannot transition triage status from RESOLVED to NEW"):
+        store.update_status("AE-TRANS-1", TriageStatus.NEW, "triager", "illegal rollback")
+
+    item_after_fail = store.get_triage_item("AE-TRANS-1")
+    assert item_after_fail is not None
+    assert item_after_fail.status == TriageStatus.RESOLVED
+    assert len(item_after_fail.history) == resolved_history_len
+
+    # 5. Permitted reopen: RESOLVED -> UNDER_REVIEW
+    store.update_status("AE-TRANS-1", TriageStatus.UNDER_REVIEW, "triager", "reopen to review")
+    item = store.get_triage_item("AE-TRANS-1")
+    assert item is not None and item.status == TriageStatus.UNDER_REVIEW
+
+    # 6. Permitted return: UNDER_REVIEW -> NEW
+    store.update_status("AE-TRANS-1", TriageStatus.NEW, "triager", "back to new")
+    item = store.get_triage_item("AE-TRANS-1")
+    assert item is not None and item.status == TriageStatus.NEW
+
+
+def test_triage_store_upsert_item_validates_transitions(tmp_path: Path) -> None:
+    """Test upsert_item enforces allowed transitions and preserves state on illegal ones."""
+    store = TriageStore(tmp_path / "triage.sqlite3")
+    store.upsert_item(_seed_item("AE-UPSERT-1"))
+
+    # Update item attributes while keeping the same status NEW
+    item = store.get_triage_item("AE-UPSERT-1")
+    assert item is not None
+    item.assignee = "new-assignee"
+    store.upsert_item(item)
+    updated = store.get_triage_item("AE-UPSERT-1")
+    assert updated is not None
+    assert updated.assignee == "new-assignee"
+    assert updated.status == TriageStatus.NEW
+
+    # Valid transition via upsert: NEW -> RESOLVED
+    item.status = TriageStatus.RESOLVED
+    store.upsert_item(item)
+    resolved = store.get_triage_item("AE-UPSERT-1")
+    assert resolved is not None
+    assert resolved.status == TriageStatus.RESOLVED
+
+    # Illegal transition via upsert: RESOLVED -> NEW raises ValueError
+    item.status = TriageStatus.NEW
+    with pytest.raises(ValueError, match="Cannot transition triage status from RESOLVED to NEW"):
+        store.upsert_item(item)
+
+    # Verify state was preserved in SQLite
+    preserved = store.get_triage_item("AE-UPSERT-1")
+    assert preserved is not None
+    assert preserved.status == TriageStatus.RESOLVED

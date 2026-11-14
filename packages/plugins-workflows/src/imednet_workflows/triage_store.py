@@ -12,7 +12,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
-from imednet.spi.models import TriageAnnotation, TriageHistoryEntry, TriageItem, TriageStatus
+from imednet.spi.models import (
+    TriageAnnotation,
+    TriageHistoryEntry,
+    TriageItem,
+    TriageStatus,
+    validate_transition,
+)
 from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text, sqlite_connection
 
 _SAFE_SQL_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]+$")
@@ -147,6 +153,20 @@ class TriageStore:
 
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to write triage item data."""
+            existing = conn.execute(
+                "SELECT status FROM triage_items WHERE item_id = ?",
+                (item.item_id,),
+            ).fetchone()
+            if existing is not None:
+                current_status = TriageStatus(str(existing["status"]))
+                target_status = (
+                    item.status
+                    if isinstance(item.status, TriageStatus)
+                    else TriageStatus(str(item.status))
+                )
+                if current_status != target_status:
+                    validate_transition(current_status, target_status)
+
             conn.execute(
                 """
                 INSERT INTO triage_items (
@@ -384,13 +404,22 @@ class TriageStore:
                 raise ValueError(f"Unknown triage item: {item_id}")
 
             from_status = TriageStatus(str(row["status"]))
+            target_status = (
+                to_status if isinstance(to_status, TriageStatus) else TriageStatus(str(to_status))
+            )
+
+            if from_status == target_status:
+                return
+
+            validate_transition(from_status, target_status)
+
             conn.execute(
                 """
                 UPDATE triage_items
                 SET status = ?, updated_at = ?
                 WHERE item_id = ?
                 """,
-                (to_status.value, timestamp, item_id),
+                (target_status.value, timestamp, item_id),
             )
             conn.execute(
                 """
@@ -403,7 +432,7 @@ class TriageStore:
                     str(uuid.uuid4()),
                     item_id,
                     from_status.value,
-                    to_status.value,
+                    target_status.value,
                     user_id,
                     normalized_comment,
                     timestamp,
