@@ -67,6 +67,29 @@ jobs:
         run: pylint --disable=all --enable=similarities --min-similarity-lines=4 $(git ls-files 'packages/**/*.py')
 
   # ------------------------------------------------------------------
+  # JOB 0.2: PRE-COMMIT CHECK (Runs unconditionally)
+  # ------------------------------------------------------------------
+  pre-commit:
+    name: Pre-commit Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Cache pre-commit environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-${{ runner.os }}-
+      - name: Install pre-commit
+        run: pip install pre-commit
+      - name: Run pre-commit hooks
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  # ------------------------------------------------------------------
   # JOB 0.5: DETECT CHANGES & PLAN
   # ------------------------------------------------------------------
   plan:

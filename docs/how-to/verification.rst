@@ -4,11 +4,12 @@ Verification Loop
 
 Before proposing any solution, execute and pass all CI quality gates locally.
 
-1. Read ``.github/workflows/main.yml`` (the ``quality`` job) to identify the authoritative lint, format, and type-check commands.
-2. Run the full gate in order:
+1. Read ``.github/workflows/main.yml`` (the ``quality`` and ``pre-commit`` jobs) to identify the authoritative lint, format, and type-check commands.
+2. Run the full gate in order (contributors must execute ``uvx pre-commit run --all-files`` before opening pull requests):
 
    .. code-block:: bash
 
+      uvx pre-commit run --all-files
       hatch run ruff format --check .
       hatch run ruff check .
       hatch run mypy packages/core/src/imednet
@@ -40,6 +41,7 @@ Alternatively, if running via ``uv`` directly:
    uv sync --extra dev --extra docs
 
    # Quality gate
+   uvx pre-commit run --all-files
    uv run ruff format --check .
    uv run ruff check .
    uv run mypy packages/core/src/imednet
