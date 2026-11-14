@@ -143,3 +143,67 @@ def test_create_raises_on_header_injection(dummy_client, context):
     ep = records.RecordsEndpoint(dummy_client, context)
     with pytest.raises(ClientError, match="Header value must not contain newlines"):
         ep.create("S1", [{"data": {}}], email_notify="test\n@example.com")
+
+
+def test_to_dataframe_success(dummy_client, context, paginator_factory):
+    """Test that to_dataframe exports queried records to a pandas DataFrame."""
+    ep = records.RecordsEndpoint(dummy_client, context)
+    paginator_factory(records, [{"recordId": 1, "recordData": {"age": 25}}])
+
+    df = ep.to_dataframe("S1")
+
+    assert len(df) == 1
+    assert df.loc[0, "record_id"] == 1
+    assert df.loc[0, "record_data"] == {"age": 25}
+
+
+def test_to_dataframe_parameter_forwarding(
+    dummy_client, context, paginator_factory, patch_build_filter
+):
+    """Test that to_dataframe forwards filters and study key to list."""
+    ep = records.RecordsEndpoint(dummy_client, context)
+    captured = paginator_factory(records, [{"recordId": 1}])
+    filter_capture = patch_build_filter(records)
+
+    df = ep.to_dataframe(
+        study_key="S1",
+        record_data_filter="age>10",
+        status="open",
+    )
+
+    assert captured["path"] == "/api/v1/edc/studies/S1/records"
+    assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "age>10"}
+    assert filter_capture["filters"] == {"status": "open", "studyKey": "S1"}
+    assert len(df) == 1
+
+
+def test_to_dataframe_flatten_option(dummy_client, context, paginator_factory):
+    """Test that to_dataframe supports flatten option."""
+    ep = records.RecordsEndpoint(dummy_client, context)
+    paginator_factory(records, [{"recordId": 1, "recordData": {"age": 25}}])
+
+    df = ep.to_dataframe("S1", flatten=True)
+
+    assert len(df) == 1
+    assert "record_data" not in df.columns
+    assert df.loc[0, "age"] == 25
+
+
+def test_to_dataframe_empty_results(dummy_client, context, paginator_factory):
+    """Test that to_dataframe handles empty query results."""
+    ep = records.RecordsEndpoint(dummy_client, context)
+    paginator_factory(records, [])
+
+    df = ep.to_dataframe("S1")
+
+    assert df.empty
+
+
+def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, context, paginator_factory):
+    """Test that to_dataframe raises ImportError when pandas is not installed."""
+    ep = records.RecordsEndpoint(dummy_client, context)
+    paginator_factory(records, [{"recordId": 1}])
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+
+    with pytest.raises(ImportError, match="pandas is required for records_to_dataframe"):
+        ep.to_dataframe("S1")
