@@ -132,12 +132,10 @@ def load_from_api(
                 forms_map[f_key] = Form(formKey=f_key)
             forms_map[f_key].variables.append(var)
 
-    now_timestamp = datetime.now(timezone.utc).strftime("%m-%d-%Y %H:%M:%S")
     metadata = Metadata(
-        schemaVersion="1.0.0",
         studyKey=study_key,
-        generatedAt=now_timestamp,
         source="api",
+        generatedAt=datetime.now(timezone.utc).strftime("%m-%d-%Y %H:%M:%S"),
         validationWarnings=warnings,
     )
 

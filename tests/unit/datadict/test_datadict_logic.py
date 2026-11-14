@@ -20,6 +20,33 @@ def test_parse_logic_xml_malformed() -> None:
         parse_logic_xml("<rule><unclosed></rule>")
 
 
+def test_parse_logic_xml_recursive_entity_expansion() -> None:
+    """Test that recursive entity expansion payloads fail safely with ValueError."""
+    xml_str = """<?xml version="1.0"?>
+    <!DOCTYPE lolz [
+     <!ENTITY lol "lol">
+     <!ELEMENT lolz (#PCDATA)>
+     <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+     <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
+    ]>
+    <rule>&lol2;</rule>
+    """
+    with pytest.raises(ValueError, match="Malformed business logic XML"):
+        parse_logic_xml(xml_str)
+
+
+def test_parse_logic_xml_external_entity_declaration() -> None:
+    """Test that external entity declarations fail safely with ValueError."""
+    xml_str = """<?xml version="1.0"?>
+    <!DOCTYPE data [
+      <!ENTITY ext SYSTEM "http://127.0.0.1/evil.xml">
+    ]>
+    <rule>&ext;</rule>
+    """
+    with pytest.raises(ValueError, match="Malformed business logic XML"):
+        parse_logic_xml(xml_str)
+
+
 def test_parse_logic_xml_empty_elements_as_true() -> None:
     """Test that empty XML elements (<true/>, <new_record/>, <last/>) become True."""
     xml_str = """
