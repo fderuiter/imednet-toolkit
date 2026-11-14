@@ -10,7 +10,14 @@ from datetime import datetime, timezone
 import pytest
 
 import imednet_workflows.state_ledger as _state_ledger_module
-from imednet_workflows.state_ledger import ExtractionStateLedger, LedgerState
+from imednet_workflows.state_ledger import (
+    ExtractionStateLedger,
+    InvalidStateTransitionError,
+    LedgerState,
+    StreamExecutionStatus,
+    is_valid_transition,
+    validate_transition,
+)
 
 
 def test_state_ledger_read_write(tmp_path) -> None:
@@ -327,3 +334,191 @@ def test_airflow_state_provider_transaction_error():
         with pytest.raises(ValueError):
             with provider.transaction("STUDY-01", "records", fallback_timestamp=fallback_ts):
                 raise ValueError("Test error")
+
+
+def test_stream_execution_status_enum() -> None:
+    """Test StreamExecutionStatus enumeration values and string representation."""
+    assert StreamExecutionStatus.PENDING == "pending"
+    assert StreamExecutionStatus.RUNNING == "running"
+    assert StreamExecutionStatus.SUCCESS == "success"
+    assert StreamExecutionStatus.FAILED == "failed"
+    assert str(StreamExecutionStatus.PENDING) == "pending"
+    assert str(StreamExecutionStatus.RUNNING) == "running"
+    assert str(StreamExecutionStatus.SUCCESS) == "success"
+    assert str(StreamExecutionStatus.FAILED) == "failed"
+    assert f"{StreamExecutionStatus.SUCCESS}" == "success"
+
+
+def test_valid_state_transitions() -> None:
+    """Verify all valid lifecycle status transitions."""
+    valid_cases = [
+        (None, StreamExecutionStatus.PENDING),
+        (None, StreamExecutionStatus.RUNNING),
+        (None, StreamExecutionStatus.SUCCESS),
+        (None, StreamExecutionStatus.FAILED),
+        (StreamExecutionStatus.PENDING, StreamExecutionStatus.RUNNING),
+        (StreamExecutionStatus.PENDING, StreamExecutionStatus.FAILED),
+        (StreamExecutionStatus.PENDING, StreamExecutionStatus.PENDING),
+        (StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS),
+        (StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED),
+        (StreamExecutionStatus.SUCCESS, StreamExecutionStatus.PENDING),
+        (StreamExecutionStatus.SUCCESS, StreamExecutionStatus.RUNNING),
+        (StreamExecutionStatus.SUCCESS, StreamExecutionStatus.SUCCESS),
+        (StreamExecutionStatus.FAILED, StreamExecutionStatus.PENDING),
+        (StreamExecutionStatus.FAILED, StreamExecutionStatus.RUNNING),
+        (StreamExecutionStatus.FAILED, StreamExecutionStatus.FAILED),
+    ]
+    for current, target in valid_cases:
+        assert is_valid_transition(current, target) is True
+        result = validate_transition(current, target)
+        assert result == target
+
+    # Also verify string arguments
+    assert is_valid_transition("pending", "running") is True
+    assert validate_transition("pending", "running") == StreamExecutionStatus.RUNNING
+
+
+def test_invalid_state_transitions_rejected() -> None:
+    """Verify invalid lifecycle transitions are rejected with InvalidStateTransitionError."""
+    invalid_cases = [
+        (StreamExecutionStatus.PENDING, StreamExecutionStatus.SUCCESS),
+        (StreamExecutionStatus.RUNNING, StreamExecutionStatus.RUNNING),
+        (StreamExecutionStatus.RUNNING, StreamExecutionStatus.PENDING),
+        (StreamExecutionStatus.SUCCESS, StreamExecutionStatus.FAILED),
+        (StreamExecutionStatus.FAILED, StreamExecutionStatus.SUCCESS),
+    ]
+    for current, target in invalid_cases:
+        assert is_valid_transition(current, target) is False
+        with pytest.raises(InvalidStateTransitionError, match="Cannot transition stream state"):
+            validate_transition(current, target)
+
+    # Invalid status string argument
+    assert is_valid_transition("pending", "not_a_status") is False
+    with pytest.raises(InvalidStateTransitionError, match="Invalid stream execution status"):
+        validate_transition("pending", "not_a_status")
+
+
+def test_set_last_timestamp_validation_and_rejections(tmp_path) -> None:
+    """Verify set_last_timestamp validates requested status values and transitions."""
+    ledger_file = tmp_path / "ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+    ts = datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Invalid status value must raise ValueError
+    with pytest.raises(ValueError, match="Invalid stream execution status"):
+        ledger.set_last_timestamp("STUDY-01", "records", ts, status="invalid_status")
+
+    # Valid status as enum and string succeeds
+    ledger.set_last_timestamp("STUDY-01", "records", ts, status=StreamExecutionStatus.PENDING)
+    state = ledger.read_state()
+    assert (
+        state.studies["STUDY-01"].streams["records"].last_run_status
+        == StreamExecutionStatus.PENDING
+    )
+
+    # Transition from PENDING directly to SUCCESS must be rejected
+    with pytest.raises(InvalidStateTransitionError, match="Cannot transition stream state"):
+        ledger.set_last_timestamp("STUDY-01", "records", ts, status=StreamExecutionStatus.SUCCESS)
+
+    # Transition from PENDING to RUNNING is valid
+    ledger.set_last_timestamp("STUDY-01", "records", ts, status=StreamExecutionStatus.RUNNING)
+    state2 = ledger.read_state()
+    assert (
+        state2.studies["STUDY-01"].streams["records"].last_run_status
+        == StreamExecutionStatus.RUNNING
+    )
+
+    # Transition from RUNNING to SUCCESS is valid
+    ledger.set_last_timestamp("STUDY-01", "records", ts, status=StreamExecutionStatus.SUCCESS)
+    state3 = ledger.read_state()
+    assert (
+        state3.studies["STUDY-01"].streams["records"].last_run_status
+        == StreamExecutionStatus.SUCCESS
+    )
+
+
+def test_legacy_ledger_backward_compatibility(tmp_path) -> None:
+    """Legacy ledger files with unknown raw status strings safely fallback to failed."""
+    ledger_file = tmp_path / "ledger.json"
+    legacy_data = {
+        "studies": {
+            "STUDY-LEGACY": {
+                "streams": {
+                    "records": {
+                        "last_timestamp": "2026-05-22T10:00:00+00:00",
+                        "records_processed": 50,
+                        "last_run_status": "legacy_in_progress",
+                        "error_message": None,
+                        "metadata": {"legacy": True},
+                    }
+                }
+            }
+        }
+    }
+    with open(ledger_file, "w", encoding="utf-8") as f:
+        import json
+
+        json.dump(legacy_data, f)
+
+    ledger = ExtractionStateLedger(str(ledger_file))
+    state = ledger.read_state()
+    stream = state.studies["STUDY-LEGACY"].streams["records"]
+
+    assert stream.last_run_status == StreamExecutionStatus.FAILED
+    assert stream.records_processed == 50
+    assert stream.metadata == {"legacy": True}
+
+
+def test_transaction_atomic_guard_prevents_concurrent_runs(tmp_path) -> None:
+    """Stream in RUNNING status rejects starting a second transaction."""
+    ledger_file = tmp_path / "ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+    fallback_ts = datetime(2026, 5, 22, 10, 0, 0, tzinfo=timezone.utc)
+
+    # Simulate an active or crashed worker that left stream in RUNNING state
+    ledger.set_last_timestamp(
+        "STUDY-01", "records", fallback_ts, status=StreamExecutionStatus.RUNNING
+    )
+    state = ledger.read_state()
+    assert (
+        state.studies["STUDY-01"].streams["records"].last_run_status
+        == StreamExecutionStatus.RUNNING
+    )
+
+    # Attempting transaction for the stream while RUNNING must be rejected by atomic guard
+    with pytest.raises(
+        InvalidStateTransitionError,
+        match="Cannot transition stream state from 'running' to 'running'",
+    ):
+        with ledger.transaction("STUDY-01", "records", fallback_timestamp=fallback_ts):
+            pass
+
+
+def test_transaction_failure_preserves_previous_high_water_mark(tmp_path) -> None:
+    """Unexpected transaction exception transitions to failed and preserves previous high-water mark."""
+    ledger_file = tmp_path / "ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+    previous_ts = datetime(2026, 5, 22, 10, 0, 0, tzinfo=timezone.utc)
+    partial_ts = datetime(2026, 5, 22, 11, 0, 0, tzinfo=timezone.utc)
+
+    # Establish an initial successful checkpoint
+    ledger.set_last_timestamp("STUDY-01", "records", previous_ts, records_processed=50)
+
+    # Start a subsequent transaction that sets new_timestamp then encounters an exception
+    with pytest.raises(RuntimeError, match="Worker crash"):
+        with ledger.transaction("STUDY-01", "records") as tx:
+            assert tx["last_timestamp"] == previous_ts
+            tx["new_timestamp"] = partial_ts
+            tx["records_processed"] = 75
+            raise RuntimeError("Worker crash")
+
+    # High-water mark must NOT advance to partial_ts; previous_ts must be preserved
+    retrieved_ts = ledger.get_last_timestamp("STUDY-01", "records")
+    assert retrieved_ts == previous_ts
+
+    state = ledger.read_state()
+    stream = state.studies["STUDY-01"].streams["records"]
+    assert stream.last_timestamp == previous_ts
+    assert stream.last_run_status == StreamExecutionStatus.FAILED
+    assert stream.error_message == "Worker crash"
+    assert stream.records_processed == 75

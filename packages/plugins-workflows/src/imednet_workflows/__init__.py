@@ -26,7 +26,13 @@ from .standards_validation import (
     StandardsReadinessReport,
     StandardsReadinessValidator,
 )
-from .state_ledger import ExtractionStateLedger, LedgerState, StreamState
+from .state_ledger import (
+    ExtractionStateLedger,
+    InvalidStateTransitionError,
+    LedgerState,
+    StreamExecutionStatus,
+    StreamState,
+)
 from .study_structure import async_get_study_structure, get_study_structure
 from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncWorker, SyncWorkerConfig
@@ -44,6 +50,7 @@ __all__ = [
     "ExtractionStateLedger",
     "FieldProfile",
     "FormProfile",
+    "InvalidStateTransitionError",
     "JobPollSummary",
     "JobPoller",
     "JobProgressCallback",
@@ -58,6 +65,7 @@ __all__ = [
     "SchemaProfiler",
     "StandardsReadinessReport",
     "StandardsReadinessValidator",
+    "StreamExecutionStatus",
     "StreamState",
     "SubjectDataWorkflow",
     "SyncWorker",

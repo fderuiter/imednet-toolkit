@@ -9,10 +9,11 @@ import os
 import tempfile
 from collections.abc import Generator
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Graceful fallback if fcntl is not available (e.g. non-UNIX environments)
 try:
@@ -21,14 +22,142 @@ except ImportError:
     fcntl = None  # type: ignore[assignment]
 
 
+class StreamExecutionStatus(str, Enum):
+    """Execution status for workflow stream checkpoints."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+    def __str__(self) -> str:
+        """Return the string value of the execution status."""
+        return self.value
+
+
+class InvalidStateTransitionError(ValueError):
+    """Raised when an invalid stream execution state transition is requested."""
+
+
+TRANSITION_MATRIX: dict[StreamExecutionStatus | None, set[StreamExecutionStatus]] = {
+    None: {
+        StreamExecutionStatus.PENDING,
+        StreamExecutionStatus.RUNNING,
+        StreamExecutionStatus.SUCCESS,
+        StreamExecutionStatus.FAILED,
+    },
+    StreamExecutionStatus.PENDING: {
+        StreamExecutionStatus.PENDING,
+        StreamExecutionStatus.RUNNING,
+        StreamExecutionStatus.FAILED,
+    },
+    StreamExecutionStatus.RUNNING: {
+        StreamExecutionStatus.SUCCESS,
+        StreamExecutionStatus.FAILED,
+    },
+    StreamExecutionStatus.SUCCESS: {
+        StreamExecutionStatus.PENDING,
+        StreamExecutionStatus.RUNNING,
+        StreamExecutionStatus.SUCCESS,
+    },
+    StreamExecutionStatus.FAILED: {
+        StreamExecutionStatus.PENDING,
+        StreamExecutionStatus.RUNNING,
+        StreamExecutionStatus.FAILED,
+    },
+}
+
+VALID_TRANSITIONS = TRANSITION_MATRIX
+
+
+def _coerce_and_validate_status(status: StreamExecutionStatus | str) -> StreamExecutionStatus:
+    """Coerces a status argument into StreamExecutionStatus or raises ValueError."""
+    if isinstance(status, StreamExecutionStatus):
+        return status
+    if isinstance(status, str):
+        try:
+            return StreamExecutionStatus(status.lower())
+        except ValueError as exc:
+            valid_values = ", ".join(repr(s.value) for s in StreamExecutionStatus)
+            raise ValueError(
+                f"Invalid stream execution status '{status}'. Must be one of: {valid_values}."
+            ) from exc
+    raise ValueError(f"Status must be a StreamExecutionStatus or str, got {type(status).__name__}")
+
+
+def is_valid_transition(
+    current_status: StreamExecutionStatus | str | None,
+    target_status: StreamExecutionStatus | str,
+) -> bool:
+    """Checks whether transitioning from current_status to target_status is permitted."""
+    resolved_current: StreamExecutionStatus | None = None
+    if current_status is not None:
+        if isinstance(current_status, StreamExecutionStatus):
+            resolved_current = current_status
+        elif isinstance(current_status, str):
+            try:
+                resolved_current = StreamExecutionStatus(current_status.lower())
+            except ValueError:
+                resolved_current = StreamExecutionStatus.FAILED
+
+    try:
+        resolved_target = _coerce_and_validate_status(target_status)
+    except ValueError:
+        return False
+
+    allowed_targets = TRANSITION_MATRIX.get(resolved_current, set())
+    return resolved_target in allowed_targets
+
+
+def validate_transition(
+    current_status: StreamExecutionStatus | str | None,
+    target_status: StreamExecutionStatus | str,
+) -> StreamExecutionStatus:
+    """Validates and returns target_status if valid, or raises InvalidStateTransitionError."""
+    try:
+        resolved_target = _coerce_and_validate_status(target_status)
+    except ValueError as exc:
+        raise InvalidStateTransitionError(str(exc)) from exc
+
+    resolved_current: StreamExecutionStatus | None = None
+    if current_status is not None:
+        if isinstance(current_status, StreamExecutionStatus):
+            resolved_current = current_status
+        elif isinstance(current_status, str):
+            try:
+                resolved_current = StreamExecutionStatus(current_status.lower())
+            except ValueError:
+                resolved_current = StreamExecutionStatus.FAILED
+
+    allowed_targets = TRANSITION_MATRIX.get(resolved_current, set())
+    if resolved_target not in allowed_targets:
+        curr_str = resolved_current.value if resolved_current else "None"
+        raise InvalidStateTransitionError(
+            f"Cannot transition stream state from '{curr_str}' to '{resolved_target.value}'."
+        )
+    return resolved_target
+
+
 class StreamState(BaseModel):
     """Schema for individual stream execution checkpoints."""
 
     last_timestamp: datetime
     records_processed: int = 0
-    last_run_status: str = "success"
+    last_run_status: StreamExecutionStatus = StreamExecutionStatus.SUCCESS
     error_message: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("last_run_status", mode="before")
+    @classmethod
+    def _coerce_status(cls, v: Any) -> StreamExecutionStatus:
+        if isinstance(v, StreamExecutionStatus):
+            return v
+        if isinstance(v, str):
+            try:
+                return StreamExecutionStatus(v.lower())
+            except ValueError:
+                return StreamExecutionStatus.FAILED
+        return StreamExecutionStatus.FAILED
 
 
 class StudyState(BaseModel):
@@ -50,6 +179,10 @@ class BaseStateProvider(abc.ABC):
     def get_last_timestamp(self, study_key: str, stream_name: str) -> datetime | None:
         """Returns the high-water mark timestamp for a given study and stream."""
 
+    def get_last_status(self, study_key: str, stream_name: str) -> StreamExecutionStatus | None:
+        """Returns the last execution status for a given study and stream."""
+        return None
+
     @abc.abstractmethod
     def set_last_timestamp(
         self,
@@ -57,7 +190,7 @@ class BaseStateProvider(abc.ABC):
         stream_name: str,
         timestamp: datetime,
         records_processed: int = 0,
-        status: str = "success",
+        status: StreamExecutionStatus | str = StreamExecutionStatus.SUCCESS,
         error_message: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -167,20 +300,40 @@ class FileStateProvider(BaseStateProvider):
                 ts = ts.replace(tzinfo=timezone.utc)
             return ts
 
+    def get_last_status(self, study_key: str, stream_name: str) -> StreamExecutionStatus | None:
+        """Returns the last execution status for a given study and stream."""
+        with self._lock():
+            state = self.read_state()
+            study = state.studies.get(study_key)
+            if not study:
+                return None
+            stream = study.streams.get(stream_name)
+            if not stream:
+                return None
+            return stream.last_run_status
+
     def set_last_timestamp(
         self,
         study_key: str,
         stream_name: str,
         timestamp: datetime,
         records_processed: int = 0,
-        status: str = "success",
+        status: StreamExecutionStatus | str = StreamExecutionStatus.SUCCESS,
         error_message: str | None = None,
         metadata: dict[str, Any] | None = None,
+        force: bool = False,
     ) -> None:
         """Sets the high-water mark timestamp atomically."""
+        validated_status = _coerce_and_validate_status(status)
+
         with self._lock():
             state = self.read_state()
             study = state.studies.setdefault(study_key, StudyState())
+
+            if not force:
+                current_stream = study.streams.get(stream_name)
+                current_status = current_stream.last_run_status if current_stream else None
+                validate_transition(current_status, validated_status)
 
             # Ensure timezone-aware datetime
             if timestamp.tzinfo is None:
@@ -189,7 +342,7 @@ class FileStateProvider(BaseStateProvider):
             study.streams[stream_name] = StreamState(
                 last_timestamp=timestamp,
                 records_processed=records_processed,
-                last_run_status=status,
+                last_run_status=validated_status,
                 error_message=error_message,
                 metadata=metadata or {},
             )
@@ -210,18 +363,30 @@ class FileStateProvider(BaseStateProvider):
         """
         with self._lock():
             state = self.read_state()
-            study = state.studies.get(study_key)
+            study = state.studies.setdefault(study_key, StudyState())
+            current_stream = study.streams.get(stream_name)
+            current_status = current_stream.last_run_status if current_stream else None
+
             last_ts: datetime | None = None
-            if study:
-                stream_state = study.streams.get(stream_name)
-                if stream_state:
-                    last_ts = stream_state.last_timestamp
-                    if last_ts.tzinfo is None:
-                        last_ts = last_ts.replace(tzinfo=timezone.utc)
+            if current_stream:
+                last_ts = current_stream.last_timestamp
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=timezone.utc)
             if last_ts is None:
                 last_ts = fallback_timestamp
             if last_ts is not None and last_ts.tzinfo is None:
                 last_ts = last_ts.replace(tzinfo=timezone.utc)
+
+            # Atomic transaction guard: ensure transition to RUNNING is valid
+            validate_transition(current_status, StreamExecutionStatus.RUNNING)
+
+            running_ts = last_ts or datetime.now(timezone.utc)
+            study.streams[stream_name] = StreamState(
+                last_timestamp=running_ts,
+                records_processed=0,
+                last_run_status=StreamExecutionStatus.RUNNING,
+            )
+            self.write_state(state)
 
             tx_data: dict[str, Any] = {
                 "last_timestamp": last_ts,
@@ -231,29 +396,32 @@ class FileStateProvider(BaseStateProvider):
             }
             try:
                 yield tx_data
-                # Commit changes only if successful and new_timestamp is set
+                # Validate transition to SUCCESS
+                validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
+
+                # Commit changes only if successful
                 new_ts = tx_data.get("new_timestamp")
-                if new_ts:
-                    if new_ts.tzinfo is None:
-                        new_ts = new_ts.replace(tzinfo=timezone.utc)
-                    study_entry = state.studies.setdefault(study_key, StudyState())
-                    study_entry.streams[stream_name] = StreamState(
-                        last_timestamp=new_ts,
-                        records_processed=tx_data.get("records_processed", 0),
-                        last_run_status="success",
-                        metadata=tx_data.get("metadata") or {},
-                    )
-                    self.write_state(state)
+                commit_ts = new_ts or last_ts or running_ts
+                if commit_ts.tzinfo is None:
+                    commit_ts = commit_ts.replace(tzinfo=timezone.utc)
+
+                study_entry = state.studies.setdefault(study_key, StudyState())
+                study_entry.streams[stream_name] = StreamState(
+                    last_timestamp=commit_ts,
+                    records_processed=tx_data.get("records_processed", 0),
+                    last_run_status=StreamExecutionStatus.SUCCESS,
+                    metadata=tx_data.get("metadata") or {},
+                )
+                self.write_state(state)
             except Exception as err:
-                # Mark stream as failed
-                err_ts = tx_data.get("new_timestamp") or last_ts or datetime.now(timezone.utc)
-                if err_ts.tzinfo is None:
-                    err_ts = err_ts.replace(tzinfo=timezone.utc)
+                # Mark stream as failed and preserve previous high-water mark
+                validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
+                err_ts = last_ts or running_ts
                 study_entry = state.studies.setdefault(study_key, StudyState())
                 study_entry.streams[stream_name] = StreamState(
                     last_timestamp=err_ts,
                     records_processed=tx_data.get("records_processed", 0),
-                    last_run_status="failed",
+                    last_run_status=StreamExecutionStatus.FAILED,
                     error_message=str(err),
                     metadata=tx_data.get("metadata") or {},
                 )
@@ -327,24 +495,77 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
             pass
         return None
 
+    def get_last_status(self, study_key: str, stream_name: str) -> StreamExecutionStatus | None:
+        """Returns the execution status from Airflow XCom."""
+        try:
+            from airflow.operators.python import get_current_context
+
+            context = get_current_context()
+            ti = context["ti"]
+            val = ti.xcom_pull(
+                key=self._get_xcom_key(study_key, stream_name), include_prior_dates=True
+            )
+            if val and isinstance(val, dict) and "status" in val:
+                raw_status = val["status"]
+                if isinstance(raw_status, StreamExecutionStatus):
+                    return raw_status
+                if isinstance(raw_status, str):
+                    try:
+                        return StreamExecutionStatus(raw_status.lower())
+                    except ValueError:
+                        return StreamExecutionStatus.FAILED
+                return StreamExecutionStatus.FAILED
+        except Exception:  # noqa: S110
+            pass
+
+        try:
+            from airflow.models.xcom import XCom
+            from airflow.utils.session import provide_session
+
+            @provide_session  # type: ignore[misc]
+            def _get_xcom(session: Any = None) -> Any:
+                return (
+                    session.query(XCom)
+                    .filter(XCom.key == self._get_xcom_key(study_key, stream_name))
+                    .order_by(XCom.timestamp.desc())
+                    .first()
+                )
+
+            xcom_obj = _get_xcom()
+            if xcom_obj and isinstance(xcom_obj.value, dict) and "status" in xcom_obj.value:
+                raw_status = xcom_obj.value["status"]
+                if isinstance(raw_status, StreamExecutionStatus):
+                    return raw_status
+                if isinstance(raw_status, str):
+                    try:
+                        return StreamExecutionStatus(raw_status.lower())
+                    except ValueError:
+                        return StreamExecutionStatus.FAILED
+                return StreamExecutionStatus.FAILED
+        except ImportError:
+            pass
+        return None
+
     def set_last_timestamp(
         self,
         study_key: str,
         stream_name: str,
         timestamp: datetime,
         records_processed: int = 0,
-        status: str = "success",
+        status: StreamExecutionStatus | str = StreamExecutionStatus.SUCCESS,
         error_message: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Sets the high-water mark timestamp atomically using Airflow XCom."""
+        validated_status = _coerce_and_validate_status(status)
+
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
 
         val = {
             "last_timestamp": timestamp.isoformat(),
             "records_processed": records_processed,
-            "status": status,
+            "status": validated_status.value,
             "error_message": error_message,
             "metadata": metadata or {},
         }
@@ -396,6 +617,19 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
         if last_ts is not None and last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=timezone.utc)
 
+        current_status = self.get_last_status(study_key, stream_name)
+        # Atomic transaction guard: ensure transition to RUNNING is valid
+        validate_transition(current_status, StreamExecutionStatus.RUNNING)
+
+        running_ts = last_ts or datetime.now(timezone.utc)
+        self.set_last_timestamp(
+            study_key=study_key,
+            stream_name=stream_name,
+            timestamp=running_ts,
+            records_processed=0,
+            status=StreamExecutionStatus.RUNNING,
+        )
+
         tx_data: dict[str, Any] = {
             "last_timestamp": last_ts,
             "new_timestamp": None,
@@ -405,24 +639,26 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
 
         try:
             yield tx_data
+            validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
             new_ts = tx_data.get("new_timestamp")
-            if new_ts:
-                self.set_last_timestamp(
-                    study_key=study_key,
-                    stream_name=stream_name,
-                    timestamp=new_ts,
-                    records_processed=tx_data.get("records_processed", 0),
-                    status="success",
-                    metadata=tx_data.get("metadata"),
-                )
+            commit_ts = new_ts or last_ts or running_ts
+            self.set_last_timestamp(
+                study_key=study_key,
+                stream_name=stream_name,
+                timestamp=commit_ts,
+                records_processed=tx_data.get("records_processed", 0),
+                status=StreamExecutionStatus.SUCCESS,
+                metadata=tx_data.get("metadata"),
+            )
         except Exception as err:
-            err_ts = tx_data.get("new_timestamp") or last_ts or datetime.now(timezone.utc)
+            validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
+            err_ts = last_ts or running_ts
             self.set_last_timestamp(
                 study_key=study_key,
                 stream_name=stream_name,
                 timestamp=err_ts,
                 records_processed=tx_data.get("records_processed", 0),
-                status="failed",
+                status=StreamExecutionStatus.FAILED,
                 error_message=str(err),
                 metadata=tx_data.get("metadata"),
             )
