@@ -814,3 +814,62 @@ def test_plugin_load_exception(monkeypatch, capsys):
 
     _out, err = capsys.readouterr()
     assert "Warning: Failed to load CLI plugin 'broken': Test error loading plugin" in err
+
+
+def test_cli_subcommand_isolation(runner: CliRunner) -> None:
+    """Verify that internal development scripts are not registered as CLI subcommands."""
+    import argparse
+
+    from imednet.cli import get_parser
+
+    parser = get_parser()
+    subparser_actions = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    assert len(subparser_actions) == 1
+    registered_subcommands = set(subparser_actions[0].choices.keys())
+
+    # Core clinical commands should be registered
+    expected_core_commands = {
+        "studies",
+        "records",
+        "export",
+        "datadict",
+        "sites",
+        "subjects",
+        "queries",
+        "variables",
+        "record-revisions",
+        "intervals",
+        "jobs",
+    }
+    assert expected_core_commands.issubset(registered_subcommands)
+
+    # Repository maintenance script names should not be registered as subcommands
+    internal_script_commands = [
+        "aggregate-verification",
+        "build-docs",
+        "check-root-files",
+        "ci-plan",
+        "post-smoke-record",
+        "tighten-dependencies",
+        "typecheck-docs",
+        "validate-diagrams",
+        "validate-docs",
+        "validate-package-consumption",
+    ]
+    for script_cmd in internal_script_commands:
+        assert script_cmd not in registered_subcommands
+
+    # Dynamic check against all python scripts in root scripts/ directory if present
+    repo_root = Path(__file__).resolve().parents[3]
+    scripts_dir = repo_root / "scripts"
+    if scripts_dir.is_dir():
+        for script_file in scripts_dir.glob("*.py"):
+            if script_file.name == "__init__.py":
+                continue
+            script_cmd = script_file.stem.replace("_", "-")
+            assert script_cmd not in registered_subcommands
+
+    # Invoking an obsolete script command should fail with an invalid choice error
+    result = runner.invoke(cli.app, ["ci-plan"])
+    assert result.exit_code != 0
+    assert "invalid choice" in result.stderr or "unrecognized" in result.stderr
