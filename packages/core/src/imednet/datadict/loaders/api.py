@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from ..models import (
@@ -132,11 +131,10 @@ def load_from_api(
                 forms_map[f_key] = Form(formKey=f_key)
             forms_map[f_key].variables.append(var)
 
-    metadata = Metadata(
-        studyKey=study_key,
+    metadata = Metadata.create(
+        study_key=study_key,
         source="api",
-        generatedAt=datetime.now(timezone.utc).strftime("%m-%d-%Y %H:%M:%S"),
-        validationWarnings=warnings,
+        validation_warnings=warnings,
     )
 
     return DataDictionary(

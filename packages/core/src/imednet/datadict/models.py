@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -98,6 +99,25 @@ class Metadata(BaseModel):
     extraAttributes: dict[str, Any] = Field(
         default_factory=dict, description="Unknown metadata columns or properties"
     )
+
+    @classmethod
+    def create(
+        cls,
+        study_key: str | None = None,
+        source: str | None = None,
+        validation_warnings: list[str] | None = None,
+        **extra: Any,
+    ) -> Metadata:
+        """Create a Metadata envelope with current UTC timestamp."""
+        now_timestamp = datetime.now(timezone.utc).strftime("%m-%d-%Y %H:%M:%S")
+        return cls(
+            schemaVersion="1.0.0",
+            studyKey=study_key,
+            generatedAt=now_timestamp,
+            source=source,
+            validationWarnings=validation_warnings or [],
+            **extra,
+        )
 
     def __eq__(self, other: Any) -> bool:
         """Equality comparison excluding generatedAt for deterministic testing."""
