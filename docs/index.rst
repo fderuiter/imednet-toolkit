@@ -66,6 +66,7 @@ This documentation is organized according to the Diátaxis framework into four m
    reference/triage_playbook
    reference/governance
    reference/verification_reports
+   adr/index
    reference/api/core
    reference/api/plugins-sinks
    reference/api/plugins-workflows
