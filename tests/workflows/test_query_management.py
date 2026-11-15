@@ -1,17 +1,24 @@
 """Unit tests for query management."""
 
+from typing import Any
 from unittest.mock import MagicMock
 
-from imednet.models.queries import Query, QueryComment
+from imednet.models.queries import Query, QueryComment, QueryStatus
 from imednet.models.subjects import Subject
 from imednet.testing import fake_data
 from imednet_workflows.query_management import QueryManagementWorkflow
 
 
-def make_query(sequence_closed: list[tuple[int, bool]]) -> Query:
+def make_query(
+    sequence_closed: list[tuple[int, bool]],
+    status: QueryStatus | str | None = None,
+) -> Query:
     """Helper function to make query."""
     comments = [QueryComment(sequence=seq, closed=closed) for seq, closed in sequence_closed]
-    return Query(query_comments=comments)
+    kwargs: dict[str, Any] = {"query_comments": comments}
+    if status is not None:
+        kwargs["status"] = status
+    return Query(**kwargs)
 
 
 def test_get_open_queries_filters_latest_comment() -> None:
@@ -19,8 +26,8 @@ def test_get_open_queries_filters_latest_comment() -> None:
     sdk = MagicMock()
     query_closed = make_query([(1, False), (2, True)])
     query_open = make_query([(1, False)])
-    query_unknown = make_query([])
-    sdk.get_queries.return_value = [query_closed, query_open, query_unknown]
+    query_cancelled = Query(status=QueryStatus.CANCELLED)
+    sdk.get_queries.return_value = [query_closed, query_open, query_cancelled]
 
     wf = QueryManagementWorkflow(sdk)
     result = wf.get_open_queries("STUDY", additional_filter={"state": "new"})
@@ -45,15 +52,21 @@ def test_get_query_state_counts_aggregates_states() -> None:
     sdk = MagicMock()
     open_query = make_query([(1, False)])
     closed_query = make_query([(1, True)])
-    unknown_query = make_query([])
-    sdk.get_queries.return_value = [open_query, closed_query, unknown_query]
+    answered_query = Query(status=QueryStatus.ANSWERED)
+    cancelled_query = Query(status=QueryStatus.CANCELLED)
+    sdk.get_queries.return_value = [open_query, closed_query, answered_query, cancelled_query]
 
     wf = QueryManagementWorkflow(sdk)
     counts = wf.get_query_state_counts("STUDY")
 
     sdk.get_queries.assert_called_once_with("STUDY")
     assert sdk.get_queries.call_args.kwargs == {}
-    assert counts == {"open": 1, "closed": 1, "unknown": 1}
+    assert counts == {
+        QueryStatus.OPEN.value: 1,
+        QueryStatus.ANSWERED.value: 1,
+        QueryStatus.CLOSED.value: 1,
+        QueryStatus.CANCELLED.value: 1,
+    }
 
 
 def test_get_queries_by_site_filters_using_subjects() -> None:
