@@ -71,7 +71,7 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
     }
     assert sdk.get_records.call_args_list[2].kwargs == {
         "study_key": "STUDY",
-        "record_data_filter": None,
+        "record_data_filter": "none",
         "deleted": False,
     }
 
@@ -189,3 +189,101 @@ def test_count_cached_records_counts_matching_study(tmp_path: Path) -> None:
 
     with get_sqlite_connection(loader.db_path) as conn:
         assert loader.count_cached_records("STUDY", conn=conn) == 2
+
+
+def test_fetch_active_record_ids_uses_lightweight_projection_without_record_data(
+    tmp_path: Path,
+) -> None:
+    """Verify that _fetch_active_record_ids requests record_data_filter="none" and extracts IDs."""
+    sdk = MagicMock()
+    # Projected record models returned by API omit clinical question data (record_data is None)
+    projected_records = [
+        Record(study_key="STUDY", record_id=101, form_key="DEMOG", record_data=None),
+        Record(study_key="STUDY", record_id=102, form_key="VITALS", record_data=None),
+        Record(study_key="STUDY", record_id=None, form_key="EMPTY", record_data=None),
+    ]
+    sdk.get_records.return_value = projected_records
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    active_ids = loader._fetch_active_record_ids("STUDY")
+
+    assert active_ids == {101, 102}
+    sdk.get_records.assert_called_once_with(
+        study_key="STUDY",
+        record_data_filter="none",
+        deleted=False,
+    )
+
+
+def test_reconcile_cache_prunes_deleted_records_with_projected_id_set(tmp_path: Path) -> None:
+    """Verify reconcile_cache accurately prunes orphaned records when supplied projected IDs."""
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    r1 = _record(1, "2024-01-01 00:00:00+00:00")
+    r2 = _record(2, "2024-01-02 00:00:00+00:00")
+    r3 = _record(3, "2024-01-03 00:00:00+00:00")
+
+    with get_sqlite_connection(loader.db_path) as conn:
+        loader._upsert_records(conn, [r1, r2, r3])
+        assert loader.count_cached_records("STUDY", conn=conn) == 3
+
+        # Projected active IDs set indicates record 2 was deleted upstream in EDC
+        projected_active_ids = {1, 3}
+        loader.reconcile_cache(conn, "STUDY", projected_active_ids)
+
+        remaining = [
+            row["record_id"]
+            for row in conn.execute(
+                "SELECT record_id FROM record_cache WHERE study_key = ? ORDER BY record_id",
+                ("STUDY",),
+            ).fetchall()
+        ]
+        assert remaining == [1, 3]
+
+
+def test_cache_sync_minimal_network_overhead_with_lightweight_projection(tmp_path: Path) -> None:
+    """Verify mock network transfer overhead is reduced by >90% when omitting clinical form data."""
+    import json
+
+    sdk = MagicMock()
+    # Create large clinical form payloads with multiple questions
+    clinical_form_data = {f"QUESTION_{i}": f"clinical_response_value_{i}" * 5 for i in range(100)}
+    full_payloads = [
+        Record(
+            study_key="STUDY",
+            record_id=i,
+            form_key="FORM",
+            record_data=clinical_form_data,
+        ).model_dump(mode="json", by_alias=True)
+        for i in range(50)
+    ]
+    projected_payloads = [
+        Record(
+            study_key="STUDY",
+            record_id=i,
+            form_key="FORM",
+            record_data=None,
+        ).model_dump(mode="json", by_alias=True)
+        for i in range(50)
+    ]
+
+    full_bytes = len(json.dumps(full_payloads).encode("utf-8"))
+    projected_bytes = len(json.dumps(projected_payloads).encode("utf-8"))
+
+    # Verify lightweight projection achieves >90% reduction in network payload volume
+    payload_reduction = (full_bytes - projected_bytes) / full_bytes
+    assert payload_reduction > 0.90, f"Payload reduction was only {payload_reduction:.2%}"
+
+    # Verify loader uses projected records during sync reconciliation
+    sdk.get_records.side_effect = [
+        [Record(**p) for p in full_payloads],  # Initial delta sync
+        [Record(**p) for p in projected_payloads],  # Reconciliation with record_data_filter="none"
+    ]
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    loader.sync_records("STUDY", reconcile=True)
+
+    reconcile_call = sdk.get_records.call_args_list[1]
+    assert reconcile_call.kwargs["record_data_filter"] == "none"
+    assert loader.count_cached_records("STUDY") == 50

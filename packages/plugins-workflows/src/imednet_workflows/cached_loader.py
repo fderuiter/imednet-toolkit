@@ -227,8 +227,8 @@ class CachedRecordsLoader:
         )
 
     def _fetch_active_record_ids(self, study_key: str) -> set[int]:
-        """Fetch the set of all non-deleted record IDs for a study from the API."""
-        records = self._list_records(study_key=study_key, record_data_filter=None, deleted=False)
+        """Fetch the set of all non-deleted record IDs for a study from the API using lightweight projection."""
+        records = self._list_records(study_key=study_key, record_data_filter="none", deleted=False)
         return {record.record_id for record in records if record.record_id is not None}
 
     def _list_records(self, **filters: Any) -> list[Record]:
