@@ -11,9 +11,32 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, cast, runtime_checkable
 
-from imednet.models.jobs import JobStatus
+from imednet.models.jobs import (
+    InvalidJobStateError,
+    InvalidJobTransitionError,
+    InvalidStateTransitionError,
+    JobState,
+    JobStatus,
+    normalize_job_state,
+    validate_job_transition,
+)
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "AsyncJobPoller",
+    "BaseJobPoller",
+    "InvalidJobStateError",
+    "InvalidJobTransitionError",
+    "InvalidStateTransitionError",
+    "JobFailedError",
+    "JobPollSummary",
+    "JobPoller",
+    "JobProgressCallback",
+    "JobStatusEvent",
+    "JobTimeoutError",
+    "evaluate_job_state",
+]
 
 
 @runtime_checkable
@@ -84,16 +107,41 @@ class JobFailedError(Exception):
         self.status = status
 
 
-def evaluate_job_state(job: JobStatus) -> bool:
+def evaluate_job_state(
+    job: JobStatus | Any,
+    previous_state: JobState | str | None = None,
+) -> bool:
     """Evaluate a job's status.
+
+    Verifies monotonic state progression before raising errors.
+
+    Args:
+        job: The job or job status object to evaluate.
+        previous_state: The optional previous state to verify monotonic progression from.
 
     Returns:
         True if the job completed successfully.
         False if the job is still in progress.
 
     Raises:
+        InvalidJobStateError: If the job state string is unrecognized.
+        InvalidJobTransitionError: If the transition from previous_state to current state is invalid.
         JobFailedError: If the job ended in a failed or cancelled state.
     """
+    current_state_val = getattr(job, "state", None)
+    if isinstance(current_state_val, (str, JobState)):
+        normalize_job_state(current_state_val)
+
+    # Determine previous state (explicit parameter takes precedence over attribute)
+    prev = previous_state
+    if prev is None:
+        candidate = getattr(job, "previous_state", None)
+        if isinstance(candidate, (str, JobState)):
+            prev = candidate
+
+    if prev is not None and isinstance(current_state_val, (str, JobState)):
+        validate_job_transition(prev, current_state_val)
+
     if getattr(job, "is_failed", False):
         batch_id = getattr(job, "batch_id", getattr(job, "batchId", "unknown"))
         raise JobFailedError(f"Job {batch_id} ended in state {job.state}", job)
@@ -102,6 +150,62 @@ def evaluate_job_state(job: JobStatus) -> bool:
 
 class BaseJobPoller:
     """Base class for polling a job until it reaches a terminal state."""
+
+    def __init__(self) -> None:
+        """Initialize transition tracking ledger."""
+        self._terminal_states: dict[str, JobStatus] = {}
+        self._lock = threading.Lock()
+
+    def _guard_transition(
+        self,
+        batch_id: str,
+        status: JobStatus,
+        last_status: JobStatus | None,
+        terminal_status: JobStatus | None,
+    ) -> tuple[JobStatus, JobStatus | None]:
+        """Guard against state regressions and validate monotonic transitions.
+
+        If a terminal state was already reached, stale non-terminal payloads are ignored
+        and the terminal status is preserved.
+
+        Args:
+            batch_id: The job batch identifier.
+            status: The newly polled JobStatus payload.
+            last_status: The most recent status observed in this polling run.
+            terminal_status: The terminal status if one has already been reached.
+
+        Returns:
+            A tuple of (effective_status, effective_terminal_status).
+        """
+        # If terminal state was already recorded, ignore stale non-terminal responses
+        if terminal_status is not None and getattr(terminal_status, "is_terminal", False):
+            if not getattr(status, "is_terminal", False):
+                logger.warning(
+                    "[JobPoller] Ignoring stale response for batch_id=%s in state %s; terminal state %s preserved",
+                    batch_id,
+                    getattr(status, "state", None),
+                    terminal_status.state,
+                )
+                return terminal_status, terminal_status
+            terminal_status = status
+            with self._lock:
+                self._terminal_states[batch_id] = status
+            return status, terminal_status
+
+        # If the newly polled status is terminal, record it
+        if getattr(status, "is_terminal", False):
+            terminal_status = status
+            with self._lock:
+                self._terminal_states[batch_id] = status
+            return status, terminal_status
+
+        # If both previous and new status are active, validate monotonic transition
+        last_state = getattr(last_status, "state", None) if last_status else None
+        curr_state = getattr(status, "state", None)
+        if last_state is not None and curr_state is not None:
+            validate_job_transition(last_state, curr_state)
+
+        return status, terminal_status
 
     def _check_complete(self, status: JobStatus, batch_id: str) -> JobStatus:
         """Internal hook to check if the status is complete."""
@@ -160,6 +264,7 @@ class JobPoller(BaseJobPoller):
             get_job: Callable that takes study_key and batch_id and returns JobStatus.
             fetch_result: Optional callable to fetch the result data from the result URL.
         """
+        super().__init__()
         self._get_job = get_job
         self._fetch_result = fetch_result
 
@@ -175,11 +280,18 @@ class JobPoller(BaseJobPoller):
         """Synchronously poll a job until completion."""
         start = time.monotonic()
         poll_number = 0
+        last_status: JobStatus | None = None
+        with self._lock:
+            terminal_status: JobStatus | None = self._terminal_states.get(batch_id)
 
         while True:
             poll_number += 1
             result = self._get_job(study_key, batch_id)
             status = self._check_complete(result, batch_id)
+            status, terminal_status = self._guard_transition(
+                batch_id, status, last_status, terminal_status
+            )
+            last_status = status
             elapsed = time.monotonic() - start
             is_terminal = self._evaluate(start, timeout, batch_id, status)
 
@@ -273,7 +385,14 @@ class JobPoller(BaseJobPoller):
                     on_progress=on_progress,
                 )
                 with lock:
-                    results[batch_id] = status
+                    if (
+                        batch_id in results
+                        and getattr(results[batch_id], "is_terminal", False)
+                        and not getattr(status, "is_terminal", False)
+                    ):
+                        pass
+                    else:
+                        results[batch_id] = status
             except Exception as exc:
                 with lock:
                     failures[batch_id] = exc
@@ -310,6 +429,7 @@ class AsyncJobPoller(BaseJobPoller):
             get_job: Awaitable callable that takes study_key and batch_id and returns JobStatus.
             fetch_result: Optional awaitable callable to fetch the result data.
         """
+        super().__init__()
         self._get_job = get_job
         self._fetch_result = fetch_result
 
@@ -325,11 +445,18 @@ class AsyncJobPoller(BaseJobPoller):
         """Asynchronously poll a job until completion."""
         start = time.monotonic()
         poll_number = 0
+        last_status: JobStatus | None = None
+        with self._lock:
+            terminal_status: JobStatus | None = self._terminal_states.get(batch_id)
 
         while True:
             poll_number += 1
             result = await self._get_job(study_key, batch_id)
             status = self._check_complete(result, batch_id)
+            status, terminal_status = self._guard_transition(
+                batch_id, status, last_status, terminal_status
+            )
+            last_status = status
             elapsed = time.monotonic() - start
             is_terminal = self._evaluate(start, timeout, batch_id, status)
 
@@ -406,7 +533,14 @@ class AsyncJobPoller(BaseJobPoller):
                     timeout=timeout,
                     on_progress=on_progress,
                 )
-                results[batch_id] = status
+                if (
+                    batch_id in results
+                    and getattr(results[batch_id], "is_terminal", False)
+                    and not getattr(status, "is_terminal", False)
+                ):
+                    pass
+                else:
+                    results[batch_id] = status
             except Exception as exc:
                 failures[batch_id] = exc
                 if fail_fast:

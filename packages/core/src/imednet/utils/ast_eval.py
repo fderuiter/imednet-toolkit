@@ -1,5 +1,7 @@
 """Restricted AST evaluation engine re-exports."""
 
+# pylint: disable=duplicate-code
+
 from imednet.utils.evaluator import (
     DEFAULT_SAFE_FUNCTIONS,
     RestrictedAstEvaluator,

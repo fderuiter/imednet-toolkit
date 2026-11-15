@@ -15,7 +15,22 @@ from imednet.models.codings import Coding
 from imednet.models.engine import ResourceRegistry
 from imednet.models.forms import Form
 from imednet.models.intervals import FormSummary, Interval
-from imednet.models.jobs import Job, JobStatus
+from imednet.models.jobs import (
+    ACTIVE_JOB_STATES,
+    ALLOWED_JOB_TRANSITIONS,
+    FAILED_JOB_STATES,
+    SUCCESSFUL_JOB_STATES,
+    TERMINAL_JOB_STATES,
+    InvalidJobStateError,
+    InvalidJobTransitionError,
+    InvalidStateTransitionError,
+    Job,
+    JobState,
+    JobStatus,
+    is_valid_job_transition,
+    normalize_job_state,
+    validate_job_transition,
+)
 from imednet.models.queries import (
     ALLOWED_QUERY_TRANSITIONS,
     Query,
@@ -84,10 +99,15 @@ from imednet.utils.validators import (
 )
 
 __all__: list[str] = [
+    "ACTIVE_JOB_STATES",
+    "ALLOWED_JOB_TRANSITIONS",
     "ALLOWED_QUERY_TRANSITIONS",
     "ALLOWED_STATUS_TRANSITIONS",
     "ALLOWED_TRANSITIONS",
+    "FAILED_JOB_STATES",
     "PROFILE_REGISTRY",
+    "SUCCESSFUL_JOB_STATES",
+    "TERMINAL_JOB_STATES",
     "AdverseEvent",
     "AnalysisAdverseEvent",
     "AnalysisLabResult",
@@ -106,7 +126,11 @@ __all__: list[str] = [
     "ImednetBaseModel",
     "Interval",
     "IntervalStructure",
+    "InvalidJobStateError",
+    "InvalidJobTransitionError",
+    "InvalidStateTransitionError",
     "Job",
+    "JobState",
     "JobStatus",
     "Keyword",
     "MappingRule",
@@ -145,15 +169,18 @@ __all__: list[str] = [
     "WidgetConfig",
     "calculate_legacy_status",
     "can_transition",
+    "is_valid_job_transition",
     "is_valid_query_transition",
     "is_valid_status_transition",
     "is_valid_transition",
+    "normalize_job_state",
     "parse_bool",
     "parse_datetime",
     "parse_dict_or_default",
     "parse_int_or_default",
     "parse_list_or_default",
     "parse_str_or_default",
+    "validate_job_transition",
     "validate_query_transition",
     "validate_status_transition",
     "validate_transition",

@@ -315,5 +315,6 @@ def test_load_from_cdisc_odm_invalid_root_and_type_errors() -> None:
     # Empty document without MetaDataVersion
     xml_empty = "<ODM><Study OID='S1'></Study></ODM>"
     dd_empty = load_from_cdisc_odm(xml_empty)
-    assert any("No 'MetaDataVersion' element found" in w for w in dd_empty.metadata.validationWarnings)
-
+    assert any(
+        "No 'MetaDataVersion' element found" in w for w in dd_empty.metadata.validationWarnings
+    )

@@ -21,10 +21,7 @@ def generate_adr_index(adr_dir: Path | None = None) -> None:
         return
 
     pattern = re.compile(r"^\d{4}-.+\.md$")
-    records = [
-        item for item in adr_dir.iterdir()
-        if item.is_file() and pattern.match(item.name)
-    ]
+    records = [item for item in adr_dir.iterdir() if item.is_file() and pattern.match(item.name)]
     records.sort(key=lambda p: p.name)
 
     content = [

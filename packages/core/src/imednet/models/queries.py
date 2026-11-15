@@ -1,3 +1,4 @@
+# pylint: disable=duplicate-code
 """Query and annotation models for iMedNet."""
 
 from __future__ import annotations
