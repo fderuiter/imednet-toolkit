@@ -138,8 +138,24 @@ ignore_missing_imports = true
 quote-style = "preserve"
 
 [tool.pytest.ini_options]
-addopts = "-ra --ignore=tests/live"
+addopts = "--junitxml=reports/junit.xml -ra --ignore=tests/live"
+asyncio_mode = "auto"
+log_cli = true
+log_cli_level = "INFO"
 testpaths = ["tests", "packages/plugins-sinks/tests"]
+markers = [
+    "unit: marks unit tests",
+    "live: marks tests as requiring a live external connection (deselect with '-m \"not live\"')",
+    "fuzzing: marks fuzzing tests",
+    "performance: marks performance tests",
+]
+filterwarnings = [
+    "ignore::ResourceWarning",
+    "ignore:Exception ignored in",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+    "ignore::pytest.PytestUnknownMarkWarning",
+    "ignore::pytest.PytestDeprecationWarning",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = []
