@@ -1,4 +1,4 @@
-"""Endpoint for managing variables (data points on eCRFs) in a study."""
+"""Endpoint for managing variables (data points on forms) in a study."""
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.core.endpoint.strategies import PopStudyKeyStrategy

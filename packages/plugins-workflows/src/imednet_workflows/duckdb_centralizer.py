@@ -1,4 +1,7 @@
-"""DuckDB ingestion workflow for incremental eCRF centralization."""
+"""DuckDB ingestion workflow for incremental form centralization.
+
+Provides an incremental record centralization pipeline using DuckDB.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ _SAFE_STUDY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 
 
 class DuckDBIngestionWorkflow:
-    """Incremental eCRF centralization pipeline using a bronze/silver DuckDB layout."""
+    """Incremental record centralization pipeline using a bronze/silver DuckDB layout."""
 
     def __init__(self, sdk: ImednetFacade, db_path: str = "imednet_central.duckdb") -> None:
         """Initialize the DuckDB ingestion workflow.
