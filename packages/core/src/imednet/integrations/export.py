@@ -9,7 +9,7 @@ import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -272,7 +272,7 @@ class TabularCSVSink(ExportSink):
             "destination": self.path,
             "row_count": row_count,
             "checksum": checksum,
-            "loaded_at": datetime.now(tz=timezone.utc).isoformat(),
+            "loaded_at": datetime.now(tz=UTC).isoformat(),
         }
         with open(self._cfg.manifest_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + os.linesep)
@@ -351,7 +351,7 @@ class TabularSQLSink(ExportSink):
             "destination": self.table,
             "row_count": row_count,
             "checksum": checksum,
-            "loaded_at": datetime.now(tz=timezone.utc).isoformat(),
+            "loaded_at": datetime.now(tz=UTC).isoformat(),
         }
         with open(self._cfg.manifest_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + os.linesep)

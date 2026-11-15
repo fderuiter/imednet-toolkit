@@ -7,6 +7,16 @@ execute against a real iMednet environment and are skipped unless
 :doc:`/reference/configuration`). Each test verifies that the SDK behaves correctly when
 interacting with a running server.
 
+Scheduled smoke tests have been retired. The GitHub Actions live workflow runs
+only through manual dispatch with ``approved=true`` in the ``live-testing``
+environment. It no longer posts smoke Records before pytest. Mutating scenarios
+remain separately gated by ``IMEDNET_ALLOW_MUTATION=1``. Default offline CI and
+synthetic Postman contract checks do not require these credentials.
+
+The manual workflow uses a read-only GitHub token and publishes outcome counts
+in the Actions job summary. Test failures, missing results, and report aggregation
+failures all fail the job; it does not post pull-request comments.
+
 The suite can auto-discover required IDs when environment variables are unset.
 See :mod:`imednet.discovery` for details on locating study, form, site, subject,
 and interval identifiers at runtime.

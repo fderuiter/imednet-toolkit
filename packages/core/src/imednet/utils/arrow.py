@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from imednet.utils.validators import is_boolean_token, parse_bool
@@ -22,8 +22,8 @@ class _ModelDumpable(Protocol):
 def _normalize_datetime(value: datetime) -> datetime:
     """Ensure a datetime object is timezone-aware and set to UTC."""
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _normalize_record(record: Any) -> dict[str, Any]:

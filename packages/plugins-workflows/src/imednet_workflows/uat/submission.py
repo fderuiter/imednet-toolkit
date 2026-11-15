@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import Field
@@ -27,7 +27,7 @@ class BatchSubmission(ImednetBaseModel):
     form_name: str | None = None
     record_count: int
     job: Job
-    submitted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    submitted_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class SubmissionResult(ImednetBaseModel):
@@ -123,7 +123,7 @@ class BulkRecordSubmissionWorkflow:
         """
         result = SubmissionResult(
             study_key=study_key,
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
         )
 
         registration_sets = [
@@ -178,7 +178,7 @@ class BulkRecordSubmissionWorkflow:
                 )
                 result.data_batches.append(batch)
 
-        result.completed_at = datetime.now(timezone.utc)
+        result.completed_at = datetime.now(UTC)
         return result
 
     def _chunk_payloads(self, payloads: list[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:

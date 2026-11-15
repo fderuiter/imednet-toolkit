@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 
@@ -94,7 +94,7 @@ class RandomDataGenerator:
     def date_time(self) -> datetime:
         """Return a mocked value."""
         days = self._rng.randint(0, 365)
-        return datetime.now(timezone.utc) - timedelta(days=days)
+        return datetime.now(UTC) - timedelta(days=days)
 
 
 generator = RandomDataGenerator()

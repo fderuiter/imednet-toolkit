@@ -54,7 +54,6 @@ def test_hatch_scripts_for_maintenance_tasks() -> None:
         "check-root-files",
         "ci-plan",
         "aggregate-verification",
-        "post-smoke-record",
         "tighten-dependencies",
         "typecheck-docs",
         "validate-diagrams",
@@ -68,3 +67,6 @@ def test_hatch_scripts_for_maintenance_tasks() -> None:
         )
         script_file = task.replace("-", "_") + ".py"
         assert f"scripts/{script_file}" in hatch_scripts[task]
+
+    for retired_task in ("post-smoke-record", "post_smoke_record"):
+        assert retired_task not in hatch_scripts

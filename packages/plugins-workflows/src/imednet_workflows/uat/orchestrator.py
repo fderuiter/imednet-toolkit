@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -265,7 +265,7 @@ class UATWorkflow:
         email_notify: bool | str | None = None,
     ) -> UATRunResult:
         """Execute the full UAT pipeline and return a UATRunResult."""
-        started_at = datetime.now(timezone.utc)
+        started_at = datetime.now(UTC)
         phase_durations: dict[str, float] = {}
 
         # 1. Inspect
@@ -302,7 +302,7 @@ class UATWorkflow:
         return UATRunResult(
             study_key=study_key,
             started_at=started_at,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
             spec=spec,
             record_sets=record_sets,
             submission_result=submission_result,

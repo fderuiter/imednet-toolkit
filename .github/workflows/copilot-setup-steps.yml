@@ -33,7 +33,7 @@ jobs:
         id: setup-python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Cache Workspace Dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -41,9 +41,9 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.10"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.10"-
+            uv-venv-${{ runner.os }}-"3.11"-
 
       # Caching dependencies speeds up Copilot engine initialization significantly
       - name: Load cached venv

@@ -17,12 +17,10 @@ pip install ./packages/plugins-workflows
 ```
 
 **Required Dependencies:**
-This package requires `imednet` as a parent dependency along with `pandas`, `typer` (for standard CLI tools), `tenacity`, and `fcntl` / `filelock` (for Unix file locking).
-
-Optionally, you can install the `uat` extra for synthetic test generation:
-```bash
-pip install imednet-workflows[uat]
-```
+Requires Python 3.11 or newer, `imednet`, `pandas`, `cryptography`, and
+`filelock>=4.2.1` for cross-platform file locking. Recreate Python 3.10 virtual
+environments before upgrading. UAT commands are included; there is no separate
+`uat` extra.
 
 ## Launch via CLI
 

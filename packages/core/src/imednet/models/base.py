@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import (
     Any,
     Generic,
+    Self,
     TypeVar,
     Union,
     get_args,
@@ -16,7 +17,6 @@ from typing import (
 )
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from typing_extensions import Self
 
 from imednet.utils.validators import (
     is_missing_value,

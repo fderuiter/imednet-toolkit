@@ -2,12 +2,12 @@ Live Test Charter
 =================
 
 This document is the authoritative contract for all live test code in this
-repository. It defines the purpose of the smoke path and ``tests/live``,
+repository. It defines the purpose of the opt-in ``tests/live`` suite,
 the mutation policy, environment prerequisites, discovery rules,
 pass/skip/fail semantics, observability expectations, and a maintainer
 runbook for interpreting results.
 
-Every implementation issue that touches smoke or live testing should be
+Every implementation issue that touches live testing should be
 evaluated against this charter.
 
 ----
@@ -15,22 +15,24 @@ evaluated against this charter.
 1. Purpose
 ----------
 
-Smoke path (``scripts/post_smoke_record.py``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Offline checks and opt-in live validation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The smoke script proves **authentication, connectivity, and the write path**
-against a live iMednet environment.
+Scheduled credential-dependent smoke testing and its Record-posting helper have
+been retired. Expired or unavailable test credentials must not drive unattended
+API requests or daily failure issues. The retired helper is also no longer a
+pre-step of the manual live workflow.
 
-A successful smoke run means:
+Default CI retains offline unit, integration, Postman-contract, drift-regression,
+and installed-package checks. These checks use synthetic or mocked responses;
+they do not need live iMednet credentials. A test named "smoke" that only imports
+SDK modules is an offline check and remains part of the suite.
 
-* valid credentials were accepted by the API,
-* at least one study and one form were discovered or explicitly configured,
-* at least one record was submitted and the resulting job reached ``COMPLETED``
-  status within the configured timeout.
-
-The smoke script is the fastest signal that the environment is ready before
-running the broader live suite.  It is the appropriate target for nightly
-schedules or on-demand readiness checks.
+The ``Live Integration Tests`` workflow remains available through manual
+``workflow_dispatch`` with ``approved=true`` and the protected ``live-testing``
+environment. It has no schedule or push/pull-request trigger. Its pytest suite
+sets ``IMEDNET_RUN_E2E=1``; write scenarios still separately require
+``IMEDNET_ALLOW_MUTATION=1``. Do not enable a live run to validate this retirement.
 
 ``tests/live`` pytest suite
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -130,9 +132,6 @@ suite.
    * - ``RegisterSubjectsWorkflow.register_subjects``
      -
      - ✓
-   * - Smoke ``post_smoke_record.py``
-     -
-     - ✓ (always mutates)
 
 **Rules:**
 
@@ -140,8 +139,6 @@ suite.
   environment contains at least one study.
 * Mutating tests skip automatically when ``IMEDNET_ALLOW_MUTATION`` is not
   set to ``1``.  Missing the variable is never a failure.
-* The smoke script always mutates.  Running it against a production study
-  without intent is an operator error, not a code defect.
 * Mutation tests are responsible for their own cleanup.  No cleanup helpers
   are required, but tests must not assume data they create persists across
   runs.
@@ -269,35 +266,6 @@ implements this contract.
 6. Pass / skip / fail semantics
 --------------------------------
 
-Smoke (``scripts/post_smoke_record.py``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. list-table::
-   :header-rows: 1
-   :widths: 30 20 50
-
-   * - Condition
-     - Outcome
-     - Meaning
-   * - Credentials valid, study found, record submitted, job ``COMPLETED``
-     - **Green** (exit 0)
-     - The environment is reachable and the write path works.
-   * - Credentials valid, study or form found, but no identifiers available for
-       any write scenario
-     - **Skip** (exit 2 + ``::notice::`` annotation)
-     - The environment exists but is not configured for writes.  This is a
-       warning, not a failure.
-   * - Credentials valid, no studies or no eligible form found
-     - **Red** (exit 1)
-     - The environment has no accessible data; the smoke run cannot prove
-       anything.
-   * - Job did not reach ``COMPLETED`` within the timeout
-     - **Red** (exit 1)
-     - Record submission failed or is stuck.
-   * - Authentication error, network error, or unhandled exception
-     - **Red** (exit 1)
-     - The environment is unreachable or credentials are wrong.
-
 ``tests/live`` pytest suite
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -382,30 +350,6 @@ log file unless they originate from the SDK itself.
 8. Maintainer runbook
 ---------------------
 
-Interpreting smoke results
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Green exit (0)
-   The write path is confirmed.  Record creation completed within the
-   timeout.  Safe to proceed to the full live suite.
-
-Skip exit (2) with ``::notice::`` annotations
-   Authentication succeeded but some identifiers (site, subject, or
-   interval) were not available.  Fewer scenarios were tested.  Check
-   whether the study is correctly populated.
-
-Red exit (1) — ``NoLiveDataError``
-   No study or form was discoverable.  Check that valid credentials point
-   to an environment with at least one study and one subject-record form.
-
-Red exit (1) — timeout or ``COMPLETED`` not reached
-   Record submission succeeded (job was created) but the job did not
-   finish.  This may indicate server-side processing latency.  Try
-   ``--timeout`` with a larger value.  If it persists, check server logs.
-
-Red exit (1) — authentication error
-   ``IMEDNET_API_KEY`` or ``IMEDNET_SECURITY_KEY`` is wrong or expired.
-
 Interpreting live pytest results
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -437,10 +381,12 @@ Tests failed with assertion errors
 Determining the cause of a "no eligible data" skip
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Run the smoke script first with ``--verbose``.  It prints the discovered
-study key, form key, site, subject, and interval.  If any are missing, the
-relevant entity must be created or activated in the target study before the
-live suite can cover that scenario.
+For an explicitly requested live run, inspect the startup context and the
+per-test skip reason. Pin ``IMEDNET_STUDY_KEY`` and ``IMEDNET_FORM_KEY`` when
+you need a specific study and form. Use the EDC portal or deliberately invoked
+read-only SDK/CLI queries to inspect the missing entity; do not create records
+merely to diagnose a skip. Mutation coverage requires a prepared test study and
+separate mutation opt-in.
 
 Keeping the charter current
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~

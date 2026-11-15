@@ -192,7 +192,7 @@ banner "iMedNet EDC Environment & Developer Workspace Setup"
 stage "Tooling & PATH Verification"
 say "Checking required developer tooling (Python, uv, and GitHub CLI)..."
 
-# 1. Check Python >= 3.10
+# 1. Check Python >= 3.11
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then
   PYTHON_BIN="python3"
@@ -203,8 +203,13 @@ fi
 if [[ -n "$PYTHON_BIN" ]]; then
   PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
   say "Found Python $PY_VER ($PYTHON_BIN)"
+  if ! "$PYTHON_BIN" -c "import sys; sys.exit(sys.version_info < (3, 11))"; then
+    warn "Python 3.11+ is required. Upgrade Python before configuring the workspace."
+    exit 1
+  fi
 else
-  warn "Python not found! Please install Python 3.10+."
+  warn "Python not found! Please install Python 3.11+."
+  exit 1
 fi
 
 # 2. Check uv and locate if not in PATH
@@ -341,7 +346,7 @@ fi
 
 # ── Stage 5: Study Configuration & Safety Guardrails ──────────────────────
 stage "Study Configuration & Safety Guardrails"
-say "Configure a default study key for local queries, CLI operations, and smoke tests."
+say "Configure a default study key for local queries, CLI operations, and opt-in live tests."
 step "In the EDC portal, look at the Study list for your trial identifier."
 ask IMEDNET_STUDY_KEY "Enter default IMEDNET_STUDY_KEY (or press Enter to discover dynamically):"
 if [[ -n "$IMEDNET_STUDY_KEY" ]]; then

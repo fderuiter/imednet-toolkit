@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -137,7 +137,7 @@ class UATSpecification(UATBaseModel):
     spec_version: str = "1.0"
     study_key: str
     study_name: str
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     generated_by: str = "imednet-sdk-uat"
     subject_specs: list[UATSubjectSpec] = Field(default_factory=list)
     form_specs: list[UATFormSpec] = Field(default_factory=list)

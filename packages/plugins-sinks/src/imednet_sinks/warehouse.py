@@ -71,7 +71,7 @@ import os
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -294,7 +294,7 @@ class SnowflakeExportSink(ExportSink):
             "batch_id": batch_id,
             "stage_path": stage_path,
             "row_count": row_count,
-            "loaded_at": datetime.now(tz=timezone.utc).isoformat(),
+            "loaded_at": datetime.now(tz=UTC).isoformat(),
         }
         with open(manifest_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + os.linesep)

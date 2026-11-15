@@ -21,7 +21,7 @@ def _record(record_id: int, modified_at: str) -> Record:
         form_key="FORM",
         record_id=record_id,
         subject_key=f"S{record_id}",
-        date_modified=datetime.fromisoformat(modified_at.replace("Z", "+00:00")),
+        date_modified=datetime.fromisoformat(modified_at),
         record_data={"value": record_id},
     )
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # Python 3.11+ supports Z and any precision of fractional seconds in fromisoformat
 _IS_PY311_OR_GREATER = sys.version_info >= (3, 11)
@@ -63,5 +63,5 @@ def format_iso_datetime(dt: datetime) -> str:
         A string representing the datetime in ISO 8601 format.
     """
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")

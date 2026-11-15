@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
 
 from imednet.utils.dates import parse_iso_datetime  # Centralized date parsing
@@ -50,9 +50,9 @@ def parse_datetime(v: str | int | float | datetime) -> datetime:
         return parse_iso_datetime(v.strip())
     if isinstance(v, (int, float)):
         try:
-            return datetime.fromtimestamp(v, tz=timezone.utc)
+            return datetime.fromtimestamp(v, tz=UTC)
         except (OSError, OverflowError, ValueError):
-            return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=v)
+            return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=v)
     return v
 
 

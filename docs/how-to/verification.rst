@@ -50,8 +50,8 @@ Alternatively, if running via ``uv`` directly:
    uv run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov-fail-under=90
    uv run python scripts/build_docs.py
 
-   # Security vulnerability audit
-   uv run --with pip-audit pip-audit -s osv --timeout 60 \
-     --ignore-vuln PYSEC-2026-3481 --ignore-vuln CVE-2026-52870 --ignore-vuln GHSA-hvrp-rf83-w775 \
-     --ignore-vuln PYSEC-2026-3482 --ignore-vuln GHSA-jpw9-pfvf-9f58 --ignore-vuln CVE-2026-52869 \
-     --ignore-vuln PYSEC-2026-3483 --ignore-vuln GHSA-vj7q-gjh5-988w --ignore-vuln CVE-2026-59950
+   # Security vulnerability audit (shared policy with CI)
+   uvx hatch run lint:audit
+
+The audit policy and scanner-only upstream exceptions are documented in
+:doc:`/reference/security_exceptions`. No filelock advisories are suppressed.
