@@ -147,6 +147,25 @@ dependencies = [
 [tool.hatch.envs.default.scripts]
 test = "pytest --ignore=tests/live/ {args:tests/}"
 docs = "python scripts/build_docs.py"
+build-docs = "python scripts/build_docs.py"
+check-root-files = "python scripts/check_root_files.py {args}"
+ci-plan = "python scripts/ci_plan.py {args}"
+aggregate-verification = "python scripts/aggregate_verification.py {args}"
+post-smoke-record = "python scripts/post_smoke_record.py {args}"
+tighten-dependencies = "python scripts/tighten_dependencies.py {args}"
+typecheck-docs = "python scripts/typecheck_docs.py {args}"
+validate-diagrams = "python scripts/validate_diagrams.py {args}"
+validate-docs = "python scripts/validate_docs.py {args}"
+validate-package-consumption = "python scripts/validate_package_consumption.py {args}"
+check_root_files = "python scripts/check_root_files.py {args}"
+ci_plan = "python scripts/ci_plan.py {args}"
+aggregate_verification = "python scripts/aggregate_verification.py {args}"
+post_smoke_record = "python scripts/post_smoke_record.py {args}"
+tighten_dependencies = "python scripts/tighten_dependencies.py {args}"
+typecheck_docs = "python scripts/typecheck_docs.py {args}"
+validate_diagrams = "python scripts/validate_diagrams.py {args}"
+validate_docs = "python scripts/validate_docs.py {args}"
+validate_package_consumption = "python scripts/validate_package_consumption.py {args}"
 
 [tool.hatch.envs.lint]
 detached = true
