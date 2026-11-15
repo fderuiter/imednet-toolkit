@@ -375,10 +375,20 @@ def test_export_to_duckdb_by_form(monkeypatch):
     form1 = MagicMock(form_id=1, form_key="F1")
     form2 = MagicMock(form_id=2, form_key="F2")
     sdk.forms.list.return_value = [form1, form2]
+    sdk.variables.list.return_value = [
+        MagicMock(variable_name="A", label="A", form_id=1),
+        MagicMock(variable_name="B", label="B", form_id=2),
+    ]
+
+    mapper_inst = MagicMock()
+    mapper_inst._build_record_model.return_value = object()
+    mapper_inst._fetch_records.side_effect = [MagicMock(), MagicMock()]
+    mapper_inst._parse_records.side_effect = [([], 0), ([], 0)]
     df1 = pd.DataFrame({"A": [1]})
     df2 = pd.DataFrame({"B": [2]})
-    records_df_mock = MagicMock(side_effect=[df1, df2])
-    monkeypatch.setattr(export_mod, "_records_df", records_df_mock)
+    mapper_inst._build_dataframe.side_effect = [df1, df2]
+    mapper_cls = MagicMock(return_value=mapper_inst)
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
 
     conn = MagicMock()
     duckdb_module = ModuleType("duckdb")
@@ -394,23 +404,14 @@ def test_export_to_duckdb_by_form(monkeypatch):
         form_whitelist=[1, 2],
     )
 
-    assert records_df_mock.call_args_list == [
-        call(
-            sdk,
-            "STUDY",
-            use_labels_as_columns=True,
-            variable_whitelist=["A", "B"],
-            form_whitelist=[1],
-        ),
-        call(
-            sdk,
-            "STUDY",
-            use_labels_as_columns=True,
-            variable_whitelist=["A", "B"],
-            form_whitelist=[2],
-        ),
-    ]
-    assert conn.register.call_args_list == [call("df", df1), call("df", df2)]
+    mapper_cls.assert_called_once_with(sdk)
+    assert sdk.variables.list.call_count == 1
+    sdk.variables.list.assert_called_once_with(study_key="STUDY", formIds=[1, 2])
+    assert conn.register.call_count == 2
+    assert conn.register.call_args_list[0][0][0] == "df"
+    pd.testing.assert_frame_equal(conn.register.call_args_list[0][0][1], df1)
+    assert conn.register.call_args_list[1][0][0] == "df"
+    pd.testing.assert_frame_equal(conn.register.call_args_list[1][0][1], df2)
     assert conn.execute.call_args_list == [
         call('CREATE OR REPLACE TABLE "F1" AS SELECT * FROM "df"'),
         call('CREATE OR REPLACE TABLE "F2" AS SELECT * FROM "df"'),

@@ -69,20 +69,26 @@ def test_export_to_duckdb_by_form_creates_per_form_tables(
         SimpleNamespace(form_id=1, form_key="FORM_A"),
         SimpleNamespace(form_id=2, form_key="FORM_B"),
     ]
+    sdk.variables.list.return_value = [
+        SimpleNamespace(variable_name="value", label="value", form_id=1),
+        SimpleNamespace(variable_name="value", label="value", form_id=2),
+    ]
 
-    monkeypatch.setattr(
-        export_mod,
-        "_records_df",
-        MagicMock(
-            side_effect=[
-                pd.DataFrame({"record_id": [1], "value": ["A"]}),
-                pd.DataFrame({"record_id": [2], "value": ["B"]}),
-            ]
-        ),
-    )
+    mapper_inst = MagicMock()
+    mapper_inst._build_record_model.return_value = object()
+    mapper_inst._fetch_records.side_effect = [MagicMock(), MagicMock()]
+    mapper_inst._parse_records.side_effect = [([], 0), ([], 0)]
+    mapper_inst._build_dataframe.side_effect = [
+        pd.DataFrame({"record_id": [1], "value": ["A"]}),
+        pd.DataFrame({"record_id": [2], "value": ["B"]}),
+    ]
+    mapper_cls = MagicMock(return_value=mapper_inst)
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
 
     db_path = tmp_path / "forms.duckdb"
     export_mod.export_to_duckdb_by_form(sdk, "STUDY", str(db_path))
+
+    assert sdk.variables.list.call_count == 1
 
     conn = duckdb.connect(str(db_path))
     try:
@@ -93,6 +99,119 @@ def test_export_to_duckdb_by_form_creates_per_form_tables(
 
     assert table_a == [(1, "A")]
     assert table_b == [(2, "B")]
+
+
+def test_export_to_duckdb_by_form_form_whitelist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that form_whitelist restricts both the variable pre-fetch and table creation."""
+    duckdb = pytest.importorskip("duckdb")
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [
+        SimpleNamespace(form_id=1, form_key="FORM_A"),
+        SimpleNamespace(form_id=2, form_key="FORM_B"),
+        SimpleNamespace(form_id=3, form_key="FORM_C"),
+    ]
+    sdk.variables.list.return_value = [
+        SimpleNamespace(variable_name="val_a", label="Val A", form_id=1),
+        SimpleNamespace(variable_name="val_c", label="Val C", form_id=3),
+    ]
+
+    mapper_inst = MagicMock()
+    mapper_inst._build_record_model.return_value = object()
+    mapper_inst._fetch_records.side_effect = [MagicMock(), MagicMock()]
+    mapper_inst._parse_records.side_effect = [([], 0), ([], 0)]
+    mapper_inst._build_dataframe.side_effect = [
+        pd.DataFrame({"record_id": [1], "val_a": ["A"]}),
+        pd.DataFrame({"record_id": [3], "val_c": ["C"]}),
+    ]
+    mapper_cls = MagicMock(return_value=mapper_inst)
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
+
+    db_path = tmp_path / "whitelist_forms.duckdb"
+    export_mod.export_to_duckdb_by_form(sdk, "STUDY", str(db_path), form_whitelist=[1, 3])
+
+    sdk.variables.list.assert_called_once_with(study_key="STUDY", formIds=[1, 3])
+
+    conn = duckdb.connect(str(db_path))
+    try:
+        tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
+    finally:
+        conn.close()
+
+    assert "FORM_A" in tables
+    assert "FORM_C" in tables
+    assert "FORM_B" not in tables
+
+
+def test_export_to_duckdb_by_form_variable_whitelist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that variable_whitelist restricts column extraction."""
+    pytest.importorskip("duckdb")
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [
+        SimpleNamespace(form_id=1, form_key="FORM_A"),
+    ]
+    sdk.variables.list.return_value = [
+        SimpleNamespace(variable_name="keep_var", label="Keep", form_id=1),
+        SimpleNamespace(variable_name="drop_var", label="Drop", form_id=1),
+    ]
+
+    mapper_inst = MagicMock()
+    mapper_inst._build_record_model.return_value = object()
+    mapper_inst._fetch_records.return_value = MagicMock()
+    mapper_inst._parse_records.return_value = ([], 0)
+    mapper_inst._build_dataframe.return_value = pd.DataFrame(
+        {"record_id": [1], "keep_var": ["val"]}
+    )
+    mapper_cls = MagicMock(return_value=mapper_inst)
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
+
+    db_path = tmp_path / "whitelist_vars.duckdb"
+    export_mod.export_to_duckdb_by_form(sdk, "STUDY", str(db_path), variable_whitelist=["keep_var"])
+
+    mapper_inst._build_record_model.assert_called_once_with(["keep_var"], {"keep_var": "Keep"})
+    mapper_inst._fetch_records.assert_called_once_with(
+        "STUDY",
+        extra_filters={"formId": 1, "variableNames": ["keep_var"]},
+    )
+
+
+def test_export_to_duckdb_by_form_handles_zero_variables_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that in-memory variable partitioning cleanly handles forms with zero defined variables."""
+    duckdb = pytest.importorskip("duckdb")
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [
+        SimpleNamespace(form_id=10, form_key="EMPTY_FORM"),
+    ]
+    # No variables returned for form 10
+    sdk.variables.list.return_value = []
+
+    mapper_inst = MagicMock()
+    mapper_inst._build_record_model.return_value = object()
+    mapper_inst._fetch_records.return_value = MagicMock()
+    mapper_inst._parse_records.return_value = ([], 0)
+    mapper_inst._build_dataframe.return_value = pd.DataFrame({"record_id": [100]})
+    mapper_cls = MagicMock(return_value=mapper_inst)
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
+
+    db_path = tmp_path / "empty_form.duckdb"
+    export_mod.export_to_duckdb_by_form(sdk, "STUDY", str(db_path))
+
+    mapper_inst._build_record_model.assert_called_once_with([], {})
+    conn = duckdb.connect(str(db_path))
+    try:
+        rows = conn.execute("SELECT record_id FROM EMPTY_FORM").fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [(100,)]
 
 
 def test_export_to_duckdb_import_error(monkeypatch: pytest.MonkeyPatch) -> None:
