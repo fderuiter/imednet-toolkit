@@ -9,7 +9,7 @@ try:  # pragma: no cover - optional Airflow dependency
     try:
         from airflow.sdk.bases.sensor import BaseSensorOperator
     except ImportError:
-        from airflow.sensors.base import BaseSensorOperator
+        from airflow.sensors.base import BaseSensorOperator  # type: ignore[no-redef]
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - placeholder fallback
 
     class BaseSensorOperator:  # type: ignore
