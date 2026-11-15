@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/fderuiter/imednet-toolkit/compare/apache-airflow-providers-imednet-v0.7.0...apache-airflow-providers-imednet-v0.8.0) (2026-11-15)
+
+
+### Features
+
+* **jobs:** implement pydantic job lifecycle state machine with monotonic transition validation ([#1674](https://github.com/fderuiter/imednet-toolkit/issues/1674)) ([a8f171e](https://github.com/fderuiter/imednet-toolkit/commit/a8f171eeb48df2108c2ad3b26716f9b4792fa047))
+
 ## [0.7.0](https://github.com/fderuiter/imednet-toolkit/compare/apache-airflow-providers-imednet-v0.6.0...apache-airflow-providers-imednet-v0.7.0) (2026-09-10)
 
 

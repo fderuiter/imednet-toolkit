@@ -252,7 +252,7 @@ wheels = [
 
 [[package]]
 name = "apache-airflow-providers-imednet"
-version = "0.7.0"
+version = "0.8.0"
 source = { editable = "packages/providers-airflow" }
 dependencies = [
     { name = "apache-airflow" },
@@ -1397,7 +1397,7 @@ wheels = [
 
 [[package]]
 name = "imednet"
-version = "0.10.1"
+version = "0.11.0"
 source = { editable = "packages/core" }
 dependencies = [
     { name = "defusedxml" },
@@ -1499,7 +1499,7 @@ provides-extras = ["neo4j", "mongodb", "snowflake", "all"]
 
 [[package]]
 name = "imednet-workflows"
-version = "0.7.0"
+version = "0.8.0"
 source = { editable = "packages/plugins-workflows" }
 dependencies = [
     { name = "cryptography" },
