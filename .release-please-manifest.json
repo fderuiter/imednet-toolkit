@@ -1,6 +1,6 @@
 {
-  "packages/core": "0.11.0",
-  "packages/providers-airflow": "0.8.0",
-  "packages/plugins-workflows": "0.8.0",
-  "packages/plugins-sinks": "0.2.0"
+  "packages/core": "1.0.0",
+  "packages/providers-airflow": "1.0.0",
+  "packages/plugins-workflows": "1.0.0",
+  "packages/plugins-sinks": "1.0.0"
 }

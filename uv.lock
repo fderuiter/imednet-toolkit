@@ -3,10 +3,10 @@ revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version < '3.12'",
 ]
@@ -249,7 +249,7 @@ wheels = [
 
 [[package]]
 name = "apache-airflow-providers-imednet"
-version = "0.8.0"
+version = "1.0.0"
 source = { editable = "packages/providers-airflow" }
 dependencies = [
     { name = "apache-airflow" },
@@ -1252,7 +1252,7 @@ wheels = [
 
 [[package]]
 name = "imednet"
-version = "0.11.0"
+version = "1.0.0"
 source = { editable = "packages/core" }
 dependencies = [
     { name = "defusedxml" },
@@ -1318,7 +1318,7 @@ provides-extras = ["cli", "duckdb", "export", "mongodb", "neo4j", "snowflake"]
 
 [[package]]
 name = "imednet-plugins-sinks"
-version = "0.2.0"
+version = "1.0.0"
 source = { editable = "packages/plugins-sinks" }
 dependencies = [
     { name = "imednet" },
@@ -1354,7 +1354,7 @@ provides-extras = ["neo4j", "mongodb", "snowflake", "all"]
 
 [[package]]
 name = "imednet-workflows"
-version = "0.8.0"
+version = "1.0.0"
 source = { editable = "packages/plugins-workflows" }
 dependencies = [
     { name = "cryptography" },
