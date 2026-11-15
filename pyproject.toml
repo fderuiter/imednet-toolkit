@@ -270,14 +270,12 @@ apache-airflow-providers-imednet = { workspace = true }
 
 
 
-# Explicit exceptions for unmigrated legacy packages [cite:source_relaxed_packages]
+# Allow subclassing untyped Airflow base classes
 [[tool.mypy.overrides]]
 module = [
-    "imednet.form_designer.*",
     "apache_airflow_providers_imednet.*"
 ]
-strict = false
-ignore_errors = true
+disallow_subclassing_any = false
 
 [tool.pylint.SIMILARITIES]
 min-similarity-lines = 15

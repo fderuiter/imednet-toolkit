@@ -9,7 +9,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from airflow.exceptions import AirflowException
+    try:
+        from airflow.sdk.exceptions import AirflowException
+    except ImportError:
+        from airflow.exceptions import AirflowException  # type: ignore[attr-defined]
     from airflow.sdk.definitions.context import Context
 else:  # pragma: no cover - typing fallback for optional Airflow dependency
     try:
@@ -17,10 +20,15 @@ else:  # pragma: no cover - typing fallback for optional Airflow dependency
     except (ImportError, ModuleNotFoundError):
         Context = dict[str, Any]
     try:
-        from airflow.exceptions import AirflowException
+        from airflow.sdk.exceptions import AirflowException
     except (ImportError, ModuleNotFoundError):
+        try:
+            from airflow.exceptions import AirflowException
+        except (ImportError, ModuleNotFoundError):
 
-        class _FallbackAirflowError(Exception):
-            """Fallback exception used when ``airflow.exceptions.AirflowException`` is unavailable."""
+            class _FallbackAirflowError(Exception):
+                """Fallback exception used when ``AirflowException`` is unavailable."""
 
-        AirflowException = _FallbackAirflowError
+            AirflowException = _FallbackAirflowError
+
+__all__ = ["AirflowException", "Context"]
