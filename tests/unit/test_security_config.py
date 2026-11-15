@@ -22,3 +22,9 @@ def test_config_repr_masks_secrets():
 
     # Assert non-sensitive info is present
     assert base_url in repr_str
+
+    # Assert obsolete accessibility fields are NOT in repr or attributes
+    assert "vpat_path" not in repr_str
+    assert "a11y_report_path" not in repr_str
+    assert not hasattr(config, "vpat_path")
+    assert not hasattr(config, "a11y_report_path")

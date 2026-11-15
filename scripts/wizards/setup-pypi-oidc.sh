@@ -186,7 +186,7 @@ finish() {
 
 TOTAL_STAGES=7
 
-banner "PyPI Trusted Publishing Setup (5 packages)"
+banner "PyPI Trusted Publishing Setup (4 packages)"
 
 # ── Stage 1: GitHub Environment ───────────────────────────────────────────
 stage "GitHub: Create 'pypi' environment"
