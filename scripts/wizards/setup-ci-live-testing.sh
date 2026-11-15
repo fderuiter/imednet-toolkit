@@ -200,7 +200,7 @@ pause "Press Enter once the 'live-testing' environment is created..."
 
 # ── Stage 2: iMedNet Secrets for CI ───────────────────────────────────────
 stage "GitHub Secrets: IMEDNET_API_KEY & IMEDNET_SECURITY_KEY"
-say "Configure secrets used by .github/workflows/live-tests.yml and smoke.yml."
+say "Configure secrets used only by the manually approved .github/workflows/live-tests.yml."
 ask_secret IMEDNET_API_KEY "Paste IMEDNET_API_KEY for CI:"
 ask_secret IMEDNET_SECURITY_KEY "Paste IMEDNET_SECURITY_KEY for CI:"
 set_secret IMEDNET_API_KEY "$IMEDNET_API_KEY"

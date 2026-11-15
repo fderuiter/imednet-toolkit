@@ -214,7 +214,8 @@ Configuration requirements:
   ```bash
   bash scripts/wizards/setup-pypi-oidc.sh
   ```
-- Live CI testing and smoke test workflows require the `live-testing` GitHub environment and credentials:
+- Live CI testing is an explicitly approved, manual workflow. It requires the `live-testing`
+  GitHub environment and valid credentials; scheduled smoke testing has been retired:
   ```bash
   bash scripts/wizards/setup-ci-live-testing.sh
   ```

@@ -341,7 +341,7 @@ fi
 
 # ── Stage 5: Study Configuration & Safety Guardrails ──────────────────────
 stage "Study Configuration & Safety Guardrails"
-say "Configure a default study key for local queries, CLI operations, and smoke tests."
+say "Configure a default study key for local queries, CLI operations, and opt-in live tests."
 step "In the EDC portal, look at the Study list for your trial identifier."
 ask IMEDNET_STUDY_KEY "Enter default IMEDNET_STUDY_KEY (or press Enter to discover dynamically):"
 if [[ -n "$IMEDNET_STUDY_KEY" ]]; then

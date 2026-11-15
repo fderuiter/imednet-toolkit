@@ -53,15 +53,6 @@ jobs:
           packages+=("-e" ".[dev,docs]")
           python -m pip install "${packages[@]}"
 
-      - name: Run Smoke Tests
-        env:
-          IMEDNET_API_KEY: ${{ secrets.IMEDNET_API_KEY }}
-          IMEDNET_SECURITY_KEY: ${{ secrets.IMEDNET_SECURITY_KEY }}
-          IMEDNET_BASE_URL: ${{ vars.IMEDNET_BASE_URL }}
-          IMEDNET_POSTMAN_PATH: ${{ github.workspace }}/imednet.postman_collection.json
-        run: |
-          python scripts/post_smoke_record.py
-
       - name: Execute Live Test Suite & Detect Drift
         id: live_tests
         continue-on-error: true
