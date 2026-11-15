@@ -179,6 +179,51 @@ def test_help_text_completeness(runner):
         assert "options" in result.stdout.lower()
 
 
+def test_active_subparser_help_without_subactions(runner, monkeypatch):
+    """Verify contextual help is displayed when subcommands are invoked without arguments."""
+    # Root CLI invocation displays root help banner
+    result = runner.invoke(app, [])
+    assert result.exit_code == 0
+    assert "iMednet SDK Command Line Interface" in result.stdout
+
+    # records subcommand displays records subparser help
+    result = runner.invoke(app, ["records"])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert " records " in result.stdout
+    assert "iMednet SDK Command Line Interface" not in result.stdout
+
+    # studies subcommand displays studies subparser help
+    result = runner.invoke(app, ["studies"])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert " studies " in result.stdout
+    assert "iMednet SDK Command Line Interface" not in result.stdout
+
+    # export subcommand displays export subparser help
+    result = runner.invoke(app, ["export"])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert " export " in result.stdout
+    assert "iMednet SDK Command Line Interface" not in result.stdout
+
+    # --high-contrast records displays records help and activates high contrast
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    result = runner.invoke(app, ["--high-contrast", "records"])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert " records " in result.stdout
+    assert "iMednet SDK Command Line Interface" not in result.stdout
+    assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+
+    # workflows plugin subcommand displays workflows help
+    result = runner.invoke(app, ["workflows"])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert " workflows " in result.stdout
+    assert "iMednet SDK Command Line Interface" not in result.stdout
+
+
 def test_keyboard_interrupt_handling(runner, mock_sdk):
     """Verify clean exit on Ctrl+C."""
     mock_sdk.studies.list.side_effect = KeyboardInterrupt()

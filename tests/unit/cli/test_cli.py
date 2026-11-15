@@ -873,3 +873,72 @@ def test_cli_subcommand_isolation(runner: CliRunner) -> None:
     result = runner.invoke(cli.app, ["ci-plan"])
     assert result.exit_code != 0
     assert "invalid choice" in result.stderr or "unrecognized" in result.stderr
+
+
+def test_root_help_without_arguments(runner: CliRunner) -> None:
+    """Invoking imednet without arguments displays the main root help banner."""
+    result = runner.invoke(cli.app, [])
+    assert result.exit_code == 0
+    assert "iMednet SDK Command Line Interface" in result.stdout
+    assert "options:" in result.stdout or "optional arguments:" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "datadict",
+        "studies",
+        "queries",
+        "variables",
+        "record-revisions",
+        "sites",
+        "export",
+        "subjects",
+        "intervals",
+        "jobs",
+        "records",
+    ],
+)
+def test_noun_commands_show_contextual_help(runner: CliRunner, cmd: str) -> None:
+    """Invoking any of the eleven noun commands without sub-actions displays contextual help."""
+    result = runner.invoke(cli.app, [cmd])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert f" {cmd} " in result.stdout
+    if cmd != "datadict":
+        assert "iMednet SDK Command Line Interface" not in result.stdout
+
+
+def test_high_contrast_with_subcommand(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Invoking imednet --high-contrast records displays records help and sets the env var."""
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    result = runner.invoke(cli.app, ["--high-contrast", "records"])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert " records " in result.stdout
+    assert "iMednet SDK Command Line Interface" not in result.stdout
+    assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+
+
+def test_plugin_subparser_help(runner: CliRunner) -> None:
+    """Invoking a plugin command such as workflows displays its contextual help."""
+    result = runner.invoke(cli.app, ["workflows"])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert " workflows " in result.stdout
+    assert "extract-records" in result.stdout
+    assert "sync-worker" in result.stdout
+    assert "state" in result.stdout
+    assert "iMednet SDK Command Line Interface" not in result.stdout
+
+
+def test_nested_plugin_subparser_help(runner: CliRunner) -> None:
+    """Invoking nested subparser workflows state displays state subparser help."""
+    result = runner.invoke(cli.app, ["workflows", "state"])
+    assert result.exit_code == 0
+    assert "usage:" in result.stdout
+    assert " workflows state " in result.stdout
+    assert "show" in result.stdout
+    assert "set" in result.stdout
+    assert "reset" in result.stdout
+    assert "iMednet SDK Command Line Interface" not in result.stdout
