@@ -9,6 +9,7 @@ from .output import (
     _truncate,
     console,
     display_list,
+    print_error,
 )
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "fetching_status",
     "get_sdk",
     "parse_filter_args",
+    "print_error",
     "register_list_command",
 ]

@@ -4,7 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from imednet.cli.utils import _format_cell_value, display_list, fetching_status
+from imednet.cli.utils import (
+    _format_cell_value,
+    display_list,
+    fetching_status,
+    print_error,
+)
 
 
 def test_fetching_status_records() -> None:
@@ -165,3 +170,42 @@ def test_format_cell_value_non_status_columns() -> None:
 def test_format_cell_value_unknown_status() -> None:
     """Test that unknown statuses are not colorized."""
     assert _format_cell_value("UnknownStatus", key="status") == "UnknownStatus"
+
+
+def test_print_error_writes_to_stderr(capfd: pytest.CaptureFixture[str]) -> None:
+    """print_error writes to stderr and preserves clean stdout."""
+    print_error("Failed to connect to study service.")
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Failed to connect to study service.\n" == captured.err
+
+
+def test_print_error_strips_ansi_on_non_tty(capfd: pytest.CaptureFixture[str]) -> None:
+    """print_error strips ANSI escape sequences when stderr is non-interactive."""
+    colored_msg = "\033[31mError:\033[0m something went wrong"
+    print_error(colored_msg)
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Error: something went wrong\n"
+
+
+def test_print_error_preserves_ansi_on_tty() -> None:
+    """print_error preserves ANSI escape sequences when stderr is a tty."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+    colored_msg = "\033[31mError:\033[0m failure"
+    print_error(colored_msg, file=mock_stream)
+    mock_stream.write.assert_any_call("\033[31mError:\033[0m failure")
+
+
+def test_print_error_handles_broken_pipe_and_ioerror() -> None:
+    """print_error handles BrokenPipeError and IOError without raising."""
+    broken_stream = MagicMock()
+    broken_stream.write.side_effect = BrokenPipeError("Broken pipe")
+    # Should not raise exception
+    print_error("Error message", file=broken_stream)
+
+    io_stream = MagicMock()
+    io_stream.write.side_effect = OSError("I/O failure")
+    # Should not raise exception
+    print_error("Error message", file=io_stream)

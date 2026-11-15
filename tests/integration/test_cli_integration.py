@@ -51,7 +51,7 @@ def test_cli_rejects_missing_credentials(monkeypatch: pytest.MonkeyPatch) -> Non
     result = runner.invoke(cli.app, ["studies", "list"])
 
     assert result.exit_code == 1
-    assert "IMEDNET_API_KEY" in result.stdout
+    assert "IMEDNET_API_KEY" in result.stderr
 
 
 def test_studies_list_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -142,4 +142,4 @@ def test_invalid_filter_string(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(cli.app, ["subjects", "list", "ST", "--filter", "badfilter"])
 
     assert result.exit_code == 1
-    assert "Invalid filter format" in result.stdout
+    assert "Invalid filter format" in result.stderr
