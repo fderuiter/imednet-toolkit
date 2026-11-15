@@ -25,7 +25,11 @@ from imednet.spi.models import (
     StudyConfiguration,
     SubjectLevelAnalysis,
 )
-from imednet.spi.utils import is_missing_value
+from imednet.spi.utils import (
+    evaluate_expression,
+    is_missing_value,
+    parse_expression,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -236,11 +240,15 @@ def _compile_business_logic(logic: str) -> Any:
     Returns:
         The compiled code object.
     """
-    return compile(logic, "<string>", "eval")
+    return parse_expression(logic)
 
 
 def _evaluate_business_logic(
-    logic: str, record: Record, payload: dict[str, Any], context: SubjectContext, value: Any = None
+    logic: str | Any,
+    record: Record,
+    payload: dict[str, Any],
+    context: SubjectContext,
+    value: Any = None,
 ) -> Any:
     """Safely evaluate Python business logic for a mapping rule.
 
@@ -266,14 +274,7 @@ def _evaluate_business_logic(
             "subject_key": context.subject_key,
             "value": value,
         }
-        builtins = {
-            "float": float,
-            "int": int,
-            "str": str,
-            "bool": bool,
-            "len": len,
-        }
-        return eval(code, {"__builtins__": builtins}, env)  # nosem
+        return evaluate_expression(code, env, raise_on_error=True)
     except Exception as e:
         logger.warning(f"Derivation logic failed for {context.subject_key}: {e}")
         return None

@@ -10,12 +10,11 @@ from imednet.models.studies import Study
 async def test_async_list_builds_path_and_filters(
     monkeypatch,
     dummy_client,
-    context,
     async_paginator_factory,
     patch_build_filter,
 ):
     """Test that async list builds path and filters asynchronously."""
-    ep = studies.AsyncStudiesEndpoint(dummy_client, context)
+    ep = studies.AsyncStudiesEndpoint(dummy_client)
     captured = async_paginator_factory(studies, [{"studyKey": "S1"}])
     filter_capture = patch_build_filter(studies)
 

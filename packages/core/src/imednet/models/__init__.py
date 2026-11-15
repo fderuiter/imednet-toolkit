@@ -31,7 +31,15 @@ from imednet.models.jobs import (
     normalize_job_state,
     validate_job_transition,
 )
-from imednet.models.queries import Query, QueryComment
+from imednet.models.queries import (
+    ALLOWED_QUERY_TRANSITIONS,
+    Query,
+    QueryComment,
+    QueryStatus,
+    calculate_legacy_status,
+    is_valid_query_transition,
+    validate_query_transition,
+)
 from imednet.models.record_revisions import RecordRevision
 from imednet.models.records import (
     BaseRecordRequest,
@@ -93,6 +101,7 @@ from imednet.utils.validators import (
 __all__: list[str] = [
     "ACTIVE_JOB_STATES",
     "ALLOWED_JOB_TRANSITIONS",
+    "ALLOWED_QUERY_TRANSITIONS",
     "ALLOWED_STATUS_TRANSITIONS",
     "ALLOWED_TRANSITIONS",
     "FAILED_JOB_STATES",
@@ -130,6 +139,7 @@ __all__: list[str] = [
     "ProtocolDeviation",
     "Query",
     "QueryComment",
+    "QueryStatus",
     "Record",
     "RecordData",
     "RecordJobResponse",
@@ -157,8 +167,10 @@ __all__: list[str] = [
     "Variable",
     "Visit",
     "WidgetConfig",
+    "calculate_legacy_status",
     "can_transition",
     "is_valid_job_transition",
+    "is_valid_query_transition",
     "is_valid_status_transition",
     "is_valid_transition",
     "normalize_job_state",
@@ -169,6 +181,7 @@ __all__: list[str] = [
     "parse_list_or_default",
     "parse_str_or_default",
     "validate_job_transition",
+    "validate_query_transition",
     "validate_status_transition",
     "validate_transition",
 ]

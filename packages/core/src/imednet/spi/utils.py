@@ -9,6 +9,11 @@ from imednet.core.context import (
 )
 from imednet.utils.dates import format_iso_datetime, parse_iso_datetime
 from imednet.utils.db import get_sqlite_connection, sqlite_connection
+from imednet.utils.evaluator import (
+    RestrictedAstEvaluator,
+    evaluate_expression,
+    parse_expression,
+)
 from imednet.utils.filters import build_filter_string
 from imednet.utils.job_poller import (
     AsyncJobPoller,
@@ -40,7 +45,9 @@ __all__ = [
     "JobProgressCallback",
     "JobStatusEvent",
     "JobTimeoutError",
+    "RestrictedAstEvaluator",
     "build_filter_string",
+    "evaluate_expression",
     "evaluate_job_state",
     "flatten",
     "format_iso_datetime",
@@ -51,6 +58,7 @@ __all__ = [
     "is_missing_value",
     "mask_clinical_phi",
     "parse_bool",
+    "parse_expression",
     "parse_iso_datetime",
     "redact_sensitive_payload",
     "redact_sensitive_text",

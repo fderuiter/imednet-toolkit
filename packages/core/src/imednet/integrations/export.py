@@ -704,9 +704,20 @@ def export_to_duckdb_by_form(
             "Install with `pip install 'imednet[duckdb]'`."
         ) from error
 
+    mapper = _record_mapper()(sdk)
+    forms = sdk.forms.list(study_key=study_key)
+
+    # Fetch all variables for the study once to avoid N+1 queries
+    _form_filter: dict[str, Any] = {"formIds": form_whitelist} if form_whitelist else {}
+    all_variables = sdk.variables.list(study_key=study_key, **_form_filter)
+    variables_by_form: dict[int, list[Any]] = {}
+    for v in all_variables:
+        if v.form_id is not None:
+            variables_by_form.setdefault(v.form_id, []).append(v)
+
     conn: Any = duckdb.connect(db_path)
     try:
-        for form in sdk.forms.list(study_key=study_key):
+        for form in forms:
             if form.form_id is None or form.form_key is None:
                 continue
             if form_whitelist is not None and form.form_id not in form_whitelist:
@@ -714,14 +725,35 @@ def export_to_duckdb_by_form(
 
             _validate_duckdb_identifier(form.form_key)
 
-            df = _records_df(
-                sdk,
+            variables = variables_by_form.get(form.form_id, [])
+            variable_keys = [
+                v.variable_name
+                for v in variables
+                if variable_whitelist is None or v.variable_name in variable_whitelist
+            ]
+            label_map = {
+                v.variable_name: v.label for v in variables if v.variable_name in variable_keys
+            }
+            record_model = mapper._build_record_model(variable_keys, label_map)
+            records = mapper._fetch_records(
                 study_key,
-                use_labels_as_columns=use_labels_as_columns,
-                variable_whitelist=variable_whitelist,
-                form_whitelist=[form.form_id],
+                extra_filters={
+                    "formId": form.form_id,
+                    **({"variableNames": variable_whitelist} if variable_whitelist else {}),
+                },
             )
-            df = _mask_df(df)
+            rows, _ = mapper._parse_records(records, record_model)
+            df = mapper._build_dataframe(
+                rows,
+                variable_keys,
+                label_map,
+                use_labels_as_columns,
+            )
+            if isinstance(df, pd.DataFrame):
+                df.columns = df.columns.astype(str)
+                dup_mask = df.columns.str.lower().duplicated()
+                df = df.loc[:, ~dup_mask]
+                df = _mask_df(df)
 
             conn.register(_DUCKDB_DF_ALIAS, df)
             conn.execute(

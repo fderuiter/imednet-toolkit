@@ -56,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
@@ -74,6 +76,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
@@ -103,6 +107,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -125,11 +130,13 @@ jobs:
 
       - name: Determine Impacted Packages
         id: set-matrix
+        env:
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
-          if [ -z "${{ steps.changed-files.outputs.all_changed_files }}" ]; then
+          if [ -z "$ALL_CHANGED_FILES" ]; then
             PLAN=$(echo "" | python3 scripts/ci_plan.py)
           else
-            PLAN=$(echo "${{ steps.changed-files.outputs.all_changed_files }}" | tr ',' '\n' | python3 scripts/ci_plan.py)
+            PLAN=$(echo "$ALL_CHANGED_FILES" | tr ',' '\n' | python3 scripts/ci_plan.py)
           fi
           echo "Impacted packages: $PLAN"
           echo "matrix=$(echo "$PLAN" | jq -c '.test')" >> "$GITHUB_OUTPUT"
@@ -175,6 +182,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.10"
@@ -204,6 +213,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.10"
@@ -227,8 +238,10 @@ jobs:
         run: python scripts/tighten_dependencies.py --rewrite
 
       - name: Build Workspace Packages
+        env:
+          BUILD_MATRIX: ${{ needs.plan.outputs.build_matrix }}
         run: |
-          IMPACTED=$(echo '${{ needs.plan.outputs.build_matrix }}' | jq -r '.[]')
+          IMPACTED=$(echo "$BUILD_MATRIX" | jq -r '.[]')
           for package in packages/*; do
             if [ -f "$package/pyproject.toml" ]; then
               PKG_NAME=$(basename "$package")
@@ -294,6 +307,8 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
@@ -327,22 +342,23 @@ jobs:
 
       - name: Run Tests
         env:
+          PACKAGE: ${{ matrix.package }}
           IMEDNET_API_KEY: dummy
           IMEDNET_SECURITY_KEY: dummy
           IMEDNET_POSTMAN_PATH: ${{ github.workspace }}/imednet.postman_collection.json
         run: |
-          if [ "${{ matrix.package }}" = "core" ]; then
+          if [ "$PACKAGE" = "core" ]; then
             TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*sinks* tests/"
             COV_ARGS="--cov=imednet"
-          elif [ "${{ matrix.package }}" = "plugins-workflows" ]; then
+          elif [ "$PACKAGE" = "plugins-workflows" ]; then
 
 
             TEST_ARGS="tests/unit/test_workflows*.py tests/unit/workflows/ tests/workflows/ tests/unit/test_chunked_pipeline.py tests/unit/cli/ tests/unit/test_config_version_control.py tests/unit/test_duckdb_ingestion_workflow.py tests/unit/test_job_poller.py tests/unit/test_record_mapper.py tests/unit/test_record_mapper_hierarchy.py tests/unit/test_state_ledger.py tests/unit/test_study_structure.py tests/unit/test_sync_worker.py tests/unit/test_cached_records_loader.py"
             COV_ARGS="--cov=imednet_workflows"
-          elif [ "${{ matrix.package }}" = "providers-airflow" ]; then
+          elif [ "$PACKAGE" = "providers-airflow" ]; then
             TEST_ARGS="tests/unit/test_airflow*.py"
             COV_ARGS="--cov=apache_airflow_providers_imednet"
-          elif [ "${{ matrix.package }}" = "plugins-sinks" ]; then
+          elif [ "$PACKAGE" = "plugins-sinks" ]; then
             TEST_ARGS="packages/plugins-sinks/tests/"
             COV_ARGS="--cov=imednet_sinks"
           fi
@@ -350,7 +366,7 @@ jobs:
           hatch run test -q $COV_ARGS --cov-report=xml --cov-fail-under=90 -m "not live" --ignore=tests/live/ $TEST_ARGS || {
             RET=$?
             if [ $RET -eq 5 ]; then
-              echo "No tests collected for ${{ matrix.package }}. Passing gracefully."
+              echo "No tests collected for $PACKAGE. Passing gracefully."
               exit 0
             else
               exit $RET
@@ -367,6 +383,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -414,6 +432,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -457,6 +477,8 @@ jobs:
         extra: ["export", "duckdb", "mongodb", "neo4j", "snowflake", "cli"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.10"
@@ -488,12 +510,14 @@ jobs:
         run: python scripts/tighten_dependencies.py --restore
 
       - name: Install Core with Extra
+        env:
+          EXTRA: ${{ matrix.extra }}
         run: |
           WHEEL=$(ls packages/core/dist/imednet-*.whl)
           SINKS_WHEEL=$(ls packages/plugins-sinks/dist/imednet_plugins_sinks-*.whl)
           WORKFLOWS_WHEEL=$(ls packages/plugins-workflows/dist/imednet_workflows-*.whl)
           python3 -m pip install "$WHEEL" "$SINKS_WHEEL" "$WORKFLOWS_WHEEL"
-          python3 -m pip install "${WHEEL}[${{ matrix.extra }}]"
+          python3 -m pip install "${WHEEL}[${EXTRA}]"
 
       - name: Verify CLI Availability
         run: |
@@ -508,6 +532,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.10"
@@ -544,6 +570,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.10"
@@ -618,14 +646,16 @@ jobs:
     steps:
       - name: Set Artifact Name
         id: set-artifact
+        env:
+          PACKAGE: ${{ matrix.package }}
         run: |
-          if [ "${{ matrix.package }}" = "core" ]; then
+          if [ "$PACKAGE" = "core" ]; then
             echo "artifact=dist-core" >> $GITHUB_OUTPUT
-          elif [ "${{ matrix.package }}" = "plugins-workflows" ]; then
+          elif [ "$PACKAGE" = "plugins-workflows" ]; then
             echo "artifact=dist-workflows" >> $GITHUB_OUTPUT
-          elif [ "${{ matrix.package }}" = "providers-airflow" ]; then
+          elif [ "$PACKAGE" = "providers-airflow" ]; then
             echo "artifact=dist-providers" >> $GITHUB_OUTPUT
-          elif [ "${{ matrix.package }}" = "plugins-sinks" ]; then
+          elif [ "$PACKAGE" = "plugins-sinks" ]; then
             echo "artifact=dist-sinks" >> $GITHUB_OUTPUT
           fi
 

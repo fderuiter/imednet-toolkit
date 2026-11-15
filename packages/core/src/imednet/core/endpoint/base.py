@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import builtins
-import warnings
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -48,23 +47,14 @@ class GenericEndpoint(EndpointABC[T]):
     def __init__(
         self,
         client: RequesterProtocol | None = None,
-        ctx: object | None = None,
         async_client: AsyncRequesterProtocol | None = None,
     ) -> None:
         """Initialize the generic endpoint.
 
         Args:
             client: Synchronous requester instance.
-            ctx: Deprecated context object.
             async_client: Asynchronous requester instance.
         """
-        if ctx is not None:
-            warnings.warn(
-                "The 'ctx' constructor argument is deprecated and ignored. "
-                "Pass study_key explicitly or use ImednetSDK.study_context(...).",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         self._client = client
         self._async_client = async_client
 
@@ -310,10 +300,9 @@ class SyncListGetEndpoint(_ListGetEndpointBase[T], SyncEndpointContext):
     def __init__(
         self,
         client: RequesterProtocol,
-        ctx: object | None = None,
     ) -> None:
         """Initialize the synchronous endpoint."""
-        super().__init__(client=client, ctx=ctx)
+        super().__init__(client=client)
 
 
 class AsyncListGetEndpoint(_ListGetEndpointBase[T], AsyncEndpointContext):
@@ -322,10 +311,9 @@ class AsyncListGetEndpoint(_ListGetEndpointBase[T], AsyncEndpointContext):
     def __init__(
         self,
         async_client: AsyncRequesterProtocol,
-        ctx: object | None = None,
     ) -> None:
         """Initialize the asynchronous endpoint."""
-        super().__init__(ctx=ctx, async_client=async_client)
+        super().__init__(async_client=async_client)
 
 
 # Backward-compatible alias. New code should use SyncListGetEndpoint / AsyncListGetEndpoint.

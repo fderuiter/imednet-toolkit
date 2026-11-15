@@ -15,9 +15,9 @@ Full documentation: <https://fderuiter.github.io/imednet-python-sdk/>
 
 </div>
 
-This package simplifies integration with the iMednet REST API for clinical trial
+This package simplifies integration with the iMednet REST API for study
 management. It provides typed endpoint wrappers, helper workflows and a CLI so
-researchers and developers can automate data extraction and submission without
+researchers and developers can automate data extraction and record operations without
 reimplementing HTTP logic.
 
 ## Documentation
@@ -34,7 +34,7 @@ Our documentation is organized according to the **Diátaxis framework**, which c
 *Problem-oriented guides for completing specific tasks.*
 - [CLI Usage](docs/how-to/cli.rst)
 - [UAT Workflow](docs/how-to/workflows/uat_workflow.rst)
-- [Bulk Submission](docs/how-to/workflows/bulk_submission.rst)
+- [Bulk Record Creation](docs/how-to/workflows/bulk_submission.rst)
 - [Export Destinations](docs/how-to/export_destinations.rst)
 
 ### 💡 [Explanation](docs/explanation/)

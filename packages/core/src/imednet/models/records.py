@@ -1,5 +1,5 @@
 # pylint: disable=duplicate-code
-"""Record (eCRF instance) models for iMedNet."""
+"""Record (form instance) models for iMedNet."""
 
 from __future__ import annotations
 

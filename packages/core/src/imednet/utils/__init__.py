@@ -26,6 +26,9 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "build_safe_path": ("imednet.utils.url", "build_safe_path"),
     "sanitize_csv_formula": ("imednet.utils.security", "sanitize_csv_formula"),
     "validate_partition_key": ("imednet.utils.security", "validate_partition_key"),
+    "RestrictedAstEvaluator": ("imednet.utils.evaluator", "RestrictedAstEvaluator"),
+    "evaluate_expression": ("imednet.utils.evaluator", "evaluate_expression"),
+    "parse_expression": ("imednet.utils.evaluator", "parse_expression"),
 }
 
 
@@ -45,15 +48,18 @@ __all__ = [
     "FilterValue",
     "ItemId",
     "JsonDict",
+    "RestrictedAstEvaluator",
     "build_filter_string",
     "build_safe_path",
     "configure_json_logging",
+    "evaluate_expression",
     "export_records_csv",
     "flatten",
     "format_iso_datetime",
     "parse_bool",
     "parse_datetime",
     "parse_dict_or_default",
+    "parse_expression",
     "parse_int_or_default",
     "parse_iso_datetime",
     "parse_list_or_default",

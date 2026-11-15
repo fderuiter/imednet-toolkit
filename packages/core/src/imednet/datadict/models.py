@@ -88,7 +88,7 @@ class Metadata(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     schemaVersion: str = Field(default="1.0.0", description="Data dictionary schema version")
-    studyKey: str | None = Field(default=None, description="Clinical trial study key")
+    studyKey: str | None = Field(default=None, description="Study key")
     generatedAt: str | None = Field(
         default=None, description="Timestamp of data dictionary generation"
     )
@@ -151,7 +151,9 @@ class Variable(DictCompatMixin, BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     variableName: str = Field(description="Unique identifier for variable within form")
-    label: str | None = Field(default=None, description="Display prompt/label on the eCRF")
+    label: str | None = Field(
+        default=None, description="Display prompt/label on the Form for a Subject"
+    )
     variableType: str | None = Field(
         default=None, description="Field type (Text, Radio, Date/Time Precision, etc.)"
     )
@@ -196,7 +198,7 @@ class BusinessLogicRule(DictCompatMixin, BaseModel):
 
 
 class Form(DictCompatMixin, BaseModel):
-    """An electronic Case Report Form (eCRF)."""
+    """A form defining data fields and rules for clinical data entry."""
 
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
@@ -204,7 +206,7 @@ class Form(DictCompatMixin, BaseModel):
     formName: str | None = Field(default=None, description="Human-readable form title")
     formId: str | int | None = Field(default=None, description="Unique form identifier")
     formType: str | None = Field(
-        default=None, description="Type of form (Patient, Study, Admin, etc.)"
+        default=None, description="Type of form (Subject, Study, Admin, etc.)"
     )
     variables: list[Variable] = Field(
         default_factory=list, description="Variables defined on this form"

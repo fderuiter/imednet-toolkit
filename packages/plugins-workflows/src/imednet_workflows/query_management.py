@@ -2,10 +2,31 @@
 
 from typing import TYPE_CHECKING, Any
 
-from imednet.spi.models import Query
+from imednet.spi.models import Query, QueryStatus, calculate_legacy_status
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
+
+
+class QueryStateCounts(dict[str, int]):
+    """State counts dictionary supporting case-insensitive and enum key access."""
+
+    def __getitem__(self, key: Any) -> int:
+        """Retrieve state count supporting case-insensitive and enum keys."""
+        if isinstance(key, str) and key not in self:
+            for k, v in self.items():
+                if k.lower() == key.lower():
+                    return v
+        if hasattr(key, "value") and key.value in self:
+            return self[key.value]
+        return super().__getitem__(key)
+
+    def get(self, key: Any, default: Any = 0) -> Any:  # type: ignore[override]
+        """Get state count with fallback default on missing keys."""
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
 
 class QueryManagementWorkflow:
@@ -24,34 +45,13 @@ class QueryManagementWorkflow:
         self._sdk = sdk
 
     @staticmethod
-    def _is_query_open(query: Query) -> bool | None:
-        """Determines if a query is open based on its comments.
-
-        Returns None if the state cannot be determined (no comments).
-        """
-        if not getattr(
-            query,
-            'query_comments',
-            getattr(query, 'model_extra', {}).get('query_comments', [])
-            if getattr(query, 'model_extra', None) is not None
-            else [],
-        ):
-            return None
-
-        # Find the comment with the highest sequence number
-        latest_comment = max(
-            getattr(
-                query,
-                'query_comments',
-                getattr(query, 'model_extra', {}).get('query_comments', [])
-                if getattr(query, 'model_extra', None) is not None
-                else [],
-            ),
-            key=lambda c: c.sequence,
-        )
-
-        # Check if the latest comment indicates the query is open (closed=False)
-        return not latest_comment.closed
+    def _is_query_open(query: Query) -> bool:
+        """Determines if a query is open based on its explicit status or comments."""
+        status = getattr(query, "status", None)
+        if status is not None:
+            return status in (QueryStatus.OPEN, QueryStatus.OPEN.value)
+        comments = getattr(query, "query_comments", None)
+        return calculate_legacy_status(comments) == QueryStatus.OPEN
 
     def get_open_queries(
         self,
@@ -61,8 +61,7 @@ class QueryManagementWorkflow:
     ) -> list[Query]:
         """Retrieves all open queries for a given study, potentially filtered further.
 
-        An 'open' query is defined as one where the query comment with the highest
-        sequence number has its 'closed' field set to False.
+        An 'open' query is defined as one where the `status` attribute is OPEN.
 
         Note:
             This method fetches queries based on `additional_filter` and then
@@ -83,7 +82,11 @@ class QueryManagementWorkflow:
 
         open_queries: list[Query] = []
         for query in all_matching_queries:
-            if self._is_query_open(query) is True:
+            status = getattr(query, "status", None)
+            if status is not None:
+                if status in (QueryStatus.OPEN, QueryStatus.OPEN.value):
+                    open_queries.append(query)
+            elif self._is_query_open(query):
                 open_queries.append(query)
 
         return open_queries
@@ -144,15 +147,10 @@ class QueryManagementWorkflow:
         return list(self._sdk.get_queries(study_key, **final_filter_dict, **kwargs))
 
     def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
-        """Counts queries grouped by their current state (open/closed/unknown).
+        """Counts queries grouped by their current QueryStatus values.
 
-        The state is determined by the 'closed' field of the query comment
-        with the highest sequence number. Queries without any comments are
-        counted as 'unknown'.
-
-        Note:
-            This method fetches all queries matching the base criteria (if any
-            are passed via kwargs) and then performs the aggregation client-side.
+        The discrepancy lifecycle state is evaluated in linear time directly from
+        each Query's status attribute, with fallback calculation for legacy payloads.
 
         Args:
             study_key: The key identifying the study.
@@ -160,20 +158,24 @@ class QueryManagementWorkflow:
                       (e.g., for initial filtering before counting).
 
         Returns:
-            A dictionary with keys 'open', 'closed', 'unknown' and their respective counts.
+            A dictionary with QueryStatus values as keys and their respective counts.
         """
         all_queries = self._sdk.get_queries(study_key, **kwargs)
-        # Initialize counts for all possible states
-        state_counts: dict[str, int] = {"open": 0, "closed": 0, "unknown": 0}
+        state_counts = QueryStateCounts({s.value: 0 for s in QueryStatus})
 
         for query in all_queries:
-            is_open = self._is_query_open(query)
-            if is_open is None:
-                state_counts["unknown"] += 1
-            elif is_open:
-                state_counts["open"] += 1
+            status = getattr(query, "status", None)
+            if status is None:
+                comments = getattr(query, "query_comments", None)
+                status = calculate_legacy_status(comments)
+            if isinstance(status, QueryStatus):
+                status_key = status.value
             else:
-                state_counts["closed"] += 1
+                try:
+                    status_key = QueryStatus(str(status).strip().upper()).value
+                except ValueError:
+                    status_key = QueryStatus.OPEN.value
+            state_counts[status_key] += 1
 
         return state_counts
 

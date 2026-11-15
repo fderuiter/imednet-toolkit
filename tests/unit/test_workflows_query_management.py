@@ -1,16 +1,23 @@
 """Unit tests for workflows query management."""
 
+from typing import Any
 from unittest.mock import MagicMock
 
-from imednet.models.queries import Query, QueryComment
+from imednet.models.queries import Query, QueryComment, QueryStatus
 from imednet.models.subjects import Subject
 from imednet_workflows.query_management import QueryManagementWorkflow
 
 
-def make_query(sequence_closed: list[tuple[int, bool]]) -> Query:
+def make_query(
+    sequence_closed: list[tuple[int, bool]],
+    status: QueryStatus | str | None = None,
+) -> Query:
     """Helper function to make query."""
     comments = [QueryComment(sequence=seq, closed=closed) for seq, closed in sequence_closed]
-    return Query(query_comments=comments)
+    kwargs: dict[str, Any] = {"query_comments": comments}
+    if status is not None:
+        kwargs["status"] = status
+    return Query(**kwargs)
 
 
 def test_get_open_queries_filters_latest_comment() -> None:
@@ -18,8 +25,8 @@ def test_get_open_queries_filters_latest_comment() -> None:
     sdk = MagicMock()
     query_closed = make_query([(1, False), (2, True)])
     query_open = make_query([(1, False)])
-    query_unknown = make_query([])
-    sdk.get_queries.return_value = [query_closed, query_open, query_unknown]
+    query_cancelled = Query(status=QueryStatus.CANCELLED)
+    sdk.get_queries.return_value = [query_closed, query_open, query_cancelled]
 
     wf = QueryManagementWorkflow(sdk)
     result = wf.get_open_queries("STUDY", additional_filter={"state": "new"})
@@ -44,15 +51,21 @@ def test_get_query_state_counts_aggregates_states() -> None:
     sdk = MagicMock()
     open_query = make_query([(1, False)])
     closed_query = make_query([(1, True)])
-    unknown_query = make_query([])
-    sdk.get_queries.return_value = [open_query, closed_query, unknown_query]
+    answered_query = Query(status=QueryStatus.ANSWERED)
+    cancelled_query = Query(status=QueryStatus.CANCELLED)
+    sdk.get_queries.return_value = [open_query, closed_query, answered_query, cancelled_query]
 
     wf = QueryManagementWorkflow(sdk)
     counts = wf.get_query_state_counts("STUDY")
 
     sdk.get_queries.assert_called_once_with("STUDY")
     assert sdk.get_queries.call_args.kwargs == {}
-    assert counts == {"open": 1, "closed": 1, "unknown": 1}
+    assert counts == {
+        QueryStatus.OPEN.value: 1,
+        QueryStatus.ANSWERED.value: 1,
+        QueryStatus.CLOSED.value: 1,
+        QueryStatus.CANCELLED.value: 1,
+    }
 
 
 def test_get_queries_by_site_filters_using_subjects() -> None:
@@ -92,3 +105,39 @@ def test_get_queries_by_site_with_space_in_name() -> None:
     sdk.get_subjects.assert_called_once_with("STUDY", site_name="Mock Site")
     sdk.get_queries.assert_called_once_with("STUDY", subject_key=["S1"])
     assert sdk.get_queries.call_args.kwargs == {"subject_key": ["S1"]}
+
+
+def test_query_state_counts_dict_lookups() -> None:
+    """Test that QueryStateCounts supports enum, case-insensitive, and missing keys."""
+    from imednet_workflows.query_management import QueryStateCounts
+
+    counts = QueryStateCounts({"OPEN": 5, "CLOSED": 2})
+    assert counts[QueryStatus.OPEN] == 5
+    assert counts["open"] == 5
+    assert counts["OPEN"] == 5
+    assert counts["closed"] == 2
+    assert counts.get("cancelled", 0) == 0
+    assert counts.get("NONEXISTENT", 99) == 99
+
+
+def test_query_management_duck_typed_objects_fallback() -> None:
+    """Test that legacy or duck-typed objects lacking status attribute fall back correctly."""
+    sdk = MagicMock()
+
+    class LegacyQuery:
+        def __init__(self, closed: bool | None) -> None:
+            self.query_comments = (
+                [QueryComment(sequence=1, closed=closed)] if closed is not None else []
+            )
+
+    legacy_open = LegacyQuery(closed=False)
+    legacy_closed = LegacyQuery(closed=True)
+    sdk.get_queries.return_value = [legacy_open, legacy_closed]
+
+    wf = QueryManagementWorkflow(sdk)
+    open_queries = wf.get_open_queries("STUDY")
+    assert open_queries == [legacy_open]
+
+    counts = wf.get_query_state_counts("STUDY")
+    assert counts["OPEN"] == 1
+    assert counts["CLOSED"] == 1

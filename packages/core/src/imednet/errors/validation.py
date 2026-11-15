@@ -30,3 +30,11 @@ class ConfigurationError(ClientError):
 
 class PathTraversalValidationError(ClientError):
     """Raised when a partition key contains unsafe path content."""
+
+
+class EvaluationError(ClientError):
+    """Raised when expression evaluation fails."""
+
+
+class RestrictedEvaluationError(EvaluationError):
+    """Raised when an expression attempts forbidden operations or syntax."""

@@ -15,6 +15,13 @@ imednet.utils.arrow module
    :members:
    :show-inheritance:
 
+imednet.utils.ast\_eval module
+------------------------------
+
+.. automodule:: imednet.utils.ast_eval
+   :members:
+   :show-inheritance:
+
 imednet.utils.dates module
 --------------------------
 
@@ -26,6 +33,13 @@ imednet.utils.db module
 -----------------------
 
 .. automodule:: imednet.utils.db
+   :members:
+   :show-inheritance:
+
+imednet.utils.evaluator module
+------------------------------
+
+.. automodule:: imednet.utils.evaluator
    :members:
    :show-inheritance:
 

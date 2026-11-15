@@ -12,7 +12,7 @@ def test_list_builds_path_with_default(
 ):
     """Test that list builds path with default."""
     context.set_default_study_key("S1")
-    ep = subjects.SubjectsEndpoint(dummy_client, context)
+    ep = subjects.SubjectsEndpoint(dummy_client)
     capture = paginator_factory(subjects, [{"subjectKey": "x"}])
     patch = patch_build_filter(subjects)
 
@@ -24,9 +24,9 @@ def test_list_builds_path_with_default(
     assert isinstance(result[0], Subject)
 
 
-def test_get_not_found(monkeypatch, dummy_client, context):
+def test_get_not_found(monkeypatch, dummy_client):
     """Test that get not found."""
-    ep = subjects.SubjectsEndpoint(dummy_client, context)
+    ep = subjects.SubjectsEndpoint(dummy_client)
 
     def fake_impl(self, client, paginator, *, study_key=None, refresh=False, **filters):
         """Helper function to fake impl."""

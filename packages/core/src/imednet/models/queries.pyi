@@ -2,11 +2,38 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any
 
 from pydantic import Field
 
 from imednet.models.base import ImednetBaseModel
+
+class QueryStatus(str, Enum):
+    """Enumeration of clinical query discrepancy lifecycle states."""
+
+    OPEN = "OPEN"
+    ANSWERED = "ANSWERED"
+    CLOSED = "CLOSED"
+    CANCELLED = "CANCELLED"
+
+    def can_transition_to(self, target: QueryStatus | str) -> bool: ...
+    def validate_transition_to(self, target: QueryStatus | str) -> bool: ...
+    @property
+    def allowed_transitions(self) -> set[QueryStatus]: ...
+
+ALLOWED_QUERY_TRANSITIONS: dict[QueryStatus, set[QueryStatus]]
+ALLOWED_TRANSITIONS: dict[QueryStatus, set[QueryStatus]]
+
+def is_valid_query_transition(
+    from_status: QueryStatus | str, to_status: QueryStatus | str
+) -> bool: ...
+def is_valid_transition(from_status: QueryStatus | str, to_status: QueryStatus | str) -> bool: ...
+def validate_query_transition(
+    from_status: QueryStatus | str, to_status: QueryStatus | str
+) -> bool: ...
+def validate_transition(from_status: QueryStatus | str, to_status: QueryStatus | str) -> bool: ...
+def calculate_legacy_status(query_comments: list[Any] | None) -> QueryStatus: ...
 
 class QueryComment(ImednetBaseModel):
     """A comment or response within a data query thread."""
@@ -22,6 +49,7 @@ class Query(ImednetBaseModel):
     """Represents a data query (discrepancy) raised on a record."""
 
     query_comments: list[QueryComment] = Field(default_factory=list, alias="queryComments")
+    status: QueryStatus = Field(default=QueryStatus.OPEN, alias="status")
 
     study_key: str | None
     subject_id: int | None
@@ -36,3 +64,7 @@ class Query(ImednetBaseModel):
     subject_oid: Any
     type: Any
     last_updated: str | None
+
+    def transition_to(self, target_status: QueryStatus | str) -> QueryStatus: ...
+    def update_status(self, target_status: QueryStatus | str) -> QueryStatus: ...
+    def can_transition_to(self, target_status: QueryStatus | str) -> bool: ...
