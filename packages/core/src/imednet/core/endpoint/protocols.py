@@ -3,7 +3,6 @@
 from collections.abc import AsyncIterator, Iterator
 from typing import (
     Any,
-    Generic,
     Protocol,
     TypeVar,
     runtime_checkable,
@@ -113,40 +112,4 @@ class SupportsCreate(Protocol[T_co]):
 
     async def async_create(self, *args: Any, **kwargs: Any) -> T_co:
         """Create an item asynchronously."""
-        ...
-
-
-class SyncOperationProtocol(Protocol, Generic[T_co]):
-    """Protocol for sync operation executors requiring explicit transport injection.
-
-    Note:
-        These operation protocols are intentionally generic extension points for
-        future endpoint operation bindings.
-    """
-
-    def __init__(self, client: RequesterProtocol, path: str, *args: Any, **kwargs: Any) -> None:
-        """Initialize the synchronous operation."""
-        ...
-
-    def execute(self) -> T_co:
-        """Execute synchronously."""
-        ...
-
-
-class AsyncOperationProtocol(Protocol, Generic[T_co]):
-    """Protocol for async operation executors requiring explicit transport injection.
-
-    Note:
-        These operation protocols are intentionally generic extension points for
-        future endpoint operation bindings.
-    """
-
-    def __init__(
-        self, client: AsyncRequesterProtocol, path: str, *args: Any, **kwargs: Any
-    ) -> None:
-        """Initialize the asynchronous operation."""
-        ...
-
-    async def execute(self) -> T_co:
-        """Execute asynchronously."""
         ...
