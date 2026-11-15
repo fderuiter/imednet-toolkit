@@ -1,11 +1,13 @@
 """Tests for contract validation across namespaces and plugins."""
 
 import inspect
+import sys
 from unittest.mock import MagicMock
 
 import pytest
 from imednet_sinks.plugin import SinksNamespace
 
+from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
 
 
@@ -35,12 +37,42 @@ def test_workflows_namespace_contract():
         pytest.fail(f"Failed to access duckdb_centralizer: {e}")
 
     assert duckdb_workflow is not None
+    assert isinstance(duckdb_workflow, DuckDBIngestionWorkflow)
+    assert workflows_ns.duckdb_centralizer is duckdb_workflow
+
+
+def test_workflows_namespace_lazy_instantiation_without_duckdb(monkeypatch):
+    """Verify that Workflows instantiates cleanly without duckdb and defers ImportError."""
+    builtin_import = __import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "duckdb":
+            raise ImportError("No module named duckdb")
+        return builtin_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "duckdb", raising=False)
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    mock_sdk = MagicMock()
+    workflows_ns = Workflows(mock_sdk)
+
+    assert workflows_ns.data_extraction is not None
+
+    with pytest.raises(
+        ImportError,
+        match=(
+            r"DuckDB ingestion requires the optional 'duckdb' dependency\. "
+            r"Install with `pip install 'imednet\[duckdb\]'`\."
+        ),
+    ):
+        _ = workflows_ns.duckdb_centralizer
 
 
 def test_workflow_constructors_contract():
     """Verify that all workflow constructors accept at most one mandatory argument (the SDK client)."""
     mock_sdk = MagicMock()
     workflows_ns = Workflows(mock_sdk)
+    _ = workflows_ns.duckdb_centralizer
 
     for attr_name, attr_val in vars(workflows_ns).items():
         if attr_name.startswith("_"):
