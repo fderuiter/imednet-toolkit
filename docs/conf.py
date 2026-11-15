@@ -23,10 +23,10 @@ Attributes:
     templates_path (list[str]): Path to custom templates
     exclude_patterns (list[str]): Patterns to exclude from documentation
     html_static_path (list[str]): Path to static files
-    html_theme (str): The HTML theme to be used ("sphinx_rtd_theme")
+    html_theme (str): The HTML theme to be used ("furo")
     html_theme_path (list): Path to the HTML theme
 Note:
-    This configuration uses the Read the Docs theme and includes support for
+    This configuration uses the Furo theme and includes support for
     automatic documentation generation from docstrings and type hints.
 """
 
@@ -165,6 +165,7 @@ exclude_patterns: list[str] = [
     "agents/**",
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
+html_css_files: list[str] = ["custom.css"]
 
 doctest_global_setup = """
 import os
@@ -297,6 +298,26 @@ _print_patcher.stop()
 """
 
 html_theme = "furo"
+html_title = f"{project} Documentation"
+html_logo = "_static/logo.png"
+html_favicon = "_static/logo.png"
+
+html_theme_options: dict[str, Any] = {
+    "source_repository": "https://github.com/fderuiter/imednet-toolkit",
+    "source_branch": "main",
+    "source_directory": "docs/",
+    "light_css_variables": {
+        "color-brand-primary": "#005fb8",
+        "color-brand-content": "#005fb8",
+        "color-brand-visited": "#5c3d99",
+    },
+    "dark_css_variables": {
+        "color-brand-primary": "#58a6ff",
+        "color-brand-content": "#79c0ff",
+        "color-brand-visited": "#c4a0ff",
+    },
+}
+
 master_doc = 'index'
 
 # Linkcheck configuration
