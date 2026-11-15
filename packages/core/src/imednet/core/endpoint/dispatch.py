@@ -23,14 +23,6 @@ class AsyncEndpointContext:
     """Marker class for asynchronous endpoints."""
 
 
-class SyncClientContext:
-    """Marker class for synchronous SDK client."""
-
-
-class AsyncClientContext:
-    """Marker class for asynchronous SDK client."""
-
-
 class Operation(Generic[T]):
     """Protocol for an Operation that can be executed both ways."""
 
