@@ -4,6 +4,52 @@
 Welcome to imednet's documentation!
 ===================================
 
+Role-Based Pathways
+-------------------
+
+.. container:: role-cards-grid
+
+   .. container:: role-card role-pathway-section
+
+      .. rubric:: Clinical Data Managers
+         :class: role-card-title
+
+      Curated workflows for clinical study configuration, subject registration, form building, and data verification.
+
+      * :doc:`how-to/register_subjects`
+      * :doc:`how-to/form_builder`
+      * :doc:`how-to/workflows/bulk_submission`
+      * :doc:`how-to/verification`
+
+   .. container:: role-card role-pathway-section
+
+      .. rubric:: Integration Engineers
+         :class: role-card-title
+
+      Quick-start tutorials, CLI tooling, Airflow orchestration, and core Python SDK and REST API references.
+
+      * :doc:`tutorials/quick_start`
+      * :doc:`how-to/cli`
+      * :doc:`how-to/airflow`
+      * :doc:`reference/rest_api_reference`
+      * :doc:`reference/api/core`
+
+   .. container:: role-card role-pathway-section
+
+      .. rubric:: Regulatory Compliance Auditors
+         :class: role-card-title
+
+      Accessibility conformance disclosures (VPAT / WCAG 2.1 AA), governance policies, standards, and architecture records.
+
+      * :doc:`reference/VPAT`
+      * :doc:`reference/governance`
+      * :doc:`reference/project_standards`
+      * :doc:`reference/security_exceptions`
+      * :doc:`adr/index`
+
+Documentation Overview
+----------------------
+
 This documentation is organized according to the Diátaxis framework into four main sections.
 
 .. toctree::
@@ -67,6 +113,7 @@ This documentation is organized according to the Diátaxis framework into four m
    reference/governance
    reference/verification_reports
    reference/security_exceptions
+   reference/VPAT
    adr/index
    reference/api/core
    reference/api/plugins-sinks
