@@ -7,6 +7,7 @@ import httpx
 import pytest
 import respx
 
+from imednet.models.queries import QueryStatus
 from imednet.sdk import ImednetSDK
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 from imednet_workflows.query_management import QueryManagementWorkflow
@@ -117,7 +118,12 @@ def test_query_management_counts():
     wf = QueryManagementWorkflow(sdk)
     counts = wf.get_query_state_counts("ST")
 
-    assert counts == {"open": 1, "closed": 1, "unknown": 1}
+    assert counts == {
+        QueryStatus.OPEN.value: 2,
+        QueryStatus.ANSWERED.value: 0,
+        QueryStatus.CLOSED.value: 1,
+        QueryStatus.CANCELLED.value: 0,
+    }
 
 
 @respx.mock
