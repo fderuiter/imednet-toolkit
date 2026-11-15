@@ -7,7 +7,17 @@ import json
 import sys
 from pathlib import Path
 
-from ...datadict import diff, get_schema, load_from_api, load_from_csv, to_file, to_json, validate
+from ...datadict import (
+    diff,
+    get_schema,
+    load_from_api,
+    load_from_cdisc_odm,
+    load_from_csv,
+    load_from_redcap,
+    to_file,
+    to_json,
+    validate,
+)
 from ...datadict.models import DataDictionary
 from ..utils import get_sdk
 
@@ -22,6 +32,46 @@ def _handle_from_csv(args: argparse.Namespace) -> None:
         )
     except Exception as exc:
         print(f"Error loading from CSV: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        to_file(dd, args.output)
+        print(f"Successfully wrote data dictionary to '{args.output}'")
+    else:
+        print(to_json(dd), end="")
+
+
+def _handle_from_odm(args: argparse.Namespace) -> None:
+    """Handle `imednet datadict from-odm` command."""
+    try:
+        dd = load_from_cdisc_odm(
+            args.path,
+            study_key=getattr(args, "study_key", None),
+            strict=args.strict,
+            no_raw_xml=args.no_raw_xml,
+        )
+    except Exception as exc:
+        print(f"Error loading from CDISC ODM: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        to_file(dd, args.output)
+        print(f"Successfully wrote data dictionary to '{args.output}'")
+    else:
+        print(to_json(dd), end="")
+
+
+def _handle_from_redcap(args: argparse.Namespace) -> None:
+    """Handle `imednet datadict from-redcap` command."""
+    try:
+        dd = load_from_redcap(
+            args.path,
+            study_key=getattr(args, "study_key", None),
+            strict=args.strict,
+            no_raw_xml=args.no_raw_xml,
+        )
+    except Exception as exc:
+        print(f"Error loading from REDCap: {exc}", file=sys.stderr)
         sys.exit(1)
 
     if args.output:
@@ -143,6 +193,66 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         help="Omit verbatim XML strings from business logic rules.",
     )
     csv_parser.set_defaults(func=_handle_from_csv)
+
+    # 1b. from-odm
+    odm_parser = cmd_subparsers.add_parser(
+        "from-odm",
+        help="Compile canonical JSON data dictionary from CDISC ODM 1.3 XML file.",
+    )
+    odm_parser.add_argument(
+        "path",
+        help="Path to CDISC ODM XML file.",
+    )
+    odm_parser.add_argument(
+        "-o",
+        "--output",
+        help="Destination JSON file path (default: stdout).",
+    )
+    odm_parser.add_argument(
+        "--study-key",
+        help="Optional study key identifier override.",
+    )
+    odm_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail fast on unknown elements, unreferenced definitions, or format issues.",
+    )
+    odm_parser.add_argument(
+        "--no-raw-xml",
+        action="store_true",
+        help="Omit verbatim XML strings from business logic rules.",
+    )
+    odm_parser.set_defaults(func=_handle_from_odm)
+
+    # 1c. from-redcap
+    redcap_parser = cmd_subparsers.add_parser(
+        "from-redcap",
+        help="Compile canonical JSON data dictionary from REDCap CSV file.",
+    )
+    redcap_parser.add_argument(
+        "path",
+        help="Path to REDCap data dictionary CSV file.",
+    )
+    redcap_parser.add_argument(
+        "-o",
+        "--output",
+        help="Destination JSON file path (default: stdout).",
+    )
+    redcap_parser.add_argument(
+        "--study-key",
+        help="Optional study key identifier override.",
+    )
+    redcap_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail fast on unknown columns, unreferenced forms, or format issues.",
+    )
+    redcap_parser.add_argument(
+        "--no-raw-xml",
+        action="store_true",
+        help="Omit verbatim XML strings.",
+    )
+    redcap_parser.set_defaults(func=_handle_from_redcap)
 
     # 2. from-api
     api_parser = cmd_subparsers.add_parser(

@@ -8,7 +8,13 @@ from __future__ import annotations
 
 from .diff import DiffItem, DiffReport, diff
 from .emit import sort_data_dictionary, to_file, to_json
-from .loaders import load_from_api, load_from_csv, load_from_csv_files
+from .loaders import (
+    load_from_api,
+    load_from_cdisc_odm,
+    load_from_csv,
+    load_from_csv_files,
+    load_from_redcap,
+)
 from .logic import parse_logic_xml
 from .models import (
     BusinessLogicRule,
@@ -33,8 +39,10 @@ __all__ = [
     "diff",
     "get_schema",
     "load_from_api",
+    "load_from_cdisc_odm",
     "load_from_csv",
     "load_from_csv_files",
+    "load_from_redcap",
     "parse_logic_xml",
     "sort_data_dictionary",
     "to_camel_case",
