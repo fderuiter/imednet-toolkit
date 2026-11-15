@@ -39,10 +39,13 @@ jobs:
         with:
           ref: release-please--branches--main
           token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Update uv lockfile
         if: ${{ steps.release.outputs.prs_created == 'true' && steps.checkout-release-pr.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           pip install uv
           uv lock
@@ -51,5 +54,5 @@ jobs:
             git config --local user.name "github-actions[bot]"
             git add uv.lock
             git commit -m "chore: update uv.lock for release"
-            git push origin release-please--branches--main
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" release-please--branches--main
           fi

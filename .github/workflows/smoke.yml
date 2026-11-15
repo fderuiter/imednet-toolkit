@@ -19,6 +19,8 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.10'
@@ -61,9 +63,10 @@ jobs:
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           set -e
       - name: Evaluate smoke result
+        env:
+          STATUS: ${{ steps.smoke_record.outputs.exit_code }}
         run: |
-          status="${{ steps.smoke_record.outputs.exit_code }}"
-          case "$status" in
+          case "$STATUS" in
             0)
               echo "::notice:: Smoke status: passed"
               ;;
@@ -92,10 +95,13 @@ jobs:
           python scripts/aggregate_verification.py
       - name: Check Drift
         if: always()
+        env:
+          DRIFT_DETECTED: ${{ steps.analyze_drift.outputs.drift_detected }}
+          DRIFT_COUNT: ${{ steps.analyze_drift.outputs.drift_count }}
         run: |
-          if [ "${{ steps.analyze_drift.outputs.drift_detected }}" == "true" ]; then
+          if [ "$DRIFT_DETECTED" == "true" ]; then
             echo "Found violations."
-            if [ "${{ steps.analyze_drift.outputs.drift_count }}" -gt 20 ]; then
+            if [ "$DRIFT_COUNT" -gt 20 ]; then
               echo "::error:: Drift threshold exceeded. Triggering alert."
               exit 1
             fi
