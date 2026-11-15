@@ -11,6 +11,7 @@ import pytest
 
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
+from imednet_workflows.namespace import Workflows
 
 
 def test_duckdb_ingestion_import_error(monkeypatch) -> None:
@@ -34,6 +35,46 @@ def test_duckdb_ingestion_import_error(monkeypatch) -> None:
         ),
     ):
         DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+
+def test_workflows_namespace_lazy_duckdb_centralizer(monkeypatch) -> None:
+    """Test that Workflows instantiates without duckdb and defers ImportError."""
+    builtin_import = __import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):  # type: ignore[no-untyped-def]
+        """Helper function to fake import."""
+        if name == "duckdb":
+            raise ImportError("No module named duckdb")
+        return builtin_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "duckdb", raising=False)
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    sdk = MagicMock()
+    workflows = Workflows(sdk)
+    assert workflows.data_extraction is not None
+
+    with pytest.raises(
+        ImportError,
+        match=(
+            r"DuckDB ingestion requires the optional 'duckdb' dependency\. "
+            r"Install with `pip install 'imednet\[duckdb\]'`\."
+        ),
+    ):
+        _ = workflows.duckdb_centralizer
+
+
+def test_workflows_namespace_duckdb_centralizer_caching() -> None:
+    """Test that duckdb_centralizer returns a cached DuckDBIngestionWorkflow instance."""
+    pytest.importorskip("duckdb")
+    sdk = MagicMock()
+    workflows = Workflows(sdk)
+
+    centralizer1 = workflows.duckdb_centralizer
+    centralizer2 = workflows.duckdb_centralizer
+
+    assert isinstance(centralizer1, DuckDBIngestionWorkflow)
+    assert centralizer1 is centralizer2
 
 
 def test_ingest_revisions_and_build_silver_view() -> None:
