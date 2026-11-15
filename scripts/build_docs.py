@@ -66,7 +66,6 @@ def main():
             str(api_dir),
             "packages/core/src/imednet",
             "packages/core/src/imednet/core",
-            "packages/core/src/imednet/compat",
             "packages/core/src/imednet/http",
             "-f",
             "-M",

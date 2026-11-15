@@ -247,7 +247,6 @@ apache-airflow-providers-imednet = { workspace = true }
 [[tool.mypy.overrides]]
 module = [
     "imednet.form_designer.*",
-    "imednet.compat.*",
     "apache_airflow_providers_imednet.*"
 ]
 strict = false
