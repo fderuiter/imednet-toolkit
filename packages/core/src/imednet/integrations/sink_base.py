@@ -71,6 +71,7 @@ Public-API exposure rules
 from __future__ import annotations
 
 import logging
+import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -78,6 +79,11 @@ from dataclasses import dataclass, field
 from importlib import import_module
 from types import TracebackType
 from typing import Any
+
+from tenacity import wait_exponential
+
+from imednet.core.operations.executor import OperationRetryPolicy
+from imednet.errors import ExportConfigurationError
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +94,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BATCH_SIZE = 500
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_RETRY_BACKOFF = 1.0
+
+
+class _SinkRetryPolicy(OperationRetryPolicy):
+    """Keep deterministic configuration and input failures out of retries."""
+
+    def should_retry(self, exception: Exception) -> bool:
+        """Retry destination failures, preserving the existing driver fallback."""
+        return not isinstance(exception, (ExportConfigurationError, ValueError, TypeError))
 
 
 @dataclass
@@ -120,10 +134,23 @@ class SinkConfig:
     min_schema_readiness_score: float = 100.0
     tracer: Any | None = field(default=None, repr=False)
 
-    def __post_init__(self):  # type: ignore[no-untyped-def]
+    def __post_init__(self) -> None:
         """Validate config properties after initialization."""
         if not self.study_key or not isinstance(self.study_key, str) or not self.study_key.strip():
             raise ValueError("study_key must be a non-empty string")
+        if (
+            isinstance(self.max_retries, bool)
+            or not isinstance(self.max_retries, int)
+            or self.max_retries < 0
+        ):
+            raise ValueError("max_retries must be a non-negative integer")
+        if (
+            isinstance(self.retry_backoff, bool)
+            or not isinstance(self.retry_backoff, (int, float))
+            or not math.isfinite(self.retry_backoff)
+            or self.retry_backoff < 0
+        ):
+            raise ValueError("retry_backoff must be a finite non-negative number")
 
 
 # ---------------------------------------------------------------------------
@@ -223,22 +250,43 @@ class ExportSink(ABC):
             Callable that performs the export and returns the record count.
         """
         from imednet.core.operations.executor import UniversalExecutor
+        from imednet.core.retry import RetryConfig
         from imednet.errors import ExportBatchError
 
+        attempts = 0
+
+        def execute_batch() -> int:
+            nonlocal attempts
+            attempts += 1
+            # Driver messages may contain credentials, URIs or payloads. Only
+            # sanitized exceptions may cross the executor/telemetry boundary.
+            try:
+                return execute_fn()
+            except ExportConfigurationError:
+                raise ExportConfigurationError("Invalid export configuration.") from None
+            except (ValueError, TypeError):
+                raise ValueError("Invalid export batch input.") from None
+            except Exception:
+                raise RuntimeError("Export destination operation failed.") from None
+
         executor = UniversalExecutor(
-            retries=self.config.max_retries,
-            backoff_factor=self.config.retry_backoff,
+            retry_config=RetryConfig(
+                retries=self.config.max_retries,
+                backoff_factor=self.config.retry_backoff,
+                retry_policy=_SinkRetryPolicy(),
+            ),
+            wait_strategy=wait_exponential(multiplier=self.config.retry_backoff),
             tracer=self.config.tracer,
             operation_name=operation_name,
             batch_id=batch_id,
         )
         try:
-            return executor.execute(execute_fn)
-        except Exception as exc:
+            return executor.execute(execute_batch)
+        except Exception:
             raise ExportBatchError(
-                f"Batch {batch_id!r} failed after {self.config.max_retries + 1} attempts: {exc}",
+                f"Batch {batch_id!r} failed after {attempts} attempts.",
                 batch_id=batch_id,
-            ) from exc
+            ) from None
 
     # ------------------------------------------------------------------
     # Context-manager support

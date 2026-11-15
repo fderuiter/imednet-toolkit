@@ -7,6 +7,7 @@ def main():
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
     approved_files = {
+        ".git",  # Linked worktrees store Git metadata as a file.
         "README.md",
         "AGENTS.md",
         "CHANGELOG.md",
