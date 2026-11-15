@@ -48,9 +48,9 @@ ALL_ASYNC_ENDPOINT_CLASSES = [
 ]
 
 
-def test_records_endpoint_keeps_public_read_api(dummy_client, context, paginator_factory):
+def test_records_endpoint_keeps_public_read_api(dummy_client, paginator_factory):
     """Test that records endpoint keeps public read api."""
-    endpoint = RecordsEndpoint(dummy_client, context)
+    endpoint = RecordsEndpoint(dummy_client)
     capture = paginator_factory(records_module, [{"recordId": 1}])
 
     listed = endpoint.list(study_key="S1")
@@ -63,9 +63,9 @@ def test_records_endpoint_keeps_public_read_api(dummy_client, context, paginator
     assert capture["path"] == "/api/v1/edc/studies/S1/records"
 
 
-def test_jobs_endpoint_keeps_public_read_api(dummy_client, context, response_factory):
+def test_jobs_endpoint_keeps_public_read_api(dummy_client, response_factory):
     """Test that jobs endpoint keeps public read api."""
-    endpoint = JobsEndpoint(dummy_client, context)
+    endpoint = JobsEndpoint(dummy_client)
     dummy_client.get.return_value = response_factory({"jobId": "1"})
 
     result = endpoint.get("S1", "B1")

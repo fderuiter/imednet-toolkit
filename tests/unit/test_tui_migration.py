@@ -34,7 +34,7 @@ def test_job_status_properties():
 
 def test_subject_filtering_logic():
     """Verify logic migrated from TUI SubjectTable."""
-    from unittest.mock import MagicMock, Mock
+    from unittest.mock import MagicMock
 
     from imednet.endpoints.subjects import SubjectsEndpoint
 
@@ -51,10 +51,8 @@ def test_subject_filtering_logic():
         ],
         "pagination": {"totalPages": 1},
     }
-    mock_ctx = Mock()
-    mock_ctx.default_study_key = "sk"
 
-    endpoint = SubjectsEndpoint(mock_client, mock_ctx)
+    endpoint = SubjectsEndpoint(mock_client)
 
     # Act: Filter by site 101
     filtered = endpoint.list_by_site("sk", 101)

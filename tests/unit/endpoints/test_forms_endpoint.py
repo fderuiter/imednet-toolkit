@@ -12,7 +12,7 @@ def test_list_requires_study_key_and_page_size(
     monkeypatch, dummy_client, context, paginator_factory, patch_build_filter
 ):
     """Test that list requires study key and page size."""
-    ep = forms.FormsEndpoint(dummy_client, context)
+    ep = forms.FormsEndpoint(dummy_client)
     captured = paginator_factory(forms, [{"formId": 1}])
     filter_capture = patch_build_filter(forms)
 
@@ -29,9 +29,9 @@ def test_list_requires_study_key_and_page_size(
     assert isinstance(result[0], Form)
 
 
-def test_get_success(monkeypatch, dummy_client, context):
+def test_get_success(monkeypatch, dummy_client):
     """Test that get success."""
-    ep = forms.FormsEndpoint(dummy_client, context)
+    ep = forms.FormsEndpoint(dummy_client)
     called = {}
 
     def fake_impl(self, client, paginator, *, study_key=None, **filters):
@@ -48,9 +48,9 @@ def test_get_success(monkeypatch, dummy_client, context):
     assert isinstance(res, Form)
 
 
-def test_get_not_found(monkeypatch, dummy_client, context):
+def test_get_not_found(monkeypatch, dummy_client):
     """Test that get not found."""
-    ep = forms.FormsEndpoint(dummy_client, context)
+    ep = forms.FormsEndpoint(dummy_client)
 
     def fake_impl(self, client, paginator, *, study_key=None, **filters):
         """Helper function to fake impl."""
@@ -62,9 +62,9 @@ def test_get_not_found(monkeypatch, dummy_client, context):
         ep.get("S1", 1)
 
 
-def test_list_makes_request_per_call(dummy_client, context, paginator_factory):
+def test_list_makes_request_per_call(dummy_client, paginator_factory):
     """Test that list makes request per call."""
-    ep = forms.FormsEndpoint(dummy_client, context)
+    ep = forms.FormsEndpoint(dummy_client)
     capture = paginator_factory(forms, [{"formId": 1}])
 
     ep.list(study_key="S1")
@@ -73,9 +73,9 @@ def test_list_makes_request_per_call(dummy_client, context, paginator_factory):
     assert capture["count"] == 2
 
 
-def test_list_different_study_keys_make_separate_requests(dummy_client, context, paginator_factory):
+def test_list_different_study_keys_make_separate_requests(dummy_client, paginator_factory):
     """Test that list different study keys make separate requests."""
-    ep = forms.FormsEndpoint(dummy_client, context)
+    ep = forms.FormsEndpoint(dummy_client)
     capture = paginator_factory(forms, [{"formId": 1}])
 
     ep.list(study_key="S1")

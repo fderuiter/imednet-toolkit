@@ -8,9 +8,9 @@ from imednet.errors.validation import ConfigurationError
 from imednet.models.sites import Site
 
 
-def test_list_requires_study_key(dummy_client, context, paginator_factory, patch_build_filter):
+def test_list_requires_study_key(dummy_client, paginator_factory, patch_build_filter):
     """Test that list requires study key."""
-    ep = sites.SitesEndpoint(dummy_client, context)
+    ep = sites.SitesEndpoint(dummy_client)
     paginator_capture = paginator_factory(sites, [{"siteId": 1}])
     patch = patch_build_filter(sites)
 
@@ -25,9 +25,9 @@ def test_list_requires_study_key(dummy_client, context, paginator_factory, patch
     assert isinstance(result[0], Site)
 
 
-def test_get_not_found(monkeypatch, dummy_client, context):
+def test_get_not_found(monkeypatch, dummy_client):
     """Test that get not found."""
-    ep = sites.SitesEndpoint(dummy_client, context)
+    ep = sites.SitesEndpoint(dummy_client)
 
     def fake_impl(self, client, paginator, *, study_key=None, refresh=False, **filters):
         """Helper function to fake impl."""

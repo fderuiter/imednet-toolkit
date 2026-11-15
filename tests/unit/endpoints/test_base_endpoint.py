@@ -22,9 +22,9 @@ class MockEndpointImpl(EdcEndpointMixin, GenericEndpoint[MockModel]):
     PATH = "/test"
     MODEL = MockModel
 
-    def __init__(self, client, ctx, async_client=None):
+    def __init__(self, client=None, async_client=None):
         """Initialize the test object."""
-        super().__init__(client, ctx, async_client)
+        super().__init__(client=client, async_client=async_client)
 
 
 class MockListGetEndpoint(EdcEndpointMixin, GenericListGetEndpoint[MockModel]):
@@ -48,16 +48,16 @@ class TestBaseEndpoint:
         """Helper function to context."""
         return Context()
 
-    def test_require_async_client_raises(self, client, context):
+    def test_require_async_client_raises(self, client):
         """Test that require async client raises."""
-        ep = MockEndpointImpl(client, context, async_client=None)
+        ep = MockEndpointImpl(client, async_client=None)
         with pytest.raises(RuntimeError, match="Async client not configured"):
             ep._require_async_client()
 
     def test_auto_filter_injects_study_key(self, client, context):
         """Test that auto filter injects study key."""
         context.set_default_study_key("DEFAULT")
-        ep = MockEndpointImpl(client, context)
+        ep = MockEndpointImpl(client)
 
         filters = {"foo": "bar"}
         result = ep._auto_filter(filters)
@@ -67,22 +67,22 @@ class TestBaseEndpoint:
     def test_auto_filter_preserves_existing_study_key(self, client, context):
         """Test that auto filter preserves existing study key."""
         context.set_default_study_key("DEFAULT")
-        ep = MockEndpointImpl(client, context)
+        ep = MockEndpointImpl(client)
 
         filters = {"studyKey": "EXPLICIT", "foo": "bar"}
         result = ep._auto_filter(filters)
         assert result["studyKey"] == "EXPLICIT"
 
-    def test_get_signature_is_explicit(self, client, context):
+    def test_get_signature_is_explicit(self, client):
         """Test that get signature is explicit."""
-        ep = MockListGetEndpoint(client, context)
+        ep = MockListGetEndpoint(client)
         signature = inspect.signature(ep.get)
 
         assert list(signature.parameters.keys()) == ["self", "study_key", "item_id"]
 
-    def test_get_requires_item_id(self, client, context):
+    def test_get_requires_item_id(self, client):
         """Test that get requires item id."""
-        ep = MockListGetEndpoint(client, context)
+        ep = MockListGetEndpoint(client)
 
         with pytest.raises(TypeError, match="Missing required argument: item_id"):
             ep.get("S1", None)

@@ -2,7 +2,6 @@
 
 from unittest.mock import MagicMock
 
-from imednet.core.context import Context
 from imednet.core.endpoint.base import GenericListGetEndpoint
 from imednet.models.base import ImednetBaseModel
 
@@ -26,7 +25,7 @@ class EndpointWithParsing(GenericListGetEndpoint[MockModel]):
 
 def test_parsing_mixin_parse_item():
     """Test that parsing mixin parse item."""
-    endpoint = EndpointWithParsing(client=MagicMock(), ctx=Context())
+    endpoint = EndpointWithParsing(client=MagicMock())
     result = endpoint._parse_item({"id": 1})
     assert isinstance(result, MockModel)
     assert result.id == 1
