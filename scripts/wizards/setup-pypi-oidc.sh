@@ -184,9 +184,9 @@ finish() {
 # Replace the example below. Set TOTAL_STAGES to match the stages you write.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=7
+TOTAL_STAGES=6
 
-banner "PyPI Trusted Publishing Setup (5 packages)"
+banner "PyPI Trusted Publishing Setup (4 packages)"
 
 # ── Stage 1: GitHub Environment ───────────────────────────────────────────
 stage "GitHub: Create 'pypi' environment"
@@ -237,18 +237,18 @@ step "  • Environment name:   pypi"
 step "Click 'Add'."
 pause "Press Enter once 'apache-airflow-providers-imednet' publisher is added on PyPI..."
 
-# ── Stage 5: Package 4 - imednet-sinks ────────────────────────────────────
-stage "PyPI Publisher: imednet-sinks"
-say "Register Trusted Publisher for 'imednet-sinks' (packages/plugins-sinks)."
+# ── Stage 5: Package 4 - imednet-plugins-sinks ────────────────────────────
+stage "PyPI Publisher: imednet-plugins-sinks"
+say "Register Trusted Publisher for 'imednet-plugins-sinks' (packages/plugins-sinks)."
 open_url "https://pypi.org/manage/account/publishing/"
 step "On the PyPI Publishing page, enter:"
-step "  • PyPI Project Name:  imednet-sinks"
+step "  • PyPI Project Name:  imednet-plugins-sinks"
 step "  • Owner:              fderuiter"
 step "  • Repository name:    imednet-toolkit"
 step "  • Workflow name:      main.yml"
 step "  • Environment name:   pypi"
 step "Click 'Add'."
-pause "Press Enter once 'imednet-sinks' publisher is added on PyPI..."
+pause "Press Enter once 'imednet-plugins-sinks' publisher is added on PyPI..."
 
 # ── Stage 6: Optional Fallback Token ──────────────────────────────────────
 stage "PyPI Fallback: API Token (Optional)"
