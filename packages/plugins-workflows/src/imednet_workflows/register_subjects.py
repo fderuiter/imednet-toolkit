@@ -1,4 +1,4 @@
-"""Workflow for registering subjects (patients) in iMednet via the Records API.
+"""Workflow for registering subjects in iMednet via the Records API.
 
 This workflow is self-contained and does not borrow from record_update.py.
 It provides a simple, robust interface for registering one or more subjects.

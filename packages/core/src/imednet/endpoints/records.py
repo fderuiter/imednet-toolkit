@@ -1,4 +1,4 @@
-"""Endpoint for managing records (eCRF instances) in a study."""
+"""Endpoint for managing records (form instances) in a study."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ class RecordsOperationDef:
 
 
 class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # type: ignore[misc]
-    """API endpoint for interacting with records (eCRF instances)."""
+    """API endpoint for interacting with records (form instances)."""
 
     def to_dataframe(
         self,
@@ -84,7 +84,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
 
 
 class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record]):  # type: ignore[misc]
-    """Async API endpoint for interacting with records (eCRF instances)."""
+    """Async API endpoint for interacting with records (form instances)."""
 
     async def to_dataframe(
         self,
