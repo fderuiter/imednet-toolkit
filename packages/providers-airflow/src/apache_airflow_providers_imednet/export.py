@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from imednet.spi import export as _base_export
+from imednet.spi import export_helpers as _base_export
 
 
 def export_to_csv(*args: Any, **kwargs: Any) -> None:

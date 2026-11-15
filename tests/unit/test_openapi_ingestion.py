@@ -1,12 +1,11 @@
 """Tests for OpenAPI ingestion."""
 
 import json
-import os
 
 from imednet.models.engine import ModelEngine
 
 
-def test_openapi_ingestion(tmp_path):
+def test_openapi_ingestion(tmp_path, monkeypatch):
     """Test openapi ingestion."""
     # Setup OpenAPI file
     openapi_content = {
@@ -68,12 +67,13 @@ def test_openapi_ingestion(tmp_path):
     with open(openapi_file, 'w') as f:
         json.dump(openapi_content, f)
 
-    os.environ["IMEDNET_OPENAPI_PATH"] = str(openapi_file)
+    monkeypatch.setenv("IMEDNET_OPENAPI_PATH", str(openapi_file))
 
     # We need to clear the engine cache
     from imednet.models import engine
 
-    engine._CONTRACT_CACHE = None
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+    monkeypatch.setattr(ModelEngine, "_model_cache", {})
 
     study_model = ModelEngine.get_model("Study")
     subject_model = ModelEngine.get_model("Subject")
