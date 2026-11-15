@@ -728,7 +728,7 @@ def test_export_operator_resolves_snowflake_sink(monkeypatch):
 
     # Mock imednet_sinks
     sinks_mock = MagicMock()
-    sys.modules["imednet_sinks"] = sinks_mock
+    monkeypatch.setitem(sys.modules, "imednet_sinks", sinks_mock)
     mock_snowflake_sink_cls = MagicMock()
     mock_snowflake_sink_cls.return_value = MagicMock()
     sinks_mock.SnowflakeExportSink = mock_snowflake_sink_cls

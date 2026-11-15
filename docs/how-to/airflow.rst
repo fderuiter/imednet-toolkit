@@ -8,6 +8,11 @@ Installation
 
 Install the provider package:
 
+The current 1.x workflows, sinks and Airflow provider require core
+``imednet>=1.0.0,<2.0.0``. Install matching 1.x packages together; the former
+pre-1.0 dependency range excluded the released core and prevented ordinary
+pip installation. Package versions remain managed by release-please.
+
 .. code-block:: bash
 
    pip install "apache-airflow>=3.2.0,<4.0.0" apache-airflow-providers-imednet
@@ -104,3 +109,9 @@ The unit tests stub out the Airflow dependencies. When the ``airflow`` package
 is installed, ``tests/integration/test_airflow_dag.py`` runs a small DAG with
 ``ImednetExportOperator`` and ``ImednetJobSensor``. It is
 skipped automatically if Airflow is missing.
+
+Procedural export helpers use ``imednet.spi.export_helpers``, an explicit
+module namespace for CSV, JSON, Excel, Parquet and SQL helpers. The legacy
+``imednet.spi.export`` binding remains available for compatibility; provider
+delegation does not depend on whether that name resolves to a dispatcher or
+an imported module.

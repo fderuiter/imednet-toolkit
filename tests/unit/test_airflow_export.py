@@ -1,6 +1,8 @@
 """Unit tests for airflow export."""
 
+import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
@@ -89,3 +91,40 @@ def test_airflow_export_forwards_arguments(func_name: str) -> None:
     with patch(base_export_path) as mock_base_func:
         airflow_func(*args, **kwargs)
         mock_base_func.assert_called_once_with(*args, **kwargs)
+
+
+@pytest.mark.parametrize("func_name", EXPORT_FUNCTIONS)
+def test_spi_export_delegation_with_dispatcher_binding(func_name: str) -> None:
+    """Resolve real SPI bindings independently of package attribute import order."""
+    script = '''
+import importlib
+from unittest.mock import patch
+import imednet.integrations as integrations
+
+# A cached submodule import must not decide whether `export` is callable or a module.
+importlib.reload(integrations)
+assert callable(integrations.export)
+import imednet.spi as spi
+importlib.reload(spi)
+assert spi.export is integrations.export
+from apache_airflow_providers_imednet import export
+with patch("imednet.integrations.export." + FUNC, return_value=None) as destination:
+    getattr(export, FUNC)("synthetic-study", path="synthetic-output")
+    destination.assert_called_once_with("synthetic-study", path="synthetic-output")
+with patch("imednet.integrations.export." + FUNC, side_effect=ImportError("optional-driver")):
+    try:
+        getattr(export, FUNC)("synthetic-study")
+    except ImportError as error:
+        assert str(error) == "optional-driver"
+    else:
+        raise AssertionError("dependency error was swallowed")
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", "FUNC = " + repr(func_name) + "\n" + script],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
