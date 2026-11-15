@@ -80,6 +80,7 @@ extensions = [
     "sphinxarg.ext",
     "sphinx.ext.doctest",
     "myst_parser",
+    "sphinx.ext.githubpages",
 ]
 
 autosummary_generate = False

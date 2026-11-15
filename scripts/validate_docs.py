@@ -196,14 +196,47 @@ def check_adr_records() -> bool:
     return has_errors
 
 
+def check_sphinx_githubpages_extension() -> bool:
+    """Validate that sphinx.ext.githubpages is registered in docs/conf.py."""
+    print("Checking for sphinx.ext.githubpages in docs/conf.py...")
+    conf_py = Path("docs/conf.py")
+    if not conf_py.exists():
+        print(f"Error: {conf_py} not found.")
+        return True
+
+    try:
+        content = conf_py.read_text(encoding="utf-8")
+        tree = ast.parse(content, filename=str(conf_py))
+    except Exception as e:
+        print(f"Error parsing {conf_py}: {e}")
+        return True
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "extensions"
+                    and isinstance(node.value, (ast.List, ast.Tuple, ast.Set))
+                ):
+                    for elt in node.value.elts:
+                        if isinstance(elt, ast.Constant) and elt.value == "sphinx.ext.githubpages":
+                            print("sphinx.ext.githubpages extension is correctly registered.")
+                            return False
+
+    print("Error: sphinx.ext.githubpages is missing from extensions in docs/conf.py.")
+    return True
+
+
 def main():
     """Run validation scripts."""
     todos_failed = check_todos_in_init()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
     adr_failed = check_adr_records()
+    githubpages_failed = check_sphinx_githubpages_extension()
 
-    if todos_failed or packages_failed or docs_failed or adr_failed:
+    if todos_failed or packages_failed or docs_failed or adr_failed or githubpages_failed:
         print("Validation failed.")
         sys.exit(1)
 
