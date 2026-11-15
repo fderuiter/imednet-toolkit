@@ -3,37 +3,64 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any
 
 from pydantic import Field, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
+class JobState(str, Enum):
+    """Enumeration of valid job states."""
+
+    PENDING = "PENDING"
+    QUEUED = "QUEUED"
+    OPEN = "OPEN"
+    RUNNING = "RUNNING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    COMPLETE = "COMPLETE"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    TIMEOUT = "TIMEOUT"
+
+    def can_transition_to(self, target: JobState | str) -> bool: ...
+    def validate_transition_to(self, target: JobState | str) -> bool: ...
+    def __str__(self) -> str: ...
+    @property
+    def allowed_transitions(self) -> set[JobState]: ...
+
+TERMINAL_JOB_STATES: set[JobState]
+ACTIVE_JOB_STATES: set[JobState]
+SUCCESSFUL_JOB_STATES: set[JobState]
+FAILED_JOB_STATES: set[JobState]
+ALLOWED_JOB_TRANSITIONS: dict[JobState, set[JobState]]
+
+class InvalidJobStateError(ValueError): ...
+class InvalidJobTransitionError(ValueError): ...
+
+InvalidStateTransitionError = InvalidJobTransitionError
+
+def normalize_job_state(state: JobState | str) -> JobState: ...
+def is_valid_job_transition(from_state: JobState | str, to_state: JobState | str) -> bool: ...
+def validate_job_transition(from_state: JobState | str, to_state: JobState | str) -> bool: ...
+
 class Job(ImednetBaseModel):
     """Represents an asynchronous background job."""
 
-    @property
-    def is_terminal(self) -> bool:
-        """Checks if the job has reached a final state (Success/Failed/Cancelled)."""
-        return (
-            self.state.upper() in {"COMPLETED", "SUCCESS", "FAILED", "CANCELLED"}
-            if self.state
-            else False
-        )
+    state: JobState | str | None
 
+    def transition_to(self, target: JobState | str) -> Job: ...
     @property
-    def is_successful(self) -> bool:
-        """Checks if the job completed successfully."""
-        return self.state.upper() in {"COMPLETED", "SUCCESS"} if self.state else False
-
+    def is_terminal(self) -> bool: ...
     @property
-    def is_failed(self) -> bool:
-        """Checks if the job failed or was cancelled."""
-        return self.state.upper() in {"FAILED", "CANCELLED"} if self.state else False
+    def is_successful(self) -> bool: ...
+    @property
+    def is_failed(self) -> bool: ...
 
     job_id: str | None
     batch_id: str | None
-    state: str | None
     date_created: Any
     date_finished: Any
     date_started: Any
@@ -44,67 +71,17 @@ class JobStatus(Job):
     results: Any = Field(default=None)
 
     @field_validator("progress", mode="before", check_fields=False)
-    def _parse_progress(cls, v: Any) -> int:
-        """Parse progress value as an integer.
-
-        Args:
-            v: The progress value from the API.
-
-        Returns:
-            The parsed integer progress.
-        """
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return 0
-
+    def _parse_progress(cls, v: Any) -> int: ...
     @property
-    def total_records(self) -> int:
-        """Return the total number of records processed."""
-        if isinstance(self.results, list):
-            return len(self.results)
-        if isinstance(self.results, dict):
-            return int(self.results.get("total", 0))
-        if self.results:
-            return 1
-        return 0
-
+    def total_records(self) -> int: ...
     @property
-    def successful_records(self) -> int:
-        """Return the total number of successful records processed."""
-        if isinstance(self.results, list):
-            return sum(
-                1
-                for r in self.results
-                if isinstance(r, dict)
-                and (r.get("status") or "").upper() in {"PASS", "SUCCESS", "COMPLETED"}
-            )
-        if isinstance(self.results, dict):
-            return int(self.results.get("success", 0))
-        if self.is_successful and self.results:
-            return 1
-        return 0
-
+    def successful_records(self) -> int: ...
     @property
-    def failed_records(self) -> int:
-        """Return the total number of failed records processed."""
-        if isinstance(self.results, list):
-            return sum(
-                1
-                for r in self.results
-                if isinstance(r, dict)
-                and (r.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"}
-            )
-        if isinstance(self.results, dict):
-            return int(self.results.get("failed", 0))
-        if self.is_failed and self.results:
-            return 1
-        # If it's plain text and state is failed, we count it as 1 failure.
-        return 0
+    def failed_records(self) -> int: ...
 
     job_id: str | None
     batch_id: str | None
-    state: str | None
+    state: JobState | str | None
     date_created: str | None
     date_started: str | None
     date_finished: str | None
