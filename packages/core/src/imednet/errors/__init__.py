@@ -21,7 +21,9 @@ from .registry import get_error_class
 from .validation import (
     BadRequestError,
     ConfigurationError,
+    EvaluationError,
     PathTraversalValidationError,
+    RestrictedEvaluationError,
     UnknownVariableTypeError,
     ValidationError,
 )
@@ -34,6 +36,7 @@ __all__ = [
     "ClientError",
     "ConfigurationError",
     "ConflictError",
+    "EvaluationError",
     "ExportBatchError",
     "ExportConfigurationError",
     "ExportError",
@@ -47,6 +50,7 @@ __all__ = [
     "PluginLoadError",
     "RateLimitError",
     "RequestError",
+    "RestrictedEvaluationError",
     "ServerError",
     "UnauthorizedError",
     "UnknownVariableTypeError",

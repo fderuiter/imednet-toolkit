@@ -573,3 +573,50 @@ def test_lazy_record_payload_initializes_on_demand() -> None:
     assert list(lazy.values())
     assert list(lazy.items())
     assert iter(lazy)
+
+
+def test_extraction_engine_rejects_class_traversal_payloads(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that malicious class traversal payload in extraction engine fails safely."""
+    config = StudyConfiguration(
+        study_key="STUDY-EXPLOIT",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                target_field="subjectKey",
+                source_form_key="AE_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeTerm",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.term",
+                businessLogic="value.__class__.__bases__[0].__subclasses__()",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeSeverity",
+                source_form_key="AE_FORM",
+                source_variable_name="",
+                fallback_value="MILD",
+            ),
+        ],
+    )
+
+    record = Record(
+        record_id=1,
+        form_key="AE_FORM",
+        subject_key="SUBJ-001",
+        date_created=datetime(2024, 1, 1),
+        record_data={"term": "Headache"},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = extract_canonical_records(records=[record], study_configuration=config)
+
+    assert len(result.adverse_events) == 1
+    # The derived business logic failed safely, keeping the initial extracted value "Headache"
+    assert result.adverse_events[0].ae_term == "Headache"
+    assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)

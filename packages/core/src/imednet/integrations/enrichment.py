@@ -95,6 +95,7 @@ import logging
 from typing import Any
 
 from imednet.models.study_config import StudyConfiguration
+from imednet.utils.evaluator import evaluate_expression
 
 logger = logging.getLogger(__name__)
 
@@ -145,10 +146,8 @@ class EnrichmentPipeline:
             The result of the evaluated expression, or the original value if evaluation fails.
         """
         try:
-            # Provide a safe evaluation environment
             env = {"value": value}
-            # Simple eval. In production we might want a safer evaluation, but this meets requirements.
-            return eval(expr, {"__builtins__": {}}, env)  # nosem
+            return evaluate_expression(expr, env, default=value, raise_on_error=False)
         except Exception as e:
             logger.warning(
                 f"Business logic evaluation failed for expr '{expr}' with value '{value}': {e}"
