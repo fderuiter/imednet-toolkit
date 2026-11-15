@@ -7,9 +7,9 @@ from imednet.errors import NotFoundError
 from imednet.models.jobs import JobStatus
 
 
-def test_get_success(dummy_client, context, response_factory):
+def test_get_success(dummy_client, response_factory):
     """Test that get success."""
-    ep = jobs.JobsEndpoint(dummy_client, context)
+    ep = jobs.JobsEndpoint(dummy_client)
     dummy_client.get.return_value = response_factory({"jobId": "1"})
 
     result = ep.get("S1", "B1")
@@ -18,9 +18,9 @@ def test_get_success(dummy_client, context, response_factory):
     assert isinstance(result, JobStatus)
 
 
-def test_get_not_found(dummy_client, context, response_factory):
+def test_get_not_found(dummy_client, response_factory):
     """Test that get not found."""
-    ep = jobs.JobsEndpoint(dummy_client, context)
+    ep = jobs.JobsEndpoint(dummy_client)
     dummy_client.get.return_value = response_factory({})
     with pytest.raises(NotFoundError):
         ep.get("S1", "B1")

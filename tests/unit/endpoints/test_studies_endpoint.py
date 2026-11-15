@@ -8,10 +8,10 @@ from imednet.models.studies import Study
 
 
 def test_list_builds_path_and_filters(
-    monkeypatch, dummy_client, context, paginator_factory, patch_build_filter
+    monkeypatch, dummy_client, paginator_factory, patch_build_filter
 ):
     """Test that list builds path and filters."""
-    ep = studies.StudiesEndpoint(dummy_client, context)
+    ep = studies.StudiesEndpoint(dummy_client)
     captured = paginator_factory(studies, [{"studyKey": "S1"}])
     filter_capture = patch_build_filter(studies)
 
@@ -23,9 +23,9 @@ def test_list_builds_path_and_filters(
     assert isinstance(result[0], Study)
 
 
-def test_get_success(monkeypatch, dummy_client, context, paginator_factory, patch_build_filter):
+def test_get_success(monkeypatch, dummy_client, paginator_factory, patch_build_filter):
     """Test that get success."""
-    ep = studies.StudiesEndpoint(dummy_client, context)
+    ep = studies.StudiesEndpoint(dummy_client)
     captured = paginator_factory(studies, [{"studyKey": "S1"}])
     filter_capture = patch_build_filter(studies)
 
@@ -37,17 +37,17 @@ def test_get_success(monkeypatch, dummy_client, context, paginator_factory, patc
     assert isinstance(res, Study)
 
 
-def test_get_not_found(monkeypatch, dummy_client, context, paginator_factory):
+def test_get_not_found(monkeypatch, dummy_client, paginator_factory):
     """Test that get not found."""
-    ep = studies.StudiesEndpoint(dummy_client, context)
+    ep = studies.StudiesEndpoint(dummy_client)
     paginator_factory(studies, [])
     with pytest.raises(NotFoundError):
         ep.get(None, "missing")
 
 
-def test_list_each_call_makes_request(dummy_client, context, paginator_factory):
+def test_list_each_call_makes_request(dummy_client, paginator_factory):
     """Test that list each call makes request."""
-    ep = studies.StudiesEndpoint(dummy_client, context)
+    ep = studies.StudiesEndpoint(dummy_client)
     captured = paginator_factory(studies, [{"studyKey": "S1"}])
 
     ep.list()

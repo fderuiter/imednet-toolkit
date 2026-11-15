@@ -10,7 +10,7 @@ from imednet.models.record_revisions import RecordRevision
 def test_list_uses_filters(dummy_client, context, paginator_factory, patch_build_filter):
     """Test that list uses filters."""
     context.set_default_study_key("S1")
-    ep = record_revisions.RecordRevisionsEndpoint(dummy_client, context)
+    ep = record_revisions.RecordRevisionsEndpoint(dummy_client)
     capture = paginator_factory(record_revisions, [{"recordRevisionId": 1}])
     patch = patch_build_filter(record_revisions)
 
@@ -22,9 +22,9 @@ def test_list_uses_filters(dummy_client, context, paginator_factory, patch_build
     assert isinstance(result[0], RecordRevision)
 
 
-def test_get_not_found(monkeypatch, dummy_client, context):
+def test_get_not_found(monkeypatch, dummy_client):
     """Test that get not found."""
-    ep = record_revisions.RecordRevisionsEndpoint(dummy_client, context)
+    ep = record_revisions.RecordRevisionsEndpoint(dummy_client)
 
     def fake_impl(self, client, paginator, *, study_key=None, refresh=False, **filters):
         """Helper function to fake impl."""

@@ -10,9 +10,8 @@ from imednet.endpoints.subjects import AsyncSubjectsEndpoint, SubjectsEndpoint
 def test_list_by_site_filtering():
     """Test that list by site filtering."""
     mock_client = Mock()
-    mock_ctx = Mock()
 
-    endpoint = SubjectsEndpoint(mock_client, mock_ctx)
+    endpoint = SubjectsEndpoint(mock_client)
     endpoint._list_sync = Mock(return_value=[])
 
     endpoint.list_by_site("sk", 101)
@@ -30,9 +29,8 @@ def test_list_by_site_filtering():
 async def test_async_list_by_site_filtering():
     """Test that async list by site filtering asynchronously."""
     mock_client = Mock()
-    mock_ctx = Mock()
 
-    endpoint = AsyncSubjectsEndpoint(mock_client, mock_ctx)
+    endpoint = AsyncSubjectsEndpoint(mock_client)
 
     async def fake_async_list(*args, **kwargs):
         """Helper function to fake async list."""

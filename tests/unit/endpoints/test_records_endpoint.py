@@ -10,10 +10,10 @@ from imednet.validation.cache import SchemaCache
 
 
 def test_list_builds_path_filters_and_data_filter(
-    dummy_client, context, paginator_factory, patch_build_filter
+    dummy_client, paginator_factory, patch_build_filter
 ):
     """Test that list builds path filters and data filter."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     captured = paginator_factory(records, [{"recordId": 1}])
     filter_capture = patch_build_filter(records)
 
@@ -29,9 +29,9 @@ def test_list_builds_path_filters_and_data_filter(
     assert isinstance(result[0], Record)
 
 
-def test_get_success(monkeypatch, dummy_client, context):
+def test_get_success(monkeypatch, dummy_client):
     """Test that get success."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     called = {}
 
     def fake_impl(self, client, paginator, *, study_key=None, **filters):
@@ -51,7 +51,7 @@ def test_get_success(monkeypatch, dummy_client, context):
 def test_get_rejects_unknown_keyword(monkeypatch, dummy_client, context):
     """Test that get rejects unknown keyword."""
     context.set_default_study_key("S1")
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     monkeypatch.setattr(
         records.RecordsEndpoint, "_list_sync", lambda *args, **kwargs: [Record(record_id=1)]
     )
@@ -60,9 +60,9 @@ def test_get_rejects_unknown_keyword(monkeypatch, dummy_client, context):
         ep.get(record_id=1)
 
 
-def test_get_not_found(monkeypatch, dummy_client, context):
+def test_get_not_found(monkeypatch, dummy_client):
     """Test that get not found."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
 
     def fake_impl(self, client, paginator, *, study_key=None, refresh=False, **filters):
         """Helper function to fake impl."""
@@ -74,9 +74,9 @@ def test_get_not_found(monkeypatch, dummy_client, context):
         ep.get("S1", 1)
 
 
-def test_create_sends_headers_and_parses_job(dummy_client, context, response_factory, monkeypatch):
+def test_create_sends_headers_and_parses_job(dummy_client, response_factory, monkeypatch):
     """Test that create sends headers and parses job."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     dummy_client.post.return_value = response_factory({"jobId": "1"})
     called = {}
 
@@ -98,9 +98,9 @@ def test_create_sends_headers_and_parses_job(dummy_client, context, response_fac
     assert res == "JOB"
 
 
-def test_create_validates_data(dummy_client, context, response_factory):
+def test_create_validates_data(dummy_client, response_factory):
     """Test that create validates data."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     schema = SchemaCache()
     var = Variable(variable_name="age", variable_type="integer", form_id=1, form_key="F1")
     schema._form_variables = {"F1": {"age": var}}
@@ -122,9 +122,9 @@ def test_create_validates_data(dummy_client, context, response_factory):
     dummy_client.post.assert_called_once()
 
 
-def test_create_validates_data_with_snake_case_keys(dummy_client, context, response_factory):
+def test_create_validates_data_with_snake_case_keys(dummy_client, response_factory):
     """Test that create validates data with snake case keys."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     schema = SchemaCache()
     var = Variable(variable_name="age", variable_type="integer", form_id=1, form_key="F1")
     schema._form_variables = {"F1": {"age": var}}
@@ -138,16 +138,16 @@ def test_create_validates_data_with_snake_case_keys(dummy_client, context, respo
         ep.create("S1", [{"form_key": "F1", "data": {"bad": 1}}], schema=schema)
 
 
-def test_create_raises_on_header_injection(dummy_client, context):
+def test_create_raises_on_header_injection(dummy_client):
     """Test that create raises on header injection."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     with pytest.raises(ClientError, match="Header value must not contain newlines"):
         ep.create("S1", [{"data": {}}], email_notify="test\n@example.com")
 
 
-def test_to_dataframe_success(dummy_client, context, paginator_factory):
+def test_to_dataframe_success(dummy_client, paginator_factory):
     """Test that to_dataframe exports queried records to a pandas DataFrame."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     paginator_factory(records, [{"recordId": 1, "recordData": {"age": 25}}])
 
     df = ep.to_dataframe("S1")
@@ -157,11 +157,9 @@ def test_to_dataframe_success(dummy_client, context, paginator_factory):
     assert df.loc[0, "record_data"] == {"age": 25}
 
 
-def test_to_dataframe_parameter_forwarding(
-    dummy_client, context, paginator_factory, patch_build_filter
-):
+def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patch_build_filter):
     """Test that to_dataframe forwards filters and study key to list."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     captured = paginator_factory(records, [{"recordId": 1}])
     filter_capture = patch_build_filter(records)
 
@@ -177,9 +175,9 @@ def test_to_dataframe_parameter_forwarding(
     assert len(df) == 1
 
 
-def test_to_dataframe_flatten_option(dummy_client, context, paginator_factory):
+def test_to_dataframe_flatten_option(dummy_client, paginator_factory):
     """Test that to_dataframe supports flatten option."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     paginator_factory(records, [{"recordId": 1, "recordData": {"age": 25}}])
 
     df = ep.to_dataframe("S1", flatten=True)
@@ -189,9 +187,9 @@ def test_to_dataframe_flatten_option(dummy_client, context, paginator_factory):
     assert df.loc[0, "age"] == 25
 
 
-def test_to_dataframe_empty_results(dummy_client, context, paginator_factory):
+def test_to_dataframe_empty_results(dummy_client, paginator_factory):
     """Test that to_dataframe handles empty query results."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     paginator_factory(records, [])
 
     df = ep.to_dataframe("S1")
@@ -199,9 +197,9 @@ def test_to_dataframe_empty_results(dummy_client, context, paginator_factory):
     assert df.empty
 
 
-def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, context, paginator_factory):
+def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, paginator_factory):
     """Test that to_dataframe raises ImportError when pandas is not installed."""
-    ep = records.RecordsEndpoint(dummy_client, context)
+    ep = records.RecordsEndpoint(dummy_client)
     paginator_factory(records, [{"recordId": 1}])
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
 

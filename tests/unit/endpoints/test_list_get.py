@@ -61,9 +61,9 @@ ASYNC_CASES = [
 
 
 @pytest.mark.parametrize(("cls", "module", "model", "item_id"), CASES)
-def test_list_and_get(dummy_client, context, paginator_factory, cls, module, model, item_id):
+def test_list_and_get(dummy_client, paginator_factory, cls, module, model, item_id):
     """Test that list and get."""
-    ep = cls(dummy_client, context)
+    ep = cls(dummy_client)
     capture = paginator_factory(module, [{cls._id_param: item_id}])
 
     list_kwargs = {"study_key": "S1"} if getattr(ep, "requires_study_key", True) else {}
@@ -86,7 +86,6 @@ def test_list_and_get(dummy_client, context, paginator_factory, cls, module, mod
 @pytest.mark.parametrize(("cls", "module", "model", "item_id"), ASYNC_CASES)
 async def test_async_list_and_get(
     dummy_client,
-    context,
     async_paginator_factory,
     cls,
     module,
@@ -94,7 +93,7 @@ async def test_async_list_and_get(
     item_id,
 ):
     """Test that async list and get asynchronously."""
-    ep = cls(dummy_client, context)
+    ep = cls(dummy_client)
     capture = async_paginator_factory(module, [{cls._id_param: item_id}])
 
     list_kwargs = {"study_key": "S1"} if getattr(ep, "requires_study_key", True) else {}

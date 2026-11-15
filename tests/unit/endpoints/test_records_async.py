@@ -21,9 +21,9 @@ def schema():
 
 
 @pytest.mark.asyncio
-async def test_async_create_validates_data(dummy_client, context, response_factory, schema):
+async def test_async_create_validates_data(dummy_client, response_factory, schema):
     """Test that async create validates data asynchronously."""
-    ep = records.AsyncRecordsEndpoint(dummy_client, context)
+    ep = records.AsyncRecordsEndpoint(dummy_client)
     dummy_client.post = AsyncMock(return_value=response_factory({"jobId": "1"}))
 
     # Validation error: unknown form
@@ -43,10 +43,10 @@ async def test_async_create_validates_data(dummy_client, context, response_facto
 
 @pytest.mark.asyncio
 async def test_async_create_validates_data_with_snake_case_keys(
-    dummy_client, context, response_factory, schema
+    dummy_client, response_factory, schema
 ):
     """Test that async create validates data with snake case keys asynchronously."""
-    ep = records.AsyncRecordsEndpoint(dummy_client, context)
+    ep = records.AsyncRecordsEndpoint(dummy_client)
     dummy_client.post = AsyncMock(return_value=response_factory({"jobId": "1"}))
 
     # Should raise validation error because "bad" is not in schema
@@ -56,9 +56,9 @@ async def test_async_create_validates_data_with_snake_case_keys(
 
 
 @pytest.mark.asyncio
-async def test_async_create_resolves_form_id(dummy_client, context, response_factory, schema):
+async def test_async_create_resolves_form_id(dummy_client, response_factory, schema):
     """Test that async create resolves form id asynchronously."""
-    ep = records.AsyncRecordsEndpoint(dummy_client, context)
+    ep = records.AsyncRecordsEndpoint(dummy_client)
     dummy_client.post = AsyncMock(return_value=response_factory({"jobId": "1"}))
 
     # Valid data using formId instead of formKey
@@ -74,9 +74,9 @@ async def test_async_create_resolves_form_id(dummy_client, context, response_fac
 
 
 @pytest.mark.asyncio
-async def test_async_to_dataframe_success(dummy_client, context, async_paginator_factory):
+async def test_async_to_dataframe_success(dummy_client, async_paginator_factory):
     """Test that async to_dataframe exports queried records to a pandas DataFrame."""
-    ep = records.AsyncRecordsEndpoint(dummy_client, context)
+    ep = records.AsyncRecordsEndpoint(dummy_client)
     async_paginator_factory(records, [{"recordId": 1, "recordData": {"age": 25}}])
 
     df = await ep.to_dataframe("S1")
@@ -88,10 +88,10 @@ async def test_async_to_dataframe_success(dummy_client, context, async_paginator
 
 @pytest.mark.asyncio
 async def test_async_to_dataframe_parameter_forwarding(
-    dummy_client, context, async_paginator_factory, patch_build_filter
+    dummy_client, async_paginator_factory, patch_build_filter
 ):
     """Test that async to_dataframe forwards filters and study key to list."""
-    ep = records.AsyncRecordsEndpoint(dummy_client, context)
+    ep = records.AsyncRecordsEndpoint(dummy_client)
     captured = async_paginator_factory(records, [{"recordId": 1}])
     filter_capture = patch_build_filter(records)
 
@@ -108,9 +108,9 @@ async def test_async_to_dataframe_parameter_forwarding(
 
 
 @pytest.mark.asyncio
-async def test_async_to_dataframe_flatten_option(dummy_client, context, async_paginator_factory):
+async def test_async_to_dataframe_flatten_option(dummy_client, async_paginator_factory):
     """Test that async to_dataframe supports flatten option."""
-    ep = records.AsyncRecordsEndpoint(dummy_client, context)
+    ep = records.AsyncRecordsEndpoint(dummy_client)
     async_paginator_factory(records, [{"recordId": 1, "recordData": {"age": 25}}])
 
     df = await ep.to_dataframe("S1", flatten=True)
@@ -121,9 +121,9 @@ async def test_async_to_dataframe_flatten_option(dummy_client, context, async_pa
 
 
 @pytest.mark.asyncio
-async def test_async_to_dataframe_empty_results(dummy_client, context, async_paginator_factory):
+async def test_async_to_dataframe_empty_results(dummy_client, async_paginator_factory):
     """Test that async to_dataframe handles empty query results."""
-    ep = records.AsyncRecordsEndpoint(dummy_client, context)
+    ep = records.AsyncRecordsEndpoint(dummy_client)
     async_paginator_factory(records, [])
 
     df = await ep.to_dataframe("S1")
@@ -133,10 +133,10 @@ async def test_async_to_dataframe_empty_results(dummy_client, context, async_pag
 
 @pytest.mark.asyncio
 async def test_async_to_dataframe_missing_dependency(
-    monkeypatch, dummy_client, context, async_paginator_factory
+    monkeypatch, dummy_client, async_paginator_factory
 ):
     """Test that async to_dataframe raises ImportError when pandas is not installed."""
-    ep = records.AsyncRecordsEndpoint(dummy_client, context)
+    ep = records.AsyncRecordsEndpoint(dummy_client)
     async_paginator_factory(records, [{"recordId": 1}])
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
 
