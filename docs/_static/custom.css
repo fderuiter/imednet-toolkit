@@ -1,0 +1,66 @@
+/* Custom stylesheet for imednet documentation */
+
+/* Typography & readability enhancements */
+body {
+    letter-spacing: -0.01em;
+}
+
+article {
+    line-height: 1.65;
+}
+
+article h1 {
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    margin-top: 1.5rem;
+    margin-bottom: 1.25rem;
+}
+
+article h2 {
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin-top: 2rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.3rem;
+    border-bottom: 1px solid var(--color-background-border);
+}
+
+article h3 {
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    margin-top: 1.5rem;
+    margin-bottom: 0.75rem;
+}
+
+article p {
+    margin-bottom: 1.15rem;
+}
+
+/* Sidebar branding adjustments */
+.sidebar-brand-text {
+    font-weight: 700;
+    letter-spacing: -0.02em;
+}
+
+.sidebar-logo {
+    max-height: 64px;
+    width: auto;
+    object-fit: contain;
+}
+
+/* Code blocks margins & padding */
+div.highlight {
+    margin: 1.25rem 0;
+    border-radius: 6px;
+}
+
+/* Admonition margins */
+.admonition {
+    margin: 1.5rem 0;
+    border-radius: 6px;
+}
+
+/* Content spacing */
+.content-icon-container {
+    margin-bottom: 0.5rem;
+}
