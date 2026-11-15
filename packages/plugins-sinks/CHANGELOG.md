@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-plugins-sinks-v0.2.0...imednet-plugins-sinks-v1.0.0) (2026-11-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire scheduled smoke tests and harden validation ([#1702](https://github.com/fderuiter/imednet-toolkit/issues/1702))
+
+### Bug Fixes
+
+* retire scheduled smoke tests and harden validation ([#1702](https://github.com/fderuiter/imednet-toolkit/issues/1702)) ([a46cce8](https://github.com/fderuiter/imednet-toolkit/commit/a46cce8759edd1fe4035cdf3075a441d8fe1b8a6))
+
 ## [0.2.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-plugins-sinks-v0.1.0...imednet-plugins-sinks-v0.2.0) (2026-09-10)
 
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-workflows-v0.8.0...imednet-workflows-v1.0.0) (2026-11-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire scheduled smoke tests and harden validation ([#1702](https://github.com/fderuiter/imednet-toolkit/issues/1702))
+
+### Bug Fixes
+
+* retire scheduled smoke tests and harden validation ([#1702](https://github.com/fderuiter/imednet-toolkit/issues/1702)) ([a46cce8](https://github.com/fderuiter/imednet-toolkit/commit/a46cce8759edd1fe4035cdf3075a441d8fe1b8a6))
+* **workflows:** convert duckdb_centralizer to lazy cached property ([#1705](https://github.com/fderuiter/imednet-toolkit/issues/1705)) ([9342249](https://github.com/fderuiter/imednet-toolkit/commit/93422498212f48006816c3f58db41f92ce14fbf4))
+
 ## [0.8.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-workflows-v0.7.0...imednet-workflows-v0.8.0) (2026-11-15)
 
 
