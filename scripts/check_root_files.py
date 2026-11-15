@@ -27,7 +27,6 @@ def main():
         ".coverage",
         ".secrets.baseline",
         "LICENSE",
-        "pytest.ini",
         "typos.toml",
         "vulture_whitelist.py",
     }
@@ -37,7 +36,7 @@ def main():
     # .env.example, .gitignore, .pre-commit-config.yaml, .release-please-manifest.json
     # .secrets.baseline, AGENTS.md, CHANGELOG.md, CODE_OF_CONDUCT.md, CONTRIBUTING.md
     # LICENSE, README.md, a11y_exemptions.json, docker-compose.yml
-    # imednet.postman_collection.json, pyproject.toml, pytest.ini, release-please-config.json, typos.toml, uv.lock
+    # imednet.postman_collection.json, pyproject.toml, release-please-config.json, typos.toml, uv.lock
 
     unapproved_found = False
 
