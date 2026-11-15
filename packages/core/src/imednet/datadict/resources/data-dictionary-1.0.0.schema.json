@@ -165,7 +165,7 @@
     },
     "Form": {
       "additionalProperties": true,
-      "description": "An electronic Case Report Form (eCRF).",
+      "description": "A form defining data fields and rules for clinical data entry.",
       "properties": {
         "formKey": {
           "description": "Unique short code/mnemonic for the form",
@@ -211,7 +211,7 @@
             }
           ],
           "default": null,
-          "description": "Type of form (Patient, Study, Admin, etc.)",
+          "description": "Type of form (Subject, Study, Admin, etc.)",
           "title": "Formtype"
         },
         "variables": {
@@ -263,7 +263,7 @@
             }
           ],
           "default": null,
-          "description": "Clinical trial study key",
+          "description": "Study key",
           "title": "Studykey"
         },
         "generatedAt": {
@@ -329,7 +329,7 @@
             }
           ],
           "default": null,
-          "description": "Display prompt/label on the eCRF",
+          "description": "Display prompt/label on the Form for a Subject",
           "title": "Label"
         },
         "variableType": {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Any
 
 try:
     from dotenv import load_dotenv
@@ -108,6 +109,77 @@ def get_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _find_active_subparser(
+    parser: argparse.ArgumentParser, args: list[str]
+) -> argparse.ArgumentParser:
+    """Locate the active subparser context based on the CLI argument list."""
+    current_parser = parser
+    remaining_args = list(args)
+
+    while True:
+        subparser_action: argparse._SubParsersAction[Any] | None = None
+        for action in current_parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                subparser_action = action
+                break
+
+        if subparser_action is None:
+            break
+
+        option_map: dict[str, argparse.Action] = {}
+        for action in current_parser._actions:
+            for opt_str in action.option_strings:
+                option_map[opt_str] = action
+
+        matched_subparser: argparse.ArgumentParser | None = None
+        consumed_idx = len(remaining_args)
+
+        i = 0
+        while i < len(remaining_args):
+            arg = remaining_args[i]
+
+            if arg in subparser_action.choices:
+                matched_subparser = subparser_action.choices[arg]
+                consumed_idx = i + 1
+                break
+
+            if arg.startswith("-"):
+                if "=" in arg:
+                    opt, _, _ = arg.partition("=")
+                    if opt in option_map:
+                        i += 1
+                        continue
+                if arg in option_map:
+                    opt_action = option_map[arg]
+                    if opt_action.nargs == 0 or isinstance(
+                        opt_action,
+                        (
+                            argparse._StoreTrueAction,
+                            argparse._StoreFalseAction,
+                            argparse._HelpAction,
+                        ),
+                    ):
+                        i += 1
+                    else:
+                        n = (
+                            1
+                            if opt_action.nargs is None
+                            else (opt_action.nargs if isinstance(opt_action.nargs, int) else 1)
+                        )
+                        i += 1 + n
+                    continue
+
+            i += 1
+
+        if matched_subparser is None:
+            break
+
+        current_parser = matched_subparser
+        remaining_args = remaining_args[consumed_idx:]
+
+    return current_parser
+
+
 def app(args: list[str] | None = None) -> None:
     """Main entrypoint for the CLI."""
     if args is None:
@@ -123,7 +195,8 @@ def app(args: list[str] | None = None) -> None:
     if hasattr(parsed, "func"):
         parsed.func(parsed)
     else:
-        parser.print_help()
+        active_parser = _find_active_subparser(parser, args)
+        active_parser.print_help()
 
 
 if __name__ == "__main__":

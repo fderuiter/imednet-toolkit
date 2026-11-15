@@ -20,6 +20,8 @@ def test_cli_datadict_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert exc.value.code == 0
     captured = capsys.readouterr()
     assert "from-csv" in captured.out
+    assert "from-odm" in captured.out
+    assert "from-redcap" in captured.out
     assert "from-api" in captured.out
     assert "validate" in captured.out
     assert "diff" in captured.out
@@ -92,3 +94,88 @@ def test_cli_from_api(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     content = json.loads(out_file.read_text(encoding="utf-8"))
     assert content["metadata"]["studyKey"] == "STUDY1"
     assert content["forms"][0]["formKey"] == "AE"
+
+
+def test_cli_from_odm(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Test compiling JSON from CDISC ODM XML via CLI."""
+    xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">
+  <Study OID="CLI_STUDY_ODM">
+    <MetaDataVersion OID="MDV1">
+      <FormDef OID="F1" Name="Form One">
+        <ItemGroupRef ItemGroupOID="IG1" OrderNumber="1"/>
+      </FormDef>
+      <ItemGroupDef OID="IG1" Name="Group One">
+        <ItemRef ItemOID="ITEM1" OrderNumber="1" Mandatory="Yes"/>
+      </ItemGroupDef>
+      <ItemDef OID="ITEM1" Name="ITEM1" DataType="text">
+        <Question><TranslatedText>Question 1</TranslatedText></Question>
+      </ItemDef>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    xml_file = tmp_path / "odm.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    # 1. Output to file
+    out_file = tmp_path / "from_odm.json"
+    app(["datadict", "from-odm", str(xml_file), "-o", str(out_file)])
+    assert out_file.exists()
+    data = json.loads(out_file.read_text(encoding="utf-8"))
+    assert data["metadata"]["studyKey"] == "CLI_STUDY_ODM"
+    assert data["forms"][0]["formKey"] == "F1"
+    assert data["forms"][0]["variables"][0]["variableName"] == "ITEM1"
+    capsys.readouterr()
+
+    # 2. Output to stdout
+    app(["datadict", "from-odm", str(xml_file)])
+    captured = capsys.readouterr()
+    stdout_data = json.loads(captured.out)
+    assert stdout_data["metadata"]["studyKey"] == "CLI_STUDY_ODM"
+
+    # 3. Validate via CLI validate command
+    app(["datadict", "validate", str(out_file)])
+    captured = capsys.readouterr()
+    assert "Validation passed" in captured.out
+
+
+def test_cli_from_redcap(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Test compiling JSON from REDCap CSV via CLI."""
+    csv_content = """"Variable / Field Name","Form Name","Field Type","Field Label","Choices, Calculations, OR Slider Labels"
+"subj_id","demographics","text","Subject ID",
+"gender","demographics","radio","Gender","1, Male | 2, Female"
+"""
+    csv_file = tmp_path / "redcap.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    # 1. Output to file with study key override
+    out_file = tmp_path / "from_redcap.json"
+    app(
+        [
+            "datadict",
+            "from-redcap",
+            str(csv_file),
+            "--study-key",
+            "CLI_REDCAP_STUDY",
+            "-o",
+            str(out_file),
+        ]
+    )
+    assert out_file.exists()
+    data = json.loads(out_file.read_text(encoding="utf-8"))
+    assert data["metadata"]["studyKey"] == "CLI_REDCAP_STUDY"
+    assert data["forms"][0]["formKey"] == "demographics"
+    assert len(data["forms"][0]["variables"]) == 2
+    capsys.readouterr()
+
+    # 2. Output to stdout
+    app(["datadict", "from-redcap", str(csv_file)])
+    captured = capsys.readouterr()
+    stdout_data = json.loads(captured.out)
+    assert stdout_data["forms"][0]["formKey"] == "demographics"
+
+    # 3. Validate via CLI validate command
+    app(["datadict", "validate", str(out_file)])
+    captured = capsys.readouterr()
+    assert "Validation passed" in captured.out

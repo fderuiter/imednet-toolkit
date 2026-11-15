@@ -79,6 +79,7 @@ extensions = [
     "sphinxcontrib.mermaid",
     "sphinxarg.ext",
     "sphinx.ext.doctest",
+    "myst_parser",
 ]
 
 autosummary_generate = False
@@ -160,6 +161,7 @@ templates_path: list[str] = ["_templates"]
 exclude_patterns: list[str] = [
     "tutorials/examples/dummy.py",
     "reference/VPAT.rst",
+    "agents/**",
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 

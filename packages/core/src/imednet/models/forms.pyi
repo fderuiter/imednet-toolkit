@@ -1,4 +1,4 @@
-"""Form (eCRF) metadata models for iMedNet."""
+"""Form metadata models for iMedNet."""
 
 from __future__ import annotations
 
