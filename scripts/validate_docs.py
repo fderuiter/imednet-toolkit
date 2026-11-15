@@ -1,6 +1,7 @@
 """Validation script for documentation."""
 
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -134,13 +135,75 @@ def check_package_docs() -> bool:
     return has_errors
 
 
+def check_adr_records() -> bool:
+    """Validate that all ADR records in docs/adr follow naming patterns and have valid titles."""
+    print("Checking architecture decision records (ADRs)...")
+    adr_dir = Path("docs/adr")
+    if not adr_dir.exists():
+        print(f"Warning: ADR directory {adr_dir} not found.")
+        return False
+
+    adr_name_pattern = re.compile(r"^\d{4}-[a-z0-9-]+\.md$")
+    has_errors = False
+    record_count = 0
+
+    for item in sorted(adr_dir.iterdir()):
+        # Ignore hidden files like .gitkeep and generated index files like index.rst
+        if item.name.startswith(".") or item.name == "index.rst":
+            continue
+
+        if not item.is_file():
+            print(f"Error: Unexpected directory in docs/adr: {item.name}")
+            has_errors = True
+            continue
+
+        if not adr_name_pattern.match(item.name):
+            print(
+                f"Error: ADR file {item.name} does not match the numeric naming pattern (e.g. '0001-slug-title.md')."
+            )
+            has_errors = True
+            continue
+
+        try:
+            content = item.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"Error reading {item.name}: {e}")
+            has_errors = True
+            continue
+
+        non_empty_lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if not non_empty_lines:
+            print(f"Error: ADR record {item.name} is empty.")
+            has_errors = True
+            continue
+
+        first_line = non_empty_lines[0]
+        if not first_line.startswith("# ") or not first_line[2:].strip():
+            print(
+                f"Error: ADR record {item.name} must start with a valid level-1 heading ('# <Title>')."
+            )
+            has_errors = True
+            continue
+
+        record_count += 1
+
+    if record_count == 0:
+        print(f"Error: No valid ADR records found in {adr_dir}.")
+        has_errors = True
+
+    if not has_errors:
+        print(f"All {record_count} ADR records passed validation.")
+    return has_errors
+
+
 def main():
     """Run validation scripts."""
     todos_failed = check_todos_in_init()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
+    adr_failed = check_adr_records()
 
-    if todos_failed or packages_failed or docs_failed:
+    if todos_failed or packages_failed or docs_failed or adr_failed:
         print("Validation failed.")
         sys.exit(1)
 
