@@ -7,7 +7,7 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "imednet>=0.8.0,<1.0.0",
+    "imednet>=1.0.0,<2.0.0",
     "apache-airflow>=3.2.0,<4.0.0"
 ]
 

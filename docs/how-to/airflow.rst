@@ -8,6 +8,11 @@ Installation
 
 Install the provider package:
 
+The current 1.x workflows, sinks and Airflow provider require core
+``imednet>=1.0.0,<2.0.0``. Install matching 1.x packages together; the former
+pre-1.0 dependency range excluded the released core and prevented ordinary
+pip installation. Package versions remain managed by release-please.
+
 .. code-block:: bash
 
    pip install "apache-airflow>=3.2.0,<4.0.0" apache-airflow-providers-imednet

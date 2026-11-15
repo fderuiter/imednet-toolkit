@@ -7,7 +7,7 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "imednet>=0.8.0,<1.0.0",
+    "imednet>=1.0.0,<2.0.0",
     "pandas>=2.2.3,<3.0.0",
     "filelock>=4.2.1,<5.0.0",
     "cryptography"
