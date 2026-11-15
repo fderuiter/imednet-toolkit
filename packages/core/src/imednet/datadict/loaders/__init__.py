@@ -1,5 +1,7 @@
 """Data dictionary loaders package."""
 
+# pylint: disable=duplicate-code
+
 from __future__ import annotations
 
 from .api import load_from_api
