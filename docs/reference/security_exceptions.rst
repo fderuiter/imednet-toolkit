@@ -40,7 +40,7 @@ remain. Verification invokes ``semgrep scan`` with metrics disabled; it does
 not start an MCP server or enable affected server features. This limits exposure
 and does not claim the vulnerable dependencies are fixed. Do not use the tooling
 environment to host services or deploy application code. An audit success means
-no *unexcepted* findings, not absence of all advisories.
+no findings outside the documented exceptions, not absence of all advisories.
 
 Upgrade Semgrep when supported constraints admit the patches, remove the
 matching exceptions, and rerun the complete quality gate. Do not force incompatible
