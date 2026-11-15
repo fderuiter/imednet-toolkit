@@ -161,7 +161,6 @@ napoleon_include_init_with_doc = True
 templates_path: list[str] = ["_templates"]
 exclude_patterns: list[str] = [
     "tutorials/examples/dummy.py",
-    "reference/VPAT.rst",
     "agents/**",
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
