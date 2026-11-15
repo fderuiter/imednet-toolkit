@@ -9,7 +9,7 @@ requires-python = ">=3.10"
 dependencies = [
     "imednet>=0.8.0,<1.0.0",
     "pandas>=2.2.3,<3.0.0",
-    "filelock>=3.20.3,<4.0.0",
+    "filelock>=3.20.3,<5.0.0",
     "cryptography"
 ]
 
