@@ -297,3 +297,10 @@ _print_patcher.stop()
 
 html_theme = "furo"
 master_doc = 'index'
+
+# Linkcheck configuration
+linkcheck_ignore = [
+    r"https://.*\.imednet\.com.*",
+]
+linkcheck_timeout = 30
+linkcheck_retries = 3

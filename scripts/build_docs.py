@@ -115,6 +115,19 @@ def main():
         ["sphinx-build", "-b", "doctest", "-W", "--keep-going", "docs", "docs/_build/doctest"]
     )
 
+    print("Checking hyperlinks...")
+    run_command(
+        [
+            "sphinx-build",
+            "-b",
+            "linkcheck",
+            "-W",
+            "--keep-going",
+            "docs",
+            "docs/_build/linkcheck",
+        ]
+    )
+
     print("Building HTML...")
     run_command(["sphinx-build", "-b", "html", "-W", "--keep-going", "docs", "docs/_build/html"])
 

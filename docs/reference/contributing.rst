@@ -2,8 +2,8 @@ Contributing
 ============
 
 This guide summarizes how to set up your environment, validate changes, and submit
-pull requests. Please review our `Code of Conduct <../CODE_OF_CONDUCT.md>`__ and
-see `CONTRIBUTING.md <../CONTRIBUTING.md>`__ for complete details.
+pull requests. Please review our `Code of Conduct <https://github.com/fderuiter/imednet-toolkit/blob/main/CODE_OF_CONDUCT.md>`__ and
+see `CONTRIBUTING.md <https://github.com/fderuiter/imednet-toolkit/blob/main/CONTRIBUTING.md>`__ for complete details.
 
 .. toctree::
    :maxdepth: 1
