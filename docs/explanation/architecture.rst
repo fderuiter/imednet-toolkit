@@ -39,6 +39,10 @@ Retry policy
   :class:`~imednet.sdk.ImednetSDK`, and :class:`~imednet.sdk.AsyncImednetSDK`.
 * Backoff uses Tenacity's randomized exponential wait strategy with
   ``backoff_factor`` as the multiplier.
+* Paginators call the requester directly. The HTTP transport is the sole
+  retry, circuit-breaker accounting and request-telemetry owner for each page,
+  including endpoints returning a raw JSON list. Custom requesters must own
+  their own retry policy; paginators do not replay their exceptions.
 * If a retriable response includes ``Retry-After``, that delay overrides the
   backoff schedule.
 
@@ -258,6 +262,15 @@ Error propagation
 
 * Transient errors are retried up to ``max_retries`` times with
   exponential back-off.
+* ``max_retries`` counts retries after the first attempt: zero means one
+  execution, and two means at most three executions. Sink backoff starts at
+  ``retry_backoff`` and doubles for each retry. Negative/non-integral retry
+  counts and non-finite/negative backoff values are rejected at configuration.
+* Sink configuration and input validation errors are not replayed. Driver
+  exception messages are replaced before entering operation telemetry, because
+  they may contain connection strings or payloads. Export errors report the
+  actual number of destination calls, including zero when a breaker blocks
+  execution, and retain ``batch_id`` without copying the driver message.
 * After all retries are exhausted, sinks raise
   :class:`~imednet.errors.ExportBatchError` (carries ``batch_id``) so
   that callers can log and resume partial exports.

@@ -3,8 +3,6 @@
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, Generic, TypeVar
 
-import httpx
-
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.errors.client import PaginationError
 
@@ -146,39 +144,17 @@ class BasePaginator(Generic[ClientT]):
 
 
 class Paginator(BasePaginator[RequesterProtocol]):
-    """Iterate synchronously over paginated API results."""
+    """Iterate synchronously over paginated API results.
+
+    The requester owns retries, circuit breaking and HTTP telemetry.
+    """
 
     def __iter__(self) -> Iterator[Any]:
         """Iterate over all items across all pages."""
-        from imednet.core.operations.executor import UniversalExecutor
-
-        retries = getattr(self.client, "retries", 3)
-        backoff_factor = getattr(self.client, "backoff_factor", 1.0)
-        tracer = getattr(self.client, "_tracer", None)
-
-        attributes: dict[str, Any] = {"path": self.path}
-        if self.params:
-            for k, v in self.params.items():
-                attributes[k] = v
-
-        executor = UniversalExecutor(
-            retries=retries,
-            backoff_factor=backoff_factor,
-            tracer=tracer,
-            operation_name="list_page",
-            **attributes,
-        )
-
         self._cursor = self._explicit_page if self._explicit_page is not None else 0
         while self._cursor is not None:
-            params = self._get_page_params()
-
-            def _fetch() -> httpx.Response:
-                return self.client.get(self.path, params=params)  # noqa: B023
-
-            response: httpx.Response = executor.execute(_fetch)
-            payload = response.json()
-            items = self._process_page_response(payload)
+            response = self.client.get(self.path, params=self._get_page_params())
+            items = self._process_page_response(response.json())
             yield from items
 
 
@@ -187,35 +163,10 @@ class AsyncPaginator(BasePaginator[AsyncRequesterProtocol]):
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         """Iterate asynchronously over all items across all pages."""
-        from imednet.core.operations.executor import UniversalExecutor
-
-        retries = getattr(self.client, "retries", 3)
-        backoff_factor = getattr(self.client, "backoff_factor", 1.0)
-        tracer = getattr(self.client, "_tracer", None)
-
-        attributes: dict[str, Any] = {"path": self.path}
-        if self.params:
-            for k, v in self.params.items():
-                attributes[k] = v
-
-        executor = UniversalExecutor(
-            retries=retries,
-            backoff_factor=backoff_factor,
-            tracer=tracer,
-            operation_name="list_page",
-            **attributes,
-        )
-
         self._cursor = self._explicit_page if self._explicit_page is not None else 0
         while self._cursor is not None:
-            params = self._get_page_params()
-
-            async def _fetch() -> httpx.Response:
-                return await self.client.get(self.path, params=params)  # noqa: B023
-
-            response: httpx.Response = await executor.execute_async(_fetch)
-            payload = response.json()
-            items = self._process_page_response(payload)
+            response = await self.client.get(self.path, params=self._get_page_params())
+            items = self._process_page_response(response.json())
             for item in items:
                 yield item
 
@@ -225,31 +176,8 @@ class JsonListPaginator(Paginator):
 
     def __iter__(self) -> Iterator[Any]:
         """Iterate over a single response that returns a list directly."""
-        from imednet.core.operations.executor import UniversalExecutor
-
-        retries = getattr(self.client, "retries", 3)
-        backoff_factor = getattr(self.client, "backoff_factor", 1.0)
-        tracer = getattr(self.client, "_tracer", None)
-
-        attributes: dict[str, Any] = {"path": self.path}
-        if self.params:
-            for k, v in self.params.items():
-                attributes[k] = v
-
-        executor = UniversalExecutor(
-            retries=retries,
-            backoff_factor=backoff_factor,
-            tracer=tracer,
-            operation_name="list_page",
-            **attributes,
-        )
-
-        def _fetch() -> httpx.Response:
-            return self.client.get(self.path, params=self.params)
-
-        response: httpx.Response = executor.execute(_fetch)
-        payload = response.json()
-        yield from self._process_json_list_response(payload)
+        response = self.client.get(self.path, params=self.params)
+        yield from self._process_json_list_response(response.json())
 
 
 class AsyncJsonListPaginator(AsyncPaginator):
@@ -257,29 +185,6 @@ class AsyncJsonListPaginator(AsyncPaginator):
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         """Iterate asynchronously over a single response that returns a list directly."""
-        from imednet.core.operations.executor import UniversalExecutor
-
-        retries = getattr(self.client, "retries", 3)
-        backoff_factor = getattr(self.client, "backoff_factor", 1.0)
-        tracer = getattr(self.client, "_tracer", None)
-
-        attributes: dict[str, Any] = {"path": self.path}
-        if self.params:
-            for k, v in self.params.items():
-                attributes[k] = v
-
-        executor = UniversalExecutor(
-            retries=retries,
-            backoff_factor=backoff_factor,
-            tracer=tracer,
-            operation_name="list_page",
-            **attributes,
-        )
-
-        async def _fetch() -> httpx.Response:
-            return await self.client.get(self.path, params=self.params)
-
-        response: httpx.Response = await executor.execute_async(_fetch)
-        payload = response.json()
-        for item in self._process_json_list_response(payload):
+        response = await self.client.get(self.path, params=self.params)
+        for item in self._process_json_list_response(response.json()):
             yield item
