@@ -30,6 +30,5 @@ def test_parse_filter_args_invalid_escaped(capfd: pytest.CaptureFixture[str]):
     assert exc_info.value.code == 1
 
     captured = capfd.readouterr()
-    # Rich renders escaped markup as literal text.
-    # If it weren't escaped, Rich (in no-color mode) would strip the tags.
-    assert "[red]bad[/red]" in captured.out
+    assert "[red]bad[/red]" in captured.err
+    assert captured.out == ""

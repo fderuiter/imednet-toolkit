@@ -78,10 +78,10 @@ def test_missing_credentials(runner, monkeypatch):
 
     assert result.exit_code == 1
     # Check for core message, ignoring possible line breaks from rich wrapping
-    assert "IMEDNET_API_KEY" in result.stdout
-    assert "IMEDNET_SECURITY_KEY" in result.stdout
-    assert "environment variables must be" in result.stdout.replace("\n", " ")
-    assert "set" in result.stdout
+    assert "IMEDNET_API_KEY" in result.stderr
+    assert "IMEDNET_SECURITY_KEY" in result.stderr
+    assert "environment variables must be" in result.stderr.replace("\n", " ")
+    assert "set" in result.stderr
 
 
 def test_authentication_error_handling(runner, mock_sdk):
@@ -91,8 +91,8 @@ def test_authentication_error_handling(runner, mock_sdk):
     result = runner.invoke(app, ["studies", "list"])
 
     assert result.exit_code == 1
-    assert "Authentication Failed" in result.stdout
-    assert "Invalid API Key" in result.stdout
+    assert "Authentication Failed" in result.stderr
+    assert "Invalid API Key" in result.stderr
 
 
 def test_authorization_error_handling(runner, mock_sdk):
@@ -102,8 +102,8 @@ def test_authorization_error_handling(runner, mock_sdk):
     result = runner.invoke(app, ["studies", "list"])
 
     assert result.exit_code == 1
-    assert "Permission Denied" in result.stdout
-    assert "Insufficient permissions" in result.stdout
+    assert "Permission Denied" in result.stderr
+    assert "Insufficient permissions" in result.stderr
 
 
 def test_rate_limit_error_handling(runner, mock_sdk):
@@ -113,8 +113,8 @@ def test_rate_limit_error_handling(runner, mock_sdk):
     result = runner.invoke(app, ["studies", "list"])
 
     assert result.exit_code == 1
-    assert "Rate Limit Exceeded" in result.stdout
-    assert "Try again in 60s" in result.stdout
+    assert "Rate Limit Exceeded" in result.stderr
+    assert "Try again in 60s" in result.stderr
 
 
 def test_not_found_error_handling(runner, mock_sdk):
@@ -124,8 +124,8 @@ def test_not_found_error_handling(runner, mock_sdk):
     result = runner.invoke(app, ["sites", "list", "MISSING"])
 
     assert result.exit_code == 1
-    assert "Not Found" in result.stdout
-    assert "Study not found: MISSING" in result.stdout
+    assert "Not Found" in result.stderr
+    assert "Study not found: MISSING" in result.stderr
 
 
 def test_malformed_filter_input(runner, mock_sdk):
@@ -133,8 +133,8 @@ def test_malformed_filter_input(runner, mock_sdk):
     result = runner.invoke(app, ["subjects", "list", "STUDY", "--filter", "invalid_filter"])
 
     assert result.exit_code == 1
-    assert "Invalid filter format" in result.stdout
-    assert "key=value" in result.stdout
+    assert "Invalid filter format" in result.stderr
+    assert "key=value" in result.stderr
 
 
 def test_invalid_output_format(runner, mock_sdk):
@@ -142,7 +142,7 @@ def test_invalid_output_format(runner, mock_sdk):
     result = runner.invoke(app, ["records", "list", "STUDY", "--output", "pdf"])
 
     assert result.exit_code == 1
-    assert "Invalid output format" in result.stdout
+    assert "Invalid output format" in result.stderr
 
 
 def test_secret_masking_in_errors(runner, mock_sdk, monkeypatch):
@@ -156,8 +156,9 @@ def test_secret_masking_in_errors(runner, mock_sdk, monkeypatch):
     result = runner.invoke(app, ["studies", "list"])
 
     assert result.exit_code == 1
+    assert secret_value not in result.stderr
     assert secret_value not in result.stdout
-    assert "Unexpected error" in result.stdout
+    assert "Unexpected error" in result.stderr
 
 
 def test_help_text_completeness(runner):
@@ -231,7 +232,7 @@ def test_keyboard_interrupt_handling(runner, mock_sdk):
     result = runner.invoke(app, ["studies", "list"])
 
     assert result.exit_code == 130
-    assert "Aborted by user" in result.stdout
+    assert "Aborted by user" in result.stderr
 
 
 def test_output_file_correctness_csv(runner, mock_sdk, tmp_path):

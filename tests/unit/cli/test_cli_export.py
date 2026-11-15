@@ -111,7 +111,8 @@ def test_cli_export_duckdb_missing_dependency(
     )
 
     assert result.exit_code == 1
-    assert "imednet[duckdb]" in result.stdout
+    assert "imednet[duckdb]" in result.stderr
+    assert result.stdout == ""
 
 
 def test_cli_export_duckdb_vars_forms_passthrough(
@@ -175,7 +176,8 @@ def test_cli_export_duckdb_rejects_invalid_table_name(
     )
 
     assert result.exit_code == 1
-    assert "Invalid identifier" in result.stdout or "Error" in result.stdout
+    assert "Invalid identifier" in result.stderr or "Error" in result.stderr
+    assert result.stdout == ""
     func.assert_not_called()
 
 
@@ -235,7 +237,8 @@ def test_cli_export_mongodb_missing_dependency(
     )
 
     assert result.exit_code == 1
-    assert "imednet[mongodb]" in result.stdout
+    assert "imednet[mongodb]" in result.stderr
+    assert result.stdout == ""
 
 
 def test_cli_export_neo4j_happy_path(
@@ -296,7 +299,8 @@ def test_cli_export_neo4j_missing_dependency(
     )
 
     assert result.exit_code == 1
-    assert "imednet[neo4j]" in result.stdout
+    assert "imednet[neo4j]" in result.stderr
+    assert result.stdout == ""
 
 
 def test_cli_export_snowflake_happy_path(
@@ -368,4 +372,5 @@ def test_cli_export_snowflake_missing_dependency(
     )
 
     assert result.exit_code == 1
-    assert "imednet[snowflake]" in result.stdout
+    assert "imednet[snowflake]" in result.stderr
+    assert result.stdout == ""

@@ -86,7 +86,8 @@ def test_missing_env_vars(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
     result = runner.invoke(cli.app, ["studies", "list"])
     assert result.exit_code == 1
-    assert "IMEDNET_API_KEY" in result.stdout
+    assert "IMEDNET_API_KEY" in result.stderr
+    assert result.stdout == ""
 
 
 def test_studies_list_success(runner: CliRunner, sdk: MagicMock) -> None:
@@ -108,7 +109,8 @@ def test_studies_list_api_error(runner: CliRunner, sdk: MagicMock) -> None:
     sdk.studies.list.side_effect = ApiError("boom")
     result = runner.invoke(cli.app, ["studies", "list"])
     assert result.exit_code == 1
-    assert "API Error" in result.stdout
+    assert "API Error" in result.stderr
+    assert "API Error" not in result.stdout
 
 
 def test_sdk_closed_after_command(runner: CliRunner, sdk: MagicMock) -> None:
@@ -153,7 +155,8 @@ def test_sites_list_api_error(runner: CliRunner, sdk: MagicMock) -> None:
     sdk.sites.list.side_effect = ApiError("fail")
     result = runner.invoke(cli.app, ["sites", "list", "STUDY"])
     assert result.exit_code == 1
-    assert "API Error" in result.stdout
+    assert "API Error" in result.stderr
+    assert "API Error" not in result.stdout
 
 
 def test_subjects_list_success(runner: CliRunner, sdk: MagicMock) -> None:
@@ -180,7 +183,8 @@ def test_subjects_list_invalid_filter(runner: CliRunner, sdk: MagicMock) -> None
     """Test that subjects list invalid filter."""
     result = runner.invoke(cli.app, ["subjects", "list", "STUDY", "--filter", "badfilter"])
     assert result.exit_code == 1
-    assert "Invalid filter format" in result.stdout
+    assert "Invalid filter format" in result.stderr
+    assert result.stdout == ""
     sdk.subjects.list.assert_not_called()
 
 
@@ -189,7 +193,8 @@ def test_subjects_list_api_error(runner: CliRunner, sdk: MagicMock) -> None:
     sdk.subjects.list.side_effect = ApiError("boom")
     result = runner.invoke(cli.app, ["subjects", "list", "STUDY"])
     assert result.exit_code == 1
-    assert "API Error" in result.stdout
+    assert "API Error" in result.stderr
+    assert "API Error" not in result.stdout
 
 
 def test_extract_records_calls_workflow(
@@ -225,7 +230,8 @@ def test_extract_records_api_error(
     )
     result = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY"])
     assert result.exit_code == 1
-    assert "API Error" in result.stdout
+    assert "API Error" in result.stderr
+    assert "API Error" not in result.stdout
 
 
 def test_records_list_success(runner: CliRunner, sdk: MagicMock) -> None:
@@ -284,7 +290,8 @@ def test_records_list_invalid_output(runner: CliRunner, sdk: MagicMock) -> None:
     """Test that records list invalid output."""
     result = runner.invoke(cli.app, ["records", "list", "STUDY", "--output", "txt"])
     assert result.exit_code == 1
-    assert "Invalid output format" in result.stdout
+    assert "Invalid output format" in result.stderr
+    assert result.stdout == ""
     sdk.records.list.assert_not_called()
 
 
@@ -293,7 +300,8 @@ def test_records_list_api_error(runner: CliRunner, sdk: MagicMock) -> None:
     sdk.records.list.side_effect = ApiError("oops")
     result = runner.invoke(cli.app, ["records", "list", "STUDY"])
     assert result.exit_code == 1
-    assert "API Error" in result.stdout
+    assert "API Error" in result.stderr
+    assert "API Error" not in result.stdout
 
 
 def test_export_parquet_calls_helper(
@@ -585,7 +593,8 @@ def test_export_parquet_missing_pyarrow(runner: CliRunner, monkeypatch: pytest.M
     monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
     result = runner.invoke(cli.app, ["export", "parquet", "STUDY", "out.parquet"])
     assert result.exit_code == 1
-    assert "pyarrow is required" in result.stdout
+    assert "pyarrow is required" in result.stderr
+    assert result.stdout == ""
 
 
 def test_export_sql_missing_sqlalchemy(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -604,7 +613,8 @@ def test_export_sql_missing_sqlalchemy(runner: CliRunner, monkeypatch: pytest.Mo
         ["export", "sql", "STUDY", "table", "sqlite://"],
     )
     assert result.exit_code == 1
-    assert "SQLAlchemy is required" in result.stdout
+    assert "SQLAlchemy is required" in result.stderr
+    assert result.stdout == ""
 
 
 def test_export_duckdb_missing_dependency(
@@ -625,7 +635,8 @@ def test_export_duckdb_missing_dependency(
         ["export", "duckdb", "STUDY", "table", "out.duckdb"],
     )
     assert result.exit_code == 1
-    assert "imednet[duckdb]" in result.stdout
+    assert "imednet[duckdb]" in result.stderr
+    assert result.stdout == ""
 
 
 def test_subject_data_calls_workflow(

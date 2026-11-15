@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+from .output import print_error
+
 STUDY_KEY_ARG = "The key identifying the study."
 
 
@@ -15,13 +17,13 @@ def parse_filter_args(filter_args: list[str] | None) -> dict[str, Any] | None:
     filter_dict: dict[str, str | bool | int] = {}
     for arg in filter_args:
         if "=" not in arg or arg.startswith("=") or arg.endswith("="):
-            print(
+            print_error(
                 f"Error: Invalid filter format: '{arg}'. Use 'key=value' with non-empty key and value."
             )
             sys.exit(1)
         key, value = arg.split("=", 1)
         if not key.strip() or not value.strip():
-            print(f"Error: Invalid filter format: '{arg}'. Key and value cannot be empty.")
+            print_error(f"Error: Invalid filter format: '{arg}'. Key and value cannot be empty.")
             sys.exit(1)
 
         if value.lower() == "true":

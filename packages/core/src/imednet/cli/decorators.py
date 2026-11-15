@@ -43,6 +43,7 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         """Initialize the SDK, execute the command, and handle common API errors."""
         from .utils.context import get_sdk
+        from .utils.output import print_error
 
         sdk = get_sdk()
         try:
@@ -51,30 +52,30 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
             raise
         except (AuthenticationError, UnauthorizedError) as exc:
             msg = _redact_secrets(str(exc))
-            print(f"Authentication Failed: {msg}")
+            print_error(f"Authentication Failed: {msg}")
             sys.exit(1)
         except (AuthorizationError, ForbiddenError) as exc:
             msg = _redact_secrets(str(exc))
-            print(f"Permission Denied: {msg}")
+            print_error(f"Permission Denied: {msg}")
             sys.exit(1)
         except RateLimitError as exc:
             msg = _redact_secrets(str(exc))
-            print(f"Rate Limit Exceeded: {msg}")
+            print_error(f"Rate Limit Exceeded: {msg}")
             sys.exit(1)
         except NotFoundError as exc:
             msg = _redact_secrets(str(exc))
-            print(f"Not Found: {msg}")
+            print_error(f"Not Found: {msg}")
             sys.exit(1)
         except ApiError as exc:
             msg = _redact_secrets(str(exc))
-            print(f"API Error: {msg}")
+            print_error(f"API Error: {msg}")
             sys.exit(1)
         except KeyboardInterrupt:
-            print("\nAborted by user.")
+            print_error("\nAborted by user.")
             sys.exit(130)
         except Exception as exc:  # pragma: no cover - defensive
             msg = _redact_secrets(str(exc))
-            print(f"Unexpected error: {msg}")
+            print_error(f"Unexpected error: {msg}")
             sys.exit(1)
         finally:
             close = getattr(sdk, "close", None)
