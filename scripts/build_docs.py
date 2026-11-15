@@ -66,7 +66,6 @@ def main():
             str(api_dir),
             "packages/core/src/imednet",
             "packages/core/src/imednet/core",
-            "packages/core/src/imednet/compat",
             "packages/core/src/imednet/http",
             "-f",
             "-M",
@@ -114,6 +113,19 @@ def main():
     print("Running doctests...")
     run_command(
         ["sphinx-build", "-b", "doctest", "-W", "--keep-going", "docs", "docs/_build/doctest"]
+    )
+
+    print("Checking hyperlinks...")
+    run_command(
+        [
+            "sphinx-build",
+            "-b",
+            "linkcheck",
+            "-W",
+            "--keep-going",
+            "docs",
+            "docs/_build/linkcheck",
+        ]
     )
 
     print("Building HTML...")

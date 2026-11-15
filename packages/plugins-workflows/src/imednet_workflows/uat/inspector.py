@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from pydantic import Field
@@ -25,7 +25,7 @@ class StudySnapshot(ImednetBaseModel):
     """Point-in-time snapshot of a study's structural metadata."""
 
     study_key: str
-    captured_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    captured_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     forms: list[Form]
     variables: list[Variable]
     intervals: list[Interval]

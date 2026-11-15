@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from pydantic import Field
@@ -151,7 +151,7 @@ class SyntheticRecordGenerator:
             return date.today().isoformat()
 
         if v_type == "DateTime":
-            return datetime.now(timezone.utc).isoformat()
+            return datetime.now(UTC).isoformat()
 
         if v_type == "Coded":
             if var_spec.coded_values:

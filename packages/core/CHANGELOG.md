@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.11.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.10.1...imednet-v0.11.0) (2026-11-15)
+
+
+### Features
+
+* **datadict:** add unified core loaders for CDISC ODM and REDCap ([#1669](https://github.com/fderuiter/imednet-toolkit/issues/1669)) ([e16658a](https://github.com/fderuiter/imednet-toolkit/commit/e16658a4f9a4b57f93ed1b2fda596464b15ec86e))
+* **jobs:** implement pydantic job lifecycle state machine with monotonic transition validation ([#1674](https://github.com/fderuiter/imednet-toolkit/issues/1674)) ([a8f171e](https://github.com/fderuiter/imednet-toolkit/commit/a8f171eeb48df2108c2ad3b26716f9b4792fa047))
+* query lifecycle state machine with formal discrepancy status enum ([#1673](https://github.com/fderuiter/imednet-toolkit/issues/1673)) ([9176fe3](https://github.com/fderuiter/imednet-toolkit/commit/9176fe363ba7d3425f9d6996e69b6896e0faf7ef))
+* **records:** add to_dataframe export to records endpoints ([#1658](https://github.com/fderuiter/imednet-toolkit/issues/1658)) ([8390b1e](https://github.com/fderuiter/imednet-toolkit/commit/8390b1edc88e77dda3ea6e9ec8a8f2b200a938ce))
+* validate deterministic status transitions in TriageStore ([#1655](https://github.com/fderuiter/imednet-toolkit/issues/1655)) ([3afdb60](https://github.com/fderuiter/imednet-toolkit/commit/3afdb60a3f13d34d793cd6b3f1661c99dca5245b))
+
+
+### Bug Fixes
+
+* **cli:** enhance central CLI dispatcher for active subparser help ([#1667](https://github.com/fderuiter/imednet-toolkit/issues/1667)) ([4bedd72](https://github.com/fderuiter/imednet-toolkit/commit/4bedd722609c1f5fbc8df5bc5966e74b5cdef0d0))
+* **cli:** redirect CLI errors to standard error stream ([#1701](https://github.com/fderuiter/imednet-toolkit/issues/1701)) ([b51b8c1](https://github.com/fderuiter/imednet-toolkit/commit/b51b8c199b8b2c06f68be0e41dfac75630a8d634))
+* **export:** validate SQL identifiers, directory paths, and study keys in DuckDB queries ([#1657](https://github.com/fderuiter/imednet-toolkit/issues/1657)) ([39eaa07](https://github.com/fderuiter/imednet-toolkit/commit/39eaa076b4a09e41f862f4c1b670c47c9e6888fa))
+* **security:** migrate datadict XML parsing to defusedxml ([#1654](https://github.com/fderuiter/imednet-toolkit/issues/1654)) ([2c53cad](https://github.com/fderuiter/imednet-toolkit/commit/2c53cad8c0680fe0f6dd882e5748e1fdd71ff765))
+* **security:** replace eval with restricted AST expression evaluation engine ([#1671](https://github.com/fderuiter/imednet-toolkit/issues/1671)) ([dccd8be](https://github.com/fderuiter/imednet-toolkit/commit/dccd8be5f64cdde01b7dc201903f1a3c611e548f))
+
+
+### Performance Improvements
+
+* **export:** prefetch variable metadata in DuckDB form export ([#1668](https://github.com/fderuiter/imednet-toolkit/issues/1668)) ([0b57cd7](https://github.com/fderuiter/imednet-toolkit/commit/0b57cd7a6a16b408f9b8fa98466ec52f43473155))
+
+
+### Documentation
+
+* align domain vocabulary across interfaces and models ([#1666](https://github.com/fderuiter/imednet-toolkit/issues/1666)) ([712409b](https://github.com/fderuiter/imednet-toolkit/commit/712409b7de232cdd710d4073bab4dd8276a77e9b))
+* integrate linkcheck builder and repair broken links ([#1699](https://github.com/fderuiter/imednet-toolkit/issues/1699)) ([56d15b2](https://github.com/fderuiter/imednet-toolkit/commit/56d15b29f9e859cf66b88103ef8c8acee2804d63))
+
 ## [0.10.1](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.10.0...imednet-v0.10.1) (2026-10-23)
 
 

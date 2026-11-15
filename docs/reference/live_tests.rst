@@ -13,6 +13,10 @@ environment. It no longer posts smoke Records before pytest. Mutating scenarios
 remain separately gated by ``IMEDNET_ALLOW_MUTATION=1``. Default offline CI and
 synthetic Postman contract checks do not require these credentials.
 
+The manual workflow uses a read-only GitHub token and publishes outcome counts
+in the Actions job summary. Test failures, missing results, and report aggregation
+failures all fail the job; it does not post pull-request comments.
+
 The suite can auto-discover required IDs when environment variables are unset.
 See :mod:`imednet.discovery` for details on locating study, form, site, subject,
 and interval identifiers at runtime.

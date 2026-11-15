@@ -6,7 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any
 
@@ -162,8 +162,8 @@ class BaseRequestExecutor(ABC):
         try:
             retry_time = parsedate_to_datetime(value)
             if retry_time.tzinfo is None:
-                retry_time = retry_time.replace(tzinfo=timezone.utc)
-            delay = (retry_time - datetime.now(timezone.utc)).total_seconds()
+                retry_time = retry_time.replace(tzinfo=UTC)
+            delay = (retry_time - datetime.now(UTC)).total_seconds()
             return max(delay, 0.0)
         except (TypeError, ValueError, OverflowError):
             return None

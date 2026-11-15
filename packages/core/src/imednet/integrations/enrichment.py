@@ -6,7 +6,7 @@ data using configured mappings, terminology lookups, and PHI masking rules.
 
 import re
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from imednet.models.engine import ResourceRegistry
@@ -63,7 +63,7 @@ class CentralizedMapper:
 
         date_mod = getattr(record, 'date_modified', None)
         if date_mod is None:
-            date_mod = datetime.now(tz=timezone.utc).isoformat()
+            date_mod = datetime.now(tz=UTC).isoformat()
         mapped['date_modified'] = date_mod
 
         if study_key is not None:

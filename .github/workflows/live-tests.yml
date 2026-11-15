@@ -9,7 +9,8 @@ on:
         required: true
         default: false
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   live-validation:
@@ -19,7 +20,6 @@ jobs:
     environment: live-testing
     permissions:
       contents: read
-      pull-requests: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,7 +29,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Cache Workspace Dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -37,9 +37,9 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.10"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.10"-
+            uv-venv-${{ runner.os }}-"3.11"-
 
       - name: Install Dependencies
         run: |
@@ -74,30 +74,29 @@ jobs:
 
           python scripts/aggregate_verification.py
 
-      - name: Post Drift Report
-        if: steps.live_tests.outputs.drift_detected == 'true' && github.event_name == 'pull_request'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('drift_report.txt', 'utf8');
-            const body = `### ⚠️ API Drift Detected\n\nThe live integration tests detected schema drift or structural poly-type shifts:\n\n\`\`\`\n${report.substring(0, 60000)}\n\`\`\``;
-            try {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: body
-              });
-            } catch (error) {
-              console.log('Failed to post drift report comment:', error.message);
-            }
-
-      - name: Fail if tests failed
-        if: steps.live_tests.outputs.pytest_exit_code != '0'
+      - name: Summarize Live Validation
+        if: always()
         env:
           PYTEST_EXIT_CODE: ${{ steps.live_tests.outputs.pytest_exit_code }}
+          DRIFT_DETECTED: ${{ steps.live_tests.outputs.drift_detected }}
+          DRIFT_COUNT: ${{ steps.live_tests.outputs.drift_count }}
         run: |
-          cat pytest_output.txt
-          exit "$PYTEST_EXIT_CODE"
+          {
+            echo "### Live validation"
+            printf 'Pytest exit code: %s\n' "${PYTEST_EXIT_CODE:-not run}"
+            printf 'Drift detected: %s\n' "${DRIFT_DETECTED:-unknown}"
+            printf 'Drift violations: %s\n' "${DRIFT_COUNT:-unknown}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if validation failed
+        if: always()
+        env:
+          PYTEST_EXIT_CODE: ${{ steps.live_tests.outputs.pytest_exit_code }}
+          VALIDATION_OUTCOME: ${{ steps.live_tests.outcome }}
+        run: |
+          if [[ "$VALIDATION_OUTCOME" != "success" || "$PYTEST_EXIT_CODE" != "0" ]]; then
+            if [[ -f pytest_output.txt ]]; then
+              cat pytest_output.txt
+            fi
+            exit 1
+          fi

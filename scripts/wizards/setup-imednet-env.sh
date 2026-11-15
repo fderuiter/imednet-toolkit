@@ -192,7 +192,7 @@ banner "iMedNet EDC Environment & Developer Workspace Setup"
 stage "Tooling & PATH Verification"
 say "Checking required developer tooling (Python, uv, and GitHub CLI)..."
 
-# 1. Check Python >= 3.10
+# 1. Check Python >= 3.11
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then
   PYTHON_BIN="python3"
@@ -203,8 +203,13 @@ fi
 if [[ -n "$PYTHON_BIN" ]]; then
   PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
   say "Found Python $PY_VER ($PYTHON_BIN)"
+  if ! "$PYTHON_BIN" -c "import sys; sys.exit(sys.version_info < (3, 11))"; then
+    warn "Python 3.11+ is required. Upgrade Python before configuring the workspace."
+    exit 1
+  fi
 else
-  warn "Python not found! Please install Python 3.10+."
+  warn "Python not found! Please install Python 3.11+."
+  exit 1
 fi
 
 # 2. Check uv and locate if not in PATH
@@ -291,7 +296,7 @@ pause "Press Enter to proceed to workspace dependency sync..."
 # ── Stage 3: Workspace Dependency Synchronization ─────────────────────────
 stage "Workspace Dependency Sync"
 say "Synchronizing the monorepo workspace virtual environment (.venv)..."
-say "This installs all 5 packages in editable mode along with dev (pytest, ruff, mypy) and docs dependencies."
+say "This installs all 4 packages in editable mode along with dev (pytest, ruff, mypy) and docs dependencies."
 if confirm "Run 'uv sync --extra dev --extra docs' now?"; then
   if command -v uv >/dev/null 2>&1; then
     say "Running 'uv sync --extra dev --extra docs'..."

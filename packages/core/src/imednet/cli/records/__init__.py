@@ -7,7 +7,7 @@ import sys
 
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status
+from ..utils import STUDY_KEY_ARG, display_list, fetching_status, print_error
 from ..utils.export import export_list_to_file
 
 
@@ -24,7 +24,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     @with_sdk
     def list_records(sdk: ImednetSDK, study_key: str, output: str | None = None) -> None:
         if output and output.lower() not in {"json", "csv"}:
-            print("Invalid output format. Use 'json' or 'csv'.")
+            print_error("Invalid output format. Use 'json' or 'csv'.")
             sys.exit(1)
 
         with fetching_status("records", study_key):

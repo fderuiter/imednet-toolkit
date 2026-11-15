@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from collections.abc import Sequence
 from datetime import datetime
@@ -42,6 +43,8 @@ _STATUS_COLOR_MAP = {
     "terminated": "red",
     "withdrawn": "red",
 }
+
+_ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 class _DummyConsole:
@@ -187,3 +190,34 @@ def display_list(
 
     all_keys = list(data_list[0].keys())
     _print_table(data_list, all_keys)
+
+
+def print_error(
+    *objects: Any,
+    sep: str = " ",
+    end: str = "\n",
+    file: Any = None,
+    flush: bool = False,
+) -> None:
+    """Print an error message to sys.stderr safely.
+
+    Handles stream safety edge cases:
+    - Writes to sys.stderr by default (or custom file if provided).
+    - Silently handles BrokenPipeError and IOError/OSError if the stream is closed or broken.
+    - Strips ANSI escape sequences when writing to non-interactive (non-tty) streams.
+    """
+    target = sys.stderr if file is None else file
+    try:
+        is_tty = False
+        try:
+            is_tty = bool(target and hasattr(target, "isatty") and target.isatty())
+        except (AttributeError, ValueError, OSError):
+            is_tty = False
+
+        formatted = sep.join(str(obj) for obj in objects)
+        if not is_tty:
+            formatted = _ANSI_REGEX.sub("", formatted)
+
+        print(formatted, end=end, file=target, flush=flush)
+    except (BrokenPipeError, OSError):
+        pass

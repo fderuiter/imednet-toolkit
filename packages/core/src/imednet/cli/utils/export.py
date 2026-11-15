@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 from imednet.utils import sanitize_csv_formula
 
+from .output import print_error
+
 
 class Model(Protocol):
     """Protocol for objects that can be dumped to a dictionary."""
@@ -28,7 +30,7 @@ def export_list_to_file(
     """Export a list of Pydantic models to a file."""
     fmt = output_format.lower()
     if fmt not in {"csv", "json"}:
-        print(f"Error: Invalid output format: '{fmt}'. Supported: csv, json.")
+        print_error(f"Error: Invalid output format: '{fmt}'. Supported: csv, json.")
         sys.exit(1)
 
     path = Path(f"{filename_prefix}.{fmt}")

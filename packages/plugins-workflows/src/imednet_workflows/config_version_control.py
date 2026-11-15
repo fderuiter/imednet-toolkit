@@ -14,7 +14,7 @@ import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -267,7 +267,7 @@ class ConfigVersionStore:
 
         config_json = json.dumps(config.model_dump(mode="json", by_alias=True), sort_keys=True)
         commit_id = _sha256_of(config_json)
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
 
         # Secure the payload using Fernet encryption before writing to SQLite
         encrypted_config_json = _encrypt_payload(config_json)

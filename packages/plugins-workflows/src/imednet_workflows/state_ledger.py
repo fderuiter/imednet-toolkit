@@ -8,7 +8,7 @@ import json
 import os
 import tempfile
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -297,7 +297,7 @@ class FileStateProvider(BaseStateProvider):
             # Ensure return datetime is timezone-aware
             ts = stream.last_timestamp
             if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
+                ts = ts.replace(tzinfo=UTC)
             return ts
 
     def get_last_status(self, study_key: str, stream_name: str) -> StreamExecutionStatus | None:
@@ -337,7 +337,7 @@ class FileStateProvider(BaseStateProvider):
 
             # Ensure timezone-aware datetime
             if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=timezone.utc)
+                timestamp = timestamp.replace(tzinfo=UTC)
 
             study.streams[stream_name] = StreamState(
                 last_timestamp=timestamp,
@@ -371,16 +371,16 @@ class FileStateProvider(BaseStateProvider):
             if current_stream:
                 last_ts = current_stream.last_timestamp
                 if last_ts.tzinfo is None:
-                    last_ts = last_ts.replace(tzinfo=timezone.utc)
+                    last_ts = last_ts.replace(tzinfo=UTC)
             if last_ts is None:
                 last_ts = fallback_timestamp
             if last_ts is not None and last_ts.tzinfo is None:
-                last_ts = last_ts.replace(tzinfo=timezone.utc)
+                last_ts = last_ts.replace(tzinfo=UTC)
 
             # Atomic transaction guard: ensure transition to RUNNING is valid
             validate_transition(current_status, StreamExecutionStatus.RUNNING)
 
-            running_ts = last_ts or datetime.now(timezone.utc)
+            running_ts = last_ts or datetime.now(UTC)
             study.streams[stream_name] = StreamState(
                 last_timestamp=running_ts,
                 records_processed=0,
@@ -403,7 +403,7 @@ class FileStateProvider(BaseStateProvider):
                 new_ts = tx_data.get("new_timestamp")
                 commit_ts = new_ts or last_ts or running_ts
                 if commit_ts.tzinfo is None:
-                    commit_ts = commit_ts.replace(tzinfo=timezone.utc)
+                    commit_ts = commit_ts.replace(tzinfo=UTC)
 
                 study_entry = state.studies.setdefault(study_key, StudyState())
                 study_entry.streams[stream_name] = StreamState(
@@ -560,7 +560,7 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
         validated_status = _coerce_and_validate_status(status)
 
         if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
+            timestamp = timestamp.replace(tzinfo=UTC)
 
         val = {
             "last_timestamp": timestamp.isoformat(),
@@ -591,7 +591,7 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
             if exec_date_str:
                 exec_date = datetime.fromisoformat(exec_date_str)
             else:
-                exec_date = datetime.now(timezone.utc)
+                exec_date = datetime.now(UTC)
 
             XCom.set(
                 key=self._get_xcom_key(study_key, stream_name),
@@ -615,13 +615,13 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
         if last_ts is None:
             last_ts = fallback_timestamp
         if last_ts is not None and last_ts.tzinfo is None:
-            last_ts = last_ts.replace(tzinfo=timezone.utc)
+            last_ts = last_ts.replace(tzinfo=UTC)
 
         current_status = self.get_last_status(study_key, stream_name)
         # Atomic transaction guard: ensure transition to RUNNING is valid
         validate_transition(current_status, StreamExecutionStatus.RUNNING)
 
-        running_ts = last_ts or datetime.now(timezone.utc)
+        running_ts = last_ts or datetime.now(UTC)
         self.set_last_timestamp(
             study_key=study_key,
             stream_name=stream_name,
@@ -720,7 +720,7 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
                     if isinstance(val, dict) and "last_timestamp" in val:
                         ts = datetime.fromisoformat(val["last_timestamp"])
                         if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=timezone.utc)
+                            ts = ts.replace(tzinfo=UTC)
 
                         study = state.studies.setdefault(s_key, StudyState())
                         study.streams[s_name] = StreamState(

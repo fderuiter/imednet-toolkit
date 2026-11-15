@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.8.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-workflows-v0.7.0...imednet-workflows-v0.8.0) (2026-11-15)
+
+
+### Features
+
+* query lifecycle state machine with formal discrepancy status enum ([#1673](https://github.com/fderuiter/imednet-toolkit/issues/1673)) ([9176fe3](https://github.com/fderuiter/imednet-toolkit/commit/9176fe363ba7d3425f9d6996e69b6896e0faf7ef))
+* validate deterministic status transitions in TriageStore ([#1655](https://github.com/fderuiter/imednet-toolkit/issues/1655)) ([3afdb60](https://github.com/fderuiter/imednet-toolkit/commit/3afdb60a3f13d34d793cd6b3f1661c99dca5245b))
+* **workflows:** concurrent batch job polling for bulk record submission ([#1651](https://github.com/fderuiter/imednet-toolkit/issues/1651)) ([ac5411a](https://github.com/fderuiter/imednet-toolkit/commit/ac5411add039fc77a9714cf5eeec84d5a098663c))
+* **workflows:** implement stream execution state machine with atomic transaction guards ([#1659](https://github.com/fderuiter/imednet-toolkit/issues/1659)) ([f379d13](https://github.com/fderuiter/imednet-toolkit/commit/f379d13eb492682ab27db12dcf9c9e59c9a8cba1))
+
+
+### Bug Fixes
+
+* **deps:** relax filelock constraint and upgrade vulnerable runtime packages ([#1672](https://github.com/fderuiter/imednet-toolkit/issues/1672)) ([efc39d3](https://github.com/fderuiter/imednet-toolkit/commit/efc39d3cd17d06af71268657c9b5862003fc014f))
+* **export:** validate SQL identifiers, directory paths, and study keys in DuckDB queries ([#1657](https://github.com/fderuiter/imednet-toolkit/issues/1657)) ([39eaa07](https://github.com/fderuiter/imednet-toolkit/commit/39eaa076b4a09e41f862f4c1b670c47c9e6888fa))
+* **security:** replace eval with restricted AST expression evaluation engine ([#1671](https://github.com/fderuiter/imednet-toolkit/issues/1671)) ([dccd8be](https://github.com/fderuiter/imednet-toolkit/commit/dccd8be5f64cdde01b7dc201903f1a3c611e548f))
+
+
+### Performance Improvements
+
+* stream active record identifiers with lightweight projection ([#1663](https://github.com/fderuiter/imednet-toolkit/issues/1663)) ([e655612](https://github.com/fderuiter/imednet-toolkit/commit/e655612040ae94f4454325a5ba1a5cfb28827bab))
+* **workflows:** eliminate redundant serialization and cache compiled logic ([#1656](https://github.com/fderuiter/imednet-toolkit/issues/1656)) ([6f4d7e8](https://github.com/fderuiter/imednet-toolkit/commit/6f4d7e878613349e50304c680d0201a6d1995118))
+* **workflows:** switch SyncWorker to sync_records and sql count ([#1653](https://github.com/fderuiter/imednet-toolkit/issues/1653)) ([387602a](https://github.com/fderuiter/imednet-toolkit/commit/387602a61abae9f2cfe816a404f8f4aa660712e0))
+
+
+### Documentation
+
+* align domain vocabulary across interfaces and models ([#1666](https://github.com/fderuiter/imednet-toolkit/issues/1666)) ([712409b](https://github.com/fderuiter/imednet-toolkit/commit/712409b7de232cdd710d4073bab4dd8276a77e9b))
+
 ## [0.7.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-workflows-v0.6.0...imednet-workflows-v0.7.0) (2026-09-10)
 
 

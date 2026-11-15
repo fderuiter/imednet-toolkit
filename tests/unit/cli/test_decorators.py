@@ -53,4 +53,5 @@ def test_decorator_handles_unexpected_error(monkeypatch: pytest.MonkeyPatch) -> 
     result = runner.invoke(cli.app, ["studies", "list"])
 
     assert result.exit_code == 1
-    assert "Unexpected error" in result.stdout
+    assert "Unexpected error" in result.stderr
+    assert "Unexpected error" not in result.stdout

@@ -1,7 +1,11 @@
 """Guard the boundary between scheduled offline CI and approved live validation."""
 
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
@@ -35,6 +39,8 @@ def test_live_validation_requires_manual_approval() -> None:
     assert suite["env"]["IMEDNET_RUN_E2E"] == "1"
     assert suite["env"]["IMEDNET_ALLOW_MUTATION"] == "${{ vars.IMEDNET_ALLOW_MUTATION }}"
     assert "pytest tests/live/" in suite["run"]
+    assert workflow["permissions"] == {"contents": "read"}
+    assert job["permissions"] == {"contents": "read"}
 
 
 def test_retired_smoke_helpers_are_not_executable_workflow_steps() -> None:
@@ -45,3 +51,29 @@ def test_retired_smoke_helpers_are_not_executable_workflow_steps() -> None:
         source = path.read_text(encoding="utf-8")
         assert "post_smoke_record.py" not in source, path.name
         assert "Scheduled Smoke Test Failed" not in source, path.name
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is needed for workflow scripts")
+@pytest.mark.parametrize(
+    "pytest_exit_code,outcome,expected",
+    [("0", "success", 0), ("1", "success", 1), ("0", "failure", 1), ("", "skipped", 1)],
+)
+def test_live_workflow_propagates_test_and_aggregation_failures(
+    tmp_path, pytest_exit_code, outcome, expected
+) -> None:
+    """Aggregation errors must not be hidden by a passing pytest exit code."""
+    workflow = yaml.load(
+        (WORKFLOWS / "live-tests.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+    step = workflow["jobs"]["live-validation"]["steps"][-1]
+    assert step["if"] == "always()"
+    result = subprocess.run(
+        [shutil.which("bash"), "-e", "-c", step["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "PYTEST_EXIT_CODE": pytest_exit_code, "VALIDATION_OUTCOME": outcome},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == expected, result.stderr

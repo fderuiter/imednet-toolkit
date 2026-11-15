@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 
@@ -149,7 +149,7 @@ class TriageStore:
 
     def upsert_item(self, item: TriageItem) -> None:
         """Insert or update a triage item and its associated annotations and history."""
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
 
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to write triage item data."""
@@ -376,7 +376,7 @@ class TriageStore:
                 SET assignee = ?, updated_at = ?
                 WHERE item_id = ?
                 """,
-                (assignee.strip(), datetime.now(timezone.utc).isoformat(), item_id),
+                (assignee.strip(), datetime.now(UTC).isoformat(), item_id),
             )
             if cursor.rowcount == 0:
                 raise ValueError(f"Unknown triage item: {item_id}")
@@ -392,7 +392,7 @@ class TriageStore:
     ) -> None:
         """Update the status of a triage item and record the transition in history."""
         normalized_comment = comment.strip() if comment else None
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
 
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to update item status."""
@@ -447,7 +447,7 @@ class TriageStore:
         if not cleaned_comment:
             raise ValueError("Annotation comment must not be empty")
 
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
 
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to add item annotation."""
@@ -532,7 +532,7 @@ class TriageStore:
         columns = {
             str(row["name"]) for row in conn.execute("PRAGMA table_info(triage_items)").fetchall()
         }
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         if "created_at" not in columns:
             conn.execute("ALTER TABLE triage_items ADD COLUMN created_at TEXT")
             conn.execute(

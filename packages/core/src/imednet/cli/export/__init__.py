@@ -9,7 +9,7 @@ from pathlib import Path
 
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, fetching_status
+from ..utils import STUDY_KEY_ARG, fetching_status, print_error
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -25,7 +25,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     @with_sdk
     def export_parquet(sdk: ImednetSDK, study_key: str, path: Path) -> None:
         if importlib.util.find_spec("pyarrow") is None:
-            print(
+            print_error(
                 "Error: pyarrow is required for Parquet export. Install with \"pip install 'imednet[export]'\"."
             )
             sys.exit(1)
@@ -46,7 +46,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     @with_sdk
     def export_csv(sdk: ImednetSDK, study_key: str, path: Path) -> None:
         if importlib.util.find_spec("pandas") is None:
-            print("Error: pandas is required for CSV export.")
+            print_error("Error: pandas is required for CSV export.")
             sys.exit(1)
         from .. import export_to_csv
 
@@ -66,7 +66,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             importlib.util.find_spec("pandas") is None
             or importlib.util.find_spec("openpyxl") is None
         ):
-            print("Error: pandas and openpyxl are required for Excel export.")
+            print_error("Error: pandas and openpyxl are required for Excel export.")
             sys.exit(1)
         from .. import export_to_excel
 
@@ -117,7 +117,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         use_labels: bool = False,
     ) -> None:
         if importlib.util.find_spec("duckdb") is None:
-            print(
+            print_error(
                 "Error: duckdb is required for DuckDB export. Install with \"pip install 'imednet[duckdb]'\""
             )
             sys.exit(1)
@@ -126,7 +126,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         try:
             _validate_duckdb_identifier(table_name)
         except ValueError as exc:
-            print(f"Error: {exc}")
+            print_error(f"Error: {exc}")
             sys.exit(1)
 
         from .. import export_to_duckdb
@@ -185,7 +185,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         forms: str | None = None,
     ) -> None:
         if importlib.util.find_spec("sqlalchemy") is None:
-            print("Error: SQLAlchemy is required for SQL export.")
+            print_error("Error: SQLAlchemy is required for SQL export.")
             sys.exit(1)
         from sqlalchemy import create_engine
 
@@ -253,7 +253,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         upsert: bool = True,
     ) -> None:
         if importlib.util.find_spec("pymongo") is None:
-            print(
+            print_error(
                 "Error: pymongo is required for MongoDB export. Install with \"pip install 'imednet[mongodb]'\""
             )
             sys.exit(1)
@@ -309,7 +309,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         merge: bool = True,
     ) -> None:
         if importlib.util.find_spec("neo4j") is None:
-            print(
+            print_error(
                 "Error: neo4j is required for Neo4j export. Install with \"pip install 'imednet[neo4j]'\""
             )
             sys.exit(1)
@@ -390,7 +390,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             importlib.util.find_spec("snowflake.connector") is None
             or importlib.util.find_spec("pyarrow") is None
         ):
-            print(
+            print_error(
                 "Error: snowflake-connector-python and pyarrow are required for Snowflake export. Install with \"pip install 'imednet[snowflake]'\""
             )
             sys.exit(1)

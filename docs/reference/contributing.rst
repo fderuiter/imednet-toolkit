@@ -2,8 +2,8 @@ Contributing
 ============
 
 This guide summarizes how to set up your environment, validate changes, and submit
-pull requests. Please review our `Code of Conduct <../CODE_OF_CONDUCT.md>`__ and
-see `CONTRIBUTING.md <../CONTRIBUTING.md>`__ for complete details.
+pull requests. Please review our `Code of Conduct <https://github.com/fderuiter/imednet-toolkit/blob/main/CODE_OF_CONDUCT.md>`__ and
+see `CONTRIBUTING.md <https://github.com/fderuiter/imednet-toolkit/blob/main/CONTRIBUTING.md>`__ for complete details.
 
 .. toctree::
    :maxdepth: 1
@@ -22,7 +22,7 @@ We recommend using our interactive setup wizard to configure your environment, c
 
    bash scripts/wizards/setup-imednet-env.sh
 
-The wizard configures UTF-8 encoding (preventing Windows console errors), validates your ``uv`` installation, synchronizes all 5 packages in editable mode (``uv sync --extra dev --extra docs``), and configures ``.env`` with EDC credentials and safety flags.
+The wizard configures UTF-8 encoding (preventing Windows console errors), validates your ``uv`` installation, synchronizes all 4 packages in editable mode (``uv sync --extra dev --extra docs``), and configures ``.env`` with EDC credentials and safety flags.
 
 For manual setup:
 

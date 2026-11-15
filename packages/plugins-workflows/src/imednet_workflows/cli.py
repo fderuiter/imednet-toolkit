@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from imednet.sdk import ImednetSDK
@@ -196,10 +196,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         try:
             normalized = timestamp.replace("Z", "+00:00")
             dt = datetime.fromisoformat(normalized)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
+            dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
         except ValueError as err:
             print(f"Invalid ISO timestamp format: {err}")
             sys.exit(1)
@@ -347,10 +344,7 @@ def state_app(args: list[str] | None = None) -> None:
         try:
             normalized = timestamp.replace("Z", "+00:00")
             dt = datetime.fromisoformat(normalized)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
+            dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
         except ValueError as err:
             print(f"Invalid ISO timestamp format: {err}")
             sys.exit(1)

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -109,7 +109,7 @@ class Metadata(BaseModel):
         **extra: Any,
     ) -> Metadata:
         """Create a Metadata envelope with current UTC timestamp."""
-        now_timestamp = datetime.now(timezone.utc).strftime("%m-%d-%Y %H:%M:%S")
+        now_timestamp = datetime.now(UTC).strftime("%m-%d-%Y %H:%M:%S")
         return cls(
             schemaVersion="1.0.0",
             studyKey=study_key,

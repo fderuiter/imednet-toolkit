@@ -31,7 +31,7 @@ class FormDesignerClient:
         """Initialize the client.
 
         Args:
-            base_url: The base URL of the iMedNet instance (e.g., https://xyz.imednet.com).
+            base_url: The base URL of the iMedNet instance (e.g., ``https://xyz.imednet.com``).
             phpsessid: The active PHP session ID from the browser.
             timeout: Request timeout in seconds.
         """

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from imednet.config import load_config
 from imednet.sdk import ImednetSDK
 
-from .output import console
+from .output import console, print_error
 
 
 def get_sdk() -> ImednetSDK:
@@ -17,7 +17,9 @@ def get_sdk() -> ImednetSDK:
     try:
         config = load_config()
     except ValueError:
-        print("Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set.")
+        print_error(
+            "Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set."
+        )
         sys.exit(1)
 
     try:
@@ -27,7 +29,7 @@ def get_sdk() -> ImednetSDK:
             base_url=config.base_url,
         )
     except Exception as exc:  # pragma: no cover - defensive
-        print(f"Error initializing SDK: {exc}")
+        print_error(f"Error initializing SDK: {exc}")
         sys.exit(1)
 
 

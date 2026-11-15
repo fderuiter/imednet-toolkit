@@ -1,7 +1,7 @@
 # Contributing
 
 ## Project scope
-The SDK targets Python 3.10–3.12 and includes:
+The SDK targets Python 3.11–3.13 and includes:
 
 - Core SDK package under `packages/core/src/imednet/`
 - Workflow orchestration package under `packages/plugins-workflows/src/imednet_workflows/`
@@ -16,9 +16,10 @@ quality gates, and release expectations.
 - `packages/plugins-workflows/src/imednet_workflows/`: higher-level workflows built on the SDK.
 - `packages/providers-airflow/src/apache_airflow_providers_imednet/`: Airflow hooks/operators.
 
-For the architecture view, see `docs/architecture.rst`.
+For the architecture view, see `docs/explanation/architecture.rst`.
 
 ## Prerequisites
+- Python 3.11 or newer; recreate existing Python 3.10 virtual environments.
 - [Make](https://www.gnu.org/software/make/) (optional, for building docs)
 
 ## Setup

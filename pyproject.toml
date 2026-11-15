@@ -5,7 +5,7 @@ description = "Monorepo workspace for imednet packages"
 authors = [
     { name = "Frederick de Ruiter", email = "127706008+fderuiter@users.noreply.github.com" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "imednet",
     "imednet-workflows",
@@ -14,6 +14,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "ruff==0.15.22",
+    "pyyaml>=6.0.3,<7.0.0",
+    "httpx[socks]>=0.28.1,<0.29.0",
     "pandas>=2.2.3,<3.0.0",
     "duckdb>=1.1.0",
     "pyarrow>=14.0.1",
@@ -22,23 +25,23 @@ dev = [
     "respx>=0.22.0,<0.24.0",
     "pytest-asyncio>=0.24.0",
     "faker>=24.9.0,<41.0.0",
-    "sphinx>=6.2.0,<9.0.0",
-    "sphinx-autodoc-typehints",
-    "sphinx-rtd-theme>=3.0.2,<4.0.0",
     "sqlalchemy>=2.0,<3.0.0",
     "openpyxl>=3.1,<4.0.0",
-    "sphinxcontrib-mermaid>=0.9.2,<2.2.0",
     "neo4j>=6.2.0,<7.0.0",
     "pymongo>=4.17.0,<5.0.0",
     "atheris>=3.0.0,<4.0.0; python_version>='3.12' and sys_platform != 'win32'",
-    "sphinx-argparse>=0.5.0",
     "click>=8.3.3",
     "jsonschema>=4.20.0"
 ]
 docs = [
     "furo<2026.0.0",
     "myst-parser>=1.0.0",
-    "mypy>=1.15.0,<2.5.0"
+    "mypy>=1.15.0,<2.5.0",
+    "sphinx>=6.2.0,<9.0.0",
+    "sphinx-autodoc-typehints",
+    "sphinx-rtd-theme>=3.0.2,<4.0.0",
+    "sphinxcontrib-mermaid>=0.9.2,<2.2.0",
+    "sphinx-argparse>=0.5.0"
 ]
 
 [build-system]
@@ -110,6 +113,14 @@ module = [
 ignore_missing_imports = true
 
 [tool.ruff.lint.per-file-ignores]
+# StrEnum changes str(member); preserve existing public enum formatting.
+"packages/core/src/imednet/models/jobs.py*" = ["UP042"]
+"packages/core/src/imednet/models/queries.py*" = ["UP042"]
+"packages/core/src/imednet/models/triage.py" = ["UP042"]
+"packages/plugins-workflows/src/imednet_workflows/state_ledger.py" = ["UP042"]
+"packages/plugins-workflows/src/imednet_workflows/uat/engine.py" = ["UP042"]
+"packages/plugins-workflows/src/imednet_workflows/uat/models.py" = ["UP042"]
+"packages/plugins-workflows/src/imednet_workflows/uat/orchestrator.py" = ["UP042"]
 "docs/**/*.py" = ["D", "RUF"]
 "packages/core/**/*.py" = ["SLF001"]
 "packages/core/src/imednet/integrations/export.py" = ["D101", "D102", "D107", "S608"]
@@ -167,13 +178,14 @@ validate_package_consumption = "python scripts/validate_package_consumption.py {
 
 [tool.hatch.envs.lint]
 detached = true
-python = "3.10"
+installer = "uv"
+python = "3.11"
 dependencies = [
     "vulture>=2.11",
-    "ruff>=0.11.6,<0.16.0",
+    "ruff==0.15.22",
     "mypy>=1.15.0,<2.5.0",
     "typos",
-    "semgrep",
+    "semgrep==1.185.0",
     "pip-audit",
     "detect-secrets",
     "pandas-stubs",
@@ -194,8 +206,9 @@ fmt = "ruff format --check {args:packages}"
 ruff-check = "ruff check {args:packages}"
 mypy-check = "mypy {args:packages}"
 typos-check = "typos {args:packages}"
-semgrep-check = "semgrep scan --config p/security-audit --error {args:packages}"
-audit = "pip-audit -s osv --timeout 60 --ignore-vuln PYSEC-2026-3481 --ignore-vuln CVE-2026-52870 --ignore-vuln GHSA-hvrp-rf83-w775 --ignore-vuln PYSEC-2026-3482 --ignore-vuln GHSA-jpw9-pfvf-9f58 --ignore-vuln CVE-2026-52869 --ignore-vuln PYSEC-2026-3483 --ignore-vuln GHSA-vj7q-gjh5-988w --ignore-vuln CVE-2026-59950 --ignore-vuln CVE-2026-114605 --ignore-vuln CVE-2026-128089 --ignore-vuln CVE-2026-112906 --ignore-vuln CVE-2026-112907 --ignore-vuln CVE-2026-112908 --ignore-vuln CVE-2026-112909 --ignore-vuln CVE-2026-112910 --ignore-vuln CVE-2026-112911 --ignore-vuln CVE-2026-112912 --ignore-vuln CVE-2026-112913 --ignore-vuln CVE-2026-112914 --ignore-vuln CVE-2026-112915 --ignore-vuln CVE-2026-112934 --ignore-vuln CVE-2026-112935 --ignore-vuln CVE-2026-112936 --ignore-vuln CVE-2026-112937 --ignore-vuln CVE-2026-112938 --ignore-vuln CVE-2026-112939 --ignore-vuln CVE-2026-112940 --ignore-vuln CVE-2026-112941 --ignore-vuln CVE-2026-116685 --ignore-vuln CVE-2026-59951 --ignore-vuln CVE-2026-116686 --ignore-vuln CVE-2026-116684 --ignore-vuln CVE-2026-126360 --ignore-vuln CVE-2026-114603"
+semgrep-check = "semgrep scan --config p/security-audit --metrics off --error {args:packages}"
+# Scanner-only upstream exceptions: docs/reference/security_exceptions.rst
+audit = "pip-audit -s osv --timeout 60 --ignore-vuln CVE-2026-116685 --ignore-vuln CVE-2026-59951 --ignore-vuln CVE-2026-116686 --ignore-vuln CVE-2026-116684 --ignore-vuln CVE-2026-126360 --ignore-vuln CVE-2026-114603"
 secrets = "detect-secrets-hook --baseline .secrets.baseline {args:packages}"
 vulture-check = "vulture {args:packages} vulture_whitelist.py --min-confidence 80 --exclude **/tests/**,**/docs/**,**/scripts/**"
 pylint-sim = "pylint --disable=all --enable=similarities --min-similarity-lines=20 --ignore-paths='.*/tests/.*,.*/docs/.*,.*/scripts/.*,.*/models/.*,tests/.*,docs/.*,scripts/.*,.*\\.json$' --ignore-patterns='.*monitor.*,.*integrations.*,.*sinks.*,.*testing.*' {args:packages}"
@@ -245,7 +258,6 @@ apache-airflow-providers-imednet = { workspace = true }
 [[tool.mypy.overrides]]
 module = [
     "imednet.form_designer.*",
-    "imednet.compat.*",
     "apache_airflow_providers_imednet.*"
 ]
 strict = false

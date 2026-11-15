@@ -69,7 +69,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from imednet.errors import ExportConfigurationError
@@ -120,7 +120,7 @@ def _post_process_document(doc: dict[str, Any]) -> dict[str, Any]:
     study_key = doc.get("study_key")
     record_id = doc.get("record_id")
     doc["_id"] = _make_document_id(str(study_key), record_id)
-    doc["exported_at"] = datetime.now(tz=timezone.utc).isoformat()
+    doc["exported_at"] = datetime.now(tz=UTC).isoformat()
     return doc
 
 
