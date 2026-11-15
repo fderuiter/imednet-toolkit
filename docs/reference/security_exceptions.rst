@@ -7,7 +7,7 @@ Filelock must resolve to version 4.2.1 or newer; no filelock advisory is ignored
 Python 3.11 or newer is required so patched releases can install.
 
 Scanner-only upstream exceptions
--------------------------------
+--------------------------------
 
 **Owner:** repository maintainer (``fderuiter``).
 **Last verified:** November 14, 2026.
