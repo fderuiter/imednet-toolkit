@@ -14,8 +14,10 @@ from imednet.core.endpoint.dispatch import (
     SyncEndpointContext,
     execute_get,
     execute_list,
+    execute_operation,
 )
 from imednet.core.endpoint.operations import FilterGetOperation, ListOperation
+from imednet.core.endpoint.operations.get import PathGetOperation
 from imednet.core.endpoint.strategies import (
     DefaultParamProcessor,
     KeepStudyKeyStrategy,
@@ -96,6 +98,44 @@ class GenericEndpoint(EndpointABC[T]):
             raise RuntimeError("Async client not configured")
         return self._async_client
 
+    def _parse_item(self, item: Any) -> T:
+        """Parse a raw API item into a Pydantic model instance."""
+        parse_func = get_model_parser(self.MODEL)
+        return parse_func(item)
+
+    def _resolve_parse_func(self) -> Callable[[Any], T]:
+        """Return the function used to parse items for this endpoint."""
+        return self._parse_item
+
+    @staticmethod
+    def _require_item_id(item_id: ItemId) -> None:
+        """Ensure that an item ID was provided."""
+        if item_id is None:
+            raise TypeError("Missing required argument: item_id")
+
+
+class _GetEndpointBase(GenericEndpoint[T]):
+    """Generic base for endpoints providing single-resource retrieval."""
+
+    @execute_operation  # type: ignore
+    def get(self, study_key: str | None, item_id: ItemId) -> PathGetOperation[T]:
+        """Retrieve a single resource by its ID.
+
+        Args:
+            study_key: The study key.
+            item_id: The ID of the resource to retrieve.
+
+        Returns:
+            The requested resource.
+        """
+        self._require_item_id(item_id)
+        path = self._get_endpoint_path(study_key, item_id)
+        return PathGetOperation[T](
+            path=path,
+            parse_func=self._resolve_parse_func(),
+            not_found_func=lambda: self._raise_not_found(study_key, item_id),
+        )
+
 
 class _ListGetEndpointBase(GenericEndpoint[T]):
     """Generic base for endpoints that provide list and get-by-filter functionality.
@@ -125,15 +165,6 @@ class _ListGetEndpointBase(GenericEndpoint[T]):
         if self.PARAM_PROCESSOR:
             return self.PARAM_PROCESSOR
         return self.PARAM_PROCESSOR_CLS()
-
-    def _parse_item(self, item: Any) -> T:
-        """Parse a raw API item into a Pydantic model instance."""
-        parse_func = get_model_parser(self.MODEL)
-        return parse_func(item)
-
-    def _resolve_parse_func(self) -> Callable[[Any], T]:
-        """Return the function used to parse items for this endpoint."""
-        return self._parse_item
 
     def _resolve_params(
         self,
@@ -222,12 +253,6 @@ class _ListGetEndpointBase(GenericEndpoint[T]):
             self._raise_not_found(study_key, item_id)
         return items[0]
 
-    @staticmethod
-    def _require_item_id(item_id: ItemId) -> None:
-        """Ensure that an item ID was provided."""
-        if item_id is None:
-            raise TypeError("Missing required argument: item_id")
-
     @execute_list  # type: ignore
     def list(self, study_key: str | None = None, **filters: FilterValue) -> ListOperation[T]:
         """List resources matching the given filters.
@@ -305,6 +330,30 @@ class _ListGetEndpointBase(GenericEndpoint[T]):
         )
 
 
+class SyncGetEndpoint(_GetEndpointBase[T], SyncEndpointContext):
+    """Synchronous endpoint providing single-resource get functionality."""
+
+    def __init__(
+        self,
+        client: RequesterProtocol,
+        ctx: object | None = None,
+    ) -> None:
+        """Initialize the synchronous endpoint; retain the deprecated ctx argument."""
+        super().__init__(client=client, ctx=ctx)
+
+
+class AsyncGetEndpoint(_GetEndpointBase[T], AsyncEndpointContext):
+    """Asynchronous endpoint providing single-resource get functionality."""
+
+    def __init__(
+        self,
+        async_client: AsyncRequesterProtocol,
+        ctx: object | None = None,
+    ) -> None:
+        """Initialize the asynchronous endpoint; retain the deprecated ctx argument."""
+        super().__init__(async_client=async_client, ctx=ctx)
+
+
 class SyncListGetEndpoint(_ListGetEndpointBase[T], SyncEndpointContext):
     """Synchronous endpoint providing list and get functionality."""
 
@@ -329,5 +378,6 @@ class AsyncListGetEndpoint(_ListGetEndpointBase[T], AsyncEndpointContext):
         super().__init__(async_client=async_client, ctx=ctx)
 
 
-# Backward-compatible alias. New code should use SyncListGetEndpoint / AsyncListGetEndpoint.
+# Backward-compatible aliases. New code should use Sync* / Async* classes.
 GenericListGetEndpoint = SyncListGetEndpoint
+GenericGetEndpoint = SyncGetEndpoint

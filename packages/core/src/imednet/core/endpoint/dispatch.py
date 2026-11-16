@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import functools
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
-from typing import Any, Concatenate, Generic, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Concatenate, Generic, TypeVar, overload
 
 from typing_extensions import ParamSpec
 
-from imednet.core.endpoint.operations.filter_get import FilterGetOperation
-from imednet.core.endpoint.operations.list import ListOperation
+if TYPE_CHECKING:
+    from imednet.core.endpoint.operations.filter_get import FilterGetOperation
+    from imednet.core.endpoint.operations.list import ListOperation
 
 T = TypeVar("T")
 P = ParamSpec("P")
