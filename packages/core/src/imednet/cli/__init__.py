@@ -18,7 +18,7 @@ from ..integrations.export import (
     export_to_sql,
     export_to_sql_by_form,
 )
-from .decorators import with_sdk
+from .decorators import _redact_secrets, with_sdk
 from .utils import get_sdk, parse_filter_args
 
 __all__ = [
@@ -85,7 +85,10 @@ def get_parser() -> argparse.ArgumentParser:
             plugin_setup(subparsers)
             registered_plugins.add(entry_point.name)
         except Exception as e:
-            print(f"Warning: Failed to load CLI plugin '{entry_point.name}': {e}", file=sys.stderr)
+            print(
+                f"Warning: Failed to load CLI plugin '{entry_point.name}': {_redact_secrets(str(e))}",
+                file=sys.stderr,
+            )
 
     if "workflows" not in registered_plugins:
         workflows_parser = subparsers.add_parser(

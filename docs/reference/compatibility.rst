@@ -53,11 +53,11 @@ New optional capabilities must preserve old defaults. Private underscore members
 are not extension contracts; use the SPI. Response schema additions must not be
 silently presented as complete vendor schema coverage.
 
-The earlier ``ctx`` constructor removal in PR #1670 has already merged. It is a
-known compatibility deviation, not a precedent for removing further parameters.
+The earlier ``ctx`` constructor removal in PR #1670 is repaired for concrete
+list/get endpoints with its prior warning; GenericEndpoint accepts it by keyword.
 Use ``sdk.study_context(study_key)`` for scoped study selection; context tokens
-are restored on exit. Track restoration or a versioned migration before advertising
-compatibility to historical callers. Sync and async SDKs have distinct lifecycles;
+are restored on exit. Historical generic three-positional constructors must migrate to explicit keywords;
+the current positional async-client argument is preserved. Sync and async SDKs have distinct lifecycles;
 use ``with`` and ``async with`` respectively.
 
 Release acceptance checklist

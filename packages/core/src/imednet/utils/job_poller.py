@@ -33,6 +33,7 @@ __all__ = [
     "JobPollSummary",
     "JobPoller",
     "JobProgressCallback",
+    "JobProgressHandler",
     "JobStatusEvent",
     "JobTimeoutError",
     "evaluate_job_state",
@@ -72,6 +73,9 @@ class JobStatusEvent:
     poll_number: int  # 1-based poll attempt count
     elapsed: float  # seconds since polling started
     is_terminal: bool  # shortcut: status.is_terminal
+
+
+JobProgressHandler = JobProgressCallback | Callable[[JobStatusEvent], None]
 
 
 @dataclass
@@ -234,20 +238,26 @@ class BaseJobPoller:
 
     def _trigger_callback(
         self,
-        on_progress: JobProgressCallback | None,
+        on_progress: JobProgressHandler | None,
         event: JobStatusEvent,
     ) -> None:
         """Invoke the progress callback with signature detection."""
-        if not on_progress:
+        if on_progress is None:
             return
-
-        sig = inspect.signature(on_progress)
-        if len(sig.parameters) == 1:
-            # New style: (event: JobStatusEvent)
-            on_progress(event)  # type: ignore
+        legacy_args = (event.batch_id, event.status, event.elapsed)
+        try:
+            signature = inspect.signature(on_progress)
+        except (TypeError, ValueError):
+            # Opaque builtins use the original three-argument contract, exactly once.
+            cast(JobProgressCallback, on_progress)(*legacy_args)
+            return
+        try:
+            signature.bind(*legacy_args)
+        except TypeError:
+            signature.bind(event)
+            cast(Callable[[JobStatusEvent], None], on_progress)(event)
         else:
-            # Old style: (batch_id, status, elapsed)
-            on_progress(event.batch_id, event.status, event.elapsed)
+            cast(JobProgressCallback, on_progress)(*legacy_args)
 
 
 class JobPoller(BaseJobPoller):
@@ -275,7 +285,7 @@ class JobPoller(BaseJobPoller):
         interval: float = 5.0,
         timeout: float = 300.0,
         *,
-        on_progress: JobProgressCallback | None = None,
+        on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Synchronously poll a job until completion."""
         start = time.monotonic()
@@ -347,7 +357,7 @@ class JobPoller(BaseJobPoller):
         interval: float = 5.0,
         timeout: float = 300.0,
         *,
-        on_progress: JobProgressCallback | None = None,
+        on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
         """Poll multiple jobs concurrently using threading.
@@ -440,7 +450,7 @@ class AsyncJobPoller(BaseJobPoller):
         interval: float = 5.0,
         timeout: float = 300.0,
         *,
-        on_progress: JobProgressCallback | None = None,
+        on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Asynchronously poll a job until completion."""
         start = time.monotonic()
@@ -512,7 +522,7 @@ class AsyncJobPoller(BaseJobPoller):
         interval: float = 5.0,
         timeout: float = 300.0,
         *,
-        on_progress: JobProgressCallback | None = None,
+        on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
         """Asynchronously poll multiple jobs concurrently via asyncio.gather.
