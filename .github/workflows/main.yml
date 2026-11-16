@@ -201,7 +201,14 @@ jobs:
           restore-keys: |
             uv-venv-${{ runner.os }}-"3.11"-
       - name: Install Hatch
-        run: python -m pip install --upgrade pip hatch
+        run: python -m pip install --upgrade pip hatch uv
+
+      - name: Audit locked workspace dependencies
+        run: |
+          uv export --locked --all-packages --all-extras --no-emit-workspace \
+            --no-hashes --format requirements-txt --output-file "$RUNNER_TEMP/imednet-locked.txt"
+          uvx pip-audit -s osv --timeout 60 --disable-pip --no-deps \
+            -r "$RUNNER_TEMP/imednet-locked.txt"
 
       - name: Run Quality & Security Checks
         run: hatch run quality:all packages

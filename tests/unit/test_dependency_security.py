@@ -12,14 +12,48 @@ from packaging.version import Version
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_all_packages_share_the_supported_python_floor() -> None:
-    """Published packages must reject the interpreter unable to install patched locks."""
-    for path in [ROOT / "pyproject.toml", *ROOT.glob("packages/*/pyproject.toml")]:
+def test_published_packages_keep_supported_python_lines() -> None:
+    """Workspace tooling must not retire a published package's Python support."""
+    for path in ROOT.glob("packages/*/pyproject.toml"):
         project = tomllib.loads(path.read_text())["project"]
         supported = SpecifierSet(project["requires-python"])
         assert "3.10.99" not in supported, path
         for version in ("3.11", "3.12", "3.13"):
             assert version in supported, path
+
+
+def test_workspace_rejects_python_without_patched_selector_support() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    supported = SpecifierSet(project["requires-python"])
+    assert "3.11.4" not in supported
+    for version in ("3.11.5", "3.12", "3.13"):
+        assert version in supported
+
+
+@pytest.mark.parametrize(
+    ("name", "affected", "patched", "later_patch"),
+    [
+        ("soupsieve", ("2.9.2", "2.10", "3.0.4", "4.0.1", "4.1"), "4.1.1", "4.1.2"),
+        ("mako", ("1.3.12", "1.4.1"), "1.4.2", "1.4.3"),
+        ("opentelemetry-api", ("1.37.0", "1.43.0", "1.45.1"), "1.45.2", "1.45.3"),
+    ],
+)
+def test_workspace_resolution_excludes_reported_vulnerabilities(
+    name, affected, patched, later_patch
+) -> None:
+    """All locked copies and fresh uv resolutions must exclude vulnerable releases."""
+    locked = tomllib.loads((ROOT / "uv.lock").read_text())
+    versions = [p["version"] for p in locked["package"] if p["name"] == name]
+    assert versions
+    assert all(Version(version) >= Version(patched) for version in versions)
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    constraints = [
+        Requirement(value) for value in project["tool"]["uv"].get("constraint-dependencies", [])
+    ]
+    constraint = next(requirement for requirement in constraints if requirement.name == name)
+    assert all(version not in constraint.specifier for version in affected)
+    assert patched in constraint.specifier
+    assert later_patch in constraint.specifier
 
 
 def test_workflow_dependency_and_lockfile_exclude_vulnerable_filelock() -> None:
