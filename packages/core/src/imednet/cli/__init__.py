@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import sys
 from typing import Any
@@ -171,29 +170,6 @@ def _find_active_subparser(
     return current_parser
 
 
-def _load_dotenv_if_needed() -> None:
-    """Load environment variables from .env if credentials are unset and .env exists."""
-    if "IMEDNET_API_KEY" in os.environ and "IMEDNET_SECURITY_KEY" in os.environ:
-        return
-
-    try:
-        if not os.path.isfile(".env"):
-            return
-    except OSError:
-        return
-
-    try:
-        from dotenv import load_dotenv
-
-        with contextlib.suppress(OSError):
-            load_dotenv()
-    except ImportError:
-        print(
-            "Warning: python-dotenv not installed. Install with `pip install 'imednet[cli]'` to load .env files automatically.",
-            file=sys.stderr,
-        )
-
-
 def app(args: list[str] | None = None) -> None:
     """Main entrypoint for the CLI."""
     if args is None:
@@ -207,7 +183,6 @@ def app(args: list[str] | None = None) -> None:
         os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
 
     if hasattr(parsed, "func"):
-        _load_dotenv_if_needed()
         parsed.func(parsed)
     else:
         active_parser = _find_active_subparser(parser, args)
