@@ -204,8 +204,6 @@ _.add_sensitive_key  # unused method (packages/core/src/imednet/utils/security.p
 _.remove_sensitive_key  # unused method (packages/core/src/imednet/utils/security.py:36)
 _.add_exempt_key  # unused method (packages/core/src/imednet/utils/security.py:40)
 _.remove_exempt_key  # unused method (packages/core/src/imednet/utils/security.py:44)
-_.from_directory  # unused method (packages/core/src/imednet/validation/data_dictionary.py:83)
-_.from_zip  # unused method (packages/core/src/imednet/validation/data_dictionary.py:90)
 pytestmark  # unused variable (packages/plugins-sinks/tests/integration/test_containerized_sinks.py:13)
 fail_on_drift  # unused function (packages/plugins-sinks/tests/integration/test_containerized_sinks.py:33)
 subject_id  # unused variable (packages/plugins-sinks/tests/integration/test_containerized_sinks.py:51)

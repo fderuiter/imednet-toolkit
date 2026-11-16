@@ -23,8 +23,8 @@ def run_fuzzer():
 
         import imednet
         import imednet.models.engine
+        from imednet.datadict import load_from_csv
         from imednet.models.engine import get_contract
-        from imednet.validation.data_dictionary import DataDictionaryLoader
 
     def fuzz_dynamic_model(data: bytes):
         postman_path = "/tmp/fuzz_postman.json"
@@ -40,7 +40,7 @@ def run_fuzzer():
 
     def fuzz_data_dictionary(data: bytes):
         with contextlib.suppress(Exception):
-            DataDictionaryLoader.from_zip(BytesIO(data))
+            load_from_csv(BytesIO(data))
 
     def fuzz_warehouse_transformation(data: bytes):
         try:
