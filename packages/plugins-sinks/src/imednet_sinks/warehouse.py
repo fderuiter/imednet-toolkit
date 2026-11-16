@@ -78,13 +78,11 @@ from typing import Any
 
 from imednet.errors import ExportBatchError, ExportConfigurationError
 from imednet.sdk import ImednetSDK
-from imednet.spi.sinks import (
+from imednet.spi.sink_base import (
     ExportSink,
     SinkConfig,
+    _require_optional_dep,
     iter_batches,
-)
-from imednet.spi.sinks import (
-    require_optional_dep as _require_optional_dep,
 )
 
 logger = logging.getLogger(__name__)
@@ -376,7 +374,7 @@ def export_to_snowflake(
     config: SnowflakeSinkConfig,
 ) -> int:
     """Export study records to Snowflake using :class:`SnowflakeExportSink`."""
-    from imednet.spi.sinks import apply_quality_gate
+    from imednet.spi.sink_base import apply_quality_gate
 
     records = sdk.records.list(study_key=study_key, record_data_filter=None)
     filtered_records = list(apply_quality_gate(sdk, study_key, records, config))

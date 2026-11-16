@@ -28,6 +28,7 @@ def test_absolute_relative_and_type_only_cli_edges_fail(tmp_path, statement):
         ("imednet/spi/example.py", "from ..cli import app"),
         ("imednet_workflows/example.py", "from imednet.spi import models"),
         ("imednet_sinks/example.py", "from imednet.spi.sinks import ExportSink"),
+        ("imednet_sinks/example.py", "from imednet.spi.sink_base import ExportSink"),
         ("imednet_sinks/example.py", "from imednet import ImednetSDK"),
     ],
 )

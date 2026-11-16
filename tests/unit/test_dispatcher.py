@@ -77,125 +77,120 @@ def test_export_unsupported_target():
         export("unknown_target", sdk_mock, "STUDY3")
 
 
-def test_get_sink_lazy_load_success(monkeypatch):
+class MockEntryPoint:
+    """Mock EntryPoint for testing dynamic discovery."""
+
+    def __init__(self, name, load_func):
+        self.name = name
+        self.value = f"mock.{name}"
+        self.load = load_func
+
+
+def test_get_sink_dynamic_discovery_success(monkeypatch):
     from imednet.integrations.dispatcher import ExportRegistry
 
     registry = ExportRegistry()
-    registry._LAZY_SINKS = {"dummy_target": "dummy_module:DummyClass"}
 
     class DummyClass:
         pass
 
-    class DummyModule:
-        pass
+    ep = MockEntryPoint("dummy_target", lambda: DummyClass)
+    monkeypatch.setattr(
+        "imednet.integrations.dispatcher.entry_points",
+        lambda *, group: [ep] if group == "imednet.sinks" else [],
+    )
 
-    DummyModule.DummyClass = DummyClass
-
-    # Mock importlib.import_module
-    def mock_import(name):
-        if name == "dummy_module":
-            return DummyModule
-        raise ImportError
-
-    monkeypatch.setattr("importlib.import_module", mock_import)
-
-    # Should lazily load and register
     sink = registry.get_sink("dummy_target")
     assert sink is DummyClass
     assert registry._sink_targets["dummy_target"] is DummyClass
 
 
-def test_get_sink_lazy_load_import_error(monkeypatch):
+def test_get_sink_dynamic_discovery_import_error(monkeypatch):
     from imednet.integrations.dispatcher import ExportRegistry
 
     registry = ExportRegistry()
-    registry._LAZY_SINKS = {"dummy_target": "dummy_module:DummyClass"}
 
-    # Mock importlib.import_module to raise ImportError
-    def mock_import(name):
-        raise ImportError
+    def raise_import():
+        raise ImportError("Optional dep missing")
 
-    monkeypatch.setattr("importlib.import_module", mock_import)
+    ep = MockEntryPoint("dummy_target", raise_import)
+    monkeypatch.setattr(
+        "imednet.integrations.dispatcher.entry_points",
+        lambda *, group: [ep] if group == "imednet.sinks" else [],
+    )
 
-    # Should handle ImportError and return None
     sink = registry.get_sink("dummy_target")
     assert sink is None
 
 
-def test_get_sink_lazy_load_attribute_error(monkeypatch):
+def test_get_sink_dynamic_discovery_attribute_error(monkeypatch):
     from imednet.integrations.dispatcher import ExportRegistry
 
     registry = ExportRegistry()
-    registry._LAZY_SINKS = {"dummy_target": "dummy_module:DummyClass"}
 
-    class DummyModule:
-        pass
+    def raise_attr():
+        raise AttributeError("Symbol not found")
 
-    # Mock importlib.import_module
-    def mock_import(name):
-        return DummyModule
+    ep = MockEntryPoint("dummy_target", raise_attr)
+    monkeypatch.setattr(
+        "imednet.integrations.dispatcher.entry_points",
+        lambda *, group: [ep] if group == "imednet.sinks" else [],
+    )
 
-    monkeypatch.setattr("importlib.import_module", mock_import)
-
-    # Should handle AttributeError (DummyClass not in DummyModule) and return None
     sink = registry.get_sink("dummy_target")
     assert sink is None
 
 
-def test_get_config_class_lazy_load_success(monkeypatch):
+def test_get_config_class_dynamic_discovery_success(monkeypatch):
     from imednet.integrations.dispatcher import ExportRegistry
 
     registry = ExportRegistry()
-    registry._LAZY_CONFIGS = {"dummy_target": "dummy_module:DummyConfigClass"}
 
     class DummyConfigClass:
         pass
 
-    class DummyModule:
-        pass
-
-    DummyModule.DummyConfigClass = DummyConfigClass
-
-    def mock_import(name):
-        if name == "dummy_module":
-            return DummyModule
-        raise ImportError
-
-    monkeypatch.setattr("importlib.import_module", mock_import)
+    ep = MockEntryPoint("dummy_target", lambda: DummyConfigClass)
+    monkeypatch.setattr(
+        "imednet.integrations.dispatcher.entry_points",
+        lambda *, group: [ep] if group == "imednet.sink_configs" else [],
+    )
 
     config = registry.get_config_class("dummy_target")
     assert config is DummyConfigClass
     assert registry._config_targets["dummy_target"] is DummyConfigClass
 
 
-def test_get_config_class_lazy_load_import_error(monkeypatch):
+def test_get_config_class_dynamic_discovery_import_error(monkeypatch):
     from imednet.integrations.dispatcher import ExportRegistry, SinkConfig
 
     registry = ExportRegistry()
-    registry._LAZY_CONFIGS = {"dummy_target": "dummy_module:DummyConfigClass"}
 
-    def mock_import(name):
-        raise ImportError
+    def raise_import():
+        raise ImportError("Optional dep missing")
 
-    monkeypatch.setattr("importlib.import_module", mock_import)
+    ep = MockEntryPoint("dummy_target", raise_import)
+    monkeypatch.setattr(
+        "imednet.integrations.dispatcher.entry_points",
+        lambda *, group: [ep] if group == "imednet.sink_configs" else [],
+    )
 
     config = registry.get_config_class("dummy_target")
     assert config is SinkConfig
 
 
-def test_get_config_class_lazy_load_attribute_error(monkeypatch):
+def test_get_config_class_dynamic_discovery_attribute_error(monkeypatch):
     from imednet.integrations.dispatcher import ExportRegistry, SinkConfig
 
     registry = ExportRegistry()
-    registry._LAZY_CONFIGS = {"dummy_target": "dummy_module:DummyConfigClass"}
 
-    class DummyModule:
-        pass
+    def raise_attr():
+        raise AttributeError("Symbol not found")
 
-    def mock_import(name):
-        return DummyModule
-
-    monkeypatch.setattr("importlib.import_module", mock_import)
+    ep = MockEntryPoint("dummy_target", raise_attr)
+    monkeypatch.setattr(
+        "imednet.integrations.dispatcher.entry_points",
+        lambda *, group: [ep] if group == "imednet.sink_configs" else [],
+    )
 
     config = registry.get_config_class("dummy_target")
     assert config is SinkConfig
