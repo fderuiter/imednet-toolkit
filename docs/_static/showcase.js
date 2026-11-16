@@ -215,6 +215,36 @@
                 wcagCompliance: "PASS",
                 status: "VERIFIED"
             }
+        ],
+        vpat: [
+            {
+                criteria: "Principle 1: Perceivable",
+                standard: "WCAG 2.1 Level AA",
+                status: "PASS",
+                wcagCompliance: "PASS",
+                notes: "High contrast mode (7:1), ARIA labels and tabular fallback"
+            },
+            {
+                criteria: "Principle 2: Operable",
+                standard: "WCAG 2.1 Level AA",
+                status: "PASS",
+                wcagCompliance: "PASS",
+                notes: "Keyboard navigation, focus indicators, modal focus management"
+            },
+            {
+                criteria: "Principle 3: Understandable",
+                standard: "WCAG 2.1 Level AA",
+                status: "PASS",
+                wcagCompliance: "PASS",
+                notes: "Consistent navigation, descriptive error prompts, clear field labels"
+            },
+            {
+                criteria: "Principle 4: Robust",
+                standard: "WCAG 2.1 Level AA",
+                status: "PASS",
+                wcagCompliance: "PASS",
+                notes: "Valid HTML5, standard ARIA roles, assistive technology compatible"
+            }
         ]
     };
 
@@ -339,15 +369,28 @@
         const personaTabs = root.querySelectorAll(".showcase-persona-tab");
         const personaPanels = root.querySelectorAll(".showcase-panel");
 
-        function switchPersona(targetId) {
+        function isValidPanel(targetId) {
+            if (!targetId) return false;
+            for (let i = 0; i < personaPanels.length; i++) {
+                if (personaPanels[i].id === targetId) return true;
+            }
+            return false;
+        }
+
+        function switchPersona(targetId, updateHistory) {
+            if (updateHistory === undefined) {
+                updateHistory = true;
+            }
+            const activeId = isValidPanel(targetId) ? targetId : "panel-integration";
+
             personaTabs.forEach(function (tab) {
-                const isActive = tab.getAttribute("data-target") === targetId;
+                const isActive = tab.getAttribute("data-target") === activeId;
                 tab.setAttribute("aria-selected", isActive ? "true" : "false");
                 tab.classList.toggle("active", isActive);
             });
 
             personaPanels.forEach(function (panel) {
-                const isMatch = panel.id === targetId;
+                const isMatch = panel.id === activeId;
                 panel.classList.toggle("active", isMatch);
                 if (isMatch) {
                     panel.removeAttribute("hidden");
@@ -355,7 +398,37 @@
                     panel.setAttribute("hidden", "true");
                 }
             });
+
+            if (updateHistory && window.history && typeof window.history.replaceState === "function") {
+                window.history.replaceState(null, "", "#" + activeId);
+            }
         }
+
+        function getHashTarget() {
+            if (!window.location.hash) return null;
+            return window.location.hash.replace(/^#/, "");
+        }
+
+        // Initialize persona from URL hash (safely falling back to default panel-integration)
+        const initialHash = getHashTarget();
+        if (initialHash && isValidPanel(initialHash)) {
+            switchPersona(initialHash, false);
+            const targetEl = document.getElementById(initialHash);
+            if (targetEl && typeof targetEl.scrollIntoView === "function") {
+                targetEl.scrollIntoView();
+            }
+        } else {
+            switchPersona("panel-integration", false);
+        }
+
+        window.addEventListener("hashchange", function () {
+            const currentHash = getHashTarget();
+            if (isValidPanel(currentHash)) {
+                switchPersona(currentHash, false);
+            } else {
+                switchPersona("panel-integration", false);
+            }
+        });
 
         personaTabs.forEach(function (tab) {
             tab.addEventListener("click", function () {
@@ -602,6 +675,7 @@
         // ---------------------------------------------------------------------
         // 3. Regulatory Compliance Auditor Panel
         // ---------------------------------------------------------------------
+        const audScenarioSelect = root.querySelector("#aud-scenario-select");
         const audVerifyBtn = root.querySelector("#aud-verify-btn");
         const audMetricBadge = root.querySelector("#aud-metric-badge");
         const audOutputTabTable = root.querySelector("#aud-tab-table");
@@ -612,26 +686,47 @@
         const audCopyBtn = root.querySelector("#aud-copy-btn");
 
         function executeAuditorVerification() {
+            const scenario = audScenarioSelect ? audScenarioSelect.value : "part11";
+            if (scenario !== "part11" && scenario !== "vpat") {
+                // Selecting an unmapped scenario must preserve existing table contents and avoid throwing script exceptions.
+                return;
+            }
+
             const t0 = performance.now();
-            const audits = MOCK_DATA.audits;
+            let data = [];
+            let caption = "";
+            let metricText = "";
             const elapsed = (performance.now() - t0 + Math.random() * 2 + 1.1).toFixed(1);
 
+            if (scenario === "part11") {
+                data = MOCK_DATA.audits;
+                caption = "21 CFR Part 11 Audit Trail & Accessibility Log";
+                metricText = `✓ 21 CFR Part 11 Electronic Signature & VPAT Check Verified | ${elapsed} ms`;
+            } else if (scenario === "vpat") {
+                data = MOCK_DATA.vpat;
+                caption = "WCAG 2.1 AA Accessibility Conformance Verification";
+                metricText = `✓ WCAG 2.1 AA Accessibility Conformance (VPAT) Verified | ${elapsed} ms`;
+            }
+
             if (audMetricBadge) {
-                audMetricBadge.textContent = `✓ 21 CFR Part 11 Electronic Signature & VPAT Check Verified | ${elapsed} ms`;
+                audMetricBadge.textContent = metricText;
                 audMetricBadge.classList.add("active");
             }
 
             if (audViewTable) {
-                audViewTable.innerHTML = renderDataFrameTable(audits, "21 CFR Part 11 Audit Trail & Accessibility Log");
+                audViewTable.innerHTML = renderDataFrameTable(data, caption);
             }
 
             if (audJsonPre) {
-                audJsonPre.textContent = JSON.stringify(audits, null, 2);
+                audJsonPre.textContent = JSON.stringify(data, null, 2);
             }
         }
 
         if (audVerifyBtn) {
             audVerifyBtn.addEventListener("click", executeAuditorVerification);
+        }
+        if (audScenarioSelect) {
+            audScenarioSelect.addEventListener("change", executeAuditorVerification);
         }
 
         function switchAudView(view) {
