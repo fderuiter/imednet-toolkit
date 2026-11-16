@@ -6,6 +6,7 @@ from imednet.spi.utils import (
     JobPoller,
     JobPollSummary,
     JobProgressCallback,
+    JobProgressHandler,
     JobStatusEvent,
     JobTimeoutError,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "JobPollSummary",
     "JobPoller",
     "JobProgressCallback",
+    "JobProgressHandler",
     "JobStatusEvent",
     "JobTimeoutError",
     "LedgerState",

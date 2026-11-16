@@ -179,6 +179,7 @@ verify-static = [
     "mypy packages/core/src/imednet",
     "mypy packages/plugins-workflows/src/imednet_workflows",
     "mypy packages/providers-airflow/src/apache_airflow_providers_imednet",
+    "mypy tests/typing/endpoint_contracts.py",
 ]
 verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov-fail-under=90"
 verify = ["verify-static", "verify-tests", "docs"]
