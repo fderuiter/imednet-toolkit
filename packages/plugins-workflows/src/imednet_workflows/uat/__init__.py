@@ -4,11 +4,13 @@ from .engine import EditCheckResultStatus, EditCheckVerificationReport, UATExecu
 from .generator import GeneratedRecordSet, SyntheticRecordGenerator
 from .inspector import StudySchemaInspector, StudySnapshot
 from .models import (
+    InvalidUATStateTransitionError,
     RecordTestType,
     UATFormSpec,
     UATSpecification,
     UATSubjectSpec,
     UATVariableSpec,
+    UATWorkflowState,
     VariableTestStrategy,
 )
 from .orchestrator import UATRunPhase, UATRunResult, UATSpecificationBuilder, UATWorkflow
@@ -16,6 +18,7 @@ from .submission import (
     BatchSubmission,
     BulkRecordSubmissionWorkflow,
     BulkSubmissionError,
+    SubmissionPhase,
     SubmissionResult,
 )
 
@@ -26,9 +29,11 @@ __all__ = [
     "EditCheckResultStatus",
     "EditCheckVerificationReport",
     "GeneratedRecordSet",
+    "InvalidUATStateTransitionError",
     "RecordTestType",
     "StudySchemaInspector",
     "StudySnapshot",
+    "SubmissionPhase",
     "SubmissionResult",
     "SyntheticRecordGenerator",
     "UATExecutionEngine",
@@ -40,5 +45,6 @@ __all__ = [
     "UATSubjectSpec",
     "UATVariableSpec",
     "UATWorkflow",
+    "UATWorkflowState",
     "VariableTestStrategy",
 ]

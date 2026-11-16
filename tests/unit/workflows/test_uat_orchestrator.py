@@ -176,3 +176,205 @@ def test_workflow_individual_phases(mock_sdk, snapshot):
     with patch.object(workflow, "_poller") as mock_poll:
         mock_poll.poll_many.return_value = MagicMock()
         assert workflow.monitor("S", MagicMock()) is not None
+
+
+def test_workflow_lifecycle_transitions_and_history(mock_sdk, snapshot):
+    """Test full sequential lifecycle transitions and state history recording."""
+    from imednet_workflows.uat.models import UATWorkflowState
+
+    workflow = UATWorkflow(mock_sdk)
+    assert workflow.state == UATWorkflowState.PENDING
+    assert workflow.state_history == [UATWorkflowState.PENDING]
+
+    workflow.inspect = MagicMock(return_value=snapshot)
+    workflow.build_spec = MagicMock(return_value=MagicMock(spec=UATSpecification))
+    workflow.generate = MagicMock(return_value=[MagicMock(spec=GeneratedRecordSet)])
+    mock_submission = MagicMock(spec=SubmissionResult)
+    mock_submission.total_records_submitted = 5
+    mock_submission.all_batch_ids = ["B1"]
+    workflow.submit = MagicMock(return_value=mock_submission)
+    mock_poll = MagicMock()
+    mock_poll.all_successful = True
+    mock_poll.results = {"B1": MagicMock()}
+    mock_poll.failures = {}
+    workflow.monitor = MagicMock(return_value=mock_poll)
+
+    result = workflow.run("TEST_STUDY")
+
+    assert workflow.state == UATWorkflowState.COMPLETED
+    assert result.state == UATWorkflowState.COMPLETED
+    assert result.failure_phase is None
+    assert result.failed_phase is None
+    assert result.error_message is None
+    assert result.is_terminal is True
+    assert result.overall_success is True
+
+    expected_history = [
+        UATWorkflowState.PENDING,
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.BUILDING_SPEC,
+        UATWorkflowState.GENERATING,
+        UATWorkflowState.SUBMITTING,
+        UATWorkflowState.MONITORING,
+        UATWorkflowState.COMPLETED,
+    ]
+    assert workflow.state_history == expected_history
+    assert result.state_history == expected_history
+    assert workflow.last_result is result
+
+
+def test_workflow_run_inspect_failure_transitions_to_failed(mock_sdk):
+    """Test unexpected exception during INSPECT phase transitions to FAILED."""
+    from imednet_workflows.uat.models import UATWorkflowState
+
+    workflow = UATWorkflow(mock_sdk)
+    workflow.inspect = MagicMock(side_effect=RuntimeError("Study schema unreachable"))
+
+    result = workflow.run("TEST_STUDY")
+
+    assert workflow.state == UATWorkflowState.FAILED
+    assert result.state == UATWorkflowState.FAILED
+    assert result.failure_phase == UATWorkflowState.INSPECTING
+    assert result.failed_phase == UATWorkflowState.INSPECTING
+    assert "Study schema unreachable" in (result.error_message or "")
+    assert result.overall_success is False
+    assert result.state_history == [
+        UATWorkflowState.PENDING,
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.FAILED,
+    ]
+    summary = result.summary()
+    assert "Overall: FAIL" in summary
+    assert "Failed phase: INSPECTING" in summary
+    assert "Error: Study schema unreachable" in summary
+
+
+def test_workflow_run_generate_failure_transitions_to_failed(mock_sdk, snapshot):
+    """Test unexpected exception during GENERATE phase transitions to FAILED."""
+    from imednet_workflows.uat.models import UATWorkflowState
+
+    workflow = UATWorkflow(mock_sdk)
+    workflow.inspect = MagicMock(return_value=snapshot)
+    workflow.build_spec = MagicMock(return_value=MagicMock(spec=UATSpecification))
+    workflow.generate = MagicMock(side_effect=ValueError("Data generation crashed"))
+
+    result = workflow.run("TEST_STUDY")
+
+    assert workflow.state == UATWorkflowState.FAILED
+    assert result.state == UATWorkflowState.FAILED
+    assert result.failure_phase == UATWorkflowState.GENERATING
+    assert "Data generation crashed" in (result.error_message or "")
+    assert result.overall_success is False
+    assert result.state_history == [
+        UATWorkflowState.PENDING,
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.BUILDING_SPEC,
+        UATWorkflowState.GENERATING,
+        UATWorkflowState.FAILED,
+    ]
+
+
+def test_workflow_run_submit_failure_transitions_to_failed(mock_sdk, snapshot):
+    """Test unexpected exception during SUBMIT phase transitions to FAILED."""
+    from imednet_workflows.uat.models import UATWorkflowState
+    from imednet_workflows.uat.submission import BulkSubmissionError
+
+    workflow = UATWorkflow(mock_sdk)
+    workflow.inspect = MagicMock(return_value=snapshot)
+    workflow.build_spec = MagicMock(return_value=MagicMock(spec=UATSpecification))
+    workflow.generate = MagicMock(return_value=[MagicMock(spec=GeneratedRecordSet)])
+    workflow.submit = MagicMock(
+        side_effect=BulkSubmissionError("2 registration batches failed", failed_batches=[])
+    )
+
+    result = workflow.run("TEST_STUDY")
+
+    assert workflow.state == UATWorkflowState.FAILED
+    assert result.state == UATWorkflowState.FAILED
+    assert result.failure_phase == UATWorkflowState.SUBMITTING
+    assert "2 registration batches failed" in (result.error_message or "")
+    assert result.overall_success is False
+    assert result.state_history == [
+        UATWorkflowState.PENDING,
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.BUILDING_SPEC,
+        UATWorkflowState.GENERATING,
+        UATWorkflowState.SUBMITTING,
+        UATWorkflowState.FAILED,
+    ]
+
+
+def test_workflow_run_monitor_failure_transitions_to_failed(mock_sdk, snapshot):
+    """Test unexpected exception during MONITOR phase transitions to FAILED."""
+    from imednet_workflows.uat.models import UATWorkflowState
+
+    workflow = UATWorkflow(mock_sdk)
+    workflow.inspect = MagicMock(return_value=snapshot)
+    workflow.build_spec = MagicMock(return_value=MagicMock(spec=UATSpecification))
+    workflow.generate = MagicMock(return_value=[MagicMock(spec=GeneratedRecordSet)])
+    workflow.submit = MagicMock(return_value=MagicMock(spec=SubmissionResult))
+    workflow.monitor = MagicMock(side_effect=TimeoutError("Poller timed out"))
+
+    result = workflow.run("TEST_STUDY")
+
+    assert workflow.state == UATWorkflowState.FAILED
+    assert result.state == UATWorkflowState.FAILED
+    assert result.failure_phase == UATWorkflowState.MONITORING
+    assert "Poller timed out" in (result.error_message or "")
+    assert result.overall_success is False
+    assert result.state_history == [
+        UATWorkflowState.PENDING,
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.BUILDING_SPEC,
+        UATWorkflowState.GENERATING,
+        UATWorkflowState.SUBMITTING,
+        UATWorkflowState.MONITORING,
+        UATWorkflowState.FAILED,
+    ]
+
+
+def test_workflow_attempt_submitting_to_inspecting_raises_invalid_transition(mock_sdk):
+    """Test attempting to transition from SUBMITTING back to INSPECTING raises InvalidUATStateTransitionError."""
+    from imednet_workflows.uat.models import InvalidUATStateTransitionError, UATWorkflowState
+
+    workflow = UATWorkflow(mock_sdk)
+    # Manually transition forward to SUBMITTING
+    workflow.transition_to(UATWorkflowState.INSPECTING)
+    workflow.transition_to(UATWorkflowState.BUILDING_SPEC)
+    workflow.transition_to(UATWorkflowState.GENERATING)
+    workflow.transition_to(UATWorkflowState.SUBMITTING)
+    assert workflow.state == UATWorkflowState.SUBMITTING
+
+    with pytest.raises(InvalidUATStateTransitionError) as exc_info:
+        workflow.transition_to(UATWorkflowState.INSPECTING)
+
+    assert "Cannot transition UAT workflow from SUBMITTING to INSPECTING" in str(exc_info.value)
+    # State should remain SUBMITTING
+    assert workflow.state == UATWorkflowState.SUBMITTING
+
+
+def test_workflow_reset_and_rerun(mock_sdk, snapshot):
+    """Test reset restores state to PENDING and allows re-running workflow."""
+    from imednet_workflows.uat.models import InvalidUATStateTransitionError, UATWorkflowState
+
+    workflow = UATWorkflow(mock_sdk)
+    workflow.inspect = MagicMock(return_value=snapshot)
+    workflow.build_spec = MagicMock(return_value=MagicMock(spec=UATSpecification))
+    workflow.generate = MagicMock(return_value=[])
+    workflow.submit = MagicMock(return_value=MagicMock(spec=SubmissionResult))
+    workflow.monitor = MagicMock(return_value=MagicMock(all_successful=True))
+
+    result1 = workflow.run("TEST_STUDY")
+    assert result1.state == UATWorkflowState.COMPLETED
+    assert workflow.state == UATWorkflowState.COMPLETED
+
+    # Running again without reset raises InvalidUATStateTransitionError
+    with pytest.raises(InvalidUATStateTransitionError):
+        workflow.run("TEST_STUDY")
+
+    # Reset allows rerun
+    workflow.reset()
+    assert workflow.state == UATWorkflowState.PENDING
+    assert workflow.state_history == [UATWorkflowState.PENDING]
+    result2 = workflow.run("TEST_STUDY")
+    assert result2.state == UATWorkflowState.COMPLETED

@@ -405,3 +405,126 @@ def test_concurrent_registration_polling_skips_empty_batch_ids(mock_sdk):
 
     mock_sdk.get_job.assert_called_once_with("study1", "valid_job")
     assert batch_valid.job.state == "COMPLETED"
+
+
+def test_submission_phase_lifecycle_success(mock_sdk):
+    """Test BulkRecordSubmissionWorkflow transitions through REGISTRATION -> AWAITING -> DATA -> COMPLETED."""
+    from imednet_workflows.uat.submission import SubmissionPhase
+
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+    assert workflow.phase == SubmissionPhase.PENDING
+
+    mock_sdk.create_record.side_effect = [
+        Job(batch_id="reg_1", state="PENDING"),
+        Job(batch_id="data_1", state="PENDING"),
+    ]
+    mock_sdk.get_job.return_value = JobStatus(batch_id="reg_1", state="COMPLETED")
+
+    rs_reg = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 1}],
+        subject_keys=["S1"],
+    )
+    rs_data = GeneratedRecordSet(
+        form_key="DATA",
+        form_name="Data Form",
+        test_type=RecordTestType.UPDATE_SCHEDULED_RECORD,
+        payloads=[{"data": 2}],
+        subject_keys=["S1"],
+    )
+
+    result = workflow.submit("study1", [rs_reg, rs_data])
+    assert workflow.phase == SubmissionPhase.COMPLETED
+    assert len(result.registration_batches) == 1
+    assert len(result.data_batches) == 1
+
+
+def test_submission_phase_lifecycle_without_await(mock_sdk):
+    """Test when await_registration=False, workflow skips awaiting and completes DATA."""
+    from imednet_workflows.uat.submission import SubmissionPhase
+
+    workflow = BulkRecordSubmissionWorkflow(
+        mock_sdk,
+        await_registration=False,
+        skip_existing_subjects=False,
+    )
+    assert workflow.phase == SubmissionPhase.PENDING
+
+    mock_sdk.create_record.return_value = Job(batch_id="job", state="PENDING")
+
+    rs = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 1}],
+        subject_keys=["S1"],
+    )
+
+    workflow.submit("study1", [rs])
+    assert workflow.phase == SubmissionPhase.COMPLETED
+    mock_sdk.get_job.assert_not_called()
+
+
+def test_submission_phase_lifecycle_on_failure(mock_sdk):
+    """Test workflow phase is marked FAILED when registration polling fails."""
+    from imednet_workflows.uat.submission import SubmissionPhase
+
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+    mock_sdk.create_record.return_value = Job(batch_id="reg_1", state="PENDING")
+    mock_sdk.get_job.return_value = JobStatus(batch_id="reg_1", state="FAILED")
+
+    rs = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 1}],
+        subject_keys=["S1"],
+    )
+
+    with pytest.raises(BulkSubmissionError):
+        workflow.submit("study1", [rs])
+
+    assert workflow.phase == SubmissionPhase.FAILED
+
+
+def test_submission_poller_uses_job_transition_to_and_job_state(mock_sdk):
+    """Verify Job.transition_to is invoked and sets JobState enum values."""
+    from unittest.mock import patch
+
+    from imednet.spi.models import JobState
+
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+
+    real_job = Job(batch_id="job_spy", state="PENDING")
+    batch = BatchSubmission(phase="registration", record_count=1, job=real_job)
+
+    mock_sdk.get_job.return_value = JobStatus(batch_id="job_spy", state="COMPLETED")
+
+    with patch.object(
+        Job, "transition_to", autospec=True, wraps=Job.transition_to
+    ) as mock_transition:
+        workflow._await_registration_jobs("study1", [batch])
+        mock_transition.assert_called_once_with(real_job, JobState.COMPLETED)
+
+    assert batch.job.state == JobState.COMPLETED
+    assert isinstance(batch.job.state, JobState)
+    assert batch.job.is_successful is True
+
+
+def test_submission_poller_rejects_illegal_job_transition(mock_sdk):
+    """Verify that attempting an illegal transition on Job raises InvalidJobTransitionError."""
+    from imednet.models.jobs import InvalidJobTransitionError
+
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+
+    # Job is already terminal COMPLETED
+    job = Job(batch_id="job_completed", state="COMPLETED")
+    batch = BatchSubmission(phase="registration", record_count=1, job=job)
+
+    # Poller returns FAILED, which is an illegal transition from COMPLETED
+    mock_sdk.get_job.return_value = JobStatus(batch_id="job_completed", state="FAILED")
+
+    with pytest.raises(InvalidJobTransitionError):
+        workflow._await_registration_jobs("study1", [batch])
