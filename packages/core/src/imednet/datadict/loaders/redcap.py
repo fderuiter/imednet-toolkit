@@ -14,7 +14,7 @@ from ..models import (
     Metadata,
     Variable,
 )
-from ..normalize import to_camel_case
+from ..normalize import _is_file_target, _safe_is_file, to_camel_case
 
 # Canonical internal keys mapped from various common REDCap header formats
 COLUMN_ALIASES: dict[str, str] = {
@@ -130,16 +130,20 @@ SUPPORTED_FIELD_TYPES = {
 def _read_source_text(source: Path | str | TextIO | BinaryIO) -> str:
     """Read CSV content from path, string buffer, or stream into str."""
     if isinstance(source, Path):
+        if not _safe_is_file(source):
+            raise FileNotFoundError(f"Target file '{source}' does not exist")
         return source.read_text(encoding="utf-8-sig")
     if isinstance(source, str):
         if "\n" in source or "\r" in source:
             return source.lstrip("\ufeff")
-        try:
+        if _is_file_target(source):
             p = Path(source)
-            if p.is_file():
-                return p.read_text(encoding="utf-8-sig")
-        except OSError:
-            pass
+            if not _safe_is_file(p):
+                raise FileNotFoundError(f"Target file '{source}' does not exist")
+            return p.read_text(encoding="utf-8-sig")
+        p = Path(source)
+        if _safe_is_file(p):
+            return p.read_text(encoding="utf-8-sig")
         return source.lstrip("\ufeff")
     if hasattr(source, "read"):
         data = source.read()

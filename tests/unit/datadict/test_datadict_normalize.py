@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from imednet.datadict.normalize import (
+    _is_file_target,
+    _safe_is_file,
     normalize_row_data,
     to_camel_case,
     validate_timestamp,
@@ -79,3 +83,52 @@ def test_validate_timestamp_calendar_bounds() -> None:
     ]:
         with pytest.raises(ValueError, match="timestamps must adhere to MM-DD-YYYY format"):
             validate_timestamp(invalid)
+
+
+def test_is_file_target(tmp_path: Path) -> None:
+    """Test file target discrimination helper."""
+    # Path instance is always a file target
+    assert _is_file_target(Path("something.csv")) is True
+    assert _is_file_target(Path("foo/bar")) is True
+
+    # Standard extensions
+    assert _is_file_target("data.json") is True
+    assert _is_file_target("study.xml") is True
+    assert _is_file_target("dict.csv") is True
+    assert _is_file_target("DATA.CSV") is True
+
+    # Path delimiters
+    assert _is_file_target("some/nested/path") is True
+    assert _is_file_target("some\\nested\\path") is True
+
+    # JSON structures
+    assert _is_file_target('{"key": "value"}') is False
+    assert _is_file_target('[{"key": "value"}]') is False
+
+    # XML structures
+    assert _is_file_target("<ODM>xml</ODM>") is False
+    assert _is_file_target("  <Study/>  ") is False
+
+    # Multiline text
+    assert _is_file_target("line1\nline2.csv") is False
+    assert _is_file_target("line1\rline2.xml") is False
+
+    # Single line text without delimiters or standard extensions
+    assert _is_file_target("single_column_name") is False
+    assert _is_file_target("var1,var2,var3") is False
+
+    # Non-string/non-path
+    assert _is_file_target(12345) is False
+    assert _is_file_target(None) is False
+
+
+def test_safe_is_file(tmp_path: Path) -> None:
+    """Test safe file check helper."""
+    real_file = tmp_path / "exists.txt"
+    real_file.write_text("hello", encoding="utf-8")
+    assert _safe_is_file(real_file) is True
+
+    fake_file = tmp_path / "does_not_exist.txt"
+    assert _safe_is_file(fake_file) is False
+
+    assert _safe_is_file(tmp_path) is False
