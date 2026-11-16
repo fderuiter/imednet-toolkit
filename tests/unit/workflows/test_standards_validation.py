@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from imednet.models.standards import DrugSafetyProfile
+from imednet.models.standards import DrugSafetyProfile, GeneralClinicalProfile
 from imednet_workflows.standards_validation import (
     CategoricalNormalizer,
     NormalizationResult,
@@ -216,3 +216,211 @@ def test_standards_readiness_validator_custom_normalizer_without_normalize_looku
     )
     assert report.successfully_validated_fields == 1
     assert report.total_expected_fields == 7
+
+
+def test_standards_readiness_validator_scores_demographics_records() -> None:
+    """Test that validator scores Demographics records and detects missing required/recommended fields."""
+    validator = StandardsReadinessValidator(profile=GeneralClinicalProfile())
+    report = validator.score_records(
+        records_by_domain={
+            "DM": [
+                {
+                    "subjectKey": "S001",
+                    "sex": "M",
+                    "birthDate": "1990-01-01",
+                    "age": 34,
+                    "race": "White",
+                    "ethnicity": "Not Hispanic or Latino",
+                },
+                {
+                    "subjectKey": "S002",
+                    # missing sex (required) and birthDate, age (recommended)
+                    "race": "Asian",
+                    "ethnicity": "Not Hispanic or Latino",
+                },
+            ]
+        }
+    )
+
+    # 6 expected fields per DM record in general profile = 12 total expected
+    assert report.total_expected_fields == 12
+    # Record 1: all 6 valid. Record 2: subjectKey, race, ethnicity valid = 3 valid. Total = 9
+    assert report.successfully_validated_fields == 9
+    assert report.score == pytest.approx((9 / 12) * 100)
+    assert {(v.field, v.severity) for v in report.violations} == {
+        ("sex", "ERROR"),
+        ("birthDate", "WARNING"),
+        ("age", "WARNING"),
+    }
+
+
+def test_standards_readiness_validator_scores_vital_signs_records() -> None:
+    """Test that validator scores Vital Signs records and detects missing attributes."""
+    validator = StandardsReadinessValidator(profile=GeneralClinicalProfile())
+    report = validator.score_records(
+        records_by_domain={
+            "VS": [
+                {
+                    "subjectKey": "S001",
+                    "vsTest": "Systolic Blood Pressure",
+                    "vsTestCd": "SYSBP",
+                    "vsResult": 120,
+                    "vsUnit": "mmHg",
+                    "vsDate": "2024-01-01T10:00:00",
+                },
+                {
+                    "subjectKey": "S002",
+                    "vsTest": "Pulse",
+                    # missing vsResult, vsDate (required), missing vsTestCd, vsUnit (recommended)
+                },
+            ]
+        }
+    )
+
+    # 6 expected fields per VS record (4 required + 2 recommended) = 12 total expected
+    assert report.total_expected_fields == 12
+    # Record 1: 6 valid. Record 2: subjectKey, vsTest valid = 2 valid. Total = 8
+    assert report.successfully_validated_fields == 8
+    assert report.score == pytest.approx((8 / 12) * 100)
+    assert {(v.field, v.severity) for v in report.violations} == {
+        ("vsResult", "ERROR"),
+        ("vsDate", "ERROR"),
+        ("vsTestCd", "WARNING"),
+        ("vsUnit", "WARNING"),
+    }
+
+
+def test_standards_readiness_validator_scores_combined_clinical_domains() -> None:
+    """Test that validator scores combined datasets with AE, DM, and VS records."""
+    validator = StandardsReadinessValidator(profile=GeneralClinicalProfile())
+    records = {
+        "AE": [
+            {
+                "subjectKey": "S001",
+                "aeTerm": "Headache",
+                "aeSeverity": "MILD",
+                "aeDecod": "HEADACHE",
+                "aeRelationship": "NOT RELATED",
+            }
+        ],
+        "DM": [
+            {
+                "subjectKey": "S001",
+                "sex": "F",
+                "birthDate": "1985-06-20",
+                "age": 39,
+                "race": "Black",
+                "ethnicity": "Not Hispanic or Latino",
+            }
+        ],
+        "VS": [
+            {
+                "subjectKey": "S001",
+                "vsTest": "Heart Rate",
+                "vsTestCd": "HR",
+                "vsResult": 72,
+                "vsUnit": "bpm",
+                "vsDate": "2024-01-01T10:00:00",
+            }
+        ],
+    }
+
+    report = validator.score_records(records_by_domain=records)
+    # AE: 5 expected (3 req + 2 rec)
+    # DM: 6 expected (2 req + 4 rec)
+    # VS: 6 expected (4 req + 2 rec)
+    # Total expected = 17, all valid = 17
+    assert report.total_expected_fields == 17
+    assert report.successfully_validated_fields == 17
+    assert report.score == 100.0
+    assert report.violations == []
+    assert report.warnings == []
+
+
+def test_standards_readiness_validator_handles_domain_aliases() -> None:
+    """Test that validator handles domain aliases such as Demographics and Vital Signs."""
+    validator = StandardsReadinessValidator(profile=GeneralClinicalProfile())
+
+    report_canonical = validator.score_records(
+        records_by_domain={
+            "DM": [{"subjectKey": "S001", "sex": "M"}],
+            "VS": [
+                {"subjectKey": "S001", "vsTest": "SYSBP", "vsResult": 120, "vsDate": "2024-01-01"}
+            ],
+        }
+    )
+
+    report_aliased = validator.score_records(
+        records_by_domain={
+            "Demographics": [{"subjectKey": "S001", "sex": "M"}],
+            "Vital Signs": [
+                {"subjectKey": "S001", "vsTest": "SYSBP", "vsResult": 120, "vsDate": "2024-01-01"}
+            ],
+        }
+    )
+
+    assert report_canonical.score == report_aliased.score
+    assert (
+        report_canonical.successfully_validated_fields
+        == report_aliased.successfully_validated_fields
+    )
+    assert report_canonical.total_expected_fields == report_aliased.total_expected_fields
+
+
+def test_standards_readiness_validator_terminology_normalization_and_warnings() -> None:
+    """Test that categorical normalizer maps terminology and flags unmapped values as warnings."""
+    validator = StandardsReadinessValidator(profile=DrugSafetyProfile())
+    lookups = {
+        "sex": {"MALE": "M", "FEMALE": "F"},
+        "vsTestCd": {"BLOOD_PRESSURE": "SYSBP"},
+        "vsUnit": {"MILLIMETERS_OF_MERCURY": "mmHg"},
+    }
+
+    records = {
+        "DM": [
+            {
+                "subjectKey": "S001",
+                "sex": "MALE",
+                "birthDate": "1990-01-01",
+                "age": 34,
+                "race": "White",
+                "ethnicity": "Not Hispanic",
+            },
+            {
+                "subjectKey": "S002",
+                "sex": "UNKNOWN_OTHER",  # unmapped
+                "birthDate": "1992-01-01",
+                "age": 32,
+                "race": "White",
+                "ethnicity": "Not Hispanic",
+            },
+        ],
+        "VS": [
+            {
+                "subjectKey": "S001",
+                "vsTest": "Blood Pressure",
+                "vsTestCd": "BLOOD_PRESSURE",  # mapped to SYSBP
+                "vsResult": 120,
+                "vsUnit": "MILLIMETERS_OF_MERCURY",  # mapped to mmHg
+                "vsDate": "2024-01-01T00:00:00",
+            },
+            {
+                "subjectKey": "S002",
+                "vsTest": "Blood Pressure",
+                "vsTestCd": "UNMAPPED_CD",  # unmapped
+                "vsResult": 120,
+                "vsUnit": "LIGHT_YEARS",  # unmapped and invalid constraint
+                "vsDate": "2024-01-01T00:00:00",
+            },
+        ],
+    }
+
+    report = validator.score_records(records_by_domain=records, terminology_lookups=lookups)
+
+    assert "Subject S002 record sex is unmapped" in report.warnings
+    assert "Subject S002 record vsTestCd is unmapped" in report.warnings
+    assert "Subject S002 record vsUnit is unmapped" in report.warnings
+    # S002 has sex and vsUnit constraint error violations
+    error_fields = {v.field for v in report.violations if v.severity == "ERROR"}
+    assert "sex" in error_fields
+    assert "vsUnit" in error_fields
