@@ -6,7 +6,7 @@ from typing import Any
 
 from importlib import import_module
 
-from .dates import format_iso_datetime, parse_iso_datetime
+from .dates import format_iso_datetime, normalize_iso_date, parse_iso_datetime
 from .filters import build_filter_string
 from .json_logging import configure_json_logging
 from .typing import FilterValue, ItemId, JsonDict
@@ -57,6 +57,7 @@ __all__ = [
     "export_records_csv",
     "flatten",
     "format_iso_datetime",
+    "normalize_iso_date",
     "parse_bool",
     "parse_datetime",
     "parse_dict_or_default",

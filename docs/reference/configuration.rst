@@ -108,3 +108,13 @@ Troubleshooting
 **Missing required environment variable(s)**
 
 If you see an error like ``Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set.`` (CLI) or ``API key and security key are required`` (SDK), or an "Unauthorized" API error, ensure you have set these variables in your shell or in a ``.env`` file in the directory where you run the script. See `Using a .env File`_ for details.
+
+Mapping-name validation
+------------------------
+
+``IMEDNET_STRICT_CDASH`` enables the opt-in local mapping-name/prefix heuristic
+for MappingRule and StudyConfiguration. It defaults to false and is independent
+of SDK response-drift ``IMEDNET_STRICT_MODE``. Per-configuration ``strictCdash``
+and its local ``strict``/``strictMode`` flags also enable this heuristic. These
+checks do not establish complete CDISC conformance; see
+:doc:`/how-to/record_mapping` for transformation and evidence boundaries.

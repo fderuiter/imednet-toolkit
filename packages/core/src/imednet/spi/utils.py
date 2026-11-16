@@ -7,7 +7,7 @@ from imednet.core.context import (
     reset_base_url_context,
     set_base_url_context,
 )
-from imednet.utils.dates import format_iso_datetime, parse_iso_datetime
+from imednet.utils.dates import format_iso_datetime, normalize_iso_date, parse_iso_datetime
 from imednet.utils.db import get_sqlite_connection, sqlite_connection
 from imednet.utils.evaluator import (
     RestrictedAstEvaluator,
@@ -59,6 +59,7 @@ __all__ = [
     "is_boolean_token",
     "is_missing_value",
     "mask_clinical_phi",
+    "normalize_iso_date",
     "parse_bool",
     "parse_expression",
     "parse_iso_datetime",

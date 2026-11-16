@@ -81,3 +81,121 @@ def test_study_configuration_rejects_unknown_reporting_profile() -> None:
                 "reportingProfile": "custom",
             }
         )
+
+
+def test_mapping_rule_rejects_invalid_cdash_target_in_strict_mode() -> None:
+    """Test that MappingRule rejects non-CDASH target variables when strict mode is active."""
+    # Prefix mismatch: cmMed is not valid in domain AE
+    with pytest.raises(ValidationError, match="does not match CDASH domain prefix"):
+        MappingRule(
+            domain="AE",
+            target_field="cmMed",
+            source_form_key="FORM_AE",
+            source_variable_name="AE_MED",
+            strict=True,
+        )
+
+    # Completely non-standard variable name
+    with pytest.raises(ValidationError, match="does not match CDASH domain prefix"):
+        MappingRule.model_validate(
+            {
+                "domain": "AE",
+                "targetField": "customNonStandardField",
+                "sourceFormKey": "FORM_AE",
+                "sourceVariableName": "RAW_VAR",
+                "strictMode": True,
+            }
+        )
+
+
+def test_mapping_rule_accepts_valid_cdash_targets_in_strict_mode() -> None:
+    """Test that MappingRule accepts valid CDASH target variables in strict mode."""
+    # Domain prefix variable
+    rule_ae = MappingRule(
+        domain="AE",
+        target_field="aeSeverity",
+        source_form_key="FORM_AE",
+        source_variable_name="AE_SEV",
+        strict=True,
+    )
+    assert rule_ae.target_field == "aeSeverity"
+
+    # Uppercase CDASH variable
+    rule_ae_upper = MappingRule(
+        domain="AE",
+        target_field="AETERM",
+        source_form_key="FORM_AE",
+        source_variable_name="AE_TERM",
+        strict_cdash=True,
+    )
+    assert rule_ae_upper.target_field == "AETERM"
+
+    # Universal CDASH identifier
+    rule_id = MappingRule(
+        domain="AE",
+        target_field="subjectKey",
+        source_form_key="FORM_AE",
+        source_variable_name="SUBJ_ID",
+        strict=True,
+    )
+    assert rule_id.target_field == "subjectKey"
+
+    # PD domain accepts dv prefix
+    rule_pd = MappingRule(
+        domain="PD",
+        target_field="dvSeverity",
+        source_form_key="FORM_PD",
+        source_variable_name="DEV_SEV",
+        strict=True,
+    )
+    assert rule_pd.target_field == "dvSeverity"
+
+
+def test_mapping_rule_permits_non_standard_targets_when_not_strict() -> None:
+    """Test that non-standard variables are permitted when strict mode is inactive."""
+    rule = MappingRule(
+        domain="AE",
+        target_field="custom_random_field",
+        source_form_key="FORM_AE",
+        source_variable_name="RAW_VAL",
+        strict=False,
+    )
+    assert rule.target_field == "custom_random_field"
+
+
+def test_study_configuration_strict_mode_rejects_invalid_mapping() -> None:
+    """Test that StudyConfiguration rejects invalid mappings when strict mode is active."""
+    with pytest.raises(ValidationError, match="does not match CDASH domain prefix"):
+        StudyConfiguration.model_validate(
+            {
+                "studyKey": "STUDY-004",
+                "strictMode": True,
+                "mappings": [
+                    {
+                        "domain": "AE",
+                        "targetField": "arbitrary_var",
+                        "sourceFormKey": "FORM_AE",
+                        "sourceVariableName": "AE_VAR",
+                    }
+                ],
+            }
+        )
+
+
+def test_study_configuration_obeys_strict_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that IMEDNET_STRICT_CDASH activates the local naming policy."""
+    monkeypatch.setenv("IMEDNET_STRICT_CDASH", "1")
+    with pytest.raises(ValidationError, match="does not match CDASH domain prefix"):
+        StudyConfiguration.model_validate(
+            {
+                "studyKey": "STUDY-005",
+                "mappings": [
+                    {
+                        "domain": "AE",
+                        "targetField": "invalid_var",
+                        "sourceFormKey": "FORM_AE",
+                        "sourceVariableName": "VAR",
+                    }
+                ],
+            }
+        )

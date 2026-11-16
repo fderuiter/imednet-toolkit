@@ -64,6 +64,8 @@ from imednet.models.reporting import (
 )
 from imednet.models.sites import Site
 from imednet.models.standards import (
+    CDISC_CONTROLLED_TERMINOLOGY,
+    NORMALIZATION_TERMINOLOGY,
     PROFILE_REGISTRY,
     DeviceSafetyProfile,
     DrugSafetyProfile,
@@ -71,6 +73,8 @@ from imednet.models.standards import (
     StandardsProfile,
     StandardsProfileRegistry,
     ValidationViolation,
+    is_valid_cdash_variable,
+    validate_cdash_variable,
 )
 from imednet.models.studies import Study
 from imednet.models.study_config import MappingRule, StudyConfiguration, WidgetConfig
@@ -107,7 +111,9 @@ __all__: list[str] = [
     "ALLOWED_QUERY_TRANSITIONS",
     "ALLOWED_STATUS_TRANSITIONS",
     "ALLOWED_TRANSITIONS",
+    "CDISC_CONTROLLED_TERMINOLOGY",
     "FAILED_JOB_STATES",
+    "NORMALIZATION_TERMINOLOGY",
     "PROFILE_REGISTRY",
     "SUCCESSFUL_JOB_STATES",
     "TERMINAL_JOB_STATES",
@@ -175,6 +181,7 @@ __all__: list[str] = [
     "WidgetConfig",
     "calculate_legacy_status",
     "can_transition",
+    "is_valid_cdash_variable",
     "is_valid_job_transition",
     "is_valid_query_transition",
     "is_valid_status_transition",
@@ -186,6 +193,7 @@ __all__: list[str] = [
     "parse_int_or_default",
     "parse_list_or_default",
     "parse_str_or_default",
+    "validate_cdash_variable",
     "validate_job_transition",
     "validate_query_transition",
     "validate_status_transition",
