@@ -5,7 +5,7 @@ description = "Monorepo workspace for imednet packages"
 authors = [
     { name = "Frederick de Ruiter", email = "127706008+fderuiter@users.noreply.github.com" }
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.11.5"
 dependencies = [
     "imednet",
     "imednet-workflows",
@@ -255,6 +255,11 @@ all = [
     "symilar-check"
 ]
 
+[tool.hatch.envs.lint.env-vars]
+# This detached scanner has vendor pins incompatible with workspace floors.
+# Its exceptions are separate from the unignored exported-lock audit.
+UV_NO_CONFIG = "true"
+
 [tool.hatch.envs.duplication]
 detached = true
 dependencies = ["pylint>=3.0.0"]
@@ -269,6 +274,15 @@ detached = true
 all = [
     "hatch run lint:all {args:packages}",
     "hatch run duplication:check {args:packages}"
+]
+
+[tool.uv]
+# Workspace-only security floors; these are not SDK runtime dependencies.
+# Soup Sieve 4.1.1 also fixes follow-up selector DoS advisories in 4.0/4.1.
+constraint-dependencies = [
+    "soupsieve>=4.1.1",
+    "mako>=1.4.2",
+    "opentelemetry-api>=1.45.2",
 ]
 
 [tool.uv.workspace]

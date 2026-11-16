@@ -34,6 +34,14 @@ verification before being advertised. Do not override vendor bounds to force a
 combination. Retire a Python line or raise required dependency floors in a major
 release, with a documented migration and security exception approved by the maintainer.
 
+Development and documentation checkouts require Python >=3.11.5 so patched
+Soup Sieve releases can install. Recreate older workspace virtual environments
+with a supported interpreter, then run ``uv sync --locked --extra dev --extra docs``.
+This patch minimum belongs to the workspace's tooling; the four published
+distributions retain their Python >=3.11 metadata. Workspace security constraints
+and the independent lockfile audit are documented in
+:doc:`security_exceptions`.
+
 Install core with ``pip install imednet``. Use ``imednet[cli]`` for optional dotenv
 and logging helpers, ``imednet[export]`` for tabular workflows, or
 ``imednet[mongodb]``, ``imednet[neo4j]``, ``imednet[snowflake]`` for sinks.

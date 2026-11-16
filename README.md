@@ -6,6 +6,9 @@ Requires Python 3.11 or newer. Recreate Python 3.10 virtual environments with a
 supported interpreter before upgrading; the minimum enables patched workflow
 file locking dependencies.
 
+Development and documentation checkouts require Python **3.11.5+** to install
+patched selector dependencies. Published packages retain Python 3.11+ support.
+
 Full documentation: <https://fderuiter.github.io/imednet-python-sdk/> | [Interactive Live Explorer](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
 
 <div align="center">
@@ -83,7 +86,7 @@ bash scripts/wizards/setup-imednet-env.sh
 ```
 
 The wizard guides you through:
-1. **Tooling Verification**: Ensuring Python (>= 3.11) and `uv` are available in your `PATH`.
+1. **Tooling Verification**: Ensuring Python (>= 3.11.5) and `uv` are available in your `PATH`.
 2. **UTF-8 Encoding**: Configuring `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` to prevent Windows console `charmap` encoding errors.
 3. **Workspace Synchronization**: Running `uv sync --extra dev --extra docs` to link workspace packages in editable mode.
 4. **EDC Credentials**: Safely entering EDC API credentials into `.env` (with optional GitHub Actions secrets sync via `gh`).
