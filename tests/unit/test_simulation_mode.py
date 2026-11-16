@@ -6,8 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from imednet import AsyncImednetSDK, ImednetSDK
-from imednet.config import Config, load_config
-from imednet.simulation import SimulationState, SimulationTransport, create_simulation_transport
+from imednet.config import load_config
+from imednet.simulation import SimulationState, create_simulation_transport
 
 
 def test_simulation_mode_initialization_without_credentials():
@@ -182,4 +182,3 @@ async def test_async_sdk_simulation_mode():
 
             after_records = [r async for r in sdk.records.list(study_key="STUDY")]
             assert len(after_records) == initial_count + 1
-

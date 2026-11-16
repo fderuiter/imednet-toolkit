@@ -94,7 +94,7 @@ def load_config(
 
     if simulation_mode is None:
         env_simulation_mode = os.getenv("IMEDNET_SIMULATION_MODE")
-        if env_simulation_mode is not None:  # noqa: SIM108
+        if env_simulation_mode is not None:
             simulation_mode = parse_bool(env_simulation_mode)
         else:
             simulation_mode = False

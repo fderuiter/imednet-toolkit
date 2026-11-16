@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import threading
-import uuid
 from typing import Any
 
 
@@ -403,10 +402,7 @@ class SimulationState:
             matched = [f for f in forms if f.get("studyKey") == study_key]
             if matched:
                 return matched
-            return [
-                dict(f, studyKey=study_key)
-                for f in forms
-            ]
+            return [dict(f, studyKey=study_key) for f in forms]
 
     def get_visits(self, study_key: str | None = None) -> list[dict[str, Any]]:
         """Return list of visits for a study."""
@@ -427,9 +423,7 @@ class SimulationState:
                 return records
             return [r for r in records if r.get("studyKey") == study_key]
 
-    def create_records(
-        self, study_key: str, records_data: list[dict[str, Any]]
-    ) -> dict[str, Any]:
+    def create_records(self, study_key: str, records_data: list[dict[str, Any]]) -> dict[str, Any]:
         """Store new records in memory and return a background Job creation response."""
         with self._lock:
             for item in records_data:
@@ -543,10 +537,12 @@ class SimulationState:
                 # If job was initialized in a non-terminal state, advance on polling
                 poll_count = job.get("_poll_count", 0) + 1
                 job["_poll_count"] = poll_count
-                if job.get("state") in ("PROCESSING", "RUNNING", "QUEUED", "PENDING"):
-                    if poll_count >= 2:
-                        job["state"] = "COMPLETED"
-                        job["progress"] = 100
+                if (
+                    job.get("state") in ("PROCESSING", "RUNNING", "QUEUED", "PENDING")
+                    and poll_count >= 2
+                ):
+                    job["state"] = "COMPLETED"
+                    job["progress"] = 100
                 res = copy.deepcopy(job)
                 res.pop("_poll_count", None)
                 return res

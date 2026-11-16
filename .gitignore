@@ -95,3 +95,6 @@ examples/register_subjects_input/*
 # Local data dictionary exports
 data_dictionary.json
 data_dictionary_*.json
+
+# Local DuckDB databases
+*.duckdb

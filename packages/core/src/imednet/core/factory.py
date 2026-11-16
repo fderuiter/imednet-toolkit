@@ -6,6 +6,8 @@ handling authentication, configuration, and retry policies.
 
 from __future__ import annotations
 
+from typing import Any
+
 from imednet.auth.api_key import ApiKeyAuth
 from imednet.auth.oidc import OIDCAuth
 from imednet.auth.strategy import AuthStrategy

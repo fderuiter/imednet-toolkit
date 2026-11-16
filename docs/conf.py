@@ -1,6 +1,7 @@
 """Sphinx configuration."""
 
 # Configuration file for the Sphinx documentation builder.
+import importlib.util
 import logging
 import os
 import sys
@@ -43,9 +44,7 @@ warnings.filterwarnings("ignore", message="Failed guarded type import*")
 
 # Mock heavy optional dependencies so autodoc does not require them.
 # Mock pandas to avoid heavy dependency while building docs if not installed.
-try:
-    import pandas
-except ImportError:
+if not importlib.util.find_spec("pandas"):
     pandas_stub = types.ModuleType("pandas")
 
     class DataFrame:  # pragma: no cover - simple stub
