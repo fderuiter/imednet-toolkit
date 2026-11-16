@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import warnings
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,7 +15,7 @@ from imednet.utils.serialization import flatten as _flatten
 from imednet_workflows.config_version_control import ConfigVersionStore, _sha256_of
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixtures & Mocks
 # ---------------------------------------------------------------------------
 
 
@@ -23,7 +25,7 @@ def _make_config(
     *,
     extra_mapping: bool = False,
 ) -> StudyConfiguration:
-    """Helper function to  make config."""
+    """Helper function to make config."""
     mappings = [
         MappingRule(
             domain="AE",
@@ -56,6 +58,47 @@ def _make_config(
         ],
         terminologyLookups={"AE.aeTerm": {"mild": "MILD"}},
     )
+
+
+class MockAuth:
+    """Mock authentication strategy for testing."""
+
+    def __init__(
+        self,
+        roles: list[str] | None = None,
+        user_id: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self._roles = ["admin"] if roles is None else roles
+        self.api_key = api_key
+        if user_id is not None:
+            self._user_id = user_id
+        elif api_key:
+            self._user_id = "api-key-user"
+        else:
+            self._user_id = "alice"
+
+    def get_user_roles(self) -> list[str]:
+        return list(self._roles)
+
+    def get_user_id(self) -> str:
+        return self._user_id
+
+
+class MockSDK:
+    """Mock SDK instance providing authentication and permissions."""
+
+    def __init__(self, auth: MockAuth | None = None) -> None:
+        self.auth: Any = auth if auth is not None else MockAuth()
+
+    def get_sites(self, study_key: str, limit: int = 1) -> list[dict[str, str]]:
+        return [{"siteId": "SITE-01"}]
+
+
+@pytest.fixture
+def mock_sdk() -> MockSDK:
+    """Fixture providing an authorized mock SDK instance."""
+    return MockSDK()
 
 
 @pytest.fixture
@@ -120,35 +163,38 @@ def test_flatten_mixed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_commit_config_returns_sha256(store: ConfigVersionStore) -> None:
+def test_commit_config_returns_sha256(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that commit config returns sha256."""
     config = _make_config()
-    commit_id = store.commit_config("STUDY-01", config, user="alice", desc="Initial commit")
+    commit_id = store.commit_config("STUDY-01", config, desc="Initial commit", sdk=mock_sdk)
     assert len(commit_id) == 64
     assert commit_id.islower()
 
 
-def test_commit_config_duplicate_raises(store: ConfigVersionStore) -> None:
+def test_commit_config_duplicate_raises(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that commit config duplicate raises."""
     config = _make_config()
-    store.commit_config("STUDY-01", config, user="alice", desc="First")
+    store.commit_config("STUDY-01", config, desc="First", sdk=mock_sdk)
     with pytest.raises(ValueError, match="already exists"):
-        store.commit_config("STUDY-01", config, user="alice", desc="Duplicate")
+        store.commit_config("STUDY-01", config, desc="Duplicate", sdk=mock_sdk)
 
 
-def test_commit_config_different_content_succeeds(store: ConfigVersionStore) -> None:
+def test_commit_config_different_content_succeeds(
+    store: ConfigVersionStore, mock_sdk: MockSDK
+) -> None:
     """Test that commit config different content succeeds."""
     config_a = _make_config(version="1.0.0")
     config_b = _make_config(version="1.1.0")
-    id_a = store.commit_config("STUDY-01", config_a, user="alice", desc="v1.0.0")
-    id_b = store.commit_config("STUDY-01", config_b, user="alice", desc="v1.1.0")
+    id_a = store.commit_config("STUDY-01", config_a, desc="v1.0.0", sdk=mock_sdk)
+    id_b = store.commit_config("STUDY-01", config_b, desc="v1.1.0", sdk=mock_sdk)
     assert id_a != id_b
 
 
 def test_commit_config_persists_metadata(store: ConfigVersionStore, tmp_path: Path) -> None:
     """Test that commit config persists metadata."""
     config = _make_config()
-    commit_id = store.commit_config("STUDY-01", config, user="bob", desc="Test commit")
+    bob_sdk = MockSDK(MockAuth(user_id="bob"))
+    commit_id = store.commit_config("STUDY-01", config, desc="Test commit", sdk=bob_sdk)
     history = store.get_history("STUDY-01")
     assert len(history) == 1
     entry = history[0]
@@ -158,6 +204,120 @@ def test_commit_config_persists_metadata(store: ConfigVersionStore, tmp_path: Pa
     assert entry["modified_by"] == "bob"
     assert entry["description"] == "Test commit"
     assert "timestamp" in entry
+
+
+def test_commit_config_without_sdk_raises_permission_error(store: ConfigVersionStore) -> None:
+    """Calling commit_config without an authorized SDK session must raise PermissionError."""
+    config = _make_config()
+    with pytest.raises(PermissionError, match="authenticated SDK session"):
+        store.commit_config("STUDY-01", config, "test", sdk=None, user="unauthorized_actor")
+
+    with pytest.raises(PermissionError, match="authenticated SDK session"):
+        store.commit_config("STUDY-01", config, "test")
+
+
+def test_commit_config_missing_auth_raises_permission_error(store: ConfigVersionStore) -> None:
+    """Calling commit_config with an SDK instance missing auth raises PermissionError."""
+    config = _make_config()
+    unauth_sdk = MockSDK()
+    unauth_sdk.auth = None
+    with pytest.raises(PermissionError, match="missing auth strategy"):
+        store.commit_config("STUDY-01", config, desc="no auth", sdk=unauth_sdk)
+
+
+def test_commit_config_unauthorized_role_raises_permission_error(store: ConfigVersionStore) -> None:
+    """User lacking admin or manager role cannot commit config."""
+    config = _make_config()
+    viewer_sdk = MockSDK(MockAuth(roles=["viewer"]))
+    with pytest.raises(PermissionError, match="lacks manager or admin role"):
+        store.commit_config("STUDY-01", config, desc="viewer commit", sdk=viewer_sdk)
+
+    empty_role_sdk = MockSDK(MockAuth(roles=[]))
+    with pytest.raises(PermissionError, match="lacks manager or admin role"):
+        store.commit_config("STUDY-01", config, desc="no role commit", sdk=empty_role_sdk)
+
+
+def test_commit_config_manager_role_succeeds(store: ConfigVersionStore) -> None:
+    """User with manager role is permitted to commit config."""
+    config = _make_config()
+    manager_sdk = MockSDK(MockAuth(roles=["manager"], user_id="manager_user"))
+    commit_id = store.commit_config("STUDY-01", config, desc="manager commit", sdk=manager_sdk)
+    assert len(commit_id) == 64
+    history = store.get_history("STUDY-01")
+    assert history[0]["modified_by"] == "manager_user"
+
+
+def test_commit_config_legacy_key_valid_succeeds(store: ConfigVersionStore) -> None:
+    """Legacy API key with study access is granted admin role and succeeds."""
+    config = _make_config()
+    legacy_sdk = MockSDK(MockAuth(roles=[], api_key="valid-api-key"))
+    commit_id = store.commit_config("STUDY-01", config, desc="legacy commit", sdk=legacy_sdk)
+    assert len(commit_id) == 64
+    history = store.get_history("STUDY-01")
+    assert history[0]["modified_by"] == "legacy-api-key"
+
+
+def test_commit_config_legacy_key_invalid_raises_permission_error(
+    store: ConfigVersionStore,
+) -> None:
+    """Legacy API key that fails study access verification raises PermissionError."""
+    config = _make_config()
+    legacy_sdk = MockSDK(MockAuth(roles=[], api_key="invalid-key"))
+
+    def _fail_get_sites(study_key: str, limit: int = 1) -> list[dict[str, str]]:
+        raise RuntimeError("API access denied")
+
+    legacy_sdk.get_sites = _fail_get_sites
+    with pytest.raises(PermissionError, match="Server-side authorization failure for legacy key"):
+        store.commit_config("STUDY-01", config, desc="invalid legacy commit", sdk=legacy_sdk)
+
+
+def test_commit_config_auth_failure_raises_permission_error(store: ConfigVersionStore) -> None:
+    """Exceptions raised during auth role or user lookup raise explicit PermissionError."""
+    config = _make_config()
+    broken_sdk = MockSDK()
+
+    def _fail_roles() -> list[str]:
+        raise RuntimeError("Auth service unreachable")
+
+    broken_sdk.auth.get_user_roles = _fail_roles
+    with pytest.raises(
+        PermissionError, match="Server-side authorization failure: Auth service unreachable"
+    ):
+        store.commit_config("STUDY-01", config, desc="broken auth", sdk=broken_sdk)
+
+    broken_user_sdk = MockSDK()
+
+    def _fail_user_id() -> str:
+        raise RuntimeError("User lookup failed")
+
+    broken_user_sdk.auth.get_user_id = _fail_user_id
+    with pytest.raises(
+        PermissionError, match="Server-side authorization failure: User lookup failed"
+    ):
+        store.commit_config("STUDY-01", config, desc="broken user", sdk=broken_user_sdk)
+
+
+def test_commit_config_user_deprecation_warning(
+    store: ConfigVersionStore, mock_sdk: MockSDK
+) -> None:
+    """Passing user parameter emits a DeprecationWarning."""
+    config = _make_config()
+    with pytest.deprecated_call(match="The 'user' parameter is deprecated"):
+        store.commit_config("STUDY-01", config, desc="test deprecation", sdk=mock_sdk, user="bob")
+
+
+def test_commit_config_user_override_ignored_when_authenticated(store: ConfigVersionStore) -> None:
+    """User parameter cannot override verified authenticated identity."""
+    config = _make_config()
+    auth_sdk = MockSDK(MockAuth(roles=["admin"], user_id="real_user"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        store.commit_config(
+            "STUDY-01", config, desc="spoof attempt", sdk=auth_sdk, user="spoofed_user"
+        )
+    history = store.get_history("STUDY-01")
+    assert history[0]["modified_by"] == "real_user"
 
 
 # ---------------------------------------------------------------------------
@@ -170,15 +330,15 @@ def test_get_history_empty(store: ConfigVersionStore) -> None:
     assert store.get_history("UNKNOWN") == []
 
 
-def test_get_history_ordered(store: ConfigVersionStore) -> None:
+def test_get_history_ordered(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that get history ordered."""
     c1 = _make_config(version="1.0.0")
     c2 = _make_config(version="1.1.0")
     c3 = _make_config(version="1.2.0", extra_mapping=True)
 
-    store.commit_config("STUDY-01", c1, user="alice", desc="v1.0.0")
-    store.commit_config("STUDY-01", c2, user="alice", desc="v1.1.0")
-    store.commit_config("STUDY-01", c3, user="alice", desc="v1.2.0")
+    store.commit_config("STUDY-01", c1, desc="v1.0.0", sdk=mock_sdk)
+    store.commit_config("STUDY-01", c2, desc="v1.1.0", sdk=mock_sdk)
+    store.commit_config("STUDY-01", c3, desc="v1.2.0", sdk=mock_sdk)
 
     history = store.get_history("STUDY-01")
     assert len(history) == 3
@@ -187,22 +347,22 @@ def test_get_history_ordered(store: ConfigVersionStore) -> None:
     assert versions == ["1.0.0", "1.1.0", "1.2.0"]
 
 
-def test_get_history_isolated_by_study(store: ConfigVersionStore) -> None:
+def test_get_history_isolated_by_study(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that get history isolated by study."""
     c1 = _make_config(study_key="STUDY-01")
     c2 = _make_config(study_key="STUDY-02")
-    store.commit_config("STUDY-01", c1, user="alice", desc="first")
-    store.commit_config("STUDY-02", c2, user="alice", desc="second")
+    store.commit_config("STUDY-01", c1, desc="first", sdk=mock_sdk)
+    store.commit_config("STUDY-02", c2, desc="second", sdk=mock_sdk)
 
     assert len(store.get_history("STUDY-01")) == 1
     assert len(store.get_history("STUDY-02")) == 1
     assert len(store.get_history("STUDY-03")) == 0
 
 
-def test_get_history_excludes_config_data(store: ConfigVersionStore) -> None:
+def test_get_history_excludes_config_data(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that get history excludes config data."""
     config = _make_config()
-    store.commit_config("STUDY-01", config, user="alice", desc="first")
+    store.commit_config("STUDY-01", config, desc="first", sdk=mock_sdk)
     history = store.get_history("STUDY-01")
     assert "config_data" not in history[0]
 
@@ -232,12 +392,12 @@ def test_diff_configs_no_changes(store: ConfigVersionStore) -> None:
     assert diff["changed"] == {}
 
 
-def test_diff_configs_detects_changes(store: ConfigVersionStore) -> None:
+def test_diff_configs_detects_changes(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that diff configs detects changes."""
     c1 = _make_config(version="1.0.0")
     c2 = _make_config(version="1.1.0")
-    id_a = store.commit_config("STUDY-01", c1, user="alice", desc="v1.0.0")
-    id_b = store.commit_config("STUDY-01", c2, user="alice", desc="v1.1.0")
+    id_a = store.commit_config("STUDY-01", c1, desc="v1.0.0", sdk=mock_sdk)
+    id_b = store.commit_config("STUDY-01", c2, desc="v1.1.0", sdk=mock_sdk)
     diff = store.diff_configs(id_a, id_b)
     # version field should appear in changed
     assert "version" in diff["changed"]
@@ -245,21 +405,21 @@ def test_diff_configs_detects_changes(store: ConfigVersionStore) -> None:
     assert diff["changed"]["version"]["after"] == "1.1.0"
 
 
-def test_diff_configs_detects_added_keys(store: ConfigVersionStore) -> None:
+def test_diff_configs_detects_added_keys(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that diff configs detects added keys."""
     c1 = _make_config(version="1.0.0", extra_mapping=False)
     c2 = _make_config(version="1.1.0", extra_mapping=True)
-    id_a = store.commit_config("STUDY-01", c1, user="alice", desc="base")
-    id_b = store.commit_config("STUDY-01", c2, user="alice", desc="with-pd")
+    id_a = store.commit_config("STUDY-01", c1, desc="base", sdk=mock_sdk)
+    id_b = store.commit_config("STUDY-01", c2, desc="with-pd", sdk=mock_sdk)
     diff = store.diff_configs(id_a, id_b)
     # New mapping keys should appear in added
     assert diff["added"] or diff["changed"]
 
 
-def test_diff_configs_missing_commit_raises(store: ConfigVersionStore) -> None:
+def test_diff_configs_missing_commit_raises(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that diff configs missing commit raises."""
     c1 = _make_config()
-    id_a = store.commit_config("STUDY-01", c1, user="alice", desc="base")
+    id_a = store.commit_config("STUDY-01", c1, desc="base", sdk=mock_sdk)
     with pytest.raises(KeyError):
         store.diff_configs(id_a, "nonexistent_commit_id")
 
@@ -269,14 +429,14 @@ def test_diff_configs_missing_commit_raises(store: ConfigVersionStore) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_rollback_config_restores_original(store: ConfigVersionStore) -> None:
+def test_rollback_config_restores_original(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that rollback config restores original."""
     original = _make_config(version="1.0.0")
-    commit_id = store.commit_config("STUDY-01", original, user="alice", desc="base")
+    commit_id = store.commit_config("STUDY-01", original, desc="base", sdk=mock_sdk)
 
     # Commit a new version
     updated = _make_config(version="1.1.0")
-    store.commit_config("STUDY-01", updated, user="alice", desc="update")
+    store.commit_config("STUDY-01", updated, desc="update", sdk=mock_sdk)
 
     # Rollback to original commit
     restored = store.rollback_config("STUDY-01", commit_id)
@@ -285,12 +445,12 @@ def test_rollback_config_restores_original(store: ConfigVersionStore) -> None:
     assert restored.study_key == "STUDY-01"
 
 
-def test_rollback_config_is_non_destructive(store: ConfigVersionStore) -> None:
+def test_rollback_config_is_non_destructive(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that rollback config is non destructive."""
     c1 = _make_config(version="1.0.0")
     c2 = _make_config(version="1.1.0")
-    id1 = store.commit_config("STUDY-01", c1, user="alice", desc="v1")
-    store.commit_config("STUDY-01", c2, user="alice", desc="v2")
+    id1 = store.commit_config("STUDY-01", c1, desc="v1", sdk=mock_sdk)
+    store.commit_config("STUDY-01", c2, desc="v2", sdk=mock_sdk)
 
     store.rollback_config("STUDY-01", id1)
 
@@ -299,10 +459,10 @@ def test_rollback_config_is_non_destructive(store: ConfigVersionStore) -> None:
     assert len(history) == 2
 
 
-def test_rollback_config_wrong_study_raises(store: ConfigVersionStore) -> None:
+def test_rollback_config_wrong_study_raises(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that rollback config wrong study raises."""
     config = _make_config(study_key="STUDY-01")
-    commit_id = store.commit_config("STUDY-01", config, user="alice", desc="base")
+    commit_id = store.commit_config("STUDY-01", config, desc="base", sdk=mock_sdk)
     with pytest.raises(KeyError, match="not found for study"):
         store.rollback_config("STUDY-WRONG", commit_id)
 
@@ -318,10 +478,10 @@ def test_rollback_config_unknown_commit_raises(store: ConfigVersionStore) -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_commit_content_hash_matches(store: ConfigVersionStore) -> None:
+def test_commit_content_hash_matches(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """The stored commit_id must equal SHA-256 of the canonical JSON."""
     config = _make_config()
-    commit_id = store.commit_config("STUDY-01", config, user="alice", desc="integrity")
+    commit_id = store.commit_config("STUDY-01", config, desc="integrity", sdk=mock_sdk)
 
     config_json = json.dumps(config.model_dump(mode="json", by_alias=True), sort_keys=True)
     expected_id = _sha256_of(config_json)
@@ -333,8 +493,10 @@ def test_multiple_studies_independent(store: ConfigVersionStore) -> None:
     c_a = _make_config(study_key="STUDY-A", version="1.0.0")
     c_b = _make_config(study_key="STUDY-B", version="2.0.0")
 
-    store.commit_config("STUDY-A", c_a, user="alice", desc="a1")
-    store.commit_config("STUDY-B", c_b, user="bob", desc="b1")
+    alice_sdk = MockSDK(MockAuth(user_id="alice"))
+    bob_sdk = MockSDK(MockAuth(user_id="bob"))
+    store.commit_config("STUDY-A", c_a, desc="a1", sdk=alice_sdk)
+    store.commit_config("STUDY-B", c_b, desc="b1", sdk=bob_sdk)
 
     hist_a = store.get_history("STUDY-A")
     hist_b = store.get_history("STUDY-B")
@@ -406,10 +568,12 @@ def test_rollback_config_detects_invalid_signature(store: ConfigVersionStore) ->
         store.rollback_config("STUDY-01", forged_commit)
 
 
-def test_diff_configs_detects_invalid_signature(store: ConfigVersionStore) -> None:
+def test_diff_configs_detects_invalid_signature(
+    store: ConfigVersionStore, mock_sdk: MockSDK
+) -> None:
     """Test that diff configs detects invalid signature."""
     valid = _make_config(version="1.0.0")
-    valid_commit = store.commit_config("STUDY-01", valid, user="alice", desc="valid")
+    valid_commit = store.commit_config("STUDY-01", valid, desc="valid", sdk=mock_sdk)
     forged_json = json.dumps(
         _make_config(version="2.0.0").model_dump(mode="json", by_alias=True),
         sort_keys=True,
@@ -439,10 +603,10 @@ def test_diff_configs_detects_invalid_signature(store: ConfigVersionStore) -> No
         store.diff_configs(valid_commit, forged_commit)
 
 
-def test_history_rows_cannot_be_updated(store: ConfigVersionStore) -> None:
+def test_history_rows_cannot_be_updated(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that history rows cannot be updated."""
     config = _make_config(version="1.0.0")
-    commit_id = store.commit_config("STUDY-01", config, user="alice", desc="base")
+    commit_id = store.commit_config("STUDY-01", config, desc="base", sdk=mock_sdk)
 
     with (
         sqlite3.connect(store.db_path) as conn,
@@ -454,10 +618,10 @@ def test_history_rows_cannot_be_updated(store: ConfigVersionStore) -> None:
         )
 
 
-def test_history_rows_cannot_be_deleted(store: ConfigVersionStore) -> None:
+def test_history_rows_cannot_be_deleted(store: ConfigVersionStore, mock_sdk: MockSDK) -> None:
     """Test that history rows cannot be deleted."""
     config = _make_config(version="1.0.0")
-    commit_id = store.commit_config("STUDY-01", config, user="alice", desc="base")
+    commit_id = store.commit_config("STUDY-01", config, desc="base", sdk=mock_sdk)
 
     with (
         sqlite3.connect(store.db_path) as conn,
@@ -474,7 +638,8 @@ def test_encryption_zero_plaintext_on_disk(tmp_path: Path) -> None:
     os.environ["IMEDNET_SECURITY_KEY"] = "my_secure_encryption_key"
     store = ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
     config = _make_config()
-    store.commit_config("STUDY-01", config, user="bob", desc="secure commit")
+    bob_sdk = MockSDK(MockAuth(user_id="bob"))
+    store.commit_config("STUDY-01", config, desc="secure commit", sdk=bob_sdk)
 
     with sqlite3.connect(store.db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -487,7 +652,7 @@ def test_encryption_zero_plaintext_on_disk(tmp_path: Path) -> None:
         assert encrypted_payload.startswith("gAAAA")
 
 
-def test_dynamic_sqlite_selection_per_base_url(tmp_path: Path) -> None:
+def test_dynamic_sqlite_selection_per_base_url(tmp_path: Path, mock_sdk: MockSDK) -> None:
     """Verify separate SQLite files are instantiated for different base URLs."""
     import os
 
@@ -500,7 +665,7 @@ def test_dynamic_sqlite_selection_per_base_url(tmp_path: Path) -> None:
     try:
         os.environ["IMEDNET_SECURITY_KEY"] = "key1"
         path1 = store.db_path
-        store.commit_config("STUDY-01", config, user="alice", desc="env1 commit")
+        store.commit_config("STUDY-01", config, desc="env1 commit", sdk=mock_sdk)
     finally:
         reset_base_url_context(t1)
 
@@ -528,7 +693,7 @@ def test_dynamic_sqlite_selection_per_study_context(tmp_path: Path) -> None:
         reset_study_context(t1)
 
 
-def test_decryption_incorrect_or_missing_key_raises(tmp_path: Path) -> None:
+def test_decryption_incorrect_or_missing_key_raises(tmp_path: Path, mock_sdk: MockSDK) -> None:
     """Verify that configuration reads fail if the decryption key is incorrect or missing."""
     import os
 
@@ -537,7 +702,7 @@ def test_decryption_incorrect_or_missing_key_raises(tmp_path: Path) -> None:
     os.environ["IMEDNET_SECURITY_KEY"] = "secret1"
     store = ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
     config = _make_config()
-    commit_id = store.commit_config("STUDY-01", config, user="alice", desc="env1 commit")
+    commit_id = store.commit_config("STUDY-01", config, desc="env1 commit", sdk=mock_sdk)
 
     os.environ["IMEDNET_SECURITY_KEY"] = "wrong_secret"
     with pytest.raises(ValueError, match="Decryption failed|integrity check failed"):

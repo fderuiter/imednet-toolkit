@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -235,32 +236,55 @@ class ConfigVersionStore:
 
         Raises:
             ValueError: If a commit with the same content hash already exists.
-            PermissionError: If the authenticated session does not have manager/admin role.
+            PermissionError: If an authenticated SDK session is not provided,
+                or if the authenticated session does not have manager/admin role.
         """
-        if sdk is not None:
+        if sdk is None:
+            raise PermissionError(
+                "An authenticated SDK session is required to commit configuration."
+            )
+
+        if not hasattr(sdk, "auth") or sdk.auth is None:
+            raise PermissionError("SDK session is not authenticated: missing auth strategy.")
+
+        try:
             roles = sdk.auth.get_user_roles()
+        except Exception as exc:
+            raise PermissionError(f"Server-side authorization failure: {exc}") from exc
 
-            # Legacy fallback: if using static keys, validate server-side by making an API call
-            if not roles and hasattr(sdk.auth, "api_key") and sdk.auth.api_key:
-                try:
-                    # Validate the key has access by requesting study data
-                    sdk.get_sites(study_key, limit=1)
-                    roles = ["admin"]  # Legacy keys with access map to admin
-                except Exception as exc:
-                    raise PermissionError(  # noqa: B904
-                        f"Server-side authorization failure for legacy key: {exc}"
-                    )
-
-            if not roles or ("admin" not in roles and "manager" not in roles):
-                raise PermissionError(
-                    "Server-side authorization failure: user lacks manager or admin role required to publish."
+        # Legacy fallback: if using static keys, validate server-side by making an API call
+        if not roles and hasattr(sdk.auth, "api_key") and sdk.auth.api_key:
+            try:
+                # Validate the key has access by requesting study data
+                sdk.get_sites(study_key, limit=1)
+                roles = ["admin"]  # Legacy keys with access map to admin
+            except Exception as exc:
+                raise PermissionError(  # noqa: B904
+                    f"Server-side authorization failure for legacy key: {exc}"
                 )
 
+        if not roles or ("admin" not in roles and "manager" not in roles):
+            raise PermissionError(
+                "Server-side authorization failure: user lacks manager or admin role required to publish."
+            )
+
+        if user:
+            warnings.warn(
+                "The 'user' parameter is deprecated and will be removed in a future release. "
+                "User identity is resolved from the authenticated SDK session.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        try:
             user_id = sdk.auth.get_user_id()
-            if user_id and user_id != "api-key-user":
-                user = user_id
-            elif not user and user_id == "api-key-user":
-                user = "legacy-api-key"
+        except Exception as exc:
+            raise PermissionError(f"Server-side authorization failure: {exc}") from exc
+
+        if user_id and user_id != "api-key-user":
+            user = user_id
+        elif not user and user_id == "api-key-user":
+            user = "legacy-api-key"
 
         if not user:
             raise ValueError("A user identifier is required to commit.")
