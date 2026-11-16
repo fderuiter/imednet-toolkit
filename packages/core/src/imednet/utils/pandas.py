@@ -10,10 +10,26 @@ except ImportError:
     pd: Any = None  # type: ignore[no-redef]
 from ..models.records import Record
 from ..models.subjects import Subject
+from ..models.variables import Variable
 from .security import sanitize_csv_formula
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
     from ..sdk import ImednetSDK
+
+
+def variables_to_dataframe(variables: list[Variable]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.variables.Variable` to a DataFrame.
+
+    Each variable model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for variables_to_dataframe. Install with \"pip install 'imednet[export]'\"."
+        )
+
+    variable_dicts = [v.model_dump(by_alias=False) for v in variables]
+    return pd.DataFrame(variable_dicts)
 
 
 def subjects_to_dataframe(subjects: list[Subject]) -> pd.DataFrame:

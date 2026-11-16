@@ -8,7 +8,23 @@ import pytest
 
 from imednet.models.records import Record
 from imednet.models.subjects import Subject
-from imednet.utils.pandas import export_records_csv, records_to_dataframe, subjects_to_dataframe
+from imednet.models.variables import Variable
+from imednet.utils.pandas import (
+    export_records_csv,
+    records_to_dataframe,
+    subjects_to_dataframe,
+    variables_to_dataframe,
+)
+
+
+def _sample_variable() -> Variable:
+    """Helper function to sample variable."""
+    return Variable(
+        label="Subject Initials",
+        variable_oid="SUBJ_INIT",
+        variable_id=1,
+        study_key="S1",
+    )
 
 
 def _sample_record() -> Record:
@@ -54,6 +70,31 @@ def test_subjects_to_dataframe_raises_importerror_when_pandas_missing(monkeypatc
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
     with pytest.raises(ImportError, match="pandas is required for subjects_to_dataframe"):
         subjects_to_dataframe([])
+
+
+def test_variables_to_dataframe_success() -> None:
+    """Test converting variables to a pandas DataFrame."""
+    var = _sample_variable()
+    df = variables_to_dataframe([var])
+    assert not df.empty
+    assert len(df) == 1
+    assert df.loc[0, "label"] == "Subject Initials"
+    assert df.loc[0, "variable_oid"] == "SUBJ_INIT"
+    assert df.loc[0, "variable_id"] == 1
+    assert df.loc[0, "study_key"] == "S1"
+
+
+def test_variables_to_dataframe_empty() -> None:
+    """Test converting empty variables collection to DataFrame."""
+    df = variables_to_dataframe([])
+    assert df.empty
+
+
+def test_variables_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
+    """Test that variables_to_dataframe raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for variables_to_dataframe"):
+        variables_to_dataframe([])
 
 
 def test_records_to_dataframe_flatten() -> None:
