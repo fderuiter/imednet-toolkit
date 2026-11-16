@@ -6,10 +6,14 @@ including reporting profiles, widgets, and mapping rules.
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+import os
+from typing import Self
+
+from pydantic import Field, field_validator, model_validator
 
 from imednet.models.base import ImednetBaseModel
-from imednet.models.standards import PROFILE_REGISTRY
+from imednet.models.standards import PROFILE_REGISTRY, validate_cdash_variable
+from imednet.utils.validators import parse_bool
 
 
 class MappingRule(ImednetBaseModel):
@@ -22,6 +26,25 @@ class MappingRule(ImednetBaseModel):
     fallback_value: str | None = Field(None, alias="fallbackValue")
     business_logic: str | None = Field(None, alias="businessLogic")
     is_baseline: bool = Field(False, alias="isBaseline")
+    strict: bool = Field(False, alias="strict")
+    strict_mode: bool = Field(False, alias="strictMode")
+    strict_cdash: bool = Field(False, alias="strictCdash")
+
+    @model_validator(mode="after")
+    def _validate_cdash_target(self) -> Self:  # noqa: N804
+        """Validate target variable against CDASH rules when strict mode is active."""
+        is_strict = (
+            self.strict
+            or self.strict_mode
+            or self.strict_cdash
+            or parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"))
+            or parse_bool(os.getenv("IMEDNET_STRICT_CDASH", "false"))
+        )
+        if is_strict:
+            valid, err_msg = validate_cdash_variable(self.target_field, self.domain)
+            if not valid:
+                raise ValueError(err_msg)
+        return self
 
 
 class WidgetConfig(ImednetBaseModel):
@@ -48,6 +71,9 @@ class StudyConfiguration(ImednetBaseModel):
     )
     widgets: list[WidgetConfig] = Field(default_factory=list, alias="widgets")
     phi_fields: list[str] = Field(default_factory=list, alias="phiFields")
+    strict: bool = Field(False, alias="strict")
+    strict_mode: bool = Field(False, alias="strictMode")
+    strict_cdash: bool = Field(False, alias="strictCdash")
 
     @field_validator("reporting_profile", check_fields=False, mode="before")
     @classmethod
@@ -62,3 +88,20 @@ class StudyConfiguration(ImednetBaseModel):
 
         available_profiles = ", ".join(PROFILE_REGISTRY.list_profiles())
         raise ValueError(f"reportingProfile must be one of: {available_profiles}")
+
+    @model_validator(mode="after")
+    def _validate_mappings_strict(self) -> Self:  # noqa: N804
+        """Enforce CDASH rules across all mappings if strict mode is active."""
+        is_strict = (
+            self.strict
+            or self.strict_mode
+            or self.strict_cdash
+            or parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"))
+            or parse_bool(os.getenv("IMEDNET_STRICT_CDASH", "false"))
+        )
+        if is_strict:
+            for rule in self.mappings:
+                valid, err_msg = validate_cdash_variable(rule.target_field, rule.domain)
+                if not valid:
+                    raise ValueError(err_msg)
+        return self

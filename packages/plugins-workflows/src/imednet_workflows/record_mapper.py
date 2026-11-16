@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
+from imednet.spi.utils import normalize_iso_date
 
 from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
@@ -231,22 +232,19 @@ class RecordMapper:
         Returns:
             A dictionary containing both metadata and parsed record data.
         """
+        subj_key = rec.subject_key.strip() if isinstance(rec.subject_key, str) else rec.subject_key
         meta = {
             "recordId": rec.record_id,
-            "subjectKey": rec.subject_key,
+            "subjectKey": subj_key,
             "visitId": rec.visit_id,
             "formId": rec.form_id,
             "recordStatus": rec.record_status,
-            "dateCreated": (
-                rec.date_created.isoformat()  # type: ignore[union-attr]
-                if hasattr(rec.date_created, 'isoformat')
-                else str(rec.date_created)
-                if rec.date_created
-                else None
-            ),
+            "dateCreated": (normalize_iso_date(rec.date_created) if rec.date_created else None),
         }
         data = rec.record_data if isinstance(rec.record_data, dict) else {}
         parsed = record_model(**data).model_dump(by_alias=False)
+        for key, val in parsed.items():
+            parsed[key] = normalize_iso_date(val)
         return {**meta, **parsed}
 
     def _parse_records(

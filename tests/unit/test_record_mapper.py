@@ -315,3 +315,37 @@ def test_iter_dataframes_streams_large_study_with_bounded_memory() -> None:
     loader.sync_records.assert_called_once_with("STUDY")
     assert chunk_sizes == [5_000] * 10
     assert peak_bytes < _STREAMING_PEAK_BYTES_LIMIT
+
+
+def test_parse_record_normalizes_dates_to_iso8601() -> None:
+    """Test that _parse_record transforms valid date inputs into ISO 8601 strings."""
+    sdk = MagicMock()
+    mapper = RecordMapper(sdk)
+
+    record_model = mapper._build_record_model(
+        ["DATE_COL1", "DATE_COL2", "TEXT_COL"],
+        {"DATE_COL1": "Date 1", "DATE_COL2": "Date 2", "TEXT_COL": "Text"},
+    )
+
+    rec = Record(
+        record_id=42,
+        subject_key="  SUBJ-001  ",
+        visit_id=1,
+        form_id=10,
+        record_status="Complete",
+        date_created=datetime(2024, 3, 15, 10, 0, 0),
+        record_data={
+            "DATE_COL1": "2024/03/15",
+            "DATE_COL2": "15-MAR-2024",
+            "TEXT_COL": "Non-date string",
+        },
+    )
+
+    parsed = mapper._parse_record(rec, record_model)
+
+    assert parsed["recordId"] == 42
+    assert parsed["subjectKey"] == "SUBJ-001"
+    assert parsed["dateCreated"] == "2024-03-15T10:00:00"
+    assert parsed["DATE_COL1"] == "2024-03-15"
+    assert parsed["DATE_COL2"] == "2024-03-15"
+    assert parsed["TEXT_COL"] == "Non-date string"

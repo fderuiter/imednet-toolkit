@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic import BaseModel
@@ -226,12 +227,331 @@ PROFILE_REGISTRY.register(DrugSafetyProfile())
 PROFILE_REGISTRY.register(DeviceSafetyProfile())
 
 
+CDISC_CONTROLLED_TERMINOLOGY: dict[str, set[str]] = {
+    # Severity / Intensity (C66769)
+    "aeSeverity": {"MILD", "MODERATE", "SEVERE", "1", "2", "3", "4", "5"},
+    "AESEV": {"MILD", "MODERATE", "SEVERE", "1", "2", "3", "4", "5"},
+    "dvSeverity": {"MILD", "MODERATE", "SEVERE", "MAJOR", "MINOR", "CRITICAL"},
+    "DVSEV": {"MILD", "MODERATE", "SEVERE", "MAJOR", "MINOR", "CRITICAL"},
+    "pdSeverity": {"MILD", "MODERATE", "SEVERE", "MAJOR", "MINOR", "CRITICAL"},
+    # Causality / Relationship (C66768)
+    "aeRelationship": {
+        "RELATED",
+        "NOT RELATED",
+        "POSSIBLE",
+        "PROBABLE",
+        "DEFINITE",
+        "REMOTE",
+        "UNRELATED",
+        "POSSIBLY RELATED",
+        "PROBABLY RELATED",
+        "DEFINITELY RELATED",
+        "UNLIKELY RELATED",
+        "CONDITIONAL",
+        "NOT ASSESSABLE",
+        "YES",
+        "NO",
+    },
+    "AEREL": {
+        "RELATED",
+        "NOT RELATED",
+        "POSSIBLE",
+        "PROBABLE",
+        "DEFINITE",
+        "REMOTE",
+        "UNRELATED",
+        "POSSIBLY RELATED",
+        "PROBABLY RELATED",
+        "DEFINITELY RELATED",
+        "UNLIKELY RELATED",
+        "CONDITIONAL",
+        "NOT ASSESSABLE",
+        "YES",
+        "NO",
+    },
+    "ddRelationship": {"RELATED", "NOT RELATED", "POSSIBLE", "PROBABLE", "REMOTE", "YES", "NO"},
+    "DDREL": {"RELATED", "NOT RELATED", "POSSIBLE", "PROBABLE", "REMOTE", "YES", "NO"},
+    # Action Taken (C66767)
+    "aeActionTaken": {
+        "NONE",
+        "DOSE REDUCED",
+        "DOSE INCREASED",
+        "DOSE NOT CHANGED",
+        "DRUG INTERRUPTED",
+        "DRUG WITHDRAWN",
+        "NOT APPLICABLE",
+        "UNKNOWN",
+    },
+    "AEACN": {
+        "NONE",
+        "DOSE REDUCED",
+        "DOSE INCREASED",
+        "DOSE NOT CHANGED",
+        "DRUG INTERRUPTED",
+        "DRUG WITHDRAWN",
+        "NOT APPLICABLE",
+        "UNKNOWN",
+    },
+    "ddActionTaken": {
+        "REPLACED",
+        "REPAIRED",
+        "REMOVED",
+        "NONE",
+        "OTHER",
+        "NOT APPLICABLE",
+        "UNKNOWN",
+    },
+    "DDACN": {
+        "REPLACED",
+        "REPAIRED",
+        "REMOVED",
+        "NONE",
+        "OTHER",
+        "NOT APPLICABLE",
+        "UNKNOWN",
+    },
+    # Outcome (C66768)
+    "aeOutcome": {
+        "RECOVERED/RESOLVED",
+        "RECOVERED",
+        "RESOLVED",
+        "RECOVERING/RESOLVING",
+        "RECOVERING",
+        "NOT RECOVERED/NOT RESOLVED",
+        "NOT RECOVERED",
+        "RECOVERED/RESOLVED WITH SEQUELAE",
+        "FATAL",
+        "UNKNOWN",
+    },
+    "AEOUT": {
+        "RECOVERED/RESOLVED",
+        "RECOVERED",
+        "RESOLVED",
+        "RECOVERING/RESOLVING",
+        "RECOVERING",
+        "NOT RECOVERED/NOT RESOLVED",
+        "NOT RECOVERED",
+        "RECOVERED/RESOLVED WITH SEQUELAE",
+        "FATAL",
+        "UNKNOWN",
+    },
+    # Seriousness
+    "aeSerious": {"Y", "N", "YES", "NO", "TRUE", "FALSE"},
+    "AESER": {"Y", "N", "YES", "NO", "TRUE", "FALSE"},
+    "ddSerious": {"Y", "N", "YES", "NO", "TRUE", "FALSE"},
+    "DDSER": {"Y", "N", "YES", "NO", "TRUE", "FALSE"},
+    # Deviation / Deficiency Categories & Status
+    "dvCategory": {
+        "INCLUSION/EXCLUSION",
+        "INFORMED CONSENT",
+        "STUDY PROCEDURE",
+        "CONCOMITANT MEDICATION",
+        "INVESTIGATIONAL PRODUCT",
+        "SAFETY REPORTING",
+        "VISIT SCHEDULE",
+        "OTHER",
+        "ELIGIBILITY",
+        "CONSENT",
+        "PROCEDURE",
+    },
+    "DVCAT": {
+        "INCLUSION/EXCLUSION",
+        "INFORMED CONSENT",
+        "STUDY PROCEDURE",
+        "CONCOMITANT MEDICATION",
+        "INVESTIGATIONAL PRODUCT",
+        "SAFETY REPORTING",
+        "VISIT SCHEDULE",
+        "OTHER",
+        "ELIGIBILITY",
+        "CONSENT",
+        "PROCEDURE",
+    },
+    "pdCategory": {
+        "INCLUSION/EXCLUSION",
+        "INFORMED CONSENT",
+        "STUDY PROCEDURE",
+        "CONCOMITANT MEDICATION",
+        "INVESTIGATIONAL PRODUCT",
+        "SAFETY REPORTING",
+        "VISIT SCHEDULE",
+        "OTHER",
+        "ELIGIBILITY",
+        "CONSENT",
+        "PROCEDURE",
+    },
+    "dvStatus": {
+        "OPEN",
+        "RESOLVED",
+        "CLOSED",
+        "COMPLETED",
+        "PENDING",
+        "UNREVIEWED",
+        "APPROVED",
+        "ESCALATED",
+    },
+    "DVSTATUS": {
+        "OPEN",
+        "RESOLVED",
+        "CLOSED",
+        "COMPLETED",
+        "PENDING",
+        "UNREVIEWED",
+        "APPROVED",
+        "ESCALATED",
+    },
+    "pdStatus": {
+        "OPEN",
+        "RESOLVED",
+        "CLOSED",
+        "COMPLETED",
+        "PENDING",
+        "UNREVIEWED",
+        "APPROVED",
+        "ESCALATED",
+    },
+    "ddCategory": {
+        "HARDWARE",
+        "SOFTWARE",
+        "PACKAGING",
+        "LABELING",
+        "MECHANICAL",
+        "ELECTRICAL",
+        "BATTERY",
+        "OTHER",
+    },
+    "DDCAT": {
+        "HARDWARE",
+        "SOFTWARE",
+        "PACKAGING",
+        "LABELING",
+        "MECHANICAL",
+        "ELECTRICAL",
+        "BATTERY",
+        "OTHER",
+    },
+}
+
+UNIVERSAL_CDASH_IDENTIFIERS: frozenset[str] = frozenset(
+    {
+        "studyid",
+        "study_id",
+        "domain",
+        "usubjid",
+        "subjid",
+        "siteid",
+        "site_id",
+        "visit",
+        "visitnum",
+        "visit_num",
+        "visitid",
+        "visit_id",
+        "visitdy",
+        "epoch",
+        "subjectkey",
+        "subject_key",
+        "recordid",
+        "record_id",
+    }
+)
+
+DOMAIN_PREFIXES: dict[str, set[str]] = {
+    "AE": {"ae"},
+    "PD": {"dv", "pd"},
+    "DV": {"dv", "pd"},
+    "DD": {"dd"},
+    "DM": {"dm"},
+    "CM": {"cm"},
+    "EX": {"ex"},
+    "LB": {"lb"},
+    "MH": {"mh"},
+    "QS": {"qs"},
+    "VS": {"vs"},
+    "PE": {"pe"},
+    "DA": {"da"},
+    "DS": {"ds"},
+    "IE": {"ie"},
+    "SU": {"su"},
+}
+
+DM_ALLOWED_VARIABLES: frozenset[str] = frozenset(
+    {
+        "age",
+        "ageu",
+        "sex",
+        "race",
+        "ethnic",
+        "arm",
+        "armcd",
+        "actarm",
+        "actarmcd",
+        "country",
+        "brthdtc",
+        "dthdtc",
+        "dthfl",
+        "dmdtc",
+    }
+)
+
+
+def validate_cdash_variable(target_field: str, domain: str) -> tuple[bool, str | None]:
+    """Validate a target variable against CDASH naming conventions and domain prefixes.
+
+    Args:
+        target_field: The field name to validate.
+        domain: The clinical domain code (e.g. 'AE', 'PD', 'DD').
+
+    Returns:
+        A tuple of (is_valid, error_message_or_none).
+    """
+    if not target_field or not isinstance(target_field, str):
+        return False, "Target field must be a non-empty string"
+    if not domain or not isinstance(domain, str):
+        return False, "Domain must be a non-empty string"
+
+    clean_target = target_field.strip()
+    clean_domain = domain.strip().upper()
+    lower_target = clean_target.lower()
+
+    if not re.match(r"^[A-Za-z][A-Za-z0-9_]{1,31}$", clean_target):
+        return False, f"Target field '{clean_target}' is not a valid CDASH variable name"
+
+    if lower_target in UNIVERSAL_CDASH_IDENTIFIERS:
+        return True, None
+
+    if clean_domain == "DM" and lower_target in DM_ALLOWED_VARIABLES:
+        return True, None
+
+    allowed_prefixes = DOMAIN_PREFIXES.get(clean_domain, {clean_domain.lower()})
+    has_prefix = any(lower_target.startswith(prefix) for prefix in allowed_prefixes)
+    if not has_prefix:
+        expected = ", ".join(f"'{p}'" for p in sorted(allowed_prefixes))
+        return False, (
+            f"Target variable '{clean_target}' does not match CDASH domain prefix for {clean_domain} "
+            f"(expected prefix: {expected})"
+        )
+
+    return True, None
+
+
+def is_valid_cdash_variable(target_field: str, domain: str) -> bool:
+    """Check whether a target variable conforms to CDASH conventions for a domain."""
+    valid, _ = validate_cdash_variable(target_field, domain)
+    return valid
+
+
 __all__ = [
+    "CDISC_CONTROLLED_TERMINOLOGY",
+    "DM_ALLOWED_VARIABLES",
+    "DOMAIN_PREFIXES",
     "PROFILE_REGISTRY",
+    "UNIVERSAL_CDASH_IDENTIFIERS",
     "DeviceSafetyProfile",
     "DrugSafetyProfile",
     "GeneralClinicalProfile",
     "StandardsProfile",
     "StandardsProfileRegistry",
     "ValidationViolation",
+    "is_valid_cdash_variable",
+    "validate_cdash_variable",
 ]
