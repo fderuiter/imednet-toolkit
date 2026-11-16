@@ -13,7 +13,7 @@ if TYPE_CHECKING:
         from airflow.sdk.bases.hook import BaseHook
     except ImportError:
         try:
-            from airflow.hooks.base import BaseHook  # type: ignore[attr-defined]
+            from airflow.hooks.base import BaseHook  # type: ignore[attr-defined,no-redef]
         except ImportError:
 
             class BaseHook:  # type: ignore[no-redef]

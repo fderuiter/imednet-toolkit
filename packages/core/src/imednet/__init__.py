@@ -14,6 +14,11 @@ from .orchestration import (
 )
 from .plugins import PluginProtocol, WorkflowsNamespaceProtocol
 from .sdk import AsyncImednetSDK, ImednetSDK
+from .simulation import (
+    SimulationState,
+    SimulationTransport,
+    create_simulation_transport,
+)
 from .utils.typing import FilterScalar, FilterValue, ItemId, JsonDict
 
 # Provide a backward-compatible alias
@@ -38,9 +43,12 @@ __all__ = [
     "PluginProtocol",
     "RetryPolicy",
     "RetryState",
+    "SimulationState",
+    "SimulationTransport",
     "StudyWorkerCallable",
     "WorkflowsNamespaceProtocol",
     "__version__",
+    "create_simulation_transport",
     "load_config",
 ]
 

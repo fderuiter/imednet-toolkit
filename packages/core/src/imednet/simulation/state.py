@@ -1,0 +1,612 @@
+"""In-memory fixture state for offline simulation mode."""
+
+from __future__ import annotations
+
+import copy
+import threading
+from typing import Any
+
+
+class SimulationState:
+    """Thread-safe in-memory store representing simulated EDC server state."""
+
+    def __init__(self) -> None:
+        """Initialize simulation state with deterministic fixtures."""
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        """Reset all in-memory fixtures to clean initial state."""
+        with getattr(self, "_lock", threading.Lock()):
+            self._next_record_id: int = 1000
+            self._next_batch_num: int = 1
+
+            self.studies: list[dict[str, Any]] = [
+                {
+                    "studyKey": "DEMO-STUDY",
+                    "studyName": "Demo Oncology Trial",
+                    "studyDescription": "A simulated Phase II oncology investigation",
+                    "studyType": "Interventional",
+                    "sponsorKey": "ACME-SPONSOR",
+                    "studyId": 1001,
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateModified": "2026-01-01T00:00:00Z",
+                    "lastUpdated": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "studyKey": "MY_STUDY",
+                    "studyName": "Primary Clinical Trial",
+                    "studyDescription": "Primary simulated clinical investigation",
+                    "studyType": "Interventional",
+                    "sponsorKey": "ACME-SPONSOR",
+                    "studyId": 1002,
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateModified": "2026-01-01T00:00:00Z",
+                    "lastUpdated": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "studyKey": "STUDY",
+                    "studyName": "Benchmark Validation Study",
+                    "studyDescription": "Benchmark simulated study",
+                    "studyType": "Observational",
+                    "sponsorKey": "ACME-SPONSOR",
+                    "studyId": 1003,
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateModified": "2026-01-01T00:00:00Z",
+                    "lastUpdated": "2026-01-01T00:00:00Z",
+                },
+            ]
+
+            self.sites: list[dict[str, Any]] = [
+                {
+                    "siteId": 101,
+                    "siteName": "SITE",
+                    "studyKey": "STUDY",
+                    "siteEnrollmentStatus": "Active",
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateModified": "2026-01-01T00:00:00Z",
+                    "lastUpdated": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "siteId": 102,
+                    "siteName": "North Site",
+                    "studyKey": "DEMO-STUDY",
+                    "siteEnrollmentStatus": "Active",
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateModified": "2026-01-01T00:00:00Z",
+                    "lastUpdated": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "siteId": 103,
+                    "siteName": "Main Site",
+                    "studyKey": "MY_STUDY",
+                    "siteEnrollmentStatus": "Active",
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateModified": "2026-01-01T00:00:00Z",
+                    "lastUpdated": "2026-01-01T00:00:00Z",
+                },
+            ]
+
+            self.subjects: list[dict[str, Any]] = [
+                {
+                    "subjectId": 201,
+                    "subjectKey": "SUB1",
+                    "studyKey": "STUDY",
+                    "siteId": 101,
+                    "siteName": "SITE",
+                    "subjectStatus": "Enrolled",
+                    "deleted": False,
+                    "keywords": [],
+                    "dateCreated": "2026-01-05T08:00:00Z",
+                    "dateModified": "2026-01-05T08:00:00Z",
+                    "lastUpdated": "2026-01-05T08:00:00Z",
+                },
+                {
+                    "subjectId": 202,
+                    "subjectKey": "SUBJ-001",
+                    "studyKey": "DEMO-STUDY",
+                    "siteId": 102,
+                    "siteName": "North Site",
+                    "subjectStatus": "Enrolled",
+                    "deleted": False,
+                    "keywords": [],
+                    "dateCreated": "2026-01-05T08:00:00Z",
+                    "dateModified": "2026-01-05T08:00:00Z",
+                    "lastUpdated": "2026-01-05T08:00:00Z",
+                },
+            ]
+
+            self.forms: list[dict[str, Any]] = [
+                {
+                    "formId": 301,
+                    "formKey": "F_DM",
+                    "formName": "Demographics",
+                    "formType": "Enrollment",
+                    "studyKey": "STUDY",
+                    "revision": 1,
+                    "disabled": False,
+                    "eproForm": False,
+                    "allowCopy": False,
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateModified": "2026-01-01T00:00:00Z",
+                    "lastUpdated": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "formId": 302,
+                    "formKey": "F_VS",
+                    "formName": "Vital Signs",
+                    "formType": "Standard",
+                    "studyKey": "STUDY",
+                    "revision": 1,
+                    "disabled": False,
+                    "eproForm": False,
+                    "allowCopy": False,
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateModified": "2026-01-01T00:00:00Z",
+                    "lastUpdated": "2026-01-01T00:00:00Z",
+                },
+            ]
+
+            self.visits: list[dict[str, Any]] = [
+                {
+                    "visitId": 401,
+                    "studyKey": "STUDY",
+                    "intervalId": 501,
+                    "intervalName": "Baseline",
+                    "subjectId": 201,
+                    "subjectKey": "SUB1",
+                    "startDate": "2026-01-10T09:00:00Z",
+                    "visitDate": "2026-01-10T09:00:00Z",
+                    "deleted": False,
+                    "dateCreated": "2026-01-10T09:00:00Z",
+                    "dateModified": "2026-01-10T09:00:00Z",
+                    "lastUpdated": "2026-01-10T09:00:00Z",
+                },
+                {
+                    "visitId": 402,
+                    "studyKey": "STUDY",
+                    "intervalId": 502,
+                    "intervalName": "Follow-Up Month 1",
+                    "subjectId": 201,
+                    "subjectKey": "SUB1",
+                    "startDate": "2026-02-10T09:00:00Z",
+                    "visitDate": "2026-02-10T09:00:00Z",
+                    "deleted": False,
+                    "dateCreated": "2026-02-10T09:00:00Z",
+                    "dateModified": "2026-02-10T09:00:00Z",
+                    "lastUpdated": "2026-02-10T09:00:00Z",
+                },
+            ]
+
+            self.records: list[dict[str, Any]] = [
+                {
+                    "recordId": 601,
+                    "studyKey": "STUDY",
+                    "subjectKey": "SUB1",
+                    "subjectId": 201,
+                    "formId": 301,
+                    "formKey": "F_DM",
+                    "visitId": 401,
+                    "intervalId": 501,
+                    "siteId": 101,
+                    "recordType": "Standard",
+                    "recordStatus": "Complete",
+                    "recordData": {"V_AGE": 45, "V_GENDER": "Female"},
+                    "deleted": False,
+                    "dateCreated": "2026-01-10T09:30:00Z",
+                    "dateModified": "2026-01-10T09:30:00Z",
+                    "lastUpdated": "2026-01-10T09:30:00Z",
+                },
+                {
+                    "recordId": 602,
+                    "studyKey": "STUDY",
+                    "subjectKey": "SUB1",
+                    "subjectId": 201,
+                    "formId": 302,
+                    "formKey": "F_VS",
+                    "visitId": 401,
+                    "intervalId": 501,
+                    "siteId": 101,
+                    "recordType": "Standard",
+                    "recordStatus": "Complete",
+                    "recordData": {"V_WEIGHT": 68.5},
+                    "deleted": False,
+                    "dateCreated": "2026-01-10T09:35:00Z",
+                    "dateModified": "2026-01-10T09:35:00Z",
+                    "lastUpdated": "2026-01-10T09:35:00Z",
+                },
+            ]
+
+            self.queries: list[dict[str, Any]] = [
+                {
+                    "annotationId": 701,
+                    "studyKey": "STUDY",
+                    "subjectKey": "SUB1",
+                    "subjectId": 201,
+                    "recordId": 601,
+                    "description": "Please verify demographic details.",
+                    "variable": "V_AGE",
+                    "status": "OPEN",
+                    "queryComments": [
+                        {
+                            "sequence": 1,
+                            "closed": False,
+                            "comment": "Initial check required",
+                            "user": "verifier",
+                            "date": "2026-01-12T10:00:00Z",
+                        }
+                    ],
+                },
+                {
+                    "annotationId": 702,
+                    "studyKey": "STUDY",
+                    "subjectKey": "SUB1",
+                    "subjectId": 201,
+                    "recordId": 601,
+                    "description": "Check vital sign measurement.",
+                    "variable": "V_WEIGHT",
+                    "status": "OPEN",
+                    "queryComments": [
+                        {
+                            "sequence": 1,
+                            "closed": False,
+                            "comment": "Measurement outlier",
+                            "user": "verifier",
+                            "date": "2026-01-12T10:00:00Z",
+                        }
+                    ],
+                },
+            ]
+
+            self.intervals: list[dict[str, Any]] = [
+                {
+                    "intervalId": 501,
+                    "intervalName": "Baseline",
+                    "studyKey": "STUDY",
+                }
+            ]
+
+            self.variables: list[dict[str, Any]] = [
+                {
+                    "variableId": 801,
+                    "variableName": "V_AGE",
+                    "variableKey": "V_AGE",
+                    "variableType": "Number",
+                    "formId": 301,
+                    "formKey": "F_DM",
+                    "studyKey": "STUDY",
+                    "label": "Age",
+                },
+                {
+                    "variableId": 802,
+                    "variableName": "V_GENDER",
+                    "variableKey": "V_GENDER",
+                    "variableType": "Coded",
+                    "formId": 301,
+                    "formKey": "F_DM",
+                    "studyKey": "STUDY",
+                    "label": "Gender",
+                },
+                {
+                    "variableId": 803,
+                    "variableName": "V_WEIGHT",
+                    "variableKey": "V_WEIGHT",
+                    "variableType": "Float",
+                    "formId": 302,
+                    "formKey": "F_VS",
+                    "studyKey": "STUDY",
+                    "label": "Weight",
+                },
+            ]
+
+            self.users: list[dict[str, Any]] = [
+                {
+                    "userId": 901,
+                    "userName": "sim_user",
+                    "email": "sim@example.com",
+                    "studyKey": "STUDY",
+                },
+                {
+                    "userId": 902,
+                    "userName": "sim_admin",
+                    "email": "admin@example.com",
+                    "studyKey": "STUDY",
+                },
+            ]
+
+            self.jobs: dict[str, dict[str, Any]] = {
+                "BATCH": {
+                    "jobId": "JOB-BATCH",
+                    "batchId": "BATCH",
+                    "state": "COMPLETED",
+                    "progress": 100,
+                    "totalRecords": 1,
+                    "successfulRecords": 1,
+                    "failedRecords": 0,
+                    "results": {"status": "Completed"},
+                    "dateCreated": "2026-01-01T00:00:00Z",
+                    "dateStarted": "2026-01-01T00:00:00Z",
+                    "dateFinished": "2026-01-01T00:00:00Z",
+                },
+                "JOB-1002": {
+                    "jobId": "JOB-1002",
+                    "batchId": "JOB-1002",
+                    "state": "RUNNING",
+                    "progress": 50,
+                    "totalRecords": 10,
+                    "successfulRecords": 5,
+                    "failedRecords": 0,
+                    "results": {"status": "Running"},
+                    "dateCreated": "2026-01-02T00:00:00Z",
+                    "dateStarted": "2026-01-02T00:00:00Z",
+                    "dateFinished": None,
+                },
+            }
+
+    def get_studies(self) -> list[dict[str, Any]]:
+        """Return list of simulated studies."""
+        with self._lock:
+            return copy.deepcopy(self.studies)
+
+    def get_sites(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of sites, ensuring sites exist for the requested study."""
+        with self._lock:
+            sites = copy.deepcopy(self.sites)
+            if not study_key:
+                return sites
+            matched = [s for s in sites if s.get("studyKey") == study_key]
+            if matched:
+                return matched
+            # Provide a deterministic fallback site for the requested study
+            fallback = {
+                "siteId": 101,
+                "siteName": "SITE",
+                "studyKey": study_key,
+                "siteEnrollmentStatus": "Active",
+                "dateCreated": "2026-01-01T00:00:00Z",
+                "dateModified": "2026-01-01T00:00:00Z",
+                "lastUpdated": "2026-01-01T00:00:00Z",
+            }
+            return [fallback]
+
+    def get_subjects(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of subjects for a study."""
+        with self._lock:
+            subjects = copy.deepcopy(self.subjects)
+            if not study_key:
+                return subjects
+            matched = [s for s in subjects if s.get("studyKey") == study_key]
+            if matched:
+                return matched
+            fallback = {
+                "subjectId": 201,
+                "subjectKey": "SUB1",
+                "studyKey": study_key,
+                "siteId": 101,
+                "siteName": "SITE",
+                "subjectStatus": "Enrolled",
+                "deleted": False,
+                "keywords": [],
+                "dateCreated": "2026-01-05T08:00:00Z",
+                "dateModified": "2026-01-05T08:00:00Z",
+                "lastUpdated": "2026-01-05T08:00:00Z",
+            }
+            return [fallback]
+
+    def get_forms(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of forms for a study."""
+        with self._lock:
+            forms = copy.deepcopy(self.forms)
+            if not study_key:
+                return forms
+            matched = [f for f in forms if f.get("studyKey") == study_key]
+            if matched:
+                return matched
+            return [dict(f, studyKey=study_key) for f in forms]
+
+    def get_visits(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of visits for a study."""
+        with self._lock:
+            visits = copy.deepcopy(self.visits)
+            if not study_key:
+                return visits
+            matched = [v for v in visits if v.get("studyKey") == study_key]
+            if matched:
+                return matched
+            return [dict(v, studyKey=study_key) for v in visits]
+
+    def get_records(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of records for a study."""
+        with self._lock:
+            records = copy.deepcopy(self.records)
+            if not study_key:
+                return records
+            return [r for r in records if r.get("studyKey") == study_key]
+
+    def create_records(self, study_key: str, records_data: list[dict[str, Any]]) -> dict[str, Any]:
+        """Store new records in memory and return a background Job creation response."""
+        with self._lock:
+            for item in records_data:
+                self._next_record_id += 1
+                rec_id = self._next_record_id
+                rec_data = item.get("data") or item.get("recordData") or item
+                record_entry = {
+                    "recordId": rec_id,
+                    "studyKey": study_key,
+                    "subjectKey": item.get("subjectKey") or f"SUBJ-{rec_id}",
+                    "subjectId": item.get("subjectId", 200 + (rec_id % 100)),
+                    "formId": item.get("formId", 301),
+                    "formKey": item.get("formKey", "F_DM"),
+                    "visitId": item.get("visitId", 401),
+                    "intervalId": item.get("intervalId", 501),
+                    "siteId": item.get("siteId", 101),
+                    "recordType": item.get("recordType", "Standard"),
+                    "recordStatus": "Complete",
+                    "recordData": copy.deepcopy(rec_data),
+                    "deleted": False,
+                    "dateCreated": "2026-11-15T00:00:00Z",
+                    "dateModified": "2026-11-15T00:00:00Z",
+                    "lastUpdated": "2026-11-15T00:00:00Z",
+                }
+                self.records.append(record_entry)
+
+            batch_id = f"BATCH-{self._next_batch_num}"
+            job_id = f"JOB-{self._next_batch_num}"
+            self._next_batch_num += 1
+
+            job = {
+                "jobId": job_id,
+                "batchId": batch_id,
+                "state": "COMPLETED",
+                "progress": 100,
+                "totalRecords": len(records_data),
+                "successfulRecords": len(records_data),
+                "failedRecords": 0,
+                "results": {"status": "Completed", "recordsCreated": len(records_data)},
+                "dateCreated": "2026-11-15T00:00:00Z",
+                "dateStarted": "2026-11-15T00:00:00Z",
+                "dateFinished": "2026-11-15T00:00:00Z",
+            }
+            self.jobs[batch_id] = job
+            return {
+                "jobId": job_id,
+                "batchId": batch_id,
+                "state": "COMPLETED",
+            }
+
+    def get_queries(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of queries for a study."""
+        with self._lock:
+            queries = copy.deepcopy(self.queries)
+            if not study_key:
+                return queries
+            matched = [q for q in queries if q.get("studyKey") == study_key]
+            if matched:
+                return matched
+            return [
+                {
+                    "annotationId": 701,
+                    "studyKey": study_key,
+                    "subjectKey": "SUB1",
+                    "subjectId": 201,
+                    "recordId": 601,
+                    "description": "Please verify demographic details.",
+                    "variable": "V_AGE",
+                    "status": "OPEN",
+                    "queryComments": [
+                        {
+                            "sequence": 1,
+                            "closed": False,
+                            "comment": "Initial check required",
+                            "user": "verifier",
+                            "date": "2026-01-12T10:00:00Z",
+                        }
+                    ],
+                },
+                {
+                    "annotationId": 702,
+                    "studyKey": study_key,
+                    "subjectKey": "SUB1",
+                    "subjectId": 201,
+                    "recordId": 601,
+                    "description": "Check vital sign measurement.",
+                    "variable": "V_WEIGHT",
+                    "status": "OPEN",
+                    "queryComments": [
+                        {
+                            "sequence": 1,
+                            "closed": False,
+                            "comment": "Measurement outlier",
+                            "user": "verifier",
+                            "date": "2026-01-12T10:00:00Z",
+                        }
+                    ],
+                },
+            ]
+
+    def get_jobs(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of all jobs."""
+        with self._lock:
+            return [copy.deepcopy(j) for j in self.jobs.values()]
+
+    def get_job(self, study_key: str | None, batch_id: str) -> dict[str, Any]:
+        """Return job status by batch ID, handling state transitions on polling."""
+        with self._lock:
+            if batch_id in self.jobs:
+                job = self.jobs[batch_id]
+                # If job was initialized in a non-terminal state, advance on polling
+                poll_count = job.get("_poll_count", 0) + 1
+                job["_poll_count"] = poll_count
+                if (
+                    job.get("state") in ("PROCESSING", "RUNNING", "QUEUED", "PENDING")
+                    and poll_count >= 2
+                ):
+                    job["state"] = "COMPLETED"
+                    job["progress"] = 100
+                res = copy.deepcopy(job)
+                res.pop("_poll_count", None)
+                return res
+
+            # Auto-provision terminal status for any unknown batch identifier
+            job = {
+                "jobId": f"JOB-{batch_id}",
+                "batchId": batch_id,
+                "state": "COMPLETED",
+                "progress": 100,
+                "totalRecords": 1,
+                "successfulRecords": 1,
+                "failedRecords": 0,
+                "results": {"status": "Completed"},
+                "dateCreated": "2026-01-01T00:00:00Z",
+                "dateStarted": "2026-01-01T00:00:00Z",
+                "dateFinished": "2026-01-01T00:00:00Z",
+            }
+            self.jobs[batch_id] = job
+            return copy.deepcopy(job)
+
+    def get_intervals(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of intervals for a study."""
+        with self._lock:
+            intervals = copy.deepcopy(self.intervals)
+            if not study_key:
+                return intervals
+            return [dict(i, studyKey=study_key) for i in intervals]
+
+    def get_variables(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of variables for a study."""
+        with self._lock:
+            variables = copy.deepcopy(self.variables)
+            if not study_key:
+                return variables
+            return [dict(v, studyKey=study_key) for v in variables]
+
+    def get_users(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of users for a study."""
+        with self._lock:
+            users = copy.deepcopy(self.users)
+            if not study_key:
+                return users
+            return [dict(u, studyKey=study_key) for u in users]
+
+
+_default_state: SimulationState | None = None
+_state_lock = threading.Lock()
+
+
+def get_default_simulation_state() -> SimulationState:
+    """Return the global default simulation state instance."""
+    global _default_state
+    with _state_lock:
+        if _default_state is None:
+            _default_state = SimulationState()
+        return _default_state
+
+
+def reset_default_simulation_state() -> None:
+    """Reset the global default simulation state."""
+    global _default_state
+    with _state_lock:
+        if _default_state is not None:
+            _default_state.reset()
+        else:
+            _default_state = SimulationState()

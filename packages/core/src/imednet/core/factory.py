@@ -6,6 +6,8 @@ handling authentication, configuration, and retry policies.
 
 from __future__ import annotations
 
+from typing import Any
+
 from imednet.auth.api_key import ApiKeyAuth
 from imednet.auth.oidc import OIDCAuth
 from imednet.auth.strategy import AuthStrategy
@@ -23,10 +25,18 @@ class ClientFactory:
         config: Config,
         timeout: float = 30.0,
         retry_config: RetryConfig | None = None,
+        transport: Any = None,
     ) -> Client:
         """Create a synchronous client."""
         auth: AuthStrategy
-        if config.oidc_token:
+        if transport is None and config.simulation_mode:
+            from imednet.simulation import create_simulation_transport
+
+            transport = create_simulation_transport()
+            auth = ApiKeyAuth(
+                config.api_key or "SIMULATED_KEY", config.security_key or "SIMULATED_KEY"
+            )
+        elif config.oidc_token:
             auth = OIDCAuth(config.oidc_token)
         else:
             # Type ignore since config ensures api_key/security_key are not None here
@@ -38,6 +48,8 @@ class ClientFactory:
             timeout=timeout,
             retry_config=retry_config,
             auth=auth,
+            transport=transport,
+            simulation_mode=config.simulation_mode,
         )
         client.auth = auth
         return client
@@ -47,10 +59,18 @@ class ClientFactory:
         config: Config,
         timeout: float = 30.0,
         retry_config: RetryConfig | None = None,
+        transport: Any = None,
     ) -> AsyncClient:
         """Create an asynchronous client."""
         auth: AuthStrategy
-        if config.oidc_token:
+        if transport is None and config.simulation_mode:
+            from imednet.simulation import create_simulation_transport
+
+            transport = create_simulation_transport()
+            auth = ApiKeyAuth(
+                config.api_key or "SIMULATED_KEY", config.security_key or "SIMULATED_KEY"
+            )
+        elif config.oidc_token:
             auth = OIDCAuth(config.oidc_token)
         else:
             auth = ApiKeyAuth(config.api_key, config.security_key)  # type: ignore[arg-type]
@@ -61,6 +81,8 @@ class ClientFactory:
             timeout=timeout,
             retry_config=retry_config,
             auth=auth,
+            transport=transport,
+            simulation_mode=config.simulation_mode,
         )
         async_client.auth = auth
         return async_client
