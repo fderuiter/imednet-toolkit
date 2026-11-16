@@ -690,7 +690,7 @@ def export_to_duckdb_by_form(
         if v.form_id is not None:
             variables_by_form.setdefault(v.form_id, []).append(v)
 
-    conn: Any = duckdb.connect(db_path)
+    conn: Any = duckdb.connect(db_path, config={"threads": "1"})
     try:
         for form in forms:
             if form.form_id is None or form.form_key is None:

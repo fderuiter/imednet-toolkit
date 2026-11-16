@@ -1,9 +1,8 @@
 """Endpoint for checking job status in a study."""
 
 from imednet.core.endpoint.dispatch import execute_operation
-from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
+from imednet.core.endpoint.edc_mixin import EdcAsyncGetEndpoint, EdcSyncGetEndpoint
 from imednet.core.endpoint.operations.get import PathGetOperation
-from imednet.core.paginator import AsyncJsonListPaginator, JsonListPaginator
 from imednet.models.jobs import JobStatus
 from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
 from imednet.utils.typing import ItemId
@@ -14,8 +13,6 @@ class JobsOperationDef:
 
     PATH = "jobs"
     MODEL = JobStatus
-    PAGINATOR_CLS = JsonListPaginator
-    ASYNC_PAGINATOR_CLS = AsyncJsonListPaginator
 
     @execute_operation  # type: ignore
     def get(self, study_key: str | None, item_id: ItemId) -> PathGetOperation[JobStatus]:
@@ -29,7 +26,7 @@ class JobsOperationDef:
         )
 
 
-class JobsEndpoint(JobsOperationDef, EdcSyncListGetEndpoint[JobStatus]):  # type: ignore[misc]
+class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ignore[misc]
     """Synchronous endpoint for managing Jobs."""
 
     def poll(
@@ -67,7 +64,7 @@ class JobsEndpoint(JobsOperationDef, EdcSyncListGetEndpoint[JobStatus]):  # type
         )
 
 
-class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncListGetEndpoint[JobStatus]):  # type: ignore[misc]
+class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # type: ignore[misc]
     """Asynchronous endpoint for managing Jobs."""
 
     async def poll(

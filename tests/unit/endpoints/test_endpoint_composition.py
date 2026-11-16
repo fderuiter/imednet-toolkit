@@ -70,7 +70,9 @@ def test_jobs_endpoint_keeps_public_read_api(dummy_client, response_factory):
 
     result = endpoint.get("S1", "B1")
 
-    assert callable(endpoint.list)
+    assert not hasattr(endpoint, "list")
+    assert not hasattr(JobsEndpoint, "list")
+    assert not hasattr(AsyncJobsEndpoint, "list")
     assert callable(endpoint.get)
     assert result.job_id == "1"
     assert "ListEndpointMixin" not in {cls.__name__ for cls in JobsEndpoint.__mro__}
@@ -78,11 +80,14 @@ def test_jobs_endpoint_keeps_public_read_api(dummy_client, response_factory):
 
 
 def test_all_endpoints_inherit_from_single_edc_base():
-    """Endpoints must have EdcSyncListGetEndpoint as their sole direct parent."""
+    """Endpoints must have their respective EDC base as their sole direct parent."""
     for endpoint_cls in ALL_ENDPOINT_CLASSES:
         direct_bases = endpoint_cls.__bases__
         base_names = {b.__name__ for b in direct_bases if not b.__name__.endswith("OperationDef")}
-        assert base_names == {"EdcSyncListGetEndpoint"}, (
+        expected_base = (
+            "EdcSyncGetEndpoint" if endpoint_cls is JobsEndpoint else "EdcSyncListGetEndpoint"
+        )
+        assert base_names == {expected_base}, (
             f"{endpoint_cls.__name__} has unexpected direct bases: {base_names}"
         )
 
@@ -99,11 +104,16 @@ def test_no_endpoint_directly_inherits_edc_mixin():
 
 
 def test_all_async_endpoints_inherit_from_single_edc_base():
-    """Async endpoints must have EdcAsyncListGetEndpoint as their sole direct parent."""
+    """Async endpoints must have their respective EDC base as their sole direct parent."""
     for endpoint_cls in ALL_ASYNC_ENDPOINT_CLASSES:
         base_names = {
             b.__name__ for b in endpoint_cls.__bases__ if not b.__name__.endswith("OperationDef")
         }
-        assert base_names == {"EdcAsyncListGetEndpoint"}, (
+        expected_base = (
+            "EdcAsyncGetEndpoint"
+            if endpoint_cls is AsyncJobsEndpoint
+            else "EdcAsyncListGetEndpoint"
+        )
+        assert base_names == {expected_base}, (
             f"{endpoint_cls.__name__} has unexpected direct bases: {base_names}"
         )
