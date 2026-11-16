@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Iterator
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 try:
@@ -28,6 +29,395 @@ if TYPE_CHECKING:
 
 # Setup basic logging
 logger = logging.getLogger(__name__)
+
+
+def format_iso8601_dtc(val: Any) -> str | None:
+    """Convert a timestamp/date value to standard CDISC ISO 8601 DTC string.
+
+    Args:
+        val: Date, datetime, string, or numeric value to convert.
+
+    Returns:
+        Formatted ISO 8601 string (e.g. '2026-01-15T09:30:00' or '2026-01-15'), or None.
+    """
+    if val is None or (pd is not None and pd.isna(val)):
+        return None
+    if isinstance(val, datetime):
+        return val.isoformat()
+    if isinstance(val, date):
+        return val.isoformat()
+    if isinstance(val, str):
+        val_str = val.strip()
+        if not val_str:
+            return None
+        # Check standard date-only pattern YYYY-MM-DD
+        if len(val_str) == 10 and val_str[4] == "-" and val_str[7] == "-":
+            try:
+                d = date.fromisoformat(val_str)
+                return d.isoformat()
+            except ValueError:
+                pass
+        # Check common date-only patterns
+        for fmt in ("%m/%d/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%B-%Y", "%m-%d-%Y"):
+            try:
+                dt = datetime.strptime(val_str, fmt)
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        # Check datetime ISO or space-separated formats
+        try:
+            dt = datetime.fromisoformat(val_str)
+            return dt.isoformat()
+        except ValueError:
+            pass
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y/%m/%d %H:%M:%S",
+            "%m/%d/%Y %H:%M:%S",
+        ):
+            try:
+                dt = datetime.strptime(val_str, fmt)
+                return dt.isoformat()
+            except ValueError:
+                continue
+        return val_str
+    return str(val)
+
+
+def _format_sdtm_flag(val: Any) -> str | None:
+    """Format boolean flag values into CDISC standard 'Y' or 'N'."""
+    if val is None or (pd is not None and pd.isna(val)):
+        return None
+    if isinstance(val, bool):
+        return "Y" if val else "N"
+    if isinstance(val, str):
+        v = val.strip().upper()
+        if v in ("Y", "YES", "TRUE", "1"):
+            return "Y"
+        if v in ("N", "NO", "FALSE", "0"):
+            return "N"
+        return val
+    return "Y" if bool(val) else "N"
+
+
+SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
+    "AE": {
+        "domain": "AE",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "AESEQ",
+            "AETERM",
+            "AEDECOD",
+            "AESEV",
+            "AESER",
+            "AESTDTC",
+            "AEENDTC",
+            "AEOUT",
+            "AEREL",
+            "AEACN",
+        ],
+        "aliases": {
+            "AETERM": ["aeTerm", "ae_term", "AETERM", "aeterm", "ae_name", "term"],
+            "AEDECOD": ["aeDecod", "ae_decod", "AEDECOD", "aedecod", "preferred_term", "pt"],
+            "AESEV": ["aeSeverity", "ae_severity", "AESEV", "aesev", "severity"],
+            "AESER": ["aeSerious", "ae_serious", "AESER", "aeser", "serious"],
+            "AESTDTC": [
+                "aeStartDate",
+                "ae_start_date",
+                "AESTDTC",
+                "aestdtc",
+                "start_date",
+                "startDate",
+            ],
+            "AEENDTC": ["aeEndDate", "ae_end_date", "AEENDTC", "aeendtc", "end_date", "endDate"],
+            "AEOUT": ["aeOutcome", "ae_outcome", "AEOUT", "aeout", "outcome"],
+            "AEREL": [
+                "aeRelationship",
+                "ae_relationship",
+                "AEREL",
+                "aerel",
+                "relationship",
+                "causality",
+            ],
+            "AEACN": ["aeActionTaken", "ae_action_taken", "AEACN", "aeacn", "action_taken"],
+        },
+        "flags": {"AESER"},
+        "dtc": {"AESTDTC", "AEENDTC"},
+    },
+    "DV": {
+        "domain": "DV",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "DVSEQ",
+            "DVTERM",
+            "DVCAT",
+            "DVSEV",
+            "DVSTDTC",
+            "DVSTAT",
+        ],
+        "aliases": {
+            "DVTERM": [
+                "dvTerm",
+                "dv_term",
+                "DVTERM",
+                "dvterm",
+                "deviation_term",
+                "description",
+                "term",
+            ],
+            "DVCAT": ["dvCategory", "dv_category", "DVCAT", "dvcat", "category"],
+            "DVSEV": ["dvSeverity", "dv_severity", "DVSEV", "dvsev", "severity"],
+            "DVSTDTC": ["dvDate", "dv_date", "DVSTDTC", "dvstdtc", "deviation_date", "date"],
+            "DVSTAT": ["dvStatus", "dv_status", "DVSTAT", "dvstat", "status"],
+        },
+        "flags": set(),
+        "dtc": {"DVSTDTC"},
+    },
+    "DD": {
+        "domain": "DD",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "DDSEQ",
+            "DDTERM",
+            "DDCAT",
+            "DDSER",
+            "DDSTDTC",
+        ],
+        "aliases": {
+            "DDTERM": ["ddTerm", "dd_term", "DDTERM", "ddterm", "deficiency_term", "term"],
+            "DDCAT": ["ddCategory", "dd_category", "DDCAT", "ddcat", "category"],
+            "DDSER": ["ddSerious", "dd_serious", "DDSER", "ddser", "DDSPID", "ddspid", "serious"],
+            "DDSTDTC": ["ddDate", "dd_date", "DDSTDTC", "ddstdtc", "deficiency_date", "date"],
+        },
+        "flags": {"DDSER"},
+        "dtc": {"DDSTDTC"},
+    },
+    "CM": {
+        "domain": "CM",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "CMSEQ",
+            "CMTRT",
+            "CMDECOD",
+            "CMDOSE",
+            "CMDOSU",
+            "CMROUTE",
+            "CMSTDTC",
+            "CMENDTC",
+            "CMINDC",
+        ],
+        "aliases": {
+            "CMTRT": [
+                "cmTerm",
+                "cm_term",
+                "CMTRT",
+                "cmtrt",
+                "medication",
+                "medicationName",
+                "drug_name",
+                "cm_trt",
+            ],
+            "CMDECOD": ["cmDecod", "cm_decod", "CMDECOD", "cmdecod"],
+            "CMDOSE": ["cmDose", "cm_dose", "CMDOSE", "cmdose", "dose"],
+            "CMDOSU": ["cmDoseUnit", "cm_dose_unit", "CMDOSU", "cmdosu", "dose_unit", "unit"],
+            "CMROUTE": ["cmRoute", "cm_route", "CMROUTE", "cmroute", "route"],
+            "CMSTDTC": ["cmStartDate", "cm_start_date", "CMSTDTC", "cmstdtc", "start_date"],
+            "CMENDTC": ["cmEndDate", "cm_end_date", "CMENDTC", "cmendtc", "end_date"],
+            "CMINDC": ["cmIndication", "cm_indication", "CMINDC", "cmindc", "indication"],
+        },
+        "flags": set(),
+        "dtc": {"CMSTDTC", "CMENDTC"},
+    },
+    "DM": {
+        "domain": "DM",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "SUBJID",
+            "BRTHDTC",
+            "AGE",
+            "AGEU",
+            "SEX",
+            "RACE",
+            "ETHNIC",
+            "ARM",
+        ],
+        "aliases": {
+            "SUBJID": ["subjid", "SUBJID", "subject_id", "subjectId", "subjectKey", "subject_key"],
+            "BRTHDTC": [
+                "brthdat",
+                "birthDate",
+                "birth_date",
+                "BRTHDTC",
+                "brthdtc",
+                "date_of_birth",
+            ],
+            "AGE": ["age", "AGE"],
+            "AGEU": ["ageu", "age_unit", "AGEU"],
+            "SEX": ["sex", "SEX", "gender"],
+            "RACE": ["race", "RACE"],
+            "ETHNIC": ["ethnic", "ethnicity", "ETHNIC"],
+            "ARM": ["arm", "ARM", "treatment_arm", "armcd"],
+        },
+        "flags": set(),
+        "dtc": {"BRTHDTC"},
+    },
+}
+
+
+def transform_records_to_sdtm(
+    records: Iterable[Any],
+    domain: str,
+    study_key: str,
+) -> pd.DataFrame:
+    """Transform clinical records into a normalized CDISC SDTM domain DataFrame.
+
+    Maps subject keys to USUBJID, study keys to STUDYID, sequences records per
+    subject, and converts event timestamps to standard ISO 8601 DTC string formats.
+
+    Args:
+        records: An iterable of Record models, Pydantic models (such as AdverseEvent),
+            or raw dictionaries.
+        domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM').
+        study_key: Unique study identifier to populate STUDYID.
+
+    Returns:
+        A pandas DataFrame with standardized domain variables.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for SDTM transformations. Install with "
+            "'pip install \"imednet[pandas]\"'."
+        )
+
+    domain_clean = domain.strip().upper()
+    if domain_clean == "PD":
+        domain_clean = "DV"
+
+    spec = SDTM_DOMAIN_SPECS.get(domain_clean)
+    std_vars = spec["variables"] if spec else ["STUDYID", "DOMAIN", "USUBJID", f"{domain_clean}SEQ"]
+    alias_map = spec["aliases"] if spec else {}
+    flag_vars = spec["flags"] if spec else set()
+    dtc_vars = spec["dtc"] if spec else set()
+
+    rows: list[dict[str, Any]] = []
+    seq_counters: dict[str, int] = {}
+
+    for rec in records:
+        if hasattr(rec, "record_data") and getattr(rec, "record_data", None) is not None:
+            rec_dict = dict(rec.record_data) if isinstance(rec.record_data, dict) else {}
+            if getattr(rec, "subject_key", None):
+                rec_dict["subject_key"] = rec.subject_key
+                rec_dict["subjectKey"] = rec.subject_key
+            if getattr(rec, "date_created", None):
+                rec_dict["date_created"] = rec.date_created
+        elif isinstance(rec, BaseModel):
+            rec_dict = rec.model_dump(by_alias=False)
+            rec_dict.update(rec.model_dump(by_alias=True))
+        elif isinstance(rec, dict):
+            rec_dict = dict(rec)
+        else:
+            rec_dict = getattr(rec, "__dict__", {})
+
+        if "record_data" in rec_dict and isinstance(rec_dict["record_data"], dict):
+            nested_data = rec_dict.pop("record_data")
+            for k, v in nested_data.items():
+                if k not in rec_dict:
+                    rec_dict[k] = v
+
+        usubjid = (
+            rec_dict.get("USUBJID")
+            or rec_dict.get("subjectKey")
+            or rec_dict.get("subject_key")
+            or getattr(rec, "subject_key", None)
+            or ""
+        )
+        seq_counters[usubjid] = seq_counters.get(usubjid, 0) + 1
+        seq_val = seq_counters[usubjid]
+
+        row: dict[str, Any] = {
+            "STUDYID": study_key,
+            "DOMAIN": domain_clean,
+            "USUBJID": usubjid,
+            f"{domain_clean}SEQ": seq_val,
+        }
+
+        consumed_keys: set[str] = {
+            "USUBJID",
+            "subjectKey",
+            "subject_key",
+            "study_key",
+            "studyKey",
+            "STUDYID",
+            "DOMAIN",
+            "domain",
+            "recordId",
+            "formId",
+            "visitId",
+            "recordStatus",
+        }
+
+        lower_rec_dict = {k.lower(): (k, v) for k, v in rec_dict.items()}
+
+        for var_name in std_vars:
+            if var_name in ("STUDYID", "DOMAIN", "USUBJID", f"{domain_clean}SEQ"):
+                continue
+
+            val = None
+            found_key = None
+            if var_name in rec_dict:
+                val = rec_dict[var_name]
+                found_key = var_name
+            elif var_name.lower() in lower_rec_dict:
+                found_key, val = lower_rec_dict[var_name.lower()]
+            else:
+                candidates = alias_map.get(var_name, [])
+                for cand in candidates:
+                    if cand in rec_dict:
+                        val = rec_dict[cand]
+                        found_key = cand
+                        break
+                    if cand.lower() in lower_rec_dict:
+                        found_key, val = lower_rec_dict[cand.lower()]
+                        break
+
+            if found_key:
+                consumed_keys.add(found_key)
+
+            if var_name in dtc_vars or var_name.endswith("DTC"):
+                row[var_name] = format_iso8601_dtc(val)
+            elif var_name in flag_vars or var_name.endswith("SET"):
+                row[var_name] = _format_sdtm_flag(val)
+            else:
+                row[var_name] = val
+
+        for k, v in rec_dict.items():
+            if k not in consumed_keys and k.lower() not in {c.lower() for c in consumed_keys}:
+                if any(x in k.lower() for x in ("date", "time", "dtc")):
+                    row[k] = format_iso8601_dtc(v)
+                else:
+                    row[k] = v
+
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=std_vars)
+
+    df = pd.DataFrame(rows)
+    cols = [c for c in std_vars if c in df.columns]
+    extra_cols = [c for c in df.columns if c not in std_vars]
+    df = df[cols + extra_cols]
+    return df
 
 
 class RecordMapper:
@@ -326,14 +716,30 @@ class RecordMapper:
         use_labels_as_columns: bool = True,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield mapped record DataFrames in bounded chunks.
+
+        When ``as_sdtm`` is True, yields normalized CDISC SDTM domain DataFrames.
 
         Each yielded frame contains at most ``chunk_size`` mapped records from
         this mapper instance. Prefer this method over ``dataframe()`` when
         processing or exporting large studies so each chunk can be committed
         before the next batch is parsed.
         """
+        if as_sdtm:
+            target_domain = domain or "AE"
+            yield from self.iter_sdtm_dataframes(
+                study_key=study_key,
+                domain=target_domain,
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+            return
+
         if pd is None:
             raise ImportError(
                 "pandas is required for RecordMapper.dataframe. Install "
@@ -502,6 +908,98 @@ class RecordMapper:
 
         return result
 
+    def transform_to_sdtm(
+        self,
+        records: Iterable[Any],
+        domain: str,
+        study_key: str,
+    ) -> pd.DataFrame:
+        """Transform an iterable of records into a normalized SDTM domain DataFrame."""
+        return transform_records_to_sdtm(records, domain=domain, study_key=study_key)
+
+    def sdtm_dataframe(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+    ) -> pd.DataFrame:
+        """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset.
+
+        Standardizes clinical records into CDISC SDTM tabular datasets matching
+        models in ``reporting.py``, assigning STUDYID, USUBJID, DOMAIN, sequence
+        numbers, and ISO 8601 DTC timestamps.
+
+        Args:
+            study_key: Unique study identifier.
+            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM').
+            visit_key: Optional visit filter.
+            variable_whitelist: Optional variable name whitelist.
+            form_whitelist: Optional form ID whitelist.
+
+        Returns:
+            Normalized pandas DataFrame with standard SDTM domain variables.
+        """
+        if pd is None:
+            raise ImportError(
+                "pandas is required for RecordMapper.sdtm_dataframe. Install "
+                "with 'pip install \"imednet[pandas]\"'."
+            )
+        frames = list(
+            self.iter_sdtm_dataframes(
+                study_key=study_key,
+                domain=domain,
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+        )
+        if not frames:
+            return transform_records_to_sdtm([], domain=domain, study_key=study_key)
+        return pd.concat(frames, ignore_index=True)
+
+    def iter_sdtm_dataframes(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+    ) -> Iterator[pd.DataFrame]:
+        """Yield chunked pandas DataFrames transformed into an SDTM domain dataset.
+
+        Args:
+            study_key: Unique study identifier.
+            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM').
+            visit_key: Optional visit filter.
+            variable_whitelist: Optional variable name whitelist.
+            form_whitelist: Optional form ID whitelist.
+
+        Yields:
+            Chunked DataFrames containing normalized SDTM domain records.
+        """
+        if pd is None:
+            raise ImportError(
+                "pandas is required for RecordMapper.iter_sdtm_dataframes. Install "
+                "with 'pip install \"imednet[pandas]\"'."
+            )
+        extra_filters: dict[str, Any] = {}
+        if variable_whitelist is not None:
+            extra_filters["variableNames"] = variable_whitelist
+        if form_whitelist is not None:
+            extra_filters["formIds"] = form_whitelist
+
+        records = self._iter_records(
+            study_key,
+            visit_key=visit_key,
+            extra_filters=extra_filters or None,
+        )
+        for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
+            df = transform_records_to_sdtm(chunk, domain=domain, study_key=study_key)
+            if not df.empty:
+                yield df
+
     def dataframe(
         self,
         study_key: str,
@@ -509,12 +1007,28 @@ class RecordMapper:
         use_labels_as_columns: bool = True,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` of records for a study.
 
         This method still materialises all yielded chunks into one DataFrame.
         For bounded-memory processing of large studies, prefer ``iter_dataframes()``.
+
+        When ``as_sdtm`` is True, clinical records are transformed into a normalized
+        CDISC SDTM tabular dataset matching the models in ``reporting.py``.
         """
+        if as_sdtm:
+            target_domain = domain or "AE"
+            return self.sdtm_dataframe(
+                study_key=study_key,
+                domain=target_domain,
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+
         if pd is None:
             raise ImportError(
                 "pandas is required for RecordMapper.dataframe. Install "
@@ -532,3 +1046,12 @@ class RecordMapper:
         if not frames:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True)
+
+
+__all__ = [
+    "DEFAULT_CHUNK_SIZE",
+    "SDTM_DOMAIN_SPECS",
+    "RecordMapper",
+    "format_iso8601_dtc",
+    "transform_records_to_sdtm",
+]

@@ -16,7 +16,7 @@ from .config_version_control import ConfigVersionStore
 from .duckdb_centralizer import DuckDBIngestionWorkflow
 from .extraction_engine import ExtractionResult, extract_canonical_records
 from .query_management import QueryManagementWorkflow
-from .record_mapper import RecordMapper
+from .record_mapper import RecordMapper, format_iso8601_dtc, transform_records_to_sdtm
 from .record_update import RecordUpdateWorkflow
 from .register_subjects import RegisterSubjectsWorkflow
 from .schema_profiler import FieldProfile, FormProfile, SchemaProfiler
@@ -74,6 +74,8 @@ __all__ = [
     "UATSpecification",
     "async_get_study_structure",
     "extract_canonical_records",
+    "format_iso8601_dtc",
     "get_study_structure",
     "iter_chunks",
+    "transform_records_to_sdtm",
 ]
