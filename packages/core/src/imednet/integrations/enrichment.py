@@ -4,6 +4,7 @@ This module provides the :class:`EnrichmentPipeline` for transforming raw API
 data using configured mappings, terminology lookups, and PHI masking rules.
 """
 
+import functools
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -12,10 +13,14 @@ from typing import Any
 from imednet.models.engine import ResourceRegistry
 from imednet.utils.serialization import flatten
 
+_FIRST_CAP_RE = re.compile(r'(.)([A-Z][a-z]+)')
+_ALL_CAP_RE = re.compile(r'([a-z0-9])([A-Z])')
 
+
+@functools.lru_cache(maxsize=1024)
 def _to_snake_case(name: str) -> str:
-    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+    s1 = _FIRST_CAP_RE.sub(r'\1_\2', name)
+    return _ALL_CAP_RE.sub(r'\1_\2', s1).lower()
 
 
 class CentralizedMapper:

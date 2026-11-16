@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from imednet.integrations.enrichment import EnrichmentPipeline
+from imednet.integrations.enrichment import EnrichmentPipeline, _to_snake_case
 from imednet.models.study_config import MappingRule, StudyConfiguration
 
 
@@ -102,3 +102,48 @@ def test_enrichment_pipeline_syntax_error_fallback(
 
     assert result["target"] == 99
     assert any("Expression evaluation failed" in r.message for r in caplog.records)
+
+
+def test_to_snake_case_edge_cases() -> None:
+    """Test _to_snake_case with edge cases including empty strings, non-alphanumeric chars, and snake_case."""
+    # Empty string
+    assert _to_snake_case("") == ""
+
+    # Already snake_case
+    assert _to_snake_case("already_snake_case") == "already_snake_case"
+    assert _to_snake_case("date_created") == "date_created"
+    assert _to_snake_case("record_id") == "record_id"
+
+    # CamelCase and PascalCase
+    assert _to_snake_case("camelCase") == "camel_case"
+    assert _to_snake_case("PascalCase") == "pascal_case"
+    assert _to_snake_case("HTMLParser") == "html_parser"
+    assert _to_snake_case("dateCreated") == "date_created"
+
+    # Alphanumeric with numbers
+    assert _to_snake_case("field123Value") == "field123_value"
+    assert _to_snake_case("v1Alpha2") == "v1_alpha2"
+
+    # Non-alphanumeric characters
+    assert _to_snake_case("item-code") == "item-code"
+    assert _to_snake_case("field.subfield") == "field.subfield"
+    assert _to_snake_case("param#1") == "param#1"
+
+
+def test_to_snake_case_memoization() -> None:
+    """Test that _to_snake_case caches results with bounded lru_cache."""
+    _to_snake_case.cache_clear()
+    info = _to_snake_case.cache_info()
+    assert info.hits == 0
+    assert info.misses == 0
+    assert info.maxsize == 1024
+
+    res1 = _to_snake_case("cachedIdentifier")
+    assert res1 == "cached_identifier"
+    assert _to_snake_case.cache_info().misses == 1
+    assert _to_snake_case.cache_info().hits == 0
+
+    res2 = _to_snake_case("cachedIdentifier")
+    assert res2 == "cached_identifier"
+    assert _to_snake_case.cache_info().hits == 1
+    assert _to_snake_case.cache_info().misses == 1
