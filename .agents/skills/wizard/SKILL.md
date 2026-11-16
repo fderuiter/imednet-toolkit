@@ -5,11 +5,9 @@ description: Generate an interactive bash wizard that walks a human through step
 
 # Wizard
 
-A **wizard** is a bash script that walks a human, step by step, through a manual procedure that's tedious to do by hand and tedious to re-explain to an AI every time. It opens each URL, says exactly what to click and copy, captures the values, writes them where they belong (`.env`, GitHub secrets), confirms at every stage, and shows how many stages are left. It might configure third-party services, run a one-off migration, or move the project from one state to another.
+A **wizard** is an interactive script (`bash` using [template.sh](template.sh) via Git Bash/macOS/Linux, or a matching PowerShell `.ps1` script for Windows-only operators per `scripts/wizards/`) that walks a human step by step through manual steps only they can take (provisioning credentials, third-party dashboards, CI secrets). Store ephemeral scripts in `.scratch/` and repeatable repo onboarding scripts under `scripts/wizards/`.
 
-The delightful UX is already solved by [template.sh](template.sh): stage-by-stage progress, confirmation gates, cross-platform URL opening (including WSL), hidden secret entry, idempotent `.env` upserts, `gh secret`/`gh variable` writes, and a closing summary. **Your job is only to scope the procedure and author its stages.** The library above the `STAGES` marker is identical in every wizard; that consistency is the point: never hand-edit it.
-
-A wizard is ephemeral by default: built for one run, saved to a scratch or `scripts/` path, deleted when the job's done. Commit it only when the user wants a repeatable setup path that should live in the repo.
+The bash UX library above the `STAGES` marker is already solved in [template.sh](template.sh): stage progress, confirmation gates, cross-platform URL opening (including WSL), hidden secret entry, idempotent `.env` upserts, and `gh secret`/`gh variable` writes. **Your job is only to scope the procedure and author its stages.** Never hand-edit the library above `STAGES`.
 
 ## Process
 

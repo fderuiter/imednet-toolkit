@@ -1,31 +1,17 @@
-# Discover the session history
+# Discover Session History Across Harnesses
 
-Resolve the session your human partner named using the tools and information
-available in this environment. Your knowledge can suggest where to look; verify
-the result against the actual history.
+Resolve the session your human partner named using read-only bounded filesystem inspection and the tools available in the active runtime. Verify every path and field schema on disk rather than assuming a format from memory.
 
-Use the harness's exposed session tools, configured storage, local help,
-documentation, or bounded filesystem inspection. Measure files before reading
-their content and follow context-safety.md. Inspect archives or indexes when the
-environment points to them. A supplied usable path does not need another search.
+## Common Harness Session Roots (Verify on Disk)
 
-Confirm identity using the available session id, working directory, timestamps,
-and matching conversation content. Recency alone is not confirmation. Distinguish
-the requested session from its children and unrelated candidates. Ask for a
-missing identifying fact when the available evidence cannot distinguish them.
+- **Google Antigravity:** `<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl` (compact) and `transcript_full.jsonl` (untruncated). Subagent logs live under `<appDataDir>/brain/<subagent-conversation-id>/`. Check Windows (`%APPDATA%` / `~/.gemini/antigravity/brain/`) or workspace environment metadata (`Conversation ID`).
+- **Claude Code:** `~/.claude/projects/<encoded-project-path>/<session-id>.jsonl` (plus nested subagent transcripts alongside or under session directories).
+- **OpenAI Codex:** `${CODEX_HOME:-~/.codex}/sessions/` (rollout JSONL logs grouped by date/session id) or local Desktop state stores.
 
-For each filesystem source, obtain its full absolute path from the environment,
-with home-directory shorthand and variables expanded. Use that same path in the
-case record and in the discovery answer you give your human partner.
+## Verification Rules
 
-Establish the record meanings needed for the requested investigation from
-observed records or documentation. Distinguish human messages from injected
-messages, tool results, and a parent agent's dispatch. Match tool calls to their
-results. Establish usage-counter semantics before calculating totals. Do not
-infer a format from another harness or turn a missing field into a zero.
-
-Record the exact sources, relevant field meanings, supporting record locations,
-associated sessions, rejected plausible candidates, and unresolved information
-in the case file. Subsequent readers use that record rather than repeating
-discovery. If history is missing, inaccessible, or ambiguous, state the specific
-limitation and ask for the missing path, export, or identifying detail.
+1. Confirm identity using session ID, working directory, timestamps, and quoted first prompt—never recency alone.
+2. Measure line sizes before reading (`references/context-safety.md`); read compact files first and pull truncated lines selectively.
+3. Expand home shorthands and environment variables to verified absolute paths before passing them to analyst subagents (a subagent's own current conversation ID differs from the target session).
+4. Establish actor semantics (`human` vs hook/system injection vs tool result vs parent subagent prompt) directly from observed record keys.
+5. Record all verified sources, rejected candidate paths, and field semantics in `case.md` so parallel analysts do not re-run discovery.

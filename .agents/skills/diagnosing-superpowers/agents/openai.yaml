@@ -1,0 +1,5 @@
+interface:
+  display_name: "Diagnosing & Retrospective"
+  short_description: "Transcript forensics and session retrospectives across harnesses"
+policy:
+  allow_implicit_invocation: true

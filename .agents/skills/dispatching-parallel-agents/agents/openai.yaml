@@ -1,0 +1,5 @@
+interface:
+  display_name: "Dispatching Parallel Agents"
+  short_description: "Concurrent agents for independent multi-stream failures"
+policy:
+  allow_implicit_invocation: true

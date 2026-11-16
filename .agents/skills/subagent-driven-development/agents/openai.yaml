@@ -1,0 +1,5 @@
+interface:
+  display_name: "Subagent-Driven Dev"
+  short_description: "Per-task implementer plus two-stage spec/quality review"
+policy:
+  allow_implicit_invocation: true

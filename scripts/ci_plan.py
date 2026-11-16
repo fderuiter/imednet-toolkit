@@ -1,91 +1,83 @@
-"""TODO: Add docstring."""
+"""Compute impacted monorepo packages from a list of changed file paths."""
+
+from __future__ import annotations
 
 import glob
 import json
 import os
 import re
 import sys
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+_IGNORED_PREFIXES = ("docs/", "examples/", ".agents/")
+
+
+def _normalize_path(file_path: str) -> str:
+    """Normalize OS separators and leading relative prefixes in repo paths."""
+    normalized = file_path.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def is_ignored_path(file_path: str) -> bool:
+    """Return True when a changed path requires no package build or test run."""
+    normalized = _normalize_path(file_path)
+    return normalized.startswith(_IGNORED_PREFIXES) or normalized.endswith(".md")
 
 
 def parse_dependency_name(dep_str: str) -> str:
-    """
-    Extracts the base package name from a PEP 508 dependency string.
+    """Extract the base package name from a PEP 508 dependency string.
+
     This safely strips out optional extras, version bounds, and environment markers.
     """
-    match = re.match(r'^([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)', dep_str.strip())
+    match = re.match(r"^([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)", dep_str.strip())
     if match:
         return match.group(1)
     return dep_str.strip()
 
 
-def main():
-    """TODO: Add docstring."""
-    import tomllib
+def plan_ci_impact(
+    changed_files: Sequence[str],
+    packages: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    """Determine which monorepo packages must build and test for changed paths."""
+    cleaned_files = [line.strip() for line in changed_files if line.strip()]
 
-    packages = {}
-    for pyproject in glob.glob('packages/*/pyproject.toml'):
-        with open(pyproject, 'rb') as f:
-            data = tomllib.load(f)
-        pkg_dir = os.path.basename(os.path.dirname(pyproject))
-        pkg_name = data.get('project', {}).get('name')
+    def fallback() -> dict[str, list[str]]:
+        all_pkgs = list(packages.keys())
+        return {"test": all_pkgs, "build": list(all_pkgs)}
 
-        deps = data.get('project', {}).get('dependencies', [])
-        # Dropping optional cycle linkages
-        all_deps = list(deps)
+    if not cleaned_files:
+        return fallback()
 
-        # extract package name from dependency strings (e.g. "imednet-workflows>=0.6.0" -> "imednet-workflows")
-        parsed_deps = []
-        for dep in all_deps:
-            parsed_deps.append(parse_dependency_name(dep))
+    if all(is_ignored_path(path) for path in cleaned_files):
+        return {"test": [], "build": []}
 
-        packages[pkg_dir] = {'name': pkg_name, 'deps': parsed_deps}
+    name_to_dir = {
+        str(info["name"]): dir_name for dir_name, info in packages.items() if info.get("name")
+    }
+    build_impacted: set[str] = set()
+    test_only_impacted: set[str] = set()
 
-    # map package name back to directory
-    name_to_dir = {info['name']: dir_name for dir_name, info in packages.items() if info['name']}
+    for file_path in cleaned_files:
+        normalized = _normalize_path(file_path)
 
-    lines = sys.stdin.read().splitlines()
-    changed_files = [line.strip() for line in lines if line.strip()]
+        if is_ignored_path(normalized):
+            continue
 
-    def fallback():
-        print(json.dumps({"test": list(packages.keys()), "build": list(packages.keys())}))
-        sys.exit(0)
-
-    if not changed_files:
-        fallback()
-
-    # Check if all changed files are docs/examples/md
-    all_ignored = True
-    for file in changed_files:
-        if not (file.startswith(('docs/', 'examples/')) or file.endswith('.md')):
-            all_ignored = False
-            break
-
-    if all_ignored:
-        print(json.dumps({"test": [], "build": []}))
-        return
-
-    build_impacted = set()
-    test_only_impacted = set()
-
-    for file in changed_files:
-        if file.startswith('packages/'):
-            parts = file.split('/')
+        if normalized.startswith("packages/"):
+            parts = normalized.split("/")
             if len(parts) > 1 and parts[1] in packages:
                 changed_pkg_dir = parts[1]
-                if len(parts) > 2 and parts[2] == 'tests':
+                if len(parts) > 2 and parts[2] == "tests":
                     test_only_impacted.add(changed_pkg_dir)
                 else:
                     build_impacted.add(changed_pkg_dir)
-            else:
-                # unknown package or something else in packages/
-                fallback()
-        else:
-            if file.startswith(('docs/', 'examples/')) or file.endswith('.md'):
                 continue
-            # some core file changed (like root Makefile, etc)
-            fallback()
+        return fallback()
 
-    # Compute transitive impacts
     behavior_changed = set(build_impacted)
     added = True
     while added:
@@ -93,8 +85,7 @@ def main():
         for pkg_dir, info in packages.items():
             if pkg_dir in behavior_changed:
                 continue
-            # if this pkg depends on any of the packages whose behavior changed, its behavior might change too
-            for dep in info['deps']:
+            for dep in info.get("deps", []):
                 dep_dir = name_to_dir.get(dep)
                 if dep_dir and dep_dir in behavior_changed:
                     behavior_changed.add(pkg_dir)
@@ -102,7 +93,27 @@ def main():
                     break
 
     test_impacted = behavior_changed.union(test_only_impacted)
-    print(json.dumps({"build": list(build_impacted), "test": list(test_impacted)}))
+    return {"build": list(build_impacted), "test": list(test_impacted)}
+
+
+def main() -> None:
+    """Read changed file paths from stdin and print the impacted package JSON plan."""
+    import tomllib
+
+    packages: dict[str, dict[str, Any]] = {}
+    for pyproject in glob.glob("packages/*/pyproject.toml"):
+        with open(pyproject, "rb") as f:
+            data = tomllib.load(f)
+        pkg_dir = os.path.basename(os.path.dirname(pyproject))
+        pkg_name = data.get("project", {}).get("name")
+        deps = list(data.get("project", {}).get("dependencies", []))
+        packages[pkg_dir] = {
+            "name": pkg_name,
+            "deps": [parse_dependency_name(dep) for dep in deps],
+        }
+
+    changed_files = sys.stdin.read().splitlines()
+    print(json.dumps(plan_ci_impact(changed_files, packages)))
 
 
 if __name__ == "__main__":

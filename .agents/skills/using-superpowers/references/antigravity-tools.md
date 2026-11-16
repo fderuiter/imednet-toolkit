@@ -1,23 +1,21 @@
-# Antigravity CLI (`agy`) Tool Mapping
+# Google Antigravity Tool Mapping
 
-Skills speak in actions ("dispatch a subagent", "create a todo", "read a file"). On the Antigravity CLI (`agy`) these resolve to the tools below.
+Skills use harness-neutral action verbs. On Google Antigravity (IDE & `agy` CLI), map those actions to the live tools below:
 
-| Action skills request | Antigravity CLI equivalent |
-|----------------------|----------------------|
-| Dispatch a subagent (`Subagent (general-purpose):` template) | `invoke_subagent` with a built-in `TypeName` — `self` for full-capability work, `research` for read-only |
-| Task tracking ("create a todo", "mark complete") | a **task artifact** — `write_to_file` with `IsArtifact: true` and `ArtifactType: "task"` (see [Task tracking](#task-tracking)). **Not** `manage_task`, which manages background processes. |
+| Action skills request | Antigravity tool equivalent |
+| --- | --- |
+| Activate a skill | `read_file` on `.agents/skills/<name>/SKILL.md` |
+| Read / write / edit files | `read_file`, `write_file`, `edit_file` |
+| Structured user questions / rounds | `ask_question` (`(Recommended)` option first, 1 question or focused round at a time) |
+| Dispatch an isolated subagent | `invoke_subagent` (`TypeName: "self"` for editing/command tasks, `"research"` for read-only exploration; `Workspace: "inherit" \| "branch" \| "share"`) |
+| Coordinate parallel multi-author agents | Antigravity built-in `swarm` (`workspace: "share"` or `"branch"`) paired with `dispatching-parallel-agents` |
+| Task tracking ("track tasks", "plan checklist") | Plan / task **artifact** (`write_file` / `edit_file` inside the session `<appDataDir>/brain/<conversation-id>/` with `ArtifactMetadata: {Summary, UserFacing, RequestFeedback}`). Do **not** confuse with `manage_task`, which manages background shell processes. |
+| Recurring timers / schedules | Built-in `schedule` (or Antigravity `automation` skill) |
+| Interactive visual reports / UI | Built-in `generative_ui` (self-contained HTML without external CDN links when embedded inline) |
 
-## Task tracking
+## Built-In Platform Skills Composition
 
-Antigravity has **no todo tool** (`manage_task` manages background
-processes — `list`/`kill`/`status`/`send_input` — it is *not* a checklist). When a
-skill says to create a todo list or track tasks, maintain a **task artifact**: a
-markdown checklist saved with `write_to_file` (`IsArtifact: true`,
-`ArtifactMetadata.ArtifactType: "task"`), edited with `replace_file_content` /
-`multi_replace_file_content` as you go.
+Antigravity ships platform built-ins (`agy-customizations`, `automation`, `generative_ui`, `swarm`, `plugin`, `ui-plugin-navigation`). Repo skills under `.agents/skills/` intentionally complement rather than duplicate them:
 
-At the start of any multi-step task, create the task artifact listing every step of
-your plan. As you complete each step, edit the artifact to mark it done (`- [x]`).
-If the plan changes, update the checklist. Keep it current — it is your source of
-truth for what remains; once the conversation gets long, re-read it before starting
-each step.
+- Prefer `scripts/env.ps1` via PowerShell (`pwsh`) or direct `.venv` tools on Windows; remember WSL `bash.exe` often precedes Git Bash (`C:\Program Files\Git\bin\bash.exe`) on `PATH`.
+- Keep all repo-committed artifacts inside approved directories (`docs/superpowers/`, `docs/agents/`, `.scratch/`) so `scripts/check_root_files.py` never fails on commit.

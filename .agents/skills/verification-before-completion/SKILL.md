@@ -103,6 +103,17 @@ Skip any step = lying, not verifying
 ❌ Trust agent report
 ```
 
+## Repository Verification Gates (`imednet-toolkit`)
+
+Before claiming any branch/PR task is complete or ready for review, run the documented quality gates from `docs/how-to/verification.rst` and confirm clean output:
+
+- **Formatting, lint, typos & root hygiene:** `uvx pre-commit run --all-files` (on Windows PowerShell use `pwsh` + `scripts/env.ps1` or `.venv`; note `scripts/check_root_files.py` blocks stray root files)
+- **Full workspace static, type, & coverage gates (`>=90%`):** `hatch run verify` (or `verify-static` + `verify-tests`)
+- **Documentation & ADR index generation:** `hatch run docs`
+- **Multi-package static/security audit:** `uvx hatch run quality:all packages`
+
+If any required tool or gate cannot execute in your current environment, report the exact failure/blocker honestly instead of claiming it passed.
+
 ## When To Apply
 
 **ALWAYS before:**

@@ -1,0 +1,5 @@
+interface:
+  display_name: "Using Git Worktrees"
+  short_description: "Isolated workspace setup with uv sync and baseline tests"
+policy:
+  allow_implicit_invocation: true

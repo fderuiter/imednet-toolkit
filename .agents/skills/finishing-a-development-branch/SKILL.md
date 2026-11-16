@@ -11,19 +11,19 @@ description: Use when implementation is complete, all tests pass, and you need t
 
 **Announce at start:** "I'm using the finishing-a-development-branch skill to complete this work."
 
-## Step 1: Verify Tests
+## Step 1: Verify Quality & Tests
 
-Run the project's full test suite (`npm test` / `cargo test` / `pytest` / `go test ./...`).
+Run the repository verification gates (`verification-before-completion` and `docs/how-to/verification.rst`):
 
-**If tests fail**, report the failures and stop — the menu comes after a green suite:
-
-```
-Tests failing (<N> failures). Must fix before completing:
-
-[Show failures]
+```bash
+uvx pre-commit run --all-files
+hatch run verify
+hatch run docs
 ```
 
-**If tests pass:** continue to Step 2.
+**If any check or test fails**, report the failures and stop — integration choices only follow a verified green run.
+
+**If everything passes (or if blocked only by an environment boundary explicitly reported):** continue to Step 2.
 
 ## Step 2: Detect Environment
 
@@ -83,7 +83,9 @@ is theirs.
 
 ## Step 5: Execute Choice
 
-### Option 1: Merge Locally
+### Option 1: Merge Locally (Only if repo policy permits)
+
+*Warning: `imednet-toolkit` protects `main`, validates Conventional Commit PR titles (`Semantic PR Title`), integrates via **Squash and merge**, and drives releases with `release-please`. Prefer Option 2 (PR) unless the user explicitly asks for local fast-forward/merge.*
 
 ```bash
 # Get main repo root for CWD safety
@@ -96,7 +98,7 @@ git pull
 git merge <feature-branch>
 
 # Verify tests on merged result
-<test command>
+hatch run verify
 ```
 
 If tests fail on the merged result: stop, leave the worktree and branch in
@@ -110,7 +112,7 @@ delete the branch:
 git branch -d <feature-branch>
 ```
 
-### Option 2: Push and Create PR
+### Option 2: Push and Create PR (Standard for `imednet-toolkit`)
 
 ```bash
 git push -u origin <feature-branch>
@@ -118,10 +120,9 @@ git push -u origin <feature-branch>
 # git push origin HEAD:refs/heads/<new-branch>
 ```
 
-Then create the pull/merge request against <base-branch> with the forge's
-tooling — its CLI if one is available, or the creation URL most forges
-print when you push — following the repo's PR template and conventions if
-present, and report the URL to your human partner.
+Create the Pull Request against `<base-branch>` (`gh pr create`) enforcing repository rules:
+- **Conventional Commit PR title** (passes `Semantic PR Title` CI check, e.g., `feat(cli): ...`, `fix(http): ...`, `chore(agents): ...`; `main` integrates via **Squash and merge** and triggers `release-please`).
+- Complete `.github/PULL_REQUEST_TEMPLATE.md` sections cleanly and report the exact checks executed plus PR URL.
 
 Keep the worktree — your human partner iterates on PR feedback there.
 

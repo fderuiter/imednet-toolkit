@@ -101,30 +101,21 @@ cd "$path"
 
 ## Step 2: Project Setup
 
-Auto-detect and run appropriate setup:
+Auto-detect and run the repository environment setup (`imednet-toolkit` uses `uv` + `hatch`):
 
 ```bash
-# Node.js
-if [ -f package.json ]; then npm install; fi
-
-# Rust
-if [ -f Cargo.toml ]; then cargo build; fi
-
-# Python
-if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-if [ -f pyproject.toml ]; then poetry install; fi
-
-# Go
-if [ -f go.mod ]; then go mod download; fi
+# Python monorepo (canonical for imednet-toolkit)
+if [ -f uv.lock ] || [ -f pyproject.toml ]; then uv sync --locked --extra dev --extra docs; fi
 ```
+
+On Windows PowerShell, load `scripts/env.ps1` (under `pwsh`) or ensure `uv` and `.venv` are resolved before running tests.
 
 ## Step 3: Verify Clean Baseline
 
 Run tests to ensure workspace starts clean:
 
 ```bash
-# Use project-appropriate command
-npm test / cargo test / pytest / go test ./...
+pytest --ignore=tests/live/
 ```
 
 **If tests fail:** Report failures, ask whether to proceed or investigate.

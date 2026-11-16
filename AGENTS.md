@@ -1,36 +1,25 @@
 # AGENTS.md — Contributor Guide
 
-**Note:** This file contains strict instructions for AI agents and human contributors working in this directory and its subdirectories.
+**Note:** Authoritative instructions for AI agents and human contributors working across **OpenAI Codex / ChatGPT**, **Claude Code**, and **Google Antigravity** in `imednet-toolkit`.
 
-1. **Stack & Rules**: You MUST follow the dependency stack rules and immutable constraints (credential handling, testing boundaries, PR guidelines) defined in `docs/reference/agent_rules.rst`.
-2. **Verification**: You MUST execute the full CI quality gate locally before proposing a solution, as detailed in `docs/how-to/verification.rst`. Contributors must execute `uvx pre-commit run --all-files` before opening pull requests.
-3. **Architecture**: You MUST adhere to the separation of concerns defined in `docs/explanation/architecture.rst`.
+1. **Stack & Rules:** Follow dependencies, credential redaction, testing boundaries, and PR rules in `docs/reference/agent_rules.rst`.
+2. **Verification:** Run local CI gates per `docs/how-to/verification.rst`: `uvx pre-commit run --all-files`, `hatch run verify` (`>=90%` coverage), `hatch run docs`, and `uvx hatch run quality:all packages` before opening PRs.
+3. **Architecture:** Adhere to package layering in `docs/explanation/architecture.rst` and `tests/unit/architecture/import_rules.py`.
 
-## Superpowers Methodology
+## Cross-Harness Agent Skills Workflow
 
-This repository includes the [obra/superpowers](https://github.com/obra/superpowers) skills library under `.agents/skills/` (alongside the existing `mattpocock/skills` suite; see `.agents/skills/README.md`).
+All canonical skills live under `.agents/skills/` (`.agents/skills/README.md`, registered in `.agents/skills.json`) using harness-agnostic action vocabulary and 1:1 `disable-model-invocation` ↔ `agents/openai.yaml` (`policy.allow_implicit_invocation`) parity.
 
-- **Session Bootstrap**: Start conversations by checking `.agents/skills/using-superpowers/SKILL.md` (and `.agents/skills/using-superpowers/references/antigravity-tools.md` when running in Antigravity) and invoke any applicable skill before acting or writing code.
-- **Standard Flow**: `brainstorming` (design/spec) -> `using-git-worktrees` (isolated branch/worktree) -> `writing-plans` -> `subagent-driven-development` or `executing-plans` + `test-driven-development` -> `requesting-code-review` -> `verification-before-completion` -> `finishing-a-development-branch`.
-- **Skill Precedence** (coexisting suites in `.agents/skills/`):
-  - Default to **Superpowers** (`brainstorming`, `writing-plans`, `subagent-driven-development` / `executing-plans`, `test-driven-development`, `systematic-debugging`, `requesting-code-review`, `receiving-code-review`, `verification-before-completion`, `finishing-a-development-branch`) for end-to-end feature and bugfix execution.
-  - Use **`mattpocock/skills`** for GitHub-issue/graph workflows (`to-spec`, `to-tickets`, `triage`, `wayfinder` backed by `docs/agents/*`), domain/architecture modeling (`grill-with-docs`, `domain-modeling`, `improve-codebase-architecture`, `codebase-design`), and session utilities (`handoff`, `wait-what`, `teach`, `to-questionnaire`, `wizard`, `prototype`, `research`).
-- **Project Overrides** (these take precedence over generic defaults in upstream skills):
-  - **Environment Setup**: Use `uv sync --locked --extra dev --extra docs` instead of `poetry` or `pip`. Never introduce unlisted dependencies without explicit approval per `docs/reference/agent_rules.rst`.
-  - **Worktrees**: Prefer harness-native worktree tools when available; otherwise use `.worktrees/` (ignored in `.gitignore`).
-  - **Specs & Plans**: Save Superpowers design specs and implementation plans under `docs/superpowers/specs/` and `docs/superpowers/plans/` (excluded from Sphinx builds in `docs/conf.py`), or publish issues/tickets to GitHub per `docs/agents/issue-tracker.md`.
-  - **Verification & Finishing**: `verification-before-completion` and `finishing-a-development-branch` MUST pass `uvx pre-commit run --all-files`, `hatch run verify` (or `verify-static` + `verify-tests` with >=90% coverage), and `hatch run docs` before claiming completion or opening a PR. PR titles must follow Conventional Commits and merge via Squash and merge.
+- **Bootstrap:** Start by checking `.agents/skills/using-superpowers/SKILL.md` and your harness adapter (`using-superpowers/references/{codex,claude-code,antigravity}-tools.md`). For an interactive workflow map, see `/workflow-guide`.
+- **Claude Code local setup:** Run `python scripts/setup_agent_harnesses.py` once per checkout to create gitignored `.claude/skills` and `@AGENTS.md` `CLAUDE.md` bridges (never commit symlinks since `core.symlinks` may be `false` on Windows).
+- **Single-PR Flow:** `brainstorming` (+ `grilling` / `domain-modeling`) → `using-git-worktrees` → `writing-plans` → `subagent-driven-development` or `executing-plans` (+ `test-driven-development`) → `requesting-code-review` + `receiving-code-review` → `verification-before-completion` → `finishing-a-development-branch`.
+- **Multi-PR Epics & Triage:** Use `to-spec`, `to-tickets`, `wayfinder`, and `triage` backed by `docs/agents/{issue-tracker,triage-labels}.md`.
+- **Diagnostics & Utilities:** `systematic-debugging`, `improve-codebase-architecture` + `codebase-design`, `diagnosing-superpowers`, `writing-skills`, `research`, `prototype`, `resolving-merge-conflicts`, `wizard`, `handoff`, `wait-what`, `to-questionnaire`.
 
-## Agent skills
+## Project Overrides & Governance Precedence
 
-### Issue tracker
-
-GitHub issues (`fderuiter/imednet-toolkit`). See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Canonical triage roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context (`CONTEXT.md` + `docs/adr/`). See `docs/agents/domain.md`.
+- **Environment Setup:** Use `uv sync --locked --extra dev --extra docs` (never `poetry`, unpinned `pip`, or unlisted deps). On Windows PowerShell, use `pwsh` with `scripts/env.ps1` / `.venv`, and prefer Git Bash (`C:\Program Files\Git\bin\bash.exe`) over WSL `bash.exe`.
+- **Workspace & Root Hygiene:** Use native harness worktrees or `.worktrees/`; save ephemeral artifacts, questionnaires, and handoffs under `.scratch/` or OS temp—never repo root (`scripts/check_root_files.py`).
+- **Specs & Domain Model:** Store single-PR specs/plans in `docs/superpowers/{specs,plans}/` (excluded in `docs/conf.py`). Maintain `CONTEXT.md` + `docs/adr/` via `domain-modeling` and regenerate `docs/adr/index.rst` via `hatch run docs` (`docs/agents/domain.md`).
+- **Triage Label Precedence:** `docs/agents/triage-labels.md` is authoritative for live GitHub labels and overrides legacy label spellings in frozen `docs/reference/{issue_management,triage_playbook}.rst` and `.github/ISSUE_TEMPLATE/*.yml`.
+- **PRs & Merging:** PR titles must satisfy Conventional Commits (`Semantic PR Title` CI check) and integrate via **Squash and merge** (`release-please`).

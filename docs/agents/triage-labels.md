@@ -1,15 +1,42 @@
-# Triage Labels
+# Triage Labels & Live GitHub Vocabulary
 
-The skills speak in terms of five canonical triage roles. This file maps those roles to the actual label strings used in this repo's issue tracker.
+**Precedence rule:** This guide is the **authoritative label reference** for automated skills and agents in `imednet-toolkit` (`fderuiter/imednet-toolkit`), verified against live GitHub labels. Until `docs/reference/{issue_management,triage_playbook}.rst` and `.github/ISSUE_TEMPLATE/*.yml` are synchronized in a follow-up docs PR, **this file overrides any non-existent legacy label strings** listed there.
 
-| Label in mattpocock/skills | Label in our tracker | Meaning                                  |
-| -------------------------- | -------------------- | ---------------------------------------- |
-| `needs-triage`             | `needs-triage`       | Maintainer needs to evaluate this issue  |
-| `needs-info`               | `needs-info`         | Waiting on reporter for more information |
-| `ready-for-agent`          | `ready-for-agent`    | Fully specified, ready for an AFK agent  |
-| `ready-for-human`          | `ready-for-human`    | Requires human implementation            |
-| `wontfix`                  | `wontfix`            | Will not be actioned                     |
+## Canonical Triage Role Mapping
 
-When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
+| Triage role (in skills) | Live GitHub label(s) | Meaning |
+| --- | --- | --- |
+| `needs-triage` | `status:triage` | Maintainer needs to evaluate this issue |
+| `needs-info` | `question` | Waiting on reporter for clarification (do not apply non-existent `status:needs-info`) |
+| `ready-for-agent` | `ready-for-agent`, `status:ready` | Fully specified with brief, ready for agent execution |
+| `ready-for-human` | `status:needs-design` (design/judgment) or `status:ready` + `help wanted` (without `ready-for-agent`) | Requires human decision or manual work |
+| `wontfix` | `wontfix` (or `duplicate` / `invalid`) | Will not be actioned; rationale captured in closing comment |
 
-Edit the right-hand column to match whatever vocabulary you actually use.
+## Category & Epic Mapping
+
+- **Bug / Defect:** `type:bug`
+- **Feature / Enhancement:** `type:feature` or `type:enhancement`
+- **Refactor / Tech Debt:** `type:refactor` or `type:tech-debt`
+- **Docs / CI / Tests / Security:** `type:docs`, `type:ci`, `type:test`, `type:security`
+- **Multi-PR Epics & Research (`wayfinder` / `to-spec`):** `type:epic`, `type:research` (with `status:needs-design`, `status:blocked`, `status:ready`, `status:in-progress`, `status:review`, `status:done`)
+
+## Legacy `.rst` / `.github/ISSUE_TEMPLATE/` Translation Table
+
+When other repo docs cite legacy spellings absent on GitHub, translate them as follows:
+
+| Documented legacy spelling | Live GitHub label to apply |
+| --- | --- |
+| `status:needs-info` / `needs-info` | `question` |
+| `needs-triage` | `status:triage` |
+| `ready-for-human` | `status:needs-design` or `help wanted` (omit `ready-for-agent`) |
+| `type:maintenance` | `type:tech-debt` |
+| `area:workflows-plugin` | `area:workflows` |
+| `area:airflow-provider` | `area:airflow` |
+| `area:contributing` | `area:github` or `area:docs` |
+| `risk:medium`, `risk:high` | Omit nonexistent label; state risk and rationale in issue body and `priority:*` |
+| `wayfinder:map`, `wayfinder:*` | `type:epic`, `type:research` paired with `status:*` |
+
+## Supported Dimensions
+
+- **Area:** `area:core`, `area:http`, `area:models`, `area:auth`, `area:pagination`, `area:cli`, `area:workflows`, `area:airflow`, `area:docs`, `area:tests`, `area:release`, `area:github`, `area:ci`, `area:testing`, `area:streamlit`, `area:mapping`, `area:records`, `area:standards`, `area:dashboard`, `area:review-workbench`, `area:terminology`, `area:governance`, `area:performance`.
+- **Priority & Size:** `priority:p0`, `priority:p1`, `priority:p2`, `priority:p3`; `size:xs`, `size:s`, `size:m`, `size:l`, `size:xl`; `risk:low`.

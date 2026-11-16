@@ -110,12 +110,13 @@ controllers that lost their place have re-dispatched entire completed task
 sequences — the single most expensive failure observed. Track progress in
 a ledger file, not only in todos.
 
-- Each plan owns a workspace: at skill start, run this skill's
+- Each plan owns a workspace: at skill start, invoke with explicit `bash` (prefer Git Bash over WSL bash on Windows):
   `bash scripts/sdd-workspace PLAN_FILE` by its absolute path, from the
   working tree you're executing in — it prints the plan's git-ignored
   directory (under `<repo-root>/.superpowers/sdd/`), home to
   every artifact for THIS plan: ledger, briefs, reports, review packages.
   Another plan's directory is never yours to read or write.
+- Translate subagent dispatches through `using-superpowers` harness adapters (`Agent` in Claude Code, `spawn_agent` in Codex, `invoke_subagent` in Antigravity).
 - Check for this plan's ledger at `<workspace>/progress.md`. If one exists,
   read [references/resuming.md](references/resuming.md) before anything
   else: it says whose ledger it is and where to resume.

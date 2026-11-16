@@ -1,29 +1,27 @@
-# Claude Code Tool Notes
+# Claude Code Tool Mapping
 
-Claude Code is the reference harness: skills speak its vocabulary
-(`Agent` for a subagent dispatch, todos, `Skill`). These notes cover the
-one place Claude Code can run a plan cheaper than the skills' default
-shape. It is opt-in by your human partner and changes nothing the skills
-require.
+Claude Code acts as the reference action vocabulary (`Skill`, `Agent`, todos, `AskUserQuestion`), with repo-specific bridge rules for `imednet-toolkit`.
 
-## Cheaper orchestration for subagent-driven development
+| Action skills request | Claude Code equivalent |
+| --- | --- |
+| Activate a skill | `Skill` tool or `Read` on `.agents/skills/<name>/SKILL.md` |
+| Dispatch a subagent | `Agent` tool (use worktree isolation for parallel writers) |
+| Task tracking | Built-in task / todo tools |
 
-The controller session is the most expensive seat in a
-superpowers:subagent-driven-development run: it reads every dispatch
-result and every report, and it usually runs on the session's most
-capable model. Claude Code supports nested subagents (three layers below
-the main conversation by default; `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`
-adjusts it), so the whole loop can run one layer down.
+## Local Repo Discovery Bridge (`.claude/skills` & `CLAUDE.md`)
 
-When your human partner asks for it — or has said the session model is
-too expensive to spend on coordination — dispatch ONE orchestrator
-subagent on a mid-tier model with the plan path and the instruction to
-use superpowers:subagent-driven-development end to end. The orchestrator
-dispatches its own implementers and reviewers per that skill's Model
-Selection; the workspace and ledger live on disk, so nothing is lost to
-the extra layer. Its final message must carry the "Rulings I made" list
-verbatim — that list is how the decisions reach your human partner, and
-you relay it, not summarize it.
+`imednet-toolkit` stores canonical skills in `.agents/skills/` and instructions in `AGENTS.md`, and sets `git config core.symlinks` safely for Windows compatibility (tracked git symlinks are forbidden). Before running Claude Code locally in this repo, run once per checkout:
 
-Do this only for a whole plan. Nesting a single task's dispatch buys
-nothing and adds a seat.
+```bash
+python scripts/setup_agent_harnesses.py
+```
+
+This creates gitignored local bridges:
+- `.claude/skills` -> `.agents/skills` (Windows NTFS junction or POSIX symlink)
+- `CLAUDE.md` -> `@AGENTS.md` (gitignored and whitelisted in `scripts/check_root_files.py`)
+
+Verify at any time with `python scripts/setup_agent_harnesses.py --check`.
+
+## Cheaper Orchestration for `subagent-driven-development`
+
+Claude Code supports nested subagents (`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`). When your partner asks to conserve top-tier orchestration tokens on a whole plan, dispatch one mid-tier orchestrator subagent pointing at `docs/superpowers/plans/<plan>.md` to run `subagent-driven-development` end to end, requiring its final summary to reproduce the `"Rulings I made"` list verbatim. Do not add a nested orchestrator for single-task edits.
