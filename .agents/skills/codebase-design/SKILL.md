@@ -70,27 +70,32 @@ Good interfaces make testing natural:
 
 1. **Accept dependencies, don't create them.**
 
-   ```typescript
-   // Testable
-   function processOrder(order, paymentGateway) {}
+   ```python
+   # Testable: transport/gateway injected at the seam
+   def process_order(order: Order, payment_gateway: PaymentGateway) -> Receipt:
+       return payment_gateway.charge(order.total)
 
-   // Hard to test
-   function processOrder(order) {
-     const gateway = new StripeGateway();
-   }
+
+   # Hard to test: concrete client constructed internally
+   def process_order(order: Order) -> Receipt:
+       gateway = StripeGateway()
+       return gateway.charge(order.total)
    ```
 
-2. **Return results, don't produce side effects.**
+2. **Return results, don't produce hidden side effects.**
 
-   ```typescript
-   // Testable
-   function calculateDiscount(cart): Discount {}
+   ```python
+   # Testable: pure value result
+   def calculate_discount(cart: Cart) -> Discount:
+       ...
 
-   // Hard to test
-   function applyDiscount(cart): void {
-     cart.total -= discount;
-   }
+
+   # Hard to test: mutates caller state in place
+   def apply_discount(cart: Cart) -> None:
+       cart.total -= discount
    ```
+
+Note for `imednet-toolkit`: `docs/explanation/architecture.rst` and `tests/unit/architecture/import_rules.py` govern package import boundaries (`core` -> `plugins-workflows` -> `providers-airflow` / `plugins-sinks`); keep those runtime boundaries satisfied while designing deep modules cleanly.
 
 3. **Small surface area.** Fewer methods = fewer tests needed. Fewer params = simpler test setup.
 

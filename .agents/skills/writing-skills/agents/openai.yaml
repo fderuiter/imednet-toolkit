@@ -1,0 +1,6 @@
+interface:
+  display_name: "Writing Skills"
+  short_description: "TDD and best-practice authoring for skills and AGENTS.md"
+policy:
+  allow_implicit_invocation: true
+

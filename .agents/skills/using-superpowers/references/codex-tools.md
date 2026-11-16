@@ -106,3 +106,9 @@ the user to use the App's native controls:
 
 The agent can still run tests, stage files, and output suggested branch
 names, commit messages, and PR descriptions for the user to copy.
+
+## Repository Parity & Windows Notes (`imednet-toolkit`)
+
+- **Skill discovery:** OpenAI Codex natively reads `AGENTS.md` (32 KiB limit) and `.agents/skills/`.
+- **Manual invocation gating:** Every manual-only skill sets both `disable-model-invocation: true` in `SKILL.md` frontmatter and `policy.allow_implicit_invocation: false` in `agents/openai.yaml`. Keep both synchronized when adding or editing skills.
+- **Windows shell traps:** Prefer `pwsh` + `scripts/env.ps1` / `.venv` or Git Bash (`C:\Program Files\Git\bin\bash.exe`) when running helper scripts; WSL `bash.exe` precedes Git Bash on some Windows `PATH` configurations and may lack Python >=3.11.

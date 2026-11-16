@@ -1,0 +1,6 @@
+interface:
+  display_name: "Systematic Debugging"
+  short_description: "Tight red-loop root-cause debugging and ranked hypotheses"
+policy:
+  allow_implicit_invocation: true
+

@@ -132,9 +132,11 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/path/test.py src/path/file.py
-git commit -m "feat: add specific feature"
+git add tests/path/test.py packages/<pkg>/src/.../file.py
+git commit -m "feat(<area>): add concise conventional commit summary"
 ```
+
+Note: In `imednet-toolkit`, run `pytest`, `ruff`, `mypy`, and final verification (`uvx pre-commit run --all-files`, `hatch run verify`, `hatch run docs`) matching `docs/how-to/verification.rst`.
 ````
 
 ## What a Step Contains

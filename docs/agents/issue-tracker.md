@@ -1,45 +1,31 @@
-# Issue tracker: GitHub
+# Issue Tracker: GitHub (`fderuiter/imednet-toolkit`)
 
-Issues and specs for this repo live as GitHub issues (`fderuiter/imednet-toolkit`). Use the `gh` CLI for all operations.
+Issues and multi-PR epic specs for this repo live as GitHub issues (`fderuiter/imednet-toolkit`). Use the `gh` CLI (`gh issue`, `gh pr`, `gh api`) for all operations, translating every label through [triage-labels.md](triage-labels.md) (which overrides legacy label names in frozen `.rst` docs and `.github/ISSUE_TEMPLATE/*.yml`).
 
-## Conventions
+## Issue Conventions & Required Structure
 
-- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
-- **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
-- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
-- **Comment on an issue**: `gh issue comment <number> --body "..."`
-- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
-- **Close**: `gh issue close <number> --comment "..."`
+- **Titles:** Follow Conventional Issue titles from `docs/reference/issue_management.rst`: `<type>(<area>): <concise outcome>` (e.g., `feat(workflows): normalize codelist values`).
+- **Bodies:** Align issue bodies with `.github/ISSUE_TEMPLATE/` sections (`Problem`, `Outcome`, `Constraints / Non-goals`, `Acceptance criteria`, `Test / Docs impact`, `API surface & Compatibility impact`, `Verification`).
+- **Labels:** Apply at least one `type:*`, one `area:*`, one `priority:*`, and one `status:*` label from [triage-labels.md](triage-labels.md). Never pass unverified label names.
 
-Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
+## Core Commands
 
-## Pull requests as a triage surface
+- **Create an issue:** `gh issue create --title "<type>(<area>): <outcome>" --label "..." --body-file <file>` (prefer `--body-file` or stdin heredoc over inline multiline shell escaping on Windows).
+- **Read an issue:** `gh issue view <number> --comments --json number,title,body,labels,comments`.
+- **List open issues:** `gh issue list --state open --json number,title,body,labels,comments`.
+- **Search previously rejected requests (`wontfix` memory):** `gh issue list --state closed --label wontfix --json number,title,body,labels,comments` (or `--search "<concept> label:wontfix"`). Do not create local `.out-of-scope/` files; capture rejection rationale directly inside the GitHub closing comment.
+- **Comment / Label / Close:** `gh issue comment <number> --body-file <file>`, `gh issue edit <number> --add-label "..." --remove-label "..."`, `gh issue close <number> --comment "..."`.
 
-**PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
+## Pull Requests as a Triage Surface
 
-When set to `yes`, PRs run through the same labels and states as issues, using the `gh pr` equivalents:
+**PRs as a request surface: no.** Unless the maintainer asks to triage an explicit `#<number>` PR, triage focuses on issues. When inspecting an explicit PR, use `gh pr view <number> --comments` and `gh pr diff <number>`. Note GitHub shares numeric IDs across issues and PRs (`gh pr view` vs `gh issue view`).
 
-- **Read a PR**: `gh pr view <number> --comments` and `gh pr diff <number>` for the diff.
-- **List external PRs for triage**: `gh pr list --state open --json number,title,body,labels,author,authorAssociation,comments` then keep only `authorAssociation` of `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, or `NONE` (drop `OWNER`/`MEMBER`/`COLLABORATOR`).
-- **Comment / label / close**: `gh pr comment`, `gh pr edit --add-label`/`--remove-label`, `gh pr close`.
+## Wayfinding & Epic Graph Operations
 
-GitHub shares one number space across issues and PRs, so a bare `#42` may be either: resolve with `gh pr view 42` and fall back to `gh issue view 42`.
+Used by `wayfinder` and `to-tickets` for multi-PR epics:
 
-## When a skill says "publish to the issue tracker"
-
-Create a GitHub issue.
-
-## When a skill says "fetch the relevant ticket"
-
-Run `gh issue view <number> --comments`.
-
-## Wayfinding operations
-
-Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.
-
-- **Map**: a single issue labelled `wayfinder:map`, holding the Notes / Decisions-so-far / Fog body. `gh issue create --label wayfinder:map`.
-- **Child ticket**: an issue linked to the map as a GitHub sub-issue (`gh api` on the sub-issues endpoint). Where sub-issues aren't enabled, add the child to a task list in the map body and put `Part of #<map>` at the top of the child body. Labels: `wayfinder:<type>` (`research`/`prototype`/`grilling`/`task`). Once claimed, the ticket is assigned to the driving dev.
-- **Blocking**: GitHub's **native issue dependencies**, the canonical, UI-visible representation. Add an edge with `gh api --method POST repos/<owner>/<repo>/issues/<child>/dependencies/blocked_by -F issue_id=<blocker-db-id>`, where `<blocker-db-id>` is the blocker's numeric **database id** (`gh api repos/<owner>/<repo>/issues/<n> --jq .id`, _not_ the `#number` or `node_id`). GitHub reports `issue_dependencies_summary.blocked_by` (open blockers only, the live gate). Where dependencies aren't available, fall back to a `Blocked by: #<n>, #<n>` line at the top of the child body. A ticket is unblocked when every blocker is closed.
-- **Frontier query**: list the map's open children (`gh issue list --state open`, scoped to the map's sub-issues / task list), drop any with an open blocker (`issue_dependencies_summary.blocked_by > 0`, or an open issue in the `Blocked by` line) or an assignee; first in map order wins.
-- **Claim**: `gh issue edit <n> --add-assignee @me`, the session's first write.
-- **Resolve**: `gh issue comment <n> --body "<answer>"`, then `gh issue close <n>`, then append a context pointer (gist + link) to the map's Decisions-so-far.
+- **Epic / Map:** A single parent issue labeled `type:epic` and `status:needs-design` holding Objectives, Decisions-so-far, and remaining Fog-of-war open questions.
+- **Child Tickets:** Linked as GitHub sub-issues (`gh api` sub-issues endpoint) or listed in a task list with `Part of #<map>` in the child body. Use live category/status labels (`type:research`, `type:feature`, `status:needs-design`, `status:ready`, `status:blocked`)—never nonexistent `wayfinder:*` labels.
+- **Blocking Edges:** Use GitHub native issue dependencies (`gh api --method POST repos/{owner}/{repo}/issues/<child>/dependencies/blocked_by -F issue_id=<blocker-db-id>` where `<blocker-db-id>` comes from `gh api repos/{owner}/{repo}/issues/<n> --jq .id`, falling back to `Blocked by: #<n>` in the child body if disabled).
+- **Frontier Query:** Open children with no assignee and zero open blockers (`issue_dependencies_summary.blocked_by == 0`).
+- **Claim & Resolve:** Assign `@me` (`gh issue edit <n> --add-assignee @me`); close resolved children with a structured summary comment (`gh issue close <n> --comment "..."`) and append a link + gist to the parent epic.

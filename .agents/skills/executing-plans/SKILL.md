@@ -122,8 +122,8 @@ The workspace and ledger are shared with superpowers:subagent-driven-development
 — same directory, same format — so a plan can change executors mid-flight
 and the new one resumes from the same ledger.
 
-- Each plan owns a workspace: at skill start, run
-  `../subagent-driven-development/scripts/sdd-workspace PLAN_FILE` by its
+- Each plan owns a workspace: at skill start, invoke with explicit `bash` (prefer Git Bash `C:\Program Files\Git\bin\bash.exe` over WSL bash on Windows):
+  `bash ../subagent-driven-development/scripts/sdd-workspace PLAN_FILE` by its
   absolute path, from the working tree you're executing in — it
   prints the plan's git-ignored directory
   (`<repo-root>/.superpowers/sdd/<plan-basename>/`), home to every

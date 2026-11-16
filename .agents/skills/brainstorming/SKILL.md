@@ -27,9 +27,11 @@ Before you start implementing, you must, in order:
 
 1. Lay out the approaches in a message of their own, and have your
    human partner pick one (see Lay out the approaches).
-2. Write the design doc, short or full (see Size the Work).
+2. Write the design doc, short or full (`docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`). When deep decision trees or domain terminology (`CONTEXT.md` / `docs/adr/`) need tightening alongside exploration, compose with `grilling` and `domain-modeling` cleanly.
 3. Get their approval of that doc.
-4. Invoke the superpowers:writing-plans skill.
+4. Activate `writing-plans` (for immediate single-PR execution) or `to-spec` / `to-tickets` (for multi-PR GitHub epics).
+
+In Antigravity, structured single-question choices work naturally via `ask_question` (or browser visual companion via `bash scripts/start-server.sh` using Git Bash on Windows).
 
 If nothing is open when you write your first message and there's one
 sensible way, steps 1 to 3 happen in that message (see Your First

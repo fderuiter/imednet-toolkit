@@ -10,6 +10,7 @@ def main():
         ".git",  # Linked worktrees store Git metadata as a file.
         "README.md",
         "AGENTS.md",
+        "CLAUDE.md",  # Optional local gitignored bridge created by scripts/setup_agent_harnesses.py.
         "CHANGELOG.md",
         "CODE_OF_CONDUCT.md",
         "CONTRIBUTING.md",

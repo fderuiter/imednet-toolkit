@@ -1,0 +1,6 @@
+interface:
+  display_name: "Writing Plans"
+  short_description: "Detailed TDD implementation plans in docs/superpowers/plans/"
+policy:
+  allow_implicit_invocation: true
+

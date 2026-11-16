@@ -27,3 +27,9 @@ def test_worktree_still_rejects_stray_root_output(tmp_path, capsys):
         load_guard(tmp_path).main()
     assert caught.value.code == 1
     assert "temporary-output.log" in capsys.readouterr().out
+
+
+def test_worktree_allows_local_claude_md(tmp_path):
+    (tmp_path / ".git").write_text("gitdir: /synthetic/repository/.git/worktrees/check\n")
+    (tmp_path / "CLAUDE.md").write_text("@AGENTS.md\n", encoding="utf-8")
+    load_guard(tmp_path).main()

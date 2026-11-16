@@ -1,16 +1,18 @@
 ---
 name: handoff
-description: Compact the current conversation into a handoff document for another agent to pick up.
+description: Compact the current conversation into a handoff document for another agent session or harness to pick up.
 argument-hint: "What will the next session be used for?"
 disable-model-invocation: true
 ---
 
-Write a handoff document summarising the current conversation so a fresh agent can continue the work. Save to the temporary directory of the user's OS - not the current workspace.
+Write a concise, portable handoff document summarizing the current session so a fresh agent session (on OpenAI Codex, Claude Code, or Google Antigravity) can resume without re-discovering settled facts.
 
-Include a "suggested skills" section in the document, naming which skills the next agent should call the Skill tool for.
+Save the document in the OS temp directory or `.scratch/handoffs/` (never repo root, so `scripts/check_root_files.py` never fails) and report its exact path.
 
-Do not duplicate content already captured in other artifacts (specs, plans, ADRs, issues, commits, diffs). Reference them by path or URL instead.
+Include:
+1. Current branch/worktree state, commits made, and verification commands already run vs still needed.
+2. Exact primary-source paths (specs, plans, ADRs, GitHub issues/PRs, modified modules) by pointer rather than copying large bodies.
+3. A **Suggested Skills** section naming exact `.agents/skills/<name>` skills for the next session to activate.
+4. Any human decisions or open questions pending.
 
-Redact any sensitive information, such as API keys, passwords, or personally identifiable information.
-
-If the user passed arguments, treat them as a description of what the next session will focus on and tailor the doc accordingly.
+Redact all credentials, API keys, tokens, or PII (`<REDACTED>`). If the user supplied arguments describing the next session focus, tailor the handoff accordingly.

@@ -135,28 +135,30 @@ Return: Summary of what you found and what you fixed.
 
 ## Real Example from Session
 
-**Scenario:** 6 test failures across 3 files after major refactoring
+**Scenario:** 6 test failures across 3 independent modules after a refactor
 
 **Failures:**
-- agent-tool-abort.test.ts: 3 failures (timing issues)
-- batch-completion-behavior.test.ts: 2 failures (tools not executing)
-- tool-approval-race-conditions.test.ts: 1 failure (execution count = 0)
+- `tests/unit/test_retry.py`: 3 failures (timing/backoff waits)
+- `tests/unit/test_export_sink.py`: 2 failures (CSV batch flush)
+- `tests/unit/test_job_poller.py`: 1 failure (status polling race condition)
 
-**Decision:** Independent domains - abort logic separate from batch completion separate from race conditions
+**Decision:** Independent modules—retry backoff, CSV sink, and job poller have zero shared mutable files or state.
 
 **Dispatch:**
-```
-Agent 1 → Fix agent-tool-abort.test.ts
-Agent 2 → Fix batch-completion-behavior.test.ts
-Agent 3 → Fix tool-approval-race-conditions.test.ts
+(On Antigravity, use `invoke_subagent` for read-only analysis or `swarm` with `workspace: "share"` when multiple agents edit isolated files; on Claude Code use `Agent`; on Codex use `spawn_agent`.)
+
+```text
+Agent 1 -> Fix tests/unit/test_retry.py and retry helper
+Agent 2 -> Fix tests/unit/test_export_sink.py and batch writer
+Agent 3 -> Fix tests/unit/test_job_poller.py and poller wait loop
 ```
 
 **Results:**
-- Agent 1: Replaced timeouts with event-based waiting
-- Agent 2: Fixed event structure bug (threadId in wrong place)
-- Agent 3: Added wait for async tool execution to complete
+- Agent 1: Replaced fixed sleeps with injected monotonic clock / condition waiting
+- Agent 2: Fixed flush threshold check on final partial batch
+- Agent 3: Fixed terminal status transition guard
 
-**Integration:** All fixes independent, no conflicts, full suite green
+**Integration:** All fixes independent, zero file conflicts, full `hatch run verify` suite green.
 
 ## Verification
 
