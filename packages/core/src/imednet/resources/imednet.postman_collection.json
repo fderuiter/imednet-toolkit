@@ -1,0 +1,2515 @@
+{
+    "item": [
+        {
+            "name": "studies",
+            "description": "",
+            "item": [
+                {
+                    "id": "64b882dd-2f08-4bbb-b211-787e4ee79bc9",
+                    "name": "List studies",
+                    "request": {
+                        "name": "List studies",
+                        "description": {},
+                        "url": {
+                            "path": [
+                                "studies"
+                            ],
+                            "host": [
+                                "{{baseUrl}}"
+                            ],
+                            "query": [
+                                {
+                                    "disabled": false,
+                                    "description": {
+                                        "content": "",
+                                        "type": "text/plain"
+                                    },
+                                    "key": "page",
+                                    "value": "0"
+                                },
+                                {
+                                    "disabled": false,
+                                    "description": {
+                                        "content": "",
+                                        "type": "text/plain"
+                                    },
+                                    "key": "size",
+                                    "value": "25"
+                                },
+                                {
+                                    "disabled": false,
+                                    "description": {
+                                        "content": "",
+                                        "type": "text/plain"
+                                    },
+                                    "key": "sort",
+                                    "value": "studyKey,asc"
+                                },
+                                {
+                                    "disabled": true,
+                                    "description": {
+                                        "content": "",
+                                        "type": "text/plain"
+                                    },
+                                    "key": "filter",
+                                    "value": "<string>"
+                                }
+                            ],
+                            "variable": []
+                        },
+                        "header": [
+                            {
+                                "key": "Accept",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "x-api-key",
+                                "value": "{{api_key}}"
+                            },
+                            {
+                                "key": "x-imn-security-key",
+                                "value": "{{security_key}}"
+                            }
+                        ],
+                        "method": "GET",
+                        "body": {},
+                        "auth": null
+                    },
+                    "response": [
+                        {
+                            "id": "db279322-a342-44c7-a79c-44f58f2414f8",
+                            "name": "List of studies",
+                            "originalRequest": {
+                                "url": {
+                                    "path": [
+                                        "studies"
+                                    ],
+                                    "host": [
+                                        "{{baseUrl}}"
+                                    ],
+                                    "query": [
+                                        {
+                                            "disabled": false,
+                                            "description": {
+                                                "content": "",
+                                                "type": "text/plain"
+                                            },
+                                            "key": "page",
+                                            "value": "0"
+                                        },
+                                        {
+                                            "disabled": false,
+                                            "description": {
+                                                "content": "",
+                                                "type": "text/plain"
+                                            },
+                                            "key": "size",
+                                            "value": "25"
+                                        },
+                                        {
+                                            "disabled": false,
+                                            "description": {
+                                                "content": "",
+                                                "type": "text/plain"
+                                            },
+                                            "key": "sort",
+                                            "value": "studyKey,asc"
+                                        },
+                                        {
+                                            "disabled": false,
+                                            "description": {
+                                                "content": "",
+                                                "type": "text/plain"
+                                            },
+                                            "key": "filter",
+                                            "value": "<string>"
+                                        }
+                                    ],
+                                    "variable": []
+                                },
+                                "header": [
+                                    {
+                                        "key": "Accept",
+                                        "value": "application/json"
+                                    }
+                                ],
+                                "method": "GET",
+                                "body": {}
+                            },
+                            "status": "OK",
+                            "code": 200,
+                            "header": [
+                                {
+                                    "key": "Content-Type",
+                                    "value": "application/json"
+                                }
+                            ],
+                            "body": "{\n  \"metadata\": {\n    \"status\": \"<string>\",\n    \"method\": \"<string>\",\n    \"path\": \"<string>\",\n    \"timestamp\": \"<string>\",\n    \"error\": {}\n  },\n  \"pagination\": {\n    \"currentPage\": \"<integer>\",\n    \"size\": \"<integer>\",\n    \"totalPages\": \"<integer>\",\n    \"totalElements\": \"<integer>\",\n    \"sort\": [\n      {\n        \"property\": \"<string>\",\n        \"direction\": \"<string>\"\n      },\n      {\n        \"property\": \"<string>\",\n        \"direction\": \"<string>\"\n      }\n    ]\n  },\n  \"data\": [\n    {\n      \"sponsorKey\": \"<string>\",\n      \"studyKey\": \"<string>\",\n      \"studyId\": \"<integer>\",\n      \"studyName\": \"<string>\",\n      \"studyDescription\": \"<string>\",\n      \"studyType\": \"<string>\",\n      \"dateCreated\": \"<string>\",\n      \"dateModified\": \"<string>\"\n    },\n    {\n      \"sponsorKey\": \"<string>\",\n      \"studyKey\": \"<string>\",\n      \"studyId\": \"<integer>\",\n      \"studyName\": \"<string>\",\n      \"studyDescription\": \"<string>\",\n      \"studyType\": \"<string>\",\n      \"dateCreated\": \"<string>\",\n      \"dateModified\": \"<string>\"\n    }\n  ]\n}",
+                            "cookie": [],
+                            "_postman_previewlanguage": "json"
+                        }
+                    ],
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test(\"List studies succeeds\", function () {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "pm.test(\"List studies returns a data array\", function () {",
+                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "protocolProfileBehavior": {
+                        "disableBodyPruning": true
+                    }
+                },
+                {
+                    "name": "{studyKey}",
+                    "description": "",
+                    "item": [
+                        {
+                            "id": "9e4e2035-d138-4736-a54a-b8f6a1ac2a00",
+                            "name": "Retrieve a study",
+                            "request": {
+                                "name": "Retrieve a study",
+                                "description": {},
+                                "url": {
+                                    "path": [
+                                        "studies",
+                                        ":studyKey"
+                                    ],
+                                    "host": [
+                                        "{{baseUrl}}"
+                                    ],
+                                    "query": [],
+                                    "variable": [
+                                        {
+                                            "type": "any",
+                                            "value": "<string>",
+                                            "key": "studyKey",
+                                            "disabled": false,
+                                            "description": {
+                                                "content": "(Required) ",
+                                                "type": "text/plain"
+                                            }
+                                        }
+                                    ]
+                                },
+                                "header": [
+                                    {
+                                        "key": "Accept",
+                                        "value": "application/json"
+                                    }
+                                ],
+                                "method": "GET",
+                                "body": {},
+                                "auth": null
+                            },
+                            "response": [
+                                {
+                                    "id": "ee63e46f-e50f-4ccf-ae14-c8b203f0ad40",
+                                    "name": "Study information",
+                                    "originalRequest": {
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [],
+                                            "variable": []
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {}
+                                    },
+                                    "status": "OK",
+                                    "code": 200,
+                                    "header": [
+                                        {
+                                            "key": "Content-Type",
+                                            "value": "application/json"
+                                        }
+                                    ],
+                                    "body": "{\n    \"sponsorKey\": \"<string>\",\n    \"studyKey\": \"<string>\",\n    \"studyId\": \"<integer>\",\n    \"studyName\": \"<string>\",\n    \"studyDescription\": \"<string>\",\n    \"studyType\": \"<string>\",\n    \"dateCreated\": \"<string>\",\n    \"dateModified\": \"<string>\",\n    \"lastUpdated\": \"<string>\"\n}",
+                                    "cookie": [],
+                                    "_postman_previewlanguage": "json"
+                                }
+                            ],
+                            "event": [
+                                {
+                                    "listen": "test",
+                                    "script": {
+                                        "type": "text/javascript",
+                                        "exec": [
+                                            "pm.test(\"Retrieve a study succeeds\", function () {",
+                                            "    pm.response.to.have.status(200);",
+                                            "});",
+                                            "pm.test(\"Retrieve a study returns a study object\", function () {",
+                                            "    pm.expect(pm.response.json()).to.have.property(\"studyKey\");",
+                                            "});"
+                                        ]
+                                    }
+                                }
+                            ],
+                            "protocolProfileBehavior": {
+                                "disableBodyPruning": true
+                            }
+                        },
+                        {
+                            "name": "forms",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "dc56e534-4a0c-4704-aa22-d0f92dc3ebe4",
+                                    "name": "List forms",
+                                    "request": {
+                                        "name": "List forms",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "forms"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "34299c8a-c7a6-4740-b1e7-b9db985c25b7",
+                                            "name": "List of forms",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "forms"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"formId\": \"<integer>\",\n            \"formKey\": \"<string>\",\n            \"formName\": \"<string>\",\n            \"formType\": \"<string>\",\n            \"revision\": \"<integer>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"disabled\": \"<boolean>\",\n            \"eproForm\": \"<boolean>\",\n            \"allowCopy\": \"<boolean>\",\n            \"embeddedLog\": false,\n            \"enforceOwnership\": false,\n            \"otherForms\": [],\n            \"userAgreement\": false,\n            \"lastUpdated\": \"<string>\",\n            \"subjectRecordReport\": \"<boolean>\",\n            \"unscheduledVisit\": \"<boolean>\"\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"formId\": \"<integer>\",\n            \"formKey\": \"<string>\",\n            \"formName\": \"<string>\",\n            \"formType\": \"<string>\",\n            \"revision\": \"<integer>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"disabled\": \"<boolean>\",\n            \"eproForm\": \"<boolean>\",\n            \"allowCopy\": \"<boolean>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List forms succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List forms returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "variables",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "8c2a91d5-d098-4326-bc2e-61e32bb82d0f",
+                                    "name": "List variables",
+                                    "request": {
+                                        "name": "List variables",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "variables"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "5edd769c-4c48-4f69-b8a0-1966a79acbbd",
+                                            "name": "Variable list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "variables"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"variableId\": \"<integer>\",\n            \"variableType\": \"<string>\",\n            \"variableName\": \"<string>\",\n            \"sequence\": \"<integer>\",\n            \"revision\": \"<integer>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"formId\": \"<integer>\",\n            \"formKey\": \"<string>\",\n            \"formName\": \"<string>\",\n            \"blinded\": false,\n            \"deleted\": false,\n            \"disabled\": false,\n            \"lastUpdated\": \"<string>\",\n            \"label\": \"<string>\",\n            \"variableOid\": \"<string>\"\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"variableId\": \"<integer>\",\n            \"variableType\": \"<string>\",\n            \"variableName\": \"<string>\",\n            \"sequence\": \"<integer>\",\n            \"revision\": \"<integer>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"formId\": \"<integer>\",\n            \"formKey\": \"<string>\",\n            \"formName\": \"<string>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List variables succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List variables returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "intervals",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "9cc1d8c5-ecd7-4205-8ad4-d5687e42a9ed",
+                                    "name": "List intervals",
+                                    "request": {
+                                        "name": "List intervals",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "intervals"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "7b32b5dd-a005-4916-a703-4498af494b6f",
+                                            "name": "Interval list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "intervals"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"intervalId\": \"<integer>\",\n            \"intervalName\": \"<string>\",\n            \"intervalDescription\": \"<string>\",\n            \"intervalSequence\": \"<integer>\",\n            \"intervalGroupId\": \"<integer>\",\n            \"intervalGroupName\": \"<string>\",\n            \"disabled\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"actualDate\": \"\",\n            \"actualDateForm\": \"\",\n            \"definedUsingInterval\": \"\",\n            \"dueDateWillBeIn\": 0,\n            \"eproGracePeriod\": 0,\n            \"negativeSlack\": 0,\n            \"positiveSlack\": 0,\n            \"timeline\": \"\",\n            \"windowCalculationDate\": \"\",\n            \"windowCalculationForm\": \"\",\n            \"lastUpdated\": \"<string>\",\n            \"forms\": []\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"intervalId\": \"<integer>\",\n            \"intervalName\": \"<string>\",\n            \"intervalDescription\": \"<string>\",\n            \"intervalSequence\": \"<integer>\",\n            \"intervalGroupId\": \"<integer>\",\n            \"intervalGroupName\": \"<string>\",\n            \"disabled\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List intervals succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List intervals returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "sites",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "6a7a940b-9474-4ad3-ade0-22a53b4d6aaf",
+                                    "name": "List sites",
+                                    "request": {
+                                        "name": "List sites",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "sites"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "07cb0d79-ed62-49e2-8ca4-0be39582d109",
+                                            "name": "Site list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "sites"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"siteName\": \"<string>\",\n            \"siteEnrollmentStatus\": \"<string>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"lastUpdated\": \"<string>\"\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"siteName\": \"<string>\",\n            \"siteEnrollmentStatus\": \"<string>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List sites succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List sites returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "subjects",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "e0eb2bac-0fff-4755-be73-bd40d09660e1",
+                                    "name": "List subjects",
+                                    "request": {
+                                        "name": "List subjects",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "subjects"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "b5146402-e5df-468a-ab0f-44d1c027d394",
+                                            "name": "Subject list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "subjects"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectKey\": \"<string>\",\n            \"subjectStatus\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"siteName\": \"<string>\",\n            \"deleted\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"enrollmentStartDate\": \"\",\n            \"subjectOid\": \"\",\n            \"lastUpdated\": \"<string>\",\n            \"keywords\": \"<string>\"\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectKey\": \"<string>\",\n            \"subjectStatus\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"siteName\": \"<string>\",\n            \"deleted\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List subjects succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List subjects returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "records",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "ecfe50a7-56a9-4b9e-9a10-71cd19ba16eb",
+                                    "name": "List records",
+                                    "request": {
+                                        "name": "List records",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "records"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "recordDataFilter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "f2af15da-8cbd-4d5d-8697-d73888004eb3",
+                                            "name": "Record list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "records"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "recordDataFilter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"intervalId\": \"<integer>\",\n            \"formId\": \"<integer>\",\n            \"formKey\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"recordId\": \"<integer>\",\n            \"recordOid\": \"<string>\",\n            \"recordType\": \"<string>\",\n            \"recordStatus\": \"<string>\",\n            \"deleted\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectOid\": \"<string>\",\n            \"subjectKey\": \"<string>\",\n            \"visitId\": \"<integer>\",\n            \"parentRecordId\": \"<integer>\",\n            \"recordData\": {},\n            \"lastUpdated\": \"<string>\",\n            \"keywords\": \"<string>\"\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"intervalId\": \"<integer>\",\n            \"formId\": \"<integer>\",\n            \"formKey\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"recordId\": \"<integer>\",\n            \"recordOid\": \"<string>\",\n            \"recordType\": \"<string>\",\n            \"recordStatus\": \"<string>\",\n            \"deleted\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectOid\": \"<string>\",\n            \"subjectKey\": \"<string>\",\n            \"visitId\": \"<integer>\",\n            \"parentRecordId\": \"<integer>\",\n            \"recordData\": {}\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List records succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List records returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                },
+                                {
+                                    "id": "f9a63ec7-94af-4cb0-99e8-aac5e1b32e36",
+                                    "name": "Create records",
+                                    "request": {
+                                        "name": "Create records",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "records"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Content-Type",
+                                                "value": "application/json"
+                                            },
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "POST",
+                                        "body": {
+                                            "mode": "raw",
+                                            "raw": "[\n  {\n    \"formKey\": \"<string>\",\n    \"subjectKey\": \"<string>\",\n    \"siteName\": \"<string>\",\n    \"intervalName\": \"<string>\",\n    \"data\": {}\n  },\n  {\n    \"formKey\": \"<string>\",\n    \"subjectKey\": \"<string>\",\n    \"siteName\": \"<string>\",\n    \"intervalName\": \"<string>\",\n    \"data\": {}\n  }\n]",
+                                            "options": {
+                                                "raw": {
+                                                    "headerFamily": "json",
+                                                    "language": "json"
+                                                }
+                                            }
+                                        },
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "14712e36-a559-4c0c-9d65-1a0b18f574da",
+                                            "name": "Job created",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "records"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Content-Type",
+                                                        "value": "application/json"
+                                                    },
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "POST",
+                                                "body": {
+                                                    "mode": "raw",
+                                                    "raw": "[\n  {\n    \"formKey\": \"<string>\",\n    \"subjectKey\": \"<string>\",\n    \"siteName\": \"<string>\",\n    \"intervalName\": \"<string>\",\n    \"data\": {}\n  },\n  {\n    \"formKey\": \"<string>\",\n    \"subjectKey\": \"<string>\",\n    \"siteName\": \"<string>\",\n    \"intervalName\": \"<string>\",\n    \"data\": {}\n  }\n]",
+                                                    "options": {
+                                                        "raw": {
+                                                            "headerFamily": "json",
+                                                            "language": "json"
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            "status": "Accepted",
+                                            "code": 202,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"jobId\": \"<string>\",\n    \"batchId\": \"<string>\",\n    \"state\": \"<string>\",\n    \"dateCreated\": \"\",\n    \"dateFinished\": \"\",\n    \"dateStarted\": \"\"\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"Create records succeeds\", function () {",
+                                                    "    pm.response.to.have.status(202);",
+                                                    "});",
+                                                    "pm.test(\"Create records returns a job object\", function () {",
+                                                    "    pm.expect(pm.response.json()).to.have.property(\"jobId\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "recordRevisions",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "93b30448-c831-4088-af34-76ede61efe3e",
+                                    "name": "List record revisions",
+                                    "request": {
+                                        "name": "List record revisions",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "recordRevisions"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "0896b929-9d00-441e-b308-51209ac4fbbf",
+                                            "name": "Record revision list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "recordRevisions"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"recordRevisionId\": \"<integer>\",\n            \"recordId\": \"<integer>\",\n            \"recordRevision\": \"<integer>\",\n            \"dataRevision\": \"<integer>\",\n            \"recordStatus\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectKey\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"formKey\": \"<string>\",\n            \"intervalId\": \"<integer>\",\n            \"deleted\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"reasonForChange\": \"\",\n            \"recordOid\": \"\",\n            \"role\": \"\",\n            \"subjectOid\": \"\",\n            \"user\": \"\",\n            \"lastUpdated\": \"<string>\"\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"recordRevisionId\": \"<integer>\",\n            \"recordId\": \"<integer>\",\n            \"recordRevision\": \"<integer>\",\n            \"dataRevision\": \"<integer>\",\n            \"recordStatus\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectKey\": \"<string>\",\n            \"siteId\": \"<integer>\",\n            \"formKey\": \"<string>\",\n            \"intervalId\": \"<integer>\",\n            \"deleted\": \"<boolean>\",\n            \"dateCreated\": \"<string>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List record revisions succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List record revisions returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "codings",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "6732ea6c-3399-447c-82d3-c4d6b3614b07",
+                                    "name": "List codings",
+                                    "request": {
+                                        "name": "List codings",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "codings"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "fc9937a3-3ae2-460a-9157-6619fa7d8928",
+                                            "name": "Coding list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "codings"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n  \"metadata\": {\n    \"status\": \"<string>\",\n    \"method\": \"<string>\",\n    \"path\": \"<string>\",\n    \"timestamp\": \"<string>\",\n    \"error\": {}\n  },\n  \"pagination\": {\n    \"currentPage\": \"<integer>\",\n    \"size\": \"<integer>\",\n    \"totalPages\": \"<integer>\",\n    \"totalElements\": \"<integer>\",\n    \"sort\": [\n      {\n        \"property\": \"<string>\",\n        \"direction\": \"<string>\"\n      },\n      {\n        \"property\": \"<string>\",\n        \"direction\": \"<string>\"\n      }\n    ]\n  },\n  \"data\": [\n    {\n      \"studyKey\": \"<string>\",\n      \"siteName\": \"<string>\",\n      \"siteId\": \"<integer>\",\n      \"subjectId\": \"<integer>\",\n      \"subjectKey\": \"<string>\",\n      \"formId\": \"<integer>\",\n      \"formName\": \"<string>\",\n      \"formKey\": \"<string>\",\n      \"recordId\": \"<integer>\",\n      \"variable\": \"<string>\",\n      \"value\": \"<string>\",\n      \"codingId\": \"<string>\",\n      \"code\": \"<string>\",\n      \"codedBy\": \"<string>\",\n      \"dictionaryName\": \"<string>\",\n      \"dictionaryVersion\": \"<string>\",\n      \"dateCoded\": \"<string>\",\n      \"reason\": \"\",\n      \"revision\": 1,\n      \"lastUpdated\": \"<string>\"\n    },\n    {\n      \"studyKey\": \"<string>\",\n      \"siteName\": \"<string>\",\n      \"siteId\": \"<integer>\",\n      \"subjectId\": \"<integer>\",\n      \"subjectKey\": \"<string>\",\n      \"formId\": \"<integer>\",\n      \"formName\": \"<string>\",\n      \"formKey\": \"<string>\",\n      \"recordId\": \"<integer>\",\n      \"variable\": \"<string>\",\n      \"value\": \"<string>\",\n      \"codingId\": \"<string>\",\n      \"code\": \"<string>\",\n      \"codedBy\": \"<string>\",\n      \"dictionaryName\": \"<string>\",\n      \"dictionaryVersion\": \"<string>\",\n      \"dateCoded\": \"<string>\",\n      \"lastUpdated\": \"<string>\"\n    }\n  ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List codings succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List codings returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "queries",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "6fdcec55-b97d-40e9-9bf3-933440bd0570",
+                                    "name": "List queries",
+                                    "request": {
+                                        "name": "List queries",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "queries"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "35a6a01f-c015-415d-99d5-2711dc452057",
+                                            "name": "Query list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "queries"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"studyKey\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"annotationId\": \"<integer>\",\n            \"description\": \"<string>\",\n            \"recordId\": \"<integer>\",\n            \"variable\": \"<string>\",\n            \"subjectKey\": \"<string>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"annotationType\": \"\",\n            \"subjectOid\": \"\",\n            \"type\": \"\",\n            \"lastUpdated\": \"<string>\",\n            \"queryComments\": []\n        },\n        {\n            \"studyKey\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"annotationId\": \"<integer>\",\n            \"description\": \"<string>\",\n            \"recordId\": \"<integer>\",\n            \"variable\": \"<string>\",\n            \"subjectKey\": \"<string>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List queries succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List queries returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "visits",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "0af14c1c-e3ef-4b3a-a077-92bc730183d9",
+                                    "name": "List visits",
+                                    "request": {
+                                        "name": "List visits",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "visits"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "filter",
+                                                    "value": "<string>"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "29769b45-a2b6-4417-8fdd-ff63642d9657",
+                                            "name": "Visit list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "visits"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "filter",
+                                                            "value": "<string>"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"visitId\": \"<integer>\",\n            \"studyKey\": \"<string>\",\n            \"intervalId\": \"<integer>\",\n            \"intervalName\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectKey\": \"<string>\",\n            \"startDate\": \"<string>\",\n            \"endDate\": \"<string>\",\n            \"dueDate\": \"<string>\",\n            \"visitDate\": \"<string>\",\n            \"deleted\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\",\n            \"visitDateForm\": \"\",\n            \"visitDateQuestion\": \"\",\n            \"lastUpdated\": \"<string>\"\n        },\n        {\n            \"visitId\": \"<integer>\",\n            \"studyKey\": \"<string>\",\n            \"intervalId\": \"<integer>\",\n            \"intervalName\": \"<string>\",\n            \"subjectId\": \"<integer>\",\n            \"subjectKey\": \"<string>\",\n            \"startDate\": \"<string>\",\n            \"endDate\": \"<string>\",\n            \"dueDate\": \"<string>\",\n            \"visitDate\": \"<string>\",\n            \"deleted\": \"<boolean>\",\n            \"dateCreated\": \"<string>\",\n            \"dateModified\": \"<string>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List visits succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List visits returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "users",
+                            "description": "",
+                            "item": [
+                                {
+                                    "id": "72d346c5-f1d0-4b48-bc0c-c3bee1288e68",
+                                    "name": "List users",
+                                    "request": {
+                                        "name": "List users",
+                                        "description": {},
+                                        "url": {
+                                            "path": [
+                                                "studies",
+                                                ":studyKey",
+                                                "users"
+                                            ],
+                                            "host": [
+                                                "{{baseUrl}}"
+                                            ],
+                                            "query": [
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "page",
+                                                    "value": "0"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "size",
+                                                    "value": "25"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "sort",
+                                                    "value": "<string>"
+                                                },
+                                                {
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "",
+                                                        "type": "text/plain"
+                                                    },
+                                                    "key": "includeInactive",
+                                                    "value": "false"
+                                                }
+                                            ],
+                                            "variable": [
+                                                {
+                                                    "type": "any",
+                                                    "value": "<string>",
+                                                    "key": "studyKey",
+                                                    "disabled": false,
+                                                    "description": {
+                                                        "content": "(Required) ",
+                                                        "type": "text/plain"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "header": [
+                                            {
+                                                "key": "Accept",
+                                                "value": "application/json"
+                                            }
+                                        ],
+                                        "method": "GET",
+                                        "body": {},
+                                        "auth": null
+                                    },
+                                    "response": [
+                                        {
+                                            "id": "da666557-bb4e-4d5d-9eee-49a77638eabd",
+                                            "name": "User list",
+                                            "originalRequest": {
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "users"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "page",
+                                                            "value": "0"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "size",
+                                                            "value": "25"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "sort",
+                                                            "value": "<string>"
+                                                        },
+                                                        {
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "",
+                                                                "type": "text/plain"
+                                                            },
+                                                            "key": "includeInactive",
+                                                            "value": "false"
+                                                        }
+                                                    ],
+                                                    "variable": []
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {}
+                                            },
+                                            "status": "OK",
+                                            "code": 200,
+                                            "header": [
+                                                {
+                                                    "key": "Content-Type",
+                                                    "value": "application/json"
+                                                }
+                                            ],
+                                            "body": "{\n    \"metadata\": {\n        \"status\": \"<string>\",\n        \"method\": \"<string>\",\n        \"path\": \"<string>\",\n        \"timestamp\": \"<string>\",\n        \"error\": {}\n    },\n    \"pagination\": {\n        \"currentPage\": \"<integer>\",\n        \"size\": \"<integer>\",\n        \"totalPages\": \"<integer>\",\n        \"totalElements\": \"<integer>\",\n        \"sort\": [\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            },\n            {\n                \"property\": \"<string>\",\n                \"direction\": \"<string>\"\n            }\n        ]\n    },\n    \"data\": [\n        {\n            \"userId\": \"<string>\",\n            \"login\": \"<string>\",\n            \"firstName\": \"<string>\",\n            \"lastName\": \"<string>\",\n            \"email\": \"<string>\",\n            \"userActiveInStudy\": \"<boolean>\",\n            \"roles\": []\n        },\n        {\n            \"userId\": \"<string>\",\n            \"login\": \"<string>\",\n            \"firstName\": \"<string>\",\n            \"lastName\": \"<string>\",\n            \"email\": \"<string>\",\n            \"userActiveInStudy\": \"<boolean>\"\n        }\n    ]\n}",
+                                            "cookie": [],
+                                            "_postman_previewlanguage": "json"
+                                        }
+                                    ],
+                                    "event": [
+                                        {
+                                            "listen": "test",
+                                            "script": {
+                                                "type": "text/javascript",
+                                                "exec": [
+                                                    "pm.test(\"List users succeeds\", function () {",
+                                                    "    pm.response.to.have.status(200);",
+                                                    "});",
+                                                    "pm.test(\"List users returns a data array\", function () {",
+                                                    "    pm.expect(pm.response.json().data).to.be.an(\"array\");",
+                                                    "});"
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "protocolProfileBehavior": {
+                                        "disableBodyPruning": true
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "jobs",
+                            "description": "",
+                            "item": [
+                                {
+                                    "name": "{batchId}",
+                                    "description": "",
+                                    "item": [
+                                        {
+                                            "id": "b41de8b9-e183-4fe3-849d-20849783fd0f",
+                                            "name": "Retrieve job status",
+                                            "request": {
+                                                "name": "Retrieve job status",
+                                                "description": {},
+                                                "url": {
+                                                    "path": [
+                                                        "studies",
+                                                        ":studyKey",
+                                                        "jobs",
+                                                        ":batchId"
+                                                    ],
+                                                    "host": [
+                                                        "{{baseUrl}}"
+                                                    ],
+                                                    "query": [],
+                                                    "variable": [
+                                                        {
+                                                            "type": "any",
+                                                            "value": "<string>",
+                                                            "key": "studyKey",
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "(Required) ",
+                                                                "type": "text/plain"
+                                                            }
+                                                        },
+                                                        {
+                                                            "type": "any",
+                                                            "value": "<string>",
+                                                            "key": "batchId",
+                                                            "disabled": false,
+                                                            "description": {
+                                                                "content": "(Required) ",
+                                                                "type": "text/plain"
+                                                            }
+                                                        }
+                                                    ]
+                                                },
+                                                "header": [
+                                                    {
+                                                        "key": "Accept",
+                                                        "value": "application/json"
+                                                    }
+                                                ],
+                                                "method": "GET",
+                                                "body": {},
+                                                "auth": null
+                                            },
+                                            "response": [
+                                                {
+                                                    "id": "01cf5165-b9ce-4244-b02d-227e5ad6bb8d",
+                                                    "name": "Job status",
+                                                    "originalRequest": {
+                                                        "url": {
+                                                            "path": [
+                                                                "studies",
+                                                                ":studyKey",
+                                                                "jobs",
+                                                                ":batchId"
+                                                            ],
+                                                            "host": [
+                                                                "{{baseUrl}}"
+                                                            ],
+                                                            "query": [],
+                                                            "variable": []
+                                                        },
+                                                        "header": [
+                                                            {
+                                                                "key": "Accept",
+                                                                "value": "application/json"
+                                                            }
+                                                        ],
+                                                        "method": "GET",
+                                                        "body": {}
+                                                    },
+                                                    "status": "OK",
+                                                    "code": 200,
+                                                    "header": [
+                                                        {
+                                                            "key": "Content-Type",
+                                                            "value": "application/json"
+                                                        }
+                                                    ],
+                                                    "body": "{\n  \"jobId\": \"<string>\",\n  \"batchId\": \"<string>\",\n  \"state\": \"<string>\",\n  \"dateCreated\": \"<string>\",\n  \"dateStarted\": \"<string>\",\n  \"dateFinished\": \"<string>\",\n  \"progress\": \"<integer>\",\n  \"resultUrl\": \"<string>\"\n}",
+                                                    "cookie": [],
+                                                    "_postman_previewlanguage": "json"
+                                                }
+                                            ],
+                                            "event": [
+                                                {
+                                                    "listen": "test",
+                                                    "script": {
+                                                        "type": "text/javascript",
+                                                        "exec": [
+                                                            "pm.test(\"Retrieve job status succeeds\", function () {",
+                                                            "    pm.response.to.have.status(200);",
+                                                            "});",
+                                                            "pm.test(\"Retrieve job status returns job details\", function () {",
+                                                            "    pm.expect(pm.response.json()).to.have.property(\"jobId\");",
+                                                            "});"
+                                                        ]
+                                                    }
+                                                }
+                                            ],
+                                            "protocolProfileBehavior": {
+                                                "disableBodyPruning": true
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    ],
+    "event": [],
+    "variable": [
+        {
+            "key": "baseUrl",
+            "value": "https://edc.prod.imednetapi.com/api/v1/edc"
+        }
+    ],
+    "info": {
+        "_postman_id": "a5d103c8-a01f-41a2-bc4e-c048880f32e4",
+        "name": "iMednet EDC API",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        "description": {
+            "content": "Swagger specification for the iMednet EDC REST API derived from\nthe SDK documentation. The API exposes clinical study resources\nvia JSON. Requests require `x-api-key` and `x-imn-security-key`\nheaders for authentication.\n",
+            "type": "text/plain"
+        }
+    }
+}
