@@ -70,7 +70,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from imednet.integrations.enrichment import CentralizedMapper
 
 from imednet.errors import ExportConfigurationError
 from imednet.integrations.sink_base import (
@@ -124,11 +127,14 @@ def _post_process_document(doc: dict[str, Any]) -> dict[str, Any]:
     return doc
 
 
-def _record_to_document(record: Any, study_key: str) -> dict[str, Any]:
+def _record_to_document(
+    record: Any, study_key: str, mapper: CentralizedMapper | None = None
+) -> dict[str, Any]:
     """Wrap a typed ``Record`` model in the standard document envelope."""
-    from imednet.integrations.enrichment import CentralizedMapper
+    if mapper is None:
+        from imednet.integrations.enrichment import CentralizedMapper
 
-    mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
+        mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
     return mapper.map_record(record, study_key=study_key)
 
 
@@ -187,7 +193,10 @@ class MongoDbExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
-        docs = [_record_to_document(r, self._study_key) for r in records]
+        from imednet.integrations.enrichment import CentralizedMapper
+
+        mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
+        docs = [_record_to_document(r, self._study_key, mapper=mapper) for r in records]
         if not docs:
             return 0
 

@@ -223,6 +223,57 @@ class TestNeo4jExportSink:
         sink.close()
         sink.close()  # must not raise
 
+    def test_write_batch_reuses_mapper_instance(self, monkeypatch):
+        """Verify CentralizedMapper is instantiated once per write_batch execution."""
+        import imednet_sinks.graph as graph_mod
+
+        from imednet.integrations.enrichment import CentralizedMapper
+
+        neo4j, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
+
+        real_init = CentralizedMapper.__init__
+        instances = []
+
+        def tracked_init(self, *args, **kwargs):
+            instances.append(self)
+            return real_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(CentralizedMapper, "__init__", tracked_init)
+
+        from imednet_sinks.graph import Neo4jExportSink
+
+        records = [
+            MagicMock(record_id=i, form_id=1, visit_id=1, subject_key="S1", record_data={})
+            for i in range(5)
+        ]
+        with Neo4jExportSink(
+            Neo4jSinkConfig(study_key="STUDY1", uri="bolt://localhost:7687", auth=("neo4j", "pass"))
+        ) as sink:
+            count = sink.write_batch(records, batch_id="STUDY1/F1/0")
+
+        assert count == 5
+        assert len(instances) == 1
+        assert "STUDY1" in instances[0]._pipeline_cache
+
+    def test_record_to_row_accepts_and_uses_injected_mapper(self):
+        """Verify _record_to_row uses injected mapper and maintains backward compatibility."""
+        from imednet_sinks.graph import _post_process_graph, _record_to_row
+
+        from imednet.integrations.enrichment import CentralizedMapper
+
+        record = MagicMock(record_id=10, form_id=1, visit_id=1, subject_key="S1", record_data={})
+
+        # Backward compatibility when mapper is not passed
+        row1 = _record_to_row(record, study_key="STUDY1")
+        assert row1["record_id"] == 10
+
+        # Injected mapper
+        custom_mapper = CentralizedMapper(mode="document", post_processor=_post_process_graph)
+        row2 = _record_to_row(record, study_key="STUDY1", mapper=custom_mapper)
+        assert row2["record_id"] == 10
+        assert "STUDY1" in custom_mapper._pipeline_cache
+
 
 # ---------------------------------------------------------------------------
 # MongoDbExportSink
@@ -428,6 +479,59 @@ class TestMongoDbExportSink:
         )
         sink.close()
         sink.close()  # must not raise
+
+    def test_write_batch_reuses_mapper_instance(self, monkeypatch):
+        """Verify CentralizedMapper is instantiated once per write_batch execution."""
+        import imednet_sinks.document as doc_mod
+
+        from imednet.integrations.enrichment import CentralizedMapper
+
+        pymongo, client, collection = _fake_pymongo_module()
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+
+        real_init = CentralizedMapper.__init__
+        instances = []
+
+        def tracked_init(self, *args, **kwargs):
+            instances.append(self)
+            return real_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(CentralizedMapper, "__init__", tracked_init)
+
+        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
+
+        records = [
+            MagicMock(record_id=i, form_id=1, visit_id=1, subject_key="S1", record_data={})
+            for i in range(5)
+        ]
+        with MongoDbExportSink(
+            MongoDbSinkConfig(
+                study_key="STUDY1", uri="mongodb://localhost:27017", database="db", collection="col"
+            )
+        ) as sink:
+            count = sink.write_batch(records, batch_id="STUDY1/F1/0")
+
+        assert count == 5
+        assert len(instances) == 1
+        assert "STUDY1" in instances[0]._pipeline_cache
+
+    def test_record_to_document_accepts_and_uses_injected_mapper(self):
+        """Verify _record_to_document uses injected mapper and maintains backward compatibility."""
+        from imednet_sinks.document import _post_process_document, _record_to_document
+
+        from imednet.integrations.enrichment import CentralizedMapper
+
+        record = MagicMock(record_id=10, form_id=1, visit_id=1, subject_key="S1", record_data={})
+
+        # Backward compatibility when mapper is not passed
+        doc1 = _record_to_document(record, study_key="STUDY1")
+        assert doc1["_id"] == "STUDY1/10"
+
+        # Injected mapper
+        custom_mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
+        doc2 = _record_to_document(record, study_key="STUDY1", mapper=custom_mapper)
+        assert doc2["_id"] == "STUDY1/10"
+        assert "STUDY1" in custom_mapper._pipeline_cache
 
 
 # ---------------------------------------------------------------------------
@@ -810,3 +914,47 @@ def test_export_to_snowflake(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # integrations/__init__.py re-exports
 # ---------------------------------------------------------------------------
+
+
+class TestBatchScopedMapperPerformance:
+    """Performance and caching tests for batch-scoped CentralizedMapper reuse."""
+
+    def test_pipeline_cache_reuse_across_1000_records(self):
+        """Verify pipeline cache is populated once and reused across 1,000 records."""
+        from imednet_sinks.document import _post_process_document, _record_to_document
+        from imednet_sinks.graph import _post_process_graph, _record_to_row
+
+        from imednet.integrations.enrichment import CentralizedMapper
+
+        records = [
+            SimpleNamespace(
+                record_id=i,
+                subject_id=i % 50,
+                subject_key=f"SUBJ-{i % 50}",
+                visit_id=1,
+                form_id=2,
+                form_key="BASELINE",
+                record_status="Complete",
+                deleted=False,
+                date_created="2024-01-01T00:00:00Z",
+                date_modified="2024-01-02T00:00:00Z",
+                record_data={"score": i, "result": "PASS"},
+            )
+            for i in range(1000)
+        ]
+
+        # MongoDB document mapper cache reuse
+        doc_mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
+        assert len(doc_mapper._pipeline_cache) == 0
+        docs = [_record_to_document(r, "STUDY1", mapper=doc_mapper) for r in records]
+        assert len(docs) == 1000
+        assert len(doc_mapper._pipeline_cache) == 1
+        assert "STUDY1" in doc_mapper._pipeline_cache
+
+        # Neo4j graph row mapper cache reuse
+        graph_mapper = CentralizedMapper(mode="document", post_processor=_post_process_graph)
+        assert len(graph_mapper._pipeline_cache) == 0
+        rows = [_record_to_row(r, "STUDY1", mapper=graph_mapper) for r in records]
+        assert len(rows) == 1000
+        assert len(graph_mapper._pipeline_cache) == 1
+        assert "STUDY1" in graph_mapper._pipeline_cache
