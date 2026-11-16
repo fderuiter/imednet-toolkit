@@ -7,9 +7,9 @@ from collections.abc import Mapping, MutableMapping
 from datetime import date, datetime
 from typing import Any, TypeAlias, Union, cast
 
-from airflow.sdk.bases.hook import BaseHook
-
 from imednet import Config, ImednetSDK, load_config
+
+from .._airflow_compat import BaseHook
 
 Primitive = Union[str, int, float, bool, None]  # noqa: UP007
 # Primitive-only payload contract for discovery helpers that feed Airflow mapping/XCom.
@@ -80,7 +80,10 @@ class ImednetHook(BaseHook):
 
     def _resolved_config(self) -> Config:
         """Resolve hook configuration from Airflow connection fields and env fallback."""
-        from airflow.sdk.bases.hook import BaseHook
+        try:
+            from airflow.sdk.bases.hook import BaseHook
+        except (ImportError, ModuleNotFoundError):
+            from .._airflow_compat import BaseHook
 
         conn = BaseHook.get_connection(self.imednet_conn_id)
         extras_dict = self._connection_extras(conn)
