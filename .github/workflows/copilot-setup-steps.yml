@@ -14,7 +14,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-permissions: read-all
+permissions: {}
 
 jobs:
   # CRITICAL: This exact job key name is required by GitHub Copilot

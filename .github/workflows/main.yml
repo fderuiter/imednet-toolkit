@@ -15,7 +15,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-permissions: read-all
+permissions: {}
 
 jobs:
   # ------------------------------------------------------------------
@@ -54,6 +54,8 @@ jobs:
   global-lint:
     name: Global Code Quality Check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -74,6 +76,8 @@ jobs:
   pre-commit:
     name: Pre-commit Quality Checks
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,6 +103,8 @@ jobs:
   plan:
     name: Plan CI Execution
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       build_matrix: ${{ steps.set-matrix.outputs.build_matrix }}
@@ -211,6 +217,8 @@ jobs:
     needs: [plan, quality]
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -300,6 +308,8 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -381,6 +391,8 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.run_integration == 'true' && needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -472,6 +484,8 @@ jobs:
     needs: build
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         extra: ["export", "duckdb", "mongodb", "neo4j", "snowflake", "cli"]
@@ -530,6 +544,8 @@ jobs:
     name: Validate Package Consumption
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -568,6 +584,8 @@ jobs:
     name: Build Documentation
     needs: plan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
