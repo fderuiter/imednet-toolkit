@@ -1,6 +1,7 @@
 """Sphinx configuration."""
 
 # Configuration file for the Sphinx documentation builder.
+import importlib.util
 import logging
 import os
 import sys
@@ -42,17 +43,33 @@ warnings.filterwarnings("ignore", message="duplicate object description*")
 warnings.filterwarnings("ignore", message="Failed guarded type import*")
 
 # Mock heavy optional dependencies so autodoc does not require them.
-# Mock pandas to avoid heavy dependency while building docs. The stub provides
-# minimal attributes used in type hints.
-if "pandas" not in sys.modules:
+# Mock pandas to avoid heavy dependency while building docs if not installed.
+if not importlib.util.find_spec("pandas"):
     pandas_stub = types.ModuleType("pandas")
 
     class DataFrame:  # pragma: no cover - simple stub
         """Dummy DataFrame class."""
 
-        def __init__(self):
+        def __init__(self, *args: Any, **kwargs: Any):
             """Initialize dummy DataFrame."""
-            self.columns = type('MockColumns', (), {'astype': lambda self, t: self})()
+            self.columns = type(
+                "MockColumns",
+                (),
+                {
+                    "astype": lambda self, t: self,
+                    "str": type(
+                        "MockStr",
+                        (),
+                        {
+                            "lower": lambda self: type(
+                                "MockLower", (), {"duplicated": lambda self: []}
+                            )()
+                        },
+                    )(),
+                },
+            )()
+            self.loc = type("MockLoc", (), {"__getitem__": lambda self, idx: DataFrame()})()
+            self.empty = True
 
     def json_normalize(*args: Any, **kwargs: Any) -> DataFrame:  # type: ignore
         """Dummy json_normalize function."""
@@ -61,6 +78,8 @@ if "pandas" not in sys.modules:
     pandas_stub.DataFrame = DataFrame
     pandas_stub.json_normalize = json_normalize
     sys.modules["pandas"] = pandas_stub
+else:
+    import pandas  # noqa: F401
 
 from imednet import __version__ as imednet_version
 
@@ -175,7 +194,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["thebe_pyodide.js"]
+html_js_files: list[str] = ["showcase.js", "thebe_pyodide.js"]
 
 doctest_global_setup = """
 import os
@@ -191,19 +210,13 @@ warnings.simplefilter("ignore")
 import httpx
 from unittest.mock import MagicMock, patch
 
+os.environ["IMEDNET_SIMULATION_MODE"] = "true"
 os.environ["IMEDNET_API_KEY"] = "dummy_api_key"  # pragma: allowlist secret
 os.environ["IMEDNET_SECURITY_KEY"] = "dummy_security_key"  # pragma: allowlist secret
 os.environ["SNOWFLAKE_PASSWORD"] = "dummy_password"  # pragma: allowlist secret
 os.environ["IMEDNET_STUDY_KEY"] = "MY_STUDY"
 
 __file__ = "/a/b/c/d/e/dummy.py"
-
-_respx_mock = respx.mock(assert_all_called=False)
-_respx_mock.start()
-# Mock site endpoint for register_subjects
-_respx_mock.route(path__startswith="/api/v1/studies/STUDY/sites").mock(return_value=httpx.Response(200, json={"items": [{"siteName": "SITE"}]}))
-_respx_mock.route(path__startswith="/api/v1/jobs").mock(return_value=httpx.Response(200, json={"status": "Completed"}))
-_respx_mock.route().mock(return_value=httpx.Response(200, json={"message": "ok", "items": [{"recordId": "R1"}], "results": [], "data": []}))
 
 import duckdb
 _duckdb_connect_patcher = patch('duckdb.connect', return_value=MagicMock())
@@ -219,15 +232,6 @@ _cvs_patcher3.start()
 _cvs_patcher4 = patch.object(ConfigVersionStore, 'get_history', return_value=[{"version_tag": "v1", "commit_id": "mock_commit_id", "timestamp": "2026-01-01"}])
 _cvs_patcher4.start()
 
-from imednet.sdk import ImednetSDK, AsyncImednetSDK
-_poll_patcher1 = patch.object(ImednetSDK, 'poll_job', return_value={'status': 'Completed'})
-_poll_patcher1.start()
-_poll_patcher2 = patch.object(AsyncImednetSDK, 'async_poll_job', return_value={'status': 'Completed'})
-_poll_patcher2.start()
-
-_records_patcher = patch('imednet.endpoints.records.RecordsEndpoint.list', return_value=[])
-_records_patcher.start()
-
 import imednet.integrations.export
 _export_patcher = patch.object(imednet.integrations.export, '_prepare_export_df', return_value=sys.modules['pandas'].DataFrame())
 _export_patcher.start()
@@ -236,8 +240,6 @@ from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
 _reg_patcher = patch.object(RegisterSubjectsWorkflow, 'register_subjects', return_value={'batch_id': 'MOCK_BATCH'})
 _reg_patcher.start()
 
-# Mock optional dependencies
-import sys
 from unittest.mock import MagicMock, patch
 import builtins
 
@@ -289,15 +291,11 @@ api_response = {}
 """
 
 doctest_global_cleanup = """
-_respx_mock.stop()
 _duckdb_connect_patcher.stop()
 _cvs_patcher1.stop()
 _cvs_patcher2.stop()
 _cvs_patcher3.stop()
 _cvs_patcher4.stop()
-_poll_patcher1.stop()
-_poll_patcher2.stop()
-_records_patcher.stop()
 _export_patcher.stop()
 _reg_patcher.stop()
 _snowflake_patcher.stop()

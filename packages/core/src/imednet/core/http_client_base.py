@@ -50,6 +50,8 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
         tracer: Tracer | None = None,
         retry_config: RetryConfig | None = None,
         auth: AuthStrategy | None = None,
+        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
+        simulation_mode: bool | None = None,
     ) -> None:
         """Initialize the HTTP client.
 
@@ -61,6 +63,8 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
             tracer: Optional OpenTelemetry tracer instance.
             retry_config: Centralized configuration for retry behaviors.
             auth: Optional pre-configured AuthStrategy.
+            transport: Optional custom httpx transport.
+            simulation_mode: Optional flag to enable offline simulation mode.
         """
         super().__init__(
             api_key=api_key,
@@ -70,6 +74,8 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
             tracer=tracer,
             retry_config=retry_config,
             auth=auth,
+            transport=transport,
+            simulation_mode=simulation_mode,
         )
 
         self._executor = self._create_executor(self._client, self.retry_config)
@@ -83,11 +89,15 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
         headers.update(auth.get_headers())
 
         client_cls = self._get_client_class()
-        client: Any = client_cls(
-            base_url=self._base_url,
-            headers=headers,
-            timeout=self.timeout,
-        )
+        client_kwargs: dict[str, Any] = {
+            "base_url": self._base_url,
+            "headers": headers,
+            "timeout": self.timeout,
+        }
+        if getattr(self, "_transport", None) is not None:
+            client_kwargs["transport"] = self._transport
+
+        client: Any = client_cls(**client_kwargs)
         return cast(ClientT, client)
 
     @property

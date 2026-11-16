@@ -41,7 +41,10 @@ __all__ = [
 
 def get_parser() -> argparse.ArgumentParser:
     """Return the main argparse.ArgumentParser for the CLI."""
-    parser = argparse.ArgumentParser(description="iMednet SDK Command Line Interface")
+    parser = argparse.ArgumentParser(
+        description="iMednet SDK Command Line Interface",
+        epilog="Install optional CLI features: pip install 'imednet[cli]'",
+    )
     parser.add_argument(
         "--high-contrast", action="store_true", help="Enable high-contrast mode for accessibility."
     )

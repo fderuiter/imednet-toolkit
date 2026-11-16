@@ -21,6 +21,7 @@ Subpackages
    imednet.models
    imednet.orchestration
    imednet.pagination
+   imednet.simulation
    imednet.spi
    imednet.testing
    imednet.utils
