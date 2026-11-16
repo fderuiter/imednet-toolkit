@@ -68,6 +68,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -75,7 +76,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from imednet.errors import ExportConfigurationError
+from imednet.errors import ExportBatchError, ExportConfigurationError
 from imednet.integrations.sink_base import (
     ExportSink,
     SinkConfig,
@@ -85,6 +86,16 @@ from imednet.integrations.sink_base import (
 from imednet.sdk import ImednetSDK
 
 logger = logging.getLogger(__name__)
+
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
+_PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9_./-]+$")
+_BATCH_UNSAFE_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _quote_identifier(ident: str) -> str:
+    """Safely quote a Snowflake SQL identifier with double quotes."""
+    escaped = ident.replace('"', '""')
+    return f'"{escaped}"'
 
 
 @dataclass
@@ -111,6 +122,8 @@ class SnowflakeSinkConfig(SinkConfig):
         Destination table name inside *database*.*schema*.
     stage_prefix:
         Path prefix inside the stage (default ``"imednet"``).
+    prefix:
+        Optional alias for ``stage_prefix``.
     local_staging_dir:
         Local directory used to write Parquet files before ``PUT``.
         Defaults to a temporary directory created by :mod:`tempfile`.
@@ -128,8 +141,49 @@ class SnowflakeSinkConfig(SinkConfig):
     stage: str = ""
     table: str = ""
     stage_prefix: str = "imednet"
+    prefix: str | None = None
     local_staging_dir: str | os.PathLike[str] | None = None
     manifest_path: str | os.PathLike[str] | None = None
+
+    def __post_init__(self) -> None:
+        """Validate configuration parameters."""
+        super().__post_init__()
+        if self.prefix is not None:
+            self.stage_prefix = self.prefix
+        self.validate_identifiers(require_coordinates=False)
+
+    def validate_identifiers(self, *, require_coordinates: bool = False) -> None:
+        """Validate Snowflake database coordinates and stage prefix against strict patterns."""
+        coordinates = {
+            "database": self.database,
+            "schema": self.schema,
+            "warehouse": self.warehouse,
+            "stage": self.stage,
+            "table": self.table,
+        }
+        for name, value in coordinates.items():
+            if value:
+                if not _IDENTIFIER_PATTERN.match(value):
+                    raise ExportConfigurationError(
+                        f"SnowflakeSinkConfig parameter '{name}' contains invalid characters: {value!r}"
+                    )
+            elif require_coordinates:
+                raise ExportConfigurationError(
+                    f"SnowflakeSinkConfig parameter '{name}' must be non-empty."
+                )
+
+        prefix_val = self.stage_prefix
+        if prefix_val:
+            if not _PREFIX_PATTERN.match(prefix_val):
+                raise ExportConfigurationError(
+                    f"SnowflakeSinkConfig parameter 'stage_prefix' contains invalid characters: {prefix_val!r}"
+                )
+        elif require_coordinates:
+            raise ExportConfigurationError(
+                "SnowflakeSinkConfig parameter 'stage_prefix' must be non-empty."
+            )
+
+    _validate_identifiers = validate_identifiers
 
 
 def _records_to_arrow_table(records: Sequence[Any]) -> Any:
@@ -195,6 +249,8 @@ class SnowflakeExportSink(ExportSink):
                 f"SnowflakeSinkConfig is missing required fields: {missing}"
             )
 
+        cfg.validate_identifiers(require_coordinates=True)
+
         snowflake = _require_optional_dep("snowflake.connector", "snowflake")
         logger.debug("Connecting to Snowflake account=%s database=%s", cfg.account, cfg.database)
         try:
@@ -229,8 +285,14 @@ class SnowflakeExportSink(ExportSink):
         if not records:
             return 0
 
+        safe_batch = _BATCH_UNSAFE_PATTERN.sub("_", batch_id).strip("_")
+        if not safe_batch:
+            raise ExportBatchError(
+                f"Batch identifier {batch_id!r} resolved to an empty string after sanitization.",
+                batch_id=batch_id,
+            )
+
         arrow_table = _records_to_arrow_table(records)
-        safe_batch = batch_id.replace("/", "_").replace(" ", "_")
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
         pq = _require_optional_dep("pyarrow.parquet", "snowflake")
         pq.write_table(arrow_table, str(local_path))
@@ -242,11 +304,16 @@ class SnowflakeExportSink(ExportSink):
             """Execute PUT and COPY INTO commands to load data into Snowflake."""
             cur = self._conn.cursor()
             try:
-                cur.execute(f"PUT file://{local_path} @{cfg.stage}/{cfg.stage_prefix}/")  # nosem
+                cur.execute(f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/'")  # nosem
                 force_clause = "FORCE = FALSE" if self.config.idempotent else "FORCE = TRUE"
+                target_table = (
+                    f"{_quote_identifier(cfg.database)}."
+                    f"{_quote_identifier(cfg.schema)}."
+                    f"{_quote_identifier(cfg.table)}"
+                )
                 cur.execute(
-                    f"COPY INTO {cfg.database}.{cfg.schema}.{cfg.table} "
-                    f"FROM @{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet "
+                    f"COPY INTO {target_table} "
+                    f"FROM '{stage_path}' "
                     f"FILE_FORMAT = (TYPE = PARQUET) "
                     f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
                     f"{force_clause}"
