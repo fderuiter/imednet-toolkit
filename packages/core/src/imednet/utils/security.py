@@ -6,6 +6,27 @@ from typing import Any
 from imednet.errors import ClientError, PathTraversalValidationError
 
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
+_CAMEL_TO_SNAKE_RE1 = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_TO_SNAKE_RE2 = re.compile(r"([a-z\d])([A-Z])")
+_DELIMITER_RE = re.compile(r"[^a-zA-Z0-9]+")
+
+
+def _normalize_key(key: Any) -> str:
+    """Normalize a field key to canonical lowercase snake_case.
+
+    Converts camelCase, PascalCase, uppercase acronyms, and delimited names
+    (hyphens, whitespace, etc.) into lowercase snake_case. Non-string inputs
+    are converted to strings first.
+    """
+    if key is None:
+        return ""
+    s = str(key).strip()
+    if not s:
+        return ""
+    s = _CAMEL_TO_SNAKE_RE1.sub(r"\1_\2", s)
+    s = _CAMEL_TO_SNAKE_RE2.sub(r"\1_\2", s)
+    s = _DELIMITER_RE.sub("_", s)
+    return s.strip("_").lower()
 
 
 class SensitivityRegistry:
@@ -28,28 +49,32 @@ class SensitivityRegistry:
         # Keys explicitly exempted from masking
         self._exempt_keys = {"subject_key", "study_key", "record_id"}
 
-    def add_sensitive_key(self, key: str) -> None:
+    def add_sensitive_key(self, key: Any) -> None:
         """Add a key to the sensitive list if it is not exempted."""
-        if key not in self._exempt_keys:
-            self._sensitive_keys.add(key)
+        norm_key = _normalize_key(key)
+        if norm_key and norm_key not in self._exempt_keys:
+            self._sensitive_keys.add(norm_key)
 
-    def remove_sensitive_key(self, key: str) -> None:
+    def remove_sensitive_key(self, key: Any) -> None:
         """Remove a key from the sensitive list."""
-        self._sensitive_keys.discard(key)
+        self._sensitive_keys.discard(_normalize_key(key))
 
-    def add_exempt_key(self, key: str) -> None:
+    def add_exempt_key(self, key: Any) -> None:
         """Add a key to the exemption list."""
-        self._exempt_keys.add(key)
+        norm_key = _normalize_key(key)
+        if norm_key:
+            self._exempt_keys.add(norm_key)
 
-    def remove_exempt_key(self, key: str) -> None:
+    def remove_exempt_key(self, key: Any) -> None:
         """Remove a key from the exemption list."""
-        self._exempt_keys.discard(key)
+        self._exempt_keys.discard(_normalize_key(key))
 
-    def is_sensitive(self, key: str) -> bool:
+    def is_sensitive(self, key: Any) -> bool:
         """Check if a key is considered sensitive and not exempted."""
-        if key in self._exempt_keys:
+        norm_key = _normalize_key(key)
+        if not norm_key or norm_key in self._exempt_keys:
             return False
-        return key in self._sensitive_keys
+        return norm_key in self._sensitive_keys
 
 
 global_sensitivity_registry = SensitivityRegistry()

@@ -10,6 +10,16 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     try:
+        from airflow.sdk.bases.hook import BaseHook
+    except ImportError:
+        try:
+            from airflow.hooks.base import BaseHook  # type: ignore[attr-defined]
+        except ImportError:
+
+            class BaseHook:  # type: ignore[no-redef]
+                """Fallback BaseHook typing stub."""
+
+    try:
         from airflow.sdk.exceptions import AirflowException
     except ImportError:
         from airflow.exceptions import AirflowException  # type: ignore[attr-defined]
@@ -31,4 +41,26 @@ else:  # pragma: no cover - typing fallback for optional Airflow dependency
 
             AirflowException = _FallbackAirflowError
 
-__all__ = ["AirflowException", "Context"]
+    try:
+        from airflow.sdk.bases.hook import BaseHook
+    except (ImportError, ModuleNotFoundError):
+        try:
+            from airflow.hooks.base import BaseHook
+        except (ImportError, ModuleNotFoundError):
+
+            class _FallbackBaseHook:
+                """Fallback base hook used when Airflow is unavailable."""
+
+                def __init__(self, *args: Any, **kwargs: Any) -> None:
+                    """Initialize fallback hook."""
+
+                @classmethod
+                def get_connection(cls, conn_id: str) -> Any:
+                    """Stub for retrieving Airflow connections offline."""
+                    raise AirflowException(
+                        f"Cannot retrieve connection '{conn_id}': Apache Airflow is not installed."
+                    )
+
+            BaseHook = _FallbackBaseHook
+
+__all__ = ["AirflowException", "BaseHook", "Context"]

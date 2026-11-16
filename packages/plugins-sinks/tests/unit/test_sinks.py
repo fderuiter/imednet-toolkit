@@ -825,6 +825,195 @@ class TestSnowflakeExportSink:
         sink.close()
         sink.close()  # must not raise
 
+    @pytest.mark.parametrize(
+        "param_name,invalid_val",
+        [
+            ("database", "DB; DROP TABLE TBL;--"),
+            ("database", "DB' OR '1'='1"),
+            ("database", "DB WITH SPACES"),
+            ("schema", "PUBLIC;--"),
+            ("warehouse", "WH /* comment */"),
+            ("stage", "STG/PATH"),
+            ("table", "TBL; TRUNCATE TABLE TBL;"),
+            ("table", 'TBL"'),
+        ],
+    )
+    def test_config_raises_for_invalid_identifier(self, param_name, invalid_val, tmp_path):
+        """Test that invalid Snowflake database coordinates raise ExportConfigurationError."""
+        from imednet_sinks.warehouse import SnowflakeSinkConfig
+
+        valid_kwargs = {
+            "study_key": "STUDY1",
+            "account": "acct",
+            "user": "user",
+            "password": "secret",
+            "database": "DB",
+            "schema": "PUBLIC",
+            "warehouse": "WH",
+            "stage": "STG",
+            "table": "TBL",
+            "local_staging_dir": str(tmp_path),
+        }
+        valid_kwargs[param_name] = invalid_val
+        with pytest.raises(
+            ExportConfigurationError, match=f"parameter '{param_name}' contains invalid characters"
+        ):
+            SnowflakeSinkConfig(**valid_kwargs)
+
+    @pytest.mark.parametrize(
+        "prefix_field,invalid_val",
+        [
+            ("stage_prefix", "prefix; DROP TABLE TBL;--"),
+            ("stage_prefix", "prefix with spaces"),
+            ("stage_prefix", "prefix' OR '1'='1"),
+            ("prefix", "prefix; DROP TABLE TBL;--"),
+        ],
+    )
+    def test_config_raises_for_invalid_stage_prefix(self, prefix_field, invalid_val, tmp_path):
+        """Test that invalid stage prefixes raise ExportConfigurationError."""
+        from imednet_sinks.warehouse import SnowflakeSinkConfig
+
+        kwargs = {
+            "study_key": "STUDY1",
+            "account": "acct",
+            "user": "user",
+            "password": "secret",
+            "database": "DB",
+            "schema": "PUBLIC",
+            "warehouse": "WH",
+            "stage": "STG",
+            "table": "TBL",
+            "local_staging_dir": str(tmp_path),
+            prefix_field: invalid_val,
+        }
+        with pytest.raises(
+            ExportConfigurationError, match="parameter 'stage_prefix' contains invalid characters"
+        ):
+            SnowflakeSinkConfig(**kwargs)
+
+    def test_sink_validates_coordinates_on_connect(self, monkeypatch, tmp_path):
+        """Test that sink validation catches invalid coordinates modified after config instantiation."""
+        from imednet_sinks.warehouse import SnowflakeExportSink
+
+        cfg, sf, conn, cursor, pq = self._make_sink(monkeypatch, tmp_path=tmp_path)
+        cfg.table = "TBL; DROP TABLE TBL;--"
+        with pytest.raises(
+            ExportConfigurationError, match="parameter 'table' contains invalid characters"
+        ):
+            SnowflakeExportSink(config=cfg)
+
+    def test_write_batch_sanitizes_special_characters_in_batch_id(self, monkeypatch, tmp_path):
+        """Test that write_batch sanitizes special characters in batch identifier into safe alphanumeric format."""
+        from imednet_sinks.warehouse import SnowflakeExportSink
+
+        cfg, sf, conn, cursor, pq = self._make_sink(monkeypatch, tmp_path=tmp_path)
+        sink = SnowflakeExportSink(config=cfg)
+        records = [MagicMock(record_id=1, form_id=1, visit_id=1, subject_key="S", record_data={})]
+
+        count = sink.write_batch(records, batch_id="STUDY-1/FORM 1/batch:0#extra")
+        assert count == 1
+
+        # Check call arguments
+        calls = [c.args[0] for c in cursor.execute.call_args_list if c.args]
+        put_call = next(c for c in calls if "PUT" in c)
+        copy_call = next(c for c in calls if "COPY INTO" in c)
+
+        assert "STUDY_1_FORM_1_batch_0_extra.parquet" in put_call
+        assert "STUDY_1_FORM_1_batch_0_extra.parquet" in copy_call
+        sink.close()
+
+    @pytest.mark.parametrize(
+        "unsafe_batch_id",
+        [
+            "",
+            "   ",
+            ";;;;",
+            "!@#$%^&*()",
+            "___",
+            "---",
+            "/ / /",
+        ],
+    )
+    def test_write_batch_rejects_empty_sanitized_batch_id(
+        self, monkeypatch, tmp_path, unsafe_batch_id
+    ):
+        """Test that write_batch rejects batch IDs resolving to empty strings after sanitization."""
+        from imednet_sinks.warehouse import SnowflakeExportSink
+
+        cfg, sf, conn, cursor, pq = self._make_sink(monkeypatch, tmp_path=tmp_path)
+        sink = SnowflakeExportSink(config=cfg)
+        records = [MagicMock(record_id=1, form_id=1, visit_id=1, subject_key="S", record_data={})]
+
+        with pytest.raises(
+            ExportBatchError, match="resolved to an empty string after sanitization"
+        ):
+            sink.write_batch(records, batch_id=unsafe_batch_id)
+        sink.close()
+
+    def test_write_batch_quotes_identifiers_and_stage_path(self, monkeypatch, tmp_path):
+        """Test that database identifiers and stage paths are properly quoted in queries."""
+        from imednet_sinks.warehouse import SnowflakeExportSink
+
+        cfg, sf, conn, cursor, pq = self._make_sink(monkeypatch, tmp_path=tmp_path)
+        sink = SnowflakeExportSink(config=cfg)
+        records = [MagicMock(record_id=1, form_id=1, visit_id=1, subject_key="S", record_data={})]
+
+        sink.write_batch(records, batch_id="STUDY/FORM/0")
+
+        calls = [c.args[0] for c in cursor.execute.call_args_list if c.args]
+        put_call = next(c for c in calls if "PUT" in c)
+        copy_call = next(c for c in calls if "COPY INTO" in c)
+
+        # Stage path in PUT should be quoted
+        assert "'@STG/imednet/'" in put_call
+        # Database identifiers and stage path in COPY INTO should be safely quoted
+        assert 'COPY INTO "DB"."PUBLIC"."TBL"' in copy_call
+        assert "FROM '@STG/imednet/STUDY_FORM_0.parquet'" in copy_call
+        assert "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE" in copy_call
+        sink.close()
+
+    def test_write_batch_handles_non_standard_casing(self, monkeypatch, tmp_path):
+        """Test that lowercase and mixed-case table coordinates are preserved and safely quoted."""
+        import imednet_sinks.warehouse as wh_mod
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        sf, conn, cursor = _fake_snowflake_module()
+        pa, pq, table = _fake_pyarrow_modules()
+
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: (
+                sf if pkg == "snowflake.connector" else (pq if "parquet" in pkg else pa)
+            ),
+        )
+
+        cfg = SnowflakeSinkConfig(
+            study_key="study1",
+            account="my_acct",
+            user="my_user",
+            password="secret",
+            database="clinical_db",
+            schema="study_schema",
+            warehouse="compute_wh",
+            stage="my_stage",
+            table="SubjectRecords_v1",
+            stage_prefix="imednet/staging",
+            local_staging_dir=str(tmp_path),
+        )
+        sink = SnowflakeExportSink(config=cfg)
+        records = [MagicMock(record_id=1, form_id=1, visit_id=1, subject_key="S", record_data={})]
+
+        sink.write_batch(records, batch_id="study1/subj/1")
+
+        calls = [c.args[0] for c in cursor.execute.call_args_list if c.args]
+        copy_call = next(c for c in calls if "COPY INTO" in c)
+
+        assert 'COPY INTO "clinical_db"."study_schema"."SubjectRecords_v1"' in copy_call
+        assert "FROM '@my_stage/imednet/staging/study1_subj_1.parquet'" in copy_call
+        assert "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE" in copy_call
+        sink.close()
+
 
 def test_plugin_namespace():
     """TODO: Add docstring."""

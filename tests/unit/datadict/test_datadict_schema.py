@@ -55,3 +55,60 @@ def test_validate_committed_schema_file() -> None:
     }
     errors = validate(valid_dict, schema=schema)
     assert errors == []
+
+
+def test_validate_missing_file_path() -> None:
+    """Test validating a missing Path object returns FileNotFoundError."""
+    missing_path = Path("nonexistent.json")
+    errors = validate(missing_path)
+    assert errors == [f"FileNotFoundError: Target file '{missing_path}' does not exist"]
+
+
+def test_validate_missing_file_string() -> None:
+    """Test validating missing string file paths returns FileNotFoundError."""
+    for filename in [
+        "nonexistent.json",
+        "missing_file.xml",
+        "missing_data.csv",
+        "nested/path/to/missing.json",
+        "some/path/nonexistent",
+    ]:
+        errors = validate(filename)
+        assert errors == [f"FileNotFoundError: Target file '{filename}' does not exist"]
+
+
+def test_validate_raw_json_string() -> None:
+    """Test validating raw JSON strings parses normally."""
+    # Valid raw JSON string
+    raw_json = '{"forms": [{"formKey": "F1", "variables": []}]}'
+    errors = validate(raw_json)
+    assert errors == []
+
+    # Valid raw JSON string containing path separators in values
+    raw_json_with_slash = '{"forms": [{"formKey": "F1", "variables": [{"variableName": "V1", "uri": "http://example.com/api"}]}]}'
+    errors = validate(raw_json_with_slash)
+    assert errors == []
+
+    # Invalid raw JSON string
+    invalid_raw_json = '{"forms": [{"formName": "Missing Key"}]}'
+    errors = validate(invalid_raw_json)
+    assert len(errors) > 0
+    assert any("formKey" in err for err in errors)
+
+    # Malformed JSON string
+    malformed_json = "not a valid json"
+    errors = validate(malformed_json)
+    assert len(errors) == 1
+    assert "Failed to parse JSON string" in errors[0]
+
+
+def test_validate_existing_file(tmp_path: Path) -> None:
+    """Test validating an existing JSON file via Path and str."""
+    data_file = tmp_path / "valid.json"
+    data_file.write_text('{"forms": [{"formKey": "F1", "variables": []}]}', encoding="utf-8")
+
+    # Path
+    assert validate(data_file) == []
+
+    # Str
+    assert validate(str(data_file)) == []

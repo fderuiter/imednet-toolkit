@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 from pydantic import BaseModel
 
+from imednet.integrations.enrichment import _to_snake_case
 from imednet.models.records import Record
 from imednet.testing.fake_data import fake_record
 from imednet.validation.cache import SchemaCache
@@ -67,10 +68,15 @@ def run_benchmarks(record_count: int = 10000) -> dict[str, float]:
     print(f"Mongo conversion (serialization) for {record_count} records in {elapsed:.4f}s")
 
     start = time.time()
+    _to_snake_case.cache_clear()
     _records_to_arrow_table(records)
     elapsed = time.time() - start
     results["snowflake_arrow_conversion_latency"] = elapsed
-    print(f"Snowflake Arrow conversion for {record_count} records in {elapsed:.4f}s")
+    cache_info = _to_snake_case.cache_info()
+    print(
+        f"Snowflake Arrow conversion for {record_count} records in {elapsed:.4f}s "
+        f"(cache hits: {cache_info.hits}, misses: {cache_info.misses})"
+    )
 
     start = time.time()
     nodes = []
@@ -84,6 +90,33 @@ def run_benchmarks(record_count: int = 10000) -> dict[str, float]:
     print(f"Neo4j Graph conversion for {record_count} records in {elapsed:.4f}s")
 
     return results
+
+
+def test_snake_case_memoization_and_edge_cases():
+    """Verify snake_case conversion edge cases and cache hit rates during record mapping."""
+    # Test case conversion edge cases
+    assert _to_snake_case("") == ""
+    assert _to_snake_case("already_snake_case") == "already_snake_case"
+    assert _to_snake_case("camelCase") == "camel_case"
+    assert _to_snake_case("PascalCase") == "pascal_case"
+    assert _to_snake_case("HTMLParser") == "html_parser"
+    assert _to_snake_case("item-code") == "item-code"
+    assert _to_snake_case("field123Value") == "field123_value"
+    assert _to_snake_case("RECORD_ID") == "record_id"
+
+    # Verify cache behavior and hit rate on record batch
+    _to_snake_case.cache_clear()
+    cache = SchemaCache()
+    records = generate_records(500, cache)
+    _to_snake_case.cache_clear()
+    _records_to_arrow_table(records)
+
+    info = _to_snake_case.cache_info()
+    assert info.hits > 0
+    total_calls = info.hits + info.misses
+    hit_rate = info.hits / total_calls if total_calls else 0
+    assert hit_rate >= 0.95, f"Expected cache hit rate >= 95%, got {hit_rate:.2%}"
+    assert info.currsize <= 1024
 
 
 def test_performance_suite():
