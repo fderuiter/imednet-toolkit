@@ -10,6 +10,7 @@ from .duckdb_centralizer import DuckDBIngestionWorkflow
 from .query_management import QueryManagementWorkflow
 from .record_mapper import RecordMapper
 from .record_update import RecordUpdateWorkflow
+from .register_subjects import RegisterSubjectsWorkflow
 from .subject_data import SubjectDataWorkflow
 from .uat import StudySchemaInspector, UATWorkflow
 
@@ -31,6 +32,7 @@ class Workflows:
         self.query_management = QueryManagementWorkflow(sdk_instance)
         self.record_mapper = RecordMapper(sdk_instance)
         self.record_update = RecordUpdateWorkflow(sdk_instance)
+        self.register_subjects = RegisterSubjectsWorkflow(sdk_instance)
         self.subject_data = SubjectDataWorkflow(sdk_instance)
         self.uat_inspector = StudySchemaInspector(sdk_instance)
         self.uat = UATWorkflow(sdk_instance)

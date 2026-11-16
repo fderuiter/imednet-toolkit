@@ -15,9 +15,11 @@ dependencies = [
 
 [project.entry-points."imednet.workflows"]
 data_extraction = "imednet_workflows.data_extraction:DataExtractionWorkflow"
+duckdb_centralizer = "imednet_workflows.duckdb_centralizer:DuckDBIngestionWorkflow"
 query_management = "imednet_workflows.query_management:QueryManagementWorkflow"
 record_mapper = "imednet_workflows.record_mapper:RecordMapper"
 record_update = "imednet_workflows.record_update:RecordUpdateWorkflow"
+register_subjects = "imednet_workflows.register_subjects:RegisterSubjectsWorkflow"
 subject_data = "imednet_workflows.subject_data:SubjectDataWorkflow"
 uat_inspector = "imednet_workflows.uat:StudySchemaInspector"
 uat = "imednet_workflows.uat:UATWorkflow"

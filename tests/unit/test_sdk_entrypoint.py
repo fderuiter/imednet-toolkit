@@ -24,9 +24,11 @@ from imednet.errors import PluginLoadError
 from imednet.errors.orchestration import FilterConflictError, OrchestratorError
 from imednet.orchestration import MultiStudyOrchestrator, OrchestratorResult, StudyWorkerCallable
 from imednet_workflows.data_extraction import DataExtractionWorkflow
+from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.query_management import QueryManagementWorkflow
 from imednet_workflows.record_mapper import RecordMapper
 from imednet_workflows.record_update import RecordUpdateWorkflow
+from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
 from imednet_workflows.subject_data import SubjectDataWorkflow
 from imednet_workflows.uat import StudySchemaInspector
 
@@ -231,9 +233,11 @@ def test_sdk_initialization_wires_endpoints_and_workflows() -> None:
         assert isinstance(getattr(sdk, name), cls)
 
     assert isinstance(sdk.workflows.data_extraction, DataExtractionWorkflow)
+    assert isinstance(sdk.workflows.duckdb_centralizer, DuckDBIngestionWorkflow)
     assert isinstance(sdk.workflows.query_management, QueryManagementWorkflow)
     assert isinstance(sdk.workflows.record_mapper, RecordMapper)
     assert isinstance(sdk.workflows.record_update, RecordUpdateWorkflow)
+    assert isinstance(sdk.workflows.register_subjects, RegisterSubjectsWorkflow)
     assert isinstance(sdk.workflows.subject_data, SubjectDataWorkflow)
     assert isinstance(sdk.workflows.uat_inspector, StudySchemaInspector)
 

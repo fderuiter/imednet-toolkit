@@ -2,13 +2,18 @@
 
 import inspect
 import sys
+import tomllib
+from importlib.metadata import entry_points
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 from imednet_sinks.plugin import SinksNamespace
 
+from imednet.sdk import ImednetSDK
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
+from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
 
 
 def test_sinks_namespace_contract():
@@ -26,7 +31,7 @@ def test_sinks_namespace_contract():
 
 
 def test_workflows_namespace_contract():
-    """Verify that duckdb_centralizer is instantiated and accessible on Workflows."""
+    """Verify that duckdb_centralizer and register_subjects are instantiated and accessible on Workflows."""
     mock_sdk = MagicMock()
     workflows_ns = Workflows(mock_sdk)
 
@@ -39,6 +44,64 @@ def test_workflows_namespace_contract():
     assert duckdb_workflow is not None
     assert isinstance(duckdb_workflow, DuckDBIngestionWorkflow)
     assert workflows_ns.duckdb_centralizer is duckdb_workflow
+
+    try:
+        reg_workflow = workflows_ns.register_subjects
+    except AttributeError as e:
+        pytest.fail(f"Failed to access register_subjects: {e}")
+
+    assert reg_workflow is not None
+    assert isinstance(reg_workflow, RegisterSubjectsWorkflow)
+
+
+def test_workflows_contract_parity():
+    """Assert 100% parity between Workflows namespace attributes and registered entry points,
+    and assert that every registered entry point resolves and instantiates through sdk.workflows.
+    """
+    mock_sdk = MagicMock()
+    workflows_ns = Workflows(mock_sdk)
+
+    # Public attributes exposed on the Workflows namespace
+    namespace_attrs = {attr for attr in dir(workflows_ns) if not attr.startswith("_")}
+
+    # Entry points registered in the 'imednet.workflows' entrypoint group
+    eps = {ep.name: ep for ep in entry_points(group="imednet.workflows")}
+
+    # Assert 100% parity between Workflows namespace attributes and registered entry points
+    assert namespace_attrs == set(eps.keys()), (
+        f"Parity mismatch between Workflows namespace attributes and registered entry points: "
+        f"in namespace but not registered: {namespace_attrs - set(eps.keys())}, "
+        f"registered but not in namespace: {set(eps.keys()) - namespace_attrs}"
+    )
+
+    # Assert parity against packages/plugins-workflows/pyproject.toml if present
+    pyproject_path = (
+        Path(__file__).resolve().parents[3] / "packages" / "plugins-workflows" / "pyproject.toml"
+    )
+    if pyproject_path.exists():
+        with open(pyproject_path, "rb") as f:
+            pyproject_data = tomllib.load(f)
+        toml_eps = (
+            pyproject_data.get("project", {}).get("entry-points", {}).get("imednet.workflows", {})
+        )
+        assert namespace_attrs == set(toml_eps.keys()), (
+            f"Parity mismatch between Workflows namespace and pyproject.toml entry points: "
+            f"in namespace but not pyproject: {namespace_attrs - set(toml_eps.keys())}, "
+            f"in pyproject but not namespace: {set(toml_eps.keys()) - namespace_attrs}"
+        )
+
+    # Assert that every registered entry point resolves and instantiates through sdk.workflows
+    sdk = ImednetSDK(api_key="key", security_key="secret", base_url="https://example.com")
+    for name, ep in eps.items():
+        workflow_instance = getattr(sdk.workflows, name)
+        assert workflow_instance is not None
+        target_cls = ep.load()
+        assert isinstance(workflow_instance, target_cls)
+        assert sdk.workflows[name] is workflow_instance
+
+    # Acceptance criteria verification
+    assert isinstance(sdk.workflows.duckdb_centralizer, DuckDBIngestionWorkflow)
+    assert isinstance(sdk.workflows.register_subjects, RegisterSubjectsWorkflow)
 
 
 def test_workflows_namespace_lazy_instantiation_without_duckdb(monkeypatch):
