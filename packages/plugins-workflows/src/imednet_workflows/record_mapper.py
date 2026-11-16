@@ -812,12 +812,14 @@ class RecordMapper:
             for form in interval.forms:
                 if form_whitelist and form.form_id not in form_whitelist:
                     continue
+                if form.form_id in form_models:
+                    continue
                 var_keys = [
                     v.variable_name
-                    for v in form.variables
+                    for v in (form.variables or [])
                     if not variable_whitelist or v.variable_name in variable_whitelist
                 ]
-                label_map = {v.variable_name: v.label for v in form.variables}
+                label_map = {v.variable_name: v.label for v in (form.variables or [])}
                 form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
                 form_label_maps[form.form_id] = label_map  # type: ignore
 
