@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.1.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v1.0.0...imednet-v1.1.0) (2026-11-16)
+
+
+### Features
+
+* add Demographics and Vital Signs profiles and reporting models ([#1746](https://github.com/fderuiter/imednet-toolkit/issues/1746)) ([228becb](https://github.com/fderuiter/imednet-toolkit/commit/228becb8c490bcd58020e98dcff173e39caa5760))
+* add label and hierarchy flags to cli export ([#1731](https://github.com/fderuiter/imednet-toolkit/issues/1731)) ([320a21f](https://github.com/fderuiter/imednet-toolkit/commit/320a21f15c33b54ff5b45ac37483710d736021aa))
+* **core:** implement built-in simulation transport and in-memory fixture state ([#1735](https://github.com/fderuiter/imednet-toolkit/issues/1735)) ([193ea00](https://github.com/fderuiter/imednet-toolkit/commit/193ea008c01545b3c562e66f3bef6c5f3580d7b5))
+* integrate typed job polling and CLI JSON contracts ([#1750](https://github.com/fderuiter/imednet-toolkit/issues/1750)) ([72e8957](https://github.com/fderuiter/imednet-toolkit/commit/72e8957959159467c22875757526ac0d232e5a38))
+* native CDISC ODM XML serialization and SDTM domain mapper ([#1745](https://github.com/fderuiter/imednet-toolkit/issues/1745)) ([426723d](https://github.com/fderuiter/imednet-toolkit/commit/426723d8bb1b5c95843fb81960ad3ccdafc95147))
+* **standards:** implement CDASH and SDTM deterministic normalization engine ([#1744](https://github.com/fderuiter/imednet-toolkit/issues/1744)) ([c1ba240](https://github.com/fderuiter/imednet-toolkit/commit/c1ba240565c08f7fb04563fc95b896e729990018))
+* **subjects:** add to_dataframe export to subjects endpoints ([#1728](https://github.com/fderuiter/imednet-toolkit/issues/1728)) ([3804979](https://github.com/fderuiter/imednet-toolkit/commit/38049795dfeabf185f9c92bee5d67a9343b44faf))
+
+
+### Bug Fixes
+
+* **airflow:** restore export delegation and core 1.x installation ([#1709](https://github.com/fderuiter/imednet-toolkit/issues/1709)) ([1d17233](https://github.com/fderuiter/imednet-toolkit/commit/1d172334ae24553d69b8941d9fc0fa13a02d19d9))
+* **cli:** defer dotenv loading with environment guards ([#1727](https://github.com/fderuiter/imednet-toolkit/issues/1727)) ([1f71b1c](https://github.com/fderuiter/imednet-toolkit/commit/1f71b1c76c6d3ced8451143b53c423e2ce15c89b))
+* **cli:** silently load dotenv lazily in SDK context ([#1729](https://github.com/fderuiter/imednet-toolkit/issues/1729)) ([5ce027a](https://github.com/fderuiter/imednet-toolkit/commit/5ce027a73ae209795ee283f6233e40c0afb1fd16))
+* **core:** preserve CDISC ODM SDTM attributes in data dictionary ([#1743](https://github.com/fderuiter/imednet-toolkit/issues/1743)) ([33327cc](https://github.com/fderuiter/imednet-toolkit/commit/33327cceb681eb76ce553687295a0171f40b9995))
+* **datadict:** discriminate file targets in schema validation ([#1723](https://github.com/fderuiter/imednet-toolkit/issues/1723)) ([51a7dfe](https://github.com/fderuiter/imednet-toolkit/commit/51a7dfedc95b63bd10d081870eb72ff2e0f422af))
+* isolate test paths and default DuckDB fixtures to in-memory mode ([#1739](https://github.com/fderuiter/imednet-toolkit/issues/1739)) ([e320d06](https://github.com/fderuiter/imednet-toolkit/commit/e320d06e9fc0684f8d4ca7e9c8c9e9611be55b69))
+* resolve explicit authentication without placeholder credentials ([#1749](https://github.com/fderuiter/imednet-toolkit/issues/1749)) ([154e593](https://github.com/fderuiter/imednet-toolkit/commit/154e593c141b96e1233f072e7d9f4a9ee5ceee0d))
+* **retries:** enforce pagination ownership and configured sink attempts ([#1710](https://github.com/fderuiter/imednet-toolkit/issues/1710)) ([ac185b2](https://github.com/fderuiter/imednet-toolkit/commit/ac185b275ee9055e46f9e62f0650a1c720ae99a5))
+* **security:** normalize field keys in SensitivityRegistry to protect PHI ([#1722](https://github.com/fderuiter/imednet-toolkit/issues/1722)) ([741c477](https://github.com/fderuiter/imednet-toolkit/commit/741c4775c240964b6dc01bde85a9b27723f994ea))
+
+
+### Performance Improvements
+
+* **core:** memoize snake case conversions in record enrichment ([#1718](https://github.com/fderuiter/imednet-toolkit/issues/1718)) ([1364d3d](https://github.com/fderuiter/imednet-toolkit/commit/1364d3d67c0785adb8f6effb718046a53dca13ed))
+
 ## [1.0.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-v0.11.0...imednet-v1.0.0) (2026-11-15)
 
 

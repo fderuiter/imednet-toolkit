@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.0.1](https://github.com/fderuiter/imednet-toolkit/compare/imednet-plugins-sinks-v1.0.0...imednet-plugins-sinks-v1.0.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **airflow:** restore export delegation and core 1.x installation ([#1709](https://github.com/fderuiter/imednet-toolkit/issues/1709)) ([1d17233](https://github.com/fderuiter/imednet-toolkit/commit/1d172334ae24553d69b8941d9fc0fa13a02d19d9))
+* resolve explicit authentication without placeholder credentials ([#1749](https://github.com/fderuiter/imednet-toolkit/issues/1749)) ([154e593](https://github.com/fderuiter/imednet-toolkit/commit/154e593c141b96e1233f072e7d9f4a9ee5ceee0d))
+* **retries:** enforce pagination ownership and configured sink attempts ([#1710](https://github.com/fderuiter/imednet-toolkit/issues/1710)) ([ac185b2](https://github.com/fderuiter/imednet-toolkit/commit/ac185b275ee9055e46f9e62f0650a1c720ae99a5))
+* **security:** validate snowflake identifiers and sanitize export batch identifiers ([#1730](https://github.com/fderuiter/imednet-toolkit/issues/1730)) ([aeb8e08](https://github.com/fderuiter/imednet-toolkit/commit/aeb8e08b9ff2e9656f778f4381b074747bbf352d))
+
+
+### Performance Improvements
+
+* **sinks:** reuse centralized mapper per batch in document and graph sinks ([#1713](https://github.com/fderuiter/imednet-toolkit/issues/1713)) ([e115c6a](https://github.com/fderuiter/imednet-toolkit/commit/e115c6a64d3a6f42a6adacfb055760988b255f7f))
+
 ## [1.0.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-plugins-sinks-v0.2.0...imednet-plugins-sinks-v1.0.0) (2026-11-15)
 
 

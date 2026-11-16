@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.0](https://github.com/fderuiter/imednet-toolkit/compare/apache-airflow-providers-imednet-v1.0.0...apache-airflow-providers-imednet-v1.1.0) (2026-11-16)
+
+
+### Features
+
+* **core:** implement built-in simulation transport and in-memory fixture state ([#1735](https://github.com/fderuiter/imednet-toolkit/issues/1735)) ([193ea00](https://github.com/fderuiter/imednet-toolkit/commit/193ea008c01545b3c562e66f3bef6c5f3580d7b5))
+
+
+### Bug Fixes
+
+* **airflow:** restore export delegation and core 1.x installation ([#1709](https://github.com/fderuiter/imednet-toolkit/issues/1709)) ([1d17233](https://github.com/fderuiter/imednet-toolkit/commit/1d172334ae24553d69b8941d9fc0fa13a02d19d9))
+* **airflow:** wrap DuckDB export delegation in provider ([#1741](https://github.com/fderuiter/imednet-toolkit/issues/1741)) ([d0cd1b7](https://github.com/fderuiter/imednet-toolkit/commit/d0cd1b727ad5151d12170bdebe991268f49f8dd3))
+* **providers-airflow:** guard lazy provider imports and forward subprocess env ([#1719](https://github.com/fderuiter/imednet-toolkit/issues/1719)) ([6842ca4](https://github.com/fderuiter/imednet-toolkit/commit/6842ca475d224d0e4f69fccc0b9d792371995363))
+* resolve explicit authentication without placeholder credentials ([#1749](https://github.com/fderuiter/imednet-toolkit/issues/1749)) ([154e593](https://github.com/fderuiter/imednet-toolkit/commit/154e593c141b96e1233f072e7d9f4a9ee5ceee0d))
+* **retries:** enforce pagination ownership and configured sink attempts ([#1710](https://github.com/fderuiter/imednet-toolkit/issues/1710)) ([ac185b2](https://github.com/fderuiter/imednet-toolkit/commit/ac185b275ee9055e46f9e62f0650a1c720ae99a5))
+
 ## [1.0.0](https://github.com/fderuiter/imednet-toolkit/compare/apache-airflow-providers-imednet-v0.8.0...apache-airflow-providers-imednet-v1.0.0) (2026-11-15)
 
 
