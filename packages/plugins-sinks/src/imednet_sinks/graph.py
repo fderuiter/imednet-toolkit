@@ -59,7 +59,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from imednet.integrations.enrichment import CentralizedMapper
 
 from imednet.errors import ExportConfigurationError
 from imednet.integrations.sink_base import (
@@ -130,11 +133,14 @@ def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-def _record_to_row(record: Any, study_key: str) -> dict[str, Any]:
+def _record_to_row(
+    record: Any, study_key: str, mapper: CentralizedMapper | None = None
+) -> dict[str, Any]:
     """Convert a typed ``Record`` model to a flat Cypher parameter dict."""
-    from imednet.integrations.enrichment import CentralizedMapper
+    if mapper is None:
+        from imednet.integrations.enrichment import CentralizedMapper
 
-    mapper = CentralizedMapper(mode="document", post_processor=_post_process_graph)
+        mapper = CentralizedMapper(mode="document", post_processor=_post_process_graph)
     return mapper.map_record(record, study_key=study_key)
 
 
@@ -186,7 +192,10 @@ class Neo4jExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
-        rows = [_record_to_row(r, self._study_key) for r in records]
+        from imednet.integrations.enrichment import CentralizedMapper
+
+        mapper = CentralizedMapper(mode="document", post_processor=_post_process_graph)
+        rows = [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
         if not rows:
             return 0
 
