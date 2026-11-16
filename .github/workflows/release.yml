@@ -1,0 +1,173 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "imednet-v*.*.*"
+      - "imednet-workflows-v*.*.*"
+      - "apache-airflow-providers-imednet-v*.*.*"
+      - "imednet-plugins-sinks-v*.*.*"
+      - "v*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  # ------------------------------------------------------------------
+  # JOB 1: PLAN RELEASE (Determine packages to build & publish)
+  # ------------------------------------------------------------------
+  plan:
+    name: Plan Release Execution
+    if: |
+      (github.repository == 'fderuiter/imednet-toolkit' || !github.event.repository.fork) && (
+        startsWith(github.ref, 'refs/tags/') ||
+        (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: release main'))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      packages: ${{ steps.determine-packages.outputs.packages }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Determine Impacted Release Packages
+        id: determine-packages
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "Processing tag release: $TAG"
+            case "$TAG" in
+              imednet-v*)
+                PACKAGES='["core"]'
+                ;;
+              imednet-workflows-v*)
+                PACKAGES='["plugins-workflows"]'
+                ;;
+              apache-airflow-providers-imednet-v*)
+                PACKAGES='["providers-airflow"]'
+                ;;
+              imednet-plugins-sinks-v*)
+                PACKAGES='["plugins-sinks"]'
+                ;;
+              *)
+                PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks"]'
+                ;;
+            esac
+          elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            echo "Processing release commit on main"
+            DIFF_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD)
+            PLAN=$(echo "$DIFF_FILES" | python3 scripts/ci_plan.py)
+            PACKAGES=$(echo "$PLAN" | jq -c '.build')
+            if [[ -z "$PACKAGES" || "$PACKAGES" == "[]" ]]; then
+              PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks"]'
+            fi
+          else
+            PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks"]'
+          fi
+          echo "Release packages: $PACKAGES"
+          echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # JOB 2: BUILD PACKAGES (Clean environment without cache)
+  # ------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.package }} Distribution
+    needs: plan
+    if: needs.plan.outputs.packages != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.packages) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Install Hatch
+        run: python -m pip install --upgrade pip hatch
+
+      - name: Tighten Internal Dependencies
+        run: python scripts/tighten_dependencies.py --rewrite
+
+      - name: Build Package Distribution
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          cd "packages/$PACKAGE"
+          hatch build
+
+      - name: Restore Internal Dependencies
+        if: always()
+        run: python scripts/tighten_dependencies.py --restore
+
+      - name: Upload Package Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.package }}
+          path: packages/${{ matrix.package }}/dist/
+          retention-days: 1
+
+  # ------------------------------------------------------------------
+  # JOB 3: PUBLISH TO PYPI
+  # ------------------------------------------------------------------
+  publish:
+    name: Publish ${{ matrix.package }} to PyPI
+    needs: [plan, build]
+    if: needs.plan.outputs.packages != '[]'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # Mandatory for trusted publishing
+      attestations: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.packages) }}
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-${{ matrix.package }}
+          path: dist
+
+      - name: Generate SHA-256 Checksum Manifest
+        run: |
+          mkdir -p checksums
+          sha256sum dist/* > checksums/SHA256SUMS
+          (cd dist && sha256sum * > ../checksums/checksums.txt)
+          cat checksums/SHA256SUMS
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: 'dist/*'
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          skip-existing: true
