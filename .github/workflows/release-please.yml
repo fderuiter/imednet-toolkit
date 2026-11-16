@@ -9,7 +9,7 @@ on:
       - 'examples/**'
       - '**/*.md'
 
-permissions: read-all
+permissions: {}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
