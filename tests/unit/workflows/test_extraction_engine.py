@@ -620,3 +620,75 @@ def test_extraction_engine_rejects_class_traversal_payloads(
     # The derived business logic failed safely, keeping the initial extracted value "Headache"
     assert result.adverse_events[0].ae_term == "Headache"
     assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)
+
+
+def test_extraction_engine_rejects_mutator_methods_and_defends_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that expressions invoking mutating methods fail safely and cannot mutate state/payload."""
+    context = SubjectContext("SUBJ-001")
+    context.state["baseline_score"] = 50
+    record = Record(
+        record_id=1,
+        form_key="AE_FORM",
+        subject_key="SUBJ-001",
+        date_created=datetime(2024, 1, 1),
+        record_data={"term": "Fever"},
+    )
+    payload = {"aeTerm": "Fever", "site": "SiteA"}
+
+    # Attempt payload.clear()
+    with caplog.at_level(logging.WARNING):
+        res = _evaluate_business_logic("payload.clear()", record, payload, context, value="Fever")
+
+    assert res is None
+    assert payload == {"aeTerm": "Fever", "site": "SiteA"}
+    assert context.state["baseline_score"] == 50
+    assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)
+
+
+def test_extract_canonical_records_blocks_payload_clear(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that malicious mapping business logic cannot clear payload or corrupt extraction."""
+    config = StudyConfiguration(
+        study_key="STUDY-CLEAR",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                target_field="subjectKey",
+                source_form_key="AE_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeTerm",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.term",
+                business_logic="payload.clear()",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeSeverity",
+                source_form_key="AE_FORM",
+                source_variable_name="",
+                fallback_value="MILD",
+            ),
+        ],
+    )
+
+    record = Record(
+        record_id=1,
+        form_key="AE_FORM",
+        subject_key="SUBJ-001",
+        date_created=datetime(2024, 1, 1),
+        record_data={"term": "Headache"},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = extract_canonical_records(records=[record], study_configuration=config)
+
+    assert len(result.adverse_events) == 1
+    # Derived logic failed safely, keeping initial extracted value
+    assert result.adverse_events[0].ae_term == "Headache"
+    assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)

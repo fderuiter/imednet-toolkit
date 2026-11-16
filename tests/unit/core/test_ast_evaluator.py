@@ -158,12 +158,45 @@ def test_evaluator_safe_method_calls() -> None:
     env = {
         "text": "   Clean Me   ",
         "d": {"status": "ACTIVE"},
-        "obj": DummyObject(25),
     }
     assert evaluate_expression("text.strip().lower()", env) == "clean me"
     assert evaluate_expression("d.get('status', 'DEFAULT')", env) == "ACTIVE"
     assert evaluate_expression("d.get('missing', 'FALLBACK')", env) == "FALLBACK"
-    assert evaluate_expression("obj.double()", env) == 50
+
+
+def test_evaluator_rejects_unapproved_method_calls(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that calling unapproved or mutator methods raises RestrictedEvaluationError."""
+    env = {
+        "payload": {"record_id": 100, "patient": "John"},
+        "obj": DummyObject(25),
+    }
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RestrictedEvaluationError, match="Method 'clear' is forbidden"):
+            evaluate_expression("payload.clear()", env=env, raise_on_error=True)
+
+    assert any("Security warning: Method 'clear' is forbidden" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RestrictedEvaluationError, match="Method 'pop' is forbidden"):
+            evaluate_expression("payload.pop('patient')", env=env, raise_on_error=True)
+
+    assert any("Security warning: Method 'pop' is forbidden" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RestrictedEvaluationError, match="Method 'double' is forbidden"):
+            evaluate_expression("obj.double()", env=env, raise_on_error=True)
+
+    assert any(
+        "Security warning: Method 'double' is forbidden" in r.message for r in caplog.records
+    )
+
+    # Verify payload remained intact and unmutated
+    assert env["payload"] == {"record_id": 100, "patient": "John"}
 
 
 def test_evaluator_rejects_private_attribute_access(
@@ -337,6 +370,8 @@ def test_ast_eval_module_reexports() -> None:
     assert callable(ast_eval.parse_expression)
     assert issubclass(ast_eval.RestrictedAstEvaluator, object)
     assert "float" in ast_eval.DEFAULT_SAFE_FUNCTIONS
+    assert "get" in ast_eval.DEFAULT_SAFE_METHODS
+    assert "strip" in ast_eval.DEFAULT_SAFE_METHODS
 
 
 def test_evaluator_dict_unpacking_forbidden() -> None:

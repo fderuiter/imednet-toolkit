@@ -267,9 +267,11 @@ def _evaluate_business_logic(
         # evaluate safely
         env = {
             "record": record,
-            "payload": payload,
+            "payload": payload.copy() if hasattr(payload, "copy") else dict(payload),
             "context": context,
-            "state": context.state,
+            "state": context.state.copy()
+            if hasattr(context.state, "copy")
+            else dict(context.state),
             "baseline": context.baseline,
             "subject_key": context.subject_key,
             "value": value,

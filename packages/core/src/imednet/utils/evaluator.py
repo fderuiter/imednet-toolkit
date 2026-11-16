@@ -22,6 +22,85 @@ DEFAULT_SAFE_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "len": len,
 }
 
+# Default allowed method names (safe read-only operations only)
+DEFAULT_SAFE_METHODS: set[str] = {
+    # String inspection & transformation (immutable)
+    "capitalize",
+    "casefold",
+    "center",
+    "count",
+    "decode",
+    "encode",
+    "endswith",
+    "find",
+    "format",
+    "format_map",
+    "index",
+    "isalnum",
+    "isalpha",
+    "isascii",
+    "isdecimal",
+    "isdigit",
+    "isidentifier",
+    "islower",
+    "isnumeric",
+    "isprintable",
+    "isspace",
+    "istitle",
+    "isupper",
+    "join",
+    "ljust",
+    "lower",
+    "lstrip",
+    "partition",
+    "removeprefix",
+    "removesuffix",
+    "replace",
+    "rfind",
+    "rindex",
+    "rjust",
+    "rpartition",
+    "rsplit",
+    "rstrip",
+    "split",
+    "splitlines",
+    "startswith",
+    "strip",
+    "swapcase",
+    "title",
+    "upper",
+    "zfill",
+    # Dict read-only accessors
+    "get",
+    "items",
+    "keys",
+    "values",
+    # Sequence / Set / Container non-mutating operations
+    "copy",
+    "difference",
+    "intersection",
+    "isdisjoint",
+    "issubset",
+    "issuperset",
+    "symmetric_difference",
+    "union",
+    # Numeric methods
+    "as_integer_ratio",
+    "bit_count",
+    "bit_length",
+    "conjugate",
+    "hex",
+    "is_integer",
+    # Date / Time formatting & extraction
+    "date",
+    "isoformat",
+    "strftime",
+    "time",
+    "timestamp",
+    "weekday",
+    "isoweekday",
+}
+
 # Allowlist of permitted AST node types
 ALLOWED_NODE_TYPES: set[type[ast.AST]] = {
     ast.Expression,
@@ -388,6 +467,10 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
                 raise EvaluationError(
                     f"Attribute '{method_name}' on '{type(target).__name__}' is not callable"
                 )
+            if method_name not in DEFAULT_SAFE_METHODS:
+                msg = f"Method '{method_name}' is forbidden"
+                logger.warning(f"Security warning: {msg}")
+                raise RestrictedEvaluationError(msg)
             try:
                 return method(*args, **kwargs)
             except Exception as exc:
@@ -484,6 +567,7 @@ class RestrictedAstEvaluator:
 
 __all__ = [
     "DEFAULT_SAFE_FUNCTIONS",
+    "DEFAULT_SAFE_METHODS",
     "RestrictedAstEvaluator",
     "evaluate_expression",
     "parse_expression",
