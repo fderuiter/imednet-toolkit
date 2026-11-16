@@ -3,6 +3,7 @@
 import sys
 from builtins import __import__ as builtin_import
 from datetime import datetime
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, call
 
@@ -87,13 +88,14 @@ def test_export_to_excel(monkeypatch):
     pd.DataFrame.to_excel.assert_called_once_with("out.xlsx", index=False)
 
 
-def test_export_to_json(monkeypatch):
+def test_export_to_json(monkeypatch, tmp_path):
     """Test that export to json."""
     df, mapper_cls, mapper_inst = _setup_mapper(monkeypatch)
     df.where.return_value.to_dict.return_value = [{"A": 1}]
     sdk = MagicMock()
+    out_file = tmp_path / "out.json"
 
-    export_mod.export_to_json(sdk, "STUDY", "out.json")
+    export_mod.export_to_json(sdk, "STUDY", str(out_file))
 
     mapper_cls.assert_called_once_with(sdk)
     mapper_inst.dataframe.assert_called_once_with(
@@ -153,6 +155,34 @@ def test_export_to_sql(monkeypatch):
     assert args[1] == "table"
     assert args[2] == engine
     assert kwargs["if_exists"] == "append"
+    assert not Path("export_table_manifest.jsonl").exists()
+
+
+def test_export_to_sql_manifest_custom_path(tmp_path, monkeypatch):
+    """Test that export to sql writes to manifest_path when provided."""
+    df, mapper_cls, mapper_inst = _setup_mapper(monkeypatch)
+    sdk = MagicMock()
+
+    sa_module = ModuleType("sqlalchemy")
+    engine = MagicMock()
+    engine.dialect.name = "sqlite"
+    create_engine = MagicMock(return_value=engine)
+    sa_module.create_engine = create_engine
+    monkeypatch.setitem(sys.modules, "sqlalchemy", sa_module)
+
+    m_chunking = MagicMock()
+    monkeypatch.setattr(export_mod, "_to_sql_with_chunking", m_chunking)
+
+    manifest_file = tmp_path / "custom_manifest.jsonl"
+    export_mod.export_to_sql(
+        sdk,
+        "STUDY",
+        "table",
+        "sqlite://",
+        manifest_path=str(manifest_file),
+    )
+
+    assert manifest_file.exists()
 
 
 def test_export_to_duckdb(monkeypatch):

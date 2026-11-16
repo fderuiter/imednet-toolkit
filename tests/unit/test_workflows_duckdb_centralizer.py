@@ -77,6 +77,15 @@ def test_workflows_namespace_duckdb_centralizer_caching() -> None:
     assert centralizer1 is centralizer2
 
 
+def test_duckdb_centralizer_default_memory() -> None:
+    """Test that DuckDBIngestionWorkflow defaults to in-memory mode."""
+    pytest.importorskip("duckdb")
+    sdk = MagicMock()
+    with patch("duckdb.connect") as mock_connect:
+        DuckDBIngestionWorkflow(sdk)
+        mock_connect.assert_called_once_with(":memory:")
+
+
 def test_ingest_revisions_and_build_silver_view() -> None:
     """Test that ingest revisions and build silver view."""
     pytest.importorskip("duckdb")
