@@ -32,6 +32,17 @@ def test_readme_persona_anchor_links() -> None:
     cdm_url = cdm_match.group(1)
     aud_url = aud_match.group(1)
 
+    expected_prefix = "https://fderuiter.github.io/imednet-toolkit/"
+    assert ie_url.startswith(expected_prefix), (
+        f"Expected canonical prefix {expected_prefix}, got {ie_url}"
+    )
+    assert cdm_url.startswith(expected_prefix), (
+        f"Expected canonical prefix {expected_prefix}, got {cdm_url}"
+    )
+    assert aud_url.startswith(expected_prefix), (
+        f"Expected canonical prefix {expected_prefix}, got {aud_url}"
+    )
+
     assert ie_url.endswith("#panel-integration"), (
         f"Expected #panel-integration anchor, got {ie_url}"
     )
@@ -46,6 +57,9 @@ def test_readme_persona_anchor_links() -> None:
         ("Clinical Data Manager", cdm_url),
         ("Regulatory Compliance Auditor", aud_url),
     ]:
+        assert url.startswith(expected_prefix), (
+            f"{label} link must start with canonical prefix {expected_prefix}"
+        )
         assert not url.endswith("#interactive-showcase"), (
             f"{label} link must not target generic #interactive-showcase"
         )
