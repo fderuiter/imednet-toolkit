@@ -610,6 +610,9 @@ jobs:
           uv sync --locked --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
+      - name: Validate Showcases
+        run: hatch run validate-showcases
+
       - name: Build HTML and Run Doctests
         run: hatch run docs
 
@@ -647,7 +650,7 @@ jobs:
   # ------------------------------------------------------------------
   publish:
     name: Publish ${{ matrix.package }} to PyPI
-    needs: [plan, test]
+    needs: [plan, test, docs]
     if: |
       github.event_name == 'push' && (
         startsWith(github.ref, 'refs/tags/') ||

@@ -183,6 +183,7 @@ typecheck-docs = "python scripts/typecheck_docs.py {args}"
 validate-diagrams = "python scripts/validate_diagrams.py {args}"
 validate-docs = "python scripts/validate_docs.py {args}"
 validate-package-consumption = "python scripts/validate_package_consumption.py {args}"
+validate-showcases = "python scripts/validate_showcases.py {args}"
 check_root_files = "python scripts/check_root_files.py {args}"
 ci_plan = "python scripts/ci_plan.py {args}"
 aggregate_verification = "python scripts/aggregate_verification.py {args}"
@@ -191,6 +192,7 @@ typecheck_docs = "python scripts/typecheck_docs.py {args}"
 validate_diagrams = "python scripts/validate_diagrams.py {args}"
 validate_docs = "python scripts/validate_docs.py {args}"
 validate_package_consumption = "python scripts/validate_package_consumption.py {args}"
+validate_showcases = "python scripts/validate_showcases.py {args}"
 
 [tool.hatch.envs.lint]
 detached = true
