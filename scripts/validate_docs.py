@@ -228,6 +228,61 @@ def check_sphinx_githubpages_extension() -> bool:
     return True
 
 
+def check_sphinx_html_baseurl() -> bool:
+    """Validate that html_baseurl is configured with the expected canonical URL in docs/conf.py."""
+    print("Checking for html_baseurl in docs/conf.py...")
+    conf_py = Path("docs/conf.py")
+    if not conf_py.exists():
+        print(f"Error: {conf_py} not found.")
+        return True
+
+    try:
+        content = conf_py.read_text(encoding="utf-8")
+        tree = ast.parse(content, filename=str(conf_py))
+    except Exception as e:
+        print(f"Error parsing {conf_py}: {e}")
+        return True
+
+    expected_baseurl = "https://fderuiter.github.io/imednet-python-sdk/"
+    for node in ast.walk(tree):
+        val = None
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "html_baseurl"
+                    and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                ):
+                    val = node.value.value
+                    break
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "html_baseurl"
+            and node.value
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            val = node.value.value
+
+        if val is not None:
+            if not val.startswith("https://"):
+                print(f"Error: html_baseurl must start with 'https://', got '{val}'.")
+                return True
+            if not val.endswith("/"):
+                print(f"Error: html_baseurl must end with a trailing slash '/', got '{val}'.")
+                return True
+            if val != expected_baseurl:
+                print(f"Error: html_baseurl is '{val}', expected '{expected_baseurl}'.")
+                return True
+            print("html_baseurl is correctly configured.")
+            return False
+
+    print("Error: html_baseurl is missing from docs/conf.py.")
+    return True
+
+
 def main():
     """Run validation scripts."""
     todos_failed = check_todos_in_init()
@@ -235,8 +290,16 @@ def main():
     docs_failed = check_package_docs()
     adr_failed = check_adr_records()
     githubpages_failed = check_sphinx_githubpages_extension()
+    baseurl_failed = check_sphinx_html_baseurl()
 
-    if todos_failed or packages_failed or docs_failed or adr_failed or githubpages_failed:
+    if (
+        todos_failed
+        or packages_failed
+        or docs_failed
+        or adr_failed
+        or githubpages_failed
+        or baseurl_failed
+    ):
         print("Validation failed.")
         sys.exit(1)
 
