@@ -620,8 +620,33 @@ jobs:
       - name: Validate Showcases
         run: hatch run validate-showcases
 
+      - name: Validate Documentation
+        run: hatch run validate-docs
+
       - name: Build HTML and Run Doctests
         run: hatch run docs
+
+      - name: Assert Clean Working Tree
+        run: |
+          if ! git diff --quiet docs/; then
+            echo "Uncommitted changes detected in docs/:"
+            git diff --name-only docs/
+            echo ""
+            echo "Diff:"
+            git diff docs/
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain docs/)" ]; then
+            echo "Untracked generated files detected in docs/:"
+            git status --short docs/
+            exit 1
+          fi
+          git diff --exit-code docs/
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Working tree is dirty after documentation build:"
+            git status --short
+            exit 1
+          fi
 
       - name: Upload Pages Artifact
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
