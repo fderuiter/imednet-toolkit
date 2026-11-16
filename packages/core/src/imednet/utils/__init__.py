@@ -7,7 +7,15 @@ from typing import Any
 from importlib import import_module
 
 from .dates import format_iso_datetime, normalize_iso_date, parse_iso_datetime
-from .filters import build_filter_string
+from .filters import (
+    ALLOWED_OPERATORS,
+    build_filter_string,
+    validate_connector_exclusivity,
+    validate_filter_key,
+    validate_filter_operator,
+    validate_filter_syntax,
+    validate_record_filter,
+)
 from .json_logging import configure_json_logging
 from .typing import FilterValue, ItemId, JsonDict
 
@@ -46,6 +54,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "ALLOWED_OPERATORS",
     "FilterValue",
     "ItemId",
     "JsonDict",
@@ -71,5 +80,10 @@ __all__ = [
     "sanitize_csv_formula",
     "subjects_to_dataframe",
     "to_arrow_table",
+    "validate_connector_exclusivity",
+    "validate_filter_key",
+    "validate_filter_operator",
+    "validate_filter_syntax",
     "validate_partition_key",
+    "validate_record_filter",
 ]

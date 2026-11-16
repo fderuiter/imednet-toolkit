@@ -27,7 +27,7 @@ from imednet.core.paginator import AsyncPaginator, Paginator
 from imednet.core.parsing import get_model_parser
 from imednet.core.protocols import AsyncRequesterProtocol, ParamProcessor, RequesterProtocol
 from imednet.models.base import ImednetBaseModel
-from imednet.utils.filters import build_filter_string
+from imednet.utils.filters import build_filter_string, validate_record_filter
 from imednet.utils.typing import FilterValue, ItemId
 from imednet.utils.url import build_safe_path
 
@@ -174,6 +174,12 @@ class _ListGetEndpointBase(GenericEndpoint[T]):
             params["filter"] = build_filter_string(processed_filters)
         if extra_params:
             params.update(extra_params)
+
+        record_data_filter = params.get("recordDataFilter")
+        if record_data_filter is None:
+            record_data_filter = params.get("record_data_filter")
+        if record_data_filter is not None:
+            validate_record_filter(record_data_filter)
 
         return ParamState(study=study, params=params, other_filters=other_filters)
 
