@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
+
+from imednet.endpoints.records import RecordsEndpoint
+from imednet.models.forms import Form
+from imednet.models.queries import QueryStatus
+from imednet.models.studies import Study
 
 
 def get_repo_root() -> Path:
@@ -113,3 +119,102 @@ def test_showcase_script_binds_scenario_selector_and_renders_vpat() -> None:
     assert 'scenario !== "part11" && scenario !== "vpat"' in content, (
         "executeAuditorVerification must validate scenarios to preserve table content on unmapped scenarios"
     )
+
+
+def test_showcase_sdk_snippets_syntax_and_api_contracts() -> None:
+    """Verify that all showcase SDK code snippets parse as valid Python and conform to the public API contract."""
+    repo_root = get_repo_root()
+    script_path = repo_root / "docs" / "_static" / "showcase.js"
+    assert script_path.exists(), "showcase.js must exist"
+
+    content = script_path.read_text(encoding="utf-8")
+    sdk_match = re.search(r"sdk:\s*\{(.*?)\n\s*\},?\s*rest:", content, re.DOTALL)
+    assert sdk_match, "sdk snippet dictionary not found in showcase.js"
+
+    snippets = dict(re.findall(r"(\w+):\s*`([^`]+)`", sdk_match.group(1)))
+    expected_snippets = {"records", "studies", "forms", "queries"}
+    assert set(snippets.keys()) == expected_snippets, (
+        f"Expected snippets {expected_snippets}, found {set(snippets.keys())}"
+    )
+
+    class SnippetInspector(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, str]]] = []
+            self.attributes: list[tuple[str, str]] = []
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func_name = ast.unparse(node.func)
+            kw = {k.arg: ast.unparse(k.value) for k in node.keywords if k.arg is not None}
+            self.calls.append((func_name, kw))
+            self.generic_visit(node)
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            self.attributes.append((ast.unparse(node.value), node.attr))
+            self.generic_visit(node)
+
+    trees: dict[str, ast.AST] = {}
+    inspectors: dict[str, SnippetInspector] = {}
+
+    for name, raw_snippet in snippets.items():
+        # JavaScript template literal has escaped newlines
+        code_py = raw_snippet.replace(r"\n", "\n")
+        # Validate snippet parses cleanly with ast.parse
+        tree = ast.parse(code_py)
+        trees[name] = tree
+        inspector = SnippetInspector()
+        inspector.visit(tree)
+        inspectors[name] = inspector
+
+    # 1. Records extraction snippet
+    records_insp = inspectors["records"]
+    assert "to_df" not in snippets["records"], "records snippet must not call nonexistent to_df"
+    records_calls = [
+        (fn, kw) for fn, kw in records_insp.calls if fn == "client.records.to_dataframe"
+    ]
+    assert records_calls, "records snippet must call client.records.to_dataframe"
+    _, records_kw = records_calls[0]
+    assert records_kw.get("study_key") == "'STUDY-101'", (
+        f"Expected study_key='STUDY-101', got {records_kw.get('study_key')}"
+    )
+    assert records_kw.get("flatten") == "True", (
+        f"Expected flatten=True, got {records_kw.get('flatten')}"
+    )
+    assert hasattr(RecordsEndpoint, "to_dataframe"), (
+        "RecordsEndpoint must define to_dataframe method"
+    )
+
+    # 2. Studies snippet
+    studies_insp = inspectors["studies"]
+    studies_calls = [(fn, kw) for fn, kw in studies_insp.calls if fn == "client.studies.list"]
+    assert studies_calls, "studies snippet must call client.studies.list"
+    studies_item_attrs = {attr for val, attr in studies_insp.attributes if val == "s"}
+    assert "study_name" in studies_item_attrs, "studies snippet must access s.study_name"
+    assert "study_type" in studies_item_attrs, "studies snippet must access s.study_type"
+    for invalid_attr in ("name", "enrolled_subjects", "target_accrual"):
+        assert invalid_attr not in studies_item_attrs, (
+            f"studies snippet must not access invalid attribute {invalid_attr}"
+        )
+    for attr in studies_item_attrs:
+        assert attr in Study.model_fields, f"Attribute '{attr}' not found on Study model"
+
+    # 3. Forms snippet
+    forms_insp = inspectors["forms"]
+    forms_calls = [(fn, kw) for fn, kw in forms_insp.calls if fn == "client.forms.list"]
+    assert forms_calls, "forms snippet must call client.forms.list"
+    forms_item_attrs = {attr for val, attr in forms_insp.attributes if val == "f"}
+    assert "form_name" in forms_item_attrs, "forms snippet must access f.form_name"
+    assert "form_key" in forms_item_attrs, "forms snippet must access f.form_key"
+    assert "fields" not in forms_item_attrs, "forms snippet must not access nonexistent fields"
+    for attr in forms_item_attrs:
+        assert attr in Form.model_fields, f"Attribute '{attr}' not found on Form model"
+
+    # 4. Queries snippet
+    queries_insp = inspectors["queries"]
+    queries_calls = [(fn, kw) for fn, kw in queries_insp.calls if fn == "client.queries.list"]
+    assert queries_calls, "queries snippet must call client.queries.list"
+    _, queries_kw = queries_calls[0]
+    assert queries_kw.get("status") == "'OPEN'", (
+        f"Expected queries status='OPEN', got {queries_kw.get('status')}"
+    )
+    assert "severity" not in queries_kw, "queries snippet must not filter by severity"
+    assert QueryStatus.OPEN.value == "OPEN", "OPEN must be a valid QueryStatus lifecycle state"
