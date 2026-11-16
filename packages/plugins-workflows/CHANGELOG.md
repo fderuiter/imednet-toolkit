@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.1.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-workflows-v1.0.0...imednet-workflows-v1.1.0) (2026-11-16)
+
+
+### Features
+
+* integrate typed job polling and CLI JSON contracts ([#1750](https://github.com/fderuiter/imednet-toolkit/issues/1750)) ([72e8957](https://github.com/fderuiter/imednet-toolkit/commit/72e8957959159467c22875757526ac0d232e5a38))
+* native CDISC ODM XML serialization and SDTM domain mapper ([#1745](https://github.com/fderuiter/imednet-toolkit/issues/1745)) ([426723d](https://github.com/fderuiter/imednet-toolkit/commit/426723d8bb1b5c95843fb81960ad3ccdafc95147))
+* **standards:** implement CDASH and SDTM deterministic normalization engine ([#1744](https://github.com/fderuiter/imednet-toolkit/issues/1744)) ([c1ba240](https://github.com/fderuiter/imednet-toolkit/commit/c1ba240565c08f7fb04563fc95b896e729990018))
+* **uat:** implement in-engine state machine and monotonic job updates ([#1715](https://github.com/fderuiter/imednet-toolkit/issues/1715)) ([78855ab](https://github.com/fderuiter/imednet-toolkit/commit/78855abd570e2da4c40b9bb96be63e148a215a40))
+
+
+### Bug Fixes
+
+* **airflow:** restore export delegation and core 1.x installation ([#1709](https://github.com/fderuiter/imednet-toolkit/issues/1709)) ([1d17233](https://github.com/fderuiter/imednet-toolkit/commit/1d172334ae24553d69b8941d9fc0fa13a02d19d9))
+* isolate test paths and default DuckDB fixtures to in-memory mode ([#1739](https://github.com/fderuiter/imednet-toolkit/issues/1739)) ([e320d06](https://github.com/fderuiter/imednet-toolkit/commit/e320d06e9fc0684f8d4ca7e9c8c9e9611be55b69))
+* resolve explicit authentication without placeholder credentials ([#1749](https://github.com/fderuiter/imednet-toolkit/issues/1749)) ([154e593](https://github.com/fderuiter/imednet-toolkit/commit/154e593c141b96e1233f072e7d9f4a9ee5ceee0d))
+* **retries:** enforce pagination ownership and configured sink attempts ([#1710](https://github.com/fderuiter/imednet-toolkit/issues/1710)) ([ac185b2](https://github.com/fderuiter/imednet-toolkit/commit/ac185b275ee9055e46f9e62f0650a1c720ae99a5))
+
+
+### Performance Improvements
+
+* **workflows:** precompute normalized terminology lookups before validation loops ([#1726](https://github.com/fderuiter/imednet-toolkit/issues/1726)) ([933406b](https://github.com/fderuiter/imednet-toolkit/commit/933406b23bd49ade70f4661ce913aa76c63014ce))
+* **workflows:** use set lookups for record criteria extraction ([#1720](https://github.com/fderuiter/imednet-toolkit/issues/1720)) ([21cbcf5](https://github.com/fderuiter/imednet-toolkit/commit/21cbcf5ed073fff8c0929459e236d42121aaebf1))
+
 ## [1.0.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-workflows-v0.8.0...imednet-workflows-v1.0.0) (2026-11-15)
 
 
