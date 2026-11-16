@@ -1,5 +1,6 @@
 """Unit tests for airflow export."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -119,9 +120,22 @@ with patch("imednet.integrations.export." + FUNC, side_effect=ImportError("optio
     else:
         raise AssertionError("dependency error was swallowed")
 '''
+    repo_root = Path(__file__).resolve().parents[2]
+    package_paths = [
+        str(repo_root / "packages" / "providers-airflow" / "src"),
+        str(repo_root / "packages" / "core" / "src"),
+    ]
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    if existing_pythonpath:
+        env["PYTHONPATH"] = os.pathsep.join(package_paths + [existing_pythonpath])
+    else:
+        env["PYTHONPATH"] = os.pathsep.join(package_paths)
+
     result = subprocess.run(
         [sys.executable, "-c", "FUNC = " + repr(func_name) + "\n" + script],
-        cwd=Path(__file__).resolve().parents[2],
+        cwd=repo_root,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
