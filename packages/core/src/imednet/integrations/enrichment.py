@@ -129,6 +129,8 @@ class EnrichmentPipeline:
             if mapping.source_variable_name:
                 self.mappings[mapping.source_variable_name] = mapping
 
+        self._has_rules = bool(self.phi_keys or self.terminology or self.mappings)
+
     def process(self, data: Any) -> Any:
         """Process the input data through the enrichment pipeline.
 
@@ -138,6 +140,8 @@ class EnrichmentPipeline:
         Returns:
             The enriched and transformed data.
         """
+        if not self._has_rules:
+            return data
         return self._transform_recursive(data, depth=0)
 
     def _evaluate_business_logic(self, expr: str, value: Any) -> Any:
