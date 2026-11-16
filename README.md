@@ -6,7 +6,7 @@ Requires Python 3.11 or newer. Recreate Python 3.10 virtual environments with a
 supported interpreter before upgrading; the minimum enables patched workflow
 file locking dependencies.
 
-Full documentation: <https://fderuiter.github.io/imednet-python-sdk/>
+Full documentation: <https://fderuiter.github.io/imednet-python-sdk/> | [Interactive Live Explorer](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
 
 <div align="center">
 
@@ -28,9 +28,15 @@ reimplementing HTTP logic.
 
 Our documentation is organized according to the **Diátaxis framework**, which categorizes information based on user intent.
 
+### ⚡ [Interactive Live Explorer](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
+*Run live queries, test Python SDK and REST calls, inspect clinical form schemas, and verify audit trails directly in your browser without credentials or backend servers.*
+- [Integration Engineer Live Console](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
+- [Clinical Data Manager Form Validator](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
+- [Regulatory Compliance Auditor Verification](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
+
 ### 📚 [Tutorials](docs/tutorials/)
 *Learning-oriented guides for getting started.*
-- [Quick Start](docs/tutorials/quick_start.rst)
+- [Quick Start](docs/tutorials/quick_start.rst) (and [Interactive Showcase](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase))
 - [Async Quick Start](docs/tutorials/async_quick_start.rst)
 - [Examples](docs/tutorials/examples/)
 

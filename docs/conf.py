@@ -165,6 +165,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
+html_js_files: list[str] = ["showcase.js"]
 
 doctest_global_setup = """
 import os
