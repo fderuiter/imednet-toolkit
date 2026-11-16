@@ -3,4 +3,3 @@ interface:
   short_description: "Detailed TDD implementation plans in docs/superpowers/plans/"
 policy:
   allow_implicit_invocation: true
-

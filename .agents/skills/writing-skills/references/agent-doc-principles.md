@@ -33,4 +33,3 @@ A context pointer (`AGENTS.md` line or skill `description`) names external mater
 
 - **Model-invocable (default):** Omit `disable-model-invocation` in `SKILL.md` AND keep `policy.allow_implicit_invocation: true` (or omitted `false`) in `agents/openai.yaml`. Describe `"Use when..."` branches concisely so agents trigger cleanly without summary-spoiling the workflow.
 - **User-invoked only:** Set `disable-model-invocation: true` in `SKILL.md` **AND** `policy.allow_implicit_invocation: false` in `agents/openai.yaml`. Write a short human-facing summary description; keep shared knowledge out of manual skills in plain external reference files (`docs/agents/*`) so automated skills can still reach them.
-

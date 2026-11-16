@@ -3,4 +3,3 @@ interface:
   short_description: "Session bootstrap for skill discovery and activation"
 policy:
   allow_implicit_invocation: true
-

@@ -3,4 +3,3 @@ interface:
   short_description: "Plan alignment and two-axis Standards + Spec diff review"
 policy:
   allow_implicit_invocation: true
-

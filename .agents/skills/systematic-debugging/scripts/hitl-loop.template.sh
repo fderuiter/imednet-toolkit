@@ -22,4 +22,3 @@ capture ERROR_MSG "Paste the redacted error message (or 'none'):"
 printf '\n--- Captured ---\n'
 printf 'ERRORED=%s\n' "$ERRORED"
 printf 'ERROR_MSG=%s\n' "$ERROR_MSG"
-

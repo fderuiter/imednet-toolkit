@@ -1,7 +1,7 @@
 # Cross-Harness Agent Skills & Governance Design (`imednet-toolkit`)
 
-**Date:** 2026-11-16  
-**Target PR Branch:** `remove_matts_skills` (synced to `origin/main` `4c856c34`)  
+**Date:** 2026-11-16
+**Target PR Branch:** `remove_matts_skills` (synced to `origin/main` `4c856c34`)
 **Research Provenance:** [skills-synergy-research.md](../../agents/skills-synergy-research.md)
 
 ---

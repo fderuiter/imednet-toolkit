@@ -3,4 +3,3 @@ interface:
   short_description: "RED-GREEN-REFACTOR Python TDD with public seams"
 policy:
   allow_implicit_invocation: true
-

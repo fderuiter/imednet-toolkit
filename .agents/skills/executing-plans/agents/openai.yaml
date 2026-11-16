@@ -3,4 +3,3 @@ interface:
   short_description: "Inline task-by-task plan execution with ledger tracking"
 policy:
   allow_implicit_invocation: true
-

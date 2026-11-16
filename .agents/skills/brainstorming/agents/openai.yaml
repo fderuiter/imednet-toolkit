@@ -3,4 +3,3 @@ interface:
   short_description: "Interactive design gate before planning or writing code"
 policy:
   allow_implicit_invocation: true
-

@@ -61,4 +61,3 @@ Between major phases (e.g., design -> implementation -> review), choose top-to-b
 2. **Dispatch a subagent** for self-contained verification, code review, or primary-source reads.
 3. **`/handoff`** only when changing harnesses, worktrees, or collaborators.
 4. **Compact / clear** when switching to unrelated work.
-

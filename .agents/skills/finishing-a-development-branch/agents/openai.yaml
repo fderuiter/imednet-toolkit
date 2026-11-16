@@ -3,4 +3,3 @@ interface:
   short_description: "Verify CI gates, open Conventional Commit PR, clean worktree"
 policy:
   allow_implicit_invocation: true
-
