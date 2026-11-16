@@ -7,6 +7,7 @@ from imednet.core.context import (
     reset_base_url_context,
     set_base_url_context,
 )
+from imednet.errors import PathTraversalValidationError
 from imednet.utils.dates import format_iso_datetime, normalize_iso_date, parse_iso_datetime
 from imednet.utils.db import get_sqlite_connection, sqlite_connection
 from imednet.utils.evaluator import (
@@ -30,7 +31,11 @@ from imednet.utils.job_poller import (
     evaluate_job_state,
 )
 from imednet.utils.secrets import redact_sensitive_payload
-from imednet.utils.security import mask_clinical_phi, sanitize_csv_formula
+from imednet.utils.security import (
+    mask_clinical_phi,
+    sanitize_csv_formula,
+    validate_partition_key,
+)
 from imednet.utils.serialization import flatten
 from imednet.utils.url import redact_sensitive_text
 from imednet.utils.validators import is_boolean_token, is_missing_value, parse_bool
@@ -47,6 +52,7 @@ __all__ = [
     "JobProgressHandler",
     "JobStatusEvent",
     "JobTimeoutError",
+    "PathTraversalValidationError",
     "RestrictedAstEvaluator",
     "build_filter_string",
     "evaluate_expression",
@@ -69,4 +75,5 @@ __all__ = [
     "sanitize_csv_formula",
     "set_base_url_context",
     "sqlite_connection",
+    "validate_partition_key",
 ]
