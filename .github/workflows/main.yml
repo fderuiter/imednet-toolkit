@@ -535,7 +535,7 @@ jobs:
 
       - name: Verify CLI Availability
         run: |
-          imednet --help || true
+          imednet --help
 
   # ------------------------------------------------------------------
   # JOB 3.8: VALIDATE PACKAGE CONSUMPTION
