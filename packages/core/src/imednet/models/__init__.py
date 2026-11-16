@@ -55,9 +55,12 @@ from imednet.models.reporting import (
     AdverseEvent,
     AnalysisAdverseEvent,
     AnalysisLabResult,
+    Demographics,
     DeviceDeficiency,
     ProtocolDeviation,
     SubjectLevelAnalysis,
+    VitalSign,
+    VitalSigns,
 )
 from imednet.models.sites import Site
 from imednet.models.standards import (
@@ -115,6 +118,7 @@ __all__: list[str] = [
     "BaseRecordRequest",
     "Coding",
     "CreateNewRecordRequest",
+    "Demographics",
     "DeviceDeficiency",
     "DeviceSafetyProfile",
     "DrugSafetyProfile",
@@ -166,6 +170,8 @@ __all__: list[str] = [
     "ValidationViolation",
     "Variable",
     "Visit",
+    "VitalSign",
+    "VitalSigns",
     "WidgetConfig",
     "calculate_legacy_status",
     "can_transition",
