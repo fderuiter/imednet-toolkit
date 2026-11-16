@@ -41,7 +41,8 @@ docs = [
     "sphinx-autodoc-typehints",
     "sphinx-rtd-theme>=3.0.2,<4.0.0",
     "sphinxcontrib-mermaid>=0.9.2,<2.2.0",
-    "sphinx-argparse>=0.5.0"
+    "sphinx-argparse>=0.5.0",
+    "sphinx-thebe>=0.3.1"
 ]
 
 [build-system]
