@@ -30,9 +30,9 @@ Our documentation is organized according to the **Diátaxis framework**, which c
 
 ### ⚡ [Interactive Live Explorer](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
 *Run live queries, test Python SDK and REST calls, inspect clinical form schemas, and verify audit trails directly in your browser without credentials or backend servers.*
-- [Integration Engineer Live Console](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
-- [Clinical Data Manager Form Validator](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
-- [Regulatory Compliance Auditor Verification](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
+- [Integration Engineer Live Console](https://fderuiter.github.io/imednet-python-sdk/#panel-integration)
+- [Clinical Data Manager Form Validator](https://fderuiter.github.io/imednet-python-sdk/#panel-datamanager)
+- [Regulatory Compliance Auditor Verification](https://fderuiter.github.io/imednet-python-sdk/#panel-auditor)
 
 ### 📚 [Tutorials](docs/tutorials/)
 *Learning-oriented guides for getting started.*
