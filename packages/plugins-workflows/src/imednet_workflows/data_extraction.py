@@ -44,15 +44,14 @@ class DataExtractionWorkflow:
         Returns:
             A list of Record objects matching all specified criteria.
         """
-        matching_subject_keys: list[str] | None = None
+        matching_subject_keys: set[str] | None = None
         if subject_filter:
             subjects = self._sdk.get_subjects(study_key, **subject_filter)
-            matching_subject_keys = [s.subject_key for s in subjects]  # type: ignore
+            matching_subject_keys = {s.subject_key for s in subjects}  # type: ignore
             if not matching_subject_keys:
                 return []
 
-        # Changed type hint from List[str] to List[int]
-        matching_visit_ids: list[int] | None = None
+        matching_visit_ids: set[int] | None = None
         if visit_filter:
             # Client-side filtering for subject_key on visits is still needed
             # as build_filter_string doesn't handle complex AND/OR structures easily
@@ -62,8 +61,7 @@ class DataExtractionWorkflow:
             if matching_subject_keys:
                 visits = [v for v in visits if v.subject_key in matching_subject_keys]
 
-            # Corrected attribute from oid to visit_id
-            matching_visit_ids = [v.visit_id for v in visits]  # type: ignore
+            matching_visit_ids = {v.visit_id for v in visits}  # type: ignore
             if not matching_visit_ids:
                 return []
 
