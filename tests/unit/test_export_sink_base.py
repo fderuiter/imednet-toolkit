@@ -6,10 +6,13 @@ import sys
 from types import ModuleType
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
+import imednet.integrations.export as export_mod
 import imednet.integrations.sink_base as sink_base_mod
 from imednet.errors import ExportBatchError, ExportConfigurationError, ExportError
+from imednet.integrations.export import TabularCSVSink, TabularSinkConfig, TabularSQLSink
 from imednet.integrations.sink_base import (
     ExportSink,
     SinkConfig,
@@ -224,3 +227,242 @@ def _fake_neo4j_module(fail_connect: bool = False) -> ModuleType:
     neo4j.GraphDatabase = MagicMock()
     neo4j.GraphDatabase.driver.return_value = driver
     return neo4j, driver
+
+
+# ---------------------------------------------------------------------------
+# TabularCSVSink & TabularSQLSink Retry & Sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestTabularCSVSinkRetryAndSanitization:
+    """Test suite for TabularCSVSink retries, backoff, and error suppression."""
+
+    @pytest.mark.parametrize("retries,expected_sleeps", [(0, []), (2, [0.25, 0.5])])
+    def test_tabular_csv_sink_retries_and_backoff(self, monkeypatch, retries, expected_sleeps):
+        """Assert configured retry attempts and exponential backoff on transient failure."""
+        sleeps = []
+        monkeypatch.setattr("tenacity.nap.time.sleep", sleeps.append)
+        cfg = TabularSinkConfig(study_key="STUDY", max_retries=retries, retry_backoff=0.25)
+        sink = TabularCSVSink("/fake/path.csv", cfg)
+
+        call_count = 0
+
+        def failing_open(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise OSError("disk IO error")
+
+        monkeypatch.setattr(export_mod, "open", failing_open, raising=False)
+
+        with pytest.raises(ExportBatchError, match=f"after {retries + 1} attempts") as caught:
+            sink.write_batch([{"col": "val"}], batch_id="csv_batch_1")
+
+        assert call_count == retries + 1
+        assert sleeps == expected_sleeps
+        assert caught.value.batch_id == "csv_batch_1"
+        assert sink._is_first_batch is True
+
+    def test_tabular_csv_sink_success_after_transient_error(self, monkeypatch):
+        """Assert that successful execution stops retries and flips _is_first_batch."""
+        sleeps = []
+        monkeypatch.setattr("tenacity.nap.time.sleep", sleeps.append)
+        cfg = TabularSinkConfig(study_key="STUDY", max_retries=3, retry_backoff=0.25)
+        sink = TabularCSVSink("/fake/path.csv", cfg)
+
+        mock_file = MagicMock()
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_file
+        mock_ctx.__exit__.return_value = False
+
+        attempts = 0
+
+        def flaky_open(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("temporary disk glitch")
+            return mock_ctx
+
+        monkeypatch.setattr(export_mod, "open", flaky_open, raising=False)
+
+        loaded = sink.write_batch([{"col": "val"}], batch_id="csv_batch_success")
+        assert loaded == 1
+        assert attempts == 2
+        assert sleeps == [0.25]
+        assert sink._is_first_batch is False
+
+    @pytest.mark.parametrize("error_type", [ExportConfigurationError, ValueError, TypeError])
+    def test_tabular_csv_sink_permanent_failures_fail_immediately_and_redact(
+        self, monkeypatch, caplog, error_type
+    ):
+        """Verify non-transient errors fail on first attempt without leaking driver messages."""
+        sleeps = []
+        monkeypatch.setattr("tenacity.nap.time.sleep", sleeps.append)
+        tracer = MagicMock()
+        sentinel = "secret-csv-credential-token"
+        cfg = TabularSinkConfig(study_key="STUDY", max_retries=2, tracer=tracer)
+        sink = TabularCSVSink("/fake/path.csv", cfg)
+
+        call_count = 0
+
+        def failing_open(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise error_type(sentinel)
+
+        monkeypatch.setattr(export_mod, "open", failing_open, raising=False)
+
+        with pytest.raises(ExportBatchError, match="after 1 attempts") as caught:
+            sink.write_batch([{"col": "val"}], batch_id="csv_perm_fail")
+
+        assert call_count == 1
+        assert sleeps == []
+        assert sentinel not in str(caught.value)
+        assert sentinel not in caplog.text
+        assert sentinel not in str(tracer.mock_calls)
+
+    def test_tabular_csv_sink_transient_failure_redacted_before_tracing(self, monkeypatch, caplog):
+        """Assert transient driver messages are redacted from error, log, and tracer."""
+        monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
+        tracer = MagicMock()
+        sentinel = "secret-csv-transient-token"
+        cfg = TabularSinkConfig(study_key="STUDY", max_retries=0, tracer=tracer)
+        sink = TabularCSVSink("/fake/path.csv", cfg)
+
+        def failing_open(*args, **kwargs):
+            raise RuntimeError(sentinel)
+
+        monkeypatch.setattr(export_mod, "open", failing_open, raising=False)
+
+        with pytest.raises(ExportBatchError) as caught:
+            sink.write_batch([{"col": "val"}], batch_id="csv_transient_redact")
+
+        assert sentinel not in str(caught.value)
+        assert sentinel not in caplog.text
+        assert sentinel not in str(tracer.mock_calls)
+
+    def test_tabular_csv_sink_empty_batch_returns_zero(self, monkeypatch):
+        """Assert empty batches return 0 immediately without invoking retry or open."""
+        cfg = TabularSinkConfig(study_key="STUDY")
+        sink = TabularCSVSink("/fake/path.csv", cfg)
+        failing_open = MagicMock(side_effect=AssertionError("open should not be called"))
+        monkeypatch.setattr(export_mod, "open", failing_open, raising=False)
+
+        assert sink.write_batch([], batch_id="b_empty_list") == 0
+        assert sink.write_batch(pd.DataFrame(), batch_id="b_empty_df") == 0
+        assert failing_open.call_count == 0
+
+
+class TestTabularSQLSinkRetryAndSanitization:
+    """Test suite for TabularSQLSink retries, backoff, and error suppression."""
+
+    @pytest.mark.parametrize("retries,expected_sleeps", [(0, []), (2, [0.25, 0.5])])
+    def test_tabular_sql_sink_retries_and_backoff(self, monkeypatch, retries, expected_sleeps):
+        """Assert configured retry attempts and exponential backoff on transient failure."""
+        sleeps = []
+        monkeypatch.setattr("tenacity.nap.time.sleep", sleeps.append)
+        cfg = TabularSinkConfig(study_key="STUDY", max_retries=retries, retry_backoff=0.25)
+        sink = TabularSQLSink("tbl", MagicMock(), cfg)
+
+        call_count = 0
+
+        def failing_to_sql(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("database connection lost")
+
+        monkeypatch.setattr(export_mod, "_to_sql_with_chunking", failing_to_sql)
+
+        with pytest.raises(ExportBatchError, match=f"after {retries + 1} attempts") as caught:
+            sink.write_batch([{"col": 1}], batch_id="sql_batch_1")
+
+        assert call_count == retries + 1
+        assert sleeps == expected_sleeps
+        assert caught.value.batch_id == "sql_batch_1"
+        assert sink._is_first_batch is True
+
+    def test_tabular_sql_sink_success_after_transient_error(self, monkeypatch):
+        """Assert that successful execution stops retries and flips _is_first_batch."""
+        sleeps = []
+        monkeypatch.setattr("tenacity.nap.time.sleep", sleeps.append)
+        cfg = TabularSinkConfig(study_key="STUDY", max_retries=3, retry_backoff=0.25)
+        sink = TabularSQLSink("tbl", MagicMock(), cfg)
+
+        attempts = 0
+
+        def flaky_to_sql(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary deadlock")
+
+        monkeypatch.setattr(export_mod, "_to_sql_with_chunking", flaky_to_sql)
+
+        loaded = sink.write_batch([{"col": 1}], batch_id="sql_batch_success")
+        assert loaded == 1
+        assert attempts == 2
+        assert sleeps == [0.25]
+        assert sink._is_first_batch is False
+
+    @pytest.mark.parametrize("error_type", [ExportConfigurationError, ValueError, TypeError])
+    def test_tabular_sql_sink_permanent_failures_fail_immediately_and_redact(
+        self, monkeypatch, caplog, error_type
+    ):
+        """Verify non-transient errors fail on first attempt without leaking driver messages."""
+        sleeps = []
+        monkeypatch.setattr("tenacity.nap.time.sleep", sleeps.append)
+        tracer = MagicMock()
+        sentinel = "postgresql://user:password_secret@localhost:5432/db"
+        cfg = TabularSinkConfig(study_key="STUDY", max_retries=2, tracer=tracer)
+        sink = TabularSQLSink("tbl", MagicMock(), cfg)
+
+        call_count = 0
+
+        def failing_to_sql(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise error_type(sentinel)
+
+        monkeypatch.setattr(export_mod, "_to_sql_with_chunking", failing_to_sql)
+
+        with pytest.raises(ExportBatchError, match="after 1 attempts") as caught:
+            sink.write_batch([{"col": 1}], batch_id="sql_perm_fail")
+
+        assert call_count == 1
+        assert sleeps == []
+        assert sentinel not in str(caught.value)
+        assert sentinel not in caplog.text
+        assert sentinel not in str(tracer.mock_calls)
+
+    def test_tabular_sql_sink_transient_failure_redacted_before_tracing(self, monkeypatch, caplog):
+        """Assert transient driver messages are redacted from error, log, and tracer."""
+        monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
+        tracer = MagicMock()
+        sentinel = "mysql://root:secret_mysql_pass@localhost/clinical"
+        cfg = TabularSinkConfig(study_key="STUDY", max_retries=0, tracer=tracer)
+        sink = TabularSQLSink("tbl", MagicMock(), cfg)
+
+        def failing_to_sql(*args, **kwargs):
+            raise RuntimeError(sentinel)
+
+        monkeypatch.setattr(export_mod, "_to_sql_with_chunking", failing_to_sql)
+
+        with pytest.raises(ExportBatchError) as caught:
+            sink.write_batch([{"col": 1}], batch_id="sql_transient_redact")
+
+        assert sentinel not in str(caught.value)
+        assert sentinel not in caplog.text
+        assert sentinel not in str(tracer.mock_calls)
+
+    def test_tabular_sql_sink_empty_batch_returns_zero(self, monkeypatch):
+        """Assert empty batches return 0 immediately without invoking retry or sql."""
+        cfg = TabularSinkConfig(study_key="STUDY")
+        sink = TabularSQLSink("tbl", MagicMock(), cfg)
+        failing_to_sql = MagicMock(
+            side_effect=AssertionError("_to_sql_with_chunking should not be called")
+        )
+        monkeypatch.setattr(export_mod, "_to_sql_with_chunking", failing_to_sql)
+
+        assert sink.write_batch([], batch_id="sql_empty_list") == 0
+        assert sink.write_batch(pd.DataFrame(), batch_id="sql_empty_df") == 0
+        assert failing_to_sql.call_count == 0

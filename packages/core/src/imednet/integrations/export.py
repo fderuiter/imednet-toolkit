@@ -14,8 +14,6 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from imednet.core.operations.executor import UniversalExecutor
-from imednet.errors import ExportBatchError
 from imednet.integrations.sink_base import ExportSink, SinkConfig, apply_quality_gate
 
 try:
@@ -246,23 +244,9 @@ class TabularCSVSink(ExportSink):
             self._append_manifest(batch_id, rows_loaded, checksum)
             return rows_loaded
 
-        executor = UniversalExecutor(
-            retries=self.config.max_retries,
-            backoff_factor=self.config.retry_backoff,
-            tracer=self.config.tracer,
-            operation_name="export_csv",
-            batch_id=batch_id,
-        )
-
-        try:
-            loaded = executor.execute(execute_export)
-            self._is_first_batch = False
-            return loaded
-        except Exception as exc:
-            raise ExportBatchError(
-                f"Batch {batch_id!r} failed after {self.config.max_retries + 1} attempts: {exc}",
-                batch_id=batch_id,
-            ) from exc
+        loaded = self._execute_with_retry("export_csv", batch_id, execute_export)
+        self._is_first_batch = False
+        return loaded
 
     def _append_manifest(self, batch_id: str, row_count: int, checksum: str) -> None:
         if not self._cfg.manifest_path:
@@ -325,23 +309,9 @@ class TabularSQLSink(ExportSink):
             self._append_manifest(batch_id, rows_loaded, checksum)
             return rows_loaded
 
-        executor = UniversalExecutor(
-            retries=self.config.max_retries,
-            backoff_factor=self.config.retry_backoff,
-            tracer=self.config.tracer,
-            operation_name="export_sql",
-            batch_id=batch_id,
-        )
-
-        try:
-            loaded = executor.execute(execute_export)
-            self._is_first_batch = False
-            return loaded
-        except Exception as exc:
-            raise ExportBatchError(
-                f"Batch {batch_id!r} failed after {self.config.max_retries + 1} attempts: {exc}",
-                batch_id=batch_id,
-            ) from exc
+        loaded = self._execute_with_retry("export_sql", batch_id, execute_export)
+        self._is_first_batch = False
+        return loaded
 
     def _append_manifest(self, batch_id: str, row_count: int, checksum: str) -> None:
         if not self._cfg.manifest_path:
