@@ -1,3 +1,4 @@
+import contextlib
 import os
 import re
 import shutil
@@ -45,6 +46,53 @@ def generate_adr_index(adr_dir: Path | None = None) -> None:
     index_file = adr_dir / "index.rst"
     index_file.write_text("\n".join(content), encoding="utf-8")
     print(f"Generated ADR catalog at {index_file} ({len(records)} records).")
+
+
+def build_and_stage_wheels(
+    repo_root: Path | None = None, wheels_dir: Path | None = None
+) -> list[Path]:
+    """Build pure Python wheels for workspace packages and stage into docs/_static/wheels/."""
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parent.parent
+
+    if wheels_dir is None:
+        wheels_dir = repo_root / "docs" / "_static" / "wheels"
+
+    wheels_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean existing staged wheels
+    for whl in wheels_dir.glob("*.whl"):
+        with contextlib.suppress(OSError):
+            whl.unlink()
+
+    uv_bin = shutil.which("uv") or "uv"
+    build_cmd = [
+        uv_bin,
+        "build",
+        "--all-packages",
+        "--wheel",
+        "--out-dir",
+        str(wheels_dir),
+    ]
+
+    print(f"Building pure Python workspace wheels into {wheels_dir}...")
+    try:
+        # Attempt offline build first to respect offline constraint
+        subprocess.run(build_cmd + ["--offline"], check=True, cwd=str(repo_root))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        try:
+            subprocess.run(build_cmd, check=True, cwd=str(repo_root))
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(f"Warning: Failed to build wheels with uv: {exc}")
+
+    # Remove workspace root placeholder wheel if present
+    for placeholder in wheels_dir.glob("imednet_workspace-*.whl"):
+        with contextlib.suppress(OSError):
+            placeholder.unlink()
+
+    staged = sorted(wheels_dir.glob("*.whl"))
+    print(f"Staged {len(staged)} wheel artifact(s) in {wheels_dir}: {[w.name for w in staged]}")
+    return staged
 
 
 def main():
@@ -101,6 +149,9 @@ def main():
     print("Generating ADR index...")
     generate_adr_index()
 
+    print("Building and staging workspace wheels for interactive documentation...")
+    build_and_stage_wheels()
+
     print("Validating mermaid diagrams...")
     run_command([sys.executable, "scripts/validate_diagrams.py"])
 
@@ -133,6 +184,16 @@ def main():
 
     print("Building HTML...")
     run_command(["sphinx-build", "-b", "html", "-W", "--keep-going", "docs", "docs/_build/html"])
+
+    # Ensure staged wheels are present in docs/_build/html/_static/wheels/
+    html_wheels_dir = Path("docs/_build/html/_static/wheels")
+    static_wheels_dir = Path("docs/_static/wheels")
+    if static_wheels_dir.exists():
+        html_wheels_dir.mkdir(parents=True, exist_ok=True)
+        for whl in static_wheels_dir.glob("*.whl"):
+            target_whl = html_wheels_dir / whl.name
+            if not target_whl.exists():
+                shutil.copy2(whl, target_whl)
 
 
 if __name__ == "__main__":

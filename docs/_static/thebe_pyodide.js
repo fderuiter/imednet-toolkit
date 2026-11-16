@@ -30,25 +30,123 @@
   let mainThreadPyodide = null;
   let executionId = 0;
   const pendingRequests = new Map();
+  const installedMainWheels = new Set();
+
+  function getConfig() {
+    const defaultWheels = ["_static/wheels/imednet-1.1.0-py3-none-any.whl"];
+    const defaultRequirements = ["pydantic", "httpx", "tenacity", "defusedxml", "python-dotenv"];
+
+    let rawConfig = null;
+    if (typeof window !== "undefined" && window.thebe_config) {
+      rawConfig = window.thebe_config;
+    } else {
+      const scriptTag = document.querySelector('script[type="text/x-thebe-config"]');
+      if (scriptTag) {
+        try {
+          rawConfig = JSON.parse(scriptTag.textContent);
+        } catch (e) {
+          // ignore parsing error
+        }
+      }
+    }
+
+    const wheels = (rawConfig && (rawConfig.wheels || rawConfig.wheel_paths)) || defaultWheels;
+    const requirements = (rawConfig && (rawConfig.requirements || rawConfig.micropip_requirements)) || defaultRequirements;
+
+    const docRoot = (typeof DOCUMENTATION_OPTIONS !== "undefined" && DOCUMENTATION_OPTIONS.URL_ROOT)
+      ? DOCUMENTATION_OPTIONS.URL_ROOT
+      : "";
+
+    const resolvedWheels = wheels.map((w) => {
+      try {
+        const fullRel = (w.startsWith("http://") || w.startsWith("https://"))
+          ? w
+          : (docRoot + w);
+        return new URL(fullRel, window.location.href).href;
+      } catch (e) {
+        return w;
+      }
+    });
+
+    return {
+      wheels: resolvedWheels,
+      requirements: requirements,
+    };
+  }
+
+  function setCellRunButtonsDisabled(disabled) {
+    document.querySelectorAll(".thebelab-run-button").forEach((btn) => {
+      btn.disabled = disabled;
+      btn.title = disabled
+        ? "Runtime initializing, please wait..."
+        : "Execute cell (Shift+Enter)";
+    });
+  }
 
   // Web Worker script running in background thread to avoid UI freeze
   const workerCode = `
     let pyodide = null;
     let ready = false;
+    let initPromise = null;
+    const installedWheels = new Set();
 
-    async function init() {
+    async function initRuntime(config) {
+      if (ready) return;
       importScripts("${PYODIDE_CDN_URL}");
       pyodide = await loadPyodide();
+
+      // Load micropip
+      await pyodide.loadPackage("micropip");
+      const micropip = pyodide.pyimport("micropip");
+
+      const wheels = (config && config.wheels) || [];
+      const requirements = (config && config.requirements) || [];
+
+      // Pre-install package requirements if available
+      if (requirements && requirements.length > 0) {
+        try {
+          await micropip.install(requirements);
+        } catch (reqErr) {
+          console.warn("[thebe-pyodide worker] micropip requirements install warning:", reqErr);
+        }
+      }
+
+      // Install SDK wheels with caching
+      for (const wheelUrl of wheels) {
+        if (!installedWheels.has(wheelUrl)) {
+          try {
+            await pyodide.runPythonAsync(\`
+import micropip
+try:
+    await micropip.install("\${wheelUrl}")
+except Exception:
+    await micropip.install("\${wheelUrl}", deps=False)
+\`);
+            installedWheels.add(wheelUrl);
+            console.log("[thebe-pyodide worker] Successfully installed wheel:", wheelUrl);
+          } catch (whlErr) {
+            console.error("[thebe-pyodide worker] Wheel install error:", wheelUrl, whlErr);
+            throw whlErr;
+          }
+        }
+      }
+
       ready = true;
       postMessage({ type: 'status', status: 'ready', message: 'Pyodide runtime initialized' });
     }
 
-    init().catch(err => {
-      postMessage({ type: 'status', status: 'failed', message: err.toString() });
-    });
-
     onmessage = async function(e) {
-      const { id, code } = e.data;
+      const data = e.data;
+      if (data.type === 'init') {
+        if (!initPromise) {
+          initPromise = initRuntime(data.config).catch(err => {
+            postMessage({ type: 'status', status: 'failed', message: err.toString() });
+          });
+        }
+        return;
+      }
+
+      const { id, code } = data;
       if (!ready) {
         postMessage({ id, type: 'result', stdout: '', stderr: 'Pyodide runtime not ready yet.\\n', result: null });
         return;
@@ -118,12 +216,18 @@ finally:
   function initWorker() {
     if (pyodideWorker || pyodideInitializing) return;
     pyodideInitializing = true;
+    setCellRunButtonsDisabled(true);
     updateLaunchButtons("loading", "Initializing Pyodide WebAssembly runtime...");
+
+    const config = getConfig();
 
     try {
       const blob = new Blob([workerCode], { type: "application/javascript" });
       const workerUrl = URL.createObjectURL(blob);
       pyodideWorker = new Worker(workerUrl);
+
+      // Trigger initialization in worker with wheel configuration
+      pyodideWorker.postMessage({ type: "init", config: config });
 
       pyodideWorker.onmessage = function (e) {
         const data = e.data;
@@ -131,6 +235,7 @@ finally:
           if (data.status === "ready") {
             pyodideReady = true;
             pyodideInitializing = false;
+            setCellRunButtonsDisabled(false);
             updateLaunchButtons("ready", "Pyodide Ready");
             trigger("status", { status: "ready", message: data.message });
           } else {
@@ -159,13 +264,45 @@ finally:
 
   function fallbackToMainThread() {
     if (pyodideReady) return;
+    setCellRunButtonsDisabled(true);
+    const config = getConfig();
     const script = document.createElement("script");
     script.src = PYODIDE_CDN_URL;
     script.onload = async () => {
       try {
         mainThreadPyodide = await window.loadPyodide();
+        await mainThreadPyodide.loadPackage("micropip");
+        const micropip = mainThreadPyodide.pyimport("micropip");
+
+        if (config.requirements && config.requirements.length > 0) {
+          try {
+            await micropip.install(config.requirements);
+          } catch (reqErr) {
+            console.warn("[thebe-pyodide] main thread micropip requirements warning:", reqErr);
+          }
+        }
+
+        for (const wheelUrl of config.wheels) {
+          if (!installedMainWheels.has(wheelUrl)) {
+            try {
+              await mainThreadPyodide.runPythonAsync(`
+import micropip
+try:
+    await micropip.install("${wheelUrl}")
+except Exception:
+    await micropip.install("${wheelUrl}", deps=False)
+`);
+              installedMainWheels.add(wheelUrl);
+            } catch (whlErr) {
+              console.error("[thebe-pyodide] main thread failed installing wheel:", wheelUrl, whlErr);
+              throw whlErr;
+            }
+          }
+        }
+
         pyodideReady = true;
         pyodideInitializing = false;
+        setCellRunButtonsDisabled(false);
         updateLaunchButtons("ready", "Pyodide Ready");
         trigger("status", { status: "ready", message: "Pyodide runtime initialized (main thread)" });
       } catch (err) {
@@ -307,7 +444,8 @@ finally:
       runBtn.type = "button";
       runBtn.className = "thebelab-button thebelab-run-button";
       runBtn.innerHTML = "&#9654; Run";
-      runBtn.title = "Execute cell (Shift+Enter)";
+      runBtn.disabled = !pyodideReady;
+      runBtn.title = pyodideReady ? "Execute cell (Shift+Enter)" : "Runtime initializing, please wait...";
 
       const clearBtn = document.createElement("button");
       clearBtn.type = "button";
@@ -337,6 +475,7 @@ finally:
 
       // Execution handler
       function runCurrentCell() {
+        if (!pyodideReady) return;
         const code = textarea.value;
         runBtn.disabled = true;
         runBtn.innerHTML = '<span class="thebe-spin">&#8635;</span> Running...';
@@ -394,7 +533,9 @@ finally:
       textarea.addEventListener("keydown", (e) => {
         if ((e.shiftKey || e.ctrlKey) && e.key === "Enter") {
           e.preventDefault();
-          runCurrentCell();
+          if (pyodideReady) {
+            runCurrentCell();
+          }
         }
       });
     });

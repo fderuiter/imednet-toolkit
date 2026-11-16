@@ -2,6 +2,7 @@
 
 # Configuration file for the Sphinx documentation builder.
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -110,6 +111,28 @@ thebe_config = {
     "selector_input": "pre",
     "selector_output": ".output, .cell_output",
     "kernel_name": "pyodide",
+    "wheels": [
+        f"_static/wheels/imednet-{imednet_version}-py3-none-any.whl",
+    ],
+    "wheel_paths": [
+        f"_static/wheels/imednet-{imednet_version}-py3-none-any.whl",
+    ],
+    "requirements": [
+        "micropip",
+        "pydantic>=2.11.3,<3.0.0",
+        "httpx>=0.28.1,<0.29.0",
+        "tenacity>=9.1.2,<10.0.0",
+        "defusedxml>=0.7.1",
+        "python-dotenv",
+    ],
+    "micropip_requirements": [
+        "micropip",
+        "pydantic>=2.11.3,<3.0.0",
+        "httpx>=0.28.1,<0.29.0",
+        "tenacity>=9.1.2,<10.0.0",
+        "defusedxml>=0.7.1",
+        "python-dotenv",
+    ],
 }
 
 autosummary_generate = False
@@ -161,6 +184,9 @@ def setup(app: Any) -> None:  # pragma: no cover
     logging.getLogger("sphinx").addFilter(suppressor)
     logging.getLogger("sphinx.sphinx.domains.python").addFilter(suppressor)
     logging.getLogger("sphinx.sphinx_autodoc_typehints").addFilter(suppressor)
+
+    # Expose thebe_config containing wheel artifacts and requirements to client JS runtime
+    app.add_js_file(None, body=f"window.thebe_config = {json.dumps(thebe_config)};")
 
 
 # Ignore noisy pydantic schema generation warnings.
