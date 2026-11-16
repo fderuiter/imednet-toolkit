@@ -91,6 +91,28 @@ div.highlight {
     transform: translateY(-2px);
 }
 
+body[data-theme="dark"] .role-card {
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--color-background-border);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .role-card {
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--color-background-border);
+    }
+}
+
+body[data-theme="dark"] .role-card:hover {
+    border-color: var(--color-brand-primary);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--color-brand-primary);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .role-card:hover {
+        border-color: var(--color-brand-primary);
+        box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--color-brand-primary);
+    }
+}
+
 .role-card .role-card-title,
 .role-card p.rubric {
     font-size: 1.15rem;
@@ -150,7 +172,7 @@ div.highlight {
 .role-card-launch-btn:hover,
 .role-card-launch-btn:focus-visible {
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
     outline: 2px solid var(--color-brand-primary);
     outline-offset: 2px;
 }
@@ -225,7 +247,7 @@ div.highlight {
     padding: 0.3rem 0.75rem;
     border-radius: 9999px;
     background-color: rgba(16, 185, 129, 0.12);
-    color: #059669;
+    color: var(--color-status-success, var(--color-badge-success, #065f46));
     border: 1px solid rgba(16, 185, 129, 0.3);
 }
 
@@ -361,7 +383,7 @@ div.highlight {
 .mode-pill-btn.active,
 .mode-pill-btn[aria-pressed="true"] {
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
 }
 
 .mode-pill-btn:focus-visible {
@@ -374,7 +396,7 @@ div.highlight {
     align-items: center;
     gap: 0.4rem;
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
     border: 1px solid transparent;
     border-radius: 6px;
     padding: 0.5rem 1.15rem;
@@ -452,7 +474,7 @@ div.highlight {
 .explorer-metric-badge {
     font-size: 0.8rem;
     font-weight: 600;
-    color: #059669;
+    color: var(--color-status-success, var(--color-badge-success, #065f46));
     background-color: rgba(16, 185, 129, 0.1);
     border: 1px solid rgba(16, 185, 129, 0.25);
     border-radius: 4px;
@@ -488,7 +510,7 @@ div.highlight {
 .explorer-output-tab.active,
 .explorer-output-tab[aria-selected="true"] {
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
 }
 
 .explorer-output-tab:focus-visible {
@@ -552,6 +574,28 @@ div.highlight {
     background-color: rgba(0, 0, 0, 0.03);
 }
 
+body[data-theme="dark"] .explorer-dataframe-table th.index-col,
+body[data-theme="dark"] .explorer-dataframe-table td.index-col {
+    background-color: rgba(255, 255, 255, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .explorer-dataframe-table th.index-col,
+    body:not([data-theme="light"]) .explorer-dataframe-table td.index-col {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+}
+
+body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .explorer-dataframe-table tbody tr:hover {
+        background-color: rgba(255, 255, 255, 0.06);
+    }
+}
+
 /* Status badges */
 .status-badge {
     display: inline-block;
@@ -565,12 +609,12 @@ div.highlight {
 
 .badge-success {
     background-color: rgba(16, 185, 129, 0.15);
-    color: #059669;
+    color: var(--color-status-success, var(--color-badge-success, #065f46));
 }
 
 .badge-warning {
     background-color: rgba(245, 158, 11, 0.15);
-    color: #d97706;
+    color: var(--color-status-warning, var(--color-badge-warning, #92400e));
 }
 
 .badge-neutral {
@@ -646,7 +690,7 @@ div.highlight {
     padding: 0.15rem 0.5rem;
     border-radius: 4px;
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
     font-size: 0.75rem;
     font-weight: 700;
     margin-right: 0.4rem;
@@ -699,7 +743,7 @@ div.highlight {
     padding: 0.1rem 0.4rem;
     border-radius: 4px;
     background-color: rgba(239, 68, 68, 0.15);
-    color: #dc2626;
+    color: var(--color-status-danger, var(--color-badge-danger, var(--color-badge-required, #b91c1c)));
     text-transform: uppercase;
 }
 
