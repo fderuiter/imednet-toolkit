@@ -2,16 +2,15 @@
 
 import pytest
 
+from imednet.core.context import set_study_context
 from imednet.endpoints import intervals
 from imednet.errors import NotFoundError
 from imednet.models.intervals import Interval
 
 
-def test_list_uses_default_study_and_page_size(
-    dummy_client, context, paginator_factory, patch_build_filter
-):
+def test_list_uses_default_study_and_page_size(dummy_client, paginator_factory, patch_build_filter):
     """Test that list uses default study and page size."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = intervals.IntervalsEndpoint(dummy_client)
     captured = paginator_factory(intervals, [{"intervalId": 1}])
     filter_capture = patch_build_filter(intervals)

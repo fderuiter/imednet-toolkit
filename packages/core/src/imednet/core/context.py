@@ -70,20 +70,3 @@ def study_context(study_key: str) -> Iterator[None]:
         yield
     finally:
         reset_study_context(token)
-
-
-class Context:
-    """Compatibility shim backed by thread/task-local context variables."""
-
-    @property
-    def default_study_key(self) -> str | None:
-        """Return the current default study key from the context."""
-        return _active_study.get()
-
-    def set_default_study_key(self, study_key: str) -> None:
-        """Set the default study key for the current context."""
-        _active_study.set(study_key)
-
-    def clear_default_study_key(self) -> None:
-        """Clear the default study key from the current context."""
-        clear_study_context()

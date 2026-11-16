@@ -6,6 +6,8 @@ from imednet.errors import ClientError, PathTraversalValidationError
 from imednet.utils.security import (
     SensitivityRegistry,
     _normalize_key,
+    _normalize_key_cached,
+    _normalize_key_uncached,
     mask_clinical_phi,
     sanitize_csv_formula,
     validate_header_value,
@@ -256,3 +258,92 @@ def test_mask_clinical_phi_nested_mixed_case():
     assert masked["details"]["nested_list"][1]["safe_val"] == 42
     assert masked["details"][123] == "non_string_key"
     assert masked["safe_field"] == "unmasked"
+
+
+def test_normalize_key_cache_hits():
+    """Verify that repeated field key normalizations hit the LRU cache."""
+    _normalize_key.cache_clear()
+    info_start = _normalize_key.cache_info()
+    assert info_start.hits == 0
+    assert info_start.misses == 0
+    assert info_start.maxsize == 4096
+
+    # First call: cache miss
+    result1 = _normalize_key("patientName")
+    assert result1 == "patient_name"
+    assert _normalize_key.cache_info().misses == 1
+    assert _normalize_key.cache_info().hits == 0
+
+    # Second call with identical key: cache hit
+    result2 = _normalize_key("patientName")
+    assert result2 == "patient_name"
+    assert _normalize_key.cache_info().misses == 1
+    assert _normalize_key.cache_info().hits == 1
+
+    # Multiple clinical keys in loop
+    keys = ["patientName", "DOB", "dateOfBirth", "patientName", "DOB", "patientName"]
+    for k in keys:
+        _normalize_key(k)
+    info = _normalize_key.cache_info()
+    assert info.misses == 3
+    assert info.hits == 5
+
+
+def test_normalize_key_equivalence():
+    """Verify equivalence between cached and uncached normalization across clinical keys."""
+    sample_keys = [
+        "patient_name",
+        "patientName",
+        "PatientName",
+        "PATIENT_NAME",
+        "patient-name",
+        "patient.name",
+        "DOB",
+        "SSN",
+        "dateOfBirth",
+        "DATE_OF_BIRTH",
+        "subject_key",
+        "record_id",
+        123,
+        "",
+        None,
+        "  custom_field_name  ",
+    ]
+    for key in sample_keys:
+        assert _normalize_key(key) == _normalize_key_uncached(key)
+        assert _normalize_key(key) == _normalize_key_cached(key)
+
+
+def test_normalize_key_unhashable_fallback():
+    """Verify that unhashable keys fall back to uncached normalization without TypeError."""
+    unhashable_keys = [
+        ["patient", "name"],
+        {"field": "patientName"},
+        {"sub": 1},
+        {"dob"},
+    ]
+    for key in unhashable_keys:
+        norm = _normalize_key(key)
+        expected = _normalize_key_uncached(key)
+        assert norm == expected
+
+
+def test_normalize_key_cache_clear():
+    """Verify that cache_clear properly clears cached items."""
+    _normalize_key("clinical_test_key_1")
+    _normalize_key("clinical_test_key_2")
+    assert _normalize_key.cache_info().currsize >= 2
+    _normalize_key.cache_clear()
+    assert _normalize_key.cache_info().currsize == 0
+    assert _normalize_key.cache_info().hits == 0
+    assert _normalize_key.cache_info().misses == 0
+
+
+def test_sensitivity_registry_with_unhashable_and_repeated_keys():
+    """Verify SensitivityRegistry handles unhashable and repeated keys safely."""
+    registry = SensitivityRegistry()
+    assert not registry.is_sensitive(["unhashable_key"])
+    assert not registry.is_sensitive({"nested": "dict"})
+    registry.add_sensitive_key("patientName")
+    assert registry.is_sensitive("patientName")
+    assert registry.is_sensitive("patient_name")

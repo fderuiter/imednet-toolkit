@@ -43,15 +43,9 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
-          packages=()
-          for package in packages/*; do
-            if [ -f "$package/pyproject.toml" ]; then
-              packages+=("-e" "$package")
-            fi
-          done
-          packages+=("-e" ".[dev,docs]")
-          python -m pip install "${packages[@]}"
+          python -m pip install uv hatch
+          uv sync --locked --all-extras
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
       - name: Execute Live Test Suite & Detect Drift
         id: live_tests
