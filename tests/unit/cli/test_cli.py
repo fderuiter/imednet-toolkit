@@ -953,3 +953,167 @@ def test_nested_plugin_subparser_help(runner: CliRunner) -> None:
     assert "set" in result.stdout
     assert "reset" in result.stdout
     assert "iMednet SDK Command Line Interface" not in result.stdout
+
+
+def test_module_reload_without_dotenv_emits_no_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reloading imednet.cli when python-dotenv is not installed produces no stderr noise."""
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    capsys.readouterr()  # Flush any previous buffers
+    importlib.reload(cli)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_cli_help_without_dotenv_emits_no_stderr(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Displaying root CLI help when python-dotenv is not installed produces no stderr noise."""
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    result = runner.invoke(cli.app, ["--help"])
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert "iMednet SDK Command Line Interface" in result.stdout
+
+
+def test_cli_subparser_help_without_dotenv_emits_no_stderr(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Displaying subcommand help when python-dotenv is not installed produces no stderr noise."""
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    result = runner.invoke(cli.app, ["studies", "--help"])
+    assert result.exit_code == 0
+    assert result.stderr == ""
+
+
+def test_cli_command_with_env_credentials_without_dotenv_emits_no_stderr(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running an SDK command when credentials exist in env and dotenv is absent produces no stderr noise."""
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    sdk.studies.list.return_value = []
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 0
+    assert result.stderr == ""
+
+
+def test_get_sdk_without_dotenv_reports_missing_credentials(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing credentials when dotenv is not installed prints standard error without dotenv warning."""
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 1
+    assert "Warning: python-dotenv not installed" not in result.stderr
+    assert (
+        "Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set."
+        in result.stderr
+    )
+    assert result.stdout == ""
+
+
+def test_get_sdk_with_env_file_but_no_python_dotenv(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When a user provides a .env file without python-dotenv, the CLI displays missing credentials error."""
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("IMEDNET_API_KEY=file_key\nIMEDNET_SECURITY_KEY=file_secret\n")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 1
+    assert "Warning: python-dotenv not installed" not in result.stderr
+    assert (
+        "Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set."
+        in result.stderr
+    )
+    assert result.stdout == ""
+
+
+def test_get_sdk_lazily_loads_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_sdk lazily loads credentials via dotenv when absent from the environment."""
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
+
+    fake_dotenv = ModuleType("dotenv")
+    called = False
+
+    def fake_load_dotenv() -> None:
+        nonlocal called
+        called = True
+        os.environ["IMEDNET_API_KEY"] = "lazy_key_from_dotenv"
+        os.environ["IMEDNET_SECURITY_KEY"] = "lazy_sec_from_dotenv"
+
+    fake_dotenv.load_dotenv = fake_load_dotenv  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    from imednet.cli.utils.context import get_sdk
+
+    sdk_instance = get_sdk()
+    try:
+        assert called is True
+        assert sdk_instance.config.api_key == "lazy_key_from_dotenv"
+        assert sdk_instance.config.security_key == "lazy_sec_from_dotenv"
+    finally:
+        sdk_instance.close()
+
+
+def test_get_sdk_skips_dotenv_when_credentials_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_sdk does not attempt to load dotenv when credentials already exist in environment."""
+    monkeypatch.setenv("IMEDNET_API_KEY", "env_key")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "env_secret")
+
+    fake_dotenv = ModuleType("dotenv")
+    called = False
+
+    def fake_load_dotenv() -> None:
+        nonlocal called
+        called = True
+
+    fake_dotenv.load_dotenv = fake_load_dotenv  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    from imednet.cli.utils.context import get_sdk
+
+    sdk_instance = get_sdk()
+    try:
+        assert called is False
+        assert sdk_instance.config.api_key == "env_key"
+        assert sdk_instance.config.security_key == "env_secret"
+    finally:
+        sdk_instance.close()
+
+
+def test_get_sdk_handles_dotenv_parse_error_gracefully(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """get_sdk ignores dotenv parse or loading errors gracefully and reports missing credentials."""
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
+
+    fake_dotenv = ModuleType("dotenv")
+
+    def broken_load() -> None:
+        raise ValueError("Malformed .env file syntax error")
+
+    fake_dotenv.load_dotenv = broken_load  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 1
+    assert "Malformed .env file syntax error" not in result.stderr
+    assert (
+        "Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set."
+        in result.stderr
+    )

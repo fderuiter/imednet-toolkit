@@ -7,16 +7,6 @@ import os
 import sys
 from typing import Any
 
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:
-    print(
-        "Warning: python-dotenv not installed. Install with `pip install 'imednet[cli]'` to load .env files automatically.",
-        file=sys.stderr,
-    )
-
 from ..integrations import SinkConfig
 from ..integrations.export import (
     export_to_csv,
