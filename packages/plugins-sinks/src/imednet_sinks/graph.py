@@ -66,16 +66,12 @@ if TYPE_CHECKING:
 
 from imednet.errors import ExportConfigurationError
 from imednet.sdk import ImednetSDK
-from imednet.spi.sinks import (
+from imednet.spi.sink_base import (
     ExportSink,
     SinkConfig,
+    _redact_uri,
+    _require_optional_dep,
     iter_batches,
-)
-from imednet.spi.sinks import (
-    redact_uri as _redact_uri,
-)
-from imednet.spi.sinks import (
-    require_optional_dep as _require_optional_dep,
 )
 
 logger = logging.getLogger(__name__)

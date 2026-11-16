@@ -77,16 +77,12 @@ if TYPE_CHECKING:
 
 from imednet.errors import ExportConfigurationError
 from imednet.sdk import ImednetSDK
-from imednet.spi.sinks import (
+from imednet.spi.sink_base import (
     ExportSink,
     SinkConfig,
+    _redact_uri,
+    _require_optional_dep,
     iter_batches,
-)
-from imednet.spi.sinks import (
-    redact_uri as _redact_uri,
-)
-from imednet.spi.sinks import (
-    require_optional_dep as _require_optional_dep,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,7 +246,7 @@ def export_to_mongodb(
     config: MongoDbSinkConfig | None = None,
 ) -> int:
     """Export study records to MongoDB using :class:`MongoDbExportSink`."""
-    from imednet.spi.sinks import apply_quality_gate
+    from imednet.spi.sink_base import apply_quality_gate
 
     if config is None:
         config = MongoDbSinkConfig(
