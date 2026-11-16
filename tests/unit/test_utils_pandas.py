@@ -7,11 +7,12 @@ import pandas as pd
 import pytest
 
 from imednet.models.records import Record
-from imednet.utils.pandas import export_records_csv, records_to_dataframe
+from imednet.models.subjects import Subject
+from imednet.utils.pandas import export_records_csv, records_to_dataframe, subjects_to_dataframe
 
 
 def _sample_record() -> Record:
-    """Helper function to  sample record."""
+    """Helper function to sample record."""
     return Record(
         record_id=1,
         subject_key="S1",
@@ -20,6 +21,39 @@ def _sample_record() -> Record:
         record_status="Complete",
         record_data={"AGE": 30},
     )
+
+
+def _sample_subject() -> Subject:
+    """Helper function to sample subject."""
+    return Subject(
+        subject_key="SUB1",
+        subject_id=101,
+        site_id=5,
+    )
+
+
+def test_subjects_to_dataframe_success() -> None:
+    """Test converting subjects to a pandas DataFrame."""
+    subj = _sample_subject()
+    df = subjects_to_dataframe([subj])
+    assert not df.empty
+    assert len(df) == 1
+    assert df.loc[0, "subject_key"] == "SUB1"
+    assert df.loc[0, "subject_id"] == 101
+    assert df.loc[0, "site_id"] == 5
+
+
+def test_subjects_to_dataframe_empty() -> None:
+    """Test converting empty subjects collection to DataFrame."""
+    df = subjects_to_dataframe([])
+    assert df.empty
+
+
+def test_subjects_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
+    """Test that subjects_to_dataframe raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for subjects_to_dataframe"):
+        subjects_to_dataframe([])
 
 
 def test_records_to_dataframe_flatten() -> None:

@@ -14,6 +14,7 @@ from .typing import FilterValue, ItemId, JsonDict
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "flatten": ("imednet.utils.serialization", "flatten"),
     "to_arrow_table": ("imednet.utils.arrow", "to_arrow_table"),
+    "subjects_to_dataframe": ("imednet.utils.pandas", "subjects_to_dataframe"),
     "records_to_dataframe": ("imednet.utils.pandas", "records_to_dataframe"),
     "export_records_csv": ("imednet.utils.pandas", "export_records_csv"),
     "parse_bool": ("imednet.utils.validators", "parse_bool"),
@@ -67,6 +68,7 @@ __all__ = [
     "records_to_dataframe",
     "sanitize_base_url",
     "sanitize_csv_formula",
+    "subjects_to_dataframe",
     "to_arrow_table",
     "validate_partition_key",
 ]

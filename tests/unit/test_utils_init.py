@@ -7,6 +7,10 @@ from imednet import utils
 
 def test_lazy_load_pandas_functions() -> None:
     """Test that lazy load pandas functions."""
+    func_subj = utils.subjects_to_dataframe
+    from imednet.utils.pandas import subjects_to_dataframe as expected_stodf
+
+    assert func_subj is expected_stodf
     func = utils.records_to_dataframe
     from imednet.utils.pandas import records_to_dataframe as expected_rtodf
 

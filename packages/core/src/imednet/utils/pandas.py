@@ -9,10 +9,26 @@ try:
 except ImportError:
     pd: Any = None  # type: ignore[no-redef]
 from ..models.records import Record
+from ..models.subjects import Subject
 from .security import sanitize_csv_formula
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
     from ..sdk import ImednetSDK
+
+
+def subjects_to_dataframe(subjects: list[Subject]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.subjects.Subject` to a DataFrame.
+
+    Each subject model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for subjects_to_dataframe. Install with \"pip install 'imednet[export]'\"."
+        )
+
+    subject_dicts = [s.model_dump(by_alias=False) for s in subjects]
+    return pd.DataFrame(subject_dicts)
 
 
 def records_to_dataframe(records: list[Record], *, flatten: bool = False) -> pd.DataFrame:
