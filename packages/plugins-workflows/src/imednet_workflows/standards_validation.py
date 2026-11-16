@@ -17,6 +17,18 @@ class NormalizationResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+def _normalize_lookups(
+    terminology_lookups: dict[str, dict[str, str]] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Normalize terminology lookup keys for case-insensitive matching."""
+    if not terminology_lookups:
+        return {}
+    return {
+        field_name: {str(key).strip().upper(): value for key, value in lookup.items()}
+        for field_name, lookup in terminology_lookups.items()
+    }
+
+
 class CategoricalNormalizer:
     """Normalizes categorical values in data records using terminology lookups."""
 
@@ -24,27 +36,33 @@ class CategoricalNormalizer:
         self,
         record: dict[str, Any],
         *,
-        terminology_lookups: dict[str, dict[str, str]],
+        terminology_lookups: dict[str, dict[str, str]] | None = None,
+        normalized_lookups: dict[str, dict[str, str]] | None = None,
     ) -> NormalizationResult:
         """Normalize a single data record.
 
         Args:
             record: The raw data record as a dictionary.
-            terminology_lookups: A mapping of field names to their terminology maps.
+            terminology_lookups: Optional mapping of field names to their terminology maps.
+            normalized_lookups: Optional precomputed normalized terminology lookups.
 
         Returns:
             A NormalizationResult containing the normalized record and any warnings.
         """
         normalized_record: dict[str, Any] = {}
         warnings: list[str] = []
-        normalized_lookups = self._normalize_lookups(terminology_lookups)
+        lookups = (
+            normalized_lookups
+            if normalized_lookups is not None
+            else self._normalize_lookups(terminology_lookups)
+        )
 
         subject_key = record.get("subjectKey") or record.get("subject_key")
         for field_name, raw_value in record.items():
             normalized_value, warning_message = self._normalize_value(
                 field_name=field_name,
                 raw_value=raw_value,
-                normalized_lookups=normalized_lookups,
+                normalized_lookups=lookups,
                 subject_key=subject_key,
             )
             normalized_record[field_name] = normalized_value
@@ -53,14 +71,17 @@ class CategoricalNormalizer:
 
         return NormalizationResult(normalized_record=normalized_record, warnings=warnings)
 
+    def normalize_lookups(
+        self, terminology_lookups: dict[str, dict[str, str]] | None = None
+    ) -> dict[str, dict[str, str]]:
+        """Normalize terminology lookup keys for case-insensitive matching."""
+        return _normalize_lookups(terminology_lookups)
+
     def _normalize_lookups(
-        self, terminology_lookups: dict[str, dict[str, str]]
+        self, terminology_lookups: dict[str, dict[str, str]] | None = None
     ) -> dict[str, dict[str, str]]:
         """Internal helper to normalize terminology lookup keys for case-insensitive matching."""
-        return {
-            field_name: {str(key).strip().upper(): value for key, value in lookup.items()}
-            for field_name, lookup in terminology_lookups.items()
-        }
+        return self.normalize_lookups(terminology_lookups)
 
     def _normalize_value(
         self,
@@ -114,6 +135,14 @@ class StandardsReadinessValidator:
         self._profile = profile
         self._normalizer = normalizer or CategoricalNormalizer()
 
+    def _normalize_lookups(
+        self, terminology_lookups: dict[str, dict[str, str]] | None = None
+    ) -> dict[str, dict[str, str]]:
+        """Internal helper to normalize terminology lookup keys for case-insensitive matching."""
+        if hasattr(self._normalizer, "normalize_lookups"):
+            return self._normalizer.normalize_lookups(terminology_lookups)
+        return _normalize_lookups(terminology_lookups)
+
     def score_records(
         self,
         *,
@@ -134,12 +163,13 @@ class StandardsReadinessValidator:
         violations: list[ValidationViolation] = []
         successfully_validated_fields = 0
         total_expected_fields = 0
+        normalized_lookups = self._normalize_lookups(lookups)
 
         for domain, records in records_by_domain.items():
             expected_fields = self._profile.expected_fields(domain)
             for record in records:
                 normalization_result = self._normalizer.normalize_record(
-                    record, terminology_lookups=lookups
+                    record, normalized_lookups=normalized_lookups
                 )
                 warnings.extend(normalization_result.warnings)
 
