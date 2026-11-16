@@ -173,6 +173,15 @@ dependencies = [
 ]
 
 [tool.hatch.envs.default.scripts]
+verify-static = [
+    "ruff format --check .",
+    "ruff check .",
+    "mypy packages/core/src/imednet",
+    "mypy packages/plugins-workflows/src/imednet_workflows",
+    "mypy packages/providers-airflow/src/apache_airflow_providers_imednet",
+]
+verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov-fail-under=90"
+verify = ["verify-static", "verify-tests", "docs"]
 test = "pytest --ignore=tests/live/ {args:tests/}"
 docs = "python scripts/build_docs.py"
 build-docs = "python scripts/build_docs.py"

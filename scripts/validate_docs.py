@@ -199,7 +199,7 @@ def check_adr_records() -> bool:
 def check_sphinx_githubpages_extension() -> bool:
     """Validate that sphinx.ext.githubpages is registered in docs/conf.py."""
     print("Checking for sphinx.ext.githubpages in docs/conf.py...")
-    conf_py = Path("docs/conf.py")
+    conf_py = Path(__file__).resolve().parents[1] / "docs" / "conf.py"
     if not conf_py.exists():
         print(f"Error: {conf_py} not found.")
         return True
@@ -231,7 +231,7 @@ def check_sphinx_githubpages_extension() -> bool:
 def check_sphinx_html_baseurl() -> bool:
     """Validate that html_baseurl is configured with the expected canonical URL in docs/conf.py."""
     print("Checking for html_baseurl in docs/conf.py...")
-    conf_py = Path("docs/conf.py")
+    conf_py = Path(__file__).resolve().parents[1] / "docs" / "conf.py"
     if not conf_py.exists():
         print(f"Error: {conf_py} not found.")
         return True
@@ -243,7 +243,7 @@ def check_sphinx_html_baseurl() -> bool:
         print(f"Error parsing {conf_py}: {e}")
         return True
 
-    expected_baseurl = "https://fderuiter.github.io/imednet-python-sdk/"
+    expected_baseurl = "https://fderuiter.github.io/imednet-toolkit/"
     for node in ast.walk(tree):
         val = None
         if isinstance(node, ast.Assign):

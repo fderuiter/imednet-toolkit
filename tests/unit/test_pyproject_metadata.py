@@ -105,7 +105,7 @@ def test_sphinx_conf_defines_canonical_html_baseurl() -> None:
             break
 
     assert baseurl is not None, "html_baseurl must be defined in docs/conf.py"
-    assert baseurl == "https://fderuiter.github.io/imednet-python-sdk/"
+    assert baseurl == "https://fderuiter.github.io/imednet-toolkit/"
     assert baseurl.startswith("https://")
     assert baseurl.endswith("/")
 
@@ -126,7 +126,7 @@ def test_validate_docs_sphinx_html_baseurl_error_cases(monkeypatch: pytest.Monke
         Path,
         "read_text",
         lambda self, *args, **kwargs: (
-            'html_baseurl = "https://fderuiter.github.io/imednet-python-sdk"'
+            'html_baseurl = "https://fderuiter.github.io/imednet-toolkit"'
         ),
     )
     assert check_sphinx_html_baseurl() is True
@@ -148,3 +148,8 @@ def test_validate_docs_sphinx_html_baseurl_error_cases(monkeypatch: pytest.Monke
         lambda self, *args, **kwargs: 'html_baseurl = "https://example.com/docs/"',
     )
     assert check_sphinx_html_baseurl() is True
+
+
+def test_baseurl_validation_is_independent_of_working_directory(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    assert check_sphinx_html_baseurl() is False

@@ -28,30 +28,29 @@ Before proposing any solution, execute and pass all CI quality gates locally.
 
       hatch run docs
 
-Alternatively, if running via ``uv`` directly:
+Canonical tasks
+---------------
 
-.. code-block:: bash
+``pyproject.toml`` defines ``hatch run verify-static`` (format, lint and the
+three typing targets), ``hatch run verify-tests`` (offline workspace tests and
+90% coverage), and ``hatch run docs`` (strict documentation checks).
+``hatch run verify`` runs these same tasks in order; the Pipeline quality job
+invokes it directly. The expanded commands above are useful for diagnostics.
 
-   # Ensure UTF-8 console output (especially on Windows)
-   export PYTHONUTF8=1    # or in PowerShell: $env:PYTHONUTF8 = "1"
+Install with ``uv sync --locked --extra dev --extra docs`` or the setup wizard;
+no real credentials or live EDC access are required. Run pre-commit first and
+``uvx hatch run quality:all packages`` as well for the existing security, dead-code,
+spelling and similarity gates. The fast global Ruff check is an early subset;
+package/Python matrix jobs supplement the full workspace gate. Duplicate global
+similarity execution is removed; the canonical ``lint:pylint-sim`` and
+``duplication:check`` tasks retain their documented scopes and thresholds.
 
-   # Initialize environment via wizard or manual sync
-   bash scripts/wizards/setup-imednet-env.sh
-   # OR:
-   uv sync --extra dev --extra docs
+Fuzzing/performance tracks require their pytest flags; container integration
+requires ``IMEDNET_TEST_CONTAINERS=1``. Live tests remain outside the default
+suite and require explicit authorization and the live-test charter. Security
+exception ownership and review dates are in :doc:`/reference/security_exceptions`.
 
-   # Quality gate
-   uvx pre-commit run --all-files
-   uv run ruff format --check .
-   uv run ruff check .
-   uv run mypy packages/core/src/imednet
-   uv run mypy packages/plugins-workflows/src/imednet_workflows
-   uv run mypy packages/providers-airflow/src/apache_airflow_providers_imednet
-   uv run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov-fail-under=90
-   uv run python scripts/build_docs.py
-
-   # Security vulnerability audit (shared policy with CI)
-   uvx hatch run lint:audit
-
-The audit policy and scanner-only upstream exceptions are documented in
-:doc:`/reference/security_exceptions`. No filelock advisories are suppressed.
+With uv, run the expanded commands above via ``uv run`` and build documentation
+with ``uv run python scripts/build_docs.py``. The Hatch and uv routes use the
+same repository configuration and installed package sources; do not skip gates
+when using a different environment manager.

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
-import xml.etree.ElementTree as ET
+
+# Serialization only: this module never parses XML; defusedxml has no Element builder.
+import xml.etree.ElementTree as ET  # nosemgrep: python.lang.security.use-defused-xml.use-defused-xml
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
