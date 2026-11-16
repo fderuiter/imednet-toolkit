@@ -101,6 +101,9 @@ def main():
     print("Generating ADR index...")
     generate_adr_index()
 
+    print("Generating REST reference tables...")
+    run_command([sys.executable, "scripts/generate_rest_reference.py"])
+
     print("Validating mermaid diagrams...")
     run_command([sys.executable, "scripts/validate_diagrams.py"])
 
