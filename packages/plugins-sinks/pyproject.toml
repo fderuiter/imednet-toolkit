@@ -19,6 +19,10 @@ mongodb = ["pymongo>=4.0,<5.0"]
 snowflake = ["pyarrow>=14.0.1"]
 all = ["neo4j>=6.2.0,<7.0.0", "pymongo>=4.0,<5.0", "pyarrow>=14.0.1"]
 
+[project.urls]
+repository = "https://github.com/fderuiter/imednet-toolkit"
+documentation = "https://fderuiter.github.io/imednet-toolkit/"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -24,8 +24,8 @@ Before executing any task, audit the active dependency stack. Do not assume the 
      - ``pyproject.toml``
      - ``pydantic`` v2
    * - CLI framework
-     - ``pyproject.toml``
-     - ``typer[all]``
+     - ``packages/core/src/imednet/cli``
+     - standard-library ``argparse``
    * - Retry logic
      - ``pyproject.toml``
      - ``tenacity``

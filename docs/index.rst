@@ -308,6 +308,7 @@ This documentation is organized according to the Diátaxis framework into four m
 
    reference/rest_api_reference
    reference/configuration
+   reference/compatibility
    reference/agent_rules
    reference/refactoring_roadmaps
    reference/test_skip_conditions
