@@ -98,3 +98,7 @@ data_dictionary_*.json
 
 # Local DuckDB databases
 *.duckdb
+
+# Agent worktrees and Superpowers temporary artifacts
+.worktrees
+.superpowers
