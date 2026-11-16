@@ -167,26 +167,14 @@ def test_validate_record_missing_form_identifier(async_mode: bool) -> None:
         sdk.get_variables.assert_not_called()
 
 
-def test_schema_validator_is_async_deprecation_warning() -> None:
-    """Test that schema validator is async deprecation warning."""
+def test_schema_validator_rejects_is_async() -> None:
+    """Test that SchemaValidator rejects the obsolete is_async argument."""
     sdk = MagicMock()
-    with pytest.warns(
-        DeprecationWarning, match="Passing `is_async=True` to SchemaValidator is deprecated"
-    ):
-        validator = SchemaValidator(sdk, is_async=True)
+    with pytest.raises(TypeError):
+        SchemaValidator(sdk, is_async=True)  # type: ignore[call-arg]
 
-    assert isinstance(validator, AsyncSchemaValidator)
-
-
-def test_schema_validator_is_async_positional_deprecation_warning() -> None:
-    """Test that schema validator is async positional deprecation warning."""
-    sdk = MagicMock()
-    with pytest.warns(
-        DeprecationWarning, match="Passing `is_async=True` to SchemaValidator is deprecated"
-    ):
-        validator = SchemaValidator(sdk, True)
-
-    assert isinstance(validator, AsyncSchemaValidator)
+    with pytest.raises(TypeError):
+        SchemaValidator(sdk, True)  # type: ignore[call-arg]
 
 
 def test_validate_record_with_none_value_does_not_raise() -> None:
