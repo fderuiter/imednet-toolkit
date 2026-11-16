@@ -12,6 +12,11 @@ def export_to_csv(*args: Any, **kwargs: Any) -> None:
     return _base_export.export_to_csv(*args, **kwargs)  # type: ignore
 
 
+def export_to_duckdb(*args: Any, **kwargs: Any) -> None:
+    """Wrap :func:`imednet.spi.export.export_to_duckdb` for Airflow compatibility."""
+    return _base_export.export_to_duckdb(*args, **kwargs)  # type: ignore
+
+
 def export_to_parquet(*args: Any, **kwargs: Any) -> None:
     """Wrap :func:`imednet.spi.export.export_to_parquet` for Airflow compatibility."""
     return _base_export.export_to_parquet(*args, **kwargs)  # type: ignore
@@ -39,6 +44,7 @@ def export_to_sql_by_form(*args: Any, **kwargs: Any) -> None:
 
 __all__ = [
     "export_to_csv",
+    "export_to_duckdb",
     "export_to_excel",
     "export_to_json",
     "export_to_parquet",

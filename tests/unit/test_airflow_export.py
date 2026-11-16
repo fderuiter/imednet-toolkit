@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -61,6 +61,7 @@ def _setup_airflow(monkeypatch):
 
 EXPORT_FUNCTIONS = [
     "export_to_csv",
+    "export_to_duckdb",
     "export_to_parquet",
     "export_to_excel",
     "export_to_json",
@@ -142,3 +143,37 @@ with patch("imednet.integrations.export." + FUNC, side_effect=ImportError("optio
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_export_operator_dispatches_duckdb(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify operator dispatch with destination set to DuckDB."""
+    from apache_airflow_providers_imednet import export
+    from apache_airflow_providers_imednet.operators.export import (
+        _TABULAR_EXPORTS,
+        ImednetExportOperator,
+    )
+
+    assert _TABULAR_EXPORTS["duckdb"] is export.export_to_duckdb
+
+    mock_sdk = MagicMock()
+    mock_export = MagicMock()
+    monkeypatch.setattr(export, "export_to_duckdb", mock_export)
+
+    op = ImednetExportOperator(
+        task_id="test_duckdb_export",
+        study_key="STUDY-123",
+        destination="duckdb",
+        output_path="/tmp/test_study.duckdb",
+        export_kwargs={"table_name": "clinical_records"},
+    )
+    monkeypatch.setattr(op, "_get_sdk", lambda: mock_sdk)
+
+    result = op.execute({})
+
+    mock_export.assert_called_once_with(
+        mock_sdk,
+        "STUDY-123",
+        "/tmp/test_study.duckdb",
+        table_name="clinical_records",
+    )
+    assert result == "/tmp/test_study.duckdb"
