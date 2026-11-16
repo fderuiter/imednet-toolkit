@@ -6,6 +6,7 @@ import copy
 import json
 from pathlib import Path
 
+from defusedxml.ElementTree import fromstring
 from tests.unit.datadict.test_datadict_cdisc_odm_loader import SAMPLE_ODM_XML
 
 from imednet.datadict.emit import (
@@ -243,3 +244,192 @@ def test_odm_round_trip_fidelity() -> None:
                 assert c_reloaded.choiceValue == c_init.choiceValue
                 assert c_reloaded.choiceText == c_init.choiceText
                 assert c_reloaded.position == c_init.position
+
+
+def test_to_odm_xml_sdtm_attributes_emission() -> None:
+    """Verify emission of SDTM attributes on ItemGroupDef and ItemDef elements."""
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_SDTM"),
+        forms=[
+            Form(
+                formKey="DM",
+                formName="Demographics",
+                extraAttributes={"Domain": "DM", "SASDatasetName": "DM"},
+                variables=[
+                    Variable(
+                        variableName="SUBJID",
+                        label="Subject Identifier",
+                        variableType="Text",
+                        sequence=1,
+                        extraAttributes={
+                            "SDSVarName": "SUBJID",
+                            "SASFieldName": "SUBJID",
+                            "Origin": "CRF",
+                            "Comment": "Subject Identifier",
+                        },
+                    ),
+                    Variable(
+                        variableName="AGE",
+                        label="Age",
+                        variableType="Integer",
+                        sequence=2,
+                        extraAttributes={
+                            "SDSVarName": "AGE",
+                            "SASFieldName": "AGE",
+                            "Origin": "Assigned",
+                            "Comment": "Age in years",
+                        },
+                    ),
+                    Variable(
+                        variableName="BLANK_SDTM",
+                        label="Blank SDTM Attributes",
+                        variableType="Text",
+                        sequence=3,
+                        extraAttributes={
+                            "SDSVarName": "",
+                            "SASFieldName": "   ",
+                            "Origin": None,
+                            "Comment": "",
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    # ItemGroupDef attributes
+    ig_elem = root.find(".//odm:ItemGroupDef[@OID='IG_DM']", ns)
+    assert ig_elem is not None
+    assert ig_elem.attrib.get("Domain") == "DM"
+    assert ig_elem.attrib.get("SASDatasetName") == "DM"
+
+    # ItemDef attributes for SUBJID
+    subjid_elem = root.find(".//odm:ItemDef[@OID='SUBJID']", ns)
+    assert subjid_elem is not None
+    assert subjid_elem.attrib.get("SDSVarName") == "SUBJID"
+    assert subjid_elem.attrib.get("SASFieldName") == "SUBJID"
+    assert subjid_elem.attrib.get("Origin") == "CRF"
+    assert subjid_elem.attrib.get("Comment") == "Subject Identifier"
+
+    # ItemDef attributes for AGE
+    age_elem = root.find(".//odm:ItemDef[@OID='AGE']", ns)
+    assert age_elem is not None
+    assert age_elem.attrib.get("SDSVarName") == "AGE"
+    assert age_elem.attrib.get("SASFieldName") == "AGE"
+    assert age_elem.attrib.get("Origin") == "Assigned"
+    assert age_elem.attrib.get("Comment") == "Age in years"
+
+    # ItemDef for BLANK_SDTM: null, empty, and whitespace attributes must be omitted
+    blank_elem = root.find(".//odm:ItemDef[@OID='BLANK_SDTM']", ns)
+    assert blank_elem is not None
+    assert "SDSVarName" not in blank_elem.attrib
+    assert "SASFieldName" not in blank_elem.attrib
+    assert "Origin" not in blank_elem.attrib
+    assert "Comment" not in blank_elem.attrib
+
+
+def test_to_odm_xml_sdtm_fallback_to_child_variables() -> None:
+    """Verify fallback to child variables when form metadata lacks dataset attributes."""
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_FALLBACK"),
+        forms=[
+            Form(
+                formKey="VS",
+                formName="Vital Signs",
+                extraAttributes={},
+                variables=[
+                    Variable(
+                        variableName="SYSBP",
+                        label="Systolic Blood Pressure",
+                        variableType="Integer",
+                        sequence=1,
+                        extraAttributes={
+                            "Domain": "VS",
+                            "SASDatasetName": "VS",
+                            "SDSVarName": "SYSBP",
+                        },
+                    )
+                ],
+            ),
+            Form(
+                formKey="EMPTY_FORM",
+                formName="Form Without Variables",
+                extraAttributes={"Domain": "   ", "SASDatasetName": ""},
+                variables=[],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    # VS ItemGroupDef should populate Domain and SASDatasetName from child variable
+    vs_ig = root.find(".//odm:ItemGroupDef[@OID='IG_VS']", ns)
+    assert vs_ig is not None
+    assert vs_ig.attrib.get("Domain") == "VS"
+    assert vs_ig.attrib.get("SASDatasetName") == "VS"
+
+    # EMPTY_FORM ItemGroupDef should omit Domain and SASDatasetName cleanly
+    empty_ig = root.find(".//odm:ItemGroupDef[@OID='IG_EMPTY_FORM']", ns)
+    assert empty_ig is not None
+    assert "Domain" not in empty_ig.attrib
+    assert "SASDatasetName" not in empty_ig.attrib
+
+
+def test_odm_round_trip_sdtm_preservation() -> None:
+    """Verify round-trip preservation of all six SDTM attributes between loader and emitter."""
+    sdtm_source_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3" FileType="Snapshot" FileOID="SDTM_RT_01" CreationDateTime="2026-11-16T12:00:00">
+  <Study OID="STUDY_SDTM_RT">
+    <MetaDataVersion OID="MDV_001" Name="SDTM Round Trip Version">
+      <FormDef OID="DM" Name="Demographics">
+        <ItemGroupRef ItemGroupOID="IG_DM" OrderNumber="1"/>
+      </FormDef>
+      <ItemGroupDef OID="IG_DM" Name="Demographics Details" Domain="DM" SASDatasetName="DM">
+        <ItemRef ItemOID="SUBJID" OrderNumber="1"/>
+        <ItemRef ItemOID="AGE" OrderNumber="2"/>
+      </ItemGroupDef>
+      <ItemDef OID="SUBJID" Name="Subject ID" DataType="text"
+               SDSVarName="SUBJID" SASFieldName="SUBJID" Origin="CRF" Comment="Subject Identifier"/>
+      <ItemDef OID="AGE" Name="Age" DataType="integer"
+               SDSVarName="AGE" SASFieldName="AGE" Origin="Assigned" Comment="Age in years"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>"""
+
+    # 1. Load initial XML with strict=True
+    dd_initial = load_from_cdisc_odm(sdtm_source_xml, strict=True)
+    assert dd_initial.metadata.validationWarnings == []
+
+    # 2. Serialize to ODM XML
+    exported_xml = to_odm_xml(dd_initial)
+
+    # 3. Reload exported XML with strict=True
+    dd_reloaded = load_from_cdisc_odm(exported_xml, strict=True)
+    assert dd_reloaded.metadata.validationWarnings == []
+
+    # 4. Verify all six SDTM attributes preserved on reloaded model
+    form_dm = next(f for f in dd_reloaded.forms if f.formKey == "DM")
+    assert form_dm.extraAttributes.get("Domain") == "DM"
+    assert form_dm.extraAttributes.get("SASDatasetName") == "DM"
+
+    v_subjid = next(v for v in form_dm.variables if v.variableName == "SUBJID")
+    assert v_subjid.extraAttributes.get("Domain") == "DM"
+    assert v_subjid.extraAttributes.get("SASDatasetName") == "DM"
+    assert v_subjid.extraAttributes.get("SDSVarName") == "SUBJID"
+    assert v_subjid.extraAttributes.get("SASFieldName") == "SUBJID"
+    assert v_subjid.extraAttributes.get("Origin") == "CRF"
+    assert v_subjid.extraAttributes.get("Comment") == "Subject Identifier"
+
+    v_age = next(v for v in form_dm.variables if v.variableName == "AGE")
+    assert v_age.extraAttributes.get("Domain") == "DM"
+    assert v_age.extraAttributes.get("SASDatasetName") == "DM"
+    assert v_age.extraAttributes.get("SDSVarName") == "AGE"
+    assert v_age.extraAttributes.get("SASFieldName") == "AGE"
+    assert v_age.extraAttributes.get("Origin") == "Assigned"
+    assert v_age.extraAttributes.get("Comment") == "Age in years"

@@ -2,6 +2,7 @@
 
 import pytest
 
+from imednet.core.context import set_study_context
 from imednet.endpoints import forms
 from imednet.errors import NotFoundError
 from imednet.errors.validation import ConfigurationError
@@ -9,7 +10,7 @@ from imednet.models.forms import Form
 
 
 def test_list_requires_study_key_and_page_size(
-    monkeypatch, dummy_client, context, paginator_factory, patch_build_filter
+    monkeypatch, dummy_client, paginator_factory, patch_build_filter
 ):
     """Test that list requires study key and page size."""
     ep = forms.FormsEndpoint(dummy_client)
@@ -19,7 +20,7 @@ def test_list_requires_study_key_and_page_size(
     with pytest.raises(ConfigurationError):
         ep.list()
 
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     result = ep.list(status="new")
 
     assert captured["path"] == "/api/v1/edc/studies/S1/forms"

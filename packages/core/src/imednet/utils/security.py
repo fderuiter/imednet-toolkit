@@ -1,5 +1,6 @@
 """Security utilities."""
 
+import functools
 import re
 from typing import Any
 
@@ -11,13 +12,8 @@ _CAMEL_TO_SNAKE_RE2 = re.compile(r"([a-z\d])([A-Z])")
 _DELIMITER_RE = re.compile(r"[^a-zA-Z0-9]+")
 
 
-def _normalize_key(key: Any) -> str:
-    """Normalize a field key to canonical lowercase snake_case.
-
-    Converts camelCase, PascalCase, uppercase acronyms, and delimited names
-    (hyphens, whitespace, etc.) into lowercase snake_case. Non-string inputs
-    are converted to strings first.
-    """
+def _normalize_key_uncached(key: Any) -> str:
+    """Normalize a field key to canonical lowercase snake_case without caching."""
     if key is None:
         return ""
     s = str(key).strip()
@@ -27,6 +23,29 @@ def _normalize_key(key: Any) -> str:
     s = _CAMEL_TO_SNAKE_RE2.sub(r"\1_\2", s)
     s = _DELIMITER_RE.sub("_", s)
     return s.strip("_").lower()
+
+
+@functools.lru_cache(maxsize=4096)
+def _normalize_key_cached(key: Any) -> str:
+    """LRU-cached key normalization helper."""
+    return _normalize_key_uncached(key)
+
+
+def _normalize_key(key: Any) -> str:
+    """Normalize a field key to canonical lowercase snake_case.
+
+    Converts camelCase, PascalCase, uppercase acronyms, and delimited names
+    (hyphens, whitespace, etc.) into lowercase snake_case. Non-string inputs
+    are converted to strings first.
+    """
+    try:
+        return _normalize_key_cached(key)
+    except TypeError:
+        return _normalize_key_uncached(key)
+
+
+_normalize_key.cache_info = _normalize_key_cached.cache_info  # type: ignore[attr-defined]
+_normalize_key.cache_clear = _normalize_key_cached.cache_clear  # type: ignore[attr-defined]
 
 
 class SensitivityRegistry:

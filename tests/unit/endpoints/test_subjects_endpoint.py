@@ -2,16 +2,15 @@
 
 import pytest
 
+from imednet.core.context import set_study_context
 from imednet.endpoints import subjects
 from imednet.errors import NotFoundError
 from imednet.models.subjects import Subject
 
 
-def test_list_builds_path_with_default(
-    dummy_client, context, paginator_factory, patch_build_filter
-):
+def test_list_builds_path_with_default(dummy_client, paginator_factory, patch_build_filter):
     """Test that list builds path with default."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = subjects.SubjectsEndpoint(dummy_client)
     capture = paginator_factory(subjects, [{"subjectKey": "x"}])
     patch = patch_build_filter(subjects)
