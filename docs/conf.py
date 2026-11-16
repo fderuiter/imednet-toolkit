@@ -78,6 +78,8 @@ if not importlib.util.find_spec("pandas"):
     pandas_stub.DataFrame = DataFrame
     pandas_stub.json_normalize = json_normalize
     sys.modules["pandas"] = pandas_stub
+else:
+    import pandas  # noqa: F401
 
 from imednet import __version__ as imednet_version
 
