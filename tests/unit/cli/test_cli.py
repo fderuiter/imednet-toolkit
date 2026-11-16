@@ -953,3 +953,145 @@ def test_nested_plugin_subparser_help(runner: CliRunner) -> None:
     assert "set" in result.stdout
     assert "reset" in result.stdout
     assert "iMednet SDK Command Line Interface" not in result.stdout
+
+
+def test_module_reload_stderr_clean(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Module reload emits nothing to standard error even if dotenv is absent and .env exists."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("IMEDNET_API_KEY=test\nIMEDNET_SECURITY_KEY=test\n")
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    capsys.readouterr()
+    importlib.reload(cli)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_help_displays_stderr_clean(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Help displays emit clean stderr even if dotenv is absent and .env exists."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("IMEDNET_API_KEY=test\nIMEDNET_SECURITY_KEY=test\n")
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+
+    for args in [["--help"], [], ["studies"], ["studies", "--help"]]:
+        result = runner.invoke(cli.app, args)
+        assert result.exit_code == 0
+        assert result.stderr == ""
+
+
+def test_preset_credentials_clean_stderr(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, sdk: MagicMock, tmp_path: Path
+) -> None:
+    """Commands executed with preset credentials produce clean stderr without loading dotenv."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("IMEDNET_API_KEY=other\n")
+    monkeypatch.setenv("IMEDNET_API_KEY", "preset_key")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "preset_secret")
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+
+    sdk.studies.list.return_value = []
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 0
+    assert result.stderr == ""
+
+
+def test_dotenv_missing_warning_emitted_when_env_file_exists(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Warning is emitted only when credentials are unset, .env exists, and python-dotenv is missing."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("IMEDNET_API_KEY=key\n")
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 1
+    assert "Warning: python-dotenv not installed." in result.stderr
+
+
+def test_dotenv_missing_no_warning_when_no_env_file(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No warning is emitted when .env does not exist even if python-dotenv is missing."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 1
+    assert "Warning: python-dotenv not installed." not in result.stderr
+
+
+def test_dotenv_unreadable_file_handled_gracefully(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Missing read permissions or OS error on .env is handled gracefully without crashing."""
+    monkeypatch.chdir(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("IMEDNET_API_KEY=key\n")
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    def mock_isfile(path: str) -> bool:
+        raise OSError("Permission denied")
+
+    monkeypatch.setattr(os.path, "isfile", mock_isfile)
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 1
+    assert "IMEDNET_API_KEY" in result.stderr
+
+
+def test_dotenv_load_error_handled_gracefully(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """PermissionError or OSError during load_dotenv() is suppressed gracefully."""
+    monkeypatch.chdir(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("IMEDNET_API_KEY=key\n")
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    def mock_load_dotenv() -> None:
+        raise PermissionError("Access denied")
+
+    mock_dotenv = ModuleType("dotenv")
+    mock_dotenv.load_dotenv = mock_load_dotenv  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "dotenv", mock_dotenv)
+
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 1
+    assert "IMEDNET_API_KEY" in result.stderr
+
+
+def test_dotenv_loads_credentials_when_present(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, sdk: MagicMock, tmp_path: Path
+) -> None:
+    """When credentials are unset and .env exists, dotenv loads them."""
+    monkeypatch.chdir(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("IMEDNET_API_KEY=file_key\nIMEDNET_SECURITY_KEY=file_secret\n")
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    def mock_load_dotenv() -> None:
+        os.environ["IMEDNET_API_KEY"] = "file_key"
+        os.environ["IMEDNET_SECURITY_KEY"] = "file_secret"
+
+    mock_dotenv = ModuleType("dotenv")
+    mock_dotenv.load_dotenv = mock_load_dotenv  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "dotenv", mock_dotenv)
+
+    sdk.studies.list.return_value = []
+    result = runner.invoke(cli.app, ["studies", "list"])
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert os.environ.get("IMEDNET_API_KEY") == "file_key"
