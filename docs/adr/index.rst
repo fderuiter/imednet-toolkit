@@ -14,3 +14,4 @@ This section documents the architectural decisions made for the imednet toolkit.
    0002-pre-commit-velocity-and-tiering
    0003-pytest-test-boundaries-and-developer-environment-tooling
    0004-data-dictionary-standardization
+   0005-authentication-and-credential-capabilities

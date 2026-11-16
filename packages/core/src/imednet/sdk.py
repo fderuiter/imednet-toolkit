@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from importlib.metadata import EntryPoint, entry_points
 from typing import TYPE_CHECKING, Any, cast
 
+from .auth import AuthStrategy, CredentialSource
 from .config import Config, load_config
 from .core.context import study_context
 from .core.factory import ClientFactory
@@ -227,6 +228,9 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
         retry_policy: RetryPolicy | None = None,
         simulation_mode: bool | None = None,
         transport: Any = None,
+        *,
+        auth: AuthStrategy | None = None,
+        credential_source: CredentialSource | None = None,
     ) -> None:
         """Initialize the SDK with credentials and configuration.
 
@@ -243,7 +247,11 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
             retry_policy: Custom retry policy.
             simulation_mode: Toggle offline simulation mode.
             transport: Custom HTTP transport or SimulationTransport.
+            auth: Explicit authentication strategy, used instead of default credentials.
+            credential_source: Caller-owned credential source for client construction.
         """
+        if client is not None and auth is not None:
+            raise ValueError("An injected client already owns authentication")
         config = load_config(
             api_key=api_key,
             security_key=security_key,
@@ -251,6 +259,8 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
             timeout=timeout,
             strict_mode=strict_mode,
             simulation_mode=simulation_mode,
+            credential_source=credential_source if auth is None else None,
+            require_credentials=auth is None and client is None,
         )
 
         self.config = config
@@ -262,7 +272,7 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
 
             set_base_url_context(config.base_url)
 
-        if client:
+        if client is not None:
             self._client = client
         else:
             if retry_config is None and any(
@@ -281,6 +291,7 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
                 timeout=config.timeout,
                 retry_config=retry_config,
                 transport=transport,
+                auth=auth,
             )
 
         self._init_endpoints()
@@ -382,6 +393,9 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
         retry_policy: RetryPolicy | None = None,
         simulation_mode: bool | None = None,
         transport: Any = None,
+        *,
+        auth: AuthStrategy | None = None,
+        credential_source: CredentialSource | None = None,
     ) -> None:
         """Initialize the asynchronous SDK.
 
@@ -398,7 +412,11 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
             retry_policy: Custom retry policy.
             simulation_mode: Toggle offline simulation mode.
             transport: Custom HTTP transport or SimulationTransport.
+            auth: Explicit authentication strategy, used instead of default credentials.
+            credential_source: Caller-owned credential source for client construction.
         """
+        if async_client is not None and auth is not None:
+            raise ValueError("An injected client already owns authentication")
         config = load_config(
             api_key=api_key,
             security_key=security_key,
@@ -406,6 +424,8 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
             timeout=timeout,
             strict_mode=strict_mode,
             simulation_mode=simulation_mode,
+            credential_source=credential_source if auth is None else None,
+            require_credentials=auth is None and async_client is None,
         )
         self.config = config
         self._api_key = config.api_key
@@ -416,7 +436,7 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
 
             set_base_url_context(config.base_url)
 
-        if async_client:
+        if async_client is not None:
             self._async_client = async_client
         else:
             if retry_config is None and any(
@@ -435,6 +455,7 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
                 timeout=config.timeout,
                 retry_config=retry_config,
                 transport=transport,
+                auth=auth,
             )
 
         self._init_endpoints()
