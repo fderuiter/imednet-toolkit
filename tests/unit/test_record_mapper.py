@@ -1,7 +1,7 @@
 """Unit tests for record mapper."""
 
 import tracemalloc
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -10,8 +10,13 @@ from faker import Faker
 from pydantic import BaseModel, ValidationError
 
 from imednet.models.records import Record
+from imednet.models.reporting import AdverseEvent, DeviceDeficiency, ProtocolDeviation
 from imednet.models.variables import Variable
-from imednet_workflows.record_mapper import RecordMapper
+from imednet_workflows.record_mapper import (
+    RecordMapper,
+    format_iso8601_dtc,
+    transform_records_to_sdtm,
+)
 
 # A 5k-row chunk with two mapped columns should stay comfortably below this
 # threshold; a fully materialized 50k-row mapping regression would be
@@ -315,3 +320,274 @@ def test_iter_dataframes_streams_large_study_with_bounded_memory() -> None:
     loader.sync_records.assert_called_once_with("STUDY")
     assert chunk_sizes == [5_000] * 10
     assert peak_bytes < _STREAMING_PEAK_BYTES_LIMIT
+
+
+def test_format_iso8601_dtc() -> None:
+    """Test standard ISO 8601 DTC timestamp conversion."""
+    # Datetime object
+    assert format_iso8601_dtc(datetime(2026, 1, 15, 9, 30, 0)) == "2026-01-15T09:30:00"
+    # Date object
+    assert format_iso8601_dtc(date(2026, 1, 15)) == "2026-01-15"
+    # ISO string
+    assert format_iso8601_dtc("2026-01-15T09:30:00") == "2026-01-15T09:30:00"
+    # Standard format with space
+    assert format_iso8601_dtc("2026-01-15 09:30:00") == "2026-01-15T09:30:00"
+    # Date-only patterns
+    assert format_iso8601_dtc("01/15/2026") == "2026-01-15"
+    assert format_iso8601_dtc("2026-01-15") == "2026-01-15"
+    # None or empty
+    assert format_iso8601_dtc(None) is None
+    assert format_iso8601_dtc("") is None
+
+
+def test_record_mapper_sdtm_ae_domain() -> None:
+    """Test SDTM transformation for Adverse Events (AE domain)."""
+    sdk = MagicMock()
+    records = [
+        Record(
+            record_id=101,
+            subject_key="SUBJ-001",
+            visit_id=1,
+            form_id=20,
+            record_status="Complete",
+            date_created=datetime(2026, 1, 1),
+            record_data={
+                "aeTerm": "Headache",
+                "aeDecod": "Headache Preferred",
+                "aeSeverity": "MILD",
+                "aeSerious": False,
+                "aeStartDate": "2026-01-15 09:30:00",
+                "aeEndDate": "2026-01-16 18:00:00",
+                "aeOutcome": "Recovered",
+                "aeRelationship": "Not Related",
+                "aeActionTaken": "None",
+            },
+        ),
+        Record(
+            record_id=102,
+            subject_key="SUBJ-001",
+            visit_id=2,
+            form_id=20,
+            record_status="Complete",
+            date_created=datetime(2026, 2, 1),
+            record_data={
+                "aeTerm": "Nausea",
+                "aeDecod": "Nausea",
+                "aeSeverity": "SEVERE",
+                "aeSerious": True,
+                "aeStartDate": datetime(2026, 2, 1, 8, 0, 0),
+                "aeEndDate": None,
+                "aeOutcome": "Not Recovered",
+                "aeRelationship": "Probable",
+                "aeActionTaken": "Dose Reduced",
+            },
+        ),
+    ]
+    sdk.get_records.return_value = records
+
+    mapper = RecordMapper(sdk)
+    df = mapper.sdtm_dataframe(study_key="STUDY_ONCO_01", domain="AE")
+
+    assert not df.empty
+    # Validate required domain variables
+    expected_cols = [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "AESEQ",
+        "AETERM",
+        "AEDECOD",
+        "AESEV",
+        "AESER",
+        "AESTDTC",
+        "AEENDTC",
+        "AEOUT",
+        "AEREL",
+        "AEACN",
+    ]
+    for col in expected_cols:
+        assert col in df.columns
+
+    # Row 1 assertions
+    assert df.iloc[0]["STUDYID"] == "STUDY_ONCO_01"
+    assert df.iloc[0]["DOMAIN"] == "AE"
+    assert df.iloc[0]["USUBJID"] == "SUBJ-001"
+    assert df.iloc[0]["AESEQ"] == 1
+    assert df.iloc[0]["AETERM"] == "Headache"
+    assert df.iloc[0]["AESEV"] == "MILD"
+    assert df.iloc[0]["AESER"] == "N"
+    assert df.iloc[0]["AESTDTC"] == "2026-01-15T09:30:00"
+    assert df.iloc[0]["AEENDTC"] == "2026-01-16T18:00:00"
+
+    # Row 2 assertions
+    assert df.iloc[1]["AESEQ"] == 2
+    assert df.iloc[1]["AETERM"] == "Nausea"
+    assert df.iloc[1]["AESER"] == "Y"
+    assert df.iloc[1]["AESTDTC"] == "2026-02-01T08:00:00"
+
+
+def test_record_mapper_dataframe_mode_as_sdtm() -> None:
+    """Test calling mapper.dataframe with as_sdtm=True."""
+    sdk = MagicMock()
+    records = [
+        Record(
+            record_id=201,
+            subject_key="SUBJ-002",
+            visit_id=1,
+            form_id=20,
+            record_status="Complete",
+            date_created=datetime(2026, 1, 1),
+            record_data={
+                "aeTerm": "Dizziness",
+                "aeSeverity": "MODERATE",
+                "aeSerious": False,
+            },
+        )
+    ]
+    sdk.get_records.return_value = records
+
+    mapper = RecordMapper(sdk)
+    df = mapper.dataframe(study_key="STUDY_TEST", as_sdtm=True, domain="AE")
+
+    assert df.iloc[0]["STUDYID"] == "STUDY_TEST"
+    assert df.iloc[0]["USUBJID"] == "SUBJ-002"
+    assert df.iloc[0]["AETERM"] == "Dizziness"
+    assert df.iloc[0]["AESEV"] == "MODERATE"
+    assert df.iloc[0]["AESER"] == "N"
+
+
+def test_record_mapper_reporting_models_transformation() -> None:
+    """Test transforming reporting Pydantic models (AdverseEvent, ProtocolDeviation, DeviceDeficiency)."""
+    # 1. AdverseEvent model
+    ae = AdverseEvent(
+        subjectKey="SUBJ-AE-10",
+        aeTerm="Rash",
+        aeDecod="Dermatitis",
+        aeSeverity="MILD",
+        aeSerious=False,
+        aeStartDate=datetime(2026, 3, 1, 10, 0),
+        aeEndDate=datetime(2026, 3, 2, 12, 0),
+        aeOutcome="Recovered",
+        aeRelationship="Related",
+        aeActionTaken="None",
+    )
+    df_ae = transform_records_to_sdtm([ae], domain="AE", study_key="STUDY_REP_01")
+    assert df_ae.iloc[0]["STUDYID"] == "STUDY_REP_01"
+    assert df_ae.iloc[0]["USUBJID"] == "SUBJ-AE-10"
+    assert df_ae.iloc[0]["DOMAIN"] == "AE"
+    assert df_ae.iloc[0]["AETERM"] == "Rash"
+    assert df_ae.iloc[0]["AEDECOD"] == "Dermatitis"
+    assert df_ae.iloc[0]["AESEV"] == "MILD"
+    assert df_ae.iloc[0]["AESER"] == "N"
+    assert df_ae.iloc[0]["AESTDTC"] == "2026-03-01T10:00:00"
+    assert df_ae.iloc[0]["AEENDTC"] == "2026-03-02T12:00:00"
+
+    # 2. ProtocolDeviation model (DV domain)
+    pd_item = ProtocolDeviation(
+        subjectKey="SUBJ-PD-20",
+        dvTerm="Eligibility criteria violation",
+        dvCategory="ELIGIBILITY",
+        dvSeverity="MAJOR",
+        dvDate=datetime(2026, 3, 5, 14, 30),
+        dvStatus="Escalated",
+    )
+    df_pd = transform_records_to_sdtm([pd_item], domain="DV", study_key="STUDY_REP_01")
+    assert df_pd.iloc[0]["STUDYID"] == "STUDY_REP_01"
+    assert df_pd.iloc[0]["USUBJID"] == "SUBJ-PD-20"
+    assert df_pd.iloc[0]["DOMAIN"] == "DV"
+    assert df_pd.iloc[0]["DVTERM"] == "Eligibility criteria violation"
+    assert df_pd.iloc[0]["DVCAT"] == "ELIGIBILITY"
+    assert df_pd.iloc[0]["DVSEV"] == "MAJOR"
+    assert df_pd.iloc[0]["DVSTDTC"] == "2026-03-05T14:30:00"
+    assert df_pd.iloc[0]["DVSTAT"] == "Escalated"
+
+    # Also verify 'PD' domain code alias maps to 'DV'
+    df_pd_alias = transform_records_to_sdtm([pd_item], domain="PD", study_key="STUDY_REP_01")
+    assert df_pd_alias.iloc[0]["DOMAIN"] == "DV"
+    assert "DVTERM" in df_pd_alias.columns
+
+    # 3. DeviceDeficiency model (DD domain)
+    dd_item = DeviceDeficiency(
+        subjectKey="SUBJ-DD-30",
+        ddTerm="Software freeze",
+        ddCategory="SOFTWARE",
+        ddSerious=True,
+        ddDate=datetime(2026, 3, 10, 9, 0),
+    )
+    df_dd = transform_records_to_sdtm([dd_item], domain="DD", study_key="STUDY_REP_01")
+    assert df_dd.iloc[0]["STUDYID"] == "STUDY_REP_01"
+    assert df_dd.iloc[0]["USUBJID"] == "SUBJ-DD-30"
+    assert df_dd.iloc[0]["DOMAIN"] == "DD"
+    assert df_dd.iloc[0]["DDTERM"] == "Software freeze"
+    assert df_dd.iloc[0]["DDCAT"] == "SOFTWARE"
+    assert df_dd.iloc[0]["DDSER"] == "Y"
+    assert df_dd.iloc[0]["DDSTDTC"] == "2026-03-10T09:00:00"
+
+
+def test_record_mapper_concomitant_medications_domain() -> None:
+    """Test SDTM transformation for Concomitant Medications (CM domain)."""
+    raw_records = [
+        {
+            "subjectKey": "SUBJ-CM-01",
+            "cmTerm": "Aspirin",
+            "cmDecod": "Acetylsalicylic acid",
+            "cmDose": "100",
+            "cmDoseUnit": "mg",
+            "cmRoute": "ORAL",
+            "cmStartDate": "2026-01-01",
+            "cmEndDate": "2026-01-10",
+            "cmIndication": "Pain relief",
+        }
+    ]
+    df_cm = transform_records_to_sdtm(raw_records, domain="CM", study_key="STUDY_CM_01")
+    assert df_cm.iloc[0]["STUDYID"] == "STUDY_CM_01"
+    assert df_cm.iloc[0]["DOMAIN"] == "CM"
+    assert df_cm.iloc[0]["USUBJID"] == "SUBJ-CM-01"
+    assert df_cm.iloc[0]["CMSEQ"] == 1
+    assert df_cm.iloc[0]["CMTRT"] == "Aspirin"
+    assert df_cm.iloc[0]["CMDECOD"] == "Acetylsalicylic acid"
+    assert df_cm.iloc[0]["CMDOSE"] == "100"
+    assert df_cm.iloc[0]["CMDOSU"] == "mg"
+    assert df_cm.iloc[0]["CMROUTE"] == "ORAL"
+    assert df_cm.iloc[0]["CMSTDTC"] == "2026-01-01"
+    assert df_cm.iloc[0]["CMENDTC"] == "2026-01-10"
+    assert df_cm.iloc[0]["CMINDC"] == "Pain relief"
+
+
+def test_record_mapper_sdtm_empty() -> None:
+    """Test sdtm_dataframe when no records are returned."""
+    sdk = MagicMock()
+    sdk.get_records.return_value = []
+    mapper = RecordMapper(sdk)
+    df = mapper.sdtm_dataframe(study_key="STUDY_EMPTY", domain="AE")
+    assert df.empty
+    assert "STUDYID" in df.columns
+    assert "USUBJID" in df.columns
+    assert "AETERM" in df.columns
+
+
+def test_record_mapper_iter_sdtm_dataframes() -> None:
+    """Test streaming chunked SDTM DataFrames."""
+    sdk = MagicMock()
+    records = [
+        Record(
+            record_id=i,
+            subject_key=f"SUBJ-{i}",
+            visit_id=1,
+            form_id=10,
+            record_status="Complete",
+            date_created=datetime(2026, 1, 1),
+            record_data={"aeTerm": f"Event {i}", "aeSeverity": "MILD", "aeSerious": False},
+        )
+        for i in range(5)
+    ]
+    sdk.get_records.return_value = records
+
+    mapper = RecordMapper(sdk, chunk_size=2)
+    chunks = list(mapper.iter_sdtm_dataframes(study_key="STUDY_STREAM", domain="AE"))
+    assert len(chunks) == 3
+    assert len(chunks[0]) == 2
+    assert len(chunks[1]) == 2
+    assert len(chunks[2]) == 1
+    assert all("AETERM" in c.columns for c in chunks)
+    assert all(c.iloc[0]["STUDYID"] == "STUDY_STREAM" for c in chunks)

@@ -7,7 +7,7 @@ deterministic JSON emission, structural diffing, and schema validation.
 from __future__ import annotations
 
 from .diff import DiffItem, DiffReport, diff
-from .emit import sort_data_dictionary, to_file, to_json
+from .emit import sort_data_dictionary, to_file, to_json, to_odm_file, to_odm_xml
 from .loaders import (
     load_from_api,
     load_from_cdisc_odm,
@@ -48,6 +48,8 @@ __all__ = [
     "to_camel_case",
     "to_file",
     "to_json",
+    "to_odm_file",
+    "to_odm_xml",
     "validate",
     "validate_timestamp",
 ]
