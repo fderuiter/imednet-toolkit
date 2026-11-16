@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from imednet.auth.credentials import Credentials, CredentialSource
 from imednet.utils.validators import parse_bool
 
 __all__ = ["Config", "load_config"]
@@ -53,6 +54,9 @@ def load_config(
     timeout: float | None = None,
     strict_mode: bool | None = None,
     simulation_mode: bool | None = None,
+    *,
+    credential_source: CredentialSource | None = None,
+    require_credentials: bool = True,
 ) -> Config:
     """Return configuration using arguments or environment variables.
 
@@ -64,6 +68,9 @@ def load_config(
         timeout: HTTP request timeout in seconds. Defaults to IMEDNET_TIMEOUT environment variable or 30.0.
         strict_mode: Toggle strict mode for data validation. Defaults to IMEDNET_STRICT_MODE environment variable or False.
         simulation_mode: Toggle offline simulation mode. Defaults to IMEDNET_SIMULATION_MODE environment variable or False.
+        credential_source: Optional caller-owned source, consulted before the environment.
+        require_credentials: Validate default credential requirements. Custom authentication
+            or an injected client owns authentication when this is False.
 
     Returns:
         The loaded SDK configuration.
@@ -71,6 +78,19 @@ def load_config(
     Raises:
         ValueError: If required authentication parameters are missing.
     """
+    credentials = Credentials()
+    if credential_source is not None:
+        try:
+            snapshot = credential_source.get_credentials()
+            if snapshot is not None:
+                credentials = snapshot
+        except Exception:
+            raise ValueError("Credential source lookup failed") from None
+        if not isinstance(credentials, Credentials):
+            raise ValueError("Credential source returned an invalid snapshot")
+    api_key = api_key if api_key is not None else credentials.api_key
+    security_key = security_key if security_key is not None else credentials.security_key
+    oidc_token = oidc_token if oidc_token is not None else credentials.oidc_token
     api_key = api_key if api_key is not None else os.getenv("IMEDNET_API_KEY")
     security_key = security_key if security_key is not None else os.getenv("IMEDNET_SECURITY_KEY")
     base_url = base_url if base_url is not None else os.getenv("IMEDNET_BASE_URL")
@@ -110,7 +130,7 @@ def load_config(
     if simulation_mode:
         api_key = api_key or "simulated_api_key"
         security_key = security_key or "simulated_security_key"
-    elif not oidc_token:
+    elif require_credentials and not oidc_token:
         if not api_key and not security_key:
             raise ValueError("Either OIDC token or both API key and security key are required")
         if not api_key:
