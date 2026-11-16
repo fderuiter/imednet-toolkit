@@ -46,6 +46,8 @@ class BaseClient:
         tracer: Tracer | None = None,
         retry_config: RetryConfig | None = None,
         auth: AuthStrategy | None = None,
+        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
+        simulation_mode: bool | None = None,
     ) -> None:
         """Initialize common client settings.
 
@@ -57,8 +59,22 @@ class BaseClient:
             tracer: Optional OpenTelemetry tracer instance.
             retry_config: Centralized configuration for retry behaviors.
             auth: Optional pre-configured AuthStrategy.
+            transport: Optional custom httpx transport (e.g. for simulation).
+            simulation_mode: Optional flag to enable offline simulation mode.
         """
-        config = load_config(api_key=api_key, security_key=security_key, base_url=base_url)
+        config = load_config(
+            api_key=api_key,
+            security_key=security_key,
+            base_url=base_url,
+            simulation_mode=simulation_mode,
+        )
+
+        self.simulation_mode = config.simulation_mode
+        self._transport = transport
+        if self.simulation_mode and self._transport is None:
+            from imednet.simulation import create_simulation_transport
+
+            self._transport = create_simulation_transport()
 
         self.base_url = sanitize_base_url(config.base_url or DEFAULT_BASE_URL)
         self._base_url = httpx.URL(self.base_url)
@@ -68,6 +84,10 @@ class BaseClient:
 
         if auth:
             self.auth = auth
+        elif self.simulation_mode:
+            self.auth = ApiKeyAuth(
+                config.api_key or "SIMULATED_KEY", config.security_key or "SIMULATED_KEY"
+            )
         else:
             self.auth = ApiKeyAuth(config.api_key or "", config.security_key or "")
 

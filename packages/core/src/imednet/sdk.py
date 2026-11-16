@@ -225,14 +225,32 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
         retries: int | None = None,
         backoff_factor: float | None = None,
         retry_policy: RetryPolicy | None = None,
+        simulation_mode: bool | None = None,
+        transport: Any = None,
     ) -> None:
-        """Initialize the SDK with credentials and configuration."""
+        """Initialize the SDK with credentials and configuration.
+
+        Args:
+            api_key: iMednet API key.
+            security_key: iMednet security key.
+            base_url: Base URL for the iMednet API.
+            timeout: Default request timeout in seconds.
+            strict_mode: Toggle strict mode for data validation.
+            retry_config: Centralized configuration for retry behaviors.
+            client: Pre-configured client instance.
+            retries: Number of retries for failed requests.
+            backoff_factor: Backoff factor for retry delays.
+            retry_policy: Custom retry policy.
+            simulation_mode: Toggle offline simulation mode.
+            transport: Custom HTTP transport or SimulationTransport.
+        """
         config = load_config(
             api_key=api_key,
             security_key=security_key,
             base_url=base_url,
             timeout=timeout,
             strict_mode=strict_mode,
+            simulation_mode=simulation_mode,
         )
 
         self.config = config
@@ -262,6 +280,7 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
                 config=config,
                 timeout=config.timeout,
                 retry_config=retry_config,
+                transport=transport,
             )
 
         self._init_endpoints()
@@ -361,6 +380,8 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
         retries: int | None = None,
         backoff_factor: float | None = None,
         retry_policy: RetryPolicy | None = None,
+        simulation_mode: bool | None = None,
+        transport: Any = None,
     ) -> None:
         """Initialize the asynchronous SDK.
 
@@ -375,6 +396,8 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
             retries: Number of retries for failed requests.
             backoff_factor: Backoff factor for retry delays.
             retry_policy: Custom retry policy.
+            simulation_mode: Toggle offline simulation mode.
+            transport: Custom HTTP transport or SimulationTransport.
         """
         config = load_config(
             api_key=api_key,
@@ -382,6 +405,7 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
             base_url=base_url,
             timeout=timeout,
             strict_mode=strict_mode,
+            simulation_mode=simulation_mode,
         )
         self.config = config
         self._api_key = config.api_key
@@ -410,6 +434,7 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
                 config=config,
                 timeout=config.timeout,
                 retry_config=retry_config,
+                transport=transport,
             )
 
         self._init_endpoints()

@@ -32,6 +32,7 @@ class Config:
     oidc_token: str | None = None
     timeout: float = 30.0
     strict_mode: bool = False
+    simulation_mode: bool = False
 
     def __repr__(self) -> str:
         """Return a string representation of the configuration.
@@ -41,7 +42,7 @@ class Config:
         Returns:
             A string representation of the configuration.
         """
-        return f"Config(api_key='********', security_key='********', oidc_token='********', base_url={self.base_url!r}, timeout={self.timeout!r}, strict_mode={self.strict_mode!r})"
+        return f"Config(api_key='********', security_key='********', oidc_token='********', base_url={self.base_url!r}, timeout={self.timeout!r}, strict_mode={self.strict_mode!r}, simulation_mode={self.simulation_mode!r})"
 
 
 def load_config(
@@ -51,6 +52,7 @@ def load_config(
     oidc_token: str | None = None,
     timeout: float | None = None,
     strict_mode: bool | None = None,
+    simulation_mode: bool | None = None,
 ) -> Config:
     """Return configuration using arguments or environment variables.
 
@@ -61,6 +63,7 @@ def load_config(
         oidc_token: Optional OIDC token. Defaults to IMEDNET_OIDC_TOKEN environment variable.
         timeout: HTTP request timeout in seconds. Defaults to IMEDNET_TIMEOUT environment variable or 30.0.
         strict_mode: Toggle strict mode for data validation. Defaults to IMEDNET_STRICT_MODE environment variable or False.
+        simulation_mode: Toggle offline simulation mode. Defaults to IMEDNET_SIMULATION_MODE environment variable or False.
 
     Returns:
         The loaded SDK configuration.
@@ -89,6 +92,13 @@ def load_config(
         else:
             strict_mode = False
 
+    if simulation_mode is None:
+        env_simulation_mode = os.getenv("IMEDNET_SIMULATION_MODE")
+        if env_simulation_mode is not None:  # noqa: SIM108
+            simulation_mode = parse_bool(env_simulation_mode)
+        else:
+            simulation_mode = False
+
     # Set the environment variable so models can read the resolved value during validation
     os.environ["IMEDNET_STRICT_MODE"] = str(strict_mode).lower()
 
@@ -97,7 +107,10 @@ def load_config(
     base_url = base_url.strip() if base_url else None
     oidc_token = (oidc_token or "").strip() or None
 
-    if not oidc_token:
+    if simulation_mode:
+        api_key = api_key or "simulated_api_key"
+        security_key = security_key or "simulated_security_key"
+    elif not oidc_token:
         if not api_key and not security_key:
             raise ValueError("Either OIDC token or both API key and security key are required")
         if not api_key:
@@ -112,4 +125,5 @@ def load_config(
         oidc_token=oidc_token,
         timeout=timeout,
         strict_mode=strict_mode,
+        simulation_mode=simulation_mode,
     )
