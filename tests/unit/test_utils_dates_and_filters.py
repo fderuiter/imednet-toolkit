@@ -1,11 +1,21 @@
 """Unit tests for utils dates and filters."""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import pytest
 
+from imednet.endpoints.records import RecordsEndpoint
 from imednet.utils.dates import format_iso_datetime, parse_iso_datetime
-from imednet.utils.filters import build_filter_string
+from imednet.utils.filters import (
+    ALLOWED_OPERATORS,
+    build_filter_string,
+    validate_connector_exclusivity,
+    validate_filter_key,
+    validate_filter_operator,
+    validate_filter_syntax,
+    validate_record_filter,
+)
 
 
 def test_parse_iso_datetime_with_z() -> None:
@@ -80,10 +90,10 @@ def test_build_filter_string_multiple() -> None:
     assert result == "name==A;age==30"
 
 
-def test_build_filter_string_tuple_and_list() -> None:
-    """Test that build filter string tuple and list."""
-    result = build_filter_string({"age": (">", 20), "type": ["A", "B"]})
-    assert result == "age>20;type==A,type==B"
+def test_build_filter_string_tuple_and_list_raises_on_mixed_connectors() -> None:
+    """Test that build filter string raises ValueError when combining tuple and list."""
+    with pytest.raises(ValueError, match="cannot combine both ';' \\(AND\\) and ',' \\(OR\\)"):
+        build_filter_string({"age": (">", 20), "type": ["A", "B"]})
 
 
 def test_build_filter_string_bool_and_none() -> None:
@@ -127,3 +137,181 @@ def test_build_filter_string_backslashes() -> None:
     # path: C:\Temp -> "C:\\Temp"
     # quote: A\"B -> "A\\\"B"
     assert result == r'path=="C:\\Temp";quote=="A\\\"B"'
+
+
+def test_allowed_operators_constant() -> None:
+    """Test that ALLOWED_OPERATORS matches expected operator tokens."""
+    assert ALLOWED_OPERATORS == frozenset({"<", "<=", ">", ">=", "==", "!=", "=~"})
+
+
+@pytest.mark.parametrize("op", ["<", "<=", ">", ">=", "==", "!=", "=~"])
+def test_valid_operators(op: str) -> None:
+    """Test all allowed operators."""
+    result = build_filter_string({"field": (op, "value")})
+    assert result == f"field{op}value"
+
+
+@pytest.mark.parametrize("invalid_op", ["===", "<>", "LIKE", "in", "contains", "!~"])
+def test_invalid_operators(invalid_op: str) -> None:
+    """Test that invalid operators raise ValueError."""
+    with pytest.raises(ValueError, match="Invalid filter operator"):
+        build_filter_string({"field": (invalid_op, "value")})
+
+
+@pytest.mark.parametrize("whitespace_op", [" >", "> ", " > ", "\t>="])
+def test_whitespace_in_operator_raises(whitespace_op: str) -> None:
+    """Test that operators with whitespace raise ValueError."""
+    with pytest.raises(ValueError, match="cannot contain whitespace"):
+        build_filter_string({"field": (whitespace_op, "value")})
+
+
+@pytest.mark.parametrize("invalid_key", ["field name", " field", "field ", "field\tname"])
+def test_whitespace_in_key_raises(invalid_key: str) -> None:
+    """Test that keys with whitespace raise ValueError."""
+    with pytest.raises(ValueError, match="cannot contain whitespace"):
+        build_filter_string({invalid_key: "value"})
+
+
+def test_validate_filter_operator_type_error() -> None:
+    """Test that non-string operators raise ValueError."""
+    with pytest.raises(ValueError, match="non-empty string"):
+        validate_filter_operator(None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-empty string"):
+        validate_filter_operator("")
+
+
+def test_validate_filter_key_type_error() -> None:
+    """Test that non-string or empty keys raise ValueError."""
+    with pytest.raises(ValueError, match="non-empty string"):
+        validate_filter_key("")
+    with pytest.raises(ValueError, match="non-empty string"):
+        validate_filter_key("   ")
+
+
+def test_invalid_tuple_length_raises() -> None:
+    """Test that filter tuples of length other than 2 raise ValueError."""
+    with pytest.raises(ValueError, match="must have exactly 2 elements"):
+        build_filter_string({"field": (">",)})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must have exactly 2 elements"):
+        build_filter_string({"field": (">", 10, "extra")})  # type: ignore[arg-type]
+
+
+def test_invalid_value_type_raises() -> None:
+    """Test that dictionary or set filter values raise ValueError."""
+    with pytest.raises(ValueError, match="Invalid filter value type"):
+        build_filter_string({"field": {"invalid": "dict"}})
+
+
+def test_connector_exclusivity_single_connectors() -> None:
+    """Test that expressions with only semicolon or only comma are accepted."""
+    validate_connector_exclusivity("a==1;b==2;c==3")
+    validate_connector_exclusivity("a==1,b==2,c==3")
+    validate_connector_exclusivity("singleCondition==val")
+    validate_connector_exclusivity("")
+
+
+def test_connector_exclusivity_mixed_raises() -> None:
+    """Test that mixing semicolon and comma raises ValueError."""
+    with pytest.raises(ValueError, match="cannot combine both ';' \\(AND\\) and ',' \\(OR\\)"):
+        validate_connector_exclusivity("a==1;b==2,c==3")
+
+
+def test_connector_exclusivity_quoted_connectors() -> None:
+    """Test that connectors inside quotation marks are ignored for exclusivity."""
+    validate_connector_exclusivity('name=="Smith, John";status==active')
+    validate_connector_exclusivity('name=="Smith; John",status==active')
+    validate_connector_exclusivity(r'name=="Escaped \"quote, still";status==1')
+
+
+def test_connector_exclusivity_unclosed_quotes_raises() -> None:
+    """Test that unclosed quotes raise ValueError."""
+    with pytest.raises(ValueError, match="unclosed quotation marks"):
+        validate_connector_exclusivity('name=="Smith, John')
+
+
+@pytest.mark.parametrize("none_val", ["none", "None", "NONE", "  none  "])
+def test_connector_and_record_filter_none_bypass(none_val: str) -> None:
+    """Test that literal 'none' bypasses connector and syntax validation."""
+    validate_connector_exclusivity(none_val)
+    validate_record_filter(none_val)
+    validate_filter_syntax(none_val)
+
+
+@pytest.mark.parametrize("expr", ["age > 10", "age> 10", "age >10", " age>10", "age>10 "])
+def test_filter_syntax_whitespace_outside_quotes_raises(expr: str) -> None:
+    """Test that whitespace outside quotes raises ValueError."""
+    with pytest.raises(ValueError, match="contains whitespace"):
+        validate_filter_syntax(expr)
+
+
+def test_filter_syntax_valid() -> None:
+    """Test valid filter syntax."""
+    validate_filter_syntax("age>10")
+    validate_filter_syntax('siteName=="Bright Test Site"')
+    validate_filter_syntax('siteName=="Bright Test Site";status==active')
+
+
+def test_endpoint_resolve_params_valid_record_filter() -> None:
+    """Test that endpoint resolves params with valid recordDataFilter."""
+    ep = RecordsEndpoint(MagicMock())
+    state = ep._resolve_params(
+        study_key="S1",
+        extra_params={"recordDataFilter": "age>10"},
+        filters={},
+    )
+    assert state.params["recordDataFilter"] == "age>10"
+
+
+def test_endpoint_resolve_params_none_record_filter() -> None:
+    """Test that endpoint resolves params with 'none' recordDataFilter bypass."""
+    ep = RecordsEndpoint(MagicMock())
+    state = ep._resolve_params(
+        study_key="S1",
+        extra_params={"recordDataFilter": "none"},
+        filters={},
+    )
+    assert state.params["recordDataFilter"] == "none"
+
+
+def test_endpoint_resolve_params_quoted_comma_record_filter() -> None:
+    """Test that endpoint accepts recordDataFilter with comma inside quotes."""
+    ep = RecordsEndpoint(MagicMock())
+    state = ep._resolve_params(
+        study_key="S1",
+        extra_params={"recordDataFilter": 'desc=="a,b";status==1'},
+        filters={},
+    )
+    assert state.params["recordDataFilter"] == 'desc=="a,b";status==1'
+
+
+def test_endpoint_resolve_params_mixed_connectors_record_filter_raises() -> None:
+    """Test that endpoint parameter resolution rejects mixed connectors in recordDataFilter."""
+    ep = RecordsEndpoint(MagicMock())
+    with pytest.raises(ValueError, match="cannot combine both ';' \\(AND\\) and ',' \\(OR\\)"):
+        ep._resolve_params(
+            study_key="S1",
+            extra_params={"recordDataFilter": "a==1;b==2,c==3"},
+            filters={},
+        )
+
+
+def test_endpoint_resolve_params_whitespace_record_filter_raises() -> None:
+    """Test that endpoint parameter resolution rejects whitespace in recordDataFilter."""
+    ep = RecordsEndpoint(MagicMock())
+    with pytest.raises(ValueError, match="contains whitespace"):
+        ep._resolve_params(
+            study_key="S1",
+            extra_params={"recordDataFilter": "a == 1"},
+            filters={},
+        )
+
+
+def test_endpoint_resolve_params_special_param_record_data_filter() -> None:
+    """Test that endpoint parameter resolution validates record_data_filter from filters."""
+    ep = RecordsEndpoint(MagicMock())
+    with pytest.raises(ValueError, match="cannot combine both ';' \\(AND\\) and ',' \\(OR\\)"):
+        ep._resolve_params(
+            study_key="S1",
+            extra_params=None,
+            filters={"record_data_filter": "a==1;b==2,c==3"},
+        )
