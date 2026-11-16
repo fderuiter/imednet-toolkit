@@ -657,6 +657,7 @@ jobs:
     environment: pypi
     permissions:
       id-token: write # Mandatory for trusted publishing
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -682,6 +683,18 @@ jobs:
         with:
           name: ${{ steps.set-artifact.outputs.artifact }}
           path: dist
+
+      - name: Generate SHA-256 Checksum Manifest
+        run: |
+          mkdir -p checksums
+          sha256sum dist/* > checksums/SHA256SUMS
+          (cd dist && sha256sum * > ../checksums/checksums.txt)
+          cat checksums/SHA256SUMS
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: 'dist/*'
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
