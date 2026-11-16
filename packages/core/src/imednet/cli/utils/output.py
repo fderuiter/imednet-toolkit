@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
+from enum import Enum
 from typing import Any
+
+from pydantic import BaseModel
 
 _ANSI_COLORS = {
     "green": "\033[32m",
@@ -51,7 +55,8 @@ class _DummyConsole:
     def status(self, msg: str, spinner: str | None = None) -> Any:
         class DummyStatus:
             def __enter__(self) -> None:
-                print(msg)
+                if sys.stderr.isatty():
+                    print(msg, file=sys.stderr)
 
             def __exit__(self, *args: Any) -> None:
                 pass
@@ -161,9 +166,19 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
 
 
 def display_list(
-    items: Sequence[Any], label: str, empty_msg: str | None = None, fields: list[str] | None = None
+    items: Sequence[Any],
+    label: str,
+    empty_msg: str | None = None,
+    fields: list[str] | None = None,
+    *,
+    output_format: str = "table",
 ) -> None:
-    """Display a list of items."""
+    """Display a human table or one versioned JSON response without progress text."""
+    if output_format == "json":
+        emit_json(items, label.replace(" ", "_"))
+        return
+    if output_format != "table":
+        raise ValueError("Unsupported output format")
     if not items:
         print(empty_msg or f"No {label} found.")
         return
@@ -221,3 +236,28 @@ def print_error(
         print(formatted, end=end, file=target, flush=flush)
     except (BrokenPipeError, OSError):
         pass
+
+
+def _json_default(value: Any) -> Any:
+    """Serialize model/date/enum values without lossy string fallbacks."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", by_alias=True)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"Unsupported JSON value type: {type(value).__name__}")
+
+
+def emit_json(items: Sequence[Any], resource: str) -> None:
+    """Write one complete v1 response after successful retrieval and serialization."""
+    envelope = {
+        "schemaVersion": "1.0",
+        "resource": resource,
+        "status": "complete",
+        "count": len(items),
+        "items": list(items),
+    }
+    # Serialize before the first byte is emitted: failures cannot create partial JSON.
+    rendered = json.dumps(envelope, default=_json_default, ensure_ascii=False, allow_nan=False)
+    print(rendered)
