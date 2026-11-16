@@ -297,6 +297,7 @@ _print_patcher.stop()
 
 html_theme = "furo"
 html_title = f"{project} Documentation"
+html_baseurl = "https://fderuiter.github.io/imednet-python-sdk/"
 html_logo = "_static/logo.png"
 html_favicon = "_static/logo.png"
 

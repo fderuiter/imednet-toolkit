@@ -1,7 +1,11 @@
 """Unit tests for pyproject metadata."""
 
+import ast
 import re
 from pathlib import Path
+
+import pytest
+from scripts.validate_docs import check_sphinx_html_baseurl
 
 import imednet
 
@@ -70,3 +74,77 @@ def test_hatch_scripts_for_maintenance_tasks() -> None:
 
     for retired_task in ("post-smoke-record", "post_smoke_record"):
         assert retired_task not in hatch_scripts
+
+
+def test_sphinx_conf_defines_canonical_html_baseurl() -> None:
+    """Test that docs/conf.py defines the canonical html_baseurl with trailing slash."""
+    docs_conf_path = Path(__file__).resolve().parents[2] / "docs" / "conf.py"
+    assert docs_conf_path.exists()
+    content = docs_conf_path.read_text(encoding="utf-8")
+
+    tree = ast.parse(content, filename=str(docs_conf_path))
+    baseurl = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "html_baseurl"
+                    and isinstance(node.value, ast.Constant)
+                ):
+                    baseurl = node.value.value
+                    break
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "html_baseurl"
+            and node.value
+            and isinstance(node.value, ast.Constant)
+        ):
+            baseurl = node.value.value
+            break
+
+    assert baseurl is not None, "html_baseurl must be defined in docs/conf.py"
+    assert baseurl == "https://fderuiter.github.io/imednet-python-sdk/"
+    assert baseurl.startswith("https://")
+    assert baseurl.endswith("/")
+
+
+def test_validate_docs_sphinx_html_baseurl_check() -> None:
+    """Test that check_sphinx_html_baseurl succeeds on the repository docs/conf.py."""
+    assert check_sphinx_html_baseurl() is False
+
+
+def test_validate_docs_sphinx_html_baseurl_error_cases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that check_sphinx_html_baseurl detects missing, wrong scheme, or missing trailing slash."""
+    # Missing html_baseurl
+    monkeypatch.setattr(Path, "read_text", lambda self, *args, **kwargs: "html_theme = 'furo'")
+    assert check_sphinx_html_baseurl() is True
+
+    # Missing trailing slash
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda self, *args, **kwargs: (
+            'html_baseurl = "https://fderuiter.github.io/imednet-python-sdk"'
+        ),
+    )
+    assert check_sphinx_html_baseurl() is True
+
+    # Invalid scheme
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda self, *args, **kwargs: (
+            'html_baseurl = "http://fderuiter.github.io/imednet-python-sdk/"'
+        ),
+    )
+    assert check_sphinx_html_baseurl() is True
+
+    # Wrong baseurl
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda self, *args, **kwargs: 'html_baseurl = "https://example.com/docs/"',
+    )
+    assert check_sphinx_html_baseurl() is True
