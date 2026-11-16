@@ -104,6 +104,9 @@ def main():
     print("Validating mermaid diagrams...")
     run_command([sys.executable, "scripts/validate_diagrams.py"])
 
+    print("Validating showcases...")
+    run_command([sys.executable, "scripts/validate_showcases.py"])
+
     print("Type-checking documentation snippets...")
     run_command([sys.executable, "scripts/typecheck_docs.py"])
 
