@@ -55,6 +55,15 @@ def test_cli_schema_and_validate(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert "Validation passed" in captured.out
 
 
+def test_cli_validate_missing_file(capsys: pytest.CaptureFixture[str]) -> None:
+    """Test datadict validate with nonexistent file produces FileNotFoundError."""
+    with pytest.raises(SystemExit) as exc:
+        app(["datadict", "validate", "nonexistent.json"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "FileNotFoundError: Target file 'nonexistent.json' does not exist" in captured.err
+
+
 def test_cli_diff(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Test structural diff command in CLI."""
     file1 = tmp_path / "dd1.json"

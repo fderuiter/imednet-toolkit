@@ -26,6 +26,43 @@ def get_schema() -> dict[str, Any]:
     return schema
 
 
+def _is_file_target(target: Any) -> bool:
+    """Determine whether the target was intended as a file path.
+
+    Args:
+        target: Target object to inspect.
+
+    Returns:
+        True if target is considered a file path, False otherwise.
+    """
+    if isinstance(target, Path):
+        return True
+    if isinstance(target, str):
+        target_str = target.strip()
+        if target_str.startswith(("{", "[")):
+            return False
+        if target_str.lower().endswith((".json", ".xml", ".csv")):
+            return True
+        if "/" in target_str or "\\" in target_str:
+            return True
+    return False
+
+
+def _safe_is_file(p: Path) -> bool:
+    """Safely check if a Path is an existing file, handling OSErrors.
+
+    Args:
+        p: Path object to check.
+
+    Returns:
+        True if path is an existing regular file, False otherwise.
+    """
+    try:
+        return p.is_file()
+    except OSError:
+        return False
+
+
 def validate(
     target: dict[str, Any] | str | Path | DataDictionary,
     schema: dict[str, Any] | None = None,
@@ -47,7 +84,14 @@ def validate(
         data = target.model_dump(mode="json")
     elif isinstance(target, str | Path):
         p = Path(target)
-        if p.is_file():
+        if _is_file_target(target):
+            if not _safe_is_file(p):
+                return [f"FileNotFoundError: Target file '{target}' does not exist"]
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return [f"Failed to read JSON file '{target}': {exc}"]
+        elif _safe_is_file(p):
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
             except Exception as exc:
