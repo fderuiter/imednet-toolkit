@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import logging
+import time
+from unittest.mock import MagicMock
 
 import pytest
+from imednet_sinks.warehouse import _records_to_arrow_table
 
 from imednet.integrations.enrichment import EnrichmentPipeline, _to_snake_case
+from imednet.models.records import Record
 from imednet.models.study_config import MappingRule, StudyConfiguration
+from imednet.testing.fake_data import fake_record
 
 
 def test_enrichment_pipeline_valid_business_logic() -> None:
@@ -147,3 +152,171 @@ def test_to_snake_case_memoization() -> None:
     assert res2 == "cached_identifier"
     assert _to_snake_case.cache_info().hits == 1
     assert _to_snake_case.cache_info().misses == 1
+
+
+def test_enrichment_pipeline_empty_rules_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that EnrichmentPipeline detects empty rules and returns input records directly."""
+    # Default empty configuration
+    config_default = StudyConfiguration(study_key="STUDY-EMPTY")
+    pipeline_default = EnrichmentPipeline(config_default)
+    assert pipeline_default._has_rules is False
+
+    # Explicit empty collections
+    config_explicit = StudyConfiguration(
+        study_key="STUDY-EMPTY-EXPLICIT",
+        mappings=[],
+        terminology_lookups={},
+        phi_fields=[],
+    )
+    pipeline_explicit = EnrichmentPipeline(config_explicit)
+    assert pipeline_explicit._has_rules is False
+
+    # Mapping with empty source_variable_name evaluates to no active rules
+    config_no_source = StudyConfiguration(
+        study_key="STUDY-NO-SRC",
+        mappings=[
+            MappingRule(
+                domain="DM",
+                target_field="target",
+                source_form_key="DM_FORM",
+                source_variable_name="",
+            )
+        ],
+    )
+    pipeline_no_source = EnrichmentPipeline(config_no_source)
+    assert pipeline_no_source._has_rules is False
+
+    # Verify input record is returned directly without recursive traversal
+    data = {
+        "record_id": 1001,
+        "subject_key": "SUBJ-001",
+        "nested": {"site": "SITE-01", "details": [1, 2, {"key": "val"}]},
+    }
+
+    spy = MagicMock(side_effect=pipeline_default._transform_recursive)
+    monkeypatch.setattr(pipeline_default, "_transform_recursive", spy)
+
+    result = pipeline_default.process(data)
+    spy.assert_not_called()
+    assert result is data
+
+
+def test_enrichment_pipeline_active_rules_preservation() -> None:
+    """Test that active rules trigger full recursive traversal across nested structures."""
+    # PHI only
+    config_phi = StudyConfiguration(
+        study_key="STUDY-PHI",
+        phi_fields=["patient_name"],
+    )
+    pipeline_phi = EnrichmentPipeline(config_phi)
+    assert pipeline_phi._has_rules is True
+
+    # Terminology only
+    config_term = StudyConfiguration(
+        study_key="STUDY-TERM",
+        terminology_lookups={"gender": {"1": "Male", "2": "Female"}},
+    )
+    pipeline_term = EnrichmentPipeline(config_term)
+    assert pipeline_term._has_rules is True
+
+    # Combined configuration
+    config_all = StudyConfiguration(
+        study_key="STUDY-ALL",
+        phi_fields=["patient_name"],
+        terminology_lookups={"gender": {"1": "Male", "2": "Female"}},
+        mappings=[
+            MappingRule(
+                domain="DM",
+                target_field="age_in_months",
+                source_form_key="DM_FORM",
+                source_variable_name="age",
+                business_logic="value * 12",
+            )
+        ],
+    )
+    pipeline_all = EnrichmentPipeline(config_all)
+    assert pipeline_all._has_rules is True
+
+    data = {
+        "patient_name": "Alice",
+        "gender": 1,
+        "age": 5,
+        "nested_dict": {
+            "patient_name": "Bob",
+            "gender": 2,
+            "age": 10,
+        },
+        "nested_list": [
+            {"patient_name": "Charlie", "gender": 1, "age": 2},
+        ],
+        "nested_tuple": ({"patient_name": "David", "gender": 2, "age": 3},),
+    }
+
+    result = pipeline_all.process(data)
+    assert result is not data
+
+    # Root level checks
+    assert result["patient_name"] == "[MASKED]"
+    assert result["gender"] == "Male"
+    assert result["age_in_months"] == 60
+
+    # Nested dict checks
+    assert result["nested_dict"]["patient_name"] == "[MASKED]"
+    assert result["nested_dict"]["gender"] == "Female"
+    assert result["nested_dict"]["age_in_months"] == 120
+
+    # Nested list checks
+    assert result["nested_list"][0]["patient_name"] == "[MASKED]"
+    assert result["nested_list"][0]["gender"] == "Male"
+    assert result["nested_list"][0]["age_in_months"] == 24
+
+    # Nested tuple checks
+    assert isinstance(result["nested_tuple"], tuple)
+    assert result["nested_tuple"][0]["patient_name"] == "[MASKED]"
+    assert result["nested_tuple"][0]["gender"] == "Female"
+    assert result["nested_tuple"][0]["age_in_months"] == 36
+
+
+def test_arrow_conversion_speed_and_bypass() -> None:
+    """Test that empty rule bypass eliminates traversal delay and speeds up Arrow conversion."""
+    pipeline_empty = EnrichmentPipeline(StudyConfiguration(study_key="STUDY-BENCH"))
+    assert pipeline_empty._has_rules is False
+
+    test_record = {
+        "record_id": 1,
+        "subject_key": "SUBJ-001",
+        "study_key": "STUDY-BENCH",
+        "form_id": 10,
+        "visit_id": 20,
+        "deleted": False,
+        "record_data": {
+            "unvnum": "1",
+            "aeterm": "Headache",
+            "aeser": "No",
+            "sub_dict": {"k1": "v1", "k2": "v2"},
+        },
+    }
+
+    # 5,000 iterations of process() with empty rules should complete almost instantaneously
+    start = time.perf_counter()
+    for _ in range(5000):
+        res = pipeline_empty.process(test_record)
+        assert res is test_record
+    elapsed_empty = time.perf_counter() - start
+
+    # Empty bypass avoids the ~0.187s CPU reconstruction overhead across 5,000 records
+    assert elapsed_empty < 0.05, (
+        f"Expected empty pipeline process < 0.05s, took {elapsed_empty:.4f}s"
+    )
+
+    # Verify warehouse _records_to_arrow_table conversion speed with fake records
+    records = [Record.model_validate(fake_record()) for _ in range(500)]
+    start = time.perf_counter()
+    table = _records_to_arrow_table(records)
+    elapsed_arrow = time.perf_counter() - start
+
+    assert table.num_rows == 500
+    assert "record_id" in table.column_names
+    assert elapsed_arrow < 1.0, (
+        f"Expected 500-record Arrow conversion < 1.0s, took {elapsed_arrow:.4f}s"
+    )
