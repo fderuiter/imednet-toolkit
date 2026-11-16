@@ -248,7 +248,6 @@ _.get_queries_by_site  # unused method (packages/plugins-workflows/src/imednet_w
 _.get_query_state_counts  # unused method (packages/plugins-workflows/src/imednet_workflows/query_management.py:146)
 FacadeLike  # unused variable (packages/plugins-workflows/src/imednet_workflows/record_update.py:12)
 _.async_create_or_update_records  # unused method (packages/plugins-workflows/src/imednet_workflows/record_update.py:86)
-_.submit_record_batch  # unused method (packages/plugins-workflows/src/imednet_workflows/record_update.py:113)
 _.register_subject  # unused method (packages/plugins-workflows/src/imednet_workflows/record_update.py:169)
 _.update_scheduled_record  # unused method (packages/plugins-workflows/src/imednet_workflows/record_update.py:212)
 _.create_new_record  # unused method (packages/plugins-workflows/src/imednet_workflows/record_update.py:261)
