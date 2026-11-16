@@ -20,7 +20,6 @@ from imednet.errors import (
 from .async_client import AsyncClient
 from .base_client import BaseClient
 from .client import Client
-from .context import Context
 from .http_client_base import HTTPClientBase
 from .paginator import AsyncPaginator, Paginator
 from .retry import DefaultRetryPolicy, RetryPolicy, RetryState
@@ -35,7 +34,6 @@ __all__ = [
     "BaseClient",
     "Client",
     "ConflictError",
-    "Context",
     "DefaultRetryPolicy",
     "ForbiddenError",
     "HTTPClientBase",

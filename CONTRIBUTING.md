@@ -180,8 +180,8 @@ has an independent version and changelog:
 | `apache-airflow-providers-imednet` | `apache-airflow-providers-imednet-v<version>` | `apache-airflow-providers-imednet-v0.5.2` |
 | `imednet-plugins-sinks` | `imednet-plugins-sinks-v<version>` | `imednet-plugins-sinks-v0.2.0` |
 
-**PyPI publishing** — the `Pipeline` workflow in `.github/workflows/main.yml` contains publish jobs
-(`publish-core`, `publish-workflows`, `publish-providers`, `publish-sinks`).
+**PyPI publishing** — the `Release` workflow in `.github/workflows/release.yml` contains publish jobs
+(`publish`).
 Publishing is triggered either by package tags or by the release commit pushed to `main`
 (`chore: release main`). Jobs use `skip-existing` so repeated runs are idempotent.
 

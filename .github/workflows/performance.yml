@@ -43,21 +43,15 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-'3.11'-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-'3.11'-
+            uv-venv-${{ runner.os }}-"3.11"-
 
       - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
-          packages=()
-          for package in packages/*; do
-            if [ -f "$package/pyproject.toml" ]; then
-              packages+=("-e" "$package")
-            fi
-          done
-          packages+=("-e" ".[dev,docs]")
-          python -m pip install "${packages[@]}"
+          python -m pip install uv hatch
+          uv sync --locked --all-extras
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
       - name: Run Performance Suite
         env:

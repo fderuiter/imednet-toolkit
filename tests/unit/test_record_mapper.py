@@ -10,7 +10,12 @@ from faker import Faker
 from pydantic import BaseModel, ValidationError
 
 from imednet.models.records import Record
-from imednet.models.reporting import AdverseEvent, DeviceDeficiency, ProtocolDeviation
+from imednet.models.reporting import (
+    AdverseEvent,
+    DeviceDeficiency,
+    ProtocolDeviation,
+    VitalSigns,
+)
 from imednet.models.variables import Variable
 from imednet_workflows.record_mapper import (
     RecordMapper,
@@ -588,6 +593,81 @@ def test_record_mapper_concomitant_medications_domain() -> None:
     assert df_cm.iloc[0]["CMINDC"] == "Pain relief"
 
 
+def test_record_mapper_vital_signs_domain() -> None:
+    """Test SDTM transformation for Vital Signs (VS domain) with models and raw dicts."""
+    # Canonical VitalSigns model
+    vs_item = VitalSigns(
+        subjectKey="SUBJ-VS-01",
+        vsTest="Diastolic Blood Pressure",
+        vsTestCd="DIABP",
+        vsResult="80.0",
+        vsUnit="mmHg",
+        vsDate=datetime(2026, 3, 12, 8, 30),
+    )
+    df_model = transform_records_to_sdtm([vs_item], domain="VS", study_key="STUDY_VS_01")
+    assert df_model.iloc[0]["STUDYID"] == "STUDY_VS_01"
+    assert df_model.iloc[0]["DOMAIN"] == "VS"
+    assert df_model.iloc[0]["USUBJID"] == "SUBJ-VS-01"
+    assert df_model.iloc[0]["VSSEQ"] == 1
+    assert df_model.iloc[0]["VSTESTCD"] == "DIABP"
+    assert df_model.iloc[0]["VSTEST"] == "Diastolic Blood Pressure"
+    assert df_model.iloc[0]["VSORRES"] == 80.0
+    assert df_model.iloc[0]["VSORRESU"] == "mmHg"
+    assert df_model.iloc[0]["VSDTC"] == "2026-03-12T08:30:00"
+
+    # Raw dictionary with standard aliases
+    raw_records = [
+        {
+            "subjectKey": "SUBJ-VS-02",
+            "vsTestCd": "SYSBP",
+            "vsTest": "Systolic Blood Pressure",
+            "vsResult": "120.5",
+            "vsUnit": "mmHg",
+            "vsDate": "2026-03-12T08:35:00",
+        }
+    ]
+    df_raw = transform_records_to_sdtm(raw_records, domain="VS", study_key="STUDY_VS_01")
+    assert df_raw.iloc[0]["STUDYID"] == "STUDY_VS_01"
+    assert df_raw.iloc[0]["DOMAIN"] == "VS"
+    assert df_raw.iloc[0]["USUBJID"] == "SUBJ-VS-02"
+    assert df_raw.iloc[0]["VSSEQ"] == 1
+    assert df_raw.iloc[0]["VSTESTCD"] == "SYSBP"
+    assert df_raw.iloc[0]["VSTEST"] == "Systolic Blood Pressure"
+    assert df_raw.iloc[0]["VSORRES"] == "120.5"
+    assert df_raw.iloc[0]["VSORRESU"] == "mmHg"
+    assert df_raw.iloc[0]["VSDTC"] == "2026-03-12T08:35:00"
+
+    # Missing optional fields (vsTestCd, vsUnit omitted)
+    vs_partial = VitalSigns(
+        subjectKey="SUBJ-VS-03",
+        vsTest="Heart Rate",
+        vsResult=72,
+        vsDate=datetime(2026, 3, 12, 8, 40),
+    )
+    df_partial = transform_records_to_sdtm([vs_partial], domain="VS", study_key="STUDY_VS_01")
+    assert df_partial.iloc[0]["USUBJID"] == "SUBJ-VS-03"
+    assert df_partial.iloc[0]["VSTEST"] == "Heart Rate"
+    assert df_partial.iloc[0]["VSTESTCD"] is None
+    assert df_partial.iloc[0]["VSORRESU"] is None
+    assert df_partial.iloc[0]["VSORRES"] == 72.0
+
+    # Empty records return empty DataFrame retaining all standard VS headers
+    df_empty = transform_records_to_sdtm([], domain="VS", study_key="STUDY_VS_01")
+    assert df_empty.empty
+    expected_cols = [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "VSSEQ",
+        "VSTESTCD",
+        "VSTEST",
+        "VSORRES",
+        "VSORRESU",
+        "VSDTC",
+    ]
+    assert list(df_empty.columns) == expected_cols
+
+
 def test_record_mapper_sdtm_empty() -> None:
     """Test sdtm_dataframe when no records are returned."""
     sdk = MagicMock()
@@ -598,6 +678,20 @@ def test_record_mapper_sdtm_empty() -> None:
     assert "STUDYID" in df.columns
     assert "USUBJID" in df.columns
     assert "AETERM" in df.columns
+
+    df_vs = mapper.sdtm_dataframe(study_key="STUDY_EMPTY", domain="VS")
+    assert df_vs.empty
+    assert list(df_vs.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "VSSEQ",
+        "VSTESTCD",
+        "VSTEST",
+        "VSORRES",
+        "VSORRESU",
+        "VSDTC",
+    ]
 
 
 def test_record_mapper_iter_sdtm_dataframes() -> None:

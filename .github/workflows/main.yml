@@ -3,11 +3,6 @@ name: Pipeline
 on:
   push:
     branches: [main]
-    tags:
-      - "imednet-v*.*.*"
-      - "imednet-workflows-v*.*.*"
-      - "apache-airflow-providers-imednet-v*.*.*"
-      - "imednet-plugins-sinks-v*.*.*"
   pull_request: {}
 
 concurrency:
@@ -675,67 +670,3 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
-
-  # ------------------------------------------------------------------
-  # JOB 6: PUBLISH TO PYPI
-  # release-please manifest mode creates tags of the form
-  #   <package-name>-v<version>, e.g. imednet-v0.7.0
-  # Publish jobs run on package-specific tags and on release commits to main
-  # (`chore: release main`) so publication does not depend on tag push events.
-  # `skip-existing` keeps reruns idempotent.
-  # ------------------------------------------------------------------
-  publish:
-    name: Publish ${{ matrix.package }} to PyPI
-    needs: [plan, test, docs]
-    if: |
-      github.event_name == 'push' && (
-        startsWith(github.ref, 'refs/tags/') ||
-        (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: release main'))
-      ) && needs.plan.outputs.matrix != '[]'
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write # Mandatory for trusted publishing
-      attestations: write
-    strategy:
-      fail-fast: false
-      matrix:
-        package: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    steps:
-      - name: Set Artifact Name
-        id: set-artifact
-        env:
-          PACKAGE: ${{ matrix.package }}
-        run: |
-          if [ "$PACKAGE" = "core" ]; then
-            echo "artifact=dist-core" >> $GITHUB_OUTPUT
-          elif [ "$PACKAGE" = "plugins-workflows" ]; then
-            echo "artifact=dist-workflows" >> $GITHUB_OUTPUT
-          elif [ "$PACKAGE" = "providers-airflow" ]; then
-            echo "artifact=dist-providers" >> $GITHUB_OUTPUT
-          elif [ "$PACKAGE" = "plugins-sinks" ]; then
-            echo "artifact=dist-sinks" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Download Artifact
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: ${{ steps.set-artifact.outputs.artifact }}
-          path: dist
-
-      - name: Generate SHA-256 Checksum Manifest
-        run: |
-          mkdir -p checksums
-          sha256sum dist/* > checksums/SHA256SUMS
-          (cd dist && sha256sum * > ../checksums/checksums.txt)
-          cat checksums/SHA256SUMS
-
-      - name: Attest Build Provenance
-        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
-        with:
-          subject-path: 'dist/*'
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
-        with:
-          skip-existing: true

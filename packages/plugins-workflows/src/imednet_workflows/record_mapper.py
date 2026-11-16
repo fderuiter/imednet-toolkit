@@ -272,6 +272,29 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         "flags": set(),
         "dtc": {"BRTHDTC"},
     },
+    "VS": {
+        "domain": "VS",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "VSSEQ",
+            "VSTESTCD",
+            "VSTEST",
+            "VSORRES",
+            "VSORRESU",
+            "VSDTC",
+        ],
+        "aliases": {
+            "VSTESTCD": ["vsTestCd", "vs_test_cd", "VSTESTCD", "vstestcd", "test_cd", "testcd"],
+            "VSTEST": ["vsTest", "vs_test", "VSTEST", "vstest", "test_name", "test"],
+            "VSORRES": ["vsResult", "vs_result", "VSORRES", "vsorres", "result"],
+            "VSORRESU": ["vsUnit", "vs_unit", "VSORRESU", "vsorresu", "unit"],
+            "VSDTC": ["vsDate", "vs_date", "VSDTC", "vsdtc", "date"],
+        },
+        "flags": set(),
+        "dtc": {"VSDTC"},
+    },
 }
 
 
@@ -288,7 +311,7 @@ def transform_records_to_sdtm(
     Args:
         records: An iterable of Record models, Pydantic models (such as AdverseEvent),
             or raw dictionaries.
-        domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM').
+        domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
         study_key: Unique study identifier to populate STUDYID.
 
     Returns:
@@ -812,12 +835,14 @@ class RecordMapper:
             for form in interval.forms:
                 if form_whitelist and form.form_id not in form_whitelist:
                     continue
+                if form.form_id in form_models:
+                    continue
                 var_keys = [
                     v.variable_name
-                    for v in form.variables
+                    for v in (form.variables or [])
                     if not variable_whitelist or v.variable_name in variable_whitelist
                 ]
-                label_map = {v.variable_name: v.label for v in form.variables}
+                label_map = {v.variable_name: v.label for v in (form.variables or [])}
                 form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
                 form_label_maps[form.form_id] = label_map  # type: ignore
 
@@ -933,7 +958,7 @@ class RecordMapper:
 
         Args:
             study_key: Unique study identifier.
-            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM').
+            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
             visit_key: Optional visit filter.
             variable_whitelist: Optional variable name whitelist.
             form_whitelist: Optional form ID whitelist.
@@ -971,7 +996,7 @@ class RecordMapper:
 
         Args:
             study_key: Unique study identifier.
-            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM').
+            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
             visit_key: Optional visit filter.
             variable_whitelist: Optional variable name whitelist.
             form_whitelist: Optional form ID whitelist.
