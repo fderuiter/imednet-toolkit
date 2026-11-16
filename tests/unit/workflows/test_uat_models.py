@@ -167,3 +167,120 @@ def test_from_json_loads_correctly(tmp_path: Path) -> None:
 
     spec = UATSpecification.from_json(json_file)
     assert spec.study_key == "S1"
+
+
+def test_uat_workflow_state_enum_and_terminals() -> None:
+    """Verify all UATWorkflowState enum members and terminal state classifications."""
+    from imednet_workflows.uat.models import (
+        ACTIVE_UAT_STATES,
+        TERMINAL_UAT_STATES,
+        UATWorkflowState,
+    )
+
+    expected_states = {
+        "PENDING",
+        "INSPECTING",
+        "BUILDING_SPEC",
+        "GENERATING",
+        "SUBMITTING",
+        "MONITORING",
+        "COMPLETED",
+        "FAILED",
+    }
+    assert {s.value for s in UATWorkflowState} == expected_states
+
+    assert TERMINAL_UAT_STATES == {UATWorkflowState.COMPLETED, UATWorkflowState.FAILED}
+    assert ACTIVE_UAT_STATES == {
+        UATWorkflowState.PENDING,
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.BUILDING_SPEC,
+        UATWorkflowState.GENERATING,
+        UATWorkflowState.SUBMITTING,
+        UATWorkflowState.MONITORING,
+    }
+
+    assert UATWorkflowState.COMPLETED.is_terminal is True
+    assert UATWorkflowState.FAILED.is_terminal is True
+    assert UATWorkflowState.INSPECTING.is_terminal is False
+
+
+def test_uat_workflow_state_valid_forward_transitions() -> None:
+    """Test standard ordered forward progression across all states."""
+    from imednet_workflows.uat.models import UATWorkflowState, validate_uat_transition
+
+    path = [
+        (UATWorkflowState.PENDING, UATWorkflowState.INSPECTING),
+        (UATWorkflowState.INSPECTING, UATWorkflowState.BUILDING_SPEC),
+        (UATWorkflowState.BUILDING_SPEC, UATWorkflowState.GENERATING),
+        (UATWorkflowState.GENERATING, UATWorkflowState.SUBMITTING),
+        (UATWorkflowState.SUBMITTING, UATWorkflowState.MONITORING),
+        (UATWorkflowState.MONITORING, UATWorkflowState.COMPLETED),
+    ]
+
+    for from_s, to_s in path:
+        assert from_s.can_transition_to(to_s) is True
+        assert validate_uat_transition(from_s, to_s) is True
+
+
+def test_uat_workflow_state_transitions_to_failed() -> None:
+    """Verify every active state can transition to FAILED."""
+    from imednet_workflows.uat.models import ACTIVE_UAT_STATES, UATWorkflowState
+
+    for state in ACTIVE_UAT_STATES:
+        assert state.can_transition_to(UATWorkflowState.FAILED) is True
+        assert state.validate_transition_to(UATWorkflowState.FAILED) is True
+
+
+def test_uat_workflow_state_invalid_transitions() -> None:
+    """Verify backward, skipping, self, and terminal transitions raise InvalidUATStateTransitionError."""
+    from imednet_workflows.uat.models import (
+        InvalidUATStateTransitionError,
+        UATWorkflowState,
+        validate_uat_transition,
+    )
+
+    invalid_pairs = [
+        # Backward transitions
+        (UATWorkflowState.SUBMITTING, UATWorkflowState.INSPECTING),
+        (UATWorkflowState.MONITORING, UATWorkflowState.SUBMITTING),
+        (UATWorkflowState.BUILDING_SPEC, UATWorkflowState.INSPECTING),
+        # Prerequisite skipping
+        (UATWorkflowState.PENDING, UATWorkflowState.GENERATING),
+        (UATWorkflowState.INSPECTING, UATWorkflowState.SUBMITTING),
+        (UATWorkflowState.BUILDING_SPEC, UATWorkflowState.MONITORING),
+        # Self-transitions
+        (UATWorkflowState.INSPECTING, UATWorkflowState.INSPECTING),
+        (UATWorkflowState.SUBMITTING, UATWorkflowState.SUBMITTING),
+        # From terminal states
+        (UATWorkflowState.COMPLETED, UATWorkflowState.PENDING),
+        (UATWorkflowState.COMPLETED, UATWorkflowState.FAILED),
+        (UATWorkflowState.FAILED, UATWorkflowState.PENDING),
+        (UATWorkflowState.FAILED, UATWorkflowState.COMPLETED),
+    ]
+
+    for from_s, to_s in invalid_pairs:
+        assert from_s.can_transition_to(to_s) is False
+        with pytest.raises(InvalidUATStateTransitionError) as exc_info:
+            validate_uat_transition(from_s, to_s)
+        assert f"Cannot transition UAT workflow from {from_s.value} to {to_s.value}" in str(
+            exc_info.value
+        )
+
+
+def test_uat_workflow_state_normalize() -> None:
+    """Test state normalization from str and invalid type handling."""
+    from imednet_workflows.uat.models import (
+        InvalidUATStateTransitionError,
+        UATWorkflowState,
+        normalize_uat_state,
+    )
+
+    assert normalize_uat_state("pending") == UATWorkflowState.PENDING
+    assert normalize_uat_state("SUBMITTING") == UATWorkflowState.SUBMITTING
+    assert normalize_uat_state(UATWorkflowState.COMPLETED) == UATWorkflowState.COMPLETED
+
+    with pytest.raises(InvalidUATStateTransitionError, match="Invalid UAT state: 'UNKNOWN'"):
+        normalize_uat_state("UNKNOWN")
+
+    with pytest.raises(InvalidUATStateTransitionError, match="Invalid UAT state type: int"):
+        normalize_uat_state(123)  # type: ignore[arg-type]

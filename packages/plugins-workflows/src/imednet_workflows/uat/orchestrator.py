@@ -14,12 +14,17 @@ from imednet.spi.models import ImednetBaseModel
 
 from .generator import GeneratedRecordSet
 from .models import (
+    TERMINAL_UAT_STATES,
+    InvalidUATStateTransitionError,
     RecordTestType,
     UATFormSpec,
     UATSpecification,
     UATSubjectSpec,
     UATVariableSpec,
+    UATWorkflowState,
     VariableTestStrategy,
+    normalize_uat_state,
+    validate_uat_transition,
 )
 from .submission import SubmissionResult
 
@@ -48,29 +53,64 @@ class UATRunResult(ImednetBaseModel):
     started_at: datetime
     completed_at: datetime | None = None
 
-    spec: UATSpecification
-    record_sets: list[GeneratedRecordSet]
-    submission_result: SubmissionResult
-    poll_summary: Any  # JobPollSummary
+    state: UATWorkflowState = UATWorkflowState.COMPLETED
+    state_history: list[UATWorkflowState] = Field(default_factory=list)
+    failure_phase: UATWorkflowState | str | None = None
+    error_message: str | None = None
+
+    spec: UATSpecification | None = None
+    record_sets: list[GeneratedRecordSet] = Field(default_factory=list)
+    submission_result: SubmissionResult | None = None
+    poll_summary: Any = None  # JobPollSummary
 
     # Phase-level timing for performance profiling
     phase_durations: dict[str, float] = Field(default_factory=dict)  # phase name → seconds
 
     @property
+    def failed_phase(self) -> UATWorkflowState | str | None:
+        """Alias for failure_phase."""
+        return self.failure_phase
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return True if the run reached a terminal state."""
+        return self.state in TERMINAL_UAT_STATES
+
+    @property
     def overall_success(self) -> bool:
         """Return True if all jobs in the run were successful."""
+        if self.state == UATWorkflowState.FAILED:
+            return False
         return getattr(self.poll_summary, "all_successful", False)
 
     def summary(self) -> str:
         """Return a human-readable summary string suitable for CLI output."""
+        records_submitted = (
+            self.submission_result.total_records_submitted if self.submission_result else 0
+        )
+        monitored_count = (
+            len(getattr(self.poll_summary, "results", {}))
+            + len(getattr(self.poll_summary, "failures", {}))
+            if self.poll_summary
+            else 0
+        )
         lines = [
             f"UAT Run: {self.run_id}",
             f"Study:   {self.study_key}",
             f"Forms tested: {len(self.record_sets)}",
-            f"Records submitted: {self.submission_result.total_records_submitted}",
-            f"Jobs monitored: {len(getattr(self.poll_summary, 'results', {})) + len(getattr(self.poll_summary, 'failures', {}))}",
+            f"Records submitted: {records_submitted}",
+            f"Jobs monitored: {monitored_count}",
             f"Overall: {'PASS' if self.overall_success else 'FAIL'}",
         ]
+        if self.failure_phase:
+            phase_val = (
+                self.failure_phase.value
+                if isinstance(self.failure_phase, Enum)
+                else str(self.failure_phase)
+            )
+            lines.append(f"Failed phase: {phase_val}")
+        if self.error_message:
+            lines.append(f"Error: {self.error_message}")
         if self.completed_at and self.started_at:
             duration = (self.completed_at - self.started_at).total_seconds()
             lines.append(f"Duration: {duration:.1f}s")
@@ -236,6 +276,49 @@ class UATWorkflow:
         self._submitter: Any | None = None
         self._poller: Any | None = None
 
+        self._state: UATWorkflowState = UATWorkflowState.PENDING
+        self._state_history: list[UATWorkflowState] = [UATWorkflowState.PENDING]
+        self._last_result: UATRunResult | None = None
+
+    @property
+    def state(self) -> UATWorkflowState:
+        """Return the current lifecycle state of the workflow."""
+        return self._state
+
+    @property
+    def state_history(self) -> list[UATWorkflowState]:
+        """Return the recorded history of lifecycle states."""
+        return list(self._state_history)
+
+    @property
+    def last_result(self) -> UATRunResult | None:
+        """Return the result of the last run execution."""
+        return self._last_result
+
+    def transition_to(self, target: UATWorkflowState | str) -> UATWorkflowState:
+        """Transition workflow to a new state along an approved lifecycle path.
+
+        Args:
+            target: Desired target state.
+
+        Returns:
+            The newly set state.
+
+        Raises:
+            InvalidUATStateTransitionError: If the transition is not permitted.
+        """
+        target_state = normalize_uat_state(target)
+        validate_uat_transition(self._state, target_state)
+        self._state = target_state
+        self._state_history.append(target_state)
+        return self._state
+
+    def reset(self) -> None:
+        """Reset the workflow state machine back to PENDING."""
+        self._state = UATWorkflowState.PENDING
+        self._state_history = [UATWorkflowState.PENDING]
+        self._last_result = None
+
     def _get_submitter(self) -> Any:
         if self._submitter is None:
             from .submission import BulkRecordSubmissionWorkflow
@@ -266,49 +349,89 @@ class UATWorkflow:
     ) -> UATRunResult:
         """Execute the full UAT pipeline and return a UATRunResult."""
         started_at = datetime.now(UTC)
+        run_id = str(uuid.uuid4())
         phase_durations: dict[str, float] = {}
+        record_sets: list[GeneratedRecordSet] = []
+        submission_result: SubmissionResult | None = None
+        poll_summary: Any = None
 
-        # 1. Inspect
-        t0 = time.monotonic()
-        snapshot = self.inspect(study_key)
-        phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
+        try:
+            # 1. Inspect
+            self.transition_to(UATWorkflowState.INSPECTING)
+            t0 = time.monotonic()
+            snapshot = self.inspect(study_key)
+            phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
 
-        # 2. Build Spec (if not provided)
-        t0 = time.monotonic()
-        if spec is None:
-            spec = self.build_spec(
-                snapshot,
-                subject_count=subject_count,
-                site_name=site_name,
-                enabled_form_keys=enabled_form_keys,
+            # 2. Build Spec (if not provided)
+            self.transition_to(UATWorkflowState.BUILDING_SPEC)
+            t0 = time.monotonic()
+            if spec is None:
+                spec = self.build_spec(
+                    snapshot,
+                    subject_count=subject_count,
+                    site_name=site_name,
+                    enabled_form_keys=enabled_form_keys,
+                )
+            phase_durations[UATRunPhase.BUILD_SPEC] = time.monotonic() - t0
+
+            # 3. Generate
+            self.transition_to(UATWorkflowState.GENERATING)
+            t0 = time.monotonic()
+            record_sets = self.generate(spec, snapshot)
+            phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
+
+            # 4. Submit
+            self.transition_to(UATWorkflowState.SUBMITTING)
+            t0 = time.monotonic()
+            submission_result = self.submit(study_key, record_sets, email_notify=email_notify)
+            phase_durations[UATRunPhase.SUBMIT] = time.monotonic() - t0
+
+            # 5. Monitor
+            self.transition_to(UATWorkflowState.MONITORING)
+            t0 = time.monotonic()
+            poll_summary = self.monitor(study_key, submission_result)
+            phase_durations[UATRunPhase.MONITOR] = time.monotonic() - t0
+
+            # Complete
+            self.transition_to(UATWorkflowState.COMPLETED)
+            result = UATRunResult(
+                study_key=study_key,
+                run_id=run_id,
+                started_at=started_at,
+                completed_at=datetime.now(UTC),
+                state=self._state,
+                state_history=list(self._state_history),
+                spec=spec,
+                record_sets=record_sets,
+                submission_result=submission_result,
+                poll_summary=poll_summary,
+                phase_durations=phase_durations,
             )
-        phase_durations[UATRunPhase.BUILD_SPEC] = time.monotonic() - t0
+            self._last_result = result
+            return result
 
-        # 3. Generate
-        t0 = time.monotonic()
-        record_sets = self.generate(spec, snapshot)
-        phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
-
-        # 4. Submit
-        t0 = time.monotonic()
-        submission_result = self.submit(study_key, record_sets, email_notify=email_notify)
-        phase_durations[UATRunPhase.SUBMIT] = time.monotonic() - t0
-
-        # 5. Monitor
-        t0 = time.monotonic()
-        poll_summary = self.monitor(study_key, submission_result)
-        phase_durations[UATRunPhase.MONITOR] = time.monotonic() - t0
-
-        return UATRunResult(
-            study_key=study_key,
-            started_at=started_at,
-            completed_at=datetime.now(UTC),
-            spec=spec,
-            record_sets=record_sets,
-            submission_result=submission_result,
-            poll_summary=poll_summary,
-            phase_durations=phase_durations,
-        )
+        except InvalidUATStateTransitionError:
+            raise
+        except Exception as exc:
+            failed_phase = self._state
+            self.transition_to(UATWorkflowState.FAILED)
+            result = UATRunResult(
+                study_key=study_key,
+                run_id=run_id,
+                started_at=started_at,
+                completed_at=datetime.now(UTC),
+                state=self._state,
+                state_history=list(self._state_history),
+                failure_phase=failed_phase,
+                error_message=str(exc),
+                spec=spec,
+                record_sets=record_sets,
+                submission_result=submission_result,
+                poll_summary=poll_summary,
+                phase_durations=phase_durations,
+            )
+            self._last_result = result
+            return result
 
     def inspect(self, study_key: str) -> Any:
         """Fetch study metadata via StudySchemaInspector."""
@@ -343,3 +466,12 @@ class UATWorkflow:
 
 
 UATRunResult.model_rebuild()
+
+__all__ = [
+    "InvalidUATStateTransitionError",
+    "UATRunPhase",
+    "UATRunResult",
+    "UATSpecificationBuilder",
+    "UATWorkflow",
+    "UATWorkflowState",
+]

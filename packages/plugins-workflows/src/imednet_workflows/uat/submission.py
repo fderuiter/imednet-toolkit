@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import Field
 
 from imednet.spi.facade import ImednetFacade
-from imednet.spi.models import ImednetBaseModel, Job
+from imednet.spi.models import ImednetBaseModel, Job, JobState, normalize_job_state
 from imednet.spi.utils import JobFailedError, JobPoller, JobTimeoutError
 
 from .generator import GeneratedRecordSet
@@ -19,10 +20,21 @@ from .models import RecordTestType
 logger = logging.getLogger(__name__)
 
 
+class SubmissionPhase(StrEnum):
+    """Phases of a two-phase bulk submission workflow."""
+
+    PENDING = "pending"
+    REGISTRATION = "registration"
+    AWAITING_REGISTRATION = "awaiting_registration"
+    DATA = "data"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class BatchSubmission(ImednetBaseModel):
     """Tracks a single API call to records.create()."""
 
-    phase: Literal["registration", "data"]
+    phase: Literal["registration", "data"] | SubmissionPhase
     form_key: str | None = None
     form_name: str | None = None
     record_count: int
@@ -107,6 +119,7 @@ class BulkRecordSubmissionWorkflow:
         self.await_registration = await_registration
         self.registration_timeout = registration_timeout
         self.skip_existing_subjects = skip_existing_subjects
+        self.phase: SubmissionPhase = SubmissionPhase.PENDING
 
     def submit(
         self,
@@ -136,6 +149,7 @@ class BulkRecordSubmissionWorkflow:
             existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
 
         # Phase 1: Registration
+        self.phase = SubmissionPhase.REGISTRATION
         for rs in registration_sets:
             # Let's assume GeneratedRecordSet.payloads and GeneratedRecordSet.subject_keys are 1:1
             filtered_payloads = []
@@ -161,22 +175,36 @@ class BulkRecordSubmissionWorkflow:
                 )
                 result.registration_batches.append(batch)
 
-        # Await registration completion if required
+        # Determine transition from registration phase
         if self.await_registration and result.registration_batches:
-            self._await_registration_jobs(study_key, result.registration_batches)
+            self.phase = SubmissionPhase.AWAITING_REGISTRATION
+        else:
+            self.phase = SubmissionPhase.DATA
 
-        # Phase 2: Data Submission
-        for rs in data_sets:
-            for chunk in self._chunk_payloads(rs.payloads):
-                batch = self._submit_batch(
-                    study_key,
-                    chunk,
-                    phase="data",
-                    form_key=rs.form_key,
-                    form_name=rs.form_name,
-                    email_notify=email_notify,
-                )
-                result.data_batches.append(batch)
+        # Explicit submission phase check for awaiting registration
+        if self.phase == SubmissionPhase.AWAITING_REGISTRATION:
+            try:
+                self._await_registration_jobs(study_key, result.registration_batches)
+            except Exception:
+                self.phase = SubmissionPhase.FAILED
+                raise
+            self.phase = SubmissionPhase.DATA
+
+        # Explicit submission phase check for data submission
+        if self.phase == SubmissionPhase.DATA:
+            # Phase 2: Data Submission
+            for rs in data_sets:
+                for chunk in self._chunk_payloads(rs.payloads):
+                    batch = self._submit_batch(
+                        study_key,
+                        chunk,
+                        phase="data",
+                        form_key=rs.form_key,
+                        form_name=rs.form_name,
+                        email_notify=email_notify,
+                    )
+                    result.data_batches.append(batch)
+            self.phase = SubmissionPhase.COMPLETED
 
         result.completed_at = datetime.now(UTC)
         return result
@@ -190,7 +218,7 @@ class BulkRecordSubmissionWorkflow:
         self,
         study_key: str,
         payloads: list[dict[str, Any]],
-        phase: Literal["registration", "data"],
+        phase: Literal["registration", "data"] | SubmissionPhase,
         form_key: str | None,
         form_name: str | None,
         email_notify: bool | str | None,
@@ -226,20 +254,45 @@ class BulkRecordSubmissionWorkflow:
             if batch_id in summary.failures:
                 exc = summary.failures[batch_id]
                 if isinstance(exc, JobTimeoutError):
-                    batch.job.state = "TIMEOUT"
+                    target_state = JobState.TIMEOUT
                 elif isinstance(exc, JobFailedError):
                     status = getattr(exc, "status", None)
-                    batch.job.state = getattr(status, "state", "FAILED") or "FAILED"
+                    raw_state = getattr(status, "state", None)
+                    target_state = normalize_job_state(raw_state) if raw_state else JobState.FAILED
                 else:
-                    batch.job.state = "FAILED"
+                    target_state = JobState.FAILED
+                batch.job.transition_to(target_state)
+                if not isinstance(batch.job, Job):
+                    batch.job.state = target_state
                 failed_batches.append(batch)
             elif batch_id in summary.results:
                 status = summary.results[batch_id]
-                batch.job.state = status.state
-                if not status.state or status.state.upper() not in ("COMPLETED", "SUCCESS"):
+                raw_state = getattr(status, "state", None)
+                target_state = normalize_job_state(raw_state) if raw_state else JobState.FAILED
+                batch.job.transition_to(target_state)
+                if not isinstance(batch.job, Job):
+                    batch.job.state = target_state
+                is_success = (
+                    batch.job.is_successful
+                    if isinstance(batch.job.is_successful, bool)
+                    else (
+                        getattr(batch.job, "state", None)
+                        in (
+                            JobState.COMPLETED,
+                            JobState.COMPLETE,
+                            JobState.SUCCESS,
+                            "COMPLETED",
+                            "COMPLETE",
+                            "SUCCESS",
+                        )
+                    )
+                )
+                if not is_success:
                     failed_batches.append(batch)
             else:
-                batch.job.state = "UNKNOWN"
+                batch.job.transition_to(JobState.FAILED)
+                if not isinstance(batch.job, Job):
+                    batch.job.state = JobState.FAILED
                 failed_batches.append(batch)
 
         if failed_batches:
@@ -257,3 +310,12 @@ class BulkRecordSubmissionWorkflow:
             if key:
                 existing_keys.add(key)
         return existing_keys
+
+
+__all__ = [
+    "BatchSubmission",
+    "BulkRecordSubmissionWorkflow",
+    "BulkSubmissionError",
+    "SubmissionPhase",
+    "SubmissionResult",
+]
