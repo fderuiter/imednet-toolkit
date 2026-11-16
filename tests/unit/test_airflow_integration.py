@@ -80,7 +80,7 @@ def test_imednet_hook_returns_sdk(monkeypatch):
     import apache_airflow_providers_imednet as airflow_mod
 
     hook = airflow_mod.ImednetHook()
-    sdk = hook.get_conn()
+    sdk = hook.get_sdk_client()
 
     assert isinstance(sdk, sdk_mod.ImednetSDK)
     assert sdk._client._client.headers["x-api-key"] == "KEY"
@@ -240,7 +240,7 @@ def test_imednet_hook_non_dict_extras(monkeypatch):
     from apache_airflow_providers_imednet.hooks import ImednetHook
 
     hook = ImednetHook()
-    sdk = hook.get_conn()
+    sdk = hook.get_sdk_client()
 
     assert sdk._client._client.headers["x-api-key"] == "KEY"
     assert sdk._client._client.headers["x-imn-security-key"] == "SEC"
@@ -331,7 +331,7 @@ def test_imednet_hook_non_string_login(monkeypatch):
     from apache_airflow_providers_imednet.hooks import ImednetHook
 
     hook = ImednetHook()
-    sdk = hook.get_conn()
+    sdk = hook.get_sdk_client()
     assert sdk._client._client.headers["x-api-key"] == "FALLBACK_KEY"
     assert sdk._client._client.headers["x-imn-security-key"] == "SEC"
 
@@ -359,7 +359,7 @@ def test_imednet_hook_non_string_password(monkeypatch):
     from apache_airflow_providers_imednet.hooks import ImednetHook
 
     hook = ImednetHook()
-    sdk = hook.get_conn()
+    sdk = hook.get_sdk_client()
     assert sdk._client._client.headers["x-api-key"] == "KEY"
     assert sdk._client._client.headers["x-imn-security-key"] == "FALLBACK_SEC"
 
