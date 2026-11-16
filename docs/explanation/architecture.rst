@@ -134,7 +134,7 @@ can be refreshed by passing ``refresh=True`` to endpoint methods or calling
 CLI
 ---
 
-The :doc:`/how-to/cli` uses `Typer` to expose common workflows on the command line. Each
+The :doc:`/how-to/cli` uses standard-library ``argparse`` to expose common workflows on the command line. Each
 command creates an :class:`~imednet.sdk.ImednetSDK` instance, invokes a workflow,
 and closes the SDK when finished.
 
@@ -160,9 +160,9 @@ Adding New Endpoints
 Adding New Workflows
 --------------------
 
-* Create a workflow under ``imednet/workflows`` and provide sync and async
+* Create a workflow under ``packages/plugins-workflows/src/imednet_workflows`` and provide sync and async
   methods where appropriate.
-* Instantiate the workflow in ``Workflows`` inside :mod:`imednet.sdk`.
+* Register the workflow factory in the distribution's ``imednet.workflows`` entry points.
 * Add CLI commands or examples that demonstrate the workflow.
 * Update documentation and tests.
 
@@ -217,7 +217,7 @@ Shared ``ExportSink`` contract
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 All non-tabular sinks subclass
-:class:`~imednet.integrations.sink_base.ExportSink` and must implement
+``imednet.spi.sinks.ExportSink`` and must implement
 three methods:
 
 ``write_batch(records, *, batch_id) -> int``
@@ -285,7 +285,7 @@ Optional dependency conventions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Each sink module calls
-:func:`~imednet.integrations.sink_base._require_optional_dep` at
+``imednet.spi.sinks.require_optional_dep`` at
 *connection time* (not at import time).  This means:
 
 * ``import imednet.integrations.graph`` never raises even when
@@ -316,12 +316,23 @@ Public API exposure
 Adding New Export Sinks
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-1. Create a module under ``packages/core/src/imednet/integrations/``.
-2. Subclass :class:`~imednet.integrations.sink_base.ExportSink` and
+1. Create a module under ``packages/plugins-sinks/src/imednet_sinks/``.
+2. Subclass ``imednet.spi.sinks.ExportSink`` and
    implement ``write_batch``, ``flush``, and ``close``.
-3. Call :func:`~imednet.integrations.sink_base._require_optional_dep`
+3. Call ``imednet.spi.sinks.require_optional_dep``
    inside the constructor (not at module level).
-4. Add the optional dependency to ``packages/core/pyproject.toml`` and
-   define a new ``[tool.hatch.extras]`` key.
-5. Re-export the new class from :mod:`imednet.integrations`.
-6. Add unit tests; run ``pytest --cov=imednet.integrations``.
+4. Add the optional dependency to ``packages/plugins-sinks/pyproject.toml`` under
+   ``project.optional-dependencies``; add a core extra only for a supported install recipe.
+5. Expose it through the sink plugin; retain existing core import shims.
+6. Add unit tests; run the canonical verification tasks in :doc:`/how-to/verification`.
+
+Static boundary checks
+----------------------
+
+The repository guard scans core, workflows, sinks and Airflow source roots.
+It resolves relative imports before checking segment-aware package boundaries;
+missing source trees fail explicitly. Type-only references follow the same
+layering rules, without executing optional modules. Core's SPI is an intentional
+CLI composition root. Dynamic entry points and legacy lazy import shims require
+separate runtime tests. New sink implementations use ``imednet.spi.sinks``;
+legacy ``imednet.spi.sink_base`` and ``imednet.integrations`` remain compatible.

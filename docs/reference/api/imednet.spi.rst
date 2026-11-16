@@ -50,6 +50,13 @@ imednet.spi.models module
    :members:
    :show-inheritance:
 
+imednet.spi.sinks module
+------------------------
+
+.. automodule:: imednet.spi.sinks
+   :members:
+   :show-inheritance:
+
 imednet.spi.utils module
 ------------------------
 

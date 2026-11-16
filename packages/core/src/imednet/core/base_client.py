@@ -15,6 +15,7 @@ else:  # pragma: no cover - typing fallback for optional dependency
 import httpx
 
 from imednet.auth.api_key import ApiKeyAuth
+from imednet.auth.oidc import OIDCAuth
 from imednet.auth.strategy import AuthStrategy
 from imednet.config import load_config
 from imednet.constants import (
@@ -67,6 +68,7 @@ class BaseClient:
             security_key=security_key,
             base_url=base_url,
             simulation_mode=simulation_mode,
+            require_credentials=auth is None,
         )
 
         self.simulation_mode = config.simulation_mode
@@ -82,12 +84,14 @@ class BaseClient:
         self.timeout = timeout if isinstance(timeout, httpx.Timeout) else httpx.Timeout(timeout)
         self.retry_config = retry_config or RetryConfig()
 
-        if auth:
+        if auth is not None:
             self.auth = auth
         elif self.simulation_mode:
             self.auth = ApiKeyAuth(
                 config.api_key or "SIMULATED_KEY", config.security_key or "SIMULATED_KEY"
             )
+        elif config.oidc_token:
+            self.auth = OIDCAuth(config.oidc_token)
         else:
             self.auth = ApiKeyAuth(config.api_key or "", config.security_key or "")
 

@@ -100,7 +100,17 @@ extensions = [
     "sphinx.ext.doctest",
     "myst_parser",
     "sphinx.ext.githubpages",
+    "sphinx_thebe",
 ]
+
+# Configure sphinx-thebe options for interactive in-browser execution with Pyodide
+thebe_config = {
+    "always_load": False,
+    "selector": "div.highlight-python",
+    "selector_input": "pre",
+    "selector_output": ".output, .cell_output",
+    "kernel_name": "pyodide",
+}
 
 autosummary_generate = False
 
@@ -184,7 +194,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["showcase.js"]
+html_js_files: list[str] = ["showcase.js", "thebe_pyodide.js"]
 
 doctest_global_setup = """
 import os
@@ -297,6 +307,7 @@ _print_patcher.stop()
 
 html_theme = "furo"
 html_title = f"{project} Documentation"
+html_baseurl = "https://fderuiter.github.io/imednet-toolkit/"
 html_logo = "_static/logo.png"
 html_favicon = "_static/logo.png"
 
@@ -308,11 +319,29 @@ html_theme_options: dict[str, Any] = {
         "color-brand-primary": "#005fb8",
         "color-brand-content": "#005fb8",
         "color-brand-visited": "#5c3d99",
+        "color-brand-btn-text": "#ffffff",
+        "color-brand-button-text": "#ffffff",
+        "color-status-success": "#065f46",
+        "color-status-warning": "#92400e",
+        "color-status-danger": "#b91c1c",
+        "color-badge-success": "#065f46",
+        "color-badge-warning": "#92400e",
+        "color-badge-danger": "#b91c1c",
+        "color-badge-required": "#b91c1c",
     },
     "dark_css_variables": {
         "color-brand-primary": "#58a6ff",
         "color-brand-content": "#79c0ff",
         "color-brand-visited": "#c4a0ff",
+        "color-brand-btn-text": "#131416",
+        "color-brand-button-text": "#131416",
+        "color-status-success": "#34d399",
+        "color-status-warning": "#fbbf24",
+        "color-status-danger": "#f87171",
+        "color-badge-success": "#34d399",
+        "color-badge-warning": "#fbbf24",
+        "color-badge-danger": "#f87171",
+        "color-badge-required": "#f87171",
     },
 }
 
@@ -321,6 +350,8 @@ master_doc = 'index'
 # Linkcheck configuration
 linkcheck_ignore = [
     r"https://.*\.imednet\.com.*",
+    r"https://cdn\.jsdelivr\.net/.*",
+    r"https://unpkg\.com/.*",
 ]
 linkcheck_timeout = 30
 linkcheck_retries = 3

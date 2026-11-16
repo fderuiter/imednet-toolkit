@@ -18,6 +18,99 @@ class ValidationViolation(BaseModel):
     severity: str  # ERROR, WARNING
 
 
+_CANONICAL_DOMAINS: dict[str, str] = {
+    "DM": "DM",
+    "DEMOGRAPHICS": "DM",
+    "DEMOGRAPHIC": "DM",
+    "VS": "VS",
+    "VITALS": "VS",
+    "VITAL SIGNS": "VS",
+    "VITAL_SIGNS": "VS",
+    "VITALSIGNS": "VS",
+    "AE": "AE",
+    "ADVERSE EVENTS": "AE",
+    "ADVERSE_EVENTS": "AE",
+    "ADVERSE EVENT": "AE",
+    "PD": "PD",
+    "PROTOCOL DEVIATIONS": "PD",
+    "PROTOCOL_DEVIATIONS": "PD",
+    "PROTOCOL DEVIATION": "PD",
+    "DD": "DD",
+    "DEVICE DEFICIENCIES": "DD",
+    "DEVICE_DEFICIENCIES": "DD",
+    "DEVICE DEFICIENCY": "DD",
+}
+
+_STANDARD_SEX_VALUES: list[str] = ["M", "F", "U", "UNDIFFERENTIATED"]
+_STANDARD_VITAL_SIGNS_UNITS: list[str] = [
+    "mmHg",
+    "bpm",
+    "beats/min",
+    "breaths/min",
+    "C",
+    "F",
+    "Cel",
+    "kg",
+    "lbs",
+    "lb",
+    "cm",
+    "in",
+    "m",
+    "%",
+]
+
+
+def _canonical_domain(domain: str) -> str:
+    """Normalize a clinical domain identifier to its standard 2-letter code."""
+    normalized = domain.strip().upper().replace("-", "_")
+    return _CANONICAL_DOMAINS.get(normalized, normalized)
+
+
+class _DomainDict(dict[str, Any]):
+    """Dictionary supporting canonical domain key resolution."""
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self:
+            return super().__getitem__(key)
+        if isinstance(key, str):
+            if "." in key:
+                domain_part, field_part = key.split(".", 1)
+                canonical_domain = _canonical_domain(domain_part)
+                for k, v in self.items():
+                    if "." in k:
+                        kd, kf = k.split(".", 1)
+                        if _canonical_domain(kd) == canonical_domain and kf == field_part:
+                            return v
+            else:
+                canonical = _canonical_domain(key)
+                for k, v in self.items():
+                    if "." not in k and _canonical_domain(k) == canonical:
+                        return v
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self[key] if key in self else default  # noqa: SIM401
+
+    def __contains__(self, key: object) -> bool:
+        if super().__contains__(key):
+            return True
+        if isinstance(key, str):
+            if "." in key:
+                domain_part, field_part = key.split(".", 1)
+                canonical_domain = _canonical_domain(domain_part)
+                for k in self:
+                    if "." in k:
+                        kd, kf = k.split(".", 1)
+                        if _canonical_domain(kd) == canonical_domain and kf == field_part:
+                            return True
+            else:
+                canonical = _canonical_domain(key)
+                for k in self:
+                    if "." not in k and _canonical_domain(k) == canonical:
+                        return True
+        return False
+
+
 class StandardsProfile:
     """A profile defining required, recommended, and optional fields for data domains."""
 
@@ -40,30 +133,33 @@ class StandardsProfile:
             value_constraints: Mapping of field or domain.field to allowed values.
         """
         self.profile_name = profile_name
-        self.required_fields = required_fields or {}
-        self.recommended_fields = recommended_fields or {}
-        self.optional_fields = optional_fields or {}
-        self.value_constraints = value_constraints or {}
+        self.required_fields = _DomainDict(required_fields) if required_fields else _DomainDict()
+        self.recommended_fields = (
+            _DomainDict(recommended_fields) if recommended_fields else _DomainDict()
+        )
+        self.optional_fields = _DomainDict(optional_fields) if optional_fields else _DomainDict()
+        self.value_constraints = (
+            _DomainDict(value_constraints) if value_constraints else _DomainDict()
+        )
 
     def expected_fields(self, domain: str) -> list[str]:
         """Return the list of expected (required + recommended) fields for a domain."""
-        domain_key = domain.upper()
-        return [
-            *self.required_fields.get(domain_key, []),
-            *self.recommended_fields.get(domain_key, []),
-        ]
+        domain_key = _canonical_domain(domain)
+        required = self.required_fields.get(domain_key, [])
+        recommended = self.recommended_fields.get(domain_key, [])
+        return [*required, *recommended]
 
     def validate(self, domain: str, data: dict[str, Any]) -> list[ValidationViolation]:
         """Validate a data dictionary against the profile for a specific domain.
 
         Args:
-            domain: The domain name (e.g., 'AE', 'PD').
+            domain: The domain name (e.g., 'AE', 'PD', 'DM', 'VS').
             data: The data dictionary to validate.
 
         Returns:
             A list of ValidationViolation objects.
         """
-        domain_key = domain.upper()
+        domain_key = _canonical_domain(domain)
         violations: list[ValidationViolation] = []
 
         for field_name in self.required_fields.get(domain_key, []):
@@ -93,7 +189,7 @@ class StandardsProfile:
         for constraint_key, allowed_values in self.value_constraints.items():
             if "." in constraint_key:
                 constraint_domain, field_name = constraint_key.split(".", 1)
-                if constraint_domain.upper() != domain_key:
+                if _canonical_domain(constraint_domain) != domain_key:
                     continue
             else:
                 field_name = constraint_key
@@ -114,7 +210,7 @@ class StandardsProfile:
 
 
 class GeneralClinicalProfile(StandardsProfile):
-    """General clinical profile with basic AE and PD requirements."""
+    """General clinical profile with basic AE, PD, DM, and VS requirements."""
 
     def __init__(self) -> None:
         """Initialize the general clinical profile."""
@@ -123,10 +219,14 @@ class GeneralClinicalProfile(StandardsProfile):
             required_fields={
                 "AE": ["subjectKey", "aeTerm", "aeSeverity"],
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
+                "DM": ["subjectKey", "sex"],
+                "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
             },
             recommended_fields={
                 "AE": ["aeDecod", "aeRelationship"],
                 "PD": ["dvStatus"],
+                "DM": ["birthDate", "age", "race", "ethnicity"],
+                "VS": ["vsTestCd", "vsUnit"],
             },
             optional_fields={
                 "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
@@ -144,10 +244,20 @@ class DrugSafetyProfile(StandardsProfile):
             required_fields={
                 "AE": ["subjectKey", "aeTerm", "aeSeverity", "aeDecod", "aeRelationship"],
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
+                "DM": ["subjectKey", "sex"],
+                "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
             },
-            recommended_fields={"AE": ["aeActionTaken", "aeOutcome"]},
+            recommended_fields={
+                "AE": ["aeActionTaken", "aeOutcome"],
+                "DM": ["birthDate", "age", "race", "ethnicity"],
+                "VS": ["vsTestCd", "vsUnit"],
+            },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
-            value_constraints={"AE.aeSeverity": [1, 2, 3, 4, 5, "1", "2", "3", "4", "5"]},
+            value_constraints={
+                "AE.aeSeverity": [1, 2, 3, 4, 5, "1", "2", "3", "4", "5"],
+                "DM.sex": _STANDARD_SEX_VALUES,
+                "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
+            },
         )
 
 
@@ -162,15 +272,25 @@ class DeviceSafetyProfile(StandardsProfile):
                 "AE": ["subjectKey", "aeTerm", "aeSeverity"],
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
+                "DM": ["subjectKey", "sex"],
+                "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
             },
-            recommended_fields={"DD": ["ddRelationship", "ddActionTaken"]},
+            recommended_fields={
+                "DD": ["ddRelationship", "ddActionTaken"],
+                "DM": ["birthDate", "age", "race", "ethnicity"],
+                "VS": ["vsTestCd", "vsUnit"],
+            },
             optional_fields={},
+            value_constraints={
+                "DM.sex": _STANDARD_SEX_VALUES,
+                "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
+            },
         )
 
     def validate(self, domain: str, data: dict[str, Any]) -> list[ValidationViolation]:
         """Validate device-specific constraints for DD and other domains."""
         violations = super().validate(domain=domain, data=data)
-        domain_key = domain.upper()
+        domain_key = _canonical_domain(domain)
 
         if domain_key != "DD":
             return violations
@@ -227,14 +347,16 @@ PROFILE_REGISTRY.register(DrugSafetyProfile())
 PROFILE_REGISTRY.register(DeviceSafetyProfile())
 
 
-CDISC_CONTROLLED_TERMINOLOGY: dict[str, set[str]] = {
-    # Severity / Intensity (C66769)
+# Project reporting vocabulary, not a versioned CDISC CT release. Callers must
+# explicitly select it or supply their study-approved terminology snapshot.
+NORMALIZATION_TERMINOLOGY: dict[str, set[str]] = {
+    # Reporting severity/grade labels
     "aeSeverity": {"MILD", "MODERATE", "SEVERE", "1", "2", "3", "4", "5"},
     "AESEV": {"MILD", "MODERATE", "SEVERE", "1", "2", "3", "4", "5"},
     "dvSeverity": {"MILD", "MODERATE", "SEVERE", "MAJOR", "MINOR", "CRITICAL"},
     "DVSEV": {"MILD", "MODERATE", "SEVERE", "MAJOR", "MINOR", "CRITICAL"},
     "pdSeverity": {"MILD", "MODERATE", "SEVERE", "MAJOR", "MINOR", "CRITICAL"},
-    # Causality / Relationship (C66768)
+    # Reporting relationship labels
     "aeRelationship": {
         "RELATED",
         "NOT RELATED",
@@ -271,7 +393,7 @@ CDISC_CONTROLLED_TERMINOLOGY: dict[str, set[str]] = {
     },
     "ddRelationship": {"RELATED", "NOT RELATED", "POSSIBLE", "PROBABLE", "REMOTE", "YES", "NO"},
     "DDREL": {"RELATED", "NOT RELATED", "POSSIBLE", "PROBABLE", "REMOTE", "YES", "NO"},
-    # Action Taken (C66767)
+    # Reporting action labels
     "aeActionTaken": {
         "NONE",
         "DOSE REDUCED",
@@ -310,7 +432,7 @@ CDISC_CONTROLLED_TERMINOLOGY: dict[str, set[str]] = {
         "NOT APPLICABLE",
         "UNKNOWN",
     },
-    # Outcome (C66768)
+    # Reporting outcome labels
     "aeOutcome": {
         "RECOVERED/RESOLVED",
         "RECOVERED",
@@ -432,6 +554,9 @@ CDISC_CONTROLLED_TERMINOLOGY: dict[str, set[str]] = {
     },
 }
 
+# Compatibility name from the initial proposal; this is not an official CT snapshot.
+CDISC_CONTROLLED_TERMINOLOGY = NORMALIZATION_TERMINOLOGY
+
 UNIVERSAL_CDASH_IDENTIFIERS: frozenset[str] = frozenset(
     {
         "studyid",
@@ -487,6 +612,8 @@ DM_ALLOWED_VARIABLES: frozenset[str] = frozenset(
         "actarmcd",
         "country",
         "brthdtc",
+        "birthdate",
+        "ethnicity",
         "dthdtc",
         "dthfl",
         "dmdtc",
@@ -495,7 +622,10 @@ DM_ALLOWED_VARIABLES: frozenset[str] = frozenset(
 
 
 def validate_cdash_variable(target_field: str, domain: str) -> tuple[bool, str | None]:
-    """Validate a target variable against CDASH naming conventions and domain prefixes.
+    """Check the local reporting-name syntax and configured domain-prefix policy.
+
+    This heuristic accepts project aliases; it does not establish membership in
+    an official CDASH/SDTM version or certify standards conformance.
 
     Args:
         target_field: The field name to validate.
@@ -510,7 +640,7 @@ def validate_cdash_variable(target_field: str, domain: str) -> tuple[bool, str |
         return False, "Domain must be a non-empty string"
 
     clean_target = target_field.strip()
-    clean_domain = domain.strip().upper()
+    clean_domain = _canonical_domain(domain)
     lower_target = clean_target.lower()
 
     if not re.match(r"^[A-Za-z][A-Za-z0-9_]{1,31}$", clean_target):
@@ -535,7 +665,7 @@ def validate_cdash_variable(target_field: str, domain: str) -> tuple[bool, str |
 
 
 def is_valid_cdash_variable(target_field: str, domain: str) -> bool:
-    """Check whether a target variable conforms to CDASH conventions for a domain."""
+    """Check whether a target passes the local CDASH-style naming heuristic."""
     valid, _ = validate_cdash_variable(target_field, domain)
     return valid
 
@@ -544,6 +674,7 @@ __all__ = [
     "CDISC_CONTROLLED_TERMINOLOGY",
     "DM_ALLOWED_VARIABLES",
     "DOMAIN_PREFIXES",
+    "NORMALIZATION_TERMINOLOGY",
     "PROFILE_REGISTRY",
     "UNIVERSAL_CDASH_IDENTIFIERS",
     "DeviceSafetyProfile",

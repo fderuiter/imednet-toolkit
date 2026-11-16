@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Collection
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from imednet.spi.models import (
-    CDISC_CONTROLLED_TERMINOLOGY,
     StandardsProfile,
     ValidationViolation,
 )
@@ -39,13 +39,37 @@ def _normalize_lookups(
 
 
 class CategoricalNormalizer:
-    """Normalizes categorical values in data records using terminology lookups and CDISC CT."""
+    """Normalize explicit terminology/date selections without inferring clinical meaning."""
 
-    def __init__(self, cdisc_ct: dict[str, set[str]] | None = None) -> None:
-        """Initialize with optional custom CDISC Controlled Terminology codelists."""
-        self.cdisc_ct: dict[str, set[str]] = (
-            cdisc_ct if cdisc_ct is not None else CDISC_CONTROLLED_TERMINOLOGY
-        )
+    def __init__(
+        self,
+        cdisc_ct: dict[str, set[str]] | None = None,
+        *,
+        date_fields: Collection[str] = (),
+        date_order: Literal["MDY", "DMY"] | None = None,
+    ) -> None:
+        """Snapshot caller-selected codelists and date fields.
+
+        No unversioned vocabulary or guessed date-field selection is enabled by
+        default. cdisc_ct retains its proposed API name; supplying it does not
+        establish CDISC conformance. Study lookups take precedence over codelists.
+        """
+        if isinstance(date_fields, str):
+            raise ValueError("date_fields must be a collection of field names")
+        if date_order not in (None, "MDY", "DMY"):
+            raise ValueError("date_order must be MDY, DMY or None")
+        self.cdisc_ct = {field: set(terms) for field, terms in (cdisc_ct or {}).items()}
+        self._canonical_terms: dict[str, dict[str, str]] = {}
+        for field, terms in self.cdisc_ct.items():
+            canonical: dict[str, str] = {}
+            for term in sorted(terms):
+                key = term.strip().upper()
+                if not key or key in canonical:
+                    raise ValueError("Terminology contains empty or case-colliding terms")
+                canonical[key] = term.strip()
+            self._canonical_terms[field] = canonical
+        self._date_fields = frozenset(date_fields)
+        self._date_order = date_order
 
     def normalize_record(
         self,
@@ -61,7 +85,7 @@ class CategoricalNormalizer:
             record: The raw data record as a dictionary.
             terminology_lookups: Optional mapping of field names to their terminology maps.
             normalized_lookups: Optional precomputed normalized terminology lookups.
-            study_key: Optional study key for generating canonical USUBJID.
+            study_key: Explicit opt-in to deriving an empty USUBJID placeholder.
 
         Returns:
             A NormalizationResult containing the normalized record and any warnings.
@@ -74,15 +98,8 @@ class CategoricalNormalizer:
             else self._normalize_lookups(terminology_lookups)
         )
 
-        subject_key = (
-            record.get("subjectKey")
-            or record.get("subject_key")
-            or record.get("USUBJID")
-            or record.get("usubjid")
-        )
+        subject_key = record.get("subjectKey", record.get("subject_key"))
         canonical_subject = subject_key.strip() if isinstance(subject_key, str) else subject_key
-        study = study_key or record.get("studyKey") or record.get("study_key")
-
         for field_name, raw_value in record.items():
             normalized_value, warning_message = self._normalize_value(
                 field_name=field_name,
@@ -100,17 +117,17 @@ class CategoricalNormalizer:
         if "subject_key" in normalized_record and isinstance(normalized_record["subject_key"], str):
             normalized_record["subject_key"] = normalized_record["subject_key"].strip()
 
-        # Format canonical unique subject identifier (USUBJID) if study is known
-        if study and isinstance(canonical_subject, str) and canonical_subject:
-            clean_study = str(study).strip().upper()
-            clean_subj = canonical_subject.strip()
-            if not clean_subj.upper().startswith(f"{clean_study}-"):
-                canonical_usubjid = f"{clean_study}-{clean_subj}"
-            else:
-                canonical_usubjid = clean_subj
-            if "USUBJID" in record or "usubjid" in record:
-                target_key = "USUBJID" if "USUBJID" in record else "usubjid"
-                normalized_record[target_key] = canonical_usubjid
+        # Derive only an explicitly requested empty identifier. Existing global
+        # identity and caller-supplied study casing must never be rewritten.
+        if (
+            isinstance(study_key, str)
+            and study_key.strip()
+            and isinstance(canonical_subject, str)
+            and canonical_subject
+        ):
+            for key in ("USUBJID", "usubjid"):
+                if key in record and (record[key] is None or record[key] == ""):
+                    normalized_record[key] = f"{study_key.strip()}-{canonical_subject}"
 
         return NormalizationResult(normalized_record=normalized_record, warnings=warnings)
 
@@ -135,6 +152,15 @@ class CategoricalNormalizer:
         subject_key: Any,
     ) -> tuple[Any, str | None]:
         """Internal helper to normalize a single field value."""
+        if field_name in {
+            "USUBJID",
+            "usubjid",
+            "subjectKey",
+            "subject_key",
+            "studyKey",
+            "study_key",
+        }:
+            return raw_value, None
         lookup = normalized_lookups.get(field_name)
         if lookup and isinstance(raw_value, str):
             lookup_key = raw_value.strip().upper()
@@ -145,36 +171,23 @@ class CategoricalNormalizer:
             )
             return raw_value, f"{subject_prefix}record {field_name} is unmapped"
 
+        if field_name in self._canonical_terms and not is_missing_value(raw_value):
+            canonical = (
+                self._canonical_terms[field_name].get(raw_value.strip().upper())
+                if isinstance(raw_value, str)
+                else None
+            )
+            if canonical is not None:
+                return canonical, None
+            return raw_value, f"Field {field_name} is outside the configured terminology"
+
+        if field_name in self._date_fields:
+            return normalize_iso_date(raw_value, date_order=self._date_order), None
+
         if isinstance(raw_value, str):
             stripped_value = raw_value.strip()
             if stripped_value and is_boolean_token(stripped_value):
                 return parse_bool(stripped_value), None
-
-        # Check CDISC Controlled Terminology if no user lookup was provided for this field
-        if field_name in self.cdisc_ct and isinstance(raw_value, str) and raw_value.strip():
-            stripped_val = raw_value.strip()
-            upper_val = stripped_val.upper()
-            codelist = self.cdisc_ct[field_name]
-            if upper_val in codelist:
-                canonical_term = upper_val
-                for term in codelist:
-                    if str(term).upper() == upper_val:
-                        canonical_term = str(term)
-                        break
-                return canonical_term, None
-
-            subject_prefix = (
-                f"Subject {subject_key} " if isinstance(subject_key, str) and subject_key else ""
-            )
-            return (
-                raw_value,
-                f"{subject_prefix}record {field_name} value '{raw_value}' does not match CDISC Controlled Terminology",
-            )
-
-        # Transform valid date inputs into ISO 8601 strings
-        normalized_date = normalize_iso_date(raw_value)
-        if normalized_date != raw_value:
-            return normalized_date, None
 
         return raw_value, None
 
@@ -233,6 +246,10 @@ class StandardsReadinessValidator:
         successfully_validated_fields = 0
         total_expected_fields = 0
         normalized_lookups = self._normalize_lookups(lookups)
+        accepted_terms = {
+            field: {term.strip().upper() for term in terms}
+            for field, terms in getattr(self._normalizer, "cdisc_ct", {}).items()
+        }
 
         for domain, records in records_by_domain.items():
             expected_fields = self._profile.expected_fields(domain)
@@ -248,34 +265,32 @@ class StandardsReadinessValidator:
                     )
                 )
 
-                # Check for CDISC Controlled Terminology violations not already reported by profile
+                # Apply only caller-selected terminology, without duplicating profile errors.
                 existing_error_fields = {
                     violation.field
                     for violation in record_violations
                     if violation.severity.upper() == "ERROR"
                 }
-                cdisc_ct = getattr(self._normalizer, "cdisc_ct", CDISC_CONTROLLED_TERMINOLOGY)
                 for field_name in expected_fields:
                     val = normalization_result.normalized_record.get(field_name)
                     if is_missing_value(val):
                         continue
-                    if field_name not in existing_error_fields and field_name in cdisc_ct:
-                        codelist = cdisc_ct[field_name]
-                        if (
-                            isinstance(val, str)
-                            and val.strip()
-                            and val.strip().upper() not in codelist
-                        ):
-                            record_violations.append(
-                                ValidationViolation(
-                                    field=field_name,
-                                    message=(
-                                        f"{field_name} value '{val}' does not match CDISC "
-                                        f"Controlled Terminology."
-                                    ),
-                                    severity="ERROR",
-                                )
+                    if (
+                        field_name not in existing_error_fields
+                        and field_name in accepted_terms
+                        and not normalized_lookups.get(field_name)
+                        and (
+                            not isinstance(val, str)
+                            or val.strip().upper() not in accepted_terms[field_name]
+                        )
+                    ):
+                        record_violations.append(
+                            ValidationViolation(
+                                field=field_name,
+                                message=f"Field {field_name} is outside the configured terminology.",
+                                severity="ERROR",
                             )
+                        )
 
                 violations.extend(record_violations)
 

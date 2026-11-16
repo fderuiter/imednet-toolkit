@@ -16,10 +16,32 @@ from ...datadict import (
     load_from_redcap,
     to_file,
     to_json,
+    to_odm_file,
+    to_odm_xml,
     validate,
 )
 from ...datadict.models import DataDictionary
 from ..utils import get_sdk
+
+
+def _handle_to_odm(args: argparse.Namespace) -> None:
+    """Handle `imednet datadict to-odm` command."""
+    try:
+        input_text = Path(args.file).read_text(encoding="utf-8")
+        dd = DataDictionary.model_validate_json(input_text)
+    except Exception as exc:
+        print(f"Error reading data dictionary from '{args.file}': {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        if args.output:
+            to_odm_file(dd, args.output, file_oid=getattr(args, "file_oid", None))
+            print(f"Successfully wrote CDISC ODM XML to '{args.output}'")
+        else:
+            print(to_odm_xml(dd, file_oid=getattr(args, "file_oid", None)), end="")
+    except Exception as exc:
+        print(f"Error exporting to CDISC ODM XML: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _handle_from_csv(args: argparse.Namespace) -> None:
@@ -223,6 +245,26 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         help="Omit verbatim XML strings from business logic rules.",
     )
     odm_parser.set_defaults(func=_handle_from_odm)
+
+    # 1b2. to-odm
+    to_odm_parser = cmd_subparsers.add_parser(
+        "to-odm",
+        help="Export data dictionary to CDISC ODM 1.3 XML format.",
+    )
+    to_odm_parser.add_argument(
+        "file",
+        help="Path to data dictionary JSON file to export.",
+    )
+    to_odm_parser.add_argument(
+        "-o",
+        "--output",
+        help="Destination XML file path (default: stdout).",
+    )
+    to_odm_parser.add_argument(
+        "--file-oid",
+        help="Optional ODM FileOID attribute override.",
+    )
+    to_odm_parser.set_defaults(func=_handle_to_odm)
 
     # 1c. from-redcap
     redcap_parser = cmd_subparsers.add_parser(

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -104,3 +105,64 @@ class AnalysisLabResult(ImednetBaseModel):
 
     model_config = {"extra": "allow"}  # noqa: RUF012
     subject_key: str = Field(..., alias="subjectKey")
+
+
+class Demographics(ImednetBaseModel):
+    """Canonical CDISC-aligned Demographics (DM) reporting model."""
+
+    subject_key: str = Field(..., alias="subjectKey", description="Unique subject identifier")
+    sex: str = Field(..., alias="sex", description="Biological sex of the subject (SEX)")
+    birth_date: datetime | None = Field(
+        None, alias="birthDate", description="Date of birth of the subject (BRTHDTC)"
+    )
+    age: int | None = Field(None, alias="age", description="Age in years of the subject (AGE)")
+    race: str | None = Field(None, alias="race", description="Reported race of the subject (RACE)")
+    ethnicity: str | None = Field(
+        None, alias="ethnicity", description="Ethnicity of the subject (ETHNIC)"
+    )
+
+
+class VitalSigns(ImednetBaseModel):
+    """Canonical CDISC-aligned Vital Signs (VS) reporting model."""
+
+    subject_key: str = Field(..., alias="subjectKey", description="Unique subject identifier")
+    vs_test: str = Field(..., alias="vsTest", description="Vital signs test name (VSTEST)")
+    vs_test_cd: str | None = Field(
+        None, alias="vsTestCd", description="Vital signs test short code (VSTESTCD)"
+    )
+    vs_result: float | str = Field(
+        ..., alias="vsResult", description="Vital signs measurement result (VSORRES/VSSTRESN)"
+    )
+    vs_unit: str | None = Field(
+        None, alias="vsUnit", description="Vital signs measurement unit (VSORRESU/VSSTRESU)"
+    )
+    vs_date: datetime = Field(
+        ..., alias="vsDate", description="Date/time of vital signs measurement (VSDTC)"
+    )
+
+    @field_validator("vs_result", mode="before")
+    @classmethod
+    def _coerce_result(cls, v: Any) -> Any:
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            try:
+                return float(v.strip())
+            except ValueError:
+                return v.strip()
+        return v
+
+
+VitalSign = VitalSigns
+
+__all__ = [
+    "AdverseEvent",
+    "AnalysisAdverseEvent",
+    "AnalysisLabResult",
+    "Demographics",
+    "DeviceDeficiency",
+    "ProtocolDeviation",
+    "SubjectLevelAnalysis",
+    "VitalSign",
+    "VitalSigns",
+]

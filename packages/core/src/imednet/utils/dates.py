@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import sys
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Literal
 
 # Python 3.11+ supports Z and any precision of fractional seconds in fromisoformat
 _IS_PY311_OR_GREATER = sys.version_info >= (3, 11)
@@ -84,23 +84,27 @@ def format_iso_datetime(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def normalize_iso_date(value: Any) -> Any:
+def normalize_iso_date(value: Any, *, date_order: Literal["MDY", "DMY"] | None = None) -> Any:
     """Normalize a date, datetime, or date-like string into a canonical ISO 8601 string.
 
-    If the value is not a date or date-like string, it is returned unmodified.
+    Use only for explicitly selected date fields. Invalid, ambiguous and partial
+    strings are returned unchanged; no components are imputed. Slash dates with
+    two possible interpretations require date_order. Timezone offsets and source
+    fractional precision are preserved.
 
     Args:
         value: Input value to normalize.
+        date_order: Explicit ordering for ambiguous slash dates.
 
     Returns:
         ISO 8601 formatted date/datetime string, or original value if not a date.
     """
+    if date_order not in (None, "MDY", "DMY"):
+        raise ValueError("date_order must be MDY, DMY or None")
     if value is None:
         return None
 
     if isinstance(value, datetime):
-        if value.tzinfo is not None:
-            return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
         return value.isoformat()
 
     if isinstance(value, date):
@@ -122,7 +126,15 @@ def normalize_iso_date(value: Any) -> Any:
 
     match_dt = _ISO_DATETIME_REGEX.match(s)
     if match_dt:
-        return f"{match_dt.group(1)}T{match_dt.group(2)}"
+        candidate = f"{match_dt.group(1)}T{match_dt.group(2)}"
+        try:
+            datetime.fromisoformat(candidate)
+        except ValueError:
+            return value
+        offset = re.search(r"[+-](\d{2}):?(\d{2})$", candidate)
+        if offset and (int(offset.group(1)) > 23 or int(offset.group(2)) > 59):
+            return value
+        return candidate
 
     match_ymd = _SLASH_YMD_REGEX.match(s)
     if match_ymd:
@@ -132,11 +144,18 @@ def normalize_iso_date(value: Any) -> Any:
         except ValueError:
             return value
 
-    match_mdy = _SLASH_MDY_REGEX.match(s)
+    match_mdy = _SLASH_MDY_REGEX.fullmatch(s)
     if match_mdy:
+        first, second, year = map(int, match_mdy.groups())
+        if date_order is None and first <= 12 and second <= 12 and first != second:
+            return value
+        month, day = (
+            (second, first)
+            if date_order == "DMY" or (date_order is None and first > 12)
+            else (first, second)
+        )
         try:
-            mo, d, y = int(match_mdy.group(1)), int(match_mdy.group(2)), int(match_mdy.group(3))
-            return date(y, mo, d).isoformat()
+            return date(year, month, day).isoformat()
         except ValueError:
             return value
 
@@ -158,8 +177,7 @@ def normalize_iso_date(value: Any) -> Any:
                 int(match_compact.group(2)),
                 int(match_compact.group(3)),
             )
-            if 1900 <= y <= 2100:
-                return date(y, mo, d).isoformat()
+            return date(y, mo, d).isoformat()
         except ValueError:
             return value
 

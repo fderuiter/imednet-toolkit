@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import warnings
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -48,13 +49,23 @@ class GenericEndpoint(EndpointABC[T]):
         self,
         client: RequesterProtocol | None = None,
         async_client: AsyncRequesterProtocol | None = None,
+        *,
+        ctx: object | None = None,
     ) -> None:
         """Initialize the generic endpoint.
 
         Args:
             client: Synchronous requester instance.
             async_client: Asynchronous requester instance.
+            ctx: Deprecated ignored context; use scoped study_context instead.
         """
+        if ctx is not None:
+            warnings.warn(
+                "The 'ctx' constructor argument is deprecated and ignored. "
+                "Pass study_key explicitly or use ImednetSDK.study_context(...).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._client = client
         self._async_client = async_client
 
@@ -300,9 +311,10 @@ class SyncListGetEndpoint(_ListGetEndpointBase[T], SyncEndpointContext):
     def __init__(
         self,
         client: RequesterProtocol,
+        ctx: object | None = None,
     ) -> None:
-        """Initialize the synchronous endpoint."""
-        super().__init__(client=client)
+        """Initialize the synchronous endpoint; retain the deprecated ctx argument."""
+        super().__init__(client=client, ctx=ctx)
 
 
 class AsyncListGetEndpoint(_ListGetEndpointBase[T], AsyncEndpointContext):
@@ -311,9 +323,10 @@ class AsyncListGetEndpoint(_ListGetEndpointBase[T], AsyncEndpointContext):
     def __init__(
         self,
         async_client: AsyncRequesterProtocol,
+        ctx: object | None = None,
     ) -> None:
-        """Initialize the asynchronous endpoint."""
-        super().__init__(async_client=async_client)
+        """Initialize the asynchronous endpoint; retain the deprecated ctx argument."""
+        super().__init__(async_client=async_client, ctx=ctx)
 
 
 # Backward-compatible alias. New code should use SyncListGetEndpoint / AsyncListGetEndpoint.

@@ -91,6 +91,28 @@ div.highlight {
     transform: translateY(-2px);
 }
 
+body[data-theme="dark"] .role-card {
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--color-background-border);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .role-card {
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--color-background-border);
+    }
+}
+
+body[data-theme="dark"] .role-card:hover {
+    border-color: var(--color-brand-primary);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--color-brand-primary);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .role-card:hover {
+        border-color: var(--color-brand-primary);
+        box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--color-brand-primary);
+    }
+}
+
 .role-card .role-card-title,
 .role-card p.rubric {
     font-size: 1.15rem;
@@ -150,7 +172,7 @@ div.highlight {
 .role-card-launch-btn:hover,
 .role-card-launch-btn:focus-visible {
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
     outline: 2px solid var(--color-brand-primary);
     outline-offset: 2px;
 }
@@ -173,6 +195,151 @@ div.highlight {
 
 .role-card ul li a:hover {
     text-decoration: underline;
+}
+
+/* Sphinx-Thebe Interactive Cells & Pyodide Output Styles */
+.thebe-launch-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: #ffffff;
+    background-color: var(--color-brand-primary, #005fb8);
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.2s ease, opacity 0.2s ease;
+    margin: 1rem 0;
+}
+
+.thebe-launch-button:hover {
+    opacity: 0.9;
+}
+
+.thebe-launch-button.thebe-status-ready {
+    background-color: #2da44e;
+    color: #ffffff;
+}
+
+.thebelab-cell {
+    border: 1px solid var(--color-background-border, #e1e4e8);
+    border-radius: 6px;
+    background-color: var(--color-background-secondary, #f6f8fa);
+    padding: 0.75rem;
+    margin: 1.25rem 0;
+}
+
+.thebelab-input {
+    margin-bottom: 0.5rem;
+}
+
+.thebe-editor {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--font-stack--monospace, ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace);
+    font-size: 0.875rem;
+    line-height: 1.45;
+    background-color: var(--color-code-background, #ffffff);
+    color: var(--color-code-foreground, #24292f);
+    border: 1px solid var(--color-background-border, #d0d7de);
+    border-radius: 6px;
+    padding: 0.75rem;
+    resize: vertical;
+    outline: none;
+}
+
+.thebe-editor:focus {
+    border-color: var(--color-brand-primary, #005fb8);
+    box-shadow: 0 0 0 2px rgba(0, 95, 184, 0.2);
+}
+
+.thebelab-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.thebelab-button {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    padding: 0.3rem 0.75rem;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid var(--color-background-border, #d0d7de);
+    background-color: var(--color-background-primary, #ffffff);
+    color: var(--color-foreground-primary, #24292f);
+    transition: all 0.15s ease-in-out;
+}
+
+.thebelab-run-button {
+    background-color: var(--color-brand-primary, #005fb8);
+    color: #ffffff;
+    border-color: transparent;
+}
+
+.thebelab-run-button:hover:not(:disabled) {
+    opacity: 0.9;
+}
+
+.thebelab-run-button:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.thebelab-clear-button:hover {
+    background-color: var(--color-background-secondary, #f6f8fa);
+}
+
+.thebelab-cell-status {
+    font-size: 0.8125rem;
+    color: var(--color-foreground-muted, #57606a);
+    font-style: italic;
+}
+
+.thebelab-output {
+    margin-top: 0.75rem;
+    border-top: 1px solid var(--color-background-border, #e1e4e8);
+    padding-top: 0.5rem;
+}
+
+.thebe-output-area pre {
+    margin: 0.35rem 0;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.8125rem;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.thebe-stdout {
+    background-color: var(--color-code-background, #f6f8fa);
+    color: var(--color-code-foreground, #24292f);
+    border-left: 3px solid #2da44e;
+}
+
+.thebe-stderr {
+    background-color: rgba(207, 34, 46, 0.08);
+    color: #cf222e;
+    border-left: 3px solid #cf222e;
+}
+
+.thebe-result {
+    background-color: var(--color-code-background, #f6f8fa);
+    color: var(--color-brand-primary, #005fb8);
+    font-weight: 500;
+    border-left: 3px solid var(--color-brand-primary, #005fb8);
+}
+
+.thebe-no-output {
+    font-size: 0.8125rem;
+    color: var(--color-foreground-muted, #57606a);
+    font-style: italic;
+    padding: 0.25rem 0.5rem;
 }
 
 /* =========================================================================
@@ -225,7 +392,7 @@ div.highlight {
     padding: 0.3rem 0.75rem;
     border-radius: 9999px;
     background-color: rgba(16, 185, 129, 0.12);
-    color: #059669;
+    color: var(--color-status-success, var(--color-badge-success, #065f46));
     border: 1px solid rgba(16, 185, 129, 0.3);
 }
 
@@ -361,7 +528,7 @@ div.highlight {
 .mode-pill-btn.active,
 .mode-pill-btn[aria-pressed="true"] {
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
 }
 
 .mode-pill-btn:focus-visible {
@@ -374,7 +541,7 @@ div.highlight {
     align-items: center;
     gap: 0.4rem;
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
     border: 1px solid transparent;
     border-radius: 6px;
     padding: 0.5rem 1.15rem;
@@ -452,7 +619,7 @@ div.highlight {
 .explorer-metric-badge {
     font-size: 0.8rem;
     font-weight: 600;
-    color: #059669;
+    color: var(--color-status-success, var(--color-badge-success, #065f46));
     background-color: rgba(16, 185, 129, 0.1);
     border: 1px solid rgba(16, 185, 129, 0.25);
     border-radius: 4px;
@@ -488,7 +655,7 @@ div.highlight {
 .explorer-output-tab.active,
 .explorer-output-tab[aria-selected="true"] {
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
 }
 
 .explorer-output-tab:focus-visible {
@@ -552,6 +719,28 @@ div.highlight {
     background-color: rgba(0, 0, 0, 0.03);
 }
 
+body[data-theme="dark"] .explorer-dataframe-table th.index-col,
+body[data-theme="dark"] .explorer-dataframe-table td.index-col {
+    background-color: rgba(255, 255, 255, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .explorer-dataframe-table th.index-col,
+    body:not([data-theme="light"]) .explorer-dataframe-table td.index-col {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+}
+
+body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .explorer-dataframe-table tbody tr:hover {
+        background-color: rgba(255, 255, 255, 0.06);
+    }
+}
+
 /* Status badges */
 .status-badge {
     display: inline-block;
@@ -565,12 +754,12 @@ div.highlight {
 
 .badge-success {
     background-color: rgba(16, 185, 129, 0.15);
-    color: #059669;
+    color: var(--color-status-success, var(--color-badge-success, #065f46));
 }
 
 .badge-warning {
     background-color: rgba(245, 158, 11, 0.15);
-    color: #d97706;
+    color: var(--color-status-warning, var(--color-badge-warning, #92400e));
 }
 
 .badge-neutral {
@@ -646,7 +835,7 @@ div.highlight {
     padding: 0.15rem 0.5rem;
     border-radius: 4px;
     background-color: var(--color-brand-primary);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, var(--color-brand-button-text, #ffffff));
     font-size: 0.75rem;
     font-weight: 700;
     margin-right: 0.4rem;
@@ -699,7 +888,7 @@ div.highlight {
     padding: 0.1rem 0.4rem;
     border-radius: 4px;
     background-color: rgba(239, 68, 68, 0.15);
-    color: #dc2626;
+    color: var(--color-status-danger, var(--color-badge-danger, var(--color-badge-required, #b91c1c)));
     text-transform: uppercase;
 }
 

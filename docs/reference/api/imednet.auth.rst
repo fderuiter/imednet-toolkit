@@ -15,6 +15,13 @@ imednet.auth.api\_key module
    :members:
    :show-inheritance:
 
+imednet.auth.credentials module
+-------------------------------
+
+.. automodule:: imednet.auth.credentials
+   :members:
+   :show-inheritance:
+
 imednet.auth.oidc module
 ------------------------
 

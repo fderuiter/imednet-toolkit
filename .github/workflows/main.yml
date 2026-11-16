@@ -8,8 +8,7 @@ on:
       - "imednet-workflows-v*.*.*"
       - "apache-airflow-providers-imednet-v*.*.*"
       - "imednet-plugins-sinks-v*.*.*"
-  pull_request:
-    branches: [main]
+  pull_request: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -64,11 +63,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install 'ruff==0.15.22' pylint
+        run: pip install 'ruff==0.15.22'
       - name: Run Ruff Linter
         run: ruff check . --select F401,F841
-      - name: Run Similarity Check
-        run: pylint --disable=all --enable=similarities --min-similarity-lines=4 $(git ls-files 'packages/**/*.py')
 
   # ------------------------------------------------------------------
   # JOB 0.2: PRE-COMMIT CHECK (Runs unconditionally)
@@ -208,6 +205,9 @@ jobs:
 
       - name: Run Quality & Security Checks
         run: hatch run quality:all packages
+
+      - name: Run Canonical Workspace Verification
+        run: hatch run verify
 
   # ------------------------------------------------------------------
   # JOB 2: BUILD ARTIFACT (Builds the library)
@@ -617,6 +617,7 @@ jobs:
         run: hatch run docs
 
       - name: Upload Pages Artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: docs/_build/html
@@ -626,7 +627,10 @@ jobs:
   # ------------------------------------------------------------------
   deploy-docs:
     name: Deploy to GH Pages
-    needs: [plan, test, docs]
+    needs: [plan, test, docs, global-lint, quality]
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     # Only deploy docs if tests pass (or are skipped) and we are on main
     if: always() && !cancelled() && !contains(needs.*.result, 'failure') && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest

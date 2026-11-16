@@ -196,6 +196,108 @@ def test_load_from_cdisc_odm_unsupported_type_and_unmapped_attributes() -> None:
         load_from_cdisc_odm(xml_custom, strict=True)
 
 
+def test_load_from_cdisc_odm_sdtm_attributes() -> None:
+    """Test preserving SDTM attributes on forms and variables without spurious warnings."""
+    xml_sdtm = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">
+  <Study OID="STUDY_SDTM">
+    <MetaDataVersion OID="MDV_SDTM" Name="SDTM Study">
+      <FormDef OID="DM" Name="Demographics">
+        <ItemGroupRef ItemGroupOID="IG_DM" OrderNumber="1"/>
+        <ItemGroupRef ItemGroupOID="IG_SUPP" OrderNumber="2"/>
+      </FormDef>
+      <FormDef OID="DIRECT_FORM" Name="Direct Form">
+        <ItemRef ItemOID="DIRECT_ITEM" OrderNumber="1"/>
+      </FormDef>
+
+      <ItemGroupDef OID="IG_DM" Name="Demographics Group" Domain="DM" SASDatasetName="DM">
+        <ItemRef ItemOID="SUBJID" OrderNumber="1"/>
+        <ItemRef ItemOID="AGE" OrderNumber="2"/>
+      </ItemGroupDef>
+      <ItemGroupDef OID="IG_SUPP" Name="Supplemental Group">
+        <ItemRef ItemOID="SUPPQUAL" OrderNumber="1"/>
+      </ItemGroupDef>
+
+      <ItemDef OID="SUBJID" Name="Subject ID" DataType="text"
+               SDSVarName="SUBJID" SASFieldName="SUBJID" Origin="CRF" Comment="Subject Identifier"/>
+      <ItemDef OID="AGE" Name="Age" DataType="integer">
+        <Comment><TranslatedText>Age in years</TranslatedText></Comment>
+      </ItemDef>
+      <ItemDef OID="SUPPQUAL" Name="Supplemental Qual" DataType="text"/>
+      <ItemDef OID="DIRECT_ITEM" Name="Direct Item" DataType="text"
+               SDSVarName="DIRVAR" SASFieldName="DIRFIELD" Origin="eCOA" Comment="Direct comment"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    dd = load_from_cdisc_odm(xml_sdtm, strict=True)
+    # Zero warnings should be emitted for known SDTM attributes
+    assert dd.metadata.validationWarnings == []
+
+    form_dm = next(f for f in dd.forms if f.formKey == "DM")
+    # Form should have Domain and SASDatasetName preserved from ItemGroupDef
+    assert form_dm.extraAttributes.get("Domain") == "DM"
+    assert form_dm.extraAttributes.get("SASDatasetName") == "DM"
+
+    # Variable with all SDTM attributes set
+    v_subjid = next(v for v in form_dm.variables if v.variableName == "SUBJID")
+    assert v_subjid.extraAttributes.get("Domain") == "DM"
+    assert v_subjid.extraAttributes.get("SASDatasetName") == "DM"
+    assert v_subjid.extraAttributes.get("SDSVarName") == "SUBJID"
+    assert v_subjid.extraAttributes.get("SASFieldName") == "SUBJID"
+    assert v_subjid.extraAttributes.get("Origin") == "CRF"
+    assert v_subjid.extraAttributes.get("Comment") == "Subject Identifier"
+
+    # Variable lacking SDSVarName and SASFieldName: keys must be omitted
+    v_age = next(v for v in form_dm.variables if v.variableName == "AGE")
+    assert v_age.extraAttributes.get("Domain") == "DM"
+    assert v_age.extraAttributes.get("SASDatasetName") == "DM"
+    assert "SDSVarName" not in v_age.extraAttributes
+    assert "SASFieldName" not in v_age.extraAttributes
+    assert "Origin" not in v_age.extraAttributes
+    assert v_age.extraAttributes.get("Comment") == "Age in years"
+
+    # ItemGroup without Domain should not overwrite existing form attributes
+    v_supp = next(v for v in form_dm.variables if v.variableName == "SUPPQUAL")
+    assert "Domain" not in v_supp.extraAttributes
+    assert "SASDatasetName" not in v_supp.extraAttributes
+    assert form_dm.extraAttributes.get("Domain") == "DM"
+
+    # Direct ItemRef on FormDef should also preserve SDTM attributes
+    form_direct = next(f for f in dd.forms if f.formKey == "DIRECT_FORM")
+    v_dir = form_direct.variables[0]
+    assert v_dir.extraAttributes.get("SDSVarName") == "DIRVAR"
+    assert v_dir.extraAttributes.get("SASFieldName") == "DIRFIELD"
+    assert v_dir.extraAttributes.get("Origin") == "eCOA"
+    assert v_dir.extraAttributes.get("Comment") == "Direct comment"
+
+
+def test_load_from_cdisc_odm_direct_item_refs_unmapped_and_sdtm() -> None:
+    """Test direct ItemRef with custom unmapped attributes and SDTM attributes."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">
+  <Study OID="S3">
+    <MetaDataVersion OID="MDV3">
+      <FormDef OID="F3" Name="Direct SDTM Form">
+        <ItemRef ItemOID="IT_DIR" OrderNumber="1" customRefAttr="refVal"/>
+      </FormDef>
+      <ItemDef OID="IT_DIR" Name="IT_DIR" DataType="text"
+               SDSVarName="VAR_D" SASFieldName="SAS_D" Origin="Source" Comment="Direct Item Comment"
+               customItemProp="itemPropVal"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    dd = load_from_cdisc_odm(xml, strict=False)
+    var = dd.forms[0].variables[0]
+    assert var.extraAttributes.get("SDSVarName") == "VAR_D"
+    assert var.extraAttributes.get("SASFieldName") == "SAS_D"
+    assert var.extraAttributes.get("Origin") == "Source"
+    assert var.extraAttributes.get("Comment") == "Direct Item Comment"
+    assert var.extraAttributes.get("customRefAttr") == "refVal"
+    assert var.extraAttributes.get("customItemProp") == "itemPropVal"
+
+
 def test_load_from_cdisc_odm_missing_references() -> None:
     """Test handling of broken references (missing CodeListRef or ItemGroupRef)."""
     xml_broken = """<?xml version="1.0" encoding="UTF-8"?>

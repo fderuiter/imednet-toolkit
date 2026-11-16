@@ -11,6 +11,10 @@ dependencies = [
     "apache-airflow>=3.2.0,<4.0.0"
 ]
 
+[project.urls]
+repository = "https://github.com/fderuiter/imednet-toolkit"
+documentation = "https://fderuiter.github.io/imednet-toolkit/"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

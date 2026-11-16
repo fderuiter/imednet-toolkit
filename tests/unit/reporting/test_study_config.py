@@ -183,8 +183,8 @@ def test_study_configuration_strict_mode_rejects_invalid_mapping() -> None:
 
 
 def test_study_configuration_obeys_strict_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test that IMEDNET_STRICT_MODE environment variable activates strict CDASH validation."""
-    monkeypatch.setenv("IMEDNET_STRICT_MODE", "1")
+    """Test that IMEDNET_STRICT_CDASH activates the local naming policy."""
+    monkeypatch.setenv("IMEDNET_STRICT_CDASH", "1")
     with pytest.raises(ValidationError, match="does not match CDASH domain prefix"):
         StudyConfiguration.model_validate(
             {

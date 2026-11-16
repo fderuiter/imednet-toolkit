@@ -21,6 +21,7 @@ def test_cli_datadict_help(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert "from-csv" in captured.out
     assert "from-odm" in captured.out
+    assert "to-odm" in captured.out
     assert "from-redcap" in captured.out
     assert "from-api" in captured.out
     assert "validate" in captured.out
@@ -188,3 +189,44 @@ def test_cli_from_redcap(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     app(["datadict", "validate", str(out_file)])
     captured = capsys.readouterr()
     assert "Validation passed" in captured.out
+
+
+def test_cli_to_odm(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Test exporting JSON data dictionary to CDISC ODM XML via CLI."""
+    dd_data = {
+        "metadata": {
+            "schemaVersion": "1.0.0",
+            "studyKey": "CLI_ODM_EXPORT_01",
+        },
+        "forms": [
+            {
+                "formKey": "DM",
+                "formName": "Demographics",
+                "variables": [
+                    {
+                        "variableName": "AGE",
+                        "label": "Subject Age",
+                        "variableType": "Integer",
+                    }
+                ],
+            }
+        ],
+    }
+    json_path = tmp_path / "study.json"
+    json_path.write_text(json.dumps(dd_data), encoding="utf-8")
+
+    # 1. Output to file
+    xml_out = tmp_path / "exported.xml"
+    app(["datadict", "to-odm", str(json_path), "-o", str(xml_out)])
+    assert xml_out.exists()
+    content = xml_out.read_text(encoding="utf-8")
+    assert "<ODM" in content
+    assert '<Study OID="CLI_ODM_EXPORT_01">' in content
+    assert '<FormDef OID="DM"' in content
+    capsys.readouterr()
+
+    # 2. Output to stdout
+    app(["datadict", "to-odm", str(json_path)])
+    captured = capsys.readouterr()
+    assert "<ODM" in captured.out
+    assert '<Study OID="CLI_ODM_EXPORT_01">' in captured.out

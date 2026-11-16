@@ -26,6 +26,7 @@ from imednet.models.subjects import Subject
 from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
+from imednet.utils.job_poller import JobProgressHandler
 from imednet.utils.typing import FilterValue, JsonDict
 
 try:
@@ -168,13 +169,11 @@ class SyncSDKConvenienceMixin:
         *,
         interval: int = 5,
         timeout: int = 300,
+        on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Poll a job until it reaches a terminal state."""
-        from imednet.utils.job_poller import JobPoller
-
-        fetch_result = getattr(self, "_client", None) and getattr(self._client, "get", None)
-        return JobPoller(self.jobs.get, fetch_result=fetch_result).run(
-            study_key, batch_id, interval, timeout
+        return self.jobs.poll(
+            study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
         )
 
 
@@ -232,15 +231,11 @@ class AsyncSDKConvenienceMixin:
         *,
         interval: int = 5,
         timeout: int = 300,
+        on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Asynchronously poll a job until it reaches a terminal state."""
-        from imednet.utils.job_poller import AsyncJobPoller
-
-        fetch_result = getattr(self, "_async_client", None) and getattr(
-            self._async_client, "get", None
-        )
-        return await AsyncJobPoller(self.jobs.get, fetch_result=fetch_result).run(
-            study_key, batch_id, interval, timeout
+        return await self.jobs.poll(
+            study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
         )
 
 

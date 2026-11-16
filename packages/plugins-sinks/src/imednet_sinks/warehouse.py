@@ -77,13 +77,15 @@ from pathlib import Path
 from typing import Any
 
 from imednet.errors import ExportBatchError, ExportConfigurationError
-from imednet.integrations.sink_base import (
+from imednet.sdk import ImednetSDK
+from imednet.spi.sinks import (
     ExportSink,
     SinkConfig,
-    _require_optional_dep,
     iter_batches,
 )
-from imednet.sdk import ImednetSDK
+from imednet.spi.sinks import (
+    require_optional_dep as _require_optional_dep,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +191,7 @@ class SnowflakeSinkConfig(SinkConfig):
 def _records_to_arrow_table(records: Sequence[Any]) -> Any:
     """Convert *records* to a ``pyarrow.Table``."""
     pa = _require_optional_dep("pyarrow", "snowflake")
-    from imednet.integrations.enrichment import CentralizedMapper
+    from imednet.spi.sinks import CentralizedMapper
 
     mapper = CentralizedMapper(mode="tabular")
     rows = [mapper.map_record(r) for r in records]
@@ -374,7 +376,7 @@ def export_to_snowflake(
     config: SnowflakeSinkConfig,
 ) -> int:
     """Export study records to Snowflake using :class:`SnowflakeExportSink`."""
-    from imednet.integrations.sink_base import apply_quality_gate
+    from imednet.spi.sinks import apply_quality_gate
 
     records = sdk.records.list(study_key=study_key, record_data_filter=None)
     filtered_records = list(apply_quality_gate(sdk, study_key, records, config))

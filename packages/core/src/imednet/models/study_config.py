@@ -26,18 +26,17 @@ class MappingRule(ImednetBaseModel):
     fallback_value: str | None = Field(None, alias="fallbackValue")
     business_logic: str | None = Field(None, alias="businessLogic")
     is_baseline: bool = Field(False, alias="isBaseline")
-    strict: bool = Field(False, alias="strict")
-    strict_mode: bool = Field(False, alias="strictMode")
-    strict_cdash: bool = Field(False, alias="strictCdash")
+    strict: bool = Field(default=False, alias="strict")
+    strict_mode: bool = Field(default=False, alias="strictMode")
+    strict_cdash: bool = Field(default=False, alias="strictCdash")
 
     @model_validator(mode="after")
     def _validate_cdash_target(self) -> Self:  # noqa: N804
-        """Validate target variable against CDASH rules when strict mode is active."""
+        """Validate target variable against local CDASH-style naming rules when strict mode is active."""
         is_strict = (
             self.strict
             or self.strict_mode
             or self.strict_cdash
-            or parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"))
             or parse_bool(os.getenv("IMEDNET_STRICT_CDASH", "false"))
         )
         if is_strict:
@@ -71,9 +70,9 @@ class StudyConfiguration(ImednetBaseModel):
     )
     widgets: list[WidgetConfig] = Field(default_factory=list, alias="widgets")
     phi_fields: list[str] = Field(default_factory=list, alias="phiFields")
-    strict: bool = Field(False, alias="strict")
-    strict_mode: bool = Field(False, alias="strictMode")
-    strict_cdash: bool = Field(False, alias="strictCdash")
+    strict: bool = Field(default=False, alias="strict")
+    strict_mode: bool = Field(default=False, alias="strictMode")
+    strict_cdash: bool = Field(default=False, alias="strictCdash")
 
     @field_validator("reporting_profile", check_fields=False, mode="before")
     @classmethod
@@ -91,12 +90,11 @@ class StudyConfiguration(ImednetBaseModel):
 
     @model_validator(mode="after")
     def _validate_mappings_strict(self) -> Self:  # noqa: N804
-        """Enforce CDASH rules across all mappings if strict mode is active."""
+        """Enforce local CDASH-style naming rules across all mappings if strict mode is active."""
         is_strict = (
             self.strict
             or self.strict_mode
             or self.strict_cdash
-            or parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"))
             or parse_bool(os.getenv("IMEDNET_STRICT_CDASH", "false"))
         )
         if is_strict:

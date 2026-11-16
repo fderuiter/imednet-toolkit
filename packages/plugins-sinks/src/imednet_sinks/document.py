@@ -73,17 +73,21 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from imednet.integrations.enrichment import CentralizedMapper
+    from imednet.spi.sinks import CentralizedMapper
 
 from imednet.errors import ExportConfigurationError
-from imednet.integrations.sink_base import (
+from imednet.sdk import ImednetSDK
+from imednet.spi.sinks import (
     ExportSink,
     SinkConfig,
-    _redact_uri,
-    _require_optional_dep,
     iter_batches,
 )
-from imednet.sdk import ImednetSDK
+from imednet.spi.sinks import (
+    redact_uri as _redact_uri,
+)
+from imednet.spi.sinks import (
+    require_optional_dep as _require_optional_dep,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +136,7 @@ def _record_to_document(
 ) -> dict[str, Any]:
     """Wrap a typed ``Record`` model in the standard document envelope."""
     if mapper is None:
-        from imednet.integrations.enrichment import CentralizedMapper
+        from imednet.spi.sinks import CentralizedMapper
 
         mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
     return mapper.map_record(record, study_key=study_key)
@@ -193,7 +197,7 @@ class MongoDbExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
-        from imednet.integrations.enrichment import CentralizedMapper
+        from imednet.spi.sinks import CentralizedMapper
 
         mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
         docs = [_record_to_document(r, self._study_key, mapper=mapper) for r in records]
@@ -246,7 +250,7 @@ def export_to_mongodb(
     config: MongoDbSinkConfig | None = None,
 ) -> int:
     """Export study records to MongoDB using :class:`MongoDbExportSink`."""
-    from imednet.integrations.sink_base import apply_quality_gate
+    from imednet.spi.sinks import apply_quality_gate
 
     if config is None:
         config = MongoDbSinkConfig(

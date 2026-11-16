@@ -35,7 +35,7 @@ _TABULAR_EXPORTS = {
     "excel": export.export_to_excel,
     "json": export.export_to_json,
     "sql": export.export_to_sql,
-    "duckdb": getattr(export, "export_to_duckdb", None),
+    "duckdb": export.export_to_duckdb,
 }
 
 

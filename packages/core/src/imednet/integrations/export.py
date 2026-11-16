@@ -565,6 +565,7 @@ def export_to_sql(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    manifest_path: str | None = None,
     **kwargs: Any,
 ) -> None:
     """Export study records to a SQL table.
@@ -576,15 +577,19 @@ def export_to_sql(
     use_labels_as_columns:
         When ``True``, variable labels are used for column names instead of
         variable names.
+    manifest_path:
+        Optional path to a file where manifest entries should be logged.
+        Defaults to ``None``.
     """
     from sqlalchemy import create_engine
 
+    manifest_path = kwargs.pop("manifest_path", manifest_path)
     config = kwargs.pop("config", None)
     if not isinstance(config, TabularSinkConfig):
         kwargs["if_exists"] = if_exists
         config = TabularSinkConfig(
             study_key=study_key,
-            manifest_path=f"export_{table}_manifest.jsonl",
+            manifest_path=manifest_path,
             pandas_kwargs=kwargs,
             use_labels_as_columns=use_labels_as_columns,
             variable_whitelist=variable_whitelist,

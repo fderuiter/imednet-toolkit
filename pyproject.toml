@@ -41,7 +41,8 @@ docs = [
     "sphinx-autodoc-typehints",
     "sphinx-rtd-theme>=3.0.2,<4.0.0",
     "sphinxcontrib-mermaid>=0.9.2,<2.2.0",
-    "sphinx-argparse>=0.5.0"
+    "sphinx-argparse>=0.5.0",
+    "sphinx-thebe>=0.3.1"
 ]
 
 [build-system]
@@ -172,6 +173,16 @@ dependencies = [
 ]
 
 [tool.hatch.envs.default.scripts]
+verify-static = [
+    "ruff format --check .",
+    "ruff check .",
+    "mypy packages/core/src/imednet",
+    "mypy packages/plugins-workflows/src/imednet_workflows",
+    "mypy packages/providers-airflow/src/apache_airflow_providers_imednet",
+    "mypy tests/typing/endpoint_contracts.py",
+]
+verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov-fail-under=90"
+verify = ["verify-static", "verify-tests", "docs"]
 test = "pytest --ignore=tests/live/ {args:tests/}"
 docs = "python scripts/build_docs.py"
 build-docs = "python scripts/build_docs.py"
