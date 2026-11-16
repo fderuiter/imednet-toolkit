@@ -7,6 +7,7 @@ import argparse
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status, parse_filter_args
+from ..utils.args import add_output_format
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -23,15 +24,23 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         help="Filter criteria (e.g., 'subject_status=Screened'). Repeat for multiple filters.",
     )
 
+    add_output_format(list_parser)
+
     @with_sdk
     def list_subjects(
-        sdk: ImednetSDK, study_key: str, subject_filter: list[str] | None = None
+        sdk: ImednetSDK,
+        study_key: str,
+        subject_filter: list[str] | None = None,
+        output_format: str = "table",
     ) -> None:
         parsed_filter = parse_filter_args(subject_filter)
 
         with fetching_status("subjects", study_key):
-            subjects_list = sdk.subjects.list(study_key, **(parsed_filter or {}))
+            subjects_list = list(sdk.subjects.list(study_key, **(parsed_filter or {})))
 
+        if output_format == "json":
+            display_list(subjects_list, "subjects", output_format="json")
+            return
         view_models = []
         for s in subjects_list:
             keywords_str = ", ".join(k.keyword_name for k in s.keywords)
@@ -49,6 +58,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     list_parser.set_defaults(
         func=lambda args: list_subjects(
-            study_key=args.study_key, subject_filter=args.subject_filter
+            study_key=args.study_key,
+            subject_filter=args.subject_filter,
+            output_format=args.output_format,
         )
     )

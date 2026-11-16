@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from typing import Any
 
@@ -35,3 +36,14 @@ def parse_filter_args(filter_args: list[str] | None) -> dict[str, Any] | None:
         else:
             filter_dict[key.strip()] = value
     return filter_dict
+
+
+def add_output_format(parser: argparse.ArgumentParser) -> None:
+    """Add the common opt-in machine response flag to a leaf read command."""
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("table", "json"),
+        default="table",
+        help="Response format: human table (default) or versioned JSON on stdout.",
+    )
