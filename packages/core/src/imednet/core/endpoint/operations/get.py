@@ -7,14 +7,15 @@ from the API using its ID.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Generic, TypeVar
+from typing import Any, TypeVar
 
+from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 
 T = TypeVar("T")
 
 
-class PathGetOperation(Generic[T]):
+class PathGetOperation(Operation[T]):
     """Operation for executing get requests via direct path.
 
     Encapsulates the logic for making the HTTP request, handling empty
@@ -45,11 +46,12 @@ class PathGetOperation(Generic[T]):
             self.not_found_func()
         return self.parse_func(data)
 
-    def execute_sync(self, client: RequesterProtocol) -> T:
+    def execute_sync(self, client: RequesterProtocol, parse_func: Any = None) -> T:
         """Execute synchronous get request.
 
         Args:
             client: The synchronous HTTP client.
+            parse_func: Optional parse function (unused; instance parse_func is used).
 
         Returns:
             The parsed item.
@@ -57,11 +59,12 @@ class PathGetOperation(Generic[T]):
         response = client.get(self.path)
         return self._process_response(response)
 
-    async def execute_async(self, client: AsyncRequesterProtocol) -> T:
+    async def execute_async(self, client: AsyncRequesterProtocol, parse_func: Any = None) -> T:
         """Execute asynchronous get request.
 
         Args:
             client: The asynchronous HTTP client.
+            parse_func: Optional parse function (unused; instance parse_func is used).
 
         Returns:
             The parsed item.

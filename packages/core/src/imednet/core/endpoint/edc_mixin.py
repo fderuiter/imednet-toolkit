@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any, TypeVar
 
 from imednet.core.context import get_study_context
-from imednet.core.endpoint.base import AsyncListGetEndpoint, SyncListGetEndpoint
+from imednet.core.endpoint.base import (
+    AsyncGetEndpoint,
+    AsyncListGetEndpoint,
+    SyncGetEndpoint,
+    SyncListGetEndpoint,
+)
 from imednet.models.base import ImednetBaseModel
 
 T = TypeVar("T", bound=ImednetBaseModel)
@@ -73,6 +78,18 @@ class _EdcEndpointBase:
         return _inject_study_key(filters)
 
 
+class EdcSyncGetEndpoint(_EdcEndpointBase, SyncGetEndpoint[T]):
+    """Sync EDC get-only endpoint base."""
+
+    BASE_PATH = _EDC_BASE_PATH
+
+
+class EdcAsyncGetEndpoint(_EdcEndpointBase, AsyncGetEndpoint[T]):
+    """Async EDC get-only endpoint base."""
+
+    BASE_PATH = _EDC_BASE_PATH
+
+
 class EdcSyncListGetEndpoint(_EdcEndpointBase, SyncListGetEndpoint[T]):
     """Sync EDC list/get endpoint base."""
 
@@ -85,5 +102,6 @@ class EdcAsyncListGetEndpoint(_EdcEndpointBase, AsyncListGetEndpoint[T]):
     BASE_PATH = _EDC_BASE_PATH
 
 
-# Backward-compatible alias. New code should use EdcSyncListGetEndpoint / EdcAsyncListGetEndpoint.
+# Backward-compatible aliases. New code should use EdcSync* / EdcAsync* classes.
 EdcGenericListGetEndpoint = EdcSyncListGetEndpoint
+EdcGenericGetEndpoint = EdcSyncGetEndpoint

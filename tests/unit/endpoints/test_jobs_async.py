@@ -34,3 +34,11 @@ async def test_async_get_not_found(dummy_client, response_factory):
 
     with pytest.raises(NotFoundError):
         await ep.get("S1", "B1")
+
+
+def test_async_jobs_endpoint_has_no_list_method():
+    """Test that AsyncJobsEndpoint does not have or inherit a list method."""
+    async_client = AsyncMock()
+    ep = jobs.AsyncJobsEndpoint(async_client)
+    assert not hasattr(ep, "list")
+    assert not hasattr(jobs.AsyncJobsEndpoint, "list")
