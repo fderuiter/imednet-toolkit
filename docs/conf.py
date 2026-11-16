@@ -100,7 +100,17 @@ extensions = [
     "sphinx.ext.doctest",
     "myst_parser",
     "sphinx.ext.githubpages",
+    "sphinx_thebe",
 ]
+
+# Configure sphinx-thebe options for interactive in-browser execution with Pyodide
+thebe_config = {
+    "always_load": False,
+    "selector": "div.highlight-python",
+    "selector_input": "pre",
+    "selector_output": ".output, .cell_output",
+    "kernel_name": "pyodide",
+}
 
 autosummary_generate = False
 
@@ -184,7 +194,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["showcase.js"]
+html_js_files: list[str] = ["showcase.js", "thebe_pyodide.js"]
 
 doctest_global_setup = """
 import os
@@ -322,6 +332,8 @@ master_doc = 'index'
 # Linkcheck configuration
 linkcheck_ignore = [
     r"https://.*\.imednet\.com.*",
+    r"https://cdn\.jsdelivr\.net/.*",
+    r"https://unpkg\.com/.*",
 ]
 linkcheck_timeout = 30
 linkcheck_retries = 3

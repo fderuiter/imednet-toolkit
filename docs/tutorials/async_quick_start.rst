@@ -3,6 +3,8 @@ Async Quick Start
 
 This page shows a minimal asynchronous example using ``AsyncImednetSDK``.
 
+.. thebe-button:: Activate Interactive Runtime
+
 .. important::
 
    ``AsyncImednetSDK`` and ``ImednetSDK`` have **strictly separate lifecycles**.

@@ -23,12 +23,12 @@ _SAFE_STUDY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 class DuckDBIngestionWorkflow:
     """Incremental record centralization pipeline using a bronze/silver DuckDB layout."""
 
-    def __init__(self, sdk: ImednetFacade, db_path: str = "imednet_central.duckdb") -> None:
+    def __init__(self, sdk: ImednetFacade, db_path: str = ":memory:") -> None:
         """Initialize the DuckDB ingestion workflow.
 
         Args:
             sdk: An instance of the iMednet SDK facade.
-            db_path: Path to the DuckDB database file. Defaults to "imednet_central.duckdb".
+            db_path: Path to the DuckDB database file or ":memory:". Defaults to ":memory:".
         """
         try:
             import duckdb

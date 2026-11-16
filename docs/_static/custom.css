@@ -175,6 +175,151 @@ div.highlight {
     text-decoration: underline;
 }
 
+/* Sphinx-Thebe Interactive Cells & Pyodide Output Styles */
+.thebe-launch-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: #ffffff;
+    background-color: var(--color-brand-primary, #005fb8);
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.2s ease, opacity 0.2s ease;
+    margin: 1rem 0;
+}
+
+.thebe-launch-button:hover {
+    opacity: 0.9;
+}
+
+.thebe-launch-button.thebe-status-ready {
+    background-color: #2da44e;
+    color: #ffffff;
+}
+
+.thebelab-cell {
+    border: 1px solid var(--color-background-border, #e1e4e8);
+    border-radius: 6px;
+    background-color: var(--color-background-secondary, #f6f8fa);
+    padding: 0.75rem;
+    margin: 1.25rem 0;
+}
+
+.thebelab-input {
+    margin-bottom: 0.5rem;
+}
+
+.thebe-editor {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--font-stack--monospace, ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace);
+    font-size: 0.875rem;
+    line-height: 1.45;
+    background-color: var(--color-code-background, #ffffff);
+    color: var(--color-code-foreground, #24292f);
+    border: 1px solid var(--color-background-border, #d0d7de);
+    border-radius: 6px;
+    padding: 0.75rem;
+    resize: vertical;
+    outline: none;
+}
+
+.thebe-editor:focus {
+    border-color: var(--color-brand-primary, #005fb8);
+    box-shadow: 0 0 0 2px rgba(0, 95, 184, 0.2);
+}
+
+.thebelab-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.thebelab-button {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    padding: 0.3rem 0.75rem;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid var(--color-background-border, #d0d7de);
+    background-color: var(--color-background-primary, #ffffff);
+    color: var(--color-foreground-primary, #24292f);
+    transition: all 0.15s ease-in-out;
+}
+
+.thebelab-run-button {
+    background-color: var(--color-brand-primary, #005fb8);
+    color: #ffffff;
+    border-color: transparent;
+}
+
+.thebelab-run-button:hover:not(:disabled) {
+    opacity: 0.9;
+}
+
+.thebelab-run-button:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.thebelab-clear-button:hover {
+    background-color: var(--color-background-secondary, #f6f8fa);
+}
+
+.thebelab-cell-status {
+    font-size: 0.8125rem;
+    color: var(--color-foreground-muted, #57606a);
+    font-style: italic;
+}
+
+.thebelab-output {
+    margin-top: 0.75rem;
+    border-top: 1px solid var(--color-background-border, #e1e4e8);
+    padding-top: 0.5rem;
+}
+
+.thebe-output-area pre {
+    margin: 0.35rem 0;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.8125rem;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.thebe-stdout {
+    background-color: var(--color-code-background, #f6f8fa);
+    color: var(--color-code-foreground, #24292f);
+    border-left: 3px solid #2da44e;
+}
+
+.thebe-stderr {
+    background-color: rgba(207, 34, 46, 0.08);
+    color: #cf222e;
+    border-left: 3px solid #cf222e;
+}
+
+.thebe-result {
+    background-color: var(--color-code-background, #f6f8fa);
+    color: var(--color-brand-primary, #005fb8);
+    font-weight: 500;
+    border-left: 3px solid var(--color-brand-primary, #005fb8);
+}
+
+.thebe-no-output {
+    font-size: 0.8125rem;
+    color: var(--color-foreground-muted, #57606a);
+    font-style: italic;
+    padding: 0.25rem 0.5rem;
+}
+
 /* =========================================================================
    Interactive Showcase & Embedded Live Explorer Styles
    ========================================================================= */
