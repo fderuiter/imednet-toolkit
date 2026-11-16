@@ -201,6 +201,27 @@ def _get_translated_text(elem: ET.Element | None) -> str | None:
     return None
 
 
+def _extract_item_sdtm_attributes(it_def: ET.Element) -> dict[str, Any]:
+    """Extract SDSVarName, SASFieldName, Origin, and Comment from ItemDef element."""
+    sdtm: dict[str, Any] = {}
+    if (sds_var := _get_attr(it_def, "SDSVarName")) and sds_var.strip():
+        sdtm["SDSVarName"] = sds_var.strip()
+    if (sas_field := _get_attr(it_def, "SASFieldName")) and sas_field.strip():
+        sdtm["SASFieldName"] = sas_field.strip()
+    if (origin := _get_attr(it_def, "Origin")) and origin.strip():
+        sdtm["Origin"] = origin.strip()
+    comment_val = _get_attr(it_def, "Comment")
+    if not comment_val:
+        c_elem = _find_first_child(it_def, "Comment")
+        if c_elem is not None:
+            comment_val = _get_translated_text(c_elem) or (
+                c_elem.text.strip() if c_elem.text else None
+            )
+    if comment_val and comment_val.strip():
+        sdtm["Comment"] = comment_val.strip()
+    return sdtm
+
+
 def _map_datatype(
     raw_datatype: str | None,
     item_oid: str,
@@ -428,12 +449,22 @@ def load_from_cdisc_odm(
                 )
                 continue
 
-            _extract_unmapped_attributes(
+            ig_extra = _extract_unmapped_attributes(
                 ig_def,
                 KNOWN_ITEM_GROUP_ATTRIBUTES,
                 "ItemGroupDef",
                 record_warning,
             )
+            for k, v in ig_extra.items():
+                if k not in f_extra:
+                    f_extra[k] = v
+
+            ig_domain = _get_attr(ig_def, "Domain")
+            ig_sas_dataset = _get_attr(ig_def, "SASDatasetName")
+            if ig_domain and ig_domain.strip() and "Domain" not in f_extra:
+                f_extra["Domain"] = ig_domain.strip()
+            if ig_sas_dataset and ig_sas_dataset.strip() and "SASDatasetName" not in f_extra:
+                f_extra["SASDatasetName"] = ig_sas_dataset.strip()
 
             # Process ItemRef elements inside ItemGroupDef
             item_refs = _find_children(ig_def, "ItemRef")
@@ -441,7 +472,7 @@ def load_from_cdisc_odm(
 
             for item_ref in item_refs:
                 it_oid = _get_attr(item_ref, "ItemOID") or ""
-                _extract_unmapped_attributes(
+                ref_extra = _extract_unmapped_attributes(
                     item_ref,
                     KNOWN_ITEM_REF_ATTRIBUTES,
                     "ItemRef",
@@ -461,6 +492,15 @@ def load_from_cdisc_odm(
                     "ItemDef",
                     record_warning,
                 )
+                for k, v in ref_extra.items():
+                    it_extra.setdefault(k, v)
+
+                if ig_domain and ig_domain.strip():
+                    it_extra["Domain"] = ig_domain.strip()
+                if ig_sas_dataset and ig_sas_dataset.strip():
+                    it_extra["SASDatasetName"] = ig_sas_dataset.strip()
+
+                it_extra.update(_extract_item_sdtm_attributes(it_def))
 
                 # Variable Name & Label
                 var_name = _get_attr(it_def, "OID") or _get_attr(it_def, "Name") or it_oid
@@ -529,10 +569,34 @@ def load_from_cdisc_odm(
             direct_item_refs.sort(key=lambda r: _parse_order(r, 0))
             for item_ref in direct_item_refs:
                 it_oid = _get_attr(item_ref, "ItemOID") or ""
+                ref_extra = _extract_unmapped_attributes(
+                    item_ref,
+                    KNOWN_ITEM_REF_ATTRIBUTES,
+                    "ItemRef",
+                    record_warning,
+                )
+
                 it_def = item_def_elems.get(it_oid)
                 if it_def is None:
                     record_warning(f"ItemRef '{it_oid}' on Form '{f_oid}' not found.")
                     continue
+
+                it_extra = _extract_unmapped_attributes(
+                    it_def,
+                    KNOWN_ITEM_ATTRIBUTES,
+                    "ItemDef",
+                    record_warning,
+                )
+                for k, v in ref_extra.items():
+                    it_extra.setdefault(k, v)
+
+                if form_domain := f_extra.get("Domain"):
+                    it_extra.setdefault("Domain", form_domain)
+                if form_sas := f_extra.get("SASDatasetName"):
+                    it_extra.setdefault("SASDatasetName", form_sas)
+
+                it_extra.update(_extract_item_sdtm_attributes(it_def))
+
                 var_name = _get_attr(it_def, "OID") or _get_attr(it_def, "Name") or it_oid
                 q_elem = _find_first_child(it_def, "Question")
                 desc_elem = _find_first_child(it_def, "Description")
@@ -576,6 +640,7 @@ def load_from_cdisc_odm(
                         format=_get_attr(it_def, "Length"),
                         precision=_get_attr(it_def, "SignificantDigits"),
                         choices=var_choices,
+                        extraAttributes=it_extra,
                     )
                 )
                 var_seq += 1
