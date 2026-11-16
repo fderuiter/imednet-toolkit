@@ -238,7 +238,7 @@ typos-check = "typos {args:packages}"
 semgrep-check = "semgrep scan --config p/security-audit --metrics off --error {args:packages}"
 # Scanner-only upstream exceptions: docs/reference/security_exceptions.rst
 audit = "pip-audit -s osv --timeout 60 --ignore-vuln CVE-2026-116685 --ignore-vuln CVE-2026-59951 --ignore-vuln CVE-2026-116686 --ignore-vuln CVE-2026-116684 --ignore-vuln CVE-2026-126360 --ignore-vuln CVE-2026-114603"
-secrets = "detect-secrets-hook --baseline .secrets.baseline {args:packages}"
+secrets = "detect-secrets-hook --baseline .secrets.baseline {args:.}"  # pragma: allowlist secret
 vulture-check = "vulture {args:packages} vulture_whitelist.py --min-confidence 80 --exclude **/tests/**,**/docs/**,**/scripts/**"
 pylint-sim = "pylint --disable=all --enable=similarities --min-similarity-lines=20 --ignore-paths='.*/tests/.*,.*/docs/.*,.*/scripts/.*,.*/models/.*,tests/.*,docs/.*,scripts/.*,.*\\.json$' --ignore-patterns='.*monitor.*,.*integrations.*,.*sinks.*,.*testing.*' {args:packages}"
 symilar-check = "pylint --disable=all --enable=duplicate-code --fail-under=9.0 {args:packages}"
