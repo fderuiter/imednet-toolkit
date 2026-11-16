@@ -21,10 +21,14 @@ class _ValidNamespace:
     """A minimal object satisfying WorkflowsNamespaceProtocol."""
 
     data_extraction: Any = None
+    duckdb_centralizer: Any = None
     query_management: Any = None
     record_mapper: Any = None
     record_update: Any = None
+    register_subjects: Any = None
     subject_data: Any = None
+    uat: Any = None
+    uat_inspector: Any = None
 
 
 def _valid_factory(sdk_instance: Any) -> _ValidNamespace:
@@ -49,7 +53,7 @@ def test_object_missing_attributes_does_not_satisfy_namespace_protocol() -> None
         """Test suite for  Incomplete."""
 
         data_extraction: Any = None
-        # missing: query_management, record_mapper, record_update, subject_data
+        # missing: duckdb_centralizer, query_management, record_mapper, record_update, register_subjects, subject_data, uat, uat_inspector
 
     assert not isinstance(_Incomplete(), WorkflowsNamespaceProtocol)
 
