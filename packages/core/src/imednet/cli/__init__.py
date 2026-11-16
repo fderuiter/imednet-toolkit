@@ -53,6 +53,7 @@ def get_parser() -> argparse.ArgumentParser:
 
     from .datadict import setup_parser as datadict_setup
     from .export import setup_parser as export_setup
+    from .forms import setup_parser as forms_setup
     from .intervals import setup_parser as intervals_setup
     from .jobs import setup_parser as jobs_setup
     from .queries import setup_parser as queries_setup
@@ -74,6 +75,7 @@ def get_parser() -> argparse.ArgumentParser:
     intervals_setup(subparsers)
     jobs_setup(subparsers)
     records_setup(subparsers)
+    forms_setup(subparsers)
 
     import importlib.metadata
 

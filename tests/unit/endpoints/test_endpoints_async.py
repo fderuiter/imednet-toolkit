@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from imednet.core.context import set_study_context
 from imednet.endpoints import (
     codings,
     forms,
@@ -57,9 +58,9 @@ async def test_async_list_codings(dummy_client, async_paginator_factory):
 
 
 @pytest.mark.asyncio
-async def test_async_list_forms(dummy_client, context, async_paginator_factory):
+async def test_async_list_forms(dummy_client, async_paginator_factory):
     """Test that async list forms asynchronously."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = forms.AsyncFormsEndpoint(dummy_client)
     captured = async_paginator_factory(forms, [{"formId": 1}])
     result = await ep.list()
@@ -68,9 +69,9 @@ async def test_async_list_forms(dummy_client, context, async_paginator_factory):
 
 
 @pytest.mark.asyncio
-async def test_async_list_intervals(dummy_client, context, async_paginator_factory):
+async def test_async_list_intervals(dummy_client, async_paginator_factory):
     """Test that async list intervals asynchronously."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = intervals.AsyncIntervalsEndpoint(dummy_client)
     captured = async_paginator_factory(intervals, [{"intervalId": 1}])
     result = await ep.list()
@@ -79,9 +80,9 @@ async def test_async_list_intervals(dummy_client, context, async_paginator_facto
 
 
 @pytest.mark.asyncio
-async def test_async_list_queries(dummy_client, context, async_paginator_factory):
+async def test_async_list_queries(dummy_client, async_paginator_factory):
     """Test that async list queries asynchronously."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = queries.AsyncQueriesEndpoint(dummy_client)
     captured = async_paginator_factory(queries, [{"annotationId": 1}])
     result = await ep.list(status="new")
@@ -90,9 +91,9 @@ async def test_async_list_queries(dummy_client, context, async_paginator_factory
 
 
 @pytest.mark.asyncio
-async def test_async_list_record_revisions(dummy_client, context, async_paginator_factory):
+async def test_async_list_record_revisions(dummy_client, async_paginator_factory):
     """Test that async list record revisions asynchronously."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = record_revisions.AsyncRecordRevisionsEndpoint(dummy_client)
     captured = async_paginator_factory(record_revisions, [{"recordRevisionId": 1}])
     result = await ep.list(status="x")
@@ -111,9 +112,9 @@ async def test_async_list_sites(dummy_client, async_paginator_factory):
 
 
 @pytest.mark.asyncio
-async def test_async_list_subjects(dummy_client, context, async_paginator_factory):
+async def test_async_list_subjects(dummy_client, async_paginator_factory):
     """Test that async list subjects asynchronously."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = subjects.AsyncSubjectsEndpoint(dummy_client)
     captured = async_paginator_factory(subjects, [{"subjectKey": "x"}])
     result = await ep.list()
@@ -143,9 +144,9 @@ async def test_async_list_variables(dummy_client, async_paginator_factory):
 
 
 @pytest.mark.asyncio
-async def test_async_list_visits(dummy_client, context, async_paginator_factory):
+async def test_async_list_visits(dummy_client, async_paginator_factory):
     """Test that async list visits asynchronously."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = visits.AsyncVisitsEndpoint(dummy_client)
     captured = async_paginator_factory(visits, [{"visitId": 1}])
     result = await ep.list(status="x")

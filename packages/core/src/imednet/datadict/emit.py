@@ -143,6 +143,24 @@ def _map_to_odm_datatype(var_type: str | None) -> tuple[str, str | None]:
     return "text", None
 
 
+def _extract_sdtm_attr(obj: Any, key: str) -> str | None:
+    """Extract and validate a non-empty SDTM attribute from a form or variable model."""
+    if obj is None:
+        return None
+    val: Any = getattr(obj, key, None)
+    if val is None and hasattr(obj, "get"):
+        val = obj.get(key)
+    if val is None:
+        extra = getattr(obj, "extraAttributes", None)
+        if isinstance(extra, dict):
+            val = extra.get(key)
+    if val is not None:
+        cleaned = str(val).strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
 def to_odm_xml(
     datadict: DataDictionary,
     *,
@@ -245,14 +263,30 @@ def to_odm_xml(
 
     # 3. ItemGroupDef elements
     for form in sorted_forms:
+        ig_attribs: dict[str, str] = {
+            "OID": f"IG_{form.formKey}",
+            "Name": f"{form.formName or form.formKey} Details",
+            "Repeating": str(form.extraAttributes.get("repeating", "No")),
+        }
+        domain = _extract_sdtm_attr(form, "Domain")
+        sas_dataset = _extract_sdtm_attr(form, "SASDatasetName")
+        if not domain or not sas_dataset:
+            for child_var in form.variables:
+                if not domain:
+                    domain = _extract_sdtm_attr(child_var, "Domain")
+                if not sas_dataset:
+                    sas_dataset = _extract_sdtm_attr(child_var, "SASDatasetName")
+                if domain and sas_dataset:
+                    break
+        if domain:
+            ig_attribs["Domain"] = domain
+        if sas_dataset:
+            ig_attribs["SASDatasetName"] = sas_dataset
+
         ig_elem = ET.SubElement(
             mdv_elem,
             f"{{{ODM_NS}}}ItemGroupDef",
-            {
-                "OID": f"IG_{form.formKey}",
-                "Name": f"{form.formName or form.formKey} Details",
-                "Repeating": str(form.extraAttributes.get("repeating", "No")),
-            },
+            ig_attribs,
         )
         sorted_vars = sorted(
             form.variables, key=lambda v: _sort_key_int_then_str(v.sequence, v.variableName)
@@ -298,6 +332,9 @@ def to_odm_xml(
             item_attribs["SignificantDigits"] = str(var.precision)
         if control_type:
             item_attribs["ControlType"] = control_type
+        for sdtm_key in ("SDSVarName", "SASFieldName", "Origin", "Comment"):
+            if sdtm_val := _extract_sdtm_attr(var, sdtm_key):
+                item_attribs[sdtm_key] = sdtm_val
 
         item_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}ItemDef", item_attribs)
         if var.label:
