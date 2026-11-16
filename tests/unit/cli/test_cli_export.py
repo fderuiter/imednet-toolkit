@@ -374,3 +374,107 @@ def test_cli_export_snowflake_missing_dependency(
     assert result.exit_code == 1
     assert "imednet[snowflake]" in result.stderr
     assert result.stdout == ""
+
+
+def test_cli_export_parquet_with_use_labels(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that cli export parquet passes use_labels_as_columns=True."""
+    func = MagicMock()
+    monkeypatch.setattr(export_mod, "export_to_parquet", func)
+    monkeypatch.setattr(cli, "export_to_parquet", export_mod.export_to_parquet)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    result = runner.invoke(cli.app, ["export", "parquet", "STUDY", "out.parquet", "--use-labels"])
+    assert result.exit_code == 0
+    func.assert_called_once_with(sdk, "STUDY", "out.parquet", use_labels_as_columns=True)
+
+
+def test_cli_export_csv_with_use_labels(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that cli export csv passes use_labels_as_columns=True."""
+    func = MagicMock()
+    monkeypatch.setattr(export_mod, "export_to_csv", func)
+    monkeypatch.setattr(cli, "export_to_csv", export_mod.export_to_csv)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    result = runner.invoke(cli.app, ["export", "csv", "STUDY", "out.csv", "--use-labels"])
+    assert result.exit_code == 0
+    func.assert_called_once_with(sdk, "STUDY", "out.csv", use_labels_as_columns=True)
+
+
+def test_cli_export_excel_with_use_labels(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that cli export excel passes use_labels_as_columns=True."""
+    func = MagicMock()
+    monkeypatch.setattr(export_mod, "export_to_excel", func)
+    monkeypatch.setattr(cli, "export_to_excel", export_mod.export_to_excel)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    result = runner.invoke(cli.app, ["export", "excel", "STUDY", "out.xlsx", "--use-labels"])
+    assert result.exit_code == 0
+    func.assert_called_once_with(sdk, "STUDY", "out.xlsx", use_labels_as_columns=True)
+
+
+def test_cli_export_json_with_use_labels(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that cli export json passes use_labels_as_columns=True."""
+    func = MagicMock()
+    monkeypatch.setattr(export_mod, "export_to_json", func)
+    monkeypatch.setattr(cli, "export_to_json", export_mod.export_to_json)
+
+    result = runner.invoke(cli.app, ["export", "json", "STUDY", "out.json", "--use-labels"])
+    assert result.exit_code == 0
+    func.assert_called_once_with(
+        sdk, "STUDY", "out.json", use_labels_as_columns=True, hierarchical=False
+    )
+
+
+def test_cli_export_json_with_hierarchical(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that cli export json passes hierarchical=True."""
+    func = MagicMock()
+    monkeypatch.setattr(export_mod, "export_to_json", func)
+    monkeypatch.setattr(cli, "export_to_json", export_mod.export_to_json)
+
+    result = runner.invoke(cli.app, ["export", "json", "STUDY", "out.json", "--hierarchical"])
+    assert result.exit_code == 0
+    func.assert_called_once_with(
+        sdk, "STUDY", "out.json", use_labels_as_columns=False, hierarchical=True
+    )
+
+
+def test_cli_export_json_with_both_flags(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that cli export json passes both use_labels_as_columns=True and hierarchical=True."""
+    func = MagicMock()
+    monkeypatch.setattr(export_mod, "export_to_json", func)
+    monkeypatch.setattr(cli, "export_to_json", export_mod.export_to_json)
+
+    result = runner.invoke(
+        cli.app, ["export", "json", "STUDY", "out.json", "--use-labels", "--hierarchical"]
+    )
+    assert result.exit_code == 0
+    func.assert_called_once_with(
+        sdk, "STUDY", "out.json", use_labels_as_columns=True, hierarchical=True
+    )
+
+
+@pytest.mark.parametrize("subcommand", ["parquet", "csv", "excel", "json"])
+def test_cli_export_subcommand_help_includes_use_labels(runner: CliRunner, subcommand: str) -> None:
+    """Test that tabular and json export subcommands include --use-labels in help."""
+    result = runner.invoke(cli.app, ["export", subcommand, "--help"])
+    assert result.exit_code == 0
+    assert "--use-labels" in result.stdout
+
+
+def test_cli_export_json_help_includes_hierarchical(runner: CliRunner) -> None:
+    """Test that json export subcommand includes --hierarchical in help."""
+    result = runner.invoke(cli.app, ["export", "json", "--help"])
+    assert result.exit_code == 0
+    assert "--hierarchical" in result.stdout

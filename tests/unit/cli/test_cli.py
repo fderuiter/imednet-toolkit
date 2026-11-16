@@ -314,7 +314,7 @@ def test_export_parquet_calls_helper(
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
     result = runner.invoke(cli.app, ["export", "parquet", "STUDY", "out.parquet"])
     assert result.exit_code == 0
-    func.assert_called_once_with(sdk, "STUDY", "out.parquet")
+    func.assert_called_once_with(sdk, "STUDY", "out.parquet", use_labels_as_columns=False)
 
 
 def test_export_csv_calls_helper(
@@ -326,7 +326,7 @@ def test_export_csv_calls_helper(
     monkeypatch.setattr(cli, "export_to_csv", export_mod.export_to_csv)
     result = runner.invoke(cli.app, ["export", "csv", "STUDY", "out.csv"])
     assert result.exit_code == 0
-    func.assert_called_once_with(sdk, "STUDY", "out.csv")
+    func.assert_called_once_with(sdk, "STUDY", "out.csv", use_labels_as_columns=False)
 
 
 def test_export_excel_calls_helper(
@@ -338,7 +338,7 @@ def test_export_excel_calls_helper(
     monkeypatch.setattr(cli, "export_to_excel", export_mod.export_to_excel)
     result = runner.invoke(cli.app, ["export", "excel", "STUDY", "out.xlsx"])
     assert result.exit_code == 0
-    func.assert_called_once_with(sdk, "STUDY", "out.xlsx")
+    func.assert_called_once_with(sdk, "STUDY", "out.xlsx", use_labels_as_columns=False)
 
 
 def test_export_json_calls_helper(
@@ -350,7 +350,9 @@ def test_export_json_calls_helper(
     monkeypatch.setattr(cli, "export_to_json", export_mod.export_to_json)
     result = runner.invoke(cli.app, ["export", "json", "STUDY", "out.json"])
     assert result.exit_code == 0
-    func.assert_called_once_with(sdk, "STUDY", "out.json")
+    func.assert_called_once_with(
+        sdk, "STUDY", "out.json", use_labels_as_columns=False, hierarchical=False
+    )
 
 
 def test_export_duckdb_calls_helper(

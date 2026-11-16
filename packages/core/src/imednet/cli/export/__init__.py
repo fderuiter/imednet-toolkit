@@ -21,9 +21,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     pq_parser = sub.add_parser("parquet", help="Export study records to a Parquet file.")
     pq_parser.add_argument("study_key", help=STUDY_KEY_ARG)
     pq_parser.add_argument("path", type=Path, help="Destination Parquet file.")
+    pq_parser.add_argument(
+        "--use-labels",
+        action="store_true",
+        help="Use variable labels instead of names as column headers.",
+    )
 
     @with_sdk
-    def export_parquet(sdk: ImednetSDK, study_key: str, path: Path) -> None:
+    def export_parquet(
+        sdk: ImednetSDK, study_key: str, path: Path, use_labels: bool = False
+    ) -> None:
         if importlib.util.find_spec("pyarrow") is None:
             print_error(
                 "Error: pyarrow is required for Parquet export. Install with \"pip install 'imednet[export]'\"."
@@ -32,36 +39,52 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         from .. import export_to_parquet
 
         with fetching_status("records for Parquet export", study_key):
-            export_to_parquet(sdk, study_key, str(path))
+            export_to_parquet(sdk, study_key, str(path), use_labels_as_columns=use_labels)
 
     pq_parser.set_defaults(
-        func=lambda args: export_parquet(study_key=args.study_key, path=args.path)
+        func=lambda args: export_parquet(
+            study_key=args.study_key, path=args.path, use_labels=args.use_labels
+        )
     )
 
     # csv
     csv_parser = sub.add_parser("csv", help="Export study records to a CSV file.")
     csv_parser.add_argument("study_key", help=STUDY_KEY_ARG)
     csv_parser.add_argument("path", type=Path, help="Destination CSV file.")
+    csv_parser.add_argument(
+        "--use-labels",
+        action="store_true",
+        help="Use variable labels instead of names as column headers.",
+    )
 
     @with_sdk
-    def export_csv(sdk: ImednetSDK, study_key: str, path: Path) -> None:
+    def export_csv(sdk: ImednetSDK, study_key: str, path: Path, use_labels: bool = False) -> None:
         if importlib.util.find_spec("pandas") is None:
             print_error("Error: pandas is required for CSV export.")
             sys.exit(1)
         from .. import export_to_csv
 
         with fetching_status("records for CSV export", study_key):
-            export_to_csv(sdk, study_key, str(path))
+            export_to_csv(sdk, study_key, str(path), use_labels_as_columns=use_labels)
 
-    csv_parser.set_defaults(func=lambda args: export_csv(study_key=args.study_key, path=args.path))
+    csv_parser.set_defaults(
+        func=lambda args: export_csv(
+            study_key=args.study_key, path=args.path, use_labels=args.use_labels
+        )
+    )
 
     # excel
     xl_parser = sub.add_parser("excel", help="Export study records to an Excel workbook.")
     xl_parser.add_argument("study_key", help=STUDY_KEY_ARG)
     xl_parser.add_argument("path", type=Path, help="Destination Excel workbook.")
+    xl_parser.add_argument(
+        "--use-labels",
+        action="store_true",
+        help="Use variable labels instead of names as column headers.",
+    )
 
     @with_sdk
-    def export_excel(sdk: ImednetSDK, study_key: str, path: Path) -> None:
+    def export_excel(sdk: ImednetSDK, study_key: str, path: Path, use_labels: bool = False) -> None:
         if (
             importlib.util.find_spec("pandas") is None
             or importlib.util.find_spec("openpyxl") is None
@@ -71,24 +94,55 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         from .. import export_to_excel
 
         with fetching_status("records for Excel export", study_key):
-            export_to_excel(sdk, study_key, str(path))
+            export_to_excel(sdk, study_key, str(path), use_labels_as_columns=use_labels)
 
-    xl_parser.set_defaults(func=lambda args: export_excel(study_key=args.study_key, path=args.path))
+    xl_parser.set_defaults(
+        func=lambda args: export_excel(
+            study_key=args.study_key, path=args.path, use_labels=args.use_labels
+        )
+    )
 
     # json
     json_parser = sub.add_parser("json", help="Export study records to a JSON file.")
     json_parser.add_argument("study_key", help=STUDY_KEY_ARG)
     json_parser.add_argument("path", type=Path, help="Destination JSON file.")
+    json_parser.add_argument(
+        "--use-labels",
+        action="store_true",
+        help="Use variable labels instead of names as column headers.",
+    )
+    json_parser.add_argument(
+        "--hierarchical",
+        action="store_true",
+        help="Export nested hierarchical tree structure.",
+    )
 
     @with_sdk
-    def export_json_cmd(sdk: ImednetSDK, study_key: str, path: Path) -> None:
+    def export_json_cmd(
+        sdk: ImednetSDK,
+        study_key: str,
+        path: Path,
+        use_labels: bool = False,
+        hierarchical: bool = False,
+    ) -> None:
         from .. import export_to_json
 
         with fetching_status("records for JSON export", study_key):
-            export_to_json(sdk, study_key, str(path))
+            export_to_json(
+                sdk,
+                study_key,
+                str(path),
+                use_labels_as_columns=use_labels,
+                hierarchical=hierarchical,
+            )
 
     json_parser.set_defaults(
-        func=lambda args: export_json_cmd(study_key=args.study_key, path=args.path)
+        func=lambda args: export_json_cmd(
+            study_key=args.study_key,
+            path=args.path,
+            use_labels=args.use_labels,
+            hierarchical=args.hierarchical,
+        )
     )
 
     # duckdb
