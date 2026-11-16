@@ -140,6 +140,12 @@ def main():
                 "smoke": [
                     {"cmd": "import imednet"},
                     {
+                        "cmd": "from imednet.models.subjects import Subject; assert 'subject_id' in Subject.model_fields and 'subject_key' in Subject.model_fields",
+                    },
+                    {
+                        "cmd": "from imednet.models.records import Record; assert 'record_id' in Record.model_fields",
+                    },
+                    {
                         "cmd": "imednet --help",
                         "expect_fail": False,
                         "contains": "pip install 'imednet[cli]'",

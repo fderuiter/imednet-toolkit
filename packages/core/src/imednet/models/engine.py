@@ -2,6 +2,7 @@
 
 """Dynamic model generation engine based on unified contract schemas."""
 
+import importlib.resources
 import os
 import re
 from typing import Any, ClassVar
@@ -19,6 +20,10 @@ def get_contract() -> APIContract:
 
     Returns:
         The unified API contract.
+
+    Raises:
+        FileNotFoundError: If no contract specification can be located.
+        RuntimeError: If the contract specification contains no valid models.
     """
     global _CONTRACT_CACHE
     if _CONTRACT_CACHE is not None:
@@ -28,31 +33,58 @@ def get_contract() -> APIContract:
 
     # Priority 1: OpenAPI if provided via IMEDNET_OPENAPI_PATH
     openapi_path = os.environ.get("IMEDNET_OPENAPI_PATH")
-    if openapi_path and os.path.exists(openapi_path):
+    if openapi_path:
+        if not os.path.exists(openapi_path):
+            raise FileNotFoundError(
+                f"Configured OpenAPI specification file not found: {openapi_path}"
+            )
         builder.ingest_openapi(openapi_path)
     else:
-        # Priority 2: Postman
+        # Priority 2: Postman override if provided via IMEDNET_POSTMAN_PATH
         postman_path = os.environ.get("IMEDNET_POSTMAN_PATH")
-        if not postman_path:
-            local_dev_path = os.path.join(
-                os.path.dirname(
+        if postman_path:
+            if not os.path.exists(postman_path):
+                raise FileNotFoundError(
+                    f"Configured Postman collection file not found: {postman_path}"
+                )
+            builder.ingest_postman(postman_path)
+        else:
+            # Priority 3: Bundled package resource via importlib.resources
+            try:
+                resource = importlib.resources.files("imednet.resources").joinpath(
+                    "imednet.postman_collection.json"
+                )
+            except Exception:
+                resource = importlib.resources.files("imednet").joinpath(
+                    "resources", "imednet.postman_collection.json"
+                )
+
+            if resource.is_file():
+                with importlib.resources.as_file(resource) as bundled_path:
+                    builder.ingest_postman(str(bundled_path))
+            else:
+                # Local dev checkout fallback
+                local_dev_path = os.path.join(
                     os.path.dirname(
                         os.path.dirname(
                             os.path.dirname(
-                                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                                os.path.dirname(
+                                    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                                )
                             )
                         )
+                    ),
+                    "imednet.postman_collection.json",
+                )
+                if os.path.exists(local_dev_path):
+                    builder.ingest_postman(local_dev_path)
+                else:
+                    raise FileNotFoundError(
+                        "API contract specification could not be found via package resources or local workspace."
                     )
-                ),
-                "imednet.postman_collection.json",
-            )
-            if os.path.exists(local_dev_path):
-                postman_path = local_dev_path
-            else:
-                postman_path = "/app/imednet.postman_collection.json"
 
-        if postman_path and os.path.exists(postman_path):
-            builder.ingest_postman(postman_path)
+    if not builder.contract.models:
+        raise RuntimeError("No valid models could be loaded from contract specification.")
 
     _CONTRACT_CACHE = builder.contract
     return _CONTRACT_CACHE
