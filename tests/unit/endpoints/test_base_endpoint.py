@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from imednet.core.client import Client
-from imednet.core.context import Context
+from imednet.core.context import set_study_context
 from imednet.core.endpoint.base import GenericEndpoint, GenericListGetEndpoint
 from imednet.core.endpoint.edc_mixin import EdcEndpointMixin
 from imednet.models.base import ImednetBaseModel
@@ -43,20 +43,15 @@ class TestBaseEndpoint:
         """Helper function to client."""
         return MagicMock(spec=Client)
 
-    @pytest.fixture
-    def context(self):
-        """Helper function to context."""
-        return Context()
-
     def test_require_async_client_raises(self, client):
         """Test that require async client raises."""
         ep = MockEndpointImpl(client, async_client=None)
         with pytest.raises(RuntimeError, match="Async client not configured"):
             ep._require_async_client()
 
-    def test_auto_filter_injects_study_key(self, client, context):
+    def test_auto_filter_injects_study_key(self, client):
         """Test that auto filter injects study key."""
-        context.set_default_study_key("DEFAULT")
+        set_study_context("DEFAULT")
         ep = MockEndpointImpl(client)
 
         filters = {"foo": "bar"}
@@ -64,9 +59,9 @@ class TestBaseEndpoint:
         assert result["studyKey"] == "DEFAULT"
         assert result["foo"] == "bar"
 
-    def test_auto_filter_preserves_existing_study_key(self, client, context):
+    def test_auto_filter_preserves_existing_study_key(self, client):
         """Test that auto filter preserves existing study key."""
-        context.set_default_study_key("DEFAULT")
+        set_study_context("DEFAULT")
         ep = MockEndpointImpl(client)
 
         filters = {"studyKey": "EXPLICIT", "foo": "bar"}

@@ -368,30 +368,7 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
 class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     """Validate record payloads using variable metadata from the API (Synchronous)."""
 
-    def __new__(cls, sdk: ImednetFacade, *args: Any, **kwargs: Any) -> Any:
-        """Create a new instance of the validator, handling deprecation of is_async.
-
-        Args:
-            sdk: The iMednet facade instance.
-            *args: Positional arguments.
-            **kwargs: Keyword arguments.
-
-        Returns:
-            Any: A SchemaValidator or AsyncSchemaValidator instance.
-        """
-        if kwargs.get("is_async") or (args and args[0] is True):
-            import warnings
-
-            warnings.warn(
-                "Passing `is_async=True` to SchemaValidator is deprecated. "
-                "Use `AsyncSchemaValidator` instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            return AsyncSchemaValidator(sdk)  # type: ignore[arg-type]
-        return super().__new__(cls)
-
-    def __init__(self, sdk: ImednetFacade, *, is_async: bool = False) -> None:
+    def __init__(self, sdk: ImednetFacade) -> None:
         """Initialize the synchronous schema validator."""
         self._sdk = sdk
         self.schema = SchemaCache()

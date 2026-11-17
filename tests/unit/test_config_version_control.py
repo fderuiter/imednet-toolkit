@@ -554,3 +554,90 @@ def test_decryption_incorrect_or_missing_key_raises(tmp_path: Path) -> None:
         store.rollback_config("STUDY-01", commit_id)
 
     os.environ["IMEDNET_SECURITY_KEY"] = "test_sec_key"
+
+
+@pytest.mark.parametrize(
+    "invalid_key",
+    [
+        "../../escaped_canary",
+        "../study",
+        "..\\study",
+        "/rooted",
+        "\\rooted",
+        "C:\\Windows",
+        "C:/Windows",
+        "study/form",
+        "study\\form",
+        "study\x00key",
+        "..",
+    ],
+)
+def test_dynamic_db_path_invalid_study_key_raises_traversal_error(
+    tmp_path: Path, invalid_key: str
+) -> None:
+    """Verify that invalid study keys containing path traversal or separators raise PathTraversalValidationError."""
+    from imednet.core.context import reset_study_context, set_study_context
+    from imednet.errors import PathTraversalValidationError
+
+    token = set_study_context(invalid_key)
+    try:
+        with pytest.raises(PathTraversalValidationError):
+            ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
+    finally:
+        reset_study_context(token)
+
+
+@pytest.mark.parametrize("valid_key", ["STUDY-01", "study_abc", "STUDY123", "study-01_v2"])
+def test_dynamic_db_path_valid_study_keys_stay_within_base(tmp_path: Path, valid_key: str) -> None:
+    """Verify that valid study keys resolve strictly inside the allowed base directory."""
+    from imednet.core.context import reset_study_context, set_study_context
+
+    token = set_study_context(valid_key)
+    try:
+        store = ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
+        db_file = store.db_path
+        assert valid_key in str(db_file)
+        assert db_file.resolve().is_relative_to(tmp_path.resolve())
+        assert db_file.exists()
+    finally:
+        reset_study_context(token)
+
+
+def test_dynamic_db_path_empty_study_key_context(tmp_path: Path) -> None:
+    """Verify empty string study context does not fail and resolves within base directory."""
+    from imednet.core.context import reset_study_context, set_study_context
+
+    token = set_study_context("")
+    try:
+        store = ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
+        db_file = store.db_path
+        assert db_file.resolve().is_relative_to(tmp_path.resolve())
+        assert db_file.exists()
+    finally:
+        reset_study_context(token)
+
+
+def test_dynamic_db_path_missing_base_url_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify missing base URL falls back safely to localhost directory."""
+    from imednet.core.context import (
+        reset_base_url_context,
+        reset_study_context,
+        set_base_url_context,
+        set_study_context,
+    )
+
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+    b_token = set_base_url_context("")
+    s_token = set_study_context("STUDY-FALLBACK")
+    try:
+        store = ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
+        db_file = store.db_path
+        assert "localhost" in str(db_file)
+        assert "STUDY-FALLBACK" in str(db_file)
+        assert db_file.resolve().is_relative_to(tmp_path.resolve())
+        assert db_file.exists()
+    finally:
+        reset_study_context(s_token)
+        reset_base_url_context(b_token)
