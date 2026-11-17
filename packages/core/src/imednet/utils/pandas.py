@@ -9,10 +9,13 @@ try:
 except ImportError:
     pd: Any = None  # type: ignore[no-redef]
 from ..models.forms import Form
+from ..models.intervals import Interval
 from ..models.queries import Query
 from ..models.records import Record
+from ..models.sites import Site
 from ..models.subjects import Subject
 from ..models.variables import Variable
+from ..models.visits import Visit
 from .security import sanitize_csv_formula
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
@@ -77,6 +80,51 @@ def forms_to_dataframe(forms: list[Form]) -> pd.DataFrame:
 
     form_dicts = [f.model_dump(by_alias=False) for f in forms]
     return pd.DataFrame(form_dicts)
+
+
+def visits_to_dataframe(visits: list[Visit]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.visits.Visit` to a DataFrame.
+
+    Each visit model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for visits_to_dataframe. Install with \"pip install 'imednet[export]'\"."
+        )
+
+    visit_dicts = [v.model_dump(by_alias=False) for v in visits]
+    return pd.DataFrame(visit_dicts)
+
+
+def intervals_to_dataframe(intervals: list[Interval]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.intervals.Interval` to a DataFrame.
+
+    Each interval model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for intervals_to_dataframe. Install with \"pip install 'imednet[export]'\"."
+        )
+
+    interval_dicts = [i.model_dump(by_alias=False) for i in intervals]
+    return pd.DataFrame(interval_dicts)
+
+
+def sites_to_dataframe(sites: list[Site]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.sites.Site` to a DataFrame.
+
+    Each site model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for sites_to_dataframe. Install with \"pip install 'imednet[export]'\"."
+        )
+
+    site_dicts = [s.model_dump(by_alias=False) for s in sites]
+    return pd.DataFrame(site_dicts)
 
 
 def records_to_dataframe(records: list[Record], *, flatten: bool = False) -> pd.DataFrame:
