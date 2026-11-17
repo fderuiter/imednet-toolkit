@@ -193,6 +193,7 @@ class BaseStateProvider(abc.ABC):
         status: StreamExecutionStatus | str = StreamExecutionStatus.SUCCESS,
         error_message: str | None = None,
         metadata: dict[str, Any] | None = None,
+        force: bool = False,
     ) -> None:
         """Sets the high-water mark timestamp atomically."""
 
@@ -563,6 +564,7 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
         status: StreamExecutionStatus | str = StreamExecutionStatus.SUCCESS,
         error_message: str | None = None,
         metadata: dict[str, Any] | None = None,
+        force: bool = False,
     ) -> None:
         """Sets the high-water mark timestamp atomically using Airflow XCom."""
         validated_status = _coerce_and_validate_status(status)

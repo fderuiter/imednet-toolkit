@@ -35,11 +35,14 @@ _STATUS_COLOR_MAP = {
     "success": "green",
     "ok": "green",
     "completed": "green",
+    "complete": "green",
     "open": "green",
     "approved": "green",
     "verified": "green",
     "pending": "yellow",
     "processing": "yellow",
+    "running": "yellow",
+    "queued": "yellow",
     "suspended": "yellow",
     "hold": "yellow",
     "incomplete": "yellow",
@@ -49,6 +52,8 @@ _STATUS_COLOR_MAP = {
     "error": "red",
     "fail": "red",
     "failed": "red",
+    "cancelled": "red",
+    "timeout": "red",
     "rejected": "red",
     "terminated": "red",
     "withdrawn": "red",
@@ -278,7 +283,7 @@ def _truncate(text: str, length: int = 60) -> str:
 
 
 def _format_cell_value(value: Any, key: str | None = None) -> str:
-    if value is None:
+    if value is None or value == "":
         return "-"
     if isinstance(value, bool):
         return "Yes" if value else "No"
@@ -343,11 +348,14 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
                         "success": "blue",
                         "ok": "blue",
                         "completed": "blue",
+                        "complete": "blue",
                         "open": "blue",
                         "approved": "blue",
                         "verified": "blue",
                         "pending": "yellow",
                         "processing": "yellow",
+                        "running": "yellow",
+                        "queued": "yellow",
                         "suspended": "yellow",
                         "hold": "yellow",
                         "incomplete": "yellow",
@@ -357,6 +365,8 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
                         "error": "magenta",
                         "fail": "magenta",
                         "failed": "magenta",
+                        "cancelled": "magenta",
+                        "timeout": "magenta",
                         "rejected": "magenta",
                         "terminated": "magenta",
                         "withdrawn": "magenta",

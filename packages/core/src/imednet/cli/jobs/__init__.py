@@ -10,7 +10,16 @@ from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, fetching_status, format_job_progress, print_error
 from ..utils.args import add_output_format
-from ..utils.output import emit_json
+from ..utils.output import display_list
+
+JOB_SUMMARY_FIELDS: list[str] = [
+    "batch_id",
+    "job_id",
+    "state",
+    "progress",
+    "date_created",
+    "date_finished",
+]
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -30,10 +39,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     ) -> None:
         with fetching_status("job status", study_key):
             job = sdk.get_job(study_key, batch_id)
-        if output_format == "json":
-            emit_json([job], "jobs")
-        else:
-            print(job.model_dump())
+        display_list([job], "jobs", fields=JOB_SUMMARY_FIELDS, output_format=output_format)
 
     status_parser.set_defaults(
         func=lambda args: job_status(
@@ -73,10 +79,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 timeout=timeout,
                 on_progress=on_progress,
             )
-        if output_format == "json":
-            emit_json([job], "jobs")
-        else:
-            print(job.model_dump())
+        display_list([job], "jobs", fields=JOB_SUMMARY_FIELDS, output_format=output_format)
 
     wait_parser.set_defaults(
         func=lambda args: job_wait(

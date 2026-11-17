@@ -1,5 +1,6 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Record, RecordRevision
@@ -29,6 +30,7 @@ class DataExtractionWorkflow:
         record_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         subject_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         visit_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        on_progress: Callable[[str], None] | None = None,
         **other_filters: Any,
     ) -> list[Record]:
         """Extracts records based on criteria spanning subjects, visits, and records.
@@ -38,6 +40,7 @@ class DataExtractionWorkflow:
             record_filter: Dictionary of conditions for the records endpoint.
             subject_filter: Dictionary of conditions for the subjects endpoint.
             visit_filter: Dictionary of conditions for the visits endpoint.
+            on_progress: Optional callback invoked with progress status strings.
             **other_filters: Additional keyword arguments passed as filters to the
                              records endpoint `list` method.
 
@@ -46,9 +49,15 @@ class DataExtractionWorkflow:
         """
         matching_subject_keys: set[str] | None = None
         if subject_filter:
+            if on_progress:
+                on_progress("Querying subjects matching filter criteria...")
             subjects = self._sdk.get_subjects(study_key, **subject_filter)
             matching_subject_keys = {s.subject_key for s in subjects}  # type: ignore
+            if on_progress:
+                on_progress(f"Retrieved {len(matching_subject_keys)} matching subjects.")
             if not matching_subject_keys:
+                if on_progress:
+                    on_progress("No subjects matched criteria; returning 0 records.")
                 return []
 
         matching_visit_ids: set[int] | None = None
@@ -56,13 +65,19 @@ class DataExtractionWorkflow:
             # Client-side filtering for subject_key on visits is still needed
             # as build_filter_string doesn't handle complex AND/OR structures easily
             # from separate filter dictionaries.
+            if on_progress:
+                on_progress("Querying visits matching filter criteria...")
             visits = self._sdk.get_visits(study_key, **visit_filter)
 
             if matching_subject_keys:
                 visits = [v for v in visits if v.subject_key in matching_subject_keys]
 
             matching_visit_ids = {v.visit_id for v in visits}  # type: ignore
+            if on_progress:
+                on_progress(f"Retrieved {len(matching_visit_ids)} matching visits.")
             if not matching_visit_ids:
+                if on_progress:
+                    on_progress("No visits matched criteria; returning 0 records.")
                 return []
 
         # Build the final record filter dictionary
@@ -72,6 +87,8 @@ class DataExtractionWorkflow:
         # Client-side filtering is used below for subject/visit matching,
         # so no need to add complex 'in' clauses here even if build_filter_string supported it.
 
+        if on_progress:
+            on_progress(f"Querying records for study '{study_key}'...")
         records = self._sdk.get_records(
             study_key=study_key,
             record_data_filter=None,
@@ -80,12 +97,20 @@ class DataExtractionWorkflow:
 
         # Client-side filtering fallback
         if matching_subject_keys:
+            if on_progress:
+                on_progress("Filtering records by matched subject keys...")
             records = [r for r in records if r.subject_key in matching_subject_keys]
         # Corrected attribute from visit_oid to visit_id and variable name
         if matching_visit_ids:
+            if on_progress:
+                on_progress("Filtering records by matched visit IDs...")
             records = [r for r in records if r.visit_id in matching_visit_ids]
 
-        return list(records)
+        result_records = list(records)
+        if on_progress:
+            on_progress(f"Extraction complete: found {len(result_records)} matching records.")
+
+        return result_records
 
     def extract_audit_trail(
         self,
