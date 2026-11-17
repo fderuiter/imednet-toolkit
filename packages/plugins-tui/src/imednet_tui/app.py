@@ -262,6 +262,25 @@ class SubjectTable(DataTable[str]):
             self.loading = False
 
 
+class _TrackedJobPlaceholder:
+    """Representation for tracked jobs whose status could not be retrieved."""
+
+    def __init__(self, job_id: str, status: str = "FAILED") -> None:
+        """Initialize placeholder with job ID and status.
+
+        Args:
+            job_id: Identifier of the tracked job.
+            status: Status display string, such as FAILED or UNKNOWN.
+        """
+        self.job_id = job_id
+        self.batch_id = job_id
+        self.job_type = "Job"
+        self.state = status
+        self.status = status
+        self.job_status = status
+        self.date_created = ""
+
+
 class JobMonitor(Static):
     """Widget polling and displaying background study jobs."""
 
@@ -339,21 +358,31 @@ class JobMonitor(Static):
                             if asyncio.iscoroutinefunction(jobs_ep.get):
                                 job = await jobs_ep.get(self.current_study_key, jid)
                             else:
-                                res = jobs_ep.get(self.current_study_key, jid)
+                                res = await asyncio.to_thread(
+                                    jobs_ep.get, self.current_study_key, jid
+                                )
                                 if asyncio.iscoroutine(res):
                                     job = await res
                                 else:
                                     job = res
                         elif hasattr(jobs_ep, "async_get"):
-                            job = await jobs_ep.async_get(self.current_study_key, jid)
+                            res = jobs_ep.async_get(self.current_study_key, jid)
+                            if asyncio.iscoroutine(res):
+                                job = await res
+                            else:
+                                job = res
                         else:
                             job = None
+
                         if job is not None:
                             jobs.append(job)
+                        else:
+                            jobs.append(_TrackedJobPlaceholder(jid, "UNKNOWN"))
                     except Exception as err:
                         logging.getLogger("imednet_tui").warning(
                             "Failed to poll job %s: %s", jid, err
                         )
+                        jobs.append(_TrackedJobPlaceholder(jid, "FAILED"))
             else:
                 self.update(
                     f"Job Monitor: Background job enumeration is not supported by the iMednet Jobs API for study '{self.current_study_key}'.\n"
@@ -368,7 +397,7 @@ class JobMonitor(Static):
                 status = getattr(
                     job, "state", getattr(job, "status", getattr(job, "job_status", "Unknown"))
                 )
-                created = getattr(job, "date_created", "")
+                created = getattr(job, "date_created", "") or ""
                 status_str = str(status.value if hasattr(status, "value") else status)
                 color = (
                     "green"
@@ -378,7 +407,8 @@ class JobMonitor(Static):
                     else "red"
                 )
                 label = f"{job_type} ({job_id})" if job_id else str(job_type)
-                lines.append(f"[{color}]{status_str}[/{color}] - {label} ({created})")
+                created_suffix = f" ({created})" if created else ""
+                lines.append(f"[{color}]{status_str}[/{color}] - {label}{created_suffix}")
 
             self.update("\n".join(lines))
         except Exception as e:

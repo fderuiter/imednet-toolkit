@@ -358,3 +358,99 @@ async def test_job_monitor_with_real_jobs_endpoint_contract():
     sdk.jobs.get.assert_called_with("STUDY-REAL", "BATCH-999")
     assert "BATCH-999" in str(monitor.render())
     assert "COMPLETED" in str(monitor.render())
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_tracked_job_failure_retains_failed_state():
+    """Test that a tracked job whose get() raises is retained as FAILED rather than dropped."""
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = MagicMock(side_effect=RuntimeError("Internal job lookup error"))
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-ERR"
+    monitor.track_job("BATCH-ERR-101")
+    await monitor.refresh_jobs()
+
+    rendered = str(monitor.render())
+    # Crucial assertion: failure is not dropped, so active jobs is (1), not (0)
+    assert "Active & Recent Jobs (1)" in rendered
+    assert "Active & Recent Jobs (0)" not in rendered
+    assert "BATCH-ERR-101" in rendered
+    assert "FAILED" in rendered
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_tracked_job_unknown_state():
+    """Test that tracked job with unretrievable/None result is displayed as UNKNOWN."""
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = MagicMock(return_value=None)
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-UNK"
+    monitor.track_job("BATCH-UNK-202")
+    await monitor.refresh_jobs()
+
+    rendered = str(monitor.render())
+    assert "Active & Recent Jobs (1)" in rendered
+    assert "BATCH-UNK-202" in rendered
+    assert "UNKNOWN" in rendered
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_sync_get_offloaded_to_thread():
+    """Test that synchronous JobsEndpoint.get is offloaded to a worker thread."""
+    import threading
+
+    from imednet.models.jobs import JobState, JobStatus
+
+    main_thread = threading.current_thread()
+    called_in_worker_thread = False
+
+    def sync_get(study_key: str, job_id: str) -> JobStatus:
+        nonlocal called_in_worker_thread
+        if threading.current_thread() != main_thread:
+            called_in_worker_thread = True
+        return JobStatus(job_id=job_id, state=JobState.RUNNING)
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = sync_get
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-ASYNC"
+    monitor.track_job("BATCH-THREAD-1")
+    await monitor.refresh_jobs()
+
+    assert called_in_worker_thread is True
+    rendered = str(monitor.render())
+    assert "Active & Recent Jobs (1)" in rendered
+    assert "BATCH-THREAD-1" in rendered
+    assert "RUNNING" in rendered
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_with_real_jobs_endpoint_instance():
+    """Test JobMonitor with an actual JobsEndpoint class instance."""
+    from imednet.endpoints.jobs import JobsEndpoint
+
+    mock_client = MagicMock()
+    mock_client.get.side_effect = RuntimeError("Connection timed out")
+    real_endpoint = JobsEndpoint(mock_client)
+
+    sdk = MagicMock()
+    sdk.jobs = real_endpoint
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-REAL-EP"
+    monitor.track_job("BATCH-REAL-ERR")
+    await monitor.refresh_jobs()
+
+    rendered = str(monitor.render())
+    assert "Active & Recent Jobs (1)" in rendered
+    assert "FAILED" in rendered
+    assert "BATCH-REAL-ERR" in rendered
