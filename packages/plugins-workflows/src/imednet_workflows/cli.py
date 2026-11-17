@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from imednet.sdk import ImednetSDK
-from imednet.spi.cli import STUDY_KEY_ARG, parse_filter_args, with_sdk
+from imednet.spi.cli import STUDY_KEY_ARG, clear_line, console, parse_filter_args, with_sdk
 
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
@@ -331,8 +331,22 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             f"(interval={interval}s). Press Ctrl+C to stop."
         )
         try:
-            worker.run_forever()
+            with console.status(f"Starting sync worker for study '{study_key}'...") as status:
+
+                def on_cycle(cycle: int, count: int) -> None:
+                    status.update(f"Study '{study_key}' - cycle {cycle}: synced {count} records.")
+
+                def on_sleep_tick(cycle: int, remaining: int) -> None:
+                    status.update(
+                        f"Study '{study_key}' - cycle {cycle}: sleeping ({remaining}s remaining)..."
+                    )
+
+                try:
+                    worker.run_forever(on_cycle=on_cycle, on_sleep_tick=on_sleep_tick)
+                except TypeError:
+                    worker.run_forever()
         except KeyboardInterrupt:
+            clear_line()
             worker.stop()
             print("Sync worker termination requested. Exiting cleanly.")
 

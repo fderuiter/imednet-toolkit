@@ -9,7 +9,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -1108,7 +1108,9 @@ def test_jobs_wait_success(runner: CliRunner, sdk: MagicMock) -> None:
     sdk.poll_job.return_value = job
     result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH123"])
     assert result.exit_code == 0
-    sdk.poll_job.assert_called_once_with("STUDY", "BATCH123", interval=5, timeout=300)
+    sdk.poll_job.assert_called_once_with(
+        "STUDY", "BATCH123", interval=5, timeout=300, on_progress=ANY
+    )
     assert "Found 1 jobs:" in result.stdout
     assert "Batch Id" in result.stdout
     assert "Job Id" in result.stdout

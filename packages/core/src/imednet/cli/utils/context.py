@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from imednet.config import load_config
 from imednet.sdk import ImednetSDK
 
-from .output import console, print_error
+from .output import Status, console, print_error
 
 
 def get_sdk() -> ImednetSDK:
@@ -49,11 +49,11 @@ def get_sdk() -> ImednetSDK:
 
 
 @contextmanager
-def fetching_status(name: str, study_key: str | None = None) -> Iterator[None]:
+def fetching_status(name: str, study_key: str | None = None) -> Iterator[Status]:
     """Context manager to show a spinner while fetching data."""
     if study_key:  # noqa: SIM108
         msg = f"Fetching {name} for study '{study_key}'..."
     else:
         msg = f"Fetching {name}..."
-    with console.status(msg):
-        yield
+    with console.status(msg) as status:
+        yield status

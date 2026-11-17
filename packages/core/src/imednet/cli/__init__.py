@@ -211,11 +211,23 @@ def app(args: list[str] | None = None) -> None:
     if parsed.high_contrast:
         os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
 
-    if hasattr(parsed, "func"):
-        parsed.func(parsed)
-    else:
-        active_parser = _find_active_subparser(parser, args)
-        active_parser.print_help()
+    old_output_format = os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT")
+    try:
+        if getattr(parsed, "output_format", None) == "json":
+            os.environ["IMEDNET_CLI_OUTPUT_FORMAT"] = "json"
+        else:
+            os.environ.pop("IMEDNET_CLI_OUTPUT_FORMAT", None)
+
+        if hasattr(parsed, "func"):
+            parsed.func(parsed)
+        else:
+            active_parser = _find_active_subparser(parser, args)
+            active_parser.print_help()
+    finally:
+        if old_output_format is not None:
+            os.environ["IMEDNET_CLI_OUTPUT_FORMAT"] = old_output_format
+        else:
+            os.environ.pop("IMEDNET_CLI_OUTPUT_FORMAT", None)
 
 
 if __name__ == "__main__":

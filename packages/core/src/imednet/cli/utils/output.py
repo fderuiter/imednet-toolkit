@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
+import shutil
 import sys
+import threading
+import time
 from collections.abc import Sequence
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from imednet.utils.job_poller import JobStatusEvent
 
 _ANSI_COLORS = {
     "green": "\033[32m",
@@ -84,21 +91,331 @@ _HC_STATUS_COLOR_MAP = {
 
 _ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_ASCII_SPINNER_FRAMES = ("-", "\\", "|", "/")
 
-class _DummyConsole:
-    def status(self, msg: str, spinner: str | None = None) -> Any:
-        class DummyStatus:
-            def __enter__(self) -> None:
-                if sys.stderr.isatty():
-                    print(msg, file=sys.stderr)
+_CURSOR_HIDE = "\033[?25l"
+_CURSOR_SHOW = "\033[?25h"
+_CLEAR_LINE = "\r\033[K"
 
-            def __exit__(self, *args: Any) -> None:
+
+def _truncate_visible(text: str, max_width: int) -> str:
+    """Truncate text to a maximum visible width, preserving ANSI sequences.
+
+    Args:
+        text: String possibly containing ANSI escape sequences.
+        max_width: Maximum number of visible characters to permit.
+
+    Returns:
+        Truncated string whose visible character count does not exceed max_width.
+    """
+    if max_width <= 0:
+        return ""
+    stripped = _ANSI_REGEX.sub("", text)
+    if len(stripped) <= max_width:
+        return text
+
+    result: list[str] = []
+    visible_count = 0
+    pos = 0
+    has_ansi = False
+    while pos < len(text) and visible_count < max_width:
+        match = _ANSI_REGEX.match(text, pos)
+        if match:
+            has_ansi = True
+            result.append(match.group(0))
+            pos = match.end()
+        else:
+            result.append(text[pos])
+            visible_count += 1
+            pos += 1
+
+    if has_ansi:
+        result.append("\033[0m")
+    return "".join(result)
+
+
+def clear_line(stream: Any = None, lines: int = 1) -> None:
+    """Clear the current line(s) and restore terminal cursor on interactive streams.
+
+    Args:
+        stream: Target output stream (defaults to sys.stderr).
+        lines: Number of terminal rows to clear.
+    """
+    target = stream if stream is not None else sys.stderr
+    try:
+        if target and hasattr(target, "isatty") and target.isatty():
+            clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, lines - 1))
+            target.write(f"{clear_seq}{_CURSOR_SHOW}")
+            target.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+
+
+def format_job_progress(
+    event: JobStatusEvent | Any,
+    status: Any = None,
+    elapsed: float | None = None,
+    bar_width: int = 20,
+) -> str:
+    """Format a job polling event into a progress bar, state label, and elapsed timer.
+
+    Args:
+        event: A JobStatusEvent or batch_id string.
+        status: Optional JobStatus if event is a batch_id string.
+        elapsed: Optional elapsed seconds if event is a batch_id string.
+        bar_width: Width of the progress bar in characters.
+
+    Returns:
+        Formatted string containing progress bar, state label, and elapsed timer.
+    """
+    if hasattr(event, "status") and hasattr(event, "batch_id"):
+        batch_id = str(event.batch_id)
+        status_obj = event.status
+        elapsed_val = float(getattr(event, "elapsed", 0.0))
+    else:
+        batch_id = str(event)
+        status_obj = status
+        elapsed_val = float(elapsed) if elapsed is not None else 0.0
+
+    raw_progress = getattr(status_obj, "progress", 0) if status_obj is not None else 0
+    try:
+        progress = max(0, min(100, int(raw_progress)))
+    except (TypeError, ValueError):
+        progress = 0
+
+    state_val = getattr(status_obj, "state", "UNKNOWN") if status_obj is not None else "UNKNOWN"
+    state_label = state_val.value if hasattr(state_val, "value") else str(state_val)
+
+    filled = round(bar_width * progress / 100.0)
+    empty = max(0, bar_width - filled)
+    bar = "=" * filled + "-" * empty
+
+    return f"Job {batch_id}: [{bar}] {progress}% - {state_label} ({elapsed_val:.1f}s)"
+
+
+class Status:
+    """Status controller managing live ANSI spinner rendering or static fallback."""
+
+    def __init__(
+        self,
+        msg: str,
+        console: Console,
+        spinner: str | None = None,
+        refresh_per_second: float = 12.5,
+    ) -> None:
+        """Initialize a status controller.
+
+        Args:
+            msg: Initial status message.
+            console: Console instance managing stream output.
+            spinner: Optional spinner style identifier.
+            refresh_per_second: Target frame refresh rate.
+        """
+        self._msg = str(msg)
+        self.console = console
+        self.spinner = spinner
+        self._interval = 1.0 / refresh_per_second if refresh_per_second > 0 else 0.08
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_time: float = 0.0
+        self._lock = threading.Lock()
+        self._interactive = False
+        self._entered = False
+        self._frames: Sequence[str] = _SPINNER_FRAMES
+        self._lines_rendered: int = 1
+
+    @property
+    def lines_rendered(self) -> int:
+        """Get the number of terminal rows occupied by the most recent frame."""
+        return self._lines_rendered
+
+    @property
+    def msg(self) -> str:
+        """Get the current status message."""
+        with self._lock:
+            return self._msg
+
+    @msg.setter
+    def msg(self, value: str) -> None:
+        self.update(value)
+
+    def update(self, msg: str) -> None:
+        """Update the displayed status message."""
+        with self._lock:
+            self._msg = str(msg)
+        if self._interactive and self._entered:
+            self._render_frame()
+
+    def _render_frame(self, frame_idx: int = 0) -> None:
+        stream = self.console.stream
+        try:
+            with self._lock:
+                current_msg = self._msg
+            elapsed = time.monotonic() - self._start_time
+            has_timer = bool(re.search(r"\(\d+\.?\d*s\)", current_msg))
+            timer_suffix = "" if has_timer else f" ({elapsed:.1f}s)"
+
+            frame = self._frames[frame_idx % len(self._frames)]
+            content = f"{frame} {current_msg}{timer_suffix}"
+
+            cols = self.console.width
+            if cols > 0:
+                max_width = max(1, cols - 1)
+                content = _truncate_visible(content, max_width)
+
+            clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
+            line = f"{clear_seq}{content}"
+
+            vis_len = len(_ANSI_REGEX.sub("", content))
+            lines_by_width = max(1, (vis_len + cols - 1) // cols) if cols > 0 else 1
+            lines_by_newlines = content.count("\n") + 1
+            self._lines_rendered = max(lines_by_width, lines_by_newlines)
+
+            try:
+                stream.write(line)
+                stream.flush()
+            except UnicodeEncodeError:
+                self._frames = _ASCII_SPINNER_FRAMES
+                frame = self._frames[frame_idx % len(self._frames)]
+                content = f"{frame} {current_msg}{timer_suffix}"
+                if cols > 0:
+                    max_width = max(1, cols - 1)
+                    content = _truncate_visible(content, max_width)
+                clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
+                line = f"{clear_seq}{content}"
+                stream.write(line)
+                stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def _run_spinner(self) -> None:
+        idx = 0
+        while not self._stop_event.is_set():
+            self._render_frame(idx)
+            idx += 1
+            if self._stop_event.wait(self._interval):
+                break
+
+    def __enter__(self) -> Status:
+        """Enter the status context and begin live rendering or static output."""
+        self._entered = True
+        self._start_time = time.monotonic()
+        self._interactive = self.console.is_interactive()
+        stream = self.console.stream
+
+        if self._interactive:
+            try:
+                stream.write(_CURSOR_HIDE)
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run_spinner, daemon=True)
+            self._thread.start()
+        else:
+            is_json_mode = os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+            if not is_json_mode:
+                try:
+                    is_json_mode = (
+                        any(arg in sys.argv for arg in ("--format", "-f")) and "json" in sys.argv
+                    )
+                except Exception:
+                    is_json_mode = False
+
+            is_string_io = (
+                isinstance(stream, io.StringIO) or stream.__class__.__name__ == "StringIO"
+            )
+            is_test_captured = stream is sys.stderr and is_string_io
+
+            if not is_json_mode and not is_test_captured:
+                try:
+                    clean_msg = _ANSI_REGEX.sub("", self._msg)
+                    print(clean_msg, file=stream, flush=True)
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Exit the status context, stop spinner rendering, and restore cursor."""
+        self._entered = False
+        if self._interactive:
+            self._stop_event.set()
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=1.0)
+            stream = self.console.stream
+            try:
+                clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
+                stream.write(f"{clear_seq}{_CURSOR_SHOW}")
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError):
                 pass
 
-        return DummyStatus()
+
+class Console:
+    """Console handling terminal capabilities and live status rendering."""
+
+    def __init__(self, stream: Any = None, width: int | None = None) -> None:
+        """Initialize a Console instance.
+
+        Args:
+            stream: Optional stream destination (defaults to sys.stderr).
+            width: Optional terminal column width override.
+        """
+        self._stream = stream
+        self._width = width
+
+    @property
+    def stream(self) -> Any:
+        """Get the active output stream."""
+        return self._stream if self._stream is not None else sys.stderr
+
+    @property
+    def width(self) -> int:
+        """Get the terminal column width."""
+        if self._width is not None and self._width > 0:
+            return self._width
+        s = self.stream
+        for attr in ("columns", "width"):
+            val = getattr(s, attr, None)
+            if isinstance(val, int) and val > 0:
+                return val
+        try:
+            if s and hasattr(s, "fileno"):
+                return os.get_terminal_size(s.fileno()).columns
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            return shutil.get_terminal_size(fallback=(80, 24)).columns
+        except Exception:
+            return 80
+
+    @width.setter
+    def width(self, val: int | None) -> None:
+        """Set terminal column width override."""
+        self._width = val
+
+    def is_interactive(self) -> bool:
+        """Check whether the output stream is an interactive terminal."""
+        s = self.stream
+        try:
+            return bool(s and hasattr(s, "isatty") and s.isatty())
+        except (AttributeError, ValueError, OSError):
+            return False
+
+    def status(
+        self,
+        msg: str,
+        spinner: str | None = None,
+        refresh_per_second: float = 12.5,
+    ) -> Status:
+        """Create a live status context manager."""
+        return Status(msg, console=self, spinner=spinner, refresh_per_second=refresh_per_second)
 
 
-console = _DummyConsole()
+_DummyConsole = Console
+console = Console()
 
 
 def _truncate(text: str, length: int = 60) -> str:

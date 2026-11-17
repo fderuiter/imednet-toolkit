@@ -1,16 +1,23 @@
 """Unit tests for utils output."""
 
+import io
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from imednet.cli.utils import (
     _STATUS_COLOR_MAP,
+    Console,
     _format_cell_value,
+    clear_line,
     display_list,
     fetching_status,
+    format_job_progress,
     print_error,
 )
+from imednet.models.jobs import JobState, JobStatus
+from imednet.utils.job_poller import JobStatusEvent
 
 
 def test_fetching_status_records() -> None:
@@ -212,6 +219,248 @@ def test_print_error_handles_broken_pipe_and_ioerror() -> None:
     print_error("Error message", file=io_stream)
 
 
+def test_status_spinner_rendering_interactive() -> None:
+    """Console.status writes animated spinner frames, elapsed timer, and restores cursor on interactive streams."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    c = Console(stream=mock_stream)
+    with c.status("Processing records...", refresh_per_second=20):
+        time.sleep(0.08)
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+
+    # Verifies cursor hidden on enter
+    assert "\033[?25l" in all_output
+    # Verifies animated spinner frame with message and timer was written
+    assert "Processing records..." in all_output
+    assert "s)" in all_output  # elapsed timer suffix like (0.1s)
+    # Verifies line cleared and cursor restored on exit
+    assert "\r\033[K" in all_output
+    assert "\033[?25h" in all_output
+
+
+def test_status_update_interactive() -> None:
+    """Status.update dynamically updates message and refreshes display."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    c = Console(stream=mock_stream)
+    with c.status("Phase 1") as status:
+        status.update("Phase 2 - downloading")
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+
+    assert "Phase 1" in all_output
+    assert "Phase 2 - downloading" in all_output
+
+
+def test_status_interactive_exception_cleans_up() -> None:
+    """Status restores terminal cursor and clears line when exception occurs."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    c = Console(stream=mock_stream)
+    with pytest.raises(RuntimeError):
+        with c.status("Failing task"):
+            raise RuntimeError("Operation aborted")
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+
+    assert "\033[?25h" in all_output  # Cursor restored
+    assert "\r\033[K" in all_output  # Line cleared
+
+
+def test_status_interactive_keyboard_interrupt_cleans_up() -> None:
+    """Status restores terminal cursor and clears line on KeyboardInterrupt."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    c = Console(stream=mock_stream)
+    with pytest.raises(KeyboardInterrupt):
+        with c.status("Interrupted task"):
+            raise KeyboardInterrupt()
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+
+    assert "\033[?25h" in all_output
+    assert "\r\033[K" in all_output
+
+
+def test_clear_line_interactive_and_non_interactive() -> None:
+    """clear_line writes escape sequences on tty and is silent on non-tty."""
+    interactive_stream = MagicMock()
+    interactive_stream.isatty.return_value = True
+    clear_line(stream=interactive_stream)
+    interactive_stream.write.assert_called_once_with("\r\033[K\033[?25h")
+
+    non_tty_stream = MagicMock()
+    non_tty_stream.isatty.return_value = False
+    clear_line(stream=non_tty_stream)
+    non_tty_stream.write.assert_not_called()
+
+
+def test_status_non_interactive_fallback() -> None:
+    """Console.status outputs a single static text line without ANSI codes on non-interactive streams."""
+    output_buffer = io.StringIO()
+    # Explicitly non-interactive custom stream
+    output_buffer.isatty = lambda: False  # type: ignore[assignment]
+
+    c = Console(stream=output_buffer)
+    with c.status("\033[32mFetching dataset\033[0m for study..."):
+        pass
+
+    result = output_buffer.getvalue()
+    assert result == "Fetching dataset for study...\n"
+    assert "\033[" not in result  # No ANSI escape sequences
+
+
+def test_format_job_progress() -> None:
+    """format_job_progress formats JobStatusEvent into progress bar, state label, and timer."""
+    status = JobStatus(batch_id="BATCH-99", state=JobState.PROCESSING, progress=45)
+    event = JobStatusEvent(
+        batch_id="BATCH-99",
+        status=status,
+        poll_number=3,
+        elapsed=12.4,
+        is_terminal=False,
+    )
+
+    formatted = format_job_progress(event)
+
+    assert "Job BATCH-99:" in formatted
+    assert "[=========" in formatted  # 45% of 20 chars is 9 chars filled
+    assert "45%" in formatted
+    assert "PROCESSING" in formatted
+    assert "(12.4s)" in formatted
+
+
+def test_format_job_progress_bounds_and_arguments() -> None:
+    """format_job_progress clamps progress percentage and supports alternative arguments."""
+    status_over = JobStatus(batch_id="B1", state="COMPLETED", progress=150)
+    event_over = JobStatusEvent(
+        batch_id="B1", status=status_over, poll_number=1, elapsed=2.0, is_terminal=True
+    )
+    formatted_over = format_job_progress(event_over)
+    assert "[====================] 100%" in formatted_over
+    assert "COMPLETED" in formatted_over
+
+    status_neg = JobStatus(batch_id="B2", state="PENDING", progress=-10)
+    event_neg = JobStatusEvent(
+        batch_id="B2", status=status_neg, poll_number=1, elapsed=0.5, is_terminal=False
+    )
+    formatted_neg = format_job_progress(event_neg)
+    assert "[--------------------] 0%" in formatted_neg
+    assert "PENDING" in formatted_neg
+
+    # Direct argument invocation
+    formatted_direct = format_job_progress("B3", status=status_over, elapsed=3.0)
+    assert "Job B3:" in formatted_direct
+    assert "(3.0s)" in formatted_direct
+
+
+def test_job_wait_progress_callback_and_clean_stdout_json() -> None:
+    """job_wait connects on_progress to sdk.poll_job and keeps JSON stdout clean."""
+    import json
+
+    from tests.unit.cli.test_cli import CliRunner
+
+    from imednet import cli
+
+    runner = CliRunner()
+    completed_job = JobStatus(batch_id="B-123", state="COMPLETED", progress=100)
+
+    progress_events_captured: list[str] = []
+
+    def mock_poll_job(study_key, batch_id, interval=5, timeout=300, on_progress=None):
+        if on_progress:
+            # Simulate progress callback invocations
+            event1 = JobStatusEvent(
+                batch_id=batch_id,
+                status=JobStatus(batch_id=batch_id, state="PROCESSING", progress=50),
+                poll_number=1,
+                elapsed=2.5,
+                is_terminal=False,
+            )
+            on_progress(event1)
+            progress_events_captured.append(event1.batch_id)
+            event2 = JobStatusEvent(
+                batch_id=batch_id,
+                status=completed_job,
+                poll_number=2,
+                elapsed=5.0,
+                is_terminal=True,
+            )
+            on_progress(event2)
+            progress_events_captured.append(event2.batch_id)
+        return completed_job
+
+    mock_sdk = MagicMock()
+    mock_sdk.poll_job.side_effect = mock_poll_job
+
+    with patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk):
+        result = runner.invoke(cli.app, ["jobs", "wait", "STUDY-TEST", "B-123", "--format", "json"])
+
+    assert result.exit_code == 0
+    assert progress_events_captured == ["B-123", "B-123"]
+    # stdout must be strictly valid JSON without any progress bar or spinner noise
+    parsed = json.loads(result.stdout)
+    assert parsed["schemaVersion"] == "1.0"
+    assert parsed["resource"] == "jobs"
+    assert parsed["status"] == "complete"
+    assert len(parsed["items"]) == 1
+    assert parsed["items"][0]["batchId"] == "B-123"
+    assert parsed["items"][0]["state"] == "COMPLETED"
+    assert "Job B-123:" not in result.stdout
+    assert "[" not in result.stdout[:2]  # envelope starts with '{' not progress bracket '['
+
+
+def test_sync_worker_visual_feedback_iterative_cycles() -> None:
+    """sync_worker visual progress updates status with cycle count and sleep countdown."""
+    from tests.unit.cli.test_cli import CliRunner
+
+    from imednet import cli
+
+    runner = CliRunner()
+    cycles_seen = []
+    ticks_seen = []
+
+    def mock_run_forever(on_cycle=None, on_sleep_tick=None):
+        if on_cycle:
+            on_cycle(1, 42)
+            cycles_seen.append((1, 42))
+        if on_sleep_tick:
+            on_sleep_tick(1, 10)
+            on_sleep_tick(1, 9)
+            ticks_seen.extend([(1, 10), (1, 9)])
+        if on_cycle:
+            on_cycle(2, 55)
+            cycles_seen.append((2, 55))
+        raise KeyboardInterrupt()
+
+    mock_worker = MagicMock()
+    mock_worker.run_forever.side_effect = mock_run_forever
+    mock_loader_cls = MagicMock()
+    mock_sdk = MagicMock()
+
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet_workflows.cached_loader.CachedRecordsLoader", mock_loader_cls),
+        patch("imednet_workflows.cli.SyncWorker", return_value=mock_worker),
+    ):
+        result = runner.invoke(cli.app, ["workflows", "sync-worker", "STUDY-X", "--interval", "10"])
+
+    assert result.exit_code == 0
+    assert cycles_seen == [(1, 42), (2, 55)]
+    assert ticks_seen == [(1, 10), (1, 9)]
+    mock_worker.stop.assert_called_once()
+    assert "Sync worker termination requested. Exiting cleanly." in result.stdout
+
+
 def test_format_cell_value_empty_string_hyphen() -> None:
     """Empty strings and None format as hyphens in table cells."""
     assert _format_cell_value("") == "-"
@@ -254,3 +503,136 @@ def test_print_table_job_state_colors(
     assert "\033[33mRUNNING\033[0m" in captured_hc.out
     assert "\033[34mCOMPLETE\033[0m" in captured_hc.out
     assert "\033[35mCANCELLED\033[0m" in captured_hc.out
+
+
+class SimulatedTerminal:
+    """Terminal emulator tracking rows, cursor position, and ANSI sequences."""
+
+    def __init__(self, cols: int = 80, rows: int = 24) -> None:
+        self.columns = cols
+        self.rows = rows
+        self.cursor_row = 0
+        self.cursor_col = 0
+        self.buffer = [[" "] * cols for _ in range(rows)]
+        self._isatty = True
+
+    def isatty(self) -> bool:
+        """Indicate stream is an interactive terminal."""
+        return self._isatty
+
+    def write(self, text: str) -> int:
+        """Process output text, handling cursor motion and line erasing."""
+        import re
+
+        ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+        i = 0
+        while i < len(text):
+            if text[i] == "\r":
+                self.cursor_col = 0
+                i += 1
+            elif text[i : i + 3] == "\033[A":
+                self.cursor_row = max(0, self.cursor_row - 1)
+                i += 3
+            elif text[i : i + 3] == "\033[K":
+                for col in range(self.cursor_col, self.columns):
+                    self.buffer[self.cursor_row][col] = " "
+                i += 3
+            elif text[i : i + 6] in ("\033[?25h", "\033[?25l"):
+                i += 6
+            elif text[i : i + 2] == "\033[":
+                match = ansi_re.match(text[i:])
+                i += len(match.group(0)) if match else 1
+            else:
+                self.buffer[self.cursor_row][self.cursor_col] = text[i]
+                self.cursor_col += 1
+                if self.cursor_col >= self.columns:
+                    self.cursor_row += 1
+                    self.cursor_col = 0
+                i += 1
+        return len(text)
+
+    def flush(self) -> None:
+        """Flush stream buffer (no-op)."""
+
+    def occupied_rows(self) -> list[int]:
+        """Return indices of rows that contain non-space characters."""
+        return [r for r in range(self.rows) if any(ch != " " for ch in self.buffer[r])]
+
+
+def test_status_terminal_model_prevents_row_accumulation_on_80_col_terminal() -> None:
+    """Status constrains 91-char UUID job frames on 80-col terminals without row accumulation."""
+    term = SimulatedTerminal(cols=80)
+    c = Console(stream=term)
+
+    uuid_batch_id = "3b01c2d3-47c0-4b18-8bd6-5a8ff1c7e16f"
+    status_obj = JobStatus(batch_id=uuid_batch_id, state=JobState.RUNNING, progress=50)
+    event = JobStatusEvent(
+        batch_id=uuid_batch_id,
+        status=status_obj,
+        poll_number=1,
+        elapsed=10.5,
+        is_terminal=False,
+    )
+    long_msg = format_job_progress(event)
+    assert len(long_msg) > 80  # Demonstrates unrestricted frame exceeds 80 columns
+
+    with c.status(long_msg) as status_ctrl:
+        # Simulate multiple frame updates
+        for step in range(1, 6):
+            new_status = JobStatus(
+                batch_id=uuid_batch_id, state=JobState.RUNNING, progress=step * 15
+            )
+            step_event = JobStatusEvent(
+                batch_id=uuid_batch_id,
+                status=new_status,
+                poll_number=step,
+                elapsed=10.5 + step,
+                is_terminal=False,
+            )
+            status_ctrl.update(format_job_progress(step_event))
+            # Critical assertion: frame stays on single row without accumulating rows
+            assert term.occupied_rows() == [0]
+            assert term.cursor_row == 0
+
+    # On exit, all rows are cleared and cursor is restored
+    assert term.occupied_rows() == []
+    assert term.cursor_row == 0
+
+
+def test_status_terminal_model_narrow_terminal_clears_properly() -> None:
+    """Status constrains frames on narrow 40-col terminals and clears cleanly on exit."""
+    term = SimulatedTerminal(cols=40)
+    c = Console(stream=term)
+
+    with c.status("A very long progress task that far exceeds forty columns") as status_ctrl:
+        for i in range(3):
+            status_ctrl.update(f"Narrow progress update #{i} with long description text")
+            assert term.occupied_rows() == [0]
+            assert term.cursor_row == 0
+
+    assert term.occupied_rows() == []
+    assert term.cursor_row == 0
+
+
+def test_clear_line_multiple_lines() -> None:
+    """clear_line clears specified number of rows on interactive terminals."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    clear_line(stream=mock_stream, lines=3)
+    mock_stream.write.assert_called_once_with("\r\033[K\033[A\r\033[K\033[A\r\033[K\033[?25h")
+
+
+def test_console_width_override_and_attribute() -> None:
+    """Console detects width from constructor, setter, or stream attributes."""
+    stream_mock = MagicMock()
+    stream_mock.columns = 65
+
+    c1 = Console(stream=stream_mock)
+    assert c1.width == 65
+
+    c2 = Console(width=110)
+    assert c2.width == 110
+
+    c2.width = 75
+    assert c2.width == 75
