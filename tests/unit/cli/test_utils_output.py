@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from imednet.cli.utils import (
+    _STATUS_COLOR_MAP,
     _format_cell_value,
     display_list,
     fetching_status,
@@ -209,3 +210,48 @@ def test_print_error_handles_broken_pipe_and_ioerror() -> None:
     io_stream.write.side_effect = OSError("I/O failure")
     # Should not raise exception
     print_error("Error message", file=io_stream)
+
+
+def test_format_cell_value_empty_string_hyphen() -> None:
+    """Empty strings and None format as hyphens in table cells."""
+    assert _format_cell_value("") == "-"
+    assert _format_cell_value(None) == "-"
+    assert _format_cell_value("valid") == "valid"
+
+
+def test_job_state_color_mappings() -> None:
+    """Verify job states are registered in _STATUS_COLOR_MAP."""
+    assert _STATUS_COLOR_MAP["running"] == "yellow"
+    assert _STATUS_COLOR_MAP["queued"] == "yellow"
+    assert _STATUS_COLOR_MAP["complete"] == "green"
+    assert _STATUS_COLOR_MAP["cancelled"] == "red"
+    assert _STATUS_COLOR_MAP["timeout"] == "red"
+
+
+def test_print_table_job_state_colors(
+    capfd: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_print_table applies status colors to state columns."""
+    from imednet.cli.utils.output import _print_table
+
+    items = [
+        {"state": "RUNNING", "batch_id": "B1"},
+        {"state": "COMPLETE", "batch_id": "B2"},
+        {"state": "CANCELLED", "batch_id": "B3"},
+    ]
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    _print_table(items, ["batch_id", "state"])
+    captured = capfd.readouterr()
+    assert "\033[33mRUNNING\033[0m" in captured.out
+    assert "\033[32mCOMPLETE\033[0m" in captured.out
+    assert "\033[31mCANCELLED\033[0m" in captured.out
+
+    monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
+    _print_table(items, ["batch_id", "state"])
+    captured_hc = capfd.readouterr()
+    assert "\033[33mRUNNING\033[0m" in captured_hc.out
+    assert "\033[34mCOMPLETE\033[0m" in captured_hc.out
+    assert "\033[35mCANCELLED\033[0m" in captured_hc.out
+

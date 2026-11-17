@@ -2,6 +2,8 @@
 
 import importlib
 import importlib.util
+import io
+import json
 import os
 import sys
 from datetime import datetime
@@ -20,12 +22,16 @@ class Result:
         self.output = stdout + stderr
 
 
+class _TTYStringIO(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 class CliRunner:
-    def invoke(self, app, args):
-        import io
+    def invoke(self, app, args, tty: bool = False):
         from contextlib import redirect_stderr, redirect_stdout
 
-        out = io.StringIO()
+        out = _TTYStringIO() if tty else io.StringIO()
         err = io.StringIO()
         exit_code = 0
         try:
@@ -48,6 +54,7 @@ class CliRunner:
 from imednet import cli
 from imednet.errors import ApiError
 from imednet.integrations import export as export_mod
+from imednet.models.jobs import JobStatus
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +70,7 @@ def env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set required environment variables for each test."""
     monkeypatch.setenv("IMEDNET_API_KEY", "key")
     monkeypatch.setenv("IMEDNET_SECURITY_KEY", "secret")
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
 
 
 @pytest.fixture
@@ -760,17 +768,166 @@ def test_record_revisions_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
 
 
 def test_jobs_status_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that jobs status success."""
-    result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH"])
+    """Test that jobs status outputs formatted table headers and fields."""
+    job = JobStatus(
+        batchId="BATCH123",
+        jobId="JOB456",
+        state="RUNNING",
+        progress=45,
+        dateCreated="2026-11-17 10:00",
+        dateFinished=None,
+    )
+    sdk.get_job.return_value = job
+    result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH123"])
     assert result.exit_code == 0
-    sdk.get_job.assert_called_once_with("STUDY", "BATCH")
+    sdk.get_job.assert_called_once_with("STUDY", "BATCH123")
+    assert "Found 1 jobs:" in result.stdout
+    assert "Batch Id" in result.stdout
+    assert "Job Id" in result.stdout
+    assert "State" in result.stdout
+    assert "Progress" in result.stdout
+    assert "Date Created" in result.stdout
+    assert "Date Finished" in result.stdout
+    assert "BATCH123" in result.stdout
+    assert "JOB456" in result.stdout
+    assert "RUNNING" in result.stdout
+    assert "45" in result.stdout
+    assert "2026-11-17 10:00" in result.stdout
+    assert "-" in result.stdout
+    # ANSI escape sequences stripped on non-tty
+    assert "\x1b[" not in result.stdout
 
 
 def test_jobs_wait_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that jobs wait success."""
-    result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH"])
+    """Test that jobs wait outputs formatted table headers and fields."""
+    job = JobStatus(
+        batchId="BATCH123",
+        jobId="JOB456",
+        state="COMPLETE",
+        progress=100,
+        dateCreated="2026-11-17 10:00",
+        dateFinished="2026-11-17 10:05",
+    )
+    sdk.poll_job.return_value = job
+    result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH123"])
     assert result.exit_code == 0
-    sdk.poll_job.assert_called_once_with("STUDY", "BATCH", interval=5, timeout=300)
+    sdk.poll_job.assert_called_once_with("STUDY", "BATCH123", interval=5, timeout=300)
+    assert "Found 1 jobs:" in result.stdout
+    assert "Batch Id" in result.stdout
+    assert "Job Id" in result.stdout
+    assert "State" in result.stdout
+    assert "Progress" in result.stdout
+    assert "Date Created" in result.stdout
+    assert "Date Finished" in result.stdout
+    assert "BATCH123" in result.stdout
+    assert "COMPLETE" in result.stdout
+    assert "100" in result.stdout
+    assert "\x1b[" not in result.stdout
+
+
+def test_jobs_missing_timestamps_hyphens(runner: CliRunner, sdk: MagicMock) -> None:
+    """Handle terminal jobs with missing timestamp fields by printing hyphens in table cells."""
+    job = JobStatus(
+        batchId="BATCH-TERM",
+        jobId="JOB-TERM",
+        state="CANCELLED",
+        progress=10,
+        dateCreated="",
+        dateFinished=None,
+    )
+    sdk.get_job.return_value = job
+    result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH-TERM"])
+    assert result.exit_code == 0
+    # Both date_created ("") and date_finished (None) should render as "-"
+    assert "BATCH-TERM" in result.stdout
+    assert "CANCELLED" in result.stdout
+    row_line = [line for line in result.stdout.splitlines() if "BATCH-TERM" in line][0]
+    cells = [c.strip() for c in row_line.split("|")]
+    # Cells: Batch Id, Job Id, State, Progress, Date Created, Date Finished
+    assert cells[4] == "-"
+    assert cells[5] == "-"
+
+
+def test_jobs_status_json_format(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that jobs status supports --format json preserving envelope structure."""
+    job = JobStatus(batchId="BATCH_J", jobId="JOB_J", state="RUNNING", progress=50)
+    sdk.get_job.return_value = job
+    result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH_J", "--format", "json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "jobs"
+    assert payload["status"] == "complete"
+    assert payload["count"] == 1
+    assert payload["items"][0]["batchId"] == "BATCH_J"
+    assert payload["items"][0]["state"] == "RUNNING"
+
+
+def test_jobs_wait_json_format(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that jobs wait supports --format json preserving envelope structure."""
+    job = JobStatus(batchId="BATCH_W", jobId="JOB_W", state="COMPLETE", progress=100)
+    sdk.poll_job.return_value = job
+    result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH_W", "--format", "json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "jobs"
+    assert payload["status"] == "complete"
+    assert payload["count"] == 1
+    assert payload["items"][0]["batchId"] == "BATCH_W"
+    assert payload["items"][0]["state"] == "COMPLETE"
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_code"),
+    [
+        ("RUNNING", "\x1b[33mRUNNING\x1b[0m"),
+        ("QUEUED", "\x1b[33mQUEUED\x1b[0m"),
+        ("COMPLETE", "\x1b[32mCOMPLETE\x1b[0m"),
+        ("COMPLETED", "\x1b[32mCOMPLETED\x1b[0m"),
+        ("FAILED", "\x1b[31mFAILED\x1b[0m"),
+        ("CANCELLED", "\x1b[31mCANCELLED\x1b[0m"),
+        ("TIMEOUT", "\x1b[31mTIMEOUT\x1b[0m"),
+    ],
+)
+def test_jobs_status_colors_on_tty(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    expected_code: str,
+) -> None:
+    """Test that job states display correct ANSI colors when stdout is interactive (TTY)."""
+    job = JobStatus(batchId="BATCH_C", jobId="JOB_C", state=state, progress=50)
+    sdk.get_job.return_value = job
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH_C"], tty=True)
+    assert result.exit_code == 0
+    assert expected_code in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_code"),
+    [
+        ("COMPLETE", "\x1b[34mCOMPLETE\x1b[0m"),
+        ("CANCELLED", "\x1b[35mCANCELLED\x1b[0m"),
+        ("TIMEOUT", "\x1b[35mTIMEOUT\x1b[0m"),
+    ],
+)
+def test_jobs_status_colors_high_contrast(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    expected_code: str,
+) -> None:
+    """Test that job states honor high contrast color mapping on TTY."""
+    job = JobStatus(batchId="BATCH_HC", jobId="JOB_HC", state=state, progress=50)
+    sdk.get_job.return_value = job
+    monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
+    result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH_HC"], tty=True)
+    assert result.exit_code == 0
+    assert expected_code in result.stdout
 
 
 def test_intervals_list_success(runner: CliRunner, sdk: MagicMock) -> None:
