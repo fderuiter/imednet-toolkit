@@ -6,12 +6,14 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+from imednet.models.forms import Form
 from imednet.models.queries import Query, QueryStatus
 from imednet.models.records import Record
 from imednet.models.subjects import Subject
 from imednet.models.variables import Variable
 from imednet.utils.pandas import (
     export_records_csv,
+    forms_to_dataframe,
     queries_to_dataframe,
     records_to_dataframe,
     subjects_to_dataframe,
@@ -56,6 +58,45 @@ def _sample_subject() -> Subject:
         subject_id=101,
         site_id=5,
     )
+
+
+def _sample_form() -> Form:
+    """Helper function to sample form."""
+    return Form(
+        form_id=1,
+        form_name="Demographics",
+        form_key="DEMO",
+        subject_record_report=True,
+        unscheduled_visit=False,
+        disabled=False,
+    )
+
+
+def test_forms_to_dataframe_success() -> None:
+    """Test converting forms to a pandas DataFrame."""
+    form = _sample_form()
+    df = forms_to_dataframe([form])
+    assert not df.empty
+    assert len(df) == 1
+    assert df.loc[0, "form_id"] == 1
+    assert df.loc[0, "form_name"] == "Demographics"
+    assert df.loc[0, "form_key"] == "DEMO"
+    assert bool(df.loc[0, "subject_record_report"]) is True
+    assert bool(df.loc[0, "unscheduled_visit"]) is False
+    assert bool(df.loc[0, "disabled"]) is False
+
+
+def test_forms_to_dataframe_empty() -> None:
+    """Test converting empty forms collection to DataFrame."""
+    df = forms_to_dataframe([])
+    assert df.empty
+
+
+def test_forms_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
+    """Test that forms_to_dataframe raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for forms_to_dataframe"):
+        forms_to_dataframe([])
 
 
 def test_subjects_to_dataframe_success() -> None:
