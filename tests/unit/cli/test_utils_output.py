@@ -503,3 +503,136 @@ def test_print_table_job_state_colors(
     assert "\033[33mRUNNING\033[0m" in captured_hc.out
     assert "\033[34mCOMPLETE\033[0m" in captured_hc.out
     assert "\033[35mCANCELLED\033[0m" in captured_hc.out
+
+
+class SimulatedTerminal:
+    """Terminal emulator tracking rows, cursor position, and ANSI sequences."""
+
+    def __init__(self, cols: int = 80, rows: int = 24) -> None:
+        self.columns = cols
+        self.rows = rows
+        self.cursor_row = 0
+        self.cursor_col = 0
+        self.buffer = [[" "] * cols for _ in range(rows)]
+        self._isatty = True
+
+    def isatty(self) -> bool:
+        """Indicate stream is an interactive terminal."""
+        return self._isatty
+
+    def write(self, text: str) -> int:
+        """Process output text, handling cursor motion and line erasing."""
+        import re
+
+        ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+        i = 0
+        while i < len(text):
+            if text[i] == "\r":
+                self.cursor_col = 0
+                i += 1
+            elif text[i : i + 3] == "\033[A":
+                self.cursor_row = max(0, self.cursor_row - 1)
+                i += 3
+            elif text[i : i + 3] == "\033[K":
+                for col in range(self.cursor_col, self.columns):
+                    self.buffer[self.cursor_row][col] = " "
+                i += 3
+            elif text[i : i + 6] in ("\033[?25h", "\033[?25l"):
+                i += 6
+            elif text[i : i + 2] == "\033[":
+                match = ansi_re.match(text[i:])
+                i += len(match.group(0)) if match else 1
+            else:
+                self.buffer[self.cursor_row][self.cursor_col] = text[i]
+                self.cursor_col += 1
+                if self.cursor_col >= self.columns:
+                    self.cursor_row += 1
+                    self.cursor_col = 0
+                i += 1
+        return len(text)
+
+    def flush(self) -> None:
+        """Flush stream buffer (no-op)."""
+
+    def occupied_rows(self) -> list[int]:
+        """Return indices of rows that contain non-space characters."""
+        return [r for r in range(self.rows) if any(ch != " " for ch in self.buffer[r])]
+
+
+def test_status_terminal_model_prevents_row_accumulation_on_80_col_terminal() -> None:
+    """Status constrains 91-char UUID job frames on 80-col terminals without row accumulation."""
+    term = SimulatedTerminal(cols=80)
+    c = Console(stream=term)
+
+    uuid_batch_id = "3b01c2d3-47c0-4b18-8bd6-5a8ff1c7e16f"
+    status_obj = JobStatus(batch_id=uuid_batch_id, state=JobState.RUNNING, progress=50)
+    event = JobStatusEvent(
+        batch_id=uuid_batch_id,
+        status=status_obj,
+        poll_number=1,
+        elapsed=10.5,
+        is_terminal=False,
+    )
+    long_msg = format_job_progress(event)
+    assert len(long_msg) > 80  # Demonstrates unrestricted frame exceeds 80 columns
+
+    with c.status(long_msg) as status_ctrl:
+        # Simulate multiple frame updates
+        for step in range(1, 6):
+            new_status = JobStatus(
+                batch_id=uuid_batch_id, state=JobState.RUNNING, progress=step * 15
+            )
+            step_event = JobStatusEvent(
+                batch_id=uuid_batch_id,
+                status=new_status,
+                poll_number=step,
+                elapsed=10.5 + step,
+                is_terminal=False,
+            )
+            status_ctrl.update(format_job_progress(step_event))
+            # Critical assertion: frame stays on single row without accumulating rows
+            assert term.occupied_rows() == [0]
+            assert term.cursor_row == 0
+
+    # On exit, all rows are cleared and cursor is restored
+    assert term.occupied_rows() == []
+    assert term.cursor_row == 0
+
+
+def test_status_terminal_model_narrow_terminal_clears_properly() -> None:
+    """Status constrains frames on narrow 40-col terminals and clears cleanly on exit."""
+    term = SimulatedTerminal(cols=40)
+    c = Console(stream=term)
+
+    with c.status("A very long progress task that far exceeds forty columns") as status_ctrl:
+        for i in range(3):
+            status_ctrl.update(f"Narrow progress update #{i} with long description text")
+            assert term.occupied_rows() == [0]
+            assert term.cursor_row == 0
+
+    assert term.occupied_rows() == []
+    assert term.cursor_row == 0
+
+
+def test_clear_line_multiple_lines() -> None:
+    """clear_line clears specified number of rows on interactive terminals."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    clear_line(stream=mock_stream, lines=3)
+    mock_stream.write.assert_called_once_with("\r\033[K\033[A\r\033[K\033[A\r\033[K\033[?25h")
+
+
+def test_console_width_override_and_attribute() -> None:
+    """Console detects width from constructor, setter, or stream attributes."""
+    stream_mock = MagicMock()
+    stream_mock.columns = 65
+
+    c1 = Console(stream=stream_mock)
+    assert c1.width == 65
+
+    c2 = Console(width=110)
+    assert c2.width == 110
+
+    c2.width = 75
+    assert c2.width == 75

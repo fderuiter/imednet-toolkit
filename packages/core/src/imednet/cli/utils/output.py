@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -69,12 +70,54 @@ _CURSOR_SHOW = "\033[?25h"
 _CLEAR_LINE = "\r\033[K"
 
 
-def clear_line(stream: Any = None) -> None:
-    """Clear the current line and restore terminal cursor on interactive streams."""
+def _truncate_visible(text: str, max_width: int) -> str:
+    """Truncate text to a maximum visible width, preserving ANSI sequences.
+
+    Args:
+        text: String possibly containing ANSI escape sequences.
+        max_width: Maximum number of visible characters to permit.
+
+    Returns:
+        Truncated string whose visible character count does not exceed max_width.
+    """
+    if max_width <= 0:
+        return ""
+    stripped = _ANSI_REGEX.sub("", text)
+    if len(stripped) <= max_width:
+        return text
+
+    result: list[str] = []
+    visible_count = 0
+    pos = 0
+    has_ansi = False
+    while pos < len(text) and visible_count < max_width:
+        match = _ANSI_REGEX.match(text, pos)
+        if match:
+            has_ansi = True
+            result.append(match.group(0))
+            pos = match.end()
+        else:
+            result.append(text[pos])
+            visible_count += 1
+            pos += 1
+
+    if has_ansi:
+        result.append("\033[0m")
+    return "".join(result)
+
+
+def clear_line(stream: Any = None, lines: int = 1) -> None:
+    """Clear the current line(s) and restore terminal cursor on interactive streams.
+
+    Args:
+        stream: Target output stream (defaults to sys.stderr).
+        lines: Number of terminal rows to clear.
+    """
     target = stream if stream is not None else sys.stderr
     try:
         if target and hasattr(target, "isatty") and target.isatty():
-            target.write(f"{_CLEAR_LINE}{_CURSOR_SHOW}")
+            clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, lines - 1))
+            target.write(f"{clear_seq}{_CURSOR_SHOW}")
             target.flush()
     except (BrokenPipeError, OSError, ValueError):
         pass
@@ -151,6 +194,12 @@ class Status:
         self._interactive = False
         self._entered = False
         self._frames: Sequence[str] = _SPINNER_FRAMES
+        self._lines_rendered: int = 1
+
+    @property
+    def lines_rendered(self) -> int:
+        """Get the number of terminal rows occupied by the most recent frame."""
+        return self._lines_rendered
 
     @property
     def msg(self) -> str:
@@ -179,14 +228,33 @@ class Status:
             timer_suffix = "" if has_timer else f" ({elapsed:.1f}s)"
 
             frame = self._frames[frame_idx % len(self._frames)]
-            line = f"{_CLEAR_LINE}{frame} {current_msg}{timer_suffix}"
+            content = f"{frame} {current_msg}{timer_suffix}"
+
+            cols = self.console.width
+            if cols > 0:
+                max_width = max(1, cols - 1)
+                content = _truncate_visible(content, max_width)
+
+            clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
+            line = f"{clear_seq}{content}"
+
+            vis_len = len(_ANSI_REGEX.sub("", content))
+            lines_by_width = max(1, (vis_len + cols - 1) // cols) if cols > 0 else 1
+            lines_by_newlines = content.count("\n") + 1
+            self._lines_rendered = max(lines_by_width, lines_by_newlines)
+
             try:
                 stream.write(line)
                 stream.flush()
             except UnicodeEncodeError:
                 self._frames = _ASCII_SPINNER_FRAMES
                 frame = self._frames[frame_idx % len(self._frames)]
-                line = f"{_CLEAR_LINE}{frame} {current_msg}{timer_suffix}"
+                content = f"{frame} {current_msg}{timer_suffix}"
+                if cols > 0:
+                    max_width = max(1, cols - 1)
+                    content = _truncate_visible(content, max_width)
+                clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
+                line = f"{clear_seq}{content}"
                 stream.write(line)
                 stream.flush()
         except (BrokenPipeError, OSError, ValueError):
@@ -249,7 +317,8 @@ class Status:
                 self._thread.join(timeout=1.0)
             stream = self.console.stream
             try:
-                stream.write(f"{_CLEAR_LINE}{_CURSOR_SHOW}")
+                clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
+                stream.write(f"{clear_seq}{_CURSOR_SHOW}")
                 stream.flush()
             except (BrokenPipeError, OSError, ValueError):
                 pass
@@ -258,18 +327,45 @@ class Status:
 class Console:
     """Console handling terminal capabilities and live status rendering."""
 
-    def __init__(self, stream: Any = None) -> None:
+    def __init__(self, stream: Any = None, width: int | None = None) -> None:
         """Initialize a Console instance.
 
         Args:
             stream: Optional stream destination (defaults to sys.stderr).
+            width: Optional terminal column width override.
         """
         self._stream = stream
+        self._width = width
 
     @property
     def stream(self) -> Any:
         """Get the active output stream."""
         return self._stream if self._stream is not None else sys.stderr
+
+    @property
+    def width(self) -> int:
+        """Get the terminal column width."""
+        if self._width is not None and self._width > 0:
+            return self._width
+        s = self.stream
+        for attr in ("columns", "width"):
+            val = getattr(s, attr, None)
+            if isinstance(val, int) and val > 0:
+                return val
+        try:
+            if s and hasattr(s, "fileno"):
+                return os.get_terminal_size(s.fileno()).columns
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            return shutil.get_terminal_size(fallback=(80, 24)).columns
+        except Exception:
+            return 80
+
+    @width.setter
+    def width(self, val: int | None) -> None:
+        """Set terminal column width override."""
+        self._width = val
 
     def is_interactive(self) -> bool:
         """Check whether the output stream is an interactive terminal."""
