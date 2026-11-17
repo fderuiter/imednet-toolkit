@@ -19,6 +19,18 @@ def test_ci_uses_canonical_full_verification():
     assert any(s.get("run") == "hatch run quality:all packages" for s in steps)
 
 
+def test_ci_docs_job_enforces_clean_working_tree_and_validation():
+    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text())
+    steps = pipeline["jobs"]["docs"]["steps"]
+    assert any(s.get("run") == "hatch run validate-docs" for s in steps)
+    assert any(s.get("run") == "hatch run docs" for s in steps)
+    assert any(
+        "git diff --exit-code docs/" in s.get("run", "")
+        and "git status --porcelain" in s.get("run", "")
+        for s in steps
+    )
+
+
 def test_ruff_versions_and_metadata_are_consistent():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     pinned = next(
