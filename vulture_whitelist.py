@@ -20,8 +20,6 @@ EdcEndpointMixin  # unused class (packages/core/src/imednet/core/endpoint/edc_mi
 _.async_get  # unused method (packages/core/src/imednet/core/endpoint/protocols.py:88)
 _.async_list  # unused method (packages/core/src/imednet/core/endpoint/protocols.py:100)
 _.async_create  # unused method (packages/core/src/imednet/core/endpoint/protocols.py:114)
-OperationProtocol  # unused class (packages/core/src/imednet/core/operations/protocols.py:9)
-AsyncOperationProtocol  # unused class (packages/core/src/imednet/core/operations/protocols.py:26)
 _.parse_many  # unused method (packages/core/src/imednet/core/parsing.py:83)
 _.list_by_site  # unused method (packages/core/src/imednet/endpoints/subjects.py:44)
 _.add_page  # unused method (packages/core/src/imednet/form_designer/builder.py:86)
