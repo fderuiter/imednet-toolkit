@@ -6,9 +6,11 @@ import zipfile
 from pathlib import Path
 
 from scripts.validate_showcases import (
+    extract_literalinclude_slice,
     main,
     stage_wheels,
     validate_documentation_literal_includes,
+    validate_python_slice,
     validate_showcase_ast_and_imports,
     validate_staged_wheels,
 )
@@ -220,3 +222,211 @@ def test_validate_staged_wheels_workspace_integration(tmp_path: Path) -> None:
 
     errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
     assert not errors, f"Expected staged wheels to pass validation, got: {errors}"
+
+
+def test_literalinclude_slice_missing_start_marker_detection(tmp_path: Path) -> None:
+    """Verify that missing start-after pattern is detected."""
+    docs_dir = tmp_path / "docs"
+    examples_dir = tmp_path / "examples"
+    docs_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    example_target = examples_dir / "quick_start.py"
+    example_target.write_text("def main():\n    print('hello')\n", encoding="utf-8")
+
+    doc_file = docs_dir / "quick_start.rst"
+    doc_file.write_text(
+        ".. literalinclude:: /../examples/quick_start.py\n"
+        "   :language: python\n"
+        "   :start-after: # [missing_start]\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert len(errors) == 1
+    assert "start-after pattern '# [missing_start]' not found" in errors[0]
+
+
+def test_literalinclude_slice_missing_end_marker_detection(tmp_path: Path) -> None:
+    """Verify that missing end-before pattern is detected."""
+    docs_dir = tmp_path / "docs"
+    examples_dir = tmp_path / "examples"
+    docs_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    example_target = examples_dir / "quick_start.py"
+    example_target.write_text(
+        "# [start_marker]\ndef main():\n    print('hello')\n",
+        encoding="utf-8",
+    )
+
+    doc_file = docs_dir / "quick_start.rst"
+    doc_file.write_text(
+        ".. literalinclude:: /../examples/quick_start.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start_marker]\n"
+        "   :end-before: # [missing_end]\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert len(errors) == 1
+    assert "end-before pattern '# [missing_end]' not found" in errors[0]
+
+
+def test_literalinclude_slice_syntax_error_detection(tmp_path: Path) -> None:
+    """Verify that syntax errors within extracted slices are detected."""
+    docs_dir = tmp_path / "docs"
+    examples_dir = tmp_path / "examples"
+    docs_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    example_target = examples_dir / "broken_slice.py"
+    example_target.write_text(
+        "# [start_code]\ndef broken_function(\n# [end_code]\n",
+        encoding="utf-8",
+    )
+
+    doc_file = docs_dir / "index.rst"
+    doc_file.write_text(
+        ".. literalinclude:: /../examples/broken_slice.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start_code]\n"
+        "   :end-before: # [end_code]\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert len(errors) == 1
+    assert "has syntax error" in errors[0]
+
+
+def test_literalinclude_slice_zero_call_nodes_detection(tmp_path: Path) -> None:
+    """Verify that extracted slices without executable call nodes are flagged."""
+    docs_dir = tmp_path / "docs"
+    examples_dir = tmp_path / "examples"
+    docs_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    example_target = examples_dir / "no_calls.py"
+    example_target.write_text(
+        "# [start_code]\nfrom __future__ import annotations\nimport sys\n# [end_code]\n",
+        encoding="utf-8",
+    )
+
+    doc_file = docs_dir / "index.rst"
+    doc_file.write_text(
+        ".. literalinclude:: /../examples/no_calls.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start_code]\n"
+        "   :end-before: # [end_code]\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert any("contains zero executable call nodes" in e for e in errors)
+
+
+def test_literalinclude_slice_missing_function_definition_detection(tmp_path: Path) -> None:
+    """Verify that sliced showcases missing executable function definitions are flagged."""
+    docs_dir = tmp_path / "docs"
+    examples_dir = tmp_path / "examples"
+    docs_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    example_target = examples_dir / "no_func.py"
+    example_target.write_text(
+        "# [start_code]\nprint('only a call, no function def')\n# [end_code]\n",
+        encoding="utf-8",
+    )
+
+    doc_file = docs_dir / "index.rst"
+    doc_file.write_text(
+        ".. literalinclude:: /../examples/no_func.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start_code]\n"
+        "   :end-before: # [end_code]\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert any("contains zero executable function definitions" in e for e in errors)
+
+
+def test_literalinclude_valid_slice_passes(tmp_path: Path) -> None:
+    """Verify that a properly delimited slice containing function defs and calls passes."""
+    docs_dir = tmp_path / "docs"
+    examples_dir = tmp_path / "examples"
+    docs_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    example_target = examples_dir / "valid_showcase.py"
+    example_target.write_text(
+        '"""Showcase docstring."""\n'
+        "\n"
+        "# [start_demo]\n"
+        "import os\n"
+        "\n"
+        "def main() -> None:\n"
+        "    print(os.getcwd())\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+        "# [end_demo]\n",
+        encoding="utf-8",
+    )
+
+    doc_file = docs_dir / "showcase.rst"
+    doc_file.write_text(
+        ".. literalinclude:: /../examples/valid_showcase.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start_demo]\n"
+        "   :end-before: # [end_demo]\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert not errors, f"Expected no errors for valid slice, got: {errors}"
+
+
+def test_extract_literalinclude_slice_options() -> None:
+    """Verify slicing with start-at, end-at, lines, and empty slice detection."""
+    content = "line1\n# start\nline3\nline4\n# end\nline6\n"
+
+    # start-at and end-at
+    sliced, is_sliced, errs = extract_literalinclude_slice(
+        content, {"start-at": "# start", "end-at": "# end"}
+    )
+    assert not errs
+    assert is_sliced is True
+    assert sliced == "# start\nline3\nline4\n# end\n"
+
+    # lines spec
+    sliced_lines, is_sliced_lines, lines_errs = extract_literalinclude_slice(
+        content, {"lines": "1, 3-4"}
+    )
+    assert not lines_errs
+    assert is_sliced_lines is True
+    assert sliced_lines == "line1\nline3\nline4\n"
+
+    # empty slice detection
+    empty_content = "line1\n# start\n\n# end\nline6\n"
+    _, _, empty_errs = extract_literalinclude_slice(
+        empty_content, {"start-after": "# start", "end-before": "# end"}
+    )
+    assert any("Extracted literalinclude slice is empty" in e for e in empty_errs)
+
+
+def test_validate_python_slice_helper() -> None:
+    """Verify validate_python_slice returns expected errors for invalid snippets."""
+    # Syntax error
+    errs = validate_python_slice("def broken(", "target.py", is_sliced=True)
+    assert any("has syntax error" in e for e in errs)
+
+    # Missing call nodes
+    errs = validate_python_slice("x = 1\ny = 2\n", "target.py", is_sliced=False)
+    assert any("contains zero executable call nodes" in e for e in errs)
+
+    # Missing function definition when sliced
+    errs = validate_python_slice("print('call only')\n", "target.py", is_sliced=True)
+    assert any("contains zero executable function definitions" in e for e in errs)

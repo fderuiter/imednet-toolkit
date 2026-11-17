@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -128,8 +129,142 @@ def validate_showcase_ast_and_imports(
     return errors
 
 
+def extract_literalinclude_slice(
+    target_content: str,
+    options: dict[str, str],
+) -> tuple[str, bool, list[str]]:
+    """Extract code slice from target content based on Sphinx literalinclude options.
+
+    Args:
+        target_content: The full content of the target file.
+        options: Dictionary of directive options (e.g. start-after, end-before).
+
+    Returns:
+        tuple[str, bool, list[str]]: (sliced_content, is_sliced, error_messages)
+    """
+    errors: list[str] = []
+    lines = target_content.splitlines(keepends=True)
+    is_sliced = False
+
+    if "start-after" in options:
+        is_sliced = True
+        pattern = options["start-after"]
+        found = False
+        for idx, line in enumerate(lines):
+            if pattern in line:
+                lines = lines[idx + 1 :]
+                found = True
+                break
+        if not found:
+            errors.append(f"start-after pattern '{pattern}' not found")
+
+    elif "start-at" in options:
+        is_sliced = True
+        pattern = options["start-at"]
+        found = False
+        for idx, line in enumerate(lines):
+            if pattern in line:
+                lines = lines[idx:]
+                found = True
+                break
+        if not found:
+            errors.append(f"start-at pattern '{pattern}' not found")
+
+    if "end-before" in options:
+        is_sliced = True
+        pattern = options["end-before"]
+        found = False
+        for idx, line in enumerate(lines):
+            if idx > 0 and pattern in line:
+                lines = lines[:idx]
+                found = True
+                break
+        if not found:
+            errors.append(f"end-before pattern '{pattern}' not found")
+
+    elif "end-at" in options:
+        is_sliced = True
+        pattern = options["end-at"]
+        found = False
+        for idx, line in enumerate(lines):
+            if pattern in line:
+                lines = lines[: idx + 1]
+                found = True
+                break
+        if not found:
+            errors.append(f"end-at pattern '{pattern}' not found")
+
+    if "lines" in options:
+        is_sliced = True
+        linespec = options["lines"]
+        try:
+            selected_indices: list[int] = []
+            for raw_item in linespec.split(","):
+                item = raw_item.strip()
+                if not item:
+                    continue
+                if "-" in item:
+                    start_str, end_str = item.split("-", 1)
+                    s = int(start_str) if start_str.strip() else 1
+                    e = int(end_str) if end_str.strip() else len(lines)
+                    for i in range(s - 1, min(e, len(lines))):
+                        if i not in selected_indices:
+                            selected_indices.append(i)
+                else:
+                    i = int(item) - 1
+                    if 0 <= i < len(lines) and i not in selected_indices:
+                        selected_indices.append(i)
+            lines = [lines[i] for i in selected_indices]
+        except ValueError as exc:
+            errors.append(f"Invalid lines specification '{linespec}': {exc}")
+
+    sliced_content = "".join(lines)
+    if not errors and not sliced_content.strip():
+        errors.append("Extracted literalinclude slice is empty")
+
+    return sliced_content, is_sliced, errors
+
+
+def validate_python_slice(
+    slice_text: str,
+    target_name: str,
+    is_sliced: bool,
+) -> list[str]:
+    """Parse extracted slice as AST and verify syntax, executable calls, and function definitions.
+
+    Args:
+        slice_text: Code string extracted from the target file.
+        target_name: Name or path of the target file being validated.
+        is_sliced: True if slice boundaries (markers or line limits) were applied.
+
+    Returns:
+        list[str]: Validation error messages, or an empty list if valid.
+    """
+    errors: list[str] = []
+    dedented = textwrap.dedent(slice_text)
+
+    try:
+        tree = ast.parse(dedented, filename=target_name)
+    except SyntaxError as exc:
+        return [f"Sliced code from '{target_name}' has syntax error: {exc.msg} (line {exc.lineno})"]
+
+    call_nodes = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    if not call_nodes:
+        errors.append(f"Extracted slice from '{target_name}' contains zero executable call nodes")
+
+    func_nodes = [
+        n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if is_sliced and not func_nodes:
+        errors.append(
+            f"Extracted slice from '{target_name}' contains zero executable function definitions"
+        )
+
+    return errors
+
+
 def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
-    """Verify that all example paths referenced in documentation literal includes exist on disk."""
+    """Verify all documentation literal includes exist on disk and extracted slices parse as valid AST."""
     errors: list[str] = []
     if not docs_dir.exists():
         return [f"Documentation directory not found: {docs_dir}"]
@@ -147,12 +282,40 @@ def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
             errors.append(f"{doc_file}: Failed to read file: {exc}")
             continue
 
-        for lineno, line in enumerate(content.splitlines(), 1):
+        doc_lines = content.splitlines()
+        for line_idx, line in enumerate(doc_lines):
             match = LITERALINCLUDE_PATTERN.match(line)
             if not match:
                 continue
 
+            lineno = line_idx + 1
             target = match.group(1).strip("'\"")
+
+            # Parse directive options indented below the literalinclude directive
+            options: dict[str, str] = {}
+            idx = line_idx + 1
+            while idx < len(doc_lines):
+                curr = doc_lines[idx]
+                opt_match = re.match(r"^\s+:([a-zA-Z0-9_-]+):(?:\s+(.*))?$", curr)
+                if opt_match:
+                    opt_name = opt_match.group(1)
+                    opt_val = (opt_match.group(2) or "").strip()
+                    options[opt_name] = opt_val
+                    idx += 1
+                elif not curr.strip():
+                    has_next_opt = False
+                    for next_idx in range(idx + 1, len(doc_lines)):
+                        if not doc_lines[next_idx].strip():
+                            continue
+                        if re.match(r"^\s+:([a-zA-Z0-9_-]+):", doc_lines[next_idx]):
+                            has_next_opt = True
+                        break
+                    if has_next_opt:
+                        idx += 1
+                    else:
+                        break
+                else:
+                    break
 
             if target.startswith("/"):
                 # Path starting with / is relative to the Sphinx documentation root directory
@@ -166,6 +329,33 @@ def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
                     f"{doc_file}:{lineno}: Referenced literalinclude target not found on disk: "
                     f"'{target}' (resolved to '{resolved}')"
                 )
+                continue
+
+            try:
+                target_content = resolved.read_text(encoding="utf-8")
+            except Exception as exc:
+                errors.append(
+                    f"{doc_file}:{lineno}: Failed to read referenced file '{target}': {exc}"
+                )
+                continue
+
+            slice_text, is_sliced, slice_errs = extract_literalinclude_slice(
+                target_content, options
+            )
+            for s_err in slice_errs:
+                errors.append(f"{doc_file}:{lineno}: {s_err} in '{resolved}'")
+            if slice_errs:
+                continue
+
+            is_python = resolved.suffix == ".py" or options.get("language") in ("python", "py")
+            if is_python:
+                slice_validation_errs = validate_python_slice(
+                    slice_text=slice_text,
+                    target_name=target,
+                    is_sliced=is_sliced,
+                )
+                for v_err in slice_validation_errs:
+                    errors.append(f"{doc_file}:{lineno}: {v_err}")
 
     return errors
 
