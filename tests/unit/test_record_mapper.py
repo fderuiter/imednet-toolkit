@@ -842,3 +842,121 @@ def test_sdtm_transformation_deduplicates_model_aliases() -> None:
     df_simple = transform_records_to_sdtm([m], domain="AE", study_key="STUDY01")
     assert df_simple.iloc[0]["AETERM"] == "Headache"
     assert "term" not in df_simple.columns
+
+
+def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
+    """Verify that models with custom aliases or serialization_alias resolve values and suppress duplicate columns."""
+
+    # 1. Recognized field names with unrelated aliases
+    class CustomAEWithAlias(BaseModel):
+        subject_key: str = Field(alias="patientId")
+        ae_term: str = Field(alias="reportedTerm")
+        ae_severity: str = Field(alias="grade")
+        ae_start_date: str = Field(alias="onset")
+        unmapped_attr: str = Field("extra_val", alias="customExtra")
+
+    rec_alias = CustomAEWithAlias(
+        patientId="S100",
+        reportedTerm="Headache",
+        grade="MILD",
+        onset="2026-05-01T10:00:00",
+        customExtra="keep_this",
+    )
+    df_alias = transform_records_to_sdtm([rec_alias], domain="AE", study_key="STUDY01")
+    assert df_alias.iloc[0]["USUBJID"] == "S100"
+    assert df_alias.iloc[0]["AETERM"] == "Headache"
+    assert df_alias.iloc[0]["AESEV"] == "MILD"
+    assert df_alias.iloc[0]["AESTDTC"] == "2026-05-01T10:00:00"
+    assert df_alias.iloc[0]["customExtra"] == "keep_this"
+    for col in (
+        "patientId",
+        "reportedTerm",
+        "grade",
+        "onset",
+        "ae_term",
+        "ae_severity",
+        "ae_start_date",
+        "subject_key",
+    ):
+        assert col not in df_alias.columns
+    assert "customExtra" in df_alias.columns
+
+    # 2. Recognized field names with serialization_alias
+    class CustomAEWithSerializationAlias(BaseModel):
+        subject_key: str
+        ae_term: str = Field(serialization_alias="serReportedTerm")
+        ae_severity: str = Field(serialization_alias="serSeverity")
+        extra_metric: float = 98.6
+
+    rec_ser = CustomAEWithSerializationAlias(
+        subject_key="S200",
+        ae_term="Dizziness",
+        ae_severity="MODERATE",
+        extra_metric=99.1,
+    )
+    df_ser = transform_records_to_sdtm([rec_ser], domain="AE", study_key="STUDY01")
+    assert df_ser.iloc[0]["USUBJID"] == "S200"
+    assert df_ser.iloc[0]["AETERM"] == "Dizziness"
+    assert df_ser.iloc[0]["AESEV"] == "MODERATE"
+    assert df_ser.iloc[0]["extra_metric"] == 99.1
+    for col in ("serReportedTerm", "serSeverity", "ae_term", "ae_severity", "subject_key"):
+        assert col not in df_ser.columns
+    assert "extra_metric" in df_ser.columns
+
+    # 3. Ordinary SDK camelCase aliases
+    ae_sdk = AdverseEvent(
+        subjectKey="SUBJ-SDK",
+        aeTerm="Fever",
+        aeSeverity="SEVERE",
+        aeSerious=True,
+        aeStartDate=datetime(2026, 4, 1, 12, 0),
+    )
+    df_sdk = transform_records_to_sdtm([ae_sdk], domain="AE", study_key="STUDY01")
+    assert df_sdk.iloc[0]["USUBJID"] == "SUBJ-SDK"
+    assert df_sdk.iloc[0]["AETERM"] == "Fever"
+    assert df_sdk.iloc[0]["AESEV"] == "SEVERE"
+    assert df_sdk.iloc[0]["AESER"] == "Y"
+    assert df_sdk.iloc[0]["AESTDTC"] == "2026-04-01T12:00:00"
+    for col in (
+        "aeTerm",
+        "ae_term",
+        "aeSeverity",
+        "ae_severity",
+        "aeSerious",
+        "ae_serious",
+        "subjectKey",
+        "subject_key",
+    ):
+        assert col not in df_sdk.columns
+
+    # 4. Dictionary input with camelCase keys
+    dict_camel = {
+        "subjectKey": "DICT-01",
+        "aeTerm": "Nausea",
+        "aeSeverity": "MILD",
+        "extra_note": "Post-dose",
+    }
+    df_dict_camel = transform_records_to_sdtm([dict_camel], domain="AE", study_key="STUDY01")
+    assert df_dict_camel.iloc[0]["USUBJID"] == "DICT-01"
+    assert df_dict_camel.iloc[0]["AETERM"] == "Nausea"
+    assert df_dict_camel.iloc[0]["AESEV"] == "MILD"
+    assert df_dict_camel.iloc[0]["extra_note"] == "Post-dose"
+    for col in ("subjectKey", "aeTerm", "aeSeverity", "subject_key", "ae_term", "ae_severity"):
+        assert col not in df_dict_camel.columns
+    assert "extra_note" in df_dict_camel.columns
+
+    # 5. Dictionary input with snake_case keys
+    dict_snake = {
+        "subject_key": "DICT-02",
+        "ae_term": "Cough",
+        "ae_severity": "MILD",
+        "unmapped_val": 42,
+    }
+    df_dict_snake = transform_records_to_sdtm([dict_snake], domain="AE", study_key="STUDY01")
+    assert df_dict_snake.iloc[0]["USUBJID"] == "DICT-02"
+    assert df_dict_snake.iloc[0]["AETERM"] == "Cough"
+    assert df_dict_snake.iloc[0]["AESEV"] == "MILD"
+    assert df_dict_snake.iloc[0]["unmapped_val"] == 42
+    for col in ("subject_key", "ae_term", "ae_severity", "subjectKey", "aeTerm", "aeSeverity"):
+        assert col not in df_dict_snake.columns
+    assert "unmapped_val" in df_dict_snake.columns
