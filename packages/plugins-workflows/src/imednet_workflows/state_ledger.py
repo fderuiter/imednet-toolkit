@@ -218,15 +218,23 @@ class BaseStateProvider(abc.ABC):
         """Reads and validates the current full state (for CLI display)."""
 
 
+DEFAULT_LEDGER_PATH: str = os.environ.get(
+    "IMEDNET_WORKFLOW_LEDGER_PATH",
+    str(Path.home() / ".imednet" / "pipeline_ledger.json"),
+)
+
+
 class FileStateProvider(BaseStateProvider):
     """Manages transactional state bookmarks per study using a local JSON file."""
 
-    def __init__(self, ledger_path: str = "/var/lib/imednet/pipeline_ledger.json") -> None:
+    def __init__(self, ledger_path: str = DEFAULT_LEDGER_PATH) -> None:
         """Initialize the extraction state ledger.
 
         Args:
             ledger_path: Path to the JSON file where state is persisted.
         """
+        if ledger_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
+            ledger_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
         self.ledger_path = Path(ledger_path)
         self._lock_path = self.ledger_path.with_suffix(".lock")
 
@@ -736,9 +744,11 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
 
 
 def get_state_provider(
-    ledger_path: str = "/var/lib/imednet/pipeline_ledger.json",
+    ledger_path: str = DEFAULT_LEDGER_PATH,
 ) -> BaseStateProvider:
     """Factory to get the appropriate state provider based on environment."""
     if "AIRFLOW_CTX_TASK_ID" in os.environ or os.environ.get("USE_AIRFLOW_STATE_PROVIDER") == "1":
         return AirflowStateProvider()
+    if ledger_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
+        ledger_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
     return FileStateProvider(ledger_path)

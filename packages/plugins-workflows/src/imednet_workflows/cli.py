@@ -16,7 +16,7 @@ from imednet.sdk import ImednetSDK
 from imednet.spi.cli import STUDY_KEY_ARG, parse_filter_args, with_sdk
 
 from .data_extraction import DataExtractionWorkflow
-from .state_ledger import get_state_provider
+from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncWorker, SyncWorkerConfig
 
@@ -138,7 +138,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     show_parser.add_argument(
         "-l",
         "--ledger-path",
-        default="/var/lib/imednet/pipeline_ledger.json",
+        default=DEFAULT_LEDGER_PATH,
         help="Path to the pipeline ledger JSON file.",
     )
     show_parser.add_argument("-s", "--study-key", help="Filter the ledger by a specific study key.")
@@ -186,7 +186,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     set_parser.add_argument(
         "-l",
         "--ledger-path",
-        default="/var/lib/imednet/pipeline_ledger.json",
+        default=DEFAULT_LEDGER_PATH,
         help="Path to the pipeline ledger JSON file.",
     )
 
@@ -239,7 +239,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     reset_parser.add_argument(
         "-l",
         "--ledger-path",
-        default="/var/lib/imednet/pipeline_ledger.json",
+        default=DEFAULT_LEDGER_PATH,
         help="Path to the pipeline ledger JSON file.",
     )
 
@@ -301,7 +301,7 @@ def state_app(args: list[str] | None = None) -> None:
 
     # We duplicate the state logic here for tests
     show_parser = state_sub.add_parser("show")
-    show_parser.add_argument("-l", "--ledger-path", default="/var/lib/imednet/pipeline_ledger.json")
+    show_parser.add_argument("-l", "--ledger-path", default=DEFAULT_LEDGER_PATH)
     show_parser.add_argument("-s", "--study-key")
 
     def show_state(ledger_path: str, study_key: str | None = None) -> None:
@@ -336,7 +336,7 @@ def state_app(args: list[str] | None = None) -> None:
     set_parser.add_argument("-m", "--stream", required=True)
     set_parser.add_argument("-t", "--timestamp", required=True)
     set_parser.add_argument("-r", "--records-processed", type=int, default=0)
-    set_parser.add_argument("-l", "--ledger-path", default="/var/lib/imednet/pipeline_ledger.json")
+    set_parser.add_argument("-l", "--ledger-path", default=DEFAULT_LEDGER_PATH)
 
     def set_state(
         study_key: str, stream: str, timestamp: str, records_processed: int, ledger_path: str
@@ -377,9 +377,7 @@ def state_app(args: list[str] | None = None) -> None:
     reset_parser = state_sub.add_parser("reset")
     reset_parser.add_argument("-s", "--study-key", required=True)
     reset_parser.add_argument("-m", "--stream")
-    reset_parser.add_argument(
-        "-l", "--ledger-path", default="/var/lib/imednet/pipeline_ledger.json"
-    )
+    reset_parser.add_argument("-l", "--ledger-path", default=DEFAULT_LEDGER_PATH)
 
     def reset_state(study_key: str, stream: str | None, ledger_path: str) -> None:
         ledger = get_state_provider(ledger_path)
