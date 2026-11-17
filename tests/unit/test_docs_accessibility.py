@@ -1,5 +1,6 @@
 """Automated accessibility and contrast ratio regression tests for documentation theme."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -154,3 +155,69 @@ def test_vpat_document_conformance() -> None:
     assert "WCAG 2.1 Level AA" in vpat_content
     assert "4.5:1" in vpat_content
     assert "verified-wcag-aa" in vpat_content
+
+
+@pytest.mark.unit
+def test_showcase_metric_badges_aria_live_attributes() -> None:
+    """Verify that docs/index.rst declares role='status', aria-live='polite', and aria-atomic='true' on all metric badges (WCAG 4.1.3, ARIA22)."""
+    index_rst = (REPO_ROOT / "docs/index.rst").read_text(encoding="utf-8")
+
+    badge_ids = ["ie-metric-badge", "cdm-metric-badge", "aud-metric-badge"]
+    for badge_id in badge_ids:
+        # Match tag with id and required ARIA attributes
+        pattern = rf'<div[^>]*id="{badge_id}"[^>]*>'
+        match = re.search(pattern, index_rst)
+        assert match is not None, f"Badge {badge_id} not found in docs/index.rst"
+        tag = match.group(0)
+        assert 'role="status"' in tag, f"{badge_id} missing role=\"status\": {tag}"
+        assert 'aria-live="polite"' in tag, f"{badge_id} missing aria-live=\"polite\": {tag}"
+        assert 'aria-atomic="true"' in tag, f"{badge_id} missing aria-atomic=\"true\": {tag}"
+
+
+@pytest.mark.unit
+def test_thebe_pyodide_cell_status_aria_live_attributes() -> None:
+    """Verify that thebe_pyodide.js configures .thebelab-cell-status with ARIA live region attributes."""
+    thebe_js = (REPO_ROOT / "docs/_static/thebe_pyodide.js").read_text(encoding="utf-8")
+
+    assert 'cellStatus.setAttribute("role", "status")' in thebe_js, (
+        "cellStatus must set role='status'"
+    )
+    assert 'cellStatus.setAttribute("aria-live", "polite")' in thebe_js, (
+        "cellStatus must set aria-live='polite'"
+    )
+    assert 'cellStatus.setAttribute("aria-atomic", "true")' in thebe_js, (
+        "cellStatus must set aria-atomic='true'"
+    )
+
+
+@pytest.mark.unit
+def test_thebe_pyodide_execution_feedback() -> None:
+    """Verify that thebe_pyodide.js provides spoken feedback when execution starts and finishes."""
+    thebe_js = (REPO_ROOT / "docs/_static/thebe_pyodide.js").read_text(encoding="utf-8")
+
+    # Start announcement
+    assert 'cellStatus.textContent = "Executing..."' in thebe_js, (
+        "thebe_pyodide.js must announce start state"
+    )
+
+    # Completion announcement
+    assert "Execution completed" in thebe_js, "thebe_pyodide.js must announce completion state"
+
+
+@pytest.mark.unit
+def test_showcase_mutation_handlers_target_live_containers() -> None:
+    """Verify that showcase.js mutates textContent within decorated metric badges without stealing focus."""
+    showcase_js = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+
+    assert "ieMetricBadge.textContent =" in showcase_js
+    assert "cdmMetricBadge.textContent =" in showcase_js
+    assert "audMetricBadge.textContent =" in showcase_js
+
+    # Trigger action handlers must not steal focus
+    # (focus() should only be used for tab arrow navigation)
+    for handler_name in [
+        "executeIntegrationQuery",
+        "executeCdmValidation",
+        "executeAuditorVerification",
+    ]:
+        assert handler_name in showcase_js

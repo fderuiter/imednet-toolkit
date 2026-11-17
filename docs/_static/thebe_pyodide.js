@@ -455,6 +455,9 @@ finally:
 
       const cellStatus = document.createElement("span");
       cellStatus.className = "thebelab-cell-status";
+      cellStatus.setAttribute("role", "status");
+      cellStatus.setAttribute("aria-live", "polite");
+      cellStatus.setAttribute("aria-atomic", "true");
 
       controls.appendChild(runBtn);
       controls.appendChild(clearBtn);
@@ -484,7 +487,11 @@ finally:
         executeCode(code, (res) => {
           runBtn.disabled = false;
           runBtn.innerHTML = "&#9654; Run";
-          cellStatus.textContent = "";
+          if (res.stderr && res.stderr.trim() && !res.stdout && !res.result) {
+            cellStatus.textContent = "Execution completed with errors.";
+          } else {
+            cellStatus.textContent = "Execution completed.";
+          }
 
           outputContent.innerHTML = "";
 
@@ -527,6 +534,7 @@ finally:
 
       clearBtn.addEventListener("click", () => {
         outputContent.innerHTML = "";
+        cellStatus.textContent = "";
       });
 
       // Shift+Enter / Ctrl+Enter shortcut
