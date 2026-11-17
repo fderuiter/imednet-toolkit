@@ -254,4 +254,3 @@ def test_print_table_job_state_colors(
     assert "\033[33mRUNNING\033[0m" in captured_hc.out
     assert "\033[34mCOMPLETE\033[0m" in captured_hc.out
     assert "\033[35mCANCELLED\033[0m" in captured_hc.out
-
