@@ -16,7 +16,6 @@ owner  # unused variable (packages/core/src/imednet/core/endpoint/dispatch.py:14
 owner  # unused variable (packages/core/src/imednet/core/endpoint/dispatch.py:146)
 owner  # unused variable (packages/core/src/imednet/core/endpoint/dispatch.py:150)
 owner  # unused variable (packages/core/src/imednet/core/endpoint/dispatch.py:152)
-EdcEndpointMixin  # unused class (packages/core/src/imednet/core/endpoint/edc_mixin.py:24)
 _.async_get  # unused method (packages/core/src/imednet/core/endpoint/protocols.py:88)
 _.async_list  # unused method (packages/core/src/imednet/core/endpoint/protocols.py:100)
 _.async_create  # unused method (packages/core/src/imednet/core/endpoint/protocols.py:114)
