@@ -1,5 +1,6 @@
 """Automated accessibility and contrast ratio regression tests for documentation theme."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -154,3 +155,106 @@ def test_vpat_document_conformance() -> None:
     assert "WCAG 2.1 Level AA" in vpat_content
     assert "4.5:1" in vpat_content
     assert "verified-wcag-aa" in vpat_content
+
+
+@pytest.mark.unit
+def test_role_card_button_accessible_names_satisfy_wcag_2_5_3() -> None:
+    """Verify role card buttons satisfy WCAG 2.2 SC 2.5.3 (Label in Name) and Technique G208.
+
+    Accessible names (aria-label) must contain and begin with the visible text string
+    presented to sighted and speech-input users, while omitting leading emojis and preserving
+    persona context for screen readers.
+    """
+    index_rst = (REPO_ROOT / "docs/index.rst").read_text(encoding="utf-8")
+
+    # Match role card launch buttons and their inner span content
+    button_pattern = re.compile(
+        r'<button\s+type="button"\s+class="(?P<class>[^"]+)"\s+'
+        r'data-persona-target="(?P<target>[^"]+)"\s+'
+        r'aria-label="(?P<label>[^"]+)">\s*'
+        r'<span>(?P<span>[^<]+)</span>\s*'
+        r'</button>',
+        re.MULTILINE,
+    )
+
+    matches = list(button_pattern.finditer(index_rst))
+    assert len(matches) == 3, (
+        f"Expected 3 role card launch buttons in docs/index.rst, found {len(matches)}"
+    )
+
+    expected_cards = {
+        "panel-datamanager": {
+            "visible_text": "Inspect Form Schemas",
+            "context_keywords": ["Clinical Data Manager", "Explorer"],
+        },
+        "panel-integration": {
+            "visible_text": "Run Interactive Queries",
+            "context_keywords": ["Integration Engineer", "Console"],
+        },
+        "panel-auditor": {
+            "visible_text": "Verify Audit Trails",
+            "context_keywords": ["Regulatory Auditor", "Verification"],
+        },
+    }
+
+    for match in matches:
+        target = match.group("target")
+        btn_class = match.group("class")
+        aria_label = match.group("label")
+        span_text = match.group("span").strip()
+
+        assert "role-card-launch-btn" in btn_class, (
+            f"Button for {target} missing role-card-launch-btn class"
+        )
+        assert target in expected_cards, f"Unexpected persona target: {target}"
+
+        expected = expected_cards[target]
+        visible_words = expected["visible_text"]
+
+        # Ensure visible text is in the inner span
+        assert visible_words in span_text, (
+            f"Inner span text '{span_text}' does not contain expected visible text '{visible_words}'"
+        )
+
+        # WCAG 2.2 SC 2.5.3 / Technique F96: aria-label must contain visible text
+        assert visible_words in aria_label, (
+            f"aria-label '{aria_label}' does not contain visible text '{visible_words}' (violates WCAG 2.2 SC 2.5.3 / F96)"
+        )
+
+        # WCAG 2.2 Technique G208: aria-label must start with visible text
+        assert aria_label.startswith(visible_words), (
+            f"aria-label '{aria_label}' does not begin with visible text '{visible_words}' (violates Technique G208)"
+        )
+
+        # Persona role context is preserved for screen readers
+        for keyword in expected["context_keywords"]:
+            assert keyword in aria_label, (
+                f"aria-label '{aria_label}' missing persona context '{keyword}'"
+            )
+
+        # Edge case: Ensure emojis are NOT in the accessible name so speech input engines match voice commands
+        for emoji in ["📋", "⚡", "🛡️", "🛡"]:
+            assert emoji not in aria_label, (
+                f"aria-label '{aria_label}' contains emoji '{emoji}', which interferes with speech recognition activation"
+            )
+
+
+@pytest.mark.unit
+def test_role_card_trigger_contracts_preserved() -> None:
+    """Verify role card buttons maintain trigger contracts expected by showcase.js."""
+    index_rst = (REPO_ROOT / "docs/index.rst").read_text(encoding="utf-8")
+    showcase_js = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+
+    # showcase.js must query [data-persona-target]
+    assert "data-persona-target" in showcase_js, (
+        "showcase.js must handle data-persona-target triggers"
+    )
+
+    # Targets defined in docs/index.rst buttons must correspond to panels in docs/index.rst
+    for target_id in ["panel-datamanager", "panel-integration", "panel-auditor"]:
+        assert f'data-persona-target="{target_id}"' in index_rst, (
+            f"Trigger data-persona-target='{target_id}' missing in docs/index.rst"
+        )
+        assert f'id="{target_id}"' in index_rst, (
+            f"Target panel id='{target_id}' missing in docs/index.rst"
+        )
