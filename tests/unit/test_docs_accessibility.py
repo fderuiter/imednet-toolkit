@@ -1,6 +1,9 @@
 """Automated accessibility and contrast ratio regression tests for documentation theme."""
 
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -298,10 +301,87 @@ __result__ = {
     assert "ValueError: Invalid" in result["stderr"], "stderr should capture exception traceback"
     assert result["error"] is True, "error flag must be True for raised exceptions"
 
-    # 4. Verify decision logic selects failure announcement given mixed output
-    has_error = bool(result["error"] or (result["stderr"] and result["stderr"].strip()))
-    status_text = "Execution completed with errors." if has_error else "Execution completed."
-    assert status_text == "Execution completed with errors."
+    # 4. Verify decision logic selects failure announcement given mixed output,
+    # and respects explicit error: False when stderr contains ordinary warnings
+    def evaluate_decision(res: dict) -> str:
+        has_error = (
+            bool(res["error"])
+            if ("error" in res and res["error"] is not None)
+            else bool(res.get("stderr") and str(res["stderr"]).strip())
+        )
+        return "Execution completed with errors." if has_error else "Execution completed."
+
+    assert evaluate_decision(result) == "Execution completed with errors."
+
+    # 5. Verify both extracted runners from thebe_pyodide.js for warning output and print-then-raise
+    extracted_runners = re.findall(r"runnerScript\s*=\s*\\?`([\s\S]*?)\\?`;", thebe_js)
+    assert len(extracted_runners) >= 2, (
+        "Expected worker and main-thread fallback runner scripts in thebe_pyodide.js"
+    )
+
+    for i, runner_template in enumerate(extracted_runners):
+        script = runner_template.strip()
+        script_body = script.rsplit("{", 1)[0]
+        dict_body = "{" + script.rsplit("{", 1)[1]
+
+        # Case A: Successful execution with stderr output (e.g. library warnings)
+        env_warn = {"__thebe_user_code__": "import sys; print('warning', file=sys.stderr); 42"}
+        exec(script_body, env_warn)
+        res_warn = eval(dict_body, env_warn)
+        assert res_warn["error"] is False, (
+            f"Runner {i} must return error: False for warning-only stderr"
+        )
+        assert "warning" in res_warn["stderr"]
+        assert res_warn["result"] == "42"
+        assert evaluate_decision(res_warn) == "Execution completed."
+
+        # Case B: Execution with print before exception
+        env_raise = {
+            "__thebe_user_code__": "print('Starting validation')\nraise ValueError('Invalid')"
+        }
+        exec(script_body, env_raise)
+        res_raise = eval(dict_body, env_raise)
+        assert res_raise["error"] is True, f"Runner {i} must return error: True for exception"
+        assert "Starting validation" in res_raise["stdout"]
+        assert "ValueError: Invalid" in res_raise["stderr"]
+        assert evaluate_decision(res_raise) == "Execution completed with errors."
+
+    # 6. Execute real JavaScript decision block in Node if available
+    node_bin = shutil.which("node")
+    if node_bin:
+        match = re.search(
+            r"executeCode\(code,\s*\(res\)\s*=>\s*\{([\s\S]*?)\n\s*outputContent\.innerHTML",
+            thebe_js,
+        )
+        assert match is not None, "Could not extract executeCode callback from thebe_pyodide.js"
+        callback_body = match.group(1)
+        node_script = f"""
+        const callbackBody = {json.dumps(callback_body)};
+        function testDecision(res) {{
+            let runBtn = {{ disabled: false, innerHTML: "" }};
+            let cellStatus = {{ textContent: "" }};
+            const fn = new Function('res', 'runBtn', 'cellStatus', callbackBody);
+            fn(res, runBtn, cellStatus);
+            return cellStatus.textContent;
+        }}
+        const resWarn = {{ stdout: "", stderr: "warning\\n", result: "42", error: false }};
+        const resRaise = {{ stdout: "Starting validation\\n", stderr: "ValueError: Invalid\\n", result: null, error: true }};
+        const resFallbackWarn = {{ stdout: "", stderr: "warning\\n", result: "42" }};
+
+        if (testDecision(resWarn) !== "Execution completed.") {{
+            throw new Error("Expected Execution completed. for warning, got: " + testDecision(resWarn));
+        }}
+        if (testDecision(resRaise) !== "Execution completed with errors.") {{
+            throw new Error("Expected Execution completed with errors. for raise, got: " + testDecision(resRaise));
+        }}
+        if (testDecision(resFallbackWarn) !== "Execution completed with errors.") {{
+            throw new Error("Expected Execution completed with errors. for fallback warning, got: " + testDecision(resFallbackWarn));
+        }}
+        """
+        proc = subprocess.run([node_bin, "-e", node_script], capture_output=True, text=True)
+        assert proc.returncode == 0, (
+            f"Node verification of JavaScript decision failed:\n{proc.stderr}"
+        )
 
 
 @pytest.mark.unit

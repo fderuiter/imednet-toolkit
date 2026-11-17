@@ -494,7 +494,11 @@ finally:
         executeCode(code, (res) => {
           runBtn.disabled = false;
           runBtn.innerHTML = "&#9654; Run";
-          if (res.error || (res.stderr && res.stderr.trim())) {
+          if (
+            res.error !== undefined && res.error !== null
+              ? Boolean(res.error)
+              : Boolean(res.stderr && res.stderr.trim())
+          ) {
             cellStatus.textContent = "Execution completed with errors.";
           } else {
             cellStatus.textContent = "Execution completed.";
