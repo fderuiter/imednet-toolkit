@@ -5,6 +5,10 @@ from imednet.models.standards import (
     DeviceSafetyProfile,
     DrugSafetyProfile,
     GeneralClinicalProfile,
+    StandardsProfile,
+    _canonical_domain,
+    is_valid_cdash_variable,
+    validate_cdash_variable,
 )
 
 
@@ -192,3 +196,96 @@ def test_domain_canonical_alias_resolution_for_dm_and_vs() -> None:
     assert "Demographics" in profile.required_fields
     assert "VS" in profile.required_fields
     assert "Vital Signs" in profile.required_fields
+
+
+def test_domain_canonical_alias_resolution_for_concomitant_medications() -> None:
+    """Test that canonical domain resolution normalizes Concomitant Medications aliases to CM."""
+    aliases = [
+        "CM",
+        "cm",
+        "CONCOMITANT MEDICATIONS",
+        "CONCOMITANT_MEDICATIONS",
+        "CONCOMITANT MEDICATION",
+        "CONCOMITANT_MEDICATION",
+        "Concomitant Medications",
+        "concomitant medications",
+        "concomitant-medications",
+        "Concomitant Medication",
+        "concomitant medication",
+        "concomitant-medication",
+        "  concomitant medications  ",
+    ]
+    for alias in aliases:
+        assert _canonical_domain(alias) == "CM"
+
+
+def test_validate_cdash_variable_concomitant_medications_aliases() -> None:
+    """Test that validate_cdash_variable accepts CM variables across Concomitant Medications aliases."""
+    cm_aliases = [
+        "CM",
+        "cm",
+        "CONCOMITANT MEDICATIONS",
+        "CONCOMITANT_MEDICATIONS",
+        "CONCOMITANT MEDICATION",
+        "CONCOMITANT_MEDICATION",
+        "Concomitant Medications",
+        "concomitant medications",
+        "concomitant-medications",
+        "Concomitant Medication",
+        "concomitant-medication",
+    ]
+
+    for alias in cm_aliases:
+        # Valid CM variable
+        valid, err = validate_cdash_variable("cmTrt", alias)
+        assert valid, f"Expected cmTrt to be valid for alias '{alias}', got error: {err}"
+        assert err is None
+        assert is_valid_cdash_variable("cmTrt", alias)
+
+        # Universal identifier should also be accepted
+        valid, err = validate_cdash_variable("studyId", alias)
+        assert valid, f"Expected studyId to be valid for alias '{alias}'"
+        assert err is None
+
+        # Invalid prefix for CM domain should be rejected with expected prefix 'cm'
+        invalid_valid, invalid_err = validate_cdash_variable("aeTerm", alias)
+        assert not invalid_valid
+        assert invalid_err is not None
+        assert "does not match CDASH domain prefix for CM" in invalid_err
+        assert "expected prefix: 'cm'" in invalid_err
+        assert not is_valid_cdash_variable("aeTerm", alias)
+
+
+def test_standards_profile_canonical_alias_resolution_for_cm() -> None:
+    """Test that StandardsProfile and _DomainDict correctly resolve Concomitant Medications aliases."""
+    profile = StandardsProfile(
+        profile_name="conmed_test",
+        required_fields={"CM": ["subjectKey", "cmTrt"]},
+        recommended_fields={"CM": ["cmDose", "cmDosU"]},
+    )
+
+    expected = ["subjectKey", "cmTrt", "cmDose", "cmDosU"]
+    assert profile.expected_fields("CM") == expected
+    assert profile.expected_fields("Concomitant Medications") == expected
+    assert profile.expected_fields("concomitant-medications") == expected
+    assert profile.expected_fields("CONCOMITANT_MEDICATION") == expected
+    assert profile.expected_fields("concomitant medication") == expected
+
+    assert "CM" in profile.required_fields
+    assert "Concomitant Medications" in profile.required_fields
+    assert "concomitant-medications" in profile.required_fields
+    assert "CONCOMITANT_MEDICATION" in profile.required_fields
+
+    # Validation resolves CM aliases
+    violations = profile.validate("Concomitant Medications", {"subjectKey": "S001"})
+    assert {(v.field, v.severity) for v in violations} == {
+        ("cmTrt", "ERROR"),
+        ("cmDose", "WARNING"),
+        ("cmDosU", "WARNING"),
+    }
+
+    no_violations = profile.validate(
+        "concomitant-medications",
+        {"subjectKey": "S001", "cmTrt": "Aspirin", "cmDose": 100, "cmDosU": "mg"},
+    )
+    assert no_violations == []

@@ -45,9 +45,9 @@ from apache_airflow_providers_imednet.sensors import ImednetJobSensor
 
 The `ImednetHook` allows you to interact with the iMednet system securely by resolving configurations from Airflow connections. It provides access to the underlying `ImednetSDK` client.
 
-### Getting the SDK Client (Modern Approach)
+### Getting the SDK Client
 
-To retrieve a configured SDK client to use in your custom operators or tasks, use the `get_sdk_client()` method:
+To retrieve a configured SDK client to use in your custom operators or tasks, use `get_conn()` (adhering to the standard Airflow `BaseHook` interface) or its alias `get_sdk_client()`:
 
 ```python
 from apache_airflow_providers_imednet.hooks import ImednetHook
@@ -55,28 +55,13 @@ from apache_airflow_providers_imednet.hooks import ImednetHook
 
 def my_task_logic():
     hook = ImednetHook(imednet_conn_id="imednet_default")
-    sdk_client = hook.get_sdk_client()
+    # Retrieve the active ImednetSDK client using the standard BaseHook entry point:
+    client = hook.get_conn()
+    # Alternatively, hook.get_sdk_client() can also be used:
+    # client = hook.get_sdk_client()
 
-    # Use the sdk_client to interact with iMednet
-    studies = sdk_client.studies.list()
-```
-
-### Migration Notice: `get_conn()` Removed
-
-The legacy connection helper `ImednetHook.get_conn()` has been removed. Use `get_sdk_client()` instead.
-
-#### Transitioning to the Modern Client
-
-If you have legacy DAGs or custom operators using `get_conn()`, update them to use `get_sdk_client()`. Both return the same `ImednetSDK` client, making the migration straightforward:
-
-**Before (Removed):**
-```python
-client = hook.get_conn()
-```
-
-**After (Recommended):**
-```python
-client = hook.get_sdk_client()
+    # Use the client to interact with iMednet
+    studies = client.studies.list()
 ```
 
 ## Features
