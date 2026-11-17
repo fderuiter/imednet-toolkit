@@ -126,10 +126,10 @@ class _GetEndpointBase(GenericEndpoint[T]):
         )
 
 
-class _ListGetEndpointBase(GenericEndpoint[T]):
-    """Generic base for endpoints that provide list and get-by-filter functionality.
+class _ListEndpointBase(GenericEndpoint[T]):
+    """Generic base for endpoints that provide list functionality without single-resource retrieval.
 
-    Uses composable operations to provide standard list/get read operations.
+    Uses composable operations to provide standard list operations.
     """
 
     PAGE_SIZE: int = DEFAULT_PAGE_SIZE
@@ -230,24 +230,6 @@ class _ListGetEndpointBase(GenericEndpoint[T]):
             study=study,
         )
 
-    def _validate_get_result(self, items: list[T], study_key: str | None, item_id: ItemId) -> T:
-        """Validate that a get operation returned exactly one item.
-
-        Args:
-            items: The list of items returned by the filter.
-            study_key: The study key used for the request.
-            item_id: The ID of the item being requested.
-
-        Returns:
-            The first item in the list.
-
-        Raises:
-            NotFoundError: If the list is empty.
-        """
-        if not items:
-            self._raise_not_found(study_key, item_id)
-        return items[0]
-
     @execute_list  # type: ignore
     def list(self, study_key: str | None = None, **filters: FilterValue) -> ListOperation[T]:
         """List resources matching the given filters.
@@ -299,6 +281,31 @@ class _ListGetEndpointBase(GenericEndpoint[T]):
             res.append(item)
         return res
 
+
+class _ListGetEndpointBase(_ListEndpointBase[T]):
+    """Generic base for endpoints that provide list and get-by-filter functionality.
+
+    Uses composable operations to provide standard list/get read operations.
+    """
+
+    def _validate_get_result(self, items: list[T], study_key: str | None, item_id: ItemId) -> T:
+        """Validate that a get operation returned exactly one item.
+
+        Args:
+            items: The list of items returned by the filter.
+            study_key: The study key used for the request.
+            item_id: The ID of the item being requested.
+
+        Returns:
+            The first item in the list.
+
+        Raises:
+            NotFoundError: If the list is empty.
+        """
+        if not items:
+            self._raise_not_found(study_key, item_id)
+        return items[0]
+
     @execute_get
     def get(self, study_key: str | None, item_id: ItemId) -> FilterGetOperation[T]:
         """Retrieve a single resource by its ID.
@@ -323,6 +330,28 @@ class _ListGetEndpointBase(GenericEndpoint[T]):
             list_sync_func=self._list_sync,
             list_async_func=self._list_async,
         )
+
+
+class SyncListEndpoint(_ListEndpointBase[T], SyncEndpointContext):
+    """Synchronous endpoint providing list-only functionality."""
+
+    def __init__(
+        self,
+        client: RequesterProtocol,
+    ) -> None:
+        """Initialize the synchronous endpoint."""
+        super().__init__(client=client)
+
+
+class AsyncListEndpoint(_ListEndpointBase[T], AsyncEndpointContext):
+    """Asynchronous endpoint providing list-only functionality."""
+
+    def __init__(
+        self,
+        async_client: AsyncRequesterProtocol,
+    ) -> None:
+        """Initialize the asynchronous endpoint."""
+        super().__init__(async_client=async_client)
 
 
 class SyncGetEndpoint(_GetEndpointBase[T], SyncEndpointContext):
@@ -372,3 +401,4 @@ class AsyncListGetEndpoint(_ListGetEndpointBase[T], AsyncEndpointContext):
 # Backward-compatible aliases. New code should use Sync* / Async* classes.
 GenericListGetEndpoint = SyncListGetEndpoint
 GenericGetEndpoint = SyncGetEndpoint
+GenericListEndpoint = SyncListEndpoint

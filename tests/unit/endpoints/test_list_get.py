@@ -12,7 +12,6 @@ from imednet.endpoints import (
     sites,
     studies,
     subjects,
-    users,
     variables,
     visits,
 )
@@ -25,7 +24,6 @@ from imednet.models.records import Record
 from imednet.models.sites import Site
 from imednet.models.studies import Study
 from imednet.models.subjects import Subject
-from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 
@@ -39,7 +37,6 @@ CASES = [
     (sites.SitesEndpoint, sites, Site, 1),
     (studies.StudiesEndpoint, studies, Study, "S1"),
     (subjects.SubjectsEndpoint, subjects, Subject, "SUB"),
-    (users.UsersEndpoint, users, User, 1),
     (variables.VariablesEndpoint, variables, Variable, 1),
     (visits.VisitsEndpoint, visits, Visit, 1),
 ]
@@ -54,7 +51,6 @@ ASYNC_CASES = [
     (sites.AsyncSitesEndpoint, sites, Site, 1),
     (studies.AsyncStudiesEndpoint, studies, Study, "S1"),
     (subjects.AsyncSubjectsEndpoint, subjects, Subject, "SUB"),
-    (users.AsyncUsersEndpoint, users, User, 1),
     (variables.AsyncVariablesEndpoint, variables, Variable, 1),
     (visits.AsyncVisitsEndpoint, visits, Visit, 1),
 ]

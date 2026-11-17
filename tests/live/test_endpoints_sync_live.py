@@ -113,12 +113,11 @@ def test_list_variables(sdk: ImednetSDK, study_key: str) -> None:
 
 def test_list_users(sdk: ImednetSDK, study_key: str) -> None:
     """Test that list users."""
+    assert not hasattr(sdk.users, "get")
     users = list(sdk.users.list(study_key=study_key))
     assert isinstance(users, list)
     if users:
         assert isinstance(users[0], User)
-        user = sdk.users.get(study_key, users[0].user_id)
-        assert user.user_id == users[0].user_id
 
 
 def test_list_queries(sdk: ImednetSDK, study_key: str) -> None:

@@ -1,6 +1,7 @@
 """Unit tests for endpoint composition."""
 
 import imednet.endpoints.records as records_module
+import imednet.endpoints.users as users_module
 from imednet.endpoints.codings import AsyncCodingsEndpoint, CodingsEndpoint
 from imednet.endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
 from imednet.endpoints.intervals import AsyncIntervalsEndpoint, IntervalsEndpoint
@@ -79,14 +80,32 @@ def test_jobs_endpoint_keeps_public_read_api(dummy_client, response_factory):
     assert "PathGetEndpointMixin" not in {cls.__name__ for cls in JobsEndpoint.__mro__}
 
 
+def test_users_endpoint_keeps_public_read_api(dummy_client, paginator_factory):
+    """Test that users endpoint keeps public read api without get."""
+    endpoint = UsersEndpoint(dummy_client)
+    capture = paginator_factory(users_module, [{"userId": 1}])
+
+    listed = endpoint.list(study_key="S1")
+
+    assert callable(endpoint.list)
+    assert not hasattr(endpoint, "get")
+    assert not hasattr(UsersEndpoint, "get")
+    assert not hasattr(AsyncUsersEndpoint, "get")
+    assert listed[0].user_id == "1"
+    assert capture["path"] == "/api/v1/edc/studies/S1/users"
+
+
 def test_all_endpoints_inherit_from_single_edc_base():
     """Endpoints must have their respective EDC base as their sole direct parent."""
     for endpoint_cls in ALL_ENDPOINT_CLASSES:
         direct_bases = endpoint_cls.__bases__
         base_names = {b.__name__ for b in direct_bases if not b.__name__.endswith("OperationDef")}
-        expected_base = (
-            "EdcSyncGetEndpoint" if endpoint_cls is JobsEndpoint else "EdcSyncListGetEndpoint"
-        )
+        if endpoint_cls is JobsEndpoint:
+            expected_base = "EdcSyncGetEndpoint"
+        elif endpoint_cls is UsersEndpoint:
+            expected_base = "EdcSyncListEndpoint"
+        else:
+            expected_base = "EdcSyncListGetEndpoint"
         assert base_names == {expected_base}, (
             f"{endpoint_cls.__name__} has unexpected direct bases: {base_names}"
         )
@@ -98,11 +117,12 @@ def test_all_async_endpoints_inherit_from_single_edc_base():
         base_names = {
             b.__name__ for b in endpoint_cls.__bases__ if not b.__name__.endswith("OperationDef")
         }
-        expected_base = (
-            "EdcAsyncGetEndpoint"
-            if endpoint_cls is AsyncJobsEndpoint
-            else "EdcAsyncListGetEndpoint"
-        )
+        if endpoint_cls is AsyncJobsEndpoint:
+            expected_base = "EdcAsyncGetEndpoint"
+        elif endpoint_cls is AsyncUsersEndpoint:
+            expected_base = "EdcAsyncListEndpoint"
+        else:
+            expected_base = "EdcAsyncListGetEndpoint"
         assert base_names == {expected_base}, (
             f"{endpoint_cls.__name__} has unexpected direct bases: {base_names}"
         )
