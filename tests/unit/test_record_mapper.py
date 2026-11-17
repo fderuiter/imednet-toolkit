@@ -884,24 +884,30 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
     # 2. Recognized field names with serialization_alias
     class CustomAEWithSerializationAlias(BaseModel):
         subject_key: str
-        ae_term: str = Field(serialization_alias="serReportedTerm")
-        ae_severity: str = Field(serialization_alias="serSeverity")
+        ae_term: str = Field(serialization_alias="customSerializationTerm")
+        ae_severity: str = Field(serialization_alias="customSerializationSeverity")
         extra_metric: float = 98.6
 
-    rec_ser = CustomAEWithSerializationAlias(
+    rec_serialized = CustomAEWithSerializationAlias(
         subject_key="S200",
         ae_term="Dizziness",
         ae_severity="MODERATE",
         extra_metric=99.1,
     )
-    df_ser = transform_records_to_sdtm([rec_ser], domain="AE", study_key="STUDY01")
-    assert df_ser.iloc[0]["USUBJID"] == "S200"
-    assert df_ser.iloc[0]["AETERM"] == "Dizziness"
-    assert df_ser.iloc[0]["AESEV"] == "MODERATE"
-    assert df_ser.iloc[0]["extra_metric"] == 99.1
-    for col in ("serReportedTerm", "serSeverity", "ae_term", "ae_severity", "subject_key"):
-        assert col not in df_ser.columns
-    assert "extra_metric" in df_ser.columns
+    df_serialized = transform_records_to_sdtm([rec_serialized], domain="AE", study_key="STUDY01")
+    assert df_serialized.iloc[0]["USUBJID"] == "S200"
+    assert df_serialized.iloc[0]["AETERM"] == "Dizziness"
+    assert df_serialized.iloc[0]["AESEV"] == "MODERATE"
+    assert df_serialized.iloc[0]["extra_metric"] == 99.1
+    for col in (
+        "customSerializationTerm",
+        "customSerializationSeverity",
+        "ae_term",
+        "ae_severity",
+        "subject_key",
+    ):
+        assert col not in df_serialized.columns
+    assert "extra_metric" in df_serialized.columns
 
     # 3. Ordinary SDK camelCase aliases
     ae_sdk = AdverseEvent(

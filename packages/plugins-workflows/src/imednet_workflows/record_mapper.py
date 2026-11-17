@@ -342,7 +342,7 @@ def transform_records_to_sdtm(
     seq_counters: dict[str, int] = {}
 
     for rec in records:
-        model_field_to_ser: dict[str, str] = {}
+        model_field_to_serialized: dict[str, str] = {}
         all_field_aliases: dict[str, set[str]] = {}
         if hasattr(rec, "record_data") and getattr(rec, "record_data", None) is not None:
             rec_dict = dict(rec.record_data) if isinstance(rec.record_data, dict) else {}
@@ -354,16 +354,16 @@ def transform_records_to_sdtm(
         elif isinstance(rec, BaseModel):
             rec_dict = rec.model_dump(by_alias=True)
             for fname, finfo in getattr(type(rec), "model_fields", {}).items():
-                ser_key = fname
+                serialized_key = fname
                 if (
                     isinstance(getattr(finfo, "serialization_alias", None), str)
                     and finfo.serialization_alias
                 ):
-                    ser_key = finfo.serialization_alias
+                    serialized_key = finfo.serialization_alias
                 elif isinstance(getattr(finfo, "alias", None), str) and finfo.alias:
-                    ser_key = finfo.alias
+                    serialized_key = finfo.alias
 
-                field_aliases = {fname, ser_key}
+                field_aliases = {fname, serialized_key}
                 if isinstance(getattr(finfo, "alias", None), str) and finfo.alias:
                     field_aliases.add(finfo.alias)
                 if (
@@ -378,8 +378,8 @@ def transform_records_to_sdtm(
                     field_aliases.add(finfo.validation_alias)
 
                 for alias in field_aliases:
-                    model_field_to_ser[alias] = ser_key
-                    model_field_to_ser.setdefault(alias.lower(), ser_key)
+                    model_field_to_serialized[alias] = serialized_key
+                    model_field_to_serialized.setdefault(alias.lower(), serialized_key)
                     all_field_aliases.setdefault(alias, set()).update(field_aliases)
                     all_field_aliases.setdefault(alias.lower(), set()).update(field_aliases)
         elif isinstance(rec, dict):
@@ -398,13 +398,13 @@ def transform_records_to_sdtm(
             or rec_dict.get("subjectKey")
             or rec_dict.get("subject_key")
             or (
-                rec_dict.get(model_field_to_ser.get("subject_key", ""))
-                if model_field_to_ser
+                rec_dict.get(model_field_to_serialized.get("subject_key", ""))
+                if model_field_to_serialized
                 else None
             )
             or (
-                rec_dict.get(model_field_to_ser.get("subjectKey", ""))
-                if model_field_to_ser
+                rec_dict.get(model_field_to_serialized.get("subjectKey", ""))
+                if model_field_to_serialized
                 else None
             )
             or getattr(rec, "subject_key", None)
@@ -436,14 +436,14 @@ def transform_records_to_sdtm(
             "recordStatus",
         }
         for initial_k in list(consumed_keys):
-            if initial_k in model_field_to_ser:
-                ser_k = model_field_to_ser[initial_k]
-                consumed_keys.add(ser_k)
-                consumed_keys.update(all_field_aliases.get(ser_k, set()))
-            if initial_k.lower() in model_field_to_ser:
-                ser_k = model_field_to_ser[initial_k.lower()]
-                consumed_keys.add(ser_k)
-                consumed_keys.update(all_field_aliases.get(ser_k, set()))
+            if initial_k in model_field_to_serialized:
+                serialized_k = model_field_to_serialized[initial_k]
+                consumed_keys.add(serialized_k)
+                consumed_keys.update(all_field_aliases.get(serialized_k, set()))
+            if initial_k.lower() in model_field_to_serialized:
+                serialized_k = model_field_to_serialized[initial_k.lower()]
+                consumed_keys.add(serialized_k)
+                consumed_keys.update(all_field_aliases.get(serialized_k, set()))
 
         lower_rec_dict = {k.lower(): (k, v) for k, v in rec_dict.items()}
 
@@ -458,14 +458,17 @@ def transform_records_to_sdtm(
                 found_key = var_name
             elif var_name.lower() in lower_rec_dict:
                 found_key, val = lower_rec_dict[var_name.lower()]
-            elif var_name in model_field_to_ser and model_field_to_ser[var_name] in rec_dict:
-                found_key = model_field_to_ser[var_name]
+            elif (
+                var_name in model_field_to_serialized
+                and model_field_to_serialized[var_name] in rec_dict
+            ):
+                found_key = model_field_to_serialized[var_name]
                 val = rec_dict[found_key]
             elif (
-                var_name.lower() in model_field_to_ser
-                and model_field_to_ser[var_name.lower()] in rec_dict
+                var_name.lower() in model_field_to_serialized
+                and model_field_to_serialized[var_name.lower()] in rec_dict
             ):
-                found_key = model_field_to_ser[var_name.lower()]
+                found_key = model_field_to_serialized[var_name.lower()]
                 val = rec_dict[found_key]
             else:
                 candidates = alias_map.get(var_name, [])
@@ -477,15 +480,18 @@ def transform_records_to_sdtm(
                     if cand.lower() in lower_rec_dict:
                         found_key, val = lower_rec_dict[cand.lower()]
                         break
-                    if cand in model_field_to_ser and model_field_to_ser[cand] in rec_dict:
-                        found_key = model_field_to_ser[cand]
+                    if (
+                        cand in model_field_to_serialized
+                        and model_field_to_serialized[cand] in rec_dict
+                    ):
+                        found_key = model_field_to_serialized[cand]
                         val = rec_dict[found_key]
                         break
                     if (
-                        cand.lower() in model_field_to_ser
-                        and model_field_to_ser[cand.lower()] in rec_dict
+                        cand.lower() in model_field_to_serialized
+                        and model_field_to_serialized[cand.lower()] in rec_dict
                     ):
-                        found_key = model_field_to_ser[cand.lower()]
+                        found_key = model_field_to_serialized[cand.lower()]
                         val = rec_dict[found_key]
                         break
 
@@ -499,14 +505,14 @@ def transform_records_to_sdtm(
                         consumed_keys.add(cand)
                     if cand.lower() in lower_rec_dict:
                         consumed_keys.add(lower_rec_dict[cand.lower()][0])
-                    if cand in model_field_to_ser:
-                        ser_cand = model_field_to_ser[cand]
-                        consumed_keys.add(ser_cand)
-                        consumed_keys.update(all_field_aliases.get(ser_cand, set()))
-                    if cand.lower() in model_field_to_ser:
-                        ser_cand = model_field_to_ser[cand.lower()]
-                        consumed_keys.add(ser_cand)
-                        consumed_keys.update(all_field_aliases.get(ser_cand, set()))
+                    if cand in model_field_to_serialized:
+                        serialized_cand = model_field_to_serialized[cand]
+                        consumed_keys.add(serialized_cand)
+                        consumed_keys.update(all_field_aliases.get(serialized_cand, set()))
+                    if cand.lower() in model_field_to_serialized:
+                        serialized_cand = model_field_to_serialized[cand.lower()]
+                        consumed_keys.add(serialized_cand)
+                        consumed_keys.update(all_field_aliases.get(serialized_cand, set()))
                     consumed_keys.update(all_field_aliases.get(cand, set()))
                     consumed_keys.update(all_field_aliases.get(cand.lower(), set()))
 
