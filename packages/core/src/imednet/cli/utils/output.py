@@ -227,12 +227,14 @@ def display_list(
     try:
         from .grid import is_interactive_terminal, run_interactive_grid
     except ImportError:
-        is_interactive_terminal = lambda: False  # type: ignore[assignment]
-        run_interactive_grid = lambda *args, **kwargs: False  # type: ignore[assignment]
 
-    should_run_interactive = (
-        interactive if interactive is not None else is_interactive_terminal()
-    )
+        def is_interactive_terminal() -> bool:  # type: ignore[misc]
+            return False
+
+        def run_interactive_grid(*args: Any, **kwargs: Any) -> bool:  # type: ignore[misc]
+            return False
+
+    should_run_interactive = interactive if interactive is not None else is_interactive_terminal()
     if should_run_interactive:
         grid_ran = run_interactive_grid(
             items=data_list,

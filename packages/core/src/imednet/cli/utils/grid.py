@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import contextlib
-import curses
+
+try:
+    import curses
+except ImportError:
+    curses = None  # type: ignore[assignment]
+
+_CURSES_ERROR: tuple[type[BaseException], ...] = (curses.error,) if curses is not None else ()
 import os
 import sys
 from collections.abc import Sequence
@@ -19,6 +25,8 @@ def is_interactive_terminal() -> bool:
         True if interactive curses mode should be used, False if output should
         be emitted as plain tabular text.
     """
+    if curses is None:
+        return False
     if os.environ.get("IMEDNET_NON_INTERACTIVE") == "1":
         return False
     term = os.environ.get("TERM", "")
@@ -47,9 +55,12 @@ def safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
         text: String to render.
         attr: Optional curses text attribute.
     """
+    if curses is None:
+        return
+
     try:
         max_y, max_x = win.getmaxyx()
-    except curses.error:
+    except _CURSES_ERROR:
         return
 
     if y < 0 or y >= max_y or x < 0 or x >= max_x:
@@ -66,7 +77,7 @@ def safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
     if not text:
         return
 
-    with contextlib.suppress(curses.error):
+    with contextlib.suppress(*_CURSES_ERROR):
         win.addstr(y, x, text, attr)
 
 
@@ -137,6 +148,10 @@ class InteractiveDataGrid:
             details: Full domain objects corresponding to each row.
             is_high_contrast: Whether high-contrast clinical status mode is active.
         """
+        if curses is None:
+            raise RuntimeError(
+                "Interactive data grid requires the curses module, which is unavailable."
+            )
         self.stdscr = stdscr
         self.fields = fields
         self.label = label
@@ -196,9 +211,7 @@ class InteractiveDataGrid:
         """Return the curses color attribute for a clinical status value."""
         val = str(status_val).lower().strip()
         color_name = (
-            _HC_STATUS_COLOR_MAP.get(val)
-            if self.is_high_contrast
-            else _STATUS_COLOR_MAP.get(val)
+            _HC_STATUS_COLOR_MAP.get(val) if self.is_high_contrast else _STATUS_COLOR_MAP.get(val)
         )
         if color_name and color_name in self.color_attrs:
             return self.color_attrs[color_name]
@@ -372,7 +385,9 @@ class InteractiveDataGrid:
         content_x = panel_x + 2
         content_w = max(10, panel_width - 3)
 
-        panel_title = " RECORD INSPECTION " if self.label == "records" else f" {self.label.upper()} DETAILS "
+        panel_title = (
+            " RECORD INSPECTION " if self.label == "records" else f" {self.label.upper()} DETAILS "
+        )
         safe_addstr(
             self.stdscr,
             1,
@@ -462,14 +477,8 @@ class InteractiveDataGrid:
         else:
             with contextlib.suppress(curses.error):
                 curses.curs_set(0)
-            pos_info = (
-                f"Row {self.selected_idx + 1}/{total_rows}"
-                if total_rows > 0
-                else "0/0"
-            )
-            help_text = (
-                f"[↑/↓] Navigate  [/] Search  [Space] Panel  [q] Quit  {pos_info}"
-            )
+            pos_info = f"Row {self.selected_idx + 1}/{total_rows}" if total_rows > 0 else "0/0"
+            help_text = f"[↑/↓] Navigate  [/] Search  [Space] Panel  [q] Quit  {pos_info}"
             safe_addstr(self.stdscr, y, 0, help_text[:max_x].ljust(max_x), curses.A_REVERSE)
 
     def run(self) -> None:
@@ -595,7 +604,11 @@ def run_interactive_grid(
         True if the interactive grid ran and exited normally, False if curses
         could not be initialized.
     """
+    if curses is None:
+        return False
+
     try:
+
         def _curses_main(stdscr: Any) -> None:
             grid = InteractiveDataGrid(
                 stdscr,
@@ -609,10 +622,11 @@ def run_interactive_grid(
 
         curses.wrapper(_curses_main)
         return True
-    except curses.error:
+    except _CURSES_ERROR:
         return False
     except Exception:
         # Guarantee terminal restoration if any unexpected error occurs
-        with contextlib.suppress(curses.error):
-            curses.endwin()
+        if curses is not None:
+            with contextlib.suppress(*_CURSES_ERROR):
+                curses.endwin()
         return False

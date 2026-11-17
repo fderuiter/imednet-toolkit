@@ -167,7 +167,9 @@ def test_grid_initialization_and_drawing() -> None:
         {"ID": 1, "Subject": "S1", "Form": "DM", "Status": "Completed", "Created": "2024-01-01"},
         {"ID": 2, "Subject": "S2", "Form": "AE", "Status": "Pending", "Created": "2024-01-02"},
     ]
-    grid = InteractiveDataGrid(win, items=items, fields=["ID", "Subject", "Form", "Status", "Created"])
+    grid = InteractiveDataGrid(
+        win, items=items, fields=["ID", "Subject", "Form", "Status", "Created"]
+    )
     grid.draw()
 
     text_content = " ".join(s[2] for s in win.strings)
@@ -181,9 +183,7 @@ def test_grid_initialization_and_drawing() -> None:
 def test_grid_navigation_keys() -> None:
     """InteractiveDataGrid navigates selection with arrows, page keys, and home/end."""
     win = MockWindow(height=10, width=80)
-    items = [
-        {"ID": i, "Subject": f"S{i}", "Status": "Active"} for i in range(10)
-    ]
+    items = [{"ID": i, "Subject": f"S{i}", "Status": "Active"} for i in range(10)]
     grid = InteractiveDataGrid(win, items=items, fields=["ID", "Subject", "Status"])
     assert grid.selected_idx == 0
 
@@ -273,9 +273,7 @@ def test_grid_instant_search_filtering() -> None:
         {"record_data": {"note": "followup"}},
         {"record_data": {"note": "adverse event observed"}},
     ]
-    grid = InteractiveDataGrid(
-        win, items=items, fields=["ID", "Subject", "Form"], details=details
-    )
+    grid = InteractiveDataGrid(win, items=items, fields=["ID", "Subject", "Form"], details=details)
 
     # Press '/' to open search
     grid._handle_normal_input(ord("/"))
@@ -318,7 +316,9 @@ def test_grid_status_colors_high_contrast() -> None:
     """Grid uses high-contrast color mappings when requested."""
     win = MockWindow()
     items = [{"ID": 1, "Status": "Completed"}]
-    grid_normal = InteractiveDataGrid(win, items=items, fields=["ID", "Status"], is_high_contrast=False)
+    grid_normal = InteractiveDataGrid(
+        win, items=items, fields=["ID", "Status"], is_high_contrast=False
+    )
     grid_normal.color_attrs = {"green": 10, "blue": 20}
     assert grid_normal._get_status_attr("Completed") == 10
 
@@ -369,7 +369,7 @@ def test_display_list_non_interactive_fallback(capfd: pytest.CaptureFixture[str]
 
 def test_records_list_cli_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
     """Invoking 'records list' in interactive terminal invokes run_interactive_grid with full details."""
-    import imednet.cli as cli
+    from imednet import cli
 
     rec = Record.model_construct(
         record_id=42,
@@ -395,7 +395,7 @@ def test_records_list_cli_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_subjects_list_cli_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
     """Invoking 'subjects list' in interactive terminal invokes run_interactive_grid with full details."""
-    import imednet.cli as cli
+    from imednet import cli
 
     subj = Subject.model_construct(
         subject_key="S-99",
@@ -417,3 +417,162 @@ def test_subjects_list_cli_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
         assert kwargs["details"] == [subj]
         assert kwargs["items"][0]["subject_key"] == "S-99"
 
+
+def test_grid_unavailable_when_curses_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When curses is None, is_interactive_terminal and run_interactive_grid return False."""
+    import imednet.cli.utils.grid as grid_mod
+
+    monkeypatch.setattr(grid_mod, "curses", None)
+    assert grid_mod.is_interactive_terminal() is False
+    assert grid_mod.run_interactive_grid([], []) is False
+    # safe_addstr is a no-op
+    grid_mod.safe_addstr(MockWindow(), 0, 0, "test")
+    # InteractiveDataGrid raises RuntimeError
+    with pytest.raises(RuntimeError, match="curses module, which is unavailable"):
+        grid_mod.InteractiveDataGrid(MockWindow(), items=[], fields=[])
+
+
+def test_cli_help_without_curses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI --help succeeds without error even when curses is unavailable."""
+    import imednet.cli.utils.grid as grid_mod
+    from imednet import cli
+
+    monkeypatch.setattr(grid_mod, "curses", None)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.app(["--help"])
+    assert exc_info.value.code == 0
+
+
+def test_display_list_fallback_when_curses_none(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """display_list falls back to plain table when curses is unavailable, even in a TTY."""
+    import imednet.cli.utils.grid as grid_mod
+
+    monkeypatch.setattr(grid_mod, "curses", None)
+    with (
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=True),
+        patch.dict("os.environ", {"TERM": "xterm-256color"}),
+    ):
+        items = [{"ID": 10, "Status": "Active"}]
+        display_list(items, "records")
+        captured = capfd.readouterr()
+        assert "Found 1 records:" in captured.out
+        assert "Active" in captured.out
+
+
+def test_records_list_cli_fallback_when_curses_none(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """records list falls back to plain table when curses is unavailable."""
+    import imednet.cli.utils.grid as grid_mod
+    from imednet import cli
+
+    monkeypatch.setattr(grid_mod, "curses", None)
+    with (
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=True),
+        patch.dict("os.environ", {"TERM": "xterm-256color"}),
+    ):
+        rec = Record.model_construct(
+            record_id=101,
+            subject_key="S-101",
+            form_key="VS",
+            record_status="Active",
+            record_data={"SYSBP": 120},
+        )
+        mock_sdk = MagicMock()
+        mock_sdk.records.list.return_value = [rec]
+        monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: mock_sdk)
+
+        cli.app(["records", "list", "STUDY"])
+        captured = capfd.readouterr()
+        assert "Found 1 records:" in captured.out
+        assert "S-101" in captured.out
+
+
+def test_records_list_cli_json_when_curses_none(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """records list with --format json succeeds without curses."""
+    import json
+
+    import imednet.cli.utils.grid as grid_mod
+    from imednet import cli
+
+    monkeypatch.setattr(grid_mod, "curses", None)
+    rec = Record.model_construct(
+        record_id=101,
+        subject_key="S-101",
+        form_key="VS",
+        record_status="Active",
+        record_data={"SYSBP": 120},
+    )
+    mock_sdk = MagicMock()
+    mock_sdk.records.list.return_value = [rec]
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: mock_sdk)
+
+    cli.app(["records", "list", "STUDY", "--format", "json"])
+    captured = capfd.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "records"
+    assert payload["count"] == 1
+
+
+def test_subjects_list_cli_fallback_when_curses_none(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """subjects list falls back to plain table when curses is unavailable."""
+    import imednet.cli.utils.grid as grid_mod
+    from imednet import cli
+
+    monkeypatch.setattr(grid_mod, "curses", None)
+    with (
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=True),
+        patch.dict("os.environ", {"TERM": "xterm-256color"}),
+    ):
+        subj = Subject.model_construct(
+            subject_key="S-202",
+            subject_status="Active",
+            site_name="Site A",
+            keywords=[],
+        )
+        mock_sdk = MagicMock()
+        mock_sdk.subjects.list.return_value = [subj]
+        monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: mock_sdk)
+
+        cli.app(["subjects", "list", "STUDY"])
+        captured = capfd.readouterr()
+        assert "Found 1 subjects:" in captured.out
+        assert "S-202" in captured.out
+
+
+def test_subjects_list_cli_json_when_curses_none(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """subjects list with --format json succeeds without curses."""
+    import json
+
+    import imednet.cli.utils.grid as grid_mod
+    from imednet import cli
+
+    monkeypatch.setattr(grid_mod, "curses", None)
+    subj = Subject.model_construct(
+        subject_key="S-202",
+        subject_status="Active",
+        site_name="Site A",
+        keywords=[],
+    )
+    mock_sdk = MagicMock()
+    mock_sdk.subjects.list.return_value = [subj]
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: mock_sdk)
+
+    cli.app(["subjects", "list", "STUDY", "--format", "json"])
+    captured = capfd.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "subjects"
+    assert payload["count"] == 1
