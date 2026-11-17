@@ -66,10 +66,14 @@ The object returned by the factory must satisfy
 least the following attributes (any type):
 
 * ``data_extraction``
+* ``duckdb_centralizer``
 * ``query_management``
 * ``record_mapper``
 * ``record_update``
+* ``register_subjects``
 * ``subject_data``
+* ``uat``
+* ``uat_inspector``
 
 Minimal working example
 -----------------------
@@ -96,10 +100,14 @@ Minimal working example
     class MyWorkflows:
         def __init__(self, sdk: "ImednetSDK") -> None:
             self.data_extraction = MyDataExtraction(sdk)
-            self.query_management = None   # implement as needed
+            self.duckdb_centralizer = None   # implement as needed
+            self.query_management = None
             self.record_mapper = None
             self.record_update = None
+            self.register_subjects = None
             self.subject_data = None
+            self.uat = None
+            self.uat_inspector = None
 
 
     def create_workflows(sdk: "ImednetSDK") -> MyWorkflows:
