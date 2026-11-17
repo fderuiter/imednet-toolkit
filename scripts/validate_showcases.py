@@ -147,7 +147,9 @@ def extract_literalinclude_slice(
     lines = target_content.splitlines(keepends=True)
     is_sliced = False
 
-    if "start-after" in options:
+    if "start-after" in options and "start-at" in options:
+        errors.append("Cannot use both 'start-after' and 'start-at' options")
+    elif "start-after" in options:
         is_sliced = True
         pattern = options["start-after"]
         found = False
@@ -171,7 +173,9 @@ def extract_literalinclude_slice(
         if not found:
             errors.append(f"start-at pattern '{pattern}' not found")
 
-    if "end-before" in options:
+    if "end-before" in options and "end-at" in options:
+        errors.append("Cannot use both 'end-before' and 'end-at' options")
+    elif "end-before" in options:
         is_sliced = True
         pattern = options["end-before"]
         found = False
@@ -205,19 +209,50 @@ def extract_literalinclude_slice(
                 if not item:
                     continue
                 if "-" in item:
+                    if item.count("-") > 1:
+                        raise ValueError(f"invalid range '{item}'")
                     start_str, end_str = item.split("-", 1)
+                    if not start_str.strip() and not end_str.strip():
+                        raise ValueError("empty range '-'")
                     s = int(start_str) if start_str.strip() else 1
                     e = int(end_str) if end_str.strip() else len(lines)
+                    if s > e:
+                        raise ValueError(f"invalid range '{s}-{e}': start exceeds end")
                     for i in range(s - 1, min(e, len(lines))):
-                        if i not in selected_indices:
+                        if i >= 0 and i not in selected_indices:
                             selected_indices.append(i)
                 else:
                     i = int(item) - 1
                     if 0 <= i < len(lines) and i not in selected_indices:
                         selected_indices.append(i)
+            if not selected_indices and lines:
+                errors.append(f"Line specification '{linespec}' pulled no lines from file")
             lines = [lines[i] for i in selected_indices]
         except ValueError as exc:
             errors.append(f"Invalid lines specification '{linespec}': {exc}")
+
+    if "dedent" in options:
+        is_sliced = True
+        dedent_val = options["dedent"]
+        if dedent_val:
+            try:
+                d = int(dedent_val)
+                if d < 0:
+                    errors.append(
+                        f"Invalid dedent specification '{dedent_val}': must be non-negative integer"
+                    )
+                else:
+                    new_lines: list[str] = []
+                    for line in lines:
+                        new_line = line[d:]
+                        if line.endswith("\n") and not new_line:
+                            new_line = "\n"
+                        new_lines.append(new_line)
+                    lines = new_lines
+            except ValueError:
+                errors.append(f"Invalid dedent specification '{dedent_val}': must be an integer")
+        else:
+            lines = textwrap.dedent("".join(lines)).splitlines(keepends=True)
 
     sliced_content = "".join(lines)
     if not errors and not sliced_content.strip():
@@ -226,15 +261,49 @@ def extract_literalinclude_slice(
     return sliced_content, is_sliced, errors
 
 
-def validate_python_slice(
+def validate_python_syntax(
     slice_text: str,
     target_name: str,
-    is_sliced: bool,
-) -> list[str]:
-    """Parse extracted slice as AST and verify syntax, executable calls, and function definitions.
+) -> tuple[ast.AST | None, list[str]]:
+    """Parse extracted code slice as AST and verify Python syntax validity.
+
+    All Python files and slices referenced in documentation must be syntactically valid Python.
 
     Args:
         slice_text: Code string extracted from the target file.
+        target_name: Name or path of the target file being validated.
+
+    Returns:
+        tuple[ast.AST | None, list[str]]: (Parsed AST tree if successful, error messages)
+    """
+    errors: list[str] = []
+    dedented = textwrap.dedent(slice_text)
+
+    try:
+        tree = ast.parse(dedented, filename=target_name)
+        return tree, errors
+    except SyntaxError as exc:
+        return None, [
+            f"Sliced code from '{target_name}' has syntax error: {exc.msg} (line {exc.lineno})"
+        ]
+
+
+def validate_quick_start_ast_structure(
+    tree: ast.AST,
+    target_name: str,
+    is_sliced: bool = True,
+) -> list[str]:
+    """Verify structural completeness for quick-start showcases: executable calls and function definitions.
+
+    Where the stronger requirement applies:
+    This stronger requirement applies specifically to quick-start showcase tutorials (e.g.
+    `docs/tutorials/quick_start.rst` and files targeting quick-start examples). Unlike general
+    documentation snippets which may be partial variable assignments or class stubs, quick-start
+    showcase slices must demonstrate a complete, executable workflow with function definitions
+    and call invocations to avoid documentation truncation.
+
+    Args:
+        tree: Parsed AST tree of the slice.
         target_name: Name or path of the target file being validated.
         is_sliced: True if slice boundaries (markers or line limits) were applied.
 
@@ -242,13 +311,6 @@ def validate_python_slice(
         list[str]: Validation error messages, or an empty list if valid.
     """
     errors: list[str] = []
-    dedented = textwrap.dedent(slice_text)
-
-    try:
-        tree = ast.parse(dedented, filename=target_name)
-    except SyntaxError as exc:
-        return [f"Sliced code from '{target_name}' has syntax error: {exc.msg} (line {exc.lineno})"]
-
     call_nodes = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     if not call_nodes:
         errors.append(f"Extracted slice from '{target_name}' contains zero executable call nodes")
@@ -264,8 +326,49 @@ def validate_python_slice(
     return errors
 
 
+def validate_python_slice(
+    slice_text: str,
+    target_name: str,
+    is_sliced: bool = False,
+    *,
+    is_quick_start: bool = False,
+) -> list[str]:
+    """Parse extracted slice as AST and verify syntax, with optional quick-start structural checks.
+
+    Args:
+        slice_text: Code string extracted from the target file.
+        target_name: Name or path of the target file being validated.
+        is_sliced: True if slice boundaries (markers or line limits) were applied.
+        is_quick_start: If True, enforce stronger quick-start requirements
+            (executable function definitions and call nodes). General Python documentation
+            snippets only require valid syntax.
+
+    Returns:
+        list[str]: Validation error messages, or an empty list if valid.
+    """
+    tree, errors = validate_python_syntax(slice_text, target_name)
+    if errors or tree is None:
+        return errors
+
+    if is_quick_start:
+        errors.extend(validate_quick_start_ast_structure(tree, target_name, is_sliced=is_sliced))
+
+    return errors
+
+
 def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
-    """Verify all documentation literal includes exist on disk and extracted slices parse as valid AST."""
+    """Verify all documentation literal includes exist on disk and extracted slices parse as valid AST.
+
+    Slicing semantics mirror Sphinx's `literalinclude` directive (supporting `start-after`,
+    `start-at`, `end-before`, `end-at`, `lines`, and `dedent`).
+
+    Python validation applies at two tiers:
+    1. Syntax validity: All included Python slices across all documentation pages must parse
+       as syntactically valid Python code without syntax errors.
+    2. Quick-start showcase completeness: Quick-start tutorials (`quick_start.rst` and
+       quick-start targets) are additionally verified to contain executable function
+       definitions and call invocations, preventing showcase truncation.
+    """
     errors: list[str] = []
     if not docs_dir.exists():
         return [f"Documentation directory not found: {docs_dir}"]
@@ -350,10 +453,16 @@ def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
 
             is_python = resolved.suffix == ".py" or options.get("language") in ("python", "py")
             if is_python:
+                # Stronger structural expectation (executable function definitions and calls)
+                # applies specifically to quick-start showcase documents or targets.
+                is_quick_start = (
+                    "quick_start" in doc_file.name.lower() or "quick_start" in target.lower()
+                )
                 slice_validation_errs = validate_python_slice(
                     slice_text=slice_text,
                     target_name=target,
                     is_sliced=is_sliced,
+                    is_quick_start=is_quick_start,
                 )
                 for v_err in slice_validation_errs:
                     errors.append(f"{doc_file}:{lineno}: {v_err}")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 from scripts.validate_showcases import (
@@ -13,9 +14,28 @@ from scripts.validate_showcases import (
     stage_wheels,
     validate_documentation_literal_includes,
     validate_python_slice,
+    validate_python_syntax,
+    validate_quick_start_ast_structure,
     validate_showcase_ast_and_imports,
     validate_staged_wheels,
 )
+from sphinx.config import Config
+from sphinx.directives.code import LiteralIncludeReader
+
+
+def _extract_with_sphinx(
+    tmp_path: Path, filename: str, content: str, options: dict[str, Any]
+) -> tuple[str, bool, str]:
+    """Helper to extract slice using Sphinx's LiteralIncludeReader for differential testing."""
+    target_file = tmp_path / filename
+    target_file.write_text(content, encoding="utf-8")
+    cfg = Config({}, {})
+    try:
+        reader = LiteralIncludeReader(str(target_file), options, cfg)
+        text, _ = reader.read()
+        return text, True, ""
+    except Exception as exc:
+        return "", False, f"{type(exc).__name__}: {exc}"
 
 
 def test_repo_showcases_and_docs_pass() -> None:
@@ -304,7 +324,7 @@ def test_literalinclude_slice_syntax_error_detection(tmp_path: Path) -> None:
 
 
 def test_literalinclude_slice_zero_call_nodes_detection(tmp_path: Path) -> None:
-    """Verify that extracted slices without executable call nodes are flagged."""
+    """Verify that quick-start slices without executable call nodes are flagged."""
     docs_dir = tmp_path / "docs"
     examples_dir = tmp_path / "examples"
     docs_dir.mkdir(parents=True)
@@ -316,7 +336,7 @@ def test_literalinclude_slice_zero_call_nodes_detection(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    doc_file = docs_dir / "index.rst"
+    doc_file = docs_dir / "quick_start.rst"
     doc_file.write_text(
         ".. literalinclude:: /../examples/no_calls.py\n"
         "   :language: python\n"
@@ -330,7 +350,7 @@ def test_literalinclude_slice_zero_call_nodes_detection(tmp_path: Path) -> None:
 
 
 def test_literalinclude_slice_missing_function_definition_detection(tmp_path: Path) -> None:
-    """Verify that sliced showcases missing executable function definitions are flagged."""
+    """Verify that sliced quick-start showcases missing function definitions are flagged."""
     docs_dir = tmp_path / "docs"
     examples_dir = tmp_path / "examples"
     docs_dir.mkdir(parents=True)
@@ -342,7 +362,7 @@ def test_literalinclude_slice_missing_function_definition_detection(tmp_path: Pa
         encoding="utf-8",
     )
 
-    doc_file = docs_dir / "index.rst"
+    doc_file = docs_dir / "quick_start.rst"
     doc_file.write_text(
         ".. literalinclude:: /../examples/no_func.py\n"
         "   :language: python\n"
@@ -353,6 +373,34 @@ def test_literalinclude_slice_missing_function_definition_detection(tmp_path: Pa
 
     errors = validate_documentation_literal_includes(docs_dir)
     assert any("contains zero executable function definitions" in e for e in errors)
+
+
+def test_literalinclude_general_doc_slice_syntax_only_passes(tmp_path: Path) -> None:
+    """Verify that non-quick-start docs pass syntax validation without requiring function defs or calls."""
+    docs_dir = tmp_path / "docs"
+    examples_dir = tmp_path / "examples"
+    docs_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    example_target = examples_dir / "config_sample.py"
+    example_target.write_text(
+        "# [start_cfg]\nAPI_TIMEOUT = 30\nDEFAULT_RETRY = 3\n# [end_cfg]\n",
+        encoding="utf-8",
+    )
+
+    doc_file = docs_dir / "config_reference.rst"
+    doc_file.write_text(
+        ".. literalinclude:: /../examples/config_sample.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start_cfg]\n"
+        "   :end-before: # [end_cfg]\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert not errors, (
+        f"Expected non-quick-start doc slice to pass syntax-only check, got: {errors}"
+    )
 
 
 def test_literalinclude_valid_slice_passes(tmp_path: Path) -> None:
@@ -420,18 +468,276 @@ def test_extract_literalinclude_slice_options() -> None:
 
 
 def test_validate_python_slice_helper() -> None:
-    """Verify validate_python_slice returns expected errors for invalid snippets."""
-    # Syntax error
+    """Verify validate_python_slice distinguishes syntax validity from quick-start expectations."""
+    # Syntax error is always flagged
     errs = validate_python_slice("def broken(", "target.py", is_sliced=True)
     assert any("has syntax error" in e for e in errs)
 
-    # Missing call nodes
-    errs = validate_python_slice("x = 1\ny = 2\n", "target.py", is_sliced=False)
-    assert any("contains zero executable call nodes" in e for e in errs)
+    # Pure variables pass when is_quick_start=False
+    general_errs = validate_python_slice(
+        "x = 1\ny = 2\n", "target.py", is_sliced=False, is_quick_start=False
+    )
+    assert not general_errs
 
-    # Missing function definition when sliced
-    errs = validate_python_slice("print('call only')\n", "target.py", is_sliced=True)
-    assert any("contains zero executable function definitions" in e for e in errs)
+    # Pure variables fail call check when is_quick_start=True
+    qs_errs = validate_python_slice(
+        "x = 1\ny = 2\n", "target.py", is_sliced=False, is_quick_start=True
+    )
+    assert any("contains zero executable call nodes" in e for e in qs_errs)
+
+    # Sliced calls without function def fail when is_quick_start=True
+    func_errs = validate_python_slice(
+        "print('call only')\n", "target.py", is_sliced=True, is_quick_start=True
+    )
+    assert any("contains zero executable function definitions" in e for e in func_errs)
+
+    # Direct validation of syntax and quick-start helpers
+    tree, syntax_errs = validate_python_syntax("x = 1\n", "target.py")
+    assert not syntax_errs
+    assert tree is not None
+
+    qs_struct_errs = validate_quick_start_ast_structure(tree, "target.py", is_sliced=False)
+    assert any("contains zero executable call nodes" in e for e in qs_struct_errs)
+
+
+SAMPLE_MULTI_LINE = (
+    '"""Showcase sample file."""\n'
+    "import os\n"
+    "\n"
+    "# [start_demo]\n"
+    "def run_sample() -> None:\n"
+    "    print('sample executed')\n"
+    "# [end_demo]\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    run_sample()\n"
+)
+
+
+def test_sphinx_parity_start_after_end_before(tmp_path: Path) -> None:
+    """Compare start-after and end-before extraction with Sphinx LiteralIncludeReader."""
+    options = {"start-after": "# [start_demo]", "end-before": "# [end_demo]"}
+    sphinx_out, sphinx_ok, sphinx_err = _extract_with_sphinx(
+        tmp_path, "sample.py", SAMPLE_MULTI_LINE, options
+    )
+    assert sphinx_ok, f"Sphinx extraction failed: {sphinx_err}"
+
+    custom_out, is_sliced, custom_errs = extract_literalinclude_slice(SAMPLE_MULTI_LINE, options)
+    assert not custom_errs
+    assert is_sliced is True
+    assert custom_out == sphinx_out
+
+
+def test_sphinx_parity_start_at_end_at(tmp_path: Path) -> None:
+    """Compare start-at and end-at extraction with Sphinx LiteralIncludeReader."""
+    options = {"start-at": "# [start_demo]", "end-at": "# [end_demo]"}
+    sphinx_out, sphinx_ok, sphinx_err = _extract_with_sphinx(
+        tmp_path, "sample.py", SAMPLE_MULTI_LINE, options
+    )
+    assert sphinx_ok, f"Sphinx extraction failed: {sphinx_err}"
+
+    custom_out, is_sliced, custom_errs = extract_literalinclude_slice(SAMPLE_MULTI_LINE, options)
+    assert not custom_errs
+    assert is_sliced is True
+    assert custom_out == sphinx_out
+
+
+def test_sphinx_parity_line_ranges(tmp_path: Path) -> None:
+    """Compare closed and open line ranges with Sphinx LiteralIncludeReader."""
+    test_specs = [
+        "2-4",
+        "-3",
+        "4-",
+        "1, 3-4, 6-",
+    ]
+    for linespec in test_specs:
+        options = {"lines": linespec}
+        clean_name = f"sample_{linespec.replace(',', '_').replace(' ', '_').replace('-', '_')}.py"
+        sphinx_out, sphinx_ok, sphinx_err = _extract_with_sphinx(
+            tmp_path, clean_name, SAMPLE_MULTI_LINE, options
+        )
+        assert sphinx_ok, f"Sphinx extraction failed for '{linespec}': {sphinx_err}"
+
+        custom_out, is_sliced, custom_errs = extract_literalinclude_slice(
+            SAMPLE_MULTI_LINE, options
+        )
+        assert not custom_errs, f"Custom extractor returned errors for '{linespec}': {custom_errs}"
+        assert is_sliced is True
+        assert custom_out == sphinx_out, f"Mismatch for linespec '{linespec}'"
+
+
+def test_sphinx_parity_supported_combinations(tmp_path: Path) -> None:
+    """Compare combined slice options (markers + lines + dedent) with Sphinx."""
+    combo_options = [
+        {"start-after": "# [start_demo]", "end-before": "# [end_demo]", "lines": "1-2"},
+        {"start-at": "# [start_demo]", "end-at": "# [end_demo]", "lines": "2-3"},
+        {"start-after": "# [start_demo]", "end-before": "# [end_demo]", "dedent": "4"},
+        {"start-after": "# [start_demo]", "end-before": "# [end_demo]", "dedent": ""},
+    ]
+    for idx, options in enumerate(combo_options):
+        sphinx_opts = dict(options)
+        if "dedent" in sphinx_opts:
+            val = sphinx_opts["dedent"]
+            sphinx_opts["dedent"] = int(val) if val else None
+        sphinx_out, sphinx_ok, sphinx_err = _extract_with_sphinx(
+            tmp_path, f"combo_{idx}.py", SAMPLE_MULTI_LINE, sphinx_opts
+        )
+        assert sphinx_ok, f"Sphinx extraction failed for {options}: {sphinx_err}"
+
+        custom_out, is_sliced, custom_errs = extract_literalinclude_slice(
+            SAMPLE_MULTI_LINE, options
+        )
+        assert not custom_errs, f"Custom errors for {options}: {custom_errs}"
+        assert is_sliced is True
+        assert custom_out == sphinx_out, f"Mismatch for {options}"
+
+
+def test_sphinx_parity_dedent_handling(tmp_path: Path) -> None:
+    """Compare indentation and dedent handling against Sphinx."""
+    indented_text = "def outer():\n    def inner():\n        value = 100\n        return value\n"
+    # Explicit numeric dedent
+    sphinx_out, sphinx_ok, _ = _extract_with_sphinx(
+        tmp_path, "indented.py", indented_text, {"lines": "2-4", "dedent": 4}
+    )
+    assert sphinx_ok
+    custom_out, _, errs = extract_literalinclude_slice(
+        indented_text, {"lines": "2-4", "dedent": "4"}
+    )
+    assert not errs
+    assert custom_out == sphinx_out
+
+    # Auto common-whitespace dedent
+    sphinx_auto, sphinx_auto_ok, _ = _extract_with_sphinx(
+        tmp_path, "indented_auto.py", indented_text, {"lines": "2-4", "dedent": None}
+    )
+    assert sphinx_auto_ok
+    custom_auto, _, auto_errs = extract_literalinclude_slice(
+        indented_text, {"lines": "2-4", "dedent": ""}
+    )
+    assert not auto_errs
+    assert custom_auto == sphinx_auto
+
+
+def test_sphinx_parity_repeated_markers(tmp_path: Path) -> None:
+    """Compare repeated marker selection against Sphinx (first occurrences selected)."""
+    repeated_content = (
+        "# [marker]\nblock1 = True\n# [stop]\ngap = 1\n# [marker]\nblock2 = False\n# [stop]\n"
+    )
+    options = {"start-after": "# [marker]", "end-before": "# [stop]"}
+    sphinx_out, sphinx_ok, _ = _extract_with_sphinx(
+        tmp_path, "repeated.py", repeated_content, options
+    )
+    assert sphinx_ok
+
+    custom_out, _, errs = extract_literalinclude_slice(repeated_content, options)
+    assert not errs
+    assert custom_out == sphinx_out
+    assert custom_out == "block1 = True\n"
+
+
+def test_sphinx_parity_adjacent_markers_error(tmp_path: Path) -> None:
+    """Verify that adjacent markers produce actionable error matching Sphinx rejection."""
+    adjacent_content = "header = 1\n# [marker]\n# [stop]\ntail = 2\n"
+    options = {"start-after": "# [marker]", "end-before": "# [stop]"}
+    _, sphinx_ok, sphinx_err = _extract_with_sphinx(
+        tmp_path, "adjacent.py", adjacent_content, options
+    )
+    assert not sphinx_ok
+    assert "end-before pattern not found" in sphinx_err
+
+    _, _, errs = extract_literalinclude_slice(adjacent_content, options)
+    assert any("end-before pattern '# [stop]' not found" in e for e in errs)
+
+
+def test_sphinx_parity_missing_markers_diagnostics(tmp_path: Path) -> None:
+    """Verify that missing markers produce actionable diagnostics without uncaught exceptions."""
+    content = "line1\nline2\n"
+    # start-after missing
+    _, sphinx_ok1, _ = _extract_with_sphinx(
+        tmp_path, "m1.py", content, {"start-after": "# [missing]"}
+    )
+    assert not sphinx_ok1
+    _, _, errs1 = extract_literalinclude_slice(content, {"start-after": "# [missing]"})
+    assert any("start-after pattern '# [missing]' not found" in e for e in errs1)
+
+    # start-at missing
+    _, sphinx_ok2, _ = _extract_with_sphinx(tmp_path, "m2.py", content, {"start-at": "# [missing]"})
+    assert not sphinx_ok2
+    _, _, errs2 = extract_literalinclude_slice(content, {"start-at": "# [missing]"})
+    assert any("start-at pattern '# [missing]' not found" in e for e in errs2)
+
+    # end-before missing
+    content_with_start = "# [start]\nline2\n"
+    _, sphinx_ok3, _ = _extract_with_sphinx(
+        tmp_path,
+        "m3.py",
+        content_with_start,
+        {"start-after": "# [start]", "end-before": "# [missing]"},
+    )
+    assert not sphinx_ok3
+    _, _, errs3 = extract_literalinclude_slice(
+        content_with_start, {"start-after": "# [start]", "end-before": "# [missing]"}
+    )
+    assert any("end-before pattern '# [missing]' not found" in e for e in errs3)
+
+    # end-at missing
+    _, sphinx_ok4, _ = _extract_with_sphinx(
+        tmp_path, "m4.py", content_with_start, {"start-after": "# [start]", "end-at": "# [missing]"}
+    )
+    assert not sphinx_ok4
+    _, _, errs4 = extract_literalinclude_slice(
+        content_with_start, {"start-after": "# [start]", "end-at": "# [missing]"}
+    )
+    assert any("end-at pattern '# [missing]' not found" in e for e in errs4)
+
+
+def test_sphinx_parity_out_of_range_lines_diagnostics(tmp_path: Path) -> None:
+    """Verify that out-of-range lines specifications produce actionable diagnostics."""
+    content = "line1\nline2\nline3\n"
+    options = {"lines": "50-100"}
+    _, sphinx_ok, sphinx_err = _extract_with_sphinx(tmp_path, "oor.py", content, options)
+    assert not sphinx_ok
+    assert "no lines pulled" in sphinx_err.lower()
+
+    _, _, errs = extract_literalinclude_slice(content, options)
+    assert any("pulled no lines" in e for e in errs)
+
+
+def test_actionable_diagnostics_on_invalid_options() -> None:
+    """Verify that mutually exclusive options and malformed parameters yield actionable diagnostics."""
+    content = "line1\nline2\nline3\n"
+
+    # Conflicting start options
+    _, _, errs_start = extract_literalinclude_slice(
+        content, {"start-after": "line1", "start-at": "line1"}
+    )
+    assert any("Cannot use both 'start-after' and 'start-at'" in e for e in errs_start)
+
+    # Conflicting end options
+    _, _, errs_end = extract_literalinclude_slice(
+        content, {"end-before": "line2", "end-at": "line2"}
+    )
+    assert any("Cannot use both 'end-before' and 'end-at'" in e for e in errs_end)
+
+    # Inverted line range
+    _, _, errs_range = extract_literalinclude_slice(content, {"lines": "5-2"})
+    assert any("start exceeds end" in e for e in errs_range)
+
+    # Malformed non-numeric line range
+    _, _, errs_malformed = extract_literalinclude_slice(content, {"lines": "abc"})
+    assert any("Invalid lines specification 'abc'" in e for e in errs_malformed)
+
+    # Empty range '-'
+    _, _, errs_dash = extract_literalinclude_slice(content, {"lines": "-"})
+    assert any("empty range '-'" in e for e in errs_dash)
+
+    # Invalid non-numeric dedent
+    _, _, errs_dedent = extract_literalinclude_slice(content, {"dedent": "abc"})
+    assert any("Invalid dedent specification 'abc'" in e for e in errs_dedent)
+
+    # Negative dedent
+    _, _, errs_neg_dedent = extract_literalinclude_slice(content, {"dedent": "-2"})
+    assert any("must be non-negative integer" in e for e in errs_neg_dedent)
 
 
 def test_validate_staged_wheels_scrubs_coverage_env_vars(
