@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from imednet import cli
-from imednet.models import Record, Study, Subject
+from imednet.models import Coding, Record, Study, Subject, User
 from imednet.models.jobs import JobStatus
 
 
@@ -27,6 +27,8 @@ def sdk(monkeypatch):
             Record(recordId=1, recordData={"value": 0, "flag": False, "empty": None}),
         ),
         (["subjects", "list", "S"], "subjects", Subject(subjectKey="SUB")),
+        (["users", "list", "S"], "users", User(userId="U1", login="jdoe", userActiveInStudy=True)),
+        (["codings", "list", "S"], "codings", Coding(codingId="C1", dictionaryName="MedDRA")),
     ],
 )
 def test_single_json_result_preserves_values(sdk, capsys, command, attr, model):
@@ -56,6 +58,8 @@ def test_single_json_result_preserves_values(sdk, capsys, command, attr, model):
         "subjects",
         "intervals",
         "visits",
+        "users",
+        "codings",
     ],
 )
 def test_empty_core_list_json(sdk, capsys, resource):
