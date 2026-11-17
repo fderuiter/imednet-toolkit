@@ -20,12 +20,14 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
 
    imednet studies list --format json
    imednet subjects list STUDY --filter subject_status=Screened --format json
+   imednet users list STUDY --include-inactive --format json
+   imednet codings list STUDY -f dictionaryName=MedDRA --format json
    imednet records list STUDY --format json
    imednet jobs status STUDY BATCH --format json
    imednet jobs wait STUDY BATCH --timeout 60 --format json
 
 Supported core list resources are studies, queries, variables, record-revisions,
-sites, records, subjects, intervals, and visits. Core JSON reads emit exactly one envelope
+sites, records, subjects, intervals, visits, codings, and users. Core JSON reads emit exactly one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items``. Empty results use an empty items array. Item fields use the SDK models'
 JSON aliases; the JSON view includes model fields beyond the human summary table.

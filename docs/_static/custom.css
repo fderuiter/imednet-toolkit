@@ -282,7 +282,7 @@ body[data-theme="dark"] .role-card:hover {
 
 .thebelab-run-button {
     background-color: var(--color-brand-primary, #005fb8);
-    color: #ffffff;
+    color: var(--color-brand-btn-text, #ffffff);
     border-color: transparent;
 }
 
@@ -329,8 +329,8 @@ body[data-theme="dark"] .role-card:hover {
 
 .thebe-stderr {
     background-color: rgba(207, 34, 46, 0.08);
-    color: #cf222e;
-    border-left: 3px solid #cf222e;
+    color: var(--color-status-danger, #b91c1c);
+    border-left: 3px solid var(--color-status-danger, #b91c1c);
 }
 
 .thebe-result {

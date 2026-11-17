@@ -1,9 +1,14 @@
 """CLI utility functions and classes."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 from .args import STUDY_KEY_ARG, parse_filter_args
 from .commands import register_list_command
 from .context import fetching_status, get_sdk
 from .output import (
+    _HC_STATUS_COLOR_MAP,
     _STATUS_COLOR_MAP,
     _format_cell_value,
     _truncate,
@@ -12,16 +17,43 @@ from .output import (
     print_error,
 )
 
+if TYPE_CHECKING:
+    from .grid import InteractiveDataGrid, is_interactive_terminal, run_interactive_grid
+
 __all__ = [
     "STUDY_KEY_ARG",
+    "_HC_STATUS_COLOR_MAP",
     "_STATUS_COLOR_MAP",
+    "InteractiveDataGrid",
     "_format_cell_value",
     "_truncate",
     "console",
     "display_list",
     "fetching_status",
     "get_sdk",
+    "is_interactive_terminal",
     "parse_filter_args",
     "print_error",
     "register_list_command",
+    "run_interactive_grid",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily load interactive grid symbols so standard CLI startup avoids importing curses."""
+    if name in ("InteractiveDataGrid", "is_interactive_terminal", "run_interactive_grid"):
+        try:
+            from . import grid
+
+            return getattr(grid, name)
+        except (ImportError, AttributeError):
+            if name == "is_interactive_terminal":
+                return lambda: False
+            if name == "run_interactive_grid":
+                return lambda *args, **kwargs: False
+            raise
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(list(globals().keys()) + __all__)

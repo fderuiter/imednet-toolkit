@@ -51,6 +51,7 @@ def get_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
+    from .codings import setup_parser as codings_setup
     from .datadict import setup_parser as datadict_setup
     from .export import setup_parser as export_setup
     from .forms import setup_parser as forms_setup
@@ -62,6 +63,7 @@ def get_parser() -> argparse.ArgumentParser:
     from .sites import setup_parser as sites_setup
     from .studies import setup_parser as studies_setup
     from .subjects import setup_parser as subjects_setup
+    from .users import setup_parser as users_setup
     from .variables import setup_parser as variables_setup
     from .visits import setup_parser as visits_setup
 
@@ -78,6 +80,8 @@ def get_parser() -> argparse.ArgumentParser:
     records_setup(subparsers)
     forms_setup(subparsers)
     visits_setup(subparsers)
+    codings_setup(subparsers)
+    users_setup(subparsers)
 
     import importlib.metadata
 

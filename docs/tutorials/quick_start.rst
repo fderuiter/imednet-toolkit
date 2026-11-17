@@ -41,8 +41,8 @@ Synchronous Example
 
 .. literalinclude:: /../examples/quick_start.py
    :language: python
-   :start-after: """
-   :end-before: """
+   :start-after: # [start_quick_start]
+   :end-before: # [end_quick_start]
 
 
 Asynchronous Example
@@ -50,8 +50,8 @@ Asynchronous Example
 
 .. literalinclude:: /../examples/async_quick_start.py
    :language: python
-   :start-after: """
-   :end-before: """
+   :start-after: # [start_async_quick_start]
+   :end-before: # [end_async_quick_start]
 
 
 Custom retry logic can be provided via a ``RetryPolicy``:

@@ -54,7 +54,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 }
             )
 
-        display_list(view_models, "subjects", "No subjects found matching the criteria.")
+        display_list(
+            view_models,
+            "subjects",
+            "No subjects found matching the criteria.",
+            details=subjects_list,
+        )
 
     list_parser.set_defaults(
         func=lambda args: list_subjects(

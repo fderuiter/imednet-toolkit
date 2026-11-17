@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from imednet import cli
-from imednet.models import Record, Study, Subject
+from imednet.models import Coding, Record, Study, Subject, User
 from imednet.models.jobs import JobStatus
 
 
@@ -27,6 +27,8 @@ def sdk(monkeypatch):
             Record(recordId=1, recordData={"value": 0, "flag": False, "empty": None}),
         ),
         (["subjects", "list", "S"], "subjects", Subject(subjectKey="SUB")),
+        (["users", "list", "S"], "users", User(userId="U1", login="jdoe", userActiveInStudy=True)),
+        (["codings", "list", "S"], "codings", Coding(codingId="C1", dictionaryName="MedDRA")),
     ],
 )
 def test_single_json_result_preserves_values(sdk, capsys, command, attr, model):
@@ -56,6 +58,8 @@ def test_single_json_result_preserves_values(sdk, capsys, command, attr, model):
         "subjects",
         "intervals",
         "visits",
+        "users",
+        "codings",
     ],
 )
 def test_empty_core_list_json(sdk, capsys, resource):
@@ -153,6 +157,66 @@ def test_console_entrypoint_with_offline_simulation():
     assert response["schemaVersion"] == "1.0" and response["resource"] == "studies"
     assert response["count"] == len(response["items"])
     assert "Fetching" not in process.stdout
+
+
+def test_users_and_codings_json_complete_aliases_and_no_contamination(sdk, capsys):
+    """Verify complete JSON aliases, values, and zero output contamination for users and codings."""
+    from imednet.models.codings import Coding
+    from imednet.models.users import Role, User
+
+    user = User.model_validate(
+        {
+            "userId": "U-JSON-1",
+            "login": "jdoe_json",
+            "firstName": "John",
+            "lastName": "Doe",
+            "email": "jdoe@example.com",
+            "userActiveInStudy": True,
+            "roles": [Role.model_validate({"roleId": "R-1", "name": "Auditor"})],
+        }
+    )
+    sdk.users.list.return_value = [user]
+
+    cli.app(["users", "list", "STUDY-JSON", "--include-inactive", "--format", "json"])
+    captured_users = capsys.readouterr()
+    assert captured_users.err == ""
+    # Ensure raw output is valid JSON without extraneous text prefix or suffix
+    user_payload = json.loads(captured_users.out)
+    assert user_payload["schemaVersion"] == "1.0"
+    assert user_payload["status"] == "complete"
+    assert user_payload["resource"] == "users"
+    assert user_payload["count"] == 1
+    assert user_payload["items"][0]["userId"] == "U-JSON-1"
+    assert user_payload["items"][0]["login"] == "jdoe_json"
+    assert user_payload["items"][0]["userActiveInStudy"] is True
+    assert user_payload["items"][0]["name"] == "John Doe"
+
+    coding = Coding.model_validate(
+        {
+            "codingId": "COD-JSON-1",
+            "dictionaryName": "MedDRA",
+            "dictionaryVersion": "26.1",
+            "variable": "AETERM",
+            "value": "Pyrexia",
+            "code": "10037660",
+        }
+    )
+    sdk.codings.list.return_value = [coding]
+
+    cli.app(["codings", "list", "STUDY-JSON", "-f", "dictionaryName=MedDRA", "--format", "json"])
+    captured_codings = capsys.readouterr()
+    assert captured_codings.err == ""
+    coding_payload = json.loads(captured_codings.out)
+    assert coding_payload["schemaVersion"] == "1.0"
+    assert coding_payload["status"] == "complete"
+    assert coding_payload["resource"] == "codings"
+    assert coding_payload["count"] == 1
+    assert coding_payload["items"][0]["codingId"] == "COD-JSON-1"
+    assert coding_payload["items"][0]["dictionaryName"] == "MedDRA"
+    assert coding_payload["items"][0]["dictionaryVersion"] == "26.1"
+    assert coding_payload["items"][0]["variable"] == "AETERM"
+    assert coding_payload["items"][0]["value"] == "Pyrexia"
+    assert coding_payload["items"][0]["code"] == "10037660"
 
 
 @pytest.mark.parametrize("command", ["status", "wait"])
