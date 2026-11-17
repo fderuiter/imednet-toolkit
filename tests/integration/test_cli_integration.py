@@ -143,3 +143,89 @@ def test_invalid_filter_string(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result.exit_code == 1
     assert "Invalid filter format" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["users", "list", "ST"],
+        ["codings", "list", "ST"],
+    ],
+)
+def test_cli_rejects_missing_credentials_users_and_codings(
+    cmd: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that users and codings commands exit with status 1 on missing credentials."""
+    runner = CliRunner()
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    result = runner.invoke(cli.app, cmd)
+
+    assert result.exit_code == 1
+    assert "IMEDNET_API_KEY" in result.stderr
+
+
+def test_users_list_returns_active_and_inactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that imednet users list <study_key> --include-inactive returns active and inactive accounts."""
+    runner = CliRunner()
+    monkeypatch.setenv("IMEDNET_API_KEY", "k")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "s")
+
+    user_active = MagicMock()
+    user_active.user_id = "U_ACT"
+    user_active.name = "Active User"
+    user_active.status = "active"
+    user_active.user_active_in_study = True
+    user_active.login = "uact"
+    user_active.email = "uact@example.com"
+    user_active.roles = []
+
+    user_inactive = MagicMock()
+    user_inactive.user_id = "U_INACT"
+    user_inactive.name = "Inactive User"
+    user_inactive.status = "inactive"
+    user_inactive.user_active_in_study = False
+    user_inactive.login = "uinact"
+    user_inactive.email = "uinact@example.com"
+    user_inactive.roles = []
+
+    sdk = MagicMock()
+    sdk.users.list.return_value = [user_active, user_inactive]
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=sdk))
+
+    result = runner.invoke(cli.app, ["users", "list", "STUDY_AUDIT", "--include-inactive"])
+
+    assert result.exit_code == 0
+    sdk.users.list.assert_called_once_with("STUDY_AUDIT", include_inactive=True)
+    assert "U_ACT" in result.stdout
+    assert "U_INACT" in result.stdout
+
+
+def test_codings_list_sends_filter_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that imednet codings list <study_key> -f dictionaryName=MedDRA passes filter criteria."""
+    runner = CliRunner()
+    monkeypatch.setenv("IMEDNET_API_KEY", "k")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "s")
+
+    coding_entry = MagicMock()
+    coding_entry.coding_id = "COD_100"
+    coding_entry.dictionary_name = "MedDRA"
+    coding_entry.dictionary_version = "26.0"
+    coding_entry.variable = "AETERM"
+    coding_entry.value = "Nausea"
+    coding_entry.code = "10028813"
+
+    sdk = MagicMock()
+    sdk.codings.list.return_value = [coding_entry]
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=sdk))
+
+    result = runner.invoke(
+        cli.app,
+        ["codings", "list", "STUDY_CLIN", "-f", "dictionaryName=MedDRA"],
+    )
+
+    assert result.exit_code == 0
+    sdk.codings.list.assert_called_once_with("STUDY_CLIN", dictionaryName="MedDRA")
+    assert "COD_100" in result.stdout
+    assert "MedDRA" in result.stdout

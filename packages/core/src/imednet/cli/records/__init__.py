@@ -54,7 +54,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                         "Created": r.date_created,
                     }
                 )
-            display_list(view_models, "records", "No records found.")
+            display_list(view_models, "records", "No records found.", details=records)
 
     list_parser.set_defaults(
         func=lambda args: list_records(

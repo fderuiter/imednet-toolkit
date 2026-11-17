@@ -186,6 +186,58 @@ def test_vpat_document_conformance() -> None:
 
 
 @pytest.mark.unit
+def test_interactive_cells_contrast() -> None:
+    """Verify interactive code cells meet WCAG AA (>= 4.5:1) in both themes."""
+    light_vars = html_theme_options.get("light_css_variables", {})
+    dark_vars = html_theme_options.get("dark_css_variables", {})
+
+    # Run button contrast in light mode
+    light_btn_bg = light_vars["color-brand-primary"]
+    light_btn_text = light_vars["color-brand-btn-text"]
+    light_btn_ratio = contrast_ratio(light_btn_text, light_btn_bg)
+    assert light_btn_ratio >= 4.5, f"Light mode run button contrast {light_btn_ratio:.2f}:1 < 4.5:1"
+
+    # Run button contrast in dark mode
+    dark_btn_bg = dark_vars["color-brand-primary"]
+    dark_btn_text = dark_vars["color-brand-btn-text"]
+    dark_btn_ratio = contrast_ratio(dark_btn_text, dark_btn_bg)
+    assert dark_btn_ratio >= 4.5, f"Dark mode run button contrast {dark_btn_ratio:.2f}:1 < 4.5:1"
+
+    # Stderr contrast in light mode (8% tint over white page)
+    light_stderr_color = light_vars["color-status-danger"]
+    light_stderr_bg = blend_tint("#cf222e", 0.08, "#ffffff")
+    light_err_ratio = contrast_ratio(light_stderr_color, light_stderr_bg)
+    assert light_err_ratio >= 4.5, f"Light mode stderr contrast {light_err_ratio:.2f}:1 < 4.5:1"
+
+    # Stderr contrast in dark mode (8% tint over dark container backgrounds #131416 and #1a1c1e)
+    dark_stderr_color = dark_vars["color-status-danger"]
+    for container_bg in ["#131416", "#1a1c1e"]:
+        dark_stderr_bg = blend_tint("#cf222e", 0.08, container_bg)
+        dark_err_ratio = contrast_ratio(dark_stderr_color, dark_stderr_bg)
+        assert dark_err_ratio >= 4.5, (
+            f"Dark mode stderr contrast {dark_err_ratio:.2f}:1 on {container_bg} < 4.5:1"
+        )
+
+
+@pytest.mark.unit
+def test_interactive_cells_token_bindings() -> None:
+    """Verify custom.css binds interactive cells to semantic tokens and js has no inline color."""
+    css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
+    js_content = (REPO_ROOT / "docs/_static/thebe_pyodide.js").read_text(encoding="utf-8")
+
+    # Ensure custom.css binds run button to --color-brand-btn-text
+    assert "var(--color-brand-btn-text" in css_content
+
+    # Ensure custom.css binds .thebe-stderr to --color-status-danger
+    assert "var(--color-status-danger" in css_content
+
+    # Ensure hardcoded inaccessible #cf222e is removed from both custom.css and thebe_pyodide.js
+    assert "#cf222e" not in css_content, "Deprecated hardcoded #cf222e found in custom.css"
+    assert "errPre.style.color" not in js_content, "Inline style override found in thebe_pyodide.js"
+    assert "#cf222e" not in js_content, "Deprecated hardcoded #cf222e found in thebe_pyodide.js"
+
+
+@pytest.mark.unit
 def test_role_card_button_accessible_names_satisfy_wcag_2_5_3() -> None:
     """Verify role card buttons satisfy WCAG 2.2 SC 2.5.3 (Label in Name) and Technique G208.
 

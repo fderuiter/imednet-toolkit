@@ -205,6 +205,303 @@ def test_subjects_list_api_error(runner: CliRunner, sdk: MagicMock) -> None:
     assert "API Error" not in result.stdout
 
 
+def test_users_list_default_inactive_false(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that users list defaults to include_inactive=False."""
+    mock_user = MagicMock()
+    mock_user.user_id = "U1"
+    mock_user.name = "John Doe"
+    mock_user.login = "jdoe"
+    mock_user.email = "jdoe@example.com"
+    mock_user.status = "active"
+    mock_role = MagicMock()
+    mock_role.name = "Auditor"
+    mock_user.roles = [mock_role]
+    sdk.users.list.return_value = [mock_user]
+
+    result = runner.invoke(cli.app, ["users", "list", "STUDY"])
+    assert result.exit_code == 0
+    sdk.users.list.assert_called_once_with("STUDY", include_inactive=False)
+    assert "U1" in result.stdout
+    assert "John Doe" in result.stdout
+    assert "Auditor" in result.stdout
+
+
+def test_users_list_include_inactive_flag(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that users list forwards include_inactive=True with --include-inactive."""
+    mock_active = MagicMock()
+    mock_active.user_id = "U1"
+    mock_active.name = "Active User"
+    mock_active.login = "active_u"
+    mock_active.email = "active@example.com"
+    mock_active.status = "active"
+    mock_active.roles = []
+
+    mock_inactive = MagicMock()
+    mock_inactive.user_id = "U2"
+    mock_inactive.name = "Inactive User"
+    mock_inactive.login = "inactive_u"
+    mock_inactive.email = "inactive@example.com"
+    mock_inactive.user_active_in_study = False
+    mock_inactive.status = None
+    mock_inactive.roles = []
+
+    sdk.users.list.return_value = [mock_active, mock_inactive]
+
+    result = runner.invoke(cli.app, ["users", "list", "STUDY", "--include-inactive"])
+    assert result.exit_code == 0
+    sdk.users.list.assert_called_once_with("STUDY", include_inactive=True)
+    assert "U1" in result.stdout
+    assert "U2" in result.stdout
+    assert "Inactive User" in result.stdout
+
+
+def test_users_list_missing_study_key(runner: CliRunner) -> None:
+    """Test that users list requires a study key."""
+    result = runner.invoke(cli.app, ["users", "list"])
+    assert result.exit_code != 0
+
+
+def test_users_list_api_error(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that users list handles API errors."""
+    sdk.users.list.side_effect = ApiError("user api error")
+    result = runner.invoke(cli.app, ["users", "list", "STUDY"])
+    assert result.exit_code == 1
+    assert "API Error" in result.stderr
+
+
+def test_users_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that users list handles empty results."""
+    sdk.users.list.return_value = []
+    result = runner.invoke(cli.app, ["users", "list", "STUDY"])
+    assert result.exit_code == 0
+    assert "No users found" in result.stdout
+
+
+def test_users_list_dict_and_fallbacks(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test users list with dict objects, fallbacks, and string roles."""
+    dict_user_1 = {
+        "userId": "U10",
+        "firstName": "Alice",
+        "lastName": "Smith",
+        "login": "asmith",
+        "email": "alice@example.com",
+        "userActiveInStudy": True,
+        "roles": [{"name": "Admin"}, "Reviewer"],
+    }
+    dict_user_2 = {
+        "userId": "U11",
+        "login": "single_role",
+        "email": "single@example.com",
+        "status": "active",
+        "roles": "LeadAuditor",
+    }
+    sdk.users.list.return_value = [dict_user_1, dict_user_2]
+    result = runner.invoke(cli.app, ["users", "list", "STUDY"])
+    assert result.exit_code == 0
+    assert "Alice Smith" in result.stdout
+    assert "Admin, Reviewer" in result.stdout
+    assert "LeadAuditor" in result.stdout
+
+
+def test_users_list_real_model_validation_and_rendering(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test users list with real User and Role models validated from synthetic API payloads."""
+    from imednet.models.users import Role, User
+
+    # User 1: Active with full name, validated Role instances
+    user1 = User.model_validate(
+        {
+            "userId": "USR-101",
+            "firstName": "Alice",
+            "lastName": "Smith",
+            "login": "asmith",
+            "email": "alice@example.com",
+            "userActiveInStudy": True,
+            "roles": [Role.model_validate({"roleId": "R1", "name": "Principal Investigator"})],
+        }
+    )
+
+    # User 2: Inactive with single name, dict role, and string role
+    user2 = User.model_validate(
+        {
+            "userId": "USR-102",
+            "firstName": "Bob",
+            "lastName": None,
+            "login": "bsmith",
+            "email": "bob@example.com",
+            "userActiveInStudy": False,
+            "roles": [{"roleId": "R2", "name": "Data Coordinator"}, "Monitor"],
+        }
+    )
+
+    # User 3: Null status (neither status nor userActiveInStudy), missing names (None), empty roles
+    user3 = User.model_validate(
+        {
+            "userId": "USR-103",
+            "firstName": None,
+            "lastName": None,
+            "login": "system_admin",
+            "email": "admin@example.com",
+            "userActiveInStudy": None,
+            "roles": [],
+        }
+    )
+
+    sdk.users.list.return_value = [user1, user2, user3]
+    result = runner.invoke(cli.app, ["users", "list", "STUDY", "--include-inactive"])
+    assert result.exit_code == 0
+    sdk.users.list.assert_called_once_with("STUDY", include_inactive=True)
+
+    # Assert rendered cells in tabular output
+    assert "USR-101" in result.stdout
+    assert "Alice Smith" in result.stdout
+    assert "Principal Investigator" in result.stdout
+    assert "active" in result.stdout
+
+    assert "USR-102" in result.stdout
+    assert "Bob" in result.stdout
+    assert "Data Coordinator, Monitor" in result.stdout
+    assert "inactive" in result.stdout
+
+    assert "USR-103" in result.stdout
+    assert "system_admin" in result.stdout
+
+
+def test_codings_list_dict_items(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test codings list with dict items."""
+    dict_coding = {
+        "codingId": "C_DICT",
+        "dictionaryName": "WHO-DD",
+        "dictionaryVersion": "2023",
+        "variable": "CMTRT",
+        "value": "Aspirin",
+        "code": "000001",
+    }
+    sdk.codings.list.return_value = [dict_coding]
+    result = runner.invoke(cli.app, ["codings", "list", "STUDY"])
+    assert result.exit_code == 0
+    assert "C_DICT" in result.stdout
+    assert "WHO-DD" in result.stdout
+
+
+def test_codings_list_success(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that codings list succeeds with filter forwarding."""
+    mock_coding = MagicMock()
+    mock_coding.coding_id = "COD1"
+    mock_coding.dictionary_name = "MedDRA"
+    mock_coding.dictionary_version = "25.0"
+    mock_coding.variable = "AETERM"
+    mock_coding.value = "Headache"
+    mock_coding.code = "10019211"
+    sdk.codings.list.return_value = [mock_coding]
+
+    result = runner.invoke(
+        cli.app,
+        ["codings", "list", "STUDY", "-f", "dictionaryName=MedDRA"],
+    )
+    assert result.exit_code == 0
+    sdk.codings.list.assert_called_once_with("STUDY", dictionaryName="MedDRA")
+    assert "COD1" in result.stdout
+    assert "MedDRA" in result.stdout
+    assert "Headache" in result.stdout
+
+
+def test_codings_list_repeatable_filter(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that codings list forwards multiple repeatable filters."""
+    sdk.codings.list.return_value = []
+    result = runner.invoke(
+        cli.app,
+        [
+            "codings",
+            "list",
+            "STUDY",
+            "-f",
+            "dictionaryName=MedDRA",
+            "--filter",
+            "variable=AETERM",
+        ],
+    )
+    assert result.exit_code == 0
+    sdk.codings.list.assert_called_once_with("STUDY", dictionaryName="MedDRA", variable="AETERM")
+
+
+def test_codings_list_real_model_validation_and_rendering(
+    runner: CliRunner, sdk: MagicMock
+) -> None:
+    """Test codings list with real Coding models validated from synthetic API payloads."""
+    from imednet.models.codings import Coding
+
+    coding1 = Coding.model_validate(
+        {
+            "codingId": "COD-001",
+            "dictionaryName": "MedDRA",
+            "dictionaryVersion": "26.1",
+            "variable": "AETERM",
+            "value": "Headache",
+            "code": "10019211",
+        }
+    )
+    coding2 = Coding.model_validate(
+        {
+            "codingId": "COD-002",
+            "dictionaryName": "WHODrug",
+            "dictionaryVersion": "2024Q1",
+            "variable": "CMTRT",
+            "value": "Paracetamol",
+            "code": "000123",
+        }
+    )
+
+    sdk.codings.list.return_value = [coding1, coding2]
+    result = runner.invoke(
+        cli.app,
+        ["codings", "list", "STUDY", "-f", "dictionaryName=MedDRA", "-f", "variable=AETERM"],
+    )
+    assert result.exit_code == 0
+    sdk.codings.list.assert_called_once_with("STUDY", dictionaryName="MedDRA", variable="AETERM")
+
+    # Assert rendered cells in tabular output
+    assert "COD-001" in result.stdout
+    assert "MedDRA" in result.stdout
+    assert "26.1" in result.stdout
+    assert "AETERM" in result.stdout
+    assert "Headache" in result.stdout
+    assert "10019211" in result.stdout
+
+    assert "COD-002" in result.stdout
+    assert "WHODrug" in result.stdout
+
+
+def test_codings_list_invalid_filter(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that codings list rejects invalid filter format with exit code 1."""
+    result = runner.invoke(cli.app, ["codings", "list", "STUDY", "--filter", "invalid_syntax"])
+    assert result.exit_code == 1
+    assert "Invalid filter format" in result.stderr
+    assert result.stdout == ""
+    sdk.codings.list.assert_not_called()
+
+
+def test_codings_list_missing_study_key(runner: CliRunner) -> None:
+    """Test that codings list requires a study key."""
+    result = runner.invoke(cli.app, ["codings", "list"])
+    assert result.exit_code != 0
+
+
+def test_codings_list_api_error(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that codings list handles API errors."""
+    sdk.codings.list.side_effect = ApiError("coding api error")
+    result = runner.invoke(cli.app, ["codings", "list", "STUDY"])
+    assert result.exit_code == 1
+    assert "API Error" in result.stderr
+
+
+def test_codings_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that codings list handles empty results."""
+    sdk.codings.list.return_value = []
+    result = runner.invoke(cli.app, ["codings", "list", "STUDY"])
+    assert result.exit_code == 0
+    assert "No codings found" in result.stdout
+
+
 def test_extract_records_calls_workflow(
     runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1037,6 +1334,8 @@ def test_cli_subcommand_isolation(runner: CliRunner) -> None:
         "intervals",
         "jobs",
         "visits",
+        "users",
+        "codings",
     }
     assert expected_core_commands.issubset(registered_subcommands)
 
@@ -1095,6 +1394,8 @@ def test_root_help_without_arguments(runner: CliRunner) -> None:
         "jobs",
         "records",
         "visits",
+        "users",
+        "codings",
     ],
 )
 def test_noun_commands_show_contextual_help(runner: CliRunner, cmd: str) -> None:

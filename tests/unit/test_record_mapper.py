@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from faker import Faker
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from imednet.models.records import Record
 from imednet.models.reporting import (
@@ -520,6 +520,21 @@ def test_record_mapper_reporting_models_transformation() -> None:
     assert df_ae.iloc[0]["AESER"] == "N"
     assert df_ae.iloc[0]["AESTDTC"] == "2026-03-01T10:00:00"
     assert df_ae.iloc[0]["AEENDTC"] == "2026-03-02T12:00:00"
+    assert list(df_ae.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "AESEQ",
+        "AETERM",
+        "AEDECOD",
+        "AESEV",
+        "AESER",
+        "AESTDTC",
+        "AEENDTC",
+        "AEOUT",
+        "AEREL",
+        "AEACN",
+    ]
 
     # 2. ProtocolDeviation model (DV domain)
     pd_item = ProtocolDeviation(
@@ -539,6 +554,17 @@ def test_record_mapper_reporting_models_transformation() -> None:
     assert df_pd.iloc[0]["DVSEV"] == "MAJOR"
     assert df_pd.iloc[0]["DVSTDTC"] == "2026-03-05T14:30:00"
     assert df_pd.iloc[0]["DVSTAT"] == "Escalated"
+    assert list(df_pd.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "DVSEQ",
+        "DVTERM",
+        "DVCAT",
+        "DVSEV",
+        "DVSTDTC",
+        "DVSTAT",
+    ]
 
     # Also verify 'PD' domain code alias maps to 'DV'
     df_pd_alias = transform_records_to_sdtm([pd_item], domain="PD", study_key="STUDY_REP_01")
@@ -561,6 +587,16 @@ def test_record_mapper_reporting_models_transformation() -> None:
     assert df_dd.iloc[0]["DDCAT"] == "SOFTWARE"
     assert df_dd.iloc[0]["DDSER"] == "Y"
     assert df_dd.iloc[0]["DDSTDTC"] == "2026-03-10T09:00:00"
+    assert list(df_dd.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "DDSEQ",
+        "DDTERM",
+        "DDCAT",
+        "DDSER",
+        "DDSTDTC",
+    ]
 
 
 def test_record_mapper_concomitant_medications_domain() -> None:
@@ -614,6 +650,17 @@ def test_record_mapper_vital_signs_domain() -> None:
     assert df_model.iloc[0]["VSORRES"] == 80.0
     assert df_model.iloc[0]["VSORRESU"] == "mmHg"
     assert df_model.iloc[0]["VSDTC"] == "2026-03-12T08:30:00"
+    assert list(df_model.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "VSSEQ",
+        "VSTESTCD",
+        "VSTEST",
+        "VSORRES",
+        "VSORRESU",
+        "VSDTC",
+    ]
 
     # Raw dictionary with standard aliases
     raw_records = [
@@ -719,3 +766,203 @@ def test_record_mapper_iter_sdtm_dataframes() -> None:
     assert len(chunks[2]) == 1
     assert all("AETERM" in c.columns for c in chunks)
     assert all(c.iloc[0]["STUDYID"] == "STUDY_STREAM" for c in chunks)
+
+
+def test_sdtm_transformation_deduplicates_model_aliases() -> None:
+    """Assert that AdverseEvent, VitalSigns, and ProtocolDeviation produce datasets without duplicate raw attributes."""
+    ae = AdverseEvent(
+        subjectKey="SUBJ-001",
+        aeTerm="Nausea",
+        aeSeverity="MILD",
+        aeStartDate=datetime(2026, 1, 1, 8, 0),
+    )
+    df_ae = transform_records_to_sdtm([ae], domain="AE", study_key="STUDY01")
+    for raw_attr in ("ae_term", "ae_severity", "ae_start_date", "subject_key", "aeTerm"):
+        assert raw_attr not in df_ae.columns
+
+    vs = VitalSigns(
+        subjectKey="SUBJ-001",
+        vsTest="Body Temperature",
+        vsTestCd="TEMP",
+        vsResult="37.2",
+        vsUnit="C",
+        vsDate=datetime(2026, 1, 1, 8, 30),
+    )
+    df_vs = transform_records_to_sdtm([vs], domain="VS", study_key="STUDY01")
+    for raw_attr in (
+        "vs_test",
+        "vs_test_cd",
+        "vs_result",
+        "vs_unit",
+        "vs_date",
+        "subject_key",
+        "vsTest",
+    ):
+        assert raw_attr not in df_vs.columns
+
+    pd_item = ProtocolDeviation(
+        subjectKey="SUBJ-001",
+        dvTerm="Window deviation",
+        dvCategory="PROCEDURE",
+        dvSeverity="MINOR",
+        dvDate=datetime(2026, 1, 2, 9, 0),
+        dvStatus="Approved",
+    )
+    df_pd = transform_records_to_sdtm([pd_item], domain="DV", study_key="STUDY01")
+    for raw_attr in (
+        "dv_term",
+        "dv_category",
+        "dv_severity",
+        "dv_date",
+        "dv_status",
+        "subject_key",
+        "dvTerm",
+    ):
+        assert raw_attr not in df_pd.columns
+
+    # Verify custom unmapped fields are retained
+    raw_with_custom = {
+        "subjectKey": "SUBJ-002",
+        "aeTerm": "Fatigue",
+        "custom_note": "Patient reported after lunch",
+        "custom_score": 5,
+    }
+    df_custom = transform_records_to_sdtm([raw_with_custom], domain="AE", study_key="STUDY01")
+    assert "custom_note" in df_custom.columns
+    assert "custom_score" in df_custom.columns
+    assert df_custom.iloc[0]["custom_note"] == "Patient reported after lunch"
+    assert df_custom.iloc[0]["custom_score"] == 5
+
+    # Verify model with identical field name and alias
+    class SimpleModel(BaseModel):
+        subject_key: str = Field(alias="subjectKey")
+        term: str = Field(alias="term")
+
+    m = SimpleModel(subjectKey="SUBJ-003", term="Headache")
+    df_simple = transform_records_to_sdtm([m], domain="AE", study_key="STUDY01")
+    assert df_simple.iloc[0]["AETERM"] == "Headache"
+    assert "term" not in df_simple.columns
+
+
+def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
+    """Verify that models with custom aliases or serialization_alias resolve values and suppress duplicate columns."""
+
+    # 1. Recognized field names with unrelated aliases
+    class CustomAEWithAlias(BaseModel):
+        subject_key: str = Field(alias="patientId")
+        ae_term: str = Field(alias="reportedTerm")
+        ae_severity: str = Field(alias="grade")
+        ae_start_date: str = Field(alias="onset")
+        unmapped_attr: str = Field("extra_val", alias="customExtra")
+
+    rec_alias = CustomAEWithAlias(
+        patientId="S100",
+        reportedTerm="Headache",
+        grade="MILD",
+        onset="2026-05-01T10:00:00",
+        customExtra="keep_this",
+    )
+    df_alias = transform_records_to_sdtm([rec_alias], domain="AE", study_key="STUDY01")
+    assert df_alias.iloc[0]["USUBJID"] == "S100"
+    assert df_alias.iloc[0]["AETERM"] == "Headache"
+    assert df_alias.iloc[0]["AESEV"] == "MILD"
+    assert df_alias.iloc[0]["AESTDTC"] == "2026-05-01T10:00:00"
+    assert df_alias.iloc[0]["customExtra"] == "keep_this"
+    for col in (
+        "patientId",
+        "reportedTerm",
+        "grade",
+        "onset",
+        "ae_term",
+        "ae_severity",
+        "ae_start_date",
+        "subject_key",
+    ):
+        assert col not in df_alias.columns
+    assert "customExtra" in df_alias.columns
+
+    # 2. Recognized field names with serialization_alias
+    class CustomAEWithSerializationAlias(BaseModel):
+        subject_key: str
+        ae_term: str = Field(serialization_alias="customSerializationTerm")
+        ae_severity: str = Field(serialization_alias="customSerializationSeverity")
+        extra_metric: float = 98.6
+
+    rec_serialized = CustomAEWithSerializationAlias(
+        subject_key="S200",
+        ae_term="Dizziness",
+        ae_severity="MODERATE",
+        extra_metric=99.1,
+    )
+    df_serialized = transform_records_to_sdtm([rec_serialized], domain="AE", study_key="STUDY01")
+    assert df_serialized.iloc[0]["USUBJID"] == "S200"
+    assert df_serialized.iloc[0]["AETERM"] == "Dizziness"
+    assert df_serialized.iloc[0]["AESEV"] == "MODERATE"
+    assert df_serialized.iloc[0]["extra_metric"] == 99.1
+    for col in (
+        "customSerializationTerm",
+        "customSerializationSeverity",
+        "ae_term",
+        "ae_severity",
+        "subject_key",
+    ):
+        assert col not in df_serialized.columns
+    assert "extra_metric" in df_serialized.columns
+
+    # 3. Ordinary SDK camelCase aliases
+    ae_sdk = AdverseEvent(
+        subjectKey="SUBJ-SDK",
+        aeTerm="Fever",
+        aeSeverity="SEVERE",
+        aeSerious=True,
+        aeStartDate=datetime(2026, 4, 1, 12, 0),
+    )
+    df_sdk = transform_records_to_sdtm([ae_sdk], domain="AE", study_key="STUDY01")
+    assert df_sdk.iloc[0]["USUBJID"] == "SUBJ-SDK"
+    assert df_sdk.iloc[0]["AETERM"] == "Fever"
+    assert df_sdk.iloc[0]["AESEV"] == "SEVERE"
+    assert df_sdk.iloc[0]["AESER"] == "Y"
+    assert df_sdk.iloc[0]["AESTDTC"] == "2026-04-01T12:00:00"
+    for col in (
+        "aeTerm",
+        "ae_term",
+        "aeSeverity",
+        "ae_severity",
+        "aeSerious",
+        "ae_serious",
+        "subjectKey",
+        "subject_key",
+    ):
+        assert col not in df_sdk.columns
+
+    # 4. Dictionary input with camelCase keys
+    dict_camel = {
+        "subjectKey": "DICT-01",
+        "aeTerm": "Nausea",
+        "aeSeverity": "MILD",
+        "extra_note": "Post-dose",
+    }
+    df_dict_camel = transform_records_to_sdtm([dict_camel], domain="AE", study_key="STUDY01")
+    assert df_dict_camel.iloc[0]["USUBJID"] == "DICT-01"
+    assert df_dict_camel.iloc[0]["AETERM"] == "Nausea"
+    assert df_dict_camel.iloc[0]["AESEV"] == "MILD"
+    assert df_dict_camel.iloc[0]["extra_note"] == "Post-dose"
+    for col in ("subjectKey", "aeTerm", "aeSeverity", "subject_key", "ae_term", "ae_severity"):
+        assert col not in df_dict_camel.columns
+    assert "extra_note" in df_dict_camel.columns
+
+    # 5. Dictionary input with snake_case keys
+    dict_snake = {
+        "subject_key": "DICT-02",
+        "ae_term": "Cough",
+        "ae_severity": "MILD",
+        "unmapped_val": 42,
+    }
+    df_dict_snake = transform_records_to_sdtm([dict_snake], domain="AE", study_key="STUDY01")
+    assert df_dict_snake.iloc[0]["USUBJID"] == "DICT-02"
+    assert df_dict_snake.iloc[0]["AETERM"] == "Cough"
+    assert df_dict_snake.iloc[0]["AESEV"] == "MILD"
+    assert df_dict_snake.iloc[0]["unmapped_val"] == 42
+    for col in ("subject_key", "ae_term", "ae_severity", "subjectKey", "aeTerm", "aeSeverity"):
+        assert col not in df_dict_snake.columns
+    assert "unmapped_val" in df_dict_snake.columns
