@@ -74,6 +74,7 @@ def violations(path: Path, source_root: Path) -> list[str]:
                 for prefix in (
                     "imednet_workflows",
                     "imednet_sinks",
+                    "imednet_tui",
                     "apache_airflow_providers_imednet",
                 )
             ):

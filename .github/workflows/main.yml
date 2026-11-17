@@ -298,6 +298,14 @@ jobs:
           path: packages/plugins-sinks/dist/
           retention-days: 1
 
+      - name: Upload TUI Artifact
+        if: contains(fromJSON(needs.plan.outputs.build_matrix), 'plugins-tui')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-tui
+          path: packages/plugins-tui/dist/
+          retention-days: 1
+
       - name: Restore Internal Dependencies
         if: always()
         run: python scripts/tighten_dependencies.py --restore
@@ -490,7 +498,7 @@ jobs:
       contents: read
     strategy:
       matrix:
-        extra: ["export", "duckdb", "mongodb", "neo4j", "snowflake", "cli"]
+        extra: ["export", "duckdb", "mongodb", "neo4j", "snowflake", "cli", "tui"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -519,6 +527,7 @@ jobs:
         run: |
           (cd packages/plugins-workflows && hatch build)
           (cd packages/plugins-sinks && hatch build)
+          (cd packages/plugins-tui && hatch build)
           (cd packages/core && hatch build)
 
       - name: Restore Internal Dependencies
@@ -532,7 +541,8 @@ jobs:
           WHEEL=$(ls packages/core/dist/imednet-*.whl)
           SINKS_WHEEL=$(ls packages/plugins-sinks/dist/imednet_plugins_sinks-*.whl)
           WORKFLOWS_WHEEL=$(ls packages/plugins-workflows/dist/imednet_workflows-*.whl)
-          python3 -m pip install "$WHEEL" "$SINKS_WHEEL" "$WORKFLOWS_WHEEL"
+          TUI_WHEEL=$(ls packages/plugins-tui/dist/imednet_tui-*.whl)
+          python3 -m pip install "$WHEEL" "$SINKS_WHEEL" "$WORKFLOWS_WHEEL" "$TUI_WHEEL"
           python3 -m pip install "${WHEEL}[${EXTRA}]"
 
       - name: Verify CLI Availability

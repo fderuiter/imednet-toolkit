@@ -52,10 +52,10 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 exclude = ["sandbox", "vulture_whitelist.py"]
-src = ["packages/core/src", "packages/plugins-workflows/src", "packages/providers-airflow/src", "tests"]
+src = ["packages/core/src", "packages/plugins-workflows/src", "packages/providers-airflow/src", "packages/plugins-tui/src", "tests"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["imednet", "imednet_workflows", "apache_airflow_providers_imednet"]
+known-first-party = ["imednet", "imednet_workflows", "apache_airflow_providers_imednet", "imednet_tui"]
 
 [tool.ruff.lint]
 select = ["PL", "PIE", "FURB", "E", "F", "I", "N", "SLF", "D", "S", "B", "C4", "SIM", "UP", "PT", "RET", "RUF"]
@@ -170,6 +170,7 @@ dependencies = [
     "imednet-workflows @ {root:uri}/packages/plugins-workflows",
     "apache-airflow-providers-imednet @ {root:uri}/packages/providers-airflow",
     "imednet-plugins-sinks @ {root:uri}/packages/plugins-sinks",
+    "imednet-tui @ {root:uri}/packages/plugins-tui",
 ]
 
 [tool.hatch.envs.default.scripts]
@@ -293,6 +294,7 @@ imednet = { workspace = true }
 imednet-workflows = { workspace = true }
 imednet-plugins-sinks = { workspace = true }
 apache-airflow-providers-imednet = { workspace = true }
+imednet-tui = { workspace = true }
 
 
 

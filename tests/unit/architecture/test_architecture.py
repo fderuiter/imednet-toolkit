@@ -70,6 +70,7 @@ def test_core_does_not_import_workflows():
         for imp in imports:
             assert not imp.startswith("imednet_workflows"), f"File {file} has hard import of {imp}"
             assert not imp.startswith("imednet_sinks"), f"File {file} has hard import of {imp}"
+            assert not imp.startswith("imednet_tui"), f"File {file} has hard import of {imp}"
             assert not imp.startswith("apache_airflow_providers_imednet"), (
                 f"File {file} has hard import of {imp}"
             )
@@ -100,6 +101,7 @@ def test_extensions_use_spi():
     extension_dirs = [
         packages_dir / "plugins-workflows" / "src",
         packages_dir / "plugins-sinks" / "src",
+        packages_dir / "plugins-tui" / "src",
         packages_dir / "providers-airflow" / "src",
     ]
 
@@ -155,6 +157,7 @@ def test_extensions_use_spi():
         ("core", "imednet"),
         ("plugins-workflows", "imednet_workflows"),
         ("plugins-sinks", "imednet_sinks"),
+        ("plugins-tui", "imednet_tui"),
         ("providers-airflow", "apache_airflow_providers_imednet"),
     ],
 )

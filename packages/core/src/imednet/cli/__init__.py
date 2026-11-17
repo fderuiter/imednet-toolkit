@@ -106,6 +106,21 @@ def get_parser() -> argparse.ArgumentParser:
 
         workflows_parser.set_defaults(func=workflows_stub)
 
+    if "tui" not in registered_plugins:
+        tui_parser = subparsers.add_parser(
+            "tui", help="Interactive terminal interface (not installed)"
+        )
+        tui_parser.add_argument("args", nargs=argparse.REMAINDER)
+
+        def tui_stub(args: argparse.Namespace) -> None:
+            print(
+                "The terminal interface plugin is not installed. To install it, run: pip install 'imednet[tui]'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        tui_parser.set_defaults(func=tui_stub)
+
     return parser
 
 
