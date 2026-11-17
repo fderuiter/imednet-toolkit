@@ -7,8 +7,7 @@ import pytest
 
 from imednet.core.client import Client
 from imednet.core.context import set_study_context
-from imednet.core.endpoint.base import GenericEndpoint, GenericListGetEndpoint
-from imednet.core.endpoint.edc_mixin import EdcEndpointMixin
+from imednet.core.endpoint.edc_mixin import EdcSyncGetEndpoint, EdcSyncListGetEndpoint
 from imednet.models.base import ImednetBaseModel
 
 
@@ -16,7 +15,7 @@ class MockModel(ImednetBaseModel):
     """Test suite for MockModel."""
 
 
-class MockEndpointImpl(EdcEndpointMixin, GenericEndpoint[MockModel]):
+class MockEndpointImpl(EdcSyncGetEndpoint[MockModel]):
     """Test suite for MockEndpointImpl."""
 
     PATH = "/test"
@@ -24,10 +23,12 @@ class MockEndpointImpl(EdcEndpointMixin, GenericEndpoint[MockModel]):
 
     def __init__(self, client=None, async_client=None):
         """Initialize the test object."""
-        super().__init__(client=client, async_client=async_client)
+        super().__init__(client=client)
+        if async_client is not None:
+            self._async_client = async_client
 
 
-class MockListGetEndpoint(EdcEndpointMixin, GenericListGetEndpoint[MockModel]):
+class MockListGetEndpoint(EdcSyncListGetEndpoint[MockModel]):
     """Test suite for MockListGetEndpoint."""
 
     PATH = "/items"
@@ -81,3 +82,14 @@ class TestBaseEndpoint:
 
         with pytest.raises(TypeError, match="Missing required argument: item_id"):
             ep.get("S1", None)
+
+    def test_ctx_parameter_raises_type_error(self, client):
+        """Test that passing ctx to GenericEndpoint or derived endpoints raises TypeError."""
+        with pytest.raises(TypeError):
+            GenericEndpoint(client, ctx=object())
+        with pytest.raises(TypeError):
+            GenericEndpoint(client, None, object())
+        with pytest.raises(TypeError):
+            MockListGetEndpoint(client, ctx=object())
+        with pytest.raises(TypeError):
+            MockListGetEndpoint(client, object())

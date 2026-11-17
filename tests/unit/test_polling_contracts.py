@@ -103,8 +103,7 @@ async def test_async_callback_failure_and_cancellation_propagate():
 
 def test_legacy_ctx_keyword_and_positional_on_concrete_endpoint():
     with Client(api_key="a", security_key="b") as client:
-        with pytest.warns(DeprecationWarning, match="ctx"):
-            endpoint = JobsEndpoint(client, ctx=object())
-        with pytest.warns(DeprecationWarning, match="ctx"):
-            positional = JobsEndpoint(client, object())
-        assert endpoint._client is positional._client is client
+        with pytest.raises(TypeError):
+            JobsEndpoint(client, ctx=object())
+        with pytest.raises(TypeError):
+            JobsEndpoint(client, object())

@@ -61,8 +61,8 @@ New optional capabilities must preserve old defaults. Private underscore members
 are not extension contracts; use the SPI. Response schema additions must not be
 silently presented as complete vendor schema coverage.
 
-The earlier ``ctx`` constructor removal in PR #1670 is repaired for concrete
-list/get endpoints with its prior warning; GenericEndpoint accepts it by keyword.
+The deprecated ``ctx`` constructor parameter has been removed from GenericEndpoint
+and derived base endpoints (raising ``TypeError`` if passed).
 Use ``sdk.study_context(study_key)`` for scoped study selection; context tokens
 are restored on exit. Historical generic three-positional constructors must migrate to explicit keywords;
 the current positional async-client argument is preserved. Sync and async SDKs have distinct lifecycles;

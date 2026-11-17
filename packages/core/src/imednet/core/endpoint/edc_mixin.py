@@ -1,4 +1,4 @@
-"""EDC-specific endpoint base class and mixin."""
+"""EDC-specific endpoint base classes."""
 
 from __future__ import annotations
 
@@ -24,27 +24,6 @@ def _inject_study_key(filters: dict[str, Any]) -> dict[str, Any]:
     if "studyKey" not in filters and study_key:
         filters["studyKey"] = study_key
     return filters
-
-
-class EdcEndpointMixin:
-    """Mixin providing EDC-specific logic for endpoints.
-
-    This includes the base path for EDC resources and automatic injection
-    of the default study key into filters.
-    """
-
-    BASE_PATH = _EDC_BASE_PATH
-
-    def _auto_filter(self, filters: dict[str, Any]) -> dict[str, Any]:
-        """Inject default studyKey if missing.
-
-        Args:
-            filters: The current dictionary of filters.
-
-        Returns:
-            The filters dictionary with studyKey injected if applicable.
-        """
-        return _inject_study_key(filters)
 
 
 class _EdcEndpointBase:

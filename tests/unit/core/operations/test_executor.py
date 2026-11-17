@@ -4,11 +4,10 @@ import pytest
 
 from imednet.core.operations.circuit_breaker import get_global_circuit_breaker
 from imednet.core.operations.executor import DefaultOperationRetryPolicy, UniversalExecutor
-from imednet.core.operations.protocols import OperationProtocol
 from imednet.core.retry import RetryConfig
 
 
-class RESTTask(OperationProtocol[str]):
+class RESTTask:
     """Test suite for RESTTask."""
 
     def __init__(self, fail_times=0):
@@ -24,7 +23,7 @@ class RESTTask(OperationProtocol[str]):
         return "REST Success"
 
 
-class NonRESTTask(OperationProtocol[str]):
+class NonRESTTask:
     """Test suite for NonRESTTask."""
 
     def __init__(self, fail_times=0):

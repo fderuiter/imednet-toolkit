@@ -8,6 +8,7 @@ try:
     import pandas as pd
 except ImportError:
     pd: Any = None  # type: ignore[no-redef]
+from ..models.forms import Form
 from ..models.queries import Query
 from ..models.records import Record
 from ..models.subjects import Subject
@@ -61,6 +62,21 @@ def subjects_to_dataframe(subjects: list[Subject]) -> pd.DataFrame:
 
     subject_dicts = [s.model_dump(by_alias=False) for s in subjects]
     return pd.DataFrame(subject_dicts)
+
+
+def forms_to_dataframe(forms: list[Form]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.forms.Form` to a DataFrame.
+
+    Each form model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for forms_to_dataframe. Install with \"pip install 'imednet[export]'\"."
+        )
+
+    form_dicts = [f.model_dump(by_alias=False) for f in forms]
+    return pd.DataFrame(form_dicts)
 
 
 def records_to_dataframe(records: list[Record], *, flatten: bool = False) -> pd.DataFrame:

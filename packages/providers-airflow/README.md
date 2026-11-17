@@ -61,15 +61,15 @@ def my_task_logic():
     studies = sdk_client.studies.list()
 ```
 
-### Deprecation Notice: `get_conn()`
+### Migration Notice: `get_conn()` Removed
 
-The legacy connection helper `ImednetHook.get_conn()` is **deprecated** and will be removed in a future release. Calling this method will now emit a standard Python `DeprecationWarning` to the logs.
+The legacy connection helper `ImednetHook.get_conn()` has been removed. Use `get_sdk_client()` instead.
 
 #### Transitioning to the Modern Client
 
-If you have legacy DAGs or custom operators using `get_conn()`, please update them to use `get_sdk_client()` instead. Both methods return the same `ImednetSDK` client, making the migration straightforward:
+If you have legacy DAGs or custom operators using `get_conn()`, update them to use `get_sdk_client()`. Both return the same `ImednetSDK` client, making the migration straightforward:
 
-**Before (Deprecated):**
+**Before (Removed):**
 ```python
 client = hook.get_conn()
 ```
