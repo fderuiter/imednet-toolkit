@@ -58,8 +58,6 @@ For task-mapping discovery steps, ``ImednetHook`` provides explicit helper metho
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
 
-``get_conn()`` is kept as a backward-compatible alias to ``get_sdk_client()``.
-
 Operators and Sensors
 ---------------------
 The Airflow integration organizes hooks, operators, and sensors in dedicated
