@@ -4,7 +4,6 @@ from unittest.mock import MagicMock
 
 from imednet.core.client import Client
 from imednet.core.endpoint.base import GenericEndpoint
-from imednet.core.endpoint.edc_mixin import EdcEndpointMixin
 from imednet.models.base import ImednetBaseModel
 
 
@@ -12,9 +11,10 @@ class MockModel(ImednetBaseModel):
     """Test suite for MockModel."""
 
 
-class MockEndpoint(EdcEndpointMixin, GenericEndpoint[MockModel]):
+class MockEndpoint(GenericEndpoint[MockModel]):
     """Test suite for MockEndpoint."""
 
+    BASE_PATH = "/api/v1/edc/studies"
     MODEL = MockModel
     PATH = "/test"
 
