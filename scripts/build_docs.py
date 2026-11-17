@@ -149,6 +149,9 @@ def main():
     print("Generating ADR index...")
     generate_adr_index()
 
+    print("Generating REST reference tables...")
+    run_command([sys.executable, "scripts/generate_rest_reference.py"])
+
     print("Building and staging workspace wheels for interactive documentation...")
     build_and_stage_wheels()
 

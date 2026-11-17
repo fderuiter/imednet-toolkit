@@ -230,3 +230,23 @@ def test_cli_to_odm(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert "<ODM" in captured.out
     assert '<Study OID="CLI_ODM_EXPORT_01">' in captured.out
+
+
+def test_cli_from_odm_missing_file(capsys: pytest.CaptureFixture[str]) -> None:
+    """Test datadict from-odm with nonexistent file produces FileNotFoundError and exits with 1."""
+    with pytest.raises(SystemExit) as exc:
+        app(["datadict", "from-odm", "nonexistent.xml"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "Error loading from CDISC ODM:" in captured.err
+    assert "Target file 'nonexistent.xml' does not exist" in captured.err
+
+
+def test_cli_from_redcap_missing_file(capsys: pytest.CaptureFixture[str]) -> None:
+    """Test datadict from-redcap with nonexistent file produces FileNotFoundError and exits with 1."""
+    with pytest.raises(SystemExit) as exc:
+        app(["datadict", "from-redcap", "nonexistent.csv"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "Error loading from REDCap:" in captured.err
+    assert "Target file 'nonexistent.csv' does not exist" in captured.err

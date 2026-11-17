@@ -206,3 +206,24 @@ Error codes
 
 ``9001``
   Unauthorized error. Insufficient permission to retrieve data.
+
+Clinical Resource Endpoints
+---------------------------
+
+The Mednet EDC REST API provides endpoint specifications for thirteen clinical
+platform resources. All routes require ``x-api-key`` and ``x-imn-security-key``
+headers. Query filtering conforms to the syntax detailed in :ref:`filter_syntax`.
+
+.. include:: rest_tables/studies.rst
+.. include:: rest_tables/forms.rst
+.. include:: rest_tables/variables.rst
+.. include:: rest_tables/intervals.rst
+.. include:: rest_tables/sites.rst
+.. include:: rest_tables/subjects.rst
+.. include:: rest_tables/records.rst
+.. include:: rest_tables/record_revisions.rst
+.. include:: rest_tables/codings.rst
+.. include:: rest_tables/queries.rst
+.. include:: rest_tables/visits.rst
+.. include:: rest_tables/users.rst
+.. include:: rest_tables/jobs.rst
