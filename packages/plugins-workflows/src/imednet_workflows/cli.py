@@ -278,8 +278,25 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     subj_parser = subparsers.add_parser(
         "subject-data", help="Retrieve all data for a single subject."
     )
-    subj_parser.add_argument("study_key", help=STUDY_KEY_ARG)
-    subj_parser.add_argument("subject_key", help="The key identifying the subject.")
+    subj_parser.add_argument(
+        "-s",
+        "--study-key",
+        dest="study_key_flag",
+        default=None,
+        help=STUDY_KEY_ARG,
+    )
+    subj_parser.add_argument(
+        "-k",
+        "--subject-key",
+        "--subject",
+        dest="subject_key_flag",
+        default=None,
+        help="The key identifying the subject.",
+    )
+    subj_parser.add_argument("study_key", nargs="?", default=None, help=STUDY_KEY_ARG)
+    subj_parser.add_argument(
+        "subject_key", nargs="?", default=None, help="The key identifying the subject."
+    )
 
     @with_sdk
     def subject_data(sdk: ImednetSDK, study_key: str, subject_key: str) -> None:
@@ -287,9 +304,21 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         data = workflow.get_all_subject_data(study_key, subject_key)
         print(data.model_dump())
 
-    subj_parser.set_defaults(
-        func=lambda args: subject_data(study_key=args.study_key, subject_key=args.subject_key)
-    )
+    def handle_subject_data(args: argparse.Namespace) -> None:
+        study_key = args.study_key_flag if args.study_key_flag is not None else args.study_key
+        subject_key = (
+            args.subject_key_flag if args.subject_key_flag is not None else args.subject_key
+        )
+        if not study_key and not subject_key:
+            subj_parser.error("the following arguments are required: study_key, subject_key")
+        elif not study_key:
+            subj_parser.error("the following arguments are required: study_key")
+        elif not subject_key:
+            subj_parser.error("the following arguments are required: subject_key")
+
+        subject_data(study_key=study_key, subject_key=subject_key)
+
+    subj_parser.set_defaults(func=handle_subject_data)
 
 
 def state_app(args: list[str] | None = None) -> None:
