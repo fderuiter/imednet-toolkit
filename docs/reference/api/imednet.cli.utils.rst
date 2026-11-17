@@ -36,6 +36,13 @@ imednet.cli.utils.export module
    :members:
    :show-inheritance:
 
+imednet.cli.utils.grid module
+-----------------------------
+
+.. automodule:: imednet.cli.utils.grid
+   :members:
+   :show-inheritance:
+
 imednet.cli.utils.output module
 -------------------------------
 
