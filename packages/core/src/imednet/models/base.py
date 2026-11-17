@@ -113,6 +113,29 @@ def _get_normalizer(cls: type[BaseModel], field_name: str) -> Callable[[Any], An
 
 
 _drift_reported: set[str] = set()
+_FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]] = {}
+
+
+def _get_field_metadata(cls: type[BaseModel]) -> tuple[set[str], list[tuple[str, str | None]]]:
+    """Retrieve or compute cached field metadata (defined fields and required fields) for a model class."""
+    if cls in _FIELD_METADATA_CACHE:
+        return _FIELD_METADATA_CACHE[cls]
+
+    defined_fields = set(cls.model_fields.keys())
+    required_fields: list[tuple[str, str | None]] = []
+
+    for name, field in cls.model_fields.items():
+        if field.alias:
+            defined_fields.add(field.alias)
+        if field.is_required():
+            required_fields.append((name, field.alias))
+
+    if hasattr(cls, "model_computed_fields"):
+        defined_fields.update(cls.model_computed_fields.keys())
+
+    meta = (defined_fields, required_fields)
+    _FIELD_METADATA_CACHE[cls] = meta
+    return meta
 
 
 class ImednetBaseModel(BaseModel):
@@ -172,13 +195,10 @@ class ImednetBaseModel(BaseModel):
 
         logger = logging.getLogger("imednet.drift")
 
-        defined_fields = set(cls.model_fields.keys())
-        for name, field in cls.model_fields.items():  # noqa: B007
-            if field.alias:
-                defined_fields.add(field.alias)
-
-        if hasattr(cls, "model_computed_fields"):
-            defined_fields.update(cls.model_computed_fields.keys())
+        try:
+            defined_fields, required_fields = _FIELD_METADATA_CACHE[cls]
+        except KeyError:
+            defined_fields, required_fields = _get_field_metadata(cls)
 
         incoming_keys = set(data.keys())
 
@@ -194,12 +214,9 @@ class ImednetBaseModel(BaseModel):
                     logger.warning(msg)
 
         missing_fields = []
-        for name, field in cls.model_fields.items():
-            if field.is_required():  # noqa: SIM102
-                if name not in incoming_keys and (
-                    not field.alias or field.alias not in incoming_keys
-                ):
-                    missing_fields.append(name)
+        for name, alias in required_fields:
+            if name not in incoming_keys and (not alias or alias not in incoming_keys):
+                missing_fields.append(name)
         if missing_fields:
             msg = f"Drift detected (destructive): {cls.__name__} missing required fields: {', '.join(sorted(missing_fields))}"
             if msg not in _drift_reported:

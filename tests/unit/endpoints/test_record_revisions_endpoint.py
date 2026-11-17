@@ -2,14 +2,15 @@
 
 import pytest
 
+from imednet.core.context import set_study_context
 from imednet.endpoints import record_revisions
 from imednet.errors import NotFoundError
 from imednet.models.record_revisions import RecordRevision
 
 
-def test_list_uses_filters(dummy_client, context, paginator_factory, patch_build_filter):
+def test_list_uses_filters(dummy_client, paginator_factory, patch_build_filter):
     """Test that list uses filters."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = record_revisions.RecordRevisionsEndpoint(dummy_client)
     capture = paginator_factory(record_revisions, [{"recordRevisionId": 1}])
     patch = patch_build_filter(record_revisions)

@@ -2,14 +2,15 @@
 
 import pytest
 
+from imednet.core.context import set_study_context
 from imednet.endpoints import visits
 from imednet.errors import NotFoundError
 from imednet.models.visits import Visit
 
 
-def test_list_filters_and_path(dummy_client, context, paginator_factory, patch_build_filter):
+def test_list_filters_and_path(dummy_client, paginator_factory, patch_build_filter):
     """Test that list filters and path."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = visits.VisitsEndpoint(dummy_client)
     capture = paginator_factory(visits, [{"visitId": 1}])
     patch = patch_build_filter(visits)

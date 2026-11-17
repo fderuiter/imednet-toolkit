@@ -2,6 +2,7 @@
 
 import pytest
 
+from imednet.core.context import set_study_context
 from imednet.endpoints import records
 from imednet.errors import ClientError, NotFoundError, ValidationError
 from imednet.models.records import Record
@@ -48,9 +49,9 @@ def test_get_success(monkeypatch, dummy_client):
     assert isinstance(res, Record)
 
 
-def test_get_rejects_unknown_keyword(monkeypatch, dummy_client, context):
+def test_get_rejects_unknown_keyword(monkeypatch, dummy_client):
     """Test that get rejects unknown keyword."""
-    context.set_default_study_key("S1")
+    set_study_context("S1")
     ep = records.RecordsEndpoint(dummy_client)
     monkeypatch.setattr(
         records.RecordsEndpoint, "_list_sync", lambda *args, **kwargs: [Record(record_id=1)]
