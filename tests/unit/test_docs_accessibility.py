@@ -206,4 +206,3 @@ def test_interactive_cells_token_bindings() -> None:
     assert "#cf222e" not in css_content, "Deprecated hardcoded #cf222e found in custom.css"
     assert "errPre.style.color" not in js_content, "Inline style override found in thebe_pyodide.js"
     assert "#cf222e" not in js_content, "Deprecated hardcoded #cf222e found in thebe_pyodide.js"
-
