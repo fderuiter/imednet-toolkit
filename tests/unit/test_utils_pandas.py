@@ -7,17 +7,23 @@ import pandas as pd
 import pytest
 
 from imednet.models.forms import Form
+from imednet.models.intervals import FormSummary, Interval
 from imednet.models.queries import Query, QueryStatus
 from imednet.models.records import Record
+from imednet.models.sites import Site
 from imednet.models.subjects import Subject
 from imednet.models.variables import Variable
+from imednet.models.visits import Visit
 from imednet.utils.pandas import (
     export_records_csv,
     forms_to_dataframe,
+    intervals_to_dataframe,
     queries_to_dataframe,
     records_to_dataframe,
+    sites_to_dataframe,
     subjects_to_dataframe,
     variables_to_dataframe,
+    visits_to_dataframe,
 )
 
 
@@ -72,6 +78,32 @@ def _sample_form() -> Form:
     )
 
 
+def _sample_visit() -> Visit:
+    """Helper function to sample visit."""
+    return Visit(
+        visit_id=1,
+        subject_id=101,
+        interval_id=5,
+    )
+
+
+def _sample_interval() -> Interval:
+    """Helper function to sample interval."""
+    return Interval(
+        interval_id=5,
+        interval_name="Baseline",
+        forms=[FormSummary(form_id=1, form_key="DEMO", form_name="Demographics")],
+    )
+
+
+def _sample_site() -> Site:
+    """Helper function to sample site."""
+    return Site(
+        site_id=10,
+        site_name="General Hospital",
+    )
+
+
 def test_forms_to_dataframe_success() -> None:
     """Test converting forms to a pandas DataFrame."""
     form = _sample_form()
@@ -97,6 +129,82 @@ def test_forms_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
     with pytest.raises(ImportError, match="pandas is required for forms_to_dataframe"):
         forms_to_dataframe([])
+
+
+def test_visits_to_dataframe_success() -> None:
+    """Test converting visits to a pandas DataFrame."""
+    visit = _sample_visit()
+    df = visits_to_dataframe([visit])
+    assert not df.empty
+    assert len(df) == 1
+    assert df.loc[0, "visit_id"] == 1
+    assert df.loc[0, "subject_id"] == 101
+    assert df.loc[0, "interval_id"] == 5
+
+
+def test_visits_to_dataframe_empty() -> None:
+    """Test converting empty visits collection to DataFrame."""
+    df = visits_to_dataframe([])
+    assert df.empty
+
+
+def test_visits_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
+    """Test that visits_to_dataframe raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for visits_to_dataframe"):
+        visits_to_dataframe([])
+
+
+def test_intervals_to_dataframe_success() -> None:
+    """Test converting intervals to a pandas DataFrame including nested structures."""
+    interval = _sample_interval()
+    df = intervals_to_dataframe([interval])
+    assert not df.empty
+    assert len(df) == 1
+    assert df.loc[0, "interval_id"] == 5
+    assert df.loc[0, "interval_name"] == "Baseline"
+    forms = df.loc[0, "forms"]
+    assert isinstance(forms, list)
+    assert len(forms) == 1
+    assert forms[0]["form_id"] == 1
+    assert forms[0]["form_key"] == "DEMO"
+    assert forms[0]["form_name"] == "Demographics"
+
+
+def test_intervals_to_dataframe_empty() -> None:
+    """Test converting empty intervals collection to DataFrame."""
+    df = intervals_to_dataframe([])
+    assert df.empty
+
+
+def test_intervals_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
+    """Test that intervals_to_dataframe raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for intervals_to_dataframe"):
+        intervals_to_dataframe([])
+
+
+def test_sites_to_dataframe_success() -> None:
+    """Test converting sites to a pandas DataFrame."""
+    site = _sample_site()
+    df = sites_to_dataframe([site])
+    assert not df.empty
+    assert len(df) == 1
+    assert df.loc[0, "site_id"] == 10
+    assert df.loc[0, "site_name"] == "General Hospital"
+
+
+def test_sites_to_dataframe_empty() -> None:
+    """Test converting empty sites collection to DataFrame."""
+    df = sites_to_dataframe([])
+    assert df.empty
+
+
+def test_sites_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
+    """Test that sites_to_dataframe raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for sites_to_dataframe"):
+        sites_to_dataframe([])
 
 
 def test_subjects_to_dataframe_success() -> None:
