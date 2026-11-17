@@ -29,11 +29,14 @@ _STATUS_COLOR_MAP = {
     "success": "green",
     "ok": "green",
     "completed": "green",
+    "complete": "green",
     "open": "green",
     "approved": "green",
     "verified": "green",
     "pending": "yellow",
     "processing": "yellow",
+    "running": "yellow",
+    "queued": "yellow",
     "suspended": "yellow",
     "hold": "yellow",
     "incomplete": "yellow",
@@ -43,6 +46,8 @@ _STATUS_COLOR_MAP = {
     "error": "red",
     "fail": "red",
     "failed": "red",
+    "cancelled": "red",
+    "timeout": "red",
     "rejected": "red",
     "terminated": "red",
     "withdrawn": "red",
@@ -53,11 +58,14 @@ _HC_STATUS_COLOR_MAP = {
     "success": "blue",
     "ok": "blue",
     "completed": "blue",
+    "complete": "blue",
     "open": "blue",
     "approved": "blue",
     "verified": "blue",
     "pending": "yellow",
     "processing": "yellow",
+    "running": "yellow",
+    "queued": "yellow",
     "suspended": "yellow",
     "hold": "yellow",
     "incomplete": "yellow",
@@ -67,6 +75,8 @@ _HC_STATUS_COLOR_MAP = {
     "error": "magenta",
     "fail": "magenta",
     "failed": "magenta",
+    "cancelled": "magenta",
+    "timeout": "magenta",
     "rejected": "magenta",
     "terminated": "magenta",
     "withdrawn": "magenta",
@@ -97,7 +107,7 @@ def _truncate(text: str, length: int = 60) -> str:
 
 
 def _format_cell_value(value: Any, key: str | None = None) -> str:
-    if value is None:
+    if value is None or value == "":
         return "-"
     if isinstance(value, bool):
         return "Yes" if value else "No"
@@ -214,7 +224,11 @@ def display_list(
         field_keys = list(data_list[0].keys())
 
     # Launch interactive data grid if connected to an active terminal
-    from .grid import is_interactive_terminal, run_interactive_grid
+    try:
+        from .grid import is_interactive_terminal, run_interactive_grid
+    except ImportError:
+        is_interactive_terminal = lambda: False  # type: ignore[assignment]
+        run_interactive_grid = lambda *args, **kwargs: False  # type: ignore[assignment]
 
     should_run_interactive = (
         interactive if interactive is not None else is_interactive_terminal()
