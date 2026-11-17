@@ -133,7 +133,7 @@ Role-Based Pathways & Interactive Showcase
          </div>
 
          <div class="explorer-metric-bar">
-            <div id="ie-metric-badge" class="explorer-metric-badge">
+            <div id="ie-metric-badge" class="explorer-metric-badge" role="status" aria-live="polite" aria-atomic="true">
                ⚡ Executed in 1.8 ms (Mock Client Engine) | Status: 200 OK
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Output View">
@@ -181,7 +181,7 @@ Role-Based Pathways & Interactive Showcase
          </div>
 
          <div class="explorer-metric-bar">
-            <div id="cdm-metric-badge" class="explorer-metric-badge">
+            <div id="cdm-metric-badge" class="explorer-metric-badge" role="status" aria-live="polite" aria-atomic="true">
                ✓ Schema Valid (CDISC ODM Compliant) — 0 Errors | Validated in 0.9 ms
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Form Schema View">
@@ -227,7 +227,7 @@ Role-Based Pathways & Interactive Showcase
          </div>
 
          <div class="explorer-metric-bar">
-            <div id="aud-metric-badge" class="explorer-metric-badge">
+            <div id="aud-metric-badge" class="explorer-metric-badge" role="status" aria-live="polite" aria-atomic="true">
                ✓ 21 CFR Part 11 Electronic Signature &amp; VPAT Check Verified | 1.1 ms
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Auditor View">

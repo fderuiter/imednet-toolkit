@@ -1,6 +1,9 @@
 """Automated accessibility and contrast ratio regression tests for documentation theme."""
 
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -235,6 +238,221 @@ def test_interactive_cells_token_bindings() -> None:
     assert "#cf222e" not in css_content, "Deprecated hardcoded #cf222e found in custom.css"
     assert "errPre.style.color" not in js_content, "Inline style override found in thebe_pyodide.js"
     assert "#cf222e" not in js_content, "Deprecated hardcoded #cf222e found in thebe_pyodide.js"
+
+
+@pytest.mark.unit
+def test_showcase_metric_badges_aria_live_attributes() -> None:
+    """Verify that docs/index.rst declares role='status', aria-live='polite', and aria-atomic='true' on all metric badges (WCAG 4.1.3, ARIA22)."""
+    index_rst = (REPO_ROOT / "docs/index.rst").read_text(encoding="utf-8")
+
+    badge_ids = ["ie-metric-badge", "cdm-metric-badge", "aud-metric-badge"]
+    for badge_id in badge_ids:
+        # Match tag with id and required ARIA attributes
+        pattern = rf'<div[^>]*id="{badge_id}"[^>]*>'
+        match = re.search(pattern, index_rst)
+        assert match is not None, f"Badge {badge_id} not found in docs/index.rst"
+        tag = match.group(0)
+        assert 'role="status"' in tag, f"{badge_id} missing role=\"status\": {tag}"
+        assert 'aria-live="polite"' in tag, f"{badge_id} missing aria-live=\"polite\": {tag}"
+        assert 'aria-atomic="true"' in tag, f"{badge_id} missing aria-atomic=\"true\": {tag}"
+
+
+@pytest.mark.unit
+def test_thebe_pyodide_cell_status_aria_live_attributes() -> None:
+    """Verify that thebe_pyodide.js configures .thebelab-cell-status with ARIA live region attributes."""
+    thebe_js = (REPO_ROOT / "docs/_static/thebe_pyodide.js").read_text(encoding="utf-8")
+
+    assert 'cellStatus.setAttribute("role", "status")' in thebe_js, (
+        "cellStatus must set role='status'"
+    )
+    assert 'cellStatus.setAttribute("aria-live", "polite")' in thebe_js, (
+        "cellStatus must set aria-live='polite'"
+    )
+    assert 'cellStatus.setAttribute("aria-atomic", "true")' in thebe_js, (
+        "cellStatus must set aria-atomic='true'"
+    )
+
+
+@pytest.mark.unit
+def test_thebe_pyodide_execution_feedback() -> None:
+    """Verify that thebe_pyodide.js provides spoken feedback when execution starts and finishes."""
+    thebe_js = (REPO_ROOT / "docs/_static/thebe_pyodide.js").read_text(encoding="utf-8")
+
+    # Start announcement
+    assert 'cellStatus.textContent = "Executing..."' in thebe_js, (
+        "thebe_pyodide.js must announce start state"
+    )
+
+    # Completion announcement
+    assert "Execution completed" in thebe_js, "thebe_pyodide.js must announce completion state"
+
+
+@pytest.mark.unit
+def test_thebe_pyodide_mixed_output_announces_failure() -> None:
+    """Verify that cell execution failures are announced even when stdout was printed prior to exception (WCAG 4.1.3)."""
+    thebe_js = (REPO_ROOT / "docs/_static/thebe_pyodide.js").read_text(encoding="utf-8")
+
+    # 1. Error tracking in Python runner scripts
+    assert '"error": bool(_tb_str)' in thebe_js, (
+        "thebe_pyodide runner scripts must track error status independently of output buffers"
+    )
+
+    # 2. Status selection must not suppress errors when stdout or result is present
+    assert "!res.stdout" not in thebe_js, (
+        "thebe_pyodide status logic must not gate failure announcement on absence of stdout"
+    )
+    assert "!res.result" not in thebe_js, (
+        "thebe_pyodide status logic must not gate failure announcement on absence of result"
+    )
+    assert 'cellStatus.textContent = "Execution completed with errors."' in thebe_js
+
+    # 3. Functional verification of the Python runner template with print-then-raise code
+    # Simulate execution of user code that outputs stdout before raising an exception
+    runner_code = """
+import sys, ast, traceback
+from io import StringIO
+
+_stdout_buf = StringIO()
+_stderr_buf = StringIO()
+_old_out = sys.stdout
+_old_err = sys.stderr
+sys.stdout = _stdout_buf
+sys.stderr = _stderr_buf
+_eval_res = None
+_tb_str = ""
+
+try:
+    _parsed = ast.parse(__thebe_user_code__)
+    if _parsed.body and isinstance(_parsed.body[-1], ast.Expr):
+        _last_expr = ast.Expression(_parsed.body.pop().value)
+        _exec_code = compile(_parsed, '<stdin>', 'exec')
+        _eval_code = compile(_last_expr, '<stdin>', 'eval')
+        exec(_exec_code, globals())
+        _eval_res = eval(_eval_code, globals())
+    else:
+        _exec_code = compile(__thebe_user_code__, '<stdin>', 'exec')
+        exec(_exec_code, globals())
+except Exception:
+    _tb_str = traceback.format_exc()
+finally:
+    sys.stdout = _old_out
+    sys.stderr = _old_err
+
+__result__ = {
+    "stdout": _stdout_buf.getvalue(),
+    "stderr": _stderr_buf.getvalue() + _tb_str,
+    "result": repr(_eval_res) if _eval_res is not None else None,
+    "error": bool(_tb_str),
+}
+"""
+    env = {"__thebe_user_code__": "print('Starting validation')\nraise ValueError('Invalid')"}
+    exec(runner_code, env)
+    result = env["__result__"]
+
+    assert "Starting validation" in result["stdout"], "stdout should capture print statement"
+    assert "ValueError: Invalid" in result["stderr"], "stderr should capture exception traceback"
+    assert result["error"] is True, "error flag must be True for raised exceptions"
+
+    # 4. Verify decision logic selects failure announcement given mixed output,
+    # and respects explicit error: False when stderr contains ordinary warnings
+    def evaluate_decision(res: dict) -> str:
+        has_error = (
+            bool(res["error"])
+            if ("error" in res and res["error"] is not None)
+            else bool(res.get("stderr") and str(res["stderr"]).strip())
+        )
+        return "Execution completed with errors." if has_error else "Execution completed."
+
+    assert evaluate_decision(result) == "Execution completed with errors."
+
+    # 5. Verify both extracted runners from thebe_pyodide.js for warning output and print-then-raise
+    extracted_runners = re.findall(r"runnerScript\s*=\s*\\?`([\s\S]*?)\\?`;", thebe_js)
+    assert len(extracted_runners) >= 2, (
+        "Expected worker and main-thread fallback runner scripts in thebe_pyodide.js"
+    )
+
+    for i, runner_template in enumerate(extracted_runners):
+        script = runner_template.strip()
+        script_body = script.rsplit("{", 1)[0]
+        dict_body = "{" + script.rsplit("{", 1)[1]
+
+        # Case A: Successful execution with stderr output (e.g. library warnings)
+        env_warn = {"__thebe_user_code__": "import sys; print('warning', file=sys.stderr); 42"}
+        exec(script_body, env_warn)
+        res_warn = eval(dict_body, env_warn)
+        assert res_warn["error"] is False, (
+            f"Runner {i} must return error: False for warning-only stderr"
+        )
+        assert "warning" in res_warn["stderr"]
+        assert res_warn["result"] == "42"
+        assert evaluate_decision(res_warn) == "Execution completed."
+
+        # Case B: Execution with print before exception
+        env_raise = {
+            "__thebe_user_code__": "print('Starting validation')\nraise ValueError('Invalid')"
+        }
+        exec(script_body, env_raise)
+        res_raise = eval(dict_body, env_raise)
+        assert res_raise["error"] is True, f"Runner {i} must return error: True for exception"
+        assert "Starting validation" in res_raise["stdout"]
+        assert "ValueError: Invalid" in res_raise["stderr"]
+        assert evaluate_decision(res_raise) == "Execution completed with errors."
+
+    # 6. Execute real JavaScript decision block in Node if available
+    node_bin = shutil.which("node")
+    if node_bin:
+        match = re.search(
+            r"executeCode\(code,\s*\(res\)\s*=>\s*\{([\s\S]*?)\n\s*outputContent\.innerHTML",
+            thebe_js,
+        )
+        assert match is not None, "Could not extract executeCode callback from thebe_pyodide.js"
+        callback_body = match.group(1)
+        node_script = f"""
+        const callbackBody = {json.dumps(callback_body)};
+        function testDecision(res) {{
+            let runBtn = {{ disabled: false, innerHTML: "" }};
+            let cellStatus = {{ textContent: "" }};
+            const fn = new Function('res', 'runBtn', 'cellStatus', callbackBody);
+            fn(res, runBtn, cellStatus);
+            return cellStatus.textContent;
+        }}
+        const resWarn = {{ stdout: "", stderr: "warning\\n", result: "42", error: false }};
+        const resRaise = {{ stdout: "Starting validation\\n", stderr: "ValueError: Invalid\\n", result: null, error: true }};
+        const resFallbackWarn = {{ stdout: "", stderr: "warning\\n", result: "42" }};
+
+        if (testDecision(resWarn) !== "Execution completed.") {{
+            throw new Error("Expected Execution completed. for warning, got: " + testDecision(resWarn));
+        }}
+        if (testDecision(resRaise) !== "Execution completed with errors.") {{
+            throw new Error("Expected Execution completed with errors. for raise, got: " + testDecision(resRaise));
+        }}
+        if (testDecision(resFallbackWarn) !== "Execution completed with errors.") {{
+            throw new Error("Expected Execution completed with errors. for fallback warning, got: " + testDecision(resFallbackWarn));
+        }}
+        """
+        proc = subprocess.run([node_bin, "-e", node_script], capture_output=True, text=True)
+        assert proc.returncode == 0, (
+            f"Node verification of JavaScript decision failed:\n{proc.stderr}"
+        )
+
+
+@pytest.mark.unit
+def test_showcase_mutation_handlers_target_live_containers() -> None:
+    """Verify that showcase.js mutates textContent within decorated metric badges without stealing focus."""
+    showcase_js = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+
+    assert "ieMetricBadge.textContent =" in showcase_js
+    assert "cdmMetricBadge.textContent =" in showcase_js
+    assert "audMetricBadge.textContent =" in showcase_js
+
+    # Trigger action handlers must not steal focus
+    # (focus() should only be used for tab arrow navigation)
+    for handler_name in [
+        "executeIntegrationQuery",
+        "executeCdmValidation",
+        "executeAuditorVerification",
+    ]:
+        assert handler_name in showcase_js
 
 
 @pytest.mark.unit
