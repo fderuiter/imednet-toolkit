@@ -134,18 +134,6 @@ class ImednetHook(BaseHook):
             base_url=config.base_url,
         )
 
-    def get_conn(self) -> ImednetSDK:
-        """Backward compatible alias for :meth:`get_sdk_client`."""
-        import warnings
-
-        warnings.warn(
-            "ImednetHook.get_conn is deprecated and will be removed in a future release. "
-            "Please use ImednetHook.get_sdk_client() instead.",
-            category=DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_sdk_client()
-
     def describe_connection(self) -> dict[str, PrimitiveContainer]:
         """Return redacted primitive metadata about resolved hook configuration."""
         config = self._resolved_config()

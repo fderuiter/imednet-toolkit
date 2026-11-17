@@ -67,7 +67,7 @@ def test_imednet_hook() -> None:
     from apache_airflow_providers_imednet import ImednetHook
 
     hook = ImednetHook()
-    conn = hook.get_conn()
+    conn = hook.get_sdk_client()
     assert isinstance(conn, ImednetSDK)
 
 
