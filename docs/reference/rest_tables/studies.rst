@@ -236,4 +236,3 @@ Retrieve a study
        "dateModified": "<string>",
        "lastUpdated": "<string>"
    }
-

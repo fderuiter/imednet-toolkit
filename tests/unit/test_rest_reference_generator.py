@@ -132,3 +132,12 @@ def test_generator_idempotence(tmp_path: Path) -> None:
         file1 = dir1 / f"{res}.rst"
         file2 = dir2 / f"{res}.rst"
         assert file1.read_text(encoding="utf-8") == file2.read_text(encoding="utf-8")
+
+
+def test_generated_files_formatting(tmp_path: Path) -> None:
+    """Verify generated files end with exactly one newline and no trailing blank lines."""
+    generated = generate_rest_reference(collection_path=COLLECTION_PATH, output_dir=tmp_path)
+    for p in generated:
+        content = p.read_text(encoding="utf-8")
+        assert content.endswith("\n")
+        assert not content.endswith("\n\n")

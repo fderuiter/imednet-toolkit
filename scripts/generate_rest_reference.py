@@ -455,7 +455,7 @@ def generate_rest_reference(
             for op in ops:
                 rst_lines.extend(_generate_endpoint_rst(op))
 
-        content = "\n".join(rst_lines) + "\n"
+        content = "\n".join(rst_lines).rstrip() + "\n"
         file_path.write_text(content, encoding="utf-8")
         generated_files.append(file_path)
 

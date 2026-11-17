@@ -99,4 +99,3 @@ Retrieve job status
      "progress": "<integer>",
      "resultUrl": "<string>"
    }
-

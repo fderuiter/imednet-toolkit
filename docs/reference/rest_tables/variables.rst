@@ -171,4 +171,3 @@ List variables
            }
        ]
    }
-

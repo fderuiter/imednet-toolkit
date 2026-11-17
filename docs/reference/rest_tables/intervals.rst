@@ -175,4 +175,3 @@ List intervals
            }
        ]
    }
-

@@ -330,4 +330,3 @@ Create records
        "dateFinished": "",
        "dateStarted": ""
    }
-
