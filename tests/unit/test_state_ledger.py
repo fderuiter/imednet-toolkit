@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import argparse
 import os
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 import imednet_workflows.state_ledger as _state_ledger_module
+from imednet_workflows.cli import setup_parser, state_app
 from imednet_workflows.state_ledger import (
+    DEFAULT_LEDGER_PATH,
     ExtractionStateLedger,
+    FileStateProvider,
     InvalidStateTransitionError,
     LedgerState,
     StreamExecutionStatus,
+    get_state_provider,
     is_valid_transition,
     validate_transition,
 )
@@ -522,3 +531,101 @@ def test_transaction_failure_preserves_previous_high_water_mark(tmp_path) -> Non
     assert stream.last_run_status == StreamExecutionStatus.FAILED
     assert stream.error_message == "Worker crash"
     assert stream.records_processed == 75
+
+
+def test_default_ledger_path_resolution(monkeypatch) -> None:
+    """Verify that default ledger path points to user home directory."""
+    monkeypatch.delenv("IMEDNET_WORKFLOW_LEDGER_PATH", raising=False)
+    monkeypatch.delenv("AIRFLOW_CTX_TASK_ID", raising=False)
+    monkeypatch.delenv("USE_AIRFLOW_STATE_PROVIDER", raising=False)
+
+    expected_path = Path.home() / ".imednet" / "pipeline_ledger.json"
+    assert DEFAULT_LEDGER_PATH == str(expected_path)
+
+    provider = FileStateProvider()
+    assert provider.ledger_path == expected_path
+
+    factory_provider = get_state_provider()
+    assert isinstance(factory_provider, FileStateProvider)
+    assert factory_provider.ledger_path == expected_path
+
+
+def test_default_ledger_path_env_override(monkeypatch, tmp_path) -> None:
+    """Verify that IMEDNET_WORKFLOW_LEDGER_PATH overrides default ledger path."""
+    custom_ledger = str(tmp_path / "custom" / "pipeline_ledger.json")
+    monkeypatch.setenv("IMEDNET_WORKFLOW_LEDGER_PATH", custom_ledger)
+    monkeypatch.delenv("AIRFLOW_CTX_TASK_ID", raising=False)
+    monkeypatch.delenv("USE_AIRFLOW_STATE_PROVIDER", raising=False)
+
+    provider = FileStateProvider()
+    assert provider.ledger_path == Path(custom_ledger)
+
+    factory_provider = get_state_provider()
+    assert isinstance(factory_provider, FileStateProvider)
+    assert factory_provider.ledger_path == Path(custom_ledger)
+
+    # Explicit argument should take precedence over env var
+    explicit_path = str(tmp_path / "explicit" / "ledger.json")
+    explicit_provider = FileStateProvider(explicit_path)
+    assert explicit_provider.ledger_path == Path(explicit_path)
+
+    explicit_factory = get_state_provider(explicit_path)
+    assert isinstance(explicit_factory, FileStateProvider)
+    assert explicit_factory.ledger_path == Path(explicit_path)
+
+    # Subprocess check to verify import-time DEFAULT_LEDGER_PATH resolution with env var set
+    code = (
+        "import os, sys; "
+        f"os.environ['IMEDNET_WORKFLOW_LEDGER_PATH'] = {custom_ledger!r}; "
+        "from imednet_workflows.state_ledger import DEFAULT_LEDGER_PATH; "
+        f"assert DEFAULT_LEDGER_PATH == {custom_ledger!r}"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert res.returncode == 0, f"Subprocess failed: {res.stderr}"
+
+
+def test_cli_default_ledger_path_behavior() -> None:
+    """Verify that workflow CLI commands use DEFAULT_LEDGER_PATH by default."""
+    # 1. Test state_app show default
+    with patch("imednet_workflows.cli.get_state_provider") as mock_get_state:
+        mock_get_state.return_value.read_state.return_value = LedgerState(studies={})
+        state_app(["show"])
+        mock_get_state.assert_called_with(DEFAULT_LEDGER_PATH)
+
+    # 2. Test state_app set default
+    with patch("imednet_workflows.cli.get_state_provider") as mock_get_state:
+        state_app(["set", "-s", "TEST-01", "-m", "records", "-t", "2026-05-22T12:00:00Z"])
+        mock_get_state.assert_called_with(DEFAULT_LEDGER_PATH)
+
+    # 3. Test state_app reset default
+    with patch("imednet_workflows.cli.get_state_provider") as mock_get_state:
+        mock_get_state.return_value.delete_entry.return_value = True
+        state_app(["reset", "-s", "TEST-01", "-m", "records"])
+        mock_get_state.assert_called_with(DEFAULT_LEDGER_PATH)
+
+    # 4. Test setup_parser subcommand defaults
+    root_parser = argparse.ArgumentParser()
+    subparsers = root_parser.add_subparsers(dest="subcommand")
+    setup_parser(subparsers)
+
+    # Parse arguments without --ledger-path
+    show_args = root_parser.parse_args(["workflows", "state", "show"])
+    assert show_args.ledger_path == DEFAULT_LEDGER_PATH
+
+    set_args = root_parser.parse_args(
+        [
+            "workflows",
+            "state",
+            "set",
+            "-s",
+            "TEST-01",
+            "-m",
+            "records",
+            "-t",
+            "2026-05-22T12:00:00Z",
+        ]
+    )
+    assert set_args.ledger_path == DEFAULT_LEDGER_PATH
+
+    reset_args = root_parser.parse_args(["workflows", "state", "reset", "-s", "TEST-01"])
+    assert reset_args.ledger_path == DEFAULT_LEDGER_PATH
