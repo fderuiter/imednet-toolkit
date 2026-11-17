@@ -65,6 +65,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         output_format: str = "table",
     ) -> None:
         with fetching_status("job result", study_key) as status_ctrl:
+
             def on_progress(event: Any) -> None:
                 msg = format_job_progress(event)
                 if status_ctrl is not None and hasattr(status_ctrl, "update"):

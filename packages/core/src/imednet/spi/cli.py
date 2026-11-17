@@ -14,8 +14,8 @@ from imednet.cli.utils import (
 )
 
 __all__ = [
-    "Console",
     "STUDY_KEY_ARG",
+    "Console",
     "Status",
     "clear_line",
     "console",

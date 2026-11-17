@@ -331,13 +331,10 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             f"(interval={interval}s). Press Ctrl+C to stop."
         )
         try:
-            with console.status(
-                f"Starting sync worker for study '{study_key}'..."
-            ) as status:
+            with console.status(f"Starting sync worker for study '{study_key}'...") as status:
+
                 def on_cycle(cycle: int, count: int) -> None:
-                    status.update(
-                        f"Study '{study_key}' - cycle {cycle}: synced {count} records."
-                    )
+                    status.update(f"Study '{study_key}' - cycle {cycle}: synced {count} records.")
 
                 def on_sleep_tick(cycle: int, remaining: int) -> None:
                     status.update(

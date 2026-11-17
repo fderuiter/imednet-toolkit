@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from imednet.cli.utils import (
-    Console,
     _STATUS_COLOR_MAP,
+    Console,
     _format_cell_value,
     clear_line,
     display_list,
@@ -366,8 +366,10 @@ def test_format_job_progress_bounds_and_arguments() -> None:
 def test_job_wait_progress_callback_and_clean_stdout_json() -> None:
     """job_wait connects on_progress to sdk.poll_job and keeps JSON stdout clean."""
     import json
-    from imednet import cli
+
     from tests.unit.cli.test_cli import CliRunner
+
+    from imednet import cli
 
     runner = CliRunner()
     completed_job = JobStatus(batch_id="B-123", state="COMPLETED", progress=100)
@@ -401,9 +403,7 @@ def test_job_wait_progress_callback_and_clean_stdout_json() -> None:
     mock_sdk.poll_job.side_effect = mock_poll_job
 
     with patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk):
-        result = runner.invoke(
-            cli.app, ["jobs", "wait", "STUDY-TEST", "B-123", "--format", "json"]
-        )
+        result = runner.invoke(cli.app, ["jobs", "wait", "STUDY-TEST", "B-123", "--format", "json"])
 
     assert result.exit_code == 0
     assert progress_events_captured == ["B-123", "B-123"]
@@ -421,8 +421,9 @@ def test_job_wait_progress_callback_and_clean_stdout_json() -> None:
 
 def test_sync_worker_visual_feedback_iterative_cycles() -> None:
     """sync_worker visual progress updates status with cycle count and sleep countdown."""
-    from imednet import cli
     from tests.unit.cli.test_cli import CliRunner
+
+    from imednet import cli
 
     runner = CliRunner()
     cycles_seen = []
@@ -451,9 +452,7 @@ def test_sync_worker_visual_feedback_iterative_cycles() -> None:
         patch("imednet_workflows.cached_loader.CachedRecordsLoader", mock_loader_cls),
         patch("imednet_workflows.cli.SyncWorker", return_value=mock_worker),
     ):
-        result = runner.invoke(
-            cli.app, ["workflows", "sync-worker", "STUDY-X", "--interval", "10"]
-        )
+        result = runner.invoke(cli.app, ["workflows", "sync-worker", "STUDY-X", "--interval", "10"])
 
     assert result.exit_code == 0
     assert cycles_seen == [(1, 42), (2, 55)]

@@ -115,7 +115,7 @@ def format_job_progress(
     state_val = getattr(status_obj, "state", "UNKNOWN") if status_obj is not None else "UNKNOWN"
     state_label = state_val.value if hasattr(state_val, "value") else str(state_val)
 
-    filled = int(round(bar_width * progress / 100.0))
+    filled = round(bar_width * progress / 100.0)
     empty = max(0, bar_width - filled)
     bar = "=" * filled + "-" * empty
 
@@ -132,6 +132,14 @@ class Status:
         spinner: str | None = None,
         refresh_per_second: float = 12.5,
     ) -> None:
+        """Initialize a status controller.
+
+        Args:
+            msg: Initial status message.
+            console: Console instance managing stream output.
+            spinner: Optional spinner style identifier.
+            refresh_per_second: Target frame refresh rate.
+        """
         self._msg = str(msg)
         self.console = console
         self.spinner = spinner
@@ -193,6 +201,7 @@ class Status:
                 break
 
     def __enter__(self) -> Status:
+        """Enter the status context and begin live rendering or static output."""
         self._entered = True
         self._start_time = time.monotonic()
         self._interactive = self.console.is_interactive()
@@ -232,6 +241,7 @@ class Status:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Exit the status context, stop spinner rendering, and restore cursor."""
         self._entered = False
         if self._interactive:
             self._stop_event.set()
@@ -249,10 +259,16 @@ class Console:
     """Console handling terminal capabilities and live status rendering."""
 
     def __init__(self, stream: Any = None) -> None:
+        """Initialize a Console instance.
+
+        Args:
+            stream: Optional stream destination (defaults to sys.stderr).
+        """
         self._stream = stream
 
     @property
     def stream(self) -> Any:
+        """Get the active output stream."""
         return self._stream if self._stream is not None else sys.stderr
 
     def is_interactive(self) -> bool:

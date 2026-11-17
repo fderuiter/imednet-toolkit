@@ -95,9 +95,8 @@ class SyncWorker:
                     if self._stop_event.wait(sleep_chunk):
                         break
                     remaining -= int(sleep_chunk) if sleep_chunk >= 1 else 1
-            else:
-                if self._stop_event.wait(self._config.interval_seconds):
-                    break
+            elif self._stop_event.wait(self._config.interval_seconds):
+                break
         logger.info("sync worker stopped", extra={"study_key": self._config.study_key})
 
     def stop(self) -> None:
