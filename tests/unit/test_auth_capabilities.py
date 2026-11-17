@@ -255,7 +255,7 @@ def test_oidc_valid_signed_tokens():
     now = time.time()
 
     # 1. Valid HS256 signed token
-    secret = "hmac-secret-key-abcdef"
+    secret = "hmac-secret-key-abcdef"  # pragma: allowlist secret
     h_hs = (
         base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
         .decode()
