@@ -97,7 +97,11 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
             if resource is None:
                 # Single study lookup
                 items = [s for s in self.state.get_studies() if s.get("studyKey") == study_key]
-                return self._paginate_response(request, items, params)
+                if not items:
+                    return httpx.Response(
+                        404, json={"detail": f"Study {study_key} not found"}, request=request
+                    )
+                return httpx.Response(200, json=items[0], request=request)
 
             if resource == "sites":
                 items = self.state.get_sites(study_key)

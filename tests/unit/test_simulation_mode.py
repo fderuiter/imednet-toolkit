@@ -70,6 +70,15 @@ def test_simulation_studies_list_and_get():
         assert retrieved.study_key == "STUDY"
         assert retrieved.study_name == "Benchmark Validation Study"
 
+        direct_retrieved = sdk.studies.get("STUDY")
+        assert direct_retrieved.study_key == "STUDY"
+        assert direct_retrieved.study_name == "Benchmark Validation Study"
+
+        from imednet.errors import NotFoundError
+
+        with pytest.raises(NotFoundError):
+            sdk.studies.get("NONEXISTENT")
+
 
 def test_simulation_sites_list_and_get():
     """Verify sdk.sites operations in simulation mode."""
@@ -168,6 +177,14 @@ async def test_async_sdk_simulation_mode():
             studies = [s async for s in sdk.studies.list()]
             assert len(studies) > 0
             assert studies[0].study_key in ["DEMO-STUDY", "MY_STUDY", "STUDY"]
+
+            retrieved = await sdk.studies.get("STUDY")
+            assert retrieved.study_key == "STUDY"
+
+            from imednet.errors import NotFoundError
+
+            with pytest.raises(NotFoundError):
+                await sdk.studies.get("NONEXISTENT")
 
             records = [r async for r in sdk.records.list(study_key="STUDY")]
             initial_count = len(records)

@@ -180,6 +180,11 @@ def paginator_factory(monkeypatch):
                 captured["page_size"] = page_size
                 captured["count"] += 1
                 self._items = items
+                if hasattr(client, "get") and items:
+                    from tests.conftest import DummyResponse
+
+                    if isinstance(client.get, MagicMock):
+                        client.get.return_value = DummyResponse(items[0])
 
             def __iter__(self):
                 """Iterate over the provided items."""
@@ -241,6 +246,13 @@ def async_paginator_factory(monkeypatch):
                 captured["page_size"] = page_size
                 captured["count"] += 1
                 self._items = items
+                if hasattr(client, "get") and items:
+                    from unittest.mock import AsyncMock
+
+                    from tests.conftest import DummyResponse
+
+                    if isinstance(client.get, MagicMock) and not isinstance(client.get, AsyncMock):
+                        client.get = AsyncMock(return_value=DummyResponse(items[0]))
 
             async def __aiter__(self):
                 """Asynchronously iterate over the provided items."""
