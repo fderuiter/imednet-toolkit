@@ -205,7 +205,9 @@ def test_users_list_default_inactive_false(runner: CliRunner, sdk: MagicMock) ->
     mock_user.login = "jdoe"
     mock_user.email = "jdoe@example.com"
     mock_user.status = "active"
-    mock_user.roles = [MagicMock(name="Auditor")]
+    mock_role = MagicMock()
+    mock_role.name = "Auditor"
+    mock_user.roles = [mock_role]
     sdk.users.list.return_value = [mock_user]
 
     result = runner.invoke(cli.app, ["users", "list", "STUDY"])
@@ -213,6 +215,7 @@ def test_users_list_default_inactive_false(runner: CliRunner, sdk: MagicMock) ->
     sdk.users.list.assert_called_once_with("STUDY", include_inactive=False)
     assert "U1" in result.stdout
     assert "John Doe" in result.stdout
+    assert "Auditor" in result.stdout
 
 
 def test_users_list_include_inactive_flag(runner: CliRunner, sdk: MagicMock) -> None:
@@ -292,6 +295,69 @@ def test_users_list_dict_and_fallbacks(runner: CliRunner, sdk: MagicMock) -> Non
     assert "LeadAuditor" in result.stdout
 
 
+def test_users_list_real_model_validation_and_rendering(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test users list with real User and Role models validated from synthetic API payloads."""
+    from imednet.models.users import Role, User
+
+    # User 1: Active with full name, validated Role instances
+    user1 = User.model_validate(
+        {
+            "userId": "USR-101",
+            "firstName": "Alice",
+            "lastName": "Smith",
+            "login": "asmith",
+            "email": "alice@example.com",
+            "userActiveInStudy": True,
+            "roles": [Role.model_validate({"roleId": "R1", "name": "Principal Investigator"})],
+        }
+    )
+
+    # User 2: Inactive with single name, dict role, and string role
+    user2 = User.model_validate(
+        {
+            "userId": "USR-102",
+            "firstName": "Bob",
+            "lastName": None,
+            "login": "bsmith",
+            "email": "bob@example.com",
+            "userActiveInStudy": False,
+            "roles": [{"roleId": "R2", "name": "Data Coordinator"}, "Monitor"],
+        }
+    )
+
+    # User 3: Null status (neither status nor userActiveInStudy), missing names (None), empty roles
+    user3 = User.model_validate(
+        {
+            "userId": "USR-103",
+            "firstName": None,
+            "lastName": None,
+            "login": "system_admin",
+            "email": "admin@example.com",
+            "userActiveInStudy": None,
+            "roles": [],
+        }
+    )
+
+    sdk.users.list.return_value = [user1, user2, user3]
+    result = runner.invoke(cli.app, ["users", "list", "STUDY", "--include-inactive"])
+    assert result.exit_code == 0
+    sdk.users.list.assert_called_once_with("STUDY", include_inactive=True)
+
+    # Assert rendered cells in tabular output
+    assert "USR-101" in result.stdout
+    assert "Alice Smith" in result.stdout
+    assert "Principal Investigator" in result.stdout
+    assert "active" in result.stdout
+
+    assert "USR-102" in result.stdout
+    assert "Bob" in result.stdout
+    assert "Data Coordinator, Monitor" in result.stdout
+    assert "inactive" in result.stdout
+
+    assert "USR-103" in result.stdout
+    assert "system_admin" in result.stdout
+
+
 def test_codings_list_dict_items(runner: CliRunner, sdk: MagicMock) -> None:
     """Test codings list with dict items."""
     dict_coding = {
@@ -348,6 +414,53 @@ def test_codings_list_repeatable_filter(runner: CliRunner, sdk: MagicMock) -> No
     )
     assert result.exit_code == 0
     sdk.codings.list.assert_called_once_with("STUDY", dictionaryName="MedDRA", variable="AETERM")
+
+
+def test_codings_list_real_model_validation_and_rendering(
+    runner: CliRunner, sdk: MagicMock
+) -> None:
+    """Test codings list with real Coding models validated from synthetic API payloads."""
+    from imednet.models.codings import Coding
+
+    coding1 = Coding.model_validate(
+        {
+            "codingId": "COD-001",
+            "dictionaryName": "MedDRA",
+            "dictionaryVersion": "26.1",
+            "variable": "AETERM",
+            "value": "Headache",
+            "code": "10019211",
+        }
+    )
+    coding2 = Coding.model_validate(
+        {
+            "codingId": "COD-002",
+            "dictionaryName": "WHODrug",
+            "dictionaryVersion": "2024Q1",
+            "variable": "CMTRT",
+            "value": "Paracetamol",
+            "code": "000123",
+        }
+    )
+
+    sdk.codings.list.return_value = [coding1, coding2]
+    result = runner.invoke(
+        cli.app,
+        ["codings", "list", "STUDY", "-f", "dictionaryName=MedDRA", "-f", "variable=AETERM"],
+    )
+    assert result.exit_code == 0
+    sdk.codings.list.assert_called_once_with("STUDY", dictionaryName="MedDRA", variable="AETERM")
+
+    # Assert rendered cells in tabular output
+    assert "COD-001" in result.stdout
+    assert "MedDRA" in result.stdout
+    assert "26.1" in result.stdout
+    assert "AETERM" in result.stdout
+    assert "Headache" in result.stdout
+    assert "10019211" in result.stdout
+
+    assert "COD-002" in result.stdout
+    assert "WHODrug" in result.stdout
 
 
 def test_codings_list_invalid_filter(runner: CliRunner, sdk: MagicMock) -> None:

@@ -66,11 +66,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     elif isinstance(r, str):
                         role_names.append(r)
                     else:
-                        mock_name = getattr(r, "_mock_name", None)
-                        if isinstance(mock_name, str) and mock_name:
-                            role_names.append(mock_name)
-                        else:
-                            role_names.append(str(r))
+                        role_names.append(str(r))
                 roles_str = ", ".join(role_names)
             else:
                 roles_str = str(roles) if roles else ""
