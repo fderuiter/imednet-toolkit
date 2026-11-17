@@ -3,6 +3,7 @@
 This changelog tracks releases across the following workspace packages:
 * `imednet` (`packages/core`)
 * `imednet-plugins-sinks` (`packages/plugins-sinks`)
+* `imednet-tui` (`packages/plugins-tui`)
 * `imednet-workflows` (`packages/plugins-workflows`)
 * `apache-airflow-providers-imednet` (`packages/providers-airflow`)
 

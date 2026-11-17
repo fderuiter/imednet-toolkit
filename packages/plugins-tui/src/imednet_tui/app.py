@@ -249,7 +249,9 @@ class SubjectTable(DataTable[str]):
                 s_site_id = str(getattr(sub, "site_id", "") or "")
                 if site_id is None or s_site_id == str(site_id):
                     sub_id = getattr(sub, "subject_id", "-")
-                    status = getattr(sub, "status", "-")
+                    status = (
+                        getattr(sub, "subject_status", None) or getattr(sub, "status", None) or "-"
+                    )
                     created = str(getattr(sub, "date_created", "-"))
                     rows.append((str(sub_id), s_site_id, str(status), created))
             self.add_rows(rows)
@@ -283,11 +285,23 @@ class JobMonitor(Static):
         self.sdk = sdk
         self.timer: Timer | None = None
         self.current_study_key: str | None = None
+        self.tracked_job_ids: list[str] = []
 
     def on_mount(self) -> None:
         """Set up status message and interval polling timer on mount."""
         self.update("Job Monitor: Select a study to view background jobs.")
         self.timer = self.set_interval(10.0, self.refresh_jobs, pause=True)
+
+    def track_job(self, job_id: str) -> None:
+        """Register a known job ID to monitor.
+
+        Args:
+            job_id: Known background job or batch identifier.
+        """
+        if job_id not in self.tracked_job_ids:
+            self.tracked_job_ids.append(job_id)
+        if self.current_study_key and self.is_mounted:
+            self.run_worker(self.refresh_jobs())
 
     def set_study(self, study_key: str) -> None:
         """Set the active study key and trigger background job refresh.
@@ -299,7 +313,8 @@ class JobMonitor(Static):
         self.update(f"Job Monitor: Loading jobs for study '{study_key}'...")
         if self.timer:
             self.timer.resume()
-        self.run_worker(self.refresh_jobs())
+        if self.is_mounted:
+            self.run_worker(self.refresh_jobs())
 
     async def refresh_jobs(self) -> None:
         """Poll and update job list for the active study."""
@@ -311,26 +326,59 @@ class JobMonitor(Static):
 
         try:
             jobs_ep: Any = self.sdk.jobs
+            jobs = []
+
             if hasattr(jobs_ep, "async_list"):
                 jobs = await jobs_ep.async_list(self.current_study_key)
             elif hasattr(jobs_ep, "list"):
                 jobs = await asyncio.to_thread(lambda: list(jobs_ep.list(self.current_study_key)))
+            elif self.tracked_job_ids:
+                for jid in list(self.tracked_job_ids):
+                    try:
+                        if hasattr(jobs_ep, "get"):
+                            if asyncio.iscoroutinefunction(jobs_ep.get):
+                                job = await jobs_ep.get(self.current_study_key, jid)
+                            else:
+                                res = jobs_ep.get(self.current_study_key, jid)
+                                if asyncio.iscoroutine(res):
+                                    job = await res
+                                else:
+                                    job = res
+                        elif hasattr(jobs_ep, "async_get"):
+                            job = await jobs_ep.async_get(self.current_study_key, jid)
+                        else:
+                            job = None
+                        if job is not None:
+                            jobs.append(job)
+                    except Exception as err:
+                        logging.getLogger("imednet_tui").warning(
+                            "Failed to poll job %s: %s", jid, err
+                        )
             else:
-                jobs = []
+                self.update(
+                    f"Job Monitor: Background job enumeration is not supported by the iMednet Jobs API for study '{self.current_study_key}'.\n"
+                    "Use JobsEndpoint get/poll with a specific batch/job ID to track background jobs."
+                )
+                return
 
             lines = [f"[bold]Active & Recent Jobs ({len(jobs)})[/bold]"]
             for job in jobs[:15]:
-                job_type = getattr(job, "job_type", "Unknown")
-                status = getattr(job, "state", getattr(job, "status", "Unknown"))
+                job_id = getattr(job, "job_id", getattr(job, "batch_id", ""))
+                job_type = getattr(job, "job_type", "Job")
+                status = getattr(
+                    job, "state", getattr(job, "status", getattr(job, "job_status", "Unknown"))
+                )
                 created = getattr(job, "date_created", "")
+                status_str = str(status.value if hasattr(status, "value") else status)
                 color = (
                     "green"
-                    if status in ("Completed", "Success")
+                    if status_str.upper() in ("COMPLETED", "COMPLETE", "SUCCESS")
                     else "yellow"
-                    if status in ("Processing", "Pending", "Running")
+                    if status_str.upper() in ("PROCESSING", "PENDING", "RUNNING", "QUEUED", "OPEN")
                     else "red"
                 )
-                lines.append(f"[{color}]{status}[/{color}] - {job_type} ({created})")
+                label = f"{job_type} ({job_id})" if job_id else str(job_type)
+                lines.append(f"[{color}]{status_str}[/{color}] - {label} ({created})")
 
             self.update("\n".join(lines))
         except Exception as e:

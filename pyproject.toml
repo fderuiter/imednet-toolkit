@@ -180,6 +180,7 @@ verify-static = [
     "mypy packages/core/src/imednet",
     "mypy packages/plugins-workflows/src/imednet_workflows",
     "mypy packages/providers-airflow/src/apache_airflow_providers_imednet",
+    "mypy packages/plugins-tui/src/imednet_tui",
     "mypy tests/typing/endpoint_contracts.py",
 ]
 verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov-fail-under=90"
@@ -229,6 +230,7 @@ dependencies = [
     "imednet-workflows @ {root:uri}/packages/plugins-workflows",
     "apache-airflow-providers-imednet @ {root:uri}/packages/providers-airflow",
     "imednet-plugins-sinks @ {root:uri}/packages/plugins-sinks",
+    "imednet-tui @ {root:uri}/packages/plugins-tui",
 ]
 
 [tool.hatch.envs.lint.scripts]

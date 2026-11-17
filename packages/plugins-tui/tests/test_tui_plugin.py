@@ -44,13 +44,13 @@ def mock_sdk():
     mock_subj1 = MagicMock()
     mock_subj1.subject_id = "SUBJ-001"
     mock_subj1.site_id = "SITE-101"
-    mock_subj1.status = "Enrolled"
+    mock_subj1.subject_status = "Enrolled"
     mock_subj1.date_created = "2026-01-10T08:00:00Z"
 
     mock_subj2 = MagicMock()
     mock_subj2.subject_id = "SUBJ-002"
     mock_subj2.site_id = "SITE-102"
-    mock_subj2.status = "Screened"
+    mock_subj2.subject_status = "Screened"
     mock_subj2.date_created = "2026-01-11T09:00:00Z"
 
     sdk.subjects.async_list = AsyncMock(return_value=[mock_subj1, mock_subj2])
@@ -163,6 +163,7 @@ async def test_app_sync_sdk_fallback():
     del sync_sdk.sites.async_list
     del sync_sdk.subjects.async_list
     del sync_sdk.jobs.async_list
+    del sync_sdk.jobs.async_get
 
     mock_study = MagicMock()
     mock_study.study_name = None
@@ -178,16 +179,18 @@ async def test_app_sync_sdk_fallback():
     mock_subj = MagicMock()
     mock_subj.subject_id = "SUB-SYNC"
     mock_subj.site_id = "SITE-SYNC"
-    mock_subj.status = "Active"
+    mock_subj.subject_status = "Active"
     mock_subj.date_created = "2026-02-01"
     sync_sdk.subjects.list = MagicMock(return_value=[mock_subj])
     sync_sdk.subjects.list_by_site = MagicMock(return_value=[mock_subj])
 
+    del sync_sdk.jobs.list
     mock_job = MagicMock()
+    mock_job.job_id = "SYNC-JOB-1"
     mock_job.job_type = "SyncJob"
     mock_job.state = "Running"
     mock_job.date_created = "2026-02-01"
-    sync_sdk.jobs.list = MagicMock(return_value=[mock_job])
+    sync_sdk.jobs.get = MagicMock(return_value=mock_job)
 
     app = ImednetTuiApp(sync_sdk)
     async with app.run_test() as pilot:
@@ -204,6 +207,15 @@ async def test_app_sync_sdk_fallback():
 
         subject_table = app.screen.query_one(SubjectTable)
         assert subject_table.row_count == 1
+
+        job_monitor = app.screen.query_one(JobMonitor)
+        assert "enumeration is not supported" in str(job_monitor.render())
+
+        # Track job ID using supported get API
+        job_monitor.track_job("SYNC-JOB-1")
+        await pilot.pause()
+        sync_sdk.jobs.get.assert_called_with("SYNC-01", "SYNC-JOB-1")
+        assert "SYNC-JOB-1" in str(job_monitor.render())
 
         site_list.post_message(SiteList.Selected("SITE-SYNC", "Sync Site"))
         await pilot.pause()
@@ -290,3 +302,59 @@ def test_run_tui_helper(mock_sdk):
     with patch.object(ImednetTuiApp, "run") as mock_run:
         run_tui(mock_sdk)
         mock_run.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_subject_table_with_real_sdk_subject_instance():
+    """Test that SubjectTable correctly renders real SDK Subject model subject_status."""
+    from imednet.models.subjects import Subject
+
+    real_subj = Subject(
+        subject_id=42,
+        site_id=10,
+        subject_status="Enrolled",
+        date_created="2026-03-01T12:00:00Z",
+    )
+    sdk = MagicMock()
+    sdk.subjects.async_list = AsyncMock(return_value=[real_subj])
+
+    app = ImednetTuiApp(sdk)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        table = app.screen.query_one(SubjectTable)
+        await table.load_subjects("STUDY-01")
+        assert table.row_count == 1
+        # Verify row cell contains "Enrolled"
+        row_data = [str(cell) for cell in table.get_row_at(0)]
+        assert "Enrolled" in row_data
+        assert "42" in row_data
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_with_real_jobs_endpoint_contract():
+    """Test JobMonitor with real JobsEndpoint contract (no list, get supported)."""
+    from imednet.models.jobs import JobState, JobStatus
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    real_job = JobStatus(
+        job_id="BATCH-999",
+        state=JobState.COMPLETED,
+        date_created="2026-03-01T12:00:00Z",
+    )
+    sdk.jobs.get = MagicMock(return_value=real_job)
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-REAL"
+
+    # Before tracking any jobs, enumeration is explained as unsupported
+    await monitor.refresh_jobs()
+    assert "enumeration is not supported" in str(monitor.render())
+
+    # Track specific job ID
+    monitor.track_job("BATCH-999")
+    await monitor.refresh_jobs()
+    sdk.jobs.get.assert_called_with("STUDY-REAL", "BATCH-999")
+    assert "BATCH-999" in str(monitor.render())
+    assert "COMPLETED" in str(monitor.render())
