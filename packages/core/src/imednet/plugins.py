@@ -44,10 +44,26 @@ Example factory::
 
 from __future__ import annotations
 
+import inspect
+import sys
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from .spi.facade import AsyncImednetFacade, ImednetFacade
+
+if sys.version_info < (3, 12) and not TYPE_CHECKING:
+    from typing import _get_protocol_attrs, _ProtocolMeta
+
+    class _SafeRuntimeProtocolMeta(_ProtocolMeta):
+        def __instancecheck__(self, instance: Any) -> bool:
+            if getattr(self, "_is_runtime_protocol", False):
+                for attr in _get_protocol_attrs(self):
+                    try:
+                        inspect.getattr_static(instance, attr)
+                    except AttributeError:
+                        return False
+                return True
+            return super().__instancecheck__(instance)
 
 
 @runtime_checkable
@@ -66,6 +82,10 @@ class WorkflowsNamespaceProtocol(Protocol):
     subject_data: Any
     uat: Any
     uat_inspector: Any
+
+
+if sys.version_info < (3, 12) and not TYPE_CHECKING:
+    WorkflowsNamespaceProtocol.__class__ = _SafeRuntimeProtocolMeta
 
 
 @runtime_checkable

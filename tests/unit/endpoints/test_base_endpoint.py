@@ -7,6 +7,7 @@ import pytest
 
 from imednet.core.client import Client
 from imednet.core.context import set_study_context
+from imednet.core.endpoint.base import GenericEndpoint
 from imednet.core.endpoint.edc_mixin import EdcSyncGetEndpoint, EdcSyncListGetEndpoint
 from imednet.models.base import ImednetBaseModel
 
