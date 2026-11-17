@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -454,3 +455,48 @@ async def test_job_monitor_with_real_jobs_endpoint_instance():
     assert "Active & Recent Jobs (1)" in rendered
     assert "FAILED" in rendered
     assert "BATCH-REAL-ERR" in rendered
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_sync_get_responsiveness_regression_heartbeat():
+    """Responsiveness regression: synchronous get() does not block event loop heartbeat."""
+    import time
+
+    from imednet.models.jobs import JobState, JobStatus
+
+    heartbeat_ticks = 0
+    stop_heartbeat = False
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ticks
+        while not stop_heartbeat:
+            await asyncio.sleep(0.02)
+            heartbeat_ticks += 1
+
+    def slow_sync_get(study_key: str, job_id: str) -> JobStatus:
+        time.sleep(0.18)  # 180ms synchronous blocking stub (150-200ms)
+        return JobStatus(job_id=job_id, state=JobState.COMPLETED)
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = slow_sync_get
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-HEARTBEAT"
+    monitor.track_job("BATCH-HEARTBEAT-1")
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    try:
+        await monitor.refresh_jobs()
+    finally:
+        stop_heartbeat = True
+        await heartbeat_task
+
+    # During the 180ms synchronous stub, the asyncio event loop must not freeze,
+    # allowing the heartbeat task to record multiple ticks.
+    assert heartbeat_ticks >= 4
+    rendered = str(monitor.render())
+    assert "Active & Recent Jobs (1)" in rendered
+    assert "COMPLETED" in rendered
+    assert "BATCH-HEARTBEAT-1" in rendered
