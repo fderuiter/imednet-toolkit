@@ -146,6 +146,34 @@ def test_custom_css_rules_and_overrides() -> None:
     assert 'body[data-theme="dark"] .role-card' in css_content
     assert 'body[data-theme="dark"] .explorer-dataframe-table' in css_content
 
+    # Visible focus styles for preformatted code blocks
+    assert "pre:focus-visible" in css_content
+    assert "outline: 2px solid var(--color-brand-primary)" in css_content
+
+
+@pytest.mark.unit
+def test_code_block_keyboard_accessibility() -> None:
+    """Ensure preformatted code blocks receive keyboard accessibility attributes and focus styles."""
+    css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
+    js_content = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+
+    # Verify CSS focus-visible rule for preformatted code blocks
+    assert "pre:focus-visible" in css_content
+    assert "outline: 2px solid var(--color-brand-primary)" in css_content
+
+    # Verify script logic detects pre elements and tests horizontal overflow
+    assert "querySelectorAll" in js_content and "pre" in js_content
+    assert "scrollWidth >" in js_content and "clientWidth" in js_content
+
+    # Verify accessible region and tabindex attributes are assigned to overflowing containers
+    assert 'tabindex' in js_content and '"0"' in js_content
+    assert 'role' in js_content and '"region"' in js_content
+    assert 'aria-label' in js_content and '"Code snippet"' in js_content
+
+    # Verify dynamic updates on window resize and removal when not overflowing
+    assert "resize" in js_content
+    assert "removeAttribute" in js_content and "tabindex" in js_content
+
 
 @pytest.mark.unit
 def test_vpat_document_conformance() -> None:
@@ -205,6 +233,78 @@ def test_thebe_pyodide_execution_feedback() -> None:
 
 
 @pytest.mark.unit
+def test_thebe_pyodide_mixed_output_announces_failure() -> None:
+    """Verify that cell execution failures are announced even when stdout was printed prior to exception (WCAG 4.1.3)."""
+    thebe_js = (REPO_ROOT / "docs/_static/thebe_pyodide.js").read_text(encoding="utf-8")
+
+    # 1. Error tracking in Python runner scripts
+    assert '"error": bool(_tb_str)' in thebe_js, (
+        "thebe_pyodide runner scripts must track error status independently of output buffers"
+    )
+
+    # 2. Status selection must not suppress errors when stdout or result is present
+    assert "!res.stdout" not in thebe_js, (
+        "thebe_pyodide status logic must not gate failure announcement on absence of stdout"
+    )
+    assert "!res.result" not in thebe_js, (
+        "thebe_pyodide status logic must not gate failure announcement on absence of result"
+    )
+    assert 'cellStatus.textContent = "Execution completed with errors."' in thebe_js
+
+    # 3. Functional verification of the Python runner template with print-then-raise code
+    # Simulate execution of user code that outputs stdout before raising an exception
+    runner_code = """
+import sys, ast, traceback
+from io import StringIO
+
+_stdout_buf = StringIO()
+_stderr_buf = StringIO()
+_old_out = sys.stdout
+_old_err = sys.stderr
+sys.stdout = _stdout_buf
+sys.stderr = _stderr_buf
+_eval_res = None
+_tb_str = ""
+
+try:
+    _parsed = ast.parse(__thebe_user_code__)
+    if _parsed.body and isinstance(_parsed.body[-1], ast.Expr):
+        _last_expr = ast.Expression(_parsed.body.pop().value)
+        _exec_code = compile(_parsed, '<stdin>', 'exec')
+        _eval_code = compile(_last_expr, '<stdin>', 'eval')
+        exec(_exec_code, globals())
+        _eval_res = eval(_eval_code, globals())
+    else:
+        _exec_code = compile(__thebe_user_code__, '<stdin>', 'exec')
+        exec(_exec_code, globals())
+except Exception:
+    _tb_str = traceback.format_exc()
+finally:
+    sys.stdout = _old_out
+    sys.stderr = _old_err
+
+__result__ = {
+    "stdout": _stdout_buf.getvalue(),
+    "stderr": _stderr_buf.getvalue() + _tb_str,
+    "result": repr(_eval_res) if _eval_res is not None else None,
+    "error": bool(_tb_str),
+}
+"""
+    env = {"__thebe_user_code__": "print('Starting validation')\nraise ValueError('Invalid')"}
+    exec(runner_code, env)
+    result = env["__result__"]
+
+    assert "Starting validation" in result["stdout"], "stdout should capture print statement"
+    assert "ValueError: Invalid" in result["stderr"], "stderr should capture exception traceback"
+    assert result["error"] is True, "error flag must be True for raised exceptions"
+
+    # 4. Verify decision logic selects failure announcement given mixed output
+    has_error = bool(result["error"] or (result["stderr"] and result["stderr"].strip()))
+    status_text = "Execution completed with errors." if has_error else "Execution completed."
+    assert status_text == "Execution completed with errors."
+
+
+@pytest.mark.unit
 def test_showcase_mutation_handlers_target_live_containers() -> None:
     """Verify that showcase.js mutates textContent within decorated metric badges without stealing focus."""
     showcase_js = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
@@ -221,3 +321,106 @@ def test_showcase_mutation_handlers_target_live_containers() -> None:
         "executeAuditorVerification",
     ]:
         assert handler_name in showcase_js
+
+
+@pytest.mark.unit
+def test_role_card_button_accessible_names_satisfy_wcag_2_5_3() -> None:
+    """Verify role card buttons satisfy WCAG 2.2 SC 2.5.3 (Label in Name) and Technique G208.
+
+    Accessible names (aria-label) must contain and begin with the visible text string
+    presented to sighted and speech-input users, while omitting leading emojis and preserving
+    persona context for screen readers.
+    """
+    index_rst = (REPO_ROOT / "docs/index.rst").read_text(encoding="utf-8")
+
+    # Match role card launch buttons and their inner span content
+    button_pattern = re.compile(
+        r'<button\s+type="button"\s+class="(?P<class>[^"]+)"\s+'
+        r'data-persona-target="(?P<target>[^"]+)"\s+'
+        r'aria-label="(?P<label>[^"]+)">\s*'
+        r'<span>(?P<span>[^<]+)</span>\s*'
+        r'</button>',
+        re.MULTILINE,
+    )
+
+    matches = list(button_pattern.finditer(index_rst))
+    assert len(matches) == 3, (
+        f"Expected 3 role card launch buttons in docs/index.rst, found {len(matches)}"
+    )
+
+    expected_cards = {
+        "panel-datamanager": {
+            "visible_text": "Inspect Form Schemas",
+            "context_keywords": ["Clinical Data Manager", "Explorer"],
+        },
+        "panel-integration": {
+            "visible_text": "Run Interactive Queries",
+            "context_keywords": ["Integration Engineer", "Console"],
+        },
+        "panel-auditor": {
+            "visible_text": "Verify Audit Trails",
+            "context_keywords": ["Regulatory Auditor", "Verification"],
+        },
+    }
+
+    for match in matches:
+        target = match.group("target")
+        btn_class = match.group("class")
+        aria_label = match.group("label")
+        span_text = match.group("span").strip()
+
+        assert "role-card-launch-btn" in btn_class, (
+            f"Button for {target} missing role-card-launch-btn class"
+        )
+        assert target in expected_cards, f"Unexpected persona target: {target}"
+
+        expected = expected_cards[target]
+        visible_words = expected["visible_text"]
+
+        # Ensure visible text is in the inner span
+        assert visible_words in span_text, (
+            f"Inner span text '{span_text}' does not contain expected visible text '{visible_words}'"
+        )
+
+        # WCAG 2.2 SC 2.5.3 / Technique F96: aria-label must contain visible text
+        assert visible_words in aria_label, (
+            f"aria-label '{aria_label}' does not contain visible text '{visible_words}' (violates WCAG 2.2 SC 2.5.3 / F96)"
+        )
+
+        # WCAG 2.2 Technique G208: aria-label must start with visible text
+        assert aria_label.startswith(visible_words), (
+            f"aria-label '{aria_label}' does not begin with visible text '{visible_words}' (violates Technique G208)"
+        )
+
+        # Persona role context is preserved for screen readers
+        for keyword in expected["context_keywords"]:
+            assert keyword in aria_label, (
+                f"aria-label '{aria_label}' missing persona context '{keyword}'"
+            )
+
+        # Edge case: Ensure emojis are NOT in the accessible name so speech input engines match voice commands
+        for emoji in ["📋", "⚡", "🛡️", "🛡"]:
+            assert emoji not in aria_label, (
+                f"aria-label '{aria_label}' contains emoji '{emoji}', which interferes with speech recognition activation"
+            )
+
+
+@pytest.mark.unit
+def test_role_card_trigger_contracts_preserved() -> None:
+    """Verify role card buttons maintain trigger contracts expected by showcase.js."""
+    index_rst = (REPO_ROOT / "docs/index.rst").read_text(encoding="utf-8")
+    showcase_js = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+
+    # showcase.js must query [data-persona-target]
+    assert "data-persona-target" in showcase_js, (
+        "showcase.js must handle data-persona-target triggers"
+    )
+
+    # Targets defined in docs/index.rst buttons must correspond to panels in docs/index.rst
+    for target_id in ["panel-datamanager", "panel-integration", "panel-auditor"]:
+        assert f'data-persona-target="{target_id}"' in index_rst, (
+            f"Trigger data-persona-target='{target_id}' missing in docs/index.rst"
+        )
+        assert f'id="{target_id}"' in index_rst, (
+            f"Target panel id='{target_id}' missing in docs/index.rst"
+        )

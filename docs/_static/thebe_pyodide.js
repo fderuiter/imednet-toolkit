@@ -148,7 +148,7 @@ except Exception:
 
       const { id, code } = data;
       if (!ready) {
-        postMessage({ id, type: 'result', stdout: '', stderr: 'Pyodide runtime not ready yet.\\n', result: null });
+        postMessage({ id, type: 'result', stdout: '', stderr: 'Pyodide runtime not ready yet.\\n', result: null, error: true });
         return;
       }
 
@@ -187,7 +187,8 @@ finally:
 {
     "stdout": _stdout_buf.getvalue(),
     "stderr": _stderr_buf.getvalue() + _tb_str,
-    "result": repr(_eval_res) if _eval_res is not None else None
+    "result": repr(_eval_res) if _eval_res is not None else None,
+    "error": bool(_tb_str)
 }
 \`;
         const resProxy = pyodide.runPython(runnerScript);
@@ -199,7 +200,8 @@ finally:
           type: 'result',
           stdout: resObj.get ? resObj.get('stdout') : resObj.stdout,
           stderr: resObj.get ? resObj.get('stderr') : resObj.stderr,
-          result: resObj.get ? resObj.get('result') : resObj.result
+          result: resObj.get ? resObj.get('result') : resObj.result,
+          error: resObj.get ? Boolean(resObj.get('error')) : Boolean(resObj.error)
         });
       } catch (err) {
         postMessage({
@@ -207,7 +209,8 @@ finally:
           type: 'result',
           stdout: '',
           stderr: err.toString(),
-          result: null
+          result: null,
+          error: true
         });
       }
     };
@@ -325,6 +328,7 @@ except Exception:
         stdout: "",
         stderr: "Pyodide runtime is still initializing. Please wait a moment...",
         result: null,
+        error: true,
       });
       return;
     }
@@ -369,7 +373,8 @@ finally:
 {
     "stdout": _stdout_buf.getvalue(),
     "stderr": _stderr_buf.getvalue() + _tb_str,
-    "result": repr(_eval_res) if _eval_res is not None else None
+    "result": repr(_eval_res) if _eval_res is not None else None,
+    "error": bool(_tb_str)
 }
 `;
         const resProxy = mainThreadPyodide.runPython(runnerScript);
@@ -379,12 +384,14 @@ finally:
           stdout: resObj.get ? resObj.get("stdout") : resObj.stdout,
           stderr: resObj.get ? resObj.get("stderr") : resObj.stderr,
           result: resObj.get ? resObj.get("result") : resObj.result,
+          error: resObj.get ? Boolean(resObj.get("error")) : Boolean(resObj.error),
         });
       } catch (err) {
         callback({
           stdout: "",
           stderr: err.toString(),
           result: null,
+          error: true,
         });
       }
     }
@@ -487,7 +494,7 @@ finally:
         executeCode(code, (res) => {
           runBtn.disabled = false;
           runBtn.innerHTML = "&#9654; Run";
-          if (res.stderr && res.stderr.trim() && !res.stdout && !res.result) {
+          if (res.error || (res.stderr && res.stderr.trim())) {
             cellStatus.textContent = "Execution completed with errors.";
           } else {
             cellStatus.textContent = "Execution completed.";

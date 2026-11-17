@@ -21,7 +21,7 @@ Role-Based Pathways & Interactive Showcase
       .. raw:: html
 
          <div class="role-card-action">
-            <button type="button" class="role-card-launch-btn" data-persona-target="panel-datamanager" aria-label="Open Clinical Data Manager Live Explorer">
+            <button type="button" class="role-card-launch-btn" data-persona-target="panel-datamanager" aria-label="Inspect Form Schemas - Open Clinical Data Manager Live Explorer">
                <span>📋 Inspect Form Schemas</span>
             </button>
          </div>
@@ -41,7 +41,7 @@ Role-Based Pathways & Interactive Showcase
       .. raw:: html
 
          <div class="role-card-action">
-            <button type="button" class="role-card-launch-btn" data-persona-target="panel-integration" aria-label="Open Integration Engineer Live Console">
+            <button type="button" class="role-card-launch-btn" data-persona-target="panel-integration" aria-label="Run Interactive Queries - Open Integration Engineer Live Console">
                <span>⚡ Run Interactive Queries</span>
             </button>
          </div>
@@ -62,7 +62,7 @@ Role-Based Pathways & Interactive Showcase
       .. raw:: html
 
          <div class="role-card-action">
-            <button type="button" class="role-card-launch-btn" data-persona-target="panel-auditor" aria-label="Open Regulatory Auditor Live Verification">
+            <button type="button" class="role-card-launch-btn" data-persona-target="panel-auditor" aria-label="Verify Audit Trails - Open Regulatory Auditor Live Verification">
                <span>🛡️ Verify Audit Trails</span>
             </button>
          </div>
