@@ -65,13 +65,22 @@ warn() { printf '  %s⚠ %s%s\n' "$YELLOW" "$1" "$RESET"; }
 # open_url URL opens it in the human's browser, cross-platform incl. WSL.
 open_url() {
   local url="$1"
-  printf '  %s↗ opening%s %s\n' "$GREEN" "$RESET" "$url"
-  { if   command -v wslview     >/dev/null 2>&1; then wslview "$url"
-    elif command -v explorer.exe >/dev/null 2>&1; then explorer.exe "$url"
-    elif command -v xdg-open    >/dev/null 2>&1; then xdg-open "$url"
-    elif command -v open        >/dev/null 2>&1; then open "$url"
-    else warn "couldn't open a browser; visit it manually: $url"; fi
-  } >/dev/null 2>&1 || warn "couldn't open a browser, so visit it manually: $url"
+  local opener=""
+  if   command -v wslview      >/dev/null 2>&1; then opener="wslview"
+  elif command -v explorer.exe >/dev/null 2>&1; then opener="explorer.exe"
+  elif { [[ "${OSTYPE:-}" == darwin* ]] || [ "$(uname -s 2>/dev/null)" = "Darwin" ]; } && command -v open >/dev/null 2>&1; then opener="open"
+  elif [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    if   command -v xdg-open >/dev/null 2>&1; then opener="xdg-open"
+    elif command -v open     >/dev/null 2>&1; then opener="open"
+    fi
+  fi
+
+  if [ -n "$opener" ]; then
+    printf '  %s↗ opening%s %s\n' "$GREEN" "$RESET" "$url"
+    "$opener" "$url" </dev/null >/dev/null 2>&1 &
+  else
+    warn "couldn't open a browser; visit it manually: $url"
+  fi
 }
 
 # pause "msg" waits for the human to confirm they've done the manual part.
