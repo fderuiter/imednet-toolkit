@@ -146,6 +146,34 @@ def test_custom_css_rules_and_overrides() -> None:
     assert 'body[data-theme="dark"] .role-card' in css_content
     assert 'body[data-theme="dark"] .explorer-dataframe-table' in css_content
 
+    # Visible focus styles for preformatted code blocks
+    assert "pre:focus-visible" in css_content
+    assert "outline: 2px solid var(--color-brand-primary)" in css_content
+
+
+@pytest.mark.unit
+def test_code_block_keyboard_accessibility() -> None:
+    """Ensure preformatted code blocks receive keyboard accessibility attributes and focus styles."""
+    css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
+    js_content = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+
+    # Verify CSS focus-visible rule for preformatted code blocks
+    assert "pre:focus-visible" in css_content
+    assert "outline: 2px solid var(--color-brand-primary)" in css_content
+
+    # Verify script logic detects pre elements and tests horizontal overflow
+    assert "querySelectorAll" in js_content and "pre" in js_content
+    assert "scrollWidth >" in js_content and "clientWidth" in js_content
+
+    # Verify accessible region and tabindex attributes are assigned to overflowing containers
+    assert 'tabindex' in js_content and '"0"' in js_content
+    assert 'role' in js_content and '"region"' in js_content
+    assert 'aria-label' in js_content and '"Code snippet"' in js_content
+
+    # Verify dynamic updates on window resize and removal when not overflowing
+    assert "resize" in js_content
+    assert "removeAttribute" in js_content and "tabindex" in js_content
+
 
 @pytest.mark.unit
 def test_vpat_document_conformance() -> None:
