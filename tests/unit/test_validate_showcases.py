@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 from scripts.validate_showcases import (
     main,
+    stage_wheels,
     validate_documentation_literal_includes,
     validate_showcase_ast_and_imports,
+    validate_staged_wheels,
 )
 
 
@@ -162,3 +165,58 @@ def test_main_exit_code_nonzero_on_failure(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     assert "Showcase verification failed" in captured.err
     assert "broken.py" in captured.err
+
+
+def test_validate_staged_wheels_missing_directory(tmp_path: Path) -> None:
+    """Verify that missing wheels directory returns error."""
+    missing_dir = tmp_path / "nonexistent_wheels"
+    errors = validate_staged_wheels(missing_dir)
+    assert len(errors) == 1
+    assert "Staged wheels directory not found" in errors[0]
+
+
+def test_validate_staged_wheels_empty_directory(tmp_path: Path) -> None:
+    """Verify that empty wheels directory returns error."""
+    empty_dir = tmp_path / "wheels"
+    empty_dir.mkdir(parents=True)
+    errors = validate_staged_wheels(empty_dir)
+    assert len(errors) == 1
+    assert "No staged wheel artifacts" in errors[0]
+
+
+def test_validate_staged_wheels_missing_expected_package(tmp_path: Path) -> None:
+    """Verify error when expected package wheel is missing."""
+    wheels_dir = tmp_path / "wheels"
+    wheels_dir.mkdir(parents=True)
+    other_wheel = wheels_dir / "other_package-1.0.0-py3-none-any.whl"
+    other_wheel.write_text("dummy", encoding="utf-8")
+
+    errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
+    assert any("Missing expected staged wheel artifact for package 'imednet'" in e for e in errors)
+
+
+def test_validate_staged_wheels_missing_required_module(tmp_path: Path) -> None:
+    """Verify error when wheel archive does not contain required module files."""
+    wheels_dir = tmp_path / "wheels"
+    wheels_dir.mkdir(parents=True)
+    incomplete_wheel = wheels_dir / "imednet-1.1.0-py3-none-any.whl"
+
+    with zipfile.ZipFile(incomplete_wheel, "w") as zf:
+        zf.writestr("imednet/__init__.py", "print('hello')\n")
+        # Missing imednet/sdk.py and imednet/config.py
+
+    errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
+    assert any("missing required module entry 'imednet/sdk.py'" in e for e in errors)
+
+
+def test_validate_staged_wheels_workspace_integration(tmp_path: Path) -> None:
+    """Verify that staged wheels in repo pass validation and simulated Pyodide import."""
+    repo_root = Path(__file__).resolve().parents[2]
+    wheels_dir = repo_root / "docs" / "_static" / "wheels"
+
+    # Stage wheels if not already staged
+    if not list(wheels_dir.glob("*.whl")):
+        stage_wheels(repo_root, wheels_dir)
+
+    errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
+    assert not errors, f"Expected staged wheels to pass validation, got: {errors}"

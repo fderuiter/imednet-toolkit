@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import importlib.util
 import re
+import shutil
+import subprocess
 import sys
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -166,6 +170,117 @@ def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
     return errors
 
 
+def validate_staged_wheels(
+    wheels_dir: Path,
+    expected_packages: Sequence[str] = ("imednet",),
+) -> list[str]:
+    """Verify that staged wheels exist, contain required modules, and can be imported in simulated Pyodide.
+
+    Args:
+        wheels_dir: Path to directory containing staged wheel artifacts (*.whl).
+        expected_packages: Names of packages expected to have staged wheels.
+
+    Returns:
+        list[str]: Validation error messages, or an empty list if valid.
+    """
+    errors: list[str] = []
+    if not wheels_dir.exists():
+        return [f"Staged wheels directory not found: {wheels_dir}"]
+
+    wheel_files = sorted(wheels_dir.glob("*.whl"))
+    if not wheel_files:
+        return [f"No staged wheel artifacts (*.whl) found in {wheels_dir}"]
+
+    for pkg_name in expected_packages:
+        prefix = pkg_name.replace("-", "_")
+        matching = [
+            w
+            for w in wheel_files
+            if w.name.startswith(f"{prefix}-") or w.name.startswith(f"{pkg_name}-")
+        ]
+        if not matching:
+            errors.append(
+                f"Missing expected staged wheel artifact for package '{pkg_name}' in {wheels_dir}"
+            )
+            continue
+
+        wheel_path = matching[0]
+
+        # Verify wheel content archive has required modules
+        try:
+            with zipfile.ZipFile(wheel_path, "r") as zf:
+                namelist = set(zf.namelist())
+                if pkg_name == "imednet":
+                    required_entries = [
+                        "imednet/__init__.py",
+                        "imednet/sdk.py",
+                        "imednet/config.py",
+                    ]
+                    for req in required_entries:
+                        if req not in namelist:
+                            errors.append(
+                                f"Staged wheel '{wheel_path.name}' is missing required module entry '{req}'"
+                            )
+        except Exception as exc:
+            errors.append(f"Failed to inspect wheel archive '{wheel_path.name}': {exc}")
+            continue
+
+        # Verify simulated Pyodide import in an isolated subprocess
+        # Running in a separate process guarantees true environment isolation and prevents
+        # polluting sys.modules or coverage measurement in the host test runner.
+        code = (
+            "import sys\n"
+            "sys.path = [p for p in sys.path if 'packages/core/src' not in p "
+            "and 'packages/plugins' not in p and 'packages/providers' not in p]\n"
+            f"sys.path.insert(0, {str(wheel_path.resolve())!r})\n"
+            f"import {prefix}\n"
+        )
+        if pkg_name == "imednet":
+            code += f"assert hasattr({prefix}, 'ImednetSDK'), 'ImednetSDK not found'\n"
+
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or proc.stdout.strip()
+            errors.append(f"Simulated Pyodide import failed for '{wheel_path.name}': {err_msg}")
+
+    return errors
+
+
+def stage_wheels(repo_root: Path, wheels_dir: Path | None = None) -> list[Path]:
+    """Build and stage pure Python wheels for workspace packages."""
+    if wheels_dir is None:
+        wheels_dir = repo_root / "docs" / "_static" / "wheels"
+
+    wheels_dir.mkdir(parents=True, exist_ok=True)
+    uv_bin = shutil.which("uv") or "uv"
+    build_cmd = [
+        uv_bin,
+        "build",
+        "--all-packages",
+        "--wheel",
+        "--out-dir",
+        str(wheels_dir),
+    ]
+
+    try:
+        subprocess.run(build_cmd + ["--offline"], check=True, cwd=str(repo_root))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        try:
+            subprocess.run(build_cmd, check=True, cwd=str(repo_root))
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(f"Warning: Failed to stage wheels: {exc}")
+
+    for placeholder in wheels_dir.glob("imednet_workspace-*.whl"):
+        with contextlib.suppress(OSError):
+            placeholder.unlink()
+
+    return sorted(wheels_dir.glob("*.whl"))
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -189,6 +304,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Path to repository root (defaults to repository root containing scripts/)",
     )
+    parser.add_argument(
+        "--wheels-dir",
+        type=Path,
+        default=None,
+        help="Path to staged wheels directory (defaults to <docs_dir>/_static/wheels)",
+    )
+    parser.add_argument(
+        "--skip-wheels",
+        action="store_true",
+        help="Skip staged wheels validation gate",
+    )
     return parser.parse_args(argv)
 
 
@@ -198,6 +324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo_root = args.root_dir or Path(__file__).resolve().parent.parent
     examples_dir = args.examples_dir or (repo_root / "examples")
     docs_dir = args.docs_dir or (repo_root / "docs")
+    wheels_dir = args.wheels_dir or (docs_dir / "_static" / "wheels")
 
     configure_sys_path(repo_root)
 
@@ -207,7 +334,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Validating documentation literal includes in {docs_dir}...")
     doc_errors = validate_documentation_literal_includes(docs_dir)
 
-    all_errors = showcase_errors + doc_errors
+    wheel_errors: list[str] = []
+    should_check_wheels = not args.skip_wheels and (
+        args.wheels_dir is not None
+        or (docs_dir / "_static").exists()
+        or (repo_root / "packages" / "core").exists()
+    )
+
+    if should_check_wheels:
+        if (repo_root / "packages" / "core").exists() and not list(wheels_dir.glob("*.whl")):
+            print(f"Staged wheels not found in {wheels_dir}, building workspace wheels...")
+            stage_wheels(repo_root, wheels_dir)
+
+        print(f"Validating staged wheels and simulated Pyodide imports in {wheels_dir}...")
+        wheel_errors = validate_staged_wheels(wheels_dir)
+
+    all_errors = showcase_errors + doc_errors + wheel_errors
 
     if all_errors:
         print(f"\nShowcase verification failed with {len(all_errors)} error(s):", file=sys.stderr)
