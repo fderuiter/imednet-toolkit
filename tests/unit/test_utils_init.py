@@ -23,6 +23,18 @@ def test_lazy_load_pandas_functions() -> None:
     from imednet.utils.pandas import forms_to_dataframe as expected_ftodf
 
     assert func_form is expected_ftodf
+    func_visit = utils.visits_to_dataframe
+    from imednet.utils.pandas import visits_to_dataframe as expected_vtodf_visits
+
+    assert func_visit is expected_vtodf_visits
+    func_interval = utils.intervals_to_dataframe
+    from imednet.utils.pandas import intervals_to_dataframe as expected_itodf
+
+    assert func_interval is expected_itodf
+    func_site = utils.sites_to_dataframe
+    from imednet.utils.pandas import sites_to_dataframe as expected_sitedf
+
+    assert func_site is expected_sitedf
     func = utils.records_to_dataframe
     from imednet.utils.pandas import records_to_dataframe as expected_rtodf
 
