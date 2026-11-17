@@ -16,6 +16,13 @@ class MockModel(ImednetBaseModel):
     """Test suite for MockModel."""
 
 
+class MockGenericEndpoint(GenericEndpoint[MockModel]):
+    """Concrete mock endpoint subclass inheriting directly from GenericEndpoint."""
+
+    PATH = "/generic"
+    MODEL = MockModel
+
+
 class MockEndpointImpl(EdcSyncGetEndpoint[MockModel]):
     """Test suite for MockEndpointImpl."""
 
@@ -86,11 +93,13 @@ class TestBaseEndpoint:
 
     def test_ctx_parameter_raises_type_error(self, client):
         """Test that passing ctx to GenericEndpoint or derived endpoints raises TypeError."""
-        with pytest.raises(TypeError):
-            GenericEndpoint(client, ctx=object())
-        with pytest.raises(TypeError):
-            GenericEndpoint(client, None, object())
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="unexpected keyword argument 'ctx'"):
+            MockGenericEndpoint(client, ctx=object())
+        with pytest.raises(
+            TypeError, match=r"takes from 1 to 3 positional arguments but 4 were given"
+        ):
+            MockGenericEndpoint(client, None, object())
+        with pytest.raises(TypeError, match="unexpected keyword argument 'ctx'"):
             MockListGetEndpoint(client, ctx=object())
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match=r"takes 2 positional arguments but 3 were given"):
             MockListGetEndpoint(client, object())
