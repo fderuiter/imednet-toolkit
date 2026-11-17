@@ -11,6 +11,7 @@ import argparse
 import ast
 import contextlib
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -428,10 +429,21 @@ def validate_staged_wheels(
         if pkg_name == "imednet":
             code += f"assert hasattr({prefix}, 'ImednetSDK'), 'ImednetSDK not found'\n"
 
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if not (
+                k.upper().startswith(("COV_", "COVERAGE_"))
+                or "cov_core" in k.lower()
+                or "coverage" in k.lower()
+            )
+        }
+
         proc = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
+            env=clean_env,
         )
         if proc.returncode != 0:
             err_msg = proc.stderr.strip() or proc.stdout.strip()
