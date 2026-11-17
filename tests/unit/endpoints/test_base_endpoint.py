@@ -82,3 +82,14 @@ class TestBaseEndpoint:
 
         with pytest.raises(TypeError, match="Missing required argument: item_id"):
             ep.get("S1", None)
+
+    def test_ctx_parameter_raises_type_error(self, client):
+        """Test that passing ctx to GenericEndpoint or derived endpoints raises TypeError."""
+        with pytest.raises(TypeError):
+            GenericEndpoint(client, ctx=object())
+        with pytest.raises(TypeError):
+            GenericEndpoint(client, None, object())
+        with pytest.raises(TypeError):
+            MockListGetEndpoint(client, ctx=object())
+        with pytest.raises(TypeError):
+            MockListGetEndpoint(client, object())
