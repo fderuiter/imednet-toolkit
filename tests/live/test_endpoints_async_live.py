@@ -101,11 +101,11 @@ async def test_async_record_revisions(async_sdk: AsyncImednetSDK, study_key: str
 @pytest.mark.asyncio(scope="session")
 async def test_async_users(async_sdk: AsyncImednetSDK, study_key: str) -> None:
     """Test that async users asynchronously."""
+    assert not hasattr(async_sdk.users, "get")
     users = [item async for item in async_sdk.users.list(study_key)]
     assert isinstance(users, list)
     if users:
-        user = await async_sdk.users.get(study_key, users[0].user_id)
-        assert user.user_id == users[0].user_id
+        assert isinstance(users[0], User)
 
 
 @pytest.mark.asyncio(scope="session")

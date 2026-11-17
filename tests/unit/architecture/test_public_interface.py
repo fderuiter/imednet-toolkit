@@ -134,6 +134,15 @@ def test_sync_list_get_endpoint_list_uses_filter_value() -> None:
     assert not _is_any(tp), "SyncListGetEndpoint.list: **filters must not be typed as Any"
 
 
+def test_sync_list_endpoint_list_uses_filter_value() -> None:
+    """SyncListEndpoint.list must use FilterValue for **filters, not Any."""
+    from imednet.core.endpoint.base import SyncListEndpoint
+
+    tp = _get_kwargs_type(SyncListEndpoint.list, "filters")
+    assert tp is not None, "SyncListEndpoint.list must annotate **filters"
+    assert not _is_any(tp), "SyncListEndpoint.list: **filters must not be typed as Any"
+
+
 def test_async_list_get_endpoint_async_list_uses_filter_value() -> None:
     """AsyncListGetEndpoint.list must use FilterValue for **filters, not Any."""
     from imednet.core.endpoint.base import AsyncListGetEndpoint
@@ -141,6 +150,15 @@ def test_async_list_get_endpoint_async_list_uses_filter_value() -> None:
     tp = _get_kwargs_type(AsyncListGetEndpoint.list, "filters")
     assert tp is not None, "AsyncListGetEndpoint.list must annotate **filters"
     assert not _is_any(tp), "AsyncListGetEndpoint.list: **filters must not be typed as Any"
+
+
+def test_async_list_endpoint_async_list_uses_filter_value() -> None:
+    """AsyncListEndpoint.list must use FilterValue for **filters, not Any."""
+    from imednet.core.endpoint.base import AsyncListEndpoint
+
+    tp = _get_kwargs_type(AsyncListEndpoint.list, "filters")
+    assert tp is not None, "AsyncListEndpoint.list must annotate **filters"
+    assert not _is_any(tp), "AsyncListEndpoint.list: **filters must not be typed as Any"
 
 
 def test_records_endpoint_create_no_bare_dict_any() -> None:

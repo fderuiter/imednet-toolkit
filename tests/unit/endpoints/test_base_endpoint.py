@@ -7,8 +7,17 @@ import pytest
 
 from imednet.core.client import Client
 from imednet.core.context import set_study_context
-from imednet.core.endpoint.base import GenericEndpoint
-from imednet.core.endpoint.edc_mixin import EdcSyncGetEndpoint, EdcSyncListGetEndpoint
+from imednet.core.endpoint.base import (
+    AsyncListEndpoint,
+    GenericEndpoint,
+    SyncListEndpoint,
+)
+from imednet.core.endpoint.edc_mixin import (
+    EdcAsyncListEndpoint,
+    EdcSyncGetEndpoint,
+    EdcSyncListEndpoint,
+    EdcSyncListGetEndpoint,
+)
 from imednet.models.base import ImednetBaseModel
 
 
@@ -42,6 +51,34 @@ class MockListGetEndpoint(EdcSyncListGetEndpoint[MockModel]):
     PATH = "/items"
     MODEL = MockModel
     _id_param = "recordId"
+
+
+class MockListEndpoint(EdcSyncListEndpoint[MockModel]):
+    """Test suite for MockListEndpoint."""
+
+    PATH = "/list-items"
+    MODEL = MockModel
+
+
+class MockAsyncListEndpoint(EdcAsyncListEndpoint[MockModel]):
+    """Test suite for MockAsyncListEndpoint."""
+
+    PATH = "/async-list-items"
+    MODEL = MockModel
+
+
+class MockBaseSyncListEndpoint(SyncListEndpoint[MockModel]):
+    """Test suite for MockBaseSyncListEndpoint."""
+
+    PATH = "/base-list-items"
+    MODEL = MockModel
+
+
+class MockBaseAsyncListEndpoint(AsyncListEndpoint[MockModel]):
+    """Test suite for MockBaseAsyncListEndpoint."""
+
+    PATH = "/base-async-list-items"
+    MODEL = MockModel
 
 
 class TestBaseEndpoint:
@@ -103,3 +140,24 @@ class TestBaseEndpoint:
             MockListGetEndpoint(client, ctx=object())
         with pytest.raises(TypeError, match=r"takes 2 positional arguments but 3 were given"):
             MockListGetEndpoint(client, object())
+
+    def test_list_endpoint_has_no_get(self, client):
+        """Test that EdcSyncListEndpoint and SyncListEndpoint have list and no get method."""
+        ep = MockListEndpoint(client)
+        assert hasattr(ep, "list")
+        assert not hasattr(ep, "get")
+
+        base_ep = MockBaseSyncListEndpoint(client)
+        assert hasattr(base_ep, "list")
+        assert not hasattr(base_ep, "get")
+
+    def test_async_list_endpoint_has_no_get(self):
+        """Test that EdcAsyncListEndpoint and AsyncListEndpoint have list and no get method."""
+        async_client = MagicMock()
+        ep = MockAsyncListEndpoint(async_client=async_client)
+        assert hasattr(ep, "list")
+        assert not hasattr(ep, "get")
+
+        base_ep = MockBaseAsyncListEndpoint(async_client=async_client)
+        assert hasattr(base_ep, "list")
+        assert not hasattr(base_ep, "get")
