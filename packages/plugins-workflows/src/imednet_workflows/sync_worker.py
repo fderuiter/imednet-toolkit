@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -64,7 +65,11 @@ class SyncWorker:
         )
         return record_count
 
-    def run_forever(self) -> None:
+    def run_forever(
+        self,
+        on_cycle: Callable[[int, int], None] | None = None,
+        on_sleep_tick: Callable[[int, int], None] | None = None,
+    ) -> None:
         """Run sync cycles until stopped."""
         logger.info(
             "sync worker started",
@@ -73,13 +78,26 @@ class SyncWorker:
                 "interval_seconds": self._config.interval_seconds,
             },
         )
+        cycle_count = 0
         while not self._stop_event.is_set():
+            cycle_count += 1
             try:
-                self.run_once()
+                record_count = self.run_once()
+                if on_cycle:
+                    on_cycle(cycle_count, record_count)
             except Exception:  # pragma: no cover - defensive logging path
                 logger.exception("sync worker cycle failed")
-            if self._stop_event.wait(self._config.interval_seconds):
-                break
+            if on_sleep_tick:
+                remaining = self._config.interval_seconds
+                while remaining > 0 and not self._stop_event.is_set():
+                    on_sleep_tick(cycle_count, remaining)
+                    sleep_chunk = min(1.0, float(remaining))
+                    if self._stop_event.wait(sleep_chunk):
+                        break
+                    remaining -= int(sleep_chunk) if sleep_chunk >= 1 else 1
+            else:
+                if self._stop_event.wait(self._config.interval_seconds):
+                    break
         logger.info("sync worker stopped", extra={"study_key": self._config.study_key})
 
     def stop(self) -> None:

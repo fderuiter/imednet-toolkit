@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import sys
+import threading
+import time
 from collections.abc import Sequence
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from imednet.utils.job_poller import JobStatusEvent
 
 _ANSI_COLORS = {
     "green": "\033[32m",
@@ -50,21 +56,220 @@ _STATUS_COLOR_MAP = {
 
 _ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_ASCII_SPINNER_FRAMES = ("-", "\\", "|", "/")
 
-class _DummyConsole:
-    def status(self, msg: str, spinner: str | None = None) -> Any:
-        class DummyStatus:
-            def __enter__(self) -> None:
-                if sys.stderr.isatty():
-                    print(msg, file=sys.stderr)
+_CURSOR_HIDE = "\033[?25l"
+_CURSOR_SHOW = "\033[?25h"
+_CLEAR_LINE = "\r\033[K"
 
-            def __exit__(self, *args: Any) -> None:
+
+def clear_line(stream: Any = None) -> None:
+    """Clear the current line and restore terminal cursor on interactive streams."""
+    target = stream if stream is not None else sys.stderr
+    try:
+        if target and hasattr(target, "isatty") and target.isatty():
+            target.write(f"{_CLEAR_LINE}{_CURSOR_SHOW}")
+            target.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+
+
+def format_job_progress(
+    event: JobStatusEvent | Any,
+    status: Any = None,
+    elapsed: float | None = None,
+    bar_width: int = 20,
+) -> str:
+    """Format a job polling event into a progress bar, state label, and elapsed timer.
+
+    Args:
+        event: A JobStatusEvent or batch_id string.
+        status: Optional JobStatus if event is a batch_id string.
+        elapsed: Optional elapsed seconds if event is a batch_id string.
+        bar_width: Width of the progress bar in characters.
+
+    Returns:
+        Formatted string containing progress bar, state label, and elapsed timer.
+    """
+    if hasattr(event, "status") and hasattr(event, "batch_id"):
+        batch_id = str(event.batch_id)
+        status_obj = event.status
+        elapsed_val = float(getattr(event, "elapsed", 0.0))
+    else:
+        batch_id = str(event)
+        status_obj = status
+        elapsed_val = float(elapsed) if elapsed is not None else 0.0
+
+    raw_progress = getattr(status_obj, "progress", 0) if status_obj is not None else 0
+    try:
+        progress = max(0, min(100, int(raw_progress)))
+    except (TypeError, ValueError):
+        progress = 0
+
+    state_val = getattr(status_obj, "state", "UNKNOWN") if status_obj is not None else "UNKNOWN"
+    state_label = state_val.value if hasattr(state_val, "value") else str(state_val)
+
+    filled = int(round(bar_width * progress / 100.0))
+    empty = max(0, bar_width - filled)
+    bar = "=" * filled + "-" * empty
+
+    return f"Job {batch_id}: [{bar}] {progress}% - {state_label} ({elapsed_val:.1f}s)"
+
+
+class Status:
+    """Status controller managing live ANSI spinner rendering or static fallback."""
+
+    def __init__(
+        self,
+        msg: str,
+        console: Console,
+        spinner: str | None = None,
+        refresh_per_second: float = 12.5,
+    ) -> None:
+        self._msg = str(msg)
+        self.console = console
+        self.spinner = spinner
+        self._interval = 1.0 / refresh_per_second if refresh_per_second > 0 else 0.08
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_time: float = 0.0
+        self._lock = threading.Lock()
+        self._interactive = False
+        self._entered = False
+        self._frames: Sequence[str] = _SPINNER_FRAMES
+
+    @property
+    def msg(self) -> str:
+        """Get the current status message."""
+        with self._lock:
+            return self._msg
+
+    @msg.setter
+    def msg(self, value: str) -> None:
+        self.update(value)
+
+    def update(self, msg: str) -> None:
+        """Update the displayed status message."""
+        with self._lock:
+            self._msg = str(msg)
+        if self._interactive and self._entered:
+            self._render_frame()
+
+    def _render_frame(self, frame_idx: int = 0) -> None:
+        stream = self.console.stream
+        try:
+            with self._lock:
+                current_msg = self._msg
+            elapsed = time.monotonic() - self._start_time
+            has_timer = bool(re.search(r"\(\d+\.?\d*s\)", current_msg))
+            timer_suffix = "" if has_timer else f" ({elapsed:.1f}s)"
+
+            frame = self._frames[frame_idx % len(self._frames)]
+            line = f"{_CLEAR_LINE}{frame} {current_msg}{timer_suffix}"
+            try:
+                stream.write(line)
+                stream.flush()
+            except UnicodeEncodeError:
+                self._frames = _ASCII_SPINNER_FRAMES
+                frame = self._frames[frame_idx % len(self._frames)]
+                line = f"{_CLEAR_LINE}{frame} {current_msg}{timer_suffix}"
+                stream.write(line)
+                stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def _run_spinner(self) -> None:
+        idx = 0
+        while not self._stop_event.is_set():
+            self._render_frame(idx)
+            idx += 1
+            if self._stop_event.wait(self._interval):
+                break
+
+    def __enter__(self) -> Status:
+        self._entered = True
+        self._start_time = time.monotonic()
+        self._interactive = self.console.is_interactive()
+        stream = self.console.stream
+
+        if self._interactive:
+            try:
+                stream.write(_CURSOR_HIDE)
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run_spinner, daemon=True)
+            self._thread.start()
+        else:
+            is_json_mode = os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+            if not is_json_mode:
+                try:
+                    is_json_mode = (
+                        any(arg in sys.argv for arg in ("--format", "-f")) and "json" in sys.argv
+                    )
+                except Exception:
+                    is_json_mode = False
+
+            is_string_io = (
+                isinstance(stream, io.StringIO) or stream.__class__.__name__ == "StringIO"
+            )
+            is_test_captured = stream is sys.stderr and is_string_io
+
+            if not is_json_mode and not is_test_captured:
+                try:
+                    clean_msg = _ANSI_REGEX.sub("", self._msg)
+                    print(clean_msg, file=stream, flush=True)
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self._entered = False
+        if self._interactive:
+            self._stop_event.set()
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=1.0)
+            stream = self.console.stream
+            try:
+                stream.write(f"{_CLEAR_LINE}{_CURSOR_SHOW}")
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError):
                 pass
 
-        return DummyStatus()
+
+class Console:
+    """Console handling terminal capabilities and live status rendering."""
+
+    def __init__(self, stream: Any = None) -> None:
+        self._stream = stream
+
+    @property
+    def stream(self) -> Any:
+        return self._stream if self._stream is not None else sys.stderr
+
+    def is_interactive(self) -> bool:
+        """Check whether the output stream is an interactive terminal."""
+        s = self.stream
+        try:
+            return bool(s and hasattr(s, "isatty") and s.isatty())
+        except (AttributeError, ValueError, OSError):
+            return False
+
+    def status(
+        self,
+        msg: str,
+        spinner: str | None = None,
+        refresh_per_second: float = 12.5,
+    ) -> Status:
+        """Create a live status context manager."""
+        return Status(msg, console=self, spinner=spinner, refresh_per_second=refresh_per_second)
 
 
-console = _DummyConsole()
+_DummyConsole = Console
+console = Console()
 
 
 def _truncate(text: str, length: int = 60) -> str:

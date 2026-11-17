@@ -1,15 +1,22 @@
 """Unit tests for utils output."""
 
+import io
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from imednet.cli.utils import (
+    Console,
     _format_cell_value,
+    clear_line,
     display_list,
     fetching_status,
+    format_job_progress,
     print_error,
 )
+from imednet.models.jobs import JobState, JobStatus
+from imednet.utils.job_poller import JobStatusEvent
 
 
 def test_fetching_status_records() -> None:
@@ -209,3 +216,247 @@ def test_print_error_handles_broken_pipe_and_ioerror() -> None:
     io_stream.write.side_effect = OSError("I/O failure")
     # Should not raise exception
     print_error("Error message", file=io_stream)
+
+
+def test_status_spinner_rendering_interactive() -> None:
+    """Console.status writes animated spinner frames, elapsed timer, and restores cursor on interactive streams."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    c = Console(stream=mock_stream)
+    with c.status("Processing records...", refresh_per_second=20):
+        time.sleep(0.08)
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+
+    # Verifies cursor hidden on enter
+    assert "\033[?25l" in all_output
+    # Verifies animated spinner frame with message and timer was written
+    assert "Processing records..." in all_output
+    assert "s)" in all_output  # elapsed timer suffix like (0.1s)
+    # Verifies line cleared and cursor restored on exit
+    assert "\r\033[K" in all_output
+    assert "\033[?25h" in all_output
+
+
+def test_status_update_interactive() -> None:
+    """Status.update dynamically updates message and refreshes display."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    c = Console(stream=mock_stream)
+    with c.status("Phase 1") as status:
+        status.update("Phase 2 - downloading")
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+
+    assert "Phase 1" in all_output
+    assert "Phase 2 - downloading" in all_output
+
+
+def test_status_interactive_exception_cleans_up() -> None:
+    """Status restores terminal cursor and clears line when exception occurs."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    c = Console(stream=mock_stream)
+    with pytest.raises(RuntimeError):
+        with c.status("Failing task"):
+            raise RuntimeError("Operation aborted")
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+
+    assert "\033[?25h" in all_output  # Cursor restored
+    assert "\r\033[K" in all_output  # Line cleared
+
+
+def test_status_interactive_keyboard_interrupt_cleans_up() -> None:
+    """Status restores terminal cursor and clears line on KeyboardInterrupt."""
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    c = Console(stream=mock_stream)
+    with pytest.raises(KeyboardInterrupt):
+        with c.status("Interrupted task"):
+            raise KeyboardInterrupt()
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+
+    assert "\033[?25h" in all_output
+    assert "\r\033[K" in all_output
+
+
+def test_clear_line_interactive_and_non_interactive() -> None:
+    """clear_line writes escape sequences on tty and is silent on non-tty."""
+    interactive_stream = MagicMock()
+    interactive_stream.isatty.return_value = True
+    clear_line(stream=interactive_stream)
+    interactive_stream.write.assert_called_once_with("\r\033[K\033[?25h")
+
+    non_tty_stream = MagicMock()
+    non_tty_stream.isatty.return_value = False
+    clear_line(stream=non_tty_stream)
+    non_tty_stream.write.assert_not_called()
+
+
+def test_status_non_interactive_fallback() -> None:
+    """Console.status outputs a single static text line without ANSI codes on non-interactive streams."""
+    output_buffer = io.StringIO()
+    # Explicitly non-interactive custom stream
+    output_buffer.isatty = lambda: False  # type: ignore[assignment]
+
+    c = Console(stream=output_buffer)
+    with c.status("\033[32mFetching dataset\033[0m for study..."):
+        pass
+
+    result = output_buffer.getvalue()
+    assert result == "Fetching dataset for study...\n"
+    assert "\033[" not in result  # No ANSI escape sequences
+
+
+def test_format_job_progress() -> None:
+    """format_job_progress formats JobStatusEvent into progress bar, state label, and timer."""
+    status = JobStatus(batch_id="BATCH-99", state=JobState.PROCESSING, progress=45)
+    event = JobStatusEvent(
+        batch_id="BATCH-99",
+        status=status,
+        poll_number=3,
+        elapsed=12.4,
+        is_terminal=False,
+    )
+
+    formatted = format_job_progress(event)
+
+    assert "Job BATCH-99:" in formatted
+    assert "[=========" in formatted  # 45% of 20 chars is 9 chars filled
+    assert "45%" in formatted
+    assert "PROCESSING" in formatted
+    assert "(12.4s)" in formatted
+
+
+def test_format_job_progress_bounds_and_arguments() -> None:
+    """format_job_progress clamps progress percentage and supports alternative arguments."""
+    status_over = JobStatus(batch_id="B1", state="COMPLETED", progress=150)
+    event_over = JobStatusEvent(
+        batch_id="B1", status=status_over, poll_number=1, elapsed=2.0, is_terminal=True
+    )
+    formatted_over = format_job_progress(event_over)
+    assert "[====================] 100%" in formatted_over
+    assert "COMPLETED" in formatted_over
+
+    status_neg = JobStatus(batch_id="B2", state="PENDING", progress=-10)
+    event_neg = JobStatusEvent(
+        batch_id="B2", status=status_neg, poll_number=1, elapsed=0.5, is_terminal=False
+    )
+    formatted_neg = format_job_progress(event_neg)
+    assert "[--------------------] 0%" in formatted_neg
+    assert "PENDING" in formatted_neg
+
+    # Direct argument invocation
+    formatted_direct = format_job_progress("B3", status=status_over, elapsed=3.0)
+    assert "Job B3:" in formatted_direct
+    assert "(3.0s)" in formatted_direct
+
+
+def test_job_wait_progress_callback_and_clean_stdout_json() -> None:
+    """job_wait connects on_progress to sdk.poll_job and keeps JSON stdout clean."""
+    import json
+    from imednet import cli
+    from tests.unit.cli.test_cli import CliRunner
+
+    runner = CliRunner()
+    completed_job = JobStatus(batch_id="B-123", state="COMPLETED", progress=100)
+
+    progress_events_captured: list[str] = []
+
+    def mock_poll_job(study_key, batch_id, interval=5, timeout=300, on_progress=None):
+        if on_progress:
+            # Simulate progress callback invocations
+            event1 = JobStatusEvent(
+                batch_id=batch_id,
+                status=JobStatus(batch_id=batch_id, state="PROCESSING", progress=50),
+                poll_number=1,
+                elapsed=2.5,
+                is_terminal=False,
+            )
+            on_progress(event1)
+            progress_events_captured.append(event1.batch_id)
+            event2 = JobStatusEvent(
+                batch_id=batch_id,
+                status=completed_job,
+                poll_number=2,
+                elapsed=5.0,
+                is_terminal=True,
+            )
+            on_progress(event2)
+            progress_events_captured.append(event2.batch_id)
+        return completed_job
+
+    mock_sdk = MagicMock()
+    mock_sdk.poll_job.side_effect = mock_poll_job
+
+    with patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk):
+        result = runner.invoke(
+            cli.app, ["jobs", "wait", "STUDY-TEST", "B-123", "--format", "json"]
+        )
+
+    assert result.exit_code == 0
+    assert progress_events_captured == ["B-123", "B-123"]
+    # stdout must be strictly valid JSON without any progress bar or spinner noise
+    parsed = json.loads(result.stdout)
+    assert parsed["schemaVersion"] == "1.0"
+    assert parsed["resource"] == "jobs"
+    assert parsed["status"] == "complete"
+    assert len(parsed["items"]) == 1
+    assert parsed["items"][0]["batchId"] == "B-123"
+    assert parsed["items"][0]["state"] == "COMPLETED"
+    assert "Job B-123:" not in result.stdout
+    assert "[" not in result.stdout[:2]  # envelope starts with '{' not progress bracket '['
+
+
+def test_sync_worker_visual_feedback_iterative_cycles() -> None:
+    """sync_worker visual progress updates status with cycle count and sleep countdown."""
+    from imednet import cli
+    from tests.unit.cli.test_cli import CliRunner
+
+    runner = CliRunner()
+    cycles_seen = []
+    ticks_seen = []
+
+    def mock_run_forever(on_cycle=None, on_sleep_tick=None):
+        if on_cycle:
+            on_cycle(1, 42)
+            cycles_seen.append((1, 42))
+        if on_sleep_tick:
+            on_sleep_tick(1, 10)
+            on_sleep_tick(1, 9)
+            ticks_seen.extend([(1, 10), (1, 9)])
+        if on_cycle:
+            on_cycle(2, 55)
+            cycles_seen.append((2, 55))
+        raise KeyboardInterrupt()
+
+    mock_worker = MagicMock()
+    mock_worker.run_forever.side_effect = mock_run_forever
+    mock_loader_cls = MagicMock()
+    mock_sdk = MagicMock()
+
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet_workflows.cached_loader.CachedRecordsLoader", mock_loader_cls),
+        patch("imednet_workflows.cli.SyncWorker", return_value=mock_worker),
+    ):
+        result = runner.invoke(
+            cli.app, ["workflows", "sync-worker", "STUDY-X", "--interval", "10"]
+        )
+
+    assert result.exit_code == 0
+    assert cycles_seen == [(1, 42), (2, 55)]
+    assert ticks_seen == [(1, 10), (1, 9)]
+    mock_worker.stop.assert_called_once()
+    assert "Sync worker termination requested. Exiting cleanly." in result.stdout
+

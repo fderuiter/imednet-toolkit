@@ -7,7 +7,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -770,7 +770,9 @@ def test_jobs_wait_success(runner: CliRunner, sdk: MagicMock) -> None:
     """Test that jobs wait success."""
     result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH"])
     assert result.exit_code == 0
-    sdk.poll_job.assert_called_once_with("STUDY", "BATCH", interval=5, timeout=300)
+    sdk.poll_job.assert_called_once_with(
+        "STUDY", "BATCH", interval=5, timeout=300, on_progress=ANY
+    )
 
 
 def test_intervals_list_success(runner: CliRunner, sdk: MagicMock) -> None:

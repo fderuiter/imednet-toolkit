@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from typing import Any
 
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, fetching_status
+from ..utils import STUDY_KEY_ARG, fetching_status, format_job_progress, print_error
 from ..utils.args import add_output_format
 from ..utils.output import emit_json
 
@@ -56,8 +58,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         timeout: int,
         output_format: str = "table",
     ) -> None:
-        with fetching_status("job result", study_key):
-            job = sdk.poll_job(study_key, batch_id, interval=interval, timeout=timeout)
+        with fetching_status("job result", study_key) as status_ctrl:
+            def on_progress(event: Any) -> None:
+                msg = format_job_progress(event)
+                if status_ctrl is not None and hasattr(status_ctrl, "update"):
+                    status_ctrl.update(msg)
+                elif sys.stderr.isatty():
+                    print_error(f"\r\033[K{msg}", end="", flush=True)
+
+            job = sdk.poll_job(
+                study_key,
+                batch_id,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+            )
         if output_format == "json":
             emit_json([job], "jobs")
         else:
