@@ -283,6 +283,7 @@ class _UniqueStoreAction(argparse.Action):
         values: Any,
         option_string: str | None = None,
     ) -> None:
+        del option_string
         existing = getattr(namespace, self.dest, None)
         if existing is not None and existing != values:
             key_name = self.dest.replace("_flag", "")
