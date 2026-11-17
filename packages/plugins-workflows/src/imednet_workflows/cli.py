@@ -273,16 +273,42 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
 
 
+class _UniqueStoreAction(argparse.Action):
+    """Store action that rejects conflicting duplicate flag values."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        existing = getattr(namespace, self.dest, None)
+        if existing is not None and existing != values:
+            key_name = self.dest.replace("_flag", "")
+            parser.error(f"conflicting values provided for {key_name}: '{existing}' and '{values}'")
+        setattr(namespace, self.dest, values)
+
+
 def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     """Set up the subject-data argparse subparsers."""
     subj_parser = subparsers.add_parser(
-        "subject-data", help="Retrieve all data for a single subject."
+        "subject-data",
+        help="Retrieve all data for a single subject.",
+        description=(
+            "Retrieve all data for a single subject within a study. "
+            "Arguments may be provided via flags (--study-key, --subject-key/--subject), "
+            "positional arguments (<study_key> <subject_key>), or hybrid combinations "
+            "where a remaining positional argument maps deterministically to the missing key. "
+            "Flags take precedence over positional arguments."
+        ),
     )
     subj_parser.add_argument(
         "-s",
         "--study-key",
         dest="study_key_flag",
         default=None,
+        action=_UniqueStoreAction,
         help=STUDY_KEY_ARG,
     )
     subj_parser.add_argument(
@@ -291,6 +317,7 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--subject",
         dest="subject_key_flag",
         default=None,
+        action=_UniqueStoreAction,
         help="The key identifying the subject.",
     )
     subj_parser.add_argument("study_key", nargs="?", default=None, help=STUDY_KEY_ARG)
@@ -305,17 +332,73 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         print(data.model_dump())
 
     def handle_subject_data(args: argparse.Namespace) -> None:
-        study_key = args.study_key_flag if args.study_key_flag is not None else args.study_key
-        subject_key = (
-            args.subject_key_flag if args.subject_key_flag is not None else args.subject_key
-        )
-        if not study_key and not subject_key:
+        flag_study: str | None = args.study_key_flag
+        flag_subject: str | None = args.subject_key_flag
+        pos_study: str | None = args.study_key
+        pos_subject: str | None = args.subject_key
+
+        def _is_empty(val: str | None) -> bool:
+            return val is None or not val.strip()
+
+        # Determine study_key and subject_key based on flags, positionals, and hybrid grammar
+        if flag_study is not None and flag_subject is not None:
+            # Flags take precedence over positionals
+            study_key = flag_study
+            subject_key = flag_subject
+        elif flag_study is not None and flag_subject is None:
+            # Study key provided by flag; subject key must come from positional
+            study_key = flag_study
+            if pos_subject is not None and pos_study is not None:
+                # Two positionals provided: pos_study is study_key, pos_subject is subject_key
+                if (
+                    not _is_empty(pos_study)
+                    and not _is_empty(flag_study)
+                    and pos_study != flag_study
+                ):
+                    subj_parser.error(
+                        f"conflicting values provided for study_key: '{flag_study}' (flag) and '{pos_study}' (positional)"
+                    )
+                subject_key = pos_subject
+            elif pos_study is not None:
+                # Single positional provided: deterministically map to missing subject_key
+                subject_key = pos_study
+            else:
+                subject_key = None
+        elif flag_study is None and flag_subject is not None:
+            # Subject key provided by flag; study key must come from positional
+            subject_key = flag_subject
+            if pos_study is not None and pos_subject is not None:
+                # Two positionals provided: pos_study is study_key, pos_subject is subject_key
+                if (
+                    not _is_empty(pos_subject)
+                    and not _is_empty(flag_subject)
+                    and pos_subject != flag_subject
+                ):
+                    subj_parser.error(
+                        f"conflicting values provided for subject_key: '{flag_subject}' (flag) and '{pos_subject}' (positional)"
+                    )
+                study_key = pos_study
+            elif pos_study is not None:
+                # Single positional provided: deterministically map to missing study_key
+                study_key = pos_study
+            else:
+                study_key = None
+        else:
+            # Both flags missing: both keys come from positionals
+            study_key = pos_study
+            subject_key = pos_subject
+
+        missing_study = _is_empty(study_key)
+        missing_subject = _is_empty(subject_key)
+        if missing_study and missing_subject:
             subj_parser.error("the following arguments are required: study_key, subject_key")
-        elif not study_key:
+        elif missing_study:
             subj_parser.error("the following arguments are required: study_key")
-        elif not subject_key:
+        elif missing_subject:
             subj_parser.error("the following arguments are required: subject_key")
 
+        assert study_key is not None
+        assert subject_key is not None
         subject_data(study_key=study_key, subject_key=subject_key)
 
     subj_parser.set_defaults(func=handle_subject_data)

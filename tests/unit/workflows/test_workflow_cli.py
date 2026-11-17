@@ -208,3 +208,225 @@ def test_setup_subject_parser_standalone() -> None:
     assert parsed.subject_key_flag == "K1"
     assert parsed.study_key is None
     assert parsed.subject_key is None
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_study", "expected_subj"),
+    [
+        (["--study-key", "S1", "K1"], "S1", "K1"),
+        (["K1", "--study-key", "S1"], "S1", "K1"),
+        (["-s", "S1", "K1"], "S1", "K1"),
+        (["K1", "-s", "S1"], "S1", "K1"),
+        (["--subject-key", "K1", "S1"], "S1", "K1"),
+        (["S1", "--subject-key", "K1"], "S1", "K1"),
+        (["-k", "K1", "S1"], "S1", "K1"),
+        (["S1", "-k", "K1"], "S1", "K1"),
+        (["--subject", "K1", "S1"], "S1", "K1"),
+        (["S1", "--subject", "K1"], "S1", "K1"),
+    ],
+)
+def test_subject_data_hybrid_single_flag_single_positional_orderings(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    args: list[str],
+    expected_study: str,
+    expected_subj: str,
+) -> None:
+    """Test all single-flag and single-positional ordering combinations and aliases."""
+    result = runner.invoke(cli.app, ["subject-data", *args])
+    assert result.exit_code == 0
+    mock_workflow.get_all_subject_data.assert_called_once_with(expected_study, expected_subj)
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_study", "expected_subj"),
+    [
+        (["--subject-key", "SUBJ-REV", "--study-key", "STUDY-REV"], "STUDY-REV", "SUBJ-REV"),
+        (["-k", "SUBJ-SREV", "-s", "STUDY-SREV"], "STUDY-SREV", "SUBJ-SREV"),
+        (["--subject", "SUBJ-AREV", "--study-key", "STUDY-AREV"], "STUDY-AREV", "SUBJ-AREV"),
+        (["--subject", "SUBJ-AREV2", "-s", "STUDY-AREV2"], "STUDY-AREV2", "SUBJ-AREV2"),
+    ],
+)
+def test_subject_data_both_flags_reversed_order(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    args: list[str],
+    expected_study: str,
+    expected_subj: str,
+) -> None:
+    """Test both flags provided in reversed argument order."""
+    result = runner.invoke(cli.app, ["subject-data", *args])
+    assert result.exit_code == 0
+    mock_workflow.get_all_subject_data.assert_called_once_with(expected_study, expected_subj)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-s", "S1", "--study-key", "S1", "-k", "K1"],
+        ["--study-key", "S1", "-s", "S1", "--subject-key", "K1"],
+        ["-s", "S1", "--subject-key", "K1", "--subject", "K1"],
+        ["-s", "S1", "-k", "K1", "--subject-key", "K1"],
+        ["-s", "S1", "-s", "S1", "-k", "K1", "-k", "K1"],
+    ],
+)
+def test_subject_data_duplicate_flags_non_conflicting(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    args: list[str],
+) -> None:
+    """Test duplicate flags with identical values succeed."""
+    result = runner.invoke(cli.app, ["subject-data", *args])
+    assert result.exit_code == 0
+    mock_workflow.get_all_subject_data.assert_called_once_with("S1", "K1")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--study-key", "S1", "--study-key", "S2", "--subject-key", "K1"],
+        ["-s", "S1", "--study-key", "S2", "-k", "K1"],
+        ["--study-key", "S1", "-s", "S2", "-k", "K1"],
+    ],
+)
+def test_subject_data_duplicate_flags_conflicting_study_key(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    args: list[str],
+) -> None:
+    """Test duplicate study-key flags with conflicting values fail with code 2."""
+    result = runner.invoke(cli.app, ["subject-data", *args])
+    assert result.exit_code == 2
+    assert "study_key" in result.stderr
+    assert "conflicting" in result.stderr
+    mock_workflow.get_all_subject_data.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-s", "S1", "--subject-key", "K1", "--subject-key", "K2"],
+        ["-s", "S1", "-k", "K1", "--subject-key", "K2"],
+        ["-s", "S1", "--subject-key", "K1", "--subject", "K2"],
+        ["-s", "S1", "-k", "K1", "--subject", "K2"],
+    ],
+)
+def test_subject_data_duplicate_flags_conflicting_subject_key(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    args: list[str],
+) -> None:
+    """Test duplicate subject-key flags with conflicting values fail with code 2."""
+    result = runner.invoke(cli.app, ["subject-data", *args])
+    assert result.exit_code == 2
+    assert "subject_key" in result.stderr
+    assert "conflicting" in result.stderr
+    mock_workflow.get_all_subject_data.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_study", "expected_subj"),
+    [
+        (["S1", "K1", "--study-key", "S1"], "S1", "K1"),
+        (["S1", "K1", "-s", "S1"], "S1", "K1"),
+        (["--study-key", "S1", "S1", "K1"], "S1", "K1"),
+        (["S1", "K1", "--subject-key", "K1"], "S1", "K1"),
+        (["S1", "K1", "-k", "K1"], "S1", "K1"),
+        (["S1", "K1", "--subject", "K1"], "S1", "K1"),
+        (["--subject-key", "K1", "S1", "K1"], "S1", "K1"),
+    ],
+)
+def test_subject_data_positional_and_flag_non_conflicting(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    args: list[str],
+    expected_study: str,
+    expected_subj: str,
+) -> None:
+    """Test two positionals and a matching flag succeed."""
+    result = runner.invoke(cli.app, ["subject-data", *args])
+    assert result.exit_code == 0
+    mock_workflow.get_all_subject_data.assert_called_once_with(expected_study, expected_subj)
+
+
+@pytest.mark.parametrize(
+    ("args", "conflicting_param"),
+    [
+        (["S1", "K1", "--study-key", "S2"], "study_key"),
+        (["S1", "K1", "-s", "S2"], "study_key"),
+        (["--study-key", "S2", "S1", "K1"], "study_key"),
+        (["S1", "K1", "--subject-key", "K2"], "subject_key"),
+        (["S1", "K1", "-k", "K2"], "subject_key"),
+        (["S1", "K1", "--subject", "K2"], "subject_key"),
+        (["--subject-key", "K2", "S1", "K1"], "subject_key"),
+    ],
+)
+def test_subject_data_positional_and_flag_conflicting(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    args: list[str],
+    conflicting_param: str,
+) -> None:
+    """Test two positionals and a conflicting flag fail with exit code 2."""
+    result = runner.invoke(cli.app, ["subject-data", *args])
+    assert result.exit_code == 2
+    assert conflicting_param in result.stderr
+    assert "conflicting" in result.stderr
+    mock_workflow.get_all_subject_data.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("args", "missing_param"),
+    [
+        (["--study-key", "", "--subject-key", "K1"], "study_key"),
+        (["--study-key", "   ", "--subject-key", "K1"], "study_key"),
+        (["--study-key", "S1", "--subject-key", ""], "subject_key"),
+        (["--study-key", "S1", "--subject-key", "   "], "subject_key"),
+        (["--study-key", "", "--subject-key", ""], "study_key"),
+        (["-s", "S1", "--subject", ""], "subject_key"),
+        (["", ""], "study_key"),
+        (["   ", "   "], "study_key"),
+        (["S1", ""], "subject_key"),
+        (["", "K1"], "study_key"),
+        (["S1", "   "], "subject_key"),
+        (["   ", "K1"], "study_key"),
+        (["--study-key", "S1", ""], "subject_key"),
+        (["--study-key", "S1", "   "], "subject_key"),
+        (["", "--study-key", "S1"], "subject_key"),
+        (["   ", "--study-key", "S1"], "subject_key"),
+        (["--subject-key", "K1", ""], "study_key"),
+        (["--subject-key", "K1", "   "], "study_key"),
+        (["", "--subject-key", "K1"], "study_key"),
+        (["   ", "--subject-key", "K1"], "study_key"),
+        (["-s", "S1", ""], "subject_key"),
+        (["--subject", "K1", ""], "study_key"),
+    ],
+)
+def test_subject_data_empty_values_error(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    args: list[str],
+    missing_param: str,
+) -> None:
+    """Test that empty or whitespace-only values in flags, positionals, or hybrids fail."""
+    result = runner.invoke(cli.app, ["subject-data", *args])
+    assert result.exit_code == 2
+    assert missing_param in result.stderr
+    mock_workflow.get_all_subject_data.assert_not_called()
+
+
+def test_subject_data_help_text(runner: CliRunner) -> None:
+    """Test that subject-data help includes flags, positionals, and hybrid documentation."""
+    result = runner.invoke(cli.app, ["subject-data", "--help"])
+    assert result.exit_code == 0
+    assert "--study-key" in result.stdout
+    assert "--subject-key" in result.stdout
+    assert "hybrid" in result.stdout.lower()
