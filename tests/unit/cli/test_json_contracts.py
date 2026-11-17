@@ -153,3 +153,41 @@ def test_console_entrypoint_with_offline_simulation():
     assert response["schemaVersion"] == "1.0" and response["resource"] == "studies"
     assert response["count"] == len(response["items"])
     assert "Fetching" not in process.stdout
+
+
+@pytest.mark.parametrize("command", ["status", "wait"])
+def test_jobs_json_preserves_nested_results_and_full_model_equality(sdk, capsys, command):
+    """Verify JSON mode retains nested results, non-summary fields, and full alias equality."""
+    job = JobStatus(
+        batchId="B_FULL",
+        jobId="J_FULL",
+        state="COMPLETED",
+        progress=100,
+        dateCreated="2026-11-17T10:00:00Z",
+        dateStarted="2026-11-17T10:01:00Z",
+        dateFinished="2026-11-17T10:05:00Z",
+        resultUrl="https://example.com/api/v1/jobs/B_FULL/result",
+        results={
+            "total": 3,
+            "success": 2,
+            "failed": 1,
+            "details": [{"id": "rec-1", "status": "PASS"}, {"id": "rec-2", "status": "FAIL"}],
+        },
+    )
+    sdk.get_job.return_value = job
+    sdk.poll_job.return_value = job
+    cli.app(["jobs", command, "S", "B_FULL", "--format", "json"])
+    captured = capsys.readouterr()
+    response = json.loads(captured.out)
+    assert response["schemaVersion"] == "1.0"
+    assert response["status"] == "complete"
+    assert response["resource"] == "jobs"
+    assert response["count"] == 1
+    expected_item = job.model_dump(mode="json", by_alias=True)
+    assert response["items"] == [expected_item]
+    assert response["items"][0] == expected_item
+    assert response["items"][0]["results"] == job.results
+    assert response["items"][0]["resultUrl"] == job.result_url
+    assert response["items"][0]["dateStarted"] == job.date_started
+    assert "Fetching" not in captured.out
+    assert captured.err == ""

@@ -1302,3 +1302,120 @@ def test_get_sdk_handles_dotenv_parse_error_gracefully(
         "Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set."
         in result.stderr
     )
+
+
+def test_jobs_wait_failed_terminal_state_exit(runner: CliRunner, sdk: MagicMock) -> None:
+    """When a job ends in FAILED state, jobs wait exits with code 1, clean stdout, and diagnostic stderr."""
+    from imednet.utils.job_poller import JobFailedError
+
+    job = JobStatus(
+        batchId="BATCH-FAIL",
+        jobId="JOB-FAIL",
+        state="FAILED",
+        progress=80,
+        results={"error": "Database constraint violation", "failed": 1},
+    )
+    sdk.poll_job.side_effect = JobFailedError("Job BATCH-FAIL ended in state FAILED", job)
+
+    result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH-FAIL"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "Unexpected error: Job BATCH-FAIL ended in state FAILED" in result.stderr
+
+
+def test_jobs_wait_cancelled_terminal_state_exit(runner: CliRunner, sdk: MagicMock) -> None:
+    """When a job ends in CANCELLED state, jobs wait exits with code 1, clean stdout, and diagnostic stderr."""
+    from imednet.utils.job_poller import JobFailedError
+
+    job = JobStatus(
+        batchId="BATCH-CANCEL",
+        jobId="JOB-CANCEL",
+        state="CANCELLED",
+        progress=30,
+    )
+    sdk.poll_job.side_effect = JobFailedError("Job BATCH-CANCEL ended in state CANCELLED", job)
+
+    result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH-CANCEL"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "Unexpected error: Job BATCH-CANCEL ended in state CANCELLED" in result.stderr
+
+
+def test_jobs_wait_timeout_error_exit(runner: CliRunner, sdk: MagicMock) -> None:
+    """When job polling times out, jobs wait exits with code 1, clean stdout, and diagnostic stderr."""
+    from imednet.utils.job_poller import JobTimeoutError
+
+    sdk.poll_job.side_effect = JobTimeoutError("Job BATCH-TIMEOUT timed out after 300 seconds")
+    result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH-TIMEOUT"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "Unexpected error: Job BATCH-TIMEOUT timed out after 300 seconds" in result.stderr
+
+    sdk.poll_job.side_effect = TimeoutError("Polling exceeded timeout of 300s")
+    result2 = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH-TIMEOUT2"])
+    assert result2.exit_code == 1
+    assert result2.stdout == ""
+    assert "Unexpected error: Polling exceeded timeout of 300s" in result2.stderr
+
+
+def test_jobs_wait_failure_json_mode_atomic_no_stdout(runner: CliRunner, sdk: MagicMock) -> None:
+    """In JSON mode, poller failures exit 1 with clean stdout and do not emit partial JSON."""
+    from imednet.utils.job_poller import JobFailedError
+
+    job = JobStatus(batchId="BATCH-JFAIL", state="FAILED", progress=90)
+    sdk.poll_job.side_effect = JobFailedError("Job BATCH-JFAIL ended in state FAILED", job)
+
+    result = runner.invoke(cli.app, ["jobs", "wait", "STUDY", "BATCH-JFAIL", "--format", "json"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "Job BATCH-JFAIL ended in state FAILED" in result.stderr
+
+
+@pytest.mark.parametrize("command", ["status", "wait"])
+@pytest.mark.parametrize("tty", [False, True])
+def test_jobs_json_mode_interactive_and_redirected(
+    runner: CliRunner,
+    sdk: MagicMock,
+    command: str,
+    tty: bool,
+) -> None:
+    """JSON output on both interactive and redirected stdout remains a clean single envelope without ANSI or progress."""
+    job = JobStatus(
+        batchId="BATCH-STREAM",
+        jobId="JOB-STREAM",
+        state="COMPLETE",
+        progress=100,
+        dateCreated="2026-11-17T09:00:00Z",
+        dateStarted="2026-11-17T09:01:00Z",
+        dateFinished="2026-11-17T09:04:00Z",
+        resultUrl="https://example.com/api/v1/jobs/BATCH-STREAM/result",
+        results={
+            "total": 2,
+            "success": 2,
+            "failed": 0,
+            "details": [{"id": 1, "status": "PASS"}, {"id": 2, "status": "PASS"}],
+        },
+    )
+    sdk.get_job.return_value = job
+    sdk.poll_job.return_value = job
+
+    result = runner.invoke(
+        cli.app, ["jobs", command, "STUDY", "BATCH-STREAM", "--format", "json"], tty=tty
+    )
+    assert result.exit_code == 0
+    # No ANSI escape sequences anywhere in stdout
+    assert "\x1b[" not in result.stdout
+    # Progress text must never appear on stdout
+    assert "Fetching" not in result.stdout
+    # Must parse cleanly as exactly one JSON object
+    payload = json.loads(result.stdout)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "jobs"
+    assert payload["status"] == "complete"
+    assert payload["count"] == 1
+    expected_item = job.model_dump(mode="json", by_alias=True)
+    assert payload["items"] == [expected_item]
+    assert payload["items"][0] == expected_item
+    assert payload["items"][0]["results"] == job.results
+    assert payload["items"][0]["resultUrl"] == job.result_url
+    assert payload["items"][0]["dateStarted"] == job.date_started
