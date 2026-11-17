@@ -63,6 +63,7 @@ def get_parser() -> argparse.ArgumentParser:
     from .studies import setup_parser as studies_setup
     from .subjects import setup_parser as subjects_setup
     from .variables import setup_parser as variables_setup
+    from .visits import setup_parser as visits_setup
 
     datadict_setup(subparsers)
     studies_setup(subparsers)
@@ -76,6 +77,7 @@ def get_parser() -> argparse.ArgumentParser:
     jobs_setup(subparsers)
     records_setup(subparsers)
     forms_setup(subparsers)
+    visits_setup(subparsers)
 
     import importlib.metadata
 
