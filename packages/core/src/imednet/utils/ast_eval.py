@@ -4,6 +4,7 @@
 
 from imednet.utils.evaluator import (
     DEFAULT_SAFE_FUNCTIONS,
+    DEFAULT_SAFE_METHODS,
     RestrictedAstEvaluator,
     evaluate_expression,
     parse_expression,
@@ -12,6 +13,7 @@ from imednet.utils.evaluator import (
 
 __all__ = [
     "DEFAULT_SAFE_FUNCTIONS",
+    "DEFAULT_SAFE_METHODS",
     "RestrictedAstEvaluator",
     "evaluate_expression",
     "parse_expression",
