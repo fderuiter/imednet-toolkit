@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
-import importlib
 import importlib.util
 import re
 import shutil
@@ -19,7 +18,6 @@ import sys
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
 
 # Known optional integration dependencies that may not be installed in all environments
 OPTIONAL_INTEGRATION_MODULES = {
@@ -227,39 +225,27 @@ def validate_staged_wheels(
             errors.append(f"Failed to inspect wheel archive '{wheel_path.name}': {exc}")
             continue
 
-        # Verify simulated Pyodide import
-        orig_sys_path = list(sys.path)
-        isolated_sys_path = [
-            p
-            for p in orig_sys_path
-            if "packages/core/src" not in p
-            and "packages/plugins" not in p
-            and "packages/providers" not in p
-        ]
-        isolated_sys_path.insert(0, str(wheel_path.resolve()))
+        # Verify simulated Pyodide import in an isolated subprocess
+        # Running in a separate process guarantees true environment isolation and prevents
+        # polluting sys.modules or coverage measurement in the host test runner.
+        code = (
+            "import sys\n"
+            "sys.path = [p for p in sys.path if 'packages/core/src' not in p "
+            "and 'packages/plugins' not in p and 'packages/providers' not in p]\n"
+            f"sys.path.insert(0, {str(wheel_path.resolve())!r})\n"
+            f"import {prefix}\n"
+        )
+        if pkg_name == "imednet":
+            code += f"assert hasattr({prefix}, 'ImednetSDK'), 'ImednetSDK not found'\n"
 
-        saved_modules: dict[str, Any] = {}
-        for mod_key in list(sys.modules.keys()):
-            if mod_key == prefix or mod_key.startswith(f"{prefix}."):
-                saved_modules[mod_key] = sys.modules.pop(mod_key)
-
-        try:
-            sys.path = isolated_sys_path
-            imported_mod = importlib.import_module(prefix)
-            if pkg_name == "imednet":
-                sdk_cls = getattr(imported_mod, "ImednetSDK", None)
-                if sdk_cls is None:
-                    errors.append(
-                        f"ImednetSDK not found in imported module '{prefix}' from {wheel_path.name}"
-                    )
-        except Exception as exc:
-            errors.append(f"Simulated Pyodide import failed for '{wheel_path.name}': {exc}")
-        finally:
-            sys.path = orig_sys_path
-            for mod_key in list(sys.modules.keys()):
-                if mod_key == prefix or mod_key.startswith(f"{prefix}."):
-                    sys.modules.pop(mod_key, None)
-            sys.modules.update(saved_modules)
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or proc.stdout.strip()
+            errors.append(f"Simulated Pyodide import failed for '{wheel_path.name}': {err_msg}")
 
     return errors
 
