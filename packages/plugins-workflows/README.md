@@ -37,8 +37,11 @@ imednet workflows sync-worker --study-key <STUDY_KEY> --interval 900
 imednet workflows state show --study-key <STUDY_KEY>
 imednet workflows state set --study-key <STUDY_KEY> --stream records --timestamp "2023-10-27T12:00:00Z"
 
-# Single subject profile data
+# Single subject profile data (supports flags, positionals, or hybrids)
 imednet subject-data --study-key <STUDY_KEY> --subject-key <SUBJECT_KEY>
+imednet subject-data <STUDY_KEY> <SUBJECT_KEY>
+imednet subject-data --study-key <STUDY_KEY> <SUBJECT_KEY>
+imednet subject-data <STUDY_KEY> --subject-key <SUBJECT_KEY>
 ```
 
 **Registered Entry Points:**
