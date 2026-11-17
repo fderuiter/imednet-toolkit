@@ -209,3 +209,22 @@ def test_load_from_redcap_empty_and_no_header() -> None:
 
     with pytest.raises(ValueError, match="Strict loading error"):
         load_from_redcap("", strict=True)
+
+
+def test_load_from_redcap_missing_file() -> None:
+    """Test that missing CSV file paths raise FileNotFoundError instead of silent fallback."""
+    for missing in [
+        "nonexistent.csv",
+        "nested/path/to/missing.csv",
+        Path("nonexistent.csv"),
+        "some/path/nonexistent",
+    ]:
+        with pytest.raises(FileNotFoundError, match="Target file .* does not exist"):
+            load_from_redcap(missing)
+
+
+def test_load_from_redcap_single_line_csv_no_delimiters() -> None:
+    """Test that single-line CSV without file path delimiters or standard extensions parses directly."""
+    single_line_csv = '"variable_name","form_name","field_type"'
+    dd = load_from_redcap(single_line_csv)
+    assert isinstance(dd, DataDictionary)

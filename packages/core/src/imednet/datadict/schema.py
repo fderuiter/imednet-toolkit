@@ -9,8 +9,17 @@ from typing import Any
 from pydantic import ValidationError
 
 from .models import DataDictionary
+from .normalize import _is_file_target, _safe_is_file
 
 SCHEMA_PATH = Path(__file__).parent / "resources" / "data-dictionary-1.0.0.schema.json"
+
+__all__ = [
+    "SCHEMA_PATH",
+    "_is_file_target",
+    "_safe_is_file",
+    "get_schema",
+    "validate",
+]
 
 
 def get_schema() -> dict[str, Any]:
@@ -24,43 +33,6 @@ def get_schema() -> dict[str, Any]:
     schema["title"] = "iMednet Data Dictionary Schema"
     schema["version"] = "1.0.0"
     return schema
-
-
-def _is_file_target(target: Any) -> bool:
-    """Determine whether the target was intended as a file path.
-
-    Args:
-        target: Target object to inspect.
-
-    Returns:
-        True if target is considered a file path, False otherwise.
-    """
-    if isinstance(target, Path):
-        return True
-    if isinstance(target, str):
-        target_str = target.strip()
-        if target_str.startswith(("{", "[")):
-            return False
-        if target_str.lower().endswith((".json", ".xml", ".csv")):
-            return True
-        if "/" in target_str or "\\" in target_str:
-            return True
-    return False
-
-
-def _safe_is_file(p: Path) -> bool:
-    """Safely check if a Path is an existing file, handling OSErrors.
-
-    Args:
-        p: Path object to check.
-
-    Returns:
-        True if path is an existing regular file, False otherwise.
-    """
-    try:
-        return p.is_file()
-    except OSError:
-        return False
 
 
 def validate(

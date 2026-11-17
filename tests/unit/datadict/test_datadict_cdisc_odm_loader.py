@@ -420,3 +420,31 @@ def test_load_from_cdisc_odm_invalid_root_and_type_errors() -> None:
     assert any(
         "No 'MetaDataVersion' element found" in w for w in dd_empty.metadata.validationWarnings
     )
+
+
+def test_load_from_cdisc_odm_missing_file() -> None:
+    """Test that missing XML file paths raise FileNotFoundError instead of XML parse errors."""
+    for missing in [
+        "nonexistent.xml",
+        "nested/path/to/missing.xml",
+        Path("nonexistent.xml"),
+        "some/path/nonexistent",
+    ]:
+        with pytest.raises(FileNotFoundError, match="Target file .* does not exist"):
+            load_from_cdisc_odm(missing)
+
+
+def test_load_from_cdisc_odm_xml_string_bypass_file_check() -> None:
+    """Test that raw XML strings bypass file target checks even if containing slashes."""
+    single_line_xml = (
+        '<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">'
+        '<Study OID="S1">'
+        '<MetaDataVersion OID="M1">'
+        '<FormDef OID="F1" Name="Form1"/>'
+        "</MetaDataVersion>"
+        "</Study>"
+        "</ODM>"
+    )
+    dd = load_from_cdisc_odm(single_line_xml)
+    assert len(dd.forms) == 1
+    assert dd.forms[0].formKey == "F1"

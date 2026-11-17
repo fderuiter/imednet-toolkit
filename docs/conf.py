@@ -192,6 +192,7 @@ exclude_patterns: list[str] = [
     "tutorials/examples/dummy.py",
     "agents/**",
     "superpowers/**",
+    "reference/rest_tables/**",
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
