@@ -55,6 +55,7 @@ def test_single_json_result_preserves_values(sdk, capsys, command, attr, model):
         "records",
         "subjects",
         "intervals",
+        "visits",
     ],
 )
 def test_empty_core_list_json(sdk, capsys, resource):

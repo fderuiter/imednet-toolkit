@@ -795,6 +795,30 @@ def test_intervals_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
     assert "No intervals found." in result.stdout
 
 
+def test_visits_list_success(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that visits list success."""
+    obj = MagicMock()
+    obj.visit_id = 100
+    obj.interval_name = "Baseline"
+    obj.subject_key = "SUB-001"
+    obj.visit_date = "2023-01-15"
+    sdk.visits.list.return_value = [obj]
+    result = runner.invoke(cli.app, ["visits", "list", "STUDY"])
+    assert result.exit_code == 0
+    sdk.visits.list.assert_called_once_with("STUDY")
+    assert "Found 1 visits:" in result.stdout
+    assert "Baseline" in result.stdout
+    assert "SUB-001" in result.stdout
+
+
+def test_visits_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
+    """Test that visits list empty."""
+    sdk.visits.list.return_value = []
+    result = runner.invoke(cli.app, ["visits", "list", "STUDY"])
+    assert result.exit_code == 0
+    assert "No visits found." in result.stdout
+
+
 def test_workflows_stub_uninstalled_mocked(monkeypatch, capsys):
     monkeypatch.setattr("importlib.metadata.entry_points", lambda **kwargs: [])
     from imednet.cli import get_parser
@@ -853,6 +877,7 @@ def test_cli_subcommand_isolation(runner: CliRunner) -> None:
         "record-revisions",
         "intervals",
         "jobs",
+        "visits",
     }
     assert expected_core_commands.issubset(registered_subcommands)
 
@@ -910,10 +935,11 @@ def test_root_help_without_arguments(runner: CliRunner) -> None:
         "intervals",
         "jobs",
         "records",
+        "visits",
     ],
 )
 def test_noun_commands_show_contextual_help(runner: CliRunner, cmd: str) -> None:
-    """Invoking any of the eleven noun commands without sub-actions displays contextual help."""
+    """Invoking any of the core noun commands without sub-actions displays contextual help."""
     result = runner.invoke(cli.app, [cmd])
     assert result.exit_code == 0
     assert "usage:" in result.stdout

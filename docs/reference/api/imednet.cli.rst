@@ -24,6 +24,7 @@ Subpackages
    imednet.cli.subjects
    imednet.cli.utils
    imednet.cli.variables
+   imednet.cli.visits
 
 Submodules
 ----------
