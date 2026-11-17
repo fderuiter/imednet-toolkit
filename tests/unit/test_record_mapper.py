@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from faker import Faker
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from imednet.models.records import Record
 from imednet.models.reporting import (
@@ -520,6 +520,21 @@ def test_record_mapper_reporting_models_transformation() -> None:
     assert df_ae.iloc[0]["AESER"] == "N"
     assert df_ae.iloc[0]["AESTDTC"] == "2026-03-01T10:00:00"
     assert df_ae.iloc[0]["AEENDTC"] == "2026-03-02T12:00:00"
+    assert list(df_ae.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "AESEQ",
+        "AETERM",
+        "AEDECOD",
+        "AESEV",
+        "AESER",
+        "AESTDTC",
+        "AEENDTC",
+        "AEOUT",
+        "AEREL",
+        "AEACN",
+    ]
 
     # 2. ProtocolDeviation model (DV domain)
     pd_item = ProtocolDeviation(
@@ -539,6 +554,17 @@ def test_record_mapper_reporting_models_transformation() -> None:
     assert df_pd.iloc[0]["DVSEV"] == "MAJOR"
     assert df_pd.iloc[0]["DVSTDTC"] == "2026-03-05T14:30:00"
     assert df_pd.iloc[0]["DVSTAT"] == "Escalated"
+    assert list(df_pd.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "DVSEQ",
+        "DVTERM",
+        "DVCAT",
+        "DVSEV",
+        "DVSTDTC",
+        "DVSTAT",
+    ]
 
     # Also verify 'PD' domain code alias maps to 'DV'
     df_pd_alias = transform_records_to_sdtm([pd_item], domain="PD", study_key="STUDY_REP_01")
@@ -561,6 +587,16 @@ def test_record_mapper_reporting_models_transformation() -> None:
     assert df_dd.iloc[0]["DDCAT"] == "SOFTWARE"
     assert df_dd.iloc[0]["DDSER"] == "Y"
     assert df_dd.iloc[0]["DDSTDTC"] == "2026-03-10T09:00:00"
+    assert list(df_dd.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "DDSEQ",
+        "DDTERM",
+        "DDCAT",
+        "DDSER",
+        "DDSTDTC",
+    ]
 
 
 def test_record_mapper_concomitant_medications_domain() -> None:
@@ -614,6 +650,17 @@ def test_record_mapper_vital_signs_domain() -> None:
     assert df_model.iloc[0]["VSORRES"] == 80.0
     assert df_model.iloc[0]["VSORRESU"] == "mmHg"
     assert df_model.iloc[0]["VSDTC"] == "2026-03-12T08:30:00"
+    assert list(df_model.columns) == [
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "VSSEQ",
+        "VSTESTCD",
+        "VSTEST",
+        "VSORRES",
+        "VSORRESU",
+        "VSDTC",
+    ]
 
     # Raw dictionary with standard aliases
     raw_records = [
@@ -719,3 +766,79 @@ def test_record_mapper_iter_sdtm_dataframes() -> None:
     assert len(chunks[2]) == 1
     assert all("AETERM" in c.columns for c in chunks)
     assert all(c.iloc[0]["STUDYID"] == "STUDY_STREAM" for c in chunks)
+
+
+def test_sdtm_transformation_deduplicates_model_aliases() -> None:
+    """Assert that AdverseEvent, VitalSigns, and ProtocolDeviation produce datasets without duplicate raw attributes."""
+    ae = AdverseEvent(
+        subjectKey="SUBJ-001",
+        aeTerm="Nausea",
+        aeSeverity="MILD",
+        aeStartDate=datetime(2026, 1, 1, 8, 0),
+    )
+    df_ae = transform_records_to_sdtm([ae], domain="AE", study_key="STUDY01")
+    for raw_attr in ("ae_term", "ae_severity", "ae_start_date", "subject_key", "aeTerm"):
+        assert raw_attr not in df_ae.columns
+
+    vs = VitalSigns(
+        subjectKey="SUBJ-001",
+        vsTest="Body Temperature",
+        vsTestCd="TEMP",
+        vsResult="37.2",
+        vsUnit="C",
+        vsDate=datetime(2026, 1, 1, 8, 30),
+    )
+    df_vs = transform_records_to_sdtm([vs], domain="VS", study_key="STUDY01")
+    for raw_attr in (
+        "vs_test",
+        "vs_test_cd",
+        "vs_result",
+        "vs_unit",
+        "vs_date",
+        "subject_key",
+        "vsTest",
+    ):
+        assert raw_attr not in df_vs.columns
+
+    pd_item = ProtocolDeviation(
+        subjectKey="SUBJ-001",
+        dvTerm="Window deviation",
+        dvCategory="PROCEDURE",
+        dvSeverity="MINOR",
+        dvDate=datetime(2026, 1, 2, 9, 0),
+        dvStatus="Approved",
+    )
+    df_pd = transform_records_to_sdtm([pd_item], domain="DV", study_key="STUDY01")
+    for raw_attr in (
+        "dv_term",
+        "dv_category",
+        "dv_severity",
+        "dv_date",
+        "dv_status",
+        "subject_key",
+        "dvTerm",
+    ):
+        assert raw_attr not in df_pd.columns
+
+    # Verify custom unmapped fields are retained
+    raw_with_custom = {
+        "subjectKey": "SUBJ-002",
+        "aeTerm": "Fatigue",
+        "custom_note": "Patient reported after lunch",
+        "custom_score": 5,
+    }
+    df_custom = transform_records_to_sdtm([raw_with_custom], domain="AE", study_key="STUDY01")
+    assert "custom_note" in df_custom.columns
+    assert "custom_score" in df_custom.columns
+    assert df_custom.iloc[0]["custom_note"] == "Patient reported after lunch"
+    assert df_custom.iloc[0]["custom_score"] == 5
+
+    # Verify model with identical field name and alias
+    class SimpleModel(BaseModel):
+        subject_key: str = Field(alias="subjectKey")
+        term: str = Field(alias="term")
+
+    m = SimpleModel(subjectKey="SUBJ-003", term="Headache")
+    df_simple = transform_records_to_sdtm([m], domain="AE", study_key="STUDY01")
+    assert df_simple.iloc[0]["AETERM"] == "Headache"
+    assert "term" not in df_simple.columns

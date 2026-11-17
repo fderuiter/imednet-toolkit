@@ -101,6 +101,11 @@ def _format_sdtm_flag(val: Any) -> str | None:
     return "Y" if bool(val) else "N"
 
 
+def _normalize_key(key: str) -> str:
+    """Normalize a key name by removing underscores and converting to lowercase."""
+    return key.replace("_", "").lower()
+
+
 SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
     "AE": {
         "domain": "AE",
@@ -337,6 +342,7 @@ def transform_records_to_sdtm(
     seq_counters: dict[str, int] = {}
 
     for rec in records:
+        model_field_map: dict[str, str] = {}
         if hasattr(rec, "record_data") and getattr(rec, "record_data", None) is not None:
             rec_dict = dict(rec.record_data) if isinstance(rec.record_data, dict) else {}
             if getattr(rec, "subject_key", None):
@@ -345,8 +351,11 @@ def transform_records_to_sdtm(
             if getattr(rec, "date_created", None):
                 rec_dict["date_created"] = rec.date_created
         elif isinstance(rec, BaseModel):
-            rec_dict = rec.model_dump(by_alias=False)
-            rec_dict.update(rec.model_dump(by_alias=True))
+            rec_dict = rec.model_dump(by_alias=True)
+            for fname, finfo in getattr(type(rec), "model_fields", {}).items():
+                alias = getattr(finfo, "alias", None) or fname
+                model_field_map[alias] = fname
+                model_field_map[fname] = alias
         elif isinstance(rec, dict):
             rec_dict = dict(rec)
         else:
@@ -416,6 +425,15 @@ def transform_records_to_sdtm(
 
             if found_key:
                 consumed_keys.add(found_key)
+                if found_key in model_field_map:
+                    consumed_keys.add(model_field_map[found_key])
+                for cand in alias_map.get(var_name, []):
+                    if cand in rec_dict:
+                        consumed_keys.add(cand)
+                    if cand.lower() in lower_rec_dict:
+                        consumed_keys.add(lower_rec_dict[cand.lower()][0])
+                    if cand in model_field_map:
+                        consumed_keys.add(model_field_map[cand])
 
             if var_name in dtc_vars or var_name.endswith("DTC"):
                 row[var_name] = format_iso8601_dtc(val)
@@ -424,8 +442,9 @@ def transform_records_to_sdtm(
             else:
                 row[var_name] = val
 
+        normalized_consumed = {_normalize_key(c) for c in consumed_keys}
         for k, v in rec_dict.items():
-            if k not in consumed_keys and k.lower() not in {c.lower() for c in consumed_keys}:
+            if k not in consumed_keys and _normalize_key(k) not in normalized_consumed:
                 if any(x in k.lower() for x in ("date", "time", "dtc")):
                     row[k] = format_iso8601_dtc(v)
                 else:
