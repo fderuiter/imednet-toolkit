@@ -11,6 +11,7 @@ Subpackages
 .. toctree::
    :maxdepth: 4
 
+   imednet.cli.codings
    imednet.cli.datadict
    imednet.cli.export
    imednet.cli.forms
@@ -22,6 +23,7 @@ Subpackages
    imednet.cli.sites
    imednet.cli.studies
    imednet.cli.subjects
+   imednet.cli.users
    imednet.cli.utils
    imednet.cli.variables
    imednet.cli.visits
