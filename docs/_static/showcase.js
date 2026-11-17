@@ -769,9 +769,43 @@
         executeAuditorVerification();
     }
 
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", initExplorer);
-    } else {
+    // -------------------------------------------------------------------------
+    // Keyboard focus management for overflowing preformatted code blocks
+    // -------------------------------------------------------------------------
+    function initAccessibleCodeBlocks() {
+        function checkCodeBlocks() {
+            const blocks = document.querySelectorAll("pre");
+            blocks.forEach(function (block) {
+                if (block.scrollWidth > block.clientWidth) {
+                    block.setAttribute("tabindex", "0");
+                    block.setAttribute("role", "region");
+                    if (!block.getAttribute("aria-label")) {
+                        block.setAttribute("aria-label", "Code snippet");
+                    }
+                } else {
+                    if (block.hasAttribute("tabindex")) {
+                        block.removeAttribute("tabindex");
+                    }
+                    if (block.getAttribute("role") === "region" && block.getAttribute("aria-label") === "Code snippet") {
+                        block.removeAttribute("role");
+                        block.removeAttribute("aria-label");
+                    }
+                }
+            });
+        }
+
+        checkCodeBlocks();
+        window.addEventListener("resize", checkCodeBlocks);
+    }
+
+    function init() {
         initExplorer();
+        initAccessibleCodeBlocks();
+    }
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", init);
+    } else {
+        init();
     }
 })();
