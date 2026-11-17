@@ -125,14 +125,21 @@ class ImednetHook(BaseHook):
             return [cls._to_primitive(item) for item in value]
         return str(value)
 
-    def get_sdk_client(self) -> ImednetSDK:
-        """Return an SDK client for use within task execution context."""
+    def get_conn(self) -> ImednetSDK:
+        """Return an authenticated ImednetSDK instance adhering to the Airflow BaseHook contract."""
         config = self._resolved_config()
         return ImednetSDK(
             api_key=config.api_key,
             security_key=config.security_key,
             base_url=config.base_url,
         )
+
+    def get_sdk_client(self) -> ImednetSDK:
+        """Return an SDK client for use within task execution context.
+
+        Direct alias for :meth:`get_conn`.
+        """
+        return self.get_conn()
 
     def describe_connection(self) -> dict[str, PrimitiveContainer]:
         """Return redacted primitive metadata about resolved hook configuration."""
