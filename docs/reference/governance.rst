@@ -34,9 +34,11 @@ versions.
 
 .. code-block:: python
 
+    from imednet import ImednetSDK
     from imednet.models.study_config import StudyConfiguration, MappingRule
     from imednet_workflows import ConfigVersionStore
 
+    sdk = ImednetSDK(api_key="...", security_key="...")
     store = ConfigVersionStore()          # default: ~/.imednet/config_versions.sqlite3
 
     config = StudyConfiguration(
@@ -55,7 +57,7 @@ versions.
     commit_id = store.commit_config(
         study_key="MY_STUDY",
         config=config,
-        user="alice",
+        sdk=sdk,
         desc="Initial mapping configuration",
     )
     print(commit_id)   # SHA-256 hex digest
