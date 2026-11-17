@@ -232,3 +232,71 @@ def test_showcase_sdk_snippets_syntax_and_api_contracts() -> None:
     )
     assert "severity" not in queries_kw, "queries snippet must not filter by severity"
     assert QueryStatus.OPEN.value == "OPEN", "OPEN must be a valid QueryStatus lifecycle state"
+
+
+def test_showcase_rest_snippets_syntax_and_api_contracts() -> None:
+    """Verify that all showcase REST snippets match the official EDC API contracts."""
+    repo_root = get_repo_root()
+    script_path = repo_root / "docs" / "_static" / "showcase.js"
+    assert script_path.exists(), "showcase.js must exist"
+
+    content = script_path.read_text(encoding="utf-8")
+    rest_match = re.search(r"rest:\s*\{([^}]+)\}", content)
+    assert rest_match, "rest snippet dictionary not found in showcase.js"
+
+    snippets = dict(re.findall(r"(\w+):\s*`([^`]+)`", rest_match.group(1)))
+    expected_snippets = {"records", "studies", "forms", "queries"}
+    assert set(snippets.keys()) == expected_snippets, (
+        f"Expected snippets {expected_snippets}, found {set(snippets.keys())}"
+    )
+
+    required_headers = [
+        "Host: edc.prod.imednetapi.com",
+        "x-api-key: <API_KEY>",
+        "x-imn-security-key: <SECURITY_KEY>",
+        "Accept: application/json",
+    ]
+
+    for name, raw_snippet in snippets.items():
+        # Validate required headers are present
+        for header in required_headers:
+            assert header in raw_snippet, f"REST snippet '{name}' must include header '{header}'"
+
+        # Validate obsolete or fictional patterns are not present
+        assert "api.imednet.example.org" not in raw_snippet, (
+            f"REST snippet '{name}' must not reference fictional domain api.imednet.example.org"
+        )
+        assert "Authorization: Bearer" not in raw_snippet, (
+            f"REST snippet '{name}' must use EDC api-key security headers instead of Bearer token"
+        )
+
+        # Validate endpoint path prefix
+        assert "GET /api/v1/edc/" in raw_snippet, (
+            f"REST snippet '{name}' endpoint path must be prefixed with /api/v1/edc/"
+        )
+
+    # 1. Records endpoint and query parameter assertions
+    records_snippet = snippets["records"]
+    assert "GET /api/v1/edc/studies/STUDY-101/records?size=10 HTTP/1.1" in records_snippet, (
+        "records snippet must target /api/v1/edc/studies/STUDY-101/records with ?size=10"
+    )
+    assert "limit=" not in records_snippet, "records snippet must use size instead of limit"
+    assert "form=" not in records_snippet, "records snippet must not filter by invalid form param"
+
+    # 2. Studies endpoint assertions
+    studies_snippet = snippets["studies"]
+    assert "GET /api/v1/edc/studies?status=ACTIVE HTTP/1.1" in studies_snippet, (
+        "studies snippet must target /api/v1/edc/studies?status=ACTIVE"
+    )
+
+    # 3. Forms endpoint assertions
+    forms_snippet = snippets["forms"]
+    assert "GET /api/v1/edc/studies/STUDY-101/forms HTTP/1.1" in forms_snippet, (
+        "forms snippet must target /api/v1/edc/studies/STUDY-101/forms"
+    )
+
+    # 4. Queries endpoint assertions
+    queries_snippet = snippets["queries"]
+    assert "GET /api/v1/edc/studies/STUDY-101/queries?status=OPEN HTTP/1.1" in queries_snippet, (
+        "queries snippet must target /api/v1/edc/studies/STUDY-101/queries?status=OPEN"
+    )

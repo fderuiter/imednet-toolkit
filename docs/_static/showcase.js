@@ -259,10 +259,10 @@
             queries: `# Monitor clinical queries and discrepancy flags\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nqueries = client.queries.list(\n    study_key="STUDY-101",\n    status="OPEN"\n)\nprint(f"Open queries: {len(queries)}")`
         },
         rest: {
-            records: `GET /api/v1/studies/STUDY-101/records?form=VS&limit=10 HTTP/1.1\nHost: api.imednet.example.org\nAuthorization: Bearer <TOKEN>\nAccept: application/json`,
-            studies: `GET /api/v1/studies?status=ACTIVE HTTP/1.1\nHost: api.imednet.example.org\nAuthorization: Bearer <TOKEN>\nAccept: application/json`,
-            forms: `GET /api/v1/studies/STUDY-101/forms HTTP/1.1\nHost: api.imednet.example.org\nAuthorization: Bearer <TOKEN>\nAccept: application/json`,
-            queries: `GET /api/v1/studies/STUDY-101/queries?status=OPEN HTTP/1.1\nHost: api.imednet.example.org\nAuthorization: Bearer <TOKEN>\nAccept: application/json`
+            records: `GET /api/v1/edc/studies/STUDY-101/records?size=10 HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
+            studies: `GET /api/v1/edc/studies?status=ACTIVE HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
+            forms: `GET /api/v1/edc/studies/STUDY-101/forms HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
+            queries: `GET /api/v1/edc/studies/STUDY-101/queries?status=OPEN HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`
         }
     };
 
