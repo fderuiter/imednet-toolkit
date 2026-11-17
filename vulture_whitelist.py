@@ -302,7 +302,6 @@ sites_snapshot_count  # unused variable (packages/plugins-workflows/src/imednet_
 _.validate_spec_version  # unused method (packages/plugins-workflows/src/imednet_workflows/uat/models.py:151)
 _.summary  # unused method (packages/plugins-workflows/src/imednet_workflows/uat/orchestrator.py:64)
 submitted_at  # unused variable (packages/plugins-workflows/src/imednet_workflows/uat/submission.py:30)
-_.get_conn  # unused method (packages/providers-airflow/src/apache_airflow_providers_imednet/hooks/__init__.py:134)
 _.describe_connection  # unused method (packages/providers-airflow/src/apache_airflow_providers_imednet/hooks/__init__.py:145)
 _.list_study_keys  # unused method (packages/providers-airflow/src/apache_airflow_providers_imednet/hooks/__init__.py:167)
 template_fields  # unused variable (packages/providers-airflow/src/apache_airflow_providers_imednet/operators/export.py:23)
