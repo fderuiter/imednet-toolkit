@@ -260,9 +260,9 @@
         },
         rest: {
             records: `GET /api/v1/edc/studies/STUDY-101/records?size=10 HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
-            studies: `GET /api/v1/edc/studies?status=ACTIVE HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
+            studies: `GET /api/v1/edc/studies HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
             forms: `GET /api/v1/edc/studies/STUDY-101/forms HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
-            queries: `GET /api/v1/edc/studies/STUDY-101/queries?status=OPEN HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`
+            queries: `GET /api/v1/edc/studies/STUDY-101/queries HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`
         }
     };
 
