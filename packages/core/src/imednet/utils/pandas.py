@@ -8,6 +8,7 @@ try:
     import pandas as pd
 except ImportError:
     pd: Any = None  # type: ignore[no-redef]
+from ..models.queries import Query
 from ..models.records import Record
 from ..models.subjects import Subject
 from ..models.variables import Variable
@@ -15,6 +16,21 @@ from .security import sanitize_csv_formula
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
     from ..sdk import ImednetSDK
+
+
+def queries_to_dataframe(queries: list[Query]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.queries.Query` to a DataFrame.
+
+    Each query model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for queries_to_dataframe. Install with \"pip install 'imednet[export]'\"."
+        )
+
+    query_dicts = [q.model_dump(by_alias=False) for q in queries]
+    return pd.DataFrame(query_dicts)
 
 
 def variables_to_dataframe(variables: list[Variable]) -> pd.DataFrame:

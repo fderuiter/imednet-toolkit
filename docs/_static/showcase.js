@@ -253,10 +253,10 @@
     // -------------------------------------------------------------------------
     const SNIPPETS = {
         sdk: {
-            records: `# Extract clinical records into pandas DataFrame\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\ndf = client.records.to_df(\n    study_key="STUDY-101",\n    form_id="VS",\n    limit=10\n)\nprint(df.head())`,
-            studies: `# Query active clinical trials\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nstudies = client.studies.list(status="ACTIVE")\nfor s in studies:\n    print(f"{s.study_key}: {s.name} ({s.enrolled_subjects}/{s.target_accrual})")`,
-            forms: `# Fetch study Case Report Form (CRF) schemas\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nforms = client.forms.list(study_key="STUDY-101")\nfor f in forms:\n    print(f"[{f.form_id}] {f.form_name} - {len(f.fields)} fields")`,
-            queries: `# Monitor clinical queries and discrepancy flags\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nqueries = client.queries.list(\n    study_key="STUDY-101",\n    severity=["HIGH", "CRITICAL"]\n)\nprint(f"Open critical queries: {len(queries)}")`
+            records: `# Extract clinical records into pandas DataFrame\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\ndf = client.records.to_dataframe(\n    study_key="STUDY-101",\n    flatten=True\n)\nprint(df.head())`,
+            studies: `# Query active clinical trials\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nstudies = client.studies.list(status="ACTIVE")\nfor s in studies:\n    print(f"{s.study_key}: {s.study_name} ({s.study_type})")`,
+            forms: `# Fetch study Case Report Form (CRF) schemas\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nforms = client.forms.list(study_key="STUDY-101")\nfor f in forms:\n    print(f"{f.form_name} ({f.form_key})")`,
+            queries: `# Monitor clinical queries and discrepancy flags\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nqueries = client.queries.list(\n    study_key="STUDY-101",\n    status="OPEN"\n)\nprint(f"Open queries: {len(queries)}")`
         },
         rest: {
             records: `GET /api/v1/studies/STUDY-101/records?form=VS&limit=10 HTTP/1.1\nHost: api.imednet.example.org\nAuthorization: Bearer <TOKEN>\nAccept: application/json`,

@@ -41,7 +41,6 @@ repos:
     hooks:
       - id: detect-secrets
         args: ['--baseline', '.secrets.baseline']
-        files: ^packages/.*/src/
 
   # Local repository hygiene scripts
   - repo: local

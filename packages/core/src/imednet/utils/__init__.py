@@ -22,6 +22,7 @@ from .typing import FilterValue, ItemId, JsonDict
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "flatten": ("imednet.utils.serialization", "flatten"),
     "to_arrow_table": ("imednet.utils.arrow", "to_arrow_table"),
+    "queries_to_dataframe": ("imednet.utils.pandas", "queries_to_dataframe"),
     "subjects_to_dataframe": ("imednet.utils.pandas", "subjects_to_dataframe"),
     "variables_to_dataframe": ("imednet.utils.pandas", "variables_to_dataframe"),
     "records_to_dataframe": ("imednet.utils.pandas", "records_to_dataframe"),
@@ -76,6 +77,7 @@ __all__ = [
     "parse_iso_datetime",
     "parse_list_or_default",
     "parse_str_or_default",
+    "queries_to_dataframe",
     "records_to_dataframe",
     "sanitize_base_url",
     "sanitize_csv_formula",

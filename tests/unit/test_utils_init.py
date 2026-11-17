@@ -7,6 +7,10 @@ from imednet import utils
 
 def test_lazy_load_pandas_functions() -> None:
     """Test that lazy load pandas functions."""
+    func_query = utils.queries_to_dataframe
+    from imednet.utils.pandas import queries_to_dataframe as expected_qtodf
+
+    assert func_query is expected_qtodf
     func_subj = utils.subjects_to_dataframe
     from imednet.utils.pandas import subjects_to_dataframe as expected_stodf
 

@@ -13,6 +13,7 @@ Subpackages
 
    imednet.cli.datadict
    imednet.cli.export
+   imednet.cli.forms
    imednet.cli.intervals
    imednet.cli.jobs
    imednet.cli.queries

@@ -9,7 +9,7 @@ file locking dependencies.
 Development and documentation checkouts require Python **3.11.5+** to install
 patched selector dependencies. Published packages retain Python 3.11+ support.
 
-Full documentation: <https://fderuiter.github.io/imednet-python-sdk/> | [Interactive Live Explorer](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
+Full documentation: <https://fderuiter.github.io/imednet-toolkit/> | [Interactive Live Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
 
 <div align="center">
 
@@ -18,7 +18,7 @@ Full documentation: <https://fderuiter.github.io/imednet-python-sdk/> | [Interac
 [![PyPI - Wheel](https://img.shields.io/pypi/wheel/imednet.svg)](https://pypi.org/project/imednet/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/imednet.svg)](https://pypi.org/project/imednet/)
 [![License](https://img.shields.io/pypi/l/imednet.svg)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/fderuiter/imednet-python-sdk/ci.yml?branch=main)](https://github.com/fderuiter/imednet-python-sdk/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/fderuiter/imednet-toolkit/ci.yml?branch=main)](https://github.com/fderuiter/imednet-toolkit/actions/workflows/ci.yml)
 
 </div>
 
@@ -31,15 +31,15 @@ reimplementing HTTP logic.
 
 Our documentation is organized according to the **Diátaxis framework**, which categorizes information based on user intent.
 
-### ⚡ [Interactive Live Explorer](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase)
+### ⚡ [Interactive Live Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
 *Run live queries, test Python SDK and REST calls, inspect clinical form schemas, and verify audit trails directly in your browser without credentials or backend servers.*
-- [Integration Engineer Live Console](https://fderuiter.github.io/imednet-python-sdk/#panel-integration)
-- [Clinical Data Manager Form Validator](https://fderuiter.github.io/imednet-python-sdk/#panel-datamanager)
-- [Regulatory Compliance Auditor Verification](https://fderuiter.github.io/imednet-python-sdk/#panel-auditor)
+- [Integration Engineer Live Console](https://fderuiter.github.io/imednet-toolkit/#panel-integration)
+- [Clinical Data Manager Form Validator](https://fderuiter.github.io/imednet-toolkit/#panel-datamanager)
+- [Regulatory Compliance Auditor Verification](https://fderuiter.github.io/imednet-toolkit/#panel-auditor)
 
 ### 📚 [Tutorials](docs/tutorials/)
 *Learning-oriented guides for getting started.*
-- [Quick Start](docs/tutorials/quick_start.rst) (and [Interactive Showcase](https://fderuiter.github.io/imednet-python-sdk/#interactive-showcase))
+- [Quick Start](docs/tutorials/quick_start.rst) (and [Interactive Showcase](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase))
 - [Async Quick Start](docs/tutorials/async_quick_start.rst)
 - [Examples](docs/tutorials/examples/)
 

@@ -6,15 +6,25 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+from imednet.models.queries import Query, QueryStatus
 from imednet.models.records import Record
 from imednet.models.subjects import Subject
 from imednet.models.variables import Variable
 from imednet.utils.pandas import (
     export_records_csv,
+    queries_to_dataframe,
     records_to_dataframe,
     subjects_to_dataframe,
     variables_to_dataframe,
 )
+
+
+def _sample_query() -> Query:
+    """Helper function to sample query."""
+    return Query(
+        status=QueryStatus.OPEN,
+        query_comments=[],
+    )
 
 
 def _sample_variable() -> Variable:
@@ -70,6 +80,29 @@ def test_subjects_to_dataframe_raises_importerror_when_pandas_missing(monkeypatc
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
     with pytest.raises(ImportError, match="pandas is required for subjects_to_dataframe"):
         subjects_to_dataframe([])
+
+
+def test_queries_to_dataframe_success() -> None:
+    """Test converting queries to a pandas DataFrame."""
+    query = _sample_query()
+    df = queries_to_dataframe([query])
+    assert not df.empty
+    assert len(df) == 1
+    assert df.loc[0, "status"] == "OPEN"
+    assert df.loc[0, "query_comments"] == []
+
+
+def test_queries_to_dataframe_empty() -> None:
+    """Test converting empty queries collection to DataFrame."""
+    df = queries_to_dataframe([])
+    assert df.empty
+
+
+def test_queries_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
+    """Test that queries_to_dataframe raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for queries_to_dataframe"):
+        queries_to_dataframe([])
 
 
 def test_variables_to_dataframe_success() -> None:
