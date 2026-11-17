@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -257,6 +258,7 @@ class UATWorkflow:
         poll_timeout: float = 600.0,
         seed: int | None = None,
         on_progress: JobProgressCallback | None = None,
+        on_phase_change: Callable[[UATWorkflowState], None] | None = None,
     ) -> None:
         """Initialize the UAT workflow orchestrator."""
         from .generator import SyntheticRecordGenerator
@@ -272,6 +274,7 @@ class UATWorkflow:
         self._poll_interval = poll_interval
         self._poll_timeout = poll_timeout
         self._on_progress = on_progress
+        self._on_phase_change = on_phase_change
 
         self._submitter: Any | None = None
         self._poller: Any | None = None
@@ -311,6 +314,8 @@ class UATWorkflow:
         validate_uat_transition(self._state, target_state)
         self._state = target_state
         self._state_history.append(target_state)
+        if self._on_phase_change is not None:
+            self._on_phase_change(target_state)
         return self._state
 
     def reset(self) -> None:

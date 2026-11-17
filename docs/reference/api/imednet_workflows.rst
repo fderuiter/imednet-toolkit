@@ -148,3 +148,10 @@ imednet\_workflows.triage\_store module
 .. automodule:: imednet_workflows.triage_store
    :members:
    :show-inheritance:
+
+imednet\_workflows.wizard module
+--------------------------------
+
+.. automodule:: imednet_workflows.wizard
+   :members:
+   :show-inheritance:
