@@ -1,0 +1,31 @@
+[project]
+name = "imednet-tui"
+version = "1.0.0"
+description = "Terminal user interface plugin for the iMednet Python SDK"
+authors = [
+    { name = "Frederick de Ruiter", email = "127706008+fderuiter@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "imednet>=1.0.0,<2.0.0",
+    "textual>=0.86.0",
+]
+
+[project.entry-points."imednet.cli_plugins"]
+tui = "imednet_tui.cli:setup_parser"
+
+[project.urls]
+repository = "https://github.com/fderuiter/imednet-toolkit"
+documentation = "https://fderuiter.github.io/imednet-toolkit/"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/imednet_tui"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/imednet_tui"
+]

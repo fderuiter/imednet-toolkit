@@ -326,6 +326,7 @@ This documentation is organized according to the Diátaxis framework into four m
    adr/index
    reference/api/core
    reference/api/plugins-sinks
+   reference/api/plugins-tui
    reference/api/plugins-workflows
    reference/api/providers-airflow
 

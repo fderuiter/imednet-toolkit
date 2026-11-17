@@ -23,7 +23,7 @@ def test_pypi_wizard_stages_count() -> None:
     stage_calls = re.findall(r'^\s*stage\s+"([^"]+)"', content, flags=re.MULTILINE)
 
     assert active_total_stages == len(stage_calls)
-    assert active_total_stages == 6
+    assert active_total_stages == 7
 
 
 def test_pypi_wizard_banner_package_count() -> None:
@@ -40,7 +40,7 @@ def test_pypi_wizard_banner_package_count() -> None:
     packages_dir = Path(__file__).resolve().parents[2] / "packages"
     workspace_pyprojects = list(packages_dir.glob("*/pyproject.toml"))
     assert announced_package_count == len(workspace_pyprojects)
-    assert announced_package_count == 4
+    assert announced_package_count == 5
 
 
 def test_pypi_wizard_package_names_match_workspace() -> None:
@@ -69,6 +69,7 @@ def test_pypi_wizard_package_names_match_workspace() -> None:
         "imednet-workflows",
         "apache-airflow-providers-imednet",
         "imednet-plugins-sinks",
+        "imednet-tui",
     }
     assert wizard_project_names == workspace_package_names
     assert wizard_say_names == workspace_package_names

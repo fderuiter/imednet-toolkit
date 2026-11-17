@@ -193,9 +193,9 @@ finish() {
 # Replace the example below. Set TOTAL_STAGES to match the stages you write.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=6
+TOTAL_STAGES=7
 
-banner "PyPI Trusted Publishing Setup (4 packages)"
+banner "PyPI Trusted Publishing Setup (5 packages)"
 
 # ── Stage 1: GitHub Environment ───────────────────────────────────────────
 stage "GitHub: Create 'pypi' environment"
@@ -259,7 +259,20 @@ step "  • Environment name:   pypi"
 step "Click 'Add'."
 pause "Press Enter once 'imednet-plugins-sinks' publisher is added on PyPI..."
 
-# ── Stage 6: Optional Fallback Token ──────────────────────────────────────
+# ── Stage 6: Package 5 - imednet-tui ─────────────────────────────────────
+stage "PyPI Publisher: imednet-tui"
+say "Register Trusted Publisher for 'imednet-tui' (packages/plugins-tui)."
+open_url "https://pypi.org/manage/account/publishing/"
+step "On the PyPI Publishing page, enter:"
+step "  • PyPI Project Name:  imednet-tui"
+step "  • Owner:              fderuiter"
+step "  • Repository name:    imednet-toolkit"
+step "  • Workflow name:      release.yml"
+step "  • Environment name:   pypi"
+step "Click 'Add'."
+pause "Press Enter once 'imednet-tui' publisher is added on PyPI..."
+
+# ── Stage 7: Optional Fallback Token ──────────────────────────────────────
 stage "PyPI Fallback: API Token (Optional)"
 say "PyPI Trusted Publishing eliminates the need for long-lived tokens in CI."
 say "However, if you want an emergency fallback token (PYPI_API_TOKEN secret):"
