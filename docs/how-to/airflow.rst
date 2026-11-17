@@ -50,8 +50,10 @@ environment. The hook merges these settings with values from
 
 For task-mapping discovery steps, ``ImednetHook`` provides explicit helper methods:
 
-- ``get_sdk_client()`` returns the live :class:`~imednet.ImednetSDK` for use only
-  inside task execution context.
+- ``get_conn()`` returns the live :class:`~imednet.ImednetSDK` adhering to the
+  standard Airflow BaseHook contract.
+- ``get_sdk_client()`` is a direct alias for ``get_conn()`` for use inside task
+  execution context.
 - ``list_studies_metadata()`` returns JSON-serializable primitive dictionaries
   (with sensitive keys redacted) for safe mapped task expansion.
 - ``list_study_keys()`` returns primitive study keys only.

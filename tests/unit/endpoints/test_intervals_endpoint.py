@@ -58,3 +58,135 @@ def test_list_different_study_keys_make_separate_requests(dummy_client, paginato
     ep.list(study_key="S2")
 
     assert capture["count"] == 2
+
+
+def test_to_dataframe_success(dummy_client, paginator_factory):
+    """Test that to_dataframe exports queried intervals to a pandas DataFrame."""
+    ep = intervals.IntervalsEndpoint(dummy_client)
+    paginator_factory(
+        intervals,
+        [
+            {
+                "intervalId": 1,
+                "intervalName": "Baseline",
+                "forms": [{"formId": 10, "formKey": "F1", "formName": "Form 1"}],
+            }
+        ],
+    )
+
+    df = ep.to_dataframe("S1")
+
+    assert len(df) == 1
+    assert df.loc[0, "interval_id"] == 1
+    assert df.loc[0, "interval_name"] == "Baseline"
+    forms_list = df.loc[0, "forms"]
+    assert isinstance(forms_list, list)
+    assert len(forms_list) == 1
+    assert forms_list[0]["form_id"] == 10
+
+
+def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patch_build_filter):
+    """Test that to_dataframe forwards filters and study key to list."""
+    ep = intervals.IntervalsEndpoint(dummy_client)
+    captured = paginator_factory(intervals, [{"intervalId": 1}])
+    filter_capture = patch_build_filter(intervals)
+
+    df = ep.to_dataframe(
+        study_key="S1",
+        status="new",
+    )
+
+    assert captured["path"] == "/api/v1/edc/studies/S1/intervals"
+    assert captured["params"] == {"filter": "FILTERED"}
+    assert filter_capture["filters"] == {"status": "new"}
+    assert len(df) == 1
+
+
+def test_to_dataframe_empty_results(dummy_client, paginator_factory):
+    """Test that to_dataframe handles empty query results."""
+    ep = intervals.IntervalsEndpoint(dummy_client)
+    paginator_factory(intervals, [])
+
+    df = ep.to_dataframe("S1")
+
+    assert df.empty
+
+
+def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, paginator_factory):
+    """Test that to_dataframe raises ImportError when pandas is not installed."""
+    ep = intervals.IntervalsEndpoint(dummy_client)
+    paginator_factory(intervals, [{"intervalId": 1}])
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+
+    with pytest.raises(ImportError, match="pandas is required for intervals_to_dataframe"):
+        ep.to_dataframe("S1")
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_success(dummy_client, async_paginator_factory):
+    """Test that async to_dataframe exports queried intervals to a pandas DataFrame."""
+    ep = intervals.AsyncIntervalsEndpoint(dummy_client)
+    async_paginator_factory(
+        intervals,
+        [
+            {
+                "intervalId": 1,
+                "intervalName": "Baseline",
+                "forms": [{"formId": 10, "formKey": "F1", "formName": "Form 1"}],
+            }
+        ],
+    )
+
+    df = await ep.to_dataframe("S1")
+
+    assert len(df) == 1
+    assert df.loc[0, "interval_id"] == 1
+    assert df.loc[0, "interval_name"] == "Baseline"
+    forms_list = df.loc[0, "forms"]
+    assert isinstance(forms_list, list)
+    assert len(forms_list) == 1
+    assert forms_list[0]["form_id"] == 10
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_parameter_forwarding(
+    dummy_client, async_paginator_factory, patch_build_filter
+):
+    """Test that async to_dataframe forwards filters and study key to list."""
+    ep = intervals.AsyncIntervalsEndpoint(dummy_client)
+    captured = async_paginator_factory(intervals, [{"intervalId": 1}])
+    filter_capture = patch_build_filter(intervals)
+
+    df = await ep.to_dataframe(
+        study_key="S1",
+        status="new",
+    )
+
+    assert captured["path"] == "/api/v1/edc/studies/S1/intervals"
+    assert captured["params"] == {"filter": "FILTERED"}
+    assert filter_capture["filters"] == {"status": "new"}
+    assert len(df) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_empty_results(dummy_client, async_paginator_factory):
+    """Test that async to_dataframe handles empty query results."""
+    ep = intervals.AsyncIntervalsEndpoint(dummy_client)
+    async_paginator_factory(intervals, [])
+
+    df = await ep.to_dataframe("S1")
+
+    assert df.empty
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_missing_dependency(
+    monkeypatch, dummy_client, async_paginator_factory
+):
+    """Test that async to_dataframe raises ImportError when pandas is not installed."""
+    ep = intervals.AsyncIntervalsEndpoint(dummy_client)
+    async_paginator_factory(intervals, [{"intervalId": 1}])
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+
+    with pytest.raises(ImportError, match="pandas is required for intervals_to_dataframe"):
+        await ep.to_dataframe("S1")
