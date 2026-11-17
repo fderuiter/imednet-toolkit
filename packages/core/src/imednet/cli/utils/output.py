@@ -53,6 +53,35 @@ _STATUS_COLOR_MAP = {
     "withdrawn": "red",
 }
 
+_HC_STATUS_COLOR_MAP = {
+    "active": "blue",
+    "success": "blue",
+    "ok": "blue",
+    "completed": "blue",
+    "complete": "blue",
+    "open": "blue",
+    "approved": "blue",
+    "verified": "blue",
+    "pending": "yellow",
+    "processing": "yellow",
+    "running": "yellow",
+    "queued": "yellow",
+    "suspended": "yellow",
+    "hold": "yellow",
+    "incomplete": "yellow",
+    "initiated": "yellow",
+    "inactive": "magenta",
+    "closed": "magenta",
+    "error": "magenta",
+    "fail": "magenta",
+    "failed": "magenta",
+    "cancelled": "magenta",
+    "timeout": "magenta",
+    "rejected": "magenta",
+    "terminated": "magenta",
+    "withdrawn": "magenta",
+}
+
 _ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -137,38 +166,11 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
             c = cell
             if any(key in k.lower() for key in ("status", "state")):
                 lower_val = cell.lower()
-                if is_hc:
-                    hc_map = {
-                        "active": "blue",
-                        "success": "blue",
-                        "ok": "blue",
-                        "completed": "blue",
-                        "complete": "blue",
-                        "open": "blue",
-                        "approved": "blue",
-                        "verified": "blue",
-                        "pending": "yellow",
-                        "processing": "yellow",
-                        "running": "yellow",
-                        "queued": "yellow",
-                        "suspended": "yellow",
-                        "hold": "yellow",
-                        "incomplete": "yellow",
-                        "initiated": "yellow",
-                        "inactive": "magenta",
-                        "closed": "magenta",
-                        "error": "magenta",
-                        "fail": "magenta",
-                        "failed": "magenta",
-                        "cancelled": "magenta",
-                        "timeout": "magenta",
-                        "rejected": "magenta",
-                        "terminated": "magenta",
-                        "withdrawn": "magenta",
-                    }
-                    color = hc_map.get(lower_val)
-                else:
-                    color = _STATUS_COLOR_MAP.get(lower_val)
+                color = (
+                    _HC_STATUS_COLOR_MAP.get(lower_val)
+                    if is_hc
+                    else _STATUS_COLOR_MAP.get(lower_val)
+                )
                 if color:
                     c = _colorize(cell, color)
             colored_row.append(c + " " * (col_widths[i] - len(cell)))
@@ -182,6 +184,8 @@ def display_list(
     fields: list[str] | None = None,
     *,
     output_format: str = "table",
+    details: Sequence[Any] | None = None,
+    interactive: bool | None = None,
 ) -> None:
     """Display a human table or one versioned JSON response without progress text."""
     if output_format == "json":
@@ -193,28 +197,57 @@ def display_list(
         print(empty_msg or f"No {label} found.")
         return
 
-    print(f"Found {len(items)} {label}:")
-
-    if fields:
-        _print_table(items, fields)
-        return
-
-    first = items[0]
+    field_keys: list[str] = []
     data_list: list[dict[str, Any]] = []
 
-    if hasattr(first, "model_dump"):
-        data_list = [item.model_dump() for item in items]
-    elif hasattr(first, "dict"):
-        data_list = [item.dict() for item in items]
-    elif isinstance(first, dict):
-        data_list = list(items)
+    if fields:
+        field_keys = list(fields)
+        for item in items:
+            if isinstance(item, dict):
+                data_list.append({k: item.get(k) for k in field_keys})
+            else:
+                data_list.append({k: getattr(item, k, None) for k in field_keys})
+    else:
+        first = items[0]
+        if hasattr(first, "model_dump"):
+            data_list = [item.model_dump() for item in items]
+        elif hasattr(first, "dict"):
+            data_list = [item.dict() for item in items]
+        elif isinstance(first, dict):
+            data_list = list(items)
 
-    if not data_list:
-        print(items)
-        return
+        if not data_list:
+            print(f"Found {len(items)} {label}:")
+            print(items)
+            return
 
-    all_keys = list(data_list[0].keys())
-    _print_table(data_list, all_keys)
+        field_keys = list(data_list[0].keys())
+
+    # Launch interactive data grid if connected to an active terminal
+    try:
+        from .grid import is_interactive_terminal, run_interactive_grid
+    except ImportError:
+
+        def is_interactive_terminal() -> bool:  # type: ignore[misc]
+            return False
+
+        def run_interactive_grid(*args: Any, **kwargs: Any) -> bool:  # type: ignore[misc]
+            return False
+
+    should_run_interactive = interactive if interactive is not None else is_interactive_terminal()
+    if should_run_interactive:
+        grid_ran = run_interactive_grid(
+            items=data_list,
+            fields=field_keys,
+            label=label,
+            details=details,
+        )
+        if grid_ran:
+            return
+
+    # Non-interactive / piped fallback: emit standard ASCII table
+    print(f"Found {len(items)} {label}:")
+    _print_table(items if fields else data_list, field_keys)
 
 
 def print_error(

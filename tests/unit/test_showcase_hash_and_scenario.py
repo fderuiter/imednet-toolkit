@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import ast
 import re
+import urllib.parse
 from pathlib import Path
+
+import pytest
 
 from imednet.endpoints.records import RecordsEndpoint
 from imednet.models.forms import Form
@@ -232,3 +235,160 @@ def test_showcase_sdk_snippets_syntax_and_api_contracts() -> None:
     )
     assert "severity" not in queries_kw, "queries snippet must not filter by severity"
     assert QueryStatus.OPEN.value == "OPEN", "OPEN must be a valid QueryStatus lifecycle state"
+
+
+def parse_rest_request_line(
+    raw_snippet: str,
+) -> tuple[str, str, dict[str, list[str]], str]:
+    """Parse HTTP request line from raw snippet into (method, path, query_params, http_version)."""
+    normalized = raw_snippet.replace(r"\n", "\n").strip()
+    first_line = normalized.splitlines()[0]
+    parts = first_line.split(" ")
+    assert len(parts) == 3, (
+        f"Expected request line 'METHOD TARGET HTTP/VERSION', got: {first_line!r}"
+    )
+    method, target, http_version = parts
+    parsed_target = urllib.parse.urlsplit(target)
+    query_params = urllib.parse.parse_qs(parsed_target.query, keep_blank_values=True)
+    return method, parsed_target.path, query_params, http_version
+
+
+def validate_rest_query_parameters(
+    raw_snippet: str,
+    allowed_query_keys: set[str],
+) -> tuple[str, str, dict[str, list[str]]]:
+    """Validate that query parameters in the request target conform to the allowed specification."""
+    method, path, query_params, http_version = parse_rest_request_line(raw_snippet)
+    assert method == "GET", f"Expected GET method, got {method}"
+    assert http_version == "HTTP/1.1", f"Expected HTTP/1.1, got {http_version}"
+
+    disallowed_keys = set(query_params.keys()) - allowed_query_keys
+    assert not disallowed_keys, (
+        f"Endpoint '{path}' contains unsupported query parameters: {sorted(disallowed_keys)}. "
+        f"Allowed parameters are: {sorted(allowed_query_keys)}"
+    )
+    assert "status" not in query_params, (
+        f"Endpoint '{path}' must not include unsupported standalone 'status' query parameter."
+    )
+    return method, path, query_params
+
+
+def test_showcase_rest_snippets_syntax_and_api_contracts() -> None:
+    """Verify that all showcase REST snippets match the official EDC API contracts."""
+    repo_root = get_repo_root()
+    script_path = repo_root / "docs" / "_static" / "showcase.js"
+    assert script_path.exists(), "showcase.js must exist"
+
+    content = script_path.read_text(encoding="utf-8")
+    rest_match = re.search(r"rest:\s*\{([^}]+)\}", content)
+    assert rest_match, "rest snippet dictionary not found in showcase.js"
+
+    snippets = dict(re.findall(r"(\w+):\s*`([^`]+)`", rest_match.group(1)))
+    expected_snippets = {"records", "studies", "forms", "queries"}
+    assert set(snippets.keys()) == expected_snippets, (
+        f"Expected snippets {expected_snippets}, found {set(snippets.keys())}"
+    )
+
+    required_headers = [
+        "Host: edc.prod.imednetapi.com",
+        "x-api-key: <API_KEY>",
+        "x-imn-security-key: <SECURITY_KEY>",
+        "Accept: application/json",
+    ]
+
+    allowed_query_keys_by_endpoint: dict[str, set[str]] = {
+        "records": {"page", "size", "sort", "filter", "recordDataFilter"},
+        "studies": {"page", "size", "sort", "filter"},
+        "forms": {"page", "size", "sort", "filter"},
+        "queries": {"page", "size", "sort", "filter"},
+    }
+
+    parsed_requests: dict[str, tuple[str, str, dict[str, list[str]]]] = {}
+
+    for name, raw_snippet in snippets.items():
+        # Validate required headers are present
+        for header in required_headers:
+            assert header in raw_snippet, f"REST snippet '{name}' must include header '{header}'"
+
+        # Validate obsolete or fictional patterns are not present
+        assert "api.imednet.example.org" not in raw_snippet, (
+            f"REST snippet '{name}' must not reference fictional domain api.imednet.example.org"
+        )
+        assert "Authorization: Bearer" not in raw_snippet, (
+            f"REST snippet '{name}' must use EDC api-key security headers instead of Bearer token"
+        )
+
+        # Validate endpoint path prefix
+        assert "GET /api/v1/edc/" in raw_snippet, (
+            f"REST snippet '{name}' endpoint path must be prefixed with /api/v1/edc/"
+        )
+
+        # Validate parsed query keys against endpoint specification
+        method, path, query_params = validate_rest_query_parameters(
+            raw_snippet,
+            allowed_query_keys=allowed_query_keys_by_endpoint[name],
+        )
+        parsed_requests[name] = (method, path, query_params)
+
+    # 1. Records endpoint and query parameter assertions
+    method, path, query_params = parsed_requests["records"]
+    assert method == "GET"
+    assert path == "/api/v1/edc/studies/STUDY-101/records"
+    assert query_params == {"size": ["10"]}
+    assert "limit" not in query_params, "records snippet must use size instead of limit"
+    assert "form" not in query_params, "records snippet must not filter by invalid form param"
+    assert "status" not in query_params
+
+    # 2. Studies endpoint assertions
+    method, path, query_params = parsed_requests["studies"]
+    assert method == "GET"
+    assert path == "/api/v1/edc/studies"
+    assert "status" not in query_params, (
+        "studies snippet must not include unsupported status parameter"
+    )
+    assert not query_params, f"studies snippet expected no query parameters, got {query_params}"
+
+    # 3. Forms endpoint assertions
+    method, path, query_params = parsed_requests["forms"]
+    assert method == "GET"
+    assert path == "/api/v1/edc/studies/STUDY-101/forms"
+    assert not query_params, f"forms snippet expected no query parameters, got {query_params}"
+
+    # 4. Queries endpoint assertions
+    method, path, query_params = parsed_requests["queries"]
+    assert method == "GET"
+    assert path == "/api/v1/edc/studies/STUDY-101/queries"
+    assert "status" not in query_params, (
+        "queries snippet must not include unsupported status parameter"
+    )
+    assert not query_params, f"queries snippet expected no query parameters, got {query_params}"
+
+
+@pytest.mark.parametrize(
+    ("invalid_snippet", "allowed_keys", "expected_error_substring"),
+    [
+        (
+            "GET /api/v1/edc/studies?status=ACTIVE HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json",
+            {"page", "size", "sort", "filter"},
+            "unsupported query parameters: ['status']",
+        ),
+        (
+            "GET /api/v1/edc/studies/STUDY-101/queries?status=OPEN HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json",
+            {"page", "size", "sort", "filter"},
+            "unsupported query parameters: ['status']",
+        ),
+        (
+            "GET /api/v1/edc/studies/STUDY-101/records?limit=10&form=VS HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json",
+            {"page", "size", "sort", "filter", "recordDataFilter"},
+            "unsupported query parameters",
+        ),
+    ],
+)
+def test_showcase_rest_snippets_rejects_unsupported_query_parameters(
+    invalid_snippet: str,
+    allowed_keys: set[str],
+    expected_error_substring: str,
+) -> None:
+    """Verify that REST snippet validation rejects unsupported query parameters like status or limit."""
+    with pytest.raises(AssertionError, match=re.escape(expected_error_substring)):
+        validate_rest_query_parameters(invalid_snippet, allowed_query_keys=allowed_keys)

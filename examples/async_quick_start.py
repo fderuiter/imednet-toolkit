@@ -1,5 +1,6 @@
 """Asynchronous quickstart example."""
 
+# [start_async_quick_start]
 from __future__ import annotations
 
 import asyncio
@@ -59,3 +60,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+# [end_async_quick_start]

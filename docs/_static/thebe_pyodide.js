@@ -519,7 +519,6 @@ finally:
             hasOutput = true;
             const errPre = document.createElement("pre");
             errPre.className = "thebe-stderr";
-            errPre.style.color = "#cf222e";
             errPre.textContent = res.stderr;
             outputContent.appendChild(errPre);
           }
