@@ -59,6 +59,29 @@ async def test_async_get_legacy_two_arg_success(response_factory):
 
 
 @pytest.mark.asyncio
+async def test_async_get_keyword_arguments_success(response_factory):
+    """Test async keyword argument forms for backward compatibility."""
+    async_client = AsyncMock()
+    async_client.get.return_value = response_factory({"studyKey": "S1"})
+    ep = studies.AsyncStudiesEndpoint(async_client)
+
+    res1 = await ep.get(study_key="S1")
+    assert res1.study_key == "S1"
+
+    res2 = await ep.get(study_key=None, item_id="S1")
+    assert res2.study_key == "S1"
+
+    res3 = await ep.get(study_key="S1", item_id="S1")
+    assert res3.study_key == "S1"
+
+    res4 = await ep.get(item_id="S1")
+    assert res4.study_key == "S1"
+
+    res5 = await ep.get("S1", item_id="S1")
+    assert res5.study_key == "S1"
+
+
+@pytest.mark.asyncio
 async def test_async_get_not_found(response_factory):
     """Test async get raises NotFoundError on empty payload."""
     async_client = AsyncMock()

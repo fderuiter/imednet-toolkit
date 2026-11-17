@@ -1,6 +1,6 @@
 """Endpoint for managing studies in the iMedNet system."""
 
-from typing import Any, overload
+from typing import Any
 
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
@@ -16,12 +16,6 @@ class StudiesOperationDef:
     MODEL = Study
     _id_param = "studyKey"
     requires_study_key: bool = False
-
-    @overload
-    def get(self, study_key: str) -> PathGetOperation[Study]: ...
-
-    @overload
-    def get(self, study_key: str | None, item_id: ItemId) -> PathGetOperation[Study]: ...
 
     @execute_operation  # type: ignore
     def get(

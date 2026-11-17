@@ -62,6 +62,12 @@ def test_get_keyword_arguments_success(dummy_client, response_factory):
     res3 = ep.get(study_key="S1", item_id="S1")
     assert res3.study_key == "S1"
 
+    res4 = ep.get(item_id="S1")
+    assert res4.study_key == "S1"
+
+    res5 = ep.get("S1", item_id="S1")
+    assert res5.study_key == "S1"
+
 
 def test_get_empty_payload_raises_not_found(dummy_client, response_factory):
     """Test that an empty response payload raises NotFoundError."""
