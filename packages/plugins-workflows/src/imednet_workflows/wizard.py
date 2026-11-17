@@ -31,6 +31,9 @@ def prompt_input(prompt_text: str, default: str | None = None) -> str:
 
     Returns:
         The stripped string provided by the user, or the default.
+
+    Raises:
+        SystemExit: If end-of-file (EOF) is encountered on stdin.
     """
     if default is not None:
         sys.stderr.write(f"{prompt_text} [{default}]: ")
@@ -39,8 +42,9 @@ def prompt_input(prompt_text: str, default: str | None = None) -> str:
     sys.stderr.flush()
 
     line = sys.stdin.readline()
-    if not line:
-        return default or ""
+    if line == "":
+        print_progress("Error: Input stream closed (EOF). Operation cancelled.")
+        sys.exit(1)
     stripped = line.strip()
     if not stripped and default is not None:
         return default
@@ -56,14 +60,18 @@ def prompt_confirm(prompt_text: str, default: bool = False) -> bool:
 
     Returns:
         True if confirmed, False otherwise.
+
+    Raises:
+        SystemExit: If end-of-file (EOF) is encountered on stdin.
     """
     suffix = " [Y/n]: " if default else " [y/N]: "
     sys.stderr.write(f"{prompt_text}{suffix}")
     sys.stderr.flush()
 
     line = sys.stdin.readline()
-    if not line:
-        return default
+    if line == "":
+        print_progress("Error: Input stream closed (EOF). Operation cancelled.")
+        sys.exit(1)
     choice = line.strip().lower()
     if not choice:
         return default
@@ -188,6 +196,28 @@ def prompt_filters(
                 filters.append(f)
             else:
                 print_progress(f"Validation Error in provided filter: {err}")
+                corrected = prompt_input(
+                    f"Enter corrected {category_name} to replace invalid '{f}' (e.g., '{example}')"
+                )
+                if not corrected:
+                    print_progress(
+                        f"Error: Malformed filter '{f}' was not corrected. Aborting to prevent unfiltered extraction."
+                    )
+                    sys.exit(1)
+                while True:
+                    c_valid, _, _, c_err = validate_filter_syntax(corrected)
+                    if c_valid:
+                        filters.append(corrected)
+                        break
+                    print_progress(f"Validation Error: {c_err}")
+                    corrected = prompt_input(
+                        f"Enter corrected {category_name} to replace invalid '{f}' (e.g., '{example}')"
+                    )
+                    if not corrected:
+                        print_progress(
+                            f"Error: Malformed filter '{f}' was not corrected. Aborting to prevent unfiltered extraction."
+                        )
+                        sys.exit(1)
 
     # If filters were already provided, confirm or add more
     prompt_msg = (
@@ -228,6 +258,27 @@ def prompt_study_key(study_key: str | None = None) -> str:
             return val
         print_progress(
             "Validation Error: Study key cannot be empty. Please enter a valid study key."
+        )
+
+
+def prompt_stream_name(stream: str | None = None) -> str:
+    """Ensure a valid non-empty stream name, prompting if needed.
+
+    Args:
+        stream: Existing stream name from CLI arguments.
+
+    Returns:
+        Non-empty stream name string.
+    """
+    if stream and stream.strip():
+        return stream.strip()
+
+    while True:
+        val = prompt_input("Enter stream name (e.g., 'records')")
+        if val:
+            return val
+        print_progress(
+            "Validation Error: Stream name cannot be empty. Please enter a valid stream name."
         )
 
 

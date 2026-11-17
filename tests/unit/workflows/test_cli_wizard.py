@@ -23,6 +23,7 @@ from imednet_workflows.wizard import (
     prompt_iso8601_timestamp,
     prompt_non_negative_int,
     prompt_positive_int,
+    prompt_stream_name,
     prompt_study_key,
     validate_filter_syntax,
     validate_iso8601_timestamp,
@@ -104,6 +105,9 @@ def test_validate_filter_syntax_valid() -> None:
     _, k, v, _ = validate_filter_syntax("is_active=true")
     assert k == "is_active" and v is True
 
+    _, k, v, _ = validate_filter_syntax("is_active=false")
+    assert k == "is_active" and v is False
+
     _, k, v, _ = validate_filter_syntax("count=42")
     assert k == "count" and v == 42
 
@@ -137,7 +141,89 @@ def test_prompt_input_and_confirm() -> None:
 
     with patch("sys.stdin", io.StringIO("\n")):
         assert prompt_confirm("Proceed?", default=True) is True
+    with patch("sys.stdin", io.StringIO("\n")):
         assert prompt_confirm("Proceed?", default=False) is False
+
+
+def test_prompt_eof_handling() -> None:
+    """Test that all interactive prompt functions exit with code 1 upon encountering EOF."""
+    # prompt_input
+    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+        prompt_input("Test prompt")
+    assert exc.value.code == 1
+
+    # prompt_confirm
+    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+        prompt_confirm("Confirm?")
+    assert exc.value.code == 1
+
+    # prompt_study_key
+    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+        prompt_study_key(None)
+    assert exc.value.code == 1
+
+    # prompt_stream_name
+    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+        prompt_stream_name(None)
+    assert exc.value.code == 1
+
+    # prompt_iso8601_timestamp
+    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+        prompt_iso8601_timestamp()
+    assert exc.value.code == 1
+
+    # prompt_positive_int
+    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+        prompt_positive_int("Enter count")
+    assert exc.value.code == 1
+
+    # prompt_non_negative_int
+    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+        prompt_non_negative_int("Enter count")
+    assert exc.value.code == 1
+
+    # prompt_filters
+    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+        prompt_filters("record filter", "form_key=DEMO")
+    assert exc.value.code == 1
+
+
+def test_prompt_stream_name() -> None:
+    """Test prompt_stream_name accepts prefilled stream or prompts interactively."""
+    assert prompt_stream_name("records") == "records"
+    with patch("sys.stdin", io.StringIO("\n\nevents\n")):
+        assert prompt_stream_name(None) == "events"
+
+
+def test_prompt_filters_malformed_supplied_filter_rejected_on_enter() -> None:
+    """Test that malformed supplied filters are not dropped on Enter and abort with exit code 1."""
+    with patch("sys.stdin", io.StringIO("\n")), pytest.raises(SystemExit) as exc:
+        prompt_filters("record filter", "form_key=DEMO", existing_filters=["bad_format"])
+    assert exc.value.code == 1
+
+
+def test_prompt_filters_malformed_supplied_filter_corrected() -> None:
+    """Test that malformed supplied filters can be corrected interactively."""
+    user_inputs = "form_key=DEMO\n\n"
+    with patch("sys.stdin", io.StringIO(user_inputs)):
+        filters = prompt_filters("record filter", "form_key=DEMO", existing_filters=["bad_format"])
+        assert filters == ["form_key=DEMO"]
+
+
+def test_prompt_filters_malformed_supplied_filter_retry_then_valid() -> None:
+    """Test that correcting a malformed supplied filter handles multiple retries before valid."""
+    user_inputs = "still_bad\nform_key=DEMO\n\n"
+    with patch("sys.stdin", io.StringIO(user_inputs)):
+        filters = prompt_filters("record filter", "form_key=DEMO", existing_filters=["bad_format"])
+        assert filters == ["form_key=DEMO"]
+
+
+def test_prompt_filters_malformed_supplied_filter_retry_then_abort() -> None:
+    """Test that correcting a malformed supplied filter aborts if empty string given on retry."""
+    user_inputs = "still_bad\n\n"
+    with patch("sys.stdin", io.StringIO(user_inputs)), pytest.raises(SystemExit) as exc:
+        prompt_filters("record filter", "form_key=DEMO", existing_filters=["bad_format"])
+    assert exc.value.code == 1
 
 
 def test_prompt_iso8601_timestamp_retry() -> None:
@@ -160,6 +246,13 @@ def test_prompt_filters_interactive() -> None:
         filters = prompt_filters("record filter", "form_key=DEMO")
         assert filters == ["form_key=DEMO", "subject_status=Screened"]
 
+    # Test with existing valid filter
+    with patch("sys.stdin", io.StringIO("extra=1\n\n")):
+        filters = prompt_filters(
+            "record filter", "form_key=DEMO", existing_filters=["form_key=DEMO"]
+        )
+        assert filters == ["form_key=DEMO", "extra=1"]
+
 
 def test_prompt_study_key() -> None:
     """Test prompt_study_key prompts when None or empty."""
@@ -177,14 +270,14 @@ def test_prompt_positive_int() -> None:
 
 
 def test_prompt_non_negative_int() -> None:
-    """Test prompt_non_negative_int validates non-negative integers."""
-    with patch("sys.stdin", io.StringIO("-1\n0\n")):
+    """Test prompt_non_negative_int validates non-negative integers and handles invalid inputs."""
+    with patch("sys.stdin", io.StringIO("not_a_num\n-1\n0\n")):
         val = prompt_non_negative_int("Enter count", default=10)
         assert val == 0
 
 
 def test_display_ledger_streams(tmp_path) -> None:
-    """Test display_ledger_streams outputs stream metadata to stderr."""
+    """Test display_ledger_streams outputs stream metadata to stderr and filters by study_key."""
     ledger_path = str(tmp_path / "ledger.json")
     state = LedgerState(
         studies={
@@ -196,18 +289,33 @@ def test_display_ledger_streams(tmp_path) -> None:
                         last_run_status="success",
                     )
                 }
-            )
+            ),
+            "STUDY_B": StudyState(
+                streams={
+                    "records": StreamState(
+                        last_timestamp=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+                        records_processed=5,
+                        last_run_status="success",
+                    )
+                }
+            ),
         }
     )
     with patch("imednet_workflows.wizard.get_state_provider") as mock_provider:
         mock_provider.return_value.read_state.return_value = state
         err = io.StringIO()
         with patch("sys.stderr", err):
-            display_ledger_streams(ledger_path)
+            display_ledger_streams(ledger_path, study_key="STUDY_A")
         output = err.getvalue()
         assert "STUDY_A" in output
-        assert "records" in output
-        assert "success" in output
+        assert "STUDY_B" not in output
+
+        # Test read error handling
+        mock_provider.return_value.read_state.side_effect = RuntimeError("disk error")
+        err2 = io.StringIO()
+        with patch("sys.stderr", err2):
+            display_ledger_streams(ledger_path)
+        assert "Could not read existing ledger" in err2.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +345,19 @@ def test_extract_records_interactive_flow(monkeypatch: pytest.MonkeyPatch) -> No
     # 4. subject filter: subject_status=Screened
     # 5. empty line to finish subject filters
     # 6. visit filter: empty line to skip
-    stdin_input = "STUDY_INTERACTIVE\nform_key=DEMO\n\nsubject_status=Screened\n\n\n"
+    stdin_input = (
+        "\n".join(
+            [
+                "STUDY_INTERACTIVE",
+                "form_key=DEMO",
+                "",
+                "subject_status=Screened",
+                "",
+                "",
+            ]
+        )
+        + "\n"
+    )
 
     result = run_cli_command(
         cli_app,
@@ -595,3 +715,102 @@ def test_uat_workflow_phase_lifecycle_callback() -> None:
         UATWorkflowState.MONITORING,
         UATWorkflowState.COMPLETED,
     ]
+
+
+def test_extract_records_interactive_malformed_filter_aborts_without_broadening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test interactive extract-records aborts if supplied filter is malformed and not corrected."""
+    monkeypatch.setenv("IMEDNET_API_KEY", "test_key")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "test_sec")
+    mock_workflow = MagicMock()
+    monkeypatch.setattr(
+        "imednet_workflows.cli.DataExtractionWorkflow",
+        MagicMock(return_value=mock_workflow),
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=MagicMock()))
+
+    # User enters study key, then presses Enter on malformed filter prompt
+    stdin_input = "STUDY1\n\n"
+    result = run_cli_command(
+        cli_app,
+        ["workflows", "extract-records", "--record-filter", "invalidfilter", "--interactive"],
+        stdin_input=stdin_input,
+    )
+
+    assert result.exit_code == 1
+    assert "Malformed filter 'invalidfilter' was not corrected" in result.stderr
+    # Workflow must NOT be called with an unconstrained/broadened query
+    mock_workflow.extract_records_by_criteria.assert_not_called()
+
+
+def test_extract_records_interactive_eof_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test interactive extract-records aborts immediately on EOF."""
+    monkeypatch.setenv("IMEDNET_API_KEY", "test_key")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "test_sec")
+    mock_workflow = MagicMock()
+    monkeypatch.setattr(
+        "imednet_workflows.cli.DataExtractionWorkflow",
+        MagicMock(return_value=mock_workflow),
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=MagicMock()))
+
+    result = run_cli_command(
+        cli_app,
+        ["workflows", "extract-records", "--interactive"],
+        stdin_input="",
+    )
+
+    assert result.exit_code == 1
+    assert "Input stream closed (EOF)" in result.stderr
+    mock_workflow.extract_records_by_criteria.assert_not_called()
+
+
+def test_state_set_interactive_eof_aborts(tmp_path) -> None:
+    """Test state set --interactive aborts cleanly on EOF."""
+    ledger_path = str(tmp_path / "ledger.json")
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        result = run_cli_command(
+            state_app,
+            ["set", "--ledger-path", ledger_path, "--interactive"],
+            stdin_input="",
+        )
+        assert result.exit_code == 1
+        assert "Input stream closed (EOF)" in result.stderr
+        mock_ledger.return_value.set_last_timestamp.assert_not_called()
+
+
+def test_state_reset_interactive_eof_aborts(tmp_path) -> None:
+    """Test state reset --interactive aborts cleanly on EOF."""
+    ledger_path = str(tmp_path / "ledger.json")
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        result = run_cli_command(
+            state_app,
+            ["reset", "--study-key", "STUDY1", "--ledger-path", ledger_path, "--interactive"],
+            stdin_input="",
+        )
+        assert result.exit_code == 1
+        assert "Input stream closed (EOF)" in result.stderr
+        mock_ledger.return_value.delete_entry.assert_not_called()
+
+
+def test_workflows_uat_run_interactive_eof_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test workflows uat run --interactive aborts cleanly on EOF."""
+    monkeypatch.setenv("IMEDNET_API_KEY", "test_key")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "test_sec")
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=MagicMock()))
+    mock_uat_workflow = MagicMock()
+    monkeypatch.setattr(
+        "imednet_workflows.uat.UATWorkflow",
+        MagicMock(return_value=mock_uat_workflow),
+    )
+
+    result = run_cli_command(
+        cli_app,
+        ["workflows", "uat", "run", "--interactive"],
+        stdin_input="",
+    )
+
+    assert result.exit_code == 1
+    assert "Input stream closed (EOF)" in result.stderr
+    mock_uat_workflow.run.assert_not_called()

@@ -77,20 +77,16 @@ def _execute_set_state(
         display_ledger_streams,
         print_progress,
         prompt_confirm,
-        prompt_input,
         prompt_iso8601_timestamp,
         prompt_non_negative_int,
+        prompt_stream_name,
         prompt_study_key,
         validate_iso8601_timestamp,
     )
 
     display_ledger_streams(ledger_path=ledger_path, study_key=study_key)
     study_key = prompt_study_key(study_key)
-
-    while not stream:
-        stream = prompt_input("Enter stream name (e.g., 'records')")
-        if not stream:
-            print_progress("Validation Error: Stream name cannot be empty.")
+    stream = prompt_stream_name(stream)
 
     if not timestamp:
         _, dt = prompt_iso8601_timestamp(
