@@ -26,7 +26,7 @@ for source_root in (
 
 from imednet.core.async_client import AsyncClient
 from imednet.core.client import Client
-from imednet.core.context import Context, clear_study_context
+from imednet.core.context import clear_study_context
 
 
 def pytest_addoption(parser):
@@ -128,12 +128,6 @@ class DummyResponse:
             The data provided during initialization.
         """
         return self._data
-
-
-@pytest.fixture
-def context():
-    """Provide a fresh Context instance for each test."""
-    return Context()
 
 
 @pytest.fixture

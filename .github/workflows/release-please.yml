@@ -27,7 +27,7 @@ jobs:
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           # Use GITHUB_TOKEN for release-please operations.
-          # PyPI deployment is handled in main.yml on release commits to main,
+          # PyPI deployment is handled in release.yml on release commits to main,
           # so publishing does not depend on tag-triggered workflow runs.
           token: ${{ secrets.GITHUB_TOKEN }}
 
