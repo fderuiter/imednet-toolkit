@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 from imednet_sinks.plugin import SinksNamespace
 
+from imednet.plugins import WorkflowsNamespaceProtocol
 from imednet.sdk import ImednetSDK
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
@@ -74,6 +75,23 @@ def test_workflows_contract_parity():
         f"registered but not in namespace: {set(eps.keys()) - namespace_attrs}"
     )
 
+    # Protocol attributes exposed on WorkflowsNamespaceProtocol
+    protocol_attrs = set(WorkflowsNamespaceProtocol.__annotations__.keys())
+
+    # Assert 100% parity between Workflows namespace attributes and WorkflowsNamespaceProtocol attributes
+    assert namespace_attrs == protocol_attrs, (
+        f"Parity mismatch between Workflows namespace attributes and WorkflowsNamespaceProtocol: "
+        f"in namespace but not protocol: {namespace_attrs - protocol_attrs}, "
+        f"in protocol but not namespace: {protocol_attrs - namespace_attrs}"
+    )
+
+    # Assert 100% parity between registered entry points and WorkflowsNamespaceProtocol attributes
+    assert set(eps.keys()) == protocol_attrs, (
+        f"Parity mismatch between registered entry points and WorkflowsNamespaceProtocol: "
+        f"registered but not in protocol: {set(eps.keys()) - protocol_attrs}, "
+        f"in protocol but not registered: {protocol_attrs - set(eps.keys())}"
+    )
+
     # Assert parity against packages/plugins-workflows/pyproject.toml if present
     pyproject_path = (
         Path(__file__).resolve().parents[3] / "packages" / "plugins-workflows" / "pyproject.toml"
@@ -89,6 +107,14 @@ def test_workflows_contract_parity():
             f"in namespace but not pyproject: {namespace_attrs - set(toml_eps.keys())}, "
             f"in pyproject but not namespace: {set(toml_eps.keys()) - namespace_attrs}"
         )
+        assert protocol_attrs == set(toml_eps.keys()), (
+            f"Parity mismatch between WorkflowsNamespaceProtocol and pyproject.toml entry points: "
+            f"in protocol but not pyproject: {protocol_attrs - set(toml_eps.keys())}, "
+            f"in pyproject but not protocol: {set(toml_eps.keys()) - protocol_attrs}"
+        )
+
+    # Assert that Workflows instance satisfies WorkflowsNamespaceProtocol
+    assert isinstance(workflows_ns, WorkflowsNamespaceProtocol)
 
     # Assert that every registered entry point resolves and instantiates through sdk.workflows
     sdk = ImednetSDK(api_key="key", security_key="secret", base_url="https://example.com")
@@ -118,6 +144,9 @@ def test_workflows_namespace_lazy_instantiation_without_duckdb(monkeypatch):
 
     mock_sdk = MagicMock()
     workflows_ns = Workflows(mock_sdk)
+
+    # Protocol runtime check passes without importing duckdb
+    assert isinstance(workflows_ns, WorkflowsNamespaceProtocol)
 
     assert workflows_ns.data_extraction is not None
 

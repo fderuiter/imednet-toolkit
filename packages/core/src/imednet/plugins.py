@@ -29,10 +29,14 @@ Example factory::
     class MyWorkflows:
         def __init__(self, sdk: ImednetSDK) -> None:
             self.data_extraction = ...
+            self.duckdb_centralizer = ...
             self.query_management = ...
             self.record_mapper = ...
             self.record_update = ...
+            self.register_subjects = ...
             self.subject_data = ...
+            self.uat = ...
+            self.uat_inspector = ...
 
     def create_workflows(sdk: ImednetSDK) -> MyWorkflows:
         return MyWorkflows(sdk)
@@ -54,10 +58,14 @@ class WorkflowsNamespaceProtocol(Protocol):
     """
 
     data_extraction: Any
+    duckdb_centralizer: Any
     query_management: Any
     record_mapper: Any
     record_update: Any
+    register_subjects: Any
     subject_data: Any
+    uat: Any
+    uat_inspector: Any
 
 
 @runtime_checkable
