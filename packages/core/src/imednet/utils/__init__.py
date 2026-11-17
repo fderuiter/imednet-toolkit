@@ -24,6 +24,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "to_arrow_table": ("imednet.utils.arrow", "to_arrow_table"),
     "queries_to_dataframe": ("imednet.utils.pandas", "queries_to_dataframe"),
     "subjects_to_dataframe": ("imednet.utils.pandas", "subjects_to_dataframe"),
+    "variables_to_dataframe": ("imednet.utils.pandas", "variables_to_dataframe"),
     "records_to_dataframe": ("imednet.utils.pandas", "records_to_dataframe"),
     "export_records_csv": ("imednet.utils.pandas", "export_records_csv"),
     "parse_bool": ("imednet.utils.validators", "parse_bool"),
@@ -88,4 +89,5 @@ __all__ = [
     "validate_filter_syntax",
     "validate_partition_key",
     "validate_record_filter",
+    "variables_to_dataframe",
 ]

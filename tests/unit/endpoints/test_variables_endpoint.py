@@ -60,3 +60,111 @@ def test_list_different_study_keys_make_separate_requests(dummy_client, paginato
     ep.list(study_key="S2")
 
     assert capture["count"] == 2
+
+
+def test_to_dataframe_success(dummy_client, paginator_factory):
+    """Test that to_dataframe exports queried variables to a pandas DataFrame."""
+    ep = variables.VariablesEndpoint(dummy_client)
+    paginator_factory(variables, [{"variableId": 1, "label": "Age", "variableOid": "AGE"}])
+
+    df = ep.to_dataframe("S1")
+
+    assert len(df) == 1
+    assert df.loc[0, "variable_id"] == 1
+    assert df.loc[0, "label"] == "Age"
+    assert df.loc[0, "variable_oid"] == "AGE"
+
+
+def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patch_build_filter):
+    """Test that to_dataframe forwards filters and study key to list."""
+    ep = variables.VariablesEndpoint(dummy_client)
+    captured = paginator_factory(variables, [{"variableId": 1}])
+    filter_capture = patch_build_filter(variables)
+
+    df = ep.to_dataframe(
+        study_key="S1",
+        name="x",
+    )
+
+    assert captured["path"] == "/api/v1/edc/studies/S1/variables"
+    assert captured["params"] == {"filter": "FILTERED"}
+    assert filter_capture["filters"] == {"name": "x"}
+    assert len(df) == 1
+
+
+def test_to_dataframe_empty_results(dummy_client, paginator_factory):
+    """Test that to_dataframe handles empty query results."""
+    ep = variables.VariablesEndpoint(dummy_client)
+    paginator_factory(variables, [])
+
+    df = ep.to_dataframe("S1")
+
+    assert df.empty
+
+
+def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, paginator_factory):
+    """Test that to_dataframe raises ImportError when pandas is not installed."""
+    ep = variables.VariablesEndpoint(dummy_client)
+    paginator_factory(variables, [{"variableId": 1}])
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+
+    with pytest.raises(ImportError, match="pandas is required for variables_to_dataframe"):
+        ep.to_dataframe("S1")
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_success(dummy_client, async_paginator_factory):
+    """Test that async to_dataframe exports queried variables to a pandas DataFrame."""
+    ep = variables.AsyncVariablesEndpoint(dummy_client)
+    async_paginator_factory(variables, [{"variableId": 1, "label": "Age", "variableOid": "AGE"}])
+
+    df = await ep.to_dataframe("S1")
+
+    assert len(df) == 1
+    assert df.loc[0, "variable_id"] == 1
+    assert df.loc[0, "label"] == "Age"
+    assert df.loc[0, "variable_oid"] == "AGE"
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_parameter_forwarding(
+    dummy_client, async_paginator_factory, patch_build_filter
+):
+    """Test that async to_dataframe forwards filters and study key to list."""
+    ep = variables.AsyncVariablesEndpoint(dummy_client)
+    captured = async_paginator_factory(variables, [{"variableId": 1}])
+    filter_capture = patch_build_filter(variables)
+
+    df = await ep.to_dataframe(
+        study_key="S1",
+        name="x",
+    )
+
+    assert captured["path"] == "/api/v1/edc/studies/S1/variables"
+    assert captured["params"] == {"filter": "FILTERED"}
+    assert filter_capture["filters"] == {"name": "x"}
+    assert len(df) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_empty_results(dummy_client, async_paginator_factory):
+    """Test that async to_dataframe handles empty query results."""
+    ep = variables.AsyncVariablesEndpoint(dummy_client)
+    async_paginator_factory(variables, [])
+
+    df = await ep.to_dataframe("S1")
+
+    assert df.empty
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_missing_dependency(
+    monkeypatch, dummy_client, async_paginator_factory
+):
+    """Test that async to_dataframe raises ImportError when pandas is not installed."""
+    ep = variables.AsyncVariablesEndpoint(dummy_client)
+    async_paginator_factory(variables, [{"variableId": 1}])
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+
+    with pytest.raises(ImportError, match="pandas is required for variables_to_dataframe"):
+        await ep.to_dataframe("S1")
