@@ -15,7 +15,7 @@ from ..models import (
     Metadata,
     Variable,
 )
-from ..normalize import to_camel_case
+from ..normalize import _is_file_target, _safe_is_file, to_camel_case
 
 # Standard ODM attributes by element type
 KNOWN_FORM_ATTRIBUTES = {
@@ -159,16 +159,20 @@ def _extract_unmapped_attributes(
 def _read_source_content(source: Path | str | TextIO | BinaryIO) -> bytes:
     """Read XML content from path, string, or stream into bytes."""
     if isinstance(source, Path):
+        if not _safe_is_file(source):
+            raise FileNotFoundError(f"Target file '{source}' does not exist")
         return source.read_bytes()
     if isinstance(source, str):
         if "\n" in source or "\r" in source or source.strip().startswith("<"):
             return source.encode("utf-8")
-        try:
+        if _is_file_target(source):
             p = Path(source)
-            if p.is_file():
-                return p.read_bytes()
-        except OSError:
-            pass
+            if not _safe_is_file(p):
+                raise FileNotFoundError(f"Target file '{source}' does not exist")
+            return p.read_bytes()
+        p = Path(source)
+        if _safe_is_file(p):
+            return p.read_bytes()
         return source.encode("utf-8")
     if hasattr(source, "read"):
         data = source.read()

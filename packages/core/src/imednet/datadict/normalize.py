@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 # Regex to validate MM-DD-YYYY with optional time and timezone
@@ -124,3 +125,42 @@ def normalize_row_data(
             )
 
     return known_data, extra_attributes, warnings
+
+
+def _is_file_target(target: Any) -> bool:
+    """Determine whether the target was intended as a file path.
+
+    Args:
+        target: Target object to inspect.
+
+    Returns:
+        True if target is considered a file path, False otherwise.
+    """
+    if isinstance(target, Path):
+        return True
+    if isinstance(target, str):
+        if "\n" in target or "\r" in target:
+            return False
+        target_str = target.strip()
+        if target_str.startswith(("<", "{", "[")):
+            return False
+        if target_str.lower().endswith((".json", ".xml", ".csv")):
+            return True
+        if "/" in target_str or "\\" in target_str:
+            return True
+    return False
+
+
+def _safe_is_file(p: Path) -> bool:
+    """Safely check if a Path is an existing file, handling OSErrors.
+
+    Args:
+        p: Path object to check.
+
+    Returns:
+        True if path is an existing regular file, False otherwise.
+    """
+    try:
+        return p.is_file()
+    except OSError:
+        return False
