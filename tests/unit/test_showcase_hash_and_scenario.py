@@ -451,7 +451,9 @@ def test_showcase_accessible_code_blocks_module_scope_and_bindings() -> None:
         )
 
     # 5. MutationObserver fallback observing hidden and class attributes
-    assert "MutationObserver" in content, "initAccessibleCodeBlocks must instantiate MutationObserver"
+    assert "MutationObserver" in content, (
+        "initAccessibleCodeBlocks must instantiate MutationObserver"
+    )
     assert 'attributeFilter: ["hidden", "class"]' in content or '["hidden", "class"]' in content, (
         "MutationObserver must observe hidden and class attributes"
     )
@@ -633,4 +635,3 @@ def test_showcase_code_block_overflow_evaluation_lifecycle() -> None:
 
     # 5. Rapid sequential triggers debounce frame requests
     assert data["canceledRafCount"] >= 2, "Rapid triggers must cancel previous animation frames"
-
