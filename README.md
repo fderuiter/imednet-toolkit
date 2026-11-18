@@ -18,7 +18,7 @@ Full documentation: <https://fderuiter.github.io/imednet-toolkit/> | [Interactiv
 [![PyPI - Wheel](https://img.shields.io/pypi/wheel/imednet.svg)](https://pypi.org/project/imednet/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/imednet.svg)](https://pypi.org/project/imednet/)
 [![License](https://img.shields.io/pypi/l/imednet.svg)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/fderuiter/imednet-toolkit/ci.yml?branch=main)](https://github.com/fderuiter/imednet-toolkit/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/fderuiter/imednet-toolkit/main.yml?branch=main)](https://github.com/fderuiter/imednet-toolkit/actions/workflows/main.yml)
 
 </div>
 

@@ -1,5 +1,7 @@
 """Unit tests for forms endpoint."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from imednet.core.context import set_study_context
@@ -128,11 +130,16 @@ def test_to_dataframe_empty_results(dummy_client, paginator_factory):
 def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, paginator_factory):
     """Test that to_dataframe raises ImportError when pandas is not installed."""
     ep = forms.FormsEndpoint(dummy_client)
-    paginator_factory(forms, [{"formId": 1}])
+    captured = paginator_factory(forms, [{"formId": 1}])
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    mock_list = MagicMock()
+    monkeypatch.setattr(ep, "list", mock_list)
 
     with pytest.raises(ImportError, match="pandas is required for forms_to_dataframe"):
         ep.to_dataframe("S1")
+
+    mock_list.assert_not_called()
+    assert captured["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -186,8 +193,13 @@ async def test_async_to_dataframe_missing_dependency(
 ):
     """Test that async to_dataframe raises ImportError when pandas is not installed."""
     ep = forms.AsyncFormsEndpoint(dummy_client)
-    async_paginator_factory(forms, [{"formId": 1}])
+    captured = async_paginator_factory(forms, [{"formId": 1}])
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    mock_list = MagicMock()
+    monkeypatch.setattr(ep, "list", mock_list)
 
     with pytest.raises(ImportError, match="pandas is required for forms_to_dataframe"):
         await ep.to_dataframe("S1")
+
+    mock_list.assert_not_called()
+    assert captured["count"] == 0

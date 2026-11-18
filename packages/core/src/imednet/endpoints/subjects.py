@@ -72,8 +72,9 @@ class SubjectsEndpoint(SubjectsOperationDef, EdcSyncListGetEndpoint[Subject]):  
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import subjects_to_dataframe
+        from imednet.utils.pandas import check_pandas, subjects_to_dataframe
 
+        check_pandas("subjects_to_dataframe")
         subjects = list(self.list(study_key=study_key, **filters))
         return subjects_to_dataframe(subjects)
 
@@ -98,7 +99,8 @@ class AsyncSubjectsEndpoint(SubjectsOperationDef, EdcAsyncListGetEndpoint[Subjec
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import subjects_to_dataframe
+        from imednet.utils.pandas import check_pandas, subjects_to_dataframe
 
+        check_pandas("subjects_to_dataframe")
         subjects = [subject async for subject in self.list(study_key=study_key, **filters)]
         return subjects_to_dataframe(subjects)
