@@ -293,18 +293,36 @@ class JobMonitor(Static):
     }
     """
 
-    def __init__(self, sdk: ImednetSDK, **kwargs: Any) -> None:
+    MAX_CONCURRENT_POLLS: ClassVar[int] = 5
+
+    def __init__(
+        self,
+        sdk: ImednetSDK,
+        *,
+        max_concurrency: int = MAX_CONCURRENT_POLLS,
+        **kwargs: Any,
+    ) -> None:
         """Initialize the JobMonitor widget.
 
         Args:
             sdk: Active iMednet SDK client instance.
+            max_concurrency: Maximum number of concurrent status polling requests.
             **kwargs: Additional widget arguments.
         """
         super().__init__(**kwargs)
         self.sdk = sdk
+        self.max_concurrency = max_concurrency
+        self._semaphore: asyncio.Semaphore | None = None
         self.timer: Timer | None = None
         self.current_study_key: str | None = None
         self.tracked_job_ids: list[str] = []
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        """Asyncio semaphore bounding simultaneous job status queries."""
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrency)
+        return self._semaphore
 
     def on_mount(self) -> None:
         """Set up status message and interval polling timer on mount."""
@@ -335,6 +353,49 @@ class JobMonitor(Static):
         if self.is_mounted:
             self.run_worker(self.refresh_jobs())
 
+    async def _poll_tracked_job(
+        self,
+        jobs_ep: Any,
+        study_key: str,
+        jid: str,
+    ) -> Any:
+        """Poll status for a single tracked job under the concurrency semaphore.
+
+        Args:
+            jobs_ep: Jobs endpoint instance or mock.
+            study_key: Active study key identifier.
+            jid: Tracked job or batch identifier.
+
+        Returns:
+            Retrieved job model instance or _TrackedJobPlaceholder on failure/unknown.
+        """
+        async with self.semaphore:
+            try:
+                if hasattr(jobs_ep, "get"):
+                    if asyncio.iscoroutinefunction(jobs_ep.get):
+                        job = await jobs_ep.get(study_key, jid)
+                    else:
+                        res = await asyncio.to_thread(jobs_ep.get, study_key, jid)
+                        if asyncio.iscoroutine(res):
+                            job = await res
+                        else:
+                            job = res
+                elif hasattr(jobs_ep, "async_get"):
+                    res = jobs_ep.async_get(study_key, jid)
+                    if asyncio.iscoroutine(res):
+                        job = await res
+                    else:
+                        job = res
+                else:
+                    job = None
+
+                if job is not None:
+                    return job
+                return _TrackedJobPlaceholder(jid, "UNKNOWN")
+            except Exception as err:
+                logging.getLogger("imednet_tui").warning("Failed to poll job %s: %s", jid, err)
+                return _TrackedJobPlaceholder(jid, "FAILED")
+
     async def refresh_jobs(self) -> None:
         """Poll and update job list for the active study."""
         if not self.current_study_key:
@@ -352,37 +413,11 @@ class JobMonitor(Static):
             elif hasattr(jobs_ep, "list"):
                 jobs = await asyncio.to_thread(lambda: list(jobs_ep.list(self.current_study_key)))
             elif self.tracked_job_ids:
-                for jid in list(self.tracked_job_ids):
-                    try:
-                        if hasattr(jobs_ep, "get"):
-                            if asyncio.iscoroutinefunction(jobs_ep.get):
-                                job = await jobs_ep.get(self.current_study_key, jid)
-                            else:
-                                res = await asyncio.to_thread(
-                                    jobs_ep.get, self.current_study_key, jid
-                                )
-                                if asyncio.iscoroutine(res):
-                                    job = await res
-                                else:
-                                    job = res
-                        elif hasattr(jobs_ep, "async_get"):
-                            res = jobs_ep.async_get(self.current_study_key, jid)
-                            if asyncio.iscoroutine(res):
-                                job = await res
-                            else:
-                                job = res
-                        else:
-                            job = None
-
-                        if job is not None:
-                            jobs.append(job)
-                        else:
-                            jobs.append(_TrackedJobPlaceholder(jid, "UNKNOWN"))
-                    except Exception as err:
-                        logging.getLogger("imednet_tui").warning(
-                            "Failed to poll job %s: %s", jid, err
-                        )
-                        jobs.append(_TrackedJobPlaceholder(jid, "FAILED"))
+                tasks = [
+                    self._poll_tracked_job(jobs_ep, self.current_study_key, jid)
+                    for jid in list(self.tracked_job_ids)
+                ]
+                jobs = list(await asyncio.gather(*tasks))
             else:
                 self.update(
                     f"Job Monitor: Background job enumeration is not supported by the iMednet Jobs API for study '{self.current_study_key}'.\n"
