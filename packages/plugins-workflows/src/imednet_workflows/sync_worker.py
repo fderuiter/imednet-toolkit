@@ -46,15 +46,18 @@ class SyncWorker:
         self._config = config
         self._stop_event = stop_event or Event()
         lock_path = Path(f"{loader.db_path}.lock")
-        self._lock = FileLock(str(lock_path), timeout=config.lock_timeout_seconds)
+        if hasattr(loader, "lock") and isinstance(loader.lock, FileLock):
+            loader.lock.timeout = config.lock_timeout_seconds
+            self._lock = loader.lock
+        else:
+            self._lock = FileLock(str(lock_path), timeout=config.lock_timeout_seconds)
 
     def run_once(self) -> int:
         """Run one idempotent cache sync cycle."""
-        with self._lock:
-            self._loader.sync_records(
-                self._config.study_key,
-                reconcile=self._config.reconcile,
-            )
+        self._loader.sync_records(
+            self._config.study_key,
+            reconcile=self._config.reconcile,
+        )
         record_count = self._loader.count_cached_records(self._config.study_key)
         logger.info(
             "sync cycle complete",
