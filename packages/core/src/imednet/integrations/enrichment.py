@@ -5,13 +5,18 @@ data using configured mappings, terminology lookups, and PHI masking rules.
 """
 
 import functools
+import logging
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from imednet.models.engine import ResourceRegistry
+from imednet.models.study_config import StudyConfiguration
+from imednet.utils.evaluator import evaluate_expression
 from imednet.utils.serialization import flatten
+
+logger = logging.getLogger(__name__)
 
 _FIRST_CAP_RE = re.compile(r'(.)([A-Z][a-z]+)')
 _ALL_CAP_RE = re.compile(r'([a-z0-9])([A-Z])')
@@ -25,6 +30,10 @@ def _to_snake_case(name: str) -> str:
 
 class CentralizedMapper:
     """Unified Mapper with Enrichment Engine for data sinks."""
+
+    _cached_fields: list[tuple[str, str]] | None = None
+    _cached_field_pairs: list[tuple[str, str]] | None = None
+    _DEFAULT_PIPELINE: Any = None
 
     def __init__(
         self,
@@ -40,17 +49,24 @@ class CentralizedMapper:
         self.mode = mode
         self.post_processor = post_processor
         self._pipeline_cache: dict[str, Any] = {}
+        if CentralizedMapper._cached_fields is None:
+            pairs = [(f, _to_snake_case(f)) for f in ResourceRegistry.get_fields("Record")]
+            CentralizedMapper._cached_fields = pairs
+            CentralizedMapper._cached_field_pairs = pairs
 
     def map_record(
         self, record: Any, study_key: str | None = None
     ) -> dict[str, Any]:  # pragma: no cover
         """Map a clinical record to the unified destination format."""
-        fields = ResourceRegistry.get_fields("Record")
+        fields = self._cached_fields
+        if fields is None:
+            fields = [(f, _to_snake_case(f)) for f in ResourceRegistry.get_fields("Record")]
+            CentralizedMapper._cached_fields = fields
+            CentralizedMapper._cached_field_pairs = fields
 
         mapped = {}
-        for f in fields:
+        for f, snake_key in fields:
             val = getattr(record, f, None)
-            snake_key = _to_snake_case(f)
 
             if f == "record_data":
                 val = dict(val or {})
@@ -76,17 +92,9 @@ class CentralizedMapper:
         elif 'study_key' not in mapped or not mapped['study_key']:
             mapped['study_key'] = getattr(record, 'study_key', None)
 
-        from imednet.models.study_config import StudyConfiguration
-
         sk = mapped.get('study_key') or "UNKNOWN"
         if sk not in self._pipeline_cache:
-            self._pipeline_cache[sk] = EnrichmentPipeline(
-                StudyConfiguration(
-                    studyKey=sk,
-                    version="1.0",
-                    reportingProfile="general",
-                )
-            )
+            self._pipeline_cache[sk] = self._DEFAULT_PIPELINE
 
         mapped = self._pipeline_cache[sk].process(mapped)
 
@@ -94,15 +102,6 @@ class CentralizedMapper:
             mapped = self.post_processor(mapped)
 
         return mapped
-
-
-import logging
-from typing import Any
-
-from imednet.models.study_config import StudyConfiguration
-from imednet.utils.evaluator import evaluate_expression
-
-logger = logging.getLogger(__name__)
 
 
 class EnrichmentPipeline:
@@ -210,3 +209,12 @@ class EnrichmentPipeline:
         if isinstance(data, tuple):
             return tuple(self._transform_recursive(item, depth + 1) for item in data)
         return data
+
+
+_DEFAULT_STUDY_CONFIG = StudyConfiguration(
+    studyKey="UNKNOWN",
+    version="1.0",
+    reportingProfile="general",
+)
+_DEFAULT_PIPELINE = EnrichmentPipeline(_DEFAULT_STUDY_CONFIG)
+CentralizedMapper._DEFAULT_PIPELINE = _DEFAULT_PIPELINE
