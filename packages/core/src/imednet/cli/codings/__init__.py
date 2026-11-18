@@ -72,7 +72,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 }
             )
 
-        display_list(view_models, "codings", "No codings found matching the criteria.")
+        display_list(
+            view_models,
+            "codings",
+            "No codings found matching the criteria.",
+            details=codings_list,
+        )
 
     list_parser.set_defaults(
         func=lambda args: list_codings(
