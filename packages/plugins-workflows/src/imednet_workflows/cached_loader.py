@@ -9,6 +9,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from filelock import FileLock
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from imednet.spi.models import Record
@@ -64,6 +65,8 @@ class CachedRecordsLoader:
         cache_dir: str | Path | None = None,
         database_name: str = "records_cache.sqlite3",
         retry_attempts: int = 3,
+        lock_timeout_seconds: int = 30,
+        lock: FileLock | None = None,
     ) -> None:
         """Initialize the cached records loader.
 
@@ -72,12 +75,23 @@ class CachedRecordsLoader:
             cache_dir: Directory to store the SQLite cache. Defaults to ~/.imednet/cache.
             database_name: Name of the SQLite database file.
             retry_attempts: Number of API retry attempts.
+            lock_timeout_seconds: Number of seconds to wait when acquiring the cache file lock.
+            lock: Optional FileLock instance for synchronizing write transactions.
         """
         self._sdk = sdk
         base_dir = DEFAULT_CACHE_DIR if cache_dir is None else Path(cache_dir).expanduser()
         self.db_path = base_dir / database_name
         self._retry_attempts = retry_attempts
+        lock_path = Path(f"{self.db_path}.lock")
+        self._lock = (
+            lock if lock is not None else FileLock(str(lock_path), timeout=lock_timeout_seconds)
+        )
         self._initialise_cache()
+
+    @property
+    def lock(self) -> FileLock:
+        """Return the inter-process file lock protecting cache write operations."""
+        return self._lock
 
     def load_records(self, study_key: str, *, reconcile: bool = True) -> list[Record]:
         """Synchronise the cache for ``study_key`` and return cached records."""
@@ -173,7 +187,7 @@ class CachedRecordsLoader:
         local_ids = {cast(int, row["record_id"]) for row in local_rows}
         orphaned_ids = local_ids - active_record_ids
         if orphaned_ids:
-            with conn:
+            with self._lock, conn:
                 conn.executemany(
                     "DELETE FROM record_cache WHERE study_key = ? AND record_id = ?",
                     [(study_key, orphaned_id) for orphaned_id in orphaned_ids],
@@ -287,7 +301,7 @@ class CachedRecordsLoader:
         if not payloads:
             return
 
-        with conn:
+        with self._lock, conn:
             conn.executemany(
                 """
                 INSERT INTO record_cache (study_key, record_id, form_key, date_modified, payload)
