@@ -57,3 +57,19 @@ def test_extension_private_and_prefix_lookalikes_fail(tmp_path, statement):
 def test_missing_package_is_an_error(tmp_path):
     with pytest.raises(AssertionError, match="Missing expected source package"):
         scan_package(tmp_path, "imednet_sinks")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "import imednet_sinks",
+        "from imednet_sinks import SnowflakeExportSink",
+        "from imednet_sinks.warehouse import SnowflakeSinkConfig",
+    ],
+)
+def test_airflow_provider_cannot_import_sinks(tmp_path, statement):
+    path = tmp_path / "apache_airflow_providers_imednet" / "operators" / "export.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(statement)
+    errors = violations(path, tmp_path)
+    assert any("Airflow provider cannot import sinks" in error for error in errors)

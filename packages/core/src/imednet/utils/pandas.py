@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 try:
     import pandas as pd
 except ImportError:
     pd: Any = None  # type: ignore[no-redef]
+from ..models.base import ImednetBaseModel
 from ..models.forms import Form
 from ..models.intervals import Interval
 from ..models.queries import Query
 from ..models.records import Record
 from ..models.sites import Site
 from ..models.subjects import Subject
+from ..models.users import User
 from ..models.variables import Variable
 from ..models.visits import Visit
 from .security import sanitize_csv_formula
@@ -38,16 +41,27 @@ def check_pandas(feature_name: str | None = None) -> None:
         )
 
 
+def _models_to_dataframe(
+    models: Iterable[ImednetBaseModel],
+    feature_name: str | None = None,
+) -> pd.DataFrame:
+    """Convert an iterable of :class:`~imednet.models.base.ImednetBaseModel` to a DataFrame.
+
+    Each model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    check_pandas(feature_name)
+    rows = [model.model_dump(by_alias=False) for model in models]
+    return pd.DataFrame(rows)
+
+
 def queries_to_dataframe(queries: list[Query]) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.queries.Query` to a DataFrame.
 
     Each query model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    check_pandas("queries_to_dataframe")
-
-    query_dicts = [q.model_dump(by_alias=False) for q in queries]
-    return pd.DataFrame(query_dicts)
+    return _models_to_dataframe(queries, "queries_to_dataframe")
 
 
 def variables_to_dataframe(variables: list[Variable]) -> pd.DataFrame:
@@ -56,10 +70,7 @@ def variables_to_dataframe(variables: list[Variable]) -> pd.DataFrame:
     Each variable model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    check_pandas("variables_to_dataframe")
-
-    variable_dicts = [v.model_dump(by_alias=False) for v in variables]
-    return pd.DataFrame(variable_dicts)
+    return _models_to_dataframe(variables, "variables_to_dataframe")
 
 
 def subjects_to_dataframe(subjects: list[Subject]) -> pd.DataFrame:
@@ -68,10 +79,7 @@ def subjects_to_dataframe(subjects: list[Subject]) -> pd.DataFrame:
     Each subject model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    check_pandas("subjects_to_dataframe")
-
-    subject_dicts = [s.model_dump(by_alias=False) for s in subjects]
-    return pd.DataFrame(subject_dicts)
+    return _models_to_dataframe(subjects, "subjects_to_dataframe")
 
 
 def forms_to_dataframe(forms: list[Form]) -> pd.DataFrame:
@@ -80,10 +88,7 @@ def forms_to_dataframe(forms: list[Form]) -> pd.DataFrame:
     Each form model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    check_pandas("forms_to_dataframe")
-
-    form_dicts = [f.model_dump(by_alias=False) for f in forms]
-    return pd.DataFrame(form_dicts)
+    return _models_to_dataframe(forms, "forms_to_dataframe")
 
 
 def visits_to_dataframe(visits: list[Visit]) -> pd.DataFrame:
@@ -92,10 +97,7 @@ def visits_to_dataframe(visits: list[Visit]) -> pd.DataFrame:
     Each visit model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    check_pandas("visits_to_dataframe")
-
-    visit_dicts = [v.model_dump(by_alias=False) for v in visits]
-    return pd.DataFrame(visit_dicts)
+    return _models_to_dataframe(visits, "visits_to_dataframe")
 
 
 def intervals_to_dataframe(intervals: list[Interval]) -> pd.DataFrame:
@@ -104,10 +106,7 @@ def intervals_to_dataframe(intervals: list[Interval]) -> pd.DataFrame:
     Each interval model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    check_pandas("intervals_to_dataframe")
-
-    interval_dicts = [i.model_dump(by_alias=False) for i in intervals]
-    return pd.DataFrame(interval_dicts)
+    return _models_to_dataframe(intervals, "intervals_to_dataframe")
 
 
 def sites_to_dataframe(sites: list[Site]) -> pd.DataFrame:
@@ -116,10 +115,19 @@ def sites_to_dataframe(sites: list[Site]) -> pd.DataFrame:
     Each site model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    check_pandas("sites_to_dataframe")
+    return _models_to_dataframe(sites, "sites_to_dataframe")
 
-    site_dicts = [s.model_dump(by_alias=False) for s in sites]
-    return pd.DataFrame(site_dicts)
+
+def users_to_dataframe(users: list[User]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.users.User` to a DataFrame.
+
+    Each user model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    check_pandas("users_to_dataframe")
+
+    user_dicts = [u.model_dump(by_alias=False) for u in users]
+    return pd.DataFrame(user_dicts)
 
 
 def records_to_dataframe(records: list[Record], *, flatten: bool = False) -> pd.DataFrame:
@@ -130,10 +138,7 @@ def records_to_dataframe(records: list[Record], *, flatten: bool = False) -> pd.
     expanded using :func:`pandas.json_normalize` so that each variable becomes a
     column in the resulting DataFrame.
     """
-    check_pandas("records_to_dataframe")
-
-    rows = [r.model_dump(by_alias=False) for r in records]
-    df = pd.DataFrame(rows)
+    df = _models_to_dataframe(records, "records_to_dataframe")
     if flatten and not df.empty:
         record_df = pd.json_normalize(df["record_data"].tolist(), sep="_")
         df = pd.concat([df.drop(columns=["record_data"]), record_df], axis=1)
