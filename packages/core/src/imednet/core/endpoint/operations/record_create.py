@@ -5,15 +5,20 @@ Encapsulates validation, header construction, and execution logic for record cre
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any, Generic, TypeVar
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
+from imednet.core.context import get_study_context
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
+from imednet.utils.job_ledger import record_study_job
 from imednet.utils.security import validate_header_value
 from imednet.validation.cache import BaseSchemaCache, validate_record_entry
 
 T = TypeVar("T")
+
+_STUDY_PATH_RE = re.compile(r"/studies/([^/]+)/records(?:/|$)")
 
 
 class RecordCreateOperation(Generic[T]):
@@ -29,6 +34,8 @@ class RecordCreateOperation(Generic[T]):
         records_data: list[dict[str, Any]],
         email_notify: bool | str | None = None,
         schema: BaseSchemaCache[Any] | None = None,
+        *,
+        study_key: str | None = None,
     ) -> None:
         """Initialize the record creation operation.
 
@@ -37,6 +44,7 @@ class RecordCreateOperation(Generic[T]):
             records_data: List of record data objects to create.
             email_notify: Email notification setting.
             schema: Optional schema cache for validation.
+            study_key: Optional study key associated with the record batch.
 
         Raises:
             ValidationError: If record data is invalid against the schema.
@@ -46,9 +54,19 @@ class RecordCreateOperation(Generic[T]):
         self.records_data = records_data
         self.email_notify = email_notify
         self.schema = schema
+        self.study_key = study_key
 
         self._validate()
         self.headers = self._build_headers()
+
+    def _resolve_study_key(self) -> str | None:
+        """Resolve the study key from explicit arg, request path, or study context."""
+        if self.study_key:
+            return self.study_key
+        match = _STUDY_PATH_RE.search(self.path)
+        if match:
+            return match.group(1)
+        return get_study_context()
 
     def _validate(self) -> None:
         """Validate records against schema if provided."""
@@ -78,7 +96,12 @@ class RecordCreateOperation(Generic[T]):
         """Process the raw HTTP response."""
         from imednet.models.jobs import Job
 
-        return (parse_func or Job.from_json)(response.json())  # type: ignore
+        raw = response.json()
+        parsed: T = (parse_func or Job.from_json)(raw)  # type: ignore[assignment]
+        study_key = self._resolve_study_key()
+        if study_key:
+            record_study_job(study_key, parsed, job_type="RecordSubmission", source="sdk")
+        return parsed
 
     def execute_sync(
         self,

@@ -1,9 +1,11 @@
 """Endpoint for checking job status in a study."""
 
+from imednet.core.context import get_study_context
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncGetEndpoint, EdcSyncGetEndpoint
 from imednet.core.endpoint.operations.get import PathGetOperation
 from imednet.models.jobs import JobStatus
+from imednet.utils.job_ledger import record_study_job
 from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
 from imednet.utils.typing import ItemId
 
@@ -19,9 +21,21 @@ class JobsOperationDef:
         """Get a single Job by ID."""
         self._require_item_id(item_id)  # type: ignore
         path = self._get_endpoint_path(study_key, item_id)  # type: ignore
+        resolved_study = study_key or get_study_context()
+
+        def _parse_and_record(payload: object) -> JobStatus:
+            parsed: JobStatus = self._parse_item(payload)  # type: ignore
+            record_study_job(
+                resolved_study,
+                parsed,
+                fallback_batch_id=str(item_id),
+                only_if_tracked=True,
+            )
+            return parsed
+
         return PathGetOperation[JobStatus](
             path=path,
-            parse_func=self._parse_item,  # type: ignore
+            parse_func=_parse_and_record,
             not_found_func=lambda: self._raise_not_found(study_key, item_id),  # type: ignore
         )
 

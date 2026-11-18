@@ -22,6 +22,13 @@ imednet.spi.constants module
    :members:
    :show-inheritance:
 
+imednet.spi.datadict module
+---------------------------
+
+.. automodule:: imednet.spi.datadict
+   :members:
+   :show-inheritance:
+
 imednet.spi.endpoints module
 ----------------------------
 
@@ -40,6 +47,13 @@ imednet.spi.facade module
 -------------------------
 
 .. automodule:: imednet.spi.facade
+   :members:
+   :show-inheritance:
+
+imednet.spi.jobs module
+-----------------------
+
+.. automodule:: imednet.spi.jobs
    :members:
    :show-inheritance:
 

@@ -11,16 +11,31 @@ from imednet.integrations import export
 # Keep the legacy binding while providing an unambiguous procedural namespace.
 export_helpers = _import_module("imednet.integrations.export")
 
-from . import cli, constants, endpoints, errors, facade, models, sink_base, sinks, utils, validation
+from . import (
+    cli,
+    constants,
+    datadict,
+    endpoints,
+    errors,
+    facade,
+    jobs,
+    models,
+    sink_base,
+    sinks,
+    utils,
+    validation,
+)
 
 __all__ = [
     "cli",
     "constants",
+    "datadict",
     "endpoints",
     "errors",
     "export",
     "export_helpers",
     "facade",
+    "jobs",
     "models",
     "sink_base",
     "sinks",

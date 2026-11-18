@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from ...sdk import ImednetSDK
+from ...utils.job_ledger import JobLedger
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, fetching_status, format_job_progress, print_error
 from ..utils.args import add_output_format
@@ -26,6 +27,30 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     """Setup the parser for this module."""
     parser = subparsers.add_parser("jobs", help="Manage background jobs.")
     sub = parser.add_subparsers(dest="command")
+
+    list_parser = sub.add_parser(
+        "list", help="List active and recent jobs persisted in the local study job ledger."
+    )
+    list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    list_parser.add_argument(
+        "--active",
+        action="store_true",
+        help="Show only active (non-terminal) jobs.",
+    )
+    add_output_format(list_parser)
+
+    def job_list(study_key: str, active_only: bool = False, output_format: str = "table") -> None:
+        ledger = JobLedger()
+        items = ledger.list_jobs(study_key, active_only=active_only)
+        display_list(items, "jobs", fields=JOB_SUMMARY_FIELDS, output_format=output_format)
+
+    list_parser.set_defaults(
+        func=lambda args: job_list(
+            study_key=args.study_key,
+            active_only=args.active,
+            output_format=args.output_format,
+        )
+    )
 
     status_parser = sub.add_parser("status", help="Fetch a job's current status.")
     status_parser.add_argument("study_key", help=STUDY_KEY_ARG)
