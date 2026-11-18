@@ -325,7 +325,7 @@ Create records
    {
        "jobId": "<string>",
        "batchId": "<string>",
-       "state": "<string>",
+       "state": "OPEN",
        "dateCreated": "",
        "dateFinished": "",
        "dateStarted": ""
