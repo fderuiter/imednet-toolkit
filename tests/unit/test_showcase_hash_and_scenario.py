@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
+import shutil
+import subprocess
 import urllib.parse
 from pathlib import Path
 
@@ -430,3 +433,243 @@ def test_showcase_rest_snippets_rejects_unsupported_query_parameters(
     """Verify that REST snippet validation rejects unsupported query parameters like status or limit."""
     with pytest.raises(AssertionError, match=re.escape(expected_error_substring)):
         validate_rest_query_parameters(invalid_snippet, allowed_query_keys=allowed_keys)
+
+
+def test_showcase_accessible_code_blocks_module_scope_and_bindings() -> None:
+    """Verify that checkCodeBlocks is in module scope, called on tab reveal, and observes attribute mutations."""
+    repo_root = get_repo_root()
+    script_path = repo_root / "docs" / "_static" / "showcase.js"
+    assert script_path.exists(), "showcase.js must exist"
+
+    content = script_path.read_text(encoding="utf-8")
+
+    # 1. checkCodeBlocks and scheduleCheckCodeBlocks lifted to shared module scope (defined before initExplorer)
+    check_pos = content.find("function checkCodeBlocks()")
+    schedule_pos = content.find("function scheduleCheckCodeBlocks()")
+    init_explorer_pos = content.find("function initExplorer()")
+    init_accessible_pos = content.find("function initAccessibleCodeBlocks()")
+
+    assert check_pos != -1, "checkCodeBlocks function must be defined"
+    assert schedule_pos != -1, "scheduleCheckCodeBlocks function must be defined"
+    assert init_explorer_pos != -1, "initExplorer function must be defined"
+    assert init_accessible_pos != -1, "initAccessibleCodeBlocks function must be defined"
+
+    # Must be at module scope, preceding initExplorer and outside initAccessibleCodeBlocks
+    assert check_pos < init_explorer_pos, (
+        "checkCodeBlocks must be lifted to module scope before initExplorer"
+    )
+    assert schedule_pos < init_explorer_pos, (
+        "scheduleCheckCodeBlocks must be lifted to module scope before initExplorer"
+    )
+
+    # 2. Scheduling debouncing via requestAnimationFrame and cancelAnimationFrame
+    assert "requestAnimationFrame" in content, (
+        "showcase.js must use requestAnimationFrame for check scheduling"
+    )
+    assert "cancelAnimationFrame" in content, (
+        "showcase.js must use cancelAnimationFrame to debounce frame requests"
+    )
+
+    # 3. Tab switching functions call scheduleCheckCodeBlocks
+    for view_func in ["switchPersona", "switchIeView", "switchCdmView", "switchAudView"]:
+        pattern = rf"function\s+{view_func}\b.*?scheduleCheckCodeBlocks"
+        assert re.search(pattern, content, re.DOTALL), (
+            f"{view_func} must invoke scheduleCheckCodeBlocks on visibility change"
+        )
+
+    # 4. JSON rendering execution functions call scheduleCheckCodeBlocks
+    for exec_func in [
+        "executeIntegrationQuery",
+        "executeCdmValidation",
+        "executeAuditorVerification",
+    ]:
+        pattern = rf"function\s+{exec_func}\b.*?scheduleCheckCodeBlocks"
+        assert re.search(pattern, content, re.DOTALL), (
+            f"{exec_func} must invoke scheduleCheckCodeBlocks after rendering dynamic JSON content"
+        )
+
+    # 5. MutationObserver fallback observing hidden and class attributes
+    assert "MutationObserver" in content, (
+        "initAccessibleCodeBlocks must instantiate MutationObserver"
+    )
+    assert 'attributeFilter: ["hidden", "class"]' in content or '["hidden", "class"]' in content, (
+        "MutationObserver must observe hidden and class attributes"
+    )
+    assert "subtree: true" in content, "MutationObserver must observe subtree mutations"
+
+    # 6. WCAG 2.1 AA attributes and zero-dimension safety check
+    assert 'tabindex", "0"' in content or "tabindex', '0'" in content, (
+        "checkCodeBlocks must set tabindex=0 on overflowing blocks"
+    )
+    assert 'role", "region"' in content or "role', 'region'" in content, (
+        "checkCodeBlocks must set role=region on overflowing blocks"
+    )
+    assert 'aria-label", "Code snippet"' in content or "aria-label', 'Code snippet'" in content, (
+        "checkCodeBlocks must set aria-label='Code snippet' on overflowing blocks"
+    )
+    assert "block.clientWidth > 0" in content, (
+        "checkCodeBlocks must ensure clientWidth > 0 to avoid setting tabindex on hidden containers"
+    )
+    assert "removeAttribute" in content and "tabindex" in content, (
+        "checkCodeBlocks must remove stale tabindex when block is not overflowing or hidden"
+    )
+
+
+def test_showcase_code_block_overflow_evaluation_lifecycle() -> None:
+    """Verify code block accessibility lifecycle (hidden container, reveal, hide, and debounce) via Node.js."""
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node runtime not available for DOM mock evaluation")
+
+    repo_root = get_repo_root()
+    script_path = repo_root / "docs" / "_static" / "showcase.js"
+
+    js_test = f"""
+    const fs = require('fs');
+    const code = fs.readFileSync('{script_path.as_posix()}', 'utf8');
+
+    let rafCallbacks = [];
+    let rafCancelCount = 0;
+    let nextRafId = 1;
+
+    global.requestAnimationFrame = (cb) => {{
+        const id = nextRafId++;
+        rafCallbacks.push({{ id, cb }});
+        return id;
+    }};
+
+    global.cancelAnimationFrame = (id) => {{
+        rafCancelCount++;
+        rafCallbacks = rafCallbacks.filter(item => item.id !== id);
+    }};
+
+    let listeners = {{}};
+    global.window = {{
+        addEventListener: (event, cb) => {{
+            listeners[event] = listeners[event] || [];
+            listeners[event].push(cb);
+        }},
+        history: {{ replaceState: () => {{}} }},
+        location: {{ hash: '' }}
+    }};
+
+    function makeElement(id, tagName = 'div') {{
+        const attrs = {{}};
+        const classes = new Set();
+        return {{
+            id,
+            tagName,
+            clientWidth: 0,
+            scrollWidth: 0,
+            attrs,
+            classList: {{
+                add: (...cls) => cls.forEach(c => classes.add(c)),
+                remove: (...cls) => cls.forEach(c => classes.delete(c)),
+                toggle: (cls, force) => {{
+                    if (force === undefined) force = !classes.has(cls);
+                    if (force) classes.add(cls); else classes.delete(cls);
+                    return force;
+                }},
+                contains: (cls) => classes.has(cls)
+            }},
+            setAttribute: (k, v) => {{ attrs[k] = String(v); }},
+            removeAttribute: (k) => {{ delete attrs[k]; }},
+            getAttribute: (k) => attrs[k] || null,
+            hasAttribute: (k) => k in attrs,
+            addEventListener: () => {{}}
+        }};
+    }}
+
+    const preOverflow = makeElement('cdm-json-pre', 'pre');
+    preOverflow.clientWidth = 0;
+    preOverflow.scrollWidth = 0;
+
+    const preNormal = makeElement('normal-pre', 'pre');
+    preNormal.clientWidth = 500;
+    preNormal.scrollWidth = 400;
+
+    const allPre = [preOverflow, preNormal];
+
+    global.document = {{
+        readyState: 'complete',
+        getElementById: () => null,
+        querySelectorAll: (sel) => sel === 'pre' ? allPre : [],
+        addEventListener: () => {{}},
+        body: makeElement('body')
+    }};
+
+    global.MutationObserver = class {{
+        constructor(cb) {{ this.cb = cb; }}
+        observe() {{}}
+        disconnect() {{}}
+    }};
+
+    eval(code);
+
+    function flushRaf() {{
+        const cbs = rafCallbacks.slice();
+        rafCallbacks = [];
+        cbs.forEach(item => item.cb());
+    }}
+
+    const results = {{}};
+
+    // 1. Initial load (container hidden)
+    results.initialTabindex = preOverflow.getAttribute('tabindex');
+
+    // 2. Container revealed and overflowing
+    preOverflow.clientWidth = 400;
+    preOverflow.scrollWidth = 800;
+    listeners['resize'][0]();
+    flushRaf();
+    results.revealedTabindex = preOverflow.getAttribute('tabindex');
+    results.revealedRole = preOverflow.getAttribute('role');
+    results.revealedAriaLabel = preOverflow.getAttribute('aria-label');
+
+    // 3. Normal block should not receive tabindex
+    results.normalTabindex = preNormal.getAttribute('tabindex');
+
+    // 4. Container hidden again (clientWidth becomes 0)
+    preOverflow.clientWidth = 0;
+    preOverflow.scrollWidth = 0;
+    listeners['resize'][0]();
+    flushRaf();
+    results.hiddenAgainTabindex = preOverflow.getAttribute('tabindex');
+    results.hiddenAgainRole = preOverflow.getAttribute('role');
+
+    // 5. Verify debouncing
+    listeners['resize'][0]();
+    listeners['resize'][0]();
+    listeners['resize'][0]();
+    results.canceledRafCount = rafCancelCount;
+
+    console.log(JSON.stringify(results));
+    """
+
+    res = subprocess.run(
+        [node_bin, "-e", js_test],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(res.stdout)
+
+    # 1. Hidden block initially has no tabindex
+    assert data["initialTabindex"] is None, "Hidden code block must not have tabindex initially"
+
+    # 2. Revealed overflowing block receives WCAG Level AA accessibility attributes
+    assert data["revealedTabindex"] == "0", "Overflowing block must receive tabindex='0'"
+    assert data["revealedRole"] == "region", "Overflowing block must receive role='region'"
+    assert data["revealedAriaLabel"] == "Code snippet", (
+        "Overflowing block must receive aria-label='Code snippet'"
+    )
+
+    # 3. Non-overflowing block retains default behavior without tabindex
+    assert data["normalTabindex"] is None, "Non-overflowing block must not have tabindex"
+
+    # 4. Hidden again removes stale tabindex and role attributes
+    assert data["hiddenAgainTabindex"] is None, "Hidden block must clean up stale tabindex"
+    assert data["hiddenAgainRole"] is None, "Hidden block must clean up role"
+
+    # 5. Rapid sequential triggers debounce frame requests
+    assert data["canceledRafCount"] >= 2, "Rapid triggers must cancel previous animation frames"

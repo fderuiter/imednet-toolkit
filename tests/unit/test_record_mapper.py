@@ -19,6 +19,8 @@ from imednet.models.reporting import (
 from imednet.models.variables import Variable
 from imednet_workflows.record_mapper import (
     RecordMapper,
+    _get_model_field_aliases,
+    _normalize_key,
     format_iso8601_dtc,
     transform_records_to_sdtm,
 )
@@ -374,9 +376,25 @@ def test_format_iso8601_dtc() -> None:
     # Date-only patterns
     assert format_iso8601_dtc("01/15/2026") == "2026-01-15"
     assert format_iso8601_dtc("2026-01-15") == "2026-01-15"
+    assert format_iso8601_dtc("2026/01/15") == "2026-01-15"
+    assert format_iso8601_dtc("01-15-2026") == "2026-01-15"
+    assert format_iso8601_dtc("15-Jan-2026") == "2026-01-15"
+    assert format_iso8601_dtc("15-MAR-2024") == "2024-03-15"
+    assert format_iso8601_dtc("15-January-2026") == "2026-01-15"
+    # Datetime patterns
+    assert format_iso8601_dtc("2026-01-15 09:30:00.123456") == "2026-01-15T09:30:00.123456"
+    assert format_iso8601_dtc("2026/01/15 09:30:00") == "2026-01-15T09:30:00"
+    assert format_iso8601_dtc("01/15/2026 09:30:00") == "2026-01-15T09:30:00"
     # None or empty
     assert format_iso8601_dtc(None) is None
     assert format_iso8601_dtc("") is None
+    assert format_iso8601_dtc("   ") is None
+    assert format_iso8601_dtc(float("nan")) is None
+    # Unmatched / non-date strings gracefully preserved
+    assert format_iso8601_dtc("invalid-date") == "invalid-date"
+    assert format_iso8601_dtc("not-a-date") == "not-a-date"
+    # Numeric values converted to str
+    assert format_iso8601_dtc(12345) == "12345"
 
 
 def test_record_mapper_sdtm_ae_domain() -> None:
@@ -966,3 +984,63 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
     for col in ("subject_key", "ae_term", "ae_severity", "subjectKey", "aeTerm", "aeSeverity"):
         assert col not in df_dict_snake.columns
     assert "unmapped_val" in df_dict_snake.columns
+
+
+def test_sdtm_transformation_large_batch_benchmark() -> None:
+    """Benchmark SDTM transformation on a large batch verifying cached aliases and date parsing dispatch."""
+    import time
+
+    class BenchmarkAE(BaseModel):
+        subject_key: str = Field(alias="patientId")
+        ae_term: str = Field(alias="reportedTerm")
+        ae_severity: str = Field(alias="grade")
+        ae_start_date: str = Field(alias="onset")
+        ae_end_date: str = Field(alias="resolution")
+        extra_score: int = 100
+
+    batch_size = 5000
+    records = [
+        BenchmarkAE(
+            patientId=f"SUBJ-{i % 250}",
+            reportedTerm="Headache",
+            grade="MILD",
+            onset="2026-01-15 09:30:00",
+            resolution="2026-01-16 18:00:00",
+        )
+        for i in range(batch_size)
+    ]
+
+    _get_model_field_aliases.cache_clear()
+    _normalize_key.cache_clear()
+
+    start = time.perf_counter()
+    df = transform_records_to_sdtm(records, domain="AE", study_key="STUDY01")
+    elapsed = time.perf_counter() - start
+
+    assert len(df) == batch_size
+    assert "STUDYID" in df.columns
+    assert "DOMAIN" in df.columns
+    assert "USUBJID" in df.columns
+    assert "AESEQ" in df.columns
+    assert "AETERM" in df.columns
+    assert "AESEV" in df.columns
+    assert "AESTDTC" in df.columns
+    assert "AEENDTC" in df.columns
+    assert "extra_score" in df.columns
+
+    # Verify first row transformations
+    assert df.iloc[0]["USUBJID"] == "SUBJ-0"
+    assert df.iloc[0]["AETERM"] == "Headache"
+    assert df.iloc[0]["AESEV"] == "MILD"
+    assert df.iloc[0]["AESTDTC"] == "2026-01-15T09:30:00"
+    assert df.iloc[0]["AEENDTC"] == "2026-01-16T18:00:00"
+    assert df.iloc[0]["extra_score"] == 100
+
+    # Verify model aliases and normalized keys were effectively cached
+    alias_cache = _get_model_field_aliases.cache_info()
+    normalize_cache = _normalize_key.cache_info()
+    assert alias_cache.hits >= batch_size - 1
+    assert normalize_cache.hits > 100_000
+
+    # Assert processing time is well under threshold (typically ~0.4-0.6s for 5,000 records)
+    assert elapsed < 2.5
