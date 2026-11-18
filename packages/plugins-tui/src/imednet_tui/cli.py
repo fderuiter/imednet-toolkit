@@ -31,7 +31,13 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
 
     @with_sdk
-    def run_tui_command(sdk: ImednetSDK, args: argparse.Namespace | None = None) -> None:
+    def _launch(sdk: ImednetSDK, args: argparse.Namespace | None = None) -> None:
+        from .app import run_tui
+
+        force = bool(args and getattr(args, "force", False))
+        run_tui(sdk, force=force)
+
+    def run_tui_command(args: argparse.Namespace | None = None) -> None:
         if args is not None and getattr(args, "high_contrast", False):
             os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
 
@@ -40,8 +46,6 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             print_error("Error: Interactive terminal required to run the TUI interface.")
             raise SystemExit(1)
 
-        from .app import run_tui
-
-        run_tui(sdk, force=force)
+        _launch(args)
 
     tui_parser.set_defaults(func=run_tui_command)

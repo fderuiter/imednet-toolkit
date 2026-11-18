@@ -636,7 +636,7 @@ def test_cli_run_tui_command_headless_exits(mock_sdk, capsys):
 
     args = argparse.Namespace(high_contrast=False, force=False)
     with (
-        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk) as mock_get_sdk,
         patch("imednet_tui.cli.is_interactive_terminal", return_value=False),
         pytest.raises(SystemExit) as exc_info,
     ):
@@ -645,6 +645,33 @@ def test_cli_run_tui_command_headless_exits(mock_sdk, capsys):
     assert exc_info.value.code == 1
     _, err = capsys.readouterr()
     assert "Error: Interactive terminal required to run the TUI interface." in err
+    mock_get_sdk.assert_not_called()
+
+
+def test_cli_run_tui_command_headless_skips_sdk_initialization(capsys):
+    """Verify headless execution emits terminal diagnostic and skips SDK initialization entirely."""
+    subparsers = MagicMock()
+    mock_parser = MagicMock()
+    subparsers.add_parser.return_value = mock_parser
+
+    setup_parser(subparsers)
+    command_func = mock_parser.set_defaults.call_args[1]["func"]
+
+    args = argparse.Namespace(high_contrast=False, force=False)
+    with (
+        patch(
+            "imednet.cli.utils.context.get_sdk",
+            side_effect=RuntimeError("SDK credentials missing in headless environment"),
+        ) as mock_get_sdk,
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=False),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        command_func(args)
+
+    assert exc_info.value.code == 1
+    _, err = capsys.readouterr()
+    assert "Error: Interactive terminal required to run the TUI interface." in err
+    mock_get_sdk.assert_not_called()
 
 
 def test_cli_run_tui_command_non_interactive_env_exits(mock_sdk, capsys):
@@ -658,7 +685,7 @@ def test_cli_run_tui_command_non_interactive_env_exits(mock_sdk, capsys):
 
     args = argparse.Namespace(high_contrast=False, force=False)
     with (
-        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk) as mock_get_sdk,
         patch.dict(
             "os.environ", {"IMEDNET_NON_INTERACTIVE": "1", "TERM": "xterm-256color"}, clear=True
         ),
@@ -671,6 +698,7 @@ def test_cli_run_tui_command_non_interactive_env_exits(mock_sdk, capsys):
     assert exc_info.value.code == 1
     _, err = capsys.readouterr()
     assert "Interactive terminal required" in err
+    mock_get_sdk.assert_not_called()
 
 
 def test_cli_run_tui_command_term_dumb_or_missing_exits(mock_sdk, capsys):
@@ -684,7 +712,7 @@ def test_cli_run_tui_command_term_dumb_or_missing_exits(mock_sdk, capsys):
 
     args = argparse.Namespace(high_contrast=False, force=False)
     with (
-        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk) as mock_get_sdk,
         patch.dict("os.environ", {"TERM": "dumb"}, clear=True),
         patch("sys.stdout.isatty", return_value=True),
         patch("sys.stdin.isatty", return_value=True),
@@ -695,6 +723,7 @@ def test_cli_run_tui_command_term_dumb_or_missing_exits(mock_sdk, capsys):
     assert exc_info.value.code == 1
     _, err = capsys.readouterr()
     assert "Interactive terminal required" in err
+    mock_get_sdk.assert_not_called()
 
 
 def test_cli_run_tui_command_force_flag_bypasses(mock_sdk):

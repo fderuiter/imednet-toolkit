@@ -124,17 +124,18 @@ def test_tui_plugin_non_interactive_exits(monkeypatch, capsys):
 
     with (
         patch("imednet_tui.cli.is_interactive_terminal", return_value=False),
-        patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
+        patch(
+            "imednet.cli.utils.context.get_sdk",
+            side_effect=RuntimeError("SDK credentials missing in headless environment"),
+        ) as mock_get_sdk,
     ):
-        mock_sdk = MagicMock()
-        mock_get_sdk.return_value = mock_sdk
-
         with pytest.raises(SystemExit) as exc_info:
             args.func(args)
 
     assert exc_info.value.code == 1
     _, err = capsys.readouterr()
     assert "Interactive terminal required" in err
+    mock_get_sdk.assert_not_called()
 
 
 def test_tui_plugin_force_flag_bypasses_guard(monkeypatch):
