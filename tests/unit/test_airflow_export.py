@@ -14,12 +14,18 @@ import pytest
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
     airflow_mod = ModuleType("airflow")
+    airflow_mod.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")
+    hooks_pkg.__path__ = []
     hooks_mod = ModuleType("airflow.sdk.bases.hook")
     sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.__path__ = []
     sdk_bases = ModuleType("airflow.sdk.bases")
+    sdk_bases.__path__ = []
     sdk_defs = ModuleType("airflow.sdk.definitions")
+    sdk_defs.__path__ = []
     sdk_ctx = ModuleType("airflow.sdk.definitions.context")
+    sdk_dag = ModuleType("airflow.sdk.definitions.dag")
     models_mod = ModuleType("airflow.models")
 
     class DummyBaseHook:
@@ -40,10 +46,14 @@ def _setup_airflow(monkeypatch):
 
     hooks_mod.BaseHook = DummyBaseHook
     models_mod.BaseOperator = DummyBaseOperator
+    models_mod.DAG = DummyBaseOperator
+    sdk_dag.DAG = DummyBaseOperator
+    sdk_dag.dag = DummyBaseOperator
 
     sdk_bases.hook = hooks_mod
     sdk_mod.bases = sdk_bases
     sdk_defs.context = sdk_ctx
+    sdk_defs.dag = sdk_dag
     sdk_mod.definitions = sdk_defs
     airflow_mod.sdk = sdk_mod
     airflow_mod.hooks = hooks_pkg
@@ -51,11 +61,12 @@ def _setup_airflow(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
     monkeypatch.setitem(sys.modules, "airflow.hooks", hooks_pkg)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
     monkeypatch.setitem(sys.modules, "airflow.models", models_mod)
 
 
@@ -209,9 +220,6 @@ def test_operator_missing_sinks_plugin_raises_airflow_exception(
     from apache_airflow_providers_imednet._airflow_compat import AirflowException
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 
-    # Ensure imednet_sinks is not in sys.modules for this test
-    monkeypatch.delitem(sys.modules, "imednet_sinks", raising=False)
-
     mock_sdk = MagicMock(sinks=None)
     op = ImednetExportOperator(
         task_id=f"test_{destination}_missing_sinks",
@@ -230,8 +238,6 @@ def test_operator_missing_sinks_plugin_raises_airflow_exception(
 def test_operator_resolves_snowflake_sink_via_sdk_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify operator resolves SnowflakeExportSink through sdk.sinks."""
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-
-    monkeypatch.delitem(sys.modules, "imednet_sinks", raising=False)
 
     mock_sink_instance = MagicMock()
     mock_sink_cls = MagicMock(return_value=mock_sink_instance)
@@ -252,7 +258,7 @@ def test_operator_resolves_snowflake_sink_via_sdk_sinks(monkeypatch: pytest.Monk
         export_kwargs={
             "account": "test_account",
             "user": "test_user",
-            "password": "secret_password",
+            "password": "mock_password",  # pragma: allowlist secret
             "database": "TEST_DB",
             "schema": "PUBLIC",
             "warehouse": "TEST_WH",
@@ -272,7 +278,7 @@ def test_operator_resolves_snowflake_sink_via_sdk_sinks(monkeypatch: pytest.Monk
         extra=op._get_runtime_export_kwargs(),
         account="test_account",
         user="test_user",
-        password="secret_password",
+        password="mock_password",  # pragma: allowlist secret
         database="TEST_DB",
         schema="PUBLIC",
         warehouse="TEST_WH",
@@ -287,8 +293,6 @@ def test_operator_resolves_snowflake_sink_via_sdk_sinks(monkeypatch: pytest.Monk
 def test_operator_resolves_neo4j_sink_via_sdk_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify operator resolves Neo4jExportSink through sdk.sinks."""
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-
-    monkeypatch.delitem(sys.modules, "imednet_sinks", raising=False)
 
     mock_sink_instance = MagicMock()
     mock_sink_cls = MagicMock(return_value=mock_sink_instance)
@@ -329,8 +333,6 @@ def test_operator_resolves_neo4j_sink_via_sdk_sinks(monkeypatch: pytest.MonkeyPa
 def test_operator_resolves_mongodb_sink_via_sdk_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify operator resolves MongoDbExportSink through sdk.sinks."""
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-
-    monkeypatch.delitem(sys.modules, "imednet_sinks", raising=False)
 
     mock_sink_instance = MagicMock()
     mock_sink_cls = MagicMock(return_value=mock_sink_instance)
@@ -379,8 +381,6 @@ def test_operator_missing_sink_factory_raises_airflow_exception(
     """Verify that when a specific sink class is missing on sdk.sinks, an actionable error is raised."""
     from apache_airflow_providers_imednet._airflow_compat import AirflowException
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-
-    monkeypatch.delitem(sys.modules, "imednet_sinks", raising=False)
 
     class IncompleteSinks:
         pass

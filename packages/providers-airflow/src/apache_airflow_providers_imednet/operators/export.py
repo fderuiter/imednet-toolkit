@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -109,20 +108,11 @@ class ImednetExportOperator(BaseOperator):
             sdk = self._get_sdk()
 
         sinks = getattr(sdk, "sinks", None)
-        legacy_sinks = sys.modules.get("imednet_sinks")
-        if sinks is None or (
-            hasattr(sinks, "_mock_name")
-            and legacy_sinks is not None
-            and "SnowflakeExportSink" in legacy_sinks.__dict__
-            and "SnowflakeExportSink" not in sinks.__dict__
-        ):
-            if legacy_sinks is not None:
-                sinks = legacy_sinks
-            else:
-                raise AirflowException(
-                    f"The sinks plugin is required for destination '{dest}' but is not installed. "
-                    "Please install it using: pip install imednet-plugins-sinks"
-                )
+        if sinks is None:
+            raise AirflowException(
+                f"The sinks plugin is required for destination '{dest}' but is not installed. "
+                "Please install it using: pip install imednet-plugins-sinks"
+            )
 
         if dest == "snowflake":
             sink_cls = getattr(sinks, "SnowflakeExportSink", None)

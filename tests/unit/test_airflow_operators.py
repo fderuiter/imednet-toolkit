@@ -11,14 +11,21 @@ import pytest
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
     airflow = ModuleType("airflow")
+    airflow.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")
+    hooks_pkg.__path__ = []
     hooks_base = ModuleType("airflow.sdk.bases.hook")
     sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.__path__ = []
     sdk_bases = ModuleType("airflow.sdk.bases")
+    sdk_bases.__path__ = []
     sdk_defs = ModuleType("airflow.sdk.definitions")
+    sdk_defs.__path__ = []
     sdk_ctx = ModuleType("airflow.sdk.definitions.context")
+    sdk_dag = ModuleType("airflow.sdk.definitions.dag")
     models_mod = ModuleType("airflow.models")
     sensors_base = ModuleType("airflow.sensors.base")
+    sensors_sdk = ModuleType("airflow.sdk.bases.sensor")
     exc_mod = ModuleType("airflow.exceptions")
     s3_mod = ModuleType("airflow.providers.amazon.aws.hooks.s3")
 
@@ -48,7 +55,11 @@ def _setup_airflow(monkeypatch):
 
     hooks_base.BaseHook = DummyBaseHook
     models_mod.BaseOperator = DummyBaseOperator
+    models_mod.DAG = DummyBaseOperator
     sensors_base.BaseSensorOperator = DummySensorOperator
+    sensors_sdk.BaseSensorOperator = DummySensorOperator
+    sdk_dag.DAG = DummyBaseOperator
+    sdk_dag.dag = DummyBaseOperator
 
     class DummyAirflowError(Exception):
         """Test suite for DummyAirflowError."""
@@ -57,28 +68,37 @@ def _setup_airflow(monkeypatch):
     s3_mod.S3Hook = MagicMock
 
     sdk_bases.hook = hooks_base
+    sdk_bases.sensor = sensors_sdk
     sdk_mod.bases = sdk_bases
     sdk_defs.context = sdk_ctx
+    sdk_defs.dag = sdk_dag
     sdk_mod.definitions = sdk_defs
     airflow.sdk = sdk_mod
     airflow.hooks = hooks_pkg
     airflow.models = models_mod
     airflow.sensors = ModuleType("airflow.sensors")
+    airflow.sensors.__path__ = []
     airflow.sensors.base = sensors_base
     airflow.providers = ModuleType("airflow.providers")
+    airflow.providers.__path__ = []
     airflow.providers.amazon = ModuleType("airflow.providers.amazon")
+    airflow.providers.amazon.__path__ = []
     airflow.providers.amazon.aws = ModuleType("airflow.providers.amazon.aws")
+    airflow.providers.amazon.aws.__path__ = []
     airflow.providers.amazon.aws.hooks = ModuleType("airflow.providers.amazon.aws.hooks")
+    airflow.providers.amazon.aws.hooks.__path__ = []
     airflow.providers.amazon.aws.hooks.s3 = s3_mod
 
     modules = {
         "airflow": airflow,
         "airflow.hooks": hooks_pkg,
-        "airflow.sdk.bases.hook": hooks_base,
         "airflow.sdk": sdk_mod,
         "airflow.sdk.bases": sdk_bases,
+        "airflow.sdk.bases.hook": hooks_base,
+        "airflow.sdk.bases.sensor": sensors_sdk,
         "airflow.sdk.definitions": sdk_defs,
         "airflow.sdk.definitions.context": sdk_ctx,
+        "airflow.sdk.definitions.dag": sdk_dag,
         "airflow.models": models_mod,
         "airflow.sensors": airflow.sensors,
         "airflow.sensors.base": sensors_base,
