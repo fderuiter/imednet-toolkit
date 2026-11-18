@@ -2,8 +2,8 @@
 
 from unittest.mock import Mock
 
+from imednet.datadict.models import DataDictionary
 from imednet.errors import ValidationError
-from imednet.validation.data_dictionary import DataDictionary
 from imednet_workflows.uat.engine import EditCheckResultStatus, UATExecutionEngine
 
 
@@ -157,8 +157,8 @@ def test_generate_negative_test_case_all_branches():
 
 
 def test_uat_engine_run_verification_failure_and_skip():
+    from imednet.datadict.models import DataDictionary
     from imednet.errors import ApiError
-    from imednet.validation.data_dictionary import DataDictionary
     from imednet_workflows.uat.engine import UATExecutionEngine
 
     sdk = Mock()

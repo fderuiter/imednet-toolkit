@@ -13,14 +13,12 @@ from .cache import (
     SchemaValidator,
     validate_record_data,
 )
-from .data_dictionary import DataDictionary
 
 __all__ = [
     "AsyncSchemaCache",
     "AsyncSchemaValidator",
     "BaseSchemaCache",
     "BaseSchemaValidator",
-    "DataDictionary",
     "SchemaCache",
     "SchemaValidator",
     "validate_record_data",
