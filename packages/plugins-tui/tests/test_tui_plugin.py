@@ -500,3 +500,189 @@ async def test_job_monitor_sync_get_responsiveness_regression_heartbeat():
     assert "Active & Recent Jobs (1)" in rendered
     assert "COMPLETED" in rendered
     assert "BATCH-HEARTBEAT-1" in rendered
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_bounded_concurrent_polling_duration_and_limit():
+    """Verify tracked jobs execute concurrently within one round-trip window bounded by semaphore."""
+    import time
+
+    from imednet.models.jobs import JobState, JobStatus
+
+    current_concurrent = 0
+    max_concurrent_seen = 0
+    lock = asyncio.Lock()
+
+    async def mock_async_get(study_key: str, job_id: str) -> JobStatus:
+        nonlocal current_concurrent, max_concurrent_seen
+        async with lock:
+            current_concurrent += 1
+            max_concurrent_seen = max(max_concurrent_seen, current_concurrent)
+        await asyncio.sleep(0.12)
+        async with lock:
+            current_concurrent -= 1
+        return JobStatus(job_id=job_id, state=JobState.COMPLETED)
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = mock_async_get
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-CONCURRENT"
+    job_ids = [f"BATCH-CONC-{i}" for i in range(5)]
+    for jid in job_ids:
+        monitor.track_job(jid)
+
+    start = time.monotonic()
+    await monitor.refresh_jobs()
+    elapsed = time.monotonic() - start
+
+    # 5 jobs taking 0.12s each in parallel complete in < 0.35s (sequential would take >= 0.60s)
+    assert elapsed < 0.35
+    assert max_concurrent_seen <= 5
+    assert max_concurrent_seen >= 2
+
+    rendered = str(monitor.render())
+    assert "Active & Recent Jobs (5)" in rendered
+    for jid in job_ids:
+        assert jid in rendered
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_semaphore_bounds_maximum_concurrency():
+    """Verify that tracking more than 5 jobs never exceeds the concurrency limit of 5."""
+    from imednet.models.jobs import JobState, JobStatus
+
+    current_concurrent = 0
+    max_concurrent_seen = 0
+    lock = asyncio.Lock()
+
+    async def mock_async_get(study_key: str, job_id: str) -> JobStatus:
+        nonlocal current_concurrent, max_concurrent_seen
+        async with lock:
+            current_concurrent += 1
+            max_concurrent_seen = max(max_concurrent_seen, current_concurrent)
+        await asyncio.sleep(0.05)
+        async with lock:
+            current_concurrent -= 1
+        return JobStatus(job_id=job_id, state=JobState.RUNNING)
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = mock_async_get
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-BOUND"
+    job_ids = [f"BATCH-BOUND-{i}" for i in range(12)]
+    for jid in job_ids:
+        monitor.track_job(jid)
+
+    await monitor.refresh_jobs()
+
+    assert max_concurrent_seen == 5
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_partial_network_timeout_does_not_abort_batch(caplog):
+    """Test scenario: Network timeout on one tracked job displays FAILED while others succeed."""
+    from imednet.models.jobs import JobState, JobStatus
+
+    async def mock_get(study_key: str, job_id: str) -> JobStatus:
+        if job_id == "BATCH-TIMEOUT":
+            raise TimeoutError("Gateway timeout connecting to iMednet Jobs API")
+        return JobStatus(job_id=job_id, state=JobState.COMPLETED)
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = mock_get
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-PARTIAL-FAIL"
+    monitor.track_job("BATCH-OK-1")
+    monitor.track_job("BATCH-TIMEOUT")
+    monitor.track_job("BATCH-OK-2")
+
+    with caplog.at_level(logging.WARNING, logger="imednet_tui"):
+        await monitor.refresh_jobs()
+
+    rendered = str(monitor.render())
+    assert "Active & Recent Jobs (3)" in rendered
+    assert "BATCH-OK-1" in rendered
+    assert "BATCH-TIMEOUT" in rendered
+    assert "BATCH-OK-2" in rendered
+    assert "FAILED" in rendered
+    assert "COMPLETED" in rendered
+
+    assert any("Failed to poll job BATCH-TIMEOUT" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_preserves_registration_order():
+    """Verify that refresh_jobs preserves the exact registration order despite varying completion order."""
+    from imednet.models.jobs import JobState, JobStatus
+
+    delays = {
+        "BATCH-FIRST": 0.08,
+        "BATCH-SECOND": 0.01,
+        "BATCH-THIRD": 0.05,
+    }
+
+    async def mock_get(study_key: str, job_id: str) -> JobStatus:
+        await asyncio.sleep(delays[job_id])
+        return JobStatus(job_id=job_id, state=JobState.COMPLETED)
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = mock_get
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-ORDER"
+    for jid in ["BATCH-FIRST", "BATCH-SECOND", "BATCH-THIRD"]:
+        monitor.track_job(jid)
+
+    await monitor.refresh_jobs()
+
+    rendered = str(monitor.render())
+    pos1 = rendered.index("BATCH-FIRST")
+    pos2 = rendered.index("BATCH-SECOND")
+    pos3 = rendered.index("BATCH-THIRD")
+    assert pos1 < pos2 < pos3
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_sync_endpoint_bounded_concurrency():
+    """Verify synchronous get() endpoints also execute concurrently across worker threads."""
+    import time
+
+    from imednet.models.jobs import JobState, JobStatus
+
+    def sync_get(study_key: str, job_id: str) -> JobStatus:
+        time.sleep(0.08)
+        return JobStatus(job_id=job_id, state=JobState.RUNNING)
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+    sdk.jobs.get = sync_get
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-SYNC-CONC"
+    job_ids = [f"BATCH-SYNC-{i}" for i in range(5)]
+    for jid in job_ids:
+        monitor.track_job(jid)
+
+    start = time.monotonic()
+    await monitor.refresh_jobs()
+    elapsed = time.monotonic() - start
+
+    # 5 synchronous jobs taking 0.08s each in parallel threads complete in < 0.25s
+    # (If sequential, it would take >= 0.40s)
+    assert elapsed < 0.25
+    rendered = str(monitor.render())
+    assert "Active & Recent Jobs (5)" in rendered
+    for jid in job_ids:
+        assert jid in rendered
