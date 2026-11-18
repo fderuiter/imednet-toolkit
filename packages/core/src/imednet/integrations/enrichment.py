@@ -54,9 +54,7 @@ class CentralizedMapper:
             CentralizedMapper._cached_fields = pairs
             CentralizedMapper._cached_field_pairs = pairs
 
-    def map_record(
-        self, record: Any, study_key: str | None = None
-    ) -> dict[str, Any]:  # pragma: no cover
+    def map_record(self, record: Any, study_key: str | None = None) -> dict[str, Any]:
         """Map a clinical record to the unified destination format."""
         fields = self._cached_fields
         if fields is None:

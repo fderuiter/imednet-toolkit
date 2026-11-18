@@ -357,3 +357,70 @@ def test_centralized_mapper_cached_fields_and_shared_pipeline() -> None:
     assert mapped_custom["record_data"]["patient_name"] == "[MASKED]"
     # Dynamic field snake_case conversion is preserved
     assert "vital_sign" in mapped_custom["record_data"]
+
+    # Document mode, lazy cache initialization, metadata defaults, and post_processor
+    orig_fields = CentralizedMapper._cached_fields
+    orig_pairs = CentralizedMapper._cached_field_pairs
+    try:
+        CentralizedMapper._cached_fields = None
+        CentralizedMapper._cached_field_pairs = None
+        doc_mapper = CentralizedMapper(
+            mode="document",
+            post_processor=lambda d: {**d, "post_processed": True},
+        )
+        assert doc_mapper._cached_fields is not None
+
+        CentralizedMapper._cached_fields = None
+        sparse_record = SimpleNamespace(
+            record_id=1000,
+            deleted=None,
+            date_modified=None,
+            study_key=None,
+            record_data={"nestedObj": {"innerVal": 1}},
+        )
+        mapped_sparse = doc_mapper.map_record(sparse_record, study_key=None)
+        assert doc_mapper._cached_fields is not None
+        assert mapped_sparse["deleted"] is False
+        assert isinstance(mapped_sparse["date_modified"], str)
+        assert mapped_sparse["study_key"] is None
+        assert doc_mapper._pipeline_cache["UNKNOWN"] is _DEFAULT_PIPELINE
+        assert mapped_sparse["record_data"]["nested_obj"] == {"innerVal": 1}
+        assert mapped_sparse["post_processed"] is True
+    finally:
+        CentralizedMapper._cached_fields = orig_fields
+        CentralizedMapper._cached_field_pairs = orig_pairs
+
+
+def test_enrichment_pipeline_evaluator_exception_and_scalar_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test fallback when evaluate_expression raises unexpectedly and on non-container values."""
+    config = StudyConfiguration(
+        study_key="STUDY-FALLBACK",
+        mappings=[
+            MappingRule(
+                domain="DM",
+                target_field="computed",
+                source_form_key="DM_FORM",
+                source_variable_name="raw_val",
+                business_logic="value + 1",
+            )
+        ],
+    )
+    pipeline = EnrichmentPipeline(config)
+
+    # Scalar and primitive elements in list/tuple hit the base return path in _transform_recursive
+    assert pipeline.process("scalar_value") == "scalar_value"
+    list_tuple_res = pipeline.process({"items": ["a", 1], "pair": ("x", 2)})
+    assert list_tuple_res == {"items": ["a", 1], "pair": ("x", 2)}
+
+    monkeypatch.setattr(
+        "imednet.integrations.enrichment.evaluate_expression",
+        MagicMock(side_effect=RuntimeError("unexpected evaluator error")),
+    )
+    with caplog.at_level(logging.WARNING):
+        res = pipeline.process({"raw_val": 42})
+
+    assert res["computed"] == 42
+    assert any("Business logic evaluation failed" in r.message for r in caplog.records)
