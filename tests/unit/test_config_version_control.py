@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -210,7 +209,7 @@ def test_commit_config_without_sdk_raises_permission_error(store: ConfigVersionS
     """Calling commit_config without an authorized SDK session must raise PermissionError."""
     config = _make_config()
     with pytest.raises(PermissionError, match="authenticated SDK session"):
-        store.commit_config("STUDY-01", config, "test", sdk=None, user="unauthorized_actor")
+        store.commit_config("STUDY-01", config, "test", sdk=None)
 
     with pytest.raises(PermissionError, match="authenticated SDK session"):
         store.commit_config("STUDY-01", config, "test")
@@ -298,25 +297,38 @@ def test_commit_config_auth_failure_raises_permission_error(store: ConfigVersion
         store.commit_config("STUDY-01", config, desc="broken user", sdk=broken_user_sdk)
 
 
-def test_commit_config_user_deprecation_warning(
+def test_commit_config_unexpected_user_param_raises_type_error(
     store: ConfigVersionStore, mock_sdk: MockSDK
 ) -> None:
-    """Passing user parameter emits a DeprecationWarning."""
+    """Passing removed user or other unexpected keyword arguments raises TypeError."""
     config = _make_config()
-    with pytest.deprecated_call(match="The 'user' parameter is deprecated"):
-        store.commit_config("STUDY-01", config, desc="test deprecation", sdk=mock_sdk, user="bob")
+    with pytest.raises(TypeError, match="unexpected keyword argument 'user'"):
+        store.commit_config("STUDY-01", config, desc="test", sdk=mock_sdk, user="bob")  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="unexpected keyword argument 'unexpected_kw'"):
+        store.commit_config("STUDY-01", config, desc="test", sdk=mock_sdk, unexpected_kw=True)  # type: ignore[call-arg]
 
 
-def test_commit_config_user_override_ignored_when_authenticated(store: ConfigVersionStore) -> None:
-    """User parameter cannot override verified authenticated identity."""
+def test_commit_config_empty_user_id_raises_value_error(store: ConfigVersionStore) -> None:
+    """When SDK auth yields an empty user identifier, commit_config raises ValueError."""
+    config = _make_config()
+    empty_user_sdk = MockSDK(MockAuth(roles=["admin"], user_id=""))
+    with pytest.raises(ValueError, match="A user identifier is required to commit"):
+        store.commit_config("STUDY-01", config, desc="empty user commit", sdk=empty_user_sdk)
+
+    none_user_sdk = MockSDK(MockAuth(roles=["admin"]))
+    none_user_sdk.auth.get_user_id = lambda: None  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="A user identifier is required to commit"):
+        store.commit_config("STUDY-01", config, desc="none user commit", sdk=none_user_sdk)
+
+
+def test_commit_config_persists_authenticated_modified_by(store: ConfigVersionStore) -> None:
+    """Authenticated commits persist the identity resolved from sdk.auth.get_user_id()."""
     config = _make_config()
     auth_sdk = MockSDK(MockAuth(roles=["admin"], user_id="real_user"))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        store.commit_config(
-            "STUDY-01", config, desc="spoof attempt", sdk=auth_sdk, user="spoofed_user"
-        )
+    commit_id = store.commit_config("STUDY-01", config, desc="authenticated commit", sdk=auth_sdk)
     history = store.get_history("STUDY-01")
+    assert len(history) == 1
+    assert history[0]["commit_id"] == commit_id
     assert history[0]["modified_by"] == "real_user"
 
 
