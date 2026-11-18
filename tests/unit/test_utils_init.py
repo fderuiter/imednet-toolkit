@@ -35,6 +35,10 @@ def test_lazy_load_pandas_functions() -> None:
     from imednet.utils.pandas import sites_to_dataframe as expected_sitedf
 
     assert func_site is expected_sitedf
+    func_user = utils.users_to_dataframe
+    from imednet.utils.pandas import users_to_dataframe as expected_utodf
+
+    assert func_user is expected_utodf
     func = utils.records_to_dataframe
     from imednet.utils.pandas import records_to_dataframe as expected_rtodf
 

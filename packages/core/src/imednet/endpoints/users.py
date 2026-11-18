@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.strategies import PopStudyKeyStrategy
 from imednet.core.endpoint.structs import ParamState
 from imednet.core.protocols import ParamProcessor
 from imednet.models.users import User
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 class UsersParamProcessor(ParamProcessor):
@@ -109,6 +112,50 @@ class UsersOperationDef:
 class UsersEndpoint(UsersOperationDef, EdcSyncListEndpoint[User]):  # type: ignore[misc]
     """Synchronous endpoint for managing Users."""
 
+    def to_dataframe(
+        self,
+        study_key: str | None = None,
+        **filters: Any,
+    ) -> pd.DataFrame:
+        """Export queried users directly to a pandas DataFrame.
+
+        Args:
+            study_key: Optional study key override.
+            **filters: Resource filters passed to :meth:`list`.
+
+        Returns:
+            A pandas DataFrame containing the queried users.
+
+        Raises:
+            ImportError: If pandas is not installed.
+        """
+        from imednet.utils.pandas import users_to_dataframe
+
+        users = list(self.list(study_key=study_key, **filters))
+        return users_to_dataframe(users)
+
 
 class AsyncUsersEndpoint(UsersOperationDef, EdcAsyncListEndpoint[User]):  # type: ignore[misc]
     """Asynchronous endpoint for managing Users."""
+
+    async def to_dataframe(
+        self,
+        study_key: str | None = None,
+        **filters: Any,
+    ) -> pd.DataFrame:
+        """Export queried users asynchronously directly to a pandas DataFrame.
+
+        Args:
+            study_key: Optional study key override.
+            **filters: Resource filters passed to :meth:`list`.
+
+        Returns:
+            A pandas DataFrame containing the queried users.
+
+        Raises:
+            ImportError: If pandas is not installed.
+        """
+        from imednet.utils.pandas import users_to_dataframe
+
+        users = [user async for user in self.list(study_key=study_key, **filters)]
+        return users_to_dataframe(users)

@@ -12,6 +12,7 @@ from imednet.models.queries import Query, QueryStatus
 from imednet.models.records import Record
 from imednet.models.sites import Site
 from imednet.models.subjects import Subject
+from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 from imednet.utils.pandas import (
@@ -22,6 +23,7 @@ from imednet.utils.pandas import (
     records_to_dataframe,
     sites_to_dataframe,
     subjects_to_dataframe,
+    users_to_dataframe,
     variables_to_dataframe,
     visits_to_dataframe,
 )
@@ -101,6 +103,18 @@ def _sample_site() -> Site:
     return Site(
         site_id=10,
         site_name="General Hospital",
+    )
+
+
+def _sample_user() -> User:
+    """Helper function to sample user."""
+    return User(
+        user_id="1",
+        login="jdoe",
+        first_name="John",
+        last_name="Doe",
+        email="jdoe@example.com",
+        user_active_in_study=True,
     )
 
 
@@ -205,6 +219,34 @@ def test_sites_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
     with pytest.raises(ImportError, match="pandas is required for sites_to_dataframe"):
         sites_to_dataframe([])
+
+
+def test_users_to_dataframe_success() -> None:
+    """Test converting users to a pandas DataFrame."""
+    user = _sample_user()
+    df = users_to_dataframe([user])
+    assert not df.empty
+    assert len(df) == 1
+    assert df.loc[0, "user_id"] == "1"
+    assert df.loc[0, "login"] == "jdoe"
+    assert df.loc[0, "first_name"] == "John"
+    assert df.loc[0, "last_name"] == "Doe"
+    assert df.loc[0, "email"] == "jdoe@example.com"
+    assert bool(df.loc[0, "user_active_in_study"]) is True
+    assert df.loc[0, "name"] == "John Doe"
+
+
+def test_users_to_dataframe_empty() -> None:
+    """Test converting empty users collection to DataFrame."""
+    df = users_to_dataframe([])
+    assert df.empty
+
+
+def test_users_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
+    """Test that users_to_dataframe raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for users_to_dataframe"):
+        users_to_dataframe([])
 
 
 def test_subjects_to_dataframe_success() -> None:

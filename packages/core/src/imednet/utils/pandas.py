@@ -14,6 +14,7 @@ from ..models.queries import Query
 from ..models.records import Record
 from ..models.sites import Site
 from ..models.subjects import Subject
+from ..models.users import User
 from ..models.variables import Variable
 from ..models.visits import Visit
 from .security import sanitize_csv_formula
@@ -125,6 +126,21 @@ def sites_to_dataframe(sites: list[Site]) -> pd.DataFrame:
 
     site_dicts = [s.model_dump(by_alias=False) for s in sites]
     return pd.DataFrame(site_dicts)
+
+
+def users_to_dataframe(users: list[User]) -> pd.DataFrame:
+    """Convert a list of :class:`~imednet.models.users.User` to a DataFrame.
+
+    Each user model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    """
+    if pd is None:
+        raise ImportError(
+            "pandas is required for users_to_dataframe. Install with \"pip install 'imednet[export]'\"."
+        )
+
+    user_dicts = [u.model_dump(by_alias=False) for u in users]
+    return pd.DataFrame(user_dicts)
 
 
 def records_to_dataframe(records: list[Record], *, flatten: bool = False) -> pd.DataFrame:
