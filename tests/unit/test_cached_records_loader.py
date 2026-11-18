@@ -287,3 +287,127 @@ def test_cache_sync_minimal_network_overhead_with_lightweight_projection(tmp_pat
     reconcile_call = sdk.get_records.call_args_list[1]
     assert reconcile_call.kwargs["record_data_filter"] == "none"
     assert loader.count_cached_records("STUDY") == 50
+
+
+def test_remote_fetches_execute_outside_file_lock(tmp_path: Path) -> None:
+    """Verify that remote delta and active record ID fetches run outside the file lock."""
+    from filelock import FileLock
+
+    sdk = MagicMock()
+    r1 = _record(1, "2024-01-01 00:00:00+00:00")
+    projected = [Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None)]
+
+    lock_held_during_delta = None
+    external_can_acquire_during_delta = None
+    lock_held_during_reconcile = None
+    external_can_acquire_during_reconcile = None
+    call_count = 0
+
+    def _mock_fetch(*args, **kwargs):
+        nonlocal call_count, lock_held_during_delta, external_can_acquire_during_delta
+        nonlocal lock_held_during_reconcile, external_can_acquire_during_reconcile
+        call_count += 1
+        if call_count == 1:
+            lock_held_during_delta = loader.lock.is_locked
+            external_lock = FileLock(str(loader.db_path) + ".lock", timeout=0)
+            try:
+                with external_lock:
+                    external_can_acquire_during_delta = True
+            except Exception:
+                external_can_acquire_during_delta = False
+            return [r1]
+        lock_held_during_reconcile = loader.lock.is_locked
+        external_lock = FileLock(str(loader.db_path) + ".lock", timeout=0)
+        try:
+            with external_lock:
+                external_can_acquire_during_reconcile = True
+        except Exception:
+            external_can_acquire_during_reconcile = False
+        return projected
+
+    sdk.get_records.side_effect = _mock_fetch
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    loader.sync_records("STUDY", reconcile=True)
+
+    assert lock_held_during_delta is False
+    assert external_can_acquire_during_delta is True
+    assert lock_held_during_reconcile is False
+    assert external_can_acquire_during_reconcile is True
+
+
+def test_write_transactions_acquire_file_lock(tmp_path: Path) -> None:
+    """Verify that _upsert_records and reconcile_cache acquire file lock during execution."""
+    from unittest.mock import patch
+
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    lock_states_in_upsert = []
+    original_acquire = loader.lock.acquire
+
+    def _spy_acquire(*args, **kwargs):
+        res = original_acquire(*args, **kwargs)
+        lock_states_in_upsert.append(loader.lock.is_locked)
+        return res
+
+    with patch.object(loader.lock, "acquire", side_effect=_spy_acquire):
+        with get_sqlite_connection(loader.db_path) as conn:
+            loader._upsert_records(conn, [_record(1, "2024-01-01 00:00:00+00:00")])
+
+    assert lock_states_in_upsert == [True]
+    assert loader.lock.is_locked is False
+
+    lock_states_in_reconcile = []
+
+    def _spy_acquire_reconcile(*args, **kwargs):
+        res = original_acquire(*args, **kwargs)
+        lock_states_in_reconcile.append(loader.lock.is_locked)
+        return res
+
+    with patch.object(loader.lock, "acquire", side_effect=_spy_acquire_reconcile):
+        with get_sqlite_connection(loader.db_path) as conn:
+            loader.reconcile_cache(conn, "STUDY", set())  # record 1 is orphaned
+
+    assert lock_states_in_reconcile == [True]
+    assert loader.lock.is_locked is False
+
+
+def test_lock_hold_duration_below_threshold(tmp_path: Path) -> None:
+    """Verify that file lock hold duration is well below 50ms for typical batch upsert operations."""
+    import time
+    from unittest.mock import patch
+
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    records = [_record(i, f"2024-01-{(i % 28) + 1:02d} 00:00:00+00:00") for i in range(1, 101)]
+
+    hold_durations = []
+    original_acquire = loader.lock.acquire
+    original_release = loader.lock.release
+
+    start_time = 0.0
+
+    def _tracking_acquire(*args, **kwargs):
+        nonlocal start_time
+        res = original_acquire(*args, **kwargs)
+        start_time = time.perf_counter()
+        return res
+
+    def _tracking_release(*args, **kwargs):
+        nonlocal start_time
+        duration = time.perf_counter() - start_time
+        hold_durations.append(duration)
+        return original_release(*args, **kwargs)
+
+    with (
+        patch.object(loader.lock, "acquire", side_effect=_tracking_acquire),
+        patch.object(loader.lock, "release", side_effect=_tracking_release),
+    ):
+        with get_sqlite_connection(loader.db_path) as conn:
+            loader._upsert_records(conn, records)
+
+    assert len(hold_durations) == 1
+    # 50 milliseconds = 0.05 seconds
+    assert hold_durations[0] < 0.05, f"Lock held for {hold_durations[0]:.4f}s which exceeds 50ms"
