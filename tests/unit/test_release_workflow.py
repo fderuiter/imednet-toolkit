@@ -71,16 +71,15 @@ def _run_determine_packages(
     if diff_files is not None or mock_plan is not None:
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
-        if diff_files is not None:
-            real_git = shutil.which("git") or "/usr/bin/git"
-            stub_git = bin_dir / "git"
-            stub_diff_file = tmp_path / "stub_diff_files.txt"
-            stub_diff_file.write_text(diff_files, encoding="utf-8")
-            stub_git.write_text(
-                f'#!/bin/sh\nif [ "$1" = "diff-tree" ]; then\n  cat "{stub_diff_file}"\n  exit 0\nfi\nexec "{real_git}" "$@"\n',
-                encoding="utf-8",
-            )
-            stub_git.chmod(0o755)
+        real_git = shutil.which("git") or "/usr/bin/git"
+        stub_git = bin_dir / "git"
+        stub_diff_file = tmp_path / "stub_diff_files.txt"
+        stub_diff_file.write_text(diff_files or "", encoding="utf-8")
+        stub_git.write_text(
+            f'#!/bin/sh\nif [ "$1" = "diff-tree" ]; then\n  cat "{stub_diff_file}"\n  exit 0\nfi\nexec "{real_git}" "$@"\n',
+            encoding="utf-8",
+        )
+        stub_git.chmod(0o755)
 
         if mock_plan is not None:
             real_py = shutil.which("python3") or "/usr/bin/python3"
