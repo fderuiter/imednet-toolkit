@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -95,16 +96,43 @@ class ImednetExportOperator(BaseOperator):
         """Return a defensive copy of export kwargs for mapped task isolation."""
         return dict(self.export_kwargs)
 
-    def _resolve_sink(self, config: sink_base.SinkConfig) -> Any:
-        """Dynamically load and configure the target sink, handling dependencies lazily."""
+    def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
+        """Dynamically load and configure the target sink from the SDK, handling dependencies lazily."""
         dest = self.destination
         if not dest and self.export_func:
             dest = self.export_func.replace("export_to_", "")
 
-        if dest == "snowflake":
-            from imednet_sinks import SnowflakeExportSink, SnowflakeSinkConfig
+        if dest not in ("snowflake", "neo4j", "mongodb"):
+            return None
 
-            snowflake_config = SnowflakeSinkConfig(
+        if sdk is None:
+            sdk = self._get_sdk()
+
+        sinks = getattr(sdk, "sinks", None)
+        legacy_sinks = sys.modules.get("imednet_sinks")
+        if sinks is None or (
+            hasattr(sinks, "_mock_name")
+            and legacy_sinks is not None
+            and "SnowflakeExportSink" in legacy_sinks.__dict__
+            and "SnowflakeExportSink" not in sinks.__dict__
+        ):
+            if legacy_sinks is not None:
+                sinks = legacy_sinks
+            else:
+                raise AirflowException(
+                    f"The sinks plugin is required for destination '{dest}' but is not installed. "
+                    "Please install it using: pip install imednet-plugins-sinks"
+                )
+
+        if dest == "snowflake":
+            sink_cls = getattr(sinks, "SnowflakeExportSink", None)
+            config_cls = getattr(sinks, "SnowflakeSinkConfig", None)
+            if sink_cls is None or config_cls is None:
+                raise AirflowException(
+                    "Snowflake sink is not available in the installed sinks plugin. "
+                    "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[snowflake]'"
+                )
+            snowflake_config = config_cls(
                 study_key=config.study_key,
                 batch_size=config.batch_size,
                 max_retries=config.max_retries,
@@ -119,11 +147,17 @@ class ImednetExportOperator(BaseOperator):
                 stage=self.export_kwargs.get("stage", ""),
                 table=self.export_kwargs.get("table", ""),
             )
-            return SnowflakeExportSink(config=snowflake_config)
-        if dest == "neo4j":
-            from imednet_sinks import Neo4jExportSink, Neo4jSinkConfig
+            return sink_cls(config=snowflake_config)
 
-            neo4j_config = Neo4jSinkConfig(
+        if dest == "neo4j":
+            sink_cls = getattr(sinks, "Neo4jExportSink", None)
+            config_cls = getattr(sinks, "Neo4jSinkConfig", None)
+            if sink_cls is None or config_cls is None:
+                raise AirflowException(
+                    "Neo4j sink is not available in the installed sinks plugin. "
+                    "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[neo4j]'"
+                )
+            neo4j_config = config_cls(
                 study_key=config.study_key,
                 batch_size=config.batch_size,
                 max_retries=config.max_retries,
@@ -132,11 +166,17 @@ class ImednetExportOperator(BaseOperator):
                 uri=self.export_kwargs.get("uri", ""),
                 auth=self.export_kwargs.get("auth", ("", "")),
             )
-            return Neo4jExportSink(config=neo4j_config)
-        if dest == "mongodb":
-            from imednet_sinks import MongoDbExportSink, MongoDbSinkConfig
+            return sink_cls(config=neo4j_config)
 
-            mongo_config = MongoDbSinkConfig(
+        if dest == "mongodb":
+            sink_cls = getattr(sinks, "MongoDbExportSink", None)
+            config_cls = getattr(sinks, "MongoDbSinkConfig", None)
+            if sink_cls is None or config_cls is None:
+                raise AirflowException(
+                    "MongoDB sink is not available in the installed sinks plugin. "
+                    "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[mongodb]'"
+                )
+            mongo_config = config_cls(
                 study_key=config.study_key,
                 batch_size=config.batch_size,
                 max_retries=config.max_retries,
@@ -146,7 +186,8 @@ class ImednetExportOperator(BaseOperator):
                 database=self.export_kwargs.get("database", ""),
                 collection=self.export_kwargs.get("collection", ""),
             )
-            return MongoDbExportSink(config=mongo_config)
+            return sink_cls(config=mongo_config)
+
         return None
 
     def execute(self, context: Context) -> str | None:
@@ -164,14 +205,10 @@ class ImednetExportOperator(BaseOperator):
         elif self.export_func and hasattr(export, self.export_func):
             export_callable = getattr(export, self.export_func)
 
-        sink = None
-        if not export_callable:
-            config_for_check = sink_base.SinkConfig(study_key=self.study_key)
-            sink = self._resolve_sink(config_for_check)
-            if not sink:
-                raise AirflowException(
-                    f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
-                )
+        if not export_callable and dest not in ("snowflake", "neo4j", "mongodb"):
+            raise AirflowException(
+                f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
+            )
 
         sdk = self._get_sdk()
 
@@ -183,7 +220,13 @@ class ImednetExportOperator(BaseOperator):
             extra=self._get_runtime_export_kwargs(),
         )
 
-        sink = self._resolve_sink(config)
+        sink = None
+        if not export_callable:
+            sink = self._resolve_sink(config, sdk=sdk)
+            if not sink:
+                raise AirflowException(
+                    f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
+                )
 
         if sink:
             # Single execution path for Sink-based destinations
