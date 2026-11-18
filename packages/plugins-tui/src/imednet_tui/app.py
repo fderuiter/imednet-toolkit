@@ -27,8 +27,22 @@ from textual.widgets import (
     TabPane,
 )
 
+from .terminal import is_interactive_terminal
+
 if TYPE_CHECKING:
     from imednet.sdk import ImednetSDK
+
+__all__ = [
+    "DashboardScreen",
+    "ImednetTuiApp",
+    "JobMonitor",
+    "SiteList",
+    "StudyList",
+    "SubjectTable",
+    "TextualLogHandler",
+    "is_interactive_terminal",
+    "run_tui",
+]
 
 
 class TextualLogHandler(logging.Handler):
@@ -688,11 +702,17 @@ class ImednetTuiApp(App[None]):
             self.run_worker(study_list.load_studies())
 
 
-def run_tui(sdk: ImednetSDK) -> None:
+def run_tui(sdk: ImednetSDK, force: bool = False) -> None:
     """Run the TUI application.
 
     Args:
         sdk: Active iMednet SDK client instance.
+        force: If True, bypass stream interactivity checks and launch the TUI unconditionally.
+
+    Raises:
+        RuntimeError: If stdin or stdout is not connected to an interactive TTY and force is False.
     """
+    if not force and not is_interactive_terminal():
+        raise RuntimeError("Interactive terminal required to run the TUI interface.")
     app = ImednetTuiApp(sdk)
     app.run()

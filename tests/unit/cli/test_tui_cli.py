@@ -57,6 +57,7 @@ def test_tui_plugin_registered_and_run(monkeypatch):
     args = parser.parse_args(["tui"])
 
     with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
         patch("imednet_tui.app.run_tui") as mock_run_tui,
         patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
     ):
@@ -64,7 +65,7 @@ def test_tui_plugin_registered_and_run(monkeypatch):
         mock_get_sdk.return_value = mock_sdk
 
         args.func(args)
-        mock_run_tui.assert_called_once_with(mock_sdk)
+        mock_run_tui.assert_called_once_with(mock_sdk, force=False)
 
 
 def test_tui_plugin_high_contrast_flag(monkeypatch):
@@ -89,6 +90,7 @@ def test_tui_plugin_high_contrast_flag(monkeypatch):
     args = parser.parse_args(["tui", "--high-contrast"])
 
     with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
         patch("imednet_tui.app.run_tui") as mock_run_tui,
         patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
     ):
@@ -98,3 +100,71 @@ def test_tui_plugin_high_contrast_flag(monkeypatch):
         args.func(args)
         mock_run_tui.assert_called_once()
         assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+
+
+def test_tui_plugin_non_interactive_exits(monkeypatch, capsys):
+    """Verify that tui subcommand exits with code 1 and prints error in non-interactive terminal."""
+    from imednet_tui.cli import setup_parser
+
+    class DummyEntryPoint:
+        name = "tui"
+
+        def load(self):
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: (
+            [DummyEntryPoint()] if kwargs.get("group") == "imednet.cli_plugins" else []
+        ),
+    )
+
+    parser = get_parser()
+    args = parser.parse_args(["tui"])
+
+    with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=False),
+        patch(
+            "imednet.cli.utils.context.get_sdk",
+            side_effect=RuntimeError("SDK credentials missing in headless environment"),
+        ) as mock_get_sdk,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            args.func(args)
+
+    assert exc_info.value.code == 1
+    _, err = capsys.readouterr()
+    assert "Interactive terminal required" in err
+    mock_get_sdk.assert_not_called()
+
+
+def test_tui_plugin_force_flag_bypasses_guard(monkeypatch):
+    """Verify that --force flag runs TUI even when non-interactive."""
+    from imednet_tui.cli import setup_parser
+
+    class DummyEntryPoint:
+        name = "tui"
+
+        def load(self):
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: (
+            [DummyEntryPoint()] if kwargs.get("group") == "imednet.cli_plugins" else []
+        ),
+    )
+
+    parser = get_parser()
+    args = parser.parse_args(["tui", "--force"])
+
+    with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=False),
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+        patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
+    ):
+        mock_sdk = MagicMock()
+        mock_get_sdk.return_value = mock_sdk
+
+        args.func(args)
+        mock_run_tui.assert_called_once_with(mock_sdk, force=True)

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.models.subjects import Subject
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 
 class ListBySiteOperation:
@@ -55,52 +52,6 @@ class SubjectsOperationDef:
 class SubjectsEndpoint(SubjectsOperationDef, EdcSyncListGetEndpoint[Subject]):  # type: ignore[misc]
     """Synchronous endpoint for managing Subjects."""
 
-    def to_dataframe(
-        self,
-        study_key: str | None = None,
-        **filters: Any,
-    ) -> pd.DataFrame:
-        """Export queried subjects directly to a pandas DataFrame.
-
-        Args:
-            study_key: Optional study key override.
-            **filters: Resource filters passed to :meth:`list`.
-
-        Returns:
-            A pandas DataFrame containing the queried subjects.
-
-        Raises:
-            ImportError: If pandas is not installed.
-        """
-        from imednet.utils.pandas import check_pandas, subjects_to_dataframe
-
-        check_pandas("subjects_to_dataframe")
-        subjects = list(self.list(study_key=study_key, **filters))
-        return subjects_to_dataframe(subjects)
-
 
 class AsyncSubjectsEndpoint(SubjectsOperationDef, EdcAsyncListGetEndpoint[Subject]):  # type: ignore[misc]
     """Asynchronous endpoint for managing Subjects."""
-
-    async def to_dataframe(
-        self,
-        study_key: str | None = None,
-        **filters: Any,
-    ) -> pd.DataFrame:
-        """Export queried subjects asynchronously directly to a pandas DataFrame.
-
-        Args:
-            study_key: Optional study key override.
-            **filters: Resource filters passed to :meth:`list`.
-
-        Returns:
-            A pandas DataFrame containing the queried subjects.
-
-        Raises:
-            ImportError: If pandas is not installed.
-        """
-        from imednet.utils.pandas import check_pandas, subjects_to_dataframe
-
-        check_pandas("subjects_to_dataframe")
-        subjects = [subject async for subject in self.list(study_key=study_key, **filters)]
-        return subjects_to_dataframe(subjects)

@@ -13,16 +13,31 @@ from imednet.core.endpoint.base import (
     SyncListEndpoint,
 )
 from imednet.core.endpoint.edc_mixin import (
+    EdcAsyncGetEndpoint,
     EdcAsyncListEndpoint,
     EdcSyncGetEndpoint,
     EdcSyncListEndpoint,
     EdcSyncListGetEndpoint,
+)
+from imednet.endpoints import (
+    forms,
+    intervals,
+    jobs,
+    queries,
+    records,
+    sites,
+    subjects,
+    variables,
+    visits,
 )
 from imednet.models.base import ImednetBaseModel
 
 
 class MockModel(ImednetBaseModel):
     """Test suite for MockModel."""
+
+    item_id: int | None = None
+    label: str | None = None
 
 
 class MockGenericEndpoint(GenericEndpoint[MockModel]):
@@ -161,3 +176,129 @@ class TestBaseEndpoint:
         base_ep = MockBaseAsyncListEndpoint(async_client=async_client)
         assert hasattr(base_ep, "list")
         assert not hasattr(base_ep, "get")
+
+    def test_sync_list_endpoint_to_dataframe(self, monkeypatch, client):
+        """Test that EdcSyncListEndpoint provides a default synchronous to_dataframe method."""
+        ep = MockListEndpoint(client)
+        called = {}
+
+        def fake_list(*, study_key=None, **filters):
+            called["study_key"] = study_key
+            called["filters"] = filters
+            return iter([MockModel(item_id=1, label="Alpha")])
+
+        monkeypatch.setattr(ep, "list", fake_list)
+
+        df = ep.to_dataframe(study_key="S1", status="active")
+
+        assert called == {"study_key": "S1", "filters": {"status": "active"}}
+        assert len(df) == 1
+        assert df.loc[0, "item_id"] == 1
+        assert df.loc[0, "label"] == "Alpha"
+
+    def test_sync_list_endpoint_to_dataframe_missing_pandas(self, monkeypatch, client):
+        """Test that EdcSyncListEndpoint.to_dataframe raises ImportError before calling list."""
+        ep = MockListEndpoint(client)
+        monkeypatch.setattr("imednet.utils.pandas.pd", None)
+        mock_list = MagicMock()
+        monkeypatch.setattr(ep, "list", mock_list)
+
+        with pytest.raises(ImportError, match="pandas is required for list-items_to_dataframe"):
+            ep.to_dataframe("S1")
+
+        mock_list.assert_not_called()
+
+    def test_sync_list_endpoint_to_dataframe_empty_path_feature_name(self, monkeypatch, client):
+        """Test that an empty PATH uses 'to_dataframe' in missing-pandas ImportError."""
+
+        class EmptyPathEndpoint(EdcSyncListEndpoint[MockModel]):
+            PATH = ""
+            MODEL = MockModel
+
+        ep = EmptyPathEndpoint(client)
+        monkeypatch.setattr("imednet.utils.pandas.pd", None)
+
+        with pytest.raises(ImportError, match="pandas is required for to_dataframe"):
+            ep.to_dataframe()
+
+    @pytest.mark.asyncio
+    async def test_async_list_endpoint_to_dataframe(self, monkeypatch):
+        """Test that EdcAsyncListEndpoint provides a default asynchronous to_dataframe method."""
+        async_client = MagicMock()
+        ep = MockAsyncListEndpoint(async_client=async_client)
+        called = {}
+
+        async def fake_gen():
+            yield MockModel(item_id=2, label="Beta")
+
+        def fake_list(*, study_key=None, **filters):
+            called["study_key"] = study_key
+            called["filters"] = filters
+            return fake_gen()
+
+        monkeypatch.setattr(ep, "list", fake_list)
+
+        df = await ep.to_dataframe(study_key="S1", status="open")
+
+        assert called == {"study_key": "S1", "filters": {"status": "open"}}
+        assert len(df) == 1
+        assert df.loc[0, "item_id"] == 2
+        assert df.loc[0, "label"] == "Beta"
+
+    @pytest.mark.asyncio
+    async def test_async_list_endpoint_to_dataframe_missing_pandas(self, monkeypatch):
+        """Test that EdcAsyncListEndpoint.to_dataframe raises ImportError before calling list."""
+        async_client = MagicMock()
+        ep = MockAsyncListEndpoint(async_client=async_client)
+        monkeypatch.setattr("imednet.utils.pandas.pd", None)
+        mock_list = MagicMock()
+        monkeypatch.setattr(ep, "list", mock_list)
+
+        with pytest.raises(
+            ImportError, match="pandas is required for async-list-items_to_dataframe"
+        ):
+            await ep.to_dataframe("S1")
+
+        mock_list.assert_not_called()
+
+    def test_non_list_endpoints_do_not_expose_to_dataframe(self, client):
+        """Test that get-only and non-EDC generic endpoints do not expose to_dataframe."""
+        assert not hasattr(EdcSyncGetEndpoint, "to_dataframe")
+        assert not hasattr(EdcAsyncGetEndpoint, "to_dataframe")
+        assert not hasattr(jobs.JobsEndpoint, "to_dataframe")
+        assert not hasattr(jobs.AsyncJobsEndpoint, "to_dataframe")
+        assert not hasattr(MockEndpointImpl(client), "to_dataframe")
+        assert not hasattr(SyncListEndpoint, "to_dataframe")
+        assert not hasattr(AsyncListEndpoint, "to_dataframe")
+
+    def test_concrete_endpoints_inherit_to_dataframe_without_duplication(self):
+        """Test that the 7 endpoint modules inherit to_dataframe and records overrides it."""
+        inherited_sync = [
+            forms.FormsEndpoint,
+            intervals.IntervalsEndpoint,
+            queries.QueriesEndpoint,
+            sites.SitesEndpoint,
+            subjects.SubjectsEndpoint,
+            variables.VariablesEndpoint,
+            visits.VisitsEndpoint,
+        ]
+        inherited_async = [
+            forms.AsyncFormsEndpoint,
+            intervals.AsyncIntervalsEndpoint,
+            queries.AsyncQueriesEndpoint,
+            sites.AsyncSitesEndpoint,
+            subjects.AsyncSubjectsEndpoint,
+            variables.AsyncVariablesEndpoint,
+            visits.AsyncVisitsEndpoint,
+        ]
+
+        for sync_cls in inherited_sync:
+            assert "to_dataframe" not in sync_cls.__dict__
+            assert sync_cls.to_dataframe is EdcSyncListEndpoint.to_dataframe
+
+        for async_cls in inherited_async:
+            assert "to_dataframe" not in async_cls.__dict__
+            assert async_cls.to_dataframe is EdcAsyncListEndpoint.to_dataframe
+
+        assert "to_dataframe" in records.RecordsEndpoint.__dict__
+        assert "to_dataframe" in records.AsyncRecordsEndpoint.__dict__
