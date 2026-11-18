@@ -12,7 +12,6 @@ import json
 import os
 import re
 import sqlite3
-import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -232,7 +231,6 @@ class ConfigVersionStore:
         desc: str,
         *,
         sdk: Any = None,
-        user: str = "",
     ) -> str:
         """Serialise *config*, compute its SHA-256 hash, and persist the commit.
 
@@ -242,7 +240,6 @@ class ConfigVersionStore:
                 to store.
             desc: Human-readable description of what changed.
             sdk: The SDK instance used to verify server-side permissions.
-            user: (Deprecated) Identifier of the person or process making the change.
 
         Returns:
             The ``commit_id`` (SHA-256 hex digest of the serialised JSON body).
@@ -281,25 +278,19 @@ class ConfigVersionStore:
                 "Server-side authorization failure: user lacks manager or admin role required to publish."
             )
 
-        if user:
-            warnings.warn(
-                "The 'user' parameter is deprecated and will be removed in a future release. "
-                "User identity is resolved from the authenticated SDK session.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         try:
             user_id = sdk.auth.get_user_id()
         except Exception as exc:
             raise PermissionError(f"Server-side authorization failure: {exc}") from exc
 
-        if user_id and user_id != "api-key-user":
-            user = user_id
-        elif not user and user_id == "api-key-user":
-            user = "legacy-api-key"
+        if user_id == "api-key-user":
+            author = "legacy-api-key"
+        elif user_id:
+            author = str(user_id)
+        else:
+            author = ""
 
-        if not user:
+        if not author:
             raise ValueError("A user identifier is required to commit.")
 
         config_json = json.dumps(config.model_dump(mode="json", by_alias=True), sort_keys=True)
@@ -329,7 +320,7 @@ class ConfigVersionStore:
                     study_key,
                     config.version,
                     encrypted_config_json,
-                    user,
+                    author,
                     desc,
                     timestamp,
                 ),
