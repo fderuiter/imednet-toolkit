@@ -27,6 +27,7 @@ def _setup_airflow(monkeypatch):
     sensors_base = ModuleType("airflow.sensors.base")
     sensors_sdk = ModuleType("airflow.sdk.bases.sensor")
     exc_mod = ModuleType("airflow.exceptions")
+    sdk_exc = ModuleType("airflow.sdk.exceptions")
     s3_mod = ModuleType("airflow.providers.amazon.aws.hooks.s3")
 
     class DummyBaseHook:
@@ -65,11 +66,13 @@ def _setup_airflow(monkeypatch):
         """Test suite for DummyAirflowError."""
 
     exc_mod.AirflowException = DummyAirflowError
+    sdk_exc.AirflowException = DummyAirflowError
     s3_mod.S3Hook = MagicMock
 
     sdk_bases.hook = hooks_base
     sdk_bases.sensor = sensors_sdk
     sdk_mod.bases = sdk_bases
+    sdk_mod.exceptions = sdk_exc
     sdk_defs.context = sdk_ctx
     sdk_defs.dag = sdk_dag
     sdk_mod.definitions = sdk_defs
@@ -108,6 +111,7 @@ def _setup_airflow(monkeypatch):
         "airflow.providers.amazon.aws.hooks": airflow.providers.amazon.aws.hooks,
         "airflow.providers.amazon.aws.hooks.s3": s3_mod,
         "airflow.exceptions": exc_mod,
+        "airflow.sdk.exceptions": sdk_exc,
     }
     for name, mod in modules.items():
         monkeypatch.setitem(sys.modules, name, mod)

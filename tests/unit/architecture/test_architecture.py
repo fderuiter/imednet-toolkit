@@ -1,6 +1,7 @@
 """Unit tests for architecture."""
 
 import ast
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -95,12 +96,11 @@ def test_workflows_does_not_import_providers():
 
 def test_providers_does_not_import_sinks():
     """Test that Airflow provider does not import sinks."""
-    try:
-        import apache_airflow_providers_imednet
-    except ImportError:
+    spec = importlib.util.find_spec("apache_airflow_providers_imednet")
+    if spec is None or spec.origin is None:
         pytest.skip("apache_airflow_providers_imednet not installed")
 
-    provider_dir = Path(apache_airflow_providers_imednet.__file__).parent
+    provider_dir = Path(spec.origin).parent
     files = get_all_python_files(provider_dir)
     assert len(files) > 0, f"No files found to test in {provider_dir}"
 

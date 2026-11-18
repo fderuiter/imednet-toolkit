@@ -375,7 +375,18 @@ def test_operator_resolves_mongodb_sink_via_sdk_sinks(monkeypatch: pytest.Monkey
     mock_sink_instance.write_batch.assert_called()
 
 
+@pytest.mark.parametrize(
+    ("destination", "label", "extra_name"),
+    [
+        ("snowflake", "Snowflake", "snowflake"),
+        ("neo4j", "Neo4j", "neo4j"),
+        ("mongodb", "MongoDB", "mongodb"),
+    ],
+)
 def test_operator_missing_sink_factory_raises_airflow_exception(
+    destination: str,
+    label: str,
+    extra_name: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify that when a specific sink class is missing on sdk.sinks, an actionable error is raised."""
@@ -387,14 +398,71 @@ def test_operator_missing_sink_factory_raises_airflow_exception(
 
     mock_sdk = MagicMock(sinks=IncompleteSinks())
     op = ImednetExportOperator(
-        task_id="test_missing_factory",
+        task_id=f"test_missing_{destination}_factory",
         study_key="STUDY-123",
-        destination="snowflake",
+        destination=destination,
     )
     monkeypatch.setattr(op, "_get_sdk", lambda: mock_sdk)
 
     with pytest.raises(
         AirflowException,
-        match=r"Snowflake sink is not available in the installed sinks plugin\. Please install the required sink dependencies: pip install 'imednet-plugins-sinks\[snowflake\]'",
+        match=(
+            rf"{label} sink is not available in the installed sinks plugin\. "
+            rf"Please install the required sink dependencies: pip install 'imednet-plugins-sinks\[{extra_name}\]'"
+        ),
     ):
         op.execute({})
+
+
+def test_resolve_sink_direct_fallbacks_and_legacy_export_func(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify _resolve_sink handles non-sink destinations, lazy SDK lookup, and export_func prefix stripping."""
+    from apache_airflow_providers_imednet import export
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.spi import sink_base
+
+    cfg = sink_base.SinkConfig(study_key="STUDY-FALLBACK")
+
+    # 1. Non-sink destination returns None without touching SDK
+    csv_op = ImednetExportOperator(
+        task_id="test_default_csv",
+        study_key="STUDY-FALLBACK",
+        output_path="/tmp/default.csv",
+    )
+    assert csv_op._resolve_sink(cfg) is None
+
+    mock_sdk = MagicMock(sinks=None)
+    mock_csv = MagicMock()
+    monkeypatch.setattr(csv_op, "_get_sdk", lambda: mock_sdk)
+    monkeypatch.setattr(export, "export_to_csv", mock_csv)
+    assert csv_op.execute({}) == "/tmp/default.csv"
+    mock_csv.assert_called_once_with(mock_sdk, "STUDY-FALLBACK", "/tmp/default.csv")
+
+    # 2. Legacy tabular export_func not in _TABULAR_EXPORTS (export_to_sql_by_form)
+    sql_by_form_op = ImednetExportOperator(
+        task_id="test_sql_by_form",
+        study_key="STUDY-FALLBACK",
+        export_func="export_to_sql_by_form",
+        output_path="sqlite:///:memory:",
+    )
+    mock_sql_by_form = MagicMock()
+    monkeypatch.setattr(sql_by_form_op, "_get_sdk", lambda: mock_sdk)
+    monkeypatch.setattr(export, "export_to_sql_by_form", mock_sql_by_form)
+    assert sql_by_form_op.execute({}) == "sqlite:///:memory:"
+    mock_sql_by_form.assert_called_once_with(mock_sdk, "STUDY-FALLBACK", "sqlite:///:memory:")
+
+    # 3. _resolve_sink with export_func='export_to_neo4j' and sdk=None resolves via _get_sdk()
+    mock_sink_cls = MagicMock()
+    mock_config_cls = MagicMock()
+    neo_sdk = MagicMock(
+        sinks=MagicMock(Neo4jExportSink=mock_sink_cls, Neo4jSinkConfig=mock_config_cls)
+    )
+    neo_op = ImednetExportOperator(
+        task_id="test_legacy_neo4j_func",
+        study_key="STUDY-FALLBACK",
+        export_func="export_to_neo4j",
+    )
+    monkeypatch.setattr(neo_op, "_get_sdk", lambda: neo_sdk)
+    resolved = neo_op._resolve_sink(cfg)
+    assert resolved is mock_sink_cls.return_value
