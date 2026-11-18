@@ -3,17 +3,22 @@
 ## Decision
 
 Keep the shipped standard-library argparse parser. All core commands, nested help,
-required positional arguments, plugin setup_parser entry points, filter syntax and
-existing export flags already work through argparse. Typer/Rich would require replacing
-registration hooks, rechecking every command and adding dependencies without a concrete
-missing capability. The old contributor stack declaration did not justify that cost.
-Revisit only for a measured user-facing requirement.
+required positional arguments, `imednet.cli_plugins` `setup_parser` entry-point discovery
+(used by `imednet-workflows` and `imednet-tui`, with graceful fallback stubs when
+uninstalled), filter syntax and existing export flags already work through argparse.
+Typer/Rich would require replacing registration hooks, rechecking every command and
+adding dependencies without a concrete missing capability. The old contributor stack
+declaration did not justify that cost. Revisit only for a measured user-facing requirement.
 
 Add opt-in `--format json` to core list reads and job status/wait, using one versioned
-response envelope. Human defaults and existing file export flags remain. Datadict JSON
+response envelope. Human defaults render through curses `InteractiveDataGrid` paging,
+live search and side-panel inspection on interactive TTYs, and fall back to plain
+tabular stdout when streams are non-interactive, `TERM=dumb`, or
+`IMEDNET_NON_INTERACTIVE=1` is set; existing file export flags remain. Datadict JSON
 uses its own versioned Data Dictionary/schema/diff contracts and is deliberately not
-wrapped in the list envelope. Workflow plugins own their own documented outputs; this
-change does not claim a global machine-output mode for arbitrary third-party commands.
+wrapped in the list envelope. Workflow and TUI plugins own their own documented outputs
+and interactive sessions; this change does not claim a global machine-output mode for
+arbitrary third-party commands.
 
 ## Output and exits
 
