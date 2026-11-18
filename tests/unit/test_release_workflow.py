@@ -52,7 +52,12 @@ def test_release_workflow_permissions(release_workflow: dict) -> None:
 
 
 def _run_determine_packages(
-    script: str, github_ref: str, tmp_path: Path, cwd: Path | None = None
+    script: str,
+    github_ref: str,
+    tmp_path: Path,
+    cwd: Path | None = None,
+    diff_files: str | None = None,
+    mock_plan: str | None = None,
 ) -> list[str]:
     output_file = tmp_path / "github_output"
     output_file.touch()
@@ -62,6 +67,33 @@ def _run_determine_packages(
         "GITHUB_REF": github_ref,
         "GITHUB_OUTPUT": str(output_file),
     }
+
+    if diff_files is not None or mock_plan is not None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        if diff_files is not None:
+            real_git = shutil.which("git") or "/usr/bin/git"
+            stub_git = bin_dir / "git"
+            stub_diff_file = tmp_path / "stub_diff_files.txt"
+            stub_diff_file.write_text(diff_files, encoding="utf-8")
+            stub_git.write_text(
+                f'#!/bin/sh\nif [ "$1" = "diff-tree" ]; then\n  cat "{stub_diff_file}"\n  exit 0\nfi\nexec "{real_git}" "$@"\n',
+                encoding="utf-8",
+            )
+            stub_git.chmod(0o755)
+
+        if mock_plan is not None:
+            real_py = shutil.which("python3") or "/usr/bin/python3"
+            stub_py = bin_dir / "python3"
+            stub_plan_file = tmp_path / "stub_plan.json"
+            stub_plan_file.write_text(mock_plan, encoding="utf-8")
+            stub_py.write_text(
+                f'#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "scripts/ci_plan.py" ]; then\n    cat "{stub_plan_file}"\n    exit 0\n  fi\ndone\nexec "{real_py}" "$@"\n',
+                encoding="utf-8",
+            )
+            stub_py.chmod(0o755)
+
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
 
     subprocess.run(
         ["bash", "-e", "-c", script],
@@ -112,24 +144,82 @@ def test_tag_and_fallback_package_resolution(
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for script execution")
-def test_main_branch_empty_plan_fallback(determine_packages_script: str, tmp_path: Path) -> None:
-    """Verify that refs/heads/main falls back to all packages when ci_plan build is empty."""
+@pytest.mark.parametrize(
+    "diff_files,mock_plan",
+    [
+        ("docs/index.md\n", None),
+        ("README.md\n", None),
+        (None, '{"build": []}'),
+        (None, ""),
+    ],
+)
+def test_main_branch_empty_plan_fallback(
+    determine_packages_script: str, tmp_path: Path, diff_files: str | None, mock_plan: str | None
+) -> None:
+    """Verify that refs/heads/main falls back to all 5 packages when ci_plan build is empty."""
     packages = _run_determine_packages(
-        determine_packages_script, "refs/heads/main", tmp_path, cwd=ROOT
+        determine_packages_script,
+        "refs/heads/main",
+        tmp_path,
+        cwd=ROOT,
+        diff_files=diff_files,
+        mock_plan=mock_plan,
     )
     assert "plugins-tui" in packages
-    assert set(packages) == {
+    assert packages == [
+        "core",
+        "plugins-workflows",
+        "providers-airflow",
+        "plugins-sinks",
+        "plugins-tui",
+    ]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for script execution")
+@pytest.mark.parametrize(
+    "diff_files,mock_plan,expected_packages",
+    [
+        ("packages/core/src/imednet/client.py\n", None, ["core"]),
+        ("packages/plugins-tui/src/imednet_tui/app.py\n", None, ["plugins-tui"]),
+        (None, '{"build": ["core"]}', ["core"]),
+        (None, '{"build": ["plugins-tui"]}', ["plugins-tui"]),
+        (
+            None,
+            '{"build": ["plugins-workflows", "plugins-sinks"]}',
+            ["plugins-workflows", "plugins-sinks"],
+        ),
+    ],
+)
+def test_main_branch_nonempty_plan_preservation(
+    determine_packages_script: str,
+    tmp_path: Path,
+    diff_files: str | None,
+    mock_plan: str | None,
+    expected_packages: list[str],
+) -> None:
+    """Verify that refs/heads/main preserves nonempty planner build output and does not fall back."""
+    packages = _run_determine_packages(
+        determine_packages_script,
+        "refs/heads/main",
+        tmp_path,
+        cwd=ROOT,
+        diff_files=diff_files,
+        mock_plan=mock_plan,
+    )
+    assert packages == expected_packages
+
+
+def test_fallback_package_list_matches_workspace() -> None:
+    """Verify that the 5-package fallback set matches all workspace package directories."""
+    packages_dir = ROOT / "packages"
+    workspace_dirs = {
+        p.name for p in packages_dir.iterdir() if p.is_dir() and (p / "pyproject.toml").exists()
+    }
+    expected_fallback = {
         "core",
         "plugins-workflows",
         "providers-airflow",
         "plugins-sinks",
         "plugins-tui",
     }
-
-
-def test_fallback_package_list_matches_workspace() -> None:
-    """Verify that the 5-package fallback set matches all workspace package directories."""
-    packages_dir = ROOT / "packages"
-    workspace_dirs = {p.name for p in packages_dir.iterdir() if p.is_dir() and (p / "pyproject.toml").exists()}
-    expected_fallback = {"core", "plugins-workflows", "providers-airflow", "plugins-sinks", "plugins-tui"}
     assert workspace_dirs == expected_fallback
