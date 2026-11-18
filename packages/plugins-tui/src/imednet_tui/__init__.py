@@ -9,6 +9,7 @@ from .app import (
     SiteList,
     StudyList,
     SubjectTable,
+    is_interactive_terminal,
     run_tui,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "SiteList",
     "StudyList",
     "SubjectTable",
+    "is_interactive_terminal",
     "run_tui",
 ]

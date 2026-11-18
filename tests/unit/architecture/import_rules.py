@@ -85,6 +85,8 @@ def violations(path: Path, source_root: Path) -> list[str]:
                 rule = "extensions must use public API or SPI"
         if within(module, "imednet_workflows") and within(edge, "apache_airflow_providers_imednet"):
             rule = "workflows cannot import Airflow provider"
+        if within(module, "apache_airflow_providers_imednet") and within(edge, "imednet_sinks"):
+            rule = "Airflow provider cannot import sinks"
         if rule:
             errors.append(f"{path}: {module} -> {edge}: {rule}")
     return errors

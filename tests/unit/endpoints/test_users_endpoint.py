@@ -1,5 +1,7 @@
 """Unit tests for users endpoint."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from imednet.endpoints import users
@@ -155,3 +157,159 @@ async def test_async_list_rejects_unsupported_filters(dummy_client, invalid_kwar
 
     with pytest.raises(ConfigurationError, match=r"does not support query filtering"):
         ep.list(study_key="S1", **invalid_kwargs)
+
+
+def test_to_dataframe_success(dummy_client, paginator_factory):
+    """Test that to_dataframe exports queried users to a pandas DataFrame."""
+    ep = users.UsersEndpoint(dummy_client)
+    paginator_factory(
+        users,
+        [
+            {
+                "userId": 1,
+                "login": "jdoe",
+                "firstName": "John",
+                "lastName": "Doe",
+                "email": "jdoe@example.com",
+            }
+        ],
+    )
+
+    df = ep.to_dataframe("S1")
+
+    assert len(df) == 1
+    assert df.loc[0, "user_id"] == "1"
+    assert df.loc[0, "login"] == "jdoe"
+    assert df.loc[0, "first_name"] == "John"
+    assert df.loc[0, "last_name"] == "Doe"
+    assert df.loc[0, "name"] == "John Doe"
+
+
+def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory):
+    """Test that to_dataframe forwards filters and study key to list."""
+    ep = users.UsersEndpoint(dummy_client)
+    captured = paginator_factory(users, [{"userId": 1}])
+
+    df = ep.to_dataframe(
+        study_key="S1",
+        include_inactive=True,
+        page=0,
+        size=25,
+        sort="lastName,asc",
+    )
+
+    assert captured["path"] == "/api/v1/edc/studies/S1/users"
+    assert captured["params"] == {
+        "includeInactive": "true",
+        "page": 0,
+        "size": 25,
+        "sort": "lastName,asc",
+    }
+    assert "filter" not in captured["params"]
+    assert len(df) == 1
+
+
+def test_to_dataframe_empty_results(dummy_client, paginator_factory):
+    """Test that to_dataframe handles empty query results."""
+    ep = users.UsersEndpoint(dummy_client)
+    paginator_factory(users, [])
+
+    df = ep.to_dataframe("S1")
+
+    assert df.empty
+
+
+def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, paginator_factory):
+    """Test that to_dataframe raises ImportError when pandas is not installed."""
+    ep = users.UsersEndpoint(dummy_client)
+    captured = paginator_factory(users, [{"userId": 1}])
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    mock_list = MagicMock()
+    monkeypatch.setattr(ep, "list", mock_list)
+
+    with pytest.raises(ImportError, match="pandas is required for users_to_dataframe"):
+        ep.to_dataframe("S1")
+
+    mock_list.assert_not_called()
+    assert captured["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_success(dummy_client, async_paginator_factory):
+    """Test that async to_dataframe exports queried users to a pandas DataFrame."""
+    ep = users.AsyncUsersEndpoint(dummy_client)
+    async_paginator_factory(
+        users,
+        [
+            {
+                "userId": 1,
+                "login": "jdoe",
+                "firstName": "John",
+                "lastName": "Doe",
+                "email": "jdoe@example.com",
+            }
+        ],
+    )
+
+    df = await ep.to_dataframe("S1")
+
+    assert len(df) == 1
+    assert df.loc[0, "user_id"] == "1"
+    assert df.loc[0, "login"] == "jdoe"
+    assert df.loc[0, "first_name"] == "John"
+    assert df.loc[0, "last_name"] == "Doe"
+    assert df.loc[0, "name"] == "John Doe"
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_parameter_forwarding(dummy_client, async_paginator_factory):
+    """Test that async to_dataframe forwards filters and study key to list."""
+    ep = users.AsyncUsersEndpoint(dummy_client)
+    captured = async_paginator_factory(users, [{"userId": 1}])
+
+    df = await ep.to_dataframe(
+        study_key="S1",
+        include_inactive=True,
+        page=1,
+        size=50,
+        sort="login,asc",
+    )
+
+    assert captured["path"] == "/api/v1/edc/studies/S1/users"
+    assert captured["params"] == {
+        "includeInactive": "true",
+        "page": 1,
+        "size": 50,
+        "sort": "login,asc",
+    }
+    assert "filter" not in captured["params"]
+    assert len(df) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_empty_results(dummy_client, async_paginator_factory):
+    """Test that async to_dataframe handles empty query results."""
+    ep = users.AsyncUsersEndpoint(dummy_client)
+    async_paginator_factory(users, [])
+
+    df = await ep.to_dataframe("S1")
+
+    assert df.empty
+
+
+@pytest.mark.asyncio
+async def test_async_to_dataframe_missing_dependency(
+    monkeypatch, dummy_client, async_paginator_factory
+):
+    """Test that async to_dataframe raises ImportError when pandas is not installed."""
+    ep = users.AsyncUsersEndpoint(dummy_client)
+    captured = async_paginator_factory(users, [{"userId": 1}])
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    mock_list = MagicMock()
+    monkeypatch.setattr(ep, "list", mock_list)
+
+    with pytest.raises(ImportError, match="pandas is required for users_to_dataframe"):
+        await ep.to_dataframe("S1")
+
+    mock_list.assert_not_called()
+    assert captured["count"] == 0

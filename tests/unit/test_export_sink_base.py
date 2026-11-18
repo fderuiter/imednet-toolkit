@@ -466,3 +466,105 @@ class TestTabularSQLSinkRetryAndSanitization:
         assert sink.write_batch([], batch_id="sql_empty_list") == 0
         assert sink.write_batch(pd.DataFrame(), batch_id="sql_empty_df") == 0
         assert failing_to_sql.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# apply_quality_gate and spi.sinks
+# ---------------------------------------------------------------------------
+
+
+class TestApplyQualityGate:
+    """Test suite for apply_quality_gate in sink_base."""
+
+    def test_disabled_quality_gate_yields_all(self):
+        """Assert disabled quality gate yields all records without filtering."""
+        records = [{"record_id": "r1"}, {"record_id": "r2"}]
+        cfg = SinkConfig(study_key="STUDY", quality_gate_enabled=False)
+        result = list(sink_base_mod.apply_quality_gate(MagicMock(), "STUDY", records, cfg))
+        assert result == records
+
+    def test_enabled_quality_gate_filtering(self, monkeypatch, caplog):
+        """Assert enabled quality gate filters records based on schema readiness score."""
+        import logging
+
+        caplog.set_level(logging.INFO)
+        mock_validator_cls = MagicMock()
+        mock_validator = MagicMock()
+        mock_validator_cls.return_value = mock_validator
+        mock_schema = MagicMock()
+        mock_validator.schema = mock_schema
+
+        def form_key_lookup(fid):
+            if fid == 10:
+                return "form_10"
+            return None
+
+        mock_schema.form_key_from_id.side_effect = form_key_lookup
+
+        def mock_calc_readiness(schema, fk, data):
+            if fk == "f_pass":
+                return 100.0, []
+            elif fk == "f_fail":
+                return 40.0, ["Missing mandatory field"]
+            elif fk == "form_10":
+                return 95.0, []
+            return 0.0, ["Unknown"]
+
+        monkeypatch.setattr("imednet.validation.cache.SchemaValidator", mock_validator_cls)
+        monkeypatch.setattr(
+            "imednet.validation.cache.calculate_readiness_score", mock_calc_readiness
+        )
+
+        class ModelDumpRecord:
+            def model_dump(self):
+                return {"formKey": "f_pass", "data": {"a": 1}, "record_id": "rec_dump"}
+
+        class AttrRecord:
+            def __init__(self):
+                self.form_key = "f_fail"
+                self.form_id = None
+                self.record_data = {"b": 2}
+                self.record_id = "rec_attr"
+
+        rec1 = ModelDumpRecord()
+        rec2 = AttrRecord()
+        rec3 = {"formId": 10, "data": None, "record_id": "rec_fid"}
+        rec4 = {"data": {"c": 3}, "record_id": "rec_no_form"}
+        rec5 = "not_a_dict_or_object"
+
+        cfg = SinkConfig(
+            study_key="STUDY", quality_gate_enabled=True, min_schema_readiness_score=80.0
+        )
+        res = list(
+            sink_base_mod.apply_quality_gate(
+                MagicMock(), "STUDY", [rec1, rec2, rec3, rec4, rec5], cfg
+            )
+        )
+
+        assert res == [rec1, rec3]
+        mock_validator.refresh.assert_called_once_with("STUDY")
+        assert "Quality gate dropped 3 records in total." in caplog.text
+
+
+class TestSpiSinks:
+    """Test suite for imednet.spi.sinks re-exports and namespace modules."""
+
+    def test_spi_redact_uri(self):
+        """Assert spi redact_uri correctly redacts credentials."""
+        import imednet.spi.sinks as spi_sinks
+
+        assert spi_sinks.redact_uri("mongodb://u:p@localhost/db") == "mongodb://***@localhost/db"
+
+    def test_spi_require_optional_dep(self):
+        """Assert spi require_optional_dep resolves installed module."""
+        import sys
+
+        import imednet.spi.sinks as spi_sinks
+
+        assert spi_sinks.require_optional_dep("sys", "core") is sys
+
+    def test_http_namespace_import(self):
+        """Assert imednet.http module is importable."""
+        import imednet.http
+
+        assert imednet.http.__all__ == []
