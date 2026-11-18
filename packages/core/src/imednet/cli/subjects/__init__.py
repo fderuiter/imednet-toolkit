@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 
+from ...models.subjects import Subject
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status, parse_filter_args
@@ -33,7 +34,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         subject_filter: list[str] | None = None,
         output_format: str = "table",
     ) -> None:
-        parsed_filter = parse_filter_args(subject_filter)
+        parsed_filter = parse_filter_args(subject_filter, model=Subject)
 
         with fetching_status("subjects", study_key):
             subjects_list = list(sdk.subjects.list(study_key, **(parsed_filter or {})))

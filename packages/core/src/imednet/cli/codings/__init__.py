@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
+from ...models.codings import Coding
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status, parse_filter_args
@@ -46,7 +47,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         coding_filter: list[str] | None = None,
         output_format: str = "table",
     ) -> None:
-        parsed_filter = parse_filter_args(coding_filter)
+        parsed_filter = parse_filter_args(coding_filter, model=Coding)
 
         with fetching_status("codings", study_key):
             codings_list = list(sdk.codings.list(study_key, **(parsed_filter or {})))

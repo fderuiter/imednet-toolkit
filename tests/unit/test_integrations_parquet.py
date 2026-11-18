@@ -191,7 +191,7 @@ def test_export_to_hive_parquet_flushes_form_batches(monkeypatch, tmp_path) -> N
 
         def _iter_records(self, _study_key, extra_filters):
             """Helper function to  iter records."""
-            assert extra_filters == {"formIds": [1]}
+            assert extra_filters == {"formId": 1}
             return iter([1, 2, 3])
 
         def _iter_parsed_rows(self, records, _record_model):
