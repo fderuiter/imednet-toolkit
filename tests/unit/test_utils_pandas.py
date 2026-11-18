@@ -16,6 +16,7 @@ from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 from imednet.utils.pandas import (
+    check_pandas,
     export_records_csv,
     forms_to_dataframe,
     intervals_to_dataframe,
@@ -384,3 +385,29 @@ def test_export_records_csv_raises_importerror_when_pandas_missing(monkeypatch):
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
     with pytest.raises(ImportError, match="pandas is required for export_records_csv"):
         export_records_csv(None, "STUDY", "path.csv")
+
+
+def test_check_pandas_success() -> None:
+    """Test that check_pandas succeeds when pandas is installed."""
+    assert check_pandas() is None
+    assert check_pandas("test_feature") is None
+
+
+def test_check_pandas_raises_when_missing(monkeypatch) -> None:
+    """Test that check_pandas raises ImportError when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(
+        ImportError,
+        match=r"pandas is required\. Install with \"pip install 'imednet\[export\]'\"\.",
+    ):
+        check_pandas()
+
+
+def test_check_pandas_raises_with_feature_when_missing(monkeypatch) -> None:
+    """Test that check_pandas raises ImportError with feature name when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(
+        ImportError,
+        match=r"pandas is required for test_feature\. Install with \"pip install 'imednet\[export\]'\"\.",
+    ):
+        check_pandas("test_feature")

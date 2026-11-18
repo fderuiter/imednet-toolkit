@@ -77,8 +77,9 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import records_to_dataframe
+        from imednet.utils.pandas import check_pandas, records_to_dataframe
 
+        check_pandas("records_to_dataframe")
         records = list(self.list(study_key=study_key, **filters))
         return records_to_dataframe(records, flatten=flatten)
 
@@ -106,7 +107,8 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import records_to_dataframe
+        from imednet.utils.pandas import check_pandas, records_to_dataframe
 
+        check_pandas("records_to_dataframe")
         records = [record async for record in self.list(study_key=study_key, **filters)]
         return records_to_dataframe(records, flatten=flatten)

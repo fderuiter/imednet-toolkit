@@ -39,8 +39,9 @@ class QueriesEndpoint(QueriesOperationDef, EdcSyncListGetEndpoint[Query]):  # ty
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import queries_to_dataframe
+        from imednet.utils.pandas import check_pandas, queries_to_dataframe
 
+        check_pandas("queries_to_dataframe")
         queries = list(self.list(study_key=study_key, **filters))
         return queries_to_dataframe(queries)
 
@@ -65,7 +66,8 @@ class AsyncQueriesEndpoint(QueriesOperationDef, EdcAsyncListGetEndpoint[Query]):
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import queries_to_dataframe
+        from imednet.utils.pandas import check_pandas, queries_to_dataframe
 
+        check_pandas("queries_to_dataframe")
         queries = [query async for query in self.list(study_key=study_key, **filters)]
         return queries_to_dataframe(queries)

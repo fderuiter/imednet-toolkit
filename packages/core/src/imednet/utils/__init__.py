@@ -22,6 +22,7 @@ from .typing import FilterValue, ItemId, JsonDict
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "flatten": ("imednet.utils.serialization", "flatten"),
     "to_arrow_table": ("imednet.utils.arrow", "to_arrow_table"),
+    "check_pandas": ("imednet.utils.pandas", "check_pandas"),
     "queries_to_dataframe": ("imednet.utils.pandas", "queries_to_dataframe"),
     "subjects_to_dataframe": ("imednet.utils.pandas", "subjects_to_dataframe"),
     "forms_to_dataframe": ("imednet.utils.pandas", "forms_to_dataframe"),
@@ -68,6 +69,7 @@ __all__ = [
     "RestrictedAstEvaluator",
     "build_filter_string",
     "build_safe_path",
+    "check_pandas",
     "configure_json_logging",
     "evaluate_expression",
     "export_records_csv",

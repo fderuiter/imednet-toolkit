@@ -23,16 +23,29 @@ if TYPE_CHECKING:  # pragma: no cover - only for type checking
     from ..sdk import ImednetSDK
 
 
+def check_pandas(feature_name: str | None = None) -> None:
+    """Validate that pandas is installed, raising an ImportError if missing.
+
+    Args:
+        feature_name: Optional name of the feature or function requiring pandas.
+
+    Raises:
+        ImportError: If pandas is not installed.
+    """
+    if pd is None:
+        target = f" for {feature_name}" if feature_name else ""
+        raise ImportError(
+            f"pandas is required{target}. Install with \"pip install 'imednet[export]'\"."
+        )
+
+
 def queries_to_dataframe(queries: list[Query]) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.queries.Query` to a DataFrame.
 
     Each query model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for queries_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("queries_to_dataframe")
 
     query_dicts = [q.model_dump(by_alias=False) for q in queries]
     return pd.DataFrame(query_dicts)
@@ -44,10 +57,7 @@ def variables_to_dataframe(variables: list[Variable]) -> pd.DataFrame:
     Each variable model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for variables_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("variables_to_dataframe")
 
     variable_dicts = [v.model_dump(by_alias=False) for v in variables]
     return pd.DataFrame(variable_dicts)
@@ -59,10 +69,7 @@ def subjects_to_dataframe(subjects: list[Subject]) -> pd.DataFrame:
     Each subject model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for subjects_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("subjects_to_dataframe")
 
     subject_dicts = [s.model_dump(by_alias=False) for s in subjects]
     return pd.DataFrame(subject_dicts)
@@ -74,10 +81,7 @@ def forms_to_dataframe(forms: list[Form]) -> pd.DataFrame:
     Each form model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for forms_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("forms_to_dataframe")
 
     form_dicts = [f.model_dump(by_alias=False) for f in forms]
     return pd.DataFrame(form_dicts)
@@ -89,10 +93,7 @@ def visits_to_dataframe(visits: list[Visit]) -> pd.DataFrame:
     Each visit model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for visits_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("visits_to_dataframe")
 
     visit_dicts = [v.model_dump(by_alias=False) for v in visits]
     return pd.DataFrame(visit_dicts)
@@ -104,10 +105,7 @@ def intervals_to_dataframe(intervals: list[Interval]) -> pd.DataFrame:
     Each interval model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for intervals_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("intervals_to_dataframe")
 
     interval_dicts = [i.model_dump(by_alias=False) for i in intervals]
     return pd.DataFrame(interval_dicts)
@@ -119,10 +117,7 @@ def sites_to_dataframe(sites: list[Site]) -> pd.DataFrame:
     Each site model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for sites_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("sites_to_dataframe")
 
     site_dicts = [s.model_dump(by_alias=False) for s in sites]
     return pd.DataFrame(site_dicts)
@@ -151,10 +146,7 @@ def records_to_dataframe(records: list[Record], *, flatten: bool = False) -> pd.
     expanded using :func:`pandas.json_normalize` so that each variable becomes a
     column in the resulting DataFrame.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for records_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("records_to_dataframe")
 
     rows = [r.model_dump(by_alias=False) for r in records]
     df = pd.DataFrame(rows)
@@ -173,10 +165,7 @@ def export_records_csv(
     DataFrame is written with :meth:`pandas.DataFrame.to_csv` using
     ``index=False``.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for export_records_csv. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("export_records_csv")
 
     records = list(sdk.records.list(study_key=study_key))
     df = records_to_dataframe(records, flatten=flatten)

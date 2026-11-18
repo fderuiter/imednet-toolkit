@@ -42,8 +42,9 @@ class VariablesEndpoint(VariablesOperationDef, EdcSyncListGetEndpoint[Variable])
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import variables_to_dataframe
+        from imednet.utils.pandas import check_pandas, variables_to_dataframe
 
+        check_pandas("variables_to_dataframe")
         variables = list(self.list(study_key=study_key, **filters))
         return variables_to_dataframe(variables)
 
@@ -68,7 +69,8 @@ class AsyncVariablesEndpoint(VariablesOperationDef, EdcAsyncListGetEndpoint[Vari
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import variables_to_dataframe
+        from imednet.utils.pandas import check_pandas, variables_to_dataframe
 
+        check_pandas("variables_to_dataframe")
         variables = [var async for var in self.list(study_key=study_key, **filters)]
         return variables_to_dataframe(variables)

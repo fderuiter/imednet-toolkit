@@ -143,7 +143,7 @@ addopts = "--junitxml=reports/junit.xml -ra --ignore=tests/live"
 asyncio_mode = "auto"
 log_cli = true
 log_cli_level = "INFO"
-testpaths = ["tests", "packages/plugins-sinks/tests"]
+testpaths = ["tests", "packages/plugins-sinks/tests", "packages/plugins-tui/tests"]
 markers = [
     "unit: marks unit tests",
     "live: marks tests as requiring a live external connection (deselect with '-m \"not live\"')",
@@ -183,7 +183,7 @@ verify-static = [
     "mypy packages/plugins-tui/src/imednet_tui",
     "mypy tests/typing/endpoint_contracts.py",
 ]
-verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov-fail-under=90"
+verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_tui --cov-fail-under=90"
 verify = ["verify-static", "verify-tests", "docs"]
 test = "pytest --ignore=tests/live/ {args:tests/}"
 docs = "python scripts/build_docs.py"

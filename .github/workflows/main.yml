@@ -368,7 +368,7 @@ jobs:
           IMEDNET_POSTMAN_PATH: ${{ github.workspace }}/imednet.postman_collection.json
         run: |
           if [ "$PACKAGE" = "core" ]; then
-            TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*sinks* tests/"
+            TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*sinks* --ignore-glob=*tui/* tests/"
             COV_ARGS="--cov=imednet"
           elif [ "$PACKAGE" = "plugins-workflows" ]; then
 
@@ -381,6 +381,9 @@ jobs:
           elif [ "$PACKAGE" = "plugins-sinks" ]; then
             TEST_ARGS="packages/plugins-sinks/tests/"
             COV_ARGS="--cov=imednet_sinks"
+          elif [ "$PACKAGE" = "plugins-tui" ]; then
+            TEST_ARGS="packages/plugins-tui/tests/ tests/unit/tui/ tests/unit/cli/test_tui_cli.py"
+            COV_ARGS="--cov=imednet_tui"
           fi
 
           hatch run test -q $COV_ARGS --cov-report=xml --cov-fail-under=90 -m "not live" --ignore=tests/live/ $TEST_ARGS || {

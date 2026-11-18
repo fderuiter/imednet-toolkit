@@ -42,8 +42,9 @@ class FormsEndpoint(FormsOperationDef, EdcSyncListGetEndpoint[Form]):  # type: i
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import forms_to_dataframe
+        from imednet.utils.pandas import check_pandas, forms_to_dataframe
 
+        check_pandas("forms_to_dataframe")
         forms = list(self.list(study_key=study_key, **filters))
         return forms_to_dataframe(forms)
 
@@ -68,7 +69,8 @@ class AsyncFormsEndpoint(FormsOperationDef, EdcAsyncListGetEndpoint[Form]):  # t
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import forms_to_dataframe
+        from imednet.utils.pandas import check_pandas, forms_to_dataframe
 
+        check_pandas("forms_to_dataframe")
         forms = [form async for form in self.list(study_key=study_key, **filters)]
         return forms_to_dataframe(forms)

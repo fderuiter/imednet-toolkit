@@ -47,6 +47,10 @@ def test_lazy_load_pandas_functions() -> None:
     from imednet.utils.pandas import export_records_csv as expected_export
 
     assert func2 is expected_export
+    func_check = utils.check_pandas
+    from imednet.utils.pandas import check_pandas as expected_check_pandas
+
+    assert func_check is expected_check_pandas
 
 
 def test_lazy_load_arrow_function() -> None:
