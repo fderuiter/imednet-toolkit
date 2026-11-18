@@ -403,7 +403,12 @@ def apply_quality_gate(
             dropped_count += 1
             continue
 
-        data = rec_dict.get("data", {})
+        if "data" in rec_dict:
+            data = rec_dict["data"]
+        elif "record_data" in rec_dict:
+            data = rec_dict["record_data"]
+        else:
+            data = rec_dict.get("recordData", {})
         if data is None:
             data = {}
         score, reasons = calculate_readiness_score(validator.schema, fk, data)

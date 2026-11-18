@@ -3,12 +3,28 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Self
 
-from pydantic import Field, RootModel
+from pydantic import (
+    ConfigDict,
+    Field,
+    RootModel,
+    field_validator,
+    model_validator,
+)
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
+
+_INT_ID_FIELDS = {"form_id", "site_id", "subject_id", "interval_id", "record_id"}
+_STR_ID_FIELDS = {
+    "form_key",
+    "site_name",
+    "subject_key",
+    "subject_oid",
+    "interval_name",
+    "record_oid",
+}
 
 
 class Keyword(ImednetBaseModel):
@@ -38,34 +54,91 @@ class RecordData(RootModel[dict[str, Any]]):
 
 
 class BaseRecordRequest(ImednetBaseModel):
-    """Base class for record creation/update requests."""
+    """Base class for strict record creation/update requests."""
 
-    form_key: str = Field("", alias="formKey")
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        str_strip_whitespace=True,
+    )
+
+    form_key: str | None = Field(default=None, alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _detect_drift(cls, data: Any) -> Any:
+        """Disable response drift warnings on client request models."""
+        return data
+
+    @field_validator("*", check_fields=False, mode="before")
+    @classmethod
+    def _normalise(cls, v: Any, info: Any) -> Any:
+        """Disable lenient response coercion so request types are validated strictly."""
+        field_name = getattr(info, "field_name", None)
+        if v is None or not field_name:
+            return v
+        if field_name in _INT_ID_FIELDS:
+            if isinstance(v, bool):
+                raise ValueError(f"{field_name} must be an integer, not boolean")
+            return v
+        if field_name in _STR_ID_FIELDS:
+            if not isinstance(v, str):
+                raise ValueError(f"{field_name} must be a string")
+            return v
+        return v
+
+    @model_validator(mode="after")
+    def _validate_request_identifiers(self) -> Self:  # noqa: N804
+        """Validate positive integer identifiers."""
+        for id_attr, alias_name in (
+            ("form_id", "formId"),
+            ("site_id", "siteId"),
+            ("subject_id", "subjectId"),
+            ("interval_id", "intervalId"),
+            ("record_id", "recordId"),
+        ):
+            val = getattr(self, id_attr, None)
+            if val is not None and val <= 0:
+                raise ValueError(f"{alias_name} must be a positive integer")
+        return self
 
 
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
     Per the API documentation, registering a subject only requires ``formKey``
-    and ``siteName``.  The system assigns the subject identifier upon creation.
-    Do **not** include a ``subjectKey`` here — doing so causes the server to
-    treat the request as an update and reject it when the key is unknown.
+    (or ``formId``) and ``siteName`` (or ``siteId``). The system assigns the
+    subject identifier upon creation. Do **not** include a ``subjectKey`` here
+    — doing so causes the server to treat the request as an update and reject
+    it when the key is unknown.
     """
 
-    site_name: str = Field(
-        "", alias="siteName", description="Name of the site where the subject is enrolled"
+    site_name: str | None = Field(
+        default=None, alias="siteName", description="Name of the site where the subject is enrolled"
+    )
+    site_id: int | None = Field(
+        default=None, alias="siteId", description="ID of the site where the subject is enrolled"
     )
 
 
-class UpdateScheduledRecordRequest(BaseRecordRequest):
+class CreateNewRecordRequest(RegisterSubjectRequest):
+    """Payload for creating a new unscheduled record or updating a record by identifier."""
+
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    record_id: int | None = Field(default=None, alias="recordId")
+    record_oid: str | None = Field(default=None, alias="recordOid")
+
+
+class UpdateScheduledRecordRequest(CreateNewRecordRequest):
     """Payload for updating an existing scheduled record."""
 
-    subject_key: str = Field("", alias="subjectKey")
-    interval_name: str = Field("", alias="intervalName")
+    interval_name: str | None = Field(default=None, alias="intervalName")
+    interval_id: int | None = Field(default=None, alias="intervalId")
 
 
-class CreateNewRecordRequest(BaseRecordRequest):
-    """Payload for creating a new unscheduled record."""
-
-    subject_key: str = Field("", alias="subjectKey")
+class RecordRequest(UpdateScheduledRecordRequest):
+    """Strict request envelope supporting all documented POST /records identifier pairs."""

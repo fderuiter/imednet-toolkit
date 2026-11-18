@@ -15,6 +15,7 @@ from imednet.models.engine import ModelEngine
 class JobState(str, Enum):
     """Enumeration of valid job states."""
 
+    CREATED = "CREATED"
     PENDING = "PENDING"
     QUEUED = "QUEUED"
     OPEN = "OPEN"
@@ -55,6 +56,7 @@ TERMINAL_JOB_STATES: set[JobState] = {
 }
 
 ACTIVE_JOB_STATES: set[JobState] = {
+    JobState.CREATED,
     JobState.PENDING,
     JobState.QUEUED,
     JobState.OPEN,
@@ -75,6 +77,20 @@ FAILED_JOB_STATES: set[JobState] = {
 }
 
 ALLOWED_JOB_TRANSITIONS: dict[JobState, set[JobState]] = {
+    JobState.CREATED: {
+        JobState.CREATED,
+        JobState.PENDING,
+        JobState.QUEUED,
+        JobState.OPEN,
+        JobState.RUNNING,
+        JobState.PROCESSING,
+        JobState.COMPLETED,
+        JobState.COMPLETE,
+        JobState.SUCCESS,
+        JobState.FAILED,
+        JobState.CANCELLED,
+        JobState.TIMEOUT,
+    },
     JobState.PENDING: {
         JobState.PENDING,
         JobState.QUEUED,

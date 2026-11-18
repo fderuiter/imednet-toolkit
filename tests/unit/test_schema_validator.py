@@ -1,6 +1,7 @@
 """Unit tests for schema validator."""
 
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -158,12 +159,16 @@ def test_validate_record_missing_form_identifier(async_mode: bool) -> None:
 
     validator.schema._form_variables["F1"] = {"age": var}
 
-    # Missing formKey and formId entirely should just skip validation without error
+    # Missing formKey and formId entirely must raise ValidationError without calling the API
+    with pytest.raises(ValidationError, match="formKey"):
+        if async_mode:
+            asyncio.run(validator.validate_record("STUDY", {"data": {"age": "bad"}}))
+        else:
+            validator.validate_record("STUDY", {"data": {"age": "bad"}})
+
     if async_mode:
-        asyncio.run(validator.validate_record("STUDY", {"data": {"age": "bad"}}))
         sdk.async_get_variables.assert_not_awaited()
     else:
-        validator.validate_record("STUDY", {"data": {"age": "bad"}})
         sdk.get_variables.assert_not_called()
 
 
@@ -244,15 +249,17 @@ def test_validate_record_entry_missing_both() -> None:
     schema = SchemaCache()
     schema.populate([var])
 
-    # Should not raise, just skips validation
-    validate_record_entry(schema, {"data": {"age": 1}})
+    # Missing both formKey and formId must raise ValidationError
+    with pytest.raises(ValidationError, match="formKey"):
+        validate_record_entry(schema, {"data": {"age": 1}})
 
 
 def test_type_validators_coverage() -> None:
-    """Test that type validators coverage."""
+    """Test type validators including boolean rejection in numeric validators and YYYY-MM-DD dates."""
     from imednet.validation.cache import (
         ValidationError,
         _validate_bool,
+        _validate_date,
         _validate_float,
         _validate_int,
         _validate_text,
@@ -260,12 +267,105 @@ def test_type_validators_coverage() -> None:
 
     with pytest.raises(ValidationError, match="must be an integer"):
         _validate_int("1")
+    with pytest.raises(ValidationError, match="must be an integer"):
+        _validate_int(True)
+    with pytest.raises(ValidationError, match="must be an integer"):
+        _validate_int(False)
+
     with pytest.raises(ValidationError, match="must be numeric"):
         _validate_float("1.0")
+    with pytest.raises(ValidationError, match="must be numeric"):
+        _validate_float(True)
+    with pytest.raises(ValidationError, match="must be numeric"):
+        _validate_float(False)
+
     with pytest.raises(ValidationError, match="must be boolean"):
         _validate_bool(1)
     with pytest.raises(ValidationError, match="must be a string"):
         _validate_text(1)
+
+    _validate_date("2026-05-01")
+    _validate_date("2024-02-29")
+    for bad_date in [
+        19800101,
+        "20260501",
+        "2026/05/01",
+        "2026-5-1",
+        "2026-02-30",
+        "2025-02-29",
+        "1985-13-01",
+        "1985-04-12T00:00:00Z",
+    ]:
+        with pytest.raises(ValidationError, match="YYYY-MM-DD") as exc_info:
+            _validate_date(bad_date)
+        assert str(bad_date) not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ecrf_variable_types_and_readiness_score(async_mode: bool) -> None:
+    """Verify RADIO, DROPDOWN, MEMO, CHECKBOX, DATE, INTEGER, TEXT, and decimal NUMBER validation."""
+    from imednet.validation.cache import SchemaCache, calculate_readiness_score
+
+    variables = [
+        Variable(variable_name="v_text", variable_type="TEXT", form_id=7, form_key="EC1"),
+        Variable(variable_name="v_int", variable_type="INTEGER", form_id=7, form_key="EC1"),
+        Variable(variable_name="v_num", variable_type="NUMBER", form_id=7, form_key="EC1"),
+        Variable(variable_name="v_date", variable_type="DATE", form_id=7, form_key="EC1"),
+        Variable(variable_name="v_memo", variable_type="MEMO", form_id=7, form_key="EC1"),
+        Variable(variable_name="v_drop", variable_type="DROPDOWN", form_id=7, form_key="EC1"),
+        Variable(variable_name="v_radio", variable_type="RADIO", form_id=7, form_key="EC1"),
+        Variable(variable_name="v_check", variable_type="CHECKBOX", form_id=7, form_key="EC1"),
+    ]
+    sdk = MagicMock()
+    if async_mode:
+        sdk.async_get_variables = AsyncMock(return_value=variables)
+        validator: Any = AsyncSchemaValidator(sdk)
+    else:
+        sdk.get_variables.return_value = variables
+        validator = SchemaValidator(sdk)
+
+    valid_data = {
+        "v_text": "normal",
+        "v_int": 42,
+        "v_num": 98.6,
+        "v_date": "2026-05-01",
+        "v_memo": "Long clinical note",
+        "v_drop": "OPTION_A",
+        "v_radio": "YES",
+        "v_check": True,
+    }
+
+    # Validate via uncached formId=7 (triggers refresh and resolves EC1)
+    payload_by_id = {"formId": 7, "data": valid_data}
+    if async_mode:
+        asyncio.run(validator.validate_record("STUDY", payload_by_id))
+    else:
+        validator.validate_record("STUDY", payload_by_id)
+
+    cache = SchemaCache()
+    cache.populate(variables)
+    score, reasons = calculate_readiness_score(cache, "EC1", valid_data)
+    assert score == 100.0
+    assert reasons == []
+
+    # Boolean in numeric variable reduces readiness score and fails validate_record
+    bad_bool_num = dict(valid_data, v_num=True)
+    score_bad, reasons_bad = calculate_readiness_score(cache, "EC1", bad_bool_num)
+    assert score_bad < 100.0
+    assert any("v_num" in r for r in reasons_bad)
+
+    # Unknown formId after refresh raises ValidationError
+    with pytest.raises(ValidationError, match="Unknown formId 999"):
+        if async_mode:
+            asyncio.run(validator.validate_record("STUDY", {"formId": 999, "data": {}}))
+        else:
+            validator.validate_record("STUDY", {"formId": 999, "data": {}})
+
+    # Direct _validate_cached with missing form_key raises ValidationError
+    with pytest.raises(ValidationError, match="formKey"):
+        validator._validate_cached(None, {})
+    with pytest.raises(ValidationError, match="formKey"):
+        validator._validate_cached("   ", {})
 
 
 def test_validate_batch_coverage() -> None:

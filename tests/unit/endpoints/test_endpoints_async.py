@@ -205,17 +205,35 @@ async def test_async_get_record_not_found(monkeypatch, dummy_client, response_fa
 
 
 @pytest.mark.asyncio
-async def test_async_create_record(dummy_client, response_factory, monkeypatch):
-    """Test that async create record asynchronously."""
-    ep = records.AsyncRecordsEndpoint(dummy_client)
-    dummy_client.post = AsyncMock(return_value=response_factory({"jobId": "1"}))
+async def test_async_create_record(dummy_client, response_factory):
+    """Test that AsyncRecordsEndpoint.create parses state='created' into JobState.CREATED."""
+    from imednet.errors import ValidationError
+    from imednet.models.jobs import JobState
 
-    monkeypatch.setattr(records.Job, "from_json", lambda d: d)
-    job = await ep.create("S1", [{"foo": "bar"}], email_notify="user@test")
+    ep = records.AsyncRecordsEndpoint(dummy_client)
+    dummy_client.post = AsyncMock(
+        return_value=response_factory({"jobId": "1", "batchId": "b1", "state": "created"})
+    )
+
+    job = await ep.create(
+        "S1",
+        [{"formKey": "F1", "data": {"foo": "bar"}}],
+        email_notify="user@test.com",
+    )
 
     dummy_client.post.assert_awaited_once_with(
         "/api/v1/edc/studies/S1/records",
-        json=[{"foo": "bar"}],
-        headers={"x-email-notify": "user@test"},
+        json=[{"formKey": "F1", "data": {"foo": "bar"}}],
+        headers={"x-email-notify": "user@test.com"},
     )
-    assert job == {"jobId": "1"}
+    assert isinstance(job, records.Job)
+    assert job.job_id == "1"
+    assert job.batch_id == "b1"
+    assert job.state == JobState.CREATED
+
+    dummy_client.post.reset_mock()
+    with pytest.raises(ValidationError):
+        await ep.create("S1", [{"formKey": "F1", "data": {}}], email_notify=False)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        await ep.create("S1", [{"formKey": "F1", "recordData": {"foo": "bar"}}])
+    dummy_client.post.assert_not_awaited()

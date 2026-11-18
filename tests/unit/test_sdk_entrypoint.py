@@ -352,7 +352,12 @@ def test_convenience_methods_delegate_to_endpoints(monkeypatch) -> None:
     assert sdk.get_records("S1", record_data_filter="x") == ["REC"]
     assert sdk.get_sites("S1", country="US") == ["SITE"]
     assert sdk.get_subjects("S1", status="new") == ["SUB"]
-    assert sdk.create_record("S1", [{"a": 1}], email_notify=True) == "JOB"
+    assert (
+        sdk.create_record(
+            "S1", [{"formKey": "F1", "data": {"a": 1}}], email_notify="notify@example.com"
+        )
+        == "JOB"
+    )
     assert sdk.get_forms("S1", page=2) == ["FORM"]
     assert sdk.get_intervals("S1") == ["INT"]
     assert sdk.get_variables("S1") == ["VAR"]
@@ -367,7 +372,7 @@ def test_convenience_methods_delegate_to_endpoints(monkeypatch) -> None:
     assert calls["records"] == ("S1", "x", {})
     assert calls["sites"] == ("S1", {"country": "US"})
     assert calls["subjects"] == ("S1", {"status": "new"})
-    assert calls["create"] == ("S1", [{"a": 1}], True)
+    assert calls["create"] == ("S1", [{"formKey": "F1", "data": {"a": 1}}], "notify@example.com")
     assert calls["forms"] == ("S1", {"page": 2})
     assert calls["intervals"] == ("S1", {})
     assert calls["variables"] == ("S1", {})

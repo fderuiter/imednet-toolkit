@@ -4,12 +4,15 @@ import functools
 import re
 from typing import Any
 
-from imednet.errors import ClientError, PathTraversalValidationError
+from imednet.errors import ClientError, PathTraversalValidationError, ValidationError
 
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
 _CAMEL_TO_SNAKE_RE1 = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_TO_SNAKE_RE2 = re.compile(r"([a-z\d])([A-Z])")
 _DELIMITER_RE = re.compile(r"[^a-zA-Z0-9]+")
+_EMAIL_LOCAL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$")
+_EMAIL_DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_EMAIL_TLD_RE = re.compile(r"^[A-Za-z]{2,63}$")
 
 
 def _normalize_key_uncached(key: Any) -> str:
@@ -143,6 +146,57 @@ def validate_header_value(value: str) -> None:
     """
     if "\n" in value or "\r" in value:
         raise ClientError(f"Header value must not contain newlines: {value!r}")
+
+
+def validate_email_notify(value: Any) -> str:
+    """Validate an ``email_notify`` header destination for safety and email syntax.
+
+    Args:
+        value: Candidate email address for the ``x-email-notify`` header.
+
+    Returns:
+        Normalized email address string safe for HTTP header transmission.
+
+    Raises:
+        ValidationError: If ``value`` is a boolean, non-string, empty, or malformed email.
+        ClientError: If ``value`` contains newline or control characters.
+    """
+    if isinstance(value, bool):
+        raise ValidationError("email_notify must be a valid email address string")
+    if not isinstance(value, str):
+        raise ValidationError("email_notify must be a valid email address string")
+
+    validate_header_value(value)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ClientError("Header value must not contain control characters")
+
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValidationError("email_notify must not be empty")
+
+    if len(cleaned) > 254 or cleaned.count("@") != 1:
+        raise ValidationError("email_notify must be a valid email address")
+
+    local, domain = cleaned.split("@")
+    if (
+        not (1 <= len(local) <= 64)
+        or local.startswith(".")
+        or local.endswith(".")
+        or ".." in local
+        or not _EMAIL_LOCAL_RE.match(local)
+    ):
+        raise ValidationError("email_notify must be a valid email address")
+
+    labels = domain.split(".")
+    if (
+        len(domain) > 253
+        or len(labels) < 2
+        or any(not label or not _EMAIL_DOMAIN_LABEL_RE.match(label) for label in labels)
+        or not _EMAIL_TLD_RE.match(labels[-1])
+    ):
+        raise ValidationError("email_notify must be a valid email address")
+
+    return cleaned
 
 
 def validate_partition_key(key: str) -> None:

@@ -152,7 +152,7 @@ class SyncSDKConvenienceMixin:
         self,
         study_key: str,
         records_data: list[JsonDict],
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
         *,
         schema: Any = None,
     ) -> Job:
@@ -214,7 +214,7 @@ class AsyncSDKConvenienceMixin:
         self,
         study_key: str,
         records_data: list[JsonDict],
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
         *,
         schema: Any = None,
     ) -> Job:

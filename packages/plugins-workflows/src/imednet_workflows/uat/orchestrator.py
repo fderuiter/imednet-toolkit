@@ -350,7 +350,7 @@ class UATWorkflow:
         subject_count: int = 2,
         site_name: str | None = None,
         enabled_form_keys: list[str] | None = None,
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
     ) -> UATRunResult:
         """Execute the full UAT pipeline and return a UATRunResult."""
         started_at = datetime.now(UTC)
@@ -454,7 +454,7 @@ class UATWorkflow:
         self,
         study_key: str,
         record_sets: list[GeneratedRecordSet],
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
     ) -> SubmissionResult:
         """Execute the two-phase bulk submission."""
         return self._get_submitter().submit(study_key, record_sets, email_notify=email_notify)  # type: ignore[no-any-return]

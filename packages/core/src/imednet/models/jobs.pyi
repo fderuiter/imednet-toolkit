@@ -13,6 +13,7 @@ from imednet.models.base import ImednetBaseModel
 class JobState(str, Enum):
     """Enumeration of valid job states."""
 
+    CREATED = "CREATED"
     PENDING = "PENDING"
     QUEUED = "QUEUED"
     OPEN = "OPEN"

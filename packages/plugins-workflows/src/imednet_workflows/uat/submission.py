@@ -126,7 +126,7 @@ class BulkRecordSubmissionWorkflow:
         study_key: str,
         record_sets: list[GeneratedRecordSet],
         *,
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
         keyword_tag: str = "UAT",
     ) -> SubmissionResult:
         """Execute the two-phase submission.
@@ -221,7 +221,7 @@ class BulkRecordSubmissionWorkflow:
         phase: Literal["registration", "data"] | SubmissionPhase,
         form_key: str | None,
         form_name: str | None,
-        email_notify: bool | str | None,
+        email_notify: str | None,
     ) -> BatchSubmission:
         """Submit a single batch and return a BatchSubmission."""
         job = self.sdk.create_record(study_key, payloads, email_notify=email_notify)

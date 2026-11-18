@@ -46,6 +46,7 @@ from imednet.utils.job_poller import (
 def test_job_state_enum_members() -> None:
     """Verify that all required states are present in JobState enum."""
     expected_states = {
+        "CREATED",
         "PENDING",
         "QUEUED",
         "RUNNING",
@@ -59,10 +60,17 @@ def test_job_state_enum_members() -> None:
     actual_states = {s.value for s in JobState}
     assert expected_states.issubset(actual_states)
     assert JobState.COMPLETED in TERMINAL_JOB_STATES
+    assert JobState.CREATED in ACTIVE_JOB_STATES
     assert JobState.RUNNING in ACTIVE_JOB_STATES
     assert JobState.COMPLETED in SUCCESSFUL_JOB_STATES
     assert JobState.FAILED in FAILED_JOB_STATES
+    assert normalize_job_state("created") == JobState.CREATED
     assert normalize_job_state("running") == JobState.RUNNING
+    created_job = Job.from_json({"jobId": "J1", "batchId": "B1", "state": "created"})
+    assert created_job.state == JobState.CREATED
+    assert created_job.is_terminal is False
+    assert created_job.is_successful is False
+    assert created_job.is_failed is False
 
 
 def test_job_model_validates_and_normalizes_casing() -> None:
@@ -126,9 +134,11 @@ def test_job_terminal_and_success_properties() -> None:
 
 
 @pytest.mark.parametrize(
-    "terminal_state", ["COMPLETED", "SUCCESS", "FAILED", "CANCELLED", "TIMEOUT"]
+    "terminal_state", ["COMPLETED", "COMPLETE", "SUCCESS", "FAILED", "CANCELLED", "TIMEOUT"]
 )
-@pytest.mark.parametrize("active_state", ["RUNNING", "QUEUED", "PROCESSING", "PENDING"])
+@pytest.mark.parametrize(
+    "active_state", ["CREATED", "RUNNING", "QUEUED", "PROCESSING", "PENDING", "OPEN"]
+)
 def test_terminal_states_reject_transitions_to_active(
     terminal_state: str, active_state: str
 ) -> None:
@@ -138,6 +148,40 @@ def test_terminal_states_reject_transitions_to_active(
     with pytest.raises(InvalidJobTransitionError) as exc_info:
         validate_job_transition(terminal_state, active_state)
     assert "Cannot transition terminal job state" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("active_state", ["PENDING", "QUEUED", "OPEN", "RUNNING", "PROCESSING"])
+def test_active_states_reject_backward_transitions_to_created(active_state: str) -> None:
+    """Active states reject moving backwards to CREATED."""
+    assert is_valid_job_transition(active_state, "CREATED") is False
+    with pytest.raises(InvalidJobTransitionError):
+        validate_job_transition(active_state, "CREATED")
+
+
+@pytest.mark.parametrize(
+    "target_state",
+    [
+        "CREATED",
+        "PENDING",
+        "QUEUED",
+        "OPEN",
+        "RUNNING",
+        "PROCESSING",
+        "COMPLETED",
+        "COMPLETE",
+        "SUCCESS",
+        "FAILED",
+        "CANCELLED",
+        "TIMEOUT",
+    ],
+)
+def test_created_allows_forward_transitions(target_state: str) -> None:
+    """CREATED allows self-transition and forward transitions to active and terminal states."""
+    assert is_valid_job_transition("CREATED", target_state) is True
+    assert validate_job_transition("CREATED", target_state) is True
+    job = Job(state="created")
+    job.transition_to(target_state)
+    assert job.state == JobState(target_state)
 
 
 @pytest.mark.parametrize("active_state", ["RUNNING", "PROCESSING"])
@@ -356,3 +400,74 @@ async def test_async_poll_many_ignores_stale_responses() -> None:
 
     assert summary.results["A1"].state == JobState.COMPLETED
     assert summary.results["A1"].is_terminal is True
+
+
+def test_job_poller_accepts_created_progression_and_rejects_regression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JobPoller accepts CREATED -> QUEUED -> RUNNING -> PROCESSING -> COMPLETED/FAILED and rejects -> CREATED."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    seq_ok = [
+        JobStatus(batchId="B1", state="created"),
+        JobStatus(batchId="B1", state="QUEUED"),
+        JobStatus(batchId="B1", state="RUNNING"),
+        JobStatus(batchId="B1", state="PROCESSING"),
+        JobStatus(batchId="B1", state="COMPLETED"),
+    ]
+    poller = JobPoller(lambda s, b: seq_ok.pop(0))
+    res = poller.run("ST", "B1", interval=0, timeout=10)
+    assert res.state == JobState.COMPLETED
+
+    seq_fail = [
+        JobStatus(batchId="B2", state="CREATED"),
+        JobStatus(batchId="B2", state="FAILED"),
+    ]
+    fail_poller = JobPoller(lambda s, b: seq_fail.pop(0))
+    with pytest.raises(JobFailedError) as exc_info:
+        fail_poller.run("ST", "B2", interval=0, timeout=10)
+    assert exc_info.value.status.state == JobState.FAILED
+
+    seq_regress = [
+        JobStatus(batchId="B3", state="QUEUED"),
+        JobStatus(batchId="B3", state="CREATED"),
+    ]
+    reg_poller = JobPoller(lambda s, b: seq_regress.pop(0))
+    with pytest.raises(InvalidJobTransitionError):
+        reg_poller.run("ST", "B3", interval=0, timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_async_job_poller_accepts_created_progression_and_rejects_regression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AsyncJobPoller accepts CREATED -> QUEUED -> RUNNING -> PROCESSING -> COMPLETED/FAILED and rejects -> CREATED."""
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    seq_ok = [
+        JobStatus(batchId="A2", state="created"),
+        JobStatus(batchId="A2", state="QUEUED"),
+        JobStatus(batchId="A2", state="RUNNING"),
+        JobStatus(batchId="A2", state="PROCESSING"),
+        JobStatus(batchId="A2", state="COMPLETED"),
+    ]
+    poller = AsyncJobPoller(AsyncMock(side_effect=lambda s, b: seq_ok.pop(0)))
+    res = await poller.run("ST", "A2", interval=0, timeout=10)
+    assert res.state == JobState.COMPLETED
+
+    seq_fail = [
+        JobStatus(batchId="A3", state="CREATED"),
+        JobStatus(batchId="A3", state="FAILED"),
+    ]
+    fail_poller = AsyncJobPoller(AsyncMock(side_effect=lambda s, b: seq_fail.pop(0)))
+    with pytest.raises(JobFailedError) as exc_info:
+        await fail_poller.run("ST", "A3", interval=0, timeout=10)
+    assert exc_info.value.status.state == JobState.FAILED
+
+    seq_regress = [
+        JobStatus(batchId="A4", state="RUNNING"),
+        JobStatus(batchId="A4", state="CREATED"),
+    ]
+    reg_poller = AsyncJobPoller(AsyncMock(side_effect=lambda s, b: seq_regress.pop(0)))
+    with pytest.raises(InvalidJobTransitionError):
+        await reg_poller.run("ST", "A4", interval=0, timeout=10)

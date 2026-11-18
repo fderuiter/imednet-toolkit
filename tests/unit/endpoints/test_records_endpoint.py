@@ -77,28 +77,62 @@ def test_get_not_found(monkeypatch, dummy_client):
         ep.get("S1", 1)
 
 
-def test_create_sends_headers_and_parses_job(dummy_client, response_factory, monkeypatch):
-    """Test that create sends headers and parses job."""
+def test_create_sends_headers_and_parses_job(dummy_client, response_factory):
+    """Test that create sends headers and parses state='created' into JobState.CREATED."""
+    from imednet.models.jobs import JobState
+
     ep = records.RecordsEndpoint(dummy_client)
-    dummy_client.post.return_value = response_factory({"jobId": "1"})
-    called = {}
+    dummy_client.post.return_value = response_factory(
+        {"jobId": "1", "batchId": "b1", "state": "created"}
+    )
 
-    def fake_from_json(data):
-        """Helper function to fake from json."""
-        called["data"] = data
-        return "JOB"
-
-    monkeypatch.setattr(records.Job, "from_json", staticmethod(fake_from_json))
-
-    res = ep.create("S1", [{"foo": "bar"}], email_notify=True)
+    res = ep.create(
+        "S1",
+        [{"formKey": "F1", "data": {"foo": "bar"}}],
+        email_notify="user@example.com",
+    )
 
     dummy_client.post.assert_called_once_with(
         "/api/v1/edc/studies/S1/records",
-        json=[{"foo": "bar"}],
-        headers={"x-email-notify": "true"},
+        json=[{"formKey": "F1", "data": {"foo": "bar"}}],
+        headers={"x-email-notify": "user@example.com"},
     )
-    assert called["data"] == {"jobId": "1"}
-    assert res == "JOB"
+    assert isinstance(res, records.Job)
+    assert res.job_id == "1"
+    assert res.batch_id == "b1"
+    assert res.state == JobState.CREATED
+
+
+@pytest.mark.parametrize(
+    "bad_email",
+    [True, False, "", "   ", "true", "user@test", "not-an-email", "@example.com", "a@b@c.com"],
+)
+def test_create_rejects_boolean_or_malformed_email_before_dispatch(dummy_client, bad_email):
+    """Passing boolean or malformed email_notify raises ValidationError before HTTP dispatch."""
+    ep = records.RecordsEndpoint(dummy_client)
+    with pytest.raises(ValidationError):
+        ep.create("S1", [{"formKey": "F1", "data": {}}], email_notify=bad_email)
+    dummy_client.post.assert_not_called()
+
+
+def test_create_rejects_missing_form_identifier_and_record_data(dummy_client):
+    """RecordsEndpoint.create rejects missing formKey/formId and unmapped recordData keys."""
+    ep = records.RecordsEndpoint(dummy_client)
+    with pytest.raises(ValidationError):
+        ep.create("S1", [{"data": {"age": 30}}])
+    with pytest.raises(ValidationError) as exc_info:
+        ep.create(
+            "S1",
+            [
+                {
+                    "formKey": "F1",
+                    "recordData": {"patient_name": "Alice Secret", "ssn": "999-00-1111"},
+                }
+            ],
+        )
+    assert "Alice Secret" not in str(exc_info.value)
+    assert "999-00-1111" not in str(exc_info.value)
+    dummy_client.post.assert_not_called()
 
 
 def test_create_validates_data(dummy_client, response_factory):
@@ -109,7 +143,9 @@ def test_create_validates_data(dummy_client, response_factory):
     schema._form_variables = {"F1": {"age": var}}
     schema._form_id_to_key = {1: "F1"}
 
-    dummy_client.post.return_value = response_factory({"jobId": "1"})
+    dummy_client.post.return_value = response_factory(
+        {"jobId": "1", "batchId": "b1", "state": "created"}
+    )
     # unknown form key
     with pytest.raises(ValidationError, match="Unknown form BAD"):
         ep.create("S1", [{"formKey": "BAD", "data": {}}], schema=schema)
@@ -121,7 +157,8 @@ def test_create_validates_data(dummy_client, response_factory):
     dummy_client.post.assert_not_called()
 
     # valid
-    ep.create("S1", [{"formKey": "F1", "data": {"age": 5}}], schema=schema)
+    job = ep.create("S1", [{"formKey": "F1", "data": {"age": 5}}], schema=schema)
+    assert job.state == "CREATED"
     dummy_client.post.assert_called_once()
 
 

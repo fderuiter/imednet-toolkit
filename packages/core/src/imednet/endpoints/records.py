@@ -30,7 +30,7 @@ class RecordsOperationDef:
         self,
         study_key: str,
         records_data: list[JsonDict],
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
         *,
         schema: SchemaCache | None = None,
     ) -> RecordCreateOperation[Job]:
@@ -39,7 +39,7 @@ class RecordsOperationDef:
         Args:
             study_key: The study key.
             records_data: The data for the records to create.
-            email_notify: Whether to send email notifications.
+            email_notify: Optional email address to notify upon completion.
             schema: Optional schema cache for validation.
 
         Returns:

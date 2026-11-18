@@ -545,6 +545,64 @@ class TestApplyQualityGate:
         mock_validator.refresh.assert_called_once_with("STUDY")
         assert "Quality gate dropped 3 records in total." in caplog.text
 
+    def test_quality_gate_accepts_ecrf_types_and_blocks_invalid_values(self):
+        """Quality gate accepts RADIO, DROPDOWN, MEMO, CHECKBOX, DATE, and decimal NUMBER values."""
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+
+        sdk = MagicMock()
+        sdk.get_variables.return_value = [
+            Variable(variable_name="radio_v", variable_type="RADIO", form_id=1, form_key="F_ECRF"),
+            Variable(
+                variable_name="drop_v", variable_type="DROPDOWN", form_id=1, form_key="F_ECRF"
+            ),
+            Variable(variable_name="memo_v", variable_type="MEMO", form_id=1, form_key="F_ECRF"),
+            Variable(variable_name="chk_v", variable_type="CHECKBOX", form_id=1, form_key="F_ECRF"),
+            Variable(variable_name="date_v", variable_type="DATE", form_id=1, form_key="F_ECRF"),
+            Variable(variable_name="num_v", variable_type="NUMBER", form_id=1, form_key="F_ECRF"),
+        ]
+        good = {
+            "record_id": "r_good",
+            "formKey": "F_ECRF",
+            "recordData": {
+                "radio_v": "A",
+                "drop_v": "B",
+                "memo_v": "Notes",
+                "chk_v": False,
+                "date_v": "2026-05-01",
+                "num_v": 36.7,
+            },
+        }
+        good_model = Record(
+            record_id=2,
+            form_key="F_ECRF",
+            record_data={
+                "radio_v": "A",
+                "drop_v": "B",
+                "memo_v": "Notes",
+                "chk_v": True,
+                "date_v": "2026-05-02",
+                "num_v": 98.6,
+            },
+        )
+        bad = {
+            "record_id": "r_bad",
+            "formKey": "F_ECRF",
+            "recordData": {
+                "radio_v": "A",
+                "drop_v": "B",
+                "memo_v": "Notes",
+                "chk_v": "not-bool",
+                "date_v": "05/01/2026",
+                "num_v": True,
+            },
+        }
+        cfg = SinkConfig(
+            study_key="STUDY", quality_gate_enabled=True, min_schema_readiness_score=100.0
+        )
+        passed = list(sink_base_mod.apply_quality_gate(sdk, "STUDY", [good, good_model, bad], cfg))
+        assert passed == [good, good_model]
+
 
 class TestSpiSinks:
     """Test suite for imednet.spi.sinks re-exports and namespace modules."""

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable
+from datetime import date
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -14,7 +16,7 @@ from typing import (
 from imednet.errors import UnknownVariableTypeError, ValidationError
 
 from ..models.variables import Variable
-from ._base import _ValidatorMixin
+from ._base import _extract_form_identifiers, _ValidatorMixin
 
 if TYPE_CHECKING:
     from ..endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
@@ -151,29 +153,32 @@ class AsyncSchemaCache(BaseSchemaCache["AsyncImednetFacade"]):
         super().__init__(is_async=True)
 
 
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def _validate_int(value: Any) -> None:
-    """Validate that the value is an integer.
+    """Validate that the value is an integer (excluding booleans).
 
     Args:
         value: The value to validate.
 
     Raises:
-        ValidationError: If the value is not an integer.
+        ValidationError: If the value is a boolean or not an integer.
     """
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValidationError("Value must be an integer")
 
 
 def _validate_float(value: Any) -> None:
-    """Validate that the value is numeric (int or float).
+    """Validate that the value is numeric (int or float, excluding booleans).
 
     Args:
         value: The value to validate.
 
     Raises:
-        ValidationError: If the value is not numeric.
+        ValidationError: If the value is a boolean or not numeric.
     """
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError("Value must be numeric")
 
 
@@ -203,17 +208,38 @@ def _validate_text(value: Any) -> None:
         raise ValidationError("Value must be a string")
 
 
+def _validate_date(value: Any) -> None:
+    """Validate that the value is a calendar date string in YYYY-MM-DD format.
+
+    Args:
+        value: The value to validate.
+
+    Raises:
+        ValidationError: If the value is not a valid YYYY-MM-DD date string.
+    """
+    if not isinstance(value, str) or not _DATE_RE.match(value):
+        raise ValidationError("Value must be a valid YYYY-MM-DD date string")
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise ValidationError("Value must be a valid YYYY-MM-DD date string") from None
+
+
 _TYPE_VALIDATORS: dict[str, Callable[[Any], None]] = {
     "int": _validate_int,
     "integer": _validate_int,
-    "number": _validate_int,
+    "number": _validate_float,
     "float": _validate_float,
     "decimal": _validate_float,
     "bool": _validate_bool,
     "boolean": _validate_bool,
+    "checkbox": _validate_bool,
     "text": _validate_text,
     "string": _validate_text,
-    "date": _validate_text,
+    "memo": _validate_text,
+    "dropdown": _validate_text,
+    "radio": _validate_text,
+    "date": _validate_date,
     "datetime": _validate_text,
     "time": _validate_text,
 }
@@ -333,12 +359,15 @@ def validate_record_entry(
         ValidationError: If the form key is not present in the schema or the data
             fails validation checks.
     """
-    fk = record.get("formKey") or record.get("form_key")
-    if not fk:
-        fid = record.get("formId") or record.get("form_id") or 0
+    fk, fid = _extract_form_identifiers(record)
+    if not fk and fid is not None:
         fk = schema.form_key_from_id(fid)
-    if fk:
-        validate_record_data(schema, fk, record.get("recordData", record.get("data", {})))
+    if not fk:
+        raise ValidationError(f"Unknown formId {fid}")
+    data = record.get("recordData", record.get("data", {}))
+    if not isinstance(data, dict):
+        raise ValidationError("Record data must be a dictionary")
+    validate_record_data(schema, fk, data)
 
 
 class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
@@ -361,7 +390,7 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
             A tuple of (form_key, needs_refresh).
         """
         form_key = self._resolve_form_key(record)
-        needs_refresh = bool(form_key and not self.schema.variables_for_form(form_key))
+        needs_refresh = not bool(form_key and self.schema.variables_for_form(form_key))
         return form_key, needs_refresh
 
 
@@ -387,6 +416,11 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
         form_key, needs_refresh = self._needs_refresh(record)
         if needs_refresh:
             self.refresh(study_key)
+            if not form_key:
+                form_key = self._resolve_form_key(record)
+        if not form_key:
+            _, fid = _extract_form_identifiers(record)
+            raise ValidationError(f"Unknown formId {fid}")
         self._validate_cached(form_key, record.get("recordData", record.get("data", {})))
 
     def validate_batch(self, study_key: str, records: list[dict[str, Any]]) -> None:
@@ -417,6 +451,11 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
         form_key, needs_refresh = self._needs_refresh(record)
         if needs_refresh:
             await self.refresh(study_key)
+            if not form_key:
+                form_key = self._resolve_form_key(record)
+        if not form_key:
+            _, fid = _extract_form_identifiers(record)
+            raise ValidationError(f"Unknown formId {fid}")
         self._validate_cached(form_key, record.get("recordData", record.get("data", {})))
 
     async def validate_batch(self, study_key: str, records: list[dict[str, Any]]) -> None:

@@ -58,10 +58,15 @@ class RegisterSubjectsWorkflow:
             ApiError: If the API call fails.
         """
         # Validate that each site exists before posting
-        sites = {s.site_name for s in self._sdk.get_sites(study_key=study_key)}
+        site_objs = self._sdk.get_sites(study_key=study_key)
+        sites = {s.site_name for s in site_objs}
+        site_ids = {s.site_id for s in site_objs if s.site_id is not None}
         errors: list[str] = []
         for idx, subj in enumerate(subjects):
-            if not subj.site_name:
+            if subj.site_id is not None:
+                if subj.site_id not in site_ids:
+                    errors.append(f"Index {idx}: siteId '{subj.site_id}' not found")
+            elif not subj.site_name:
                 errors.append(f"Index {idx}: siteName is required")
             elif subj.site_name not in sites:
                 errors.append(f"Index {idx}: site '{subj.site_name}' not found")

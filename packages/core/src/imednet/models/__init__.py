@@ -48,6 +48,7 @@ from imednet.models.records import (
     Record,
     RecordData,
     RecordJobResponse,
+    RecordRequest,
     RegisterSubjectRequest,
     UpdateScheduledRecordRequest,
 )
@@ -153,6 +154,7 @@ __all__: list[str] = [
     "Record",
     "RecordData",
     "RecordJobResponse",
+    "RecordRequest",
     "RecordRevision",
     "RegisterSubjectRequest",
     "ResourceRegistry",

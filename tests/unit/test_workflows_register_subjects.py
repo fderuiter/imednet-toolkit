@@ -77,3 +77,20 @@ def test_register_subjects_missing_site_name() -> None:
 
     with pytest.raises(ValueError, match="siteName is required"):
         wf.register_subjects("STUDY", [req])
+
+
+def test_register_subjects_with_site_id() -> None:
+    """Test subject registration with formId and siteId identifier pairs."""
+    sdk = MagicMock()
+    job = Job(jobId="1", batchId="1", state="CREATED")
+    sdk.create_record.return_value = job
+    sdk.get_sites.return_value = [
+        Site(studyKey="S", siteId=101, siteName="SITE", siteEnrollmentStatus="Active")
+    ]
+    wf = RegisterSubjectsWorkflow(sdk)
+    req = RegisterSubjectRequest(formId=10, siteId=101)
+    assert wf.register_subjects("STUDY", [req]) == job
+
+    bad_req = RegisterSubjectRequest(formId=10, siteId=999)
+    with pytest.raises(ValueError, match="siteId '999' not found"):
+        wf.register_subjects("STUDY", [bad_req])

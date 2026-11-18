@@ -123,13 +123,14 @@ def test_simulation_records_create_and_retrieve():
             {
                 "subjectKey": "SUB1",
                 "formKey": "F_DM",
-                "recordData": {"V_AGE": 50, "V_GENDER": "Female"},
+                "data": {"V_AGE": 50, "V_GENDER": "Female"},
             }
         ]
 
         response = sdk.records.create(study_key="STUDY", records_data=new_record_data)
         assert response is not None
-        assert response.batch_id is not None or response.state is not None
+        assert response.state == "CREATED"
+        assert response.batch_id is not None
 
         after_records = list(sdk.records.list(study_key="STUDY"))
         assert len(after_records) == initial_count + 1
@@ -162,7 +163,7 @@ def test_custom_simulation_transport_sharing():
 
     sdk1.records.create(
         study_key="STUDY",
-        records_data=[{"subjectKey": "SUB1", "formKey": "F_VS", "recordData": {"V_WEIGHT": 65}}],
+        records_data=[{"subjectKey": "SUB1", "formKey": "F_VS", "data": {"V_WEIGHT": 65}}],
     )
 
     records2 = list(sdk2.records.list(study_key="STUDY"))
@@ -191,11 +192,10 @@ async def test_async_sdk_simulation_mode():
 
             created = await sdk.records.create(
                 study_key="STUDY",
-                records_data=[
-                    {"subjectKey": "SUB1", "formKey": "F_VS", "recordData": {"V_WEIGHT": 70}}
-                ],
+                records_data=[{"subjectKey": "SUB1", "formKey": "F_VS", "data": {"V_WEIGHT": 70}}],
             )
-            assert created.batch_id is not None or created.state is not None
+            assert created.state == "CREATED"
+            assert created.batch_id is not None
 
             after_records = [r async for r in sdk.records.list(study_key="STUDY")]
             assert len(after_records) == initial_count + 1

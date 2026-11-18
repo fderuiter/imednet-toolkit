@@ -14,13 +14,16 @@ def test_create_or_update_records_no_wait() -> None:
     """Test that create or update records no wait."""
     sdk = MagicMock()
     del sdk.async_create_record
-    job = Job(jobId="1", batchId="1", state="PROCESSING")
+    job = Job(jobId="1", batchId="1", state="CREATED")
     sdk.create_record.return_value = job
 
     wf = RecordUpdateWorkflow(sdk)
-    result = wf.create_or_update_records("STUDY", [{"a": 1}])
+    var = Variable(variable_name="a", variable_type="integer", form_id=1, form_key="F1")
+    wf._schema.populate([var])
+    payload = [{"formKey": "F1", "data": {"a": 1}}]
+    result = wf.create_or_update_records("STUDY", payload)
 
-    sdk.create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.create_record.assert_called_once_with("STUDY", payload, schema=wf._schema)
     assert result == job
 
 
@@ -28,25 +31,38 @@ def test_create_or_update_records_wait_for_completion(monkeypatch) -> None:
     """Test that create or update records wait for completion."""
     sdk = MagicMock()
     del sdk.async_create_record
-    initial_job = Job(jobId="1", batchId="1", state="PROCESSING")
+    initial_job = Job(jobId="1", batchId="1", state="CREATED")
     completed_job = Job(jobId="1", batchId="1", state="COMPLETED")
     sdk.create_record.return_value = initial_job
     sdk.poll_job.return_value = completed_job
 
     wf = RecordUpdateWorkflow(sdk)
+    var = Variable(variable_name="a", variable_type="integer", form_id=1, form_key="F1")
+    wf._schema.populate([var])
+    payload = [{"formKey": "F1", "data": {"a": 1}}]
     # patch sleep to avoid delay
     monkeypatch.setattr("time.sleep", lambda *args: None)
     result = wf.create_or_update_records(
         "STUDY",
-        [{"a": 1}],
+        payload,
         wait_for_completion=True,
         poll_interval=0,
         timeout=5,
     )
 
-    sdk.create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.create_record.assert_called_once_with("STUDY", payload, schema=wf._schema)
     sdk.poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
     assert result.state == "COMPLETED"
+
+
+def test_create_or_update_records_rejects_missing_form_identifier() -> None:
+    """RecordUpdateWorkflow rejects records missing both formKey and formId."""
+    sdk = MagicMock()
+    del sdk.async_create_record
+    wf = RecordUpdateWorkflow(sdk)
+    with pytest.raises(ValidationError, match="formKey"):
+        wf.create_or_update_records("STUDY", [{"a": 1}])
+    sdk.create_record.assert_not_called()
 
 
 def test_update_scheduled_record_builds_payload() -> None:
@@ -332,13 +348,16 @@ async def test_async_create_or_update_records_no_wait() -> None:
     """Test that async create or update records no wait asynchronously."""
     sdk = MagicMock()
     sdk._async_client = True
-    job = Job(jobId="1", batchId="1", state="PROCESSING")
+    job = Job(jobId="1", batchId="1", state="CREATED")
     sdk.async_create_record = AsyncMock(return_value=job)
 
     wf = RecordUpdateWorkflow(sdk)
-    result = await wf.async_create_or_update_records("STUDY", [{"a": 1}])
+    var = Variable(variable_name="a", variable_type="integer", form_id=1, form_key="F1")
+    wf._schema.populate([var])
+    payload = [{"formKey": "F1", "data": {"a": 1}}]
+    result = await wf.async_create_or_update_records("STUDY", payload)
 
-    sdk.async_create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.async_create_record.assert_called_once_with("STUDY", payload, schema=wf._schema)
     assert result == job
 
 
@@ -347,24 +366,27 @@ async def test_async_create_or_update_records_wait_for_completion(monkeypatch) -
     """Test that async create or update records wait for completion asynchronously."""
     sdk = MagicMock()
     sdk._async_client = True
-    initial_job = Job(jobId="1", batchId="1", state="PROCESSING")
+    initial_job = Job(jobId="1", batchId="1", state="CREATED")
     completed_job = Job(jobId="1", batchId="1", state="COMPLETED")
     sdk.async_create_record = AsyncMock(return_value=initial_job)
     sdk.async_poll_job = AsyncMock(return_value=completed_job)
 
     wf = RecordUpdateWorkflow(sdk)
+    var = Variable(variable_name="a", variable_type="integer", form_id=1, form_key="F1")
+    wf._schema.populate([var])
+    payload = [{"formKey": "F1", "data": {"a": 1}}]
     import anyio
 
     monkeypatch.setattr(anyio, "sleep", AsyncMock())
     result = await wf.async_create_or_update_records(
         "STUDY",
-        [{"a": 1}],
+        payload,
         wait_for_completion=True,
         poll_interval=0,
         timeout=5,
     )
 
-    sdk.async_create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.async_create_record.assert_called_once_with("STUDY", payload, schema=wf._schema)
     sdk.async_poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
     assert result.state == "COMPLETED"
 

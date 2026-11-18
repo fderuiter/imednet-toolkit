@@ -110,12 +110,14 @@ def fake_query() -> dict[str, Any]:
 def _fake_value(var_type: str) -> Any:
     """Return a fake value matching ``var_type``."""
     var_type = (var_type or "").lower()
-    if var_type in {"int", "integer", "number"}:
+    if var_type in {"int", "integer"}:
         return faker.random_int(min=0, max=100)
-    if var_type in {"float", "decimal"}:
+    if var_type in {"number", "float", "decimal"}:
         return faker.pyfloat(left_digits=2, right_digits=2, positive=True)
-    if var_type in {"bool", "boolean"}:
+    if var_type in {"bool", "boolean", "checkbox"}:
         return faker.boolean()
+    if var_type == "date":
+        return faker.date_time().strftime("%Y-%m-%d")
     return faker.word()
 
 

@@ -47,31 +47,36 @@ class RecordData(RootModel[dict[str, Any]]):
     """Arbitrary record data as a dictionary."""
 
 class BaseRecordRequest(ImednetBaseModel):
-    """Base class for record creation/update requests."""
+    """Base class for strict record creation/update requests."""
 
-    form_key: str = Field("", alias="formKey")
+    form_key: str | None = Field(default=None, alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
 
 class RegisterSubjectRequest(BaseRecordRequest):
-    """Payload for registering (enrolling) a new subject.
+    """Payload for registering (enrolling) a new subject."""
 
-    Per the API documentation, registering a subject only requires ``formKey``
-    and ``siteName``.  The system assigns the subject identifier upon creation.
-    Do **not** include a ``subjectKey`` here — doing so causes the server to
-    treat the request as an update and reject it when the key is unknown.
-    """
-
-    site_name: str = Field(
-        "", alias="siteName", description="Name of the site where the subject is enrolled"
+    site_name: str | None = Field(
+        default=None, alias="siteName", description="Name of the site where the subject is enrolled"
+    )
+    site_id: int | None = Field(
+        default=None, alias="siteId", description="ID of the site where the subject is enrolled"
     )
 
-class UpdateScheduledRecordRequest(BaseRecordRequest):
+class CreateNewRecordRequest(RegisterSubjectRequest):
+    """Payload for creating a new unscheduled record or updating a record by identifier."""
+
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    record_id: int | None = Field(default=None, alias="recordId")
+    record_oid: str | None = Field(default=None, alias="recordOid")
+
+class UpdateScheduledRecordRequest(CreateNewRecordRequest):
     """Payload for updating an existing scheduled record."""
 
-    subject_key: str = Field("", alias="subjectKey")
-    interval_name: str = Field("", alias="intervalName")
+    interval_name: str | None = Field(default=None, alias="intervalName")
+    interval_id: int | None = Field(default=None, alias="intervalId")
 
-class CreateNewRecordRequest(BaseRecordRequest):
-    """Payload for creating a new unscheduled record."""
-
-    subject_key: str = Field("", alias="subjectKey")
+class RecordRequest(UpdateScheduledRecordRequest):
+    """Strict request envelope supporting all documented POST /records identifier pairs."""

@@ -471,7 +471,7 @@ class SimulationState:
             return {
                 "jobId": job_id,
                 "batchId": batch_id,
-                "state": "COMPLETED",
+                "state": "created",
             }
 
     def get_queries(self, study_key: str | None = None) -> list[dict[str, Any]]:
@@ -538,7 +538,8 @@ class SimulationState:
                 poll_count = job.get("_poll_count", 0) + 1
                 job["_poll_count"] = poll_count
                 if (
-                    job.get("state") in ("PROCESSING", "RUNNING", "QUEUED", "PENDING")
+                    str(job.get("state", "")).upper()
+                    in ("CREATED", "PROCESSING", "RUNNING", "QUEUED", "PENDING")
                     and poll_count >= 2
                 ):
                     job["state"] = "COMPLETED"

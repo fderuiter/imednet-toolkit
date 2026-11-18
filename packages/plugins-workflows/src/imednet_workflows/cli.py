@@ -10,10 +10,10 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
-from imednet.sdk import ImednetSDK
 from imednet.spi.cli import STUDY_KEY_ARG, clear_line, console, parse_filter_args, with_sdk
+from imednet.spi.facade import ImednetFacade
 
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
@@ -232,7 +232,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
     @with_sdk
     def extract_records(
-        sdk: ImednetSDK,
+        sdk: Any,
         study_key: str | None,
         record_filter: list[str] | None = None,
         subject_filter: list[str] | None = None,
@@ -258,7 +258,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             extract_parser.error("the following arguments are required: study_key")
 
         assert study_key is not None
-        workflow = DataExtractionWorkflow(sdk)  # type: ignore[arg-type]
+        workflow = DataExtractionWorkflow(cast(ImednetFacade, sdk))
         parsed_record_filter = parse_filter_args(record_filter)
         parsed_subject_filter = parse_filter_args(subject_filter)
         parsed_visit_filter = parse_filter_args(visit_filter)
@@ -309,7 +309,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
     @with_sdk
     def sync_worker(
-        sdk: ImednetSDK,
+        sdk: Any,
         study_key: str,
         interval: int = 900,
         once: bool = False,
@@ -317,7 +317,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         from .cached_loader import CachedRecordsLoader
 
         worker = SyncWorker(
-            CachedRecordsLoader(sdk),  # type: ignore[arg-type]
+            CachedRecordsLoader(cast(ImednetFacade, sdk)),
             config=SyncWorkerConfig(study_key=study_key, interval_seconds=interval),
         )
 
@@ -486,18 +486,18 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     uat_run_parser.add_argument(
         "--email-notify",
         default=None,
-        help="Optional email notification destination or flag.",
+        help="Optional email notification address.",
     )
 
     @with_sdk
     def uat_run(
-        sdk: ImednetSDK,
+        sdk: Any,
         study_key: str | None,
         interactive: bool = False,
         subject_count: int = 2,
         site_name: str | None = None,
         enabled_form_keys: list[str] | None = None,
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
     ) -> None:
         from .uat import UATWorkflow, UATWorkflowState
         from .wizard import print_progress, prompt_input, prompt_positive_int, prompt_study_key
@@ -543,7 +543,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         print_progress(f"Starting UAT pipeline for study '{study_key}'...")
         workflow = UATWorkflow(
-            sdk,  # type: ignore[arg-type]
+            cast(ImednetFacade, sdk),
             on_progress=on_progress,
             on_phase_change=on_phase,
         )
@@ -625,8 +625,8 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
 
     @with_sdk
-    def subject_data(sdk: ImednetSDK, study_key: str, subject_key: str) -> None:
-        workflow = SubjectDataWorkflow(sdk)  # type: ignore[arg-type]
+    def subject_data(sdk: Any, study_key: str, subject_key: str) -> None:
+        workflow = SubjectDataWorkflow(cast(ImednetFacade, sdk))
         data = workflow.get_all_subject_data(study_key, subject_key)
         print(data.model_dump())
 

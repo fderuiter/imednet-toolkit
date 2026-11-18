@@ -184,7 +184,7 @@ class ImednetFacade(Protocol):
         self,
         study_key: str,
         records_data: list[JsonDict],
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
         *,
         schema: Any = None,
     ) -> Job:
@@ -387,7 +387,7 @@ class AsyncImednetFacade(Protocol):
         self,
         study_key: str,
         records_data: list[JsonDict],
-        email_notify: bool | str | None = None,
+        email_notify: str | None = None,
         *,
         schema: Any = None,
     ) -> Job:

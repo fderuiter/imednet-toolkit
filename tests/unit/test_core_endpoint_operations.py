@@ -231,15 +231,17 @@ def test_record_create_operation_sync():
 
     operation = RecordCreateOperation(
         path="/create",
-        records_data=[{"field1": "val1"}],
-        email_notify=True,
+        records_data=[{"formKey": "F1", "data": {"field1": "val1"}}],
+        email_notify="notify@example.com",
     )
 
     result = operation.execute_sync(client, dummy_parse_func)
 
     assert result == {"status": "created"}
     client.post.assert_called_once_with(
-        "/create", json=[{"field1": "val1"}], headers={HEADER_EMAIL_NOTIFY: "true"}
+        "/create",
+        json=[{"formKey": "F1", "data": {"field1": "val1"}}],
+        headers={HEADER_EMAIL_NOTIFY: "notify@example.com"},
     )
 
 
@@ -248,8 +250,14 @@ def test_record_create_operation_header_validation_failure():
     with pytest.raises(ClientError, match="Header value must not contain newlines"):
         RecordCreateOperation(
             path="/create",
-            records_data=[{"field1": "val1"}],
+            records_data=[{"formKey": "F1", "data": {"field1": "val1"}}],
             email_notify="test@example.com\n",
+        )
+    with pytest.raises(ClientError, match="control characters"):
+        RecordCreateOperation(
+            path="/create",
+            records_data=[{"formKey": "F1", "data": {"field1": "val1"}}],
+            email_notify="test\x00@example.com",
         )
 
 
@@ -265,7 +273,9 @@ def test_record_create_operation_schema_validation_failure():
 
         with pytest.raises(ClientError, match="Invalid record data"):
             RecordCreateOperation(
-                path="/create", records_data=[{"invalid": "data"}], schema=schema_mock
+                path="/create",
+                records_data=[{"formKey": "F1", "data": {"invalid": "data"}}],
+                schema=schema_mock,
             )
 
 
@@ -279,7 +289,7 @@ async def test_record_create_operation_async():
 
     operation = RecordCreateOperation(
         path="/create",
-        records_data=[{"field1": "val1"}],
+        records_data=[{"formId": 12, "data": {"field1": "val1"}}],
         email_notify="user@example.com",
     )
 
@@ -288,6 +298,110 @@ async def test_record_create_operation_async():
     assert result == {"status": "created"}
     client.post.assert_called_once_with(
         "/create",
-        json=[{"field1": "val1"}],
+        json=[{"formId": 12, "data": {"field1": "val1"}}],
         headers={HEADER_EMAIL_NOTIFY: "user@example.com"},
     )
+
+
+def test_record_create_operation_all_identifier_pairs_and_strict_rejections():
+    """Verify BaseRecordRequest subclasses, identifier serialization, PHI masking, and email checks."""
+    from imednet.errors import ValidationError
+    from imednet.models.records import (
+        CreateNewRecordRequest,
+        RecordData,
+        RegisterSubjectRequest,
+        UpdateScheduledRecordRequest,
+    )
+
+    reg_by_id = RegisterSubjectRequest(formId=10, siteId=20, data=RecordData({"v": 1}))
+    sched_by_oid = UpdateScheduledRecordRequest(
+        formKey="VISIT_FORM",
+        siteName="Site A",
+        subjectId=30,
+        subjectOid="SUBJ-OID-1",
+        subjectKey="SUBJ-1",
+        intervalId=40,
+        intervalName="Baseline",
+        recordId=50,
+        recordOid="REC-OID-1",
+        data=RecordData({"bp": 120}),
+    )
+    unsched = CreateNewRecordRequest(
+        form_id=11,
+        subject_oid="SUBJ-OID-2",
+        record_id=55,
+        data=RecordData({"note": "ok"}),
+    )
+
+    op = RecordCreateOperation(
+        path="/create",
+        records_data=[
+            reg_by_id,  # type: ignore[list-item]
+            sched_by_oid,  # type: ignore[list-item]
+            unsched.model_dump(by_alias=True, exclude_none=True),
+            {"form_key": "F2", "site_id": 9, "interval_id": 3, "data": {"x": "y"}},
+        ],
+    )
+    assert op.records_data == [
+        {"formId": 10, "siteId": 20, "data": {"v": 1}},
+        {
+            "formKey": "VISIT_FORM",
+            "siteName": "Site A",
+            "subjectKey": "SUBJ-1",
+            "subjectId": 30,
+            "subjectOid": "SUBJ-OID-1",
+            "intervalName": "Baseline",
+            "intervalId": 40,
+            "recordId": 50,
+            "recordOid": "REC-OID-1",
+            "data": {"bp": 120},
+        },
+        {"formId": 11, "subjectOid": "SUBJ-OID-2", "recordId": 55, "data": {"note": "ok"}},
+        {"formKey": "F2", "siteId": 9, "intervalId": 3, "data": {"x": "y"}},
+    ]
+
+    # Reject subjectKey on RegisterSubjectRequest
+    with pytest.raises(Exception):
+        RegisterSubjectRequest(formKey="F1", siteName="S1", subjectKey="SUBJ-1")  # type: ignore[call-arg]
+
+    # Reject non-list records_data and non-dict items
+    with pytest.raises(ValidationError, match="records_data must be a list"):
+        RecordCreateOperation(path="/create", records_data={"formKey": "F1"})  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="expected dictionary"):
+        RecordCreateOperation(path="/create", records_data=["bad"])  # type: ignore[list-item]
+
+    # Reject missing formKey & formId, string/bool IDs, non-positive IDs, and recordData without leaking PHI
+    for invalid_item in [
+        {"data": {"patient_name": "Jane Doe"}},
+        {"formKey": "", "data": {"patient_name": "Jane Doe"}},
+        {"formId": 0, "data": {"patient_name": "Jane Doe"}},
+        {"formId": True, "data": {"patient_name": "Jane Doe"}},
+        {"formId": "10", "data": {"patient_name": "Jane Doe"}},
+        {"formKey": 123, "data": {"patient_name": "Jane Doe"}},
+        {"formKey": "F1", "recordData": {"patient_name": "Jane Doe", "ssn": "123-45-6789"}},
+        {"formKey": "F1", "unknownKey": "Jane Doe", "data": {}},
+        {"formKey": "F1", "data": "Jane Doe"},
+    ]:
+        with pytest.raises(ValidationError) as exc_info:
+            RecordCreateOperation(path="/create", records_data=[invalid_item])  # type: ignore[list-item]
+        assert "Jane Doe" not in str(exc_info.value)
+        assert "123-45-6789" not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+
+    # Reject boolean, non-string, empty, and malformed email_notify
+    for bad_notify in [
+        True,
+        False,
+        123,
+        "",
+        "   ",
+        "user..a@domain.com",
+        "user@domain..com",
+        "user@domain.1",
+    ]:
+        with pytest.raises(ValidationError):
+            RecordCreateOperation(
+                path="/create",
+                records_data=[{"formKey": "F1", "data": {}}],
+                email_notify=bad_notify,  # type: ignore[arg-type]
+            )
