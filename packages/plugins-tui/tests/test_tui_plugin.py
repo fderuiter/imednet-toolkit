@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
@@ -18,8 +19,10 @@ from imednet_tui.app import (
     StudyList,
     SubjectTable,
     TextualLogHandler,
+    is_interactive_terminal,
     run_tui,
 )
+from imednet_tui.cli import setup_parser
 
 
 @pytest.fixture
@@ -299,8 +302,11 @@ def test_textual_log_handler():
 
 
 def test_run_tui_helper(mock_sdk):
-    """Test that run_tui starts the app."""
-    with patch.object(ImednetTuiApp, "run") as mock_run:
+    """Test that run_tui starts the app when terminal is interactive."""
+    with (
+        patch("imednet_tui.app.is_interactive_terminal", return_value=True),
+        patch.object(ImednetTuiApp, "run") as mock_run,
+    ):
         run_tui(mock_sdk)
         mock_run.assert_called_once()
 
@@ -500,3 +506,232 @@ async def test_job_monitor_sync_get_responsiveness_regression_heartbeat():
     assert "Active & Recent Jobs (1)" in rendered
     assert "COMPLETED" in rendered
     assert "BATCH-HEARTBEAT-1" in rendered
+
+
+def test_is_interactive_terminal_true():
+    """Verify is_interactive_terminal returns True when streams are TTY and TERM is valid."""
+    with (
+        patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=True),
+    ):
+        assert is_interactive_terminal() is True
+
+
+def test_is_interactive_terminal_false_when_non_interactive_env():
+    """Verify is_interactive_terminal returns False when IMEDNET_NON_INTERACTIVE=1."""
+    with (
+        patch.dict(
+            "os.environ",
+            {"IMEDNET_NON_INTERACTIVE": "1", "TERM": "xterm-256color"},
+            clear=True,
+        ),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=True),
+    ):
+        assert is_interactive_terminal() is False
+
+
+@pytest.mark.parametrize("term_val", ["dumb", "", "   "])
+def test_is_interactive_terminal_false_when_term_dumb_or_empty(term_val):
+    """Verify is_interactive_terminal returns False when TERM is dumb, empty, or whitespace."""
+    with (
+        patch.dict("os.environ", {"TERM": term_val}, clear=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=True),
+    ):
+        assert is_interactive_terminal() is False
+
+
+def test_is_interactive_terminal_false_when_non_tty_stdout():
+    """Verify is_interactive_terminal returns False when stdout is redirected / non-tty."""
+    with (
+        patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=True),
+        patch("sys.stdout.isatty", return_value=False),
+        patch("sys.stdin.isatty", return_value=True),
+    ):
+        assert is_interactive_terminal() is False
+
+
+def test_is_interactive_terminal_false_when_non_tty_stdin():
+    """Verify is_interactive_terminal returns False when stdin is piped / non-tty."""
+    with (
+        patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=False),
+    ):
+        assert is_interactive_terminal() is False
+
+
+@pytest.mark.parametrize(
+    "exc_type", [OSError("Closed"), ValueError("Invalid"), AttributeError("No isatty")]
+)
+def test_is_interactive_terminal_false_on_stream_exception(exc_type):
+    """Verify is_interactive_terminal safely returns False on stream inspection exceptions."""
+    with (
+        patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=True),
+        patch("sys.stdout.isatty", side_effect=exc_type),
+        patch("sys.stdin.isatty", return_value=True),
+    ):
+        assert is_interactive_terminal() is False
+
+
+def test_is_interactive_terminal_false_when_stream_is_none():
+    """Verify is_interactive_terminal safely handles None streams."""
+    with (
+        patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=True),
+        patch("sys.stdout", None),
+    ):
+        assert is_interactive_terminal() is False
+
+
+def test_run_tui_headless_raises_runtime_error(mock_sdk):
+    """Verify run_tui raises RuntimeError when terminal is non-interactive and force is False."""
+    with (
+        patch("imednet_tui.app.is_interactive_terminal", return_value=False),
+        patch.object(ImednetTuiApp, "run") as mock_run,
+    ):
+        with pytest.raises(RuntimeError, match="Interactive terminal required to run the TUI"):
+            run_tui(mock_sdk, force=False)
+        mock_run.assert_not_called()
+
+
+def test_run_tui_force_flag_bypasses_check(mock_sdk):
+    """Verify run_tui runs app when force=True even in non-interactive environment."""
+    with (
+        patch("imednet_tui.app.is_interactive_terminal", return_value=False),
+        patch.object(ImednetTuiApp, "run") as mock_run,
+    ):
+        run_tui(mock_sdk, force=True)
+        mock_run.assert_called_once()
+
+
+def test_cli_run_tui_command_interactive_success(mock_sdk):
+    """Verify CLI run_tui_command launches run_tui when terminal is interactive."""
+    subparsers = MagicMock()
+    mock_parser = MagicMock()
+    subparsers.add_parser.return_value = mock_parser
+
+    setup_parser(subparsers)
+    command_func = mock_parser.set_defaults.call_args[1]["func"]
+
+    args = argparse.Namespace(high_contrast=False, force=False)
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+    ):
+        command_func(args)
+        mock_run_tui.assert_called_once_with(mock_sdk, force=False)
+
+
+def test_cli_run_tui_command_headless_exits(mock_sdk, capsys):
+    """Verify CLI run_tui_command prints error and exits with code 1 in headless/non-tty runs."""
+    subparsers = MagicMock()
+    mock_parser = MagicMock()
+    subparsers.add_parser.return_value = mock_parser
+
+    setup_parser(subparsers)
+    command_func = mock_parser.set_defaults.call_args[1]["func"]
+
+    args = argparse.Namespace(high_contrast=False, force=False)
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=False),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        command_func(args)
+
+    assert exc_info.value.code == 1
+    _, err = capsys.readouterr()
+    assert "Error: Interactive terminal required to run the TUI interface." in err
+
+
+def test_cli_run_tui_command_non_interactive_env_exits(mock_sdk, capsys):
+    """Verify CLI run_tui_command exits cleanly with code 1 when IMEDNET_NON_INTERACTIVE=1."""
+    subparsers = MagicMock()
+    mock_parser = MagicMock()
+    subparsers.add_parser.return_value = mock_parser
+
+    setup_parser(subparsers)
+    command_func = mock_parser.set_defaults.call_args[1]["func"]
+
+    args = argparse.Namespace(high_contrast=False, force=False)
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch.dict(
+            "os.environ", {"IMEDNET_NON_INTERACTIVE": "1", "TERM": "xterm-256color"}, clear=True
+        ),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=True),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        command_func(args)
+
+    assert exc_info.value.code == 1
+    _, err = capsys.readouterr()
+    assert "Interactive terminal required" in err
+
+
+def test_cli_run_tui_command_term_dumb_or_missing_exits(mock_sdk, capsys):
+    """Verify CLI run_tui_command exits cleanly with code 1 when TERM is dumb or missing."""
+    subparsers = MagicMock()
+    mock_parser = MagicMock()
+    subparsers.add_parser.return_value = mock_parser
+
+    setup_parser(subparsers)
+    command_func = mock_parser.set_defaults.call_args[1]["func"]
+
+    args = argparse.Namespace(high_contrast=False, force=False)
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch.dict("os.environ", {"TERM": "dumb"}, clear=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("sys.stdin.isatty", return_value=True),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        command_func(args)
+
+    assert exc_info.value.code == 1
+    _, err = capsys.readouterr()
+    assert "Interactive terminal required" in err
+
+
+def test_cli_run_tui_command_force_flag_bypasses(mock_sdk):
+    """Verify CLI run_tui_command bypasses interactivity guard when --force is set."""
+    subparsers = MagicMock()
+    mock_parser = MagicMock()
+    subparsers.add_parser.return_value = mock_parser
+
+    setup_parser(subparsers)
+    command_func = mock_parser.set_defaults.call_args[1]["func"]
+
+    args = argparse.Namespace(high_contrast=False, force=True)
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=False),
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+    ):
+        command_func(args)
+        mock_run_tui.assert_called_once_with(mock_sdk, force=True)
+
+
+def test_cli_run_tui_command_high_contrast(mock_sdk, monkeypatch):
+    """Verify CLI run_tui_command sets IMEDNET_HIGH_CONTRAST when high_contrast is True."""
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    subparsers = MagicMock()
+    mock_parser = MagicMock()
+    subparsers.add_parser.return_value = mock_parser
+
+    setup_parser(subparsers)
+    command_func = mock_parser.set_defaults.call_args[1]["func"]
+
+    args = argparse.Namespace(high_contrast=True, force=False)
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+    ):
+        command_func(args)
+        mock_run_tui.assert_called_once_with(mock_sdk, force=False)
+        assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
