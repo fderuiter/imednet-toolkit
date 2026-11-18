@@ -1,6 +1,7 @@
 """Unit tests for variables endpoint."""
 
 import pytest
+from unittest.mock import MagicMock
 
 from imednet.endpoints import variables
 from imednet.errors import NotFoundError
@@ -105,11 +106,16 @@ def test_to_dataframe_empty_results(dummy_client, paginator_factory):
 def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, paginator_factory):
     """Test that to_dataframe raises ImportError when pandas is not installed."""
     ep = variables.VariablesEndpoint(dummy_client)
-    paginator_factory(variables, [{"variableId": 1}])
+    captured = paginator_factory(variables, [{"variableId": 1}])
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    mock_list = MagicMock()
+    monkeypatch.setattr(ep, "list", mock_list)
 
     with pytest.raises(ImportError, match="pandas is required for variables_to_dataframe"):
         ep.to_dataframe("S1")
+
+    mock_list.assert_not_called()
+    assert captured["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -163,8 +169,13 @@ async def test_async_to_dataframe_missing_dependency(
 ):
     """Test that async to_dataframe raises ImportError when pandas is not installed."""
     ep = variables.AsyncVariablesEndpoint(dummy_client)
-    async_paginator_factory(variables, [{"variableId": 1}])
+    captured = async_paginator_factory(variables, [{"variableId": 1}])
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    mock_list = MagicMock()
+    monkeypatch.setattr(ep, "list", mock_list)
 
     with pytest.raises(ImportError, match="pandas is required for variables_to_dataframe"):
         await ep.to_dataframe("S1")
+
+    mock_list.assert_not_called()
+    assert captured["count"] == 0

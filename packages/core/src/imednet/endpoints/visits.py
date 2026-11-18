@@ -39,8 +39,9 @@ class VisitsEndpoint(VisitsOperationDef, EdcSyncListGetEndpoint[Visit]):  # type
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import visits_to_dataframe
+        from imednet.utils.pandas import check_pandas, visits_to_dataframe
 
+        check_pandas("visits_to_dataframe")
         visits = list(self.list(study_key=study_key, **filters))
         return visits_to_dataframe(visits)
 
@@ -65,7 +66,8 @@ class AsyncVisitsEndpoint(VisitsOperationDef, EdcAsyncListGetEndpoint[Visit]):  
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import visits_to_dataframe
+        from imednet.utils.pandas import check_pandas, visits_to_dataframe
 
+        check_pandas("visits_to_dataframe")
         visits = [visit async for visit in self.list(study_key=study_key, **filters)]
         return visits_to_dataframe(visits)
