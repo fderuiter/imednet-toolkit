@@ -1,6 +1,6 @@
 """Unit tests for utils dates and filters."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,7 +9,9 @@ from imednet.endpoints.records import RecordsEndpoint
 from imednet.utils.dates import format_iso_datetime, parse_iso_datetime
 from imednet.utils.filters import (
     ALLOWED_OPERATORS,
+    RECORD_DATA_OPERATORS,
     build_filter_string,
+    extract_filter_attributes,
     validate_connector_exclusivity,
     validate_filter_key,
     validate_filter_operator,
@@ -97,9 +99,34 @@ def test_build_filter_string_tuple_and_list_raises_on_mixed_connectors() -> None
 
 
 def test_build_filter_string_bool_and_none() -> None:
-    """Test that build filter string bool and none."""
-    result = build_filter_string({"active": True, "missing": None})
-    assert result == "active==True;missing==None"
+    """Test lowercase boolean serialization and ValueError on None values."""
+    result = build_filter_string({"active": True, "deleted": False})
+    assert result == "active==true;deleted==false"
+
+    with pytest.raises(ValueError, match="cannot be None"):
+        build_filter_string({"missing": None})
+    with pytest.raises(ValueError, match="cannot be None"):
+        build_filter_string({"missing": ("==", None)})
+    with pytest.raises(ValueError, match="cannot be None"):
+        build_filter_string({"missing": ["A", None]})
+
+
+def test_build_filter_string_unquoted_iso_timestamps_and_dates() -> None:
+    """Test ISO-8601 timestamps and date/datetime objects serialize unquoted."""
+    dt = datetime(2024, 1, 2, 12, 30, 0, tzinfo=timezone.utc)
+    d = date(2024, 1, 2)
+    assert (
+        build_filter_string({"date_modified": (">=", dt)}) == "dateModified>=2024-01-02T12:30:00Z"
+    )
+    assert build_filter_string({"visit_date": d}) == "visitDate==2024-01-02"
+    assert (
+        build_filter_string({"date_modified": (">=", "2024-01-02T00:00:00Z")})
+        == "dateModified>=2024-01-02T00:00:00Z"
+    )
+    assert (
+        build_filter_string({"date_created": ("<", "2024-01-02T00:00:00-06:00")})
+        == "dateCreated<2024-01-02T00:00:00-06:00"
+    )
 
 
 def test_build_filter_string_empty() -> None:
@@ -140,15 +167,46 @@ def test_build_filter_string_backslashes() -> None:
 
 
 def test_allowed_operators_constant() -> None:
-    """Test that ALLOWED_OPERATORS matches expected operator tokens."""
-    assert ALLOWED_OPERATORS == frozenset({"<", "<=", ">", ">=", "==", "!=", "=~"})
+    """Test that ALLOWED_OPERATORS excludes =~ while RECORD_DATA_OPERATORS includes =~."""
+    assert ALLOWED_OPERATORS == frozenset({"<", "<=", ">", ">=", "==", "!="})
+    assert RECORD_DATA_OPERATORS == frozenset({"<", "<=", ">", ">=", "==", "!=", "=~"})
 
 
-@pytest.mark.parametrize("op", ["<", "<=", ">", ">=", "==", "!=", "=~"])
+@pytest.mark.parametrize("op", ["<", "<=", ">", ">=", "==", "!="])
 def test_valid_operators(op: str) -> None:
-    """Test all allowed operators."""
+    """Test all allowed standard filter operators."""
     result = build_filter_string({"field": (op, "value")})
     assert result == f"field{op}value"
+
+
+def test_regex_operator_restricted_to_record_data_filter() -> None:
+    """Test =~ is rejected in standard filters and accepted in recordDataFilter."""
+    with pytest.raises(ValueError, match="Invalid filter operator '=~'"):
+        build_filter_string({"field": ("=~", "value")})
+    with pytest.raises(ValueError, match="Invalid filter operator '=~'"):
+        validate_filter_syntax("field=~value")
+
+    validate_filter_operator("=~", allow_regex=True)
+    validate_record_filter("aeTerm=~headache")
+
+
+def test_duplicate_attributes_rejected_in_and_clauses_allowed_in_or_clauses() -> None:
+    """Test duplicate attributes in ';' AND clauses raise ValueError while ',' OR allows repeats."""
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'siteId'"):
+        build_filter_string({"site_id": 1, "siteId": 2})
+
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'name'"):
+        validate_filter_syntax("name==John;name!=Jane")
+
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'age'"):
+        validate_record_filter("age>=18;age<=65")
+
+    validate_filter_syntax("subjectKey==SUB1,subjectKey==SUB2")
+    validate_record_filter("aeTerm==A,aeTerm==B")
+    assert extract_filter_attributes("subjectKey==SUB1,subjectKey==SUB2") == [
+        "subjectKey",
+        "subjectKey",
+    ]
 
 
 @pytest.mark.parametrize("invalid_op", ["===", "<>", "LIKE", "in", "contains", "!~"])

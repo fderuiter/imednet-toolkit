@@ -23,7 +23,33 @@ class RecordsOperationDef:
     PATH = "records"
     MODEL = Record
     _id_param = "recordId"
-    PARAM_PROCESSOR = MappingParamProcessor({"record_data_filter": "recordDataFilter"})
+    PARAM_PROCESSOR = MappingParamProcessor(
+        {
+            "record_data_filter": "recordDataFilter",
+            "recordDataFilter": "recordDataFilter",
+        }
+    )
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "intervalId",
+            "formId",
+            "formKey",
+            "siteId",
+            "recordId",
+            "recordOid",
+            "recordType",
+            "recordStatus",
+            "deleted",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+            "subjectId",
+            "subjectOid",
+            "subjectKey",
+            "visitId",
+            "parentRecordId",
+        }
+    )
 
     @execute_operation  # type: ignore
     def create(

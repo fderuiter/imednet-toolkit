@@ -6,37 +6,39 @@ import pytest
 
 from imednet.core.context import set_study_context
 from imednet.endpoints import visits
-from imednet.errors import NotFoundError
+from imednet.errors.validation import ConfigurationError
 from imednet.models.visits import Visit
 
 
 def test_list_filters_and_path(dummy_client, paginator_factory, patch_build_filter):
-    """Test that list filters and path."""
+    """Test that list builds path and omits studyKey from filter."""
     set_study_context("S1")
     ep = visits.VisitsEndpoint(dummy_client)
     capture = paginator_factory(visits, [{"visitId": 1}])
     patch = patch_build_filter(visits)
 
-    result = ep.list(status="x")
+    result = ep.list(intervalName="Baseline")
 
     assert capture["path"] == "/api/v1/edc/studies/S1/visits"
     assert capture["params"] == {"filter": "FILTERED"}
-    assert patch["filters"] == {"status": "x", "studyKey": "S1"}
+    assert patch["filters"] == {"intervalName": "Baseline"}
     assert isinstance(result[0], Visit)
 
 
-def test_get_not_found(monkeypatch, dummy_client):
-    """Test that get not found."""
+def test_visits_endpoint_is_list_only_and_rejects_undocumented_filters(dummy_client):
+    """Test that VisitsEndpoint exposes no get method and rejects visitId/status."""
     ep = visits.VisitsEndpoint(dummy_client)
+    async_ep = visits.AsyncVisitsEndpoint(dummy_client)
 
-    def fake_impl(self, client, paginator, *, study_key=None, refresh=False, **filters):
-        """Helper function to fake impl."""
-        return []
+    assert not hasattr(ep, "get")
+    assert not hasattr(async_ep, "get")
+    assert not hasattr(visits.VisitsOperationDef, "_id_param")
 
-    monkeypatch.setattr(visits.VisitsEndpoint, "_list_sync", fake_impl)
+    with pytest.raises(ConfigurationError, match="visitId"):
+        ep.list("S1", visitId=1)
 
-    with pytest.raises(NotFoundError):
-        ep.get("S1", 1)
+    with pytest.raises(ConfigurationError, match="status"):
+        ep.list("S1", status="open")
 
 
 def test_to_dataframe_success(dummy_client, paginator_factory):
@@ -60,12 +62,12 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
 
     df = ep.to_dataframe(
         study_key="S1",
-        status="new",
+        interval_name="Baseline",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/visits"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "new", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"interval_name": "Baseline"}
     assert len(df) == 1
 
 
@@ -119,12 +121,12 @@ async def test_async_to_dataframe_parameter_forwarding(
 
     df = await ep.to_dataframe(
         study_key="S1",
-        status="new",
+        interval_name="Baseline",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/visits"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "new", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"interval_name": "Baseline"}
     assert len(df) == 1
 
 

@@ -7,37 +7,57 @@ to customize how filters are processed and special parameters are extracted.
 from typing import Any, Protocol, runtime_checkable
 
 from imednet.core.protocols import ParamProcessor
+from imednet.errors.validation import ConfigurationError
+
+COMMON_LIST_PARAM_MAPPING: dict[str, str] = {
+    "page": "page",
+    "size": "size",
+    "sort": "sort",
+    "filter": "filter",
+}
 
 
 class DefaultParamProcessor(ParamProcessor):
-    """Default parameter processor.
+    """Default parameter processor for collection list endpoints.
 
-    Simply passes filters through without modification.
+    Extracts standard top-level query parameters (``page``, ``size``, ``sort``,
+    and raw ``filter``) so they are routed as URL query arguments rather than
+    serialized inside ``filter``.
     """
 
     def process_filters(self, filters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Return filters as-is and no special parameters.
+        """Extract standard top-level query parameters from filters.
 
         Args:
             filters: The input filters dictionary.
 
         Returns:
-            A tuple of (copy of filters, empty dict).
+            A tuple of (remaining resource filters, extracted top-level query parameters).
         """
-        return filters.copy(), {}
+        cleaned = filters.copy()
+        special_params: dict[str, Any] = {}
+        for key, api_key in COMMON_LIST_PARAM_MAPPING.items():
+            if key in cleaned:
+                value = cleaned.pop(key)
+                if value is not None:
+                    special_params[api_key] = value
+        return cleaned, special_params
 
 
 class MappingParamProcessor(ParamProcessor):
     """ParamProcessor that maps specific filter keys to API parameters.
 
-    Extracts keys defined in the mapping and returns them as special parameters,
-    optionally renaming them according to the mapping values.
+    Extracts standard collection query keys (``page``, ``size``, ``sort``, ``filter``)
+    plus any endpoint-specific keys defined in ``mapping`` and returns them as
+    special parameters.
     """
 
     def __init__(
         self,
         mapping: dict[str, str],
         defaults: dict[str, Any] | None = None,
+        *,
+        include_common_params: bool = True,
     ) -> None:
         """Initialize the processor with a mapping.
 
@@ -45,8 +65,11 @@ class MappingParamProcessor(ParamProcessor):
             mapping: A dictionary where keys are the filter keys to look for,
                      and values are the API parameter names to map them to.
             defaults: A dictionary of default values for keys not found in filters.
+            include_common_params: Whether to include ``page``, ``size``, ``sort``, and ``filter``.
         """
-        self.mapping = mapping
+        base_mapping = dict(COMMON_LIST_PARAM_MAPPING) if include_common_params else {}
+        base_mapping.update(mapping)
+        self.mapping = base_mapping
         self.defaults = defaults or {}
 
     def process_filters(self, filters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -59,7 +82,7 @@ class MappingParamProcessor(ParamProcessor):
             A tuple of (cleaned filters, special parameters).
         """
         filters = filters.copy()
-        special_params = {}
+        special_params: dict[str, Any] = {}
 
         for filter_key, api_key in self.mapping.items():
             value = None
@@ -69,11 +92,12 @@ class MappingParamProcessor(ParamProcessor):
                 value = self.defaults[filter_key]
 
             if value is not None:
-                # Convert boolean to lowercase string if necessary, or just pass through
-                if isinstance(value, bool):
-                    special_params[api_key] = str(value).lower()
-                else:
-                    special_params[api_key] = value
+                formatted = str(value).lower() if isinstance(value, bool) else value
+                if api_key in special_params and special_params[api_key] != formatted:
+                    raise ConfigurationError(
+                        f"Conflicting values provided for query parameter '{api_key}'."
+                    )
+                special_params[api_key] = formatted
 
         return filters, special_params
 
