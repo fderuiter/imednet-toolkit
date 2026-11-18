@@ -9,6 +9,7 @@ on:
       - "imednet-workflows-v*.*.*"
       - "apache-airflow-providers-imednet-v*.*.*"
       - "imednet-plugins-sinks-v*.*.*"
+      - "imednet-tui-v*.*.*"
       - "v*.*.*"
 
 concurrency:
@@ -64,8 +65,11 @@ jobs:
               imednet-plugins-sinks-v*)
                 PACKAGES='["plugins-sinks"]'
                 ;;
+              imednet-tui-v*)
+                PACKAGES='["plugins-tui"]'
+                ;;
               *)
-                PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks"]'
+                PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks", "plugins-tui"]'
                 ;;
             esac
           elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
@@ -74,10 +78,10 @@ jobs:
             PLAN=$(echo "$DIFF_FILES" | python3 scripts/ci_plan.py)
             PACKAGES=$(echo "$PLAN" | jq -c '.build')
             if [[ -z "$PACKAGES" || "$PACKAGES" == "[]" ]]; then
-              PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks"]'
+              PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks", "plugins-tui"]'
             fi
           else
-            PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks"]'
+            PACKAGES='["core", "plugins-workflows", "providers-airflow", "plugins-sinks", "plugins-tui"]'
           fi
           echo "Release packages: $PACKAGES"
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
