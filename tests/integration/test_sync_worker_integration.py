@@ -238,3 +238,90 @@ def test_high_concurrency_no_exceptions(tmp_path: Path, n_readers: int, n_cycles
 
     assert sync_errors == []
     assert [e for r in readers for e in r.errors] == []
+
+
+def test_parallel_sync_workers_no_timeout_under_network_delay(tmp_path: Path) -> None:
+    """Parallel workers must not timeout when network requests experience latency."""
+    import time
+
+    records = [_make_record(i) for i in range(1, 6)]
+
+    def _slow_fetch(*args, **kwargs):
+        # 0.15s latency simulates slow remote EDC API response
+        time.sleep(0.15)
+        return records
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def _run_worker(worker_id: int) -> None:
+        sdk = MagicMock()
+        sdk.records.list.side_effect = _slow_fetch
+        sdk.get_records.side_effect = _slow_fetch
+        loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+        # Lock timeout is 50ms, strictly LESS than the 150ms network delay.
+        # If the lock were held across the network call, the second worker would time out.
+        worker = SyncWorker(
+            loader,
+            config=SyncWorkerConfig(
+                study_key="PROT-01",
+                interval_seconds=0,
+                lock_timeout_seconds=0.05,
+            ),
+        )
+        barrier.wait()
+        try:
+            for _ in range(2):
+                worker.run_once()
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_run_worker, args=(i,), daemon=True) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert errors == [], f"Workers raised timeout or other exceptions under network delay: {errors}"
+
+
+def test_concurrent_readers_during_slow_remote_sync(tmp_path: Path) -> None:
+    """Readers access local cache without blocking while remote data retrieval is in progress."""
+    import time
+
+    records = [_make_record(i) for i in range(1, 6)]
+    initial_sdk = _make_sdk(records)
+    initial_loader = CachedRecordsLoader(initial_sdk, cache_dir=tmp_path)
+    initial_loader.sync_records("PROT-01")
+
+    # Mock SDK with 0.3s network delay
+    def _slow_fetch(*args, **kwargs):
+        time.sleep(0.3)
+        return records
+
+    sdk = MagicMock()
+    sdk.records.list.side_effect = _slow_fetch
+    sdk.get_records.side_effect = _slow_fetch
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    worker = SyncWorker(
+        loader,
+        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=0),
+    )
+
+    stop_event = threading.Event()
+    reader = _ReaderLoop(loader, stop_event)
+    reader.start()
+
+    worker_thread = threading.Thread(target=worker.run_once)
+    worker_thread.start()
+
+    # While worker is sleeping in network call, reader should perform multiple reads
+    time.sleep(0.15)
+    reads_mid_sync = reader.read_count
+
+    worker_thread.join(timeout=5)
+    stop_event.set()
+    reader.join(timeout=5)
+
+    assert reader.errors == []
+    assert reads_mid_sync > 0, "Reader was blocked while remote sync was retrieving data"
