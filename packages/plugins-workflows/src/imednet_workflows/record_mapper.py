@@ -7,6 +7,7 @@ DataFrames, including support for dynamic Pydantic model validation.
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Iterable, Iterator
 from datetime import date, datetime
@@ -57,30 +58,58 @@ def format_iso8601_dtc(val: Any) -> str | None:
                 return d.isoformat()
             except ValueError:
                 pass
-        # Check common date-only patterns
-        for fmt in ("%m/%d/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%B-%Y", "%m-%d-%Y"):
-            try:
-                dt = datetime.strptime(val_str, fmt)
-                return dt.strftime("%Y-%m-%d")
-            except ValueError:
-                continue
-        # Check datetime ISO or space-separated formats
+
+        # Try fast ISO datetime parsing (handles YYYY-MM-DDTHH:MM:SS, space-separated, fractional seconds, tz)
         try:
             dt = datetime.fromisoformat(val_str)
             return dt.isoformat()
         except ValueError:
             pass
-        for fmt in (
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M:%S.%f",
-            "%Y/%m/%d %H:%M:%S",
-            "%m/%d/%Y %H:%M:%S",
-        ):
-            try:
-                dt = datetime.strptime(val_str, fmt)
-                return dt.isoformat()
-            except ValueError:
-                continue
+
+        # Dispatch remaining string formats by delimiter and length
+        if "/" in val_str:
+            if ":" in val_str and len(val_str) >= 19:
+                fmt = None
+                if val_str[4] == "/" and val_str[7] == "/":
+                    fmt = "%Y/%m/%d %H:%M:%S.%f" if "." in val_str else "%Y/%m/%d %H:%M:%S"
+                elif val_str[2] == "/" and val_str[5] == "/":
+                    fmt = "%m/%d/%Y %H:%M:%S.%f" if "." in val_str else "%m/%d/%Y %H:%M:%S"
+                if fmt:
+                    try:
+                        return datetime.strptime(val_str, fmt).isoformat()
+                    except ValueError:
+                        pass
+            elif len(val_str) == 10:
+                fmt = None
+                if val_str[2] == "/" and val_str[5] == "/":
+                    fmt = "%m/%d/%Y"
+                elif val_str[4] == "/" and val_str[7] == "/":
+                    fmt = "%Y/%m/%d"
+                if fmt:
+                    try:
+                        return datetime.strptime(val_str, fmt).strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+        elif "-" in val_str:
+            if len(val_str) == 10 and val_str[2] == "-" and val_str[5] == "-":
+                try:
+                    return datetime.strptime(val_str, "%m-%d-%Y").strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+            elif len(val_str) == 11 and val_str[2] == "-" and val_str[6] == "-":
+                try:
+                    return datetime.strptime(val_str, "%d-%b-%Y").strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+            elif val_str.count("-") == 2:
+                parts = val_str.split("-")
+                if len(parts) == 3 and parts[0].isdigit() and parts[2].isdigit():
+                    for fmt in ("%d-%b-%Y", "%d-%B-%Y"):
+                        try:
+                            return datetime.strptime(val_str, fmt).strftime("%Y-%m-%d")
+                        except ValueError:
+                            pass
+
         return val_str
     return str(val)
 
@@ -101,6 +130,7 @@ def _format_sdtm_flag(val: Any) -> str | None:
     return "Y" if bool(val) else "N"
 
 
+@functools.lru_cache(maxsize=1024)
 def _normalize_key(key: str) -> str:
     """Normalize a key name by removing underscores and converting to lowercase."""
     return key.replace("_", "").lower()
@@ -303,6 +333,93 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
+_BASE_SDTM_CONSUMED_KEYS: frozenset[str] = frozenset(
+    {
+        "USUBJID",
+        "subjectKey",
+        "subject_key",
+        "study_key",
+        "studyKey",
+        "STUDYID",
+        "DOMAIN",
+        "domain",
+        "recordId",
+        "formId",
+        "visitId",
+        "recordStatus",
+    }
+)
+
+
+@functools.lru_cache(maxsize=128)
+def _get_model_field_aliases(
+    model_cls: type[BaseModel],
+) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """Extract and cache field alias mappings for a Pydantic model class.
+
+    Args:
+        model_cls: A Pydantic BaseModel subclass.
+
+    Returns:
+        A tuple of (model_field_to_serialized, all_field_aliases).
+    """
+    model_field_to_serialized: dict[str, str] = {}
+    all_field_aliases: dict[str, set[str]] = {}
+
+    for fname, finfo in getattr(model_cls, "model_fields", {}).items():
+        serialized_key = fname
+        if (
+            isinstance(getattr(finfo, "serialization_alias", None), str)
+            and finfo.serialization_alias
+        ):
+            serialized_key = finfo.serialization_alias
+        elif isinstance(getattr(finfo, "alias", None), str) and finfo.alias:
+            serialized_key = finfo.alias
+
+        field_aliases = {fname, serialized_key}
+        if isinstance(getattr(finfo, "alias", None), str) and finfo.alias:
+            field_aliases.add(finfo.alias)
+        if (
+            isinstance(getattr(finfo, "serialization_alias", None), str)
+            and finfo.serialization_alias
+        ):
+            field_aliases.add(finfo.serialization_alias)
+        if isinstance(getattr(finfo, "validation_alias", None), str) and finfo.validation_alias:
+            field_aliases.add(finfo.validation_alias)
+
+        for alias in field_aliases:
+            model_field_to_serialized[alias] = serialized_key
+            model_field_to_serialized.setdefault(alias.lower(), serialized_key)
+            all_field_aliases.setdefault(alias, set()).update(field_aliases)
+            all_field_aliases.setdefault(alias.lower(), set()).update(field_aliases)
+
+    return model_field_to_serialized, all_field_aliases
+
+
+@functools.lru_cache(maxsize=128)
+def _get_model_consumed_keys(model_cls: type[BaseModel]) -> frozenset[str]:
+    """Precompute base consumed keys for a Pydantic model class.
+
+    Args:
+        model_cls: A Pydantic BaseModel subclass.
+
+    Returns:
+        A frozenset of consumed key names for the model.
+    """
+    model_field_to_serialized, all_field_aliases = _get_model_field_aliases(model_cls)
+    consumed = set(_BASE_SDTM_CONSUMED_KEYS)
+    for initial_k in list(consumed):
+        if initial_k in model_field_to_serialized:
+            serialized_k = model_field_to_serialized[initial_k]
+            consumed.add(serialized_k)
+            consumed.update(all_field_aliases.get(serialized_k, set()))
+        if initial_k.lower() in model_field_to_serialized:
+            serialized_k = model_field_to_serialized[initial_k.lower()]
+            consumed.add(serialized_k)
+            consumed.update(all_field_aliases.get(serialized_k, set()))
+    return frozenset(consumed)
+
+
 def transform_records_to_sdtm(
     records: Iterable[Any],
     domain: str,
@@ -344,6 +461,8 @@ def transform_records_to_sdtm(
     for rec in records:
         model_field_to_serialized: dict[str, str] = {}
         all_field_aliases: dict[str, set[str]] = {}
+        base_consumed: frozenset[str] | set[str] = _BASE_SDTM_CONSUMED_KEYS
+
         if hasattr(rec, "record_data") and getattr(rec, "record_data", None) is not None:
             rec_dict = dict(rec.record_data) if isinstance(rec.record_data, dict) else {}
             if getattr(rec, "subject_key", None):
@@ -353,35 +472,9 @@ def transform_records_to_sdtm(
                 rec_dict["date_created"] = rec.date_created
         elif isinstance(rec, BaseModel):
             rec_dict = rec.model_dump(by_alias=True)
-            for fname, finfo in getattr(type(rec), "model_fields", {}).items():
-                serialized_key = fname
-                if (
-                    isinstance(getattr(finfo, "serialization_alias", None), str)
-                    and finfo.serialization_alias
-                ):
-                    serialized_key = finfo.serialization_alias
-                elif isinstance(getattr(finfo, "alias", None), str) and finfo.alias:
-                    serialized_key = finfo.alias
-
-                field_aliases = {fname, serialized_key}
-                if isinstance(getattr(finfo, "alias", None), str) and finfo.alias:
-                    field_aliases.add(finfo.alias)
-                if (
-                    isinstance(getattr(finfo, "serialization_alias", None), str)
-                    and finfo.serialization_alias
-                ):
-                    field_aliases.add(finfo.serialization_alias)
-                if (
-                    isinstance(getattr(finfo, "validation_alias", None), str)
-                    and finfo.validation_alias
-                ):
-                    field_aliases.add(finfo.validation_alias)
-
-                for alias in field_aliases:
-                    model_field_to_serialized[alias] = serialized_key
-                    model_field_to_serialized.setdefault(alias.lower(), serialized_key)
-                    all_field_aliases.setdefault(alias, set()).update(field_aliases)
-                    all_field_aliases.setdefault(alias.lower(), set()).update(field_aliases)
+            model_cls = type(rec)
+            model_field_to_serialized, all_field_aliases = _get_model_field_aliases(model_cls)
+            base_consumed = _get_model_consumed_keys(model_cls)
         elif isinstance(rec, dict):
             rec_dict = dict(rec)
         else:
@@ -421,29 +514,7 @@ def transform_records_to_sdtm(
             f"{domain_clean}SEQ": seq_val,
         }
 
-        consumed_keys: set[str] = {
-            "USUBJID",
-            "subjectKey",
-            "subject_key",
-            "study_key",
-            "studyKey",
-            "STUDYID",
-            "DOMAIN",
-            "domain",
-            "recordId",
-            "formId",
-            "visitId",
-            "recordStatus",
-        }
-        for initial_k in list(consumed_keys):
-            if initial_k in model_field_to_serialized:
-                serialized_k = model_field_to_serialized[initial_k]
-                consumed_keys.add(serialized_k)
-                consumed_keys.update(all_field_aliases.get(serialized_k, set()))
-            if initial_k.lower() in model_field_to_serialized:
-                serialized_k = model_field_to_serialized[initial_k.lower()]
-                consumed_keys.add(serialized_k)
-                consumed_keys.update(all_field_aliases.get(serialized_k, set()))
+        consumed_keys: set[str] = set(base_consumed)
 
         lower_rec_dict = {k.lower(): (k, v) for k, v in rec_dict.items()}
 
