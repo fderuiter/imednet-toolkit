@@ -41,3 +41,19 @@ commands, datadict JSON/schema/diff outputs and optional workflow command format
 retain their own contracts. This is not a global JSON wrapper for plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
+
+Terminal capabilities and non-interactive mode
+----------------------------------------------
+
+Multi-item ``list`` commands open an interactive keyboard grid when both ``stdin``
+and ``stdout`` are connected to a capable TTY, while single-job commands
+(``imednet jobs status`` and ``imednet jobs wait``) always print a static summary
+table to ``stdout`` and exit immediately.
+
+Pass ``--no-interactive`` (at the root command or on read/workflow subcommands) or
+set ``IMEDNET_NON_INTERACTIVE=1`` to disable full-screen ``curses`` grids, live
+``stderr`` spinners, and interactive ``stdin`` prompts. Set ``NO_COLOR=1`` (or any
+non-empty value) or ``TERM=dumb`` to suppress ANSI color escape sequences across
+tables and diagnostics while preserving ``--high-contrast`` palettes when color
+output is permitted. Interactive workflow wizards reject piped or non-TTY ``stdin``
+streams immediately with exit code ``1``.

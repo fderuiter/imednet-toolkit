@@ -11,11 +11,11 @@ except ImportError:
 
 _CURSES_ERROR: tuple[type[BaseException], ...] = (curses.error,) if curses is not None else ()
 import os
-import sys
 from collections.abc import Sequence
 from typing import Any
 
 from .output import _HC_STATUS_COLOR_MAP, _STATUS_COLOR_MAP, _format_cell_value
+from .terminal import supports_fullscreen_ui
 
 
 def is_interactive_terminal() -> bool:
@@ -27,22 +27,7 @@ def is_interactive_terminal() -> bool:
     """
     if curses is None:
         return False
-    if os.environ.get("IMEDNET_NON_INTERACTIVE") == "1":
-        return False
-    term = os.environ.get("TERM", "")
-    if not term or term == "dumb":
-        return False
-    try:
-        return bool(
-            sys.stdout
-            and hasattr(sys.stdout, "isatty")
-            and sys.stdout.isatty()
-            and sys.stdin
-            and hasattr(sys.stdin, "isatty")
-            and sys.stdin.isatty()
-        )
-    except (AttributeError, ValueError, OSError):
-        return False
+    return supports_fullscreen_ui()
 
 
 def safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:

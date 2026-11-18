@@ -8,7 +8,12 @@ from typing import Any
 
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, fetching_status, format_job_progress, print_error
+from ..utils import (
+    STUDY_KEY_ARG,
+    fetching_status,
+    format_job_progress,
+    supports_live_status,
+)
 from ..utils.args import add_output_format
 from ..utils.output import display_list
 
@@ -39,7 +44,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     ) -> None:
         with fetching_status("job status", study_key):
             job = sdk.get_job(study_key, batch_id)
-        display_list([job], "jobs", fields=JOB_SUMMARY_FIELDS, output_format=output_format)
+        display_list(
+            [job],
+            "jobs",
+            fields=JOB_SUMMARY_FIELDS,
+            output_format=output_format,
+            interactive=False,
+        )
 
     status_parser.set_defaults(
         func=lambda args: job_status(
@@ -70,8 +81,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 msg = format_job_progress(event)
                 if status_ctrl is not None and hasattr(status_ctrl, "update"):
                     status_ctrl.update(msg)
-                elif sys.stderr.isatty():
-                    print_error(f"\r\033[K{msg}", end="", flush=True)
+                elif supports_live_status(sys.stderr):
+                    try:
+                        sys.stderr.write(f"\r\033[K{msg}")
+                        sys.stderr.flush()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
 
             job = sdk.poll_job(
                 study_key,
@@ -80,7 +95,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 timeout=timeout,
                 on_progress=on_progress,
             )
-        display_list([job], "jobs", fields=JOB_SUMMARY_FIELDS, output_format=output_format)
+        display_list(
+            [job],
+            "jobs",
+            fields=JOB_SUMMARY_FIELDS,
+            output_format=output_format,
+            interactive=False,
+        )
 
     wait_parser.set_defaults(
         func=lambda args: job_wait(

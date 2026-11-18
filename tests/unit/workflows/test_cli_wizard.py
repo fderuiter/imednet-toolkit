@@ -30,6 +30,13 @@ from imednet_workflows.wizard import (
 )
 
 
+class _TTYStringIO(io.StringIO):
+    """In-memory StringIO stream that reports isatty() == True."""
+
+    def isatty(self) -> bool:
+        return True
+
+
 class CliResult:
     """Captured result of CLI invocation."""
 
@@ -40,14 +47,17 @@ class CliResult:
         self.output = stdout + stderr
 
 
-def run_cli_command(app_fn, args: list[str], stdin_input: str = "") -> CliResult:
+def run_cli_command(
+    app_fn, args: list[str], stdin_input: str = "", *, tty_stdin: bool = True
+) -> CliResult:
     """Invoke CLI entry point with redirected stdin, stdout, and stderr."""
     from contextlib import redirect_stderr, redirect_stdout
 
     out = io.StringIO()
     err = io.StringIO()
+    stdin_stream = _TTYStringIO(stdin_input) if tty_stdin else io.StringIO(stdin_input)
     exit_code = 0
-    with redirect_stdout(out), redirect_stderr(err), patch("sys.stdin", io.StringIO(stdin_input)):
+    with redirect_stdout(out), redirect_stderr(err), patch("sys.stdin", stdin_stream):
         try:
             app_fn(args)
         except SystemExit as exc:
@@ -125,65 +135,65 @@ def test_validate_filter_syntax_invalid() -> None:
 
 def test_prompt_input_and_confirm() -> None:
     """Test prompt_input and prompt_confirm reading from stdin."""
-    with patch("sys.stdin", io.StringIO("custom_val\n")):
+    with patch("sys.stdin", _TTYStringIO("custom_val\n")):
         val = prompt_input("Enter value", default="def")
         assert val == "custom_val"
 
-    with patch("sys.stdin", io.StringIO("\n")):
+    with patch("sys.stdin", _TTYStringIO("\n")):
         val = prompt_input("Enter value", default="def")
         assert val == "def"
 
-    with patch("sys.stdin", io.StringIO("y\n")):
+    with patch("sys.stdin", _TTYStringIO("y\n")):
         assert prompt_confirm("Proceed?") is True
 
-    with patch("sys.stdin", io.StringIO("n\n")):
+    with patch("sys.stdin", _TTYStringIO("n\n")):
         assert prompt_confirm("Proceed?") is False
 
-    with patch("sys.stdin", io.StringIO("\n")):
+    with patch("sys.stdin", _TTYStringIO("\n")):
         assert prompt_confirm("Proceed?", default=True) is True
-    with patch("sys.stdin", io.StringIO("\n")):
+    with patch("sys.stdin", _TTYStringIO("\n")):
         assert prompt_confirm("Proceed?", default=False) is False
 
 
 def test_prompt_eof_handling() -> None:
     """Test that all interactive prompt functions exit with code 1 upon encountering EOF."""
     # prompt_input
-    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("")), pytest.raises(SystemExit) as exc:
         prompt_input("Test prompt")
     assert exc.value.code == 1
 
     # prompt_confirm
-    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("")), pytest.raises(SystemExit) as exc:
         prompt_confirm("Confirm?")
     assert exc.value.code == 1
 
     # prompt_study_key
-    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("")), pytest.raises(SystemExit) as exc:
         prompt_study_key(None)
     assert exc.value.code == 1
 
     # prompt_stream_name
-    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("")), pytest.raises(SystemExit) as exc:
         prompt_stream_name(None)
     assert exc.value.code == 1
 
     # prompt_iso8601_timestamp
-    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("")), pytest.raises(SystemExit) as exc:
         prompt_iso8601_timestamp()
     assert exc.value.code == 1
 
     # prompt_positive_int
-    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("")), pytest.raises(SystemExit) as exc:
         prompt_positive_int("Enter count")
     assert exc.value.code == 1
 
     # prompt_non_negative_int
-    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("")), pytest.raises(SystemExit) as exc:
         prompt_non_negative_int("Enter count")
     assert exc.value.code == 1
 
     # prompt_filters
-    with patch("sys.stdin", io.StringIO("")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("")), pytest.raises(SystemExit) as exc:
         prompt_filters("record filter", "form_key=DEMO")
     assert exc.value.code == 1
 
@@ -191,13 +201,13 @@ def test_prompt_eof_handling() -> None:
 def test_prompt_stream_name() -> None:
     """Test prompt_stream_name accepts prefilled stream or prompts interactively."""
     assert prompt_stream_name("records") == "records"
-    with patch("sys.stdin", io.StringIO("\n\nevents\n")):
+    with patch("sys.stdin", _TTYStringIO("\n\nevents\n")):
         assert prompt_stream_name(None) == "events"
 
 
 def test_prompt_filters_malformed_supplied_filter_rejected_on_enter() -> None:
     """Test that malformed supplied filters are not dropped on Enter and abort with exit code 1."""
-    with patch("sys.stdin", io.StringIO("\n")), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO("\n")), pytest.raises(SystemExit) as exc:
         prompt_filters("record filter", "form_key=DEMO", existing_filters=["bad_format"])
     assert exc.value.code == 1
 
@@ -205,7 +215,7 @@ def test_prompt_filters_malformed_supplied_filter_rejected_on_enter() -> None:
 def test_prompt_filters_malformed_supplied_filter_corrected() -> None:
     """Test that malformed supplied filters can be corrected interactively."""
     user_inputs = "form_key=DEMO\n\n"
-    with patch("sys.stdin", io.StringIO(user_inputs)):
+    with patch("sys.stdin", _TTYStringIO(user_inputs)):
         filters = prompt_filters("record filter", "form_key=DEMO", existing_filters=["bad_format"])
         assert filters == ["form_key=DEMO"]
 
@@ -213,7 +223,7 @@ def test_prompt_filters_malformed_supplied_filter_corrected() -> None:
 def test_prompt_filters_malformed_supplied_filter_retry_then_valid() -> None:
     """Test that correcting a malformed supplied filter handles multiple retries before valid."""
     user_inputs = "still_bad\nform_key=DEMO\n\n"
-    with patch("sys.stdin", io.StringIO(user_inputs)):
+    with patch("sys.stdin", _TTYStringIO(user_inputs)):
         filters = prompt_filters("record filter", "form_key=DEMO", existing_filters=["bad_format"])
         assert filters == ["form_key=DEMO"]
 
@@ -221,7 +231,7 @@ def test_prompt_filters_malformed_supplied_filter_retry_then_valid() -> None:
 def test_prompt_filters_malformed_supplied_filter_retry_then_abort() -> None:
     """Test that correcting a malformed supplied filter aborts if empty string given on retry."""
     user_inputs = "still_bad\n\n"
-    with patch("sys.stdin", io.StringIO(user_inputs)), pytest.raises(SystemExit) as exc:
+    with patch("sys.stdin", _TTYStringIO(user_inputs)), pytest.raises(SystemExit) as exc:
         prompt_filters("record filter", "form_key=DEMO", existing_filters=["bad_format"])
     assert exc.value.code == 1
 
@@ -229,7 +239,7 @@ def test_prompt_filters_malformed_supplied_filter_retry_then_abort() -> None:
 def test_prompt_iso8601_timestamp_retry() -> None:
     """Test prompt_iso8601_timestamp retries on invalid input before succeeding."""
     user_inputs = "bad_date\n2026-05-22T12:00:00Z\n"
-    with patch("sys.stdin", io.StringIO(user_inputs)):
+    with patch("sys.stdin", _TTYStringIO(user_inputs)):
         raw, dt = prompt_iso8601_timestamp()
         assert raw == "2026-05-22T12:00:00Z"
         assert dt == datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -242,12 +252,12 @@ def test_prompt_filters_interactive() -> None:
     # 3rd valid filter: "subject_status=Screened"
     # 4th empty line to finish
     user_inputs = "bad_format\nform_key=DEMO\nsubject_status=Screened\n\n"
-    with patch("sys.stdin", io.StringIO(user_inputs)):
+    with patch("sys.stdin", _TTYStringIO(user_inputs)):
         filters = prompt_filters("record filter", "form_key=DEMO")
         assert filters == ["form_key=DEMO", "subject_status=Screened"]
 
     # Test with existing valid filter
-    with patch("sys.stdin", io.StringIO("extra=1\n\n")):
+    with patch("sys.stdin", _TTYStringIO("extra=1\n\n")):
         filters = prompt_filters(
             "record filter", "form_key=DEMO", existing_filters=["form_key=DEMO"]
         )
@@ -258,20 +268,20 @@ def test_prompt_study_key() -> None:
     """Test prompt_study_key prompts when None or empty."""
     assert prompt_study_key("STUDY-01") == "STUDY-01"
 
-    with patch("sys.stdin", io.StringIO("\n\nPROMPT_STUDY\n")):
+    with patch("sys.stdin", _TTYStringIO("\n\nPROMPT_STUDY\n")):
         assert prompt_study_key(None) == "PROMPT_STUDY"
 
 
 def test_prompt_positive_int() -> None:
     """Test prompt_positive_int validates positive numbers."""
-    with patch("sys.stdin", io.StringIO("not_a_num\n0\n-5\n4\n")):
+    with patch("sys.stdin", _TTYStringIO("not_a_num\n0\n-5\n4\n")):
         val = prompt_positive_int("Enter count", default=1)
         assert val == 4
 
 
 def test_prompt_non_negative_int() -> None:
     """Test prompt_non_negative_int validates non-negative integers and handles invalid inputs."""
-    with patch("sys.stdin", io.StringIO("not_a_num\n-1\n0\n")):
+    with patch("sys.stdin", _TTYStringIO("not_a_num\n-1\n0\n")):
         val = prompt_non_negative_int("Enter count", default=10)
         assert val == 0
 
@@ -814,3 +824,79 @@ def test_workflows_uat_run_interactive_eof_aborts(monkeypatch: pytest.MonkeyPatc
     assert result.exit_code == 1
     assert "Input stream closed (EOF)" in result.stderr
     mock_uat_workflow.run.assert_not_called()
+
+
+def test_prompts_reject_piped_stdin_and_non_interactive_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Test interactive prompts and wizards exit with code 1 on non-TTY stdin or --no-interactive."""
+    err = io.StringIO()
+    with patch("sys.stdin", io.StringIO("value\n")), patch("sys.stderr", err):
+        with pytest.raises(SystemExit) as exc_in:
+            prompt_input("Enter value")
+        assert exc_in.value.code == 1
+    assert "Interactive prompts require an interactive TTY on stdin" in err.getvalue()
+
+    err_confirm = io.StringIO()
+    with patch("sys.stdin", io.StringIO("y\n")), patch("sys.stderr", err_confirm):
+        with pytest.raises(SystemExit) as exc_conf:
+            prompt_confirm("Proceed?")
+        assert exc_conf.value.code == 1
+    assert "Interactive prompts require an interactive TTY on stdin" in err_confirm.getvalue()
+
+    ledger_path = str(tmp_path / "ledger.json")
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        res_piped = run_cli_command(
+            state_app,
+            ["set", "--ledger-path", ledger_path, "--interactive"],
+            stdin_input="S1\nrecords\n2026-05-22T12:00:00Z\n0\ny\n",
+            tty_stdin=False,
+        )
+        assert res_piped.exit_code == 1
+        assert "Interactive prompts require an interactive TTY on stdin" in res_piped.stderr
+        mock_ledger.return_value.set_last_timestamp.assert_not_called()
+
+        res_flag = run_cli_command(
+            cli_app,
+            [
+                "--no-interactive",
+                "workflows",
+                "state",
+                "reset",
+                "--study-key",
+                "S1",
+                "--ledger-path",
+                ledger_path,
+                "--interactive",
+            ],
+            stdin_input="y\n",
+            tty_stdin=True,
+        )
+        assert res_flag.exit_code == 1
+        assert "Interactive prompts require an interactive TTY on stdin" in res_flag.stderr
+        mock_ledger.return_value.delete_entry.assert_not_called()
+
+    monkeypatch.setenv("IMEDNET_API_KEY", "test_key")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "test_sec")
+    mock_get_sdk = MagicMock()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", mock_get_sdk)
+
+    res_extract = run_cli_command(
+        cli_app,
+        ["workflows", "extract-records", "--interactive"],
+        stdin_input="STUDY1\n\n\n\n",
+        tty_stdin=False,
+    )
+    assert res_extract.exit_code == 1
+    assert "Interactive prompts require an interactive TTY on stdin" in res_extract.stderr
+    mock_get_sdk.assert_not_called()
+
+    res_uat = run_cli_command(
+        cli_app,
+        ["workflows", "uat", "run", "--interactive", "--no-interactive"],
+        stdin_input="STUDY1\n2\n\n\n",
+        tty_stdin=True,
+    )
+    assert res_uat.exit_code == 1
+    assert "Interactive prompts require an interactive TTY on stdin" in res_uat.stderr
+    mock_get_sdk.assert_not_called()
