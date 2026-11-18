@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from imednet.core.context import get_study_context
 from imednet.core.endpoint.base import (
@@ -15,6 +15,9 @@ from imednet.core.endpoint.base import (
 )
 from imednet.models.base import ImednetBaseModel
 
+if TYPE_CHECKING:
+    import pandas as pd
+
 T = TypeVar("T", bound=ImednetBaseModel)
 
 _EDC_BASE_PATH = "/api/v1/edc/studies"
@@ -26,6 +29,12 @@ def _inject_study_key(filters: dict[str, Any]) -> dict[str, Any]:
     if "studyKey" not in filters and study_key:
         filters["studyKey"] = study_key
     return filters
+
+
+def _dataframe_feature_name(path: str) -> str:
+    """Return the pandas feature identifier for an EDC endpoint path."""
+    cleaned = path.strip("/")
+    return f"{cleaned}_to_dataframe" if cleaned else "to_dataframe"
 
 
 class _EdcEndpointBase:
@@ -64,11 +73,59 @@ class EdcSyncListEndpoint(_EdcEndpointBase, SyncListEndpoint[T]):
 
     BASE_PATH = _EDC_BASE_PATH
 
+    def to_dataframe(
+        self,
+        study_key: str | None = None,
+        **filters: Any,
+    ) -> pd.DataFrame:
+        """Export queried resources directly to a pandas DataFrame.
+
+        Args:
+            study_key: Optional study key override.
+            **filters: Resource filters passed to :meth:`list`.
+
+        Returns:
+            A pandas DataFrame containing the queried resources.
+
+        Raises:
+            ImportError: If pandas is not installed.
+        """
+        from imednet.utils.pandas import _models_to_dataframe, check_pandas
+
+        feature_name = _dataframe_feature_name(self.PATH)
+        check_pandas(feature_name)
+        items = list(self.list(study_key=study_key, **filters))
+        return _models_to_dataframe(items, feature_name)
+
 
 class EdcAsyncListEndpoint(_EdcEndpointBase, AsyncListEndpoint[T]):
     """Async EDC list-only endpoint base."""
 
     BASE_PATH = _EDC_BASE_PATH
+
+    async def to_dataframe(
+        self,
+        study_key: str | None = None,
+        **filters: Any,
+    ) -> pd.DataFrame:
+        """Export queried resources asynchronously directly to a pandas DataFrame.
+
+        Args:
+            study_key: Optional study key override.
+            **filters: Resource filters passed to :meth:`list`.
+
+        Returns:
+            A pandas DataFrame containing the queried resources.
+
+        Raises:
+            ImportError: If pandas is not installed.
+        """
+        from imednet.utils.pandas import _models_to_dataframe, check_pandas
+
+        feature_name = _dataframe_feature_name(self.PATH)
+        check_pandas(feature_name)
+        items = [item async for item in self.list(study_key=study_key, **filters)]
+        return _models_to_dataframe(items, feature_name)
 
 
 class EdcSyncGetEndpoint(_EdcEndpointBase, SyncGetEndpoint[T]):
@@ -83,13 +140,13 @@ class EdcAsyncGetEndpoint(_EdcEndpointBase, AsyncGetEndpoint[T]):
     BASE_PATH = _EDC_BASE_PATH
 
 
-class EdcSyncListGetEndpoint(_EdcEndpointBase, SyncListGetEndpoint[T]):
+class EdcSyncListGetEndpoint(EdcSyncListEndpoint[T], SyncListGetEndpoint[T]):
     """Sync EDC list/get endpoint base."""
 
     BASE_PATH = _EDC_BASE_PATH
 
 
-class EdcAsyncListGetEndpoint(_EdcEndpointBase, AsyncListGetEndpoint[T]):
+class EdcAsyncListGetEndpoint(EdcAsyncListEndpoint[T], AsyncListGetEndpoint[T]):
     """Async EDC list/get endpoint base."""
 
     BASE_PATH = _EDC_BASE_PATH
