@@ -255,9 +255,7 @@ async def test_async_to_dataframe_success(dummy_client, async_paginator_factory)
 
 
 @pytest.mark.asyncio
-async def test_async_to_dataframe_parameter_forwarding(
-    dummy_client, async_paginator_factory
-):
+async def test_async_to_dataframe_parameter_forwarding(dummy_client, async_paginator_factory):
     """Test that async to_dataframe forwards filters and study key to list."""
     ep = users.AsyncUsersEndpoint(dummy_client)
     captured = async_paginator_factory(users, [{"userId": 1}])
