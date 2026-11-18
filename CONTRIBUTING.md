@@ -64,9 +64,9 @@ Our pre-commit configuration is optimized for developer velocity: hooks execute 
 The repository uses a documented issue operating model for intake, prioritization,
 and decomposition. Before opening or triaging an issue, review:
 
-- `docs/issue_management.rst` for title conventions, label taxonomy, and hierarchy
-- `docs/project_standards.rst` for engineering and verification standards
-- `docs/triage_playbook.rst` for maintainer triage workflow
+- `docs/reference/issue_management.rst` for title conventions, label taxonomy, and hierarchy
+- `docs/reference/project_standards.rst` for engineering and verification standards
+- `docs/reference/triage_playbook.rst` for maintainer triage workflow
 
 Issue titles should use the format `<type>(<area>): <concise outcome>`, for example
 `bug(http): delegate URL path construction to httpx` or
