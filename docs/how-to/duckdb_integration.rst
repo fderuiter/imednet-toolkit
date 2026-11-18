@@ -137,8 +137,8 @@ For incremental bronze/silver ingestion, use
    conn = duckdb.connect("./centralized.duckdb", read_only=True)
    print(
        conn.execute(
-           "SELECT record_id, variable_name, value "
-           "FROM silver_current_state ORDER BY record_id, variable_name LIMIT 10"
+           'SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created '
+           "FROM silver_current_state ORDER BY record_id LIMIT 10"
        ).fetchall()
    )
 

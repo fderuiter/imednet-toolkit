@@ -69,14 +69,23 @@ class DuckDBIngestionWorkflow:
                 """
                 INSERT INTO bronze_revisions (
                     study_key,
+                    record_revision_id,
                     record_id,
-                    form_id,
-                    variable_name,
-                    value,
-                    revision_number,
-                    date_modified,
-                    modified_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    record_oid,
+                    form_key,
+                    subject_key,
+                    site_id,
+                    interval_id,
+                    record_status,
+                    record_revision,
+                    data_revision,
+                    "user",
+                    role,
+                    reason_for_change,
+                    deleted,
+                    date_created,
+                    last_updated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -94,18 +103,31 @@ class DuckDBIngestionWorkflow:
             CREATE OR REPLACE VIEW silver_current_state AS
             SELECT
                 study_key,
+                record_revision_id,
                 record_id,
-                form_id,
-                variable_name,
-                value,
-                revision_number,
-                date_modified,
-                modified_by
+                record_oid,
+                form_key,
+                subject_key,
+                site_id,
+                interval_id,
+                record_status,
+                record_revision,
+                data_revision,
+                "user",
+                role,
+                reason_for_change,
+                deleted,
+                date_created,
+                last_updated
             FROM bronze_revisions
             WHERE study_key = '{escaped_study_key}'
             QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY record_id, variable_name
-                ORDER BY revision_number DESC
+                PARTITION BY record_id
+                ORDER BY
+                    record_revision DESC NULLS LAST,
+                    data_revision DESC NULLS LAST,
+                    date_created DESC NULLS LAST,
+                    record_revision_id DESC NULLS LAST
             ) = 1
             """
         self._connection.execute(query)  # nosem
@@ -115,37 +137,64 @@ class DuckDBIngestionWorkflow:
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS bronze_revisions (
                 study_key VARCHAR,
-                record_id INTEGER,
-                form_id INTEGER,
-                variable_name VARCHAR,
-                value VARCHAR,
-                revision_number INTEGER,
-                date_modified TIMESTAMP,
-                modified_by VARCHAR
+                record_revision_id BIGINT,
+                record_id BIGINT,
+                record_oid VARCHAR,
+                form_key VARCHAR,
+                subject_key VARCHAR,
+                site_id BIGINT,
+                interval_id BIGINT,
+                record_status VARCHAR,
+                record_revision INTEGER,
+                data_revision INTEGER,
+                "user" VARCHAR,
+                role VARCHAR,
+                reason_for_change VARCHAR,
+                deleted BOOLEAN,
+                date_created TIMESTAMP,
+                last_updated TIMESTAMP
             )
             """)
 
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        """Convert optional integer fields without coercing None to zero."""
+        return None if value is None else int(value)
+
+    @staticmethod
+    def _optional_timestamp(value: Any) -> datetime | str | None:
+        """Normalize empty timestamp strings to None for DuckDB TIMESTAMP columns."""
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        if isinstance(value, (datetime, str)):
+            return value
+        return str(value)
+
     def _to_rows(
         self, study_key: str, revisions: Iterable[RecordRevision]
-    ) -> Iterable[tuple[str, int, int, str, str, int, datetime | None, str]]:
+    ) -> Iterable[tuple[Any, ...]]:
         """Internal helper to convert RecordRevision models into database rows."""
         for revision in revisions:
-            value = getattr(revision, "value", "")
-            date_modified = getattr(
-                revision, "date_modified", getattr(revision, "date_created", None)
-            )
-            revision_number = getattr(
-                revision,
-                "revision_number",
-                getattr(revision, "record_revision", 0),
-            )
+            rev_study_key = getattr(revision, "study_key", None) or study_key
+            deleted_val = getattr(revision, "deleted", False)
             yield (
-                study_key,
-                int(getattr(revision, "record_id", 0) or 0),
-                int(getattr(revision, "form_id", 0) or 0),
-                str(getattr(revision, "variable_name", "")),
-                "" if value is None else str(value),
-                int(revision_number or 0),
-                date_modified,
-                str(getattr(revision, "modified_by", getattr(revision, "user", ""))),
+                str(rev_study_key),
+                self._optional_int(getattr(revision, "record_revision_id", None)),
+                self._optional_int(getattr(revision, "record_id", None)),
+                getattr(revision, "record_oid", None),
+                getattr(revision, "form_key", None),
+                getattr(revision, "subject_key", None),
+                self._optional_int(getattr(revision, "site_id", None)),
+                self._optional_int(getattr(revision, "interval_id", None)),
+                getattr(revision, "record_status", None),
+                self._optional_int(getattr(revision, "record_revision", None)),
+                self._optional_int(getattr(revision, "data_revision", None)),
+                getattr(revision, "user", None),
+                getattr(revision, "role", None),
+                getattr(revision, "reason_for_change", None),
+                False if deleted_val is None else bool(deleted_val),
+                self._optional_timestamp(getattr(revision, "date_created", None)),
+                self._optional_timestamp(getattr(revision, "last_updated", None)),
             )

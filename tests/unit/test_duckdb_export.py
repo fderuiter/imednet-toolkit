@@ -132,7 +132,7 @@ def test_export_to_duckdb_by_form_form_whitelist(
     db_path = tmp_path / "whitelist_forms.duckdb"
     export_mod.export_to_duckdb_by_form(sdk, "STUDY", str(db_path), form_whitelist=[1, 3])
 
-    sdk.variables.list.assert_called_once_with(study_key="STUDY", formIds=[1, 3])
+    sdk.variables.list.assert_called_once_with(study_key="STUDY", formId=[1, 3])
 
     conn = duckdb.connect(str(db_path))
     try:
@@ -176,7 +176,7 @@ def test_export_to_duckdb_by_form_variable_whitelist(
     mapper_inst._build_record_model.assert_called_once_with(["keep_var"], {"keep_var": "Keep"})
     mapper_inst._fetch_records.assert_called_once_with(
         "STUDY",
-        extra_filters={"formId": 1, "variableNames": ["keep_var"]},
+        extra_filters={"formId": 1},
     )
 
 

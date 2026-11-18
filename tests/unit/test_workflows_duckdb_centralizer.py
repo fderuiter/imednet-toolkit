@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime
-from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from imednet.models.record_revisions import RecordRevision
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
@@ -93,43 +93,64 @@ def test_ingest_revisions_and_build_silver_view() -> None:
     workflow = DuckDBIngestionWorkflow(sdk, ":memory:")
 
     initial_revisions = [
-        SimpleNamespace(
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=101,
             record_id=1,
-            form_id=10,
-            variable_name="AGE",
-            value=30,
-            revision_number=1,
-            date_modified=datetime(2024, 1, 1, 10, 0, 0),
-            modified_by="alice",
+            record_oid="OID-1",
+            form_key="DEMO",
+            subject_key="SUBJ-01",
+            site_id=10,
+            interval_id=5,
+            record_status="Record Incomplete",
+            record_revision=1,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="Initial entry",
+            deleted=False,
+            date_created="2024-01-01T10:00:00Z",
+            last_updated="2024-01-01T10:00:00Z",
         ),
-        SimpleNamespace(
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=102,
             record_id=1,
-            form_id=10,
-            variable_name="AGE",
-            value=31,
-            revision_number=2,
-            date_modified=datetime(2024, 1, 2, 10, 0, 0),
-            modified_by="bob",
-        ),
-        SimpleNamespace(
-            record_id=1,
-            form_id=10,
-            variable_name="WEIGHT",
-            value=70,
-            revision_number=1,
-            date_modified=datetime(2024, 1, 1, 11, 0, 0),
-            modified_by="alice",
+            record_oid="OID-1",
+            form_key="DEMO",
+            subject_key="SUBJ-01",
+            site_id=10,
+            interval_id=5,
+            record_status="Record Complete",
+            record_revision=2,
+            data_revision=2,
+            user="bob",
+            role="Investigator",
+            reason_for_change="Corrected demographics",
+            deleted=False,
+            date_created="2024-01-02T10:00:00Z",
+            last_updated="2024-01-02T10:05:00Z",
         ),
     ]
     appended_revision = [
-        SimpleNamespace(
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=201,
             record_id=2,
-            form_id=11,
-            variable_name="HEIGHT",
-            value=180,
-            revision_number=1,
-            date_modified=datetime(2024, 1, 3, 12, 0, 0),
-            modified_by="carol",
+            record_oid="OID-2",
+            form_key="VITALS",
+            subject_key="SUBJ-02",
+            site_id=11,
+            interval_id=6,
+            record_status="Record Complete",
+            record_revision=1,
+            data_revision=1,
+            user="carol",
+            role="CRC",
+            reason_for_change="Baseline vitals",
+            deleted=False,
+            date_created="2024-01-03T12:00:00Z",
+            last_updated="2024-01-03T12:00:00Z",
         )
     ]
 
@@ -145,7 +166,7 @@ def test_ingest_revisions_and_build_silver_view() -> None:
                 end_date="2024-01-31",
                 mode="replace",
             )
-            == 3
+            == 2
         )
         assert workflow.ingest_revisions("STUDY", mode="append") == 1
 
@@ -154,27 +175,77 @@ def test_ingest_revisions_and_build_silver_view() -> None:
         call("STUDY", start_date=None, end_date=None),
     ]
 
+    expected_columns = [
+        "study_key",
+        "record_revision_id",
+        "record_id",
+        "record_oid",
+        "form_key",
+        "subject_key",
+        "site_id",
+        "interval_id",
+        "record_status",
+        "record_revision",
+        "data_revision",
+        "user",
+        "role",
+        "reason_for_change",
+        "deleted",
+        "date_created",
+        "last_updated",
+    ]
+    bronze_cols = [
+        desc[0]
+        for desc in workflow._connection.execute(
+            "SELECT * FROM bronze_revisions LIMIT 0"
+        ).description
+    ]
+    assert bronze_cols == expected_columns
+    assert "variable_name" not in bronze_cols
+    assert "value" not in bronze_cols
+
     bronze_count = workflow._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()[
         0
     ]
-    assert bronze_count == 4
-    age_value = workflow._connection.execute("""
-        SELECT value
+    assert bronze_count == 3
+    rev2_reason = workflow._connection.execute("""
+        SELECT reason_for_change
         FROM bronze_revisions
-        WHERE record_id = 1 AND variable_name = 'AGE' AND revision_number = 2
+        WHERE record_id = 1 AND record_revision = 2
         """).fetchone()[0]
-    assert age_value == "31"
+    assert rev2_reason == "Corrected demographics"
 
     workflow.build_silver_view("STUDY")
+    silver_cols = [
+        desc[0]
+        for desc in workflow._connection.execute(
+            "SELECT * FROM silver_current_state LIMIT 0"
+        ).description
+    ]
+    assert silver_cols == expected_columns
+
     silver_rows = workflow._connection.execute("""
-        SELECT record_id, variable_name, value, revision_number
+        SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created
         FROM silver_current_state
-        ORDER BY record_id, variable_name
+        ORDER BY record_id
         """).fetchall()
     assert silver_rows == [
-        (1, "AGE", "31", 2),
-        (1, "WEIGHT", "70", 1),
-        (2, "HEIGHT", "180", 1),
+        (
+            1,
+            "DEMO",
+            2,
+            "bob",
+            "Corrected demographics",
+            datetime(2024, 1, 2, 10, 0, 0),
+        ),
+        (
+            2,
+            "VITALS",
+            1,
+            "carol",
+            "Baseline vitals",
+            datetime(2024, 1, 3, 12, 0, 0),
+        ),
     ]
 
 
