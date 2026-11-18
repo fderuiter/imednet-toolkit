@@ -211,6 +211,12 @@ jobs:
       - name: Run Canonical Workspace Verification
         run: hatch run verify
 
+      - name: Verify Model Type Stubs
+        run: |
+          hatch run python -m imednet.models.engine --check
+          hatch run python -c "from imednet.models.engine import ModelEngine; ModelEngine.generate_stubs('packages/core/src/imednet/models')"
+          git diff --exit-code packages/core/src/imednet/models/
+
   # ------------------------------------------------------------------
   # JOB 2: BUILD ARTIFACT (Builds the library)
   # ------------------------------------------------------------------

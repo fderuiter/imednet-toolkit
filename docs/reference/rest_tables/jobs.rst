@@ -92,10 +92,10 @@ Retrieve job status
    {
      "jobId": "<string>",
      "batchId": "<string>",
-     "state": "<string>",
+     "state": "COMPLETED",
      "dateCreated": "<string>",
      "dateStarted": "<string>",
      "dateFinished": "<string>",
-     "progress": "<integer>",
+     "progress": 100,
      "resultUrl": "<string>"
    }
