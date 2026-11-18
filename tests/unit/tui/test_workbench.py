@@ -232,7 +232,7 @@ async def test_subject_key_display_drilldown_clear_and_phi_masking(
         assert isinstance(screen, DashboardScreen)
 
         # Select Study ONCO_01
-        screen.on_study_list_selected(StudyList.Selected("ONCO_01", "Oncology Phase II"))
+        screen.on_study_list_study_selected(StudyList.StudySelected("ONCO_01", "Oncology Phase II"))
         await pilot.pause()
         await screen.workers.wait_for_complete()
         await pilot.pause()
@@ -320,7 +320,7 @@ async def test_entity_keyboard_filtering_and_datadict_validation(
         screen = app.screen
         assert isinstance(screen, DashboardScreen)
 
-        screen.on_study_list_selected(StudyList.Selected("ONCO_01", "Oncology Phase II"))
+        screen.on_study_list_study_selected(StudyList.StudySelected("ONCO_01", "Oncology Phase II"))
         await pilot.pause()
         await screen.workers.wait_for_complete()
         await pilot.pause()
@@ -394,7 +394,7 @@ async def test_job_monitor_auto_loads_ledger_renders_progress_and_pauses_when_id
         screen = app.screen
         assert isinstance(screen, DashboardScreen)
 
-        screen.on_study_list_selected(StudyList.Selected("ONCO_01", "Oncology Phase II"))
+        screen.on_study_list_study_selected(StudyList.StudySelected("ONCO_01", "Oncology Phase II"))
         await pilot.pause()
         await screen.workers.wait_for_complete()
         await pilot.pause()
@@ -470,7 +470,7 @@ async def test_workflows_pane_discovers_all_9_runs_off_ui_thread_and_registers_j
         screen = app.screen
         assert isinstance(screen, DashboardScreen)
 
-        screen.on_study_list_selected(StudyList.Selected("ONCO_01", "Oncology Phase II"))
+        screen.on_study_list_study_selected(StudyList.StudySelected("ONCO_01", "Oncology Phase II"))
         await pilot.pause()
         await screen.workers.wait_for_complete()
 
@@ -791,7 +791,7 @@ async def test_triage_crud_filters_degradation_and_view_details(
         screen = app.screen
         assert isinstance(screen, DashboardScreen)
 
-        screen.on_study_list_selected(StudyList.Selected("ONCO_01", "Oncology Phase II"))
+        screen.on_study_list_study_selected(StudyList.StudySelected("ONCO_01", "Oncology Phase II"))
         await pilot.pause()
         await screen.workers.wait_for_complete()
         await pilot.pause()

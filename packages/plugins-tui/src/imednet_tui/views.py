@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,7 +27,7 @@ from imednet.spi.datadict import (
 from imednet.spi.utils import mask_clinical_phi
 
 if TYPE_CHECKING:
-    from imednet.sdk import ImednetSDK
+    from imednet.sdk import AsyncImednetSDK, ImednetSDK
 
 
 def _stringify_cell(raw_value: Any, *, phi_masked: bool = False, sensitive: bool = False) -> str:
@@ -203,20 +204,66 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
 }
 
 
+async def collect_endpoint_items(
+    func: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> list[Any]:
+    """Collect items from a synchronous, coroutine, or async-iterable endpoint method.
+
+    Args:
+        func: SDK endpoint callable to invoke.
+        *args: Positional arguments forwarded to ``func``.
+        **kwargs: Keyword arguments forwarded to ``func``.
+
+    Returns:
+        Materialized list of items yielded or returned by ``func``.
+    """
+    if inspect.iscoroutinefunction(func):
+        result = await func(*args, **kwargs)
+    elif inspect.isasyncgenfunction(func):
+        return [item async for item in func(*args, **kwargs)]
+    else:
+
+        def _invoke_sync() -> Any:
+            res = func(*args, **kwargs)
+            if inspect.isawaitable(res) or isinstance(res, AsyncIterable):
+                return res
+            return list(res)
+
+        result = await asyncio.to_thread(_invoke_sync)
+
+    if inspect.isawaitable(result):
+        result = await result
+    if isinstance(result, AsyncIterable):
+        return [item async for item in result]
+    return list(result)
+
+
 async def _fetch_endpoint_items(endpoint: Any, study_key: str) -> list[Any]:
     """Fetch items from a sync or async SDK endpoint without blocking the UI loop."""
     if endpoint is None:
         return []
     if hasattr(endpoint, "async_list") and callable(endpoint.async_list):
-        result = endpoint.async_list(study_key)
-        if asyncio.iscoroutine(result):
-            return list(await result)
-        return list(result)
+        return await collect_endpoint_items(endpoint.async_list, study_key)
     if hasattr(endpoint, "list") and callable(endpoint.list):
-        if asyncio.iscoroutinefunction(endpoint.list):
-            return list(await endpoint.list(study_key))
-        return await asyncio.to_thread(lambda: list(endpoint.list(study_key)))
+        return await collect_endpoint_items(endpoint.list, study_key)
     return []
+
+
+class _PrefetchedDataDictAdapter:
+    """Sync adapter exposing pre-fetched forms and variables to ``load_from_api``."""
+
+    class _StaticListEndpoint:
+        def __init__(self, items: list[Any]) -> None:
+            self._items = items
+
+        def list(self, **_kwargs: Any) -> list[Any]:
+            return self._items
+
+    def __init__(self, forms_items: list[Any], vars_items: list[Any]) -> None:
+        self.forms = self._StaticListEndpoint(forms_items)
+        self.variables = self._StaticListEndpoint(vars_items)
 
 
 class EntityTablePane(Container):
@@ -227,7 +274,7 @@ class EntityTablePane(Container):
 
     def __init__(
         self,
-        sdk: ImednetSDK,
+        sdk: ImednetSDK | AsyncImednetSDK,
         spec: EntityViewSpec,
         *,
         phi_masked: bool = False,
@@ -427,7 +474,7 @@ class EntityTablePane(Container):
 class DataDictionaryPane(Container):
     """Data Dictionary explorer and schema validator backed by ``imednet.spi.datadict``."""
 
-    def __init__(self, sdk: ImednetSDK, **kwargs: Any) -> None:
+    def __init__(self, sdk: ImednetSDK | AsyncImednetSDK, **kwargs: Any) -> None:
         """Initialize the Data Dictionary pane."""
         super().__init__(**kwargs)
         self.sdk = sdk
@@ -493,7 +540,18 @@ class DataDictionaryPane(Container):
         self.current_study_key = study_key
         self.loading = True
         try:
-            dd = await asyncio.to_thread(load_from_api, self.sdk, study_key)
+            forms_ep = getattr(self.sdk, "forms", None)
+            vars_ep = getattr(self.sdk, "variables", None)
+            forms_list_fn = getattr(forms_ep, "list", None)
+            if inspect.iscoroutinefunction(forms_list_fn) or inspect.isasyncgenfunction(
+                forms_list_fn
+            ):
+                forms_items = await _fetch_endpoint_items(forms_ep, study_key)
+                vars_items = await _fetch_endpoint_items(vars_ep, study_key)
+                adapter = _PrefetchedDataDictAdapter(forms_items, vars_items)
+                dd = await asyncio.to_thread(load_from_api, adapter, study_key)
+            else:
+                dd = await asyncio.to_thread(load_from_api, self.sdk, study_key)
             errors = await asyncio.to_thread(validate, dd, get_schema())
             self.dictionary = dd
             self.validation_errors = errors
@@ -638,4 +696,5 @@ __all__ = [
     "EntityColumnSpec",
     "EntityTablePane",
     "EntityViewSpec",
+    "collect_endpoint_items",
 ]

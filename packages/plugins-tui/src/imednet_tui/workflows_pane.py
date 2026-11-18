@@ -19,7 +19,7 @@ from imednet.spi.jobs import record_study_job
 from imednet.spi.models import RegisterSubjectRequest
 
 if TYPE_CHECKING:
-    from imednet.sdk import ImednetSDK
+    from imednet.sdk import AsyncImednetSDK, ImednetSDK
 
 logger = logging.getLogger("imednet.tui.workflows")
 
@@ -421,7 +421,7 @@ class WorkflowsPane(Container):
 
     def __init__(
         self,
-        sdk: ImednetSDK,
+        sdk: ImednetSDK | AsyncImednetSDK,
         *,
         log_callback: Callable[[str], None] | None = None,
         **kwargs: Any,

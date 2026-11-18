@@ -144,6 +144,10 @@ Screen {
     color: #F8FAFC;
 }
 
+DashboardScreen {
+    layout: vertical;
+}
+
 App.-light-mode Screen {
     background: #FFFFFF;
     color: #0F172A;

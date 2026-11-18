@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
+import re
 import threading
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -41,11 +43,11 @@ from imednet.spi.utils import mask_clinical_phi
 from .terminal import is_interactive_terminal
 from .theme import WORKBENCH_CSS, format_progress_bar, format_status_badge
 from .triage_pane import TriagePane
-from .views import ENTITY_VIEW_SPECS, DataDictionaryPane, EntityTablePane
+from .views import ENTITY_VIEW_SPECS, DataDictionaryPane, EntityTablePane, collect_endpoint_items
 from .workflows_pane import WorkflowsPane
 
 if TYPE_CHECKING:
-    from imednet.sdk import ImednetSDK
+    from imednet.sdk import AsyncImednetSDK, ImednetSDK
 
 __all__ = [
     "DashboardScreen",
@@ -59,6 +61,44 @@ __all__ = [
     "is_interactive_terminal",
     "run_tui",
 ]
+
+_INVALID_ID_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]")
+_VALID_ID_START_RE = re.compile(r"^[A-Za-z_]")
+
+
+def _sanitize_dom_id(prefix: str, raw_value: object, used_ids: set[str]) -> str:
+    """Build a unique Textual DOM identifier matching ``[A-Za-z_][A-Za-z0-9_-]*``.
+
+    Args:
+        prefix: Leading namespace prefix such as ``study`` or ``site``.
+        raw_value: Raw SDK identifier value that may contain dots or symbols.
+        used_ids: Set of already-allocated DOM IDs within the parent widget.
+
+    Returns:
+        Sanitized, collision-free DOM identifier string.
+    """
+    cleaned_prefix = _INVALID_ID_CHARS_RE.sub("_", prefix) or "item"
+    if not _VALID_ID_START_RE.match(cleaned_prefix):
+        cleaned_prefix = f"_{cleaned_prefix}"
+    cleaned_value = _INVALID_ID_CHARS_RE.sub("_", str(raw_value)) or "item"
+    base_id = f"{cleaned_prefix}-{cleaned_value}"
+    candidate = base_id
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{base_id}-{suffix}"
+        suffix += 1
+    used_ids.add(candidate)
+    return candidate
+
+
+def _fallback_item_label(item: ListItem, default: str) -> str:
+    """Extract human-readable text from a ``ListItem`` when unmapped."""
+    try:
+        label_widget = item.query_one(Label)
+        rendered = getattr(label_widget, "renderable", None) or label_widget.render()
+        return str(rendered)
+    except Exception:
+        return default
 
 
 class TextualLogHandler(logging.Handler):
@@ -96,7 +136,7 @@ class TextualLogHandler(logging.Handler):
 class StudyList(ListView):
     """List of available clinical studies."""
 
-    class Selected(Message):
+    class StudySelected(Message):
         """Event emitted when a study is selected."""
 
         def __init__(self, study_key: str, study_name: str) -> None:
@@ -105,11 +145,17 @@ class StudyList(ListView):
             self.study_name = study_name
             super().__init__()
 
-    def __init__(self, sdk: ImednetSDK, **kwargs: Any) -> None:
-        """Initialize the StudyList widget."""
+    def __init__(self, sdk: ImednetSDK | AsyncImednetSDK, **kwargs: Any) -> None:
+        """Initialize the StudyList widget.
+
+        Args:
+            sdk: Active iMednet SDK client instance.
+            **kwargs: Additional widget arguments.
+        """
         super().__init__(**kwargs)
         self.sdk = sdk
         self.loaded = False
+        self._study_items: dict[str, tuple[str, str]] = {}
 
     async def on_mount(self) -> None:
         """Load studies automatically upon mounting the widget."""
@@ -117,23 +163,39 @@ class StudyList(ListView):
 
     async def load_studies(self) -> None:
         """Fetch and populate study items from the SDK asynchronously."""
-        if self.is_mounted:
-            self.clear()
+        prev_index = self.index
+        if self.children:
+            await self.clear()
+        self._study_items.clear()
         self.loading = True
         try:
             studies_ep: Any = self.sdk.studies
             if hasattr(studies_ep, "async_list"):
-                studies = await studies_ep.async_list()
+                studies = await collect_endpoint_items(studies_ep.async_list)
             else:
-                studies = await asyncio.to_thread(lambda: list(self.sdk.studies.list()))
+                studies = await collect_endpoint_items(studies_ep.list)
 
-            items = []
+            used_ids: set[str] = set()
+            items: list[ListItem] = []
+            study_map: dict[str, tuple[str, str]] = {}
             for study in studies:
-                name = getattr(study, "study_name", None) or getattr(study, "name", "Unknown Study")
-                key = getattr(study, "study_key", "no-key")
-                label = f"{name} ({key})"
-                items.append(ListItem(Label(label), id=f"study-{key}"))
-            self.extend(items)
+                name = str(
+                    getattr(study, "study_name", None)
+                    or getattr(study, "name", None)
+                    or "Unknown Study"
+                )
+                key = str(getattr(study, "study_key", "no-key"))
+                item_id = _sanitize_dom_id("study", key, used_ids)
+                study_map[item_id] = (key, name)
+                items.append(ListItem(Label(f"{name} ({key})"), id=item_id))
+
+            self._study_items = study_map
+            if self.is_attached:
+                if self.children:
+                    await self.clear()
+                self.extend(items)
+                if items:
+                    self.index = min(prev_index, len(items) - 1) if prev_index is not None else 0
             self.loaded = True
         except Exception as e:
             if hasattr(self.app, "notify"):
@@ -144,19 +206,19 @@ class StudyList(ListView):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Handle selection event in the list view."""
         if event.item and event.item.id:
-            study_key = event.item.id.replace("study-", "")
-            try:
-                label_widget = event.item.query_one(Label)
-                study_name = str(getattr(label_widget, "renderable", study_key))
-            except Exception:
-                study_name = study_key
-            self.post_message(self.Selected(study_key, study_name))
+            mapped = self._study_items.get(event.item.id)
+            if mapped is not None:
+                study_key, study_name = mapped
+            else:
+                study_key = event.item.id.removeprefix("study-")
+                study_name = _fallback_item_label(event.item, study_key)
+            self.post_message(self.StudySelected(study_key, study_name))
 
 
 class SiteList(ListView):
     """List of sites for a selected study."""
 
-    class Selected(Message):
+    class SiteSelected(Message):
         """Event emitted when a site is selected."""
 
         def __init__(self, site_id: str, site_name: str) -> None:
@@ -165,32 +227,54 @@ class SiteList(ListView):
             self.site_name = site_name
             super().__init__()
 
-    def __init__(self, sdk: ImednetSDK, **kwargs: Any) -> None:
-        """Initialize the SiteList widget."""
+    def __init__(self, sdk: ImednetSDK | AsyncImednetSDK, **kwargs: Any) -> None:
+        """Initialize the SiteList widget.
+
+        Args:
+            sdk: Active iMednet SDK client instance.
+            **kwargs: Additional widget arguments.
+        """
         super().__init__(**kwargs)
         self.sdk = sdk
         self.current_study_key: str | None = None
+        self._site_items: dict[str, tuple[str, str]] = {}
 
     async def load_sites(self, study_key: str) -> None:
-        """Fetch and populate site items for a given study key."""
+        """Fetch and populate site items for a given study key.
+
+        Args:
+            study_key: Study key to load sites for.
+        """
+        prev_index = self.index if self.current_study_key == study_key else None
         self.current_study_key = study_key
-        if self.is_mounted:
-            self.clear()
+        if self.children:
+            await self.clear()
+        self._site_items.clear()
         self.loading = True
         try:
             sites_ep: Any = self.sdk.sites
             if hasattr(sites_ep, "async_list"):
-                sites = await sites_ep.async_list(study_key)
+                sites = await collect_endpoint_items(sites_ep.async_list, study_key)
             else:
-                sites = await asyncio.to_thread(lambda: list(self.sdk.sites.list(study_key)))
+                sites = await collect_endpoint_items(sites_ep.list, study_key)
 
-            items = []
+            used_ids: set[str] = set()
+            items: list[ListItem] = []
+            site_map: dict[str, tuple[str, str]] = {}
             for site in sites:
-                site_id = getattr(site, "site_id", "no-id")
-                name = getattr(site, "site_name", "Unknown Site")
-                label = f"{name} ({site_id})"
-                items.append(ListItem(Label(label), id=f"site-{site_id}"))
-            self.extend(items)
+                site_id = str(getattr(site, "site_id", "no-id"))
+                name = str(getattr(site, "site_name", None) or "Unknown Site")
+                item_id = _sanitize_dom_id("site", site_id, used_ids)
+                site_map[item_id] = (site_id, name)
+                items.append(ListItem(Label(f"{name} ({site_id})"), id=item_id))
+
+            self._site_items = site_map
+            if self.is_attached:
+                if self.children:
+                    await self.clear()
+                self.extend(items)
+                if items:
+                    self.index = min(prev_index, len(items) - 1) if prev_index is not None else 0
         except Exception as e:
             if hasattr(self.app, "notify"):
                 self.app.notify(f"Error loading sites: {e}", severity="error")
@@ -200,13 +284,13 @@ class SiteList(ListView):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Handle selection event in the site list view."""
         if event.item and event.item.id:
-            site_id = event.item.id.replace("site-", "")
-            try:
-                label_widget = event.item.query_one(Label)
-                site_name = str(getattr(label_widget, "renderable", site_id))
-            except Exception:
-                site_name = site_id
-            self.post_message(self.Selected(site_id, site_name))
+            mapped = self._site_items.get(event.item.id)
+            if mapped is not None:
+                site_id, site_name = mapped
+            else:
+                site_id = event.item.id.removeprefix("site-")
+                site_name = _fallback_item_label(event.item, site_id)
+            self.post_message(self.SiteSelected(site_id, site_name))
 
 
 class SubjectTable(DataTable[str]):
@@ -222,8 +306,20 @@ class SubjectTable(DataTable[str]):
             self.site_id = site_id
             super().__init__()
 
-    def __init__(self, sdk: ImednetSDK, *, phi_masked: bool = False, **kwargs: Any) -> None:
-        """Initialize the SubjectTable widget."""
+    def __init__(
+        self,
+        sdk: ImednetSDK | AsyncImednetSDK,
+        *,
+        phi_masked: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the SubjectTable widget.
+
+        Args:
+            sdk: Active iMednet SDK client instance.
+            phi_masked: Whether to mask clinical PHI fields.
+            **kwargs: Additional widget arguments.
+        """
         super().__init__(**kwargs)
         self.sdk = sdk
         self.phi_masked = phi_masked
@@ -269,13 +365,13 @@ class SubjectTable(DataTable[str]):
         try:
             subjects_ep: Any = self.sdk.subjects
             if hasattr(subjects_ep, "async_list"):
-                subjects = await subjects_ep.async_list(study_key)
+                subjects = await collect_endpoint_items(subjects_ep.async_list, study_key)
             elif site_id is not None and hasattr(subjects_ep, "list_by_site"):
-                subjects = await asyncio.to_thread(
-                    lambda: list(subjects_ep.list_by_site(study_key, site_id))
+                subjects = await collect_endpoint_items(
+                    subjects_ep.list_by_site, study_key, site_id
                 )
             else:
-                subjects = await asyncio.to_thread(lambda: list(self.sdk.subjects.list(study_key)))
+                subjects = await collect_endpoint_items(subjects_ep.list, study_key)
 
             rows: list[tuple[str, str, str, str, str]] = []
             for sub in subjects:
@@ -283,11 +379,7 @@ class SubjectTable(DataTable[str]):
                 if site_id is None or s_site_id == str(site_id):
                     sub_id = str(getattr(sub, "subject_id", "-") or "-")
                     raw_key = getattr(sub, "subject_key", None)
-                    sub_key = (
-                        str(raw_key).strip()
-                        if isinstance(raw_key, str) and raw_key.strip()
-                        else sub_id
-                    )
+                    sub_key = _clean_scalar_str(raw_key) or sub_id
                     status = (
                         getattr(sub, "subject_status", None) or getattr(sub, "status", None) or "-"
                     )
@@ -366,7 +458,7 @@ class JobMonitor(Static):
 
     def __init__(
         self,
-        sdk: ImednetSDK,
+        sdk: ImednetSDK | AsyncImednetSDK,
         *,
         max_concurrency: int = MAX_CONCURRENT_POLLS,
         ledger: JobLedger | None = None,
@@ -480,14 +572,14 @@ class JobMonitor(Static):
         async with self.semaphore:
             try:
                 if hasattr(jobs_ep, "get"):
-                    if asyncio.iscoroutinefunction(jobs_ep.get):
+                    if inspect.iscoroutinefunction(jobs_ep.get):
                         job = await jobs_ep.get(study_key, jid)
                     else:
                         res = await asyncio.to_thread(jobs_ep.get, study_key, jid)
-                        job = await res if asyncio.iscoroutine(res) else res
+                        job = await res if inspect.isawaitable(res) else res
                 elif hasattr(jobs_ep, "async_get"):
                     res = jobs_ep.async_get(study_key, jid)
-                    job = await res if asyncio.iscoroutine(res) else res
+                    job = await res if inspect.isawaitable(res) else res
                 else:
                     job = None
 
@@ -521,9 +613,9 @@ class JobMonitor(Static):
             jobs: list[Any] = []
 
             if hasattr(jobs_ep, "async_list"):
-                jobs = list(await jobs_ep.async_list(study_key))
+                jobs = await collect_endpoint_items(jobs_ep.async_list, study_key)
             elif hasattr(jobs_ep, "list"):
-                jobs = await asyncio.to_thread(lambda: list(jobs_ep.list(study_key)))
+                jobs = await collect_endpoint_items(jobs_ep.list, study_key)
             elif self.tracked_job_ids:
                 tasks = [
                     self._poll_tracked_job(jobs_ep, study_key, jid, ledger_map.get(jid))
@@ -634,14 +726,22 @@ class DashboardScreen(Screen[None]):
 
     CSS = WORKBENCH_CSS
 
-    def __init__(self, sdk: ImednetSDK, **kwargs: Any) -> None:
-        """Initialize the DashboardScreen."""
+    def __init__(self, sdk: ImednetSDK | AsyncImednetSDK, **kwargs: Any) -> None:
+        """Initialize the DashboardScreen.
+
+        Args:
+            sdk: Active iMednet SDK client instance.
+            **kwargs: Additional screen arguments.
+        """
         super().__init__(**kwargs)
         self.sdk = sdk
         self.log_viewer = LogViewer(id="log_viewer")
         self.current_study_key: str | None = None
+        self.selected_study_key: str | None = None
+        self.selected_site_id: str | None = None
         self.selected_subject_key: str | None = None
         self.phi_masked: bool = False
+        self._log_handler: TextualLogHandler | None = None
 
     def compose(self) -> ComposeResult:
         """Compose study/site/subject navigation alongside entity, workflow, triage, and job tabs."""
@@ -741,20 +841,45 @@ class DashboardScreen(Screen[None]):
                     yield self.log_viewer
         yield Footer()
 
+    def on_mount(self) -> None:
+        """Sync high-contrast mode and attach SDK log handler when mounted."""
+        if getattr(self.app, "high_contrast_enabled", False) or "high-contrast" in self.app.classes:
+            self.add_class("high-contrast")
+
+        handler = TextualLogHandler(self.log_viewer, owner_thread_id=threading.get_ident())
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        handler.setFormatter(formatter)
+        logger = logging.getLogger("imednet")
+        if logger.level == logging.NOTSET or logger.level > logging.INFO:
+            logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        self._log_handler = handler
+
+    def on_unmount(self) -> None:
+        """Detach the SDK log handler when the screen is unmounted."""
+        if self._log_handler is not None:
+            logging.getLogger("imednet").removeHandler(self._log_handler)
+            self._log_handler = None
+
     def _append_log_line(self, line: str) -> None:
         """Append a single line to the dashboard LogViewer."""
         self.log_viewer.write_line(line)
 
-    def load_all_study_panes(self, study_key: str) -> None:
+    def load_all_study_panes(self, study_key: str, *, preserve_subject_scope: bool = False) -> None:
         """Asynchronously load all study entity, Data Dictionary, workflow, and triage views."""
+        subj_key = self.selected_subject_key if preserve_subject_scope else None
         for pane in self.query(EntityTablePane):
-            self.run_worker(pane.load_study(study_key, subject_key=None))
+            self.run_worker(
+                pane.load_study(study_key, subject_key=subj_key),
+                exclusive=True,
+                group=f"load-entity-{pane.spec.key}",
+            )
         dd_pane = self.query_one(DataDictionaryPane)
-        self.run_worker(dd_pane.load_study(study_key))
+        self.run_worker(dd_pane.load_study(study_key), exclusive=True, group="load-datadict")
         wf_pane = self.query_one(WorkflowsPane)
         wf_pane.set_study(study_key)
         triage_pane = self.query_one(TriagePane)
-        self.run_worker(triage_pane.load_study(study_key))
+        self.run_worker(triage_pane.load_study(study_key), exclusive=True, group="load-triage")
 
     def set_phi_masked(self, enabled: bool) -> None:
         """Apply clinical PHI masking across SubjectTable and all EntityTablePanes."""
@@ -805,31 +930,50 @@ class DashboardScreen(Screen[None]):
         self.log_viewer.write_line(f"Tracking manual background job: {batch_id}")
         job_input.value = ""
 
-    def on_study_list_selected(self, message: StudyList.Selected) -> None:
-        """Handle study selection by populating sites, subjects, entities, workflows, and jobs."""
+    def on_study_list_study_selected(self, message: StudyList.StudySelected) -> None:
+        """Handle study selection by populating sites, subjects, entities, workflows, and jobs.
+
+        Args:
+            message: Study selection event containing study details.
+        """
+        self.selected_study_key = message.study_key
         self.current_study_key = message.study_key
+        self.selected_site_id = None
         self.selected_subject_key = None
         self.log_viewer.write_line(f"Selected Study: {message.study_name} ({message.study_key})")
 
         site_list = self.query_one(SiteList)
-        self.run_worker(site_list.load_sites(message.study_key))
+        self.run_worker(site_list.load_sites(message.study_key), exclusive=True, group="load-sites")
 
         subject_table = self.query_one(SubjectTable)
-        self.run_worker(subject_table.load_subjects(message.study_key))
+        self.run_worker(
+            subject_table.load_subjects(message.study_key),
+            exclusive=True,
+            group="load-subjects",
+        )
 
         job_monitor = self.query_one(JobMonitor)
         job_monitor.set_study(message.study_key)
 
         self.load_all_study_panes(message.study_key)
 
-    def on_site_list_selected(self, message: SiteList.Selected) -> None:
-        """Handle site selection by filtering displayed subjects."""
+    def on_site_list_site_selected(self, message: SiteList.SiteSelected) -> None:
+        """Handle site selection by filtering displayed subjects.
+
+        Args:
+            message: Site selection event containing site details.
+        """
+        self.selected_site_id = message.site_id
         self.log_viewer.write_line(f"Selected Site: {message.site_name} (ID: {message.site_id})")
         site_list = self.query_one(SiteList)
-        study_key = site_list.current_study_key
+        study_key = self.selected_study_key or site_list.current_study_key
         if study_key:
             subject_table = self.query_one(SubjectTable)
-            self.run_worker(subject_table.load_subjects(study_key, message.site_id))
+            self.run_worker(
+                subject_table.load_subjects(study_key, message.site_id),
+                exclusive=True,
+                group="load-subjects",
+            )
 
     def on_subject_table_selected(self, message: SubjectTable.Selected) -> None:
         """Filter Records, Visits, Queries, and Revisions when a Subject is selected."""
@@ -886,55 +1030,47 @@ class ImednetTuiApp(App[None]):
         ("r", "refresh_data", "Refresh"),
     ]
 
-    def __init__(self, sdk: ImednetSDK, **kwargs: Any) -> None:
-        """Initialize the iMednet TUI application."""
+    def __init__(self, sdk: ImednetSDK | AsyncImednetSDK, **kwargs: Any) -> None:
+        """Initialize the iMednet TUI application.
+
+        Args:
+            sdk: Active iMednet SDK client instance.
+            **kwargs: Additional application arguments.
+        """
         super().__init__(**kwargs)
         self.sdk = sdk
         self.high_contrast_enabled = os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
-        self._log_handler: TextualLogHandler | None = None
+
+    def _sync_high_contrast_classes(self) -> None:
+        """Synchronize the ``high-contrast`` class across the app and dashboard screens."""
+        self.set_class(self.high_contrast_enabled, "high-contrast")
+        for screen in self.screen_stack:
+            if isinstance(screen, DashboardScreen):
+                screen.set_class(self.high_contrast_enabled, "high-contrast")
 
     def on_mount(self) -> None:
-        """Configure application title, contrast mode, screen, and logger on mount."""
+        """Configure application title, contrast mode, and dashboard screen on mount."""
         self.title = "iMednet Mission Control"
         base_url = getattr(getattr(self.sdk, "config", None), "base_url", None) or getattr(
             self.sdk, "_base_url", "Unknown"
         )
         self.sub_title = f"Env: {base_url}"
 
+        dashboard = DashboardScreen(self.sdk)
         if self.high_contrast_enabled:
             self.add_class("high-contrast")
+            dashboard.add_class("high-contrast")
 
-        dashboard = DashboardScreen(self.sdk)
         self.push_screen(dashboard)
-
-        with contextlib.suppress(Exception):
-            handler = TextualLogHandler(
-                dashboard.log_viewer,
-                owner_thread_id=threading.get_ident(),
-            )
-            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-            handler.setFormatter(formatter)
-            logger = logging.getLogger("imednet")
-            logger.setLevel(logging.INFO)
-            logger.addHandler(handler)
-            self._log_handler = handler
-
-    def on_unmount(self) -> None:
-        """Detach the Textual log handler on application teardown."""
-        if self._log_handler is not None:
-            with contextlib.suppress(Exception):
-                logging.getLogger("imednet").removeHandler(self._log_handler)
-            self._log_handler = None
 
     def action_toggle_high_contrast(self) -> None:
         """Toggle accessibility high contrast mode."""
         self.high_contrast_enabled = not self.high_contrast_enabled
         if self.high_contrast_enabled:
-            self.add_class("high-contrast")
             os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
         else:
-            self.remove_class("high-contrast")
             os.environ.pop("IMEDNET_HIGH_CONTRAST", None)
+        self._sync_high_contrast_classes()
 
     def action_toggle_phi_mask(self) -> None:
         """Toggle clinical PHI masking across all workbench views."""
@@ -955,18 +1091,47 @@ class ImednetTuiApp(App[None]):
             active_screen.focus_active_filter()
 
     def action_refresh_data(self) -> None:
-        """Refresh current screen data."""
-        with contextlib.suppress(Exception):
-            active_screen: Any = self.screen
-            if isinstance(active_screen, DashboardScreen):
-                study_list = active_screen.query_one(StudyList)
-                self.run_worker(study_list.load_studies())
-                if active_screen.current_study_key:
-                    active_screen.load_all_study_panes(active_screen.current_study_key)
-                    self.run_worker(active_screen.query_one(JobMonitor).refresh_jobs())
+        """Refresh studies and any active study/site/entity panes on the dashboard screen."""
+        try:
+            screen: Screen[Any] = self.screen
+        except Exception:
+            return
+
+        if not isinstance(screen, DashboardScreen):
+            return
+
+        study_list = screen.query_one(StudyList)
+        screen.run_worker(study_list.load_studies(), exclusive=True, group="load-studies")
+
+        site_list = screen.query_one(SiteList)
+        job_monitor = screen.query_one(JobMonitor)
+        study_key = (
+            screen.selected_study_key
+            or screen.current_study_key
+            or site_list.current_study_key
+            or job_monitor.current_study_key
+        )
+        if study_key:
+            screen.run_worker(
+                site_list.load_sites(study_key),
+                exclusive=True,
+                group="load-sites",
+            )
+            subject_table = screen.query_one(SubjectTable)
+            screen.run_worker(
+                subject_table.load_subjects(study_key, screen.selected_site_id),
+                exclusive=True,
+                group="load-subjects",
+            )
+            screen.run_worker(
+                job_monitor.refresh_jobs(),
+                exclusive=True,
+                group="refresh-jobs",
+            )
+            screen.load_all_study_panes(study_key, preserve_subject_scope=True)
 
 
-def run_tui(sdk: ImednetSDK, force: bool = False) -> None:
+def run_tui(sdk: ImednetSDK | AsyncImednetSDK, force: bool = False) -> None:
     """Run the TUI application.
 
     Args:
