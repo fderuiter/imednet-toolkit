@@ -74,6 +74,7 @@ def register_list_command(
                 empty_msg,
                 fields=summary_fields,
                 output_format=output_format,
+                details=items,
                 truncated=truncated,
             )
 
@@ -118,6 +119,7 @@ def register_list_command(
                 empty_msg,
                 fields=summary_fields,
                 output_format=output_format,
+                details=items,
                 truncated=truncated,
             )
 

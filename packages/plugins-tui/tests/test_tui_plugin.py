@@ -10,9 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from textual.app import App
+from textual.containers import Container
 from textual.widgets import ListItem, ListView
 
+from imednet.sdk import AsyncImednetSDK, ImednetSDK
 from imednet_tui.app import (
+    DashboardScreen,
     ImednetTuiApp,
     JobMonitor,
     SiteList,
@@ -23,6 +26,12 @@ from imednet_tui.app import (
     run_tui,
 )
 from imednet_tui.cli import setup_parser
+
+
+@pytest.fixture(autouse=True)
+def reset_high_contrast_env(monkeypatch):
+    """Prevent IMEDNET_HIGH_CONTRAST state leaks across tests."""
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
 
 
 @pytest.fixture
@@ -113,7 +122,7 @@ async def test_app_study_and_subject_flow(mock_sdk):
         assert len(study_list.children) == 1
 
         # Simulate selecting a study
-        study_list.post_message(StudyList.Selected("STUDY-ONC-01", "Oncology Phase III"))
+        study_list.post_message(StudyList.StudySelected("STUDY-ONC-01", "Oncology Phase III"))
         await pilot.pause()
 
         site_list = app.screen.query_one(SiteList)
@@ -126,7 +135,7 @@ async def test_app_study_and_subject_flow(mock_sdk):
         assert job_monitor.current_study_key == "STUDY-ONC-01"
 
         # Simulate selecting a site to filter subjects
-        site_list.post_message(SiteList.Selected("SITE-101", "Memorial Hospital"))
+        site_list.post_message(SiteList.SiteSelected("SITE-101", "Memorial Hospital"))
         await pilot.pause()
 
         assert subject_table.row_count == 1
@@ -134,6 +143,10 @@ async def test_app_study_and_subject_flow(mock_sdk):
         # Trigger refresh action
         app.action_refresh_data()
         await pilot.pause()
+        assert mock_sdk.studies.async_list.await_count >= 2
+        assert mock_sdk.sites.async_list.await_count >= 2
+        assert mock_sdk.subjects.async_list.await_count >= 3
+        assert mock_sdk.jobs.async_list.await_count >= 2
 
 
 @pytest.mark.asyncio
@@ -203,7 +216,7 @@ async def test_app_sync_sdk_fallback():
         study_list = app.screen.query_one(StudyList)
         assert len(study_list.children) == 1
 
-        study_list.post_message(StudyList.Selected("SYNC-01", "Sync Study"))
+        study_list.post_message(StudyList.StudySelected("SYNC-01", "Sync Study"))
         await pilot.pause()
 
         site_list = app.screen.query_one(SiteList)
@@ -221,7 +234,7 @@ async def test_app_sync_sdk_fallback():
         sync_sdk.jobs.get.assert_called_with("SYNC-01", "SYNC-JOB-1")
         assert "SYNC-JOB-1" in str(job_monitor.render())
 
-        site_list.post_message(SiteList.Selected("SITE-SYNC", "Sync Site"))
+        site_list.post_message(SiteList.SiteSelected("SITE-SYNC", "Sync Site"))
         await pilot.pause()
         assert subject_table.row_count == 1
 
@@ -238,7 +251,7 @@ async def test_app_error_notifications(mock_sdk):
         await pilot.pause()
 
         study_list = app.screen.query_one(StudyList)
-        study_list.post_message(StudyList.Selected("STUDY-ONC-01", "Oncology Phase III"))
+        study_list.post_message(StudyList.StudySelected("STUDY-ONC-01", "Oncology Phase III"))
         await pilot.pause()
 
         site_list = app.screen.query_one(SiteList)
@@ -262,16 +275,29 @@ async def test_app_handles_study_load_error(mock_sdk):
 
 @pytest.mark.asyncio
 async def test_app_high_contrast_class_applied(mock_sdk, monkeypatch):
-    """Test that high contrast CSS class is added to app when enabled."""
+    """Test that high contrast CSS class and heavy white borders apply to DashboardScreen."""
     monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
     app = ImednetTuiApp(mock_sdk)
     async with app.run_test() as pilot:
         await pilot.pause()
         assert "high-contrast" in app.classes
+        assert isinstance(app.screen, DashboardScreen)
+        assert "high-contrast" in app.screen.classes
 
-        app.action_toggle_high_contrast()
+        studies_box = app.screen.query_one("#studies-box", Container)
+        sites_box = app.screen.query_one("#sites-box", Container)
+        subjects_box = app.screen.query_one("#subjects-box", Container)
+        assert studies_box.styles.border.top[0] == "heavy"
+        assert sites_box.styles.border.top[0] == "heavy"
+        assert subjects_box.styles.border.top[0] == "heavy"
+
+        await pilot.press("h")
         await pilot.pause()
         assert "high-contrast" not in app.classes
+        assert "high-contrast" not in app.screen.classes
+        assert studies_box.styles.border.top[0] == "solid"
+        assert sites_box.styles.border.top[0] == "solid"
+        assert subjects_box.styles.border.top[0] == "solid"
 
 
 @pytest.mark.asyncio
@@ -1027,7 +1053,7 @@ async def test_subject_table_2500_study_issues_single_http_request_and_loads_all
             assert studies_route.call_count == 1
 
             study_list = app.screen.query_one(StudyList)
-            study_list.post_message(StudyList.Selected("LARGE-01", "Large Trial"))
+            study_list.post_message(StudyList.StudySelected("LARGE-01", "Large Trial"))
             await pilot.pause()
 
             # Crucial Acceptance Criterion 4 check: exactly 1 HTTP request issued before render!
@@ -1125,3 +1151,232 @@ async def test_study_list_bounded_truncation_and_load_all() -> None:
         assert len(study_list.children) == 135
         assert study_list.truncated is False
         assert study_list.status_notice == ""
+
+
+@pytest.mark.asyncio
+async def test_pilot_sync_simulation_sdk_selection_logs_refresh_and_contrast():
+    """Verify Pilot keyboard controls (enter, r, h) and log routing with sync ImednetSDK."""
+    imednet_logger = logging.getLogger("imednet")
+    baseline_handlers = list(imednet_logger.handlers)
+
+    with ImednetSDK(simulation_mode=True) as sdk:
+        app = ImednetTuiApp(sdk)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+            dashboard = app.screen
+
+            study_list = dashboard.query_one(StudyList)
+            assert len(study_list.children) >= 1
+            study_list.focus()
+            await pilot.pause()
+
+            # Select first study via Enter
+            await pilot.press("enter")
+            await pilot.pause()
+
+            site_list = dashboard.query_one(SiteList)
+            subject_table = dashboard.query_one(SubjectTable)
+            job_monitor = dashboard.query_one(JobMonitor)
+            assert dashboard.selected_study_key == "DEMO-STUDY"
+            assert len(site_list.children) == 1
+            assert subject_table.row_count == 1
+            assert job_monitor.current_study_key == "DEMO-STUDY"
+
+            # Select site via Enter
+            site_list.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert dashboard.selected_site_id == "102"
+            assert subject_table.row_count == 1
+
+            # Verify SDK logger routes into DashboardScreen.log_viewer
+            imednet_logger.info("Sync simulation audit log")
+            await pilot.pause()
+            log_text = "\n".join(str(line) for line in dashboard.log_viewer.lines)
+            assert "Selected Study: Demo Oncology Trial (DEMO-STUDY)" in log_text
+            assert "Selected Site: North Site (ID: 102)" in log_text
+            assert "Sync simulation audit log" in log_text
+
+            # Verify 'r' refreshes studies and active panes
+            with (
+                patch.object(
+                    study_list, "load_studies", wraps=study_list.load_studies
+                ) as spy_studies,
+                patch.object(site_list, "load_sites", wraps=site_list.load_sites) as spy_sites,
+                patch.object(
+                    subject_table, "load_subjects", wraps=subject_table.load_subjects
+                ) as spy_subjects,
+                patch.object(
+                    job_monitor, "refresh_jobs", wraps=job_monitor.refresh_jobs
+                ) as spy_jobs,
+            ):
+                await pilot.press("r")
+                await pilot.pause()
+                spy_studies.assert_called_once()
+                spy_sites.assert_called_once_with("DEMO-STUDY")
+                spy_subjects.assert_called_once_with("DEMO-STUDY", "102")
+                spy_jobs.assert_called_once()
+
+            # Verify 'h' toggles high-contrast styling on DashboardScreen
+            studies_box = dashboard.query_one("#studies-box", Container)
+            assert studies_box.styles.border.top[0] == "solid"
+            await pilot.press("h")
+            await pilot.pause()
+            assert "high-contrast" in app.classes
+            assert "high-contrast" in dashboard.classes
+            assert studies_box.styles.border.top[0] == "heavy"
+
+    # Verify TextualLogHandler detached on unmount
+    remaining_textual_handlers = [
+        h
+        for h in imednet_logger.handlers
+        if isinstance(h, TextualLogHandler) and h not in baseline_handlers
+    ]
+    assert remaining_textual_handlers == []
+
+
+@pytest.mark.asyncio
+async def test_pilot_async_simulation_sdk_selection_logs_refresh_and_contrast():
+    """Verify Pilot keyboard controls (enter, r, h) with AsyncImednetSDK iterators and coroutines."""
+    imednet_logger = logging.getLogger("imednet")
+    baseline_handlers = list(imednet_logger.handlers)
+
+    async with AsyncImednetSDK(simulation_mode=True) as sdk:
+        app = ImednetTuiApp(sdk)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+            dashboard = app.screen
+
+            study_list = dashboard.query_one(StudyList)
+            assert len(study_list.children) >= 1
+            study_list.focus()
+            await pilot.pause()
+
+            # Select study via Enter -> iterates AsyncStudiesEndpoint, AsyncSitesEndpoint, AsyncSubjectsEndpoint
+            await pilot.press("enter")
+            await pilot.pause()
+
+            site_list = dashboard.query_one(SiteList)
+            subject_table = dashboard.query_one(SubjectTable)
+            job_monitor = dashboard.query_one(JobMonitor)
+            assert dashboard.selected_study_key == "DEMO-STUDY"
+            assert len(site_list.children) == 1
+            assert subject_table.row_count == 1
+            assert job_monitor.current_study_key == "DEMO-STUDY"
+
+            # Select site via Enter -> iterates/awaits AsyncSubjectsEndpoint for site
+            site_list.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert dashboard.selected_site_id == "102"
+            assert subject_table.row_count == 1
+
+            imednet_logger.info("Async simulation audit log")
+            await pilot.pause()
+            log_text = "\n".join(str(line) for line in dashboard.log_viewer.lines)
+            assert "Async simulation audit log" in log_text
+
+            # Refresh via 'r' and toggle contrast via 'h'
+            await pilot.press("r")
+            await pilot.pause()
+            assert subject_table.row_count == 1
+
+            await pilot.press("h")
+            await pilot.pause()
+            studies_box = dashboard.query_one("#studies-box", Container)
+            assert "high-contrast" in dashboard.classes
+            assert studies_box.styles.border.top[0] == "heavy"
+
+    remaining_textual_handlers = [
+        h
+        for h in imednet_logger.handlers
+        if isinstance(h, TextualLogHandler) and h not in baseline_handlers
+    ]
+    assert remaining_textual_handlers == []
+
+
+@pytest.mark.asyncio
+async def test_pilot_dotted_and_colliding_keys_preserve_raw_sdk_keys():
+    """Verify STUDY.01/STUDY_01 and SITE.01/SITE_01 deduplicate DOM IDs and preserve raw keys."""
+    sdk = MagicMock()
+    del sdk.studies.async_list
+    del sdk.sites.async_list
+    del sdk.subjects.async_list
+    del sdk.jobs.async_list
+    del sdk.jobs.list
+
+    study_dot = MagicMock(study_key="STUDY.01", study_name="Dotted Study")
+    study_under = MagicMock(study_key="STUDY_01", study_name="Underscore Study")
+    sdk.studies.list = MagicMock(return_value=iter([study_dot, study_under]))
+
+    site_dot = MagicMock(site_id="SITE.01", site_name="Dotted Site")
+    site_under = MagicMock(site_id="SITE_01", site_name="Underscore Site")
+    sdk.sites.list = MagicMock(side_effect=lambda _key: iter([site_dot, site_under]))
+
+    subj_dot = MagicMock(
+        subject_id="SUB-01",
+        site_id="SITE.01",
+        subject_status="Enrolled",
+        date_created="2026-04-01",
+    )
+    subj_under = MagicMock(
+        subject_id="SUB-02",
+        site_id="SITE_01",
+        subject_status="Screened",
+        date_created="2026-04-02",
+    )
+    sdk.subjects.list = MagicMock(side_effect=lambda _key: iter([subj_dot, subj_under]))
+    sdk.subjects.list_by_site = MagicMock(
+        side_effect=lambda _key, sid: [subj_dot] if sid == "SITE.01" else [subj_under]
+    )
+
+    app = ImednetTuiApp(sdk)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, DashboardScreen)
+        dashboard = app.screen
+
+        study_list = dashboard.query_one(StudyList)
+        study_dom_ids = [child.id for child in study_list.children]
+        assert study_dom_ids == ["study-STUDY_01", "study-STUDY_01-2"]
+
+        # Select STUDY.01 via Enter
+        study_list.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        sdk.sites.list.assert_called_with("STUDY.01")
+        sdk.subjects.list.assert_called_with("STUDY.01")
+
+        site_list = dashboard.query_one(SiteList)
+        site_dom_ids = [child.id for child in site_list.children]
+        assert site_dom_ids == ["site-SITE_01", "site-SITE_01-2"]
+
+        # Select SITE.01 via Enter
+        site_list.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        sdk.subjects.list_by_site.assert_called_with("STUDY.01", "SITE.01")
+
+        subject_table = dashboard.query_one(SubjectTable)
+        assert subject_table.row_count == 1
+        assert str(subject_table.get_row_at(0)[0]) == "SUB-01"
+
+        # Move down to colliding SITE_01 and select via Enter
+        await pilot.press("down", "enter")
+        await pilot.pause()
+        sdk.subjects.list_by_site.assert_called_with("STUDY.01", "SITE_01")
+        assert str(subject_table.get_row_at(0)[0]) == "SUB-02"
+
+        # Move down in StudyList to colliding STUDY_01 and select via Enter
+        study_list.focus()
+        await pilot.pause()
+        await pilot.press("down", "enter")
+        await pilot.pause()
+        sdk.sites.list.assert_called_with("STUDY_01")
