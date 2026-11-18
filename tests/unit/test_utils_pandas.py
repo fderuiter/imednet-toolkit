@@ -15,6 +15,7 @@ from imednet.models.subjects import Subject
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 from imednet.utils.pandas import (
+    _models_to_dataframe,
     check_pandas,
     export_records_csv,
     forms_to_dataframe,
@@ -369,3 +370,20 @@ def test_check_pandas_raises_with_feature_when_missing(monkeypatch) -> None:
         match=r"pandas is required for test_feature\. Install with \"pip install 'imednet\[export\]'\"\.",
     ):
         check_pandas("test_feature")
+
+
+def test_models_to_dataframe_helper_serializes_iterables() -> None:
+    """Test that _models_to_dataframe serializes an iterable of models with by_alias=False."""
+    gen = (item for item in [_sample_site(), _sample_site()])
+    df = _models_to_dataframe(gen, "custom_feature")
+
+    assert len(df) == 2
+    assert list(df["site_id"]) == [10, 10]
+    assert list(df["site_name"]) == ["General Hospital", "General Hospital"]
+
+
+def test_models_to_dataframe_helper_raises_when_pandas_missing(monkeypatch) -> None:
+    """Test that _models_to_dataframe raises ImportError with feature name when pandas is missing."""
+    monkeypatch.setattr("imednet.utils.pandas.pd", None)
+    with pytest.raises(ImportError, match="pandas is required for custom_feature"):
+        _models_to_dataframe([], "custom_feature")
