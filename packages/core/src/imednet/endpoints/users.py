@@ -129,8 +129,9 @@ class UsersEndpoint(UsersOperationDef, EdcSyncListEndpoint[User]):  # type: igno
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import users_to_dataframe
+        from imednet.utils.pandas import check_pandas, users_to_dataframe
 
+        check_pandas("users_to_dataframe")
         users = list(self.list(study_key=study_key, **filters))
         return users_to_dataframe(users)
 
@@ -155,7 +156,8 @@ class AsyncUsersEndpoint(UsersOperationDef, EdcAsyncListEndpoint[User]):  # type
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import users_to_dataframe
+        from imednet.utils.pandas import check_pandas, users_to_dataframe
 
+        check_pandas("users_to_dataframe")
         users = [user async for user in self.list(study_key=study_key, **filters)]
         return users_to_dataframe(users)

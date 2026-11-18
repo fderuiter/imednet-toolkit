@@ -129,10 +129,7 @@ def users_to_dataframe(users: list[User]) -> pd.DataFrame:
     Each user model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    if pd is None:
-        raise ImportError(
-            "pandas is required for users_to_dataframe. Install with \"pip install 'imednet[export]'\"."
-        )
+    check_pandas("users_to_dataframe")
 
     user_dicts = [u.model_dump(by_alias=False) for u in users]
     return pd.DataFrame(user_dicts)
