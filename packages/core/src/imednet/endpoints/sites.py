@@ -41,8 +41,9 @@ class SitesEndpoint(SitesOperationDef, EdcSyncListGetEndpoint[Site]):  # type: i
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import sites_to_dataframe
+        from imednet.utils.pandas import check_pandas, sites_to_dataframe
 
+        check_pandas("sites_to_dataframe")
         sites = list(self.list(study_key=study_key, **filters))
         return sites_to_dataframe(sites)
 
@@ -67,7 +68,8 @@ class AsyncSitesEndpoint(SitesOperationDef, EdcAsyncListGetEndpoint[Site]):  # t
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import sites_to_dataframe
+        from imednet.utils.pandas import check_pandas, sites_to_dataframe
 
+        check_pandas("sites_to_dataframe")
         sites = [site async for site in self.list(study_key=study_key, **filters)]
         return sites_to_dataframe(sites)

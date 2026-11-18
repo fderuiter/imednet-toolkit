@@ -42,8 +42,9 @@ class IntervalsEndpoint(IntervalsOperationDef, EdcSyncListGetEndpoint[Interval])
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import intervals_to_dataframe
+        from imednet.utils.pandas import check_pandas, intervals_to_dataframe
 
+        check_pandas("intervals_to_dataframe")
         intervals = list(self.list(study_key=study_key, **filters))
         return intervals_to_dataframe(intervals)
 
@@ -68,7 +69,8 @@ class AsyncIntervalsEndpoint(IntervalsOperationDef, EdcAsyncListGetEndpoint[Inte
         Raises:
             ImportError: If pandas is not installed.
         """
-        from imednet.utils.pandas import intervals_to_dataframe
+        from imednet.utils.pandas import check_pandas, intervals_to_dataframe
 
+        check_pandas("intervals_to_dataframe")
         intervals = [interval async for interval in self.list(study_key=study_key, **filters)]
         return intervals_to_dataframe(intervals)

@@ -31,6 +31,21 @@ def test_readme_persona_anchor_links() -> None:
 
     content = readme_path.read_text(encoding="utf-8")
 
+    # Verify CI badge targets canonical main.yml pipeline and preserves branch query
+    ci_match = re.search(
+        r"\[!\[CI\]\((https://img\.shields\.io/github/actions/workflow/status/[^)]+)\)\]\((https://github\.com/[^)]+)\)",
+        content,
+    )
+    assert ci_match, "CI badge link not found in README.md"
+    ci_img, ci_target = ci_match.groups()
+    assert "main.yml?branch=main" in ci_img, (
+        f"Expected CI badge image to target main.yml with branch=main, got {ci_img}"
+    )
+    assert ci_target == "https://github.com/fderuiter/imednet-toolkit/actions/workflows/main.yml", (
+        f"Expected CI badge destination to point to main.yml, got {ci_target}"
+    )
+    assert "ci.yml" not in content, "README.md must not reference obsolete ci.yml workflow"
+
     # Match persona links
     ie_match = re.search(r"\[Integration Engineer Live Console\]\(([^)]+)\)", content)
     cdm_match = re.search(r"\[Clinical Data Manager Form Validator\]\(([^)]+)\)", content)
@@ -75,6 +90,29 @@ def test_readme_persona_anchor_links() -> None:
         assert not url.endswith("#interactive-showcase"), (
             f"{label} link must not target generic #interactive-showcase"
         )
+
+
+def test_readme_ci_badge_target() -> None:
+    """Verify that README CI badge points to canonical main.yml workflow and preserves branch query."""
+    repo_root = get_repo_root()
+    readme_path = repo_root / "README.md"
+    assert readme_path.exists(), "README.md must exist"
+
+    content = readme_path.read_text(encoding="utf-8")
+    assert "ci.yml" not in content, "README.md must not reference obsolete ci.yml workflow"
+
+    ci_match = re.search(
+        r"\[!\[CI\]\((https://img\.shields\.io/github/actions/workflow/status/[^)]+)\)\]\((https://github\.com/[^)]+)\)",
+        content,
+    )
+    assert ci_match, "CI badge link not found in README.md"
+    ci_img, ci_target = ci_match.groups()
+    assert "main.yml?branch=main" in ci_img, (
+        f"Expected CI badge image to target main.yml with branch=main, got {ci_img}"
+    )
+    assert ci_target == "https://github.com/fderuiter/imednet-toolkit/actions/workflows/main.yml", (
+        f"Expected CI badge destination to point to main.yml, got {ci_target}"
+    )
 
 
 def test_docs_markup_defines_matching_panels_and_scenario_select() -> None:

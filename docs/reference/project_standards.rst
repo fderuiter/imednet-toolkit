@@ -7,17 +7,16 @@ repository. It is a contributor-facing companion to ``AGENTS.md``.
 Dependency policy
 -----------------
 
-Use the dependency stack already declared in ``pyproject.toml`` and ``hatch.lock``.
+Use the dependency stack already declared in ``pyproject.toml`` and ``uv.lock``.
 The current source of truth includes:
 
 - ``httpx`` for HTTP transport
 - ``pydantic`` v2 for models and validation
-- ``typer[all]`` for the CLI
+- ``argparse`` for the CLI
 - ``tenacity`` for retry behavior
 - ``respx`` for HTTP mocking in tests
 - ``mypy`` for type checking
-- ``ruff`` for linting
-- ``black`` and ``isort`` for formatting
+- ``ruff`` for linting and formatting
 
 Do not introduce new runtime or development dependencies without explicit approval.
 
@@ -29,7 +28,7 @@ policy:
 
 .. code-block:: bash
 
-   hatch run lint
+   hatch run lint:all
    hatch run test
    hatch run docs
 
