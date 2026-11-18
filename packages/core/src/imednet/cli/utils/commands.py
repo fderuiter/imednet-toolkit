@@ -55,6 +55,7 @@ def register_list_command(
                 empty_msg,
                 fields=summary_fields,
                 output_format=output_format,
+                details=items,
                 interactive=False if no_interactive else None,
             )
 
@@ -82,6 +83,7 @@ def register_list_command(
                 empty_msg,
                 fields=summary_fields,
                 output_format=output_format,
+                details=items,
                 interactive=False if no_interactive else None,
             )
 

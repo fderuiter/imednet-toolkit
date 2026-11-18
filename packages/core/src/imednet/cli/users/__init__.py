@@ -104,6 +104,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             view_models,
             "users",
             "No users found matching the criteria.",
+            details=users_list,
             interactive=False if no_interactive else None,
         )
 

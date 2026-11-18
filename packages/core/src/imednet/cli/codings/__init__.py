@@ -77,6 +77,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             view_models,
             "codings",
             "No codings found matching the criteria.",
+            details=codings_list,
             interactive=False if no_interactive else None,
         )
 

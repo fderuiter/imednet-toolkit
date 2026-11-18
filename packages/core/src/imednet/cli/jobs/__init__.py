@@ -49,6 +49,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "jobs",
             fields=JOB_SUMMARY_FIELDS,
             output_format=output_format,
+            details=[job],
             interactive=False,
         )
 
@@ -100,6 +101,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "jobs",
             fields=JOB_SUMMARY_FIELDS,
             output_format=output_format,
+            details=[job],
             interactive=False,
         )
 
