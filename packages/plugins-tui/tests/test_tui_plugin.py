@@ -950,3 +950,178 @@ async def test_job_monitor_sync_endpoint_bounded_concurrency():
     assert "Active & Recent Jobs (5)" in rendered
     for jid in job_ids:
         assert jid in rendered
+
+
+@pytest.mark.asyncio
+async def test_subject_table_2500_study_issues_single_http_request_and_loads_all() -> None:
+    """Acceptance Criterion 4 & Req 7/8: SubjectTable issues 1 HTTP request on a 2,500-item Study."""
+    import httpx
+    import respx
+    from textual.containers import Container
+    from textual.widgets import Static
+
+    from imednet.sdk import ImednetSDK
+
+    with respx.mock(assert_all_called=False) as router:
+        studies_route = router.get("https://api.test/api/v1/edc/studies").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [{"studyKey": "LARGE-01", "studyName": "Large Trial"}],
+                    "pagination": {"page": 0, "size": 100, "totalPages": 1, "totalItems": 1},
+                },
+            )
+        )
+        sites_route = router.get("https://api.test/api/v1/edc/studies/LARGE-01/sites").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [{"siteId": i, "siteName": f"Site {i}"} for i in range(1, 101)],
+                    "pagination": {"page": 0, "size": 100, "totalPages": 2, "totalItems": 150},
+                },
+            )
+        )
+
+        def _subjects_handler(request: httpx.Request) -> httpx.Response:
+            page = int(request.url.params.get("page", 0))
+            size = int(request.url.params.get("size", 100))
+            total_pages = 25 if size == 100 else 5
+            count = size
+            start = page * size
+            data = [
+                {
+                    "subjectId": start + idx + 1,
+                    "subjectKey": f"SUB-{start + idx + 1:04d}",
+                    "siteId": 1,
+                    "subjectStatus": "Enrolled",
+                    "dateCreated": "2026-02-01T00:00:00Z",
+                }
+                for idx in range(count)
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "data": data,
+                    "pagination": {
+                        "page": page,
+                        "size": size,
+                        "totalPages": total_pages,
+                        "totalItems": 2500,
+                    },
+                },
+            )
+
+        subjects_route = router.get("https://api.test/api/v1/edc/studies/LARGE-01/subjects").mock(
+            side_effect=_subjects_handler
+        )
+
+        sdk = ImednetSDK(
+            api_key="test-key",
+            security_key="test-secret",
+            base_url="https://api.test",
+        )
+
+        app = ImednetTuiApp(sdk)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert studies_route.call_count == 1
+
+            study_list = app.screen.query_one(StudyList)
+            study_list.post_message(StudyList.Selected("LARGE-01", "Large Trial"))
+            await pilot.pause()
+
+            # Crucial Acceptance Criterion 4 check: exactly 1 HTTP request issued before render!
+            assert subjects_route.call_count == 1
+            assert sites_route.call_count == 1
+
+            subject_table = app.screen.query_one(SubjectTable)
+            assert subject_table.row_count == 100
+            assert subject_table.truncated is True
+
+            site_list = app.screen.query_one(SiteList)
+            assert len(site_list.children) == 100
+            assert site_list.truncated is True
+
+            # Verify status notice is displayed in banner and container border subtitle
+            banner = app.screen.query_one("#truncation-notice", Static)
+            assert "visible" in banner.classes
+            assert "Showing first 100 subjects" in str(banner.render())
+            subjects_box = app.screen.query_one("#subjects-box", Container)
+            assert "100" in str(subjects_box.border_subtitle)
+
+            # Now replace routes with smaller 2-page total so Load All ('a') finishes fast
+            sites_route.mock(
+                side_effect=lambda req: httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"siteId": int(req.url.params["page"]) * 100 + i, "siteName": f"S{i}"}
+                            for i in range(1, 51 if int(req.url.params["page"]) == 1 else 101)
+                        ],
+                        "pagination": {
+                            "page": int(req.url.params["page"]),
+                            "size": 100,
+                            "totalPages": 2,
+                        },
+                    },
+                )
+            )
+            subjects_route.mock(
+                side_effect=lambda req: httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "subjectId": int(req.url.params["page"]) * 100 + i,
+                                "siteId": 1,
+                                "subjectStatus": "Enrolled",
+                            }
+                            for i in range(1, 21 if int(req.url.params["page"]) == 1 else 101)
+                        ],
+                        "pagination": {
+                            "page": int(req.url.params["page"]),
+                            "size": 100,
+                            "totalPages": 2,
+                        },
+                    },
+                )
+            )
+
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert subject_table.row_count == 120
+            assert subject_table.truncated is False
+            assert len(site_list.children) == 150
+            assert site_list.truncated is False
+            assert "visible" not in banner.classes
+            assert subjects_box.border_subtitle == ""
+
+
+@pytest.mark.asyncio
+async def test_study_list_bounded_truncation_and_load_all() -> None:
+    """Verify StudyList bounds initial studies to 100 items and action_load_all loads remaining."""
+    sdk = MagicMock()
+    sdk.config.base_url = "https://edc.test.imednetapi.com"
+    many_studies = [
+        MagicMock(study_name=f"Study {i}", study_key=f"ST-{i:03d}") for i in range(1, 136)
+    ]
+    sdk.studies.async_list = AsyncMock(return_value=many_studies)
+
+    app = ImednetTuiApp(sdk)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        study_list = app.screen.query_one(StudyList)
+        assert len(study_list.children) == 100
+        assert study_list.truncated is True
+        assert "Showing first 100 studies" in study_list.status_notice
+
+        app.action_load_all()
+        await pilot.pause()
+        await pilot.pause()
+
+        assert len(study_list.children) == 135
+        assert study_list.truncated is False
+        assert study_list.status_notice == ""

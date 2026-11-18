@@ -503,6 +503,8 @@ def display_list(
     output_format: str = "table",
     details: Sequence[Any] | None = None,
     interactive: bool | None = None,
+    truncated: bool = False,
+    status_notice: str | None = None,
 ) -> None:
     """Display a human table or one versioned JSON response without progress text."""
     if output_format == "json":
@@ -513,6 +515,12 @@ def display_list(
     if not items:
         print(empty_msg or f"No {label} found.")
         return
+
+    effective_notice = status_notice or (
+        f"Showing first {len(items)} {label} (truncated; pass --all or --limit for more)"
+        if truncated
+        else None
+    )
 
     field_keys: list[str] = []
     data_list: list[dict[str, Any]] = []
@@ -553,18 +561,23 @@ def display_list(
 
     should_run_interactive = interactive if interactive is not None else is_interactive_terminal()
     if should_run_interactive:
-        grid_ran = run_interactive_grid(
-            items=data_list,
-            fields=field_keys,
-            label=label,
-            details=details,
-        )
+        grid_kwargs: dict[str, Any] = {
+            "items": data_list,
+            "fields": field_keys,
+            "label": label,
+            "details": details,
+        }
+        if effective_notice is not None:
+            grid_kwargs["status_notice"] = effective_notice
+        grid_ran = run_interactive_grid(**grid_kwargs)
         if grid_ran:
             return
 
     # Non-interactive / piped fallback: emit standard ASCII table
     print(f"Found {len(items)} {label}:")
     _print_table(items if fields else data_list, field_keys)
+    if effective_notice:
+        print(f"Notice: {effective_notice}")
 
 
 def print_error(

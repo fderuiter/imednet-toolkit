@@ -6,7 +6,7 @@ import builtins
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from imednet.constants import DEFAULT_PAGE_SIZE
+from imednet.constants import DEFAULT_PAGE_SIZE, LARGE_PAGE_SIZE
 from imednet.core.endpoint.abc import EndpointABC
 from imednet.core.endpoint.dispatch import (
     AsyncEndpointContext,
@@ -28,7 +28,11 @@ from imednet.core.paginator import AsyncPaginator, Paginator
 from imednet.core.parsing import get_model_parser
 from imednet.core.protocols import AsyncRequesterProtocol, ParamProcessor, RequesterProtocol
 from imednet.models.base import ImednetBaseModel
-from imednet.utils.filters import build_filter_string, validate_record_filter
+from imednet.utils.filters import (
+    build_filter_string,
+    validate_filter_syntax,
+    validate_record_filter,
+)
 from imednet.utils.typing import FilterValue, ItemId
 from imednet.utils.url import build_safe_path
 
@@ -172,6 +176,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
             A ParamState containing the resolved study, parameters, and other filters.
         """
         filters = self._auto_filter(filters.copy())
+        raw_filter = filters.pop("filter", None)
 
         processed_filters, special_params = self.param_processor.process_filters(filters)
         if special_params:
@@ -190,10 +195,28 @@ class _ListEndpointBase(GenericEndpoint[T]):
         other_filters = {k: v for k, v in processed_filters.items() if k != "studyKey"}
 
         params: dict[str, Any] = {}
-        if processed_filters:
+        if raw_filter is not None:
+            validate_filter_syntax(raw_filter)
+            stripped_raw = raw_filter.strip()
+            if stripped_raw and stripped_raw.lower() != "none":
+                if other_filters:
+                    combined = f"{raw_filter};{build_filter_string(other_filters)}"
+                    validate_filter_syntax(combined)
+                    params["filter"] = combined
+                else:
+                    params["filter"] = raw_filter
+            elif other_filters:
+                params["filter"] = build_filter_string(other_filters)
+        elif processed_filters:
             params["filter"] = build_filter_string(processed_filters)
         if extra_params:
             params.update(extra_params)
+
+        if "size" in params and params["size"] is not None:
+            raw_size = int(params["size"])
+            if raw_size <= 0:
+                raise ValueError(f"size must be a positive integer, got {raw_size}")
+            params["size"] = min(raw_size, LARGE_PAGE_SIZE)
 
         record_data_filter = params.get("recordDataFilter")
         if record_data_filter is None:

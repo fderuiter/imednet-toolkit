@@ -8,7 +8,12 @@ from typing import Any
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status
-from ..utils.args import add_output_format
+from ..utils.args import (
+    add_list_query_args,
+    add_output_format,
+    collect_list_items,
+    prepare_list_query,
+)
 
 
 def _get_val(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -35,6 +40,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         default=False,
         help="Include inactive user accounts.",
     )
+    add_list_query_args(list_parser, include_filter=False)
 
     add_output_format(list_parser)
 
@@ -44,9 +50,22 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         study_key: str,
         include_inactive: bool = False,
         output_format: str = "table",
+        sort: str | None = None,
+        limit: int | None = None,
+        fetch_all: bool = False,
     ) -> None:
+        req_kwargs, effective_limit = prepare_list_query(
+            sort=sort,
+            limit=limit,
+            fetch_all=fetch_all,
+            output_format=output_format,
+        )
+
         with fetching_status("users", study_key):
-            users_list = list(sdk.users.list(study_key, include_inactive=include_inactive))
+            users_list, truncated = collect_list_items(
+                sdk.users.list(study_key, include_inactive=include_inactive, **req_kwargs),
+                effective_limit,
+            )
 
         if output_format == "json":
             display_list(users_list, "users", output_format="json")
@@ -99,12 +118,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 }
             )
 
-        display_list(view_models, "users", "No users found matching the criteria.")
+        display_list(
+            view_models,
+            "users",
+            "No users found matching the criteria.",
+            details=users_list,
+            truncated=truncated,
+        )
 
     list_parser.set_defaults(
         func=lambda args: list_users(
             study_key=args.study_key,
             include_inactive=args.include_inactive,
             output_format=args.output_format,
+            sort=args.sort,
+            limit=args.limit,
+            fetch_all=args.fetch_all,
         )
     )

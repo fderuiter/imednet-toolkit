@@ -8,30 +8,46 @@ from typing import Any, Protocol, runtime_checkable
 
 from imednet.core.protocols import ParamProcessor
 
+_TOP_LEVEL_QUERY_KEYS = ("page", "size", "sort")
+
+
+def _extract_top_level_query_params(
+    filters: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Pop top-level pagination and sorting keys out of a filters dictionary."""
+    cleaned = filters.copy()
+    special_params: dict[str, Any] = {}
+    for key in _TOP_LEVEL_QUERY_KEYS:
+        if key in cleaned:
+            val = cleaned.pop(key)
+            if val is not None:
+                special_params[key] = val
+    return cleaned, special_params
+
 
 class DefaultParamProcessor(ParamProcessor):
     """Default parameter processor.
 
-    Simply passes filters through without modification.
+    Extracts top-level pagination/sorting parameters and passes remaining filters through.
     """
 
     def process_filters(self, filters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Return filters as-is and no special parameters.
+        """Extract top-level query keys and return remaining filters.
 
         Args:
             filters: The input filters dictionary.
 
         Returns:
-            A tuple of (copy of filters, empty dict).
+            A tuple of (remaining filters, extracted top-level query parameters).
         """
-        return filters.copy(), {}
+        return _extract_top_level_query_params(filters)
 
 
 class MappingParamProcessor(ParamProcessor):
     """ParamProcessor that maps specific filter keys to API parameters.
 
-    Extracts keys defined in the mapping and returns them as special parameters,
-    optionally renaming them according to the mapping values.
+    Extracts keys defined in the mapping (plus top-level pagination/sorting keys)
+    and returns them as special parameters, optionally renaming mapped keys.
     """
 
     def __init__(
@@ -58,8 +74,7 @@ class MappingParamProcessor(ParamProcessor):
         Returns:
             A tuple of (cleaned filters, special parameters).
         """
-        filters = filters.copy()
-        special_params = {}
+        filters, special_params = _extract_top_level_query_params(filters)
 
         for filter_key, api_key in self.mapping.items():
             value = None

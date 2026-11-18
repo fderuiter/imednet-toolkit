@@ -103,6 +103,12 @@ class UsersOperationDef:
         if extra_params:
             params.update(extra_params)
 
+        if "size" in params and params["size"] is not None:
+            raw_size = int(params["size"])
+            if raw_size <= 0:
+                raise ValueError(f"size must be a positive integer, got {raw_size}")
+            params["size"] = min(raw_size, 500)
+
         # Ensure 'filter' is never generated under any circumstances
         params.pop("filter", None)
 
