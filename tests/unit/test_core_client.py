@@ -69,6 +69,112 @@ def test_request_error_mapping(status, exc) -> None:
             client.get("/some")
 
 
+@pytest.mark.parametrize(
+    ("http_status", "payload", "expected_exc", "expected_code", "expected_msg", "expected_field"),
+    [
+        (
+            400,
+            {
+                "metadata": {
+                    "status": "BAD_REQUEST",
+                    "path": "/api/v1/edc/studies",
+                    "timestamp": "2018-10-18 05:46:29",
+                    "error": {
+                        "code": "1000",
+                        "description": "Field raised validation errors",
+                        "field": {"attribute": "page", "value": "XX"},
+                    },
+                }
+            },
+            errors.ValidationError,
+            1000,
+            "Field raised validation errors",
+            {"attribute": "page", "value": "XX"},
+        ),
+        (
+            500,
+            {
+                "metadata": {
+                    "status": "INTERNAL_SERVER_ERROR",
+                    "path": "/api/v1/edc/studies",
+                    "timestamp": "2018-10-18 05:46:29",
+                    "error": {
+                        "code": "9000",
+                        "description": "Unknown error. Please contact Mednet support for assistance.",
+                    },
+                }
+            },
+            errors.ServerError,
+            9000,
+            "Unknown error. Please contact Mednet support for assistance.",
+            None,
+        ),
+        (
+            403,
+            {
+                "metadata": {
+                    "status": "FORBIDDEN",
+                    "path": "/api/v1/edc/studies/STUDY1/sites",
+                    "timestamp": "2018-10-18 05:46:29",
+                    "error": {
+                        "code": "9001",
+                        "description": "Unauthorized error. Insufficient permission to retrieve data.",
+                    },
+                }
+            },
+            errors.AuthenticationError,
+            9001,
+            "Unauthorized error. Insufficient permission to retrieve data.",
+            None,
+        ),
+    ],
+)
+def test_nested_metadata_error_http_dispatch(
+    http_status, payload, expected_exc, expected_code, expected_msg, expected_field
+) -> None:
+    """Test Client HTTP error dispatch and attribute parsing for nested metadata.error envelopes."""
+    client = Client(
+        api_key="A",
+        security_key="B",
+        base_url="https://api.test",
+        retry_config=RetryConfig(retries=0),
+    )
+
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as respx_mock:
+        respx_mock.get("https://api.test/nested").respond(status_code=http_status, json=payload)
+
+        with pytest.raises(expected_exc) as exc_info:
+            client.get("/nested")
+
+    err = exc_info.value
+    assert type(err) is expected_exc
+    assert err.code == expected_code
+    assert err.message == expected_msg
+    assert err.description == expected_msg
+    assert err.field == expected_field
+    assert err.status == payload["metadata"]["status"]
+
+
+def test_non_json_error_fallback() -> None:
+    """Test Client HTTP fallback when non-2xx response is plain text."""
+    client = Client(
+        api_key="A",
+        security_key="B",
+        base_url="https://api.test",
+        retry_config=RetryConfig(retries=0),
+    )
+
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as respx_mock:
+        respx_mock.get("https://api.test/text-err").respond(status_code=502, text="Bad Gateway")
+
+        with pytest.raises(errors.ServerError) as exc_info:
+            client.get("/text-err")
+
+    assert exc_info.value.message == "Bad Gateway"
+    assert exc_info.value.code is None
+    assert exc_info.value.field is None
+
+
 def test_tracer_records_span() -> None:
     """Test that tracer records span."""
     tracer = MagicMock()
