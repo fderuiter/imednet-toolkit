@@ -359,6 +359,48 @@
     }
 
     // -------------------------------------------------------------------------
+    // Keyboard focus management for overflowing preformatted code blocks
+    // -------------------------------------------------------------------------
+    let codeBlocksRaf = null;
+
+    function checkCodeBlocks() {
+        const blocks = document.querySelectorAll("pre");
+        blocks.forEach(function (block) {
+            const isOverflowing = block.clientWidth > 0 && block.scrollWidth > block.clientWidth;
+            if (isOverflowing) {
+                block.setAttribute("tabindex", "0");
+                block.setAttribute("role", "region");
+                if (!block.getAttribute("aria-label")) {
+                    block.setAttribute("aria-label", "Code snippet");
+                }
+            } else {
+                if (block.hasAttribute("tabindex")) {
+                    block.removeAttribute("tabindex");
+                }
+                if (block.getAttribute("role") === "region" && block.getAttribute("aria-label") === "Code snippet") {
+                    block.removeAttribute("role");
+                    block.removeAttribute("aria-label");
+                }
+            }
+        });
+    }
+
+    function scheduleCheckCodeBlocks() {
+        if (typeof cancelAnimationFrame === "function" && codeBlocksRaf) {
+            cancelAnimationFrame(codeBlocksRaf);
+            codeBlocksRaf = null;
+        }
+        if (typeof requestAnimationFrame === "function") {
+            codeBlocksRaf = requestAnimationFrame(function () {
+                codeBlocksRaf = null;
+                checkCodeBlocks();
+            });
+        } else {
+            checkCodeBlocks();
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Main Initialization
     // -------------------------------------------------------------------------
     function initExplorer() {
@@ -402,6 +444,8 @@
             if (updateHistory && window.history && typeof window.history.replaceState === "function") {
                 window.history.replaceState(null, "", "#" + activeId);
             }
+
+            scheduleCheckCodeBlocks();
         }
 
         function getHashTarget() {
@@ -558,6 +602,7 @@
             if (ieJsonPre) {
                 ieJsonPre.textContent = JSON.stringify(data, null, 2);
             }
+            scheduleCheckCodeBlocks();
         }
 
         if (ieRunBtn) {
@@ -581,6 +626,7 @@
                 ieViewJson.removeAttribute("hidden");
                 ieViewTable.setAttribute("hidden", "true");
             }
+            scheduleCheckCodeBlocks();
         }
 
         if (ieOutputTabTable && ieOutputTabJson) {
@@ -630,6 +676,7 @@
             if (cdmJsonPre) {
                 cdmJsonPre.textContent = JSON.stringify(formDef, null, 2);
             }
+            scheduleCheckCodeBlocks();
         }
 
         if (cdmValidateBtn) {
@@ -655,6 +702,7 @@
                 cdmViewJson.removeAttribute("hidden");
                 cdmViewCrf.setAttribute("hidden", "true");
             }
+            scheduleCheckCodeBlocks();
         }
 
         if (cdmOutputTabCrf && cdmOutputTabJson) {
@@ -720,6 +768,7 @@
             if (audJsonPre) {
                 audJsonPre.textContent = JSON.stringify(data, null, 2);
             }
+            scheduleCheckCodeBlocks();
         }
 
         if (audVerifyBtn) {
@@ -745,6 +794,7 @@
                 audViewJson.removeAttribute("hidden");
                 audViewTable.setAttribute("hidden", "true");
             }
+            scheduleCheckCodeBlocks();
         }
 
         if (audOutputTabTable && audOutputTabJson) {
@@ -773,29 +823,22 @@
     // Keyboard focus management for overflowing preformatted code blocks
     // -------------------------------------------------------------------------
     function initAccessibleCodeBlocks() {
-        function checkCodeBlocks() {
-            const blocks = document.querySelectorAll("pre");
-            blocks.forEach(function (block) {
-                if (block.scrollWidth > block.clientWidth) {
-                    block.setAttribute("tabindex", "0");
-                    block.setAttribute("role", "region");
-                    if (!block.getAttribute("aria-label")) {
-                        block.setAttribute("aria-label", "Code snippet");
-                    }
-                } else {
-                    if (block.hasAttribute("tabindex")) {
-                        block.removeAttribute("tabindex");
-                    }
-                    if (block.getAttribute("role") === "region" && block.getAttribute("aria-label") === "Code snippet") {
-                        block.removeAttribute("role");
-                        block.removeAttribute("aria-label");
-                    }
-                }
-            });
-        }
-
         checkCodeBlocks();
-        window.addEventListener("resize", checkCodeBlocks);
+        window.addEventListener("resize", scheduleCheckCodeBlocks);
+
+        if (typeof MutationObserver !== "undefined") {
+            const observer = new MutationObserver(function () {
+                scheduleCheckCodeBlocks();
+            });
+            const target = document.body || document.documentElement;
+            if (target) {
+                observer.observe(target, {
+                    attributes: true,
+                    attributeFilter: ["hidden", "class"],
+                    subtree: true
+                });
+            }
+        }
     }
 
     function init() {
