@@ -191,3 +191,199 @@ def test_postman_bundled_asset_identical_to_root():
     assert ROOT_COLLECTION.read_bytes() == BUNDLED_COLLECTION.read_bytes(), (
         "Bundled Postman collection differs from root collection"
     )
+
+
+def test_parse_postman_type_infers_literals_and_checks_bool_before_int():
+    """Verify ContractBuilder.parse_postman_type infers scalar and container types with None defaults."""
+    from imednet.models.contract import ContractBuilder
+
+    builder = ContractBuilder()
+    assert builder.parse_postman_type(True) == ("boolean", None)
+    assert builder.parse_postman_type(False) == ("boolean", None)
+    assert builder.parse_postman_type("<boolean>") == ("boolean", None)
+    assert builder.parse_postman_type(0) == ("integer", None)
+    assert builder.parse_postman_type(42) == ("integer", None)
+    assert builder.parse_postman_type("<integer>") == ("integer", None)
+    assert builder.parse_postman_type("") == ("string", None)
+    assert builder.parse_postman_type("literal") == ("string", None)
+    assert builder.parse_postman_type("<string>") == ("string", None)
+    assert builder.parse_postman_type({}) == ("dict", None)
+    assert builder.parse_postman_type([]) == ("list", None)
+    assert builder.parse_postman_type(None) == ("any", None)
+
+
+def test_zero_any_fields_across_collection_models_and_job():
+    """Verify zero documented attributes resolve to typing.Any across all SDK contract models except JobStatus.results."""
+    from typing import Any
+
+    from imednet.models.codings import Coding
+    from imednet.models.forms import Form
+    from imednet.models.intervals import Interval
+    from imednet.models.jobs import Job, JobStatus
+    from imednet.models.queries import Query
+    from imednet.models.record_revisions import RecordRevision
+    from imednet.models.records import Record
+    from imednet.models.sites import Site
+    from imednet.models.studies import Study
+    from imednet.models.subjects import Subject
+    from imednet.models.users import User
+    from imednet.models.variables import Variable
+    from imednet.models.visits import Visit
+
+    models_without_any = [
+        Form,
+        Variable,
+        Interval,
+        Site,
+        Subject,
+        Record,
+        RecordRevision,
+        Coding,
+        Query,
+        Visit,
+        User,
+        Study,
+        Job,
+    ]
+    for model_cls in models_without_any:
+        any_fields = [
+            fname for fname, finfo in model_cls.model_fields.items() if finfo.annotation is Any
+        ]
+        assert any_fields == [], f"{model_cls.__name__} retains typing.Any fields: {any_fields}"
+
+    job_status_any = [
+        fname for fname, finfo in JobStatus.model_fields.items() if finfo.annotation is Any
+    ]
+    assert job_status_any == ["results"]
+
+
+def test_all_nullable_integer_and_boolean_contract_attributes_default_to_none():
+    """Verify all nullable integer and boolean contract attributes default to None when omitted."""
+    contract = get_contract()
+    int_bool_count = 0
+    for model_name, model_def in contract.models.items():
+        dyn_cls = ModelEngine.get_model(model_name)
+        instance = dyn_cls.from_json({})
+        for fname, fdef in model_def.fields.items():
+            if fdef.type_name in {"integer", "boolean"}:
+                int_bool_count += 1
+                assert fdef.default_value is None, f"{model_name}.{fname} default is not None"
+                assert getattr(instance, fname) is None, (
+                    f"{model_name}.{fname} resolved to {getattr(instance, fname)!r} instead of None"
+                )
+    assert int_bool_count >= 46
+
+
+def test_record_from_json_defaults_and_typed_keywords():
+    """Verify Record.from_json preserves None nullable IDs/booleans and parses Keyword objects."""
+    from datetime import UTC, datetime
+
+    from imednet.models.records import Keyword, Record
+
+    minimal = Record.from_json({"studyKey": "S1", "recordId": 1})
+    assert minimal.visit_id is None
+    assert minimal.parent_record_id is None
+    assert minimal.deleted is None
+    assert minimal.keywords == []
+    assert minimal.record_data == {}
+
+    with_keywords = Record.from_json(
+        {
+            "studyKey": "S1",
+            "recordId": 2,
+            "keywords": [
+                {
+                    "keywordName": "Safety Review",
+                    "keywordKey": "SAFE_REV",
+                    "keywordId": 77,
+                    "dateAdded": "2026-05-13T14:06:50Z",
+                }
+            ],
+            "recordData": {"AETERM": "Nausea"},
+        }
+    )
+    assert len(with_keywords.keywords) == 1
+    kw = with_keywords.keywords[0]
+    assert isinstance(kw, Keyword)
+    assert kw.keyword_id == 77
+    assert kw.keyword_key == "SAFE_REV"
+    assert kw.keyword_name == "Safety Review"
+    assert kw.date_added == datetime(2026, 5, 13, 14, 6, 50, tzinfo=UTC)
+    assert with_keywords.record_data == {"AETERM": "Nausea"}
+
+
+def test_coding_and_form_documented_types():
+    """Verify Coding numeric fields and Form.other_forms boolean field preserve documented types."""
+    from imednet.models.codings import Coding
+    from imednet.models.forms import Form
+
+    coding = Coding.from_json({"codingId": 1, "revision": 2, "reason": "Fix"})
+    assert coding.coding_id == 1 and type(coding.coding_id) is int
+    assert coding.revision == 2 and type(coding.revision) is int
+    assert coding.reason == "Fix" and type(coding.reason) is str
+
+    form = Form.from_json({"otherForms": True})
+    assert form.other_forms is True
+    assert Form.from_json({}).other_forms is None
+
+
+def test_user_from_json_roles_timestamp_arrays_and_strict_mode(monkeypatch):
+    """Verify User.from_json validates Role items, parses 7-element timestamps, and rejects extra nested keys in strict mode."""
+    from datetime import UTC, datetime
+
+    from pydantic import ValidationError
+
+    from imednet.models.users import Role, User
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "true")
+    user = User.from_json(
+        {
+            "userId": "u-1",
+            "login": "auditor",
+            "firstName": "Ada",
+            "lastName": "Lovelace",
+            "email": "ada@example.com",
+            "userActiveInStudy": True,
+            "roles": [
+                {
+                    "dateCreated": [2026, 5, 13, 14, 6, 50, 612000000],
+                    "dateModified": [2026, 5, 13, 14, 6, 50, 613000000],
+                    "roleId": "DATA_MGR",
+                    "communityId": 12,
+                    "name": "Data Manager",
+                    "description": "Clinical data review",
+                    "level": 2,
+                    "type": "Study",
+                    "inactive": False,
+                }
+            ],
+        }
+    )
+    assert len(user.roles) == 1
+    role = user.roles[0]
+    assert isinstance(role, Role)
+    assert role.role_id == "DATA_MGR"
+    assert role.community_id == 12
+    assert role.date_created == datetime(2026, 5, 13, 14, 6, 50, 612000, tzinfo=UTC)
+    assert role.date_modified == datetime(2026, 5, 13, 14, 6, 50, 613000, tzinfo=UTC)
+
+    with pytest.raises(ValidationError, match="undocumentedNestedKey"):
+        User.from_json(
+            {
+                "userId": "u-2",
+                "roles": [
+                    {
+                        "roleId": "R1",
+                        "undocumentedNestedKey": "unexpected",
+                    }
+                ],
+            }
+        )
+
+    with pytest.raises(ValidationError, match="7-element integer timestamp array"):
+        User.from_json(
+            {
+                "userId": "u-3",
+                "roles": [{"roleId": "R1", "dateCreated": [2026, 5, 13]}],
+            }
+        )

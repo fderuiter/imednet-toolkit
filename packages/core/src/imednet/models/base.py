@@ -38,7 +38,20 @@ def _identity(v: Any) -> Any:
 
 def _optional_str(v: Any) -> Any:
     """Convert value to string, returning None if missing."""
-    return None if is_missing_value(v) else parse_str_or_default(v)
+    if is_missing_value(v):
+        return None
+    if isinstance(v, (list, dict)):
+        import logging
+
+        msg = (
+            f"Drift detected (destructive): type-changed field. "
+            f"Expected str, got {type(v).__name__} (value: {v!r})"
+        )
+        logging.getLogger("imednet.drift").warning(msg)
+        if parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false")):
+            raise ValueError(msg)
+        return None
+    return parse_str_or_default(v)
 
 
 def _optional_int(v: Any) -> Any:

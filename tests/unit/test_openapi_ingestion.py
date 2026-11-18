@@ -94,3 +94,56 @@ def test_openapi_ingestion(tmp_path, monkeypatch):
     contract = engine.get_contract()
     assert contract.paths.get("studies") == "Study"
     assert contract.paths.get("subjects") == "Subject"
+
+
+def test_openapi_ingestion_containers_literals_and_none_defaults(tmp_path, monkeypatch):
+    """Verify OpenAPI ingestion maps object/array/literal examples to dict/list/scalar with None defaults."""
+    from imednet.models import engine
+
+    openapi_content = {
+        "openapi": "3.0.0",
+        "components": {
+            "schemas": {
+                "Record": {
+                    "type": "object",
+                    "properties": {
+                        "recordId": {"type": "integer"},
+                        "deleted": {"type": "boolean"},
+                        "recordData": {"type": "object"},
+                        "keywords": {"type": "array", "items": {"type": "object"}},
+                        "literalFlag": {"example": False},
+                        "literalCount": {"default": 0},
+                        "literalNote": {"example": ""},
+                    },
+                }
+            }
+        },
+    }
+    openapi_file = tmp_path / "openapi_containers.json"
+    openapi_file.write_text(json.dumps(openapi_content))
+
+    monkeypatch.setenv("IMEDNET_OPENAPI_PATH", str(openapi_file))
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+    monkeypatch.setattr(ModelEngine, "_model_cache", {})
+
+    contract = engine.get_contract()
+    rec_fields = contract.models["Record"].fields
+    assert rec_fields["record_id"].type_name == "integer"
+    assert rec_fields["deleted"].type_name == "boolean"
+    assert rec_fields["record_data"].type_name == "dict"
+    assert rec_fields["keywords"].type_name == "list"
+    assert rec_fields["literal_flag"].type_name == "boolean"
+    assert rec_fields["literal_count"].type_name == "integer"
+    assert rec_fields["literal_note"].type_name == "string"
+    for fdef in rec_fields.values():
+        assert fdef.default_value is None
+
+    dyn_record = ModelEngine.get_model("Record")
+    inst = dyn_record.from_json({})
+    assert inst.record_id is None
+    assert inst.deleted is None
+    assert inst.record_data is None
+    assert inst.keywords is None
+    assert inst.literal_flag is None
+    assert inst.literal_count is None
+    assert inst.literal_note is None

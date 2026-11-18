@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import Field
 
 from imednet.models.base import ImednetBaseModel
@@ -30,14 +28,14 @@ class Interval(ImednetBaseModel):
     disabled: bool | None
     date_created: str | None
     date_modified: str | None
-    actual_date: Any
-    actual_date_form: Any
-    defined_using_interval: Any
-    due_date_will_be_in: Any
-    epro_grace_period: Any
-    negative_slack: Any
-    positive_slack: Any
-    timeline: Any
-    window_calculation_date: Any
-    window_calculation_form: Any
+    actual_date: str | None
+    actual_date_form: str | None
+    defined_using_interval: str | None
+    due_date_will_be_in: int | None
+    epro_grace_period: int | None
+    negative_slack: int | None
+    positive_slack: int | None
+    timeline: str | None
+    window_calculation_date: str | None
+    window_calculation_form: str | None
     last_updated: str | None

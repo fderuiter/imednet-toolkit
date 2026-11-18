@@ -166,3 +166,35 @@ def test_parse_bool_invalid_float():
     """Test that parse bool invalid float."""
     # To cover the 'except (ValueError, TypeError)' block in parse_bool float fallback
     assert validators.parse_bool("1invalid") is False
+
+
+@pytest.mark.parametrize("container", [["a", "b"], {"k": "v"}])
+def test_str_normalizers_guard_against_containers(caplog, monkeypatch, container):
+    """Verify parse_str_or_default and _optional_str emit drift warnings and fail in strict mode instead of calling str(v)."""
+    import logging
+
+    from pydantic import Field, ValidationError
+
+    from imednet.models.base import ImednetBaseModel, _optional_str
+
+    class SampleStrModel(ImednetBaseModel):
+        opt_text: str | None = Field(default=None, alias="optText")
+        req_text: str = Field(default="fallback", alias="reqText")
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "false")
+    with caplog.at_level(logging.WARNING, logger="imednet.drift"):
+        assert validators.parse_str_or_default(container, default="def") == "def"
+        assert _optional_str(container) is None
+        parsed = SampleStrModel.from_json({"optText": container, "reqText": container})
+        assert parsed.opt_text is None
+        assert parsed.req_text == ""
+    assert "Expected str, got" in caplog.text
+
+    with pytest.raises(ValueError, match="Expected str, got"):
+        validators.parse_str_or_default(container, strict=True)
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "true")
+    with pytest.raises(ValueError, match="Expected str, got"):
+        _optional_str(container)
+    with pytest.raises(ValidationError, match="Expected str, got"):
+        SampleStrModel.from_json({"optText": container})

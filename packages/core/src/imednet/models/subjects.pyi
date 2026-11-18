@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from pydantic import Field
 
@@ -31,6 +30,6 @@ class Subject(ImednetBaseModel):
     deleted: bool | None
     date_created: str | None
     date_modified: str | None
-    enrollment_start_date: Any
-    subject_oid: Any
+    enrollment_start_date: str | None
+    subject_oid: str | None
     last_updated: str | None

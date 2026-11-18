@@ -32,13 +32,20 @@ class JobState(str, Enum):
     def allowed_transitions(self) -> set[JobState]: ...
 
 TERMINAL_JOB_STATES: set[JobState]
+
 ACTIVE_JOB_STATES: set[JobState]
+
 SUCCESSFUL_JOB_STATES: set[JobState]
+
 FAILED_JOB_STATES: set[JobState]
+
 ALLOWED_JOB_TRANSITIONS: dict[JobState, set[JobState]]
 
-class InvalidJobStateError(ValueError): ...
-class InvalidJobTransitionError(ValueError): ...
+class InvalidJobStateError(ValueError):
+    """Raised when an unrecognized job state string is encountered."""
+
+class InvalidJobTransitionError(ValueError):
+    """Raised when an invalid state transition is attempted."""
 
 InvalidStateTransitionError = InvalidJobTransitionError
 
@@ -49,7 +56,7 @@ def validate_job_transition(from_state: JobState | str, to_state: JobState | str
 class Job(ImednetBaseModel):
     """Represents an asynchronous background job."""
 
-    state: JobState | str | None
+    state: JobState | str | None = Field(default=None, alias="state")
 
     def transition_to(self, target: JobState | str) -> Job: ...
     @property
@@ -61,16 +68,16 @@ class Job(ImednetBaseModel):
 
     job_id: str | None
     batch_id: str | None
-    date_created: Any
-    date_finished: Any
-    date_started: Any
+    date_created: str | None
+    date_finished: str | None
+    date_started: str | None
 
 class JobStatus(Job):
     """Extended job information returned when polling."""
 
     results: Any = Field(default=None)
 
-    @field_validator("progress", mode="before", check_fields=False)
+    @field_validator('progress', mode='before', check_fields=False)
     def _parse_progress(cls, v: Any) -> int: ...
     @property
     def total_records(self) -> int: ...
@@ -79,11 +86,11 @@ class JobStatus(Job):
     @property
     def failed_records(self) -> int: ...
 
+    state: JobState | str | None
     job_id: str | None
     batch_id: str | None
-    state: JobState | str | None
     date_created: str | None
-    date_started: str | None
     date_finished: str | None
+    date_started: str | None
     progress: int | None
     result_url: str | None

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import Field
 
 from imednet.models.base import ImednetBaseModel
@@ -25,8 +23,8 @@ class Form(ImednetBaseModel):
     date_modified: str | None
     epro_form: bool | None
     allow_copy: bool | None
-    embedded_log: Any
-    enforce_ownership: Any
-    other_forms: Any
-    user_agreement: Any
+    embedded_log: bool | None
+    enforce_ownership: bool | None
+    other_forms: bool | None
+    user_agreement: bool | None
     last_updated: str | None

@@ -28,7 +28,7 @@ def sdk(monkeypatch):
         ),
         (["subjects", "list", "S"], "subjects", Subject(subjectKey="SUB")),
         (["users", "list", "S"], "users", User(userId="U1", login="jdoe", userActiveInStudy=True)),
-        (["codings", "list", "S"], "codings", Coding(codingId="C1", dictionaryName="MedDRA")),
+        (["codings", "list", "S"], "codings", Coding(codingId=1, dictionaryName="MedDRA")),
     ],
 )
 def test_single_json_result_preserves_values(sdk, capsys, command, attr, model):
@@ -193,7 +193,7 @@ def test_users_and_codings_json_complete_aliases_and_no_contamination(sdk, capsy
 
     coding = Coding.model_validate(
         {
-            "codingId": "COD-JSON-1",
+            "codingId": 9001,
             "dictionaryName": "MedDRA",
             "dictionaryVersion": "26.1",
             "variable": "AETERM",
@@ -211,7 +211,7 @@ def test_users_and_codings_json_complete_aliases_and_no_contamination(sdk, capsy
     assert coding_payload["status"] == "complete"
     assert coding_payload["resource"] == "codings"
     assert coding_payload["count"] == 1
-    assert coding_payload["items"][0]["codingId"] == "COD-JSON-1"
+    assert coding_payload["items"][0]["codingId"] == 9001
     assert coding_payload["items"][0]["dictionaryName"] == "MedDRA"
     assert coding_payload["items"][0]["dictionaryVersion"] == "26.1"
     assert coding_payload["items"][0]["variable"] == "AETERM"

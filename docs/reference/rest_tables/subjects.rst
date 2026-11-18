@@ -150,7 +150,14 @@ List subjects
                "enrollmentStartDate": "",
                "subjectOid": "",
                "lastUpdated": "<string>",
-               "keywords": "<string>"
+               "keywords": [
+                   {
+                       "keywordName": "<string>",
+                       "keywordKey": "<string>",
+                       "keywordId": "<integer>",
+                       "dateAdded": "<string>"
+                   }
+               ]
            },
            {
                "studyKey": "<string>",

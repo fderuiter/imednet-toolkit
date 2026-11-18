@@ -152,9 +152,27 @@ def parse_int_or_default(v: Any, default: int = 0, strict: bool = False) -> int:
             return default
 
 
-def parse_str_or_default(v: Any, default: str = "") -> str:
-    """Normalize string values, defaulting if None."""
-    return default if v is None else str(v)
+def parse_str_or_default(v: Any, default: str = "", strict: bool = False) -> str:
+    """Normalize string values, defaulting if None.
+
+    Guards against list and dict container values by emitting a drift warning
+    and raising ValueError when strict=True or IMEDNET_STRICT_MODE is enabled.
+    """
+    if v is None:
+        return default
+    if isinstance(v, (list, dict)):
+        import logging
+        import os
+
+        msg = (
+            f"Drift detected (destructive): type-changed field. "
+            f"Expected str, got {type(v).__name__} (value: {v!r})"
+        )
+        logging.getLogger("imednet.drift").warning(msg)
+        if strict or parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false")):
+            raise ValueError(msg)
+        return default
+    return str(v)
 
 
 def parse_list_or_default(v: Any, default_factory: Callable[[], list[T]] = list) -> list[T]:
