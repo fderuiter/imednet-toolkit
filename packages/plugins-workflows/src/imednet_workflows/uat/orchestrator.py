@@ -31,7 +31,7 @@ from .submission import SubmissionResult
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
-    from imednet.spi.utils import JobProgressCallback
+    from imednet.spi.utils import JobProgressHandler
 
     from .inspector import StudySnapshot
 
@@ -257,7 +257,7 @@ class UATWorkflow:
         poll_interval: float = 10.0,
         poll_timeout: float = 600.0,
         seed: int | None = None,
-        on_progress: JobProgressCallback | None = None,
+        on_progress: JobProgressHandler | None = None,
         on_phase_change: Callable[[UATWorkflowState], None] | None = None,
     ) -> None:
         """Initialize the UAT workflow orchestrator."""
@@ -331,6 +331,8 @@ class UATWorkflow:
             self._submitter = BulkRecordSubmissionWorkflow(
                 self._sdk,
                 batch_size=self._batch_size,
+                poll_interval=self._poll_interval,
+                on_progress=self._on_progress,
             )
         return self._submitter
 

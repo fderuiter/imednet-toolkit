@@ -114,6 +114,101 @@ class TestShowState:
 
         assert result.exit_code == 1
 
+    def test_show_table_and_cli_app_parity(self, runner: CliRunner, tmp_path) -> None:
+        """Verify state_app and workflows state show share aligned table rendering."""
+        from imednet import cli
+
+        ledger_path = str(tmp_path / "ledger.json")
+        state = _make_ledger_state("STUDY-01", "records")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.return_value = state
+            res_app = runner.invoke(state_app, ["show", "--ledger-path", ledger_path])
+            res_cli = runner.invoke(
+                cli.app, ["workflows", "state", "show", "--ledger-path", ledger_path]
+            )
+
+        assert res_app.exit_code == 0
+        assert res_cli.exit_code == 0
+        assert res_app.stdout == res_cli.stdout
+        assert "Found 1 ledger entries:" in res_app.stdout
+        assert "STUDY-01" in res_app.stdout
+        assert "records" in res_app.stdout
+        assert "42" in res_app.stdout
+
+    def test_show_json_envelope_both_entrypoints(self, runner: CliRunner, tmp_path) -> None:
+        """Verify state show --format json emits schemaVersion 1.0 JSON envelope."""
+        import json
+
+        from imednet import cli
+
+        ledger_path = str(tmp_path / "ledger.json")
+        state = _make_ledger_state("STUDY-01", "records")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.return_value = state
+            res_app = runner.invoke(
+                state_app, ["show", "--ledger-path", ledger_path, "--format", "json"]
+            )
+            res_cli = runner.invoke(
+                cli.app,
+                ["workflows", "state", "show", "--ledger-path", ledger_path, "--format", "json"],
+            )
+
+        assert res_app.exit_code == 0
+        assert res_cli.exit_code == 0
+        assert res_app.stderr == ""
+        assert res_cli.stderr == ""
+
+        for raw in (res_app.stdout, res_cli.stdout):
+            payload = json.loads(raw)
+            assert payload["schemaVersion"] == "1.0"
+            assert payload["resource"] == "ledger_entries"
+            assert payload["status"] == "complete"
+            assert payload["count"] == 1
+            assert payload["items"][0]["study_key"] == "STUDY-01"
+            assert payload["items"][0]["stream_name"] == "records"
+            assert payload["items"][0]["records_processed"] == 42
+
+    def test_show_interactive_opens_grid_on_tty_and_degrades_on_pipe(
+        self, runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verify --interactive opens curses grid on active TTY and falls back on pipes."""
+        from imednet import cli
+
+        ledger_path = str(tmp_path / "ledger.json")
+        state = _make_ledger_state("STUDY-01", "records")
+        grid_calls: list[dict[str, object]] = []
+
+        def fake_grid(**kwargs: object) -> bool:
+            grid_calls.append(kwargs)
+            return True
+
+        monkeypatch.setattr("imednet.cli.utils.grid.run_interactive_grid", fake_grid)
+
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.return_value = state
+
+            # Active TTY -> opens curses grid
+            monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+            res_tty = runner.invoke(
+                cli.app,
+                ["workflows", "state", "show", "--ledger-path", ledger_path, "--interactive"],
+            )
+            assert res_tty.exit_code == 0
+            assert len(grid_calls) == 1
+            assert res_tty.stdout == ""
+
+            # Piped / non-interactive fallback -> renders aligned table
+            monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: False)
+            monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
+            res_pipe = runner.invoke(
+                cli.app,
+                ["workflows", "state", "show", "--ledger-path", ledger_path, "--interactive"],
+            )
+            assert res_pipe.exit_code == 0
+            assert len(grid_calls) == 1
+            assert "Found 1 ledger entries:" in res_pipe.stdout
+            assert "STUDY-01" in res_pipe.stdout
+
 
 class TestSetState:
     """Test suite for SetState."""

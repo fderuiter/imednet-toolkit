@@ -378,3 +378,52 @@ def test_workflow_reset_and_rerun(mock_sdk, snapshot):
     assert workflow.state_history == [UATWorkflowState.PENDING]
     result2 = workflow.run("TEST_STUDY")
     assert result2.state == UATWorkflowState.COMPLETED
+
+
+def test_uat_workflow_forwards_on_progress_and_poll_interval_to_submitter(mock_sdk):
+    """Verify UATWorkflow forwards poll_interval and on_progress to BulkRecordSubmissionWorkflow."""
+    from imednet.models.jobs import Job, JobStatus
+    from imednet_workflows.uat.models import RecordTestType
+
+    progress_calls: list[tuple[str, object, float]] = []
+
+    def on_progress(batch_id: str, status: object, elapsed: float) -> None:
+        progress_calls.append((batch_id, status, elapsed))
+
+    workflow = UATWorkflow(mock_sdk, poll_interval=0.01, on_progress=on_progress)
+    submitter = workflow._get_submitter()
+    assert submitter.poll_interval == 0.01
+    assert submitter.on_progress is on_progress
+
+    mock_sdk.subjects.list.return_value = []
+    mock_sdk.create_record.side_effect = [
+        Job(batch_id="reg_batch", state="PENDING"),
+        Job(batch_id="data_batch", state="PENDING"),
+    ]
+    mock_sdk.get_job.side_effect = lambda study_key, batch_id: JobStatus(
+        batch_id=batch_id, state="COMPLETED", progress=100
+    )
+
+    record_sets = [
+        GeneratedRecordSet(
+            form_key="DEMO",
+            form_name="Demographics",
+            test_type=RecordTestType.REGISTER_SUBJECT,
+            payloads=[{"formKey": "DEMO", "subjectKey": "S1", "data": {}}],
+            subject_keys=["S1"],
+        ),
+        GeneratedRecordSet(
+            form_key="VS",
+            form_name="Vital Signs",
+            test_type=RecordTestType.UPDATE_SCHEDULED_RECORD,
+            payloads=[{"formKey": "VS", "subjectKey": "S1", "data": {}}],
+            subject_keys=["S1"],
+        ),
+    ]
+
+    submission_res = workflow.submit("TEST_STUDY", record_sets)
+    workflow.monitor("TEST_STUDY", submission_res)
+
+    observed_batches = [batch_id for batch_id, _, _ in progress_calls]
+    assert "reg_batch" in observed_batches
+    assert "data_batch" in observed_batches

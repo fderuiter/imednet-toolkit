@@ -429,4 +429,300 @@ def test_subject_data_help_text(runner: CliRunner) -> None:
     assert result.exit_code == 0
     assert "--study-key" in result.stdout
     assert "--subject-key" in result.stdout
+    assert "--format" in result.stdout
+    assert "--interactive" in result.stdout
     assert "hybrid" in result.stdout.lower()
+
+
+def _make_sample_subject_data() -> Any:
+    """Create a realistic SubjectComprehensiveData payload for CLI output tests."""
+    from imednet.models import Query, Record, Subject, Visit
+    from imednet.models.subjects import SubjectKeyword
+    from imednet_workflows.subject_data import SubjectComprehensiveData
+
+    return SubjectComprehensiveData(
+        subject_details=Subject(
+            subjectKey="SUBJ-001",
+            subjectStatus="Enrolled",
+            siteName="General Hospital",
+            enrollmentStartDate="2026-01-15",
+            keywords=[SubjectKeyword(keywordName="Cohort-A", keywordKey="CA")],
+        ),
+        visits=[
+            Visit(
+                visitId=10,
+                intervalName="Screening",
+                subjectKey="SUBJ-001",
+                startDate="2026-01-15",
+            )
+        ],
+        records=[
+            Record(
+                recordId=101,
+                subjectKey="SUBJ-001",
+                formKey="DEMO",
+                recordStatus="Record Complete",
+                dateCreated="2026-01-15T10:00:00Z",
+                recordData={"AGE": 44, "SEX": "F"},
+            )
+        ],
+        queries=[
+            Query(
+                annotationId=501,
+                description="Verify birth year",
+                annotationType="Monitor Query",
+                subjectKey="SUBJ-001",
+                variable="BRTHYR",
+                dateCreated="2026-01-16T08:30:00Z",
+            )
+        ],
+    )
+
+
+def test_subject_data_json_envelope(
+    runner: CliRunner, sdk: MagicMock, mock_workflow: MagicMock
+) -> None:
+    """Verify subject-data --format json emits schemaVersion 1.0 JSON with zero repr text."""
+    import json
+
+    mock_workflow.get_all_subject_data.return_value = _make_sample_subject_data()
+    result = runner.invoke(cli.app, ["subject-data", "STUDY-1", "SUBJ-001", "--format", "json"])
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert "Record(" not in result.stdout
+
+    payload = json.loads(result.stdout)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "subject_data"
+    assert payload["status"] == "complete"
+    assert payload["count"] == 1
+    item = payload["items"][0]
+    assert item["subject_details"]["subjectKey"] == "SUBJ-001"
+    assert item["records"][0]["formKey"] == "DEMO"
+    assert item["visits"][0]["intervalName"] == "Screening"
+    assert item["queries"][0]["variable"] == "BRTHYR"
+
+
+def test_subject_data_aligned_section_tables_no_repr(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify subject-data renders aligned section tables without raw Python repr text."""
+    monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
+    mock_workflow.get_all_subject_data.return_value = _make_sample_subject_data()
+    result = runner.invoke(cli.app, ["subject-data", "STUDY-1", "SUBJ-001"])
+
+    assert result.exit_code == 0
+    assert "Found 1 subject details:" in result.stdout
+    assert "Found 1 visits:" in result.stdout
+    assert "Found 1 records:" in result.stdout
+    assert "Found 1 queries:" in result.stdout
+    assert "General Hospital" in result.stdout
+    assert "Cohort-A" in result.stdout
+    assert "Verify birth year" in result.stdout
+    assert "Record(" not in result.stdout
+    assert "{'subject_details'" not in result.stdout
+
+
+def test_subject_data_dict_payload_rendering(
+    runner: CliRunner, sdk: MagicMock, mock_workflow: MagicMock
+) -> None:
+    """Verify subject-data also formats dictionary-shaped payloads cleanly."""
+    mock_workflow.get_all_subject_data.return_value = {
+        "subject_details": {
+            "subjectKey": "SUBJ-DICT",
+            "subjectStatus": "Screened",
+            "siteName": "Site B",
+            "enrollmentStartDate": "2026-02-01",
+            "keywords": [{"keywordName": "K1"}],
+        },
+        "visits": [],
+        "records": [
+            {
+                "recordId": 202,
+                "subjectKey": "SUBJ-DICT",
+                "formKey": "VS",
+                "recordStatus": "Incomplete",
+                "dateCreated": "2026-02-01T12:00:00Z",
+            }
+        ],
+        "queries": [],
+    }
+    result = runner.invoke(cli.app, ["subject-data", "STUDY-1", "SUBJ-DICT"])
+    assert result.exit_code == 0
+    assert "SUBJ-DICT" in result.stdout
+    assert "No visits found." in result.stdout
+    assert "No queries found." in result.stdout
+
+
+def test_subject_data_interactive_section_selection_and_grid(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify subject-data --interactive prompts for missing keys, selects section, and opens grid."""
+    mock_workflow.get_all_subject_data.return_value = _make_sample_subject_data()
+    grid_calls: list[dict[str, Any]] = []
+
+    def fake_grid(**kwargs: Any) -> bool:
+        grid_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("imednet.cli.utils.grid.run_interactive_grid", fake_grid)
+
+    # 1. Active TTY + missing keys + invalid section retry ("99") then "3" (records)
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+    monkeypatch.setattr("sys.stdin", io.StringIO("STUDY-WIZ\nSUBJ-001\n99\n3\n"))
+    res_tty = runner.invoke(cli.app, ["subject-data", "--interactive"])
+
+    assert res_tty.exit_code == 0
+    mock_workflow.get_all_subject_data.assert_called_with("STUDY-WIZ", "SUBJ-001")
+    assert "Invalid section '99'" in res_tty.stderr
+    assert len(grid_calls) == 1
+    assert grid_calls[0]["label"] == "records"
+    assert len(grid_calls[0]["details"]) == 1
+    assert res_tty.stdout == ""
+
+    # 2. Piped / non-interactive fallback + section "visits" ("2") -> prints only visits table
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: False)
+    monkeypatch.setattr("sys.stdin", io.StringIO("2\n"))
+    res_pipe = runner.invoke(cli.app, ["subject-data", "STUDY-WIZ", "SUBJ-001", "--interactive"])
+    assert res_pipe.exit_code == 0
+    assert "Found 1 visits:" in res_pipe.stdout
+    assert "Found 1 records:" not in res_pipe.stdout
+
+    # 3. EOF during subject key prompt exits with code 1
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    res_eof = runner.invoke(cli.app, ["subject-data", "STUDY-WIZ", "--interactive"])
+    assert res_eof.exit_code == 1
+
+
+def test_extract_records_json_and_interactive_grid(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify workflows extract-records supports --format json, aligned tables, and TTY grid."""
+    import json
+
+    from imednet.models import Record
+
+    sample_records = [
+        Record(
+            recordId=77,
+            subjectKey="SUBJ-77",
+            formKey="AE",
+            recordStatus="Record Complete",
+            dateCreated="2026-03-01T09:00:00Z",
+            recordData={"AETERM": "Headache"},
+        )
+    ]
+    mock_ext = MagicMock()
+    mock_ext.extract_records_by_criteria.return_value = sample_records
+    monkeypatch.setattr(
+        "imednet_workflows.cli.DataExtractionWorkflow", MagicMock(return_value=mock_ext)
+    )
+
+    # 1. --format json
+    res_json = runner.invoke(
+        cli.app, ["workflows", "extract-records", "STUDY-1", "--format", "json"]
+    )
+    assert res_json.exit_code == 0
+    assert res_json.stderr == ""
+    payload = json.loads(res_json.stdout)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "records"
+    assert payload["count"] == 1
+    assert payload["items"][0]["recordId"] == 77
+
+    # 2. Default table output -> aligned columns, zero [Record(...)] repr
+    res_table = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY-1"])
+    assert res_table.exit_code == 0
+    assert "Found 1 matching records:" in res_table.stdout
+    assert "SUBJ-77" in res_table.stdout
+    assert "[Record(" not in res_table.stdout
+
+    # 3. --interactive on active TTY -> passes details=records to run_interactive_grid
+    grid_calls: list[dict[str, Any]] = []
+
+    def fake_grid(**kwargs: Any) -> bool:
+        grid_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+    monkeypatch.setattr("imednet.cli.utils.grid.run_interactive_grid", fake_grid)
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n\n\n"))
+    res_grid = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY-1", "--interactive"])
+    assert res_grid.exit_code == 0
+    assert len(grid_calls) == 1
+    assert grid_calls[0]["details"] == sample_records
+    assert res_grid.stdout == ""
+
+
+def test_uat_run_updates_console_status_in_place(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify workflows uat run updates console.status in place using format_job_progress."""
+    from imednet.models.jobs import JobStatus
+    from imednet_workflows.uat import UATWorkflowState
+
+    status_updates: list[str] = []
+
+    class DummyStatus:
+        def __enter__(self) -> DummyStatus:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def update(self, message: str) -> None:
+            status_updates.append(message)
+
+    monkeypatch.setattr("imednet_workflows.cli.console.status", lambda msg: DummyStatus())
+
+    class FakeUATWorkflow:
+        def __init__(
+            self,
+            sdk_arg: Any,
+            *,
+            on_progress: Any = None,
+            on_phase_change: Any = None,
+        ) -> None:
+            self._on_progress = on_progress
+            self._on_phase_change = on_phase_change
+
+        def run(self, **kwargs: Any) -> Any:
+            if self._on_phase_change:
+                self._on_phase_change(UATWorkflowState.SUBMITTING)
+            if self._on_progress:
+                self._on_progress(
+                    "reg-batch-1",
+                    JobStatus(batchId="reg-batch-1", state="PROCESSING", progress=50),
+                    1.2,
+                )
+            if self._on_phase_change:
+                self._on_phase_change(UATWorkflowState.MONITORING)
+            if self._on_progress:
+                self._on_progress(
+                    "rec-batch-1",
+                    JobStatus(batchId="rec-batch-1", state="COMPLETED", progress=100),
+                    2.4,
+                )
+            res = MagicMock()
+            res.summary.return_value = "UAT Summary OK"
+            res.overall_success = True
+            return res
+
+    monkeypatch.setattr("imednet_workflows.uat.UATWorkflow", FakeUATWorkflow)
+    result = runner.invoke(cli.app, ["workflows", "uat", "run", "STUDY-1"])
+
+    assert result.exit_code == 0
+    assert "UAT Summary OK" in result.stdout
+    assert any("reg-batch-1" in msg and "PROCESSING" in msg for msg in status_updates)
+    assert any("rec-batch-1" in msg and "COMPLETED" in msg for msg in status_updates)

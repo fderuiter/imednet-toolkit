@@ -528,3 +528,42 @@ def test_submission_poller_rejects_illegal_job_transition(mock_sdk):
 
     with pytest.raises(InvalidJobTransitionError):
         workflow._await_registration_jobs("study1", [batch])
+
+
+def test_registration_polling_forwards_on_progress_and_poll_interval(mock_sdk):
+    """Verify BulkRecordSubmissionWorkflow forwards poll_interval and on_progress to JobPoller."""
+    progress_events: list[tuple[str, object, float]] = []
+
+    def on_progress(batch_id: str, status: object, elapsed: float) -> None:
+        progress_events.append((batch_id, status, elapsed))
+
+    workflow = BulkRecordSubmissionWorkflow(
+        mock_sdk,
+        skip_existing_subjects=False,
+        poll_interval=0.01,
+        on_progress=on_progress,
+    )
+    assert workflow.poll_interval == 0.01
+    assert workflow.on_progress is on_progress
+
+    mock_sdk.create_record.return_value = Job(batch_id="reg_prog_1", state="PENDING")
+    mock_sdk.get_job.side_effect = [
+        JobStatus(batch_id="reg_prog_1", state="PROCESSING", progress=50),
+        JobStatus(batch_id="reg_prog_1", state="COMPLETED", progress=100),
+    ]
+
+    rs = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"data": 1}],
+        subject_keys=["S1"],
+    )
+
+    result = workflow.submit("study1", [rs])
+    assert result.registration_batches[0].job.state == "COMPLETED"
+    assert len(progress_events) >= 2
+    assert progress_events[0][0] == "reg_prog_1"
+    assert getattr(progress_events[0][1], "state", None) == "PROCESSING"
+    assert progress_events[-1][0] == "reg_prog_1"
+    assert getattr(progress_events[-1][1], "state", None) == "COMPLETED"

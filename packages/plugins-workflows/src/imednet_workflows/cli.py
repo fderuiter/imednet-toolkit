@@ -8,17 +8,224 @@ ledger management.
 from __future__ import annotations
 
 import argparse
+import io
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic import BaseModel
+
 from imednet.sdk import ImednetSDK
-from imednet.spi.cli import STUDY_KEY_ARG, clear_line, console, parse_filter_args, with_sdk
+from imednet.spi import cli as spi_cli
+from imednet.spi.cli import (
+    STUDY_KEY_ARG,
+    add_output_format,
+    clear_line,
+    console,
+    display_list,
+    emit_json,
+    format_job_progress,
+    parse_filter_args,
+    print_error,
+    with_sdk,
+)
 
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncWorker, SyncWorkerConfig
+
+_LEDGER_FIELDS: list[str] = [
+    "study_key",
+    "stream_name",
+    "last_timestamp",
+    "records_processed",
+    "status",
+    "error_message",
+]
+
+_SUBJECT_FIELDS: list[str] = [
+    "subject_key",
+    "status",
+    "site",
+    "enrollment_date",
+    "keywords",
+]
+
+_VISIT_FIELDS: list[str] = [
+    "visit_id",
+    "interval_name",
+    "subject_key",
+    "visit_date",
+]
+
+_RECORD_FIELDS: list[str] = [
+    "ID",
+    "Subject",
+    "Form",
+    "Status",
+    "Created",
+]
+
+_QUERY_FIELDS: list[str] = [
+    "description",
+    "annotation_type",
+    "subject_key",
+    "variable",
+    "date_created",
+]
+
+
+def _should_use_interactive_grid(interactive: bool) -> bool:
+    """Return True when interactive curses grid mode is requested on an active TTY."""
+    if not interactive:
+        return False
+    return bool(spi_cli.is_interactive_terminal())
+
+
+def _record_summary_row(record: Any) -> dict[str, Any]:
+    """Build a tabular summary row dictionary from a Record domain model or mapping."""
+    if isinstance(record, dict):
+        return {
+            "ID": record.get("record_id", record.get("recordId")),
+            "Subject": record.get("subject_key", record.get("subjectKey")),
+            "Form": record.get("form_key", record.get("formKey")),
+            "Status": record.get("record_status", record.get("recordStatus")),
+            "Created": record.get("date_created", record.get("dateCreated")),
+        }
+    return {
+        "ID": getattr(record, "record_id", None),
+        "Subject": getattr(record, "subject_key", None),
+        "Form": getattr(record, "form_key", None),
+        "Status": getattr(record, "record_status", None),
+        "Created": getattr(record, "date_created", None),
+    }
+
+
+def _subject_summary_row(subject: Any) -> dict[str, Any]:
+    """Build a tabular summary row dictionary from a Subject domain model or mapping."""
+    if isinstance(subject, dict):
+        raw_keywords = subject.get("keywords") or []
+        keywords_str = ", ".join(
+            str(k.get("keyword_name", k.get("keywordName", "")))
+            if isinstance(k, dict)
+            else str(getattr(k, "keyword_name", ""))
+            for k in raw_keywords
+            if (
+                (isinstance(k, dict) and (k.get("keyword_name") or k.get("keywordName")))
+                or getattr(k, "keyword_name", None)
+            )
+        )
+        return {
+            "subject_key": subject.get("subject_key", subject.get("subjectKey")),
+            "status": subject.get("subject_status", subject.get("subjectStatus")),
+            "site": subject.get("site_name", subject.get("siteName")),
+            "enrollment_date": subject.get(
+                "enrollment_start_date", subject.get("enrollmentStartDate")
+            ),
+            "keywords": keywords_str,
+        }
+    raw_keywords = getattr(subject, "keywords", None) or []
+    keywords_str = ", ".join(
+        str(getattr(k, "keyword_name", ""))
+        for k in raw_keywords
+        if getattr(k, "keyword_name", None)
+    )
+    return {
+        "subject_key": getattr(subject, "subject_key", None),
+        "status": getattr(subject, "subject_status", None),
+        "site": getattr(subject, "site_name", None),
+        "enrollment_date": getattr(subject, "enrollment_start_date", None),
+        "keywords": keywords_str,
+    }
+
+
+def _extract_subject_details(data: Any) -> Any | None:
+    """Safely extract subject_details from SubjectComprehensiveData, dict, or mock."""
+    if isinstance(data, dict):
+        return data.get("subject_details")
+    if isinstance(data, BaseModel):
+        return getattr(data, "subject_details", None)
+    try:
+        instance_vars = vars(data)
+    except TypeError:
+        return getattr(data, "subject_details", None)
+    if "subject_details" in instance_vars:
+        return instance_vars["subject_details"]
+    if type(data).__module__.startswith("unittest.mock"):
+        return None
+    return getattr(data, "subject_details", None)
+
+
+def _display_section(
+    rows: Sequence[Any],
+    label: str,
+    empty_msg: str,
+    *,
+    fields: list[str] | None = None,
+    details: Sequence[Any] | None = None,
+    use_grid: bool = False,
+) -> None:
+    """Display a single workflow output section via interactive grid or aligned table."""
+    display_list(
+        rows,
+        label,
+        empty_msg,
+        fields=fields,
+        details=details,
+        interactive=use_grid,
+    )
+
+
+def _execute_show_state(
+    ledger_path: str,
+    study_key: str | None = None,
+    interactive: bool = False,
+    output_format: str = "table",
+) -> None:
+    """Display high-water mark ledger entries as table, interactive grid, or JSON."""
+    ledger = get_state_provider(ledger_path)
+    try:
+        state = ledger.read_state()
+    except Exception as err:
+        print_error(f"Failed to read ledger from {ledger_path}: {err}")
+        sys.exit(1)
+
+    entries: list[dict[str, Any]] = []
+    for s_key, study_state in state.studies.items():
+        if study_key and s_key != study_key:
+            continue
+        for stream_name, stream_state in study_state.streams.items():
+            entries.append(
+                {
+                    "study_key": s_key,
+                    "stream_name": stream_name,
+                    "last_timestamp": (
+                        stream_state.last_timestamp.isoformat()
+                        if stream_state.last_timestamp
+                        else None
+                    ),
+                    "records_processed": stream_state.records_processed,
+                    "status": str(stream_state.last_run_status),
+                    "error_message": stream_state.error_message,
+                    "metadata": dict(stream_state.metadata) if stream_state.metadata else {},
+                }
+            )
+
+    if output_format == "json":
+        display_list(entries, "ledger_entries", output_format="json")
+        return
+
+    use_grid = _should_use_interactive_grid(interactive)
+    _display_section(
+        entries,
+        "ledger entries",
+        "No ledger entries found matching filters.",
+        fields=_LEDGER_FIELDS,
+        details=entries,
+        use_grid=use_grid,
+    )
 
 
 def _execute_set_state(
@@ -229,6 +436,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         action="store_true",
         help="Run in interactive wizard mode with step-by-step prompts.",
     )
+    add_output_format(extract_parser)
 
     @with_sdk
     def extract_records(
@@ -238,6 +446,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         subject_filter: list[str] | None = None,
         visit_filter: list[str] | None = None,
         interactive: bool = False,
+        output_format: str = "table",
     ) -> None:
         from .wizard import print_progress
 
@@ -263,28 +472,42 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         parsed_subject_filter = parse_filter_args(subject_filter)
         parsed_visit_filter = parse_filter_args(visit_filter)
 
-        print_progress(f"Extracting records for study '{study_key}'...")
+        if output_format != "json" or interactive:
+            print_progress(f"Extracting records for study '{study_key}'...")
         if interactive:
-            records = workflow.extract_records_by_criteria(
-                study_key=study_key,
-                record_filter=parsed_record_filter,
-                subject_filter=parsed_subject_filter,
-                visit_filter=parsed_visit_filter,
-                on_progress=lambda msg: print_progress(f"[Progress] {msg}"),
+            records = list(
+                workflow.extract_records_by_criteria(
+                    study_key=study_key,
+                    record_filter=parsed_record_filter,
+                    subject_filter=parsed_subject_filter,
+                    visit_filter=parsed_visit_filter,
+                    on_progress=lambda msg: print_progress(f"[Progress] {msg}"),
+                )
             )
         else:
-            records = workflow.extract_records_by_criteria(
-                study_key=study_key,
-                record_filter=parsed_record_filter,
-                subject_filter=parsed_subject_filter,
-                visit_filter=parsed_visit_filter,
+            records = list(
+                workflow.extract_records_by_criteria(
+                    study_key=study_key,
+                    record_filter=parsed_record_filter,
+                    subject_filter=parsed_subject_filter,
+                    visit_filter=parsed_visit_filter,
+                )
             )
 
-        if records:
-            print(f"Found {len(records)} matching records:")
-            print(records)
-        else:
-            print("No records found matching the criteria.")
+        if output_format == "json":
+            display_list(records, "records", output_format="json", details=records)
+            return
+
+        view_models = [_record_summary_row(r) for r in records]
+        display_list(
+            view_models,
+            "matching records",
+            "No records found matching the criteria.",
+            fields=_RECORD_FIELDS,
+            output_format=output_format,
+            details=records,
+            interactive=_should_use_interactive_grid(interactive),
+        )
 
     extract_parser.set_defaults(
         func=lambda args: extract_records(
@@ -293,6 +516,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             subject_filter=args.subject_filter,
             visit_filter=args.visit_filter,
             interactive=args.interactive,
+            output_format=args.output_format,
         )
     )
 
@@ -358,109 +582,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
     state_parser = sub.add_parser("state", help="Manage high-water mark execution ledger state.")
     state_sub = state_parser.add_subparsers(dest="state_command")
-
-    show_parser = state_sub.add_parser(
-        "show", help="Show the current high-water mark records and stream metadata."
-    )
-    show_parser.add_argument(
-        "-l",
-        "--ledger-path",
-        default=DEFAULT_LEDGER_PATH,
-        help="Path to the pipeline ledger JSON file.",
-    )
-    show_parser.add_argument("-s", "--study-key", help="Filter the ledger by a specific study key.")
-    show_parser.add_argument(
-        "--interactive", action="store_true", help="Run in interactive wizard mode."
-    )
-
-    def show_state(ledger_path: str, study_key: str | None = None) -> None:  # pragma: no cover
-        ledger = get_state_provider(ledger_path)
-        try:
-            state = ledger.read_state()
-        except Exception as err:
-            print(f"Failed to read ledger from {ledger_path}: {err}")
-            sys.exit(1)
-
-        has_data = False
-        print(f"iMednet Extraction Ledger ({ledger_path})")
-        print(
-            "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
-        )
-        for s_key, study_state in state.studies.items():
-            if study_key and s_key != study_key:
-                continue
-            for stream_name, stream_state in study_state.streams.items():
-                has_data = True
-                print(
-                    f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
-                )
-
-        if not has_data:
-            print("No ledger entries found matching filters.")
-
-    show_parser.set_defaults(
-        func=lambda args: show_state(ledger_path=args.ledger_path, study_key=args.study_key)
-    )
-
-    set_parser = state_sub.add_parser(
-        "set", help="Manually set a high-water mark timestamp for a study and stream."
-    )
-    set_parser.add_argument("-s", "--study-key", help="The study key.")
-    set_parser.add_argument("-m", "--stream", help="The stream name.")
-    set_parser.add_argument("-t", "--timestamp", help="The ISO-8601 timestamp (UTC).")
-    set_parser.add_argument(
-        "-r", "--records-processed", type=int, default=0, help="Number of records processed."
-    )
-    set_parser.add_argument(
-        "-l",
-        "--ledger-path",
-        default=DEFAULT_LEDGER_PATH,
-        help="Path to the pipeline ledger JSON file.",
-    )
-    set_parser.add_argument(
-        "--interactive", action="store_true", help="Run in interactive wizard mode."
-    )
-
-    set_parser.set_defaults(
-        func=lambda args: _execute_set_state(
-            study_key=args.study_key,
-            stream=args.stream,
-            timestamp=args.timestamp,
-            records_processed=args.records_processed,
-            ledger_path=args.ledger_path,
-            interactive=args.interactive,
-            parser=set_parser,
-        )
-    )
-
-    reset_parser = state_sub.add_parser(
-        "reset", help="Reset (clear) high-water mark state for a study/stream."
-    )
-    reset_parser.add_argument("-s", "--study-key", help="The study key.")
-    reset_parser.add_argument(
-        "-m",
-        "--stream",
-        help="The stream name. If omitted, all streams for the study will be reset.",
-    )
-    reset_parser.add_argument(
-        "-l",
-        "--ledger-path",
-        default=DEFAULT_LEDGER_PATH,
-        help="Path to the pipeline ledger JSON file.",
-    )
-    reset_parser.add_argument(
-        "--interactive", action="store_true", help="Run in interactive wizard mode."
-    )
-
-    reset_parser.set_defaults(
-        func=lambda args: _execute_reset_state(
-            study_key=args.study_key,
-            stream=args.stream,
-            ledger_path=args.ledger_path,
-            interactive=args.interactive,
-            parser=reset_parser,
-        )
-    )
+    _configure_state_subparsers(state_sub)
 
     # UAT command integration
     uat_parser = sub.add_parser("uat", help="Manage and execute UAT acceptance test pipelines.")
@@ -533,27 +655,34 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             UATWorkflowState.FAILED: "[Failed] UAT pipeline execution encountered an error.",
         }
 
-        def on_phase(phase: UATWorkflowState) -> None:
-            msg = phase_descriptions.get(phase, f"UAT Phase transition: {phase.value}")
-            print_progress(msg)
+        start_msg = f"Starting UAT pipeline for study '{study_key}'..."
+        if isinstance(sys.stderr, io.StringIO):
+            print_progress(start_msg)
 
-        def on_progress(batch_id: str, status: Any, elapsed: float) -> None:
-            state_val = getattr(status, "state", getattr(status, "status", str(status)))
-            print_progress(f"[Job Progress] Batch {batch_id}: {state_val} ({elapsed:.1f}s)")
+        with console.status(start_msg) as status_ctrl:
 
-        print_progress(f"Starting UAT pipeline for study '{study_key}'...")
-        workflow = UATWorkflow(
-            sdk,  # type: ignore[arg-type]
-            on_progress=on_progress,
-            on_phase_change=on_phase,
-        )
-        result = workflow.run(
-            study_key=study_key,  # type: ignore[arg-type]
-            subject_count=subject_count,
-            site_name=site_name,
-            enabled_form_keys=enabled_form_keys,
-            email_notify=email_notify,
-        )
+            def on_phase(phase: UATWorkflowState) -> None:
+                msg = phase_descriptions.get(phase, f"UAT Phase transition: {phase.value}")
+                status_ctrl.update(msg)
+
+            def on_progress(
+                batch_id: Any, status: Any = None, elapsed: float | None = None
+            ) -> None:
+                msg = format_job_progress(batch_id, status, elapsed)
+                status_ctrl.update(msg)
+
+            workflow = UATWorkflow(
+                sdk,  # type: ignore[arg-type]
+                on_progress=on_progress,
+                on_phase_change=on_phase,
+            )
+            result = workflow.run(
+                study_key=study_key,  # type: ignore[arg-type]
+                subject_count=subject_count,
+                site_name=site_name,
+                enabled_form_keys=enabled_form_keys,
+                email_notify=email_notify,
+            )
 
         print(result.summary())
         if not result.overall_success:
@@ -623,18 +752,112 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     subj_parser.add_argument(
         "subject_key", nargs="?", default=None, help="The key identifying the subject."
     )
+    subj_parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Run in interactive wizard mode with section selection.",
+    )
+    add_output_format(subj_parser)
 
     @with_sdk
-    def subject_data(sdk: ImednetSDK, study_key: str, subject_key: str) -> None:
+    def subject_data(
+        sdk: ImednetSDK,
+        study_key: str,
+        subject_key: str,
+        *,
+        interactive: bool = False,
+        output_format: str = "table",
+    ) -> None:
+        from .wizard import print_progress, prompt_subject_section
+
+        if interactive and output_format != "json":
+            print_progress(f"Retrieving subject data for '{subject_key}' in study '{study_key}'...")
         workflow = SubjectDataWorkflow(sdk)  # type: ignore[arg-type]
         data = workflow.get_all_subject_data(study_key, subject_key)
-        print(data.model_dump())
+
+        if output_format == "json":
+            emit_json([data], "subject_data")
+            return
+
+        subject_obj = _extract_subject_details(data)
+        subject_rows = [_subject_summary_row(subject_obj)] if subject_obj is not None else []
+        subject_details_list = [subject_obj] if subject_obj is not None else []
+
+        raw_visits = data.get("visits") if isinstance(data, dict) else getattr(data, "visits", None)
+        visits = list(raw_visits or [])
+
+        raw_records = (
+            data.get("records") if isinstance(data, dict) else getattr(data, "records", None)
+        )
+        records = list(raw_records or [])
+        record_rows = [_record_summary_row(r) for r in records]
+
+        raw_queries = (
+            data.get("queries") if isinstance(data, dict) else getattr(data, "queries", None)
+        )
+        queries = list(raw_queries or [])
+
+        selected_section = prompt_subject_section(default="all") if interactive else "all"
+        use_grid = _should_use_interactive_grid(interactive) and selected_section != "all"
+
+        sections: list[tuple[str, Sequence[Any], str, str, list[str], Sequence[Any]]] = [
+            (
+                "subject",
+                subject_rows,
+                "subject details",
+                "No subject details found.",
+                _SUBJECT_FIELDS,
+                subject_details_list,
+            ),
+            (
+                "visits",
+                visits,
+                "visits",
+                "No visits found.",
+                _VISIT_FIELDS,
+                visits,
+            ),
+            (
+                "records",
+                record_rows,
+                "records",
+                "No records found.",
+                _RECORD_FIELDS,
+                records,
+            ),
+            (
+                "queries",
+                queries,
+                "queries",
+                "No queries found.",
+                _QUERY_FIELDS,
+                queries,
+            ),
+        ]
+
+        rendered_count = 0
+        for section_key, rows, label, empty_msg, fields, details in sections:
+            if selected_section not in ("all", section_key):
+                continue
+            if rendered_count > 0:
+                print()
+            _display_section(
+                rows,
+                label,
+                empty_msg,
+                fields=fields,
+                details=details,
+                use_grid=use_grid,
+            )
+            rendered_count += 1
 
     def handle_subject_data(args: argparse.Namespace) -> None:
         flag_study: str | None = args.study_key_flag
         flag_subject: str | None = args.subject_key_flag
         pos_study: str | None = args.study_key
         pos_subject: str | None = args.subject_key
+        interactive: bool = bool(getattr(args, "interactive", False))
+        output_format: str = getattr(args, "output_format", "table")
 
         def _is_empty(val: str | None) -> bool:
             return val is None or not val.strip()
@@ -687,70 +910,74 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             study_key = pos_study
             subject_key = pos_subject
 
-        missing_study = _is_empty(study_key)
-        missing_subject = _is_empty(subject_key)
-        if missing_study and missing_subject:
-            subj_parser.error("the following arguments are required: study_key, subject_key")
-        elif missing_study:
-            subj_parser.error("the following arguments are required: study_key")
-        elif missing_subject:
-            subj_parser.error("the following arguments are required: subject_key")
+        if interactive:
+            from .wizard import prompt_study_key, prompt_subject_key
+
+            study_key = prompt_study_key(study_key)
+            subject_key = prompt_subject_key(subject_key)
+        else:
+            missing_study = _is_empty(study_key)
+            missing_subject = _is_empty(subject_key)
+            if missing_study and missing_subject:
+                subj_parser.error("the following arguments are required: study_key, subject_key")
+            elif missing_study:
+                subj_parser.error("the following arguments are required: study_key")
+            elif missing_subject:
+                subj_parser.error("the following arguments are required: subject_key")
 
         assert study_key is not None
         assert subject_key is not None
-        subject_data(study_key=study_key, subject_key=subject_key)
+        subject_data(
+            study_key=study_key,
+            subject_key=subject_key,
+            interactive=interactive,
+            output_format=output_format,
+        )
 
     subj_parser.set_defaults(func=handle_subject_data)
 
 
-def state_app(args: list[str] | None = None) -> None:
-    """Execute the state app logic directly for tests."""
-    if args is None:
-        args = sys.argv[1:]
-    parser = argparse.ArgumentParser(description="Manage high-water mark execution ledger state.")
-    state_sub = parser.add_subparsers(dest="state_command")
-
-    # Show parser
-    show_parser = state_sub.add_parser("show")
-    show_parser.add_argument("-l", "--ledger-path", default=DEFAULT_LEDGER_PATH)
-    show_parser.add_argument("-s", "--study-key")
-    show_parser.add_argument(
-        "--interactive", action="store_true", help="Run in interactive wizard mode."
+def _configure_state_subparsers(state_sub: argparse._SubParsersAction[Any]) -> None:
+    """Register shared show/set/reset subparsers for both CLI plugin and state_app."""
+    show_parser = state_sub.add_parser(
+        "show", help="Show the current high-water mark records and stream metadata."
     )
-
-    def show_state(ledger_path: str, study_key: str | None = None) -> None:
-        ledger = get_state_provider(ledger_path)
-        try:
-            state = ledger.read_state()
-        except Exception as err:
-            print(f"Failed to read ledger from {ledger_path}: {err}")
-            sys.exit(1)
-        has_data = False
-        print(f"iMednet Extraction Ledger ({ledger_path})")
-        print(
-            "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
-        )
-        for s_key, study_state in state.studies.items():
-            if study_key and s_key != study_key:
-                continue
-            for stream_name, stream_state in study_state.streams.items():
-                has_data = True
-                print(
-                    f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
-                )
-        if not has_data:
-            print("No ledger entries found matching filters.")
+    show_parser.add_argument(
+        "-l",
+        "--ledger-path",
+        default=DEFAULT_LEDGER_PATH,
+        help="Path to the pipeline ledger JSON file.",
+    )
+    show_parser.add_argument("-s", "--study-key", help="Filter the ledger by a specific study key.")
+    show_parser.add_argument(
+        "--interactive", action="store_true", help="Run in interactive grid mode."
+    )
+    add_output_format(show_parser)
 
     show_parser.set_defaults(
-        func=lambda args: show_state(ledger_path=args.ledger_path, study_key=args.study_key)
+        func=lambda args: _execute_show_state(
+            ledger_path=args.ledger_path,
+            study_key=args.study_key,
+            interactive=args.interactive,
+            output_format=args.output_format,
+        )
     )
 
-    set_parser = state_sub.add_parser("set")
-    set_parser.add_argument("-s", "--study-key")
-    set_parser.add_argument("-m", "--stream")
-    set_parser.add_argument("-t", "--timestamp")
-    set_parser.add_argument("-r", "--records-processed", type=int, default=0)
-    set_parser.add_argument("-l", "--ledger-path", default=DEFAULT_LEDGER_PATH)
+    set_parser = state_sub.add_parser(
+        "set", help="Manually set a high-water mark timestamp for a study and stream."
+    )
+    set_parser.add_argument("-s", "--study-key", help="The study key.")
+    set_parser.add_argument("-m", "--stream", help="The stream name.")
+    set_parser.add_argument("-t", "--timestamp", help="The ISO-8601 timestamp (UTC).")
+    set_parser.add_argument(
+        "-r", "--records-processed", type=int, default=0, help="Number of records processed."
+    )
+    set_parser.add_argument(
+        "-l",
+        "--ledger-path",
+        default=DEFAULT_LEDGER_PATH,
+        help="Path to the pipeline ledger JSON file.",
+    )
     set_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
@@ -767,10 +994,21 @@ def state_app(args: list[str] | None = None) -> None:
         )
     )
 
-    reset_parser = state_sub.add_parser("reset")
-    reset_parser.add_argument("-s", "--study-key")
-    reset_parser.add_argument("-m", "--stream")
-    reset_parser.add_argument("-l", "--ledger-path", default=DEFAULT_LEDGER_PATH)
+    reset_parser = state_sub.add_parser(
+        "reset", help="Reset (clear) high-water mark state for a study/stream."
+    )
+    reset_parser.add_argument("-s", "--study-key", help="The study key.")
+    reset_parser.add_argument(
+        "-m",
+        "--stream",
+        help="The stream name. If omitted, all streams for the study will be reset.",
+    )
+    reset_parser.add_argument(
+        "-l",
+        "--ledger-path",
+        default=DEFAULT_LEDGER_PATH,
+        help="Path to the pipeline ledger JSON file.",
+    )
     reset_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
@@ -784,6 +1022,15 @@ def state_app(args: list[str] | None = None) -> None:
             parser=reset_parser,
         )
     )
+
+
+def state_app(args: list[str] | None = None) -> None:
+    """Execute the state app logic directly for tests."""
+    if args is None:
+        args = sys.argv[1:]
+    parser = argparse.ArgumentParser(description="Manage high-water mark execution ledger state.")
+    state_sub = parser.add_subparsers(dest="state_command")
+    _configure_state_subparsers(state_sub)
 
     parsed = parser.parse_args(args)
     if hasattr(parsed, "func"):

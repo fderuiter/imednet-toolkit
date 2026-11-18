@@ -246,3 +246,47 @@ def test_plugin_discovery_failure(monkeypatch):
         match="Workflow 'some_workflow' not found. Please install the required package.",
     ):
         sdk.workflows.some_workflow
+
+
+def test_spi_cli_exports_and_lazy_curses_loading():
+    """Verify imednet.spi.cli exports output/grid helpers and defers importing curses."""
+    import subprocess
+    import sys
+
+    from imednet.spi import cli as spi_cli
+
+    expected_exports = {
+        "add_output_format",
+        "display_list",
+        "emit_json",
+        "is_interactive_terminal",
+        "run_interactive_grid",
+    }
+    assert expected_exports.issubset(set(spi_cli.__all__))
+    assert expected_exports.issubset(set(dir(spi_cli)))
+
+    assert callable(spi_cli.display_list)
+    assert callable(spi_cli.add_output_format)
+    assert callable(spi_cli.emit_json)
+    assert callable(spi_cli.is_interactive_terminal)
+    assert callable(spi_cli.run_interactive_grid)
+
+    with pytest.raises(AttributeError, match="has no attribute"):
+        _ = spi_cli.nonexistent_spi_helper
+
+    check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import imednet.spi.cli; "
+                "import imednet_workflows.cli; "
+                "assert 'curses' not in sys.modules, 'curses imported eagerly!'"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode == 0, check.stderr

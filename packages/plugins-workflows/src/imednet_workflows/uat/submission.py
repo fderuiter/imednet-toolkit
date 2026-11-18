@@ -12,7 +12,7 @@ from pydantic import Field
 
 from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import ImednetBaseModel, Job, JobState, normalize_job_state
-from imednet.spi.utils import JobFailedError, JobPoller, JobTimeoutError
+from imednet.spi.utils import JobFailedError, JobPoller, JobProgressHandler, JobTimeoutError
 
 from .generator import GeneratedRecordSet
 from .models import RecordTestType
@@ -103,6 +103,10 @@ class BulkRecordSubmissionWorkflow:
     skip_existing_subjects : bool
         If True, query the API for existing UAT-tagged subjects and skip
         registration for any that already exist. Default: True.
+    poll_interval : float
+        Seconds between job poll cycles during Phase 1 registration. Default: 5.0.
+    on_progress : JobProgressHandler | None
+        Optional progress callback invoked on each registration job poll cycle.
     """
 
     def __init__(
@@ -112,6 +116,8 @@ class BulkRecordSubmissionWorkflow:
         await_registration: bool = True,
         registration_timeout: float = 600.0,
         skip_existing_subjects: bool = True,
+        poll_interval: float = 5.0,
+        on_progress: JobProgressHandler | None = None,
     ) -> None:
         """Initialize the workflow."""
         self.sdk = sdk
@@ -119,6 +125,8 @@ class BulkRecordSubmissionWorkflow:
         self.await_registration = await_registration
         self.registration_timeout = registration_timeout
         self.skip_existing_subjects = skip_existing_subjects
+        self.poll_interval = poll_interval
+        self.on_progress = on_progress
         self.phase: SubmissionPhase = SubmissionPhase.PENDING
 
     def submit(
@@ -244,7 +252,9 @@ class BulkRecordSubmissionWorkflow:
         summary = poller.poll_many(
             study_key,
             batch_ids,
+            interval=float(self.poll_interval),
             timeout=float(self.registration_timeout),
+            on_progress=self.on_progress,
             fail_fast=False,
         )
 

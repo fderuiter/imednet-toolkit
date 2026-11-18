@@ -261,6 +261,68 @@ def prompt_study_key(study_key: str | None = None) -> str:
         )
 
 
+def prompt_subject_key(subject_key: str | None = None) -> str:
+    """Ensure a valid non-empty subject key, prompting if needed.
+
+    Args:
+        subject_key: Existing subject key from CLI arguments.
+
+    Returns:
+        Non-empty subject key string.
+    """
+    if subject_key and subject_key.strip():
+        return subject_key.strip()
+
+    while True:
+        val = prompt_input("Enter subject key")
+        if val:
+            return val
+        print_progress(
+            "Validation Error: Subject key cannot be empty. Please enter a valid subject key."
+        )
+
+
+_SUBJECT_SECTION_ALIASES: dict[str, str] = {
+    "1": "subject",
+    "subject": "subject",
+    "subject_details": "subject",
+    "details": "subject",
+    "2": "visits",
+    "visit": "visits",
+    "visits": "visits",
+    "3": "records",
+    "record": "records",
+    "records": "records",
+    "4": "queries",
+    "query": "queries",
+    "queries": "queries",
+    "5": "all",
+    "all": "all",
+}
+
+
+def prompt_subject_section(default: str = "all") -> str:
+    """Prompt the user on stderr to choose a subject-data section to inspect.
+
+    Args:
+        default: Default section key if the user presses Enter.
+
+    Returns:
+        Canonical section key: ``'subject'``, ``'visits'``, ``'records'``,
+        ``'queries'``, or ``'all'``.
+    """
+    print_progress("Select subject data section (1=subject, 2=visits, 3=records, 4=queries, 5=all)")
+    while True:
+        raw = prompt_input("Section", default=default)
+        normalized = _SUBJECT_SECTION_ALIASES.get(raw.strip().lower())
+        if normalized is not None:
+            return normalized
+        print_progress(
+            f"Validation Error: Invalid section '{raw}'. "
+            "Choose 1-5 or one of: subject, visits, records, queries, all."
+        )
+
+
 def prompt_stream_name(stream: str | None = None) -> str:
     """Ensure a valid non-empty stream name, prompting if needed.
 
