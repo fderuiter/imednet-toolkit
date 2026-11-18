@@ -1,10 +1,10 @@
-"""Tests for backward-compatible shims in imednet.validation.data_dictionary."""
+"""Tests for backward-compatible data dictionary models."""
 
 from __future__ import annotations
 
 from unittest.mock import Mock
 
-from imednet.validation.data_dictionary import DataDictionary
+from imednet.datadict.models import DataDictionary
 from imednet_workflows.uat.engine import UATExecutionEngine
 
 
