@@ -17,8 +17,8 @@ from imednet.core.paginator import Paginator
 
 def _make_sdk() -> ImednetSDK:
     return ImednetSDK(
-        api_key="test-key",
-        security_key="test-secret",
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
         base_url="https://api.test",
     )
 

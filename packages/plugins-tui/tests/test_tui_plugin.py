@@ -1016,8 +1016,8 @@ async def test_subject_table_2500_study_issues_single_http_request_and_loads_all
         )
 
         sdk = ImednetSDK(
-            api_key="test-key",
-            security_key="test-secret",
+            api_key="test-key",  # pragma: allowlist secret
+            security_key="test-secret",  # pragma: allowlist secret
             base_url="https://api.test",
         )
 
