@@ -1,7 +1,8 @@
 """Unit tests for sites endpoint."""
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from imednet.endpoints import sites
 from imednet.errors import NotFoundError

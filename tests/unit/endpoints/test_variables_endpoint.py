@@ -1,7 +1,8 @@
 """Unit tests for variables endpoint."""
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from imednet.endpoints import variables
 from imednet.errors import NotFoundError

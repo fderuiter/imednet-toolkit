@@ -1,7 +1,8 @@
 """Unit tests for intervals endpoint."""
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from imednet.core.context import set_study_context
 from imednet.endpoints import intervals

@@ -355,7 +355,8 @@ def test_check_pandas_raises_when_missing(monkeypatch) -> None:
     """Test that check_pandas raises ImportError when pandas is missing."""
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
     with pytest.raises(
-        ImportError, match=r"pandas is required\. Install with \"pip install 'imednet\[export\]'\"\."
+        ImportError,
+        match=r"pandas is required\. Install with \"pip install 'imednet\[export\]'\"\.",
     ):
         check_pandas()
 
