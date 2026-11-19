@@ -395,21 +395,47 @@ __result__ = {
 
     assert evaluate_decision(result) == "Execution completed with errors."
 
-    # 5. Verify both extracted runners from thebe_pyodide.js for warning output and print-then-raise
+    # 5. Verify both extracted async runners from thebe_pyodide.js for warning output,
+    #    print-then-raise, SystemExit capture, and asyncio.run() bridging in an active loop.
+    import ast
+    import asyncio
+    import inspect
+
+    assert "runPythonAsync(runnerScript)" in thebe_js, (
+        "thebe_pyodide.js must execute cells asynchronously via pyodide.runPythonAsync()"
+    )
+    assert (
+        "pyodide.runPython(" not in thebe_js and "mainThreadPyodide.runPython(" not in thebe_js
+    ), "Synchronous runPython() must be replaced with runPythonAsync()"
+
     extracted_runners = re.findall(r"runnerScript\s*=\s*\\?`([\s\S]*?)\\?`;", thebe_js)
     assert len(extracted_runners) >= 2, (
         "Expected worker and main-thread fallback runner scripts in thebe_pyodide.js"
     )
 
-    for i, runner_template in enumerate(extracted_runners):
+    async def _exec_extracted_runner(runner_template: str, user_code: str) -> dict:
         script = runner_template.strip()
-        script_body = script.rsplit("{", 1)[0]
-        dict_body = "{" + script.rsplit("{", 1)[1]
+        script_body, dict_tail = script.rsplit("{", 1)
+        dict_body = "{" + dict_tail
+        env_ns: dict = {"__thebe_user_code__": user_code, "__name__": "__main__"}
+        compiled_body = compile(
+            ast.parse(script_body),
+            "<runner>",
+            "exec",
+            flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
+        )
+        coro_or_none = eval(compiled_body, env_ns)
+        if inspect.iscoroutine(coro_or_none):
+            await coro_or_none
+        return eval(dict_body, env_ns)
 
+    for i, runner_template in enumerate(extracted_runners):
         # Case A: Successful execution with stderr output (e.g. library warnings)
-        env_warn = {"__thebe_user_code__": "import sys; print('warning', file=sys.stderr); 42"}
-        exec(script_body, env_warn)
-        res_warn = eval(dict_body, env_warn)
+        res_warn = asyncio.run(
+            _exec_extracted_runner(
+                runner_template, "import sys; print('warning', file=sys.stderr); 42"
+            )
+        )
         assert res_warn["error"] is False, (
             f"Runner {i} must return error: False for warning-only stderr"
         )
@@ -418,17 +444,59 @@ __result__ = {
         assert evaluate_decision(res_warn) == "Execution completed."
 
         # Case B: Execution with print before exception
-        env_raise = {
-            "__thebe_user_code__": "print('Starting validation')\nraise ValueError('Invalid')"
-        }
-        exec(script_body, env_raise)
-        res_raise = eval(dict_body, env_raise)
+        res_raise = asyncio.run(
+            _exec_extracted_runner(
+                runner_template, "print('Starting validation')\nraise ValueError('Invalid')"
+            )
+        )
         assert res_raise["error"] is True, f"Runner {i} must return error: True for exception"
         assert "Starting validation" in res_raise["stdout"]
         assert "ValueError: Invalid" in res_raise["stderr"]
         assert evaluate_decision(res_raise) == "Execution completed with errors."
 
-    # 6. Execute real JavaScript decision block in Node if available
+        # Case C: Execution calling sys.exit(1) preserves buffered stdout and stderr
+        res_exit = asyncio.run(
+            _exec_extracted_runner(
+                runner_template,
+                "import sys\nprint('Before exit')\nprint('Error: missing key', file=sys.stderr)\nsys.exit(1)",
+            )
+        )
+        assert res_exit["error"] is True, f"Runner {i} must return error: True for sys.exit(1)"
+        assert "Before exit" in res_exit["stdout"]
+        assert "Error: missing key" in res_exit["stderr"]
+        assert "SystemExit: 1" in res_exit["stderr"]
+        assert evaluate_decision(res_exit) == "Execution completed with errors."
+
+        # Case D: Execution calling sys.exit(0) preserves output without error status
+        res_exit_ok = asyncio.run(
+            _exec_extracted_runner(
+                runner_template,
+                "import sys\nprint('Clean completion')\nsys.exit(0)",
+            )
+        )
+        assert res_exit_ok["error"] is False, f"Runner {i} must return error: False for sys.exit(0)"
+        assert "Clean completion" in res_exit_ok["stdout"]
+        assert evaluate_decision(res_exit_ok) == "Execution completed."
+
+        # Case E: Execution calling asyncio.run(main()) inside an active event loop
+        res_async = asyncio.run(
+            _exec_extracted_runner(
+                runner_template,
+                "import asyncio\n"
+                "async def main():\n"
+                "    await asyncio.sleep(0)\n"
+                "    print('Async tutorial ok')\n"
+                "if __name__ == '__main__':\n"
+                "    asyncio.run(main())\n",
+            )
+        )
+        assert res_async["error"] is False, (
+            f"Runner {i} failed on asyncio.run(main()): {res_async['stderr']}"
+        )
+        assert "Async tutorial ok" in res_async["stdout"]
+        assert evaluate_decision(res_async) == "Execution completed."
+
+    # 6. Execute real JavaScript decision block and getConfig() in Node if available
     node_bin = shutil.which("node")
     if node_bin:
         match = re.search(
@@ -438,6 +506,7 @@ __result__ = {
         assert match is not None, "Could not extract executeCode callback from thebe_pyodide.js"
         callback_body = match.group(1)
         node_script = f"""
+        const fs = require("fs");
         const callbackBody = {json.dumps(callback_body)};
         function testDecision(res) {{
             let runBtn = {{ disabled: false, innerHTML: "" }};
@@ -459,11 +528,130 @@ __result__ = {
         if (testDecision(resFallbackWarn) !== "Execution completed with errors.") {{
             throw new Error("Expected Execution completed with errors. for fallback warning, got: " + testDecision(resFallbackWarn));
         }}
+
+        // Verify getConfig() prefers data-content_root over DOCUMENTATION_OPTIONS.URL_ROOT
+        // and parses #imednet-pyodide-config JSON payload cleanly when URL_ROOT is absent.
+        const thebeSource = fs.readFileSync({json.dumps(str(REPO_ROOT / "docs/_static/thebe_pyodide.js"))}, "utf8");
+        const vm = require("vm");
+        const sandbox = {{
+            URL,
+            console,
+            window: {{ location: {{ href: "https://example.org/docs/tutorials/quick_start.html" }} }},
+            document: {{
+                readyState: "complete",
+                documentElement: {{
+                    getAttribute: (attr) => attr === "data-content_root" ? "../" : null
+                }},
+                getElementById: (id) => id === "imednet-pyodide-config" ? ({{
+                    textContent: JSON.stringify({{
+                        wheels: [
+                            "_static/wheels/imednet-1.1.0-py3-none-any.whl",
+                            "_static/wheels/imednet_workflows-1.1.0-py3-none-any.whl",
+                            "_static/wheels/imednet_plugins_sinks-1.0.1-py3-none-any.whl",
+                            "_static/wheels/imednet_tui-1.0.0-py3-none-any.whl"
+                        ]
+                    }})
+                }}) : null,
+                querySelectorAll: () => []
+            }}
+        }};
+        sandbox.window.document = sandbox.document;
+        vm.runInNewContext(thebeSource, sandbox);
+        const cfg = sandbox.window.pyodideRuntime.getConfig();
+        if (cfg.wheels.length !== 3) {{
+            throw new Error("Expected 3 filtered wheels, got: " + JSON.stringify(cfg.wheels));
+        }}
+        if (cfg.wheels[0] !== "https://example.org/docs/_static/wheels/imednet-1.1.0-py3-none-any.whl") {{
+            throw new Error("Unexpected wheel URL via data-content_root: " + cfg.wheels[0]);
+        }}
         """
         proc = subprocess.run([node_bin, "-e", node_script], capture_output=True, text=True)
         assert proc.returncode == 0, (
-            f"Node verification of JavaScript decision failed:\n{proc.stderr}"
+            f"Node verification of JavaScript runtime failed:\n{proc.stderr}"
         )
+
+
+@pytest.mark.unit
+def test_pyodide_cells_sphinx_extension_and_conf() -> None:
+    """Verify native Sphinx Pyodide extension directives, HTML context hooks, and conf.py config."""
+    from docs import conf as docs_conf
+    from docs._ext.pyodide_cells import (
+        PyodideButtonNode,
+        _compute_content_root,
+        _inject_pyodide_page_context,
+    )
+    from docs._ext.pyodide_cells import (
+        setup as setup_pyodide_cells,
+    )
+
+    assert "sphinx_thebe" not in docs_conf.extensions
+    assert "pyodide_cells" in docs_conf.extensions
+    assert not hasattr(docs_conf, "thebe_config")
+
+    pyodide_cfg = docs_conf.pyodide_config
+    wheels = pyodide_cfg["wheels"]
+    assert len(wheels) == 3
+    assert any("imednet-" in w for w in wheels)
+    assert any("imednet_workflows-" in w for w in wheels)
+    assert any("imednet_plugins_sinks-" in w for w in wheels)
+    assert not any("airflow" in w or "tui" in w for w in wheels)
+    assert set(pyodide_cfg["pyodide_packages"]) >= {
+        "micropip",
+        "pydantic",
+        "cryptography",
+        "pandas",
+        "ssl",
+        "sqlite3",
+    }
+    assert set(pyodide_cfg["requirements"]) >= {
+        "httpx",
+        "tenacity",
+        "defusedxml",
+        "python-dotenv",
+        "filelock",
+    }
+    assert pyodide_cfg["env"]["IMEDNET_SIMULATION_MODE"] == "true"
+
+    # Verify button HTML rendering & escaping
+    btn_html = PyodideButtonNode(text="Activate Interactive Runtime").to_html()
+    assert 'type="button"' in btn_html
+    assert "thebe-launch-button" in btn_html
+    assert "pyodide-launch-button" in btn_html
+    assert "mybinder.org" not in btn_html
+
+    # Verify content_root computation across page depths
+    assert _compute_content_root("index") == "./"
+    assert _compute_content_root("tutorials/quick_start") == "../"
+    assert _compute_content_root("tutorials/examples/quick_start") == "../../"
+
+    # Verify page context hook injects #imednet-pyodide-config and backports content_root
+    class _DummyApp:
+        def __init__(self) -> None:
+            self.directives: list[str] = []
+            self.config = type("Cfg", (), {"pyodide_config": pyodide_cfg})()
+
+        def add_config_value(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def add_node(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def add_directive(self, name: str, *_args: object, **_kwargs: object) -> None:
+            self.directives.append(name)
+
+        def connect(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    dummy_app = _DummyApp()
+    meta = setup_pyodide_cells(dummy_app)
+    assert meta["parallel_read_safe"] is True
+    assert "pyodide-button" in dummy_app.directives
+    assert "thebe-button" in dummy_app.directives
+
+    ctx: dict[str, str] = {"metatags": ""}
+    _inject_pyodide_page_context(dummy_app, "tutorials/quick_start", "page.html", ctx, None)
+    assert ctx["content_root"] == "../"
+    assert '<script id="imednet-pyodide-config" type="application/json">' in ctx["metatags"]
 
 
 @pytest.mark.unit
@@ -586,3 +774,70 @@ def test_role_card_trigger_contracts_preserved() -> None:
         assert f'id="{target_id}"' in index_rst, (
             f"Target panel id='{target_id}' missing in docs/index.rst"
         )
+
+
+@pytest.mark.unit
+def test_verify_built_tutorial_html_invariants(tmp_path: Path) -> None:
+    """Verify static HTML gate catches legacy Thebe/Binder artifacts and validates wheel staging."""
+    from scripts.verify_pyodide_tutorials import verify_built_tutorial_html
+
+    wheels_dir = tmp_path / "_static" / "wheels"
+    wheels_dir.mkdir(parents=True)
+    wheel_names = [
+        "imednet-1.1.0-py3-none-any.whl",
+        "imednet_workflows-1.1.0-py3-none-any.whl",
+        "imednet_plugins_sinks-1.0.1-py3-none-any.whl",
+    ]
+    for whl_name in wheel_names:
+        (wheels_dir / whl_name).write_bytes(b"PK\x03\x04")
+
+    valid_cfg = {
+        "selector": "div.highlight-python",
+        "pyodide_packages": [
+            "micropip",
+            "pydantic",
+            "cryptography",
+            "pandas",
+            "ssl",
+            "sqlite3",
+        ],
+        "requirements": [
+            "httpx",
+            "tenacity",
+            "defusedxml",
+            "python-dotenv",
+            "filelock",
+        ],
+        "wheels": [f"_static/wheels/{name}" for name in wheel_names],
+        "env": {"IMEDNET_SIMULATION_MODE": "true"},
+    }
+
+    tutorials_dir = tmp_path / "tutorials"
+    tutorials_dir.mkdir(parents=True)
+    valid_html = (
+        '<!doctype html><html data-content_root="../"><head>'
+        f'<script id="imednet-pyodide-config" type="application/json">{json.dumps(valid_cfg)}</script>'
+        '</head><body><button type="button" class="thebe-launch-button">'
+        "Activate Interactive Runtime</button></body></html>"
+    )
+    (tutorials_dir / "quick_start.html").write_text(valid_html, encoding="utf-8")
+    (tutorials_dir / "async_quick_start.html").write_text(valid_html, encoding="utf-8")
+
+    assert verify_built_tutorial_html(tmp_path) == []
+
+    # Injecting legacy sphinx-thebe/Binder tokens or forbidden wheels must fail
+    bad_cfg = dict(valid_cfg)
+    bad_cfg["wheels"] = [*valid_cfg["wheels"], "_static/wheels/imednet_tui-1.0.0-py3-none-any.whl"]
+    bad_html = (
+        '<!doctype html><html data-content_root=""><head>'
+        '<script src="../_static/sphinx-thebe.js"></script>'
+        f'<script id="imednet-pyodide-config" type="application/json">{json.dumps(bad_cfg)}</script>'
+        '</head><body><button class="thebe-launch-button">Launching from mybinder.org</button>'
+        "</body></html>"
+    )
+    (tutorials_dir / "quick_start.html").write_text(bad_html, encoding="utf-8")
+    errs = verify_built_tutorial_html(tmp_path)
+    assert any("sphinx-thebe.js" in err for err in errs)
+    assert any("mybinder.org" in err for err in errs)
+    assert any("data-content_root" in err for err in errs)
+    assert any("imednet_tui" in err for err in errs)
