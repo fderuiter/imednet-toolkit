@@ -4,23 +4,27 @@ import pytest
 
 from imednet.endpoints import studies
 from imednet.errors import NotFoundError
+from imednet.errors.validation import ConfigurationError
 from imednet.models.studies import Study
 
 
 def test_list_builds_path_and_filters(
     monkeypatch, dummy_client, paginator_factory, patch_build_filter
 ):
-    """Test that list builds path and filters."""
+    """Test that list builds path and preserves documented filters including studyKey."""
     ep = studies.StudiesEndpoint(dummy_client)
     captured = paginator_factory(studies, [{"studyKey": "S1"}])
     filter_capture = patch_build_filter(studies)
 
-    result = ep.list(status="active")
+    result = ep.list(study_type="LIVE", studyKey="S1")
 
     assert captured["path"] == "/api/v1/edc/studies"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "active"}
+    assert filter_capture["filters"] == {"study_type": "LIVE", "studyKey": "S1"}
     assert isinstance(result[0], Study)
+
+    with pytest.raises(ConfigurationError, match="status"):
+        ep.list(status="active")
 
 
 def test_get_single_arg_success(dummy_client, response_factory):

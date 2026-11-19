@@ -274,6 +274,53 @@ class TestNeo4jExportSink:
         assert row2["record_id"] == 10
         assert "STUDY1" in custom_mapper._pipeline_cache
 
+    def test_write_batch_unscheduled_record_skips_visit_node(self, monkeypatch):
+        """Verify Neo4jExportSink preserves visit_id=None and guards Cypher Visit MERGE/MATCH on non-null visit_id."""
+        import json
+
+        import imednet_sinks.graph as graph_mod
+        from imednet_sinks.graph import Neo4jExportSink
+
+        from imednet.models.records import Record
+
+        neo4j, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
+
+        unscheduled = Record.from_json(
+            {
+                "studyKey": "STUDY1",
+                "recordId": 77,
+                "formId": 7,
+                "subjectKey": "SUBJ-UNSCHED",
+                "keywords": [
+                    {
+                        "keywordName": "AE",
+                        "keywordKey": "AE_KEY",
+                        "keywordId": 5,
+                        "dateAdded": "2026-05-13T14:06:50Z",
+                    }
+                ],
+                "recordData": {"aeterm": "Headache"},
+            }
+        )
+        assert unscheduled.visit_id is None
+        assert unscheduled.parent_record_id is None
+
+        with Neo4jExportSink(
+            Neo4jSinkConfig(study_key="STUDY1", uri="bolt://localhost:7687", auth=("neo4j", "pass"))
+        ) as sink:
+            count = sink.write_batch([unscheduled], batch_id="STUDY1/unsched/0")
+
+        assert count == 1
+        run_args = driver.session.return_value.__enter__.return_value.run.call_args
+        cypher = run_args.args[0]
+        assert "CASE WHEN row.visit_id IS NOT NULL" in cypher
+        assert "WHERE row.visit_id IS NOT NULL" in graph_mod._CREATE_RECORD_CYPHER
+        row = run_args.kwargs["rows"][0]
+        assert row["visit_id"] is None
+        assert row["parent_record_id"] is None
+        assert json.loads(row["keywords"])[0]["keywordId"] == 5
+
 
 # ---------------------------------------------------------------------------
 # MongoDbExportSink

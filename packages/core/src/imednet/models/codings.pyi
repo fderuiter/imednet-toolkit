@@ -18,7 +18,7 @@ class Coding(ImednetBaseModel):
     record_id: int | None
     variable: str | None
     value: str | None
-    coding_id: str | None
+    coding_id: int | None
     code: str | None
     coded_by: str | None
     dictionary_name: str | None

@@ -1,7 +1,6 @@
 """Endpoint for managing forms in a study."""
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
-from imednet.core.endpoint.strategies import PopStudyKeyStrategy
 from imednet.models.forms import Form
 
 
@@ -11,8 +10,28 @@ class FormsOperationDef:
     PATH = "forms"
     MODEL = Form
     _id_param = "formId"
-    STUDY_KEY_STRATEGY = PopStudyKeyStrategy()
     PAGE_SIZE = 500
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "formId",
+            "formKey",
+            "formName",
+            "formType",
+            "revision",
+            "embeddedLog",
+            "enforceOwnership",
+            "userAgreement",
+            "subjectRecordReport",
+            "unscheduledVisit",
+            "otherForms",
+            "eproForm",
+            "allowCopy",
+            "disabled",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+        }
+    )
 
 
 class FormsEndpoint(FormsOperationDef, EdcSyncListGetEndpoint[Form]):  # type: ignore[misc]

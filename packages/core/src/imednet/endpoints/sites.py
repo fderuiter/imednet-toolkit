@@ -1,7 +1,6 @@
 """Endpoint for managing sites (study locations) in a study."""
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
-from imednet.core.endpoint.strategies import PopStudyKeyStrategy
 from imednet.models.sites import Site
 
 
@@ -11,7 +10,16 @@ class SitesOperationDef:
     PATH = "sites"
     MODEL = Site
     _id_param = "siteId"
-    STUDY_KEY_STRATEGY = PopStudyKeyStrategy()
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "siteId",
+            "siteName",
+            "siteEnrollmentStatus",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+        }
+    )
 
 
 class SitesEndpoint(SitesOperationDef, EdcSyncListGetEndpoint[Site]):  # type: ignore[misc]

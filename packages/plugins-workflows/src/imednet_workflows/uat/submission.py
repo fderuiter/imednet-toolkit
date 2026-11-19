@@ -85,11 +85,55 @@ class BulkSubmissionError(Exception):
         self.failed_batches = failed_batches
 
 
-def _extract_subject_keys_set(subjects: Iterable[Any]) -> set[str]:
-    """Extract non-empty subject keys from an iterable of Subject models."""
+def _subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
+    """Return True if ``subj`` has a keyword matching ``keyword_tag``."""
+    if not keyword_tag:
+        return True
+    keywords = subj.get("keywords") if isinstance(subj, dict) else getattr(subj, "keywords", None)
+    if not keywords:
+        return False
+    for kw in keywords:
+        if isinstance(kw, str):
+            if kw == keyword_tag:
+                return True
+            continue
+        if isinstance(kw, dict):
+            candidates = (
+                kw.get("keyword_key"),
+                kw.get("keywordKey"),
+                kw.get("keyword_name"),
+                kw.get("keywordName"),
+            )
+        else:
+            candidates = (
+                getattr(kw, "keyword_key", None),
+                getattr(kw, "keywordKey", None),
+                getattr(kw, "keyword_name", None),
+                getattr(kw, "keywordName", None),
+            )
+        if keyword_tag in candidates:
+            return True
+    return False
+
+
+def _extract_subject_keys_set(subjects: Iterable[Any], keyword_tag: str) -> set[str]:
+    """Extract non-deleted subject keys matching ``keyword_tag`` from Subject items."""
     existing_keys: set[str] = set()
     for subj in subjects:
-        key = getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None)
+        deleted = (
+            subj.get("deleted", False)
+            if isinstance(subj, dict)
+            else getattr(subj, "deleted", False)
+        )
+        if deleted:
+            continue
+        if not _subject_has_keyword(subj, keyword_tag):
+            continue
+        key = (
+            (subj.get("subject_key") or subj.get("subjectKey"))
+            if isinstance(subj, dict)
+            else (getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None))
+        )
         if key:
             existing_keys.add(key)
     return existing_keys
@@ -413,16 +457,21 @@ class BulkRecordSubmissionWorkflow:
         )
         _reconcile_registration_poll_summary(batches_to_poll, summary)
 
+    @staticmethod
+    def _subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
+        """Return True if the subject has a keyword matching keyword_tag."""
+        return _subject_has_keyword(subj, keyword_tag)
+
     def _find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
-        """Query subjects filtered by keyword to find pre-existing UAT subjects."""
+        """Query non-deleted subjects and inspect Subject keywords locally for UAT tags."""
         sdk = cast("ImednetFacade", self.sdk)
-        return _extract_subject_keys_set(sdk.get_subjects(study_key, keyword=keyword_tag))
+        return _extract_subject_keys_set(sdk.get_subjects(study_key, deleted=False), keyword_tag)
 
     async def _async_find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
-        """Asynchronously query subjects filtered by keyword for pre-existing UAT subjects."""
+        """Asynchronously query non-deleted subjects and filter locally for UAT tags."""
         sdk = cast("AsyncImednetFacade", self.sdk)
-        subjects = await sdk.async_get_subjects(study_key, keyword=keyword_tag)
-        return _extract_subject_keys_set(subjects)
+        subjects = await sdk.async_get_subjects(study_key, deleted=False)
+        return _extract_subject_keys_set(subjects, keyword_tag)
 
 
 __all__ = [

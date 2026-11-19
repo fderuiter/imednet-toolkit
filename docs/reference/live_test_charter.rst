@@ -99,7 +99,7 @@ suite.
    * - ``intervals.list`` / ``intervals.get``
      - ✓
      -
-   * - ``visits.list`` / ``visits.get``
+   * - ``visits.list``
      - ✓
      -
    * - ``variables.list``

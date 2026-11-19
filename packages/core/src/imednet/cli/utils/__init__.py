@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .args import STUDY_KEY_ARG, parse_filter_args
+from .args import STUDY_KEY_ARG, add_no_interactive, parse_filter_args
 from .commands import register_list_command
 from .context import fetching_status, get_sdk
 from .output import (
@@ -20,11 +20,27 @@ from .output import (
     format_job_progress,
     print_error,
 )
+from .terminal import (
+    NO_COLOR_ENV,
+    NON_INTERACTIVE_ENV,
+    OUTPUT_FORMAT_ENV,
+    is_dumb_terminal,
+    is_json_output_mode,
+    is_non_interactive,
+    is_tty,
+    supports_ansi_color,
+    supports_fullscreen_ui,
+    supports_interactive_stdin,
+    supports_live_status,
+)
 
 if TYPE_CHECKING:
     from .grid import InteractiveDataGrid, is_interactive_terminal, run_interactive_grid
 
 __all__ = [
+    "NON_INTERACTIVE_ENV",
+    "NO_COLOR_ENV",
+    "OUTPUT_FORMAT_ENV",
     "STUDY_KEY_ARG",
     "_HC_STATUS_COLOR_MAP",
     "_STATUS_COLOR_MAP",
@@ -33,17 +49,26 @@ __all__ = [
     "Status",
     "_format_cell_value",
     "_truncate",
+    "add_no_interactive",
     "clear_line",
     "console",
     "display_list",
     "fetching_status",
     "format_job_progress",
     "get_sdk",
+    "is_dumb_terminal",
     "is_interactive_terminal",
+    "is_json_output_mode",
+    "is_non_interactive",
+    "is_tty",
     "parse_filter_args",
     "print_error",
     "register_list_command",
     "run_interactive_grid",
+    "supports_ansi_color",
+    "supports_fullscreen_ui",
+    "supports_interactive_stdin",
+    "supports_live_status",
 ]
 
 

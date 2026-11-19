@@ -1,7 +1,6 @@
 """Endpoint for managing intervals (visit definitions) in a study."""
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
-from imednet.core.endpoint.strategies import PopStudyKeyStrategy
 from imednet.models.intervals import Interval
 
 
@@ -11,8 +10,31 @@ class IntervalsOperationDef:
     PATH = "intervals"
     MODEL = Interval
     _id_param = "intervalId"
-    STUDY_KEY_STRATEGY = PopStudyKeyStrategy()
     PAGE_SIZE = 500
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "intervalId",
+            "intervalName",
+            "intervalDescription",
+            "intervalSequence",
+            "intervalGroupId",
+            "intervalGroupName",
+            "timeline",
+            "definedUsingInterval",
+            "windowCalculationForm",
+            "windowCalculationDate",
+            "actualDateForm",
+            "actualDate",
+            "dueDateWillBeIn",
+            "negativeSlack",
+            "positiveSlack",
+            "eproGracePeriod",
+            "disabled",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+        }
+    )
 
 
 class IntervalsEndpoint(IntervalsOperationDef, EdcSyncListGetEndpoint[Interval]):  # type: ignore[misc]

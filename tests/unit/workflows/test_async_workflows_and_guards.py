@@ -21,6 +21,7 @@ from imednet.models import (
     Record,
     RecordRevision,
     Subject,
+    SubjectKeyword,
     Variable,
     Visit,
 )
@@ -518,7 +519,21 @@ async def test_uat_submission_engine_and_orchestrator_async_paths() -> None:
     """Verify BulkRecordSubmissionWorkflow.async_submit, UATWorkflow failure capture, and UATExecutionEngine.async_run_verification."""
     # 1. BulkRecordSubmissionWorkflow Phase 1 + Phase 2 + existing subject skip
     sdk = MagicMock(spec=AsyncImednetSDK)
-    sdk.async_get_subjects = AsyncMock(return_value=[Subject(subject_key="UAT-EXIST")])
+    sdk.async_get_subjects = AsyncMock(
+        return_value=[
+            Subject(
+                subject_key="UAT-EXIST",
+                deleted=False,
+                keywords=[SubjectKeyword(keyword_key="UAT", keyword_name="UAT")],
+            ),
+            Subject(
+                subject_key="UAT-NEW",
+                deleted=True,
+                keywords=[SubjectKeyword(keyword_key="UAT", keyword_name="UAT")],
+            ),
+            Subject(subject_key="OTHER-SUBJ", deleted=False, keywords=[]),
+        ]
+    )
     sdk.async_create_record = AsyncMock(
         side_effect=[
             Job(batch_id="B-REG"),
@@ -556,6 +571,7 @@ async def test_uat_submission_engine_and_orchestrator_async_paths() -> None:
     sub_res: SubmissionResult = await submitter.async_submit(
         "ST", [reg_existing, reg_new, clin_set]
     )
+    sdk.async_get_subjects.assert_awaited_once_with("ST", deleted=False)
     assert [b.job.batch_id for b in sub_res.registration_batches] == ["B-REG"]
     assert [b.job.batch_id for b in sub_res.data_batches] == ["B-CLIN"]
 
