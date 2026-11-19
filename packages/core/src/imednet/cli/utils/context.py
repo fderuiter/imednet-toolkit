@@ -9,6 +9,7 @@ from contextlib import contextmanager
 
 from imednet.config import load_config
 from imednet.sdk import ImednetSDK
+from imednet.utils.validators import parse_bool
 
 from .output import Status, console, print_error
 
@@ -17,6 +18,7 @@ def get_sdk() -> ImednetSDK:
     """Initialize and return the SDK instance using :func:`load_config`."""
     if not (
         os.getenv("IMEDNET_OIDC_TOKEN", "").strip()
+        or parse_bool(os.getenv("IMEDNET_SIMULATION_MODE", "false"))
         or (
             os.getenv("IMEDNET_API_KEY", "").strip()
             and os.getenv("IMEDNET_SECURITY_KEY", "").strip()
@@ -38,11 +40,7 @@ def get_sdk() -> ImednetSDK:
         sys.exit(1)
 
     try:
-        return ImednetSDK(
-            api_key=config.api_key,
-            security_key=config.security_key,
-            base_url=config.base_url,
-        )
+        return ImednetSDK(config=config)
     except Exception as exc:  # pragma: no cover - defensive
         print_error(f"Error initializing SDK: {exc}")
         sys.exit(1)

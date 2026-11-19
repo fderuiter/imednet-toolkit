@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from imednet.core.context import reset_strict_mode_context, set_strict_mode_context
 from imednet.core.http.executor import AsyncRequestExecutor
 from imednet.core.retry import RetryConfig
 
@@ -34,11 +35,16 @@ class AsyncClient(HTTPClientBase[httpx.AsyncClient, AsyncRequestExecutor]):
 
     async def __aenter__(self) -> AsyncClient:
         """Enter the asynchronous context manager."""
+        self._strict_mode_tokens.append(set_strict_mode_context(self.strict_mode))
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
         """Exit the asynchronous context manager and close the client."""
-        await self.aclose()
+        try:
+            await self.aclose()
+        finally:
+            if self._strict_mode_tokens:
+                reset_strict_mode_context(self._strict_mode_tokens.pop())
 
     async def aclose(self) -> None:
         """Close the underlying async HTTP client."""

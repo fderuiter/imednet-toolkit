@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from contextlib import closing
 from pathlib import Path
 
 from ...datadict import (
@@ -106,8 +107,8 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
 def _handle_from_api(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-api` command."""
     try:
-        sdk = get_sdk()
-        dd = load_from_api(sdk, args.study_key, no_raw_xml=args.no_raw_xml)
+        with closing(get_sdk()) as sdk:
+            dd = load_from_api(sdk, args.study_key, no_raw_xml=args.no_raw_xml)
     except Exception as exc:
         print(f"Error loading from API: {exc}", file=sys.stderr)
         sys.exit(1)

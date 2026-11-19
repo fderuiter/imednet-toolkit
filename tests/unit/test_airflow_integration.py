@@ -431,8 +431,10 @@ def test_imednet_hook_describe_connection_redacts_credentials(monkeypatch):
         "base_url": "https://example.com",
         "api_key": "***",
         "security_key": "***",
+        "oidc_token": "***",
         "api_key_configured": True,
         "security_key_configured": True,
+        "oidc_token_configured": False,
     }
 
 
@@ -790,3 +792,200 @@ def test_reference_dag_safe_study_path_fragment(monkeypatch):
     assert fn("---") == "study"
     assert fn("") == "study"
     assert fn("__leading__trailing__") == "leading__trailing"
+
+
+def test_imednet_hook_oidc_config_redaction_and_single_load_config(monkeypatch):
+    """ImednetHook resolves full Config once (extras + env fallback) and masks oidc_token."""
+    import os
+    from unittest.mock import patch
+
+    import httpx
+
+    import imednet.config as config_mod
+    from imednet.auth.oidc import OIDCAuth
+
+    _setup_airflow(monkeypatch)
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_STRICT_MODE", raising=False)
+    monkeypatch.setenv("IMEDNET_TIMEOUT", "47.5")
+
+    conn = MagicMock()
+    conn.login = None
+    conn.password = None
+    conn.extra_dejson = {
+        "oidc_token": "airflow-oidc-jwt",  # pragma: allowlist secret
+        "base_url": "https://airflow.imednet.example",
+        "strict_mode": "true",
+        "simulation_mode": False,
+    }
+
+    import airflow.sdk.bases.hook as hooks_base
+
+    monkeypatch.setattr(
+        hooks_base.BaseHook,
+        "get_connection",
+        classmethod(lambda cls, cid: conn),
+    )
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+
+    call_count = 0
+    real_load = config_mod.load_config
+
+    def spy_load(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_load(*args, **kwargs)
+
+    hook = ImednetHook("imednet_oidc")
+    with (
+        patch("apache_airflow_providers_imednet.hooks.load_config", side_effect=spy_load),
+        patch("imednet.sdk.load_config", side_effect=spy_load),
+        patch("imednet.core.base_client.load_config", side_effect=spy_load),
+    ):
+        sdk = hook.get_conn()
+        try:
+            assert call_count == 1
+            assert isinstance(sdk.auth, OIDCAuth)
+            assert sdk.config.oidc_token == "airflow-oidc-jwt"
+            assert sdk.config.base_url == "https://airflow.imednet.example"
+            assert sdk.config.timeout == 47.5
+            assert sdk.config.strict_mode is True
+            assert sdk._client.timeout == httpx.Timeout(47.5)
+            assert "IMEDNET_STRICT_MODE" not in os.environ
+        finally:
+            sdk.close()
+
+    # Check explicit numeric/string timeout & simulation_mode in extras without API keys or OIDC
+    conn.extra_dejson = {"simulation_mode": "true", "timeout": "19.0", "strict_mode": 1}
+    sim_sdk = hook.get_conn()
+    try:
+        assert sim_sdk.config.simulation_mode is True
+        assert sim_sdk.config.timeout == 19.0
+        assert sim_sdk.config.strict_mode is True
+    finally:
+        sim_sdk.close()
+
+    # Check oidc_token redaction in _to_primitive and describe_connection
+    conn.extra_dejson = {"oidc_token": "raw-oidc-secret"}  # pragma: allowlist secret
+    desc = hook.describe_connection()
+    assert desc["oidc_token"] == "***"
+    assert desc["oidc_token_configured"] is True
+    assert "raw-oidc-secret" not in str(desc)
+
+    redacted = ImednetHook._to_primitive(
+        {
+            "oidc_token": "raw-oidc-secret",  # pragma: allowlist secret
+            "nested": {"OIDC_TOKEN": "raw-nested-oidc"},  # pragma: allowlist secret
+        }
+    )
+    assert redacted == {"oidc_token": "***", "nested": {"OIDC_TOKEN": "***"}}
+
+
+def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monkeypatch, tmp_path):
+    """Sensor poke, ExportOperator execute, and Hook list_studies_metadata close SDK transports."""
+    import httpx
+
+    from imednet.sdk import ImednetSDK
+
+    _setup_airflow(monkeypatch)
+    import apache_airflow_providers_imednet as airflow_mod
+    import apache_airflow_providers_imednet.operators.export as export_ops
+    from apache_airflow_providers_imednet._airflow_compat import AirflowException
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+
+    def _make_sdk(handler) -> ImednetSDK:
+        return ImednetSDK(
+            api_key="test_key",  # pragma: allowlist secret
+            security_key="test_sec",  # pragma: allowlist secret
+            retries=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+    # 1. ImednetJobSensor.poke: normal completion and error
+    sdk_poke_ok = _make_sdk(
+        lambda _req: httpx.Response(
+            200,
+            json={"batchId": "B1", "jobId": "J1", "state": "COMPLETED"},
+        )
+    )
+    sensor_ok = airflow_mod.ImednetJobSensor(task_id="s1", study_key="STUDY1", batch_id="B1")
+    monkeypatch.setattr(sensor_ok, "_get_sdk", lambda: sdk_poke_ok)
+    assert sensor_ok.poke({}) is True
+    assert sdk_poke_ok._client._client.is_closed
+
+    sdk_poke_err = _make_sdk(
+        lambda _req: httpx.Response(
+            200,
+            json={"batchId": "B2", "jobId": "J2", "state": "FAILED"},
+        )
+    )
+    sensor_err = airflow_mod.ImednetJobSensor(task_id="s2", study_key="STUDY1", batch_id="B2")
+    monkeypatch.setattr(sensor_err, "_get_sdk", lambda: sdk_poke_err)
+    with pytest.raises(AirflowException):
+        sensor_err.poke({})
+    assert sdk_poke_err._client._client.is_closed
+
+    # 2. ImednetExportOperator.execute: normal completion, error, and oidc_token secret guard
+    with pytest.raises(AirflowException, match="oidc_token"):
+        airflow_mod.ImednetExportOperator(
+            task_id="bad_oidc",
+            study_key="STUDY1",
+            export_kwargs={"oidc_token": "raw-jwt"},  # pragma: allowlist secret
+        )
+
+    sdk_exp_ok = _make_sdk(lambda _req: httpx.Response(200, json={"data": []}))
+    monkeypatch.setattr(export_ops.export, "export_to_csv", lambda *_a, **_k: None)
+    op_ok = airflow_mod.ImednetExportOperator(
+        task_id="exp_ok",
+        study_key="STUDY1",
+        destination="csv",
+        output_path=str(tmp_path / "out.csv"),
+    )
+    monkeypatch.setattr(op_ok, "_get_sdk", lambda: sdk_exp_ok)
+    assert op_ok.execute({}) == str(tmp_path / "out.csv")
+    assert sdk_exp_ok._client._client.is_closed
+
+    sdk_exp_err = _make_sdk(lambda _req: httpx.Response(200, json={"data": []}))
+
+    def _fail_export(*_a, **_k):
+        raise RuntimeError("export failed")
+
+    monkeypatch.setattr(export_ops.export, "export_to_csv", _fail_export)
+    op_err = airflow_mod.ImednetExportOperator(
+        task_id="exp_err",
+        study_key="STUDY1",
+        destination="csv",
+        output_path=str(tmp_path / "err.csv"),
+    )
+    monkeypatch.setattr(op_err, "_get_sdk", lambda: sdk_exp_err)
+    with pytest.raises(RuntimeError, match="export failed"):
+        op_err.execute({})
+    assert sdk_exp_err._client._client.is_closed
+
+    # 3. ImednetHook.list_studies_metadata: normal completion and error
+    sdk_list_ok = _make_sdk(
+        lambda _req: httpx.Response(
+            200,
+            json={
+                "data": [{"studyKey": "S-1", "studyName": "Study One"}],
+                "pagination": {"currentPage": 0, "size": 100, "totalPages": 1, "totalElements": 1},
+            },
+        )
+    )
+    hook = ImednetHook()
+    monkeypatch.setattr(hook, "get_sdk_client", lambda: sdk_list_ok)
+    studies_meta = hook.list_studies_metadata()
+    assert len(studies_meta) == 1
+    assert studies_meta[0]["studyKey"] == "S-1"
+    assert sdk_list_ok._client._client.is_closed
+
+    def _raise_connect_error(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("upstream down")
+
+    sdk_list_err = _make_sdk(_raise_connect_error)
+    monkeypatch.setattr(hook, "get_sdk_client", lambda: sdk_list_err)
+    with pytest.raises(Exception, match="Network request failed"):
+        hook.list_studies_metadata()
+    assert sdk_list_err._client._client.is_closed
