@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -189,3 +191,100 @@ async def test_orchestrator_client_mode_type_error_guards() -> None:
             await MultiStudyOrchestrator(_SyncStudiesStub()).async_resolve_active_studies()
 
     sync_sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_async_execute_pipeline_parent_cancellation_cancels_and_awaits_owned_tasks() -> None:
+    """Cancelling async_execute_pipeline cancels and awaits owned child tasks so gated writes never run."""
+    sdk = MagicMock(spec=AsyncImednetSDK)
+    sdk.studies = MagicMock()
+    sdk.studies.list = AsyncMock(
+        return_value=[
+            Study(study_key="ST-1"),
+            Study(study_key="ST-2"),
+            Study(study_key="ST-3"),
+        ]
+    )
+
+    orch = MultiStudyOrchestrator(sdk, max_workers=2)
+    started_studies: list[str] = []
+    workers_at_gate = asyncio.Event()
+    release_gate = asyncio.Event()
+    cleanup_completed: list[str] = []
+    writes_after_gate: list[str] = []
+
+    async def gated_worker(study_key: str, client: Any, log: Any) -> str:
+        started_studies.append(study_key)
+        if len(started_studies) == 2:
+            workers_at_gate.set()
+        try:
+            await release_gate.wait()
+            writes_after_gate.append(study_key)
+            return study_key
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            cleanup_completed.append(study_key)
+            raise
+
+    parent_task = asyncio.create_task(orch.async_execute_pipeline(gated_worker))
+    await asyncio.wait_for(workers_at_gate.wait(), timeout=1.0)
+
+    parent_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await parent_task
+
+    # Started child tasks must finish cancellation cleanup before parent propagates CancelledError
+    assert set(cleanup_completed) == {"ST-1", "ST-2"}
+    assert len(started_studies) == 2
+
+    # Releasing the gate after parent cancellation must never allow started or queued child writes
+    release_gate.set()
+    await asyncio.sleep(0.02)
+    assert writes_after_gate == []
+
+
+@pytest.mark.asyncio
+async def test_async_execute_pipeline_sync_blocking_callback_does_not_block_loop_or_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Synchronous blocking callbacks run off the event loop so a 20ms deadline is observed promptly."""
+    sdk = MagicMock(spec=AsyncImednetSDK)
+    sdk.studies = MagicMock()
+    sdk.studies.list = AsyncMock(return_value=[Study(study_key="ST-BLOCK")])
+
+    orch = MultiStudyOrchestrator(sdk, max_workers=2)
+    monkeypatch.setattr("imednet.orchestration.orchestrator._GLOBAL_TIMEOUT_SECONDS", 0.02)
+
+    callback_entered = threading.Event()
+    unblock_thread = threading.Event()
+
+    def blocking_sync_worker(study_key: str, client: Any, log: Any) -> str:
+        callback_entered.set()
+        unblock_thread.wait(timeout=0.15)
+        return "unexpected-success"
+
+    loop_ticks = 0
+    stop_ticker = False
+
+    async def loop_ticker() -> None:
+        nonlocal loop_ticks
+        while not stop_ticker:
+            await asyncio.sleep(0.004)
+            loop_ticks += 1
+
+    ticker_task = asyncio.create_task(loop_ticker())
+    start = time.monotonic()
+    try:
+        results = await orch.async_execute_pipeline(blocking_sync_worker)
+        elapsed = time.monotonic() - start
+    finally:
+        stop_ticker = True
+        unblock_thread.set()
+        await ticker_task
+
+    assert callback_entered.is_set()
+    assert results["ST-BLOCK"]["status"] == "FAILED"
+    assert "TimeoutError" in (results["ST-BLOCK"]["error"] or "")
+    assert results["ST-BLOCK"]["data"] is None
+    assert elapsed < 0.12
+    assert loop_ticks >= 2

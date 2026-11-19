@@ -41,6 +41,7 @@ import inspect
 import logging
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -341,6 +342,35 @@ def _run_with_context(
             limiter.release()
 
 
+def _is_async_callable(func: Any) -> bool:
+    """Return True when invoking ``func`` produces a coroutine without blocking."""
+    if inspect.iscoroutinefunction(func):
+        return True
+    if callable(func) and not isinstance(func, type):
+        return inspect.iscoroutinefunction(func.__call__)
+    return False
+
+
+async def _cancel_and_await_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
+    """Cancel unfinished owned tasks and await their completion before unwinding."""
+    task_list = list(tasks)
+    for task in task_list:
+        if not task.done():
+            task.cancel()
+    if not task_list:
+        return
+
+    gather_future = asyncio.gather(*task_list, return_exceptions=True)
+    cancelled_during_cleanup = False
+    while not gather_future.done():
+        try:
+            await asyncio.shield(gather_future)
+        except asyncio.CancelledError:
+            cancelled_during_cleanup = True
+    if cancelled_during_cleanup:
+        raise asyncio.CancelledError
+
+
 async def _async_run_with_context(
     study_key: str,
     sdk: Any,
@@ -349,16 +379,37 @@ async def _async_run_with_context(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     limiter: AsyncAdaptiveConcurrencyLimiter | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ) -> Any:
-    """Execute an async or sync worker callable inside a task-scoped ``study_context()``."""
+    """Execute an async or sync worker callable inside a task-scoped ``study_context()``.
+
+    Asynchronous coroutine callables run directly on the event loop, while
+    synchronous callables are offloaded to ``executor`` so blocking callbacks do
+    not stall the event loop or delay orchestration deadlines.
+    """
     if limiter is not None:
         await limiter.acquire()
     try:
-        with _study_context(study_key):
-            outcome = func(study_key, sdk, study_logger, *args, **kwargs)
-            if inspect.isawaitable(outcome):
+        if _is_async_callable(func):
+            with _study_context(study_key):
+                return await func(study_key, sdk, study_logger, *args, **kwargs)
+
+        loop = asyncio.get_running_loop()
+        outcome = await loop.run_in_executor(
+            executor,
+            _run_with_context,
+            study_key,
+            sdk,
+            study_logger,
+            func,
+            args,
+            kwargs,
+            None,
+        )
+        if inspect.isawaitable(outcome):
+            with _study_context(study_key):
                 return await outcome
-            return outcome
+        return outcome
     finally:
         if limiter is not None:
             await limiter.release()
@@ -575,8 +626,12 @@ class MultiStudyOrchestrator:
 
         Each study executes in its own :class:`asyncio.Task` with an isolated
         ``contextvars`` study context and bounded concurrency controlled by
-        ``max_workers``. Per-study exceptions are captured in the returned
-        :class:`OrchestratorResult` dictionary without cancelling sibling studies.
+        ``max_workers``. Synchronous callbacks are offloaded to a worker thread pool
+        so blocking work does not stall the event loop. Per-study exceptions are
+        captured in the returned :class:`OrchestratorResult` dictionary without
+        cancelling sibling studies, while cancelling ``async_execute_pipeline``
+        cancels and awaits all unfinished owned study tasks before propagating
+        cancellation.
         """
         _ensure_async_orchestrator_client(
             self._sdk,
@@ -601,64 +656,76 @@ class MultiStudyOrchestrator:
         limiter = AsyncAdaptiveConcurrencyLimiter(self._max_workers)
         task_to_study: dict[asyncio.Task[Any], str] = {}
         start_times: dict[asyncio.Task[Any], float] = {}
-
-        for study_key in target_studies:
-            study_logger = make_study_logger(study_key)
-            task: asyncio.Task[Any] = asyncio.create_task(
-                _async_run_with_context(
-                    study_key,
-                    self._sdk,
-                    study_logger,
-                    pipeline_func,
-                    args,
-                    kwargs,
-                    limiter,
-                )
-            )
-            task_to_study[task] = study_key
-            start_times[task] = time.monotonic()
-
-        pending: set[asyncio.Task[Any]] = set(task_to_study.keys())
-        deadline = time.monotonic() + _GLOBAL_TIMEOUT_SECONDS
+        executor: ThreadPoolExecutor | None = (
+            None
+            if _is_async_callable(pipeline_func)
+            else ThreadPoolExecutor(max_workers=self._max_workers)
+        )
 
         try:
-            while pending:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError
+            try:
+                for study_key in target_studies:
+                    study_logger = make_study_logger(study_key)
+                    task: asyncio.Task[Any] = asyncio.create_task(
+                        _async_run_with_context(
+                            study_key,
+                            self._sdk,
+                            study_logger,
+                            pipeline_func,
+                            args,
+                            kwargs,
+                            limiter,
+                            executor,
+                        )
+                    )
+                    task_to_study[task] = study_key
+                    start_times[task] = time.monotonic()
 
-                done, pending = await asyncio.wait(
-                    pending,
-                    timeout=remaining,
-                    return_when=asyncio.FIRST_COMPLETED,
+                pending: set[asyncio.Task[Any]] = set(task_to_study.keys())
+                deadline = time.monotonic() + _GLOBAL_TIMEOUT_SECONDS
+
+                while pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+
+                    done, pending = await asyncio.wait(
+                        pending,
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done and pending:
+                        raise TimeoutError
+
+                    for completed_task in done:
+                        study_key = task_to_study[completed_task]
+                        duration = time.monotonic() - start_times[completed_task]
+                        await limiter.record_latency(duration)
+                        try:
+                            data = completed_task.result()
+                            results[study_key] = _build_study_outcome_result(
+                                study_key, duration, data=data
+                            )
+                        except Exception as exc:
+                            results[study_key] = _build_study_outcome_result(
+                                study_key, duration, exc=exc
+                            )
+            except TimeoutError:
+                logger.error(
+                    "Global orchestration timeout (%.2fs) reached. Aborting pending studies.",
+                    _GLOBAL_TIMEOUT_SECONDS,
                 )
-                if not done and pending:
-                    raise TimeoutError
-
-                for completed_task in done:
-                    study_key = task_to_study[completed_task]
-                    duration = time.monotonic() - start_times[completed_task]
-                    await limiter.record_latency(duration)
-                    try:
-                        data = completed_task.result()
-                        results[study_key] = _build_study_outcome_result(
-                            study_key, duration, data=data
-                        )
-                    except Exception as exc:
-                        results[study_key] = _build_study_outcome_result(
-                            study_key, duration, exc=exc
-                        )
-        except TimeoutError:
-            logger.error(
-                "Global orchestration timeout (%.2fs) reached. Aborting pending studies.",
-                _GLOBAL_TIMEOUT_SECONDS,
-            )
-            for pending_task in pending:
-                study_key = task_to_study[pending_task]
-                duration = time.monotonic() - start_times[pending_task]
-                results[study_key] = _build_timeout_result(duration)
-                pending_task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+                for pending_task in pending:
+                    study_key = task_to_study[pending_task]
+                    duration = time.monotonic() - start_times[pending_task]
+                    results[study_key] = _build_timeout_result(duration)
+                await _cancel_and_await_tasks(pending)
+        except BaseException:
+            await _cancel_and_await_tasks(task_to_study.keys())
+            raise
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
         return results
 
