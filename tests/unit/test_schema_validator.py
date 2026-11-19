@@ -252,9 +252,15 @@ def test_type_validators_coverage() -> None:
     """Test that type validators coverage."""
     from imednet.validation.cache import (
         ValidationError,
+        _check_type,
+        _is_empty_value,
         _validate_bool,
+        _validate_calculation,
+        _validate_choice_membership,
         _validate_float,
         _validate_int,
+        _validate_multi_choice,
+        _validate_single_choice,
         _validate_text,
     )
 
@@ -266,6 +272,21 @@ def test_type_validators_coverage() -> None:
         _validate_bool(1)
     with pytest.raises(ValidationError, match="must be a string"):
         _validate_text(1)
+    with pytest.raises(ValidationError, match="string or integer code"):
+        _validate_single_choice(True)
+    with pytest.raises(ValidationError, match="collection of string or integer codes"):
+        _validate_multi_choice([1.5])
+    with pytest.raises(ValidationError, match="numeric or a string"):
+        _validate_calculation(True)
+
+    # Whitespace-only variable type is treated as unset
+    _check_type("   ", 123)
+    assert _is_empty_value(frozenset())
+    assert not _is_empty_value(frozenset({"A"}))
+
+    # Multi-choice membership supports bool and frozenset of integer codes
+    _validate_choice_membership("V", "F", "Checkbox", True, ["1", "2"])
+    _validate_choice_membership("V", "F", "Multi_Select", frozenset({1, 2}), ["1", "2"])
 
 
 def test_validate_batch_coverage() -> None:

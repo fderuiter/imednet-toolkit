@@ -21,7 +21,7 @@ from imednet.datadict import (
 from imednet.datadict import (
     Variable as DDVariable,
 )
-from imednet.errors import ValidationError
+from imednet.errors import UnknownVariableTypeError, ValidationError
 from imednet.models.variables import Variable as ApiVariable
 from imednet.spi.validation import ValidationSchemaProtocol as SpiValidationSchemaProtocol
 from imednet.validation import (
@@ -146,22 +146,40 @@ def test_validation_schema_protocol_conformance() -> None:
 @pytest.mark.parametrize(
     ("var_type", "valid_value", "invalid_value"),
     [
-        ("Coded", "M", 123),
+        ("Coded", "M", True),
+        ("Coded", 1, 1.5),
+        ("Coded", 0, ["M"]),
+        ("Coded", "Female", {"code": "F"}),
         ("Radio", "OPT_A", ["OPT_A"]),
-        ("Single Select", "CHOICE_1", 99),
+        ("Radio", 2, False),
+        ("Dropdown", "1", 2.5),
+        ("Dropdown", 3, {"opt": 3}),
+        ("Single Select", "CHOICE_1", True),
+        ("Single Select", 99, ["CHOICE_1"]),
+        ("Yes/No", "Yes", True),
+        ("Yes/No", 1, False),
+        ("Yes/No", 0, 1.5),
         ("Checkbox", "A`B", 123),
-        ("Checkbox", ["A", "B"], [1, 2]),
+        ("Checkbox", ["A", "B"], [1.5]),
+        ("Checkbox", [1, 2], [True]),
         ("Checkbox", True, {"a": 1}),
+        ("Checkbox", False, 3.14),
         ("Multi Select", "ASIAN`WHITE", 42),
-        ("Multi Select", ["ASIAN", "WHITE"], [1]),
-        ("Yes/No", "Yes", "Maybe"),
-        ("Yes/No", False, 5),
+        ("Multi Select", ["ASIAN", "WHITE"], [False]),
+        ("Multi Select", [1, 2], {"race": 1}),
+        ("Multi Select", True, 2.5),
+        ("Memo", "Detailed clinical observation.", 42),
         ("TextArea", "Clinical narrative text.", 100),
+        ("Notes", "Investigator follow-up note.", ["note"]),
         ("Date/Time Precision", "2026-03", 202603),
         ("Signature", "Dr. Smith", 1),
         ("File", "consent.pdf", ["consent.pdf"]),
+        ("Descriptive", "Section instructions", True),
         ("Calculation", 42.5, True),
         ("Calculation", "42.5", False),
+        ("Slider", 50, True),
+        ("Slider", 75.5, False),
+        ("Slider", "50", [50]),
     ],
 )
 def test_canonical_variable_type_validators(
@@ -494,3 +512,96 @@ def test_datadict_validation_explicit_or_group_rule() -> None:
         validate_record_data(dd, "VS", {"SYS_BP": 230, "DIA_BP": 35})
 
     validate_record_data(dd, "VS", {"SYS_BP": 120, "DIA_BP": 80})
+
+
+@pytest.mark.parametrize(
+    ("raw_type", "valid_value"),
+    [
+        ("  single   select  ", "OPT_1"),
+        ("SINGLE_SELECT", 1),
+        ("single-select", "OPT_2"),
+        ("SingleSelect", 2),
+        ("  multi\tselect\n", ["A", 1]),
+        ("MULTI_SELECT", True),
+        ("Date / Time   Precision", "2026-03"),
+        ("date_time_precision", "2026-03-15"),
+        ("Yes / No", 1),
+        ("YES_NO", "No"),
+        ("Text   Area", "free text"),
+        ("Drop   Down", "A"),
+        ("Check   Box", (1, "B")),
+        ("  MEMO  ", "clinical note"),
+        ("  NOTES ", "visit note"),
+        ("  SLIDER ", "75"),
+    ],
+)
+def test_type_matching_normalizes_casing_and_whitespace_and_rejects_unknown(
+    raw_type: str, valid_value: object
+) -> None:
+    """Type lookup normalizes casing/whitespace across multi-word types and rejects unknown names."""
+    cache = SchemaCache()
+    cache.populate(
+        [
+            ApiVariable(
+                variable_name="V_NORM",
+                variable_type=raw_type,
+                form_id=11,
+                form_key="F_NORM",
+            )
+        ]
+    )
+    validate_record_data(cache, "F_NORM", {"V_NORM": valid_value})
+    validate_record_data(cache, "F_NORM", {"V_NORM": None})
+    validate_record_data(cache, "F_NORM", {"V_NORM": ""})
+
+    bad_cache = SchemaCache()
+    bad_cache.populate(
+        [
+            ApiVariable(
+                variable_name="V_BAD",
+                variable_type="Unrecognized Clinical Widget",
+                form_id=12,
+                form_key="F_BAD",
+            )
+        ]
+    )
+    with pytest.raises(UnknownVariableTypeError, match="Unrecognized Clinical Widget"):
+        validate_record_data(bad_cache, "F_BAD", {"V_BAD": "val"})
+    with pytest.raises(UnknownVariableTypeError, match="Unrecognized Clinical Widget"):
+        validate_record_data(bad_cache, "F_BAD", {"V_BAD": ""})
+
+
+@pytest.mark.asyncio
+async def test_seeded_simulation_state_f_dm_validates_sync_and_async() -> None:
+    """Seeded SimulationState F_DM records validate cleanly in both sync and async clients."""
+    from imednet.simulation.state import SimulationState
+
+    state = SimulationState()
+    seeded_f_dm = [r for r in state.records if r.get("formKey") == "F_DM"]
+    assert seeded_f_dm
+
+    with ImednetSDK(
+        api_key="sim-key",  # pragma: allowlist secret
+        security_key="sim-sec",  # pragma: allowlist secret
+        simulation_mode=True,
+    ) as sync_sdk:
+        sync_validator = SchemaValidator(sync_sdk)
+        sync_validator.validate_batch("STUDY", seeded_f_dm)
+        score, reasons = calculate_readiness_score(
+            sync_validator.schema, "F_DM", seeded_f_dm[0]["recordData"]
+        )
+        assert score == pytest.approx(100.0)
+        assert reasons == []
+
+    async with AsyncImednetSDK(
+        api_key="sim-key",  # pragma: allowlist secret
+        security_key="sim-sec",  # pragma: allowlist secret
+        simulation_mode=True,
+    ) as async_sdk:
+        async_validator = AsyncSchemaValidator(async_sdk)
+        await async_validator.validate_batch("STUDY", seeded_f_dm)
+        async_score, async_reasons = calculate_readiness_score(
+            async_validator.schema, "F_DM", seeded_f_dm[0]["recordData"]
+        )
+        assert async_score == pytest.approx(100.0)
+        assert async_reasons == []

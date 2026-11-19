@@ -721,3 +721,104 @@ async def test_record_update_workflow_multi_study_colliding_forms_isolated() -> 
         await async_wf.async_create_or_update_records(
             "STUDY_B", [{"formId": 101, "data": {"age": 29}}]
         )
+
+
+@pytest.mark.asyncio
+async def test_all_record_update_workflow_methods_accept_clinical_variable_types() -> None:
+    """All 5 RecordUpdateWorkflow write methods (+ async variants) validate clinical Variable types."""
+    clinical_variables = [
+        Variable(variable_name="V_CODED", variable_type="Coded", form_id=301, form_key="F_CLIN"),
+        Variable(variable_name="V_RADIO", variable_type="Radio", form_id=301, form_key="F_CLIN"),
+        Variable(variable_name="V_DROP", variable_type="Dropdown", form_id=301, form_key="F_CLIN"),
+        Variable(
+            variable_name="V_SINGLE",
+            variable_type="Single Select",
+            form_id=301,
+            form_key="F_CLIN",
+        ),
+        Variable(variable_name="V_YESNO", variable_type="Yes/No", form_id=301, form_key="F_CLIN"),
+        Variable(
+            variable_name="V_MULTI",
+            variable_type="Multi Select",
+            form_id=301,
+            form_key="F_CLIN",
+        ),
+        Variable(variable_name="V_CHECK", variable_type="Checkbox", form_id=301, form_key="F_CLIN"),
+        Variable(variable_name="V_MEMO", variable_type="Memo", form_id=301, form_key="F_CLIN"),
+        Variable(
+            variable_name="V_DTP",
+            variable_type="Date/Time Precision",
+            form_id=301,
+            form_key="F_CLIN",
+        ),
+    ]
+    clinical_data = {
+        "V_CODED": 1,
+        "V_RADIO": "OPT_A",
+        "V_DROP": 2,
+        "V_SINGLE": "CHOICE_1",
+        "V_YESNO": 1,
+        "V_MULTI": ["A", 2],
+        "V_CHECK": True,
+        "V_MEMO": "Patient tolerated procedure without complications.",
+        "V_DTP": "2026-04",
+    }
+
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.get_variables.return_value = clinical_variables
+    sync_sdk.create_record.return_value = Job(jobId="10", batchId="B-CLIN", state="PROCESSING")
+
+    wf = RecordUpdateWorkflow(sync_sdk)
+    batch_summary = wf.create_or_update_records_batch(
+        "STUDY", [{"formKey": "F_CLIN", "data": clinical_data}]
+    )
+    assert batch_summary.batch_ids == ["B-CLIN"]
+
+    job_direct = wf.create_or_update_records(
+        "STUDY", [{"formKey": "F_CLIN", "data": clinical_data}]
+    )
+    assert job_direct.batch_id == "B-CLIN"
+
+    job_reg = wf.register_subject(
+        "STUDY",
+        form_identifier="F_CLIN",
+        site_identifier="SITE-01",
+        data=clinical_data,
+    )
+    assert job_reg.batch_id == "B-CLIN"
+
+    job_sched = wf.update_scheduled_record(
+        "STUDY",
+        form_identifier="F_CLIN",
+        subject_identifier="SUBJ-01",
+        interval_identifier="Baseline",
+        data=clinical_data,
+    )
+    assert job_sched.batch_id == "B-CLIN"
+
+    job_new = wf.create_new_record(
+        "STUDY",
+        form_identifier="F_CLIN",
+        subject_identifier="SUBJ-01",
+        data=clinical_data,
+    )
+    assert job_new.batch_id == "B-CLIN"
+    assert sync_sdk.create_record.call_count == 5
+
+    async_sdk = MagicMock()
+    async_sdk.async_get_variables = AsyncMock(return_value=clinical_variables)
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="11", batchId="B-ASYNC-CLIN", state="PROCESSING")
+    )
+    async_wf = RecordUpdateWorkflow(async_sdk)
+
+    async_summary = await async_wf.async_create_or_update_records_batch(
+        "STUDY", [{"formKey": "F_CLIN", "data": clinical_data}]
+    )
+    assert async_summary.batch_ids == ["B-ASYNC-CLIN"]
+
+    async_job = await async_wf.async_create_or_update_records(
+        "STUDY", [{"formKey": "F_CLIN", "data": clinical_data}]
+    )
+    assert async_job.batch_id == "B-ASYNC-CLIN"

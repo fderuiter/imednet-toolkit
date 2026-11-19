@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -475,103 +477,193 @@ def _validate_text(value: Any) -> None:
         raise ValidationError("Value must be a string")
 
 
-def _validate_yes_no(value: Any) -> None:
-    """Validate that the value is a boolean or a canonical Yes/No string."""
-    if isinstance(value, bool):
-        return
-    if isinstance(value, str) and value.strip().lower() in {
-        "yes",
-        "no",
-        "y",
-        "n",
-        "true",
-        "false",
-        "1",
-        "0",
-        "",
-    }:
-        return
-    raise ValidationError("Value must be boolean or a Yes/No string")
-
-
-def _validate_multi_select(value: Any) -> None:
-    """Validate that the value is a string or a collection of strings."""
+def _validate_single_choice(value: Any) -> None:
+    """Validate that a single-choice categorical value is text or a whole-number code."""
     if isinstance(value, str):
         return
-    if isinstance(value, (list, tuple, set)) and all(isinstance(item, str) for item in value):
+    if isinstance(value, int) and not isinstance(value, bool):
         return
-    raise ValidationError("Value must be a string or collection of strings")
+    raise ValidationError("Value must be a string or integer code")
 
 
-def _validate_checkbox(value: Any) -> None:
-    """Validate that the value is a string, boolean, or collection of strings."""
+def _is_choice_code(item: Any) -> bool:
+    """Return True if ``item`` is a string or non-boolean integer choice code."""
+    return isinstance(item, str) or (isinstance(item, int) and not isinstance(item, bool))
+
+
+def _validate_multi_choice(value: Any) -> None:
+    """Validate that a multi-choice value is text, boolean, or a collection of codes."""
     if isinstance(value, (bool, str)):
         return
-    if isinstance(value, (list, tuple, set)) and all(isinstance(item, str) for item in value):
+    if isinstance(value, (list, tuple, set, frozenset)) and all(
+        _is_choice_code(item) for item in value
+    ):
         return
-    raise ValidationError("Value must be a string, boolean, or collection of strings")
+    raise ValidationError(
+        "Value must be a string, boolean, or collection of string or integer codes"
+    )
 
 
 def _validate_calculation(value: Any) -> None:
-    """Validate that a calculated field value is numeric or string (excluding booleans)."""
+    """Validate that a computed or range value is non-boolean numeric or text."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValidationError("Value must be numeric or a string")
 
 
-_TYPE_VALIDATORS: dict[str, Callable[[Any], None]] = {
-    "int": _validate_int,
-    "integer": _validate_int,
-    "number": _validate_int,
-    "float": _validate_float,
-    "decimal": _validate_float,
-    "slider": _validate_float,
-    "bool": _validate_bool,
-    "boolean": _validate_bool,
-    "yes/no": _validate_yes_no,
-    "yesno": _validate_yes_no,
-    "text": _validate_text,
-    "string": _validate_text,
-    "textarea": _validate_text,
-    "date": _validate_text,
-    "datetime": _validate_text,
-    "date/time precision": _validate_text,
-    "time": _validate_text,
-    "coded": _validate_text,
-    "radio": _validate_text,
-    "single select": _validate_text,
-    "checkbox": _validate_checkbox,
-    "multi select": _validate_multi_select,
-    "signature": _validate_text,
-    "file": _validate_text,
-    "calculation": _validate_calculation,
-    "descriptive": _validate_text,
+_TYPE_SEP_RE = re.compile(r"[\s_-]+")
+_SLASH_SPACE_RE = re.compile(r"\s*/\s*")
+
+
+def _normalize_variable_type_key(var_type: str | None) -> str:
+    """Normalize casing, whitespace, and word separators for variable type lookup."""
+    if not var_type:
+        return ""
+    cleaned = _TYPE_SEP_RE.sub(" ", var_type.strip().lower())
+    if "/" in cleaned:
+        cleaned = _SLASH_SPACE_RE.sub("/", cleaned)
+    return cleaned
+
+
+# Canonical variable type taxonomy shared across SchemaCache and offline test helpers:
+# normalized_key -> (canonical_category, deterministic_sample_value, validator_fn)
+_CANONICAL_VARIABLE_TAXONOMY: dict[str, tuple[str, Any, Callable[[Any], None]]] = {
+    # Whole-number numeric types
+    "int": ("number", 1, _validate_int),
+    "integer": ("number", 1, _validate_int),
+    "number": ("number", 1, _validate_int),
+    # Decimal numeric types
+    "float": ("number", 1.0, _validate_float),
+    "decimal": ("number", 1.0, _validate_float),
+    "double": ("number", 1.0, _validate_float),
+    "numeric": ("number", 1.0, _validate_float),
+    # Primitive boolean types
+    "bool": ("boolean", True, _validate_bool),
+    "boolean": ("boolean", True, _validate_bool),
+    # Single-choice categorical types
+    "coded": ("coded", "1", _validate_single_choice),
+    "radio": ("radio", "1", _validate_single_choice),
+    "radiobutton": ("radio", "1", _validate_single_choice),
+    "radio button": ("radio", "1", _validate_single_choice),
+    "dropdown": ("dropdown", "1", _validate_single_choice),
+    "drop down": ("dropdown", "1", _validate_single_choice),
+    "dropdownlist": ("dropdown", "1", _validate_single_choice),
+    "dropdown list": ("dropdown", "1", _validate_single_choice),
+    "select": ("single select", "1", _validate_single_choice),
+    "single select": ("single select", "1", _validate_single_choice),
+    "singleselect": ("single select", "1", _validate_single_choice),
+    "sql": ("single select", "1", _validate_single_choice),
+    "yes/no": ("yes/no", "1", _validate_single_choice),
+    "yesno": ("yes/no", "1", _validate_single_choice),
+    "yes no": ("yes/no", "1", _validate_single_choice),
+    "true/false": ("yes/no", "1", _validate_single_choice),
+    "truefalse": ("yes/no", "1", _validate_single_choice),
+    "true false": ("yes/no", "1", _validate_single_choice),
+    # Multi-choice categorical types
+    "checkbox": ("checkbox", True, _validate_multi_choice),
+    "check box": ("checkbox", True, _validate_multi_choice),
+    "multi select": ("multi select", "1", _validate_multi_choice),
+    "multiselect": ("multi select", "1", _validate_multi_choice),
+    # Narrative & free-text types
+    "string": ("string", "example", _validate_text),
+    "text": ("string", "example", _validate_text),
+    "alphanumeric": ("string", "example", _validate_text),
+    "memo": ("memo", "example memo", _validate_text),
+    "textarea": ("memo", "example memo", _validate_text),
+    "text area": ("memo", "example memo", _validate_text),
+    "notes": ("memo", "example memo", _validate_text),
+    "note": ("memo", "example memo", _validate_text),
+    # Temporal & precision date/time types
+    "date": ("date", "2024-01-01", _validate_text),
+    "date ymd": ("date", "2024-01-01", _validate_text),
+    "date mdy": ("date", "2024-01-01", _validate_text),
+    "date dmy": ("date", "2024-01-01", _validate_text),
+    "datetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
+    "date/time": ("datetime", "2024-01-01T00:00:00", _validate_text),
+    "date time": ("datetime", "2024-01-01T00:00:00", _validate_text),
+    "durationdatetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
+    "intervaldatetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
+    "date/time precision": ("date/time precision", "2024-01-01", _validate_text),
+    "datetime precision": ("date/time precision", "2024-01-01", _validate_text),
+    "date time precision": ("date/time precision", "2024-01-01", _validate_text),
+    "time": ("time", "12:00:00", _validate_text),
+    # Computed & range types
+    "calculation": ("calculation", 1, _validate_calculation),
+    "calc": ("calculation", 1, _validate_calculation),
+    "calculated": ("calculation", 1, _validate_calculation),
+    "slider": ("slider", 1, _validate_calculation),
+    # Metadata reference types
+    "file": ("file", "example.pdf", _validate_text),
+    "upload": ("file", "example.pdf", _validate_text),
+    "fileupload": ("file", "example.pdf", _validate_text),
+    "file upload": ("file", "example.pdf", _validate_text),
+    "signature": ("signature", "signed", _validate_text),
+    "descriptive": ("descriptive", "example", _validate_text),
+    "label": ("descriptive", "example", _validate_text),
 }
 
-# Canonical Title/CamelCase aliases for O(1) lookup without .lower() allocation
-_CANONICAL_CASE_ALIASES: dict[str, Callable[[Any], None]] = {
-    "Coded": _validate_text,
-    "Radio": _validate_text,
-    "Single Select": _validate_text,
-    "Checkbox": _validate_checkbox,
-    "Multi Select": _validate_multi_select,
-    "Yes/No": _validate_yes_no,
-    "TextArea": _validate_text,
-    "DateTime": _validate_text,
-    "Date/Time Precision": _validate_text,
-    "Signature": _validate_text,
-    "File": _validate_text,
-    "Calculation": _validate_calculation,
-    "Slider": _validate_float,
-    "Descriptive": _validate_text,
-}
-_TYPE_VALIDATORS.update(_CANONICAL_CASE_ALIASES)
+for _base_key, _base_spec in list(_CANONICAL_VARIABLE_TAXONOMY.items()):
+    _CANONICAL_VARIABLE_TAXONOMY.setdefault(_base_key.replace(" ", ""), _base_spec)
+    _CANONICAL_VARIABLE_TAXONOMY.setdefault(_base_key.replace("/", " "), _base_spec)
+    _CANONICAL_VARIABLE_TAXONOMY.setdefault(_base_key.replace(" ", "").replace("/", ""), _base_spec)
 
-# Bolt Optimization: Expand validators to include common casings
-# to avoid .lower() allocation in hot paths.
-for _key, _validator in list(_TYPE_VALIDATORS.items()):
+_NORMALIZED_TYPE_VALIDATORS: dict[str, Callable[[Any], None]] = {
+    key: spec[2] for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items()
+}
+
+_MULTI_CHOICE_TYPE_KEYS: frozenset[str] = frozenset(
+    key for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items() if spec[2] is _validate_multi_choice
+)
+
+# Pre-index common casings and word-separator forms to avoid per-Record string
+# allocations during hot-path batch validation.
+_TYPE_VALIDATORS: dict[str, Callable[[Any], None]] = dict(_NORMALIZED_TYPE_VALIDATORS)
+for _key, _validator in list(_NORMALIZED_TYPE_VALIDATORS.items()):
     _TYPE_VALIDATORS[_key.capitalize()] = _validator
+    _TYPE_VALIDATORS[_key.title()] = _validator
     _TYPE_VALIDATORS[_key.upper()] = _validator
-_TYPE_VALIDATORS.update(_CANONICAL_CASE_ALIASES)
+    if " " in _key:
+        _underscore_key = _key.replace(" ", "_")
+        _hyphen_key = _key.replace(" ", "-")
+        _pascal_key = "".join(part.capitalize() for part in _key.split(" "))
+        _TYPE_VALIDATORS[_underscore_key] = _validator
+        _TYPE_VALIDATORS[_underscore_key.upper()] = _validator
+        _TYPE_VALIDATORS[_hyphen_key] = _validator
+        _TYPE_VALIDATORS[_hyphen_key.upper()] = _validator
+        _TYPE_VALIDATORS[_pascal_key] = _validator
+    if "/" in _key:
+        _slash_title = "/".join(
+            " ".join(word.capitalize() for word in seg.split(" ")) for seg in _key.split("/")
+        )
+        _TYPE_VALIDATORS[_slash_title] = _validator
+
+_TYPE_VALIDATORS.update(
+    {
+        "TextArea": _validate_text,
+        "DateTime": _validate_text,
+        "DateTimePrecision": _validate_text,
+        "DurationDateTime": _validate_text,
+        "IntervalDateTime": _validate_text,
+        "RadioButton": _validate_single_choice,
+        "DropdownList": _validate_single_choice,
+        "SingleSelect": _validate_single_choice,
+        "MultiSelect": _validate_multi_choice,
+        "YesNo": _validate_single_choice,
+        "TrueFalse": _validate_single_choice,
+        "FileUpload": _validate_text,
+    }
+)
+
+
+@lru_cache(maxsize=256)
+def _resolve_type_validator(var_type: str) -> Callable[[Any], None] | None:
+    """Resolve and cache a validator for non-standard casing or whitespace."""
+    norm = _normalize_variable_type_key(var_type)
+    if not norm:
+        return None
+    validator = _NORMALIZED_TYPE_VALIDATORS.get(norm)
+    if validator is None:
+        raise UnknownVariableTypeError(var_type)
+    return validator
 
 
 def _check_type(var_type: str | None, value: Any) -> None:
@@ -588,14 +680,14 @@ def _check_type(var_type: str | None, value: Any) -> None:
     if value is None or not var_type:
         return
 
-    # Bolt Optimization: Try direct lookup first to avoid string manipulation
-    try:
-        validator = _TYPE_VALIDATORS[var_type]
-    except KeyError:
-        try:
-            validator = _TYPE_VALIDATORS[var_type.lower()]
-        except KeyError:
-            raise UnknownVariableTypeError(var_type) from None
+    validator = _TYPE_VALIDATORS.get(var_type)
+    if validator is None:
+        validator = _resolve_type_validator(var_type)
+        if validator is None:
+            return
+
+    if value == "":
+        return
 
     validator(value)
 
@@ -605,7 +697,7 @@ def _is_empty_value(value: Any) -> bool:
         return True
     if isinstance(value, str):
         return value == ""
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, (list, tuple, set, frozenset)):
         return len(value) == 0
     return False
 
@@ -618,10 +710,12 @@ def _validate_choice_membership(
     choices: list[str],
 ) -> None:
     allowed = set(choices)
-    vtype_norm = (var_type or "").strip().lower()
+    vtype_norm = _normalize_variable_type_key(var_type)
 
-    if vtype_norm in {"checkbox", "multi select"}:
-        if isinstance(value, (list, tuple, set)):
+    if vtype_norm in _MULTI_CHOICE_TYPE_KEYS:
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
             tokens = [str(item) for item in value]
         elif isinstance(value, str):
             if value in allowed:
