@@ -7,7 +7,13 @@ It provides a simple, robust interface for registering one or more subjects.
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
-from imednet.spi.models import Job, RegisterSubjectRequest
+from imednet.spi.models import (
+    Job,
+    RegisterSubjectRequest,
+    SubjectStatus,
+    is_site_enrollment_eligible,
+    normalize_subject_status,
+)
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
     BatchCoordinator,
@@ -120,7 +126,9 @@ class RegisterSubjectsWorkflow:
         schema: ValidationSchemaProtocol | None = None,
     ) -> BatchSubmissionSummary:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
-        sites = {s.site_name for s in self._sdk.get_sites(study_key=study_key)}
+        sites_by_name = {
+            s.site_name: s for s in self._sdk.get_sites(study_key=study_key) if s.site_name
+        }
         normalized_pairs: list[
             tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]
         ] = []
@@ -134,8 +142,16 @@ class RegisterSubjectsWorkflow:
             normalized_pairs.append((raw_subj, subj))
             if not subj.site_name:
                 errors.append(f"Index {idx}: siteName is required")
-            elif subj.site_name not in sites:
+            elif subj.site_name not in sites_by_name:
                 errors.append(f"Index {idx}: site '{subj.site_name}' not found")
+            else:
+                site_obj = sites_by_name[subj.site_name]
+                site_status = getattr(site_obj, "site_enrollment_status", None)
+                if not is_site_enrollment_eligible(site_status):
+                    errors.append(
+                        f"Index {idx}: site '{subj.site_name}' is not eligible for enrollment "
+                        f"(status: {site_status!s})"
+                    )
 
         if errors:
             raise ValueError("; ".join(errors))
@@ -147,7 +163,12 @@ class RegisterSubjectsWorkflow:
         enrolled_keys: set[str] = set()
         if should_filter:
             for existing in self._sdk.get_subjects(study_key=study_key):
-                if getattr(existing, "deleted", False):
+                if getattr(existing, "deleted", None) is True:
+                    continue
+                raw_status = getattr(existing, "subject_status", None)
+                if isinstance(raw_status, (SubjectStatus, str)) and (
+                    normalize_subject_status(raw_status) == SubjectStatus.DELETED
+                ):
                     continue
                 for attr in ("subject_key", "subjectKey", "subject_oid", "subjectOid"):
                     val = getattr(existing, attr, None)

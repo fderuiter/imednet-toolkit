@@ -663,3 +663,61 @@ def test_simulation_mode_f_dm_coded_submission_via_record_update_workflow() -> N
             )
     finally:
         sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_multi_study_colliding_forms_isolated() -> None:
+    """RecordUpdateWorkflow isolates STUDY_A and STUDY_B schemas sharing formKey and formId."""
+    var_a = Variable(
+        studyKey="STUDY_A",
+        variableName="age",
+        variableType="integer",
+        formId=101,
+        formKey="DM",
+    )
+    var_b = Variable(
+        studyKey="STUDY_B",
+        variableName="country",
+        variableType="text",
+        formId=101,
+        formKey="DM",
+    )
+
+    sdk = MagicMock()
+    del sdk.async_create_record
+    sdk.get_variables.side_effect = lambda study_key: [var_a] if study_key == "STUDY_A" else [var_b]
+    sdk.create_record.return_value = Job(jobId="1", batchId="B1", state="PROCESSING")
+
+    wf = RecordUpdateWorkflow(sdk)
+    wf.create_or_update_records("STUDY_A", [{"formKey": "DM", "data": {"age": 29}}])
+    wf.create_or_update_records("STUDY_B", [{"formKey": "DM", "data": {"country": "DE"}}])
+    wf.create_or_update_records("STUDY_A", [{"formId": 101, "data": {"age": 31}}])
+    wf.create_or_update_records("STUDY_B", [{"formId": 101, "data": {"country": "FR"}}])
+
+    with pytest.raises(ValidationError, match="Unknown variables for form DM: country"):
+        wf.create_or_update_records("STUDY_A", [{"formKey": "DM", "data": {"country": "DE"}}])
+    with pytest.raises(ValidationError, match="Unknown variables for form DM: age"):
+        wf.create_or_update_records("STUDY_B", [{"formKey": "DM", "data": {"age": 29}}])
+
+    # Async workflow multi-study check
+    async_sdk = MagicMock()
+    async_sdk._async_client = True
+
+    async def _async_get_vars(study_key: str):
+        return [var_a] if study_key == "STUDY_A" else [var_b]
+
+    async_sdk.async_get_variables = AsyncMock(side_effect=_async_get_vars)
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="2", batchId="B2", state="PROCESSING")
+    )
+    async_wf = RecordUpdateWorkflow(async_sdk)
+    await async_wf.async_create_or_update_records(
+        "STUDY_A", [{"formKey": "DM", "data": {"age": 29}}]
+    )
+    await async_wf.async_create_or_update_records(
+        "STUDY_B", [{"formKey": "DM", "data": {"country": "CA"}}]
+    )
+    with pytest.raises(ValidationError, match="Unknown variables for form DM: age"):
+        await async_wf.async_create_or_update_records(
+            "STUDY_B", [{"formId": 101, "data": {"age": 29}}]
+        )

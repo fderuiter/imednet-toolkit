@@ -5,6 +5,7 @@ Encapsulates validation, header construction, and execution logic for record cre
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -19,6 +20,13 @@ from imednet.validation.cache import (
 )
 
 T = TypeVar("T")
+_STUDY_PATH_RE = re.compile(r"/studies/([^/]+)/records(?:/|$)")
+
+
+def _infer_study_key_from_path(path: str) -> str | None:
+    """Extract the study key segment from a ``/studies/<study_key>/records`` path."""
+    match = _STUDY_PATH_RE.search(path)
+    return match.group(1) if match else None
 
 
 class RecordCreateOperation(Operation[T]):
@@ -35,6 +43,7 @@ class RecordCreateOperation(Operation[T]):
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         *,
+        study_key: str | None = None,
         skip_validation: bool = False,
     ) -> None:
         """Initialize the record creation operation.
@@ -44,6 +53,7 @@ class RecordCreateOperation(Operation[T]):
             records_data: List of record data objects to create.
             email_notify: Email notification setting.
             schema: Optional validation schema (BaseSchemaCache or DataDictionary).
+            study_key: Optional study key used for study-partitioned schema lookup.
             skip_validation: If True, skip per-record schema validation because
                 the caller has already validated the batch.
 
@@ -55,6 +65,7 @@ class RecordCreateOperation(Operation[T]):
         self.records_data = records_data
         self.email_notify = email_notify
         self.schema = schema
+        self.study_key = study_key if study_key is not None else _infer_study_key_from_path(path)
         self.skip_validation = skip_validation
 
         self._validate()
@@ -68,13 +79,13 @@ class RecordCreateOperation(Operation[T]):
         if callable(is_rec_prevalidated):
             for rec in self.records_data:
                 if is_rec_prevalidated(rec) is not True:
-                    validate_record_entry(self.schema, rec)
+                    validate_record_entry(self.schema, rec, study_key=self.study_key)
             return
         if getattr(self.schema, "is_prevalidated", False) is True:
             return
         for rec in self.records_data:
             if not is_schema_record_prevalidated(self.schema, rec):
-                validate_record_entry(self.schema, rec)
+                validate_record_entry(self.schema, rec, study_key=self.study_key)
 
     def _build_headers(self) -> dict[str, str]:
         """Build headers for record creation request.

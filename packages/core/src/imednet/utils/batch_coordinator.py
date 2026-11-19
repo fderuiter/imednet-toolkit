@@ -95,19 +95,21 @@ class BatchSubmissionSummary:
 def _validate_records_with_schema(
     schema: ValidationSchemaProtocol,
     records_data: list[dict[str, Any]],
+    *,
+    study_key: str | None = None,
 ) -> None:
     """Validate records not already marked prevalidated in the active task scope."""
     is_rec_prevalidated = getattr(schema, "is_record_prevalidated", None)
     if callable(is_rec_prevalidated):
         for rec in records_data:
             if is_rec_prevalidated(rec) is not True:
-                validate_record_entry(schema, rec)
+                validate_record_entry(schema, rec, study_key=study_key)
         return
     if getattr(schema, "is_prevalidated", False) is True:
         return
     for rec in records_data:
         if not is_schema_record_prevalidated(schema, rec):
-            validate_record_entry(schema, rec)
+            validate_record_entry(schema, rec, study_key=study_key)
 
 
 def _raise_from_poll_summary(poll_summary: JobPollSummary) -> None:
@@ -152,7 +154,7 @@ class BatchCoordinator:
             if validate_batch_fn is not None:
                 validate_batch_fn(study_key, records_data)
             elif schema is not None:
-                _validate_records_with_schema(schema, records_data)
+                _validate_records_with_schema(schema, records_data, study_key=study_key)
 
         chunks = chunk_records(records_data, self.chunk_size)
         if not chunks:
@@ -258,7 +260,7 @@ class AsyncBatchCoordinator:
             if validate_batch_fn is not None:
                 await validate_batch_fn(study_key, records_data)
             elif schema is not None:
-                _validate_records_with_schema(schema, records_data)
+                _validate_records_with_schema(schema, records_data, study_key=study_key)
 
         chunks = chunk_records(records_data, self.chunk_size)
         if not chunks:

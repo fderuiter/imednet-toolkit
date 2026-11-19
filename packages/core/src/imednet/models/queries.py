@@ -118,13 +118,14 @@ def calculate_legacy_status(query_comments: list[Any] | None) -> QueryStatus:
         is_closed = getattr(latest, "closed", None)
         ann_status = getattr(latest, "annotation_status", None)
 
+    ann_str = str(ann_status).strip().lower() if ann_status else ""
+    if "cancel" in ann_str:
+        return QueryStatus.CANCELLED
+
     if is_closed is True:
         return QueryStatus.CLOSED
 
-    if ann_status:
-        ann_str = str(ann_status).strip().lower()
-        if "cancel" in ann_str:
-            return QueryStatus.CANCELLED
+    if ann_str:
         if "answer" in ann_str:
             return QueryStatus.ANSWERED
         if "close" in ann_str:

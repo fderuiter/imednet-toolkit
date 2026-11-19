@@ -77,3 +77,89 @@ def test_register_subjects_missing_site_name() -> None:
 
     with pytest.raises(ValueError, match="siteName is required"):
         wf.register_subjects("STUDY", [req])
+
+
+def test_register_subjects_accepts_enrollment_open_and_rejects_closed_site() -> None:
+    """RegisterSubjectsWorkflow accepts 'Enrollment Open' sites and rejects closed sites."""
+    sdk = MagicMock()
+    job = Job(jobId="1", batchId="B1", state="PROCESSING")
+    sdk.create_record.return_value = job
+    sdk.get_sites.return_value = [
+        Site(
+            studyKey="STUDY", siteId=1, siteName="OPEN_SITE", siteEnrollmentStatus="Enrollment Open"
+        ),
+        Site(
+            studyKey="STUDY",
+            siteId=2,
+            siteName="CLOSED_SITE",
+            siteEnrollmentStatus="Enrollment Closed",
+        ),
+    ]
+    sdk.subjects.get.return_value = []
+    wf = RegisterSubjectsWorkflow(sdk)
+
+    result = wf.register_subjects(
+        "STUDY", [RegisterSubjectRequest(formKey="F", siteName="OPEN_SITE", subjectKey="SUBJ-1")]
+    )
+    assert result == job
+
+    with pytest.raises(ValueError, match="is not eligible for enrollment"):
+        wf.register_subjects(
+            "STUDY",
+            [RegisterSubjectRequest(formKey="F", siteName="CLOSED_SITE", subjectKey="SUBJ-2")],
+        )
+
+
+def test_register_subjects_skips_soft_deleted_existing_subject_and_filters_active_duplicate() -> (
+    None
+):
+    """Soft-deleted existing subjects do not block re-registration; active duplicates are skipped."""
+    from imednet.models.subjects import Subject
+    from imednet_workflows.uat.inspector import StudySnapshot
+
+    sdk = MagicMock()
+    job = Job(jobId="1", batchId="B2", state="PROCESSING")
+    sdk.create_record.return_value = job
+    open_site = Site(
+        studyKey="STUDY", siteId=1, siteName="OPEN_SITE", siteEnrollmentStatus="Enrollment Open"
+    )
+    closed_site = Site(
+        studyKey="STUDY", siteId=2, siteName="CLOSED_SITE", siteEnrollmentStatus="Enrollment Closed"
+    )
+    sdk.get_sites.return_value = [open_site, closed_site]
+
+    deleted_subj = Subject(
+        studyKey="STUDY", subjectKey="SUBJ-1", deleted=True, subjectStatus="Enrolled"
+    )
+    sdk.get_subjects.return_value = [deleted_subj]
+
+    wf = RegisterSubjectsWorkflow(sdk)
+    summary_deleted = wf.register_subjects_batch(
+        "STUDY",
+        [{"formKey": "F", "siteName": "OPEN_SITE", "subjectKey": "SUBJ-1"}],
+        skip_existing=True,
+    )
+    assert summary_deleted.skipped_count == 0
+    assert sdk.create_record.call_count == 1
+
+    active_subj = Subject(
+        studyKey="STUDY", subjectKey="SUBJ-1", deleted=False, subjectStatus="Enrolled"
+    )
+    sdk.get_subjects.return_value = [active_subj]
+    summary_active = wf.register_subjects_batch(
+        "STUDY",
+        [{"formKey": "F", "siteName": "OPEN_SITE", "subjectKey": "SUBJ-1"}],
+        skip_existing=True,
+    )
+    assert summary_active.skipped_count == 1
+    assert sdk.create_record.call_count == 1
+
+    snapshot = StudySnapshot(
+        study_key="STUDY",
+        sites=[open_site, closed_site],
+        forms=[],
+        intervals=[],
+        variables=[],
+        subjects=[deleted_subj, active_subj],
+    )
+    assert snapshot.active_sites() == [open_site]
