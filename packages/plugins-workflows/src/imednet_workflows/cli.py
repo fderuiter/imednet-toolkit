@@ -325,6 +325,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             from .wizard import ensure_interactive_stdin
 
             ensure_interactive_stdin(force_non_interactive=no_interactive)
+        else:
+            if not args.study_key:
+                extract_parser.error("the following arguments are required: study_key")
+            from imednet.spi.models import Record, Subject, Visit
+
+            parse_filter_args(args.record_filter, model=Record)
+            parse_filter_args(args.subject_filter, model=Subject)
+            parse_filter_args(args.visit_filter, model=Visit)
         extract_records(
             study_key=args.study_key,
             record_filter=args.record_filter,

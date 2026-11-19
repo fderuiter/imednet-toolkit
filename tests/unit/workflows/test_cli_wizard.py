@@ -967,3 +967,50 @@ def test_wizard_filter_validation_preserves_zero_padded_and_superscripts_and_mat
     with patch("sys.stdin", _TTYStringIO("value=²\n\n")):
         sup_collected = prompt_filters("coding filter", "code=0042", model=Coding)
     assert sup_collected == ["value=²"]
+
+
+@pytest.mark.parametrize(
+    ("extra_flags", "expected_err"),
+    [
+        (["--visit-filter", "visit_id=1"], "Valid attributes:"),
+        (["--record-filter", "study_key=STUDY"], "'study_key' and 'studyKey' cannot be used"),
+        (["--subject-filter", "keywords=vip"], "Valid attributes:"),
+        (
+            ["--record-filter", "form_key=~DEMO"],
+            "Allowed operators: ['!=', '<', '<=', '==', '>', '>=']",
+        ),
+        (
+            ["--record-filter", "record_id>=1", "--record-filter", "recordId<=10"],
+            "Duplicate filter attribute 'recordId'",
+        ),
+    ],
+)
+def test_extract_records_headless_preflight_enforces_allowlists_before_sdk(
+    extra_flags: list[str],
+    expected_err: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 1 & 2: workflows extract-records validates endpoint allowlists before SDK instantiation."""
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    mock_get_sdk = MagicMock(side_effect=AssertionError("get_sdk must not be called in preflight"))
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", mock_get_sdk)
+
+    result = run_cli_command(cli_app, ["workflows", "extract-records", "STUDY", *extra_flags])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert expected_err in result.stderr
+    mock_get_sdk.assert_not_called()
+
+
+def test_wizard_validate_filter_syntax_enforces_endpoint_allowlists() -> None:
+    """Interactive wizard validate_filter_syntax rejects non-allowlisted fields and study_key."""
+    ok_visit, _, _, visit_err = validate_filter_syntax("visit_id=1", model=Visit)
+    assert ok_visit is False
+    assert visit_err is not None
+    assert "Valid attributes:" in visit_err
+
+    ok_study, _, _, study_err = validate_filter_syntax("study_key=STUDY", model=Record)
+    assert ok_study is False
+    assert study_err is not None
+    assert "'study_key' and 'studyKey' cannot be used in --filter" in study_err

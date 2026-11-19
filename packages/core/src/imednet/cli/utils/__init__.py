@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .args import STUDY_KEY_ARG, add_no_interactive, parse_filter_args, parse_record_data_filter
+from .args import (
+    STUDY_KEY_ARG,
+    add_no_interactive,
+    parse_filter_args,
+    parse_record_data_filter,
+    resolve_endpoint_filter_attributes,
+)
 from .commands import register_list_command
 from .context import fetching_status, get_sdk
 from .output import (
@@ -65,6 +71,7 @@ __all__ = [
     "parse_record_data_filter",
     "print_error",
     "register_list_command",
+    "resolve_endpoint_filter_attributes",
     "run_interactive_grid",
     "supports_ansi_color",
     "supports_fullscreen_ui",
