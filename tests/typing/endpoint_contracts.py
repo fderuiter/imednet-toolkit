@@ -19,6 +19,8 @@ from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+from imednet.utils.batch_coordinator import BatchSubmissionSummary
+from imednet.utils.job_poller import JobPollSummary
 
 
 def sync_contract(sdk: ImednetSDK) -> None:
@@ -33,12 +35,14 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.intervals.get('S', 1), Interval)
     assert_type(sdk.jobs.get('S', 'B'), JobStatus)
     assert_type(sdk.jobs.poll('S', 'B'), JobStatus)
+    assert_type(sdk.jobs.poll_many('S', ['B1', 'B2']), JobPollSummary)
     assert_type(sdk.queries.list('S'), Iterator[Query])
     assert_type(sdk.record_revisions.list('S'), Iterator[RecordRevision])
     assert_type(sdk.record_revisions.get('S', 1), RecordRevision)
     assert_type(sdk.records.list('S'), Iterator[Record])
     assert_type(sdk.records.get('S', 1), Record)
     assert_type(sdk.records.create('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(sdk.records.create_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(sdk.sites.list('S'), Iterator[Site])
     assert_type(sdk.sites.get('S', 1), Site)
     assert_type(sdk.studies.list(), Iterator[Study])
@@ -78,7 +82,9 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.get_visits('S'), list[Visit])
     assert_type(sdk.get_job('S', 'B'), JobStatus)
     assert_type(sdk.create_record('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(sdk.create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(sdk.poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
+    assert_type(sdk.poll_jobs('S', ['B1', 'B2']), JobPollSummary)
 
     # JobStatus and Enum literal typing
     job_status = sdk.get_job('S', 'B')
@@ -104,12 +110,14 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.intervals.get('S', 1), Interval)
     assert_type(await sdk.jobs.get('S', 'B'), JobStatus)
     assert_type(await sdk.jobs.poll('S', 'B'), JobStatus)
+    assert_type(await sdk.jobs.poll_many('S', ['B1', 'B2']), JobPollSummary)
     assert_type(sdk.queries.list('S'), AsyncIterator[Query])
     assert_type(sdk.record_revisions.list('S'), AsyncIterator[RecordRevision])
     assert_type(await sdk.record_revisions.get('S', 1), RecordRevision)
     assert_type(sdk.records.list('S'), AsyncIterator[Record])
     assert_type(await sdk.records.get('S', 1), Record)
     assert_type(await sdk.records.create('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(await sdk.records.create_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(sdk.sites.list('S'), AsyncIterator[Site])
     assert_type(await sdk.sites.get('S', 1), Site)
     assert_type(sdk.studies.list(), AsyncIterator[Study])
@@ -149,7 +157,9 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.async_get_visits('S'), list[Visit])
     assert_type(await sdk.async_get_job('S', 'B'), JobStatus)
     assert_type(await sdk.async_create_record('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(await sdk.async_create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(await sdk.async_poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
+    assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2']), JobPollSummary)
 
 
 def sync_endpoint_contract(ep: StudiesEndpoint) -> None:

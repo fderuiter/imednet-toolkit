@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
-from collections.abc import Callable, Iterable, Mapping
+import threading
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -31,6 +35,54 @@ logger = logging.getLogger(__name__)
 
 _TClient = TypeVar("_TClient")
 _LOGIC_EVALUATOR = LogicTreeEvaluator()
+_ExecutionOwner = tuple[int, int | None]
+_PrevalidatedScope = tuple[
+    int,
+    _ExecutionOwner,
+    tuple[dict[str, Any], ...] | None,
+    frozenset[int] | None,
+]
+_PREVALIDATED_SCOPES: ContextVar[tuple[_PrevalidatedScope, ...]] = ContextVar(
+    "imednet_prevalidated_scopes",
+    default=(),
+)
+
+
+def _current_execution_owner() -> _ExecutionOwner:
+    """Return ``(thread_id, task_id)`` for the currently executing thread and asyncio task."""
+    thread_id = threading.get_ident()
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return (thread_id, id(task) if task is not None else None)
+
+
+def is_schema_record_prevalidated(schema: Any, record: dict[str, Any]) -> bool:
+    """Return True if ``record`` was already validated for ``schema`` in the active task."""
+    schema_id = id(schema)
+    owner = _current_execution_owner()
+    rec_id = id(record)
+    for sid, scope_owner, _, rec_ids in _PREVALIDATED_SCOPES.get():
+        if sid == schema_id and scope_owner == owner and (rec_ids is None or rec_id in rec_ids):
+            return True
+    return False
+
+
+@contextmanager
+def prevalidated_records(
+    schema: Any, records: Iterable[dict[str, Any]] | None = None
+) -> Iterator[None]:
+    """Mark ``records`` as pre-validated for ``schema`` in the active task context."""
+    records_ref = tuple(records) if records is not None else None
+    rec_ids = frozenset(id(rec) for rec in records_ref) if records_ref is not None else None
+    owner = _current_execution_owner()
+    current = _PREVALIDATED_SCOPES.get()
+    token = _PREVALIDATED_SCOPES.set((*current, (id(schema), owner, records_ref, rec_ids)))
+    try:
+        yield
+    finally:
+        _PREVALIDATED_SCOPES.reset(token)
 
 
 @runtime_checkable
@@ -58,6 +110,39 @@ class BaseSchemaCache(Generic[_TClient]):
         self._is_async = is_async
         self._form_variables: dict[str, dict[str, Variable]] = {}
         self._form_id_to_key: dict[int, str] = {}
+
+    @property
+    def is_prevalidated(self) -> bool:
+        """Return True while inside a ``prevalidated()`` scope owned by the active task."""
+        cache_id = id(self)
+        owner = _current_execution_owner()
+        return any(
+            cid == cache_id and scope_owner == owner
+            for cid, scope_owner, _, _ in _PREVALIDATED_SCOPES.get()
+        )
+
+    def is_record_prevalidated(self, record: dict[str, Any]) -> bool:
+        """Return True if ``record`` was already validated for this cache in the active task."""
+        cache_id = id(self)
+        owner = _current_execution_owner()
+        rec_id = id(record)
+        for cid, scope_owner, _, rec_ids in _PREVALIDATED_SCOPES.get():
+            if cid == cache_id and scope_owner == owner and (rec_ids is None or rec_id in rec_ids):
+                return True
+        return False
+
+    @contextmanager
+    def prevalidated(self, records: Iterable[dict[str, Any]] | None = None) -> Iterator[None]:
+        """Mark ``records`` (or the active block) as validated in the current task context."""
+        records_ref = tuple(records) if records is not None else None
+        rec_ids = frozenset(id(rec) for rec in records_ref) if records_ref is not None else None
+        owner = _current_execution_owner()
+        current = _PREVALIDATED_SCOPES.get()
+        token = _PREVALIDATED_SCOPES.set((*current, (id(self), owner, records_ref, rec_ids)))
+        try:
+            yield
+        finally:
+            _PREVALIDATED_SCOPES.reset(token)
 
     def populate(self, variables: Iterable[Variable]) -> None:
         """Populate the cache with the given variables."""

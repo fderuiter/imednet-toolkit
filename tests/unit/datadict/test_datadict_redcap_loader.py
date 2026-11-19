@@ -228,3 +228,47 @@ def test_load_from_redcap_single_line_csv_no_delimiters() -> None:
     single_line_csv = '"variable_name","form_name","field_type"'
     dd = load_from_redcap(single_line_csv)
     assert isinstance(dd, DataDictionary)
+
+
+def test_load_from_redcap_bounds_annotations_and_odm_emission() -> None:
+    """REDCap min/max bounds and annotations leave precision empty and emit RangeChecks."""
+    from imednet.datadict.emit import to_odm_xml
+
+    redcap_csv = (
+        '"Variable / Field Name","Form Name","Field Type","Field Label",'
+        '"Text Validation Type OR Show Slider Number","Text Validation Min",'
+        '"Text Validation Max","Required Field?","Custom Alignment",'
+        '"Question Number (surveys only)","Matrix Group Name","Matrix Ranking?",'
+        '"Field Annotation"\n'
+        '"sysbp","vitals","text","Systolic Blood Pressure","integer","70","250",'
+        '"y","RH","Q1","bp_matrix","y","@REQUIRED @HIDDEN"\n'
+    )
+
+    dd = load_from_redcap(redcap_csv, study_key="REDCAP_BOUNDS", strict=True)
+    assert dd.metadata.validationWarnings == []
+    assert validate(dd, schema=get_schema()) == []
+
+    form = dd.forms[0]
+    assert form.formId is None
+    assert form.formType == "Subject"
+
+    var = form.variables[0]
+    assert var.variableName == "sysbp"
+    assert var.variableType == "Integer"
+    assert var.precision is None
+    assert var.format == "integer"
+    assert var.extraAttributes["textValidationMin"] == "70"
+    assert var.extraAttributes["textValidationMax"] == "250"
+    assert var.extraAttributes["fieldAnnotation"] == "@REQUIRED @HIDDEN"
+    assert var.extraAttributes["customAlignment"] == "RH"
+    assert var.extraAttributes["questionNumber"] == "Q1"
+    assert var.extraAttributes["matrixGroupName"] == "bp_matrix"
+    assert var.extraAttributes["matrixRanking"] == "y"
+
+    xml_str = to_odm_xml(dd)
+    assert 'SignificantDigits="70"' not in xml_str
+    assert "SignificantDigits" not in xml_str
+    assert '<RangeCheck SoftHard="Soft" Comparator="GE">' in xml_str
+    assert "<CheckValue>70</CheckValue>" in xml_str
+    assert '<RangeCheck SoftHard="Soft" Comparator="LE">' in xml_str
+    assert "<CheckValue>250</CheckValue>" in xml_str

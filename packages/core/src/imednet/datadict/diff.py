@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .models import BusinessLogicRule, DataDictionary
+from .normalize import normalize_form_id, normalize_form_type, normalize_variable_type
 
 
 @dataclass
@@ -198,11 +199,19 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
             report.add("added", f"forms[{fk}]", new_val=new_f.formName or fk)
         else:
             old_f = old_forms[fk]
-            for attr in ("formName", "formId", "formType"):
-                ov = getattr(old_f, attr)
-                nv = getattr(new_f, attr)
-                if ov != nv:
-                    report.add("modified", f"forms[{fk}].{attr}", ov, nv)
+            if old_f.formName != new_f.formName:
+                report.add("modified", f"forms[{fk}].formName", old_f.formName, new_f.formName)
+
+            old_fid = normalize_form_id(old_f.formId, fk)
+            new_fid = normalize_form_id(new_f.formId, fk)
+            if old_fid is not None and new_fid is not None and old_fid != new_fid:
+                report.add("modified", f"forms[{fk}].formId", old_f.formId, new_f.formId)
+
+            old_ft = normalize_form_type(old_f.formType, default="Subject")
+            new_ft = normalize_form_type(new_f.formType, default="Subject")
+            if old_ft != new_ft:
+                report.add("modified", f"forms[{fk}].formType", old_f.formType, new_f.formType)
+
             _compare_extra_attributes(
                 old_f.extraAttributes, new_f.extraAttributes, f"forms[{fk}]", report
             )
@@ -220,9 +229,17 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
                     report.add("added", f"forms[{fk}].variables[{vn}]", new_val=new_v.label or vn)
                 else:
                     old_v = old_vars[vn]
+                    old_vt = normalize_variable_type(old_v.variableType, precision=old_v.precision)
+                    new_vt = normalize_variable_type(new_v.variableType, precision=new_v.precision)
+                    if old_vt != new_vt:
+                        report.add(
+                            "modified",
+                            f"forms[{fk}].variables[{vn}].variableType",
+                            old_v.variableType,
+                            new_v.variableType,
+                        )
                     for attr in (
                         "label",
-                        "variableType",
                         "required",
                         "sequence",
                         "format",

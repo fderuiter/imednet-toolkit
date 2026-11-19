@@ -198,6 +198,7 @@ class UATSpecificationBuilder:
                     form_name=form.form_name or "unknown",
                     form_type=form.form_type or "unknown",
                     test_type=test_type,
+                    subject_count=subject_count,
                     variables=var_specs,
                     required_variable_names=required_names,
                     interval_name=self._resolve_interval(snapshot, form.form_key),
@@ -399,6 +400,8 @@ class UATWorkflow:
             self._submitter = BulkRecordSubmissionWorkflow(
                 self._sdk,
                 batch_size=self._batch_size,
+                registration_timeout=self._poll_timeout,
+                registration_poll_interval=self._poll_interval,
             )
         return self._submitter
 
@@ -543,7 +546,30 @@ class UATWorkflow:
         return self._get_submitter().submit(study_key, record_sets, email_notify=email_notify)  # type: ignore[no-any-return]
 
     def monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:
-        """Poll all resulting jobs to completion via JobPoller."""
+        """Poll all resulting jobs to completion via facade poll_jobs (or JobPoller fallback)."""
+        if self._poller is not None:
+            return self._poller.poll_many(
+                study_key,
+                submission_result.all_batch_ids,
+                interval=self._poll_interval,
+                timeout=self._poll_timeout,
+                on_progress=self._on_progress,
+            )
+
+        from imednet.spi.utils import JobPollSummary
+
+        poll_jobs_fn = getattr(self._sdk, "poll_jobs", None)
+        if callable(poll_jobs_fn):
+            candidate = poll_jobs_fn(
+                study_key,
+                submission_result.all_batch_ids,
+                interval=self._poll_interval,
+                timeout=self._poll_timeout,
+                on_progress=self._on_progress,
+            )
+            if isinstance(candidate, JobPollSummary):
+                return candidate
+
         return self._get_poller().poll_many(
             study_key,
             submission_result.all_batch_ids,

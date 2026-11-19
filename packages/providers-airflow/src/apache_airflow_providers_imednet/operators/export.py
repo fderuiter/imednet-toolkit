@@ -145,6 +145,18 @@ class _ValidatedExportKwargs(dict[str, Any]):
         return super().setdefault(key, default)
 
 
+_STREAMING_EXPORT_KEYS = (
+    "modified_since",
+    "record_filter",
+    "record_data_filter",
+    "include_deleted",
+    "incremental",
+    "stream_name",
+    "ledger_path",
+    "state_provider",
+)
+
+
 class ImednetExportOperator(BaseOperator):
     """Unified Airflow operator for exporting study records to any destination."""
 
@@ -179,6 +191,14 @@ class ImednetExportOperator(BaseOperator):
         idempotent: bool = True,
         quality_gate_enabled: bool = False,
         min_schema_readiness_score: float = 100.0,
+        modified_since: Any = None,
+        record_filter: Any = None,
+        record_data_filter: str | None = None,
+        include_deleted: bool = False,
+        incremental: bool = False,
+        stream_name: str | None = None,
+        ledger_path: Any = None,
+        state_provider: Any = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the operator.
@@ -207,11 +227,19 @@ class ImednetExportOperator(BaseOperator):
         self.destination_conn_id = destination_conn_id
 
         # Common operational parameters
-        self.batch_size = batch_size
+        self.batch_size: int = batch_size
         self.max_retries = max_retries
         self.idempotent = idempotent
         self.quality_gate_enabled = quality_gate_enabled
         self.min_schema_readiness_score = min_schema_readiness_score
+        self.modified_since = modified_since
+        self.record_filter = record_filter
+        self.record_data_filter = record_data_filter
+        self.include_deleted = include_deleted
+        self.incremental = incremental
+        self.stream_name = stream_name
+        self.ledger_path = ledger_path
+        self.state_provider = state_provider
 
     @property
     def output_path(self) -> str | None:
@@ -254,6 +282,27 @@ class ImednetExportOperator(BaseOperator):
         _validate_no_secrets_in_value(self.export_kwargs, field_name="export_kwargs")
         return dict(self.export_kwargs)
 
+    def _collect_streaming_options(self, runtime_kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        """Collect non-default streaming, filtering, and checkpoint options."""
+        opts: dict[str, Any] = {}
+        defaults: dict[str, Any] = {
+            "modified_since": None,
+            "record_filter": None,
+            "record_data_filter": None,
+            "include_deleted": False,
+            "incremental": False,
+            "stream_name": None,
+            "ledger_path": None,
+            "state_provider": None,
+        }
+        for key, default_val in defaults.items():
+            attr_val = getattr(self, key, default_val)
+            if attr_val != default_val:
+                opts[key] = attr_val
+            elif key in runtime_kwargs and runtime_kwargs[key] != default_val:
+                opts[key] = runtime_kwargs[key]
+        return opts
+
     def _build_tabular_kwargs(self, runtime_kwargs: dict[str, Any]) -> dict[str, Any]:
         """Merge explicitly configured operational parameters into tabular export kwargs."""
         merged = dict(runtime_kwargs)
@@ -262,6 +311,14 @@ class ImednetExportOperator(BaseOperator):
             current_val = getattr(self, key)
             if key not in merged and (key in explicit or current_val != default_val):
                 merged[key] = current_val
+        for key, val in self._collect_streaming_options(runtime_kwargs).items():
+            merged.setdefault(key, val)
+        if (
+            merged.get("incremental")
+            and "state_provider" not in merged
+            and "ledger_path" not in merged
+        ):
+            merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
         return merged
 
     def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
@@ -285,6 +342,7 @@ class ImednetExportOperator(BaseOperator):
 
         runtime_kwargs = self._get_runtime_export_kwargs()
         conn_settings = self._resolve_destination_connection(dest)
+        stream_opts = self._collect_streaming_options(runtime_kwargs)
 
         if dest == "snowflake":
             sink_cls = getattr(sinks, "SnowflakeExportSink", None)
@@ -324,6 +382,7 @@ class ImednetExportOperator(BaseOperator):
                 manifest_path=(
                     runtime_kwargs.get("manifest_path") or conn_settings.get("manifest_path")
                 ),
+                **stream_opts,
             )
             return sink_cls(config=snowflake_config)
 
@@ -347,6 +406,7 @@ class ImednetExportOperator(BaseOperator):
                 uri=runtime_kwargs.get("uri") or conn_settings.get("uri", ""),
                 auth=conn_settings.get("auth", ("", "")),
                 database=runtime_kwargs.get("database") or conn_settings.get("database", "neo4j"),
+                **stream_opts,
             )
             return sink_cls(config=neo4j_config)
 
@@ -379,6 +439,7 @@ class ImednetExportOperator(BaseOperator):
                 uri=mongo_uri,
                 database=runtime_kwargs.get("database") or conn_settings.get("database", ""),
                 collection=runtime_kwargs.get("collection") or conn_settings.get("collection", ""),
+                **stream_opts,
             )
             return sink_cls(config=mongo_config)
 
@@ -386,11 +447,11 @@ class ImednetExportOperator(BaseOperator):
 
     def execute(self, context: Context) -> str | None:
         """Execute the export task."""
+        _ = context
         # Validate templated fields at runtime prior to any export work.
         if self.output_path is not None:
             _validate_no_secrets_in_value(self.output_path, field_name="output_path")
         runtime_kwargs = self._get_runtime_export_kwargs()
-
         # Resolve destination early to fail fast on invalid configs (like legacy _get_export_callable)
         dest = self.destination
         if not dest and self.export_func:
@@ -410,6 +471,7 @@ class ImednetExportOperator(BaseOperator):
             )
 
         sdk = self._get_sdk()
+        stream_opts = self._collect_streaming_options(runtime_kwargs)
 
         config = sink_base.SinkConfig(
             study_key=self.study_key,
@@ -427,6 +489,7 @@ class ImednetExportOperator(BaseOperator):
                     self.min_schema_readiness_score,
                 )
             ),
+            **stream_opts,
         )
 
         sink = None
@@ -438,17 +501,17 @@ class ImednetExportOperator(BaseOperator):
                 )
 
         if sink:
-            # Single execution path for Sink-based destinations
-            raw_records = sdk.records.list(study_key=self.study_key, record_data_filter=None)
-            records_list = list(
-                sink_base.apply_quality_gate(sdk, self.study_key, raw_records, config)
+            sink_base.run_streaming_export(
+                sdk,
+                self.study_key,
+                sink,
+                config,
+                stream_name=f"airflow_{dest}",
+                batch_id_prefix=f"{self.study_key}/batch",
+                default_provider_name="airflow",
             )
-            with sink:
-                for i, batch in enumerate(sink_base.iter_batches(records_list, config.batch_size)):
-                    sink.write_batch(batch, batch_id=f"{self.study_key}/batch/{i}")
         else:
-            # Execution path for legacy tabular functions
-            # We dispatch to getattr so mocks in tests are preserved
+            # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)
             if not export_callable:
                 raise AirflowException(f"Unsupported destination or export_func '{dest}'")
 
