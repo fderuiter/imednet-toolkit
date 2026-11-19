@@ -10,8 +10,12 @@ from pydantic import Field
 
 from imednet.spi.models import Form, ImednetBaseModel, Interval, Site, Variable
 
+from .._guards import ensure_async_sdk, ensure_sync_sdk
+
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+
+_OWNER = "StudySchemaInspector"
 
 
 class FormVariableMap(TypedDict):
@@ -92,6 +96,7 @@ class StudySchemaInspector:
 
     def inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
         """Synchronously fetch and return a study snapshot."""
+        ensure_sync_sdk(self._sdk, _OWNER, "inspect", "async_inspect")
         if not force_refresh and study_key in self._cache:
             return self._cache[study_key]
 
@@ -108,6 +113,7 @@ class StudySchemaInspector:
 
     async def async_inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
         """Asynchronously fetch metadata concurrently and return a study snapshot."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_inspect", "inspect")
         if not force_refresh and study_key in self._cache:
             return self._cache[study_key]
 

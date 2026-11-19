@@ -1,5 +1,6 @@
 """Tests for contract validation across namespaces and plugins."""
 
+import asyncio
 import inspect
 import sys
 import tomllib
@@ -10,8 +11,9 @@ from unittest.mock import MagicMock
 import pytest
 from imednet_sinks.plugin import SinksNamespace
 
+from imednet.orchestration import MultiStudyOrchestrator
 from imednet.plugins import WorkflowsNamespaceProtocol
-from imednet.sdk import ImednetSDK
+from imednet.sdk import AsyncImednetSDK, ImednetSDK
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
 from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
@@ -118,16 +120,32 @@ def test_workflows_contract_parity():
 
     # Assert that every registered entry point resolves and instantiates through sdk.workflows
     sdk = ImednetSDK(api_key="key", security_key="secret", base_url="https://example.com")
-    for name, ep in eps.items():
-        workflow_instance = getattr(sdk.workflows, name)
-        assert workflow_instance is not None
-        target_cls = ep.load()
-        assert isinstance(workflow_instance, target_cls)
-        assert sdk.workflows[name] is workflow_instance
+    try:
+        for name, ep in eps.items():
+            workflow_instance = getattr(sdk.workflows, name)
+            assert workflow_instance is not None
+            target_cls = ep.load()
+            assert isinstance(workflow_instance, target_cls)
+            assert sdk.workflows[name] is workflow_instance
 
-    # Acceptance criteria verification
-    assert isinstance(sdk.workflows.duckdb_centralizer, DuckDBIngestionWorkflow)
-    assert isinstance(sdk.workflows.register_subjects, RegisterSubjectsWorkflow)
+        # Acceptance criteria verification
+        assert isinstance(sdk.workflows.duckdb_centralizer, DuckDBIngestionWorkflow)
+        assert isinstance(sdk.workflows.register_subjects, RegisterSubjectsWorkflow)
+    finally:
+        sdk.close()
+
+    async_sdk = AsyncImednetSDK(
+        api_key="key", security_key="secret", base_url="https://example.com"
+    )
+    try:
+        for name, ep in eps.items():
+            workflow_instance = getattr(async_sdk.workflows, name)
+            assert workflow_instance is not None
+            target_cls = ep.load()
+            assert isinstance(workflow_instance, target_cls)
+            assert async_sdk.workflows[name] is workflow_instance
+    finally:
+        asyncio.run(async_sdk.aclose())
 
 
 def test_workflows_namespace_lazy_instantiation_without_duckdb(monkeypatch):
@@ -186,3 +204,54 @@ def test_workflow_constructors_contract():
             f"Workflow class {cls.__name__} constructor requires more than one mandatory argument: "
             f"{mandatory_params}. It must accept only the SDK client as a mandatory argument."
         )
+
+
+def test_workflows_sync_async_method_parity():
+    """Assert 100% parity between sync network methods and async_* counterparts across all 9 workflows and MultiStudyOrchestrator."""
+    local_only_methods: dict[str, set[str]] = {
+        "duckdb_centralizer": {"build_silver_view"},
+        "record_mapper": {"transform_to_sdtm"},
+        "uat": {"build_spec", "generate", "reset", "transition_to"},
+        "uat_inspector": {"clear_cache"},
+    }
+
+    eps = {ep.name: ep for ep in entry_points(group="imednet.workflows")}
+    assert len(eps) == 9
+
+    for name, ep in sorted(eps.items()):
+        cls = ep.load()
+        public_methods = {
+            m: fn
+            for m, fn in inspect.getmembers(cls, predicate=inspect.isfunction)
+            if not m.startswith("_")
+        }
+        sync_network_methods = {
+            m
+            for m in public_methods
+            if not m.startswith("async_") and m not in local_only_methods.get(name, set())
+        }
+        async_methods = {m for m in public_methods if m.startswith("async_")}
+        expected_async_methods = {f"async_{m}" for m in sync_network_methods}
+
+        assert async_methods == expected_async_methods, (
+            f"Sync/async method parity mismatch on workflow '{name}' ({cls.__name__}): "
+            f"missing async counterparts={expected_async_methods - async_methods}, "
+            f"orphan async methods={async_methods - expected_async_methods}"
+        )
+
+        for async_name in sorted(async_methods):
+            async_fn = public_methods[async_name]
+            assert inspect.iscoroutinefunction(async_fn) or inspect.isasyncgenfunction(async_fn), (
+                f"{cls.__name__}.{async_name} must be an async coroutine or async generator function."
+            )
+
+    orch_methods = {
+        m: fn
+        for m, fn in inspect.getmembers(MultiStudyOrchestrator, predicate=inspect.isfunction)
+        if not m.startswith("_")
+    }
+    orch_sync = {m for m in orch_methods if not m.startswith("async_")}
+    orch_async = {m for m in orch_methods if m.startswith("async_")}
+    assert orch_async == {f"async_{m}" for m in orch_sync}
+    for async_name in sorted(orch_async):
+        assert inspect.iscoroutinefunction(orch_methods[async_name])

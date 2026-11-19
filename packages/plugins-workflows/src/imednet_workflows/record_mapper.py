@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 try:
     import pandas as pd
@@ -22,11 +22,14 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
 
+from ._guards import ensure_async_sdk, ensure_sync_sdk
 from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+
+_OWNER = "RecordMapper"
 
 # Setup basic logging
 logger = logging.getLogger(__name__)
@@ -636,12 +639,12 @@ class RecordMapper:
 
     def __init__(
         self,
-        sdk: ImednetFacade,
+        sdk: ImednetFacade | AsyncImednetFacade,
         *,
         loader: CachedRecordsLoader | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> None:
-        """Initialize with an :class:`ImednetSDK` instance.
+        """Initialize with an :class:`ImednetSDK` or :class:`AsyncImednetSDK` instance.
 
         ``loader`` enables cache-backed streaming for large-study workflows.
         ``chunk_size`` controls the maximum number of records parsed into each
@@ -654,25 +657,25 @@ class RecordMapper:
     # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
-    def _fetch_variable_metadata(
-        self,
-        study_key: str,
-        variable_whitelist: list[str] | None = None,
-        form_whitelist: list[int] | None = None,
-    ) -> tuple[list[str], dict[str, str]]:
-        """Return variable names and label mapping for a study."""
+    @staticmethod
+    def _build_variable_filters(
+        variable_whitelist: list[str] | None,
+        form_whitelist: list[int] | None,
+    ) -> dict[str, Any]:
+        """Build query filters for ``get_variables`` / ``async_get_variables``."""
         filters: dict[str, Any] = {}
         if variable_whitelist is not None:
             filters["variableNames"] = variable_whitelist
         if form_whitelist is not None:
             filters["formIds"] = form_whitelist
+        return filters
 
-        variables: list[VariableModel] = list(
-            self.sdk.get_variables(
-                study_key=study_key,
-                **filters,
-            )
-        )
+    @staticmethod
+    def _extract_variable_metadata(
+        study_key: str,
+        variables: list[VariableModel],
+    ) -> tuple[list[str], dict[str, str]]:
+        """Extract variable names and label map from ``Variable`` models."""
         if not variables:
             logger.warning(
                 "No variables found for study '%s'. Returning empty DataFrame.",
@@ -683,6 +686,76 @@ class RecordMapper:
         variable_keys = [v.variable_name for v in variables]
         label_map = {v.variable_name: v.label for v in variables}
         return variable_keys, label_map  # type: ignore
+
+    @staticmethod
+    def _build_extra_filters(
+        variable_whitelist: list[str] | None,
+        form_whitelist: list[int] | None,
+    ) -> dict[str, Any] | None:
+        """Build optional record filter dictionary from variable/form whitelists."""
+        extra_filters: dict[str, Any] = {}
+        if variable_whitelist is not None:
+            extra_filters["variableNames"] = variable_whitelist
+        if form_whitelist is not None:
+            extra_filters["formIds"] = form_whitelist
+        return extra_filters or None
+
+    @staticmethod
+    def _build_record_fetch_filters(
+        visit_key: str | None,
+        extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None,
+    ) -> dict[str, Any | tuple[str, Any] | list[Any]]:
+        """Build filter kwargs for ``get_records`` / ``async_get_records``."""
+        filters: dict[str, Any | tuple[str, Any] | list[Any]] = (
+            dict(extra_filters) if extra_filters else {}
+        )
+        if visit_key is not None:
+            try:
+                filters["visitId"] = int(visit_key)
+            except ValueError:
+                logger.warning(
+                    "Invalid visit_key '%s'. Should be convertible to int. Fetching all records.",
+                    visit_key,
+                )
+        return filters
+
+    @staticmethod
+    def _extract_form_ids(
+        extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None,
+    ) -> set[Any] | None:
+        """Extract form ID whitelist set from ``extra_filters`` if present."""
+        filters = dict(extra_filters) if extra_filters else {}
+        if "formIds" in filters and isinstance(filters["formIds"], list):
+            return set(filters["formIds"])
+        if "formId" in filters:
+            return {filters["formId"]}
+        return None
+
+    def _fetch_variable_metadata(
+        self,
+        study_key: str,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Return variable names and label mapping for a study."""
+        sdk = cast("ImednetFacade", self.sdk)
+        filters = self._build_variable_filters(variable_whitelist, form_whitelist)
+        variables: list[VariableModel] = list(sdk.get_variables(study_key=study_key, **filters))
+        return self._extract_variable_metadata(study_key, variables)
+
+    async def _async_fetch_variable_metadata(
+        self,
+        study_key: str,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Asynchronously return variable names and label mapping for a study."""
+        sdk = cast("AsyncImednetFacade", self.sdk)
+        filters = self._build_variable_filters(variable_whitelist, form_whitelist)
+        variables: list[VariableModel] = list(
+            await sdk.async_get_variables(study_key=study_key, **filters)
+        )
+        return self._extract_variable_metadata(study_key, variables)
 
     def _build_record_model(
         self, variable_keys: list[str], label_map: dict[str, str]
@@ -703,20 +776,32 @@ class RecordMapper:
         extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
     ) -> list[RecordModel]:
         """Fetch records for a study applying optional filters."""
-        filters: dict[str, Any | tuple[str, Any] | list[Any]] = (
-            dict(extra_filters) if extra_filters else {}
-        )
-        if visit_key is not None:
-            try:
-                filters["visitId"] = int(visit_key)
-            except ValueError:
-                logger.warning(
-                    "Invalid visit_key '%s'. Should be convertible to int. Fetching all records.",
-                    visit_key,
-                )
+        sdk = cast("ImednetFacade", self.sdk)
+        filters = self._build_record_fetch_filters(visit_key, extra_filters)
         try:
             return list(
-                self.sdk.get_records(
+                sdk.get_records(
+                    study_key=study_key,
+                    record_data_filter=None,
+                    **filters,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - unexpected
+            logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
+            return []
+
+    async def _async_fetch_records(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+    ) -> list[RecordModel]:
+        """Asynchronously fetch records for a study applying optional filters."""
+        sdk = cast("AsyncImednetFacade", self.sdk)
+        filters = self._build_record_fetch_filters(visit_key, extra_filters)
+        try:
+            return list(
+                await sdk.async_get_records(
                     study_key=study_key,
                     record_data_filter=None,
                     **filters,
@@ -732,23 +817,8 @@ class RecordMapper:
         visit_key: str | None = None,
         extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
     ) -> Iterable[RecordModel]:
-        """Iterate over records for a study, using cache if available.
-
-        Args:
-            study_key: The study identifier.
-            visit_key: Optional visit filter.
-            extra_filters: Optional additional filter criteria.
-
-        Returns:
-            An iterable of Record models.
-        """
-        form_ids: set[Any] | None = None
-        filters = dict(extra_filters) if extra_filters else {}
-        if "formIds" in filters and isinstance(filters["formIds"], list):
-            form_ids = set(filters["formIds"])
-        elif "formId" in filters:
-            form_ids = {filters["formId"]}
-
+        """Iterate over records for a study, using cache if available."""
+        form_ids = self._extract_form_ids(extra_filters)
         loader = self._loader
         if loader is not None:
             sync_method = getattr(loader, "sync_records", None)
@@ -762,6 +832,32 @@ class RecordMapper:
                 )
 
         return self._fetch_records(
+            study_key,
+            visit_key,
+            extra_filters=extra_filters,
+        )
+
+    async def _async_iter_records(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+    ) -> Iterable[RecordModel]:
+        """Asynchronously sync/fetch records for a study and return an iterable."""
+        form_ids = self._extract_form_ids(extra_filters)
+        loader = self._loader
+        if loader is not None:
+            async_sync_method = getattr(loader, "async_sync_records", None)
+            iter_method = getattr(type(loader), "iter_cached_records", None)
+            if callable(async_sync_method) and callable(iter_method):
+                await async_sync_method(study_key)
+                return self._filter_records(
+                    iter_method(loader, study_key, chunk_size=self._pipeline.chunk_size),
+                    visit_key=visit_key,
+                    form_ids=form_ids,
+                )
+
+        return await self._async_fetch_records(
             study_key,
             visit_key,
             extra_filters=extra_filters,
@@ -903,67 +999,29 @@ class RecordMapper:
             df = df.rename(columns=rename_map)
         return df
 
-    def iter_dataframes(
-        self,
-        study_key: str,
-        visit_key: str | None = None,
-        use_labels_as_columns: bool = True,
-        variable_whitelist: list[str] | None = None,
-        form_whitelist: list[int] | None = None,
-        *,
-        as_sdtm: bool = False,
-        domain: str | None = None,
-    ) -> Iterator[pd.DataFrame]:
-        """Yield mapped record DataFrames in bounded chunks.
-
-        When ``as_sdtm`` is True, yields normalized CDISC SDTM domain DataFrames.
-
-        Each yielded frame contains at most ``chunk_size`` mapped records from
-        this mapper instance. Prefer this method over ``dataframe()`` when
-        processing or exporting large studies so each chunk can be committed
-        before the next batch is parsed.
-        """
-        if as_sdtm:
-            target_domain = domain or "AE"
-            yield from self.iter_sdtm_dataframes(
-                study_key=study_key,
-                domain=target_domain,
-                visit_key=visit_key,
-                variable_whitelist=variable_whitelist,
-                form_whitelist=form_whitelist,
-            )
-            return
-
+    @staticmethod
+    def _ensure_pandas(method_name: str) -> None:
+        """Ensure pandas is installed before materializing DataFrames."""
         if pd is None:
             raise ImportError(
-                "pandas is required for RecordMapper.dataframe. Install "
-                "with 'pip install \"imednet[pandas]\"'."
+                f"pandas is required for RecordMapper.{method_name}. Install "
+                'with \'pip install "imednet[pandas]"\'.'
             )
-        variable_keys, label_map = self._fetch_variable_metadata(
-            study_key,
-            variable_whitelist=variable_whitelist,
-            form_whitelist=form_whitelist,
-        )
-        if not variable_keys:
-            return
 
+    def _iter_mapped_frames(
+        self,
+        *,
+        study_key: str,
+        records: Iterable[RecordModel],
+        variable_keys: list[str],
+        label_map: dict[str, str],
+        use_labels_as_columns: bool,
+    ) -> Iterator[pd.DataFrame]:
+        """Parse records in chunks and yield non-empty mapped DataFrames."""
         record_model = self._build_record_model(variable_keys, label_map)
-        extra_filters: dict[str, Any] = {}
-        if variable_whitelist is not None:
-            extra_filters["variableNames"] = variable_whitelist
-        if form_whitelist is not None:
-            extra_filters["formIds"] = form_whitelist
-
         errors = 0
         yielded = False
-        for rows, chunk_errors in self._iter_parsed_rows(
-            self._iter_records(
-                study_key,
-                visit_key,
-                extra_filters=extra_filters or None,
-            ),
-            record_model,
-        ):
+        for rows, chunk_errors in self._iter_parsed_rows(records, record_model):
             errors += chunk_errors
             df = self._build_dataframe(rows, variable_keys, label_map, use_labels_as_columns)
             if df.empty:
@@ -979,26 +1037,14 @@ class RecordMapper:
                 study_key,
             )
 
-    def build_hierarchy(
+    def _build_form_models_from_structure(
         self,
-        study_key: str,
-        visit_key: str | None = None,
-        use_labels_as_keys: bool = False,
-        variable_whitelist: list[str] | None = None,
-        form_whitelist: list[int] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Generate a nested JSON tree structure up to three levels deep.
-
-        Outputs a Subject -> Visit -> Form tree of records. Maps variables
-        using form-scoped models to prevent namespace collisions. Relational
-        identifiers such as parent_record_id are populated dynamically based
-        on hierarchy context.
-        """
-        from imednet_workflows.study_structure import get_study_structure
-
-        study_struct = get_study_structure(self.sdk, study_key)
-
-        # 1. Build form-scoped models
+        study_struct: Any,
+        *,
+        variable_whitelist: list[str] | None,
+        form_whitelist: list[int] | None,
+    ) -> tuple[dict[int, type[BaseModel]], dict[int, dict[str, str]]]:
+        """Build form-scoped dynamic Pydantic models and label maps from study structure."""
         form_models: dict[int, type[BaseModel]] = {}
         form_label_maps: dict[int, dict[str, str]] = {}
 
@@ -1017,19 +1063,17 @@ class RecordMapper:
                 form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
                 form_label_maps[form.form_id] = label_map  # type: ignore
 
-        extra_filters: dict[str, Any] = {}
-        if form_whitelist is not None:
-            extra_filters["formIds"] = form_whitelist
-        if variable_whitelist is not None:
-            extra_filters["variableNames"] = variable_whitelist
+        return form_models, form_label_maps
 
-        # 2. Fetch and iterate records
-        records = self._iter_records(
-            study_key,
-            visit_key,
-            extra_filters=extra_filters or None,
-        )
-
+    def _assemble_hierarchy_tree(
+        self,
+        records: Iterable[RecordModel],
+        *,
+        form_models: dict[int, type[BaseModel]],
+        form_label_maps: dict[int, dict[str, str]],
+        use_labels_as_keys: bool,
+    ) -> list[dict[str, Any]]:
+        """Assemble Subject -> Visit -> Form hierarchy tree from iterable of records."""
         tree: dict[str, dict[str, Any]] = {}
 
         for rec in records:
@@ -1037,7 +1081,7 @@ class RecordMapper:
                 continue
 
             model = form_models[rec.form_id]
-            label_map = form_label_maps[rec.form_id]  # type: ignore
+            label_map = form_label_maps[rec.form_id]
 
             try:
                 parsed_data = self._parse_record(rec, model)
@@ -1059,22 +1103,20 @@ class RecordMapper:
                     remapped[lbl if lbl is not None else k] = v
                 parsed_data = remapped
 
-            # Automatically perform lookups for parent record identifiers using available metadata
             resolved_parent_id = getattr(rec, "parent_record_id", None)
             if not resolved_parent_id:
                 resolved_parent_id = f"{rec.visit_id}_{rec.form_id}"
 
             if "parent_record_id" not in parsed_data or parsed_data.get("parent_record_id") is None:
                 parsed_data["parent_record_id"] = resolved_parent_id
-                # If we mapped to a label or alias, also try to set it there
                 if use_labels_as_keys and "parentRecordId" in parsed_data:
                     parsed_data["parentRecordId"] = resolved_parent_id
 
-            subj_key = rec.subject_key
+            subj_key = rec.subject_key or ""
             if subj_key not in tree:
-                tree[subj_key] = {"subject_key": subj_key, "visits": {}}  # type: ignore
+                tree[subj_key] = {"subject_key": rec.subject_key, "visits": {}}
 
-            subj_node = tree[subj_key]  # type: ignore
+            subj_node = tree[subj_key]
 
             visit_id = rec.visit_id
             if visit_id not in subj_node["visits"]:
@@ -1089,20 +1131,208 @@ class RecordMapper:
             form_node = visit_node["forms"][form_id]
             form_node["records"].append(parsed_data)
 
-        # 3. Convert dicts to lists
-        result = []
-        for subj_key, subj in tree.items():  # noqa: B007
+        result: list[dict[str, Any]] = []
+        for subj in tree.values():
             subj_visits = []
-            for visit_id, visit in subj["visits"].items():  # noqa: B007
-                visit_forms = []
-                for form_id, form in visit["forms"].items():  # noqa: B007
-                    visit_forms.append(form)
-                visit["forms"] = visit_forms
+            for visit in subj["visits"].values():
+                visit["forms"] = list(visit["forms"].values())
                 subj_visits.append(visit)
             subj["visits"] = subj_visits
             result.append(subj)
 
         return result
+
+    def iter_dataframes(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = True,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+    ) -> Iterator[pd.DataFrame]:
+        """Yield mapped record DataFrames in bounded chunks.
+
+        When ``as_sdtm`` is True, yields normalized CDISC SDTM domain DataFrames.
+
+        Each yielded frame contains at most ``chunk_size`` mapped records from
+        this mapper instance. Prefer this method over ``dataframe()`` when
+        processing or exporting large studies so each chunk can be committed
+        before the next batch is parsed.
+        """
+        ensure_sync_sdk(self.sdk, "RecordMapper", "iter_dataframes", "async_iter_dataframes")
+        if as_sdtm:
+            return self.iter_sdtm_dataframes(
+                study_key=study_key,
+                domain=domain or "AE",
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+
+        self._ensure_pandas("dataframe")
+        return self._iter_dataframes_sync(
+            study_key=study_key,
+            visit_key=visit_key,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
+
+    def _iter_dataframes_sync(
+        self,
+        *,
+        study_key: str,
+        visit_key: str | None,
+        use_labels_as_columns: bool,
+        variable_whitelist: list[str] | None,
+        form_whitelist: list[int] | None,
+    ) -> Iterator[pd.DataFrame]:
+        """Internal generator yielding mapped DataFrames synchronously."""
+        variable_keys, label_map = self._fetch_variable_metadata(
+            study_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
+        if not variable_keys:
+            return
+
+        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        records = self._iter_records(
+            study_key,
+            visit_key,
+            extra_filters=extra_filters,
+        )
+        yield from self._iter_mapped_frames(
+            study_key=study_key,
+            records=records,
+            variable_keys=variable_keys,
+            label_map=label_map,
+            use_labels_as_columns=use_labels_as_columns,
+        )
+
+    async def async_iter_dataframes(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = True,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+    ) -> AsyncIterator[pd.DataFrame]:
+        """Asynchronously yield mapped record DataFrames in bounded chunks.
+
+        When ``as_sdtm`` is True, yields normalized CDISC SDTM domain DataFrames.
+        """
+        ensure_async_sdk(self.sdk, "RecordMapper", "async_iter_dataframes", "iter_dataframes")
+        if as_sdtm:
+            async for frame in self.async_iter_sdtm_dataframes(
+                study_key=study_key,
+                domain=domain or "AE",
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            ):
+                yield frame
+            return
+
+        self._ensure_pandas("async_dataframe")
+        variable_keys, label_map = await self._async_fetch_variable_metadata(
+            study_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
+        if not variable_keys:
+            return
+
+        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        records = await self._async_iter_records(
+            study_key,
+            visit_key,
+            extra_filters=extra_filters,
+        )
+        for frame in self._iter_mapped_frames(
+            study_key=study_key,
+            records=records,
+            variable_keys=variable_keys,
+            label_map=label_map,
+            use_labels_as_columns=use_labels_as_columns,
+        ):
+            yield frame
+
+    def build_hierarchy(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_keys: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Generate a nested JSON tree structure up to three levels deep.
+
+        Outputs a Subject -> Visit -> Form tree of records. Maps variables
+        using form-scoped models to prevent namespace collisions. Relational
+        identifiers such as parent_record_id are populated dynamically based
+        on hierarchy context.
+        """
+        ensure_sync_sdk(self.sdk, "RecordMapper", "build_hierarchy", "async_build_hierarchy")
+        from imednet_workflows.study_structure import get_study_structure
+
+        study_struct = get_study_structure(cast("ImednetFacade", self.sdk), study_key)
+        form_models, form_label_maps = self._build_form_models_from_structure(
+            study_struct,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
+        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        records = self._iter_records(
+            study_key,
+            visit_key,
+            extra_filters=extra_filters,
+        )
+        return self._assemble_hierarchy_tree(
+            records,
+            form_models=form_models,
+            form_label_maps=form_label_maps,
+            use_labels_as_keys=use_labels_as_keys,
+        )
+
+    async def async_build_hierarchy(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_keys: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Asynchronously generate a nested Subject -> Visit -> Form JSON tree structure."""
+        ensure_async_sdk(self.sdk, "RecordMapper", "async_build_hierarchy", "build_hierarchy")
+        from imednet_workflows.study_structure import async_get_study_structure
+
+        study_struct = await async_get_study_structure(
+            cast("AsyncImednetFacade", self.sdk), study_key
+        )
+        form_models, form_label_maps = self._build_form_models_from_structure(
+            study_struct,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
+        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        records = await self._async_iter_records(
+            study_key,
+            visit_key,
+            extra_filters=extra_filters,
+        )
+        return self._assemble_hierarchy_tree(
+            records,
+            form_models=form_models,
+            form_label_maps=form_label_maps,
+            use_labels_as_keys=use_labels_as_keys,
+        )
 
     def transform_to_sdtm(
         self,
@@ -1137,11 +1367,8 @@ class RecordMapper:
         Returns:
             Normalized pandas DataFrame with standard SDTM domain variables.
         """
-        if pd is None:
-            raise ImportError(
-                "pandas is required for RecordMapper.sdtm_dataframe. Install "
-                "with 'pip install \"imednet[pandas]\"'."
-            )
+        ensure_sync_sdk(self.sdk, "RecordMapper", "sdtm_dataframe", "async_sdtm_dataframe")
+        self._ensure_pandas("sdtm_dataframe")
         frames = list(
             self.iter_sdtm_dataframes(
                 study_key=study_key,
@@ -1151,6 +1378,31 @@ class RecordMapper:
                 form_whitelist=form_whitelist,
             )
         )
+        if not frames:
+            return transform_records_to_sdtm([], domain=domain, study_key=study_key)
+        return pd.concat(frames, ignore_index=True)
+
+    async def async_sdtm_dataframe(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+    ) -> pd.DataFrame:
+        """Asynchronously return a :class:`pandas.DataFrame` transformed into a CDISC SDTM dataset."""
+        ensure_async_sdk(self.sdk, "RecordMapper", "async_sdtm_dataframe", "sdtm_dataframe")
+        self._ensure_pandas("async_sdtm_dataframe")
+        frames = [
+            frame
+            async for frame in self.async_iter_sdtm_dataframes(
+                study_key=study_key,
+                domain=domain,
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+        ]
         if not frames:
             return transform_records_to_sdtm([], domain=domain, study_key=study_key)
         return pd.concat(frames, ignore_index=True)
@@ -1175,21 +1427,57 @@ class RecordMapper:
         Yields:
             Chunked DataFrames containing normalized SDTM domain records.
         """
-        if pd is None:
-            raise ImportError(
-                "pandas is required for RecordMapper.iter_sdtm_dataframes. Install "
-                "with 'pip install \"imednet[pandas]\"'."
-            )
-        extra_filters: dict[str, Any] = {}
-        if variable_whitelist is not None:
-            extra_filters["variableNames"] = variable_whitelist
-        if form_whitelist is not None:
-            extra_filters["formIds"] = form_whitelist
+        ensure_sync_sdk(
+            self.sdk, "RecordMapper", "iter_sdtm_dataframes", "async_iter_sdtm_dataframes"
+        )
+        self._ensure_pandas("iter_sdtm_dataframes")
+        return self._iter_sdtm_dataframes_sync(
+            study_key=study_key,
+            domain=domain,
+            visit_key=visit_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
 
+    def _iter_sdtm_dataframes_sync(
+        self,
+        *,
+        study_key: str,
+        domain: str,
+        visit_key: str | None,
+        variable_whitelist: list[str] | None,
+        form_whitelist: list[int] | None,
+    ) -> Iterator[pd.DataFrame]:
+        """Internal generator yielding chunked SDTM DataFrames synchronously."""
+        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
         records = self._iter_records(
             study_key,
             visit_key=visit_key,
-            extra_filters=extra_filters or None,
+            extra_filters=extra_filters,
+        )
+        for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
+            df = transform_records_to_sdtm(chunk, domain=domain, study_key=study_key)
+            if not df.empty:
+                yield df
+
+    async def async_iter_sdtm_dataframes(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+    ) -> AsyncIterator[pd.DataFrame]:
+        """Asynchronously yield chunked pandas DataFrames transformed into an SDTM dataset."""
+        ensure_async_sdk(
+            self.sdk, "RecordMapper", "async_iter_sdtm_dataframes", "iter_sdtm_dataframes"
+        )
+        self._ensure_pandas("async_iter_sdtm_dataframes")
+        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        records = await self._async_iter_records(
+            study_key,
+            visit_key=visit_key,
+            extra_filters=extra_filters,
         )
         for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
             df = transform_records_to_sdtm(chunk, domain=domain, study_key=study_key)
@@ -1215,21 +1503,17 @@ class RecordMapper:
         When ``as_sdtm`` is True, clinical records are transformed into a normalized
         CDISC SDTM tabular dataset matching the models in ``reporting.py``.
         """
+        ensure_sync_sdk(self.sdk, "RecordMapper", "dataframe", "async_dataframe")
         if as_sdtm:
-            target_domain = domain or "AE"
             return self.sdtm_dataframe(
                 study_key=study_key,
-                domain=target_domain,
+                domain=domain or "AE",
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
             )
 
-        if pd is None:
-            raise ImportError(
-                "pandas is required for RecordMapper.dataframe. Install "
-                "with 'pip install \"imednet[pandas]\"'."
-            )
+        self._ensure_pandas("dataframe")
         frames = list(
             self.iter_dataframes(
                 study_key,
@@ -1239,6 +1523,43 @@ class RecordMapper:
                 form_whitelist=form_whitelist,
             )
         )
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    async def async_dataframe(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = True,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+    ) -> pd.DataFrame:
+        """Asynchronously return a :class:`pandas.DataFrame` of records for a study."""
+        ensure_async_sdk(self.sdk, "RecordMapper", "async_dataframe", "dataframe")
+        if as_sdtm:
+            return await self.async_sdtm_dataframe(
+                study_key=study_key,
+                domain=domain or "AE",
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+
+        self._ensure_pandas("async_dataframe")
+        frames = [
+            frame
+            async for frame in self.async_iter_dataframes(
+                study_key,
+                visit_key=visit_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+        ]
         if not frames:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True)

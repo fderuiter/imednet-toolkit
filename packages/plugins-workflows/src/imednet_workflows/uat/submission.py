@@ -3,21 +3,23 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import Field
 
-from imednet.spi.facade import ImednetFacade
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.models import ImednetBaseModel, Job, JobState, normalize_job_state
-from imednet.spi.utils import JobFailedError, JobPoller, JobTimeoutError
+from imednet.spi.utils import AsyncJobPoller, JobFailedError, JobPoller, JobTimeoutError
 
+from .._guards import ensure_async_sdk, ensure_sync_sdk
 from .generator import GeneratedRecordSet
 from .models import RecordTestType
 
 logger = logging.getLogger(__name__)
+_OWNER = "BulkRecordSubmissionWorkflow"
 
 
 class SubmissionPhase(StrEnum):
@@ -83,31 +85,104 @@ class BulkSubmissionError(Exception):
         self.failed_batches = failed_batches
 
 
+def _extract_subject_keys_set(subjects: Iterable[Any]) -> set[str]:
+    """Extract non-empty subject keys from an iterable of Subject models."""
+    existing_keys: set[str] = set()
+    for subj in subjects:
+        key = getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None)
+        if key:
+            existing_keys.add(key)
+    return existing_keys
+
+
+def _filter_registration_set_payloads(
+    rs: GeneratedRecordSet,
+    existing_subjects: set[str],
+    result: SubmissionResult,
+) -> list[dict[str, Any]]:
+    """Filter payloads in a registration set against pre-existing subject keys."""
+    filtered_payloads: list[dict[str, Any]] = []
+    for i, payload in enumerate(rs.payloads):
+        subj_key = rs.subject_keys[i] if i < len(rs.subject_keys) else None
+        if subj_key and subj_key in existing_subjects:
+            logger.info("Skipping registration for existing subject: %s", subj_key)
+            continue
+        filtered_payloads.append(payload)
+
+    if not filtered_payloads:
+        result.skipped_forms.append(rs.form_key)
+    return filtered_payloads
+
+
+def _reconcile_registration_poll_summary(
+    batches_to_poll: list[BatchSubmission],
+    summary: Any,
+) -> None:
+    """Update Phase 1 batch job states from ``JobPollSummary`` and raise on failures."""
+    failed_batches: list[BatchSubmission] = []
+    for batch in batches_to_poll:
+        batch_id = batch.job.batch_id
+        if batch_id in summary.failures:
+            exc = summary.failures[batch_id]
+            if isinstance(exc, JobTimeoutError):
+                target_state = JobState.TIMEOUT
+            elif isinstance(exc, JobFailedError):
+                status = getattr(exc, "status", None)
+                raw_state = getattr(status, "state", None)
+                target_state = normalize_job_state(raw_state) if raw_state else JobState.FAILED
+            else:
+                target_state = JobState.FAILED
+            batch.job.transition_to(target_state)
+            if not isinstance(batch.job, Job):
+                batch.job.state = target_state
+            failed_batches.append(batch)
+        elif batch_id in summary.results:
+            status = summary.results[batch_id]
+            raw_state = getattr(status, "state", None)
+            target_state = normalize_job_state(raw_state) if raw_state else JobState.FAILED
+            batch.job.transition_to(target_state)
+            if not isinstance(batch.job, Job):
+                batch.job.state = target_state
+            is_success = (
+                batch.job.is_successful
+                if isinstance(batch.job.is_successful, bool)
+                else (
+                    getattr(batch.job, "state", None)
+                    in (
+                        JobState.COMPLETED,
+                        JobState.COMPLETE,
+                        JobState.SUCCESS,
+                        "COMPLETED",
+                        "COMPLETE",
+                        "SUCCESS",
+                    )
+                )
+            )
+            if not is_success:
+                failed_batches.append(batch)
+        else:
+            batch.job.transition_to(JobState.FAILED)
+            if not isinstance(batch.job, Job):
+                batch.job.state = JobState.FAILED
+            failed_batches.append(batch)
+
+    if failed_batches:
+        raise BulkSubmissionError(
+            f"{len(failed_batches)} registration batches failed.",
+            failed_batches=failed_batches,
+        )
+
+
 class BulkRecordSubmissionWorkflow:
     """Two-phase bulk record submission for UAT scenarios.
 
     Phase 1: Submit all RegisterSubjectRequest payloads and await job completion.
     Phase 2: Submit all UpdateScheduledRecordRequest and CreateNewRecordRequest payloads.
-
-    Parameters
-    ----------
-    sdk : ImednetFacade
-        Initialized synchronous SDK instance.
-    batch_size : int
-        Maximum number of records per API call. Default: 100.
-    await_registration : bool
-        If True, block until all Phase 1 jobs reach terminal state before
-        submitting Phase 2 records. Default: True.
-    registration_timeout : float
-        Seconds to wait for Phase 1 jobs. Default: 600.
-    skip_existing_subjects : bool
-        If True, query the API for existing UAT-tagged subjects and skip
-        registration for any that already exist. Default: True.
     """
 
     def __init__(
         self,
-        sdk: ImednetFacade,
+        sdk: ImednetFacade | AsyncImednetFacade,
         batch_size: int = 100,
         await_registration: bool = True,
         registration_timeout: float = 600.0,
@@ -121,6 +196,24 @@ class BulkRecordSubmissionWorkflow:
         self.skip_existing_subjects = skip_existing_subjects
         self.phase: SubmissionPhase = SubmissionPhase.PENDING
 
+    @staticmethod
+    def _split_record_sets(
+        record_sets: list[GeneratedRecordSet],
+    ) -> tuple[list[GeneratedRecordSet], list[GeneratedRecordSet]]:
+        """Partition generated sets into Phase 1 registration and Phase 2 data sets."""
+        registration_sets = [
+            rs for rs in record_sets if rs.test_type == RecordTestType.REGISTER_SUBJECT
+        ]
+        data_sets = [rs for rs in record_sets if rs.test_type != RecordTestType.REGISTER_SUBJECT]
+        return registration_sets, data_sets
+
+    def _advance_post_registration_phase(self, result: SubmissionResult) -> None:
+        """Set ``self.phase`` after Phase 1 registration batches have been submitted."""
+        if self.await_registration and result.registration_batches:
+            self.phase = SubmissionPhase.AWAITING_REGISTRATION
+        else:
+            self.phase = SubmissionPhase.DATA
+
     def submit(
         self,
         study_key: str,
@@ -129,59 +222,31 @@ class BulkRecordSubmissionWorkflow:
         email_notify: bool | str | None = None,
         keyword_tag: str = "UAT",
     ) -> SubmissionResult:
-        """Execute the two-phase submission.
-
-        Returns a SubmissionResult with all jobs and metadata.
-        Raises BulkSubmissionError if Phase 1 jobs fail and Phase 2 depends on them.
-        """
-        result = SubmissionResult(
-            study_key=study_key,
-            started_at=datetime.now(UTC),
-        )
-
-        registration_sets = [
-            rs for rs in record_sets if rs.test_type == RecordTestType.REGISTER_SUBJECT
-        ]
-        data_sets = [rs for rs in record_sets if rs.test_type != RecordTestType.REGISTER_SUBJECT]
+        """Execute the synchronous two-phase submission."""
+        ensure_sync_sdk(self.sdk, _OWNER, "submit", "async_submit")
+        result = SubmissionResult(study_key=study_key, started_at=datetime.now(UTC))
+        registration_sets, data_sets = self._split_record_sets(record_sets)
 
         existing_subjects: set[str] = set()
         if self.skip_existing_subjects:
             existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
 
-        # Phase 1: Registration
         self.phase = SubmissionPhase.REGISTRATION
         for rs in registration_sets:
-            # Let's assume GeneratedRecordSet.payloads and GeneratedRecordSet.subject_keys are 1:1
-            filtered_payloads = []
-            for i, payload in enumerate(rs.payloads):
-                subj_key = rs.subject_keys[i] if i < len(rs.subject_keys) else None
-                if subj_key and subj_key in existing_subjects:
-                    logger.info("Skipping registration for existing subject: %s", subj_key)
-                    continue
-                filtered_payloads.append(payload)
-
-            if not filtered_payloads:
-                result.skipped_forms.append(rs.form_key)
-                continue
-
+            filtered_payloads = _filter_registration_set_payloads(rs, existing_subjects, result)
             for chunk in self._chunk_payloads(filtered_payloads):
-                batch = self._submit_batch(
-                    study_key,
-                    chunk,
-                    phase="registration",
-                    form_key=rs.form_key,
-                    form_name=rs.form_name,
-                    email_notify=email_notify,
+                result.registration_batches.append(
+                    self._submit_batch(
+                        study_key,
+                        chunk,
+                        phase="registration",
+                        form_key=rs.form_key,
+                        form_name=rs.form_name,
+                        email_notify=email_notify,
+                    )
                 )
-                result.registration_batches.append(batch)
 
-        # Determine transition from registration phase
-        if self.await_registration and result.registration_batches:
-            self.phase = SubmissionPhase.AWAITING_REGISTRATION
-        else:
-            self.phase = SubmissionPhase.DATA
-
-        # Explicit submission phase check for awaiting registration
+        self._advance_post_registration_phase(result)
         if self.phase == SubmissionPhase.AWAITING_REGISTRATION:
             try:
                 self._await_registration_jobs(study_key, result.registration_batches)
@@ -190,20 +255,78 @@ class BulkRecordSubmissionWorkflow:
                 raise
             self.phase = SubmissionPhase.DATA
 
-        # Explicit submission phase check for data submission
         if self.phase == SubmissionPhase.DATA:
-            # Phase 2: Data Submission
             for rs in data_sets:
                 for chunk in self._chunk_payloads(rs.payloads):
-                    batch = self._submit_batch(
+                    result.data_batches.append(
+                        self._submit_batch(
+                            study_key,
+                            chunk,
+                            phase="data",
+                            form_key=rs.form_key,
+                            form_name=rs.form_name,
+                            email_notify=email_notify,
+                        )
+                    )
+            self.phase = SubmissionPhase.COMPLETED
+
+        result.completed_at = datetime.now(UTC)
+        return result
+
+    async def async_submit(
+        self,
+        study_key: str,
+        record_sets: list[GeneratedRecordSet],
+        *,
+        email_notify: bool | str | None = None,
+        keyword_tag: str = "UAT",
+    ) -> SubmissionResult:
+        """Asynchronously execute the two-phase submission."""
+        ensure_async_sdk(self.sdk, _OWNER, "async_submit", "submit")
+        result = SubmissionResult(study_key=study_key, started_at=datetime.now(UTC))
+        registration_sets, data_sets = self._split_record_sets(record_sets)
+
+        existing_subjects: set[str] = set()
+        if self.skip_existing_subjects:
+            existing_subjects = await self._async_find_existing_uat_subjects(study_key, keyword_tag)
+
+        self.phase = SubmissionPhase.REGISTRATION
+        for rs in registration_sets:
+            filtered_payloads = _filter_registration_set_payloads(rs, existing_subjects, result)
+            for chunk in self._chunk_payloads(filtered_payloads):
+                result.registration_batches.append(
+                    await self._async_submit_batch(
                         study_key,
                         chunk,
-                        phase="data",
+                        phase="registration",
                         form_key=rs.form_key,
                         form_name=rs.form_name,
                         email_notify=email_notify,
                     )
-                    result.data_batches.append(batch)
+                )
+
+        self._advance_post_registration_phase(result)
+        if self.phase == SubmissionPhase.AWAITING_REGISTRATION:
+            try:
+                await self._async_await_registration_jobs(study_key, result.registration_batches)
+            except Exception:
+                self.phase = SubmissionPhase.FAILED
+                raise
+            self.phase = SubmissionPhase.DATA
+
+        if self.phase == SubmissionPhase.DATA:
+            for rs in data_sets:
+                for chunk in self._chunk_payloads(rs.payloads):
+                    result.data_batches.append(
+                        await self._async_submit_batch(
+                            study_key,
+                            chunk,
+                            phase="data",
+                            form_key=rs.form_key,
+                            form_name=rs.form_name,
+                            email_notify=email_notify,
+                        )
+                    )
             self.phase = SubmissionPhase.COMPLETED
 
         result.completed_at = datetime.now(UTC)
@@ -223,8 +346,29 @@ class BulkRecordSubmissionWorkflow:
         form_name: str | None,
         email_notify: bool | str | None,
     ) -> BatchSubmission:
-        """Submit a single batch and return a BatchSubmission."""
-        job = self.sdk.create_record(study_key, payloads, email_notify=email_notify)
+        """Submit a single batch synchronously and return a BatchSubmission."""
+        sdk = cast("ImednetFacade", self.sdk)
+        job = sdk.create_record(study_key, payloads, email_notify=email_notify)
+        return BatchSubmission(
+            phase=phase,
+            form_key=form_key,
+            form_name=form_name,
+            record_count=len(payloads),
+            job=job,
+        )
+
+    async def _async_submit_batch(
+        self,
+        study_key: str,
+        payloads: list[dict[str, Any]],
+        phase: Literal["registration", "data"] | SubmissionPhase,
+        form_key: str | None,
+        form_name: str | None,
+        email_notify: bool | str | None,
+    ) -> BatchSubmission:
+        """Submit a single batch asynchronously and return a BatchSubmission."""
+        sdk = cast("AsyncImednetFacade", self.sdk)
+        job = await sdk.async_create_record(study_key, payloads, email_notify=email_notify)
         return BatchSubmission(
             phase=phase,
             form_key=form_key,
@@ -239,7 +383,8 @@ class BulkRecordSubmissionWorkflow:
         if not batches_to_poll:
             return
 
-        poller = JobPoller(get_job=self.sdk.get_job)
+        sdk = cast("ImednetFacade", self.sdk)
+        poller = JobPoller(get_job=sdk.get_job)
         batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
         summary = poller.poll_many(
             study_key,
@@ -247,69 +392,37 @@ class BulkRecordSubmissionWorkflow:
             timeout=float(self.registration_timeout),
             fail_fast=False,
         )
+        _reconcile_registration_poll_summary(batches_to_poll, summary)
 
-        failed_batches: list[BatchSubmission] = []
-        for batch in batches_to_poll:
-            batch_id = batch.job.batch_id
-            if batch_id in summary.failures:
-                exc = summary.failures[batch_id]
-                if isinstance(exc, JobTimeoutError):
-                    target_state = JobState.TIMEOUT
-                elif isinstance(exc, JobFailedError):
-                    status = getattr(exc, "status", None)
-                    raw_state = getattr(status, "state", None)
-                    target_state = normalize_job_state(raw_state) if raw_state else JobState.FAILED
-                else:
-                    target_state = JobState.FAILED
-                batch.job.transition_to(target_state)
-                if not isinstance(batch.job, Job):
-                    batch.job.state = target_state
-                failed_batches.append(batch)
-            elif batch_id in summary.results:
-                status = summary.results[batch_id]
-                raw_state = getattr(status, "state", None)
-                target_state = normalize_job_state(raw_state) if raw_state else JobState.FAILED
-                batch.job.transition_to(target_state)
-                if not isinstance(batch.job, Job):
-                    batch.job.state = target_state
-                is_success = (
-                    batch.job.is_successful
-                    if isinstance(batch.job.is_successful, bool)
-                    else (
-                        getattr(batch.job, "state", None)
-                        in (
-                            JobState.COMPLETED,
-                            JobState.COMPLETE,
-                            JobState.SUCCESS,
-                            "COMPLETED",
-                            "COMPLETE",
-                            "SUCCESS",
-                        )
-                    )
-                )
-                if not is_success:
-                    failed_batches.append(batch)
-            else:
-                batch.job.transition_to(JobState.FAILED)
-                if not isinstance(batch.job, Job):
-                    batch.job.state = JobState.FAILED
-                failed_batches.append(batch)
+    async def _async_await_registration_jobs(
+        self, study_key: str, batches: list[BatchSubmission]
+    ) -> None:
+        """Await all Phase 1 registration jobs concurrently via ``AsyncJobPoller``."""
+        batches_to_poll = [b for b in batches if b.job.batch_id]
+        if not batches_to_poll:
+            return
 
-        if failed_batches:
-            raise BulkSubmissionError(
-                f"{len(failed_batches)} registration batches failed.",
-                failed_batches=failed_batches,
-            )
+        sdk = cast("AsyncImednetFacade", self.sdk)
+        poller = AsyncJobPoller(get_job=sdk.async_get_job)
+        batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
+        summary = await poller.async_poll_many(
+            study_key,
+            batch_ids,
+            timeout=float(self.registration_timeout),
+            fail_fast=False,
+        )
+        _reconcile_registration_poll_summary(batches_to_poll, summary)
 
     def _find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
         """Query subjects filtered by keyword to find pre-existing UAT subjects."""
-        subjects = self.sdk.get_subjects(study_key, keyword=keyword_tag)
-        existing_keys = set()
-        for subj in subjects:
-            key = getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None)
-            if key:
-                existing_keys.add(key)
-        return existing_keys
+        sdk = cast("ImednetFacade", self.sdk)
+        return _extract_subject_keys_set(sdk.get_subjects(study_key, keyword=keyword_tag))
+
+    async def _async_find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
+        """Asynchronously query subjects filtered by keyword for pre-existing UAT subjects."""
+        sdk = cast("AsyncImednetFacade", self.sdk)
+        subjects = await sdk.async_get_subjects(study_key, keyword=keyword_tag)
+        return _extract_subject_keys_set(subjects)
 
 
 __all__ = [

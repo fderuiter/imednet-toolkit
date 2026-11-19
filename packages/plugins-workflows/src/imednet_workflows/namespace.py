@@ -15,13 +15,13 @@ from .subject_data import SubjectDataWorkflow
 from .uat import StudySchemaInspector, UATWorkflow
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 
 class Workflows:
     """Namespace for accessing workflow classes."""
 
-    def __init__(self, sdk_instance: ImednetFacade):
+    def __init__(self, sdk_instance: ImednetFacade | AsyncImednetFacade):
         """Initialize the workflows namespace.
 
         Args:

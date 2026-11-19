@@ -7,12 +7,13 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import Field
 
 from imednet.spi.models import ImednetBaseModel
 
+from .._guards import ensure_async_sdk, ensure_sync_sdk
 from .generator import GeneratedRecordSet
 from .models import (
     TERMINAL_UAT_STATES,
@@ -30,10 +31,12 @@ from .models import (
 from .submission import SubmissionResult
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
     from imednet.spi.utils import JobProgressCallback
 
     from .inspector import StudySnapshot
+
+_OWNER = "UATWorkflow"
 
 
 class UATRunPhase(str, Enum):
@@ -251,7 +254,7 @@ class UATWorkflow:
 
     def __init__(
         self,
-        sdk: ImednetFacade,
+        sdk: ImednetFacade | AsyncImednetFacade,
         *,
         batch_size: int = 100,
         poll_interval: float = 10.0,
@@ -269,7 +272,7 @@ class UATWorkflow:
         self._builder = UATSpecificationBuilder()
         self._generator = SyntheticRecordGenerator(seed=seed)
 
-        # Config for lazy initialization of sync components
+        # Config for lazy initialization of sync/async components
         self._batch_size = batch_size
         self._poll_interval = poll_interval
         self._poll_timeout = poll_timeout
@@ -278,6 +281,7 @@ class UATWorkflow:
 
         self._submitter: Any | None = None
         self._poller: Any | None = None
+        self._async_poller: Any | None = None
 
         self._state: UATWorkflowState = UATWorkflowState.PENDING
         self._state_history: list[UATWorkflowState] = [UATWorkflowState.PENDING]
@@ -299,17 +303,7 @@ class UATWorkflow:
         return self._last_result
 
     def transition_to(self, target: UATWorkflowState | str) -> UATWorkflowState:
-        """Transition workflow to a new state along an approved lifecycle path.
-
-        Args:
-            target: Desired target state.
-
-        Returns:
-            The newly set state.
-
-        Raises:
-            InvalidUATStateTransitionError: If the transition is not permitted.
-        """
+        """Transition workflow to a new state along an approved lifecycle path."""
         target_state = normalize_uat_state(target)
         validate_uat_transition(self._state, target_state)
         self._state = target_state
@@ -338,9 +332,84 @@ class UATWorkflow:
         if self._poller is None:
             from imednet.spi.utils import JobPoller
 
-            self._poller = JobPoller(get_job=self._sdk.get_job)
+            sdk = cast("ImednetFacade", self._sdk)
+            self._poller = JobPoller(get_job=sdk.get_job)
 
         return self._poller
+
+    def _get_async_poller(self) -> Any:
+        if self._poller is not None and hasattr(self._poller, "async_poll_many"):
+            return self._poller
+        if self._async_poller is None:
+            from imednet.spi.utils import AsyncJobPoller
+
+            sdk = cast("AsyncImednetFacade", self._sdk)
+            self._async_poller = AsyncJobPoller(get_job=sdk.async_get_job)
+        return self._async_poller
+
+    def _complete_run(
+        self,
+        *,
+        study_key: str,
+        run_id: str,
+        started_at: datetime,
+        spec: UATSpecification | None,
+        record_sets: list[GeneratedRecordSet],
+        submission_result: SubmissionResult | None,
+        poll_summary: Any,
+        phase_durations: dict[str, float],
+    ) -> UATRunResult:
+        """Transition to COMPLETED and build the terminal ``UATRunResult``."""
+        self.transition_to(UATWorkflowState.COMPLETED)
+        result = UATRunResult(
+            study_key=study_key,
+            run_id=run_id,
+            started_at=started_at,
+            completed_at=datetime.now(UTC),
+            state=self._state,
+            state_history=list(self._state_history),
+            spec=spec,
+            record_sets=record_sets,
+            submission_result=submission_result,
+            poll_summary=poll_summary,
+            phase_durations=phase_durations,
+        )
+        self._last_result = result
+        return result
+
+    def _fail_run(
+        self,
+        *,
+        study_key: str,
+        run_id: str,
+        started_at: datetime,
+        exc: Exception,
+        spec: UATSpecification | None,
+        record_sets: list[GeneratedRecordSet],
+        submission_result: SubmissionResult | None,
+        poll_summary: Any,
+        phase_durations: dict[str, float],
+    ) -> UATRunResult:
+        """Transition to FAILED and build the failure ``UATRunResult``."""
+        failed_phase = self._state
+        self.transition_to(UATWorkflowState.FAILED)
+        result = UATRunResult(
+            study_key=study_key,
+            run_id=run_id,
+            started_at=started_at,
+            completed_at=datetime.now(UTC),
+            state=self._state,
+            state_history=list(self._state_history),
+            failure_phase=failed_phase,
+            error_message=str(exc),
+            spec=spec,
+            record_sets=record_sets,
+            submission_result=submission_result,
+            poll_summary=poll_summary,
+            phase_durations=phase_durations,
+        )
+        self._last_result = result
+        return result
 
     def run(
         self,
@@ -352,7 +421,8 @@ class UATWorkflow:
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
     ) -> UATRunResult:
-        """Execute the full UAT pipeline and return a UATRunResult."""
+        """Execute the full UAT pipeline synchronously and return a UATRunResult."""
+        ensure_sync_sdk(self._sdk, _OWNER, "run", "async_run")
         started_at = datetime.now(UTC)
         run_id = str(uuid.uuid4())
         phase_durations: dict[str, float] = {}
@@ -361,13 +431,11 @@ class UATWorkflow:
         poll_summary: Any = None
 
         try:
-            # 1. Inspect
             self.transition_to(UATWorkflowState.INSPECTING)
             t0 = time.monotonic()
             snapshot = self.inspect(study_key)
             phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
 
-            # 2. Build Spec (if not provided)
             self.transition_to(UATWorkflowState.BUILDING_SPEC)
             t0 = time.monotonic()
             if spec is None:
@@ -379,68 +447,133 @@ class UATWorkflow:
                 )
             phase_durations[UATRunPhase.BUILD_SPEC] = time.monotonic() - t0
 
-            # 3. Generate
             self.transition_to(UATWorkflowState.GENERATING)
             t0 = time.monotonic()
             record_sets = self.generate(spec, snapshot)
             phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
 
-            # 4. Submit
             self.transition_to(UATWorkflowState.SUBMITTING)
             t0 = time.monotonic()
             submission_result = self.submit(study_key, record_sets, email_notify=email_notify)
             phase_durations[UATRunPhase.SUBMIT] = time.monotonic() - t0
 
-            # 5. Monitor
             self.transition_to(UATWorkflowState.MONITORING)
             t0 = time.monotonic()
             poll_summary = self.monitor(study_key, submission_result)
             phase_durations[UATRunPhase.MONITOR] = time.monotonic() - t0
 
-            # Complete
-            self.transition_to(UATWorkflowState.COMPLETED)
-            result = UATRunResult(
+            return self._complete_run(
                 study_key=study_key,
                 run_id=run_id,
                 started_at=started_at,
-                completed_at=datetime.now(UTC),
-                state=self._state,
-                state_history=list(self._state_history),
                 spec=spec,
                 record_sets=record_sets,
                 submission_result=submission_result,
                 poll_summary=poll_summary,
                 phase_durations=phase_durations,
             )
-            self._last_result = result
-            return result
-
         except InvalidUATStateTransitionError:
             raise
         except Exception as exc:
-            failed_phase = self._state
-            self.transition_to(UATWorkflowState.FAILED)
-            result = UATRunResult(
+            return self._fail_run(
                 study_key=study_key,
                 run_id=run_id,
                 started_at=started_at,
-                completed_at=datetime.now(UTC),
-                state=self._state,
-                state_history=list(self._state_history),
-                failure_phase=failed_phase,
-                error_message=str(exc),
+                exc=exc,
                 spec=spec,
                 record_sets=record_sets,
                 submission_result=submission_result,
                 poll_summary=poll_summary,
                 phase_durations=phase_durations,
             )
-            self._last_result = result
-            return result
+
+    async def async_run(
+        self,
+        study_key: str,
+        *,
+        spec: UATSpecification | None = None,
+        subject_count: int = 2,
+        site_name: str | None = None,
+        enabled_form_keys: list[str] | None = None,
+        email_notify: bool | str | None = None,
+    ) -> UATRunResult:
+        """Asynchronously execute the full UAT pipeline and return a UATRunResult."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_run", "run")
+        started_at = datetime.now(UTC)
+        run_id = str(uuid.uuid4())
+        phase_durations: dict[str, float] = {}
+        record_sets: list[GeneratedRecordSet] = []
+        submission_result: SubmissionResult | None = None
+        poll_summary: Any = None
+
+        try:
+            self.transition_to(UATWorkflowState.INSPECTING)
+            t0 = time.monotonic()
+            snapshot = await self.async_inspect(study_key)
+            phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
+
+            self.transition_to(UATWorkflowState.BUILDING_SPEC)
+            t0 = time.monotonic()
+            if spec is None:
+                spec = self.build_spec(
+                    snapshot,
+                    subject_count=subject_count,
+                    site_name=site_name,
+                    enabled_form_keys=enabled_form_keys,
+                )
+            phase_durations[UATRunPhase.BUILD_SPEC] = time.monotonic() - t0
+
+            self.transition_to(UATWorkflowState.GENERATING)
+            t0 = time.monotonic()
+            record_sets = self.generate(spec, snapshot)
+            phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
+
+            self.transition_to(UATWorkflowState.SUBMITTING)
+            t0 = time.monotonic()
+            submission_result = await self.async_submit(
+                study_key, record_sets, email_notify=email_notify
+            )
+            phase_durations[UATRunPhase.SUBMIT] = time.monotonic() - t0
+
+            self.transition_to(UATWorkflowState.MONITORING)
+            t0 = time.monotonic()
+            poll_summary = await self.async_monitor(study_key, submission_result)
+            phase_durations[UATRunPhase.MONITOR] = time.monotonic() - t0
+
+            return self._complete_run(
+                study_key=study_key,
+                run_id=run_id,
+                started_at=started_at,
+                spec=spec,
+                record_sets=record_sets,
+                submission_result=submission_result,
+                poll_summary=poll_summary,
+                phase_durations=phase_durations,
+            )
+        except InvalidUATStateTransitionError:
+            raise
+        except Exception as exc:
+            return self._fail_run(
+                study_key=study_key,
+                run_id=run_id,
+                started_at=started_at,
+                exc=exc,
+                spec=spec,
+                record_sets=record_sets,
+                submission_result=submission_result,
+                poll_summary=poll_summary,
+                phase_durations=phase_durations,
+            )
 
     def inspect(self, study_key: str) -> Any:
-        """Fetch study metadata via StudySchemaInspector."""
+        """Fetch study metadata synchronously via StudySchemaInspector."""
+        ensure_sync_sdk(self._sdk, _OWNER, "inspect", "async_inspect")
         return self._inspector.inspect(study_key)
+
+    async def async_inspect(self, study_key: str) -> Any:
+        """Fetch study metadata asynchronously via StudySchemaInspector."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_inspect", "inspect")
+        return await self._inspector.async_inspect(study_key)
 
     def build_spec(self, snapshot: Any, **kwargs: Any) -> UATSpecification:
         """Auto-generate a UATSpecification from the StudySnapshot."""
@@ -456,12 +589,37 @@ class UATWorkflow:
         record_sets: list[GeneratedRecordSet],
         email_notify: bool | str | None = None,
     ) -> SubmissionResult:
-        """Execute the two-phase bulk submission."""
+        """Execute the synchronous two-phase bulk submission."""
+        ensure_sync_sdk(self._sdk, _OWNER, "submit", "async_submit")
         return self._get_submitter().submit(study_key, record_sets, email_notify=email_notify)  # type: ignore[no-any-return]
 
+    async def async_submit(
+        self,
+        study_key: str,
+        record_sets: list[GeneratedRecordSet],
+        email_notify: bool | str | None = None,
+    ) -> SubmissionResult:
+        """Execute the asynchronous two-phase bulk submission."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_submit", "submit")
+        return await self._get_submitter().async_submit(  # type: ignore[no-any-return]
+            study_key, record_sets, email_notify=email_notify
+        )
+
     def monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:
-        """Poll all resulting jobs to completion via JobPoller."""
+        """Poll all resulting jobs to completion synchronously via JobPoller."""
+        ensure_sync_sdk(self._sdk, _OWNER, "monitor", "async_monitor")
         return self._get_poller().poll_many(
+            study_key,
+            submission_result.all_batch_ids,
+            interval=self._poll_interval,
+            timeout=self._poll_timeout,
+            on_progress=self._on_progress,
+        )
+
+    async def async_monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:
+        """Poll all resulting jobs to completion asynchronously via AsyncJobPoller."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_monitor", "monitor")
+        return await self._get_async_poller().async_poll_many(
             study_key,
             submission_result.all_batch_ids,
             interval=self._poll_interval,

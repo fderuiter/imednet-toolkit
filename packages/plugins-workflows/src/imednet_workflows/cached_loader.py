@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 import threading
@@ -10,15 +11,24 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from filelock import FileLock
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    Retrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from imednet.spi.models import Record
 from imednet.spi.utils import build_filter_string
 
+from ._guards import ensure_async_sdk, ensure_sync_sdk
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+
+_OWNER = "CachedRecordsLoader"
 
 DEFAULT_CACHE_DIR = Path.home() / ".imednet" / "cache"
 
@@ -60,7 +70,7 @@ class CachedRecordsLoader:
 
     def __init__(
         self,
-        sdk: ImednetFacade,
+        sdk: ImednetFacade | AsyncImednetFacade,
         *,
         cache_dir: str | Path | None = None,
         database_name: str = "records_cache.sqlite3",
@@ -71,7 +81,7 @@ class CachedRecordsLoader:
         """Initialize the cached records loader.
 
         Args:
-            sdk: An instance of the iMednet SDK facade.
+            sdk: An instance of the iMednet SDK facade (sync or async).
             cache_dir: Directory to store the SQLite cache. Defaults to ~/.imednet/cache.
             database_name: Name of the SQLite database file.
             retry_attempts: Number of API retry attempts.
@@ -95,11 +105,19 @@ class CachedRecordsLoader:
 
     def load_records(self, study_key: str, *, reconcile: bool = True) -> list[Record]:
         """Synchronise the cache for ``study_key`` and return cached records."""
+        ensure_sync_sdk(self._sdk, _OWNER, "load_records", "async_load_records")
         self.sync_records(study_key, reconcile=reconcile)
+        return self.get_cached_records(study_key)
+
+    async def async_load_records(self, study_key: str, *, reconcile: bool = True) -> list[Record]:
+        """Asynchronously synchronise the cache for ``study_key`` and return cached records."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_load_records", "load_records")
+        await self.async_sync_records(study_key, reconcile=reconcile)
         return self.get_cached_records(study_key)
 
     def sync_records(self, study_key: str, *, reconcile: bool = True) -> None:
         """Synchronise the cache for ``study_key`` without materialising cached rows."""
+        ensure_sync_sdk(self._sdk, _OWNER, "sync_records", "async_sync_records")
         conn = get_sqlite_connection(self.db_path)
         try:
             high_water_mark = self._get_high_water_mark(conn, study_key)
@@ -107,6 +125,28 @@ class CachedRecordsLoader:
             self._upsert_records(conn, delta_records)
             if reconcile:
                 active_record_ids = self._fetch_active_record_ids(study_key)
+                self.reconcile_cache(conn, study_key, active_record_ids)
+        finally:
+            conn.close()
+
+    async def async_sync_records(self, study_key: str, *, reconcile: bool = True) -> None:
+        """Asynchronously synchronise the cache for ``study_key`` without materialising rows."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_sync_records", "sync_records")
+        conn = get_sqlite_connection(self.db_path)
+        try:
+            high_water_mark = self._get_high_water_mark(conn, study_key)
+        finally:
+            conn.close()
+
+        delta_records = await self._async_fetch_delta_records(study_key, high_water_mark)
+        active_record_ids = (
+            await self._async_fetch_active_record_ids(study_key) if reconcile else None
+        )
+
+        conn = get_sqlite_connection(self.db_path)
+        try:
+            self._upsert_records(conn, delta_records)
+            if active_record_ids is not None:
                 self.reconcile_cache(conn, study_key, active_record_ids)
         finally:
             conn.close()
@@ -232,10 +272,21 @@ class CachedRecordsLoader:
         if not high_water_mark:
             return self._list_records(study_key=study_key, record_data_filter=None)
 
-        # Use >= to avoid missing updates that share the high-water-mark timestamp.
-        # _upsert_records keeps refresh idempotent by deduplicating on (study_key, record_id).
         delta_filter = build_filter_string({"date_modified": (">=", high_water_mark)})
         return self._list_records_with_filter_override(
+            study_key=study_key,
+            filter_string=delta_filter,
+        )
+
+    async def _async_fetch_delta_records(
+        self, study_key: str, high_water_mark: str | None
+    ) -> list[Record]:
+        """Asynchronously fetch records modified since ``high_water_mark``."""
+        if not high_water_mark:
+            return await self._async_list_records(study_key=study_key, record_data_filter=None)
+
+        delta_filter = build_filter_string({"date_modified": (">=", high_water_mark)})
+        return await self._async_list_records_with_filter_override(
             study_key=study_key,
             filter_string=delta_filter,
         )
@@ -245,41 +296,79 @@ class CachedRecordsLoader:
         records = self._list_records(study_key=study_key, record_data_filter="none", deleted=False)
         return {record.record_id for record in records if record.record_id is not None}
 
-    def _list_records(self, **filters: Any) -> list[Record]:
-        """Call the SDK records list endpoint with retry logic."""
-        retryer = Retrying(
+    async def _async_fetch_active_record_ids(self, study_key: str) -> set[int]:
+        """Asynchronously fetch all non-deleted record IDs for ``study_key``."""
+        records = await self._async_list_records(
+            study_key=study_key, record_data_filter="none", deleted=False
+        )
+        return {record.record_id for record in records if record.record_id is not None}
+
+    def _build_retryer(self) -> Retrying:
+        """Create the synchronous tenacity retry controller."""
+        return Retrying(
             stop=stop_after_attempt(self._retry_attempts),
             wait=wait_exponential(multiplier=1, min=1, max=8),
             retry=retry_if_exception_type(Exception),
             reraise=True,
         )
-        return retryer(self._sdk.get_records, **filters)
+
+    def _build_async_retryer(self) -> AsyncRetrying:
+        """Create the asynchronous tenacity retry controller."""
+        return AsyncRetrying(
+            stop=stop_after_attempt(self._retry_attempts),
+            wait=wait_exponential(multiplier=1, min=1, max=8),
+            retry=retry_if_exception_type(Exception),
+            reraise=True,
+        )
+
+    def _list_records(self, **filters: Any) -> list[Record]:
+        """Call the SDK records list endpoint with retry logic."""
+        sdk = cast("ImednetFacade", self._sdk)
+        return self._build_retryer()(sdk.get_records, **filters)
+
+    async def _async_list_records(self, **filters: Any) -> list[Record]:
+        """Asynchronously call ``sdk.async_get_records`` with retry logic."""
+        sdk = cast("AsyncImednetFacade", self._sdk)
+        async for attempt in self._build_async_retryer():
+            with attempt:
+                return list(await sdk.async_get_records(**filters))
+        return []  # pragma: no cover
 
     def _list_records_with_filter_override(
         self, *, study_key: str, filter_string: str
     ) -> list[Record]:
-        """List records using an explicit raw ``filter`` query parameter.
-
-        This bypasses automatic filter construction so incremental sync can
-        send only the timestamp predicate (without ``studyKey``).
-        """
-        retryer = Retrying(
-            stop=stop_after_attempt(self._retry_attempts),
-            wait=wait_exponential(multiplier=1, min=1, max=8),
-            retry=retry_if_exception_type(Exception),
-            reraise=True,
-        )
+        """List records using an explicit raw ``filter`` query parameter."""
         endpoint = getattr(self._sdk, "records")  # noqa: B009
-
-        return cast(
-            list[Record],
-            retryer(
-                endpoint.list,
-                study_key=study_key,
-                filter=filter_string,
-                record_data_filter=None,
-            ),
+        return list(
+            cast(
+                Iterable[Record],
+                self._build_retryer()(
+                    endpoint.list,
+                    study_key=study_key,
+                    filter=filter_string,
+                    record_data_filter=None,
+                ),
+            )
         )
+
+    async def _async_list_records_with_filter_override(
+        self, *, study_key: str, filter_string: str
+    ) -> list[Record]:
+        """Asynchronously list records using an explicit raw ``filter`` query parameter."""
+        endpoint = getattr(self._sdk, "records")  # noqa: B009
+        async for attempt in self._build_async_retryer():
+            with attempt:
+                res = endpoint.list(
+                    study_key=study_key,
+                    filter=filter_string,
+                    record_data_filter=None,
+                )
+                if hasattr(res, "__aiter__"):
+                    return [item async for item in res]
+                if inspect.isawaitable(res):
+                    return list(await res)
+                return list(res)
+        return []  # pragma: no cover
 
     def _upsert_records(self, conn: sqlite3.Connection, records: Iterable[Record]) -> None:
         """Insert or update records in the local SQLite cache."""

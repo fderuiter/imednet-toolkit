@@ -1,22 +1,104 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+import asyncio
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any, cast
 
-from imednet.spi.models import Record, RecordRevision
+from imednet.spi.models import Record, RecordRevision, Subject, Visit
+
+from ._guards import ensure_async_sdk, ensure_sync_sdk
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+
+_OWNER = "DataExtractionWorkflow"
+
+
+def _extract_subject_keys(
+    subjects: Iterable[Subject],
+    on_progress: Callable[[str], None] | None,
+) -> set[str]:
+    """Collect matching subject keys and report progress."""
+    keys = {s.subject_key for s in subjects if s.subject_key is not None}
+    if on_progress:
+        on_progress(f"Retrieved {len(keys)} matching subjects.")
+        if not keys:
+            on_progress("No subjects matched criteria; returning 0 records.")
+    return keys
+
+
+def _extract_visit_ids(
+    visits: Iterable[Visit],
+    matching_subject_keys: set[str] | None,
+    on_progress: Callable[[str], None] | None,
+) -> set[int]:
+    """Collect matching visit IDs (filtered by matched subject keys) and report progress."""
+    visit_list = list(visits)
+    if matching_subject_keys:
+        visit_list = [v for v in visit_list if v.subject_key in matching_subject_keys]
+    ids = {v.visit_id for v in visit_list if v.visit_id is not None}
+    if on_progress:
+        on_progress(f"Retrieved {len(ids)} matching visits.")
+        if not ids:
+            on_progress("No visits matched criteria; returning 0 records.")
+    return ids
+
+
+def _filter_extracted_records(
+    records: Iterable[Record],
+    matching_subject_keys: set[str] | None,
+    matching_visit_ids: set[int] | None,
+    on_progress: Callable[[str], None] | None,
+) -> list[Record]:
+    """Apply client-side subject and visit filtering to fetched records."""
+    result_records = list(records)
+    if matching_subject_keys:
+        if on_progress:
+            on_progress("Filtering records by matched subject keys...")
+        result_records = [r for r in result_records if r.subject_key in matching_subject_keys]
+    if matching_visit_ids:
+        if on_progress:
+            on_progress("Filtering records by matched visit IDs...")
+        result_records = [r for r in result_records if r.visit_id in matching_visit_ids]
+    if on_progress:
+        on_progress(f"Extraction complete: found {len(result_records)} matching records.")
+    return result_records
+
+
+def _build_record_filters(
+    record_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None,
+    other_filters: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge ``record_filter`` and keyword ``other_filters`` into one dictionary."""
+    merged = dict(record_filter) if record_filter else {}
+    merged.update(other_filters)
+    return merged
+
+
+def _build_audit_trail_kwargs(
+    start_date: str | None,
+    end_date: str | None,
+    user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None,
+    filters: dict[str, Any],
+) -> dict[str, Any]:
+    """Build combined filter and date arguments for ``get_record_revisions``."""
+    combined = dict(user_filter) if user_filter else {}
+    combined.update(filters)
+    if start_date:
+        combined["start_date"] = start_date
+    if end_date:
+        combined["end_date"] = end_date
+    return combined
 
 
 class DataExtractionWorkflow:
     """Provides methods for complex data extraction tasks involving multiple iMednet endpoints.
 
     Args:
-        sdk: An instance of the ImednetSDK.
+        sdk: An instance of the ImednetSDK or AsyncImednetSDK.
     """
 
-    def __init__(self, sdk: "ImednetFacade"):
+    def __init__(self, sdk: "ImednetFacade | AsyncImednetFacade"):
         """Initialize the data extraction workflow.
 
         Args:
@@ -33,84 +115,105 @@ class DataExtractionWorkflow:
         on_progress: Callable[[str], None] | None = None,
         **other_filters: Any,
     ) -> list[Record]:
-        """Extracts records based on criteria spanning subjects, visits, and records.
+        """Extracts records based on criteria spanning subjects, visits, and records."""
+        ensure_sync_sdk(
+            self._sdk,
+            _OWNER,
+            "extract_records_by_criteria",
+            "async_extract_records_by_criteria",
+        )
+        sdk = cast("ImednetFacade", self._sdk)
 
-        Args:
-            study_key: The key identifying the study.
-            record_filter: Dictionary of conditions for the records endpoint.
-            subject_filter: Dictionary of conditions for the subjects endpoint.
-            visit_filter: Dictionary of conditions for the visits endpoint.
-            on_progress: Optional callback invoked with progress status strings.
-            **other_filters: Additional keyword arguments passed as filters to the
-                             records endpoint `list` method.
-
-        Returns:
-            A list of Record objects matching all specified criteria.
-        """
         matching_subject_keys: set[str] | None = None
         if subject_filter:
             if on_progress:
                 on_progress("Querying subjects matching filter criteria...")
-            subjects = self._sdk.get_subjects(study_key, **subject_filter)
-            matching_subject_keys = {s.subject_key for s in subjects}  # type: ignore
-            if on_progress:
-                on_progress(f"Retrieved {len(matching_subject_keys)} matching subjects.")
+            subjects = sdk.get_subjects(study_key, **subject_filter)
+            matching_subject_keys = _extract_subject_keys(subjects, on_progress)
             if not matching_subject_keys:
-                if on_progress:
-                    on_progress("No subjects matched criteria; returning 0 records.")
                 return []
 
         matching_visit_ids: set[int] | None = None
         if visit_filter:
-            # Client-side filtering for subject_key on visits is still needed
-            # as build_filter_string doesn't handle complex AND/OR structures easily
-            # from separate filter dictionaries.
             if on_progress:
                 on_progress("Querying visits matching filter criteria...")
-            visits = self._sdk.get_visits(study_key, **visit_filter)
-
-            if matching_subject_keys:
-                visits = [v for v in visits if v.subject_key in matching_subject_keys]
-
-            matching_visit_ids = {v.visit_id for v in visits}  # type: ignore
-            if on_progress:
-                on_progress(f"Retrieved {len(matching_visit_ids)} matching visits.")
+            visits = sdk.get_visits(study_key, **visit_filter)
+            matching_visit_ids = _extract_visit_ids(visits, matching_subject_keys, on_progress)
             if not matching_visit_ids:
-                if on_progress:
-                    on_progress("No visits matched criteria; returning 0 records.")
                 return []
 
-        # Build the final record filter dictionary
-        final_record_filter_dict = dict(record_filter) if record_filter else {}
-        final_record_filter_dict.update(other_filters)  # Add other_filters here
-
-        # Client-side filtering is used below for subject/visit matching,
-        # so no need to add complex 'in' clauses here even if build_filter_string supported it.
-
+        final_record_filter_dict = _build_record_filters(record_filter, other_filters)
         if on_progress:
             on_progress(f"Querying records for study '{study_key}'...")
-        records = self._sdk.get_records(
+        records = sdk.get_records(
             study_key=study_key,
             record_data_filter=None,
             **final_record_filter_dict,
         )
+        return _filter_extracted_records(
+            records, matching_subject_keys, matching_visit_ids, on_progress
+        )
 
-        # Client-side filtering fallback
-        if matching_subject_keys:
-            if on_progress:
-                on_progress("Filtering records by matched subject keys...")
-            records = [r for r in records if r.subject_key in matching_subject_keys]
-        # Corrected attribute from visit_oid to visit_id and variable name
-        if matching_visit_ids:
-            if on_progress:
-                on_progress("Filtering records by matched visit IDs...")
-            records = [r for r in records if r.visit_id in matching_visit_ids]
+    async def async_extract_records_by_criteria(
+        self,
+        study_key: str,
+        record_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        subject_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        visit_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        **other_filters: Any,
+    ) -> list[Record]:
+        """Asynchronously extract records, fetching independent study resources concurrently."""
+        ensure_async_sdk(
+            self._sdk,
+            _OWNER,
+            "async_extract_records_by_criteria",
+            "extract_records_by_criteria",
+        )
+        sdk = cast("AsyncImednetFacade", self._sdk)
 
-        result_records = list(records)
+        matching_subject_keys: set[str] | None = None
+        matching_visit_ids: set[int] | None = None
+
+        if subject_filter and visit_filter:
+            if on_progress:
+                on_progress("Querying subjects and visits matching filter criteria...")
+            subjects, visits = await asyncio.gather(
+                sdk.async_get_subjects(study_key, **subject_filter),
+                sdk.async_get_visits(study_key, **visit_filter),
+            )
+            matching_subject_keys = _extract_subject_keys(subjects, on_progress)
+            if not matching_subject_keys:
+                return []
+            matching_visit_ids = _extract_visit_ids(visits, matching_subject_keys, on_progress)
+            if not matching_visit_ids:
+                return []
+        elif subject_filter:
+            if on_progress:
+                on_progress("Querying subjects matching filter criteria...")
+            subjects = await sdk.async_get_subjects(study_key, **subject_filter)
+            matching_subject_keys = _extract_subject_keys(subjects, on_progress)
+            if not matching_subject_keys:
+                return []
+        elif visit_filter:
+            if on_progress:
+                on_progress("Querying visits matching filter criteria...")
+            visits = await sdk.async_get_visits(study_key, **visit_filter)
+            matching_visit_ids = _extract_visit_ids(visits, None, on_progress)
+            if not matching_visit_ids:
+                return []
+
+        final_record_filter_dict = _build_record_filters(record_filter, other_filters)
         if on_progress:
-            on_progress(f"Extraction complete: found {len(result_records)} matching records.")
-
-        return result_records
+            on_progress(f"Querying records for study '{study_key}'...")
+        records = await sdk.async_get_records(
+            study_key=study_key,
+            record_data_filter=None,
+            **final_record_filter_dict,
+        )
+        return _filter_extracted_records(
+            records, matching_subject_keys, matching_visit_ids, on_progress
+        )
 
     def extract_audit_trail(
         self,
@@ -120,38 +223,25 @@ class DataExtractionWorkflow:
         user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         **filters: Any,
     ) -> list[RecordRevision]:
-        """Extracts the audit trail (record revisions) based on specified filters.
+        """Extracts the audit trail (record revisions) based on specified filters."""
+        ensure_sync_sdk(self._sdk, _OWNER, "extract_audit_trail", "async_extract_audit_trail")
+        sdk = cast("ImednetFacade", self._sdk)
+        call_kwargs = _build_audit_trail_kwargs(start_date, end_date, user_filter, filters)
+        return list(sdk.get_record_revisions(study_key, **call_kwargs))
 
-        Args:
-            study_key: The key identifying the study.
-            start_date: Optional start date filter (YYYY-MM-DD format expected by API).
-            end_date: Optional end date filter (YYYY-MM-DD format expected by API).
-            user_filter: Optional dictionary of base filter conditions.
-            **filters: Additional key-value pairs to be added as equality filters.
-
-        Returns:
-            A list of RecordRevision objects matching the criteria.
-        """
-        # Start with the user_filter dict if provided, otherwise an empty dict
-        final_filter_dict = dict(user_filter) if user_filter else {}
-
-        # Add additional filters from kwargs
-        final_filter_dict.update(filters)
-
-        # Prepare keyword arguments for date filters if they exist
-        date_kwargs = {}
-        if start_date:
-            date_kwargs["start_date"] = start_date
-        if end_date:
-            date_kwargs["end_date"] = end_date
-
-        # Fetch record revisions
-        revisions = self._sdk.get_record_revisions(
-            study_key,
-            **final_filter_dict,
-            **date_kwargs,
-        )
-        return list(revisions)
+    async def async_extract_audit_trail(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        **filters: Any,
+    ) -> list[RecordRevision]:
+        """Asynchronously extract the audit trail (record revisions) based on specified filters."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_extract_audit_trail", "extract_audit_trail")
+        sdk = cast("AsyncImednetFacade", self._sdk)
+        call_kwargs = _build_audit_trail_kwargs(start_date, end_date, user_filter, filters)
+        return list(await sdk.async_get_record_revisions(study_key, **call_kwargs))
 
 
 # Integration:

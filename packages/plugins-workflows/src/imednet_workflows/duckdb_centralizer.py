@@ -10,20 +10,28 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
+from ._guards import ensure_async_sdk, ensure_sync_sdk
 from .data_extraction import DataExtractionWorkflow
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
     from imednet.spi.models import RecordRevision
 
 
 _SAFE_STUDY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+_OWNER = "DuckDBIngestionWorkflow"
+
+
+def _validate_ingest_mode(mode: str) -> None:
+    """Validate the ingestion mode parameter."""
+    if mode not in {"append", "replace"}:
+        raise ValueError("mode must be one of: 'append', 'replace'")
 
 
 class DuckDBIngestionWorkflow:
     """Incremental record centralization pipeline using a bronze/silver DuckDB layout."""
 
-    def __init__(self, sdk: ImednetFacade, db_path: str = ":memory:") -> None:
+    def __init__(self, sdk: ImednetFacade | AsyncImednetFacade, db_path: str = ":memory:") -> None:
         """Initialize the DuckDB ingestion workflow.
 
         Args:
@@ -38,27 +46,18 @@ class DuckDBIngestionWorkflow:
                 "Install with `pip install 'imednet[duckdb]'`."
             ) from error
 
+        self._sdk = sdk
         self._connection: Any = duckdb.connect(db_path)
         self._extractor = DataExtractionWorkflow(sdk)
 
-    def ingest_revisions(
+    def _write_revisions(
         self,
         study_key: str,
+        revisions: Iterable[RecordRevision],
         *,
-        start_date: str | None = None,
-        end_date: str | None = None,
-        mode: Literal["append", "replace"] = "append",
+        mode: Literal["append", "replace"],
     ) -> int:
-        """Fetch RecordRevisions and write to the bronze_revisions table."""
-        if mode not in {"append", "replace"}:
-            raise ValueError("mode must be one of: 'append', 'replace'")
-
-        revisions = self._extractor.extract_audit_trail(
-            study_key,
-            start_date=start_date,
-            end_date=end_date,
-        )
-
+        """Write fetched ``RecordRevision`` rows into ``bronze_revisions``."""
         if mode == "replace":
             self._connection.execute("DROP TABLE IF EXISTS bronze_revisions")
 
@@ -81,6 +80,42 @@ class DuckDBIngestionWorkflow:
                 rows,
             )
         return len(rows)
+
+    def ingest_revisions(
+        self,
+        study_key: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        mode: Literal["append", "replace"] = "append",
+    ) -> int:
+        """Fetch RecordRevisions and write to the bronze_revisions table."""
+        ensure_sync_sdk(self._sdk, _OWNER, "ingest_revisions", "async_ingest_revisions")
+        _validate_ingest_mode(mode)
+        revisions = self._extractor.extract_audit_trail(
+            study_key,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return self._write_revisions(study_key, revisions, mode=mode)
+
+    async def async_ingest_revisions(
+        self,
+        study_key: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        mode: Literal["append", "replace"] = "append",
+    ) -> int:
+        """Asynchronously fetch RecordRevisions and write to the bronze_revisions table."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_ingest_revisions", "ingest_revisions")
+        _validate_ingest_mode(mode)
+        revisions = await self._extractor.async_extract_audit_trail(
+            study_key,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return self._write_revisions(study_key, revisions, mode=mode)
 
     def build_silver_view(self, study_key: str) -> None:
         """Create or replace the silver_current_state view."""

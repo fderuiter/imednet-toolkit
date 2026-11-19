@@ -121,8 +121,24 @@ Workflows
 
 Workflows orchestrate several endpoints to perform higher level tasks. For
 example, :class:`~imednet_workflows.record_update.RecordUpdateWorkflow` validates
-record payloads, submits them, and polls resulting jobs. Workflows have sync and
-async variants and are available under ``sdk.workflows``.
+record payloads, submits them, and polls resulting jobs.
+
+All registered workflows under ``sdk.workflows`` (as well as
+:class:`~imednet.orchestration.orchestrator.MultiStudyOrchestrator`) expose paired
+synchronous and ``async_*`` methods for every network-backed operation:
+
+* Use synchronous methods (for example ``dataframe()``, ``get_open_queries()``,
+  ``run()``, ``execute_pipeline()``) with :class:`~imednet.sdk.ImednetSDK`.
+* Use ``async_*`` counterparts (for example ``async_dataframe()``,
+  ``async_get_open_queries()``, ``async_run()``, ``async_execute_pipeline()``)
+  with :class:`~imednet.sdk.AsyncImednetSDK`.
+* Async workflows retrieve independent study resources concurrently using
+  ``asyncio.gather`` and isolate per-study logging context across concurrent
+  tasks via ``contextvars``.
+* Mixing synchronous methods with :class:`~imednet.sdk.AsyncImednetSDK` or
+  ``async_*`` methods with :class:`~imednet.sdk.ImednetSDK` raises a
+  ``TypeError`` immediately naming the appropriate counterpart method before
+  performing network calls or mutating workflow state.
 
 Caching
 -------
@@ -160,11 +176,12 @@ Adding New Endpoints
 Adding New Workflows
 --------------------
 
-* Create a workflow under ``packages/plugins-workflows/src/imednet_workflows`` and provide sync and async
-  methods where appropriate.
+* Create a workflow under ``packages/plugins-workflows/src/imednet_workflows`` and provide paired
+  synchronous and ``async_*`` methods for all network operations, guarded against mismatched
+  SDK client modes via ``ensure_sync_sdk`` / ``ensure_async_sdk``.
 * Register the workflow factory in the distribution's ``imednet.workflows`` entry points.
 * Add CLI commands or examples that demonstrate the workflow.
-* Update documentation and tests.
+* Update documentation and contract/unit tests.
 
 Export Sink Architecture
 ------------------------

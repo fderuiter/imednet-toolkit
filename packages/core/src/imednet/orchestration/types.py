@@ -63,6 +63,7 @@ Example::
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from typing import Any, TypeVar
 
 from typing_extensions import Protocol, TypedDict, runtime_checkable
@@ -101,6 +102,38 @@ class StudyWorkerCallable(Protocol[T_Output]):
         ...
 
 
+@runtime_checkable
+class AsyncStudyWorkerCallable(Protocol[T_Output]):
+    """Defines the signature for asynchronous pipeline tasks.
+
+    Pipeline callables injected into ``MultiStudyOrchestrator.async_execute_pipeline``
+    may conform to either :class:`AsyncStudyWorkerCallable` or
+    :class:`StudyWorkerCallable`.
+    """
+
+    def __call__(
+        self,
+        study_key: str,
+        sdk_client: Any,
+        logger: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Awaitable[T_Output]:
+        """Invoke the asynchronous pipeline task for a specific study context.
+
+        Args:
+            study_key: The identifier of the study being processed.
+            sdk_client: A shared (read-only) instance of the async iMednet SDK.
+            logger: A study-specific logger instance.
+            *args: Variable positional arguments passed to the pipeline.
+            **kwargs: Variable keyword arguments passed to the pipeline.
+
+        Returns:
+            An awaitable resolving to the output of the pipeline task.
+        """
+        ...
+
+
 class OrchestratorResult(TypedDict, total=False):
     """Normalized result entry returned per study by ``execute_pipeline``."""
 
@@ -111,6 +144,7 @@ class OrchestratorResult(TypedDict, total=False):
 
 
 __all__ = [
+    "AsyncStudyWorkerCallable",
     "OrchestratorResult",
     "StudyWorkerCallable",
     "T_Output",

@@ -5,10 +5,13 @@ from typing import TYPE_CHECKING, Any, Literal, Union, cast
 from imednet.spi.models import Job
 from imednet.spi.validation import AsyncSchemaValidator, SchemaCache, SchemaValidator
 
+from ._guards import ensure_async_sdk, ensure_sync_sdk, is_async_sdk
+
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
+_OWNER = "RecordUpdateWorkflow"
 
 
 class RecordUpdateWorkflow:
@@ -17,13 +20,13 @@ class RecordUpdateWorkflow:
     and optional job status monitoring.
 
     Args:
-        sdk: An instance of the ImednetFacade.
+        sdk: An instance of the ImednetFacade or AsyncImednetFacade.
     """
 
     def __init__(self, sdk: "FacadeLike"):
         """Initialize the record update workflow with an SDK instance."""
         self._sdk = sdk
-        self._is_async = hasattr(sdk, "async_create_record")
+        self._is_async = is_async_sdk(sdk)
         self._validator: SchemaValidator | AsyncSchemaValidator
         if self._is_async:
             self._validator = AsyncSchemaValidator(cast("AsyncImednetFacade", sdk))
@@ -32,13 +35,17 @@ class RecordUpdateWorkflow:
 
         self._schema: SchemaCache = cast(SchemaCache, self._validator.schema)
 
-    def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
-        """Refresh schema if the form key is missing from cache."""
+    def _first_form_ref(self, records_data: list[dict[str, Any]]) -> str | None:
+        """Resolve the form key reference for the first record in a batch."""
         if not records_data:
-            return
-        first_ref = records_data[0].get("formKey") or self._schema.form_key_from_id(
+            return None
+        return records_data[0].get("formKey") or self._schema.form_key_from_id(
             records_data[0].get("formId", 0)
         )
+
+    def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
+        """Refresh schema if the form key is missing from cache."""
+        first_ref = self._first_form_ref(records_data)
         if first_ref and not self._schema.variables_for_form(first_ref):
             cast(SchemaValidator, self._validator).refresh(study_key)
             if first_ref not in self._schema.forms:
@@ -48,11 +55,7 @@ class RecordUpdateWorkflow:
         self, study_key: str, records_data: list[dict[str, Any]]
     ) -> None:
         """Asynchronous variant of :meth:`_validate_form_key`."""
-        if not records_data:
-            return
-        first_ref = records_data[0].get("formKey") or self._schema.form_key_from_id(
-            records_data[0].get("formId", 0)
-        )
+        first_ref = self._first_form_ref(records_data)
         if first_ref and not self._schema.variables_for_form(first_ref):
             await cast(AsyncSchemaValidator, self._validator).refresh(study_key)
             if first_ref not in self._schema.forms:
@@ -67,6 +70,12 @@ class RecordUpdateWorkflow:
         poll_interval: int = 5,
     ) -> Job:
         """Submit records for creation or update and optionally wait for completion."""
+        ensure_sync_sdk(
+            self._sdk,
+            _OWNER,
+            "create_or_update_records",
+            "async_create_or_update_records",
+        )
         self._validate_form_key(study_key, records_data)
 
         cast(SchemaValidator, self._validator).validate_batch(study_key, records_data)
@@ -79,7 +88,7 @@ class RecordUpdateWorkflow:
             raise ValueError("Submission successful but no batch_id received.")
 
         return cast(
-            'Job', sdk.poll_job(study_key, job.batch_id, timeout=timeout, interval=poll_interval)
+            "Job", sdk.poll_job(study_key, job.batch_id, timeout=timeout, interval=poll_interval)
         )
 
     async def async_create_or_update_records(
@@ -91,6 +100,12 @@ class RecordUpdateWorkflow:
         poll_interval: int = 5,
     ) -> Job:
         """Asynchronous variant of :meth:`create_or_update_records`."""
+        ensure_async_sdk(
+            self._sdk,
+            _OWNER,
+            "async_create_or_update_records",
+            "create_or_update_records",
+        )
         await self._async_validate_form_key(study_key, records_data)
 
         await cast(AsyncSchemaValidator, self._validator).validate_batch(study_key, records_data)
@@ -103,7 +118,7 @@ class RecordUpdateWorkflow:
             raise ValueError("Submission successful but no batch_id received.")
 
         return cast(
-            'Job',
+            "Job",
             await sdk.async_poll_job(
                 study_key, job.batch_id, timeout=timeout, interval=poll_interval
             ),
@@ -164,22 +179,8 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
     ) -> Job:
-        """Registers a new subject by submitting a single record.
-
-        Args:
-            study_key: The study key.
-            form_identifier: The form key or ID.
-            site_identifier: The site name or ID.
-            data: The dictionary of record data (variable names and values).
-            form_identifier_type: Whether `form_identifier` is a 'key' or 'id'.
-            site_identifier_type: Whether `site_identifier` is a 'name' or 'id'.
-            wait_for_completion: If True, wait for the job to complete.
-            timeout: Timeout in seconds for waiting.
-            poll_interval: Polling interval in seconds.
-
-        Returns:
-            The Job status object.
-        """
+        """Registers a new subject by submitting a single record."""
+        ensure_sync_sdk(self._sdk, _OWNER, "register_subject", "async_register_subject")
         record = self._build_record_payload(
             form_identifier=form_identifier,
             form_identifier_type=form_identifier_type,
@@ -188,6 +189,35 @@ class RecordUpdateWorkflow:
             data=data,
         )
         return self.create_or_update_records(
+            study_key=study_key,
+            records_data=[record],
+            wait_for_completion=wait_for_completion,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+
+    async def async_register_subject(
+        self,
+        study_key: str,
+        form_identifier: str | int,
+        site_identifier: str | int,
+        data: dict[str, Any],
+        form_identifier_type: Literal["key", "id"] = "key",
+        site_identifier_type: Literal["name", "id"] = "name",
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+    ) -> Job:
+        """Asynchronous variant of :meth:`register_subject`."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_register_subject", "register_subject")
+        record = self._build_record_payload(
+            form_identifier=form_identifier,
+            form_identifier_type=form_identifier_type,
+            site_identifier=site_identifier,
+            site_identifier_type=site_identifier_type,
+            data=data,
+        )
+        return await self.async_create_or_update_records(
             study_key=study_key,
             records_data=[record],
             wait_for_completion=wait_for_completion,
@@ -209,24 +239,13 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
     ) -> Job:
-        """Updates an existing scheduled record for a subject.
-
-        Args:
-            study_key: The study key.
-            form_identifier: The form key or ID.
-            subject_identifier: The subject key, ID, or OID.
-            interval_identifier: The interval name or ID.
-            data: The dictionary of record data (variable names and values).
-            form_identifier_type: Whether `form_identifier` is a 'key' or 'id'.
-            subject_identifier_type: Whether `subject_identifier` is a 'key', 'id', or 'oid'.
-            interval_identifier_type: Whether `interval_identifier` is a 'name' or 'id'.
-            wait_for_completion: If True, wait for the job to complete.
-            timeout: Timeout in seconds for waiting.
-            poll_interval: Polling interval in seconds.
-
-        Returns:
-            The Job status object.
-        """
+        """Updates an existing scheduled record for a subject."""
+        ensure_sync_sdk(
+            self._sdk,
+            _OWNER,
+            "update_scheduled_record",
+            "async_update_scheduled_record",
+        )
         record = self._build_record_payload(
             form_identifier=form_identifier,
             form_identifier_type=form_identifier_type,
@@ -237,6 +256,44 @@ class RecordUpdateWorkflow:
             data=data,
         )
         return self.create_or_update_records(
+            study_key=study_key,
+            records_data=[record],
+            wait_for_completion=wait_for_completion,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+
+    async def async_update_scheduled_record(
+        self,
+        study_key: str,
+        form_identifier: str | int,
+        subject_identifier: str | int,
+        interval_identifier: str | int,
+        data: dict[str, Any],
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier_type: Literal["name", "id"] = "name",
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+    ) -> Job:
+        """Asynchronous variant of :meth:`update_scheduled_record`."""
+        ensure_async_sdk(
+            self._sdk,
+            _OWNER,
+            "async_update_scheduled_record",
+            "update_scheduled_record",
+        )
+        record = self._build_record_payload(
+            form_identifier=form_identifier,
+            form_identifier_type=form_identifier_type,
+            subject_identifier=subject_identifier,
+            subject_identifier_type=subject_identifier_type,
+            interval_identifier=interval_identifier,
+            interval_identifier_type=interval_identifier_type,
+            data=data,
+        )
+        return await self.async_create_or_update_records(
             study_key=study_key,
             records_data=[record],
             wait_for_completion=wait_for_completion,
@@ -256,22 +313,8 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
     ) -> Job:
-        """Creates a new (unscheduled) record for an existing subject.
-
-        Args:
-            study_key: The study key.
-            form_identifier: The form key or ID.
-            subject_identifier: The subject key, ID, or OID.
-            data: The dictionary of record data (variable names and values).
-            form_identifier_type: Whether `form_identifier` is a 'key' or 'id'.
-            subject_identifier_type: Whether `subject_identifier` is a 'key', 'id', or 'oid'.
-            wait_for_completion: If True, wait for the job to complete.
-            timeout: Timeout in seconds for waiting.
-            poll_interval: Polling interval in seconds.
-
-        Returns:
-            The Job status object.
-        """
+        """Creates a new (unscheduled) record for an existing subject."""
+        ensure_sync_sdk(self._sdk, _OWNER, "create_new_record", "async_create_new_record")
         record = self._build_record_payload(
             form_identifier=form_identifier,
             form_identifier_type=form_identifier_type,
@@ -280,6 +323,35 @@ class RecordUpdateWorkflow:
             data=data,
         )
         return self.create_or_update_records(
+            study_key=study_key,
+            records_data=[record],
+            wait_for_completion=wait_for_completion,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+
+    async def async_create_new_record(
+        self,
+        study_key: str,
+        form_identifier: str | int,
+        subject_identifier: str | int,
+        data: dict[str, Any],
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+    ) -> Job:
+        """Asynchronous variant of :meth:`create_new_record`."""
+        ensure_async_sdk(self._sdk, _OWNER, "async_create_new_record", "create_new_record")
+        record = self._build_record_payload(
+            form_identifier=form_identifier,
+            form_identifier_type=form_identifier_type,
+            subject_identifier=subject_identifier,
+            subject_identifier_type=subject_identifier_type,
+            data=data,
+        )
+        return await self.async_create_or_update_records(
             study_key=study_key,
             records_data=[record],
             wait_for_completion=wait_for_completion,
