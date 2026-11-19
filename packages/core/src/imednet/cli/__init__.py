@@ -25,6 +25,7 @@ from .utils import (
     add_no_interactive,
     get_sdk,
     parse_filter_args,
+    parse_record_data_filter,
 )
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "get_parser",
     "get_sdk",
     "parse_filter_args",
+    "parse_record_data_filter",
     "with_sdk",
 ]
 
