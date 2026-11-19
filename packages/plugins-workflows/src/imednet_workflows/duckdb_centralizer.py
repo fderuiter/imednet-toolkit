@@ -38,7 +38,7 @@ class DuckDBIngestionWorkflow:
                 "Install with `pip install 'imednet[duckdb]'`."
             ) from error
 
-        self._connection: Any = duckdb.connect(db_path)
+        self._connection: Any = duckdb.connect(db_path, config={"threads": "1"})
         self._extractor = DataExtractionWorkflow(sdk)
 
     def ingest_revisions(

@@ -198,7 +198,7 @@ def test_export_to_duckdb(monkeypatch):
 
     export_mod.export_to_duckdb(sdk, "STUDY", "out.duckdb", "my_table")
 
-    duckdb_module.connect.assert_called_once_with("out.duckdb")
+    duckdb_module.connect.assert_called_once_with("out.duckdb", config={"threads": "1"})
     conn.register.assert_called_once_with("df", df)
     conn.execute.assert_called_once_with('CREATE OR REPLACE TABLE "my_table" AS SELECT * FROM "df"')
     conn.unregister.assert_called_once_with("df")

@@ -83,7 +83,7 @@ def test_duckdb_centralizer_default_memory() -> None:
     sdk = MagicMock()
     with patch("duckdb.connect") as mock_connect:
         DuckDBIngestionWorkflow(sdk)
-        mock_connect.assert_called_once_with(":memory:")
+        mock_connect.assert_called_once_with(":memory:", config={"threads": "1"})
 
 
 def test_ingest_revisions_and_build_silver_view() -> None:

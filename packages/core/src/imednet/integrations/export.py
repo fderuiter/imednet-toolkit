@@ -626,7 +626,7 @@ def export_to_duckdb(
         form_whitelist=form_whitelist,
     )
 
-    conn: Any = duckdb.connect(db_path)
+    conn: Any = duckdb.connect(db_path, config={"threads": "1"})
     try:
         conn.register(_DUCKDB_DF_ALIAS, df)
         conn.execute(

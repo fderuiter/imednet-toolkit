@@ -189,3 +189,14 @@ def test_duckdb_workflow_import_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ImportError, match=r"pip install"):
         DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+
+def test_duckdb_workflow_uses_single_worker_thread() -> None:
+    """Verify DuckDBIngestionWorkflow pins threads=1 to avoid cgroup v2 WaitForTask cast errors."""
+    pytest.importorskip("duckdb")
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    threads_setting = workflow._connection.execute("SELECT current_setting('threads')").fetchone()[
+        0
+    ]
+    assert int(threads_setting) == 1
