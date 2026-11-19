@@ -19,6 +19,7 @@ from imednet.models.subjects import Subject
 from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
+from imednet.utils.job_poller import JobProgressHandler
 from imednet.utils.typing import FilterValue, JsonDict
 
 if TYPE_CHECKING:
@@ -205,15 +206,22 @@ class ImednetFacade(Protocol):
         ...
 
     def poll_job(
-        self, study_key: str, batch_id: str, timeout: float = 300.0, interval: float = 2.0
+        self,
+        study_key: str,
+        batch_id: str,
+        *,
+        interval: float = 5,
+        timeout: float = 300,
+        on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Wait for a background job to reach a terminal state.
 
         Args:
             study_key: The unique identifier for the study.
             batch_id: The unique identifier for the job batch.
-            timeout: Maximum time to wait in seconds.
             interval: Time between poll attempts in seconds.
+            timeout: Maximum time to wait in seconds.
+            on_progress: Optional callback invoked on each poll cycle.
 
         Returns:
             The final JobStatus of the operation.
@@ -408,15 +416,22 @@ class AsyncImednetFacade(Protocol):
         ...
 
     async def async_poll_job(
-        self, study_key: str, batch_id: str, timeout: float = 300.0, interval: float = 2.0
+        self,
+        study_key: str,
+        batch_id: str,
+        *,
+        interval: float = 5,
+        timeout: float = 300,
+        on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Asynchronously wait for a background job to reach a terminal state.
 
         Args:
             study_key: The unique identifier for the study.
             batch_id: The unique identifier for the job batch.
-            timeout: Maximum time to wait in seconds.
             interval: Time between poll attempts in seconds.
+            timeout: Maximum time to wait in seconds.
+            on_progress: Optional callback invoked on each poll cycle.
 
         Returns:
             The final JobStatus of the operation.
