@@ -174,12 +174,35 @@ def export_to_parquet(
         When ``True``, variable labels are used for column names instead of
         variable names.
     """
-    df = _prepare_export_df(
-        sdk,
+    variable_whitelist = kwargs.pop("variable_whitelist", None)
+    form_whitelist = kwargs.pop("form_whitelist", None)
+    manifest_path = kwargs.pop("manifest_path", None)
+    config = _build_tabular_sink_config(
         study_key,
+        kwargs,
         use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        manifest_path=manifest_path,
     )
-    df.to_parquet(path, index=False, **kwargs)
+    df = (
+        _collect_tabular_df(sdk, study_key, config, sanitize=False)
+        if config.quality_gate_enabled
+        else _prepare_export_df(
+            sdk,
+            study_key,
+            use_labels_as_columns=config.use_labels_as_columns,
+            variable_whitelist=config.variable_whitelist,
+            form_whitelist=config.form_whitelist,
+        )
+    )
+
+    def _write_parquet() -> int:
+        df.to_parquet(path, index=False, **config.pandas_kwargs)
+        return len(df)
+
+    with _TabularCallableSink(config, "export_parquet", _write_parquet) as sink:
+        sink.write_batch([1], batch_id=f"{study_key}/parquet/0")
 
 
 def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -231,8 +254,16 @@ class TabularCSVSink(ExportSink):
             df = pd.DataFrame(records)
 
         def execute_export() -> int:
-            mode = "w" if self._is_first_batch else "a"
-            header = self._is_first_batch
+            if self._is_first_batch:
+                if self._cfg.idempotent or not Path(self.path).exists():
+                    mode = "w"
+                    header = True
+                else:
+                    mode = "a"
+                    header = Path(self.path).stat().st_size == 0
+            else:
+                mode = "a"
+                header = False
 
             csv_str = df.to_csv(index=False, header=header, **self._cfg.pandas_kwargs)
             checksum = hashlib.sha256(csv_str.encode('utf-8')).hexdigest()
@@ -278,7 +309,8 @@ class TabularSQLSink(ExportSink):
         self.engine = engine
         self._is_first_batch = True
         self._cfg = config
-        self._initial_if_exists = self._cfg.pandas_kwargs.pop("if_exists", "replace")
+        default_if_exists = "replace" if config.idempotent else "append"
+        self._initial_if_exists = self._cfg.pandas_kwargs.pop("if_exists", default_if_exists)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -392,6 +424,65 @@ def _tabular_export(
             sink.write_batch(cast(Any, df), batch_id=f"{study_key}/tabular/{i}")
 
 
+class _TabularCallableSink(ExportSink):
+    """Lightweight ExportSink adapter applying SinkConfig retry semantics to tabular file/DB exports."""
+
+    def __init__(
+        self,
+        config: TabularSinkConfig,
+        operation_name: str,
+        writer_fn: Any,
+    ) -> None:
+        super().__init__(config)
+        self._operation_name = operation_name
+        self._writer_fn = writer_fn
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        if not records:
+            return 0
+        return self._execute_with_retry(self._operation_name, batch_id, self._writer_fn)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _collect_tabular_df(
+    sdk: Any,
+    study_key: str,
+    config: TabularSinkConfig,
+    *,
+    sanitize: bool = False,
+) -> pd.DataFrame:
+    """Collect and transform records in ``config.batch_size`` chunks with quality gate filtering."""
+    if pd is None:
+        raise ImportError(
+            "pandas is required for _records_df. Install with \"pip install 'imednet[export]'\"."
+        )
+    frames: list[pd.DataFrame] = []
+
+    class _FrameCollectorSink(ExportSink):
+        def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+            if isinstance(records, pd.DataFrame):
+                frames.append(records)
+                return len(records)
+            return 0
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    collector = _FrameCollectorSink(config)
+    _tabular_export(sdk, study_key, collector, config, sanitize=sanitize)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Extract SinkConfig keyword arguments so they do not leak into pandas kwargs."""
     sink_keys = (
@@ -400,10 +491,38 @@ def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         "retry_backoff",
         "idempotent",
         "extra",
+        "quality_gate_enabled",
         "min_schema_readiness_score",
         "tracer",
     )
     return {k: kwargs.pop(k) for k in sink_keys if k in kwargs}
+
+
+def _build_tabular_sink_config(
+    study_key: str,
+    kwargs: dict[str, Any],
+    *,
+    use_labels_as_columns: bool = False,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
+    manifest_path: str | None = None,
+    default_quality_gate: bool = False,
+) -> TabularSinkConfig:
+    """Construct a :class:`TabularSinkConfig` while keeping sink kwargs out of ``pandas_kwargs``."""
+    config = kwargs.pop("config", None)
+    if isinstance(config, TabularSinkConfig):
+        return config
+    sink_kwargs = _pop_sink_kwargs(kwargs)
+    sink_kwargs.setdefault("quality_gate_enabled", default_quality_gate)
+    return TabularSinkConfig(
+        study_key=study_key,
+        manifest_path=manifest_path,
+        pandas_kwargs=kwargs,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        **sink_kwargs,
+    )
 
 
 def export_to_csv(
@@ -428,19 +547,16 @@ def export_to_csv(
         When ``True``, variable labels are used for column names instead of
         variable names.
     """
-    config = kwargs.pop("config", None)
-    if not isinstance(config, TabularSinkConfig):
-        sink_kwargs = _pop_sink_kwargs(kwargs)
-        config = TabularSinkConfig(
-            study_key=study_key,
-            manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
-            pandas_kwargs=kwargs,
-            use_labels_as_columns=use_labels_as_columns,
-            variable_whitelist=variable_whitelist,
-            form_whitelist=form_whitelist,
-            quality_gate_enabled=quality_gate_enabled,
-            **sink_kwargs,
-        )
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
+    config = _build_tabular_sink_config(
+        study_key,
+        kwargs,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
+        default_quality_gate=quality_gate_enabled,
+    )
 
     sink = TabularCSVSink(path, config)
     _tabular_export(sdk, study_key, sink, config, sanitize=True)
@@ -464,13 +580,36 @@ def export_to_excel(
         When ``True``, variable labels are used for column names instead of
         variable names.
     """
-    df = _prepare_export_df(
-        sdk,
+    variable_whitelist = kwargs.pop("variable_whitelist", None)
+    form_whitelist = kwargs.pop("form_whitelist", None)
+    manifest_path = kwargs.pop("manifest_path", None)
+    config = _build_tabular_sink_config(
         study_key,
+        kwargs,
         use_labels_as_columns=use_labels_as_columns,
-        sanitize=True,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        manifest_path=manifest_path,
     )
-    df.to_excel(path, index=False, **kwargs)
+    df = (
+        _collect_tabular_df(sdk, study_key, config, sanitize=True)
+        if config.quality_gate_enabled
+        else _prepare_export_df(
+            sdk,
+            study_key,
+            use_labels_as_columns=config.use_labels_as_columns,
+            variable_whitelist=config.variable_whitelist,
+            form_whitelist=config.form_whitelist,
+            sanitize=True,
+        )
+    )
+
+    def _write_excel() -> int:
+        df.to_excel(path, index=False, **config.pandas_kwargs)
+        return len(df)
+
+    with _TabularCallableSink(config, "export_excel", _write_excel) as sink:
+        sink.write_batch([1], batch_id=f"{study_key}/excel/0")
 
 
 def export_to_json(
@@ -499,15 +638,32 @@ def export_to_json(
     import logging
 
     logger = logging.getLogger(__name__)
+    variable_whitelist = kwargs.pop("variable_whitelist", None)
+    form_whitelist = kwargs.pop("form_whitelist", None)
+    manifest_path = kwargs.pop("manifest_path", None)
+    sink_cfg = _build_tabular_sink_config(
+        study_key,
+        kwargs,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        manifest_path=manifest_path,
+    )
 
     if hierarchical:
         mapper = _record_mapper()(sdk)
         data = mapper.build_hierarchy(study_key, use_labels_as_keys=use_labels_as_columns)
     else:
-        df = _prepare_export_df(
-            sdk,
-            study_key,
-            use_labels_as_columns=use_labels_as_columns,
+        df = (
+            _collect_tabular_df(sdk, study_key, sink_cfg, sanitize=False)
+            if sink_cfg.quality_gate_enabled
+            else _prepare_export_df(
+                sdk,
+                study_key,
+                use_labels_as_columns=sink_cfg.use_labels_as_columns,
+                variable_whitelist=sink_cfg.variable_whitelist,
+                form_whitelist=sink_cfg.form_whitelist,
+            )
         )
         import pandas as pd
 
@@ -541,8 +697,23 @@ def export_to_json(
     except Exception as e:
         logger.warning(f"Could not apply EnrichmentPipeline: {e}")
 
-    with open(path, "w") as f:
-        json.dump(data, f, **kwargs)
+    def _write_json() -> int:
+        mode = "w"
+        payload = data
+        if not sink_cfg.idempotent and isinstance(data, list) and Path(path).exists():
+            try:
+                with open(path, encoding="utf-8") as existing_file:
+                    existing_data = json.load(existing_file)
+                if isinstance(existing_data, list):
+                    payload = existing_data + data
+            except Exception:
+                payload = data
+        with open(path, mode, encoding="utf-8") as f:
+            json.dump(payload, f, **sink_cfg.pandas_kwargs)
+        return len(data) if isinstance(data, list) else 1
+
+    with _TabularCallableSink(sink_cfg, "export_json", _write_json) as sink:
+        sink.write_batch([1], batch_id=f"{study_key}/json/0")
 
 
 def export_to_sql(
@@ -550,7 +721,7 @@ def export_to_sql(
     study_key: str,
     table: str,
     conn_str: str,
-    if_exists: Literal["fail", "replace", "append", "delete_rows"] = "replace",
+    if_exists: Literal["fail", "replace", "append", "delete_rows"] | None = None,
     *,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -575,20 +746,18 @@ def export_to_sql(
     from sqlalchemy import create_engine
 
     manifest_path = kwargs.pop("manifest_path", manifest_path)
-    config = kwargs.pop("config", None)
-    if not isinstance(config, TabularSinkConfig):
-        sink_kwargs = _pop_sink_kwargs(kwargs)
+    if if_exists is not None:
         kwargs["if_exists"] = if_exists
-        config = TabularSinkConfig(
-            study_key=study_key,
-            manifest_path=manifest_path,
-            pandas_kwargs=kwargs,
-            use_labels_as_columns=use_labels_as_columns,
-            variable_whitelist=variable_whitelist,
-            form_whitelist=form_whitelist,
-            quality_gate_enabled=quality_gate_enabled,
-            **sink_kwargs,
-        )
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
+    config = _build_tabular_sink_config(
+        study_key,
+        kwargs,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
+    )
 
     engine = create_engine(conn_str)
     sink = TabularSQLSink(table, engine, config)
@@ -604,6 +773,7 @@ def export_to_duckdb(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    **kwargs: Any,
 ) -> None:
     """Export study records to a DuckDB table using native DataFrame registration.
 
@@ -640,25 +810,54 @@ def export_to_duckdb(
         ) from error
 
     _validate_duckdb_identifier(table_name)
-
-    df = _prepare_export_df(
-        sdk,
+    has_explicit_retry = "max_retries" in kwargs or "config" in kwargs
+    manifest_path = kwargs.pop("manifest_path", None)
+    config = _build_tabular_sink_config(
         study_key,
+        kwargs,
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
+        manifest_path=manifest_path,
     )
 
-    conn: Any = duckdb.connect(db_path)
-    try:
-        conn.register(_DUCKDB_DF_ALIAS, df)
-        conn.execute(
-            f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(table_name)} "
-            f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
+    df = (
+        _collect_tabular_df(sdk, study_key, config, sanitize=False)
+        if config.quality_gate_enabled
+        else _prepare_export_df(
+            sdk,
+            study_key,
+            use_labels_as_columns=config.use_labels_as_columns,
+            variable_whitelist=config.variable_whitelist,
+            form_whitelist=config.form_whitelist,
         )
-        conn.unregister(_DUCKDB_DF_ALIAS)
-    finally:
-        conn.close()
+    )
+
+    def _write_duckdb() -> int:
+        conn: Any = duckdb.connect(db_path)
+        try:
+            conn.register(_DUCKDB_DF_ALIAS, df)
+            quoted_table = _quote_duckdb_identifier(table_name)
+            quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
+            if config.idempotent:
+                conn.execute(
+                    f"CREATE OR REPLACE TABLE {quoted_table} AS SELECT * FROM {quoted_alias}"
+                )
+            else:
+                conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {quoted_table} AS SELECT * FROM {quoted_alias} WHERE 1=0"
+                )
+                conn.execute(f"INSERT INTO {quoted_table} SELECT * FROM {quoted_alias}")
+            conn.unregister(_DUCKDB_DF_ALIAS)
+            return len(df)
+        finally:
+            conn.close()
+
+    if has_explicit_retry:
+        with _TabularCallableSink(config, "export_duckdb", _write_duckdb) as sink:
+            sink.write_batch([1], batch_id=f"{study_key}/duckdb/0")
+    else:
+        _write_duckdb()
 
 
 def export_to_duckdb_by_form(
@@ -768,7 +967,7 @@ def export_to_sql_by_form(
     sdk: ImednetSDK,
     study_key: str,
     conn_str: str,
-    if_exists: Literal["fail", "replace", "append", "delete_rows"] = "replace",
+    if_exists: Literal["fail", "replace", "append", "delete_rows"] | None = None,
     *,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -777,6 +976,19 @@ def export_to_sql_by_form(
 ) -> None:
     """Export records to separate SQL tables for each form."""
     from sqlalchemy import create_engine
+
+    manifest_path = kwargs.pop("manifest_path", None)
+    config = _build_tabular_sink_config(
+        study_key,
+        kwargs,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        manifest_path=manifest_path,
+    )
+    resolved_if_exists: Literal["fail", "replace", "append", "delete_rows"] = (
+        if_exists if if_exists is not None else ("replace" if config.idempotent else "append")
+    )
 
     mapper = _record_mapper()(sdk)
     engine = create_engine(conn_str)
@@ -824,13 +1036,24 @@ def export_to_sql_by_form(
             dup_mask = df.columns.str.lower().duplicated()
             df = df.loc[:, ~dup_mask]
             df = _mask_df(df)
-        _to_sql_with_chunking(
-            df,
-            form.form_key or "",
-            engine,
-            if_exists=if_exists,
-            **kwargs,
-        )
+
+        form_table = form.form_key or ""
+
+        def _write_form_sql(
+            target_df: pd.DataFrame = df,
+            target_table: str = form_table,
+        ) -> int:
+            _to_sql_with_chunking(
+                target_df,
+                target_table,
+                engine,
+                if_exists=resolved_if_exists,
+                **config.pandas_kwargs,
+            )
+            return len(target_df) if hasattr(target_df, "__len__") else 1
+
+        with _TabularCallableSink(config, "export_sql_by_form", _write_form_sql) as sink:
+            sink.write_batch([1], batch_id=f"{study_key}/{form_table}/0")
 
 
 def export_to_long_sql(
