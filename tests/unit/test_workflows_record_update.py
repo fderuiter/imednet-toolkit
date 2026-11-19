@@ -4,6 +4,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from imednet import ImednetSDK
+from imednet.datadict import (
+    BusinessLogicRule,
+    Choice,
+    DataDictionary,
+    parse_logic_xml,
+)
+from imednet.datadict import (
+    Form as DDForm,
+)
+from imednet.datadict import (
+    Variable as DDVariable,
+)
 from imednet.errors import ValidationError
 from imednet.models.jobs import Job
 from imednet.models.variables import Variable
@@ -458,3 +471,195 @@ async def test_async_create_or_update_records_form_key_not_found() -> None:
             "STUDY",
             [{"formKey": "UNKNOWN_FORM", "data": {"a": 1}}],
         )
+
+
+def _sample_workflow_data_dictionary() -> DataDictionary:
+    return DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_DM",
+                formId="301",
+                variables=[
+                    DDVariable(variableName="SUBJID", variableType="Text", required="Yes"),
+                    DDVariable(variableName="AGE", variableType="Integer", required="Yes"),
+                    DDVariable(
+                        variableName="SEX",
+                        variableType="Radio",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="Male", choiceValue="M"),
+                            Choice(choiceText="Female", choiceValue="F"),
+                        ],
+                    ),
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        name="Adult Rule",
+                        type="Form",
+                        status="Active",
+                        form="F_DM",
+                        logic=parse_logic_xml(
+                            "<rule><if><lt><variable>AGE</variable><value>18</value></lt></if>"
+                            "<then><message>Subject must be at least 18</message></then></rule>"
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_with_datadictionary_sync_and_async() -> None:
+    """RecordUpdateWorkflow validates offline against DataDictionary without API calls."""
+    dd = _sample_workflow_data_dictionary()
+
+    # Sync constructor schema
+    sdk = MagicMock()
+    del sdk.async_create_record
+    sdk.create_record.return_value = Job(jobId="1", batchId="B-SYNC", state="COMPLETED")
+    wf = RecordUpdateWorkflow(sdk, schema=dd)
+
+    with pytest.raises(ValidationError, match="Subject must be at least 18"):
+        wf.create_or_update_records(
+            "STUDY",
+            [{"formKey": "F_DM", "data": {"SUBJID": "S1", "AGE": 15, "SEX": "F"}}],
+        )
+    sdk.get_variables.assert_not_called()
+    sdk.create_record.assert_not_called()
+
+    with pytest.raises(ValidationError, match="Unknown form ID 999"):
+        wf.create_or_update_records(
+            "STUDY",
+            [{"formId": 999, "data": {"SUBJID": "S1", "AGE": 30, "SEX": "F"}}],
+        )
+
+    res = wf.create_new_record(
+        "STUDY",
+        form_identifier=301,
+        subject_identifier="SUBJ1",
+        data={"SUBJID": "S1", "AGE": 30, "SEX": "F"},
+        form_identifier_type="id",
+    )
+    assert res.batch_id == "B-SYNC"
+    sdk.get_variables.assert_not_called()
+    sdk.create_record.assert_called_once()
+
+    # Async per-method schema override
+    async_sdk = MagicMock()
+    async_sdk._async_client = True
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="2", batchId="B-ASYNC", state="COMPLETED")
+    )
+    async_wf = RecordUpdateWorkflow(async_sdk)
+
+    with pytest.raises(ValidationError, match="Invalid choice"):
+        await async_wf.async_create_or_update_records(
+            "STUDY",
+            [{"formKey": "F_DM", "data": {"SUBJID": "S1", "AGE": 25, "SEX": "BAD"}}],
+            schema=dd,
+        )
+    async_sdk.async_get_variables.assert_not_called()
+
+    async_res = await async_wf.async_create_or_update_records(
+        "STUDY",
+        [{"formId": 301, "subjectKey": "SUBJ1", "data": {"SUBJID": "S1", "AGE": 25, "SEX": "M"}}],
+        schema=dd,
+    )
+    assert async_res.batch_id == "B-ASYNC"
+    async_sdk.async_get_variables.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_cold_cache_form_id_refresh_and_unknown_form_id() -> None:
+    """Cold SchemaCache refreshes on formId records and rejects unknown formId."""
+    var = Variable(
+        studyKey="STUDY",
+        variableId=1,
+        sequence=1,
+        revision=1,
+        disabled=False,
+        variableOid="OID1",
+        deleted=False,
+        formName="F1",
+        label="Label",
+        blinded=False,
+        variableName="age",
+        variableType="integer",
+        formId=101,
+        formKey="F1",
+    )
+
+    sdk = MagicMock()
+    del sdk.async_create_record
+    sdk.get_variables.return_value = [var]
+    sdk.create_record.return_value = Job(jobId="1", batchId="B1", state="PROCESSING")
+    wf = RecordUpdateWorkflow(sdk)
+
+    # Cold cache refreshes on formId=101 and validates data
+    with pytest.raises(ValidationError, match="Value must be an integer"):
+        wf.create_or_update_records("STUDY", [{"formId": 101, "data": {"age": True}}])
+    sdk.get_variables.assert_called_once_with(study_key="STUDY")
+
+    # Unknown formId raises ValidationError
+    with pytest.raises(ValidationError, match="Unknown form ID 999"):
+        wf.create_or_update_records("STUDY", [{"form_id": 999, "data": {"age": 30}}])
+
+    # Async cold cache formId refresh and unknown formId
+    async_sdk = MagicMock()
+    async_sdk._async_client = True
+    async_sdk.async_get_variables = AsyncMock(return_value=[var])
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="2", batchId="B2", state="PROCESSING")
+    )
+    async_wf = RecordUpdateWorkflow(async_sdk)
+
+    with pytest.raises(ValidationError, match="Unknown form ID 999"):
+        await async_wf.async_create_or_update_records(
+            "STUDY", [{"formId": 999, "data": {"age": 30}}]
+        )
+    async_sdk.async_get_variables.assert_called_once_with(study_key="STUDY")
+
+
+def test_simulation_mode_f_dm_coded_submission_via_record_update_workflow() -> None:
+    """RecordUpdateWorkflow submits simulated F_DM records with Coded V_GENDER and cold formId."""
+    sdk = ImednetSDK(
+        api_key="sim-key",  # pragma: allowlist secret
+        security_key="sim-sec",  # pragma: allowlist secret
+        simulation_mode=True,
+    )
+    try:
+        wf_by_key = RecordUpdateWorkflow(sdk)
+        job1 = wf_by_key.create_or_update_records(
+            "STUDY",
+            [
+                {
+                    "formKey": "F_DM",
+                    "subjectKey": "SUBJ-001",
+                    "data": {"V_AGE": 34, "V_GENDER": "F"},
+                }
+            ],
+        )
+        assert job1.batch_id
+
+        # Cold cache using formId=301 from simulation/state.py
+        wf_by_id = RecordUpdateWorkflow(sdk)
+        job2 = wf_by_id.create_or_update_records(
+            "STUDY",
+            [
+                {
+                    "formId": 301,
+                    "subjectKey": "SUBJ-001",
+                    "data": {"V_AGE": 35, "V_GENDER": "M"},
+                }
+            ],
+        )
+        assert job2.batch_id
+
+        with pytest.raises(ValidationError, match="Unknown form ID 9999"):
+            wf_by_id.create_or_update_records(
+                "STUDY",
+                [{"formId": 9999, "subjectKey": "SUBJ-001", "data": {"V_AGE": 35}}],
+            )
+    finally:
+        sdk.close()

@@ -19,7 +19,14 @@ from ..models import (
     Metadata,
     Variable,
 )
-from ..normalize import normalize_row_data, to_camel_case, validate_timestamp
+from ..normalize import (
+    normalize_form_id,
+    normalize_form_type,
+    normalize_row_data,
+    normalize_variable_type,
+    to_camel_case,
+    validate_timestamp,
+)
 
 KNOWN_FORM_FIELDS = {"formId", "formKey", "formType", "formName"}
 KNOWN_QUESTION_FIELDS = {
@@ -139,8 +146,8 @@ def load_from_csv_files(
         form = Form(
             formKey=fk,
             formName=known.get("formName"),
-            formId=known.get("formId"),
-            formType=known.get("formType"),
+            formId=normalize_form_id(known.get("formId"), form_key=fk),
+            formType=normalize_form_type(known.get("formType"), default="Subject"),
             extraAttributes=extra,
         )
         forms_by_key[fk] = form
@@ -161,20 +168,24 @@ def load_from_csv_files(
         if fk not in forms_by_key:
             record_warning(f"Question '{vname}' references undefined form '{fk}'")
             # Create form placeholder in non-strict mode
-            forms_by_key[fk] = Form(formKey=fk)
+            forms_by_key[fk] = Form(
+                formKey=fk,
+                formType=normalize_form_type(None, default="Subject"),
+            )
 
         req_val = known.get("required") or known.get("requiredField")
         seq_val = known.get("sequence")
         sequence = int(seq_val) if seq_val and str(seq_val).isdigit() else (idx + 1)
+        prec_val = known.get("precision")
 
         variable = Variable(
             variableName=vname,
             label=known.get("label"),
-            variableType=known.get("variableType"),
+            variableType=normalize_variable_type(known.get("variableType"), precision=prec_val),
             sequence=sequence,
             required=req_val,
             format=known.get("format"),
-            precision=known.get("precision"),
+            precision=prec_val,
             extraAttributes=extra,
         )
         forms_by_key[fk].variables.append(variable)

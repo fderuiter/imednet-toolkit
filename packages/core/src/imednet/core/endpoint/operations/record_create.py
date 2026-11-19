@@ -15,7 +15,7 @@ from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.job_ledger import record_study_job
 from imednet.utils.security import validate_header_value
-from imednet.validation.cache import BaseSchemaCache, validate_record_entry
+from imednet.validation.cache import ValidationSchemaProtocol, validate_record_entry
 
 T = TypeVar("T")
 
@@ -34,7 +34,7 @@ class RecordCreateOperation(Operation[T]):
         path: str,
         records_data: list[dict[str, Any]],
         email_notify: bool | str | None = None,
-        schema: BaseSchemaCache[Any] | None = None,
+        schema: ValidationSchemaProtocol | None = None,
         *,
         study_key: str | None = None,
     ) -> None:
@@ -44,7 +44,7 @@ class RecordCreateOperation(Operation[T]):
             path: The full API path for the request.
             records_data: List of record data objects to create.
             email_notify: Email notification setting.
-            schema: Optional schema cache for validation.
+            schema: Optional validation schema (BaseSchemaCache or DataDictionary).
             study_key: Optional study key associated with the record batch.
 
         Raises:
