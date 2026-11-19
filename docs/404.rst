@@ -1,0 +1,46 @@
+:orphan:
+
+.. meta::
+   :description: The requested page could not be found in the imednet-toolkit documentation portal. Use the pathways below to return to active SDK, CLI, and API guides.
+
+Page Not Found (404)
+====================
+
+The documentation URL you requested may have moved during the consolidation into ``imednet-toolkit`` or no longer exists.
+
+Where to Go Next
+----------------
+
+.. container:: role-cards-grid
+
+   .. container:: role-card role-pathway-section
+
+      .. rubric:: Documentation Home
+         :class: role-card-title
+
+      Return to the main landing portal, interactive browser showcase, and role-based pathways.
+
+      * :doc:`index`
+      * :ref:`search`
+
+   .. container:: role-card role-pathway-section
+
+      .. rubric:: Getting Started & Guides
+         :class: role-card-title
+
+      Install ``imednet``, run your first SDK query, or configure CLI and workflow integrations.
+
+      * :doc:`tutorials/quick_start`
+      * :doc:`how-to/cli`
+      * :doc:`how-to/airflow`
+
+   .. container:: role-card role-pathway-section
+
+      .. rubric:: Technical Reference
+         :class: role-card-title
+
+      Browse generated Python API modules, REST endpoint schemas, and configuration settings.
+
+      * :doc:`reference/api/core`
+      * :doc:`reference/rest_api_reference`
+      * :doc:`reference/configuration`

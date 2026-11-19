@@ -19,4 +19,4 @@ Optional workflow commands live in the separate `imednet-workflows` package, and
 the Airflow integration lives in `apache-airflow-providers-imednet`.
 
 Full project documentation is available at
-<https://fderuiter.github.io/imednet-python-sdk/>.
+<https://fderuiter.github.io/imednet-toolkit/>.

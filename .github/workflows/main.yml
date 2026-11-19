@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request: {}
+  workflow_dispatch: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -195,8 +196,10 @@ jobs:
           key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
           restore-keys: |
             uv-venv-${{ runner.os }}-"3.11"-
-      - name: Install Hatch
-        run: python -m pip install --upgrade pip hatch uv
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip uv
+          uv sync --locked --all-packages --all-extras
 
       - name: Audit locked workspace dependencies
         run: |
@@ -206,15 +209,23 @@ jobs:
             -r "$RUNNER_TEMP/imednet-locked.txt"
 
       - name: Run Quality & Security Checks
-        run: hatch run quality:all packages
+        run: |
+          uvx --from "semgrep==1.185.0" semgrep scan --config p/security-audit --metrics off --error packages
+          uvx --from "vulture>=2.11" vulture packages vulture_whitelist.py --min-confidence 80 --exclude "**/tests/**,**/docs/**,**/scripts/**"
+          uvx --from "pylint>=3.0.0" pylint --rcfile=pyproject.toml --disable=all --enable=similarities --min-similarity-lines=20 --ignore-paths='.*/tests/.*,.*/docs/.*,.*/scripts/.*,.*/models/.*,tests/.*,docs/.*,scripts/.*,.*\.json$' --ignore-patterns='.*monitor.*,.*integrations.*,.*sinks.*,.*testing.*' packages
+          uvx --from "pylint>=3.0.0" pylint --rcfile=pyproject.toml --disable=all --enable=duplicate-code packages
 
       - name: Run Canonical Workspace Verification
-        run: hatch run verify
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy packages tests/typing/endpoint_contracts.py
+          uv run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_tui --cov-fail-under=90
 
       - name: Verify Model Type Stubs
         run: |
-          hatch run python -m imednet.models.engine --check
-          hatch run python -c "from imednet.models.engine import ModelEngine; ModelEngine.generate_stubs('packages/core/src/imednet/models')"
+          uv run python -m imednet.models.engine --check
+          uv run python -c "from imednet.models.engine import ModelEngine; ModelEngine.generate_stubs('packages/core/src/imednet/models')"
           git diff --exit-code packages/core/src/imednet/models/
 
   # ------------------------------------------------------------------
@@ -632,18 +643,12 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          python -m pip install uv hatch
-          uv sync --locked --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          python -m pip install --upgrade pip uv
+          uv sync --locked --all-packages --all-extras
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
-      - name: Validate Showcases
-        run: hatch run validate-showcases
-
-      - name: Validate Documentation
-        run: hatch run validate-docs
-
-      - name: Build HTML and Run Doctests
-        run: hatch run docs
+      - name: Build and Validate Documentation
+        run: uv run python scripts/build_docs.py
 
       - name: Assert Clean Working Tree
         run: |
@@ -667,23 +672,39 @@ jobs:
             exit 1
           fi
 
+      - name: Upload Documentation Preview Artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs-html-preview
+          path: docs/_build/html
+          retention-days: 5
+
       - name: Upload Pages Artifact
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: docs/_build/html
 
   # ------------------------------------------------------------------
-  # JOB 5: DEPLOY DOCS (Only on main push)
+  # JOB 5: DEPLOY DOCS (Only on main push or manual dispatch)
   # ------------------------------------------------------------------
   deploy-docs:
     name: Deploy to GH Pages
-    needs: [plan, test, docs, global-lint, quality]
+    needs: [plan, pre-commit, test, docs, global-lint, quality]
     concurrency:
       group: pages
       cancel-in-progress: false
-    # Only deploy docs if tests pass (or are skipped) and we are on main
-    if: always() && !cancelled() && !contains(needs.*.result, 'failure') && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Only deploy docs if upstream checks succeed without failure or cancellation on main
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.docs.result == 'success' &&
+      needs.pre-commit.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       pages: write

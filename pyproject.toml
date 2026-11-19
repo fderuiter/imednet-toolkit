@@ -188,7 +188,7 @@ verify-static = [
     "mypy tests/typing/endpoint_contracts.py",
 ]
 verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_tui --cov-fail-under=90"
-verify = ["verify-static", "verify-tests", "docs"]
+verify = ["verify-static", "verify-tests"]
 test = "pytest --ignore=tests/live/ {args:tests/}"
 docs = "python scripts/build_docs.py"
 build-docs = "python scripts/build_docs.py"

@@ -4,10 +4,13 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
-def run_command(cmd, env=None, check=True):
+def run_command(
+    cmd: Sequence[str], env: Mapping[str, str] | None = None, check: bool = True
+) -> None:
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, env=env, check=check)
 
@@ -95,7 +98,7 @@ def build_and_stage_wheels(
     return staged
 
 
-def main():
+def main() -> None:
     api_dir = Path("docs/reference/api")
 
     print("Cleaning old API docs...")
@@ -197,6 +200,10 @@ def main():
             target_whl = html_wheels_dir / whl.name
             if not target_whl.exists():
                 shutil.copy2(whl, target_whl)
+        shutil.rmtree(static_wheels_dir)
+
+    print("Validating rendered HTML SEO and Pages artifacts...")
+    run_command([sys.executable, "scripts/validate_docs.py", "--require-html"])
 
 
 if __name__ == "__main__":

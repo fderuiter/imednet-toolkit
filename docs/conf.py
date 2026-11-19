@@ -1,13 +1,17 @@
 """Sphinx configuration."""
 
 # Configuration file for the Sphinx documentation builder.
+import html
 import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 import types
+import urllib.parse
 import warnings
+from pathlib import Path
 
 # mypy: ignore-errors
 from typing import Any
@@ -173,8 +177,209 @@ class _SuppressDuplicateDescriptions(logging.Filter):
         )
 
 
+_DEFAULT_SITE_DESCRIPTION = (
+    "Unofficial Python SDK, CLI, workflow plugins, TUI, and Apache Airflow provider "
+    "for the iMednet clinical trials EDC API."
+)
+_SPECIAL_PAGE_TITLES = {
+    "genindex": "Index",
+    "py-modindex": "Python Module Index",
+    "search": "Search",
+    "_modules/index": "Module Code",
+}
+_META_DESC_RE = re.compile(
+    r"<meta\s+(?:name=[\"']description[\"']\s+content=[\"'](?P<c1>[^\"']*)[\"']"
+    r"|content=[\"'](?P<c2>[^\"']*)[\"']\s+name=[\"']description[\"'])\s*/?>",
+    re.IGNORECASE,
+)
+
+
+def _strip_html(raw: str) -> str:
+    """Convert an HTML fragment into normalized plain text."""
+    text = re.sub(r"<[^>]+>", "", raw)
+    return " ".join(html.unescape(text).split())
+
+
+def _extract_doctree_description(doctree: Any) -> str:
+    """Extract a concise plain-text summary from the first body paragraph in doctree."""
+    if doctree is None:
+        return ""
+    for node in doctree.findall():
+        if node.__class__.__name__ != "paragraph":
+            continue
+        parent_name = getattr(getattr(node, "parent", None), "__class__", type(None)).__name__
+        if parent_name in {"note", "warning", "admonition", "tip", "important", "caution"}:
+            continue
+        text = " ".join(node.astext().split())
+        if text:
+            if len(text) > 200:
+                return text[:197].rstrip() + "..."
+            return text
+    return ""
+
+
+def _resolve_page_title(pagename: str, context: dict[str, Any], site_title: str) -> str:
+    """Resolve a clean plain-text page title for social metadata tags."""
+    raw_title = context.get("title")
+    if isinstance(raw_title, str) and raw_title.strip():
+        cleaned = _strip_html(raw_title)
+        if cleaned:
+            return site_title if pagename == master_doc else f"{cleaned} — {site_title}"
+    if pagename in _SPECIAL_PAGE_TITLES:
+        return f"{_SPECIAL_PAGE_TITLES[pagename]} — {site_title}"
+    if pagename.startswith("_modules/"):
+        mod_name = pagename.removeprefix("_modules/").replace("/", ".")
+        return f"Source code for {mod_name} — {site_title}"
+    fallback_slug = pagename.rsplit("/", maxsplit=1)[-1].replace("_", " ").replace("-", " ").title()
+    return f"{fallback_slug} — {site_title}"
+
+
+def _canonical_page_url(base_url: str, pagename: str) -> str:
+    """Build the canonical public URL for a given Sphinx page name."""
+    normalized_base = base_url.rstrip("/") + "/"
+    if pagename == master_doc:
+        return normalized_base
+    return f"{normalized_base}{pagename}.html"
+
+
+def _inject_seo_metadata(
+    app: Any,
+    pagename: str,
+    templatename: str,  # noqa: ARG001
+    context: dict[str, Any],
+    doctree: Any,
+) -> None:
+    """Inject description, OpenGraph, and Twitter Card metadata into HTML pages."""
+    base_url = getattr(app.config, "html_baseurl", "") or html_baseurl
+    normalized_base = base_url.rstrip("/") + "/"
+    site_title = getattr(app.config, "html_title", None) or f"{project} Documentation"
+
+    existing_metatags = context.get("metatags") or ""
+    match = _META_DESC_RE.search(existing_metatags)
+    if match:
+        raw_desc = html.unescape(match.group("c1") or match.group("c2") or "").strip()
+        description = raw_desc or _DEFAULT_SITE_DESCRIPTION
+        escaped_desc = html.escape(description, quote=True)
+        existing_metatags = _META_DESC_RE.sub(
+            f'<meta name="description" content="{escaped_desc}" />',
+            existing_metatags,
+            count=1,
+        )
+        has_meta_desc = True
+    else:
+        doctree_desc = _extract_doctree_description(doctree)
+        page_label = _resolve_page_title(pagename, context, site_title)
+        description = doctree_desc or f"{page_label}. {_DEFAULT_SITE_DESCRIPTION}"
+        has_meta_desc = False
+
+    full_title = _resolve_page_title(pagename, context, site_title)
+    canonical_url = _canonical_page_url(normalized_base, pagename)
+    logo_rel = (getattr(app.config, "html_logo", None) or "_static/logo.png").lstrip("/")
+    image_url = f"{normalized_base}{logo_rel}"
+
+    esc_title = html.escape(full_title, quote=True)
+    esc_desc = html.escape(description, quote=True)
+    esc_url = html.escape(canonical_url, quote=True)
+    esc_image = html.escape(image_url, quote=True)
+    esc_site = html.escape(site_title, quote=True)
+
+    injected_lines: list[str] = []
+    if not has_meta_desc:
+        injected_lines.append(f'<meta name="description" content="{esc_desc}" />')
+    injected_lines.extend(
+        [
+            f'<meta property="og:title" content="{esc_title}" />',
+            f'<meta property="og:description" content="{esc_desc}" />',
+            '<meta property="og:type" content="website" />',
+            f'<meta property="og:url" content="{esc_url}" />',
+            f'<meta property="og:image" content="{esc_image}" />',
+            f'<meta property="og:site_name" content="{esc_site}" />',
+            '<meta name="twitter:card" content="summary" />',
+            f'<meta name="twitter:title" content="{esc_title}" />',
+            f'<meta name="twitter:description" content="{esc_desc}" />',
+            f'<meta name="twitter:image" content="{esc_image}" />',
+        ]
+    )
+    prefix = (
+        existing_metatags
+        if existing_metatags.endswith("\n") or not existing_metatags
+        else f"{existing_metatags}\n"
+    )
+    context["metatags"] = prefix + "\n".join(injected_lines) + "\n"
+
+
+def _rewrite_not_found_assets(not_found_path: Path, base_path: str) -> None:
+    """Rewrite relative asset and navigation URLs on 404.html so nested paths render cleanly."""
+    if not not_found_path.exists():
+        return
+    prefix = "/" + base_path.strip("/") + "/" if base_path.strip("/") else "/"
+    content = not_found_path.read_text(encoding="utf-8")
+
+    # Anchor Sphinx content_root and DOCUMENTATION_OPTIONS.URL_ROOT for scripts/search
+    content = re.sub(
+        r'data-content_root="[^"]*"',
+        f'data-content_root="{prefix}"',
+        content,
+    )
+    content = re.sub(
+        r"(URL_ROOT\s*:\s*)(['\"])(?:\./|)\2",
+        rf"\g<1>\g<2>{prefix}\g<2>",
+        content,
+    )
+
+    # Rewrite relative _static/ asset paths (including JSON config strings and tag attributes)
+    content = re.sub(
+        r'(?P<q>["\'])(?:\./)?_static/',
+        rf"\g<q>{prefix}_static/",
+        content,
+    )
+
+    # Rewrite remaining root-relative href/action links so sidebar and search work from nested 404 URLs
+    def _anchor_attr(match: re.Match[str]) -> str:
+        attr = match.group("attr")
+        quote = match.group("q")
+        target = match.group("target")
+        if target.startswith(("/", "#", "http://", "https://", "mailto:", "javascript:", "data:")):
+            return match.group(0)
+        cleaned = target.removeprefix("./")
+        return f"{attr}={quote}{prefix}{cleaned}{quote}"
+
+    content = re.sub(
+        r'(?P<attr>\b(?:href|action))=(?P<q>["\'])(?P<target>[^"\']+)(?P=q)',
+        _anchor_attr,
+        content,
+    )
+    not_found_path.write_text(content, encoding="utf-8")
+
+
+def _on_build_finished(app: Any, exception: Exception | None) -> None:
+    """Finalize HTML build by rewriting 404.html asset paths and emitting sitemap.xml and robots.txt."""
+    if exception is not None or getattr(app.builder, "format", "") != "html":
+        return
+
+    outdir = Path(app.outdir)
+    base_url = (getattr(app.config, "html_baseurl", "") or html_baseurl).rstrip("/") + "/"
+    base_path = urllib.parse.urlsplit(base_url).path or "/"
+
+    _rewrite_not_found_assets(outdir / "404.html", base_path)
+
+    found_docs = sorted(doc for doc in getattr(app.env, "found_docs", set()) if doc != "404")
+    sitemap_lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
+    for docname in found_docs:
+        loc = html.escape(_canonical_page_url(base_url, docname), quote=False)
+        sitemap_lines.append(f"  <url><loc>{loc}</loc></url>")
+    sitemap_lines.append("</urlset>\n")
+    (outdir / "sitemap.xml").write_text("\n".join(sitemap_lines), encoding="utf-8")
+
+    robots_txt = f"User-agent: *\nAllow: /\n\nSitemap: {base_url}sitemap.xml\n"
+    (outdir / "robots.txt").write_text(robots_txt, encoding="utf-8")
+
+
 def setup(app: Any) -> None:  # pragma: no cover
-    """Install the duplicate-description log filter after Sphinx initialises.
+    """Install log filters and native SEO / GitHub Pages hooks after Sphinx initialises.
 
     Args:
         app: The Sphinx application instance (provided by Sphinx at startup).
@@ -188,6 +393,9 @@ def setup(app: Any) -> None:  # pragma: no cover
 
     # Expose thebe_config containing wheel artifacts and requirements to client JS runtime
     app.add_js_file(None, body=f"window.thebe_config = {json.dumps(thebe_config)};")
+
+    app.connect("html-page-context", _inject_seo_metadata)
+    app.connect("build-finished", _on_build_finished)
 
 
 # Ignore noisy pydantic schema generation warnings.
@@ -214,7 +422,7 @@ napoleon_numpy_docstring = False
 napoleon_include_init_with_doc = True
 
 # Templates and static paths
-templates_path: list[str] = ["_templates"]
+templates_path: list[str] = []
 exclude_patterns: list[str] = [
     "tutorials/examples/dummy.py",
     "agents/**",

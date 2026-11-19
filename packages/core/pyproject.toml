@@ -35,6 +35,7 @@ dependencies = [
 [project.urls]
 repository = "https://github.com/fderuiter/imednet-toolkit"
 homepage = "https://github.com/fderuiter/imednet-toolkit"
+documentation = "https://fderuiter.github.io/imednet-toolkit/"
 
 [project.scripts]
 imednet = "imednet.cli:app"
