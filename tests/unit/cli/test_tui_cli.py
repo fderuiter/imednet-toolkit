@@ -69,7 +69,8 @@ def test_tui_plugin_registered_and_run(monkeypatch):
 
 
 def test_tui_plugin_high_contrast_flag(monkeypatch):
-    """Verify that --high-contrast flag sets IMEDNET_HIGH_CONTRAST=1."""
+    """Verify that --high-contrast passes high_contrast=True without mutating os.environ."""
+    from imednet import cli as cli_mod
     from imednet_tui.cli import setup_parser
 
     class DummyEntryPoint:
@@ -85,9 +86,7 @@ def test_tui_plugin_high_contrast_flag(monkeypatch):
         ),
     )
     monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
-
-    parser = get_parser()
-    args = parser.parse_args(["tui", "--high-contrast"])
+    env_snapshot = dict(os.environ)
 
     with (
         patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
@@ -97,9 +96,10 @@ def test_tui_plugin_high_contrast_flag(monkeypatch):
         mock_sdk = MagicMock()
         mock_get_sdk.return_value = mock_sdk
 
-        args.func(args)
-        mock_run_tui.assert_called_once()
-        assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+        cli_mod.app(["tui", "--high-contrast"])
+        mock_run_tui.assert_called_once_with(mock_sdk, force=False, high_contrast=True)
+        assert "IMEDNET_HIGH_CONTRAST" not in os.environ
+        assert dict(os.environ) == env_snapshot
 
 
 def test_tui_plugin_non_interactive_exits(monkeypatch, capsys):
