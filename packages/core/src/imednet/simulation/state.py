@@ -19,6 +19,7 @@ class SimulationState:
         """Reset all in-memory fixtures to clean initial state."""
         with getattr(self, "_lock", threading.Lock()):
             self._next_record_id: int = 1000
+            self._next_revision_id: int = 1202
             self._next_batch_num: int = 1
 
             self.studies: list[dict[str, Any]] = [
@@ -301,17 +302,122 @@ class SimulationState:
 
             self.users: list[dict[str, Any]] = [
                 {
-                    "userId": 901,
-                    "userName": "sim_user",
+                    "userId": "901",
+                    "login": "sim_user",
+                    "firstName": "Simulated",
+                    "lastName": "User",
                     "email": "sim@example.com",
-                    "studyKey": "STUDY",
+                    "userActiveInStudy": True,
+                    "roles": [
+                        {
+                            "roleId": "ROLE-INV",
+                            "name": "Investigator",
+                            "description": "Principal Investigator",
+                            "level": 1,
+                            "type": "Study",
+                            "inactive": False,
+                            "communityId": 1,
+                            "dateCreated": "2026-01-01T00:00:00Z",
+                            "dateModified": "2026-01-01T00:00:00Z",
+                        }
+                    ],
                 },
                 {
-                    "userId": 902,
-                    "userName": "sim_admin",
+                    "userId": "902",
+                    "login": "sim_admin",
+                    "firstName": "Study",
+                    "lastName": "Admin",
                     "email": "admin@example.com",
-                    "studyKey": "STUDY",
+                    "userActiveInStudy": True,
+                    "roles": [
+                        {
+                            "roleId": "ROLE-DM",
+                            "name": "Data Manager",
+                            "description": "Clinical Data Manager",
+                            "level": 2,
+                            "type": "Study",
+                            "inactive": False,
+                            "communityId": 1,
+                            "dateCreated": "2026-01-01T00:00:00Z",
+                            "dateModified": "2026-01-01T00:00:00Z",
+                        }
+                    ],
                 },
+                {
+                    "userId": "903",
+                    "login": "sim_inactive",
+                    "firstName": "Former",
+                    "lastName": "Coordinator",
+                    "email": "inactive@example.com",
+                    "userActiveInStudy": False,
+                    "roles": [],
+                },
+            ]
+
+            self.codings: list[dict[str, Any]] = [
+                {
+                    "codingId": "COD-1",
+                    "studyKey": "STUDY",
+                    "siteId": 101,
+                    "siteName": "SITE",
+                    "subjectId": 201,
+                    "subjectKey": "SUB1",
+                    "formId": 301,
+                    "formName": "Demographics",
+                    "formKey": "F_DM",
+                    "recordId": 601,
+                    "variable": "V_GENDER",
+                    "value": "Female",
+                    "code": "C16576",
+                    "codedBy": "sim_user",
+                    "dictionaryName": "MedDRA",
+                    "dictionaryVersion": "26.1",
+                    "dateCoded": "2026-01-11T10:00:00Z",
+                    "reason": "Initial coding",
+                    "revision": 1,
+                    "lastUpdated": "2026-01-11T10:00:00Z",
+                },
+                {
+                    "codingId": "COD-2",
+                    "studyKey": "STUDY",
+                    "siteId": 101,
+                    "siteName": "SITE",
+                    "subjectId": 201,
+                    "subjectKey": "SUB1",
+                    "formId": 302,
+                    "formName": "Vital Signs",
+                    "formKey": "F_VS",
+                    "recordId": 602,
+                    "variable": "V_WEIGHT",
+                    "value": "68.5",
+                    "code": "W001",
+                    "codedBy": "sim_admin",
+                    "dictionaryName": "WHODrug",
+                    "dictionaryVersion": "2026-03",
+                    "dateCoded": "2026-01-11T10:05:00Z",
+                    "reason": "Automated coding",
+                    "revision": 1,
+                    "lastUpdated": "2026-01-11T10:05:00Z",
+                },
+            ]
+
+            self.record_revisions: list[dict[str, Any]] = [
+                self._build_record_revision(
+                    revision_id=1201,
+                    record_entry=self.records[0],
+                    revision_number=1,
+                    user="sim_user",
+                    role="Investigator",
+                    reason="Initial entry",
+                ),
+                self._build_record_revision(
+                    revision_id=1202,
+                    record_entry=self.records[1],
+                    revision_number=1,
+                    user="sim_user",
+                    role="Investigator",
+                    reason="Initial entry",
+                ),
             ]
 
             self.jobs: dict[str, dict[str, Any]] = {
@@ -423,13 +529,55 @@ class SimulationState:
                 return records
             return [r for r in records if r.get("studyKey") == study_key]
 
+    @staticmethod
+    def _build_record_revision(
+        *,
+        revision_id: int,
+        record_entry: dict[str, Any],
+        revision_number: int,
+        user: str = "sim_user",
+        role: str = "Investigator",
+        reason: str = "Record created",
+        record_oid: str | None = None,
+        subject_oid: str | None = None,
+    ) -> dict[str, Any]:
+        """Construct a contract-compliant RecordRevision entry for a record."""
+        rec_id = record_entry["recordId"]
+        subj_id = record_entry["subjectId"]
+        return {
+            "studyKey": record_entry["studyKey"],
+            "recordRevisionId": revision_id,
+            "recordId": rec_id,
+            "recordOid": record_oid if record_oid is not None else f"REC-{rec_id}",
+            "recordRevision": revision_number,
+            "dataRevision": revision_number,
+            "recordStatus": record_entry["recordStatus"],
+            "subjectId": subj_id,
+            "subjectOid": subject_oid if subject_oid is not None else f"SUBJ-{subj_id}",
+            "subjectKey": record_entry["subjectKey"],
+            "siteId": record_entry["siteId"],
+            "formKey": record_entry["formKey"],
+            "intervalId": record_entry["intervalId"],
+            "role": role,
+            "user": user,
+            "reasonForChange": reason,
+            "deleted": bool(record_entry.get("deleted", False)),
+            "dateCreated": record_entry["dateCreated"],
+            "lastUpdated": record_entry["lastUpdated"],
+        }
+
     def create_records(self, study_key: str, records_data: list[dict[str, Any]]) -> dict[str, Any]:
-        """Store new records in memory and return a background Job creation response."""
+        """Store new records in memory, append audit revisions, and return a Job response."""
         with self._lock:
             for item in records_data:
                 self._next_record_id += 1
                 rec_id = self._next_record_id
-                rec_data = item.get("data") or item.get("recordData") or item
+                if "data" in item and isinstance(item["data"], dict):
+                    rec_data = item["data"]
+                elif "recordData" in item and isinstance(item["recordData"], dict):
+                    rec_data = item["recordData"]
+                else:
+                    rec_data = item
                 record_entry = {
                     "recordId": rec_id,
                     "studyKey": study_key,
@@ -441,7 +589,7 @@ class SimulationState:
                     "intervalId": item.get("intervalId", 501),
                     "siteId": item.get("siteId", 101),
                     "recordType": item.get("recordType", "Standard"),
-                    "recordStatus": "Complete",
+                    "recordStatus": item.get("recordStatus", "Complete"),
                     "recordData": copy.deepcopy(rec_data),
                     "deleted": False,
                     "dateCreated": "2026-11-15T00:00:00Z",
@@ -449,6 +597,21 @@ class SimulationState:
                     "lastUpdated": "2026-11-15T00:00:00Z",
                 }
                 self.records.append(record_entry)
+
+                self._next_revision_id += 1
+                rev_num = sum(1 for r in self.record_revisions if r.get("recordId") == rec_id) + 1
+                self.record_revisions.append(
+                    self._build_record_revision(
+                        revision_id=self._next_revision_id,
+                        record_entry=record_entry,
+                        revision_number=rev_num,
+                        user=str(item.get("user", "sim_user")),
+                        role=str(item.get("role", "Investigator")),
+                        reason=str(item.get("reasonForChange", "Record created")),
+                        record_oid=item.get("recordOid"),
+                        subject_oid=item.get("subjectOid"),
+                    )
+                )
 
             batch_id = f"BATCH-{self._next_batch_num}"
             job_id = f"JOB-{self._next_batch_num}"
@@ -472,6 +635,9 @@ class SimulationState:
                 "jobId": job_id,
                 "batchId": batch_id,
                 "state": "COMPLETED",
+                "dateCreated": "2026-11-15T00:00:00Z",
+                "dateStarted": "2026-11-15T00:00:00Z",
+                "dateFinished": "2026-11-15T00:00:00Z",
             }
 
     def get_queries(self, study_key: str | None = None) -> list[dict[str, Any]]:
@@ -580,13 +746,32 @@ class SimulationState:
                 return variables
             return [dict(v, studyKey=study_key) for v in variables]
 
+    def get_codings(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of medical codings for a study."""
+        with self._lock:
+            codings = copy.deepcopy(self.codings)
+            if not study_key:
+                return codings
+            matched = [c for c in codings if c.get("studyKey") == study_key]
+            if matched:
+                return matched
+            return [dict(c, studyKey=study_key) for c in codings]
+
+    def get_record_revisions(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of record audit revisions for a study."""
+        with self._lock:
+            revisions = copy.deepcopy(self.record_revisions)
+            if not study_key:
+                return revisions
+            return [r for r in revisions if r.get("studyKey") == study_key]
+
     def get_users(self, study_key: str | None = None) -> list[dict[str, Any]]:
         """Return list of users for a study."""
         with self._lock:
             users = copy.deepcopy(self.users)
             if not study_key:
                 return users
-            return [dict(u, studyKey=study_key) for u in users]
+            return [u for u in users if "studyKey" not in u or u.get("studyKey") == study_key]
 
 
 _default_state: SimulationState | None = None
