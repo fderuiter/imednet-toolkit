@@ -14,7 +14,6 @@ class Form(ImednetBaseModel):
     subject_record_report: bool | None = Field(default=None, alias="subjectRecordReport")
     unscheduled_visit: bool | None = Field(default=None, alias="unscheduledVisit")
     disabled: bool | None = Field(default=None, alias="disabled")
-
     study_key: str | None
     form_id: int | None
     form_key: str | None
@@ -25,8 +24,8 @@ class Form(ImednetBaseModel):
     date_modified: str | None
     epro_form: bool | None
     allow_copy: bool | None
-    embedded_log: Any
-    enforce_ownership: Any
+    embedded_log: bool | None
+    enforce_ownership: bool | None
     other_forms: Any
-    user_agreement: Any
+    user_agreement: bool | None
     last_updated: str | None

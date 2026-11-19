@@ -37,8 +37,11 @@ SUCCESSFUL_JOB_STATES: set[JobState]
 FAILED_JOB_STATES: set[JobState]
 ALLOWED_JOB_TRANSITIONS: dict[JobState, set[JobState]]
 
-class InvalidJobStateError(ValueError): ...
-class InvalidJobTransitionError(ValueError): ...
+class InvalidJobStateError(ValueError):
+    """Raised when an unrecognized job state string is encountered."""
+
+class InvalidJobTransitionError(ValueError):
+    """Raised when an invalid state transition is attempted."""
 
 InvalidStateTransitionError = InvalidJobTransitionError
 
@@ -49,8 +52,16 @@ def validate_job_transition(from_state: JobState | str, to_state: JobState | str
 class Job(ImednetBaseModel):
     """Represents an asynchronous background job."""
 
-    state: JobState | str | None = None
+    state: JobState | str | None = Field(default=None, alias="state")
+    job_id: str | None
+    batch_id: str | None
+    date_created: str | None
+    date_finished: str | None
+    date_started: str | None
 
+    @field_validator("state", mode="before")
+    @classmethod
+    def _validate_state(cls, v: Any) -> JobState | None: ...
     def transition_to(self, target: JobState | str) -> Job: ...
     @property
     def is_terminal(self) -> bool: ...
@@ -58,12 +69,6 @@ class Job(ImednetBaseModel):
     def is_successful(self) -> bool: ...
     @property
     def is_failed(self) -> bool: ...
-
-    job_id: str | None = None
-    batch_id: str | None = None
-    date_created: Any = None
-    date_finished: Any = None
-    date_started: Any = None
 
 class JobStatus(Job):
     """Extended job information returned when polling."""
@@ -73,6 +78,14 @@ class JobStatus(Job):
     record_success_count: int | None = Field(default=None, alias="successfulRecords")
     record_failure_count: int | None = Field(default=None, alias="failedRecords")
     result_error: str | None = Field(default=None, alias="resultError")
+    state: JobState | str | None
+    job_id: str | None
+    batch_id: str | None
+    date_created: str | None
+    date_finished: str | None
+    date_started: str | None
+    progress: int | None
+    result_url: str | None
 
     @model_validator(mode="before")
     @classmethod
@@ -89,12 +102,3 @@ class JobStatus(Job):
     def is_successful(self) -> bool: ...
     @property
     def is_failed(self) -> bool: ...
-
-    job_id: str | None = None
-    batch_id: str | None = None
-    state: JobState | str | None = None
-    date_created: str | None = None
-    date_started: str | None = None
-    date_finished: str | None = None
-    progress: int | None = None
-    result_url: str | None = None

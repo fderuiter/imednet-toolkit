@@ -31,7 +31,7 @@ class RecordsOperationDef:
     _id_param = "recordId"
     PARAM_PROCESSOR = MappingParamProcessor({"record_data_filter": "recordDataFilter"})
 
-    @execute_operation  # type: ignore
+    @execute_operation
     def create(
         self,
         study_key: str,

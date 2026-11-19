@@ -138,6 +138,16 @@ def _extract_record_errors(status: JobStatus | Any) -> list[dict[str, Any]]:
     return extracted
 
 
+def _is_fetchable_result_url(url: Any) -> bool:
+    """Return True when ``resultUrl`` is a non-empty, non-placeholder string."""
+    if not isinstance(url, str):
+        return False
+    stripped = url.strip()
+    if not stripped:
+        return False
+    return not (stripped.startswith("<") and stripped.endswith(">"))
+
+
 def _format_job_failure_details(
     base_message: str,
     status: JobStatus | Any,
@@ -425,7 +435,9 @@ class JobPoller(BaseJobPoller):
             self._trigger_callback(on_progress, event)
 
             if is_terminal:
-                if self._fetch_result and getattr(status, "result_url", None):
+                if self._fetch_result and _is_fetchable_result_url(
+                    getattr(status, "result_url", None)
+                ):
                     try:
                         res = self._fetch_result(status.result_url)  # type: ignore
                         self._process_fetch_result(status, res)
@@ -603,7 +615,9 @@ class AsyncJobPoller(BaseJobPoller):
             self._trigger_callback(on_progress, event)
 
             if is_terminal:
-                if self._fetch_result and getattr(status, "result_url", None):
+                if self._fetch_result and _is_fetchable_result_url(
+                    getattr(status, "result_url", None)
+                ):
                     try:
                         res = await self._fetch_result(status.result_url)  # type: ignore
                         self._process_fetch_result(status, res)

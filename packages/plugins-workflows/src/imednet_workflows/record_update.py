@@ -225,7 +225,7 @@ class RecordUpdateWorkflow:
         )
         if summary.last_job is not None:
             return summary.last_job
-        return Job(state="COMPLETED")
+        return Job.model_validate({"state": "COMPLETED"})
 
     async def async_create_or_update_records_batch(
         self,
@@ -275,7 +275,7 @@ class RecordUpdateWorkflow:
         )
         if summary.last_job is not None:
             return summary.last_job
-        return Job(state="COMPLETED")
+        return Job.model_validate({"state": "COMPLETED"})
 
     def _build_record_payload(
         self,

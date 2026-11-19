@@ -251,4 +251,4 @@ class RegisterSubjectsWorkflow:
         )
         if summary.last_job is not None:
             return cast(Job, summary.last_job)
-        return Job(state="COMPLETED")
+        return Job.model_validate({"state": "COMPLETED"})
