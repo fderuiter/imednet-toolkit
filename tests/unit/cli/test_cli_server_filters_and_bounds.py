@@ -475,6 +475,10 @@ def test_upstream_size_capped_at_500_when_limit_exceeds_500(
             ["records", "list", "S1", "--record-data-filter", "   "],
             "Invalid record data filter",
         ),
+        (
+            ["records", "list", "S1", "--record-data-filter", "AGE >= 18"],
+            "contains whitespace",
+        ),
     ],
 )
 def test_cli_query_validation_errors_exit_one(
@@ -496,18 +500,27 @@ def test_cli_query_validation_errors_exit_one(
 @pytest.mark.parametrize(
     ("argv", "expected_model"),
     [
-        (["codings", "list", "S1", "--filter", "visit_key=SCREENING"], "Coding"),
+        (["studies", "list", "--filter", "visit_key=SCREENING"], "Study"),
+        (["sites", "list", "S1", "--filter", "visit_key=SCREENING"], "Site"),
+        (["forms", "list", "S1", "--filter", "visit_key=SCREENING"], "Form"),
+        (["variables", "list", "S1", "--filter", "visit_key=SCREENING"], "Variable"),
+        (["intervals", "list", "S1", "--filter", "visit_key=SCREENING"], "Interval"),
+        (["visits", "list", "S1", "--filter", "visit_key=SCREENING"], "Visit"),
+        (["queries", "list", "S1", "--filter", "visit_key=SCREENING"], "Query"),
+        (["record-revisions", "list", "S1", "--filter", "visit_key=SCREENING"], "RecordRevision"),
+        (["records", "list", "S1", "--filter", "visit_key=SCREENING"], "Record"),
         (["subjects", "list", "S1", "--filter", "visit_key=SCREENING"], "Subject"),
+        (["codings", "list", "S1", "--filter", "visit_key=SCREENING"], "Coding"),
     ],
 )
 @respx.mock
-def test_codings_and_subjects_list_reject_unknown_model_filter_attributes(
+def test_all_eleven_list_commands_reject_unknown_model_filter_attributes(
     argv: list[str],
     expected_model: str,
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """codings list and subjects list validate filter keys against Coding/Subject before HTTP."""
+    """All 11 filterable list commands validate filter keys against their resource model before HTTP."""
     sdk = _make_sdk()
     monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
     route = respx.get(url__regex=r"https://api\.test/.*").mock(
@@ -697,3 +710,184 @@ def test_console_script_entry_point_dispatches_sys_argv_offline(
     envelope = json.loads(capfd.readouterr().out)
     assert envelope["count"] == 15
     assert envelope["items"][0]["studyKey"] == "ENTRY-1"
+
+
+@respx.mock
+def test_subjects_and_codings_preserve_zero_padded_keys_and_superscripts(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Zero-padded subject_key=001, code=0042, and value=² emit exact server filter strings."""
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _make_sdk)
+
+    subj_route = respx.get("https://api.test/api/v1/edc/studies/S1/subjects").mock(
+        return_value=httpx.Response(
+            200,
+            json=_paginated_payload(
+                [{"subjectId": 1, "studyKey": "S1", "subjectKey": "001", "subjectStatus": "Active"}]
+            ),
+        )
+    )
+    cli.app(["subjects", "list", "S1", "-f", "subject_key=001", "--format", "json"])
+    subj_out = json.loads(capfd.readouterr().out)
+    assert subj_route.call_count == 1
+    assert dict(subj_route.calls[0].request.url.params)["filter"] == "subjectKey==001"
+    assert subj_out["count"] == 1
+    assert subj_out["items"][0]["subjectKey"] == "001"
+
+    coding_route = respx.get("https://api.test/api/v1/edc/studies/S1/codings").mock(
+        return_value=httpx.Response(
+            200,
+            json=_paginated_payload(
+                [
+                    {
+                        "codingId": 9,
+                        "studyKey": "S1",
+                        "code": "0042",
+                        "value": "kg/m²",
+                        "revision": 2,
+                    }
+                ]
+            ),
+        )
+    )
+    cli.app(
+        [
+            "codings",
+            "list",
+            "S1",
+            "-f",
+            "code=0042",
+            "-f",
+            "revision>=2",
+            "--format",
+            "json",
+        ]
+    )
+    coding_out = json.loads(capfd.readouterr().out)
+    assert coding_route.call_count == 1
+    assert dict(coding_route.calls[0].request.url.params)["filter"] == "code==0042;revision>=2"
+    assert coding_out["count"] == 1
+    assert coding_out["items"][0]["code"] == "0042"
+
+    coding_route.reset()
+    cli.app(["codings", "list", "S1", "-f", "value=²", "--format", "json"])
+    capfd.readouterr()
+    assert coding_route.call_count == 1
+    assert dict(coding_route.calls[0].request.url.params)["filter"] == 'value=="²"'
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_err"),
+    [
+        (
+            ["codings", "list", "S1", "-f", "revision=abc"],
+            "Invalid integer value 'abc' for attribute 'revision'",
+        ),
+        (
+            ["forms", "list", "S1", "-f", "revision=abc"],
+            "Invalid integer value 'abc' for attribute 'revision'",
+        ),
+        (
+            ["record-revisions", "list", "S1", "-f", "record_revision=abc"],
+            "Invalid integer value 'abc' for attribute 'record_revision'",
+        ),
+        (
+            ["forms", "list", "S1", "-f", "disabled=notabool"],
+            "Invalid boolean value 'notabool' for attribute 'disabled'",
+        ),
+        (
+            ["records", "list", "S1", "-f", "deleted=2"],
+            "Invalid boolean value '2' for attribute 'deleted'",
+        ),
+    ],
+)
+@respx.mock
+def test_cli_list_commands_reject_invalid_numeric_and_boolean_values_before_http(
+    argv: list[str],
+    expected_err: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Invalid integer or boolean filter values exit 1 with diagnostic on stderr and zero HTTP calls."""
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _make_sdk)
+    route = respx.get(url__regex=r"https://api\.test/.*").mock(
+        return_value=httpx.Response(200, json=_paginated_payload([]))
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.app(argv)
+
+    assert exc_info.value.code == 1
+    assert route.call_count == 0
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert expected_err in captured.err
+
+
+@respx.mock
+def test_records_list_record_data_filter_with_json_and_file_output(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """records list forwards --record-data-filter alone and alongside -f with --format json and --output."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _make_sdk)
+
+    route = respx.get("https://api.test/api/v1/edc/studies/S1/records").mock(
+        return_value=httpx.Response(
+            200,
+            json=_paginated_payload(
+                [
+                    {
+                        "recordId": 10,
+                        "studyKey": "S1",
+                        "subjectKey": "001",
+                        "formKey": "VS",
+                        "recordData": {"SYSBP": 140},
+                    }
+                ]
+            ),
+        )
+    )
+
+    cli.app(
+        [
+            "records",
+            "list",
+            "S1",
+            "-f",
+            "subject_key=001",
+            "--record-data-filter",
+            "SYSBP>=130",
+            "--format",
+            "json",
+        ]
+    )
+    envelope = json.loads(capfd.readouterr().out)
+    assert route.call_count == 1
+    params = dict(route.calls[0].request.url.params)
+    assert params["filter"] == "subjectKey==001"
+    assert params["recordDataFilter"] == "SYSBP>=130"
+    assert envelope["count"] == 1
+    assert envelope["items"][0]["subjectKey"] == "001"
+
+    route.reset()
+    cli.app(
+        [
+            "records",
+            "list",
+            "S1",
+            "--record-data-filter",
+            "SYSBP>=130",
+            "--output",
+            "json",
+        ]
+    )
+    capfd.readouterr()
+    assert route.call_count == 1
+    params_out = dict(route.calls[0].request.url.params)
+    assert "filter" not in params_out
+    assert params_out["recordDataFilter"] == "SYSBP>=130"
+    assert (tmp_path / "records.json").exists()

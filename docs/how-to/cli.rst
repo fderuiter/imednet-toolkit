@@ -119,6 +119,11 @@ Eleven filter-capable ``list`` commands (``studies``, ``sites``, ``forms``,
 ``records``, ``subjects``, and ``codings``) accept repeatable ``-f`` / ``--filter``
 arguments using ``=`` or the standard iMednet comparison operators (``<``, ``<=``,
 ``>``, ``>=``, ``==``, ``!=``) with exclusive ``;`` (AND) or ``,`` (OR) connectors.
+Filter attribute names (in ``snake_case`` or ``camelCase``) and scalar values are
+validated locally against each resource model before sending HTTP requests: string
+identifiers preserve leading zeros and non-ASCII text (such as ``subject_key=001``,
+``code=0042``, or ``value=²``), while integer and boolean attributes reject invalid
+values on ``stderr`` with exit code ``1``.
 ``records list`` additionally exposes ``--record-data-filter`` (supporting ``=~``
 regular-expression matching in addition to the six standard operators) to filter
 Form Variable values on the server. All twelve ``list`` commands—including
