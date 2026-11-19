@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import datetime
 
+import pytest
+
+from imednet.models import ErrorField as ExportedErrorField
 from imednet.models.base import (
     ApiResponse,
     Error,
+    ErrorField,
     ImednetBaseModel,
     Metadata,
     Pagination,
@@ -72,6 +76,60 @@ def test_api_response_generic():
         }
     )
     assert resp.data == 5
+
+
+def test_nested_error_envelope_and_strict_mode(monkeypatch: pytest.MonkeyPatch):
+    """Test ErrorField, nested metadata.error envelopes, empty HTTP 200 error, and strict mode."""
+    assert ExportedErrorField is ErrorField
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "true")
+
+    # Upstream HTTP 400 validation error envelope without `data`
+    error_envelope = {
+        "metadata": {
+            "status": "BAD_REQUEST",
+            "path": "/api/v1/edc/studies",
+            "timestamp": "2018-10-18 05:46:29",
+            "error": {
+                "code": "1000",
+                "description": "Field raised validation errors",
+                "field": {
+                    "attribute": "page",
+                    "value": "XX",
+                },
+            },
+        }
+    }
+    parsed_err_resp = ApiResponse[list[Study]].from_json(error_envelope)
+    assert parsed_err_resp.data is None
+    assert parsed_err_resp.metadata.status == "BAD_REQUEST"
+    assert parsed_err_resp.metadata.path == "/api/v1/edc/studies"
+    assert parsed_err_resp.metadata.error.code == "1000"
+    assert parsed_err_resp.metadata.error.description == "Field raised validation errors"
+    assert parsed_err_resp.metadata.error.message == ""
+    assert parsed_err_resp.metadata.error.field == ErrorField(attribute="page", value="XX")
+    assert parsed_err_resp.metadata.error.field.attribute == "page"
+    assert parsed_err_resp.metadata.error.field.value == "XX"
+
+    # Upstream HTTP 200 envelope with empty `metadata.error` dict
+    ok_envelope = {
+        "metadata": {
+            "status": "OK",
+            "method": "GET",
+            "path": "/api/v1/edc/studies",
+            "timestamp": "2023-01-01T00:00:00Z",
+            "error": {},
+        },
+        "data": [{"studyKey": "PHARMADEMO", "studyId": 100}],
+    }
+    parsed_ok_resp = ApiResponse[list[Study]].from_json(ok_envelope)
+    assert parsed_ok_resp.metadata.error.code == ""
+    assert parsed_ok_resp.metadata.error.description == ""
+    assert parsed_ok_resp.metadata.error.message == ""
+    assert parsed_ok_resp.metadata.error.field is None
+    assert parsed_ok_resp.metadata.error.details == {}
+    assert parsed_ok_resp.data is not None
+    assert len(parsed_ok_resp.data) == 1
 
 
 # ---------------------------------------------------------------------------
