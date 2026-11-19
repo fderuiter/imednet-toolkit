@@ -11,25 +11,6 @@ from imednet.models.base import ImednetBaseModel
 class Visit(ImednetBaseModel):
     """A specific instance of a subject visiting a site (or equivalent event)."""
 
-    @model_validator(mode="before")
-    @classmethod
-    def _clean_empty_dates(cls, data: Any) -> Any:
-        """Coerce empty strings in date fields to None before validation."""
-        if isinstance(data, dict):
-            for key in [
-                "start_date",
-                "end_date",
-                "due_date",
-                "visit_date",
-                "startDate",
-                "endDate",
-                "dueDate",
-                "visitDate",
-            ]:
-                if data.get(key) == "":
-                    data[key] = None
-        return data
-
     visit_id: int | None
     study_key: str | None
     interval_id: int | None
@@ -43,6 +24,10 @@ class Visit(ImednetBaseModel):
     deleted: bool | None
     date_created: str | None
     date_modified: str | None
-    visit_date_form: Any
-    visit_date_question: Any
+    visit_date_form: str | None
+    visit_date_question: str | None
     last_updated: str | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clean_empty_dates(cls, data: Any) -> Any: ...
