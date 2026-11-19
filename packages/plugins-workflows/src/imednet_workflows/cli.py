@@ -630,10 +630,12 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
 
     def handle_add(args: argparse.Namespace) -> None:
         try:
+            clean_id = args.item_id.strip()
+            clean_study = args.study_key.strip()
             store = _open_store(args.db_path)
             item = TriageItem(
-                item_id=args.item_id,
-                study_key=args.study_key,
+                item_id=clean_id,
+                study_key=clean_study,
                 status=TriageStatus.NEW,
                 assignee=args.assignee,
                 severity=args.severity,
@@ -643,7 +645,7 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
                 initial_comment=args.comment,
                 user_id=args.user_id,
             )
-            saved = store.get_triage_item(args.item_id) or item
+            saved = store.get_triage_item(clean_id) or item
             if args.output_format == "json":
                 emit_json([saved], "triage_items")
             else:

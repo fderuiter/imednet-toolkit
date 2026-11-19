@@ -281,6 +281,10 @@ def test_triage_store_create_item_rejects_duplicates_atomically(tmp_path: Path) 
     with pytest.raises(ValueError, match="already exists"):
         store.create_item(duplicate, initial_comment="Overwrite attempt", user_id="other_user")
 
+    padded_duplicate = duplicate.model_copy(update={"item_id": "  AE-CREATE-1  "})
+    with pytest.raises(ValueError, match="already exists"):
+        store.create_item(padded_duplicate, initial_comment="Whitespace bypass")
+
     preserved = store.get_triage_item("AE-CREATE-1")
     assert preserved is not None
     assert preserved.status == TriageStatus.UNDER_REVIEW

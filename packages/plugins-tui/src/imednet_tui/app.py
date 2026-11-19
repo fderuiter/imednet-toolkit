@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from textual.app import App, ComposeResult
@@ -430,9 +431,20 @@ def _clean_scalar_str(value: Any) -> str:
     return ""
 
 
+def _extract_job_attr(job: Any, *names: str) -> Any:
+    """Return the first non-None job attribute or mapping entry."""
+    for name in names:
+        val = job.get(name) if isinstance(job, Mapping) else getattr(job, name, None)
+        if val is not None and not callable(val):
+            return val
+    return None
+
+
 def _extract_job_state_str(job: Any) -> str:
     """Extract a string representation of a job's state attribute."""
-    status = getattr(job, "state", getattr(job, "status", getattr(job, "job_status", "Unknown")))
+    status = _extract_job_attr(job, "state", "status", "job_status", "jobStatus")
+    if status is None:
+        return "Unknown"
     return str(status.value if hasattr(status, "value") else status)
 
 
@@ -501,9 +513,17 @@ class JobMonitor(Static):
 
     def on_mount(self) -> None:
         """Set up status message and interval polling timer on mount."""
-        self.update("Job Monitor: Select a study to view background jobs.")
         self.timer = self.set_interval(self.poll_interval, self.refresh_jobs, pause=True)
-        self.is_polling_paused = True
+        if self.current_study_key:
+            self._sync_ids_from_ledger(self.current_study_key)
+            if self.tracked_job_ids:
+                self._resume_polling()
+            else:
+                self._pause_polling()
+            self.run_worker(self.refresh_jobs())
+        else:
+            self.update("Job Monitor: Select a study to view background jobs.")
+            self._pause_polling()
 
     def _pause_polling(self) -> None:
         """Pause background interval polling when idle."""
@@ -655,19 +675,19 @@ class JobMonitor(Static):
             for idx, job in enumerate(jobs[:15]):
                 fallback_id = self.tracked_job_ids[idx] if idx < len(self.tracked_job_ids) else ""
                 batch_id = (
-                    _clean_scalar_str(getattr(job, "batch_id", None))
-                    or _clean_scalar_str(getattr(job, "job_id", None))
+                    _clean_scalar_str(_extract_job_attr(job, "batch_id", "batchId"))
+                    or _clean_scalar_str(_extract_job_attr(job, "job_id", "jobId"))
                     or fallback_id
                 )
                 ledger_meta = ledger_map.get(batch_id) if batch_id else None
                 job_type = (
-                    _clean_scalar_str(getattr(job, "job_type", None))
+                    _clean_scalar_str(_extract_job_attr(job, "job_type", "jobType"))
                     or (ledger_meta.job_type if ledger_meta else None)
                     or "Job"
                 )
                 status_str = _extract_job_state_str(job)
 
-                raw_progress = getattr(job, "progress", None)
+                raw_progress = _extract_job_attr(job, "progress")
                 progress_int: int | None = (
                     int(raw_progress)
                     if isinstance(raw_progress, (int, float)) and not isinstance(raw_progress, bool)
@@ -691,7 +711,7 @@ class JobMonitor(Static):
                     dark=dark_mode,
                     high_contrast=high_contrast,
                 )
-                created_raw = getattr(job, "date_created", None)
+                created_raw = _extract_job_attr(job, "date_created", "dateCreated")
                 iso_fn = (
                     getattr(created_raw, "isoformat", None)
                     if created_raw is not None and not isinstance(created_raw, type)

@@ -207,6 +207,15 @@ class TriageStore:
     ) -> None:
         """Atomically insert a new triage item, rejecting duplicate item IDs."""
         now = datetime.now(UTC).isoformat()
+        cleaned_id = item.item_id.strip()
+        cleaned_study = item.study_key.strip()
+        if not cleaned_id:
+            raise ValueError("Triage item_id must not be empty.")
+        if not cleaned_study:
+            raise ValueError("Triage study_key must not be empty.")
+        normalized_item = item.model_copy(
+            update={"item_id": cleaned_id, "study_key": cleaned_study}
+        )
         cleaned_comment = initial_comment.strip() if initial_comment else ""
         cleaned_user = user_id.strip() or "cli-user"
 
@@ -220,24 +229,24 @@ class TriageStore:
                 ON CONFLICT(item_id) DO NOTHING
                 """,
                 (
-                    item.item_id,
-                    item.study_key,
-                    item.status.value,
-                    item.assignee,
-                    item.severity,
+                    normalized_item.item_id,
+                    normalized_item.study_key,
+                    normalized_item.status.value,
+                    normalized_item.assignee,
+                    normalized_item.severity,
                     now,
                     now,
                 ),
             )
             if cursor.rowcount == 0:
-                raise ValueError(f"Triage item '{item.item_id}' already exists.")
+                raise ValueError(f"Triage item '{normalized_item.item_id}' already exists.")
 
             extra = (
-                (str(uuid.uuid4()), item.item_id, cleaned_user, cleaned_comment, now)
+                (str(uuid.uuid4()), normalized_item.item_id, cleaned_user, cleaned_comment, now)
                 if cleaned_comment
                 else None
             )
-            self._insert_item_details(conn, item, extra_annotation=extra)
+            self._insert_item_details(conn, normalized_item, extra_annotation=extra)
 
         self._execute_write(_write)
 

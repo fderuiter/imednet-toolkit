@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
-from collections.abc import AsyncIterable, Callable
+import re
+from collections.abc import AsyncIterable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -30,34 +32,83 @@ if TYPE_CHECKING:
     from imednet.sdk import AsyncImednetSDK, ImednetSDK
 
 
+_NON_ALNUM_RE = re.compile(r"[^a-zA-Z0-9]+")
+
+
+def _norm_field_key(key: Any) -> str:
+    """Normalize a field name to lowercase alphanumeric characters for sensitivity matching."""
+    return _NON_ALNUM_RE.sub("", str(key)).lower()
+
+
+def _is_mock_object(value: Any) -> bool:
+    """Return True when value is a unittest.mock instance."""
+    return type(value).__module__.startswith("unittest.mock")
+
+
+def _coerce_preview_value(value: Any) -> Any:
+    """Recursively normalize models, mappings, dataclasses, and synthetic objects into plain data."""
+    if value is None:
+        return None
+    if hasattr(value, "value") and not isinstance(value, type) and not _is_mock_object(value):
+        return value.value
+    if isinstance(value, (str, bytes, int, float, bool)):
+        return value
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        dumped = value.model_dump(exclude_none=True)
+        if isinstance(dumped, Mapping):
+            return {str(k): _coerce_preview_value(v) for k, v in dumped.items()}
+    if isinstance(value, Mapping):
+        return {str(k): _coerce_preview_value(v) for k, v in value.items() if v is not None}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            str(f.name): _coerce_preview_value(getattr(value, f.name))
+            for f in dataclasses.fields(value)
+            if getattr(value, f.name) is not None
+        }
+    if isinstance(value, list):
+        return [_coerce_preview_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_coerce_preview_value(v) for v in value]
+    if not isinstance(value, type) and not _is_mock_object(value) and hasattr(value, "__dict__"):
+        obj_dict = {
+            str(k): _coerce_preview_value(v)
+            for k, v in vars(value).items()
+            if not str(k).startswith("_") and v is not None and not callable(v)
+        }
+        if obj_dict:
+            return obj_dict
+    return value
+
+
 def _stringify_cell(raw_value: Any, *, phi_masked: bool = False, sensitive: bool = False) -> str:
     """Format a model attribute or dictionary value for display in a DataTable."""
     if raw_value is None or raw_value == "":
         return "-"
-    if isinstance(raw_value, dict):
-        payload = mask_clinical_phi(raw_value) if phi_masked else raw_value
+    coerced = _coerce_preview_value(raw_value)
+    if isinstance(coerced, dict):
+        payload = mask_clinical_phi(coerced) if phi_masked else coerced
         return json.dumps(payload, default=str, sort_keys=True)
     if phi_masked and sensitive:
-        masked_scalar = mask_clinical_phi({"patient_name": raw_value})
+        masked_scalar = mask_clinical_phi({"patient_name": coerced})
         return str(masked_scalar.get("patient_name", "***MASKED***"))
-    if isinstance(raw_value, list):
-        if not raw_value:
+    if isinstance(coerced, list):
+        if not coerced:
             return "-"
-        return f"{len(raw_value)} item(s)"
-    if hasattr(raw_value, "value"):
-        return str(raw_value.value)
-    return str(raw_value)
+        return f"{len(coerced)} item(s)"
+    return str(coerced)
 
 
 def _extract_attr(item: Any, *names: str) -> Any:
     """Return the first non-None attribute or dict value found on item."""
     for name in names:
-        if isinstance(item, dict):
+        if isinstance(item, Mapping):
             if name in item and item[name] is not None:
                 return item[name]
         else:
             val = getattr(item, name, None)
             if val is not None and not callable(val):
+                if _is_mock_object(item) and _is_mock_object(val):
+                    continue
                 return val
     return None
 
@@ -86,29 +137,60 @@ class EntityViewSpec:
     def normalized_sensitive_fields(self) -> frozenset[str]:
         """Return normalized field keys marked sensitive for cells or detail previews."""
         names = {
-            attr.replace("_", "").lower()
+            _norm_field_key(attr)
             for col in self.columns
             if col.sensitive
             for attr in col.attr_names
         }
-        names.update(field.replace("_", "").lower() for field in self.sensitive_fields)
+        names.update(_norm_field_key(field) for field in self.sensitive_fields)
         return frozenset(names)
+
+
+def _extract_preview_payload(selected: Any, spec: EntityViewSpec) -> tuple[dict[str, Any], bool]:
+    """Extract a structured dictionary for detail preview rendering, returning (payload, is_opaque)."""
+    coerced = _coerce_preview_value(selected)
+    if isinstance(coerced, dict) and coerced:
+        return coerced, False
+
+    extracted: dict[str, Any] = {}
+    candidate_names: list[str] = []
+    for col in spec.columns:
+        candidate_names.extend(col.attr_names)
+    candidate_names.extend(spec.sensitive_fields)
+
+    seen_norms: set[str] = set()
+    for attr_name in candidate_names:
+        norm = _norm_field_key(attr_name)
+        if norm in seen_norms:
+            continue
+        val = _extract_attr(selected, attr_name)
+        if val is not None:
+            extracted[attr_name] = _coerce_preview_value(val)
+            seen_norms.add(norm)
+
+    if extracted:
+        return extracted, False
+    return {"item": str(selected)}, True
 
 
 def _mask_entity_preview_payload(
     payload: dict[str, Any],
     spec: EntityViewSpec,
+    *,
+    is_opaque_fallback: bool = False,
 ) -> dict[str, Any]:
     """Apply global PHI masking and entity-specific sensitive field rules to a preview dict."""
     masked_any = mask_clinical_phi(payload)
     masked: dict[str, Any] = masked_any if isinstance(masked_any, dict) else dict(payload)
     sensitive_norms = spec.normalized_sensitive_fields()
+    if is_opaque_fallback and sensitive_norms:
+        return {"item": "***MASKED***"}
     if not sensitive_norms:
         return masked
 
     result: dict[str, Any] = {}
     for key, val in masked.items():
-        norm_key = str(key).replace("_", "").lower()
+        norm_key = _norm_field_key(key)
         if norm_key in sensitive_norms:
             if val is None or val in ("", []) or isinstance(val, dict):
                 result[key] = val
@@ -152,7 +234,7 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         title="Queries",
         endpoint_attr="queries",
         supports_subject_filter=True,
-        sensitive_fields=("query_comments", "queryComments"),
+        sensitive_fields=("query_comments", "queryComments", "comments", "user", "author"),
         columns=(
             EntityColumnSpec("Annotation ID", ("annotation_id", "annotationId")),
             EntityColumnSpec("Subject Key", ("subject_key", "subjectKey")),
@@ -191,6 +273,7 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         endpoint_attr="record_revisions",
         supports_subject_filter=True,
         read_only_notice="21 CFR Part 11 Audit Trail — Strictly Read-Only",
+        sensitive_fields=("record_data", "recordData"),
         columns=(
             EntityColumnSpec("Revision ID", ("record_revision_id", "recordRevisionId")),
             EntityColumnSpec("Record ID", ("record_id", "recordId")),
@@ -230,7 +313,7 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         key="users",
         title="Users",
         endpoint_attr="users",
-        sensitive_fields=("name", "email"),
+        sensitive_fields=("name", "email", "full_name", "username", "display_name"),
         columns=(
             EntityColumnSpec("Account ID", ("user_id", "userId")),
             EntityColumnSpec("Login", ("login",), sensitive=True),
@@ -496,15 +579,13 @@ class EntityTablePane(Container):
 
     def _render_detail_preview(self, selected: Any) -> None:
         """Render a read-only detail preview of an entity item with sensitive field masking."""
-        payload = (
-            selected.model_dump(exclude_none=True)
-            if hasattr(selected, "model_dump")
-            else dict(selected)
-            if isinstance(selected, dict)
-            else {"item": str(selected)}
-        )
+        payload, is_opaque = _extract_preview_payload(selected, self.spec)
         if self.phi_masked:
-            payload = _mask_entity_preview_payload(payload, self.spec)
+            payload = _mask_entity_preview_payload(
+                payload,
+                self.spec,
+                is_opaque_fallback=is_opaque,
+            )
         preview = json.dumps(payload, default=str, sort_keys=True)
         if len(preview) > 220:
             preview = f"{preview[:217]}..."

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -1154,3 +1156,169 @@ async def test_job_monitor_keeps_polling_when_16th_job_is_processing(
         rendered_idle = str(monitor.render())
         assert monitor.is_polling_paused is True
         assert "Polling paused (0 active jobs)" in rendered_idle
+
+
+@pytest.mark.asyncio
+async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify synthetic SimpleNamespace/dataclass/dict adapters across previews, polling, and triage."""
+
+    @dataclass
+    class _SyntheticRevision:
+        record_revision_id: int
+        record_id: int
+        subject_key: str
+        record_status: str
+        modified_by: str
+        reason_for_change: str
+
+    sdk = _build_clinical_sdk()
+    sdk.users.list.return_value = [
+        SimpleNamespace(
+            user_id="U-NS-1",
+            login="ns_login_handle",
+            first_name="NsFirst",
+            last_name="NsLast",
+            email="ns.investigator@example.test",
+            username="ns_username",
+            active=True,
+        )
+    ]
+    sdk.record_revisions.list.return_value = [
+        _SyntheticRevision(
+            record_revision_id=950,
+            record_id=1,
+            subject_key="SUBJ-ALPHA",
+            record_status="Complete",
+            modified_by="ns_revision_author",
+            reason_for_change="NsRevisionReasonText",
+        )
+    ]
+    sdk.records.list.return_value = [
+        SimpleNamespace(
+            record_id=77,
+            subject_key="SUBJ-ALPHA",
+            form_key="DM",
+            visit_id=11,
+            record_status="Complete",
+            record_data=SimpleNamespace(patient_name="NsPatientFullName", AGE=64),
+        )
+    ]
+    monkeypatch.setattr(
+        "imednet_tui.views.load_from_api",
+        lambda _s, _k: DataDictionary(metadata=Metadata(studyName="ONCO_01")),
+    )
+
+    # Synthetic dict/namespace job adapter with 15 completed jobs + 16th processing job (state=None, status='PROCESSING')
+    completed_ids = [f"SYNTH-DONE-{idx:02d}" for idx in range(1, 16)]
+    active_16th = "SYNTH-PROC-16"
+    poll_state = {"status": "PROCESSING", "polls": 0}
+
+    def _get_synthetic_job(_study: str, batch_id: str) -> Any:
+        if batch_id == active_16th:
+            poll_state["polls"] += 1
+            return SimpleNamespace(
+                batch_id=active_16th,
+                state=None,
+                status=str(poll_state["status"]),
+                progress=30,
+            )
+        return {"batchId": batch_id, "state": "COMPLETED", "progress": 100}
+
+    sdk.jobs.get.side_effect = _get_synthetic_job
+
+    # Synthetic legacy TriageStore adapter lacking create_item()
+    existing_triage = TriageItem(
+        item_id="SYNTH-TRI-1",
+        study_key="ONCO_01",
+        status=TriageStatus.UNDER_REVIEW,
+        assignee="lead_reviewer",
+        severity="HIGH",
+    )
+
+    class _LegacyStoreAdapter:
+        def __init__(self, _db_path: Path) -> None:
+            self.upserts = 0
+
+        def get_queue(self, _study_key: str, _status: Any = None) -> list[TriageItem]:
+            return [existing_triage]
+
+        def get_triage_item(self, item_id: str) -> TriageItem | None:
+            return existing_triage if item_id == "SYNTH-TRI-1" else None
+
+        def upsert_item(self, _item: TriageItem) -> None:
+            self.upserts += 1
+
+    monkeypatch.setattr(
+        "imednet_tui.triage_pane._load_triage_store_class",
+        lambda: (_LegacyStoreAdapter, None),
+    )
+
+    app = ImednetTuiApp(sdk)
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+
+        screen.on_study_list_study_selected(StudyList.StudySelected("ONCO_01", "Oncology Phase II"))
+        await pilot.pause()
+        await screen.workers.wait_for_complete()
+        await pilot.pause()
+
+        await pilot.press("m")
+        await pilot.pause()
+
+        users_pane = screen.query_one("#users_pane", EntityTablePane)
+        revisions_pane = screen.query_one("#revisions_pane", EntityTablePane)
+        records_pane = screen.query_one("#records_pane", EntityTablePane)
+
+        for pane in (users_pane, revisions_pane, records_pane):
+            tbl = pane.query_one(f"#{pane.table_id}", DataTable)
+            pane.on_data_table_row_selected(MagicMock(data_table=tbl, cursor_row=0))
+
+        user_detail = str(users_pane.query_one("#users_detail", Static).render())
+        assert "U-NS-1" in user_detail
+        assert "***MASKED***" in user_detail
+        for sensitive_val in (
+            "ns_login_handle",
+            "NsFirst",
+            "NsLast",
+            "ns.investigator@example.test",
+            "ns_username",
+        ):
+            assert sensitive_val not in user_detail
+
+        rev_detail = str(revisions_pane.query_one("#record_revisions_detail", Static).render())
+        for sensitive_val in ("ns_revision_author", "NsRevisionReasonText"):
+            assert sensitive_val not in rev_detail
+
+        rec_detail = str(records_pane.query_one("#records_detail", Static).render())
+        assert "NsPatientFullName" not in rec_detail
+        assert "64" in rec_detail
+
+        # Fallback triage store adapter rejects duplicate add without calling upsert_item
+        triage_pane = screen.query_one("#triage_pane", TriagePane)
+        await triage_pane.create_triage_item("SYNTH-TRI-1", initial_comment="Should reject")
+        assert "already exists" in str(triage_pane.query_one("#triage_detail", Static).render())
+
+        # Synthetic dict + SimpleNamespace(state=None, status='PROCESSING') 16-job polling
+        monitor = screen.query_one(JobMonitor)
+        if monitor.timer is not None:
+            monitor.timer.stop()
+        monitor.poll_interval = 0.05
+        monitor.timer = monitor.set_interval(0.05, monitor.refresh_jobs, pause=True)
+        monitor.tracked_job_ids = [*completed_ids, active_16th]
+        monitor.current_study_key = "ONCO_01"
+        monitor._resume_polling()
+        await monitor.refresh_jobs()
+
+        assert monitor.is_polling_paused is False
+        polls_before = int(poll_state["polls"])
+        await pilot.pause(0.14)
+        assert int(poll_state["polls"]) > polls_before
+
+        poll_state["status"] = "COMPLETED"
+        await pilot.pause(0.14)
+        await monitor.workers.wait_for_complete()
+        assert monitor.is_polling_paused is True
