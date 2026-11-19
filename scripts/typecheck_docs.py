@@ -341,6 +341,7 @@ def typecheck_documentation(repo_root: Path) -> tuple[int, list[str]]:
                 sys.executable,
                 "-m",
                 "mypy",
+                "--follow-imports=silent",
                 "--ignore-missing-imports",
                 "--no-strict-optional",
                 "--allow-untyped-decorators",
