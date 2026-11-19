@@ -259,6 +259,20 @@ _OR_GROUP_KEYS = ("or", "orGroup", "any", "OR")
 _AND_GROUP_KEYS = ("and", "andGroup", "all", "AND")
 _NOT_GROUP_KEYS = ("not", "NOT")
 _CONTAINER_GROUP_KEYS = ("condition", "conditions", "conditionGroup", "group", "if")
+_NON_CONDITION_RULE_KEYS = frozenset(
+    {
+        "actions",
+        "action",
+        "then",
+        "message",
+        "errorMessage",
+        "description",
+        "id",
+        "name",
+        "status",
+        "form",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -673,6 +687,7 @@ class LogicTreeEvaluator:
             ``(triggered, is_cross_scope, skip_reason)``
         """
         unwrapped = self._unwrap_root(logic_tree)
+        root_combinator = self._root_combinator(unwrapped)
         cond_root = unwrapped.get("conditions", unwrapped.get("if", unwrapped))
         if not isinstance(cond_root, (Mapping, list)):
             return False, False, "no_conditions"
@@ -683,7 +698,13 @@ class LogicTreeEvaluator:
         if not conditions:
             return False, False, "no_conditions"
 
-        triggered = self._eval_node(cond_root, data, form_key=form_key, rule_type=rule_type)
+        triggered = self._eval_node(
+            cond_root,
+            data,
+            form_key=form_key,
+            rule_type=rule_type,
+            group_combinator=root_combinator,
+        )
         return triggered, False, None
 
     def extract_rule_metadata(
@@ -709,6 +730,7 @@ class LogicTreeEvaluator:
         )
 
         unwrapped = self._unwrap_root(logic_ast)
+        root_combinator = self._root_combinator(unwrapped)
         severity, is_ui_only, message = self._classify_rule(rule_type, unwrapped)
         cond_root = unwrapped.get("conditions", unwrapped.get("if", unwrapped))
         if not isinstance(cond_root, (Mapping, list)):
@@ -718,7 +740,7 @@ class LogicTreeEvaluator:
                 form=resolved_form,
                 rule_type=rule_type,
                 severity=severity,
-                logical_operator="AND",
+                logical_operator=root_combinator or "AND",
                 conditions=[],
                 message=message,
                 is_cross_scope=False,
@@ -734,7 +756,9 @@ class LogicTreeEvaluator:
                 is_cross_scope = True
 
         combinator: Literal["AND", "OR"] = (
-            self._effective_combinator(cond_root) if isinstance(cond_root, Mapping) else "AND"
+            self._effective_combinator(cond_root, default=root_combinator or "AND")
+            if isinstance(cond_root, Mapping)
+            else (root_combinator or "AND")
         )
         return ExtractedRuleMetadata(
             rule_id=rule_id,
@@ -878,11 +902,7 @@ class LogicTreeEvaluator:
                 return "AND"
         return None
 
-    def _node_combinator(
-        self,
-        node: Mapping[str, Any],
-        default: Literal["AND", "OR"] = "AND",
-    ) -> Literal["AND", "OR"]:
+    def _root_combinator(self, node: Mapping[str, Any]) -> Literal["AND", "OR"] | None:
         explicit = self._explicit_combinator(node)
         if explicit is not None:
             return explicit
@@ -892,40 +912,60 @@ class LogicTreeEvaluator:
             return "OR"
         if has_and_marker and not has_or_marker:
             return "AND"
-        return default
+        return None
 
-    def _effective_combinator(self, node: Mapping[str, Any]) -> Literal["AND", "OR"]:
-        explicit = self._explicit_combinator(node)
-        if explicit is not None:
-            return explicit
-        if any(node.get(k) is True for k in _OR_GROUP_KEYS) and not any(
-            node.get(k) is True for k in _AND_GROUP_KEYS
-        ):
-            return "OR"
-        content_keys = [
-            k
+    def _node_combinator(
+        self,
+        node: Mapping[str, Any],
+        default: Literal["AND", "OR"] = "AND",
+    ) -> Literal["AND", "OR"]:
+        root_comb = self._root_combinator(node)
+        return root_comb if root_comb is not None else default
+
+    @staticmethod
+    def _content_keys(node: Mapping[str, Any]) -> list[str]:
+        return [
+            str(k)
             for k in node
             if not str(k).startswith("@")
             and k != "#text"
+            and k not in _NON_CONDITION_RULE_KEYS
             and node[k] is not True
             and str(k).lstrip("@").replace("_", "").replace("-", "").lower()
             not in _COMBINATOR_ATTR_NAMES
         ]
+
+    def _effective_combinator(
+        self,
+        node: Mapping[str, Any],
+        default: Literal["AND", "OR"] = "AND",
+    ) -> Literal["AND", "OR"]:
+        explicit = self._root_combinator(node)
+        if explicit is not None:
+            return explicit
+        content_keys = self._content_keys(node)
         if len(content_keys) == 1:
             only_key = content_keys[0]
             only_val = node[only_key]
             if only_key in _OR_GROUP_KEYS:
                 if isinstance(only_val, Mapping):
-                    return self._explicit_combinator(only_val) or "OR"
+                    return self._effective_combinator(only_val, default="OR")
                 if isinstance(only_val, list) and (
                     not only_val or not any(self._is_xml_group_dict(item) for item in only_val)
                 ):
                     return "OR"
+            if only_key in _AND_GROUP_KEYS:
+                if isinstance(only_val, Mapping):
+                    return self._effective_combinator(only_val, default="AND")
+                if isinstance(only_val, list) and (
+                    not only_val or not any(self._is_xml_group_dict(item) for item in only_val)
+                ):
+                    return "AND"
             if only_key in ("conditions", "conditionGroup", "group", "if") and isinstance(
                 only_val, Mapping
             ):
-                return self._effective_combinator(only_val)
-        return "AND"
+                return self._effective_combinator(only_val, default=default)
+        return default
 
     def _is_xml_group_dict(self, item: Any) -> bool:
         if not isinstance(item, Mapping) or self._is_leaf_condition(item):
@@ -940,12 +980,12 @@ class LogicTreeEvaluator:
             )
         ):
             return True
-        content_keys = [k for k in item if not str(k).startswith("@") and k != "#text"]
+        content_keys = self._content_keys(item)
         if len(content_keys) > 1:
             return True
         if len(content_keys) == 1:
-            only_key = str(content_keys[0]).lower()
-            if only_key in _OPERATOR_TAG_MAP and isinstance(item[content_keys[0]], list):
+            only_key = content_keys[0].lower()
+            if only_key in _OPERATOR_TAG_MAP and isinstance(item[content_keys[0]], (Mapping, list)):
                 return True
         return False
 
@@ -1253,13 +1293,18 @@ class LogicTreeEvaluator:
                         )
                     )
 
+        content_keys = self._content_keys(node)
+        has_node_combinator = (
+            group_combinator is not None or self._root_combinator(node) is not None
+        )
         for key in _CONTAINER_GROUP_KEYS:
             if key in node and node[key] is not True:
                 child_val = node[key]
                 inherited_combinator: Literal["AND", "OR"] | None = (
                     combinator
-                    if key in ("conditions", "if")
-                    and group_combinator is not None
+                    if key in ("conditions", "conditionGroup", "group", "if")
+                    and has_node_combinator
+                    and len(content_keys) == 1
                     and isinstance(child_val, Mapping)
                     else None
                 )

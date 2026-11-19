@@ -946,3 +946,93 @@ def test_nested_and_or_not_explicit_group_combinations() -> None:
     or_wrap_meta = evaluator.extract_rule_metadata(or_wrapping_conds)
     assert or_wrap_meta is not None
     assert or_wrap_meta.logical_operator == "OR"
+
+    # 6. <or> wrapping <conditionGroup>/<group>, <rule operator="OR">, direct <or> + <actions>,
+    #    and symmetric single-child <and>/<eq> siblings inside <or>
+    additional_or_xmls = [
+        (
+            "<rule><conditions><or><conditionGroup>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "</conditionGroup></or></conditions></rule>"
+        ),
+        (
+            "<rule><or><group>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "</group></or>"
+            "<actions><action><type>error</type><message>Hit OR</message></action></actions>"
+            "</rule>"
+        ),
+        (
+            '<rule operator="OR"><conditions>'
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "</conditions></rule>"
+        ),
+        (
+            "<rule><conditions><group operator=\"OR\"><conditions>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "</conditions></group></conditions></rule>"
+        ),
+        (
+            "<rule><if><or>"
+            "<and><eq><variable>A</variable><value>1</value></eq></and>"
+            "<and><eq><variable>B</variable><value>2</value></eq></and>"
+            "</or></if></rule>"
+        ),
+    ]
+    for idx, xml_str in enumerate(additional_or_xmls):
+        extra_rule = BusinessLogicRule(
+            id=f"EXTRA-OR-{idx}",
+            name=f"Extra OR {idx}",
+            type="Form",
+            status="Active",
+            form="F1",
+            logic=parse_logic_xml(xml_str),
+        )
+        assert (
+            evaluator.evaluate_rule(extra_rule, {"A": 1, "B": 0}, form_key="F1").triggered is True
+        )
+        assert (
+            evaluator.evaluate_rule(extra_rule, {"A": 0, "B": 2}, form_key="F1").triggered is True
+        )
+        assert (
+            evaluator.evaluate_rule(extra_rule, {"A": 0, "B": 0}, form_key="F1").triggered is False
+        )
+        assert (
+            evaluator.evaluate_rule(extra_rule, {"A": 1, "B": 2}, form_key="F1").triggered is True
+        )
+        extra_meta = evaluator.extract_rule_metadata(extra_rule)
+        assert extra_meta is not None
+        assert extra_meta.logical_operator == "OR"
+
+    # Mixed branch <or>: A == 1 OR (B == 2 AND C == 3)
+    mixed_or_group = BusinessLogicRule(
+        name="Mixed Leaf And Group In OR",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><conditions><or>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<group>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "<condition><variable>C</variable><operator>==</operator><value>3</value></condition>"
+            "</group>"
+            "</or></conditions></rule>"
+        ),
+    )
+    assert (
+        evaluator.evaluate_rule(mixed_or_group, {"A": 1, "B": 0, "C": 0}, form_key="F1").triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(mixed_or_group, {"A": 0, "B": 2, "C": 3}, form_key="F1").triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(mixed_or_group, {"A": 0, "B": 2, "C": 0}, form_key="F1").triggered
+        is False
+    )

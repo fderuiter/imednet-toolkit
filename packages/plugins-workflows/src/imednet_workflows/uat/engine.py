@@ -309,6 +309,15 @@ class UATExecutionEngine:
             for cond in active_conds:
                 self._apply_xml_condition(cond, form_key, data)
             self._populate_other_required_fields(form_key, data)
+            raw_rule = rule.get("raw")
+            if (
+                combinator == "OR"
+                and len(xml_conditions) > 1
+                and raw_rule is not None
+                and not _LOGIC_EVALUATOR.evaluate_rule(raw_rule, data, form_key=form_key).triggered
+            ):
+                for cond in xml_conditions:
+                    self._apply_xml_condition(cond, form_key, data)
             return data
 
         data = {}

@@ -478,3 +478,42 @@ def test_uat_engine_explicit_or_group_xml_rule() -> None:
     neg_payload = engine.generate_negative_test_case(engine._rules[0])
     assert neg_payload["HR"] > 120
     assert LogicTreeEvaluator().evaluate_rule(or_rule, neg_payload, form_key="VS").triggered is True
+
+    dnf_rule = BusinessLogicRule(
+        id="VS-DNF",
+        name="Critical Vital Pair",
+        type="Form",
+        status="Active",
+        form="VS",
+        logic=parse_logic_xml(
+            "<rule><conditions><or>"
+            "<and>"
+            "<condition><variable>SYS</variable><operator>&gt;</operator><value>200</value></condition>"
+            "<condition><variable>HR</variable><operator>&gt;</operator><value>120</value></condition>"
+            "</and>"
+            "<and>"
+            "<condition><variable>DIA</variable><operator>&lt;</operator><value>40</value></condition>"
+            "<condition><variable>HR</variable><operator>&lt;</operator><value>50</value></condition>"
+            "</and>"
+            "</or></conditions></rule>"
+        ),
+    )
+    dnf_dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="VS",
+                variables=[
+                    Variable(variableName="SYS", variableType="Integer"),
+                    Variable(variableName="DIA", variableType="Integer"),
+                    Variable(variableName="HR", variableType="Integer"),
+                ],
+                businessLogic=[dnf_rule],
+            )
+        ]
+    )
+    dnf_engine = UATExecutionEngine(Mock(), dnf_dd)
+    assert dnf_engine._rules[0]["logical_operator"] == "OR"
+    dnf_payload = dnf_engine.generate_negative_test_case(dnf_engine._rules[0])
+    assert (
+        LogicTreeEvaluator().evaluate_rule(dnf_rule, dnf_payload, form_key="VS").triggered is True
+    )
