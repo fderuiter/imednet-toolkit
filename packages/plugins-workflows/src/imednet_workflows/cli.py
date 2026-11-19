@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,8 +22,10 @@ from pydantic import BaseModel
 
 from imednet.sdk import ImednetSDK
 from imednet.spi.cli import (
+    NON_INTERACTIVE_ENV,
     STUDY_KEY_ARG,
     add_list_query_args,
+    add_no_interactive,
     add_output_format,
     build_list_query_kwargs,
     clear_line,
@@ -202,6 +205,7 @@ def _execute_set_state(
     interactive: bool = False,
     parser: argparse.ArgumentParser | None = None,
     output_format: str = "table",
+    no_interactive: bool = False,
 ) -> None:
     """Execute high-water mark timestamp update for a study/stream in the ledger."""
     if not interactive:
@@ -263,6 +267,7 @@ def _execute_set_state(
 
     from .wizard import (
         display_ledger_streams,
+        ensure_interactive_stdin,
         print_progress,
         prompt_confirm,
         prompt_iso8601_timestamp,
@@ -272,6 +277,7 @@ def _execute_set_state(
         validate_iso8601_timestamp,
     )
 
+    ensure_interactive_stdin(force_non_interactive=no_interactive)
     display_ledger_streams(ledger_path=ledger_path, study_key=study_key)
     study_key = prompt_study_key(study_key)
     stream = prompt_stream_name(stream)
@@ -345,11 +351,18 @@ def _execute_reset_state(
     interactive: bool = False,
     parser: argparse.ArgumentParser | None = None,
     output_format: str = "table",
+    no_interactive: bool = False,
 ) -> None:
     """Execute high-water mark state deletion for a study/stream."""
     if interactive:
-        from .wizard import print_progress, prompt_confirm, prompt_study_key
+        from .wizard import (
+            ensure_interactive_stdin,
+            print_progress,
+            prompt_confirm,
+            prompt_study_key,
+        )
 
+        ensure_interactive_stdin(force_non_interactive=no_interactive)
         study_key = prompt_study_key(study_key)
         target_desc = (
             f"stream '{stream}' for study '{study_key}'"
@@ -453,6 +466,7 @@ def _register_state_subcommands(state_sub: argparse._SubParsersAction[Any]) -> N
             interactive=args.interactive,
             parser=set_parser,
             output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )
 
@@ -483,6 +497,7 @@ def _register_state_subcommands(state_sub: argparse._SubParsersAction[Any]) -> N
             interactive=args.interactive,
             parser=reset_parser,
             output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )
 
@@ -537,10 +552,14 @@ def _render_subject_data(
             "records": len(data.records),
             "queries": len(data.queries),
         }
-        display_list([summary_row], "subject_data", details=[data])
+        display_list([summary_row], "subject_data", details=[data], interactive=False)
         return
 
-    display_list([{"study_key": study_key, "subject_key": subject_key}], "subject_data")
+    display_list(
+        [{"study_key": study_key, "subject_key": subject_key}],
+        "subject_data",
+        interactive=False,
+    )
 
 
 def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
@@ -709,14 +728,16 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         visit_filter: list[str] | None = None,
         interactive: bool = False,
         output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         from imednet.spi.models import Record, Subject, Visit
 
         from .wizard import print_progress
 
         if interactive:
-            from .wizard import prompt_filters, prompt_study_key
+            from .wizard import ensure_interactive_stdin, prompt_filters, prompt_study_key
 
+            ensure_interactive_stdin(force_non_interactive=no_interactive)
             study_key = prompt_study_key(study_key)
             record_filter = prompt_filters(
                 "record filter",
@@ -781,18 +802,26 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "matching records",
             "No records found matching the criteria.",
             details=records,
+            interactive=False if no_interactive else None,
         )
 
-    extract_parser.set_defaults(
-        func=lambda args: extract_records(
+    def _handle_extract_records(args: argparse.Namespace) -> None:
+        no_interactive = getattr(args, "no_interactive", False)
+        if args.interactive:
+            from .wizard import ensure_interactive_stdin
+
+            ensure_interactive_stdin(force_non_interactive=no_interactive)
+        extract_records(
             study_key=args.study_key,
             record_filter=args.record_filter,
             subject_filter=args.subject_filter,
             visit_filter=args.visit_filter,
             interactive=args.interactive,
             output_format=args.output_format,
+            no_interactive=no_interactive,
         )
-    )
+
+    extract_parser.set_defaults(func=_handle_extract_records)
 
     # 2. subject_data -> subject-data (also registered at top-level via setup_subject_parser)
     setup_subject_parser(sub)
@@ -903,6 +932,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             fields=_JOB_SUMMARY_FIELDS,
             output_format=output_format,
             details=[job],
+            interactive=False,
         )
 
     update_parser.set_defaults(
@@ -1049,6 +1079,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             fields=_JOB_SUMMARY_FIELDS,
             output_format=output_format,
             details=[job],
+            interactive=False,
         )
 
     reg_parser.set_defaults(
@@ -1103,6 +1134,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         filters: list[str] | None = None,
         sort: str | None = None,
         output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         from imednet.spi.models import Query
 
@@ -1134,6 +1166,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     "query_counts",
                     "No queries found.",
                     output_format=output_format,
+                    interactive=False if no_interactive else None,
                 )
                 return
 
@@ -1183,6 +1216,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "No matching queries found.",
             output_format="table",
             details=items,
+            interactive=False if no_interactive else None,
         )
 
     qm_parser.set_defaults(
@@ -1195,6 +1229,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             filters=args.filters,
             sort=args.sort,
             output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )
 
@@ -1282,7 +1317,12 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "revisionsIngested": revisions_ingested,
             "silverViewBuilt": build_silver_view,
         }
-        display_list([summary], "duckdb_centralization", output_format=output_format)
+        display_list(
+            [summary],
+            "duckdb_centralization",
+            output_format=output_format,
+            interactive=False,
+        )
 
     ddb_parser.set_defaults(
         func=lambda args: centralize_duckdb_cmd(
@@ -1352,6 +1392,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         record_data_filter: str | None = None,
         sort: str | None = None,
         output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         from imednet.spi.models import Record
 
@@ -1390,7 +1431,12 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                         }
                         for node in hierarchy
                     ]
-                    display_list(summary_rows, "mapped_records", "No mapped records found.")
+                    display_list(
+                        summary_rows,
+                        "mapped_records",
+                        "No mapped records found.",
+                        interactive=False if no_interactive else None,
+                    )
                 return
 
             if importlib.util.find_spec("pandas") is None:
@@ -1423,6 +1469,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "mapped_records",
             "No mapped records found.",
             output_format=output_format,
+            interactive=False if no_interactive else None,
         )
 
     map_parser.set_defaults(
@@ -1438,6 +1485,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             record_data_filter=args.record_data_filter,
             sort=args.sort,
             output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )
 
@@ -1499,7 +1547,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "sites": len(snapshot.sites),
             "active_sites": len(snapshot.active_sites()),
         }
-        display_list([summary_row], "study_schema", details=[snapshot])
+        display_list([summary_row], "study_schema", details=[snapshot], interactive=False)
 
     inspect_parser.set_defaults(
         func=lambda args: inspect_study_cmd(
@@ -1520,6 +1568,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     sync_parser.add_argument(
         "--once", action="store_true", help="Run a single sync cycle and exit."
     )
+    add_no_interactive(sync_parser)
 
     @with_sdk
     def sync_worker(
@@ -1613,11 +1662,19 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
         output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         from .uat import UATWorkflow, UATWorkflowState
-        from .wizard import print_progress, prompt_input, prompt_positive_int, prompt_study_key
+        from .wizard import (
+            ensure_interactive_stdin,
+            print_progress,
+            prompt_input,
+            prompt_positive_int,
+            prompt_study_key,
+        )
 
         if interactive:
+            ensure_interactive_stdin(force_non_interactive=no_interactive)
             study_key = prompt_study_key(study_key)
             subject_count = prompt_positive_int(
                 "Enter number of test subjects", default=subject_count
@@ -1677,8 +1734,13 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         if not result.overall_success:
             sys.exit(1)
 
-    uat_run_parser.set_defaults(
-        func=lambda args: uat_run(
+    def _handle_uat_run(args: argparse.Namespace) -> None:
+        no_interactive = getattr(args, "no_interactive", False)
+        if args.interactive:
+            from .wizard import ensure_interactive_stdin
+
+            ensure_interactive_stdin(force_non_interactive=no_interactive)
+        uat_run(
             study_key=args.study_key,
             interactive=args.interactive,
             subject_count=args.subject_count,
@@ -1686,8 +1748,10 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             enabled_form_keys=args.enabled_form_keys,
             email_notify=args.email_notify,
             output_format=args.output_format,
+            no_interactive=no_interactive,
         )
-    )
+
+    uat_run_parser.set_defaults(func=_handle_uat_run)
 
 
 def state_app(args: list[str] | None = None) -> None:
@@ -1695,11 +1759,21 @@ def state_app(args: list[str] | None = None) -> None:
     if args is None:
         args = sys.argv[1:]
     parser = argparse.ArgumentParser(description="Manage high-water mark execution ledger state.")
+    add_no_interactive(parser, suppress_default=False)
     state_sub = parser.add_subparsers(dest="state_command")
     _register_state_subcommands(state_sub)
 
     parsed = parser.parse_args(args)
-    if hasattr(parsed, "func"):
-        parsed.func(parsed)
-    else:
-        parser.print_help()
+    old_non_interactive = os.environ.get(NON_INTERACTIVE_ENV)
+    try:
+        if getattr(parsed, "no_interactive", False):
+            os.environ[NON_INTERACTIVE_ENV] = "1"
+        if hasattr(parsed, "func"):
+            parsed.func(parsed)
+        else:
+            parser.print_help()
+    finally:
+        if old_non_interactive is not None:
+            os.environ[NON_INTERACTIVE_ENV] = old_non_interactive
+        else:
+            os.environ.pop(NON_INTERACTIVE_ENV, None)

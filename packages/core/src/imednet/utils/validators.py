@@ -108,7 +108,7 @@ def parse_bool(v: Any) -> bool:
 
         import logging
 
-        msg = f"Drift detected (destructive): type-changed field. Expected bool, got str (value: {v!r})"
+        msg = "Drift detected (destructive): type-changed field. Expected bool, got str"
         drift_key = "Expected bool, got str"
         if drift_key not in _drift_reported:
             _drift_reported.add(drift_key)
@@ -118,7 +118,10 @@ def parse_bool(v: Any) -> bool:
     elif v is not None:
         import logging
 
-        msg = f"Drift detected (destructive): type-changed field. Expected bool, got {type(v).__name__} (value: {v!r})"
+        msg = (
+            f"Drift detected (destructive): type-changed field. "
+            f"Expected bool, got {type(v).__name__}"
+        )
         drift_key = f"Expected bool, got {type(v).__name__}"
         if drift_key not in _drift_reported:
             _drift_reported.add(drift_key)
@@ -144,7 +147,10 @@ def parse_int_or_default(v: Any, default: int = 0, strict: bool = False) -> int:
                 raise
             import logging
 
-            msg = f"Drift detected (destructive): type-changed field. Expected int, got {type(v).__name__} (value: {v!r})"
+            msg = (
+                f"Drift detected (destructive): type-changed field. "
+                f"Expected int, got {type(v).__name__}"
+            )
             drift_key = f"Expected int, got {type(v).__name__}"
             if drift_key not in _drift_reported:
                 _drift_reported.add(drift_key)
@@ -152,9 +158,29 @@ def parse_int_or_default(v: Any, default: int = 0, strict: bool = False) -> int:
             return default
 
 
-def parse_str_or_default(v: Any, default: str = "") -> str:
-    """Normalize string values, defaulting if None."""
-    return default if v is None else str(v)
+def _guard_str_container(v: list[Any] | dict[Any, Any], *, strict: bool = False) -> None:
+    """Emit a type-only drift warning for container values in string fields and raise in strict mode."""
+    import logging
+    import os
+
+    msg = f"Drift detected (destructive): type-changed field. Expected str, got {type(v).__name__}"
+    logging.getLogger("imednet.drift").warning(msg)
+    if strict or parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false")):
+        raise ValueError(msg)
+
+
+def parse_str_or_default(v: Any, default: str = "", strict: bool = False) -> str:
+    """Normalize string values, defaulting if None.
+
+    Guards against list and dict container values by emitting a drift warning
+    and raising ValueError when strict=True or IMEDNET_STRICT_MODE is enabled.
+    """
+    if v is None:
+        return default
+    if isinstance(v, (list, dict)):
+        _guard_str_container(v, strict=strict)
+        return default
+    return str(v)
 
 
 def parse_list_or_default(v: Any, default_factory: Callable[[], list[T]] = list) -> list[T]:

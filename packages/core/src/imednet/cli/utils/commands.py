@@ -8,7 +8,13 @@ from typing import Any
 from imednet.cli.decorators import with_sdk
 from imednet.sdk import ImednetSDK
 
-from .args import STUDY_KEY_ARG, add_list_query_args, add_output_format, build_list_query_kwargs
+from .args import (
+    STUDY_KEY_ARG,
+    add_list_query_args,
+    add_no_interactive,
+    add_output_format,
+    build_list_query_kwargs,
+)
 from .context import fetching_status
 from .output import display_list
 
@@ -60,6 +66,7 @@ def register_list_command(
 
     add_list_query_args(list_parser)
     add_output_format(list_parser)
+    add_no_interactive(list_parser)
     resolved_model = model if model is not None else _resolve_endpoint_model(attr)
 
     if requires_study_key:
@@ -72,6 +79,7 @@ def register_list_command(
             filters: list[str] | None = None,
             sort: str | None = None,
             output_format: str = "table",
+            no_interactive: bool = False,
         ) -> None:
             query_kwargs = build_list_query_kwargs(
                 filters=filters,
@@ -87,6 +95,7 @@ def register_list_command(
                 fields=summary_fields,
                 output_format=output_format,
                 details=items,
+                interactive=False if no_interactive else None,
             )
 
         list_parser.set_defaults(
@@ -95,6 +104,7 @@ def register_list_command(
                 filters=args.filters,
                 sort=args.sort,
                 output_format=args.output_format,
+                no_interactive=getattr(args, "no_interactive", False),
             )
         )
 
@@ -106,6 +116,7 @@ def register_list_command(
             filters: list[str] | None = None,
             sort: str | None = None,
             output_format: str = "table",
+            no_interactive: bool = False,
         ) -> None:
             query_kwargs = build_list_query_kwargs(
                 filters=filters,
@@ -121,6 +132,7 @@ def register_list_command(
                 fields=summary_fields,
                 output_format=output_format,
                 details=items,
+                interactive=False if no_interactive else None,
             )
 
         list_parser.set_defaults(
@@ -128,5 +140,6 @@ def register_list_command(
                 filters=args.filters,
                 sort=args.sort,
                 output_format=args.output_format,
+                no_interactive=getattr(args, "no_interactive", False),
             )
         )

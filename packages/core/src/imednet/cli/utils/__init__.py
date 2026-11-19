@@ -8,6 +8,7 @@ from .args import (
     STUDY_KEY_ARG,
     add_filter_arg,
     add_list_query_args,
+    add_no_interactive,
     add_output_format,
     add_record_data_filter_arg,
     add_sort_arg,
@@ -30,11 +31,27 @@ from .output import (
     format_job_progress,
     print_error,
 )
+from .terminal import (
+    NO_COLOR_ENV,
+    NON_INTERACTIVE_ENV,
+    OUTPUT_FORMAT_ENV,
+    is_dumb_terminal,
+    is_json_output_mode,
+    is_non_interactive,
+    is_tty,
+    supports_ansi_color,
+    supports_fullscreen_ui,
+    supports_interactive_stdin,
+    supports_live_status,
+)
 
 if TYPE_CHECKING:
     from .grid import InteractiveDataGrid, is_interactive_terminal, run_interactive_grid
 
 __all__ = [
+    "NON_INTERACTIVE_ENV",
+    "NO_COLOR_ENV",
+    "OUTPUT_FORMAT_ENV",
     "STUDY_KEY_ARG",
     "_HC_STATUS_COLOR_MAP",
     "_STATUS_COLOR_MAP",
@@ -45,6 +62,7 @@ __all__ = [
     "_truncate",
     "add_filter_arg",
     "add_list_query_args",
+    "add_no_interactive",
     "add_output_format",
     "add_record_data_filter_arg",
     "add_sort_arg",
@@ -56,11 +74,19 @@ __all__ = [
     "fetching_status",
     "format_job_progress",
     "get_sdk",
+    "is_dumb_terminal",
     "is_interactive_terminal",
+    "is_json_output_mode",
+    "is_non_interactive",
+    "is_tty",
     "parse_filter_args",
     "print_error",
     "register_list_command",
     "run_interactive_grid",
+    "supports_ansi_color",
+    "supports_fullscreen_ui",
+    "supports_interactive_stdin",
+    "supports_live_status",
 ]
 
 

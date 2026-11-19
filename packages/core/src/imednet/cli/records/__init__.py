@@ -40,6 +40,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         record_filter: list[str] | None = None,
         record_data_filter: str | None = None,
         sort: str | None = None,
+        no_interactive: bool = False,
     ) -> None:
         if output and output_format == "json":
             print_error("Choose --format json for stdout or --output for a file.")
@@ -74,7 +75,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                         "Created": r.date_created,
                     }
                 )
-            display_list(view_models, "records", "No records found.", details=records)
+            display_list(
+                view_models,
+                "records",
+                "No records found.",
+                details=records,
+                interactive=False if no_interactive else None,
+            )
 
     list_parser.set_defaults(
         func=lambda args: list_records(
@@ -84,5 +91,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             record_filter=args.record_filter,
             record_data_filter=args.record_data_filter,
             sort=args.sort,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )

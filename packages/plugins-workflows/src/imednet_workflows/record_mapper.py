@@ -1126,7 +1126,9 @@ class RecordMapper:
             # Automatically perform lookups for parent record identifiers using available metadata
             resolved_parent_id = getattr(rec, "parent_record_id", None)
             if not resolved_parent_id:
-                resolved_parent_id = f"{rec.visit_id}_{rec.form_id}"
+                resolved_parent_id = (
+                    f"{rec.visit_id}_{rec.form_id}" if rec.visit_id is not None else None
+                )
 
             if "parent_record_id" not in parsed_data or parsed_data.get("parent_record_id") is None:
                 parsed_data["parent_record_id"] = resolved_parent_id
@@ -1136,22 +1138,27 @@ class RecordMapper:
 
             subj_key = rec.subject_key
             if subj_key not in tree:
-                tree[subj_key] = {"subject_key": subj_key, "visits": {}}  # type: ignore
+                tree[subj_key] = {"subject_key": subj_key, "visits": {}, "forms": {}}  # type: ignore
 
             subj_node = tree[subj_key]  # type: ignore
+            form_id = rec.form_id
 
             visit_id = rec.visit_id
-            if visit_id not in subj_node["visits"]:
-                subj_node["visits"][visit_id] = {"visit_id": visit_id, "forms": {}}
+            if visit_id is None:
+                if form_id not in subj_node["forms"]:
+                    subj_node["forms"][form_id] = {"form_id": form_id, "records": []}
+                subj_node["forms"][form_id]["records"].append(parsed_data)
+            else:
+                if visit_id not in subj_node["visits"]:
+                    subj_node["visits"][visit_id] = {"visit_id": visit_id, "forms": {}}
 
-            visit_node = subj_node["visits"][visit_id]
+                visit_node = subj_node["visits"][visit_id]
 
-            form_id = rec.form_id
-            if form_id not in visit_node["forms"]:
-                visit_node["forms"][form_id] = {"form_id": form_id, "records": []}
+                if form_id not in visit_node["forms"]:
+                    visit_node["forms"][form_id] = {"form_id": form_id, "records": []}
 
-            form_node = visit_node["forms"][form_id]
-            form_node["records"].append(parsed_data)
+                form_node = visit_node["forms"][form_id]
+                form_node["records"].append(parsed_data)
 
         # 3. Convert dicts to lists
         result = []
@@ -1164,6 +1171,9 @@ class RecordMapper:
                 visit["forms"] = visit_forms
                 subj_visits.append(visit)
             subj["visits"] = subj_visits
+            unscheduled_forms = list(subj.pop("forms", {}).values())
+            if unscheduled_forms:
+                subj["forms"] = unscheduled_forms
             result.append(subj)
 
         return result

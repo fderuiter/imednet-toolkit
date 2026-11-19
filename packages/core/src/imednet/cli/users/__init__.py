@@ -46,6 +46,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         include_inactive: bool = False,
         sort: str | None = None,
         output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         query_kwargs = build_list_query_kwargs(sort=sort)
         with fetching_status("users", study_key):
@@ -109,6 +110,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "users",
             "No users found matching the criteria.",
             details=users_list,
+            interactive=False if no_interactive else None,
         )
 
     list_parser.set_defaults(
@@ -117,5 +119,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             include_inactive=args.include_inactive,
             sort=args.sort,
             output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )

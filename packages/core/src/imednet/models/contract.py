@@ -45,19 +45,21 @@ class ContractBuilder:
         self.contract = APIContract()
 
     def parse_postman_type(self, val: Any) -> tuple[str, Any]:
-        """Map Postman placeholder strings and primitive examples to internal type names."""
+        """Map Postman placeholder strings and literal JSON values to internal type names and defaults."""
         if isinstance(val, bool):
-            return "boolean", False
+            return "boolean", None
         if isinstance(val, int):
-            return "integer", 0
+            return "integer", None
         if isinstance(val, str):
-            if val == "<string>":
-                return "string", None
-            if val == "<integer>":
-                return "integer", 0
             if val == "<boolean>":
-                return "boolean", False
+                return "boolean", None
+            if val == "<integer>":
+                return "integer", None
             return "string", None
+        if isinstance(val, dict):
+            return "dict", None
+        if isinstance(val, list):
+            return "list", None
         return "any", None
 
     def ingest_postman(self, file_path: str) -> None:
@@ -189,13 +191,27 @@ class ContractBuilder:
                     prop_type = prop.get("type")
                     if prop_type == "string":
                         type_name = "string"
-                        default_value = ""
                     elif prop_type == "integer":
                         type_name = "integer"
-                        default_value = 0  # type: ignore
                     elif prop_type == "boolean":
                         type_name = "boolean"
-                        default_value = False  # type: ignore
+                    elif prop_type == "object":
+                        type_name = "dict"
+                    elif prop_type == "array":
+                        type_name = "list"
+                    elif "example" in prop and prop["example"] is not None:
+                        type_name, _ = self.parse_postman_type(prop["example"])
+                    elif "default" in prop and prop["default"] is not None:
+                        type_name, _ = self.parse_postman_type(prop["default"])
+                    elif "const" in prop and prop["const"] is not None:
+                        type_name, _ = self.parse_postman_type(prop["const"])
+                    elif (
+                        "enum" in prop
+                        and isinstance(prop["enum"], list)
+                        and prop["enum"]
+                        and prop["enum"][0] is not None
+                    ):
+                        type_name, _ = self.parse_postman_type(prop["enum"][0])
 
                     fields[snake_key] = FieldDefinition(
                         name=snake_key,
