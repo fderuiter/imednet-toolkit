@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -74,6 +74,10 @@ class JobStatus(Job):
     """Extended job information returned when polling."""
 
     results: Any = Field(default=None)
+    record_total_count: int | None = Field(default=None, alias="totalRecords")
+    record_success_count: int | None = Field(default=None, alias="successfulRecords")
+    record_failure_count: int | None = Field(default=None, alias="failedRecords")
+    result_error: str | None = Field(default=None, alias="resultError")
     state: JobState | str | None
     job_id: str | None
     batch_id: str | None
@@ -83,6 +87,9 @@ class JobStatus(Job):
     progress: int | None
     result_url: str | None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_record_count_keys(cls, data: Any) -> Any: ...
     @field_validator("progress", mode="before", check_fields=False)
     def _parse_progress(cls, v: Any) -> int: ...
     @property
@@ -91,3 +98,7 @@ class JobStatus(Job):
     def successful_records(self) -> int: ...
     @property
     def failed_records(self) -> int: ...
+    @property
+    def is_successful(self) -> bool: ...
+    @property
+    def is_failed(self) -> bool: ...

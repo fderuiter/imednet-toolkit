@@ -7,36 +7,55 @@ import pytest
 from imednet.core.context import set_study_context
 from imednet.endpoints import subjects
 from imednet.errors import NotFoundError
+from imednet.errors.validation import ConfigurationError
 from imednet.models.subjects import Subject
 
 
 def test_list_builds_path_with_default(dummy_client, paginator_factory, patch_build_filter):
-    """Test that list builds path with default."""
+    """Test that list builds path from study context without injecting studyKey into filter."""
     set_study_context("S1")
     ep = subjects.SubjectsEndpoint(dummy_client)
     capture = paginator_factory(subjects, [{"subjectKey": "x"}])
     patch = patch_build_filter(subjects)
 
-    result = ep.list()
+    result = ep.list(subjectStatus="Enrolled")
 
     assert capture["path"] == "/api/v1/edc/studies/S1/subjects"
     assert capture["params"] == {"filter": "FILTERED"}
-    assert patch["filters"] == {"studyKey": "S1"}
+    assert patch["filters"] == {"subjectStatus": "Enrolled"}
     assert isinstance(result[0], Subject)
 
 
 def test_get_not_found(monkeypatch, dummy_client):
-    """Test that get not found."""
+    """Test that get raises NotFoundError when integer subjectId returns no items."""
     ep = subjects.SubjectsEndpoint(dummy_client)
+    called = {}
 
     def fake_impl(self, client, paginator, *, study_key=None, refresh=False, **filters):
         """Helper function to fake impl."""
+        called["filters"] = filters
         return []
 
     monkeypatch.setattr(subjects.SubjectsEndpoint, "_list_sync", fake_impl)
 
     with pytest.raises(NotFoundError):
-        ep.get("S1", "X")
+        ep.get("S1", 370)
+    assert called["filters"] == {"subjectId": 370}
+
+
+@pytest.mark.parametrize("invalid_id", ["SUB1", True, False, -1, 1.5])
+def test_get_rejects_non_integer_subject_id(dummy_client, invalid_id):
+    """Test that get validates non-negative integer subjectId inputs before dispatch."""
+    ep = subjects.SubjectsEndpoint(dummy_client)
+    with pytest.raises(ValueError, match="subjectId"):
+        ep.get("S1", invalid_id)
+
+
+def test_subjects_rejects_undocumented_filters(dummy_client):
+    """Test that undocumented filter attributes raise ConfigurationError."""
+    ep = subjects.SubjectsEndpoint(dummy_client)
+    with pytest.raises(ConfigurationError, match="status"):
+        ep.list("S1", status="active")
 
 
 def test_to_dataframe_success(dummy_client, paginator_factory):
@@ -61,12 +80,12 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
     df = ep.to_dataframe(
         study_key="S1",
         site_id="101",
-        status="active",
+        subject_status="Enrolled",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/subjects"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"site_id": "101", "status": "active", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"site_id": "101", "subject_status": "Enrolled"}
     assert len(df) == 1
 
 
@@ -121,12 +140,12 @@ async def test_async_to_dataframe_parameter_forwarding(
     df = await ep.to_dataframe(
         study_key="S1",
         site_id="101",
-        status="active",
+        subject_status="Enrolled",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/subjects"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"site_id": "101", "status": "active", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"site_id": "101", "subject_status": "Enrolled"}
     assert len(df) == 1
 
 

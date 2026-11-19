@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
+
+
+def _extract_form_ref(record: Mapping[str, Any]) -> tuple[str | None, Any]:
+    """Extract (form_key, form_id) from a record payload without coalescing None to 0."""
+    raw_fk = record.get("formKey") or record.get("form_key")
+    fk = str(raw_fk) if raw_fk else None
+    raw_fid = record.get("formId") if record.get("formId") is not None else record.get("form_id")
+    fid = None if raw_fid == "" else raw_fid
+    return fk, fid
 
 
 class _ValidatorMixin:
@@ -19,7 +29,12 @@ class _ValidatorMixin:
         Returns:
             Optional[str]: The resolved form key.
         """
-        return record.get("formKey") or self.schema.form_key_from_id(record.get("formId", 0))  # type: ignore[no-any-return]
+        fk, fid = _extract_form_ref(record)
+        if fk:
+            return fk
+        if fid is not None and not isinstance(fid, bool):
+            return self.schema.form_key_from_id(fid)  # type: ignore[no-any-return]
+        return None
 
     def _validate_cached(self, form_key: str | None, data: dict[str, Any]) -> None:
         """Validate data against a cached form schema.

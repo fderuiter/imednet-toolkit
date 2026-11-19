@@ -23,12 +23,12 @@ def test_list_requires_study_key_and_page_size(
         ep.list()
 
     set_study_context("S1")
-    result = ep.list(status="new")
+    result = ep.list(form_type="CRF")
 
     assert captured["path"] == "/api/v1/edc/studies/S1/forms"
     assert captured["page_size"] == 500
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "new"}
+    assert filter_capture["filters"] == {"form_type": "CRF"}
     assert isinstance(result[0], Form)
 
 
@@ -108,12 +108,12 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
 
     df = ep.to_dataframe(
         study_key="S1",
-        status="new",
+        form_type="CRF",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/forms"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "new"}
+    assert filter_capture["filters"] == {"form_type": "CRF"}
     assert len(df) == 1
 
 
@@ -167,12 +167,12 @@ async def test_async_to_dataframe_parameter_forwarding(
 
     df = await ep.to_dataframe(
         study_key="S1",
-        status="new",
+        form_type="CRF",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/forms"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "new"}
+    assert filter_capture["filters"] == {"form_type": "CRF"}
     assert len(df) == 1
 
 

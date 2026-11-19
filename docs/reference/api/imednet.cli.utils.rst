@@ -49,3 +49,10 @@ imednet.cli.utils.output module
 .. automodule:: imednet.cli.utils.output
    :members:
    :show-inheritance:
+
+imednet.cli.utils.terminal module
+---------------------------------
+
+.. automodule:: imednet.cli.utils.terminal
+   :members:
+   :show-inheritance:

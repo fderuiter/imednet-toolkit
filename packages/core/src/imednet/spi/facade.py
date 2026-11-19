@@ -4,7 +4,7 @@ These protocols define the expected interface for the iMednet SDK clients,
 allowing for easier mocking and decoupling in dependent packages.
 """
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from imednet.models.codings import Coding
 from imednet.models.forms import Form
@@ -19,8 +19,12 @@ from imednet.models.subjects import Subject
 from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
-from imednet.utils.job_poller import JobProgressHandler
+from imednet.utils.batch_coordinator import DEFAULT_BATCH_CHUNK_SIZE, BatchSubmissionSummary
+from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
 from imednet.utils.typing import FilterValue, JsonDict
+
+if TYPE_CHECKING:
+    from imednet.validation.cache import ValidationSchemaProtocol
 
 
 class ImednetFacade(Protocol):
@@ -187,7 +191,8 @@ class ImednetFacade(Protocol):
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: "ValidationSchemaProtocol | None" = None,
+        skip_validation: bool = False,
     ) -> Job:
         """Submit a request to create one or more data records.
 
@@ -196,10 +201,27 @@ class ImednetFacade(Protocol):
             records_data: List of dictionaries containing record field data.
             email_notify: Optional email notification settings.
             schema: Optional validation schema.
+            skip_validation: Optional flag to skip validation when pre-validated.
 
         Returns:
             A Job model representing the background operation.
         """
+        ...
+
+    def create_records_batch(
+        self,
+        study_key: str,
+        records_data: list[JsonDict],
+        email_notify: bool | str | None = None,
+        *,
+        schema: "ValidationSchemaProtocol | None" = None,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        skip_validation: bool = False,
+        wait_for_completion: bool = False,
+        timeout: float = 300.0,
+        interval: float = 5.0,
+    ) -> BatchSubmissionSummary:
+        """Submit records in bounded chunks with optional multi-job polling."""
         ...
 
     def poll_job(
@@ -223,6 +245,19 @@ class ImednetFacade(Protocol):
         Returns:
             The final JobStatus of the operation.
         """
+        ...
+
+    def poll_jobs(
+        self,
+        study_key: str,
+        batch_ids: list[str],
+        *,
+        interval: float = 5.0,
+        timeout: float = 300.0,
+        on_progress: JobProgressHandler | None = None,
+        fail_fast: bool = False,
+    ) -> JobPollSummary:
+        """Wait for multiple background jobs concurrently and fetch resultUrl payloads."""
         ...
 
     @property
@@ -397,7 +432,8 @@ class AsyncImednetFacade(Protocol):
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: "ValidationSchemaProtocol | None" = None,
+        skip_validation: bool = False,
     ) -> Job:
         """Asynchronously submit a request to create one or more data records.
 
@@ -406,10 +442,27 @@ class AsyncImednetFacade(Protocol):
             records_data: List of dictionaries containing record field data.
             email_notify: Optional email notification settings.
             schema: Optional validation schema.
+            skip_validation: Optional flag to skip validation when pre-validated.
 
         Returns:
             A Job model representing the background operation.
         """
+        ...
+
+    async def async_create_records_batch(
+        self,
+        study_key: str,
+        records_data: list[JsonDict],
+        email_notify: bool | str | None = None,
+        *,
+        schema: "ValidationSchemaProtocol | None" = None,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        skip_validation: bool = False,
+        wait_for_completion: bool = False,
+        timeout: float = 300.0,
+        interval: float = 5.0,
+    ) -> BatchSubmissionSummary:
+        """Asynchronously submit records in bounded chunks with optional multi-job polling."""
         ...
 
     async def async_poll_job(
@@ -433,4 +486,17 @@ class AsyncImednetFacade(Protocol):
         Returns:
             The final JobStatus of the operation.
         """
+        ...
+
+    async def async_poll_jobs(
+        self,
+        study_key: str,
+        batch_ids: list[str],
+        *,
+        interval: float = 5.0,
+        timeout: float = 300.0,
+        on_progress: JobProgressHandler | None = None,
+        fail_fast: bool = False,
+    ) -> JobPollSummary:
+        """Asynchronously wait for multiple background jobs and fetch resultUrl payloads."""
         ...

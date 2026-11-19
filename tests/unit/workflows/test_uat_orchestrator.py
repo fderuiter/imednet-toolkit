@@ -378,3 +378,116 @@ def test_workflow_reset_and_rerun(mock_sdk, snapshot):
     assert workflow.state_history == [UATWorkflowState.PENDING]
     result2 = workflow.run("TEST_STUDY")
     assert result2.state == UATWorkflowState.COMPLETED
+
+
+def test_builder_and_workflow_consume_data_dictionary(mock_sdk):
+    """UATSpecificationBuilder and UATWorkflow populate choices, bounds, and required flags from DataDictionary."""
+    from imednet.datadict import Choice, DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+    from imednet.validation import validate_record_entry
+
+    snap = StudySnapshot(
+        study_key="TEST_STUDY",
+        forms=[
+            Form(form_key="F_DM", form_name="Demographics", form_type="Enrollment"),
+        ],
+        variables=[
+            Variable(
+                form_key="F_DM", variable_name="SEX", variable_key="VK_SEX", variable_type="Coded"
+            ),
+            Variable(
+                form_key="F_DM", variable_name="AGE", variable_key="VK_AGE", variable_type="Number"
+            ),
+            Variable(
+                form_key="F_DM", variable_name="RACE", variable_key="VK_RACE", variable_type="Coded"
+            ),
+        ],
+        intervals=[],
+        sites=[Site(site_name="Site1", site_enrollment_status="Active")],
+    )
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_DM",
+                formName="Demographics",
+                variables=[
+                    DDVariable(
+                        variableName="SEX",
+                        variableType="Radio",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="Male", choiceValue="M"),
+                            Choice(choiceText="Female", choiceValue="F"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="AGE",
+                        variableType="Integer",
+                        required="Yes",
+                        extraAttributes={"minValue": 21, "maxValue": 65},
+                    ),
+                    DDVariable(
+                        variableName="RACE",
+                        variableType="Multi Select",
+                        required="Auto Query",
+                        choices=[
+                            Choice(choiceText="Asian", choiceValue="ASIAN"),
+                            Choice(choiceText="White", choiceValue="WHITE"),
+                        ],
+                    ),
+                ],
+            )
+        ]
+    )
+
+    builder = UATSpecificationBuilder(data_dictionary=dd)
+    spec = builder.build(snap, subject_count=2)
+    dm_spec = spec.form_specs[0]
+    assert dm_spec.required_variable_names == ["SEX", "AGE"]
+
+    sex_spec = next(v for v in dm_spec.variables if v.variable_name == "SEX")
+    assert sex_spec.variable_type == "Radio"
+    assert sex_spec.coded_values == ["M", "F"]
+    assert sex_spec.required is True
+
+    age_spec = next(v for v in dm_spec.variables if v.variable_name == "AGE")
+    assert age_spec.min_value == pytest.approx(21.0)
+    assert age_spec.max_value == pytest.approx(65.0)
+    assert age_spec.required is True
+
+    race_spec = next(v for v in dm_spec.variables if v.variable_name == "RACE")
+    assert race_spec.variable_type == "Multi Select"
+    assert race_spec.coded_values == ["ASIAN", "WHITE"]
+    assert race_spec.required is False
+
+    # Run UATWorkflow end-to-end with DataDictionary
+    workflow = UATWorkflow(mock_sdk, seed=7, data_dictionary=dd)
+    workflow.inspect = MagicMock(return_value=snap)
+    mock_submission = MagicMock(spec=SubmissionResult)
+    mock_submission.total_records_submitted = 1
+    mock_submission.all_batch_ids = ["B1"]
+    workflow.submit = MagicMock(return_value=mock_submission)
+    mock_poll = MagicMock(all_successful=True, results={"B1": MagicMock()}, failures={})
+    workflow.monitor = MagicMock(return_value=mock_poll)
+
+    res = workflow.run("TEST_STUDY")
+    assert res.overall_success is True
+    payload = res.record_sets[0].payloads[0]
+    assert payload["data"]["SEX"] in {"M", "F"}
+    assert 21 <= int(payload["data"]["AGE"]) <= 65
+    # Generated string choices validate cleanly when numeric AGE is coerced or checked
+    for token in payload["data"]["RACE"].split("`"):
+        assert token in {"ASIAN", "WHITE"}
+    validate_record_entry(
+        dd,
+        {
+            "formKey": "F_DM",
+            "data": {
+                "SEX": payload["data"]["SEX"],
+                "AGE": int(payload["data"]["AGE"]),
+                "RACE": payload["data"]["RACE"],
+            },
+        },
+    )

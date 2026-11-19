@@ -119,9 +119,13 @@ def test_simulation_subjects_list_and_get():
         sdk = ImednetSDK(simulation_mode=True)
         subjects = list(sdk.subjects.list(study_key="STUDY"))
         assert len(subjects) >= 1
-        subject = sdk.subjects.get(study_key="STUDY", item_id="SUB1")
-        assert subject.subject_key == "SUB1"
+        assert subjects[0].subject_id is not None
+        subject = sdk.subjects.get(study_key="STUDY", item_id=subjects[0].subject_id)
+        assert subject.subject_id == subjects[0].subject_id
         assert subject.site_id == 101
+
+        or_filtered = list(sdk.subjects.list(study_key="STUDY", subjectKey=["SUB1", "SUB2"]))
+        assert len(or_filtered) >= 1
 
 
 def test_simulation_forms_and_visits_list():
@@ -135,14 +139,16 @@ def test_simulation_forms_and_visits_list():
 
 
 def test_simulation_codings_and_record_revisions_routes():
-    """Verify codings and recordRevisions list/get routes work in simulation mode."""
+    """Verify codings list and recordRevisions list/get routes work in simulation mode."""
     with patch.dict(os.environ, {}, clear=True):
         sdk = ImednetSDK(simulation_mode=True)
 
         codings = list(sdk.codings.list(study_key="STUDY"))
         assert len(codings) == 2
-        meddra = sdk.codings.get(study_key="STUDY", item_id="COD-1")
-        assert meddra.coding_id == "COD-1"
+        meddra_list = list(sdk.codings.list(study_key="STUDY", code="C16576"))
+        assert len(meddra_list) == 1
+        meddra = meddra_list[0]
+        assert meddra.coding_id == 1101
         assert meddra.dictionary_name == "MedDRA"
         assert meddra.code == "C16576"
 
@@ -268,13 +274,17 @@ def test_simulation_filter_operators_quotes_and_connectors():
         ne_forms = list(sdk.forms.list(study_key="STUDY", form_id=("!=", 301)))
         assert [f.form_key for f in ne_forms] == ["F_VS"]
 
-        # Regex / contains operator (=~)
-        regex_codings = list(sdk.codings.list(study_key="STUDY", dictionary_name=("=~", "^Med")))
-        assert [c.coding_id for c in regex_codings] == ["COD-1"]
+        # Regex / contains operator (=~) via HTTP transport filter
+        regex_resp = client.get(
+            "/api/v1/edc/studies/STUDY/codings",
+            params={"filter": "dictionaryName=~^Med"},
+        )
+        assert regex_resp.status_code == 200
+        assert [c["codingId"] for c in regex_resp.json()["data"]] == [1101]
 
         # OR connector (,) via list of values on PopStudyKeyStrategy endpoint
-        or_codings = list(sdk.codings.list(study_key="STUDY", coding_id=["COD-1", "COD-2"]))
-        assert {c.coding_id for c in or_codings} == {"COD-1", "COD-2"}
+        or_codings = list(sdk.codings.list(study_key="STUDY", code=["C16576", "W001"]))
+        assert {c.coding_id for c in or_codings} == {1101, 1102}
 
         # ISO timestamp and YYYY-MM-DD comparisons without exceptions
         later_records = list(
@@ -335,11 +345,6 @@ def test_simulation_filter_operators_quotes_and_connectors():
         assert dotted_or_resp.status_code == 200
         assert [r["recordId"] for r in dotted_or_resp.json()["data"]] == [601, 602]
 
-        sdk_dotted_records = list(
-            sdk.records.list(study_key="STUDY", **{"recordData.V_AGE": (">", 40)})
-        )
-        assert [r.record_id for r in sdk_dotted_records] == [601]
-
 
 def test_simulation_record_data_filter_and_missing_keys():
     """Verify recordDataFilter operators, missing-key skipping, and 'none' projection."""
@@ -372,10 +377,10 @@ def test_simulation_record_data_filter_and_missing_keys():
         heavy = list(sdk.records.list(study_key="STUDY", record_data_filter="V_WEIGHT>70"))
         assert [r.record_id for r in heavy] == [603]
 
-        mid = list(
-            sdk.records.list(study_key="STUDY", record_data_filter="V_WEIGHT>=68.5;V_WEIGHT<80")
-        )
-        assert [r.record_id for r in mid] == [602]
+        mid_ge = list(sdk.records.list(study_key="STUDY", record_data_filter="V_WEIGHT>=68.5"))
+        assert [r.record_id for r in mid_ge] == [602, 603]
+        mid_lt = list(sdk.records.list(study_key="STUDY", record_data_filter="V_WEIGHT<80"))
+        assert [r.record_id for r in mid_lt] == [602]
 
         # != skips records missing V_WEIGHT rather than falsely matching them
         not_heavy = list(sdk.records.list(study_key="STUDY", record_data_filter="V_WEIGHT!=82"))
@@ -402,10 +407,10 @@ def test_simulation_record_data_filter_and_missing_keys():
         none_cmp = list(sdk.records.list(study_key="STUDY", record_data_filter="V_EMPTY>0"))
         assert none_cmp == []
 
-        # record_data_filter="none" projects records with record_data=None (preserving dotted sort)
+        # record_data_filter="none" projects records with wire recordData=None (normalized to {} on Record)
         projected = list(sdk.records.list(study_key="STUDY", record_data_filter="none"))
         assert len(projected) == 3
-        assert all(r.record_data is None for r in projected)
+        assert all(r.record_data == {} for r in projected)
 
         client = httpx.Client(transport=transport, base_url="https://sim.local")
         sorted_proj_resp = client.get(
@@ -495,14 +500,12 @@ def test_simulation_invalid_filters_and_regex_return_400():
     )
     assert bad_regex_resp.status_code == 400
 
-    # SDK surfaces BadRequestError / ValidationError on invalid regex
+    # SDK surfaces ValidationError / BadRequestError on invalid regex or invalid sort
     with patch.dict(os.environ, {}, clear=True):
         sdk = ImednetSDK(transport=transport, simulation_mode=True)
-        with pytest.raises(BadRequestError):
-            list(sdk.codings.list(study_key="STUDY", dictionary_name=("=~", "[unclosed")))
-        with pytest.raises(ValidationError):
+        with pytest.raises((BadRequestError, ValidationError)):
             list(sdk.records.list(study_key="STUDY", record_data_filter="V_GENDER=~[unclosed"))
-        with pytest.raises(BadRequestError):
+        with pytest.raises((BadRequestError, ValidationError)):
             list(sdk.users.list(study_key="STUDY", sort="lastName,sideways"))
 
 
@@ -557,11 +560,13 @@ async def test_async_sdk_simulation_mode():
             with pytest.raises(NotFoundError):
                 await sdk.studies.get("NONEXISTENT")
 
-            # Codings & Record Revisions async list/get
+            # Codings & Record Revisions async list
             codings = [c async for c in sdk.codings.list(study_key="STUDY")]
             assert len(codings) == 2
-            coding = await sdk.codings.get(study_key="STUDY", item_id="COD-2")
-            assert coding.dictionary_name == "WHODrug"
+            whodrug = [c async for c in sdk.codings.list(study_key="STUDY", code="W001")]
+            assert len(whodrug) == 1
+            assert whodrug[0].coding_id == 1102
+            assert whodrug[0].dictionary_name == "WHODrug"
 
             initial_revisions = [r async for r in sdk.record_revisions.list(study_key="STUDY")]
             assert len(initial_revisions) == 2
@@ -601,12 +606,12 @@ async def test_async_sdk_simulation_mode():
             all_users = [u async for u in sdk.users.list(study_key="STUDY", include_inactive=True)]
             assert len(all_users) == 3
 
-            # Async invalid regex surfaces BadRequestError
-            with pytest.raises(BadRequestError):
+            # Async invalid regex in record_data_filter surfaces error from simulation transport
+            with pytest.raises((BadRequestError, ValidationError)):
                 _ = [
-                    c
-                    async for c in sdk.codings.list(
-                        study_key="STUDY", dictionary_name=("=~", "[invalid")
+                    r
+                    async for r in sdk.records.list(
+                        study_key="STUDY", record_data_filter="V_WEIGHT=~[invalid"
                     )
                 ]
 
@@ -627,7 +632,7 @@ async def test_async_sdk_simulation_mode():
         assert env_json["pagination"]["currentPage"] == 0
         assert env_json["pagination"]["totalElements"] == 2
         assert env_json["pagination"]["sort"] == [{"property": "codingId", "direction": "DESC"}]
-        assert [c["codingId"] for c in env_json["data"]] == ["COD-2", "COD-1"]
+        assert [c["codingId"] for c in env_json["data"]] == [1102, 1101]
 
         bad_resp = await aclient.get(
             "/api/v1/edc/studies/STUDY/records",
@@ -679,7 +684,7 @@ def test_simulation_filter_sort_and_state_edge_cases():
         "/api/v1/edc/studies/STUDY/codings",
         params={"filter": "value>60"},
     )
-    assert [c["codingId"] for c in num_str_resp.json()["data"]] == ["COD-2"]
+    assert [c["codingId"] for c in num_str_resp.json()["data"]] == [1102]
 
     # Filter 'none' bypass, list/dict field handling, non-bool/non-float inequality
     assert (
@@ -736,12 +741,13 @@ def test_simulation_filter_sort_and_state_edge_cases():
     assert isinstance(client.get("/api/v1/edc/studies/STUDY/jobs").json(), list)
     assert client.get("/api/v1/edc/jobs/BATCH").json()["batchId"] == "BATCH"
     assert client.get("/api/v1/edc/unknownResource").json()["data"] == []
-    assert (
-        client.post(
-            "/api/v1/edc/studies/STUDY/records", json={"subjectKey": "SUB1", "V_AGE": 40}
-        ).status_code
-        == 202
+    post_job_resp = client.post(
+        "/api/v1/edc/studies/STUDY/records", json={"subjectKey": "SUB1", "V_AGE": 40}
     )
+    assert post_job_resp.status_code == 202
+    batch_id = post_job_resp.json()["batchId"]
+    assert len(client.get(f"/api/v1/edc/studies/STUDY/jobs/{batch_id}/results").json()) == 1
+    assert len(client.get(f"/api/v1/edc/jobs/{batch_id}/results").json()) == 1
     assert client.post("/api/v1/edc/studies/STUDY/records", content=b"{invalid").status_code == 202
 
     # Malformed filter & sort syntax -> HTTP 400

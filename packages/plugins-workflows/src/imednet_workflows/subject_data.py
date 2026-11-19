@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from imednet.spi.models import Query, Record, Subject, Visit
+from imednet.spi.sink_base import is_record_deleted
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
@@ -38,12 +39,19 @@ class SubjectDataWorkflow:
         """
         self._sdk = sdk
 
-    def get_all_subject_data(self, study_key: str, subject_key: str) -> SubjectComprehensiveData:
+    def get_all_subject_data(
+        self,
+        study_key: str,
+        subject_key: str,
+        *,
+        include_deleted: bool = False,
+    ) -> SubjectComprehensiveData:
         """Retrieves subject details, visits, records, and queries for a specific subject.
 
         Args:
             study_key: The key identifying the study.
             subject_key: The key identifying the subject.
+            include_deleted: Whether voided (``deleted=True``) records should be retained.
 
         Returns:
             A SubjectComprehensiveData object containing the aggregated data.
@@ -60,7 +68,12 @@ class SubjectDataWorkflow:
         results.visits = list(self._sdk.get_visits(study_key, **subject_filter_dict))
 
         # Fetch Records
-        results.records = list(self._sdk.get_records(study_key, **subject_filter_dict))
+        fetched_records = list(self._sdk.get_records(study_key, **subject_filter_dict))
+        results.records = (
+            fetched_records
+            if include_deleted
+            else [r for r in fetched_records if not is_record_deleted(r)]
+        )
 
         # Fetch Queries
         results.queries = list(self._sdk.get_queries(study_key, **subject_filter_dict))

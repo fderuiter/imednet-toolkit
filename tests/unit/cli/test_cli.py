@@ -320,7 +320,7 @@ def test_users_list_real_model_validation_and_rendering(runner: CliRunner, sdk: 
         }
     )
 
-    # User 2: Inactive with single name, dict role, and string role
+    # User 2: Inactive with single name and multiple dict roles
     user2 = User.model_validate(
         {
             "userId": "USR-102",
@@ -329,7 +329,10 @@ def test_users_list_real_model_validation_and_rendering(runner: CliRunner, sdk: 
             "login": "bsmith",
             "email": "bob@example.com",
             "userActiveInStudy": False,
-            "roles": [{"roleId": "R2", "name": "Data Coordinator"}, "Monitor"],
+            "roles": [
+                {"roleId": "R2", "name": "Data Coordinator"},
+                {"roleId": "R3", "name": "Monitor"},
+            ],
         }
     )
 
@@ -432,7 +435,7 @@ def test_codings_list_real_model_validation_and_rendering(
 
     coding1 = Coding.model_validate(
         {
-            "codingId": "COD-001",
+            "codingId": 1001,
             "dictionaryName": "MedDRA",
             "dictionaryVersion": "26.1",
             "variable": "AETERM",
@@ -442,7 +445,7 @@ def test_codings_list_real_model_validation_and_rendering(
     )
     coding2 = Coding.model_validate(
         {
-            "codingId": "COD-002",
+            "codingId": 1002,
             "dictionaryName": "WHODrug",
             "dictionaryVersion": "2024Q1",
             "variable": "CMTRT",
@@ -460,14 +463,14 @@ def test_codings_list_real_model_validation_and_rendering(
     sdk.codings.list.assert_called_once_with("STUDY", dictionaryName="MedDRA", variable="AETERM")
 
     # Assert rendered cells in tabular output
-    assert "COD-001" in result.stdout
+    assert "1001" in result.stdout
     assert "MedDRA" in result.stdout
     assert "26.1" in result.stdout
     assert "AETERM" in result.stdout
     assert "Headache" in result.stdout
     assert "10019211" in result.stdout
 
-    assert "COD-002" in result.stdout
+    assert "1002" in result.stdout
     assert "WHODrug" in result.stdout
 
 
