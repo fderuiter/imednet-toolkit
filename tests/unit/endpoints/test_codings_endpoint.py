@@ -28,7 +28,7 @@ def test_list_requires_study_key(dummy_client, paginator_factory, patch_build_fi
 def test_list_repeatable_coding_filters_transport(dummy_client, paginator_factory):
     """Test repeatable coding filters at parameter-building and transport boundary."""
     ep = codings.CodingsEndpoint(dummy_client)
-    capture = paginator_factory(codings, [{"codingId": "C1", "dictionaryName": "MedDRA"}])
+    capture = paginator_factory(codings, [{"codingId": 101, "dictionaryName": "MedDRA"}])
 
     result = ep.list(study_key="S1", dictionaryName="MedDRA", variable="AETERM")
 
@@ -36,7 +36,7 @@ def test_list_repeatable_coding_filters_transport(dummy_client, paginator_factor
     assert "dictionaryName==MedDRA" in capture["params"]["filter"]
     assert "variable==AETERM" in capture["params"]["filter"]
     assert len(result) == 1
-    assert result[0].coding_id == "C1"
+    assert result[0].coding_id == 101
     assert result[0].dictionary_name == "MedDRA"
 
 

@@ -108,12 +108,14 @@ _MERGE_RECORD_CYPHER = """\
 UNWIND $rows AS row
 MERGE (s:Study   {study_key:   row.study_key})
 MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
-MERGE (v:Visit    {visit_id:   row.visit_id,    study_key: row.study_key})
 MERGE (r:Record   {record_id:  row.record_id,   study_key: row.study_key})
 SET r += row
 MERGE (s)-[:HAS_SUBJECT]->(su)
-MERGE (su)-[:HAS_VISIT]->(v)
-MERGE (v)-[:HAS_RECORD]->(r)
+FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (v:Visit {visit_id: row.visit_id, study_key: row.study_key})
+    MERGE (su)-[:HAS_VISIT]->(v)
+    MERGE (v)-[:HAS_RECORD]->(r)
+)
 """
 
 _CREATE_RECORD_CYPHER = """\
@@ -121,6 +123,7 @@ UNWIND $rows AS row
 CREATE (r:Record)
 SET r = row
 WITH r, row
+WHERE row.visit_id IS NOT NULL
 MATCH (v:Visit {visit_id: row.visit_id, study_key: row.study_key})
 MERGE (v)-[:HAS_RECORD]->(r)
 """
@@ -130,6 +133,14 @@ def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
     import json
 
     row["record_data"] = json.dumps(row.get("record_data", {}))
+    keywords = row.get("keywords")
+    if isinstance(keywords, list):
+        row["keywords"] = json.dumps(
+            [
+                k.model_dump(mode="json", by_alias=True) if hasattr(k, "model_dump") else k
+                for k in keywords
+            ]
+        )
     return row
 
 

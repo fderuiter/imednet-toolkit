@@ -151,7 +151,7 @@ List forms
                "allowCopy": "<boolean>",
                "embeddedLog": false,
                "enforceOwnership": false,
-               "otherForms": [],
+               "otherForms": "<boolean>",
                "userAgreement": false,
                "lastUpdated": "<string>",
                "subjectRecordReport": "<boolean>",
