@@ -22,8 +22,6 @@ _ISO_8601_TIMESTAMP_REGEX = re.compile(
 ORDERED_FILTER_OPERATORS: tuple[str, ...] = ("<=", ">=", "!=", "==", "=~", "<", ">")
 ALLOWED_OPERATORS = frozenset({"<", "<=", ">", ">=", "==", "!="})
 RECORD_DATA_OPERATORS = frozenset(ORDERED_FILTER_OPERATORS)
-_TWO_CHAR_OPERATORS = frozenset(op for op in ORDERED_FILTER_OPERATORS if len(op) == 2)
-_SINGLE_CHAR_OPERATORS = frozenset({*(op for op in ORDERED_FILTER_OPERATORS if len(op) == 1), "="})
 _OPERATOR_CHARS = frozenset("<>=!~")
 
 T = TypeVar("T")
@@ -218,16 +216,200 @@ def validate_filter_key(key: str, *, model: type[Any] | None = None) -> None:
             )
 
 
-def _coerce_filter_scalar(raw_value: str) -> str | bool | int:
-    """Coerce boolean and integer string tokens to native scalars."""
+_VALID_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
+_CANDIDATE_OPERATORS: tuple[str, ...] = (*ORDERED_FILTER_OPERATORS, "=")
+
+
+def _split_outside_quotes(expr: str, separator: str) -> list[str]:
+    """Split a filter expression by ``separator`` only outside double quotes."""
+    parts: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    escape = False
+
+    for ch in expr:
+        if escape:
+            current.append(ch)
+            escape = False
+            continue
+        if ch == "\\" and in_quotes:
+            current.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            current.append(ch)
+            continue
+        if not in_quotes and ch == separator:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+
+    parts.append("".join(current))
+    return parts
+
+
+def _has_unquoted_char(expr: str, target: str) -> bool:
+    """Return True if ``target`` appears outside double quotes in ``expr``."""
+    in_quotes = False
+    escape = False
+    for ch in expr:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_quotes:
+            escape = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            continue
+        if not in_quotes and ch == target:
+            return True
+    return False
+
+
+def _find_operator(clause: str) -> tuple[int, str] | None:
+    """Locate the first filter operator outside double quotes in a single clause."""
+    in_quotes = False
+    escape = False
+    length = len(clause)
+
+    for idx, ch in enumerate(clause):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_quotes:
+            escape = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            continue
+        if not in_quotes:
+            for op in _CANDIDATE_OPERATORS:
+                op_len = len(op)
+                if clause.startswith(op, idx) and idx + op_len <= length:
+                    return idx, op
+    return None
+
+
+def _coerce_filter_scalar(raw_value: str, raw_arg: str = "") -> tuple[str | bool | int, bool]:
+    """Coerce quoted, boolean, and integer string tokens to native scalars."""
+    err_ctx = raw_arg or raw_value
+    if len(raw_value) >= 2 and raw_value.startswith('"') and raw_value.endswith('"'):
+        escape = False
+        for idx, ch in enumerate(raw_value[1:], start=1):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"' and idx != len(raw_value) - 1:
+                raise ValueError(
+                    f"Invalid filter format: '{err_ctx}'. Unexpected quote inside value."
+                )
+        inner = raw_value[1:-1]
+        unescaped = inner.replace(r"\"", '"').replace("\\\\", "\\")
+        return unescaped, True
+
+    if '"' in raw_value:
+        raise ValueError(f"Invalid filter format: '{err_ctx}'. Malformed quoted value.")
+
     lowered = raw_value.lower()
     if lowered == "true":
-        return True
+        return True, False
     if lowered == "false":
-        return False
+        return False, False
     if raw_value.isdigit():
-        return int(raw_value)
-    return raw_value
+        return int(raw_value), False
+    return raw_value, False
+
+
+def _validate_expression_tokens(expr: str) -> None:
+    """Validate quote balance, connector exclusivity, unquoted whitespace, and non-empty clauses."""
+    has_semi, has_comma, has_whitespace, in_quotes = _scan_filter_string(expr)
+    if in_quotes:
+        raise ValueError("Filter expression contains unclosed quotation marks")
+    if has_semi and has_comma:
+        raise ValueError("Filter expression cannot combine both ';' (AND) and ',' (OR) connectors")
+    if has_whitespace:
+        raise ValueError(
+            "Filter expression contains whitespace between attribute, operator, and value"
+        )
+    clauses, _ = _split_filter_clauses(expr.strip())
+    if any(not c for c in clauses):
+        raise ValueError("Filter expression contains an empty clause")
+
+
+def _parse_single_clause(
+    clause: str,
+    raw_arg: str,
+    *,
+    model: type[Any] | None = None,
+) -> tuple[str, str, str | bool | int, bool]:
+    """Parse ``key<op>value`` into ``(key, op, parsed_value, was_quoted)``."""
+    if not isinstance(clause, str) or not clause or not clause.strip():
+        raise ValueError(
+            f"Invalid filter format: '{raw_arg}'. "
+            "Use 'key=value' with non-empty key and value (e.g., 'form_key=DEMO')."
+        )
+
+    found = _find_operator(clause)
+    if found is None:
+        raise ValueError(
+            f"Invalid filter format: '{raw_arg}'. "
+            "Use 'key=value' with non-empty key and value (e.g., 'form_key=DEMO')."
+        )
+
+    op_idx, matched_op = found
+    raw_key = clause[:op_idx]
+    raw_value = clause[op_idx + len(matched_op) :]
+    if not raw_key or not raw_key.strip() or not raw_value or not raw_value.strip():
+        raise ValueError(
+            f"Invalid filter format: '{raw_arg}'. "
+            "Key and value cannot be empty; use 'key=value' (e.g., 'form_key=DEMO')."
+        )
+
+    try:
+        _validate_expression_tokens(clause)
+    except ValueError as exc:
+        raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
+
+    if raw_value.startswith(("=", "<", ">", "~", "!")):
+        raise ValueError(
+            f"Invalid filter format: '{raw_arg}'. "
+            f"Unsupported comparison operator; allowed operators: {list(ORDERED_FILTER_OPERATORS)}."
+        )
+
+    try:
+        validate_filter_key(raw_key, model=model)
+    except ValueError as exc:
+        raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
+
+    if not _VALID_KEY_PATTERN.match(raw_key):
+        raise ValueError(
+            f"Invalid filter format: '{raw_arg}'. Invalid filter attribute '{raw_key}'."
+        )
+
+    if matched_op != "=":
+        try:
+            validate_filter_operator(matched_op, allow_regex=True)
+        except ValueError as exc:
+            raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
+
+    parsed_scalar, was_quoted = _coerce_filter_scalar(raw_value, raw_arg)
+    return raw_key, matched_op, parsed_scalar, was_quoted
+
+
+def _format_clause(key: str, op: str, val: str | bool | int, was_quoted: bool) -> str:
+    """Format a parsed clause as a valid iMednet server filter segment."""
+    api_op = "==" if op == "=" else op
+    camel_key = _snake_to_camel(key)
+    if was_quoted and isinstance(val, str):
+        escaped = val.replace("\\", "\\\\").replace('"', r"\"")
+        return f'{camel_key}{api_op}"{escaped}"'
+    return f"{camel_key}{api_op}{_format_filter_value(val)}"
 
 
 def parse_filter_expression(
@@ -252,50 +434,16 @@ def parse_filter_expression(
     Raises:
         ValueError: If syntax, operator, or key validation fails.
     """
-    if not isinstance(filter_str, str) or not filter_str or not filter_str.strip():
-        raise ValueError(
-            f"Invalid filter format: '{filter_str}'. "
-            "Use 'key=value' with non-empty key and value (e.g., 'form_key=DEMO')."
-        )
-
-    matched_op: str | None = None
-    op_idx = -1
-    for idx in range(len(filter_str)):
-        two_char = filter_str[idx : idx + 2]
-        if len(two_char) == 2 and two_char in _TWO_CHAR_OPERATORS:
-            matched_op = two_char
-            op_idx = idx
-            break
-        one_char = filter_str[idx]
-        if one_char in _SINGLE_CHAR_OPERATORS:
-            matched_op = one_char
-            op_idx = idx
-            break
-
-    if matched_op is None:
-        raise ValueError(
-            f"Invalid filter format: '{filter_str}'. "
-            "Use 'key=value' with non-empty key and value (e.g., 'form_key=DEMO')."
-        )
-
-    raw_key = filter_str[:op_idx].strip()
-    raw_value = filter_str[op_idx + len(matched_op) :].strip()
-    if not raw_key or not raw_value:
-        raise ValueError(
-            f"Invalid filter format: '{filter_str}'. "
-            "Key and value cannot be empty; use 'key=value' (e.g., 'form_key=DEMO')."
-        )
-
-    if (matched_op == "==" and raw_value.startswith("=")) or (
-        matched_op == "<" and raw_value.startswith(">")
+    if isinstance(filter_str, str) and (
+        _has_unquoted_char(filter_str, ";") or _has_unquoted_char(filter_str, ",")
     ):
         raise ValueError(
             f"Invalid filter format: '{filter_str}'. "
-            f"Unsupported comparison operator; allowed operators: {list(ORDERED_FILTER_OPERATORS)}."
+            "Expected a single 'key=value' filter expression."
         )
-
-    validate_filter_key(raw_key, model=model)
-    parsed_scalar = _coerce_filter_scalar(raw_value)
+    raw_key, matched_op, parsed_scalar, _ = _parse_single_clause(
+        filter_str, filter_str, model=model
+    )
     if matched_op == "=":
         return raw_key, parsed_scalar
     return raw_key, (matched_op, parsed_scalar)
@@ -308,27 +456,59 @@ def parse_filter_expressions(
 ) -> dict[str, Any]:
     """Parse multiple filter expressions into a filter dictionary.
 
-    Repeated conditions on the same key are preserved as a list of
-    ``(operator, value)`` tuples so :func:`build_filter_string` joins them with
-    the semicolon ``AND`` connector.
+    Supports compound ``;`` (AND) and ``,`` (OR) expressions, quote-aware
+    values, and optional resource ``model`` attribute validation. Repeated AND
+    conditions on the same key are preserved as a list of ``(operator, value)``
+    tuples so :func:`build_filter_string` joins them with ``;``. Comma-separated
+    OR expressions return ``{"filter": formatted_or_string}``.
     """
+    for arg in expressions:
+        if not isinstance(arg, str) or not arg or not arg.strip():
+            raise ValueError(
+                f"Invalid filter format: '{arg}'. "
+                "Use 'key=value' with non-empty key and value (e.g., 'form_key=DEMO')."
+            )
+        try:
+            _validate_expression_tokens(arg)
+        except ValueError as exc:
+            raise ValueError(f"Invalid filter format: '{arg}'. {exc}") from exc
+
+    combined_raw = ";".join(expressions)
+    try:
+        validate_connector_exclusivity(combined_raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid filter format: '{combined_raw}'. {exc}") from exc
+
+    if any(_has_unquoted_char(arg, ",") for arg in expressions):
+        raw_arg = expressions[0]
+        or_clauses = _split_outside_quotes(raw_arg, ",")
+        parsed_or = [_parse_single_clause(clause, raw_arg, model=model) for clause in or_clauses]
+        formatted = ",".join(_format_clause(*pc) for pc in parsed_or)
+        try:
+            _validate_filter_expression(formatted, allow_regex=True)
+        except ValueError as exc:
+            raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
+        return {"filter": formatted}
+
     filter_dict: dict[str, Any] = {}
     for expr in expressions:
-        key, parsed_val = parse_filter_expression(expr, model=model)
-        if key not in filter_dict:
-            filter_dict[key] = parsed_val
-            continue
+        for clause in _split_outside_quotes(expr, ";"):
+            key, op, val, _ = _parse_single_clause(clause, expr, model=model)
+            parsed_val: Any = val if op == "=" else (op, val)
+            if key not in filter_dict:
+                filter_dict[key] = parsed_val
+                continue
 
-        prev = filter_dict[key]
-        if isinstance(prev, list):
-            combined = list(prev)
-        elif isinstance(prev, tuple):
-            combined = [prev]
-        else:
-            combined = [("==", prev)]
+            prev = filter_dict[key]
+            if isinstance(prev, list):
+                combined = list(prev)
+            elif isinstance(prev, tuple):
+                combined = [prev]
+            else:
+                combined = [("==", prev)]
 
-        combined.append(parsed_val if isinstance(parsed_val, tuple) else ("==", parsed_val))
-        filter_dict[key] = combined
+            combined.append(parsed_val if isinstance(parsed_val, tuple) else ("==", parsed_val))
+            filter_dict[key] = combined
     return filter_dict
 
 

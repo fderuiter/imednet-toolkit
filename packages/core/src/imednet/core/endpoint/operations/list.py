@@ -15,6 +15,51 @@ from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 T = TypeVar("T")
 
 
+class _PaginatedIterator(Iterator[T]):
+    """Synchronous iterator over parsed items exposing pagination truncation state."""
+
+    def __init__(self, paginator: Any, parse_func: Callable[[Any], T]) -> None:
+        self._paginator = paginator
+        self._parse_func = parse_func
+        self._iterator: Iterator[Any] | None = None
+
+    @property
+    def has_more(self) -> bool:
+        """Return True if more items remain in the underlying paginator."""
+        return bool(getattr(self._paginator, "has_more", False))
+
+    def __iter__(self) -> _PaginatedIterator[T]:
+        return self
+
+    def __next__(self) -> T:
+        if self._iterator is None:
+            self._iterator = iter(self._paginator)
+        return self._parse_func(next(self._iterator))
+
+
+class _AsyncPaginatedIterator(AsyncIterator[T]):
+    """Asynchronous iterator over parsed items exposing pagination truncation state."""
+
+    def __init__(self, paginator: Any, parse_func: Callable[[Any], T]) -> None:
+        self._paginator = paginator
+        self._parse_func = parse_func
+        self._iterator: AsyncIterator[Any] | None = None
+
+    @property
+    def has_more(self) -> bool:
+        """Return True if more items remain in the underlying async paginator."""
+        return bool(getattr(self._paginator, "has_more", False))
+
+    def __aiter__(self) -> _AsyncPaginatedIterator[T]:
+        return self
+
+    async def __anext__(self) -> T:
+        if self._iterator is None:
+            self._iterator = self._paginator.__aiter__()
+        item = await self._iterator.__anext__()
+        return self._parse_func(item)
+
+
 class ListOperation(Generic[T]):
     """Operation for executing list requests.
 
@@ -66,7 +111,7 @@ class ListOperation(Generic[T]):
             params=self.params,
             page_size=self.page_size,
         )
-        return (self._process_item(item) for item in paginator)
+        return _PaginatedIterator(paginator, self._process_item)
 
     def execute_async(
         self,
@@ -88,10 +133,4 @@ class ListOperation(Generic[T]):
             params=self.params,
             page_size=self.page_size,
         )
-
-        async def _generator() -> AsyncIterator[T]:
-            """Async generator to yield processed items from the paginator."""
-            async for item in paginator:
-                yield self._process_item(item)
-
-        return _generator()
+        return _AsyncPaginatedIterator(paginator, self._process_item)

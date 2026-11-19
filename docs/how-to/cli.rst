@@ -25,8 +25,9 @@ dashboard for browsing studies, sites, subjects, and background jobs:
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
 ``Enter`` to select a study or site, ``q`` to quit, ``d`` to toggle dark mode, ``h`` to
-toggle high-contrast mode, and ``r`` to refresh active study data. Pass ``--force`` only
-when intentionally bypassing TTY stream checks.
+toggle high-contrast mode, ``r`` to refresh active study data, and ``a`` to load all pages
+when a panel is truncated. Pass ``--force`` only when intentionally bypassing TTY stream
+checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
@@ -105,3 +106,31 @@ non-empty value) or ``TERM=dumb`` to suppress ANSI color escape sequences across
 tables and diagnostics while preserving ``--high-contrast`` palettes when color
 output is permitted. Interactive workflow wizards reject piped or non-TTY ``stdin``
 streams immediately with exit code ``1``.
+
+Server-side filters, sorting, and bounded fetches
+-------------------------------------------------
+
+Eleven filter-capable ``list`` commands (``studies``, ``sites``, ``forms``,
+``intervals``, ``queries``, ``record-revisions``, ``variables``, ``visits``,
+``records``, ``subjects``, and ``codings``) accept repeatable ``-f`` / ``--filter``
+arguments using ``=`` or the standard iMednet comparison operators (``<``, ``<=``,
+``>``, ``>=``, ``==``, ``!=``) with exclusive ``;`` (AND) or ``,`` (OR) connectors.
+``records list`` additionally exposes ``--record-data-filter`` (supporting ``=~``
+regular-expression matching in addition to the six standard operators) to filter
+Form Variable values on the server. All twelve ``list`` commands—including
+``users list``—accept ``--sort``, ``--limit``, and ``--all``.
+
+.. code-block:: bash
+
+   imednet records list STUDY --filter "formKey==AE;recordId>=100" \
+       --record-data-filter "AESER==Serious;AGE>=18" --sort dateCreated,desc --limit 50
+   imednet queries list STUDY --filter "type==Open,type==Answered" --sort annotationId,desc
+   imednet users list STUDY --include-inactive --sort login,asc --limit 25
+
+Interactive TTY table sessions fetch one bounded page of 100 items by default and
+display a truncation notice when additional Study items exist; pass ``--limit N``
+(upstream ``size`` is automatically capped at 500 per page) or ``--all`` to retrieve
+larger batches. Non-interactive runs (``--no-interactive``,
+``IMEDNET_NON_INTERACTIVE=1``, or piped ``stdout``), headless ``--format json``, and
+file exports (``--output json|csv``) continue to fetch all matching pages unless
+``--limit`` is explicitly specified.

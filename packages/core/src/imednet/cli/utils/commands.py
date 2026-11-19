@@ -7,7 +7,14 @@ import argparse
 from imednet.cli.decorators import with_sdk
 from imednet.sdk import ImednetSDK
 
-from .args import STUDY_KEY_ARG, add_no_interactive, add_output_format
+from .args import (
+    STUDY_KEY_ARG,
+    add_list_query_args,
+    add_no_interactive,
+    add_output_format,
+    collect_list_items,
+    prepare_list_query,
+)
 from .context import fetching_status
 from .output import display_list
 
@@ -39,16 +46,32 @@ def register_list_command(
 
     if requires_study_key:
         list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+        add_list_query_args(list_parser)
 
         @with_sdk
         def list_cmd(
             sdk: ImednetSDK,
             study_key: str,
             output_format: str = "table",
+            filter_args: list[str] | None = None,
+            sort: str | None = None,
+            limit: int | None = None,
+            fetch_all: bool = False,
             no_interactive: bool = False,
         ) -> None:
+            req_kwargs, effective_limit = prepare_list_query(
+                filter_args=filter_args,
+                sort=sort,
+                limit=limit,
+                fetch_all=fetch_all,
+                output_format=output_format,
+                no_interactive=no_interactive,
+            )
             with fetching_status(name, study_key):
-                items = list(getattr(sdk, attr).list(study_key))
+                items, truncated = collect_list_items(
+                    getattr(sdk, attr).list(study_key, **req_kwargs),
+                    effective_limit,
+                )
             display_list(
                 items,
                 name,
@@ -56,6 +79,7 @@ def register_list_command(
                 fields=summary_fields,
                 output_format=output_format,
                 details=items,
+                truncated=truncated,
                 interactive=False if no_interactive else None,
             )
 
@@ -63,20 +87,40 @@ def register_list_command(
             func=lambda args: list_cmd(
                 study_key=args.study_key,
                 output_format=args.output_format,
+                filter_args=args.filter_args,
+                sort=args.sort,
+                limit=args.limit,
+                fetch_all=args.fetch_all,
                 no_interactive=getattr(args, "no_interactive", False),
             )
         )
 
     else:
+        add_list_query_args(list_parser)
 
         @with_sdk
         def list_cmd_no_study(
             sdk: ImednetSDK,
             output_format: str = "table",
+            filter_args: list[str] | None = None,
+            sort: str | None = None,
+            limit: int | None = None,
+            fetch_all: bool = False,
             no_interactive: bool = False,
         ) -> None:
+            req_kwargs, effective_limit = prepare_list_query(
+                filter_args=filter_args,
+                sort=sort,
+                limit=limit,
+                fetch_all=fetch_all,
+                output_format=output_format,
+                no_interactive=no_interactive,
+            )
             with fetching_status(name):
-                items = list(getattr(sdk, attr).list())
+                items, truncated = collect_list_items(
+                    getattr(sdk, attr).list(**req_kwargs),
+                    effective_limit,
+                )
             display_list(
                 items,
                 name,
@@ -84,12 +128,17 @@ def register_list_command(
                 fields=summary_fields,
                 output_format=output_format,
                 details=items,
+                truncated=truncated,
                 interactive=False if no_interactive else None,
             )
 
         list_parser.set_defaults(
             func=lambda args: list_cmd_no_study(
                 output_format=args.output_format,
+                filter_args=args.filter_args,
+                sort=args.sort,
+                limit=args.limit,
+                fetch_all=args.fetch_all,
                 no_interactive=getattr(args, "no_interactive", False),
             )
         )
