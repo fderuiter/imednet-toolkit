@@ -66,3 +66,5 @@ class User(ImednetBaseModel):
 
 
 User = ModelEngine.get_model('User', User)
+
+__all__ = ["Role", "User"]

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, create_model
 
 from imednet.spi.sink_base import is_async_sdk, is_record_deleted
 from imednet.spi.tabular_mapper import BaseTabularRecordMapper
+from imednet.spi.utils import EnrichmentPipeline, resolve_enrichment_pipeline
 
 from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
@@ -650,6 +651,10 @@ class RecordMapper(BaseTabularRecordMapper):
             include_deleted=include_deleted,
         )
         self._loader = loader
+
+    def _resolve_enrichment_pipeline(self, study_key: str) -> EnrichmentPipeline | None:
+        """Resolve committed StudyConfiguration enrichment rules for *study_key*."""
+        return resolve_enrichment_pipeline(study_key)
 
     def _build_record_model(
         self, variable_keys: list[str], label_map: dict[str, str]

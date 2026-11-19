@@ -10,6 +10,7 @@ from typing import Any
 
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
+from .enrichment import resolve_enrichment_pipeline
 from .export import _mask_df, _record_mapper
 from .parquet_engine import PyArrowDatasetPartitionedStorageEngine
 
@@ -79,6 +80,11 @@ def export_to_hive_parquet(
     validate_partition_key(study_key)
 
     mapper = _build_record_mapper(sdk, chunk_size=chunk_size, mask_phi=mask_phi)
+    if hasattr(mapper, "_active_study_key"):
+        mapper._active_study_key = study_key
+    pipeline = resolve_enrichment_pipeline(study_key)
+    phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
+    has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
     forms = sdk.forms.list(study_key=study_key)
 
@@ -123,7 +129,12 @@ def export_to_hive_parquet(
                 study_key,
                 extra_filters={"formId": form.form_id},
             )
-            for rows, _ in iter_parsed_rows(records, record_model):
+            for parsed_rows, _ in iter_parsed_rows(records, record_model):
+                rows = (
+                    [pipeline.process(r, mask_phi=mask_phi) for r in parsed_rows]
+                    if pipeline is not None and not has_native_enrichment
+                    else parsed_rows
+                )
                 df = mapper._build_dataframe(
                     rows,
                     variable_keys,
@@ -135,7 +146,7 @@ def export_to_hive_parquet(
                 df.columns = df.columns.astype(str)
                 df = df.loc[:, ~df.columns.str.lower().duplicated()]
                 if mask_phi:
-                    df = _mask_df(df)
+                    df = _mask_df(df, phi_keys=phi_keys)
                 table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
                 storage_engine.write_form_table(
                     table,
@@ -150,6 +161,8 @@ def export_to_hive_parquet(
             extra_filters={"formId": form.form_id},
         )
         rows, _ = mapper._parse_records(records, record_model)
+        if pipeline is not None and not has_native_enrichment:
+            rows = [pipeline.process(r, mask_phi=mask_phi) for r in rows]
         df = mapper._build_dataframe(
             rows,
             variable_keys,
@@ -159,7 +172,7 @@ def export_to_hive_parquet(
         df.columns = df.columns.astype(str)
         df = df.loc[:, ~df.columns.str.lower().duplicated()]
         if mask_phi and not df.empty:
-            df = _mask_df(df)
+            df = _mask_df(df, phi_keys=phi_keys)
         table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
         storage_engine.write_form_table(
             table,

@@ -15,13 +15,22 @@ except ImportError:
 from pydantic import BaseModel, Field, ValidationError, create_model
 
 from imednet.errors import ImednetError
+from imednet.integrations.enrichment import (
+    EnrichmentPipeline,
+    mask_custom_phi_recursive,
+    resolve_enrichment_pipeline,
+)
 from imednet.integrations.sink_base import is_async_sdk, is_record_deleted
 from imednet.models.forms import Form
 from imednet.models.intervals import Interval
 from imednet.models.records import Record as RecordModel
 from imednet.models.study_structure import FormStructure, IntervalStructure, StudyStructure
 from imednet.models.variables import Variable as VariableModel
-from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.security import (
+    _normalize_key,
+    global_sensitivity_registry,
+    mask_clinical_phi,
+)
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
@@ -102,6 +111,21 @@ class BaseTabularRecordMapper:
         self.mask_phi = mask_phi
         self._include_deleted = include_deleted
         self._last_variables: list[VariableModel] = []
+        self._active_study_key: str | None = None
+        self._enrichment_cache: dict[str, EnrichmentPipeline | None] = {}
+
+    def _resolve_enrichment_pipeline(self, study_key: str) -> EnrichmentPipeline | None:
+        """Resolve committed StudyConfiguration enrichment rules for *study_key*."""
+        return resolve_enrichment_pipeline(study_key)
+
+    def _get_enrichment_pipeline(self, study_key: str | None = None) -> EnrichmentPipeline | None:
+        """Resolve and cache committed StudyConfiguration rules for *study_key*."""
+        sk = study_key if isinstance(study_key, str) and study_key else self._active_study_key
+        if not sk:
+            return None
+        if sk not in self._enrichment_cache:
+            self._enrichment_cache[sk] = self._resolve_enrichment_pipeline(sk)
+        return self._enrichment_cache[sk]
 
     @property
     def chunk_size(self) -> int:
@@ -118,6 +142,7 @@ class BaseTabularRecordMapper:
         form_whitelist: list[int] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Return variable names and label mapping for a study."""
+        self._active_study_key = study_key
         self._last_variables = []
         if variable_whitelist is not None and len(variable_whitelist) == 0:
             return [], {}
@@ -306,6 +331,7 @@ class BaseTabularRecordMapper:
         include_deleted: bool | None = None,
     ) -> list[RecordModel]:
         """Fetch records for a study applying optional filters."""
+        self._active_study_key = study_key
         return list(
             self._stream_sdk_records(
                 study_key,
@@ -326,6 +352,7 @@ class BaseTabularRecordMapper:
         include_deleted: bool | None = None,
     ) -> Iterable[RecordModel]:
         """Iterate lazily over records for a study, using optional cache loader if configured."""
+        self._active_study_key = study_key
         effective_include_deleted = (
             self._include_deleted if include_deleted is None else include_deleted
         )
@@ -391,6 +418,7 @@ class BaseTabularRecordMapper:
         record_model: type[BaseModel],
         *,
         mask_phi: bool | None = None,
+        study_key: str | None = None,
     ) -> dict[str, Any]:
         """Parse a single record using the dynamic Pydantic model."""
         should_mask = self.mask_phi if mask_phi is None else mask_phi
@@ -411,6 +439,16 @@ class BaseTabularRecordMapper:
         raw_data = rec.record_data if isinstance(rec.record_data, dict) else {}
         data = mask_clinical_phi(raw_data) if (should_mask and raw_data) else raw_data
         parsed = record_model(**data).model_dump(by_alias=False)
+        resolved_sk = (
+            study_key
+            if isinstance(study_key, str) and study_key
+            else getattr(rec, "study_key", None) or self._active_study_key
+        )
+        pipeline = self._get_enrichment_pipeline(
+            resolved_sk if isinstance(resolved_sk, str) else None
+        )
+        if pipeline is not None:
+            parsed = pipeline.process(parsed, mask_phi=should_mask)
         return {**meta, **parsed}
 
     def _parse_records(
@@ -466,6 +504,7 @@ class BaseTabularRecordMapper:
         use_labels: bool,
         *,
         mask_phi: bool | None = None,
+        study_key: str | None = None,
     ) -> pd.DataFrame:
         """Create the output DataFrame from parsed rows."""
         if pd is None:
@@ -478,6 +517,23 @@ class BaseTabularRecordMapper:
             return df
 
         should_mask = self.mask_phi if mask_phi is None else mask_phi
+        pipeline = self._get_enrichment_pipeline(study_key)
+        pipeline_phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
+        mapped_targets: list[str] = []
+        replaced_sources: set[str] = set()
+        if pipeline is not None and pipeline.mappings:
+            for src_var, rule in pipeline.mappings.items():
+                if rule.target_field and rule.target_field != src_var and src_var in variable_keys:
+                    replaced_sources.add(src_var)
+                    if (
+                        rule.target_field not in variable_keys
+                        and rule.target_field not in mapped_targets
+                    ):
+                        mapped_targets.append(rule.target_field)
+
+        effective_var_keys = [
+            k for k in variable_keys if k not in replaced_sources
+        ] + mapped_targets
         meta_cols = [
             "recordId",
             "subjectKey",
@@ -487,23 +543,30 @@ class BaseTabularRecordMapper:
             "dateCreated",
         ]
 
-        unique_variable_keys = list(
-            dict.fromkeys(key for key in variable_keys if key not in meta_cols)
+        unique_effective_var_keys = list(
+            dict.fromkeys(key for key in effective_var_keys if key not in meta_cols)
         )
-        for key in unique_variable_keys:
+        for key in unique_effective_var_keys:
             if key not in df.columns:
                 df[key] = pd.NA
 
-        df = df[meta_cols + unique_variable_keys]
+        df = df[meta_cols + unique_effective_var_keys]
         if should_mask:
             sensitive_vars = [
-                key for key in unique_variable_keys if global_sensitivity_registry.is_sensitive(key)
+                key
+                for key in unique_effective_var_keys
+                if global_sensitivity_registry.is_sensitive(key)
+                or (
+                    bool(pipeline_phi_keys)
+                    and not global_sensitivity_registry.is_exempt(key)
+                    and _normalize_key(key) in pipeline_phi_keys
+                )
             ]
             for key in sensitive_vars:
                 df[key] = "***MASKED***"
 
             non_sensitive_vars = [
-                key for key in unique_variable_keys if key not in set(sensitive_vars)
+                key for key in unique_effective_var_keys if key not in set(sensitive_vars)
             ]
             if non_sensitive_vars:
                 var_frame = df[non_sensitive_vars]
@@ -513,9 +576,13 @@ class BaseTabularRecordMapper:
                     obj_cols = var_frame.select_dtypes(include=[object]).columns
                 for col in obj_cols:
                     df[col] = df[col].apply(mask_clinical_phi)
+                    if pipeline_phi_keys:
+                        df[col] = df[col].apply(
+                            lambda val: mask_custom_phi_recursive(val, pipeline_phi_keys)
+                        )
 
         if use_labels:
-            rename_map = {key: label_map.get(key, key) for key in unique_variable_keys}
+            rename_map = {key: label_map.get(key, key) for key in unique_effective_var_keys}
             df = df.rename(columns=rename_map)
         return df
 
@@ -568,6 +635,7 @@ class BaseTabularRecordMapper:
                 label_map,
                 use_labels_as_columns,
                 mask_phi=mask_phi,
+                study_key=study_key,
             )
             if df.empty:
                 continue
@@ -660,6 +728,10 @@ class BaseTabularRecordMapper:
         include_deleted: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Generate a nested Subject -> Visit -> Form JSON tree of study records."""
+        self._active_study_key = study_key
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        pipeline = self._get_enrichment_pipeline(study_key)
+        pipeline_phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
         study_struct = self._get_study_structure(study_key)
 
         form_models: dict[int, type[BaseModel]] = {}
@@ -698,7 +770,6 @@ class BaseTabularRecordMapper:
             include_deleted=include_deleted,
         )
 
-        should_mask = self.mask_phi if mask_phi is None else mask_phi
         meta_keys = {
             "recordId",
             "subjectKey",
@@ -716,7 +787,12 @@ class BaseTabularRecordMapper:
             label_map = form_label_maps[rec.form_id]
 
             try:
-                parsed_data = self._parse_record(rec, model, mask_phi=should_mask)
+                parsed_data = self._parse_record(
+                    rec,
+                    model,
+                    mask_phi=should_mask,
+                    study_key=study_key,
+                )
             except (ValidationError, TypeError) as exc:
                 logger.warning(
                     "Failed to parse record data for recordId %s: %s",
@@ -730,6 +806,8 @@ class BaseTabularRecordMapper:
 
             if should_mask:
                 parsed_data = mask_clinical_phi(parsed_data)
+                if pipeline_phi_keys:
+                    parsed_data = mask_custom_phi_recursive(parsed_data, pipeline_phi_keys)
 
             if use_labels_as_keys:
                 remapped: dict[str, Any] = {}

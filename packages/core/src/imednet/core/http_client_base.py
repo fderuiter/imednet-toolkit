@@ -8,7 +8,9 @@ from typing import Any, Generic, TypeVar, cast
 
 import httpx
 
+from imednet.auth.credentials import CredentialSource
 from imednet.auth.strategy import AuthStrategy
+from imednet.config import Config
 from imednet.constants import (
     CONTENT_TYPE_JSON,
     HEADER_ACCEPT,
@@ -46,26 +48,19 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
         api_key: str | None = None,
         security_key: str | None = None,
         base_url: str | None = None,
-        timeout: float | httpx.Timeout = 30.0,
+        timeout: float | httpx.Timeout | None = None,
         tracer: Tracer | None = None,
         retry_config: RetryConfig | None = None,
         auth: AuthStrategy | None = None,
         transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
         simulation_mode: bool | None = None,
+        *,
+        config: Config | None = None,
+        oidc_token: str | None = None,
+        strict_mode: bool | None = None,
+        credential_source: CredentialSource | None = None,
     ) -> None:
-        """Initialize the HTTP client.
-
-        Args:
-            api_key: iMednet API key.
-            security_key: iMednet security key.
-            base_url: Base URL for the iMednet API.
-            timeout: Default request timeout in seconds or httpx.Timeout.
-            tracer: Optional OpenTelemetry tracer instance.
-            retry_config: Centralized configuration for retry behaviors.
-            auth: Optional pre-configured AuthStrategy.
-            transport: Optional custom httpx transport.
-            simulation_mode: Optional flag to enable offline simulation mode.
-        """
+        """Initialize the HTTP client and request executor."""
         super().__init__(
             api_key=api_key,
             security_key=security_key,
@@ -76,6 +71,10 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
             auth=auth,
             transport=transport,
             simulation_mode=simulation_mode,
+            config=config,
+            oidc_token=oidc_token,
+            strict_mode=strict_mode,
+            credential_source=credential_source,
         )
 
         self._executor = self._create_executor(self._client, self.retry_config)

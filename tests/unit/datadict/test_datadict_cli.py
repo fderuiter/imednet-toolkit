@@ -104,6 +104,32 @@ def test_cli_from_api(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     content = json.loads(out_file.read_text(encoding="utf-8"))
     assert content["metadata"]["studyKey"] == "STUDY1"
     assert content["forms"][0]["formKey"] == "AE"
+    mock_sdk.close.assert_called_once()
+
+
+def test_cli_from_api_closes_sdk_on_error(capsys: pytest.CaptureFixture[str]) -> None:
+    """from-api closes the SDK HTTP transport even when load_from_api raises."""
+    import httpx
+
+    from imednet.sdk import ImednetSDK
+
+    sdk = ImednetSDK(
+        api_key="test_key",  # pragma: allowlist secret
+        security_key="test_sec",  # pragma: allowlist secret
+        transport=httpx.MockTransport(lambda _req: httpx.Response(500)),
+    )
+    assert not sdk._client._client.is_closed
+
+    with (
+        patch("imednet.cli.datadict.get_sdk", return_value=sdk),
+        patch("imednet.cli.datadict.load_from_api", side_effect=RuntimeError("api boom")),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        app(["datadict", "from-api", "--study-key", "STUDY1"])
+
+    assert exc_info.value.code == 1
+    assert sdk._client._client.is_closed
+    assert "api boom" in capsys.readouterr().err
 
 
 def test_cli_from_odm(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

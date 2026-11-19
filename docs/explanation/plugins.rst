@@ -203,21 +203,27 @@ API reference
 .. autoclass:: imednet.plugins.PluginProtocol
    :members:
    :undoc-members:
+   :noindex:
 
 .. autoclass:: imednet.plugins.WorkflowsNamespaceProtocol
    :members:
    :undoc-members:
+   :noindex:
 
 .. autoclass:: imednet.plugins.AsyncWorkflowsNamespaceProtocol
    :members:
    :undoc-members:
+   :noindex:
 
 .. autoclass:: imednet.plugins.SinksPluginProtocol
    :members:
    :undoc-members:
+   :noindex:
 
 .. autoclass:: imednet.plugins.SinksNamespaceProtocol
    :members:
    :undoc-members:
+   :noindex:
 
 .. autoexception:: imednet.errors.PluginLoadError
+   :noindex:
