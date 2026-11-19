@@ -48,7 +48,8 @@ def test_sphinx_seo_hooks_emit_meta_tags_sitemap_robots_and_404(tmp_path: Path) 
     (static_dir / "showcase.js").write_text("", encoding="utf-8")
     (static_dir / "thebe_pyodide.js").write_text("", encoding="utf-8")
 
-    # Reuse the real docs/conf.py and docs/404.rst with a compact doc set for fast isolated build
+    # Reuse the real docs/conf.py, docs/_ext, and docs/404.rst with a compact doc set for fast isolated build
+    shutil.copytree(REPO_ROOT / "docs" / "_ext", src_dir / "_ext")
     shutil.copy2(REPO_ROOT / "docs" / "conf.py", src_dir / "conf.py")
     (src_dir / "index.rst").write_text(
         ".. meta::\n"

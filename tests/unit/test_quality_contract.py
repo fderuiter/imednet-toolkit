@@ -32,12 +32,16 @@ def test_ci_uses_canonical_full_verification():
 
 
 def test_ci_docs_job_enforces_clean_working_tree_and_validation():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    docs_deps = project["project"]["optional-dependencies"]["docs"]
+    assert not any("sphinx-thebe" in dep for dep in docs_deps)
     pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
     steps = pipeline["jobs"]["docs"]["steps"]
     run_blocks = [s.get("run", "") for s in steps if "run" in s]
     assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in run_blocks)
     assert sum("uv run python scripts/build_docs.py" == r.strip() for r in run_blocks) == 1
+    assert any("scripts/verify_pyodide_tutorials.py" in r for r in run_blocks)
     assert not any("pip install" in r for r in run_blocks)
     assert not any("hatch run" in r for r in run_blocks)
     assert any(
