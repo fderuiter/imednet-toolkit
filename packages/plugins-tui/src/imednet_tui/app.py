@@ -8,9 +8,10 @@ import inspect
 import logging
 import os
 import re
-from collections.abc import AsyncIterable, Callable, Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -33,15 +34,17 @@ from textual.widgets import (
     TabPane,
 )
 
-from imednet.sdk import AsyncImednetSDK, ImednetSDK
-from imednet.spi.models import TERMINAL_JOB_STATES, Job, JobStatus
+from imednet.spi.cli import is_interactive_terminal
+from imednet.spi.constants import MAX_PAGE_SIZE
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+from imednet.spi.models import Job, JobState, JobStatus
 from imednet.spi.utils import (
     InvalidJobStateError,
     InvalidJobTransitionError,
+    JobFailedError,
     JobStateTracker,
+    evaluate_job_state,
 )
-
-from .terminal import is_interactive_terminal
 
 __all__ = [
     "DEFAULT_FETCH_LIMIT",
@@ -62,12 +65,9 @@ DEFAULT_FETCH_LIMIT = 100
 _INVALID_ID_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]")
 _VALID_ID_START_RE = re.compile(r"^[A-Za-z_]")
 _BATCH_TOKEN_SPLIT_RE = re.compile(r"[\s,]+")
-_TERMINAL_STATE_NAMES: frozenset[str] = frozenset(
-    state.value.upper() for state in TERMINAL_JOB_STATES
-)
 _SUCCESS_STATE_NAMES: frozenset[str] = frozenset({"COMPLETED", "COMPLETE", "SUCCESS"})
 _ACTIVE_STATE_NAMES: frozenset[str] = frozenset(
-    {"PROCESSING", "PENDING", "RUNNING", "QUEUED", "OPEN"}
+    {"PROCESSING", "PENDING", "RUNNING", "QUEUED", "OPEN", "ACTIVE"}
 )
 
 
@@ -85,84 +85,6 @@ def _normalize_batch_ids(raw_values: Sequence[str] | str | None) -> list[str]:
                 seen.add(cleaned)
                 normalized.append(cleaned)
     return normalized
-
-
-def _extract_job_state(job: Any) -> str:
-    """Extract a normalized display state string from a job model or mock."""
-    for attr in ("state", "status", "job_status"):
-        val = getattr(job, attr, None)
-        if isinstance(val, Enum):
-            return str(val.value)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return "UNKNOWN"
-
-
-def _is_terminal_job(job: Any) -> bool:
-    """Return True if ``job`` has reached a terminal lifecycle state."""
-    if isinstance(job, Job):
-        return job.is_terminal
-    if isinstance(job, _TrackedJobPlaceholder):
-        return job.is_terminal
-    explicit = getattr(job, "is_terminal", None)
-    if isinstance(explicit, bool):
-        return explicit
-    return _extract_job_state(job).strip().upper() in _TERMINAL_STATE_NAMES
-
-
-def _extract_job_row(job: Any, fallback_id: str = "") -> tuple[str, str, str, str, str, str]:
-    """Extract ``(batch_id, state, progress, total, failed, created)`` strings for a job."""
-    batch_id = ""
-    for attr in ("batch_id", "job_id"):
-        raw_id = getattr(job, attr, None)
-        if isinstance(raw_id, str) and raw_id.strip():
-            batch_id = raw_id.strip()
-            break
-        if isinstance(raw_id, int) and not isinstance(raw_id, bool):
-            batch_id = str(raw_id)
-            break
-    if not batch_id:
-        batch_id = fallback_id.strip() if fallback_id.strip() else "-"
-
-    state_str = _extract_job_state(job)
-    state_upper = state_str.upper()
-
-    raw_progress = getattr(job, "progress", None)
-    if isinstance(raw_progress, (int, float)) and not isinstance(raw_progress, bool):
-        progress_str = f"{int(raw_progress)}%"
-    elif isinstance(raw_progress, str) and raw_progress.strip():
-        cleaned_prog = raw_progress.strip()
-        progress_str = cleaned_prog if cleaned_prog.endswith("%") else f"{cleaned_prog}%"
-    elif state_upper in _SUCCESS_STATE_NAMES:
-        progress_str = "100%"
-    elif isinstance(job, (Job, JobStatus)) and not isinstance(job, _TrackedJobPlaceholder):
-        progress_str = "0%"
-    else:
-        progress_str = "-"
-
-    if isinstance(job, _TrackedJobPlaceholder):
-        total_str = "-"
-        failed_str = "-"
-    else:
-        raw_total = getattr(job, "total_records", getattr(job, "record_total_count", None))
-        total_str = (
-            str(raw_total)
-            if isinstance(raw_total, int) and not isinstance(raw_total, bool)
-            else "-"
-        )
-        raw_failed = getattr(job, "failed_records", getattr(job, "record_failure_count", None))
-        failed_str = (
-            str(raw_failed)
-            if isinstance(raw_failed, int) and not isinstance(raw_failed, bool)
-            else "-"
-        )
-
-    raw_created = getattr(job, "date_created", None)
-    created_str = (
-        raw_created.strip() if isinstance(raw_created, str) and raw_created.strip() else "-"
-    )
-
-    return (batch_id, state_str, progress_str, total_str, failed_str, created_str)
 
 
 def _sanitize_dom_id(prefix: str, raw_value: object, used_ids: set[str]) -> str:
@@ -190,118 +112,36 @@ def _sanitize_dom_id(prefix: str, raw_value: object, used_ids: set[str]) -> str:
     return candidate
 
 
-def _consume_bounded(
-    source: Any,
-    limit: int | None,
-    *,
-    predicate: Callable[[Any], bool] | None = None,
-) -> tuple[list[Any], bool]:
-    """Consume up to ``limit`` items from ``source`` and report whether items were truncated."""
-    if limit is None:
-        items = [x for x in source if predicate is None or predicate(x)]
-        return items, False
-    if isinstance(source, Sequence):
-        filtered = [x for x in source if predicate is None or predicate(x)]
-        return list(filtered[:limit]), len(filtered) > limit
-    if hasattr(source, "has_more"):
-        items = []
-        for item in source:
-            if predicate is None or predicate(item):
-                items.append(item)
-                if len(items) >= limit:
-                    break
-        return items, bool(getattr(source, "has_more", False))
-    items = []
-    for item in source:
-        if predicate is None or predicate(item):
-            if len(items) >= limit:
-                return items, True
-            items.append(item)
-    return items, False
+def _escape_markup(text: str) -> str:
+    """Escape square brackets so dynamic text is rendered literally by Rich markup."""
+    return text.replace("[", r"\[")
 
 
-async def _consume_async_bounded(
-    source: AsyncIterable[Any],
-    limit: int | None,
-    *,
-    predicate: Callable[[Any], bool] | None = None,
-) -> tuple[list[Any], bool]:
-    """Consume up to ``limit`` items from an async iterable and report truncation."""
-    if limit is None:
-        return [item async for item in source if predicate is None or predicate(item)], False
-
-    has_more_attr = hasattr(source, "has_more")
-    items: list[Any] = []
-    iterator = aiter(source)
-    while len(items) < limit:
-        try:
-            item = await anext(iterator)
-        except StopAsyncIteration:
-            return items, False
-        if predicate is None or predicate(item):
-            items.append(item)
-
-    if has_more_attr:
-        return items, bool(getattr(source, "has_more", False))
-
-    while True:
-        try:
-            extra = await anext(iterator)
-        except StopAsyncIteration:
-            return items, False
-        if predicate is None or predicate(extra):
-            return items, True
-
-
-async def _collect_bounded_endpoint_items(
-    func: Callable[..., Any],
+async def _fetch_bounded_facade_items(
+    sdk: ImednetFacade | AsyncImednetFacade,
+    async_method_name: str,
+    sync_method_name: str,
     *args: Any,
     limit: int | None = None,
-    predicate: Callable[[Any], bool] | None = None,
-    **kwargs: Any,
+    **filters: Any,
 ) -> tuple[list[Any], bool]:
-    """Collect up to ``limit`` items from a sync, coroutine, or async-iterable endpoint method."""
-    if inspect.iscoroutinefunction(func):
-        result = await func(*args, **kwargs)
-    elif inspect.isasyncgenfunction(func):
-        return await _consume_async_bounded(func(*args, **kwargs), limit, predicate=predicate)
+    """Fetch items through the typed async or sync SPI facade with bounded pagination."""
+    req_filters: dict[str, Any] = dict(filters)
+    if limit is not None:
+        req_filters["limit"] = min(limit + 1, MAX_PAGE_SIZE)
+
+    async_fn: Callable[..., Any] | None = getattr(sdk, async_method_name, None)
+    if inspect.iscoroutinefunction(async_fn):
+        raw_items = await async_fn(*args, **req_filters)
     else:
+        sync_fn: Callable[..., Any] = getattr(sdk, sync_method_name)
+        raw_items = await asyncio.to_thread(sync_fn, *args, **req_filters)
 
-        def _invoke_sync() -> Any:
-            res = func(*args, **kwargs)
-            if inspect.isawaitable(res) or isinstance(res, AsyncIterable):
-                return res
-            return _consume_bounded(res, limit, predicate=predicate)
-
-        sync_outcome = await asyncio.to_thread(_invoke_sync)
-        if not inspect.isawaitable(sync_outcome) and not isinstance(sync_outcome, AsyncIterable):
-            return sync_outcome  # type: ignore[no-any-return]
-        result = sync_outcome
-
-    if inspect.isawaitable(result):
-        result = await result
-    if isinstance(result, AsyncIterable):
-        return await _consume_async_bounded(result, limit, predicate=predicate)
-    return _consume_bounded(result, limit, predicate=predicate)
-
-
-async def _collect_endpoint_items(
-    func: Callable[..., Any],
-    *args: Any,
-    **kwargs: Any,
-) -> list[Any]:
-    """Collect items from a synchronous, coroutine, or async-iterable endpoint method.
-
-    Args:
-        func: SDK endpoint callable to invoke.
-        *args: Positional arguments forwarded to ``func``.
-        **kwargs: Keyword arguments forwarded to ``func``.
-
-    Returns:
-        Materialized list of items yielded or returned by ``func``.
-    """
-    items, _ = await _collect_bounded_endpoint_items(func, *args, limit=None, **kwargs)
-    return items
+    items = list(raw_items)
+    if limit is None:
+        return items, False
+    truncated = len(items) > limit
+    return items[:limit], truncated
 
 
 def _sync_widget_truncation(widget: Any, count: int, truncated: bool) -> None:
@@ -370,7 +210,7 @@ class StudyList(ListView):
 
     def __init__(
         self,
-        sdk: ImednetSDK | AsyncImednetSDK,
+        sdk: ImednetFacade | AsyncImednetFacade,
         *,
         preferred_study_key: str | None = None,
         **kwargs: Any,
@@ -378,7 +218,7 @@ class StudyList(ListView):
         """Initialize the StudyList widget.
 
         Args:
-            sdk: Active iMednet SDK client instance.
+            sdk: Active iMednet SDK facade instance.
             preferred_study_key: Optional study key to highlight when initially loaded.
             **kwargs: Additional widget arguments.
         """
@@ -395,7 +235,7 @@ class StudyList(ListView):
         await self.load_studies()
 
     async def load_studies(self, *, load_all: bool = False) -> None:
-        """Fetch and populate study items from the SDK asynchronously.
+        """Fetch and populate study items from the SDK facade asynchronously.
 
         Args:
             load_all: When True, fetch all pages instead of the initial bounded batch.
@@ -408,19 +248,12 @@ class StudyList(ListView):
         self.loading = True
         limit = None if load_all else DEFAULT_FETCH_LIMIT
         try:
-            studies_ep: Any = self.sdk.studies
-            if hasattr(studies_ep, "async_list"):
-                studies, truncated = await _collect_bounded_endpoint_items(
-                    studies_ep.async_list, limit=limit
-                )
-            elif isinstance(self.sdk, (ImednetSDK, AsyncImednetSDK)) and limit is not None:
-                studies, truncated = await _collect_bounded_endpoint_items(
-                    studies_ep.list, limit=limit, size=limit
-                )
-            else:
-                studies, truncated = await _collect_bounded_endpoint_items(
-                    studies_ep.list, limit=limit
-                )
+            studies, truncated = await _fetch_bounded_facade_items(
+                self.sdk,
+                "async_get_studies",
+                "get_studies",
+                limit=limit,
+            )
 
             used_ids: set[str] = set()
             items: list[ListItem] = []
@@ -503,11 +336,11 @@ class SiteList(ListView):
             self.site_name = site_name
             super().__init__()
 
-    def __init__(self, sdk: ImednetSDK | AsyncImednetSDK, **kwargs: Any) -> None:
+    def __init__(self, sdk: ImednetFacade | AsyncImednetFacade, **kwargs: Any) -> None:
         """Initialize the SiteList widget.
 
         Args:
-            sdk: Active iMednet SDK client instance.
+            sdk: Active iMednet SDK facade instance.
             **kwargs: Additional widget arguments.
         """
         super().__init__(**kwargs)
@@ -532,19 +365,13 @@ class SiteList(ListView):
         self.loading = True
         limit = None if load_all else DEFAULT_FETCH_LIMIT
         try:
-            sites_ep: Any = self.sdk.sites
-            if hasattr(sites_ep, "async_list"):
-                sites, truncated = await _collect_bounded_endpoint_items(
-                    sites_ep.async_list, study_key, limit=limit
-                )
-            elif isinstance(self.sdk, (ImednetSDK, AsyncImednetSDK)) and limit is not None:
-                sites, truncated = await _collect_bounded_endpoint_items(
-                    sites_ep.list, study_key, limit=limit, size=limit
-                )
-            else:
-                sites, truncated = await _collect_bounded_endpoint_items(
-                    sites_ep.list, study_key, limit=limit
-                )
+            sites, truncated = await _fetch_bounded_facade_items(
+                self.sdk,
+                "async_get_sites",
+                "get_sites",
+                study_key,
+                limit=limit,
+            )
 
             used_ids: set[str] = set()
             items: list[ListItem] = []
@@ -560,7 +387,7 @@ class SiteList(ListView):
             if self.is_attached:
                 if self.children:
                     await self.clear()
-                self.extend(items)
+                await self.extend(items)
                 if items:
                     self.index = min(prev_index, len(items) - 1) if prev_index is not None else 0
             self.truncated = truncated
@@ -595,11 +422,11 @@ class SiteList(ListView):
 class SubjectTable(DataTable[str]):
     """Interactive table displaying subjects."""
 
-    def __init__(self, sdk: ImednetSDK | AsyncImednetSDK, **kwargs: Any) -> None:
+    def __init__(self, sdk: ImednetFacade | AsyncImednetFacade, **kwargs: Any) -> None:
         """Initialize the SubjectTable widget.
 
         Args:
-            sdk: Active iMednet SDK client instance.
+            sdk: Active iMednet SDK facade instance.
             **kwargs: Additional widget arguments.
         """
         super().__init__(**kwargs)
@@ -626,7 +453,7 @@ class SubjectTable(DataTable[str]):
 
         Args:
             study_key: Study key to query subjects from.
-            site_id: Optional site identifier to filter results.
+            site_id: Optional site identifier to filter results directly via the SDK facade.
             load_all: When True, fetch all pages instead of the initial bounded batch.
         """
         self.current_study_key = study_key
@@ -636,56 +463,30 @@ class SubjectTable(DataTable[str]):
         self.loading = True
         limit = None if load_all else DEFAULT_FETCH_LIMIT
         try:
-            subjects_ep: Any = self.sdk.subjects
-            site_pred: Callable[[Any], bool] | None = (
-                (lambda sub: str(getattr(sub, "site_id", "") or "") == str(site_id))
-                if site_id is not None
-                else None
+            filters: dict[str, Any] = {}
+            if site_id is not None:
+                filters["site_id"] = site_id
+            subjects, truncated = await _fetch_bounded_facade_items(
+                self.sdk,
+                "async_get_subjects",
+                "get_subjects",
+                study_key,
+                limit=limit,
+                **filters,
             )
-            is_real_sdk = isinstance(self.sdk, (ImednetSDK, AsyncImednetSDK))
-            if hasattr(subjects_ep, "async_list"):
-                subjects, truncated = await _collect_bounded_endpoint_items(
-                    subjects_ep.async_list,
-                    study_key,
-                    limit=limit,
-                    predicate=site_pred,
-                )
-            elif is_real_sdk:
-                req_kwargs: dict[str, Any] = {}
-                if site_id is not None:
-                    req_kwargs["site_id"] = site_id
-                if limit is not None:
-                    req_kwargs["size"] = limit
-                if site_id is not None and load_all and hasattr(subjects_ep, "list_by_site"):
-                    subjects, truncated = await _collect_bounded_endpoint_items(
-                        subjects_ep.list_by_site, study_key, site_id, limit=None
-                    )
-                else:
-                    subjects, truncated = await _collect_bounded_endpoint_items(
-                        subjects_ep.list, study_key, limit=limit, **req_kwargs
-                    )
-            elif site_id is not None and hasattr(subjects_ep, "list_by_site"):
-                subjects, truncated = await _collect_bounded_endpoint_items(
-                    subjects_ep.list_by_site, study_key, site_id, limit=limit
-                )
-            else:
-                subjects, truncated = await _collect_bounded_endpoint_items(
-                    subjects_ep.list,
-                    study_key,
-                    limit=limit,
-                    predicate=site_pred,
-                )
 
             rows = []
             for sub in subjects:
                 s_site_id = str(getattr(sub, "site_id", "") or "")
-                if site_id is None or s_site_id == str(site_id):
-                    sub_id = getattr(sub, "subject_id", "-")
-                    status = (
-                        getattr(sub, "subject_status", None) or getattr(sub, "status", None) or "-"
-                    )
-                    created = str(getattr(sub, "date_created", "-"))
-                    rows.append((str(sub_id), s_site_id, str(status), created))
+                raw_sub_id = getattr(sub, "subject_id", None)
+                sub_id = (
+                    raw_sub_id
+                    if raw_sub_id is not None
+                    else (getattr(sub, "subject_key", None) or "-")
+                )
+                status = getattr(sub, "subject_status", None) or getattr(sub, "status", None) or "-"
+                created = str(getattr(sub, "date_created", None) or "-")
+                rows.append((str(sub_id), s_site_id, str(status), created))
             if self.is_mounted:
                 self.clear()
             self.add_rows(rows)
@@ -729,6 +530,91 @@ class _TrackedJobPlaceholder:
         self.poll_error = error
         self.date_created = ""
         self.is_terminal = False
+
+
+@dataclass
+class _TrackedJobEntry:
+    """Per-study tracked job state for monotonic evaluation and terminal freezing."""
+
+    job_id: str
+    last_job: Any = None
+    last_state: JobState | str | None = None
+    is_terminal: bool = False
+    warning: str | None = None
+
+
+def _extract_entry_row(entry: _TrackedJobEntry) -> tuple[str, str, str, str, str, str]:
+    """Extract ``(batch_id, state, progress, total, failed, created)`` strings for an entry."""
+    job = entry.last_job
+    if job is None:
+        batch_id = entry.job_id.strip() if entry.job_id.strip() else "-"
+        state_str = "WARNING" if entry.warning else "ACTIVE"
+        return (batch_id, state_str, "-", "-", "-", "-")
+
+    batch_id = ""
+    for attr in ("batch_id", "job_id"):
+        raw_id = getattr(job, attr, None)
+        if isinstance(raw_id, str) and raw_id.strip():
+            batch_id = raw_id.strip()
+            break
+        if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+            batch_id = str(raw_id)
+            break
+    if not batch_id:
+        batch_id = entry.job_id.strip() if entry.job_id.strip() else "-"
+
+    if isinstance(job, _TrackedJobPlaceholder):
+        raw_state: Any = job.status
+    else:
+        raw_state = getattr(job, "state", None)
+        if raw_state is None:
+            raw_state = getattr(job, "status", None) or getattr(job, "job_status", None)
+
+    if raw_state is None:
+        state_str = "ACTIVE"
+    elif isinstance(raw_state, Enum):
+        state_str = str(raw_state.value)
+    else:
+        cleaned_state = str(raw_state).strip()
+        state_str = cleaned_state if cleaned_state else "ACTIVE"
+
+    state_upper = state_str.upper()
+    raw_progress = getattr(job, "progress", None)
+    if isinstance(raw_progress, (int, float)) and not isinstance(raw_progress, bool):
+        progress_str = f"{int(raw_progress)}%"
+    elif isinstance(raw_progress, str) and raw_progress.strip():
+        cleaned_prog = raw_progress.strip()
+        progress_str = cleaned_prog if cleaned_prog.endswith("%") else f"{cleaned_prog}%"
+    elif state_upper in _SUCCESS_STATE_NAMES:
+        progress_str = "100%"
+    elif isinstance(job, (Job, JobStatus)) and not isinstance(job, _TrackedJobPlaceholder):
+        progress_str = "0%"
+    else:
+        progress_str = "-"
+
+    if isinstance(job, _TrackedJobPlaceholder):
+        total_str = "-"
+        failed_str = "-"
+    else:
+        raw_total = getattr(job, "total_records", getattr(job, "record_total_count", None))
+        total_str = (
+            str(raw_total)
+            if isinstance(raw_total, int) and not isinstance(raw_total, bool)
+            else "-"
+        )
+        raw_failed = getattr(job, "failed_records", getattr(job, "record_failure_count", None))
+        failed_str = (
+            str(raw_failed)
+            if isinstance(raw_failed, int) and not isinstance(raw_failed, bool)
+            else "-"
+        )
+
+    raw_created = getattr(job, "date_created", None)
+    created_str = (
+        raw_created.strip() if isinstance(raw_created, str) and raw_created.strip() else "-"
+    )
+
+    return (batch_id, state_str, progress_str, total_str, failed_str, created_str)
 
 
 class JobTable(DataTable[str]):
@@ -812,7 +698,7 @@ class JobMonitor(Container):
 
     def __init__(
         self,
-        sdk: ImednetSDK | AsyncImednetSDK,
+        sdk: ImednetFacade | AsyncImednetFacade,
         *,
         max_concurrency: int = MAX_CONCURRENT_POLLS,
         **kwargs: Any,
@@ -820,7 +706,7 @@ class JobMonitor(Container):
         """Initialize the JobMonitor widget.
 
         Args:
-            sdk: Active iMednet SDK client instance.
+            sdk: Active iMednet SDK facade instance.
             max_concurrency: Maximum number of concurrent status polling requests.
             **kwargs: Additional widget arguments.
         """
@@ -832,27 +718,10 @@ class JobMonitor(Container):
         self._polling_active = False
         self.current_study_key: str | None = None
         self._tracker = JobStateTracker()
-        self._study_job_ids: dict[str, list[str]] = {}
-        self._study_job_cache: dict[str, dict[str, Any]] = {}
-        self._study_poll_errors: dict[str, dict[str, str]] = {}
-        self._unscoped_job_ids: list[str] = []
+        self._study_jobs: dict[str, dict[str, _TrackedJobEntry]] = {}
+        self._unassigned_job_ids: list[str] = []
         self._rendered_study_key: str | None = None
         self._summary_text = "Job Monitor: Select a study to view background jobs."
-
-    @property
-    def tracked_job_ids(self) -> list[str]:
-        """Tracked batch IDs scoped to the active study."""
-        if self.current_study_key:
-            return self._study_job_ids.setdefault(self.current_study_key, [])
-        return self._unscoped_job_ids
-
-    @tracked_job_ids.setter
-    def tracked_job_ids(self, value: Sequence[str]) -> None:
-        normalized = _normalize_batch_ids(list(value))
-        if self.current_study_key:
-            self._study_job_ids[self.current_study_key] = normalized
-        else:
-            self._unscoped_job_ids = normalized
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -860,6 +729,29 @@ class JobMonitor(Container):
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self.max_concurrency)
         return self._semaphore
+
+    @property
+    def state_tracker(self) -> JobStateTracker:
+        """Return the monotonic per-study job state tracker."""
+        return self._tracker
+
+    @property
+    def tracked_job_ids(self) -> list[str]:
+        """Return tracked job IDs in registration order for the active study."""
+        if self.current_study_key is not None:
+            return list(self._study_jobs.get(self.current_study_key, ()))
+        return list(self._unassigned_job_ids)
+
+    @tracked_job_ids.setter
+    def tracked_job_ids(self, value: Sequence[str]) -> None:
+        normalized = _normalize_batch_ids(list(value))
+        if self.current_study_key is not None:
+            existing = self._study_jobs.get(self.current_study_key, {})
+            self._study_jobs[self.current_study_key] = {
+                jid: existing.get(jid, _TrackedJobEntry(job_id=jid)) for jid in normalized
+            }
+        else:
+            self._unassigned_job_ids = normalized
 
     @property
     def is_polling_active(self) -> bool:
@@ -878,6 +770,38 @@ class JobMonitor(Container):
             self.timer.resume()
             self._polling_active = True
 
+    def _entries_for_study(self, study_key: str) -> dict[str, _TrackedJobEntry]:
+        """Return the ordered tracked-job map for ``study_key``."""
+        entries = self._study_jobs.setdefault(study_key, {})
+        if self._unassigned_job_ids and study_key == self.current_study_key:
+            for jid in self._unassigned_job_ids:
+                entries.setdefault(jid, _TrackedJobEntry(job_id=jid))
+            self._unassigned_job_ids.clear()
+        return entries
+
+    def _has_active_tracked_jobs(self, study_key: str) -> bool:
+        """Return True if ``study_key`` has unpolled or non-terminal tracked jobs."""
+        entries = self._study_jobs.get(study_key)
+        if not entries:
+            return False
+        return any(
+            not entry.is_terminal and not self._tracker.is_terminal(study_key, entry.job_id)
+            for entry in entries.values()
+        )
+
+    def _sync_timer_for_study(self, study_key: str | None) -> None:
+        """Resume polling timer only when active jobs exist; pause otherwise."""
+        if self.timer is None:
+            self._polling_active = False
+            return
+        if not study_key:
+            self._pause_timer()
+            return
+        if self._has_active_tracked_jobs(study_key):
+            self._resume_timer()
+        else:
+            self._pause_timer()
+
     def compose(self) -> ComposeResult:
         """Compose inline batch input, status notice, and scrollable jobs table."""
         yield Input(
@@ -886,6 +810,10 @@ class JobMonitor(Container):
         )
         yield Static(self._summary_text, id="job_monitor_notice")
         yield JobTable(id="job_table")
+
+    def update(self, content: str = "") -> None:
+        """Store summary markup text for non-composited inspection and testing."""
+        self._summary_text = content
 
     def render(self) -> Text:
         """Return summary text representation for non-composited inspection."""
@@ -900,7 +828,7 @@ class JobMonitor(Container):
         preserve_cursor: bool = True,
     ) -> None:
         """Synchronize summary text, notice banner, and table rows when mounted."""
-        self._summary_text = summary_text
+        self.update(summary_text)
         if not self.is_mounted:
             return
         with contextlib.suppress(Exception):
@@ -910,18 +838,6 @@ class JobMonitor(Container):
             table = self.query_one("#job_table", JobTable)
             table.set_job_rows(rows, preserve_cursor=preserve_cursor)
 
-    def _has_active_tracked_jobs(self, study_key: str) -> bool:
-        """Return True if ``study_key`` has unpolled or non-terminal tracked jobs."""
-        tracked = self._study_job_ids.get(study_key, [])
-        if not tracked:
-            return False
-        study_cache = self._study_job_cache.get(study_key, {})
-        return any(
-            not self._tracker.is_terminal(study_key, jid)
-            and (jid not in study_cache or not _is_terminal_job(study_cache[jid]))
-            for jid in tracked
-        )
-
     def _schedule_refresh(self) -> None:
         """Schedule an exclusive ``refresh_jobs`` worker in the ``refresh-jobs`` group."""
         if self.is_mounted:
@@ -930,23 +846,6 @@ class JobMonitor(Container):
                 exclusive=True,
                 group="refresh-jobs",
             )
-
-    def _sync_timer_for_study(self, study_key: str | None) -> None:
-        """Resume polling timer only when active jobs exist; pause otherwise."""
-        if self.timer is None:
-            self._polling_active = False
-            return
-        if not study_key:
-            self._pause_timer()
-            return
-        jobs_ep: Any = getattr(self.sdk, "jobs", None)
-        if hasattr(jobs_ep, "async_list") or hasattr(jobs_ep, "list"):
-            self._resume_timer()
-            return
-        if self._has_active_tracked_jobs(study_key):
-            self._resume_timer()
-        else:
-            self._pause_timer()
 
     def on_mount(self) -> None:
         """Set up status message and interval polling timer on mount."""
@@ -985,30 +884,34 @@ class JobMonitor(Container):
         if not parsed_ids:
             return []
 
-        target_study = study_key or self.current_study_key
-        bucket = (
-            self._study_job_ids.setdefault(target_study, [])
-            if target_study
-            else self._unscoped_job_ids
-        )
-        study_cache = self._study_job_cache.get(target_study, {}) if target_study else {}
-        for jid in parsed_ids:
-            if jid not in bucket:
-                bucket.append(jid)
-            elif isinstance(study_cache.get(jid), _TrackedJobPlaceholder):
-                study_cache.pop(jid, None)
+        target_study = study_key if study_key is not None else self.current_study_key
+        if target_study:
+            entries = self._entries_for_study(target_study)
+            for jid in parsed_ids:
+                existing = entries.get(jid)
+                if existing is None:
+                    entries[jid] = _TrackedJobEntry(job_id=jid)
+                elif (
+                    isinstance(existing.last_job, _TrackedJobPlaceholder)
+                    and not existing.is_terminal
+                ):
+                    existing.last_job = None
+        else:
+            for jid in parsed_ids:
+                if jid not in self._unassigned_job_ids:
+                    self._unassigned_job_ids.append(jid)
 
         if refresh and target_study and target_study == self.current_study_key:
             self._sync_timer_for_study(target_study)
             self._schedule_refresh()
         return parsed_ids
 
-    def track_job(self, job_id: str, *, study_key: str | None = None) -> None:
-        """Register a known job ID to monitor.
+    def track_job(self, job_id: str, study_key: str | None = None) -> None:
+        """Register a known job ID to monitor for the specified or active study.
 
         Args:
             job_id: Known background job or batch identifier.
-            study_key: Optional study key; defaults to ``current_study_key``.
+            study_key: Optional study key override; defaults to ``current_study_key``.
         """
         self.track_jobs(job_id, study_key=study_key, refresh=True)
 
@@ -1027,69 +930,242 @@ class JobMonitor(Container):
         self.track_jobs(batch_ids, study_key=self.current_study_key, refresh=True)
 
     def set_study(self, study_key: str) -> None:
-        """Set the active study key and trigger background job refresh.
+        """Set the active study key, display cached study jobs, and trigger refresh.
 
         Args:
             study_key: Active study key to track jobs for.
         """
         self.current_study_key = study_key
-        if self._unscoped_job_ids:
-            target_bucket = self._study_job_ids.setdefault(study_key, [])
-            for jid in self._unscoped_job_ids:
-                if jid not in target_bucket:
-                    target_bucket.append(jid)
-            self._unscoped_job_ids.clear()
-
+        entries = self._entries_for_study(study_key)
         self._sync_timer_for_study(study_key)
-        if not self._study_job_ids.get(study_key):
-            self._summary_text = f"Job Monitor: Loading jobs for study '{study_key}'..."
+        if entries and any(
+            e.last_job is not None or e.warning is not None for e in entries.values()
+        ):
+            self._render_study_entries(study_key, entries)
+        else:
+            loading_msg = f"Job Monitor: Loading jobs for study '{_escape_markup(study_key)}'..."
+            self._update_ui(
+                summary_text=loading_msg,
+                notice_text=loading_msg,
+                rows=(),
+                preserve_cursor=False,
+            )
         self._schedule_refresh()
 
-    async def _poll_tracked_job(
-        self,
-        jobs_ep: Any,
-        study_key: str,
-        jid: str,
-    ) -> Any:
-        """Poll status for a single tracked job under the concurrency semaphore.
+    async def _fetch_job_status(self, study_key: str, jid: str) -> Any:
+        """Retrieve a single job status through the async or sync SPI facade."""
+        async_fn: Callable[..., Any] | None = getattr(self.sdk, "async_get_job", None)
+        if inspect.iscoroutinefunction(async_fn):
+            return await async_fn(study_key, jid)
+        sync_fn = cast(ImednetFacade, self.sdk).get_job
+        return await asyncio.to_thread(sync_fn, study_key, jid)
 
-        Args:
-            jobs_ep: Jobs endpoint instance or mock.
-            study_key: Active study key identifier.
-            jid: Tracked job or batch identifier.
-
-        Returns:
-            Retrieved job model instance or _TrackedJobPlaceholder on failure/unknown.
-        """
-        async with self.semaphore:
+    def _apply_job_evaluation(self, study_key: str, entry: _TrackedJobEntry, job: Any) -> None:
+        """Evaluate ``job`` monotonically via ``JobStateTracker`` and ``evaluate_job_state``."""
+        if entry.is_terminal or self._tracker.is_terminal(study_key, entry.job_id):
+            entry.is_terminal = True
+            if job is None:
+                logging.getLogger("imednet_tui").warning(
+                    "Ignoring stale response for job %s (state=%r); terminal state %s preserved",
+                    entry.job_id,
+                    None,
+                    entry.last_state,
+                )
+                return
             try:
-                if hasattr(jobs_ep, "get"):
-                    if inspect.iscoroutinefunction(jobs_ep.get):
-                        job = await jobs_ep.get(study_key, jid)
-                    else:
-                        res = await asyncio.to_thread(jobs_ep.get, study_key, jid)
-                        if inspect.isawaitable(res):
-                            job = await res
-                        else:
-                            job = res
-                elif hasattr(jobs_ep, "async_get"):
-                    res = jobs_ep.async_get(study_key, jid)
-                    if inspect.isawaitable(res):
-                        job = await res
-                    else:
-                        job = res
-                else:
-                    job = None
+                effective = self._tracker.observe(study_key, entry.job_id, job)
+            except (InvalidJobStateError, InvalidJobTransitionError) as err:
+                logging.getLogger("imednet_tui").warning(
+                    "Invalid job state update for %s: %s", entry.job_id, err
+                )
+                entry.warning = str(err)
+                return
+            if not getattr(job, "is_terminal", False):
+                logging.getLogger("imednet_tui").warning(
+                    "Ignoring stale response for job %s (state=%r); terminal state %s preserved",
+                    entry.job_id,
+                    getattr(job, "state", None),
+                    entry.last_state,
+                )
+            else:
+                entry.last_job = effective
+                tracked_state = self._tracker.get_state(study_key, entry.job_id)
+                if tracked_state is not None:
+                    entry.last_state = tracked_state
+                entry.warning = None
+            return
 
-                if job is not None:
-                    return job
-                return _TrackedJobPlaceholder(jid, "UNKNOWN")
+        if job is None:
+            entry.last_job = _TrackedJobPlaceholder(entry.job_id, "UNKNOWN")
+            entry.warning = None
+            return
+
+        effective_job = job
+        try:
+            effective_job = self._tracker.observe(study_key, entry.job_id, job)
+            is_done = evaluate_job_state(effective_job, previous_state=entry.last_state)
+        except JobFailedError:
+            entry.last_job = effective_job
+            tracked_state = self._tracker.get_state(study_key, entry.job_id)
+            raw_state = (
+                tracked_state
+                if tracked_state is not None
+                else getattr(effective_job, "state", None)
+            )
+            if raw_state is not None:
+                entry.last_state = raw_state
+            entry.is_terminal = True
+            entry.warning = None
+        except (InvalidJobStateError, InvalidJobTransitionError) as err:
+            logging.getLogger("imednet_tui").warning(
+                "Invalid job state update for %s: %s", entry.job_id, err
+            )
+            entry.warning = str(err)
+        else:
+            entry.last_job = effective_job
+            tracked_state = self._tracker.get_state(study_key, entry.job_id)
+            raw_state = (
+                tracked_state
+                if tracked_state is not None
+                else getattr(effective_job, "state", None)
+            )
+            if raw_state is not None:
+                entry.last_state = raw_state
+            entry.warning = None
+            if is_done or self._tracker.is_terminal(study_key, entry.job_id):
+                entry.is_terminal = True
+
+    async def _poll_tracked_entry(
+        self,
+        study_key: str,
+        entry: _TrackedJobEntry,
+    ) -> None:
+        """Poll status for a single non-terminal tracked job under the concurrency semaphore."""
+        if entry.is_terminal or self._tracker.is_terminal(study_key, entry.job_id):
+            entry.is_terminal = True
+            if entry.last_job is None:
+                cached = self._tracker.get_snapshot(study_key, entry.job_id)
+                if cached is not None:
+                    entry.last_job = cached
+            return
+        async with self.semaphore:
+            if entry.is_terminal or self._tracker.is_terminal(study_key, entry.job_id):
+                entry.is_terminal = True
+                return
+            try:
+                job = await self._fetch_job_status(study_key, entry.job_id)
             except Exception as err:
-                logging.getLogger("imednet_tui").warning("Failed to poll job %s: %s", jid, err)
-                return _TrackedJobPlaceholder(jid, "POLL_ERROR", error=str(err))
+                if entry.is_terminal or self._tracker.is_terminal(study_key, entry.job_id):
+                    entry.is_terminal = True
+                    logging.getLogger("imednet_tui").warning(
+                        "Ignoring transient error for terminal job %s: %s",
+                        entry.job_id,
+                        err,
+                    )
+                    return
+                if (
+                    isinstance(err, (InvalidJobStateError, InvalidJobTransitionError))
+                    or err.__class__.__name__ == "ValidationError"
+                    or "Invalid job state" in str(err)
+                ):
+                    logging.getLogger("imednet_tui").warning(
+                        "Invalid job state update for %s: %s", entry.job_id, err
+                    )
+                    entry.warning = str(err)
+                    return
+                logging.getLogger("imednet_tui").warning(
+                    "Failed to poll job %s: %s", entry.job_id, err
+                )
+                if entry.last_job is None or isinstance(entry.last_job, _TrackedJobPlaceholder):
+                    entry.last_job = _TrackedJobPlaceholder(
+                        entry.job_id, "POLL_ERROR", error=str(err)
+                    )
+                    entry.warning = None
+                else:
+                    entry.warning = f"Poll error: {err}"
+                return
+
+            self._apply_job_evaluation(study_key, entry, job)
+
+    @staticmethod
+    def _format_entry_line(entry: _TrackedJobEntry) -> str:
+        """Format a single tracked job entry into Rich-safe markup."""
+        job = entry.last_job
+        if job is None:
+            safe_jid = _escape_markup(entry.job_id)
+            if entry.warning:
+                safe_warn = _escape_markup(entry.warning)
+                return f"[yellow]WARNING[/yellow] - Job ({safe_jid}) (Warning: {safe_warn})"
+            return f"[yellow]ACTIVE[/yellow] - Job ({safe_jid})"
+
+        batch_id, state_str, progress_str, total_str, failed_str, created_str = _extract_entry_row(
+            entry
+        )
+        raw_type = getattr(job, "job_type", None)
+        type_label = raw_type.strip() if isinstance(raw_type, str) and raw_type.strip() else "Job"
+        upper_status = state_str.upper()
+        if getattr(job, "is_failed", False):
+            color = "red"
+        elif upper_status in _SUCCESS_STATE_NAMES:
+            color = "green"
+        elif upper_status in _ACTIVE_STATE_NAMES or not entry.is_terminal:
+            color = "yellow"
+        else:
+            color = "red"
+
+        safe_status = _escape_markup(state_str)
+        safe_label = _escape_markup(f"{type_label} ({batch_id})" if batch_id != "-" else type_label)
+        metrics_suffix = (
+            ""
+            if isinstance(job, _TrackedJobPlaceholder)
+            else (
+                f" [{_escape_markup(progress_str)}, "
+                f"total={_escape_markup(total_str)}, failed={_escape_markup(failed_str)}]"
+            )
+        )
+        created_suffix = f" ({_escape_markup(created_str)})" if created_str != "-" else ""
+        warning_suffix = (
+            f" [yellow](Warning: {_escape_markup(entry.warning)})[/yellow]" if entry.warning else ""
+        )
+        return (
+            f"[{color}]{safe_status}[/{color}] - "
+            f"{safe_label}{metrics_suffix}{created_suffix}{warning_suffix}"
+        )
+
+    def _render_study_entries(
+        self,
+        study_key: str,
+        entries: dict[str, _TrackedJobEntry],
+    ) -> None:
+        """Render summary markup, notice banner, and table rows for ``entries``."""
+        entry_list = list(entries.values())
+        rows: list[tuple[str, str, str, str, str, str]] = []
+        lines = [f"[bold]Active & Recent Jobs ({len(entry_list)})[/bold]"]
+        active_count = 0
+        warnings: list[str] = []
+        for entry in entry_list:
+            rows.append(_extract_entry_row(entry))
+            lines.append(self._format_entry_line(entry))
+            if not entry.is_terminal:
+                active_count += 1
+            if entry.warning:
+                warnings.append(f"{entry.job_id}: {entry.warning}")
+
+        same_study = self._rendered_study_key == study_key
+        self._rendered_study_key = study_key
+        polling_note = f"{active_count} active" if active_count else "polling paused (all terminal)"
+        notice_text = f"Active & Recent Jobs ({len(rows)}) — {polling_note}"
+        if warnings:
+            notice_text = f"{notice_text} | Warning: {_escape_markup('; '.join(warnings))}"
+        self._update_ui(
+            summary_text="\n".join(lines),
+            notice_text=notice_text,
+            rows=rows,
+            preserve_cursor=same_study,
+        )
 
     async def refresh_jobs(self) -> None:
-        """Poll active jobs and update the job table for the active study."""
+        """Poll active jobs and update the job table and summary for the active study."""
         study_key = self.current_study_key
         if not study_key:
             self._pause_timer()
@@ -1105,153 +1181,62 @@ class JobMonitor(Container):
             )
             return
 
-        transition_error: Exception | None = None
         try:
-            jobs_ep: Any = self.sdk.jobs
-            jobs_with_ids: list[tuple[str, Any]] = []
-            has_active = False
-
-            if hasattr(jobs_ep, "async_list"):
-                listed = await _collect_endpoint_items(jobs_ep.async_list, study_key)
-                jobs_with_ids = [("", job) for job in listed]
-                has_active = any(not _is_terminal_job(job) for job in listed)
-            elif hasattr(jobs_ep, "list"):
-                listed = await _collect_endpoint_items(jobs_ep.list, study_key)
-                jobs_with_ids = [("", job) for job in listed]
-                has_active = any(not _is_terminal_job(job) for job in listed)
-            else:
-                tracked_ids = list(self._study_job_ids.get(study_key, []))
-                if not tracked_ids:
-                    if self.current_study_key != study_key and self.is_mounted:
-                        return
-                    self._pause_timer()
-                    self._rendered_study_key = study_key
-                    empty_msg = (
-                        f"Job Monitor: Background job enumeration is not supported by the iMednet Jobs API "
-                        f"for study '{study_key}' (upstream APIs require batch IDs). "
-                        "Enter one or more batch IDs above and press Enter to track jobs."
-                    )
-                    self._update_ui(
-                        summary_text=empty_msg,
-                        notice_text=empty_msg,
-                        rows=(),
-                        preserve_cursor=False,
-                    )
+            entries = self._entries_for_study(study_key)
+            if not entries:
+                if self.current_study_key != study_key and self.is_mounted:
                     return
+                self._pause_timer()
+                self._rendered_study_key = study_key
+                empty_msg = (
+                    f"Job Monitor: Background job enumeration is not supported by the iMednet Jobs API "
+                    f"for study '{_escape_markup(study_key)}' (upstream APIs require batch IDs). "
+                    "Enter one or more batch IDs above and press Enter to track jobs."
+                )
+                self._update_ui(
+                    summary_text=empty_msg,
+                    notice_text=empty_msg,
+                    rows=(),
+                    preserve_cursor=False,
+                )
+                return
 
-                study_cache = self._study_job_cache.setdefault(study_key, {})
-                poll_errors = self._study_poll_errors.setdefault(study_key, {})
-                for jid in tracked_ids:
-                    if jid not in study_cache and self._tracker.is_terminal(study_key, jid):
-                        cached_snap = self._tracker.get_snapshot(study_key, jid)
+            active_entries = []
+            for entry in entries.values():
+                if self._tracker.is_terminal(study_key, entry.job_id):
+                    entry.is_terminal = True
+                    if entry.last_job is None:
+                        cached_snap = self._tracker.get_snapshot(study_key, entry.job_id)
                         if cached_snap is not None:
-                            study_cache[jid] = cached_snap
+                            entry.last_job = cached_snap
+                if not entry.is_terminal:
+                    active_entries.append(entry)
 
-                ids_to_poll = [
-                    jid
-                    for jid in tracked_ids
-                    if not self._tracker.is_terminal(study_key, jid)
-                    and (jid not in study_cache or not _is_terminal_job(study_cache[jid]))
-                ]
-                if ids_to_poll:
-                    polled_results = await asyncio.gather(
-                        *(self._poll_tracked_job(jobs_ep, study_key, jid) for jid in ids_to_poll)
-                    )
-                    for jid, polled_job in zip(ids_to_poll, polled_results, strict=True):
-                        if isinstance(polled_job, _TrackedJobPlaceholder):
-                            if polled_job.poll_error:
-                                poll_errors[jid] = polled_job.poll_error
-                            prior_job = self._tracker.get_snapshot(study_key, jid)
-                            if prior_job is None:
-                                cached = study_cache.get(jid)
-                                if cached is not None and not isinstance(
-                                    cached, _TrackedJobPlaceholder
-                                ):
-                                    prior_job = cached
-                            if prior_job is not None:
-                                study_cache[jid] = prior_job
-                            else:
-                                study_cache[jid] = polled_job
-                        else:
-                            try:
-                                effective_job = self._tracker.observe(study_key, jid, polled_job)
-                            except (InvalidJobTransitionError, InvalidJobStateError) as err:
-                                if transition_error is None:
-                                    transition_error = err
-                                prior_job = self._tracker.get_snapshot(study_key, jid)
-                                if prior_job is not None:
-                                    study_cache[jid] = prior_job
-                            else:
-                                poll_errors.pop(jid, None)
-                                study_cache[jid] = effective_job
-
-                ordered_ids = list(self._study_job_ids.get(study_key, tracked_ids))
-                jobs_with_ids = [
-                    (jid, study_cache[jid]) for jid in ordered_ids if jid in study_cache
-                ]
-                has_active = any(
-                    not self._tracker.is_terminal(study_key, jid)
-                    and (jid not in study_cache or not _is_terminal_job(study_cache[jid]))
-                    for jid in ordered_ids
+            if active_entries:
+                await asyncio.gather(
+                    *(self._poll_tracked_entry(study_key, entry) for entry in active_entries)
                 )
 
             if self.current_study_key != study_key and self.is_mounted:
                 return
 
-            if has_active:
+            current_entries = self._entries_for_study(study_key)
+            if any(
+                not entry.is_terminal and not self._tracker.is_terminal(study_key, entry.job_id)
+                for entry in current_entries.values()
+            ):
                 self._resume_timer()
             else:
                 self._pause_timer()
 
-            rows: list[tuple[str, str, str, str, str, str]] = []
-            lines = [f"[bold]Active & Recent Jobs ({len(jobs_with_ids)})[/bold]"]
-            active_count = 0
-            for fallback_id, job in jobs_with_ids:
-                row = _extract_job_row(job, fallback_id=fallback_id)
-                rows.append(row)
-                is_term = _is_terminal_job(job)
-                if not is_term:
-                    active_count += 1
-                batch_id, status_str, progress_str, total_str, failed_str, created_str = row
-                job_type = getattr(job, "job_type", None)
-                type_label = (
-                    job_type.strip() if isinstance(job_type, str) and job_type.strip() else "Job"
-                )
-                color = (
-                    "green"
-                    if status_str.upper() in _SUCCESS_STATE_NAMES
-                    else "yellow"
-                    if status_str.upper() in _ACTIVE_STATE_NAMES or not is_term
-                    else "red"
-                )
-                label = f"{type_label} ({batch_id})" if batch_id != "-" else type_label
-                created_suffix = f" ({created_str})" if created_str != "-" else ""
-                lines.append(
-                    f"[{color}]{status_str}[/{color}] - {label} [{progress_str}, "
-                    f"total={total_str}, failed={failed_str}]{created_suffix}"
-                )
-
-            same_study = self._rendered_study_key == study_key
-            self._rendered_study_key = study_key
-            polling_note = (
-                f"{active_count} active" if active_count else "polling paused (all terminal)"
-            )
-            self._update_ui(
-                summary_text="\n".join(lines),
-                notice_text=f"Active & Recent Jobs ({len(rows)}) — {polling_note}",
-                rows=rows,
-                preserve_cursor=same_study,
-            )
-            if transition_error is not None:
-                raise transition_error
-        except (InvalidJobTransitionError, InvalidJobStateError):
-            raise
+            self._render_study_entries(study_key, current_entries)
         except Exception as e:
             if self.current_study_key == study_key or not self.is_mounted:
-                err_msg = f"[red]Error fetching jobs: {e}[/red]"
+                escaped_err = _escape_markup(str(e))
+                err_msg = f"[red]Error fetching jobs: {escaped_err}[/red]"
                 self._update_ui(
                     summary_text=err_msg,
-                    notice_text=f"Error fetching jobs: {e}",
+                    notice_text=f"Error fetching jobs: {escaped_err}",
                     rows=(),
                     preserve_cursor=False,
                 )
@@ -1443,7 +1428,7 @@ class DashboardScreen(Screen[None]):
 
     def __init__(
         self,
-        sdk: ImednetSDK | AsyncImednetSDK,
+        sdk: ImednetFacade | AsyncImednetFacade,
         *,
         initial_study_key: str | None = None,
         initial_batch_ids: Sequence[str] | None = None,
@@ -1452,7 +1437,7 @@ class DashboardScreen(Screen[None]):
         """Initialize the DashboardScreen.
 
         Args:
-            sdk: Active iMednet SDK client instance.
+            sdk: Active iMednet SDK facade instance.
             initial_study_key: Optional initial study key to select upon mount.
             initial_batch_ids: Optional initial batch IDs to register upon mount.
             **kwargs: Additional screen arguments.
@@ -1468,6 +1453,7 @@ class DashboardScreen(Screen[None]):
         self.selected_study_key: str | None = None
         self.selected_site_id: str | None = None
         self._log_handler: TextualLogHandler | None = None
+        self._previous_log_level: int | None = None
 
     def compose(self) -> ComposeResult:
         """Compose children widgets for the dashboard screen.
@@ -1533,6 +1519,7 @@ class DashboardScreen(Screen[None]):
         formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         handler.setFormatter(formatter)
         logger = logging.getLogger("imednet")
+        self._previous_log_level = logger.level
         if logger.level == logging.NOTSET or logger.level > logging.INFO:
             logger.setLevel(logging.INFO)
         logger.addHandler(handler)
@@ -1554,10 +1541,14 @@ class DashboardScreen(Screen[None]):
             self._activate_study(self.initial_study_key, self.initial_study_key)
 
     def on_unmount(self) -> None:
-        """Detach the SDK log handler when the screen is unmounted."""
+        """Detach the SDK log handler and restore the previous logger level on unmount."""
+        logger = logging.getLogger("imednet")
         if self._log_handler is not None:
-            logging.getLogger("imednet").removeHandler(self._log_handler)
+            logger.removeHandler(self._log_handler)
             self._log_handler = None
+        if self._previous_log_level is not None:
+            logger.setLevel(self._previous_log_level)
+            self._previous_log_level = None
 
     def refresh_truncation_notice(self) -> None:
         """Update the dashboard truncation status banner based on widget state."""
@@ -1663,8 +1654,9 @@ class ImednetTuiApp(App[None]):
 
     def __init__(
         self,
-        sdk: ImednetSDK | AsyncImednetSDK,
+        sdk: ImednetFacade | AsyncImednetFacade,
         *,
+        high_contrast: bool | None = None,
         study_key: str | None = None,
         batch_ids: Sequence[str] | None = None,
         **kwargs: Any,
@@ -1672,7 +1664,9 @@ class ImednetTuiApp(App[None]):
         """Initialize the iMednet TUI application.
 
         Args:
-            sdk: Active iMednet SDK client instance.
+            sdk: Active iMednet SDK facade instance.
+            high_contrast: Optional explicit high-contrast toggle; defaults to reading
+                ``IMEDNET_HIGH_CONTRAST=1`` from ``os.environ`` without modifying it.
             study_key: Optional initial study key to select on launch.
             batch_ids: Optional initial batch IDs to register in the Jobs tab.
             **kwargs: Additional application arguments.
@@ -1681,7 +1675,11 @@ class ImednetTuiApp(App[None]):
         self.sdk = sdk
         self.initial_study_key = study_key.strip() if study_key and study_key.strip() else None
         self.initial_batch_ids = _normalize_batch_ids(batch_ids)
-        self.high_contrast_enabled = os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+        self.high_contrast_enabled = (
+            bool(high_contrast)
+            if high_contrast is not None
+            else os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+        )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Suppress single-key global actions while typing inside an Input widget."""
@@ -1698,9 +1696,8 @@ class ImednetTuiApp(App[None]):
     def on_mount(self) -> None:
         """Configure application title, contrast mode, and dashboard screen on mount."""
         self.title = "iMednet Mission Control"
-        base_url = getattr(getattr(self.sdk, "config", None), "base_url", None) or getattr(
-            self.sdk, "_base_url", "Unknown"
-        )
+        config = getattr(self.sdk, "config", None)
+        base_url = getattr(config, "base_url", None) or "Unknown"
         self.sub_title = f"Env: {base_url}"
 
         dashboard = DashboardScreen(
@@ -1724,12 +1721,8 @@ class ImednetTuiApp(App[None]):
         return None
 
     def action_toggle_high_contrast(self) -> None:
-        """Toggle accessibility high contrast mode."""
+        """Toggle accessibility high contrast mode without mutating ``os.environ``."""
         self.high_contrast_enabled = not self.high_contrast_enabled
-        if self.high_contrast_enabled:
-            os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
-        else:
-            os.environ.pop("IMEDNET_HIGH_CONTRAST", None)
         self._sync_high_contrast_classes()
 
     def action_refresh_data(self) -> None:
@@ -1774,17 +1767,19 @@ class ImednetTuiApp(App[None]):
 
 
 def run_tui(
-    sdk: ImednetSDK | AsyncImednetSDK,
+    sdk: ImednetFacade | AsyncImednetFacade,
     force: bool = False,
     *,
+    high_contrast: bool | None = None,
     study_key: str | None = None,
     batch_ids: Sequence[str] | None = None,
 ) -> None:
     """Run the TUI application.
 
     Args:
-        sdk: Active iMednet SDK client instance.
+        sdk: Active iMednet SDK facade instance.
         force: If True, bypass stream interactivity checks and launch the TUI unconditionally.
+        high_contrast: Optional explicit high-contrast mode flag.
         study_key: Optional initial study key to select on launch.
         batch_ids: Optional initial batch IDs to track in the Jobs tab.
 
@@ -1793,5 +1788,10 @@ def run_tui(
     """
     if not force and not is_interactive_terminal():
         raise RuntimeError("Interactive terminal required to run the TUI interface.")
-    app = ImednetTuiApp(sdk, study_key=study_key, batch_ids=batch_ids)
+    app = ImednetTuiApp(
+        sdk,
+        high_contrast=high_contrast,
+        study_key=study_key,
+        batch_ids=batch_ids,
+    )
     app.run()
