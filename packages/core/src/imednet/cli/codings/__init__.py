@@ -8,8 +8,13 @@ from typing import Any
 from ...models.codings import Coding
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status, parse_filter_args
-from ..utils.args import add_output_format
+from ..utils import STUDY_KEY_ARG, display_list, fetching_status
+from ..utils.args import (
+    add_list_query_args,
+    add_output_format,
+    collect_list_items,
+    prepare_list_query,
+)
 
 
 def _get_val(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -30,12 +35,10 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     sub = parser.add_subparsers(dest="command")
     list_parser = sub.add_parser("list", help="List codings for a specific study.")
     list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
-    list_parser.add_argument(
-        "-f",
-        "--filter",
-        action="append",
-        dest="coding_filter",
-        help="Filter criteria (e.g., 'dictionaryName=MedDRA'). Repeat for multiple filters.",
+    add_list_query_args(
+        list_parser,
+        filter_dest="coding_filter",
+        filter_help="Filter criteria (e.g., 'dictionaryName=MedDRA' or 'dictionaryName==MedDRA'). Repeat for multiple filters.",
     )
 
     add_output_format(list_parser)
@@ -46,12 +49,26 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         study_key: str,
         coding_filter: list[str] | None = None,
         output_format: str = "table",
+        sort: str | None = None,
+        limit: int | None = None,
+        fetch_all: bool = False,
         no_interactive: bool = False,
     ) -> None:
-        parsed_filter = parse_filter_args(coding_filter, model=Coding)
+        req_kwargs, effective_limit = prepare_list_query(
+            filter_args=coding_filter,
+            sort=sort,
+            limit=limit,
+            fetch_all=fetch_all,
+            output_format=output_format,
+            no_interactive=no_interactive,
+            model=Coding,
+        )
 
         with fetching_status("codings", study_key):
-            codings_list = list(sdk.codings.list(study_key, **(parsed_filter or {})))
+            codings_list, truncated = collect_list_items(
+                sdk.codings.list(study_key, **req_kwargs),
+                effective_limit,
+            )
 
         if output_format == "json":
             display_list(codings_list, "codings", output_format="json")
@@ -79,6 +96,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "codings",
             "No codings found matching the criteria.",
             details=codings_list,
+            truncated=truncated,
             interactive=False if no_interactive else None,
         )
 
@@ -87,6 +105,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             study_key=args.study_key,
             coding_filter=args.coding_filter,
             output_format=args.output_format,
+            sort=args.sort,
+            limit=args.limit,
+            fetch_all=args.fetch_all,
             no_interactive=getattr(args, "no_interactive", False),
         )
     )

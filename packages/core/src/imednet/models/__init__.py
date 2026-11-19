@@ -41,16 +41,25 @@ from imednet.models.queries import (
     is_valid_query_transition,
     validate_query_transition,
 )
-from imednet.models.record_revisions import RecordRevision
+from imednet.models.record_revisions import (
+    RecordRevision,
+    is_valid_record_revision_chain,
+    validate_record_revision_chain,
+)
 from imednet.models.records import (
+    ALLOWED_RECORD_TRANSITIONS,
     BaseRecordRequest,
     CreateNewRecordRequest,
     Keyword,
     Record,
     RecordData,
     RecordJobResponse,
+    RecordStatus,
     RegisterSubjectRequest,
     UpdateScheduledRecordRequest,
+    is_valid_record_transition,
+    normalize_record_status,
+    validate_record_transition,
 )
 from imednet.models.reporting import (
     AdverseEvent,
@@ -63,7 +72,13 @@ from imednet.models.reporting import (
     VitalSign,
     VitalSigns,
 )
-from imednet.models.sites import Site
+from imednet.models.sites import (
+    ELIGIBLE_SITE_ENROLLMENT_STATUSES,
+    Site,
+    SiteEnrollmentStatus,
+    is_site_enrollment_eligible,
+    normalize_site_enrollment_status,
+)
 from imednet.models.standards import (
     CDISC_CONTROLLED_TERMINOLOGY,
     NORMALIZATION_TERMINOLOGY,
@@ -80,7 +95,15 @@ from imednet.models.standards import (
 from imednet.models.studies import Study
 from imednet.models.study_config import MappingRule, StudyConfiguration, WidgetConfig
 from imednet.models.study_structure import FormStructure, IntervalStructure, StudyStructure
-from imednet.models.subjects import Subject, SubjectKeyword
+from imednet.models.subjects import (
+    ALLOWED_SUBJECT_TRANSITIONS,
+    Subject,
+    SubjectKeyword,
+    SubjectStatus,
+    is_valid_subject_transition,
+    normalize_subject_status,
+    validate_subject_transition,
+)
 from imednet.models.triage import (
     ALLOWED_STATUS_TRANSITIONS,
     ALLOWED_TRANSITIONS,
@@ -110,9 +133,12 @@ __all__: list[str] = [
     "ACTIVE_JOB_STATES",
     "ALLOWED_JOB_TRANSITIONS",
     "ALLOWED_QUERY_TRANSITIONS",
+    "ALLOWED_RECORD_TRANSITIONS",
     "ALLOWED_STATUS_TRANSITIONS",
+    "ALLOWED_SUBJECT_TRANSITIONS",
     "ALLOWED_TRANSITIONS",
     "CDISC_CONTROLLED_TERMINOLOGY",
+    "ELIGIBLE_SITE_ENROLLMENT_STATUSES",
     "FAILED_JOB_STATES",
     "NORMALIZATION_TERMINOLOGY",
     "PROFILE_REGISTRY",
@@ -156,10 +182,12 @@ __all__: list[str] = [
     "RecordData",
     "RecordJobResponse",
     "RecordRevision",
+    "RecordStatus",
     "RegisterSubjectRequest",
     "ResourceRegistry",
     "Role",
     "Site",
+    "SiteEnrollmentStatus",
     "SortField",
     "StandardsProfile",
     "StandardsProfileRegistry",
@@ -169,6 +197,7 @@ __all__: list[str] = [
     "Subject",
     "SubjectKeyword",
     "SubjectLevelAnalysis",
+    "SubjectStatus",
     "TriageAnnotation",
     "TriageHistoryEntry",
     "TriageItem",
@@ -183,12 +212,19 @@ __all__: list[str] = [
     "WidgetConfig",
     "calculate_legacy_status",
     "can_transition",
+    "is_site_enrollment_eligible",
     "is_valid_cdash_variable",
     "is_valid_job_transition",
     "is_valid_query_transition",
+    "is_valid_record_revision_chain",
+    "is_valid_record_transition",
     "is_valid_status_transition",
+    "is_valid_subject_transition",
     "is_valid_transition",
     "normalize_job_state",
+    "normalize_record_status",
+    "normalize_site_enrollment_status",
+    "normalize_subject_status",
     "parse_bool",
     "parse_datetime",
     "parse_dict_or_default",
@@ -198,6 +234,9 @@ __all__: list[str] = [
     "validate_cdash_variable",
     "validate_job_transition",
     "validate_query_transition",
+    "validate_record_revision_chain",
+    "validate_record_transition",
     "validate_status_transition",
+    "validate_subject_transition",
     "validate_transition",
 ]

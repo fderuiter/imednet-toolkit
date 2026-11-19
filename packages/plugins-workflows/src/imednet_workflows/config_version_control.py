@@ -35,6 +35,13 @@ def _sha256_of(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _compute_chained_commit_id(content_hash: str, parent_commit_id: str | None) -> str:
+    """Compute a content-addressed root commit ID or parent-chained child commit ID."""
+    if parent_commit_id is None:
+        return content_hash
+    return _sha256_of(f"{parent_commit_id}:{content_hash}")
+
+
 def _sanitize_base_url_for_path(url: str) -> str:
     """Extract and sanitize host from URL to create a safe path name."""
     try:
@@ -180,20 +187,30 @@ class ConfigVersionStore:
         self._ensure_schema_initialized(self.db_path)
 
     def _initialize_schema_for_path(self, path: Path) -> None:
-        """Create the database tables and triggers if they do not exist for the given path."""
+        """Create or migrate database tables and triggers for the given path."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite_connection(path, timeout=30.0) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS config_commits (
-                    commit_id   TEXT PRIMARY KEY,
-                    study_key   TEXT NOT NULL,
-                    version_tag TEXT NOT NULL,
-                    config_data TEXT NOT NULL,
-                    modified_by TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    timestamp   TEXT NOT NULL
+                    commit_id        TEXT PRIMARY KEY,
+                    study_key        TEXT NOT NULL,
+                    version_tag      TEXT NOT NULL,
+                    config_data      TEXT NOT NULL,
+                    modified_by      TEXT NOT NULL,
+                    description      TEXT NOT NULL,
+                    timestamp        TEXT NOT NULL,
+                    parent_commit_id TEXT,
+                    content_hash     TEXT
                 )
             """)
+            existing_cols = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(config_commits)").fetchall()
+            }
+            if "parent_commit_id" not in existing_cols:
+                conn.execute("ALTER TABLE config_commits ADD COLUMN parent_commit_id TEXT")
+            if "content_hash" not in existing_cols:
+                conn.execute("ALTER TABLE config_commits ADD COLUMN content_hash TEXT")
+
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_config_commits_study"
                 " ON config_commits (study_key, timestamp)"
@@ -218,6 +235,41 @@ class ConfigVersionStore:
                     );
                 END;
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS config_heads (
+                    study_key      TEXT PRIMARY KEY,
+                    head_commit_id TEXT NOT NULL,
+                    updated_at     TEXT NOT NULL
+                )
+            """)
+            missing_studies = conn.execute(
+                """
+                SELECT DISTINCT c.study_key
+                FROM config_commits c
+                LEFT JOIN config_heads h ON h.study_key = c.study_key
+                WHERE h.study_key IS NULL
+                """
+            ).fetchall()
+            for study_row in missing_studies:
+                sk = str(study_row[0])
+                latest = conn.execute(
+                    """
+                    SELECT commit_id, timestamp
+                    FROM config_commits
+                    WHERE study_key = ?
+                    ORDER BY timestamp DESC, rowid DESC
+                    LIMIT 1
+                    """,
+                    (sk,),
+                ).fetchone()
+                if latest is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO config_heads (study_key, head_commit_id, updated_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (sk, str(latest[0]), str(latest[1])),
+                    )
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -294,26 +346,61 @@ class ConfigVersionStore:
             raise ValueError("A user identifier is required to commit.")
 
         config_json = json.dumps(config.model_dump(mode="json", by_alias=True), sort_keys=True)
-        commit_id = _sha256_of(config_json)
+        content_hash = _sha256_of(config_json)
         timestamp = datetime.now(UTC).isoformat()
 
         # Secure the payload using Fernet encryption before writing to SQLite
         encrypted_config_json = _encrypt_payload(config_json)
 
         with self._lock, self._connection() as conn:
-            existing = conn.execute(
-                "SELECT 1 FROM config_commits WHERE commit_id = ?", (commit_id,)
+            head_row = conn.execute(
+                """
+                SELECT c.commit_id, c.content_hash
+                FROM config_heads h
+                JOIN config_commits c ON c.commit_id = h.head_commit_id
+                WHERE h.study_key = ?
+                """,
+                (study_key,),
             ).fetchone()
-            if existing:
-                raise ValueError(
-                    f"Commit {commit_id!r} already exists — configuration is unchanged."
-                )
+            if head_row is None:
+                head_row = conn.execute(
+                    """
+                    SELECT commit_id, content_hash
+                    FROM config_commits
+                    WHERE study_key = ?
+                    ORDER BY timestamp DESC, rowid DESC
+                    LIMIT 1
+                    """,
+                    (study_key,),
+                ).fetchone()
+
+            parent_commit_id: str | None = None
+            if head_row is not None:
+                parent_commit_id = str(head_row["commit_id"])
+                head_content_hash = str(head_row["content_hash"] or head_row["commit_id"])
+                if head_content_hash == content_hash:
+                    raise ValueError(
+                        f"Commit {parent_commit_id!r} already exists — configuration is unchanged."
+                    )
+
+            commit_id = _compute_chained_commit_id(content_hash, parent_commit_id)
+            existing = conn.execute(
+                "SELECT study_key FROM config_commits WHERE commit_id = ?",
+                (commit_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["study_key"]) == study_key:
+                    raise ValueError(
+                        f"Commit {commit_id!r} already exists — configuration is unchanged."
+                    )
+                commit_id = _sha256_of(f"{study_key}:{parent_commit_id or ''}:{content_hash}")
+
             conn.execute(
                 """
                 INSERT INTO config_commits
                     (commit_id, study_key, version_tag, config_data,
-                     modified_by, description, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     modified_by, description, timestamp, parent_commit_id, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     commit_id,
@@ -323,11 +410,44 @@ class ConfigVersionStore:
                     author,
                     desc,
                     timestamp,
+                    parent_commit_id,
+                    content_hash,
                 ),
+            )
+            conn.execute(
+                """
+                INSERT INTO config_heads (study_key, head_commit_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(study_key) DO UPDATE SET
+                    head_commit_id = excluded.head_commit_id,
+                    updated_at = excluded.updated_at
+                """,
+                (study_key, commit_id, timestamp),
             )
             conn.commit()
 
         return commit_id
+
+    def get_head(self, study_key: str) -> str | None:
+        """Return the current head ``commit_id`` for *study_key*, or ``None`` if empty."""
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT head_commit_id FROM config_heads WHERE study_key = ?",
+                (study_key,),
+            ).fetchone()
+            if row is not None:
+                return str(row["head_commit_id"])
+            fallback = conn.execute(
+                """
+                SELECT commit_id
+                FROM config_commits
+                WHERE study_key = ?
+                ORDER BY timestamp DESC, rowid DESC
+                LIMIT 1
+                """,
+                (study_key,),
+            ).fetchone()
+        return str(fallback["commit_id"]) if fallback is not None else None
 
     def get_history(self, study_key: str) -> list[dict[str, Any]]:
         """Return all commits for *study_key*, ordered oldest-first.
@@ -337,19 +457,20 @@ class ConfigVersionStore:
 
         Returns:
             A list of dicts, each with keys ``commit_id``, ``study_key``,
-            ``version_tag``, ``modified_by``, ``description``, and
-            ``timestamp``.  The ``config_data`` body is intentionally omitted
-            to keep the payload small — use :meth:`rollback_config` to
-            retrieve the full body for a specific commit.
+            ``version_tag``, ``modified_by``, ``description``, ``timestamp``,
+            ``parent_commit_id``, and ``content_hash``. The ``config_data`` body
+            is intentionally omitted to keep the payload small — use
+            :meth:`rollback_config` to retrieve the full body for a specific commit.
         """
         with self._lock, self._connection() as conn:
             rows = conn.execute(
                 """
                 SELECT commit_id, study_key, version_tag, config_data,
-                       modified_by, description, timestamp
+                       modified_by, description, timestamp,
+                       parent_commit_id, content_hash
                 FROM   config_commits
                 WHERE  study_key = ?
-                ORDER  BY timestamp ASC
+                ORDER  BY timestamp ASC, rowid ASC
                 """,
                 (study_key,),
             ).fetchall()
@@ -358,7 +479,14 @@ class ConfigVersionStore:
             commit = dict(row)
             # Decrypt payload before verification
             decrypted_data = _decrypt_payload(commit["config_data"])
-            self._verify_commit_signature(commit["commit_id"], decrypted_data)
+            self._verify_commit_signature(
+                commit["commit_id"],
+                decrypted_data,
+                content_hash=commit.get("content_hash"),
+                parent_commit_id=commit.get("parent_commit_id"),
+                study_key=commit.get("study_key"),
+            )
+            commit["content_hash"] = commit.get("content_hash") or commit["commit_id"]
             commit.pop("config_data")
             history.append(commit)
         return history
@@ -422,7 +550,7 @@ class ConfigVersionStore:
         with self._lock, self._connection() as conn:
             row = conn.execute(
                 """
-                SELECT commit_id, config_data
+                SELECT commit_id, study_key, config_data, parent_commit_id, content_hash
                 FROM config_commits
                 WHERE commit_id = ? AND study_key = ?
                 """,
@@ -432,7 +560,13 @@ class ConfigVersionStore:
             raise KeyError(f"Commit {commit_id!r} not found for study {study_key!r}.")
         # Decrypt payload before validation
         decrypted_data = _decrypt_payload(row["config_data"])
-        self._verify_commit_signature(row["commit_id"], decrypted_data)
+        self._verify_commit_signature(
+            row["commit_id"],
+            decrypted_data,
+            content_hash=row["content_hash"],
+            parent_commit_id=row["parent_commit_id"],
+            study_key=row["study_key"],
+        )
         return StudyConfiguration.model_validate_json(decrypted_data)
 
     # ------------------------------------------------------------------
@@ -443,23 +577,53 @@ class ConfigVersionStore:
         """Retrieve the raw configuration JSON for a specific commit."""
         with self._lock, self._connection() as conn:
             row = conn.execute(
-                "SELECT commit_id, config_data FROM config_commits WHERE commit_id = ?",
+                """
+                SELECT commit_id, study_key, config_data, parent_commit_id, content_hash
+                FROM config_commits
+                WHERE commit_id = ?
+                """,
                 (commit_id,),
             ).fetchone()
         if row is None:
             raise KeyError(f"Commit {commit_id!r} not found.")
         # Decrypt payload first
         decrypted_data = _decrypt_payload(row["config_data"])
-        self._verify_commit_signature(row["commit_id"], decrypted_data)
+        self._verify_commit_signature(
+            row["commit_id"],
+            decrypted_data,
+            content_hash=row["content_hash"],
+            parent_commit_id=row["parent_commit_id"],
+            study_key=row["study_key"],
+        )
         return json.loads(decrypted_data)  # type: ignore[no-any-return]
 
-    def _verify_commit_signature(self, commit_id: str, config_data: str) -> None:
-        """Verify that the content hash matches the stored commit ID."""
-        if _sha256_of(config_data) != commit_id:
+    def _verify_commit_signature(
+        self,
+        commit_id: str,
+        config_data: str,
+        *,
+        content_hash: str | None = None,
+        parent_commit_id: str | None = None,
+        study_key: str | None = None,
+    ) -> None:
+        """Verify that the decrypted payload matches its content hash and parent-chained commit ID."""
+        actual_hash = _sha256_of(config_data)
+        expected_hash = content_hash or commit_id
+        if actual_hash != expected_hash:
             raise ValueError(
                 "Configuration data integrity check failed: "
                 f"SHA-256 hash mismatch for commit {commit_id!r}"
             )
+        if content_hash is not None:
+            expected_chained = _compute_chained_commit_id(content_hash, parent_commit_id)
+            expected_disambiguated = _sha256_of(
+                f"{study_key or ''}:{parent_commit_id or ''}:{content_hash}"
+            )
+            if commit_id not in {expected_chained, expected_disambiguated}:
+                raise ValueError(
+                    "Configuration data integrity check failed: "
+                    f"SHA-256 hash mismatch for commit {commit_id!r}"
+                )
 
 
 __all__ = ["ConfigVersionStore"]

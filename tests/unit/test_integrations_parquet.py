@@ -261,3 +261,74 @@ def test_hive_parquet_query_rejects_control_chars_and_null_bytes(invalid_path: s
     """Test that hive_parquet_query rejects null bytes, newlines, and control characters."""
     with pytest.raises(ValueError, match=r"(?i)directory path"):
         parquet_mod.hive_parquet_query(invalid_path)
+
+
+def test_export_to_hive_parquet_masks_phi_by_default_and_honors_opt_out(tmp_path: Path) -> None:
+    """Verify export_to_hive_parquet masks PHI before applying labels and supports mask_phi=False."""
+    pytest.importorskip("pyarrow")
+    from imednet.models.records import Record
+    from imednet.utils.security import global_sensitivity_registry
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [SimpleNamespace(form_id=1, form_key="DEMOGRAPHICS")]
+    sdk.variables.list.return_value = [
+        SimpleNamespace(form_id=1, variable_name="patientName", label="Participant Full Name"),
+        SimpleNamespace(form_id=1, variable_name="DOB", label="Calendar Birth Date"),
+        SimpleNamespace(form_id=1, variable_name="SSN", label="Government ID"),
+        SimpleNamespace(form_id=1, variable_name="email", label="Contact Inbox"),
+        SimpleNamespace(form_id=1, variable_name="systolicBp", label="Systolic BP"),
+    ]
+    sample_record = Record(
+        record_id=101,
+        study_key="STUDY1",
+        subject_key="SUBJ-001",
+        form_id=1,
+        form_key="DEMOGRAPHICS",
+        record_data={
+            "patientName": "Jane Doe",
+            "DOB": "1980-01-01",
+            "SSN": "123-45-6789",
+            "email": "jane@example.org",
+            "systolicBp": 120,
+        },
+    )
+    sdk.records.iter.side_effect = lambda **_kwargs: iter([sample_record.model_copy(deep=True)])
+    sdk.get_records.side_effect = lambda **_kwargs: [sample_record.model_copy(deep=True)]
+
+    snapshot_keywords = set(global_sensitivity_registry._sensitive_keys)
+
+    masked_dir = tmp_path / "masked"
+    parquet_mod.export_to_hive_parquet(
+        sdk,
+        "STUDY1",
+        str(masked_dir),
+        use_labels_as_columns=True,
+    )
+    masked_df = _read_partition_dataframe(masked_dir / "study_key=STUDY1" / "form_key=DEMOGRAPHICS")
+    masked_row = masked_df.to_dict("records")[0]
+    assert masked_row["Participant Full Name"] == "***MASKED***"
+    assert masked_row["Calendar Birth Date"] == "***MASKED***"
+    assert masked_row["Government ID"] == "***MASKED***"
+    assert masked_row["Contact Inbox"] == "***MASKED***"
+    assert masked_row["Systolic BP"] == 120
+    assert masked_row["subjectKey"] == "SUBJ-001"
+    assert masked_row["recordId"] == 101
+
+    unmasked_dir = tmp_path / "unmasked"
+    parquet_mod.export_to_hive_parquet(
+        sdk,
+        "STUDY1",
+        str(unmasked_dir),
+        use_labels_as_columns=True,
+        mask_phi=False,
+    )
+    unmasked_df = _read_partition_dataframe(
+        unmasked_dir / "study_key=STUDY1" / "form_key=DEMOGRAPHICS"
+    )
+    unmasked_row = unmasked_df.to_dict("records")[0]
+    assert unmasked_row["Participant Full Name"] == "Jane Doe"
+    assert unmasked_row["Calendar Birth Date"] == "1980-01-01"
+    assert unmasked_row["Government ID"] == "123-45-6789"
+    assert unmasked_row["Contact Inbox"] == "jane@example.org"
+    assert unmasked_row["Systolic BP"] == 120
+    assert global_sensitivity_registry._sensitive_keys == snapshot_keywords

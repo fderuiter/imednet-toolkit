@@ -74,11 +74,22 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     """Lazily load interactive grid symbols so standard CLI startup avoids importing curses."""
+    if name == "grid":
+        import importlib
+        import sys
+
+        mod = sys.modules.get(f"{__name__}.grid")
+        if mod is None:
+            mod = importlib.import_module(".grid", __name__)
+        globals().pop("grid", None)
+        return mod
     if name in ("InteractiveDataGrid", "is_interactive_terminal", "run_interactive_grid"):
         try:
-            from . import grid
+            import importlib
 
-            return getattr(grid, name)
+            grid_mod = importlib.import_module(".grid", __name__)
+            globals().pop("grid", None)
+            return getattr(grid_mod, name)
         except (ImportError, AttributeError):
             if name == "is_interactive_terminal":
                 return lambda: False

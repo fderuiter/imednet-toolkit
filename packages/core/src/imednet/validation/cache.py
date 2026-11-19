@@ -19,6 +19,7 @@ from typing import (
 
 from typing_extensions import Protocol, runtime_checkable
 
+from imednet.core.context import get_study_context
 from imednet.datadict.logic import LogicTreeEvaluator, extract_variable_constraints
 from imednet.datadict.models import DataDictionary
 from imednet.errors import UnknownVariableTypeError, ValidationError
@@ -99,7 +100,7 @@ class ValidationSchemaProtocol(Protocol):
 
 
 class BaseSchemaCache(Generic[_TClient]):
-    """Cache of variables by form key with optional async refresh."""
+    """Cache of variables partitioned by ``(study_key, form_key)`` and ``(study_key, form_id)``."""
 
     def __init__(self, is_async: bool) -> None:
         """Initialize the schema cache.
@@ -108,8 +109,9 @@ class BaseSchemaCache(Generic[_TClient]):
             is_async: Whether this cache is used in an asynchronous context.
         """
         self._is_async = is_async
-        self._form_variables: dict[str, dict[str, Variable]] = {}
-        self._form_id_to_key: dict[int, str] = {}
+        self._form_variables: dict[tuple[str, str] | str, dict[str, Variable]] = {}
+        self._form_id_to_key: dict[tuple[str, int] | int, str] = {}
+        self._refreshed_studies: set[str] = set()
 
     @property
     def is_prevalidated(self) -> bool:
@@ -144,15 +146,55 @@ class BaseSchemaCache(Generic[_TClient]):
         finally:
             _PREVALIDATED_SCOPES.reset(token)
 
-    def populate(self, variables: Iterable[Variable]) -> None:
-        """Populate the cache with the given variables."""
-        self._form_variables.clear()
-        self._form_id_to_key.clear()
-        for var in variables:
-            if var.form_id is not None and var.form_key is not None:
-                self._form_id_to_key[var.form_id] = var.form_key
+    def _clear_study_partition(self, study_key: str) -> None:
+        """Remove existing cached entries belonging only to ``study_key``."""
+        for fv_key in [
+            k
+            for k in self._form_variables
+            if (isinstance(k, tuple) and k[0] == study_key)
+            or (study_key == "" and isinstance(k, str))
+        ]:
+            del self._form_variables[fv_key]
+        for fid_key in [
+            k
+            for k in self._form_id_to_key
+            if (isinstance(k, tuple) and k[0] == study_key)
+            or (study_key == "" and isinstance(k, int))
+        ]:
+            del self._form_id_to_key[fid_key]
+
+    def populate(
+        self,
+        variables: Iterable[Variable],
+        study_key: str | None = None,
+    ) -> None:
+        """Populate the cache with ``variables``, isolated by ``study_key``."""
+        vars_list = list(variables)
+        if study_key is not None:
+            self._clear_study_partition(study_key)
+            self._refreshed_studies.add(study_key)
+            for var in vars_list:
+                if var.form_key is not None:
+                    if var.form_id is not None:
+                        self._form_id_to_key[(study_key, var.form_id)] = var.form_key
+                    if var.variable_name is not None:
+                        self._form_variables.setdefault((study_key, var.form_key), {})[
+                            var.variable_name
+                        ] = var
+            return
+
+        target_studies = {var.study_key or "" for var in vars_list} or {""}
+        for sk in target_studies:
+            self._clear_study_partition(sk)
+            if sk:
+                self._refreshed_studies.add(sk)
+        for var in vars_list:
+            sk = var.study_key or ""
+            if var.form_key is not None:
+                if var.form_id is not None:
+                    self._form_id_to_key[(sk, var.form_id)] = var.form_key
                 if var.variable_name is not None:
-                    self._form_variables.setdefault(var.form_key, {})[var.variable_name] = var
+                    self._form_variables.setdefault((sk, var.form_key), {})[var.variable_name] = var
 
     async def _refresh_async(
         self,
@@ -167,8 +209,9 @@ class BaseSchemaCache(Generic[_TClient]):
             variables: The asynchronous variables endpoint.
             study_key: The study key to refresh variables for.
         """
+        _ = forms
         vars_list = [v async for v in variables.list(study_key=study_key)]
-        self.populate(vars_list)
+        self.populate(vars_list, study_key=study_key)
 
     def _refresh_sync(
         self,
@@ -183,8 +226,9 @@ class BaseSchemaCache(Generic[_TClient]):
             variables: The synchronous variables endpoint.
             study_key: The study key to refresh variables for.
         """
+        _ = forms
         vars_list = variables.list(study_key=study_key)
-        self.populate(vars_list)
+        self.populate(vars_list, study_key=study_key)
 
     def refresh(
         self,
@@ -214,40 +258,153 @@ class BaseSchemaCache(Generic[_TClient]):
             study_key,
         )
 
-    def variables_for_form(self, form_key: str) -> dict[str, Variable]:
-        """Return the variables associated with the given form key.
+    def variables_for_form(
+        self,
+        form_key: str,
+        study_key: str | None = None,
+    ) -> dict[str, Variable]:
+        """Return the variables associated with ``form_key`` for ``study_key``."""
+        refreshed: set[str] = getattr(self, "_refreshed_studies", None) or set()
+        if study_key is not None:
+            exact = self._form_variables.get((study_key, form_key))
+            if exact is not None:
+                return exact
+            if study_key not in refreshed:
+                unscoped = self._form_variables.get(("", form_key))
+                if unscoped is not None:
+                    return unscoped
+                legacy = self._form_variables.get(form_key)
+                if legacy is not None:
+                    return legacy
+            return {}
 
-        Args:
-            form_key: The form key to look up.
+        ctx_study = get_study_context()
+        if ctx_study:
+            ctx_exact = self._form_variables.get((ctx_study, form_key))
+            if ctx_exact is not None:
+                return ctx_exact
+            if ctx_study in refreshed:
+                return {}
 
-        Returns:
-            Dict[str, Variable]: A mapping of variable names to Variable objects.
-        """
-        return self._form_variables.get(form_key, {})
+        if form_key in self._form_variables:
+            return self._form_variables[form_key]
+        if ("", form_key) in self._form_variables:
+            return self._form_variables[("", form_key)]
 
-    def form_key_from_id(self, form_id: int | str) -> str | None:
-        """Resolve a form key from a form ID.
+        matches = [
+            (k[0], v)
+            for k, v in self._form_variables.items()
+            if isinstance(k, tuple) and k[0] != "" and k[1] == form_key
+        ]
+        if len(matches) == 1:
+            return matches[0][1]
+        if len(matches) > 1:
+            studies = ", ".join(sorted(sk for sk, _ in matches))
+            raise ValidationError(
+                f"Ambiguous form '{form_key}' cached across multiple studies ({studies}); "
+                "specify study_key."
+            )
+        return {}
 
-        Args:
-            form_id: The form ID to look up.
-
-        Returns:
-            Optional[str]: The form key if found, else None.
-        """
+    @staticmethod
+    def _coerce_form_id_int(form_id: int | str) -> int | None:
+        """Parse an integer form ID, rejecting booleans and non-numeric strings."""
         if isinstance(form_id, bool):
             return None
         if isinstance(form_id, int):
-            return self._form_id_to_key.get(form_id)
+            return form_id
         if isinstance(form_id, str):
             stripped = form_id.strip()
             if stripped.lstrip("-").isdigit():
-                return self._form_id_to_key.get(int(stripped))
+                return int(stripped)
         return None
+
+    def form_key_from_id(
+        self,
+        form_id: int | str,
+        study_key: str | None = None,
+    ) -> str | None:
+        """Resolve a form key from ``form_id``, isolated by ``study_key``."""
+        fid_int = self._coerce_form_id_int(form_id)
+        if fid_int is None:
+            return None
+
+        refreshed: set[str] = getattr(self, "_refreshed_studies", None) or set()
+        if study_key is not None:
+            exact = self._form_id_to_key.get((study_key, fid_int))
+            if exact is not None:
+                return exact
+            if study_key not in refreshed:
+                unscoped = self._form_id_to_key.get(("", fid_int))
+                if unscoped is not None:
+                    return unscoped
+                legacy = self._form_id_to_key.get(fid_int)
+                if legacy is not None:
+                    return legacy
+            return None
+
+        ctx_study = get_study_context()
+        if ctx_study:
+            ctx_exact = self._form_id_to_key.get((ctx_study, fid_int))
+            if ctx_exact is not None:
+                return ctx_exact
+            if ctx_study in refreshed:
+                return None
+
+        if fid_int in self._form_id_to_key:
+            return self._form_id_to_key[fid_int]
+        if ("", fid_int) in self._form_id_to_key:
+            return self._form_id_to_key[("", fid_int)]
+
+        matches = [
+            (k[0], fk)
+            for k, fk in self._form_id_to_key.items()
+            if isinstance(k, tuple) and k[0] != "" and k[1] == fid_int
+        ]
+        if len(matches) == 1:
+            return matches[0][1]
+        if len(matches) > 1:
+            studies = ", ".join(sorted(sk for sk, _ in matches))
+            raise ValidationError(
+                f"Ambiguous form ID {fid_int} cached across multiple studies ({studies}); "
+                "specify study_key."
+            )
+        return None
+
+    def forms_for_study(self, study_key: str) -> dict[str, dict[str, Variable]]:
+        """Return cached variables grouped by form key for ``study_key``."""
+        scoped: dict[str, dict[str, Variable]] = {
+            k[1]: v
+            for k, v in self._form_variables.items()
+            if isinstance(k, tuple) and k[0] == study_key
+        }
+        if scoped or study_key in getattr(self, "_refreshed_studies", set()):
+            return scoped
+        fallback: dict[str, dict[str, Variable]] = {}
+        for k, v in self._form_variables.items():
+            if isinstance(k, str):
+                fallback[k] = v
+            elif isinstance(k, tuple) and k[0] == "":
+                fallback[k[1]] = v
+        return fallback
+
+    @property
+    def study_forms(self) -> dict[tuple[str, str], dict[str, Variable]]:
+        """Return cached variables keyed by ``(study_key, form_key)``."""
+        return {
+            (k if isinstance(k, tuple) else ("", k)): v for k, v in self._form_variables.items()
+        }
 
     @property
     def forms(self) -> dict[str, dict[str, Variable]]:
-        """Return cached variables grouped by form key."""
-        return self._form_variables
+        """Return cached variables grouped by form key for the active or unambiguous study."""
+        ctx_study = get_study_context()
+        if ctx_study and (
+            ctx_study in getattr(self, "_refreshed_studies", set())
+            or any(isinstance(k, tuple) and k[0] == ctx_study for k in self._form_variables)
+        ):
+            return self.forms_for_study(ctx_study)
+        return {(k[1] if isinstance(k, tuple) else k): v for k, v in self._form_variables.items()}
 
 
 class SchemaCache(BaseSchemaCache["ImednetFacade"]):
@@ -542,6 +699,8 @@ def validate_record_data(
     schema: ValidationSchemaProtocol,
     form_key: str,
     data: dict[str, Any],
+    *,
+    study_key: str | None = None,
 ) -> None:
     """Validate ``data`` for ``form_key`` using the provided validation schema.
 
@@ -549,7 +708,11 @@ def validate_record_data(
         ValidationError: If the form key is not present in the schema or the data
             fails validation checks.
     """
-    variables = schema.variables_for_form(form_key)
+    variables = (
+        schema.variables_for_form(form_key, study_key=study_key)
+        if isinstance(schema, BaseSchemaCache)
+        else schema.variables_for_form(form_key)
+    )
     if not variables:
         if isinstance(schema, DataDictionary):
             form_obj = schema.form_for_key(form_key)
@@ -627,13 +790,19 @@ def calculate_readiness_score(
     schema: ValidationSchemaProtocol,
     form_key: str,
     data: dict[str, Any],
+    *,
+    study_key: str | None = None,
 ) -> tuple[float, list[str]]:
     """Calculate the schema readiness score for a record's data.
 
     Returns:
         A tuple of (score, list of validation failure reasons).
     """
-    variables = schema.variables_for_form(form_key)
+    variables = (
+        schema.variables_for_form(form_key, study_key=study_key)
+        if isinstance(schema, BaseSchemaCache)
+        else schema.variables_for_form(form_key)
+    )
     if not variables:
         return 0.0, [f"Unknown form {form_key}"]
 
@@ -703,6 +872,8 @@ def calculate_readiness_score(
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
     record: dict[str, Any],
+    *,
+    study_key: str | None = None,
 ) -> None:
     """Validate a single record entry against the schema.
 
@@ -711,20 +882,32 @@ def validate_record_entry(
     Args:
         schema: The validation schema to use.
         record: The record data dictionary.
+        study_key: Optional study key for study-partitioned schema caches.
 
     Raises:
         ValidationError: If the form key or form ID is not present in the schema
             or the data fails validation checks.
     """
+    raw_study = study_key or record.get("studyKey") or record.get("study_key")
+    eff_study_key = str(raw_study) if raw_study else None
     fk, fid = _extract_form_ref(record)
     if not fk and fid is not None:
         if isinstance(fid, bool):
             raise ValidationError(f"Unknown form ID {fid}")
-        fk = schema.form_key_from_id(fid)
+        fk = (
+            schema.form_key_from_id(fid, study_key=eff_study_key)
+            if isinstance(schema, BaseSchemaCache)
+            else schema.form_key_from_id(fid)
+        )
         if not fk:
             raise ValidationError(f"Unknown form ID {fid}")
     if fk:
-        validate_record_data(schema, fk, record.get("recordData", record.get("data", {})))
+        validate_record_data(
+            schema,
+            fk,
+            record.get("recordData", record.get("data", {})),
+            study_key=eff_study_key,
+        )
 
 
 class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
@@ -732,23 +915,32 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
 
     schema: BaseSchemaCache[_TClient]
 
-    def _refresh_common(self, variables: Iterable[Variable]) -> None:
+    def _refresh_common(
+        self,
+        variables: Iterable[Variable],
+        study_key: str | None = None,
+    ) -> None:
         """Common logic to populate the schema cache.
 
         Args:
             variables: An iterable of variables to populate the cache with.
+            study_key: Optional study key partition for ``variables``.
         """
-        self.schema.populate(variables)
+        self.schema.populate(variables, study_key=study_key)
 
-    def _needs_refresh(self, record: dict[str, Any]) -> tuple[str | None, bool]:
+    def _needs_refresh(
+        self,
+        record: dict[str, Any],
+        study_key: str | None = None,
+    ) -> tuple[str | None, bool]:
         """Determine if the schema cache needs refreshing for the given record.
 
         Returns:
             A tuple of (form_key, needs_refresh).
         """
-        form_key = self._resolve_form_key(record)
+        form_key = self._resolve_form_key(record, study_key=study_key)
         if form_key:
-            return form_key, not bool(self.schema.variables_for_form(form_key))
+            return form_key, not bool(self.schema.variables_for_form(form_key, study_key=study_key))
         _, fid = _extract_form_ref(record)
         if fid is not None and not isinstance(fid, bool):
             return None, True
@@ -770,20 +962,24 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
         any API errors bubble up as :class:`~imednet.errors.ApiError`.
         """
         variables = self._sdk.get_variables(study_key=study_key)
-        self._refresh_common(variables)
+        self._refresh_common(variables, study_key=study_key)
 
     def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
         """Validate a single record payload."""
-        form_key, needs_refresh = self._needs_refresh(record)
+        form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
         if needs_refresh:
             self.refresh(study_key)
             if form_key is None:
-                form_key = self._resolve_form_key(record)
+                form_key = self._resolve_form_key(record, study_key=study_key)
         if form_key is None:
             _, fid = _extract_form_ref(record)
             if fid is not None:
                 raise ValidationError(f"Unknown form ID {fid}")
-        self._validate_cached(form_key, record.get("recordData", record.get("data", {})))
+        self._validate_cached(
+            form_key,
+            record.get("recordData", record.get("data", {})),
+            study_key=study_key,
+        )
 
     def validate_batch(self, study_key: str, records: list[dict[str, Any]]) -> None:
         """Validate a batch of record payloads."""
@@ -806,20 +1002,24 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
         any API errors bubble up as :class:`~imednet.errors.ApiError`.
         """
         variables = await self._sdk.async_get_variables(study_key=study_key)
-        self._refresh_common(variables)
+        self._refresh_common(variables, study_key=study_key)
 
     async def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
         """Validate a single record payload asynchronously."""
-        form_key, needs_refresh = self._needs_refresh(record)
+        form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
         if needs_refresh:
             await self.refresh(study_key)
             if form_key is None:
-                form_key = self._resolve_form_key(record)
+                form_key = self._resolve_form_key(record, study_key=study_key)
         if form_key is None:
             _, fid = _extract_form_ref(record)
             if fid is not None:
                 raise ValidationError(f"Unknown form ID {fid}")
-        self._validate_cached(form_key, record.get("recordData", record.get("data", {})))
+        self._validate_cached(
+            form_key,
+            record.get("recordData", record.get("data", {})),
+            study_key=study_key,
+        )
 
     async def validate_batch(self, study_key: str, records: list[dict[str, Any]]) -> None:
         """Validate a batch of record payloads asynchronously."""

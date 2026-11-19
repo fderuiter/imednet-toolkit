@@ -230,3 +230,42 @@ def test_discover_subject_key_raises_when_none_active() -> None:
 
     with pytest.raises(NoLiveDataError, match="No eligible subjects"):
         discover_subject_key(sdk, "S")
+
+
+def test_discover_site_name_accepts_natural_enrollment_open_site_model() -> None:
+    """Site with 'Enrollment Open' status is eligible and returned by discover_site_name."""
+    from imednet.discovery import is_site_eligible
+    from imednet.models.sites import Site
+
+    assert is_site_eligible("Enrollment Open") is True
+    assert is_site_eligible("Enrollment Closed") is False
+
+    sdk = MagicMock()
+    sdk.sites.list.return_value = [
+        Site(
+            studyKey="S", siteId=1, siteName="ClosedSite", siteEnrollmentStatus="Enrollment Closed"
+        ),
+        Site(studyKey="S", siteId=2, siteName="OpenSite", siteEnrollmentStatus="Enrollment Open"),
+    ]
+
+    assert discover_site_name(sdk, "S") == "OpenSite"
+
+
+def test_discover_subject_key_skips_deleted_subjects() -> None:
+    """discover_subject_key skips subjects where deleted=True even if subjectStatus is Enrolled."""
+    from imednet.models.subjects import Subject
+
+    sdk = MagicMock()
+    sdk.subjects.list.return_value = [
+        Subject(studyKey="S", subjectKey="DEL-1", deleted=True, subjectStatus="Enrolled"),
+        Subject(studyKey="S", subjectKey="LIVE-2", deleted=False, subjectStatus="Enrolled"),
+    ]
+
+    assert discover_subject_key(sdk, "S") == "LIVE-2"
+
+    sdk_only_deleted = MagicMock()
+    sdk_only_deleted.subjects.list.return_value = [
+        Subject(studyKey="S", subjectKey="DEL-1", deleted=True, subjectStatus="Enrolled"),
+    ]
+    with pytest.raises(NoLiveDataError, match="DELETED"):
+        discover_subject_key(sdk_only_deleted, "S")

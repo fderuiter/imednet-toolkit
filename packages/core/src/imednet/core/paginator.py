@@ -3,8 +3,11 @@
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, Generic, TypeVar
 
+from imednet.constants import LARGE_PAGE_SIZE
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.errors.client import PaginationError
+
+MAX_PAGE_SIZE = LARGE_PAGE_SIZE
 
 ClientT = TypeVar("ClientT", RequesterProtocol, AsyncRequesterProtocol)
 
@@ -39,7 +42,7 @@ class BasePaginator(Generic[ClientT]):
             client: Requester instance (sync or async).
             path: API path for the request.
             params: Query parameters.
-            page_size: Number of items per page.
+            page_size: Number of items per page (1 to 500).
             page_param: Query parameter name for the page index.
             size_param: Query parameter name for the page size.
             data_key: Key in the response JSON containing the items list.
@@ -75,30 +78,42 @@ class BasePaginator(Generic[ClientT]):
                 f"Conflicting pagination bounds: '{self.size_param}'={explicit_size!r} "
                 f"and 'limit'={explicit_limit!r}."
             )
-        raw_explicit_size = explicit_size if explicit_size is not None else explicit_limit
-        self._explicit_size: int | None = (
-            _parse_int_param(self.size_param, raw_explicit_size)
-            if raw_explicit_size is not None
-            else None
+        self._explicit_limit: int | None = (
+            _parse_int_param("limit", explicit_limit) if explicit_limit is not None else None
         )
-
-        parsed_size = (
-            self._explicit_size
-            if self._explicit_size is not None
-            else _parse_int_param(self.size_param, page_size)
+        raw_size = (
+            explicit_size
+            if explicit_size is not None
+            else (explicit_limit if explicit_limit is not None else page_size)
         )
-        if parsed_size < 1 or parsed_size > 500:
+        parsed_size = _parse_int_param(self.size_param, raw_size)
+        if parsed_size < 1 or parsed_size > MAX_PAGE_SIZE:
             raise ValueError(
-                f"Pagination '{self.size_param}' must be between 1 and 500, got {parsed_size}."
+                f"Pagination '{self.size_param}' must be between 1 and {MAX_PAGE_SIZE}, got {parsed_size}."
             )
         self.page_size = parsed_size
+        self._single_page_slice: int | None = (
+            self._explicit_limit
+            if self._explicit_limit is not None
+            else (
+                parsed_size
+                if self._explicit_page is not None and explicit_size is not None
+                else None
+            )
+        )
         self._cursor: int | None = None
+        self._remaining_in_page: int = 0
         self._exhausted = False
 
     @property
     def cursor(self) -> int | None:
         """The next page cursor (0-based page index), or ``None`` when exhausted."""
         return self._cursor
+
+    @property
+    def has_more(self) -> bool:
+        """Return True if unconsumed items remain in the current page or subsequent pages."""
+        return self._remaining_in_page > 0 or self._cursor is not None
 
     def _build_params(self, page: int) -> dict[str, Any]:
         """Build the query parameters for a specific page."""
@@ -125,7 +140,7 @@ class BasePaginator(Generic[ClientT]):
 
     def _next_page(self, payload: dict[str, Any], page: int, items_count: int) -> int | None:
         """Determine the next page index based on the response payload and metadata."""
-        if self._explicit_page is not None or self._explicit_size is not None:
+        if self._explicit_page is not None or self._explicit_limit is not None:
             return None
 
         pagination = payload.get("pagination")
@@ -174,8 +189,8 @@ class BasePaginator(Generic[ClientT]):
             return []
         items = self._extract_items(payload)
         self._cursor = self._next_page(payload, self._cursor, len(items))
-        if self._explicit_size is not None:
-            return items[: self._explicit_size]
+        if self._single_page_slice is not None:
+            return items[: self._single_page_slice]
         return items
 
     def _process_json_list_response(self, payload: Any) -> list[Any]:
@@ -194,10 +209,15 @@ class Paginator(BasePaginator[RequesterProtocol]):
     def __iter__(self) -> Iterator[Any]:
         """Iterate over all items across all pages."""
         self._cursor = self._explicit_page if self._explicit_page is not None else 0
+        self._remaining_in_page = 0
         while self._cursor is not None:
             response = self.client.get(self.path, params=self._get_page_params())
             items = self._process_page_response(response.json())
-            yield from items
+            total_in_page = len(items)
+            for idx, item in enumerate(items):
+                self._remaining_in_page = total_in_page - idx - 1
+                yield item
+            self._remaining_in_page = 0
 
 
 class AsyncPaginator(BasePaginator[AsyncRequesterProtocol]):
@@ -206,11 +226,15 @@ class AsyncPaginator(BasePaginator[AsyncRequesterProtocol]):
     async def __aiter__(self) -> AsyncIterator[Any]:
         """Iterate asynchronously over all items across all pages."""
         self._cursor = self._explicit_page if self._explicit_page is not None else 0
+        self._remaining_in_page = 0
         while self._cursor is not None:
             response = await self.client.get(self.path, params=self._get_page_params())
             items = self._process_page_response(response.json())
-            for item in items:
+            total_in_page = len(items)
+            for idx, item in enumerate(items):
+                self._remaining_in_page = total_in_page - idx - 1
                 yield item
+            self._remaining_in_page = 0
 
 
 class JsonListPaginator(Paginator):

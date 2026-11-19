@@ -247,3 +247,27 @@ def test_pydantic_serialization_roundtrip() -> None:
     restored = Query.model_validate(dumped)
     assert restored.status == QueryStatus.ANSWERED
     assert restored.query_comments[0].sequence == 1
+
+
+def test_cancelled_query_with_closed_flag_resolves_to_cancelled_and_blocks_reopen() -> None:
+    """Query with closed=True and annotationStatus='Cancelled' resolves to CANCELLED (terminal)."""
+    payload = {
+        "queryComments": [
+            {"sequence": 1, "closed": False, "annotationStatus": "Open"},
+            {"sequence": 2, "closed": True, "annotationStatus": "Cancelled"},
+        ]
+    }
+    query = Query.model_validate(payload)
+    assert query.status == QueryStatus.CANCELLED
+    assert query.can_transition_to(QueryStatus.OPEN) is False
+
+    with pytest.raises(ValueError, match="Cannot transition query status from CANCELLED to OPEN"):
+        query.transition_to(QueryStatus.OPEN)
+
+    with pytest.raises(ValueError, match="Cannot transition query status from CANCELLED to OPEN"):
+        query.status = QueryStatus.OPEN
+
+    comment_models = [
+        QueryComment(sequence=1, closed=True, annotation_status="Query Cancelled"),
+    ]
+    assert calculate_legacy_status(comment_models) == QueryStatus.CANCELLED

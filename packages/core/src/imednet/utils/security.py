@@ -88,6 +88,11 @@ class SensitivityRegistry:
         """Remove a key from the exemption list."""
         self._exempt_keys.discard(_normalize_key(key))
 
+    def is_exempt(self, key: Any) -> bool:
+        """Check if a key is explicitly exempted from PHI masking."""
+        norm_key = _normalize_key(key)
+        return bool(norm_key and norm_key in self._exempt_keys)
+
     def is_sensitive(self, key: Any) -> bool:
         """Check if a key is considered sensitive and not exempted."""
         norm_key = _normalize_key(key)
@@ -99,21 +104,26 @@ class SensitivityRegistry:
 global_sensitivity_registry = SensitivityRegistry()
 
 
-def mask_clinical_phi(value: Any) -> Any:
+def mask_clinical_phi(
+    value: Any,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> Any:
     """Recursively mask sensitive keys in unstructured data."""
+    active_registry = global_sensitivity_registry if registry is None else registry
     if isinstance(value, dict):
         return {
             k: (
                 "***MASKED***"
-                if global_sensitivity_registry.is_sensitive(k)
-                else mask_clinical_phi(v)
+                if active_registry.is_sensitive(k)
+                else mask_clinical_phi(v, registry=active_registry)
             )
             for k, v in value.items()
         }
     if isinstance(value, list):
-        return [mask_clinical_phi(v) for v in value]
+        return [mask_clinical_phi(v, registry=active_registry) for v in value]
     if isinstance(value, tuple):
-        return tuple(mask_clinical_phi(v) for v in value)
+        return tuple(mask_clinical_phi(v, registry=active_registry) for v in value)
     return value
 
 

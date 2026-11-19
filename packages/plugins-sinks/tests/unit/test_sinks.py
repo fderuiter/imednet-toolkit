@@ -1508,3 +1508,201 @@ class TestBatchScopedMapperPerformance:
         assert len(rows) == 1000
         assert len(graph_mapper._pipeline_cache) == 1
         assert "STUDY1" in graph_mapper._pipeline_cache
+
+
+class TestSinkPhiMaskingControls:
+    """Verify default ***MASKED*** PHI redaction and mask_phi=False opt-out across all destination sinks."""
+
+    @staticmethod
+    def _make_study1_phi_record() -> SimpleNamespace:
+        return SimpleNamespace(
+            record_id=9001,
+            study_key="STUDY1",
+            subject_id=101,
+            subject_key="SUBJ-9001",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMOGRAPHICS",
+            record_status="Complete",
+            deleted=False,
+            date_created="2025-01-01T00:00:00Z",
+            date_modified="2025-01-02T00:00:00Z",
+            record_data={
+                "patientName": "Jane Doe",
+                "DOB": "1985-07-19",
+                "SSN": "123-45-6789",
+                "email": "jane.doe@clinical.example",
+                "systolicBp": 122,
+            },
+        )
+
+    def test_mongodb_sink_masks_phi_by_default_and_honors_opt_out(self, monkeypatch):
+        """MongoDbExportSink replaces patientName, DOB, SSN, and email with ***MASKED*** unless mask_phi=False."""
+        import imednet_sinks.document as doc_mod
+        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
+
+        from imednet.utils.security import global_sensitivity_registry
+
+        registry_before = set(global_sensitivity_registry._sensitive_keys)
+        pymongo, _client, _collection = _fake_pymongo_module()
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+
+        record = self._make_study1_phi_record()
+        with MongoDbExportSink(
+            MongoDbSinkConfig(
+                study_key="STUDY1",
+                uri="mongodb://localhost:27017",
+                database="clinical",
+                collection="records",
+            )
+        ) as sink:
+            sink.write_batch([record], batch_id="STUDY1/DEMOGRAPHICS/0")
+
+        _flt, update_doc = pymongo.UpdateOne.call_args.args[:2]
+        doc = update_doc["$set"]
+        assert doc["study_key"] == "STUDY1"
+        assert doc["subject_key"] == "SUBJ-9001"
+        assert doc["record_id"] == 9001
+        assert doc["record_data"] == {
+            "patient_name": "***MASKED***",
+            "dob": "***MASKED***",
+            "ssn": "***MASKED***",
+            "email": "***MASKED***",
+            "systolic_bp": 122,
+        }
+
+        pymongo.UpdateOne.reset_mock()
+        with MongoDbExportSink(
+            MongoDbSinkConfig(
+                study_key="STUDY1",
+                uri="mongodb://localhost:27017",
+                database="clinical",
+                collection="records",
+                mask_phi=False,
+            )
+        ) as sink_unmasked:
+            sink_unmasked.write_batch([record], batch_id="STUDY1/DEMOGRAPHICS/1")
+
+        _flt2, update_doc_unmasked = pymongo.UpdateOne.call_args.args[:2]
+        assert update_doc_unmasked["$set"]["record_data"] == {
+            "patient_name": "Jane Doe",
+            "dob": "1985-07-19",
+            "ssn": "123-45-6789",
+            "email": "jane.doe@clinical.example",
+            "systolic_bp": 122,
+        }
+        assert global_sensitivity_registry._sensitive_keys == registry_before
+
+    def test_neo4j_sink_masks_phi_by_default_and_honors_opt_out(self, monkeypatch):
+        """Neo4jExportSink replaces patientName, DOB, SSN, and email with ***MASKED*** while preserving graph keys."""
+        import json
+
+        import imednet_sinks.graph as graph_mod
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
+
+        neo4j, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
+
+        record = self._make_study1_phi_record()
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="STUDY1",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "testpass"),
+            )
+        ) as sink:
+            sink.write_batch([record], batch_id="STUDY1/DEMOGRAPHICS/0")
+
+        session_mock = driver.session.return_value.__enter__.return_value
+        row = session_mock.run.call_args.kwargs["rows"][0]
+        assert row["study_key"] == "STUDY1"
+        assert row["subject_key"] == "SUBJ-9001"
+        assert row["record_id"] == 9001
+        assert json.loads(row["record_data"]) == {
+            "patient_name": "***MASKED***",
+            "dob": "***MASKED***",
+            "ssn": "***MASKED***",
+            "email": "***MASKED***",
+            "systolic_bp": 122,
+        }
+
+        session_mock.run.reset_mock()
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="STUDY1",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "testpass"),
+                mask_phi=False,
+            )
+        ) as sink_unmasked:
+            sink_unmasked.write_batch([record], batch_id="STUDY1/DEMOGRAPHICS/1")
+
+        unmasked_row = session_mock.run.call_args.kwargs["rows"][0]
+        assert json.loads(unmasked_row["record_data"])["patient_name"] == "Jane Doe"
+        assert json.loads(unmasked_row["record_data"])["ssn"] == "123-45-6789"
+
+    def test_snowflake_sink_masks_phi_by_default_and_honors_opt_out(self, monkeypatch, tmp_path):
+        """SnowflakeExportSink masks sensitive fields to ***MASKED*** in staged Arrow rows unless mask_phi=False."""
+        import json
+
+        import imednet_sinks.warehouse as wh_mod
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        sf, _conn, _cursor = _fake_snowflake_module()
+        pa, pq, _table = _fake_pyarrow_modules()
+
+        def fake_require(pkg, _extras):
+            if pkg == "snowflake.connector":
+                return sf
+            if pkg == "pyarrow":
+                return pa
+            if pkg == "pyarrow.parquet":
+                return pq
+            return MagicMock()
+
+        monkeypatch.setattr(wh_mod, "_require_optional_dep", fake_require)
+
+        record = self._make_study1_phi_record()
+        placeholder = "test-only"
+        base_kwargs = {
+            "study_key": "STUDY1",
+            "account": "acct",
+            "user": "usr",
+            "password": placeholder,
+            "database": "DB",
+            "schema": "PUBLIC",
+            "warehouse": "WH",
+            "stage": "STG",
+            "table": "RECORDS",
+            "local_staging_dir": str(tmp_path),
+        }
+
+        with SnowflakeExportSink(SnowflakeSinkConfig(**base_kwargs)) as sink:
+            sink.write_batch([record], batch_id="STUDY1/DEMOGRAPHICS/0")
+
+        staged_rows = pa.Table.from_pylist.call_args.args[0]
+        assert staged_rows[0]["study_key"] == "STUDY1"
+        assert staged_rows[0]["subject_key"] == "SUBJ-9001"
+        assert staged_rows[0]["record_id"] == 9001
+        assert json.loads(staged_rows[0]["record_data"]) == {
+            "patient_name": "***MASKED***",
+            "dob": "***MASKED***",
+            "ssn": "***MASKED***",
+            "email": "***MASKED***",
+            "systolic_bp": 122,
+        }
+
+        pa.Table.from_pylist.reset_mock()
+        with SnowflakeExportSink(
+            SnowflakeSinkConfig(**base_kwargs, mask_phi=False)
+        ) as sink_opt_out:
+            sink_opt_out.write_batch([record], batch_id="STUDY1/DEMOGRAPHICS/1")
+
+        unmasked_rows = pa.Table.from_pylist.call_args.args[0]
+        assert json.loads(unmasked_rows[0]["record_data"]) == {
+            "patient_name": "Jane Doe",
+            "dob": "1985-07-19",
+            "ssn": "123-45-6789",
+            "email": "jane.doe@clinical.example",
+            "systolic_bp": 122,
+        }

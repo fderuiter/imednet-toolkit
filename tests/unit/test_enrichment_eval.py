@@ -424,3 +424,119 @@ def test_enrichment_pipeline_evaluator_exception_and_scalar_fallback(
 
     assert res["computed"] == 42
     assert any("Business logic evaluation failed" in r.message for r in caplog.records)
+
+
+def test_centralized_mapper_masks_default_phi_and_supports_opt_out() -> None:
+    """Verify CentralizedMapper masks registered PHI to ***MASKED*** by default and honors mask_phi=False."""
+    from imednet.integrations.enrichment import CentralizedMapper
+    from imednet.utils.security import global_sensitivity_registry
+
+    sensitive_snapshot = set(global_sensitivity_registry._sensitive_keys)
+    exempt_snapshot = set(global_sensitivity_registry._exempt_keys)
+
+    raw_payload = {
+        "patientName": "Jane Doe",
+        "DOB": "1980-04-12",
+        "SSN": "123-45-6789",
+        "email": "jane@clinical.example",
+        "systolicBp": 118,
+        "contacts": {"phone": "555-0199", "clinicCode": "C1"},
+    }
+    record = Record(
+        record_id=501,
+        study_key="STUDY1",
+        subject_key="SUBJ-501",
+        visit_id=1,
+        form_id=10,
+        record_data=dict(raw_payload),
+    )
+
+    doc_mapper = CentralizedMapper(mode="document")
+    mapped_doc = doc_mapper.map_record(record, study_key="STUDY1")
+    assert mapped_doc["study_key"] == "STUDY1"
+    assert mapped_doc["subject_key"] == "SUBJ-501"
+    assert mapped_doc["record_id"] == 501
+    assert mapped_doc["record_data"]["patient_name"] == "***MASKED***"
+    assert mapped_doc["record_data"]["dob"] == "***MASKED***"
+    assert mapped_doc["record_data"]["ssn"] == "***MASKED***"
+    assert mapped_doc["record_data"]["email"] == "***MASKED***"
+    assert mapped_doc["record_data"]["contacts"]["phone"] == "***MASKED***"
+    assert mapped_doc["record_data"]["contacts"]["clinicCode"] == "C1"
+    assert mapped_doc["record_data"]["systolic_bp"] == 118
+    # Input record must remain unmutated
+    assert record.record_data["patientName"] == "Jane Doe"
+
+    tab_mapper = CentralizedMapper(mode="tabular")
+    mapped_tab = tab_mapper.map_record(record, study_key="STUDY1")
+    assert mapped_tab["record_data"]["patient_name"] == "***MASKED***"
+    assert mapped_tab["record_data"]["dob"] == "***MASKED***"
+    assert mapped_tab["record_data"]["ssn"] == "***MASKED***"
+    assert mapped_tab["record_data"]["email"] == "***MASKED***"
+    assert mapped_tab["record_data"]["contacts.phone"] == "***MASKED***"
+    assert mapped_tab["record_data"]["contacts.clinic_code"] == "C1"
+    assert mapped_tab["record_data"]["systolic_bp"] == 118
+
+    unmasked_mapper = CentralizedMapper(mode="tabular", mask_phi=False)
+    mapped_unmasked = unmasked_mapper.map_record(record, study_key="STUDY1")
+    assert mapped_unmasked["record_data"]["patient_name"] == "Jane Doe"
+    assert mapped_unmasked["record_data"]["dob"] == "1980-04-12"
+    assert mapped_unmasked["record_data"]["ssn"] == "123-45-6789"
+    assert mapped_unmasked["record_data"]["email"] == "jane@clinical.example"
+    assert global_sensitivity_registry._sensitive_keys == sensitive_snapshot
+    assert global_sensitivity_registry._exempt_keys == exempt_snapshot
+
+
+def test_study_configuration_phi_fields_case_insensitive_in_document_and_tabular_modes() -> None:
+    """Verify StudyConfiguration(phiFields=...) matches snake_case keys across document and tabular modes."""
+    from imednet.integrations.enrichment import CentralizedMapper
+
+    study_cfg = StudyConfiguration(
+        studyKey="STUDY1",
+        phiFields=["patientName", "DOB", "SSN", "medicalRecordNumber", "subjectKey", "recordId"],
+        terminology_lookups={"gender": {"1": "Female"}},
+    )
+
+    record = SimpleNamespace(
+        record_id=777,
+        study_key="STUDY1",
+        subject_key="SUBJ-777",
+        visit_id=2,
+        form_id=5,
+        record_data={
+            "patientName": "John Roe",
+            "DOB": "1975-09-21",
+            "SSN": "987-65-4321",
+            "medicalRecordNumber": "MRN-42",
+            "gender": "1",
+            "heartRate": 72,
+            "demographics": {"medicalRecordNumber": "MRN-NESTED"},
+        },
+    )
+
+    for mode in ("document", "tabular"):
+        mapper = CentralizedMapper(mode=mode, study_config=study_cfg)
+        mapped = mapper.map_record(record, study_key="STUDY1")
+
+        # Exempt relational keys remain unmasked even if listed in phiFields
+        assert mapped["study_key"] == "STUDY1"
+        assert mapped["subject_key"] == "SUBJ-777"
+        assert mapped["record_id"] == 777
+
+        rd = mapped["record_data"]
+        assert rd["patient_name"] in {"***MASKED***", "[MASKED]"}
+        assert rd["dob"] in {"***MASKED***", "[MASKED]"}
+        assert rd["ssn"] in {"***MASKED***", "[MASKED]"}
+        assert rd["medical_record_number"] == "[MASKED]"
+        assert rd["gender"] == "Female"
+        assert rd["heart_rate"] == 72
+        if mode == "document":
+            assert rd["demographics"]["medicalRecordNumber"] == "[MASKED]"
+        else:
+            assert rd["demographics.medical_record_number"] == "[MASKED]"
+
+    # Explicit opt-out skips PHI masking while keeping terminology enrichment active
+    opt_out_mapper = CentralizedMapper(mode="document", mask_phi=False, study_config=study_cfg)
+    unmasked = opt_out_mapper.map_record(record, study_key="STUDY1")
+    assert unmasked["record_data"]["patient_name"] == "John Roe"
+    assert unmasked["record_data"]["medical_record_number"] == "MRN-42"
+    assert unmasked["record_data"]["gender"] == "Female"

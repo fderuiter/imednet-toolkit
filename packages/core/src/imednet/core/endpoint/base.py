@@ -6,7 +6,7 @@ import builtins
 from collections.abc import Callable, Iterable
 from typing import Any, TypeVar
 
-from imednet.constants import DEFAULT_PAGE_SIZE
+from imednet.constants import DEFAULT_PAGE_SIZE, LARGE_PAGE_SIZE
 from imednet.core.endpoint.abc import EndpointABC
 from imednet.core.endpoint.dispatch import (
     AsyncEndpointContext,
@@ -259,6 +259,14 @@ class _ListEndpointBase(GenericEndpoint[T]):
                 params["filter"] = combined_filter
             else:
                 params["filter"] = built_filter
+
+        if "size" in params and params["size"] is not None:
+            from imednet.core.paginator import _parse_int_param
+
+            raw_size = _parse_int_param("size", params["size"])
+            if raw_size <= 0:
+                raise ValueError(f"size must be a positive integer, got {raw_size}")
+            params["size"] = min(raw_size, LARGE_PAGE_SIZE)
 
         record_data_filter = params.get("recordDataFilter")
         if record_data_filter is None:

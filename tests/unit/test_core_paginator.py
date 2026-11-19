@@ -221,15 +221,15 @@ def test_paginator_rejects_invalid_bounds(
 @pytest.mark.parametrize(
     ("params", "expected_size"),
     [
-        ({"size": 2}, 2),
+        ({"page": 0, "size": 2}, 2),
         ({"limit": 2}, 2),
         ({"size": 2, "limit": 2}, 2),
     ],
 )
-def test_paginator_explicit_size_or_limit_bounds_to_single_page(
+def test_paginator_explicit_page_or_limit_bounds_to_single_page(
     params: dict[str, Any], expected_size: int
 ) -> None:
-    """Test explicit size or limit in params restricts iteration to one page without leaking limit."""
+    """Test explicit page or limit in params restricts iteration to one page without leaking limit."""
     sync_client = DummyClient(
         [
             {"data": [1, 2, 3], "pagination": {"totalPages": 4}},

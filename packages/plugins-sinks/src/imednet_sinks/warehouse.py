@@ -225,12 +225,12 @@ def _normalize_warehouse_value(value: Any) -> Any:
     return value
 
 
-def _post_process_warehouse(row: dict[str, Any]) -> dict[str, Any]:
+def _post_process_warehouse(row: dict[str, Any], *, mask_phi: bool = True) -> dict[str, Any]:
     """Apply PHI masking and JSON-encode structured fields for single-table Parquet staging."""
     from imednet.spi.utils import mask_clinical_phi
 
     normalized_row: dict[str, Any] = _normalize_warehouse_value(row)
-    masked_row: dict[str, Any] = mask_clinical_phi(normalized_row)
+    masked_row: dict[str, Any] = mask_clinical_phi(normalized_row) if mask_phi else normalized_row
     record_payload = masked_row.get("record_data")
     if record_payload is None:
         record_payload = {}
@@ -243,6 +243,11 @@ def _post_process_warehouse(row: dict[str, Any]) -> dict[str, Any]:
     if isinstance(keywords, (list, dict, tuple)):
         masked_row["keywords"] = json.dumps(keywords, default=str)
     return masked_row
+
+
+def _post_process_warehouse_unmasked(row: dict[str, Any]) -> dict[str, Any]:
+    """JSON-encode structured fields for single-table Parquet staging without PHI masking."""
+    return _post_process_warehouse(row, mask_phi=False)
 
 
 def _resolve_merge_columns(arrow_table: Any) -> list[str]:
@@ -268,6 +273,7 @@ def _resolve_merge_columns(arrow_table: Any) -> list[str]:
 def _records_to_arrow_table(
     records: Sequence[Any],
     *,
+    mask_phi: bool = True,
     study_key: str | None = None,
     mapper: Any | None = None,
 ) -> Any:
@@ -276,7 +282,12 @@ def _records_to_arrow_table(
     if mapper is None:
         from imednet.spi.sinks import CentralizedMapper
 
-        mapper = CentralizedMapper(mode="document", post_processor=_post_process_warehouse)
+        post_proc = _post_process_warehouse if mask_phi else _post_process_warehouse_unmasked
+        mapper = CentralizedMapper(
+            mode="document",
+            post_processor=post_proc,
+            mask_phi=mask_phi,
+        )
     rows = [mapper.map_record(r, study_key=study_key) for r in records]
 
     return pa.Table.from_pylist(rows)
@@ -380,12 +391,24 @@ class SnowflakeExportSink(ExportSink):
         cfg = self._cfg
         from imednet.spi.sinks import CentralizedMapper
 
-        mapper = CentralizedMapper(mode="document", post_processor=_post_process_warehouse)
+        post_proc = (
+            _post_process_warehouse if self.config.mask_phi else _post_process_warehouse_unmasked
+        )
+        mapper = CentralizedMapper(
+            mode="document",
+            post_processor=post_proc,
+            mask_phi=self.config.mask_phi,
+        )
         custom_pipeline = cfg.extra.get("enrichment_pipeline")
         if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
             mapper.register_pipeline(cfg.study_key, custom_pipeline)
 
-        arrow_table = _records_to_arrow_table(records, study_key=cfg.study_key, mapper=mapper)
+        arrow_table = _records_to_arrow_table(
+            records,
+            mask_phi=self.config.mask_phi,
+            study_key=cfg.study_key,
+            mapper=mapper,
+        )
         merge_columns = _resolve_merge_columns(arrow_table)
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
         pq = _require_optional_dep("pyarrow.parquet", "snowflake")

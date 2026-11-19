@@ -51,6 +51,8 @@ from imednet.utils.job_poller import (
 )
 from imednet.utils.secrets import redact_sensitive_payload
 from imednet.utils.security import (
+    SensitivityRegistry,
+    global_sensitivity_registry,
     mask_clinical_phi,
     sanitize_csv_formula,
     validate_partition_key,
@@ -79,6 +81,7 @@ __all__ = [
     "JobTimeoutError",
     "PathTraversalValidationError",
     "RestrictedAstEvaluator",
+    "SensitivityRegistry",
     "build_filter_string",
     "chunk_records",
     "evaluate_expression",
@@ -88,6 +91,7 @@ __all__ = [
     "get_base_url_context",
     "get_sqlite_connection",
     "get_study_context",
+    "global_sensitivity_registry",
     "is_boolean_token",
     "is_missing_value",
     "mask_clinical_phi",

@@ -33,10 +33,12 @@ Retry policy
   * HTTP ``5xx`` responses
 * All methods (including ``POST``/``PATCH``) retry on HTTP ``429`` rate limits.
 * Non-idempotent methods do not retry on network errors or ``5xx`` responses.
-* Maximum attempts are controlled by the ``retries`` argument on
-  :class:`~imednet.core.client.Client`,
-  :class:`~imednet.core.async_client.AsyncClient`,
-  :class:`~imednet.sdk.ImednetSDK`, and :class:`~imednet.sdk.AsyncImednetSDK`.
+* Maximum attempts and backoff are configured via ``retry_config``
+  (:class:`~imednet.core.retry.RetryConfig`) on
+  :class:`~imednet.core.client.Client` and
+  :class:`~imednet.core.async_client.AsyncClient`, or via ``retry_config``,
+  ``retries``, and ``backoff_factor`` on :class:`~imednet.sdk.ImednetSDK` and
+  :class:`~imednet.sdk.AsyncImednetSDK`.
 * Backoff uses Tenacity's randomized exponential wait strategy with
   ``backoff_factor`` as the multiplier.
 * Paginators call the requester directly. The HTTP transport is the sole

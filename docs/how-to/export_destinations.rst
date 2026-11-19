@@ -108,6 +108,65 @@ Snowflake (warehouse-native export):
    rows = export_to_snowflake(sdk, "MY_STUDY", config=snowflake_cfg)
    print(rows)
 
+PHI protection and masking controls
+-----------------------------------
+
+All destination sinks, partitioned Parquet exports, flat and hierarchical JSON
+exports, and DataFrame converters mask Protected Health Information (PHI) at
+mapper ingress **by default** (``mask_phi=True``):
+
+* **Default sensitive keys**: Registered clinical identifiers—including
+  ``patientName`` / ``patient_name``, ``patientInitials``, ``DOB`` /
+  ``date_of_birth`` / ``birth_date``, ``SSN``, ``phone``, ``email``, and
+  ``address``—are replaced with ``***MASKED***`` before column label mapping,
+  hierarchy construction, or sink batch serialization.
+* **Relational identifiers preserved**: Join and graph keys (``study_key``,
+  ``subject_key``, and ``record_id``) are explicitly exempted from masking so
+  relational joins, Hive partitions, and Neo4j graph edges remain intact.
+* **Study-specific rules**: Study-level ``StudyConfiguration(phiFields=[...])``
+  rules normalize camelCase, PascalCase, uppercase acronyms, and ``snake_case``
+  field names automatically across both ``document`` and ``tabular`` mapper
+  modes. Additional global identifiers can also be registered via
+  ``global_sensitivity_registry`` (exposed on ``imednet.spi.utils`` for
+  extension plugins).
+
+Customizing study PHI fields with ``CentralizedMapper``:
+
+.. testcode::
+
+   from imednet.integrations.enrichment import CentralizedMapper
+   from imednet.models.study_config import StudyConfiguration
+
+   study_cfg = StudyConfiguration(
+       studyKey="MY_STUDY",
+       version="1.0",
+       reportingProfile="general",
+       phiFields=["patientName", "DOB", "SSN", "medicalRecordNumber"],
+   )
+   mapper = CentralizedMapper(mode="tabular", study_config=study_cfg)
+
+Opting out for authorized identifiable data transfers:
+
+When protocol governance explicitly authorizes transferring unmasked clinical
+identifiers (for example, an approved EDC migration), pass ``mask_phi=False``
+on the sink configuration, mapper, or export helper. Opting out applies only to
+that operation and never mutates ``global_sensitivity_registry``:
+
+.. testcode::
+
+   from imednet import ImednetSDK
+   from imednet_sinks import MongoDbSinkConfig, export_to_mongodb
+
+   sdk = ImednetSDK(api_key="mock", security_key="mock")
+   authorized_cfg = MongoDbSinkConfig(
+       study_key="MY_STUDY",
+       uri="mongodb://localhost:27017",
+       database="imednet",
+       collection="authorized_records",
+       mask_phi=False,
+   )
+   export_to_mongodb(sdk, "MY_STUDY", config=authorized_cfg)
+
 Runnable examples
 -----------------
 

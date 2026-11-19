@@ -347,3 +347,42 @@ def test_sensitivity_registry_with_unhashable_and_repeated_keys():
     registry.add_sensitive_key("patientName")
     assert registry.is_sensitive("patientName")
     assert registry.is_sensitive("patient_name")
+
+
+def test_spi_utils_reexports_sensitivity_helpers():
+    """Verify extension-facing imednet.spi.utils re-exports core PHI registry and masker."""
+    from imednet.spi import utils as spi_utils
+    from imednet.utils import security as core_security
+
+    assert spi_utils.SensitivityRegistry is core_security.SensitivityRegistry
+    assert spi_utils.global_sensitivity_registry is core_security.global_sensitivity_registry
+    assert spi_utils.mask_clinical_phi is core_security.mask_clinical_phi
+
+
+def test_sensitivity_registry_is_exempt_and_custom_registry_masking():
+    """Verify is_exempt checks and isolated custom registry masking without mutating global state."""
+    from imednet.utils.security import global_sensitivity_registry
+
+    custom_registry = SensitivityRegistry()
+    assert custom_registry.is_exempt("subject_key")
+    assert custom_registry.is_exempt("SubjectKey")
+    assert custom_registry.is_exempt("study_key")
+    assert custom_registry.is_exempt("record_id")
+    assert custom_registry.is_exempt("RecordID")
+    assert not custom_registry.is_exempt("patientName")
+    assert not custom_registry.is_exempt("")
+    assert not custom_registry.is_exempt(None)
+
+    custom_registry.add_sensitive_key("chartCode")
+    payload = {
+        "chart_code": "CH-001",
+        "subjectKey": "SUBJ-01",
+        "nested_tuple": ({"chartCode": "CH-002", "vital": 98.6},),
+    }
+
+    masked_custom = mask_clinical_phi(payload, registry=custom_registry)
+    assert masked_custom["chart_code"] == "***MASKED***"
+    assert masked_custom["subjectKey"] == "SUBJ-01"
+    assert masked_custom["nested_tuple"][0]["chartCode"] == "***MASKED***"
+    assert masked_custom["nested_tuple"][0]["vital"] == 98.6
+    assert not global_sensitivity_registry.is_sensitive("chartCode")

@@ -8,7 +8,14 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from pydantic import Field
 
-from imednet.spi.models import Form, ImednetBaseModel, Interval, Site, Variable
+from imednet.spi.models import (
+    Form,
+    ImednetBaseModel,
+    Interval,
+    Site,
+    Variable,
+    is_site_enrollment_eligible,
+)
 
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
@@ -68,7 +75,9 @@ class StudySnapshot(ImednetBaseModel):
 
     def active_sites(self) -> list[Site]:
         """Return sites that are actively enrolling."""
-        return [site for site in self.sites if site.site_enrollment_status == "Active"]
+        return [
+            site for site in self.sites if is_site_enrollment_eligible(site.site_enrollment_status)
+        ]
 
 
 class StudySchemaInspector:

@@ -4,11 +4,54 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
-from pydantic import Field, RootModel
+from pydantic import Field, RootModel, field_validator
 
 from imednet.models.base import ImednetBaseModel
+
+def _normalize_record_token(value: str) -> str: ...
+
+class RecordStatus(str, Enum):
+    """Normalized lifecycle statuses for eCRF form records."""
+
+    RECORD_INCOMPLETE = "Record Incomplete"
+    RECORD_COMPLETE = "Record Complete"
+    INCOMPLETE = "Incomplete"
+    COMPLETE = "Complete"
+    PARTIAL = "Partial"
+    LOCKED = "Locked"
+    FROZEN = "Frozen"
+    SIGNED = "Signed"
+    VERIFIED = "Verified"
+    APPROVED = "Approved"
+    DELETED = "DELETED"
+
+    def __str__(self) -> str: ...
+    @classmethod
+    def _missing_(cls, value: object) -> RecordStatus | None: ...
+    def can_transition_to(self, target: RecordStatus | str) -> bool: ...
+    def validate_transition_to(self, target: RecordStatus | str) -> bool: ...
+    @property
+    def allowed_transitions(self) -> set[RecordStatus]: ...
+
+_NON_DELETED_RECORD_STATUSES: set[RecordStatus]
+ALLOWED_RECORD_TRANSITIONS: dict[RecordStatus, set[RecordStatus]]
+
+def normalize_record_status(value: RecordStatus | str | None) -> RecordStatus | str | None: ...
+def is_valid_record_transition(
+    from_status: RecordStatus | str | None,
+    to_status: RecordStatus | str,
+    *,
+    deleted: bool | None = None,
+) -> bool: ...
+def validate_record_transition(
+    from_status: RecordStatus | str | None,
+    to_status: RecordStatus | str,
+    *,
+    deleted: bool | None = None,
+) -> bool: ...
 
 class Keyword(ImednetBaseModel):
     """A keyword or tag associated with a record."""
@@ -23,6 +66,8 @@ class Record(ImednetBaseModel):
 
     keywords: list[Keyword] = Field(default_factory=list, alias="keywords")
     record_data: dict[str, Any] = Field(default_factory=dict, alias="recordData")
+    record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
+    deleted: bool | None = Field(default=None, alias="deleted")
     study_key: str | None
     interval_id: int | None
     form_id: int | None
@@ -31,8 +76,6 @@ class Record(ImednetBaseModel):
     record_id: int | None
     record_oid: str | None
     record_type: str | None
-    record_status: str | None
-    deleted: bool | None
     date_created: str | None
     date_modified: str | None
     subject_id: int | None
@@ -41,6 +84,18 @@ class Record(ImednetBaseModel):
     visit_id: int | None
     parent_record_id: int | None
     last_updated: str | None
+
+    @field_validator("record_status", mode="before")
+    @classmethod
+    def _validate_record_status(cls, value: Any) -> RecordStatus | str | None: ...
+    @property
+    def is_deleted(self) -> bool: ...
+    @property
+    def effective_status(self) -> RecordStatus | str | None: ...
+    def can_transition_to(self, target_status: RecordStatus | str) -> bool: ...
+    def transition_to(self, target_status: RecordStatus | str) -> RecordStatus | str: ...
+    def update_status(self, target_status: RecordStatus | str) -> RecordStatus | str: ...
+    def __setattr__(self, name: str, value: Any) -> None: ...
 
 class RecordJobResponse(ImednetBaseModel):
     """Response for a record-related job (batch operations, etc)."""

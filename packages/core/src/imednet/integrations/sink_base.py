@@ -227,6 +227,9 @@ class SinkConfig:
     idempotent:
         When ``True``, sinks use upsert / replace semantics so that replaying
         a batch with the same ``batch_id`` produces no duplicate data.
+    mask_phi:
+        When ``True`` (default), sensitive clinical PHI fields in ``record_data``
+        are replaced with ``***MASKED***`` before writing to the destination.
     modified_since:
         Optional lower-bound modification timestamp watermark (``dateModified >= ...``).
     record_filter:
@@ -250,6 +253,7 @@ class SinkConfig:
     max_retries: int = _DEFAULT_MAX_RETRIES
     retry_backoff: float = _DEFAULT_RETRY_BACKOFF
     idempotent: bool = True
+    mask_phi: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
     quality_gate_enabled: bool = False
     min_schema_readiness_score: float = 100.0
@@ -280,6 +284,8 @@ class SinkConfig:
             or self.retry_backoff < 0
         ):
             raise ValueError("retry_backoff must be a finite non-negative number")
+        if not isinstance(self.mask_phi, bool):
+            raise ValueError("mask_phi must be a boolean")
         if self.modified_since is not None:
             normalize_watermark_datetime(self.modified_since)
         if isinstance(self.record_filter, str) and self.record_filter.strip():
@@ -525,6 +531,7 @@ def apply_quality_gate(
         yield from records
         return
 
+    from imednet.core.context import reset_study_context, set_study_context
     from imednet.validation.cache import SchemaValidator, calculate_readiness_score
 
     validator = SchemaValidator(sdk)
@@ -549,24 +556,28 @@ def apply_quality_gate(
         else:
             rec_dict = {"data": {}}
 
-        fk = rec_dict.get("formKey") or rec_dict.get("form_key")
-        if not fk:
-            fid = rec_dict.get("formId") or rec_dict.get("form_id") or 0
-            fk = validator.schema.form_key_from_id(fid)
+        ctx_token = set_study_context(study_key)
+        try:
+            fk = rec_dict.get("formKey") or rec_dict.get("form_key")
+            if not fk:
+                fid = rec_dict.get("formId") or rec_dict.get("form_id") or 0
+                fk = validator.schema.form_key_from_id(fid)
 
-        if not fk:
-            logger.info("Dropped record %s: Unknown form", rec_dict.get("record_id", "Unknown"))
-            dropped_count += 1
-            continue
+            if not fk:
+                logger.info("Dropped record %s: Unknown form", rec_dict.get("record_id", "Unknown"))
+                dropped_count += 1
+                continue
 
-        data = rec_dict.get("record_data")
-        if data is None:
-            data = rec_dict.get("recordData")
-        if data is None:
-            data = rec_dict.get("data", {})
-        if data is None:
-            data = {}
-        score, reasons = calculate_readiness_score(validator.schema, fk, data)
+            data = rec_dict.get("record_data")
+            if data is None:
+                data = rec_dict.get("recordData")
+            if data is None:
+                data = rec_dict.get("data", {})
+            if data is None:
+                data = {}
+            score, reasons = calculate_readiness_score(validator.schema, fk, data)
+        finally:
+            reset_study_context(ctx_token)
 
         if score < config.min_schema_readiness_score:
             logger.info(
