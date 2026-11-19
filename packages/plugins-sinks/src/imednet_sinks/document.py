@@ -128,13 +128,21 @@ def _post_process_document(doc: dict[str, Any]) -> dict[str, Any]:
 
 
 def _record_to_document(
-    record: Any, study_key: str, mapper: CentralizedMapper | None = None
+    record: Any,
+    study_key: str,
+    mapper: CentralizedMapper | None = None,
+    *,
+    mask_phi: bool = True,
 ) -> dict[str, Any]:
     """Wrap a typed ``Record`` model in the standard document envelope."""
     if mapper is None:
         from imednet.spi.sinks import CentralizedMapper
 
-        mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
+        mapper = CentralizedMapper(
+            mode="document",
+            post_processor=_post_process_document,
+            mask_phi=mask_phi,
+        )
     return mapper.map_record(record, study_key=study_key)
 
 
@@ -195,7 +203,11 @@ class MongoDbExportSink(ExportSink):
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
         from imednet.spi.sinks import CentralizedMapper
 
-        mapper = CentralizedMapper(mode="document", post_processor=_post_process_document)
+        mapper = CentralizedMapper(
+            mode="document",
+            post_processor=_post_process_document,
+            mask_phi=self.config.mask_phi,
+        )
         docs = [_record_to_document(r, self._study_key, mapper=mapper) for r in records]
         if not docs:
             return 0
@@ -244,6 +256,7 @@ def export_to_mongodb(
     collection: str = "",
     *,
     config: MongoDbSinkConfig | None = None,
+    mask_phi: bool = True,
 ) -> int:
     """Export study records to MongoDB using :class:`MongoDbExportSink`."""
     from imednet.spi.sink_base import apply_quality_gate
@@ -254,6 +267,7 @@ def export_to_mongodb(
             uri=uri,
             database=database,
             collection=collection,
+            mask_phi=mask_phi,
         )
 
     records = sdk.records.list(study_key=study_key, record_data_filter=None)

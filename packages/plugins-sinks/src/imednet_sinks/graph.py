@@ -134,13 +134,21 @@ def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _record_to_row(
-    record: Any, study_key: str, mapper: CentralizedMapper | None = None
+    record: Any,
+    study_key: str,
+    mapper: CentralizedMapper | None = None,
+    *,
+    mask_phi: bool = True,
 ) -> dict[str, Any]:
     """Convert a typed ``Record`` model to a flat Cypher parameter dict."""
     if mapper is None:
         from imednet.spi.sinks import CentralizedMapper
 
-        mapper = CentralizedMapper(mode="document", post_processor=_post_process_graph)
+        mapper = CentralizedMapper(
+            mode="document",
+            post_processor=_post_process_graph,
+            mask_phi=mask_phi,
+        )
     return mapper.map_record(record, study_key=study_key)
 
 
@@ -194,7 +202,11 @@ class Neo4jExportSink(ExportSink):
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
         from imednet.spi.sinks import CentralizedMapper
 
-        mapper = CentralizedMapper(mode="document", post_processor=_post_process_graph)
+        mapper = CentralizedMapper(
+            mode="document",
+            post_processor=_post_process_graph,
+            mask_phi=self.config.mask_phi,
+        )
         rows = [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
         if not rows:
             return 0
@@ -230,6 +242,7 @@ def export_to_neo4j(
     auth: tuple[str, str] = ("", ""),
     *,
     config: Neo4jSinkConfig | None = None,
+    mask_phi: bool = True,
 ) -> int:
     """Export study records to Neo4j using :class:`Neo4jExportSink`."""
     if config is None:
@@ -237,6 +250,7 @@ def export_to_neo4j(
             study_key=study_key,
             uri=uri,
             auth=auth,
+            mask_phi=mask_phi,
         )
     records = sdk.records.list(study_key=study_key, record_data_filter=None)
     total_written = 0

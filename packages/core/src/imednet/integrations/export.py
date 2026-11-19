@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -61,6 +62,22 @@ def _record_mapper() -> Any:
     return mappers[0].load()
 
 
+def _create_record_mapper(sdk: Any, *, mask_phi: bool = True) -> Any:
+    """Instantiate the configured RecordMapper while preserving call contracts."""
+    mapper_cls = _record_mapper()
+    if mask_phi:
+        return mapper_cls(sdk)
+    try:
+        accepts_mask_phi = "mask_phi" in inspect.signature(mapper_cls).parameters
+    except (TypeError, ValueError):
+        accepts_mask_phi = False
+    if accepts_mask_phi:
+        return mapper_cls(sdk, mask_phi=False)
+    mapper = mapper_cls(sdk)
+    mapper.mask_phi = False
+    return mapper
+
+
 def _mask_df(df: pd.DataFrame) -> pd.DataFrame:
     """Mask sensitive fields in the DataFrame based on the global registry."""
     sensitive_cols = [
@@ -115,13 +132,15 @@ def _records_df(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    mask_phi: bool = True,
 ) -> pd.DataFrame:
     """Return a DataFrame of study records with duplicate columns removed."""
     if pd is None:
         raise ImportError(
             "pandas is required for _records_df. Install with \"pip install 'imednet[export]'\"."
         )
-    df: pd.DataFrame = _record_mapper()(sdk).dataframe(
+    mapper = _create_record_mapper(sdk, mask_phi=mask_phi)
+    df: pd.DataFrame = mapper.dataframe(
         study_key,
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
@@ -141,6 +160,7 @@ def _prepare_export_df(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     sanitize: bool = False,
+    mask_phi: bool = True,
 ) -> pd.DataFrame:
     """Prepare a DataFrame for export by fetching records and optionally sanitizing."""
     df = _records_df(
@@ -149,8 +169,10 @@ def _prepare_export_df(
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
+        mask_phi=mask_phi,
     )
-    df = _mask_df(df)
+    if mask_phi:
+        df = _mask_df(df)
     if sanitize:
         df = _sanitize_df(df)
     return df
@@ -162,6 +184,7 @@ def export_to_parquet(
     path: str,
     *,
     use_labels_as_columns: bool = False,
+    mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
     """Export study records to a Parquet file.
@@ -173,11 +196,15 @@ def export_to_parquet(
     use_labels_as_columns:
         When ``True``, variable labels are used for column names instead of
         variable names.
+    mask_phi:
+        When ``True`` (default), sensitive PHI values are replaced with
+        ``***MASKED***``.
     """
     df = _prepare_export_df(
         sdk,
         study_key,
         use_labels_as_columns=use_labels_as_columns,
+        mask_phi=mask_phi,
     )
     df.to_parquet(path, index=False, **kwargs)
 
@@ -340,7 +367,7 @@ def _tabular_export(
     config: TabularSinkConfig,
     sanitize: bool = False,
 ) -> None:
-    mapper = _record_mapper()(sdk)
+    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
     variable_keys, label_map = mapper._fetch_variable_metadata(
         study_key,
         variable_whitelist=config.variable_whitelist,
@@ -385,7 +412,8 @@ def _tabular_export(
             dup_mask = df.columns.str.lower().duplicated()
             df = df.loc[:, ~dup_mask]
 
-            df = _mask_df(df)
+            if config.mask_phi:
+                df = _mask_df(df)
             if sanitize:
                 df = _sanitize_df(df)
 
@@ -399,6 +427,7 @@ def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         "max_retries",
         "retry_backoff",
         "idempotent",
+        "mask_phi",
         "extra",
         "min_schema_readiness_score",
         "tracer",
@@ -416,6 +445,7 @@ def export_to_csv(
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
     quality_gate_enabled: bool = True,
+    mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
     """Export study records to a CSV file.
@@ -427,10 +457,14 @@ def export_to_csv(
     use_labels_as_columns:
         When ``True``, variable labels are used for column names instead of
         variable names.
+    mask_phi:
+        When ``True`` (default), sensitive PHI values are replaced with
+        ``***MASKED***``.
     """
     config = kwargs.pop("config", None)
     if not isinstance(config, TabularSinkConfig):
         sink_kwargs = _pop_sink_kwargs(kwargs)
+        sink_kwargs.setdefault("mask_phi", mask_phi)
         config = TabularSinkConfig(
             study_key=study_key,
             manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
@@ -452,6 +486,7 @@ def export_to_excel(
     path: str,
     *,
     use_labels_as_columns: bool = False,
+    mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
     """Export study records to an Excel workbook.
@@ -463,12 +498,16 @@ def export_to_excel(
     use_labels_as_columns:
         When ``True``, variable labels are used for column names instead of
         variable names.
+    mask_phi:
+        When ``True`` (default), sensitive PHI values are replaced with
+        ``***MASKED***``.
     """
     df = _prepare_export_df(
         sdk,
         study_key,
         use_labels_as_columns=use_labels_as_columns,
         sanitize=True,
+        mask_phi=mask_phi,
     )
     df.to_excel(path, index=False, **kwargs)
 
@@ -480,6 +519,7 @@ def export_to_json(
     *,
     use_labels_as_columns: bool = False,
     hierarchical: bool = False,
+    mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
     """Export study records to a JSON file.
@@ -494,6 +534,9 @@ def export_to_json(
     hierarchical:
         When ``True``, generates a nested tree (Subject > Visit > Form) suitable
         for Veeva Vault integrations instead of a flat tabular layout.
+    mask_phi:
+        When ``True`` (default), sensitive PHI values are replaced with
+        ``***MASKED***``.
     """
     import json
     import logging
@@ -501,13 +544,16 @@ def export_to_json(
     logger = logging.getLogger(__name__)
 
     if hierarchical:
-        mapper = _record_mapper()(sdk)
+        mapper = _create_record_mapper(sdk, mask_phi=mask_phi)
         data = mapper.build_hierarchy(study_key, use_labels_as_keys=use_labels_as_columns)
+        if mask_phi:
+            data = mask_clinical_phi(data)
     else:
         df = _prepare_export_df(
             sdk,
             study_key,
             use_labels_as_columns=use_labels_as_columns,
+            mask_phi=mask_phi,
         )
         import pandas as pd
 
@@ -536,7 +582,7 @@ def export_to_json(
 
             logger.info("Enrichment pipeline triggered")
             pipeline = enrichment_pipeline_cls(config)
-            data = pipeline.process(data)
+            data = pipeline.process(data) if mask_phi else pipeline.process(data, mask_phi=False)
             logger.info("Enrichment pipeline completed successfully")
     except Exception as e:
         logger.warning(f"Could not apply EnrichmentPipeline: {e}")
@@ -557,6 +603,7 @@ def export_to_sql(
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
     quality_gate_enabled: bool = True,
+    mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
     """Export study records to a SQL table.
@@ -571,6 +618,9 @@ def export_to_sql(
     manifest_path:
         Optional path to a file where manifest entries should be logged.
         Defaults to ``None``.
+    mask_phi:
+        When ``True`` (default), sensitive PHI values are replaced with
+        ``***MASKED***``.
     """
     from sqlalchemy import create_engine
 
@@ -578,6 +628,7 @@ def export_to_sql(
     config = kwargs.pop("config", None)
     if not isinstance(config, TabularSinkConfig):
         sink_kwargs = _pop_sink_kwargs(kwargs)
+        sink_kwargs.setdefault("mask_phi", mask_phi)
         kwargs["if_exists"] = if_exists
         config = TabularSinkConfig(
             study_key=study_key,
@@ -604,6 +655,7 @@ def export_to_duckdb(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    mask_phi: bool = True,
 ) -> None:
     """Export study records to a DuckDB table using native DataFrame registration.
 
@@ -647,6 +699,7 @@ def export_to_duckdb(
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
+        mask_phi=mask_phi,
     )
 
     conn: Any = duckdb.connect(db_path)
@@ -669,6 +722,7 @@ def export_to_duckdb_by_form(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    mask_phi: bool = True,
 ) -> None:
     """Export records to separate DuckDB tables for each form.
 
@@ -702,7 +756,7 @@ def export_to_duckdb_by_form(
             "Install with `pip install 'imednet[duckdb]'`."
         ) from error
 
-    mapper = _record_mapper()(sdk)
+    mapper = _create_record_mapper(sdk, mask_phi=mask_phi)
     forms = sdk.forms.list(study_key=study_key)
 
     # Fetch all variables for the study once to avoid N+1 queries
@@ -752,7 +806,8 @@ def export_to_duckdb_by_form(
                 df.columns = df.columns.astype(str)
                 dup_mask = df.columns.str.lower().duplicated()
                 df = df.loc[:, ~dup_mask]
-                df = _mask_df(df)
+                if mask_phi:
+                    df = _mask_df(df)
 
             conn.register(_DUCKDB_DF_ALIAS, df)
             conn.execute(
@@ -773,12 +828,13 @@ def export_to_sql_by_form(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
     """Export records to separate SQL tables for each form."""
     from sqlalchemy import create_engine
 
-    mapper = _record_mapper()(sdk)
+    mapper = _create_record_mapper(sdk, mask_phi=mask_phi)
     engine = create_engine(conn_str)
     forms = sdk.forms.list(study_key=study_key)
 
@@ -823,7 +879,8 @@ def export_to_sql_by_form(
         if isinstance(df, pd.DataFrame):
             dup_mask = df.columns.str.lower().duplicated()
             df = df.loc[:, ~dup_mask]
-            df = _mask_df(df)
+            if mask_phi:
+                df = _mask_df(df)
         _to_sql_with_chunking(
             df,
             form.form_key or "",
@@ -840,6 +897,7 @@ def export_to_long_sql(
     conn_str: str,
     *,
     chunk_size: int = 1000,
+    mask_phi: bool = True,
 ) -> None:
     """Export records to a normalized long-format SQL table."""
     if pd is None:
@@ -850,7 +908,7 @@ def export_to_long_sql(
     from sqlalchemy import create_engine
 
     engine = create_engine(conn_str)
-    mapper = _record_mapper()(sdk)
+    mapper = _create_record_mapper(sdk, mask_phi=mask_phi)
     records = mapper._fetch_records(study_key)
 
     rows: list[dict[str, Any]] = []
@@ -858,7 +916,9 @@ def export_to_long_sql(
     for rec in records:
         timestamp = rec.date_modified
         for name, value in (rec.record_data or {}).items():
-            if global_sensitivity_registry.is_sensitive(name):
+            if not mask_phi:
+                masked_value = value
+            elif global_sensitivity_registry.is_sensitive(name):
                 masked_value = "***MASKED***"
             else:
                 masked_value = mask_clinical_phi(value)

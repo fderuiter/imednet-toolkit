@@ -14,6 +14,11 @@ from typing import Any
 from imednet.models.engine import ResourceRegistry
 from imednet.models.study_config import StudyConfiguration
 from imednet.utils.evaluator import evaluate_expression
+from imednet.utils.security import (
+    _normalize_key,
+    global_sensitivity_registry,
+    mask_clinical_phi,
+)
 from imednet.utils.serialization import flatten
 
 logger = logging.getLogger(__name__)
@@ -28,6 +33,24 @@ def _to_snake_case(name: str) -> str:
     return _ALL_CAP_RE.sub(r'\1_\2', s1).lower()
 
 
+def _mask_custom_phi_recursive(value: Any, phi_keys: set[str]) -> Any:
+    """Recursively mask custom normalized study PHI keys prior to flattening."""
+    if isinstance(value, dict):
+        return {
+            k: (
+                "[MASKED]"
+                if (not global_sensitivity_registry.is_exempt(k) and _normalize_key(k) in phi_keys)
+                else _mask_custom_phi_recursive(v, phi_keys)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_custom_phi_recursive(v, phi_keys) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_mask_custom_phi_recursive(v, phi_keys) for v in value)
+    return value
+
+
 class CentralizedMapper:
     """Unified Mapper with Enrichment Engine for data sinks."""
 
@@ -39,16 +62,29 @@ class CentralizedMapper:
         self,
         mode: str = "document",
         post_processor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        *,
+        mask_phi: bool = True,
+        study_config: StudyConfiguration | None = None,
     ):
         """Initialize the mapper.
 
         Args:
             mode: "tabular" for flattened structures, "document" for nested structures.
             post_processor: Optional function to apply destination-specific formatting.
+            mask_phi: Whether to mask sensitive PHI fields by default.
+            study_config: Optional study configuration containing custom enrichment rules.
         """
         self.mode = mode
         self.post_processor = post_processor
+        self.mask_phi = mask_phi
         self._pipeline_cache: dict[str, Any] = {}
+        if study_config is not None:
+            custom_pipeline = EnrichmentPipeline(study_config)
+            self._default_pipeline: Any = custom_pipeline
+            if study_config.study_key:
+                self._pipeline_cache[study_config.study_key] = custom_pipeline
+        else:
+            self._default_pipeline = None
         if CentralizedMapper._cached_fields is None:
             pairs = [(f, _to_snake_case(f)) for f in ResourceRegistry.get_fields("Record")]
             CentralizedMapper._cached_fields = pairs
@@ -62,12 +98,29 @@ class CentralizedMapper:
             CentralizedMapper._cached_fields = fields
             CentralizedMapper._cached_field_pairs = fields
 
-        mapped = {}
+        resolved_study_key = (
+            study_key if study_key is not None else getattr(record, "study_key", None)
+        )
+        sk = resolved_study_key or "UNKNOWN"
+        if sk not in self._pipeline_cache:
+            self._pipeline_cache[sk] = (
+                self._default_pipeline
+                if self._default_pipeline is not None
+                else self._DEFAULT_PIPELINE
+            )
+        active_pipeline = self._pipeline_cache[sk]
+        pipeline_phi_keys: set[str] = getattr(active_pipeline, "phi_keys", set())
+
+        mapped: dict[str, Any] = {}
         for f, snake_key in fields:
             val = getattr(record, f, None)
 
             if f == "record_data":
                 val = dict(val or {})
+                if self.mask_phi and val:
+                    val = mask_clinical_phi(val)
+                    if self.mode == "tabular" and pipeline_phi_keys:
+                        val = _mask_custom_phi_recursive(val, pipeline_phi_keys)
                 if self.mode == "tabular":
                     val = flatten(val)
                 val = {_to_snake_case(k): v for k, v in val.items()}
@@ -88,13 +141,15 @@ class CentralizedMapper:
         if study_key is not None:
             mapped['study_key'] = study_key
         elif 'study_key' not in mapped or not mapped['study_key']:
-            mapped['study_key'] = getattr(record, 'study_key', None)
+            mapped['study_key'] = resolved_study_key
 
-        sk = mapped.get('study_key') or "UNKNOWN"
-        if sk not in self._pipeline_cache:
-            self._pipeline_cache[sk] = self._DEFAULT_PIPELINE
-
-        mapped = self._pipeline_cache[sk].process(mapped)
+        if self.mask_phi:
+            mapped = active_pipeline.process(mapped)
+        else:
+            try:
+                mapped = active_pipeline.process(mapped, mask_phi=False)
+            except TypeError:
+                mapped = active_pipeline.process(mapped)
 
         if self.post_processor:
             mapped = self.post_processor(mapped)
@@ -117,7 +172,17 @@ class EnrichmentPipeline:
         """
         self.config = config
 
-        self.phi_keys = set(getattr(config, 'phi_fields', []))
+        raw_phi_fields = getattr(config, "phi_fields", []) or []
+        self.phi_keys: set[str] = set()
+        for raw_key in raw_phi_fields:
+            if global_sensitivity_registry.is_exempt(raw_key):
+                continue
+            norm_key = _normalize_key(raw_key)
+            if norm_key:
+                self.phi_keys.add(norm_key)
+            snake_norm = _normalize_key(_to_snake_case(str(raw_key)))
+            if snake_norm:
+                self.phi_keys.add(snake_norm)
 
         self.terminology = config.terminology_lookups or {}
 
@@ -128,18 +193,21 @@ class EnrichmentPipeline:
 
         self._has_rules = bool(self.phi_keys or self.terminology or self.mappings)
 
-    def process(self, data: Any) -> Any:
+    def process(self, data: Any, *, mask_phi: bool = True) -> Any:
         """Process the input data through the enrichment pipeline.
 
         Args:
             data: The raw data to be enriched.
+            mask_phi: Whether configured PHI rules should be applied.
 
         Returns:
             The enriched and transformed data.
         """
         if not self._has_rules:
             return data
-        return self._transform_recursive(data, depth=0)
+        if not mask_phi and not (self.terminology or self.mappings):
+            return data
+        return self._transform_recursive(data, depth=0, mask_phi=mask_phi)
 
     def _evaluate_business_logic(self, expr: str, value: Any) -> Any:
         """Evaluate a business logic expression on a value.
@@ -160,12 +228,13 @@ class EnrichmentPipeline:
             )
             return value
 
-    def _transform_recursive(self, data: Any, depth: int) -> Any:
+    def _transform_recursive(self, data: Any, depth: int, *, mask_phi: bool = True) -> Any:
         """Recursively transform data structures.
 
         Args:
             data: The data structure to transform.
             depth: The current recursion depth.
+            mask_phi: Whether configured PHI masking rules should run.
 
         Returns:
             The transformed data structure.
@@ -174,8 +243,18 @@ class EnrichmentPipeline:
             new_dict = {}
             for k, v in data.items():
                 new_key = k
+                is_phi_key = (
+                    mask_phi
+                    and bool(self.phi_keys)
+                    and not global_sensitivity_registry.is_exempt(k)
+                    and _normalize_key(k) in self.phi_keys
+                )
+                if is_phi_key and isinstance(v, (dict, list, tuple)):
+                    new_dict[new_key] = "[MASKED]"
+                    continue
+
                 new_val = (
-                    self._transform_recursive(v, depth + 1)
+                    self._transform_recursive(v, depth + 1, mask_phi=mask_phi)
                     if isinstance(v, (dict, list, tuple))
                     else v
                 )
@@ -196,16 +275,23 @@ class EnrichmentPipeline:
                             new_key = rule.target_field
 
                     # PHI Masking
-                    if k in self.phi_keys:
+                    if is_phi_key or (
+                        mask_phi
+                        and bool(self.phi_keys)
+                        and not global_sensitivity_registry.is_exempt(new_key)
+                        and _normalize_key(new_key) in self.phi_keys
+                    ):
                         new_val = "[MASKED]"
 
                 new_dict[new_key] = new_val
             return new_dict
 
         if isinstance(data, list):
-            return [self._transform_recursive(item, depth + 1) for item in data]
+            return [self._transform_recursive(item, depth + 1, mask_phi=mask_phi) for item in data]
         if isinstance(data, tuple):
-            return tuple(self._transform_recursive(item, depth + 1) for item in data)
+            return tuple(
+                self._transform_recursive(item, depth + 1, mask_phi=mask_phi) for item in data
+            )
         return data
 
 

@@ -213,3 +213,40 @@ def test_to_dataframe_missing_dependency(monkeypatch, dummy_client, paginator_fa
 
     mock_list.assert_not_called()
     assert captured["count"] == 0
+
+
+def test_to_dataframe_masks_phi_by_default_and_honors_opt_out(
+    dummy_client, paginator_factory, patch_build_filter
+):
+    """Test that RecordsEndpoint.to_dataframe masks PHI by default and honors mask_phi=False."""
+    ep = records.RecordsEndpoint(dummy_client)
+    raw_items = [
+        {
+            "recordId": 1,
+            "subjectKey": "SUBJ-001",
+            "studyKey": "STUDY1",
+            "recordData": {
+                "patientName": "Jane Doe",
+                "DOB": "1980-01-01",
+                "SSN": "123-45-6789",
+                "email": "jane@example.org",
+                "systolicBp": 120,
+            },
+        }
+    ]
+    paginator_factory(records, raw_items)
+    filter_capture = patch_build_filter(records)
+
+    masked_df = ep.to_dataframe("STUDY1", flatten=True, status="open")
+    assert filter_capture["filters"] == {"status": "open", "studyKey": "STUDY1"}
+    assert masked_df.loc[0, "patientName"] == "***MASKED***"
+    assert masked_df.loc[0, "DOB"] == "***MASKED***"
+    assert masked_df.loc[0, "SSN"] == "***MASKED***"
+    assert masked_df.loc[0, "email"] == "***MASKED***"
+    assert masked_df.loc[0, "systolicBp"] == 120
+    assert masked_df.loc[0, "subject_key"] == "SUBJ-001"
+
+    paginator_factory(records, raw_items)
+    unmasked_df = ep.to_dataframe("STUDY1", flatten=True, mask_phi=False)
+    assert unmasked_df.loc[0, "patientName"] == "Jane Doe"
+    assert unmasked_df.loc[0, "SSN"] == "123-45-6789"

@@ -62,6 +62,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         study_key: str | None = None,
         *,
         flatten: bool = False,
+        mask_phi: bool = True,
         **filters: Any,
     ) -> pd.DataFrame:
         """Export queried records directly to a pandas DataFrame.
@@ -69,6 +70,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         Args:
             study_key: Optional study key override.
             flatten: Whether to flatten record_data dictionary into columns.
+            mask_phi: Whether to mask sensitive PHI fields by default.
             **filters: Resource filters passed to :meth:`list`.
 
         Returns:
@@ -81,7 +83,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
 
         check_pandas("records_to_dataframe")
         records = list(self.list(study_key=study_key, **filters))
-        return records_to_dataframe(records, flatten=flatten)
+        return records_to_dataframe(records, flatten=flatten, mask_phi=mask_phi)
 
 
 class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record]):  # type: ignore[misc]
@@ -92,6 +94,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         study_key: str | None = None,
         *,
         flatten: bool = False,
+        mask_phi: bool = True,
         **filters: Any,
     ) -> pd.DataFrame:
         """Export queried records asynchronously directly to a pandas DataFrame.
@@ -99,6 +102,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         Args:
             study_key: Optional study key override.
             flatten: Whether to flatten record_data dictionary into columns.
+            mask_phi: Whether to mask sensitive PHI fields by default.
             **filters: Resource filters passed to :meth:`list`.
 
         Returns:
@@ -111,4 +115,4 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
 
         check_pandas("records_to_dataframe")
         records = [record async for record in self.list(study_key=study_key, **filters)]
-        return records_to_dataframe(records, flatten=flatten)
+        return records_to_dataframe(records, flatten=flatten, mask_phi=mask_phi)

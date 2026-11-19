@@ -186,13 +186,18 @@ class SnowflakeSinkConfig(SinkConfig):
     _validate_identifiers = validate_identifiers
 
 
-def _records_to_arrow_table(records: Sequence[Any]) -> Any:
+def _records_to_arrow_table(
+    records: Sequence[Any],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> Any:
     """Convert *records* to a ``pyarrow.Table``."""
     pa = _require_optional_dep("pyarrow", "snowflake")
     from imednet.spi.sinks import CentralizedMapper
 
-    mapper = CentralizedMapper(mode="tabular")
-    rows = [mapper.map_record(r) for r in records]
+    mapper = CentralizedMapper(mode="tabular", mask_phi=mask_phi)
+    rows = [mapper.map_record(r, study_key=study_key) for r in records]
 
     return pa.Table.from_pylist(rows)
 
@@ -292,7 +297,11 @@ class SnowflakeExportSink(ExportSink):
                 batch_id=batch_id,
             )
 
-        arrow_table = _records_to_arrow_table(records)
+        arrow_table = _records_to_arrow_table(
+            records,
+            mask_phi=self.config.mask_phi,
+            study_key=self._cfg.study_key,
+        )
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
         pq = _require_optional_dep("pyarrow.parquet", "snowflake")
         pq.write_table(arrow_table, str(local_path))

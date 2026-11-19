@@ -122,6 +122,9 @@ class SinkConfig:
     idempotent:
         When ``True``, sinks use upsert / replace semantics so that replaying
         a batch with the same ``batch_id`` produces no duplicate data.
+    mask_phi:
+        When ``True`` (default), sensitive clinical PHI fields in ``record_data``
+        are replaced with ``***MASKED***`` before writing to the destination.
     """
 
     study_key: str
@@ -129,6 +132,7 @@ class SinkConfig:
     max_retries: int = _DEFAULT_MAX_RETRIES
     retry_backoff: float = _DEFAULT_RETRY_BACKOFF
     idempotent: bool = True
+    mask_phi: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
     quality_gate_enabled: bool = False
     min_schema_readiness_score: float = 100.0
@@ -151,6 +155,8 @@ class SinkConfig:
             or self.retry_backoff < 0
         ):
             raise ValueError("retry_backoff must be a finite non-negative number")
+        if not isinstance(self.mask_phi, bool):
+            raise ValueError("mask_phi must be a boolean")
 
 
 # ---------------------------------------------------------------------------

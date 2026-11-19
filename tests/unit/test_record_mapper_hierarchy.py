@@ -235,3 +235,57 @@ def test_build_hierarchy_form_whitelist_filtering(mock_get_study_structure):
     mapper.build_hierarchy("STUDY", form_whitelist=[10])
 
     assert spy_build_record_model.call_count == 1
+
+
+@patch("imednet_workflows.study_structure.get_study_structure")
+def test_build_hierarchy_masks_phi_before_label_remapping_and_supports_opt_out(
+    mock_get_study_structure,
+):
+    """Verify build_hierarchy masks canonical PHI variables before applying label keys and honors mask_phi=False."""
+    sdk = MagicMock()
+
+    mock_study_struct = MagicMock()
+    interval = MagicMock()
+    form = MagicMock()
+    form.form_id = 10
+    form.variables = [
+        Variable(variable_name="patientName", label="Participant Full Name", form_id=10),
+        Variable(variable_name="SSN", label="Government Identifier", form_id=10),
+        Variable(variable_name="heartRate", label="Heart Rate", form_id=10),
+    ]
+    interval.forms = [form]
+    mock_study_struct.intervals = [interval]
+    mock_get_study_structure.return_value = mock_study_struct
+
+    records = [
+        Record(
+            record_id=55,
+            subject_key="SUBJ-55",
+            visit_id=1,
+            form_id=10,
+            record_status="Complete",
+            date_created=datetime(2025, 1, 1),
+            record_data={
+                "patientName": "Jane Doe",
+                "SSN": "123-45-6789",
+                "heartRate": 68,
+            },
+        )
+    ]
+
+    mapper = RecordMapper(sdk)
+    mapper._iter_records = MagicMock(return_value=records)
+
+    tree_labeled = mapper.build_hierarchy("STUDY1", use_labels_as_keys=True)
+    rec_labeled = tree_labeled[0]["visits"][0]["forms"][0]["records"][0]
+    assert tree_labeled[0]["subject_key"] == "SUBJ-55"
+    assert rec_labeled["recordId"] == 55
+    assert rec_labeled["Participant Full Name"] == "***MASKED***"
+    assert rec_labeled["Government Identifier"] == "***MASKED***"
+    assert rec_labeled["Heart Rate"] == 68
+
+    tree_unmasked = mapper.build_hierarchy("STUDY1", use_labels_as_keys=True, mask_phi=False)
+    rec_unmasked = tree_unmasked[0]["visits"][0]["forms"][0]["records"][0]
+    assert rec_unmasked["Participant Full Name"] == "Jane Doe"
+    assert rec_unmasked["Government Identifier"] == "123-45-6789"
+    assert rec_unmasked["Heart Rate"] == 68
