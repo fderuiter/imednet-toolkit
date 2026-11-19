@@ -59,6 +59,27 @@ def test_parse_filter_args_repeated_equality_builds_or_list():
     }
 
 
+@pytest.mark.parametrize(
+    "mixed_args",
+    [
+        ["revision=1", "revision=2", "revision>=3"],
+        ["revision>=3", "revision=1", "revision=2"],
+        ["revision=1", "revision>=3", "revision=2"],
+        ["revision>=3", "revision==1", "revision==2"],
+    ],
+)
+def test_parse_filter_args_rejects_mixed_equality_or_and_comparison_in_any_order(
+    mixed_args: list[str], capfd: pytest.CaptureFixture[str]
+):
+    """Test that mixed comparison and repeated equality filters exit 1 regardless of order."""
+    with pytest.raises(SystemExit) as exc_info:
+        parse_filter_args(mixed_args)
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Cannot mix equality OR filters and comparison operators" in captured.err
+
+
 @pytest.mark.parametrize("bad_expr", ["key! =val", "a===b", "a<>b", "field~=val"])
 def test_parse_filter_args_rejects_operator_chars_in_key(
     bad_expr: str, capfd: pytest.CaptureFixture[str]

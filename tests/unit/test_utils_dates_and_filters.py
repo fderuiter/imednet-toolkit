@@ -424,14 +424,63 @@ def test_parse_filter_expressions_repeated_equality_builds_or_list() -> None:
         == "subjectStatus==Screened,subjectStatus==Enrolled,subjectStatus==Completed"
     )
 
+    parsed_mixed_casing = parse_filter_expressions(
+        ["subject_status=Screened", "subjectStatus==Enrolled"]
+    )
+    assert parsed_mixed_casing == {"subject_status": ["Screened", "Enrolled"]}
+    assert (
+        build_filter_string(parsed_mixed_casing)
+        == "subjectStatus==Screened,subjectStatus==Enrolled"
+    )
+    assert (
+        build_filter_string({"subjectStatus": [("==", "Screened"), ("==", "Enrolled")]})
+        == "subjectStatus==Screened,subjectStatus==Enrolled"
+    )
 
-def test_parse_filter_expressions_rejects_mixing_equality_and_comparison_on_same_key() -> None:
-    """Test that mixing equality OR lists and range operators on the same key raises ValueError."""
+
+@pytest.mark.parametrize(
+    "mixed_expressions",
+    [
+        ["revision=1", "revision=2", "revision>=3"],
+        ["revision>=3", "revision=1", "revision=2"],
+        ["revision=1", "revision>=3", "revision=2"],
+        ["revision>=3", "revision==1", "revision==2"],
+        ["revision==1", "revision==2", "revision!=3"],
+        ["subjectStatus!=Closed", "subject_status=Open", "subjectStatus=Pending"],
+    ],
+)
+def test_parse_filter_expressions_rejects_mixing_equality_and_comparison_independent_of_order(
+    mixed_expressions: list[str],
+) -> None:
+    """Test that mixing equality OR lists and comparison operators raises in every permutation."""
     with pytest.raises(ValueError, match="Cannot mix equality OR filters and comparison"):
-        parse_filter_expressions(["revision=1", "revision=2", "revision>=3"])
-    assert parse_filter_expressions(["revision=1", "revision>=2"]) == {
-        "revision": [("==", 1), (">=", 2)]
-    }
+        parse_filter_expressions(mixed_expressions)
+
+
+@pytest.mark.parametrize(
+    "mixed_tuples",
+    [
+        [(">=", 3), ("==", 1), ("==", 2)],
+        [("==", 1), ("==", 2), (">=", 3)],
+        [("==", 1), (">=", 3), ("==", 2)],
+    ],
+)
+def test_build_filter_string_rejects_mixed_equality_or_and_comparison_tuples(
+    mixed_tuples: list[tuple[str, int]],
+) -> None:
+    """Test that build_filter_string rejects mixed repeated equality and comparison tuples."""
+    with pytest.raises(ValueError, match="Cannot mix equality OR filters and comparison"):
+        build_filter_string({"revision": mixed_tuples})
+
+
+def test_parse_filter_expressions_single_equality_and_comparison_permutations() -> None:
+    """Test that a single equality with a comparison normalizes consistently in both orders."""
+    eq_first = parse_filter_expressions(["revision=1", "revision>=2"])
+    comp_first = parse_filter_expressions(["revision>=2", "revision=1"])
+    assert eq_first == {"revision": [("==", 1), (">=", 2)]}
+    assert comp_first == {"revision": [(">=", 2), ("==", 1)]}
+    assert build_filter_string(eq_first) == "revision==1;revision>=2"
+    assert build_filter_string(comp_first) == "revision>=2;revision==1"
 
 
 def test_normalize_utc_timestamp_bound() -> None:

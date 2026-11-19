@@ -225,9 +225,33 @@ def _extract_equality_scalar(value: Any) -> tuple[bool, Any]:
         if len(value) == 2 and value[0] == "==":
             return True, value[1]
         return False, value
-    if isinstance(value, list):
-        return False, value
     return True, value
+
+
+def _classify_key_clauses(key: str, clauses: list[Any]) -> Any:
+    """Classify all parsed clauses for a single key independent of input order."""
+    if len(clauses) == 1:
+        return clauses[0]
+
+    eq_scalars: list[Any] = []
+    normalized_tuples: list[tuple[str, Any]] = []
+    comp_count = 0
+    for item in clauses:
+        is_eq, scalar_or_tuple = _extract_equality_scalar(item)
+        if is_eq:
+            eq_scalars.append(scalar_or_tuple)
+            normalized_tuples.append(("==", scalar_or_tuple))
+        else:
+            comp_count += 1
+            normalized_tuples.append(item)
+
+    if comp_count == 0:
+        return eq_scalars
+    if len(eq_scalars) >= 2:
+        raise ValueError(
+            f"Cannot mix equality OR filters and comparison operators on the same key '{key}'"
+        )
+    return normalized_tuples
 
 
 def parse_filter_expressions(
@@ -237,45 +261,30 @@ def parse_filter_expressions(
 ) -> dict[str, Any]:
     """Parse multiple filter expressions into a filter dictionary.
 
-    Repeated equality conditions (``=`` or ``==``) on the same key are combined
-    into a scalar list so :func:`build_filter_string` joins them with the comma
-    ``OR`` connector. Repeated comparison conditions involving non-equality
-    operators are preserved as a list of ``(operator, value)`` tuples so
-    :func:`build_filter_string` joins them with the semicolon ``AND`` connector.
+    All clauses for each canonical key are collected and classified consistently
+    before serialization regardless of input order:
+
+    * Repeated equality conditions (``=`` or ``==``) on the same key are combined
+      into a scalar list so :func:`build_filter_string` joins them with the comma
+      ``OR`` connector.
+    * Repeated comparison conditions involving non-equality operators are
+      preserved as a list of ``(operator, value)`` tuples so
+      :func:`build_filter_string` joins them with the semicolon ``AND`` connector.
+    * Mixing repeated equality conditions with non-equality comparison operators
+      on the same key raises :class:`ValueError` in every permutation.
     """
-    filter_dict: dict[str, Any] = {}
+    grouped: dict[str, tuple[str, list[Any]]] = {}
     for expr in expressions:
         key, parsed_val = parse_filter_expression(expr, model=model)
-        if key not in filter_dict:
-            filter_dict[key] = parsed_val
-            continue
-
-        prev = filter_dict[key]
-        new_is_eq, new_scalar = _extract_equality_scalar(parsed_val)
-        prev_is_eq, prev_scalar = _extract_equality_scalar(prev)
-
-        if new_is_eq and prev_is_eq:
-            filter_dict[key] = [prev_scalar, new_scalar]
-            continue
-
-        if isinstance(prev, list) and prev and all(not isinstance(item, tuple) for item in prev):
-            if new_is_eq:
-                filter_dict[key] = [*prev, new_scalar]
-                continue
-            raise ValueError(
-                f"Cannot mix equality OR filters and comparison operators on the same key '{key}'"
-            )
-
-        if isinstance(prev, list):
-            combined = [item if isinstance(item, tuple) else ("==", item) for item in prev]
-        elif isinstance(prev, tuple):
-            combined = [prev]
+        canonical_key = _snake_to_camel(key)
+        if canonical_key not in grouped:
+            grouped[canonical_key] = (key, [parsed_val])
         else:
-            combined = [("==", prev)]
+            grouped[canonical_key][1].append(parsed_val)
 
-        combined.append(parsed_val if isinstance(parsed_val, tuple) else ("==", parsed_val))
-        filter_dict[key] = combined
-    return filter_dict
+    return {
+        raw_key: _classify_key_clauses(raw_key, clauses) for raw_key, clauses in grouped.values()
+    }
 
 
 def validate_connector_exclusivity(filter_str: str) -> None:
@@ -376,6 +385,8 @@ def _build_filter_part(
                     f"Filter list for '{key}' cannot mix operator tuples and scalar values"
                 )
             tuple_parts: list[str] = []
+            eq_count = 0
+            comp_count = 0
             for item in value:
                 if len(item) != 2:
                     raise ValueError(
@@ -383,7 +394,17 @@ def _build_filter_part(
                     )
                 op, val = item
                 validate_filter_operator(op)
+                if op == "==":
+                    eq_count += 1
+                else:
+                    comp_count += 1
                 tuple_parts.append(f"{camel_key}{op}{_format_filter_value(val)}")
+            if eq_count >= 2 and comp_count >= 1:
+                raise ValueError(
+                    f"Cannot mix equality OR filters and comparison operators on the same key '{key}'"
+                )
+            if eq_count >= 2 and comp_count == 0:
+                return or_connector.join(tuple_parts)
             return and_connector.join(tuple_parts)
         subparts = [f"{camel_key}=={_format_filter_value(v)}" for v in value]
         return or_connector.join(subparts)

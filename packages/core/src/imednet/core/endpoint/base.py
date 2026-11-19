@@ -206,7 +206,13 @@ class _ListEndpointBase(GenericEndpoint[T]):
             if (
                 isinstance(sole_val, list)
                 and len(sole_val) > 1
-                and all(not isinstance(item, tuple) for item in sole_val)
+                and (
+                    all(not isinstance(item, tuple) for item in sole_val)
+                    or all(
+                        isinstance(item, tuple) and len(item) == 2 and item[0] == "=="
+                        for item in sole_val
+                    )
+                )
             ):
                 filter_source = other_filters
 
