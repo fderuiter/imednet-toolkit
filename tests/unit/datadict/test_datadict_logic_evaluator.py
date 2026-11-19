@@ -574,3 +574,275 @@ def test_extract_rule_metadata_and_boolean_string_regex_operators() -> None:
     assert dd.form_key_from_id("") is None
     assert dd.form_key_from_id(999) is None
     assert len(dd.rules_for_form("VS")) == 2
+
+
+def test_explicit_or_group_parsed_xml_full_truth_table() -> None:
+    """Explicit <or> groups in parsed XML preserve OR semantics across all four truth cases."""
+    evaluator = LogicTreeEvaluator()
+
+    grouped_or_xml = """
+    <rule>
+        <conditions>
+            <or>
+                <condition>
+                    <variable>SYS_BP</variable>
+                    <operator>&gt;</operator>
+                    <value>220</value>
+                    <true/>
+                </condition>
+                <condition>
+                    <variable>DIA_BP</variable>
+                    <operator>&lt;</operator>
+                    <value>40</value>
+                    <true/>
+                </condition>
+            </or>
+        </conditions>
+        <actions>
+            <action>
+                <type>error</type>
+                <message>Critical blood pressure</message>
+            </action>
+        </actions>
+    </rule>
+    """
+    parsed_ast = parse_logic_xml(grouped_or_xml)
+    assert parsed_ast is not None
+    # Confirm _parse_xml_element represents <or> with two <condition> children as a dict
+    assert isinstance(parsed_ast["conditions"]["or"], dict)
+
+    grouped_or_rule = BusinessLogicRule(
+        id="R-OR-GROUP",
+        name="Grouped OR BP Check",
+        type="Form",
+        status="Active",
+        form="VS",
+        logic=parsed_ast,
+    )
+
+    # 1. First true, second false -> True
+    assert (
+        evaluator.evaluate_rule(
+            grouped_or_rule, {"SYS_BP": 230, "DIA_BP": 80}, form_key="VS"
+        ).triggered
+        is True
+    )
+    # 2. First false, second true -> True
+    assert (
+        evaluator.evaluate_rule(
+            grouped_or_rule, {"SYS_BP": 120, "DIA_BP": 35}, form_key="VS"
+        ).triggered
+        is True
+    )
+    # 3. Neither true -> False
+    assert (
+        evaluator.evaluate_rule(
+            grouped_or_rule, {"SYS_BP": 120, "DIA_BP": 80}, form_key="VS"
+        ).triggered
+        is False
+    )
+    # 4. Both true -> True
+    assert (
+        evaluator.evaluate_rule(
+            grouped_or_rule, {"SYS_BP": 230, "DIA_BP": 35}, form_key="VS"
+        ).triggered
+        is True
+    )
+
+    meta = evaluator.extract_rule_metadata(grouped_or_rule)
+    assert meta is not None
+    assert meta.logical_operator == "OR"
+    assert len(meta.conditions) == 2
+
+    # Direct <or> under <rule>, <if>/<or> operator tags, and <conditionGroup operator="OR">
+    variant_xmls = [
+        """
+        <rule>
+            <or>
+                <condition><variable>A</variable><operator>==</operator><value>1</value></condition>
+                <condition><variable>B</variable><operator>==</operator><value>2</value></condition>
+            </or>
+        </rule>
+        """,
+        """
+        <rule>
+            <if>
+                <or>
+                    <eq><variable>A</variable><value>1</value></eq>
+                    <eq><variable>B</variable><value>2</value></eq>
+                </or>
+            </if>
+            <then><action><type>error</type><message>Hit OR</message></action></then>
+        </rule>
+        """,
+        """
+        <rule>
+            <if>
+                <or>
+                    <lt><variable>A</variable><value>2</value></lt>
+                    <gt><variable>B</variable><value>1</value></gt>
+                </or>
+            </if>
+        </rule>
+        """,
+        """
+        <rule>
+            <conditions>
+                <conditionGroup operator="OR">
+                    <condition><variable>A</variable><operator>==</operator><value>1</value></condition>
+                    <condition><variable>B</variable><operator>==</operator><value>2</value></condition>
+                </conditionGroup>
+            </conditions>
+        </rule>
+        """,
+    ]
+    for idx, xml_text in enumerate(variant_xmls):
+        rule = BusinessLogicRule(
+            id=f"VAR-OR-{idx}",
+            name=f"Variant OR {idx}",
+            type="Form",
+            status="Active",
+            form="F1",
+            logic=parse_logic_xml(xml_text),
+        )
+        assert evaluator.evaluate_rule(rule, {"A": 1, "B": 0}, form_key="F1").triggered is True
+        assert evaluator.evaluate_rule(rule, {"A": 0, "B": 2}, form_key="F1").triggered is True
+        assert evaluator.evaluate_rule(rule, {"A": 9, "B": 0}, form_key="F1").triggered is False
+        assert evaluator.evaluate_rule(rule, {"A": 1, "B": 2}, form_key="F1").triggered is True
+        vmeta = evaluator.extract_rule_metadata(rule)
+        assert vmeta is not None
+        assert vmeta.logical_operator == "OR"
+
+
+def test_nested_and_or_not_explicit_group_combinations() -> None:
+    """Nested explicit <or>, <and>, and <not> XML groups preserve boolean algebra."""
+    evaluator = LogicTreeEvaluator()
+
+    # 1. Conjunction with nested explicit OR: SEX == 'F' AND (PREG == 'Y' OR NURSING == 'Y')
+    and_with_or = BusinessLogicRule(
+        name="Female Preg Or Nursing",
+        type="Form",
+        status="Active",
+        form="DM",
+        logic=parse_logic_xml(
+            "<rule><conditions>"
+            "<condition><variable>SEX</variable><operator>==</operator><value>F</value></condition>"
+            "<or>"
+            "<condition><variable>PREG</variable><operator>==</operator><value>Y</value></condition>"
+            "<condition><variable>NURSING</variable><operator>==</operator><value>Y</value></condition>"
+            "</or>"
+            "</conditions></rule>"
+        ),
+    )
+    assert (
+        evaluator.evaluate_rule(
+            and_with_or, {"SEX": "F", "PREG": "Y", "NURSING": "N"}, form_key="DM"
+        ).triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(
+            and_with_or, {"SEX": "F", "PREG": "N", "NURSING": "Y"}, form_key="DM"
+        ).triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(
+            and_with_or, {"SEX": "F", "PREG": "Y", "NURSING": "Y"}, form_key="DM"
+        ).triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(
+            and_with_or, {"SEX": "F", "PREG": "N", "NURSING": "N"}, form_key="DM"
+        ).triggered
+        is False
+    )
+    assert (
+        evaluator.evaluate_rule(
+            and_with_or, {"SEX": "M", "PREG": "Y", "NURSING": "Y"}, form_key="DM"
+        ).triggered
+        is False
+    )
+
+    # 2. DNF: (A == 1 AND B == 1) OR (C == 1 AND D == 1)
+    dnf_rule = BusinessLogicRule(
+        name="DNF Rule",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><conditions><or>"
+            "<and>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>1</value></condition>"
+            "</and>"
+            "<and>"
+            "<condition><variable>C</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>D</variable><operator>==</operator><value>1</value></condition>"
+            "</and>"
+            "</or></conditions></rule>"
+        ),
+    )
+    assert (
+        evaluator.evaluate_rule(dnf_rule, {"A": 1, "B": 1, "C": 0, "D": 0}, form_key="F1").triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(dnf_rule, {"A": 0, "B": 0, "C": 1, "D": 1}, form_key="F1").triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(dnf_rule, {"A": 1, "B": 0, "C": 1, "D": 0}, form_key="F1").triggered
+        is False
+    )
+
+    # 3. CNF: (A == 1 OR B == 1) AND (C == 1 OR D == 1)
+    cnf_rule = BusinessLogicRule(
+        name="CNF Rule",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><conditions>"
+            "<or>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>1</value></condition>"
+            "</or>"
+            "<or>"
+            "<condition><variable>C</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>D</variable><operator>==</operator><value>1</value></condition>"
+            "</or>"
+            "</conditions></rule>"
+        ),
+    )
+    assert (
+        evaluator.evaluate_rule(cnf_rule, {"A": 1, "B": 0, "C": 0, "D": 1}, form_key="F1").triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(cnf_rule, {"A": 1, "B": 1, "C": 0, "D": 0}, form_key="F1").triggered
+        is False
+    )
+    assert (
+        evaluator.evaluate_rule(cnf_rule, {"A": 0, "B": 0, "C": 1, "D": 1}, form_key="F1").triggered
+        is False
+    )
+
+    # 4. Negated explicit OR group: NOT (A == 1 OR B == 2)
+    not_or_rule = BusinessLogicRule(
+        name="Not OR Rule",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><conditions><not><or>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "</or></not></conditions></rule>"
+        ),
+    )
+    assert evaluator.evaluate_rule(not_or_rule, {"A": 1, "B": 0}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_or_rule, {"A": 0, "B": 2}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_or_rule, {"A": 1, "B": 2}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_or_rule, {"A": 0, "B": 0}, form_key="F1").triggered is True

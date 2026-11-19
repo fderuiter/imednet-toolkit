@@ -451,3 +451,46 @@ async def test_records_endpoint_accepts_datadictionary_sync_and_async() -> None:
             schema=dd,
         )
         assert async_job.batch_id
+
+
+def test_datadict_validation_explicit_or_group_rule() -> None:
+    """validate_record_data enforces explicit <or> XML rules on both one-true, both-true, and neither-true payloads."""
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="VS",
+                formId="10",
+                variables=[
+                    DDVariable(variableName="SYS_BP", variableType="Integer"),
+                    DDVariable(variableName="DIA_BP", variableType="Integer"),
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="VS-OR-1",
+                        name="Critical BP Range",
+                        type="Form",
+                        status="Active",
+                        form="VS",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><or>"
+                            "<condition><variable>SYS_BP</variable><operator>&gt;</operator><value>220</value></condition>"
+                            "<condition><variable>DIA_BP</variable><operator>&lt;</operator><value>40</value></condition>"
+                            "</or></conditions>"
+                            "<actions><action><type>error</type><message>Critical BP</message></action></actions></rule>"
+                        ),
+                    )
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(ValidationError, match="Critical BP"):
+        validate_record_data(dd, "VS", {"SYS_BP": 230, "DIA_BP": 80})
+
+    with pytest.raises(ValidationError, match="Critical BP"):
+        validate_record_data(dd, "VS", {"SYS_BP": 120, "DIA_BP": 35})
+
+    with pytest.raises(ValidationError, match="Critical BP"):
+        validate_record_data(dd, "VS", {"SYS_BP": 230, "DIA_BP": 35})
+
+    validate_record_data(dd, "VS", {"SYS_BP": 120, "DIA_BP": 80})

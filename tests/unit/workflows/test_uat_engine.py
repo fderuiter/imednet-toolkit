@@ -435,3 +435,46 @@ def test_xml_negative_synthesis_operators_and_required_defaults():
     assert payloads[4]["POS"] == "SIT"
     assert payloads[5]["NOTES"] == "ERR"
     assert isinstance(payloads[5]["TEMP"], float)
+
+
+def test_uat_engine_explicit_or_group_xml_rule() -> None:
+    """UATExecutionEngine extracts logical_operator='OR' from grouped <or> XML rules and synthesizes triggering payloads."""
+    from imednet.datadict import (
+        BusinessLogicRule,
+        DataDictionary,
+        Form,
+        LogicTreeEvaluator,
+        Variable,
+        parse_logic_xml,
+    )
+
+    or_rule = BusinessLogicRule(
+        id="HR-OR",
+        name="Abnormal Heart Rate",
+        type="Form",
+        status="Active",
+        form="VS",
+        logic=parse_logic_xml(
+            "<rule><conditions><or>"
+            "<condition><variable>HR</variable><operator>&lt;</operator><value>40</value></condition>"
+            "<condition><variable>HR</variable><operator>&gt;</operator><value>120</value></condition>"
+            "</or></conditions></rule>"
+        ),
+    )
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="VS",
+                variables=[Variable(variableName="HR", variableType="Integer")],
+                businessLogic=[or_rule],
+            )
+        ]
+    )
+
+    engine = UATExecutionEngine(Mock(), dd)
+    assert len(engine._rules) == 1
+    assert engine._rules[0]["logical_operator"] == "OR"
+
+    neg_payload = engine.generate_negative_test_case(engine._rules[0])
+    assert neg_payload["HR"] > 120
+    assert LogicTreeEvaluator().evaluate_rule(or_rule, neg_payload, form_key="VS").triggered is True
