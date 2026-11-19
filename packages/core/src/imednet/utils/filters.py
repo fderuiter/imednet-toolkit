@@ -6,10 +6,12 @@ for iMednet API endpoints based on the reference documentation.
 
 import functools
 import re
+import types
 import weakref
 from collections.abc import Sequence
 from datetime import date, datetime
-from typing import Any, TypeVar
+from enum import Enum
+from typing import Annotated, Any, Literal, TypeVar, Union, get_args, get_origin
 
 from imednet.utils.dates import format_iso_datetime
 
@@ -160,9 +162,98 @@ def validate_filter_operator(operator: str, *, allow_regex: bool = False) -> Non
         )
 
 
+_MODEL_FIELD_TYPES_CACHE: weakref.WeakKeyDictionary[type[Any], dict[str, str]] = (
+    weakref.WeakKeyDictionary()
+)
 _MODEL_FILTER_KEYS_CACHE: weakref.WeakKeyDictionary[type[Any], frozenset[str]] = (
     weakref.WeakKeyDictionary()
 )
+_ASCII_INT_RE = re.compile(r"^-?[0-9]+$")
+_ASCII_FLOAT_RE = re.compile(r"^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$")
+_UNPADDED_ASCII_INT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+
+
+def _unwrap_annotation_variants(annotation: Any) -> list[Any]:
+    """Unwrap Optional, Union, and Annotated wrappers into leaf annotations."""
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        args = get_args(annotation)
+        return _unwrap_annotation_variants(args[0]) if args else [Any]
+    if origin is Union or origin is types.UnionType:
+        variants: list[Any] = []
+        for arg in get_args(annotation):
+            if arg is type(None):
+                continue
+            variants.extend(_unwrap_annotation_variants(arg))
+        return variants
+    return [annotation]
+
+
+def _classify_single_type(tp: Any) -> str:
+    """Classify a single leaf type annotation into a filter scalar kind."""
+    if tp is bool:
+        return "bool"
+    origin = get_origin(tp)
+    if origin is Literal:
+        lit_vals = [v for v in get_args(tp) if v is not None]
+        if lit_vals and all(isinstance(v, bool) for v in lit_vals):
+            return "bool"
+        if lit_vals and all(isinstance(v, str) for v in lit_vals):
+            return "str"
+        if lit_vals and all(isinstance(v, int) and not isinstance(v, bool) for v in lit_vals):
+            return "int"
+        if lit_vals and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) for v in lit_vals
+        ):
+            return "float"
+        return "other"
+    if isinstance(tp, type):
+        if issubclass(tp, str) or issubclass(tp, (date, datetime)):
+            return "str"
+        if issubclass(tp, int):
+            return "int"
+        if issubclass(tp, float):
+            return "float"
+        if issubclass(tp, Enum):
+            return "str"
+    return "other"
+
+
+def _classify_field_annotation(annotation: Any) -> str:
+    """Resolve the canonical scalar kind ('str', 'int', 'float', 'bool', or 'other')."""
+    variants = _unwrap_annotation_variants(annotation)
+    if not variants:
+        return "other"
+    kinds = {_classify_single_type(v) for v in variants}
+    if len(kinds) == 1:
+        return next(iter(kinds))
+    return "other"
+
+
+def _get_model_field_types(model: type[Any]) -> dict[str, str]:
+    """Return mapping of allowed snake_case/camelCase/alias keys to scalar kinds."""
+    cached = _MODEL_FIELD_TYPES_CACHE.get(model)
+    if cached is not None:
+        return cached
+
+    model_fields = getattr(model, "model_fields", None)
+    if not isinstance(model_fields, dict):
+        return {}
+
+    field_types: dict[str, str] = {}
+    for field_name, field_info in model_fields.items():
+        kind = _classify_field_annotation(getattr(field_info, "annotation", Any))
+        field_types[field_name] = kind
+        field_types[_snake_to_camel(field_name)] = kind
+        alias = getattr(field_info, "alias", None)
+        if isinstance(alias, str) and alias:
+            field_types[alias] = kind
+        validation_alias = getattr(field_info, "validation_alias", None)
+        if isinstance(validation_alias, str) and validation_alias:
+            field_types[validation_alias] = kind
+
+    _MODEL_FIELD_TYPES_CACHE[model] = field_types
+    return field_types
 
 
 def _get_model_filter_keys(model: type[Any]) -> frozenset[str]:
@@ -171,21 +262,11 @@ def _get_model_filter_keys(model: type[Any]) -> frozenset[str]:
     if cached is not None:
         return cached
 
-    model_fields = getattr(model, "model_fields", None)
-    if not isinstance(model_fields, dict):
+    field_types = _get_model_field_types(model)
+    if not field_types:
         return frozenset()
 
-    allowed: set[str] = set()
-    for field_name, field_info in model_fields.items():
-        allowed.add(field_name)
-        allowed.add(_snake_to_camel(field_name))
-        alias = getattr(field_info, "alias", None)
-        if isinstance(alias, str) and alias:
-            allowed.add(alias)
-        validation_alias = getattr(field_info, "validation_alias", None)
-        if isinstance(validation_alias, str) and validation_alias:
-            allowed.add(validation_alias)
-    result = frozenset(allowed)
+    result = frozenset(field_types.keys())
     _MODEL_FILTER_KEYS_CACHE[model] = result
     return result
 
@@ -293,9 +374,8 @@ def _find_operator(clause: str) -> tuple[int, str] | None:
     return None
 
 
-def _coerce_filter_scalar(raw_value: str, raw_arg: str = "") -> tuple[str | bool | int, bool]:
-    """Coerce quoted, boolean, and integer string tokens to native scalars."""
-    err_ctx = raw_arg or raw_value
+def _unquote_filter_scalar(raw_value: str, err_ctx: str) -> tuple[str, bool]:
+    """Validate double-quote escaping and return ``(text_value, was_quoted)``."""
     if len(raw_value) >= 2 and raw_value.startswith('"') and raw_value.endswith('"'):
         escape = False
         for idx, ch in enumerate(raw_value[1:], start=1):
@@ -316,14 +396,63 @@ def _coerce_filter_scalar(raw_value: str, raw_arg: str = "") -> tuple[str | bool
     if '"' in raw_value:
         raise ValueError(f"Invalid filter format: '{err_ctx}'. Malformed quoted value.")
 
-    lowered = raw_value.lower()
+    return raw_value, False
+
+
+def _coerce_filter_scalar(
+    raw_value: str,
+    raw_arg: str = "",
+    *,
+    field_kind: str | None = None,
+    field_name: str | None = None,
+) -> tuple[str | bool | int | float, bool]:
+    """Coerce quoted, boolean, and numeric string tokens using optional schema guidance."""
+    err_ctx = raw_arg or raw_value
+    text_value, was_quoted = _unquote_filter_scalar(raw_value, err_ctx)
+    attr_label = field_name or "attribute"
+
+    if field_kind == "str":
+        return text_value, was_quoted
+
+    if field_kind == "int":
+        if _ASCII_INT_RE.fullmatch(text_value):
+            return int(text_value), False
+        raise ValueError(
+            f"Invalid filter format: '{err_ctx}'. "
+            f"Invalid integer value '{text_value}' for attribute '{attr_label}'."
+        )
+
+    if field_kind == "float":
+        if _ASCII_FLOAT_RE.fullmatch(text_value):
+            return float(text_value), False
+        raise ValueError(
+            f"Invalid filter format: '{err_ctx}'. "
+            f"Invalid numeric value '{text_value}' for attribute '{attr_label}'."
+        )
+
+    if field_kind == "bool":
+        lowered_bool = text_value.lower()
+        if lowered_bool == "true":
+            return True, False
+        if lowered_bool == "false":
+            return False, False
+        raise ValueError(
+            f"Invalid filter format: '{err_ctx}'. "
+            f"Invalid boolean value '{text_value}' for attribute '{attr_label}'; "
+            "expected 'true' or 'false'."
+        )
+
+    if was_quoted:
+        return text_value, True
+
+    lowered = text_value.lower()
     if lowered == "true":
         return True, False
     if lowered == "false":
         return False, False
-    if raw_value.isdigit():
-        return int(raw_value), False
-    return raw_value, False
+    if _UNPADDED_ASCII_INT_RE.fullmatch(text_value):
+        return int(text_value), False
+    return text_value, False
 
 
 def _validate_expression_tokens(expr: str) -> None:
@@ -347,7 +476,7 @@ def _parse_single_clause(
     raw_arg: str,
     *,
     model: type[Any] | None = None,
-) -> tuple[str, str, str | bool | int, bool]:
+) -> tuple[str, str, str | bool | int | float, bool]:
     """Parse ``key<op>value`` into ``(key, op, parsed_value, was_quoted)``."""
     if not isinstance(clause, str) or not clause or not clause.strip():
         raise ValueError(
@@ -398,11 +527,25 @@ def _parse_single_clause(
         except ValueError as exc:
             raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
 
-    parsed_scalar, was_quoted = _coerce_filter_scalar(raw_value, raw_arg)
+    field_kind: str | None = None
+    if model is not None:
+        field_kind = _get_model_field_types(model).get(raw_key)
+
+    parsed_scalar, was_quoted = _coerce_filter_scalar(
+        raw_value,
+        raw_arg,
+        field_kind=field_kind,
+        field_name=raw_key,
+    )
     return raw_key, matched_op, parsed_scalar, was_quoted
 
 
-def _format_clause(key: str, op: str, val: str | bool | int, was_quoted: bool) -> str:
+def _format_clause(
+    key: str,
+    op: str,
+    val: str | bool | int | float,
+    was_quoted: bool,
+) -> str:
     """Format a parsed clause as a valid iMednet server filter segment."""
     api_op = "==" if op == "=" else op
     camel_key = _snake_to_camel(key)

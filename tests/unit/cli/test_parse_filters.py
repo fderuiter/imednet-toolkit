@@ -141,3 +141,57 @@ def test_parse_filter_args_rejects_invalid_expressions_on_stderr(
     captured = capfd.readouterr()
     assert captured.out == ""
     assert "Invalid filter" in captured.err
+
+
+def test_parse_filter_args_preserves_zero_padded_keys_and_superscripts() -> None:
+    """Zero-padded identifiers and Unicode superscripts stay strings without crashing."""
+    from imednet.models.codings import Coding
+    from imednet.models.subjects import Subject
+
+    assert parse_filter_args(["subject_key=001"], model=Subject) == {"subject_key": "001"}
+    assert parse_filter_args(["subject_key=123"], model=Subject) == {"subject_key": "123"}
+    assert parse_filter_args(["code=0042", "value=²"], model=Coding) == {
+        "code": "0042",
+        "value": "²",
+    }
+    assert parse_filter_args(["subject_key=001", "value=²", "count=0", "page=12"]) == {
+        "subject_key": "001",
+        "value": "²",
+        "count": 0,
+        "page": 12,
+    }
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_fragment"),
+    [
+        ("revision=abc", "Invalid integer value 'abc' for attribute 'revision'"),
+        ("revision=²", "Invalid integer value '²' for attribute 'revision'"),
+    ],
+)
+def test_parse_filter_args_rejects_invalid_model_integer_values(
+    expr: str, expected_fragment: str, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Invalid integer values for model attributes exit 1 with diagnostic on stderr."""
+    from imednet.models.codings import Coding
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_filter_args([expr], model=Coding)
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert expected_fragment in captured.err
+
+
+def test_parse_filter_args_rejects_invalid_model_boolean_values(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Invalid boolean values for model attributes exit 1 with diagnostic on stderr."""
+    from imednet.models.forms import Form
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_filter_args(["disabled=maybe"], model=Form)
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Invalid boolean value 'maybe' for attribute 'disabled'" in captured.err
