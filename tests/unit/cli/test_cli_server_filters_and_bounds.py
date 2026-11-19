@@ -199,9 +199,9 @@ def test_all_eleven_filterable_list_commands_accept_filter_sort_limit_and_all(
     argv.extend(
         [
             "-f",
-            "dateCreated>=2025-01-01,dateModified>=2025-01-01",
+            "studyKey==S1,lastUpdated>=2025-01-01",
             "--sort",
-            "dateCreated,asc",
+            "lastUpdated,asc",
             "--limit",
             "25",
             "--format",
@@ -213,8 +213,8 @@ def test_all_eleven_filterable_list_commands_accept_filter_sort_limit_and_all(
 
     assert route.call_count == 1
     params = dict(route.calls[0].request.url.params)
-    assert params["filter"] == "dateCreated>=2025-01-01,dateModified>=2025-01-01"
-    assert params["sort"] == "dateCreated,asc"
+    assert params["filter"] == "studyKey==S1,lastUpdated>=2025-01-01"
+    assert params["sort"] == "lastUpdated,asc"
     assert params["size"] == "25"
     assert params["page"] == "0"
 
@@ -484,3 +484,34 @@ def test_cli_query_validation_errors_exit_one(
     captured = capfd.readouterr()
     assert captured.out == ""
     assert expected_err in captured.err
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_model"),
+    [
+        (["codings", "list", "S1", "--filter", "visit_key=SCREENING"], "Coding"),
+        (["subjects", "list", "S1", "--filter", "visit_key=SCREENING"], "Subject"),
+    ],
+)
+@respx.mock
+def test_codings_and_subjects_list_reject_unknown_model_filter_attributes(
+    argv: list[str],
+    expected_model: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """codings list and subjects list validate filter keys against Coding/Subject before HTTP."""
+    sdk = _make_sdk()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
+    route = respx.get(url__regex=r"https://api\.test/.*").mock(
+        return_value=httpx.Response(200, json=_paginated_payload([]))
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.app(argv)
+
+    assert exc_info.value.code == 1
+    assert route.call_count == 0
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert f"Unknown filter attribute 'visit_key' for {expected_model}" in captured.err

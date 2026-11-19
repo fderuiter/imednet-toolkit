@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
+from ...models.codings import Coding
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status
@@ -58,6 +59,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             limit=limit,
             fetch_all=fetch_all,
             output_format=output_format,
+            model=Coding,
         )
 
         with fetching_status("codings", study_key):

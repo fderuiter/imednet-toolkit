@@ -6,10 +6,18 @@ from typing import Any
 
 from importlib import import_module
 
-from .dates import format_iso_datetime, normalize_iso_date, parse_iso_datetime
+from .dates import (
+    format_iso_datetime,
+    normalize_iso_date,
+    normalize_utc_timestamp_bound,
+    parse_iso_datetime,
+)
 from .filters import (
     ALLOWED_OPERATORS,
+    ORDERED_FILTER_OPERATORS,
     build_filter_string,
+    parse_filter_expression,
+    parse_filter_expressions,
     validate_connector_exclusivity,
     validate_filter_key,
     validate_filter_operator,
@@ -63,6 +71,7 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "ALLOWED_OPERATORS",
+    "ORDERED_FILTER_OPERATORS",
     "FilterValue",
     "ItemId",
     "JsonDict",
@@ -78,10 +87,13 @@ __all__ = [
     "forms_to_dataframe",
     "intervals_to_dataframe",
     "normalize_iso_date",
+    "normalize_utc_timestamp_bound",
     "parse_bool",
     "parse_datetime",
     "parse_dict_or_default",
     "parse_expression",
+    "parse_filter_expression",
+    "parse_filter_expressions",
     "parse_int_or_default",
     "parse_iso_datetime",
     "parse_list_or_default",

@@ -45,10 +45,18 @@ def redact_sensitive_payload(data: Any) -> Any:
     """Return data with sensitive key values redacted."""
     if isinstance(data, dict):
         redacted: dict[str, Any] = {}
+        sensitive_field_attr = (
+            "attribute" in data
+            and "value" in data
+            and isinstance(data.get("attribute"), str)
+            and any(pattern in data["attribute"].lower() for pattern in SENSITIVE_KEYS)
+        )
         for key, value in data.items():
             key_str = str(key)
             key_lower = key_str.lower()
-            if any(pattern in key_lower for pattern in SENSITIVE_KEYS):
+            if (sensitive_field_attr and key_str == "value") or any(
+                pattern in key_lower for pattern in SENSITIVE_KEYS
+            ):
                 redacted[key_str] = "***"
             else:
                 redacted[key_str] = redact_sensitive_payload(value)
