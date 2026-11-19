@@ -10,7 +10,8 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Sequence
+import unicodedata
+from collections.abc import Iterator, Sequence
 from datetime import date, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -102,37 +103,134 @@ _CURSOR_SHOW = "\033[?25h"
 _CLEAR_LINE = "\r\033[K"
 
 
+def _char_display_width(ch: str) -> int:
+    """Return terminal column display width (0, 1, or 2) for a single code point."""
+    cat = unicodedata.category(ch)
+    if cat in ("Mn", "Me") or cat.startswith("C"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def _iter_graphemes(text: str) -> Iterator[tuple[str, int]]:
+    """Yield (grapheme_cluster, display_width) keeping Mn/Me combining marks attached."""
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        w = _char_display_width(ch)
+        j = i + 1
+        while j < n and unicodedata.category(text[j]) in ("Mn", "Me"):
+            j += 1
+        yield text[i:j], w
+        i = j
+
+
+def _display_width(text: str) -> int:
+    """Return terminal display width of text in columns."""
+    return sum(w for _, w in _iter_graphemes(text))
+
+
+def _slice_display_width(text: str, max_width: int) -> str:
+    """Slice text so its terminal display width does not exceed max_width."""
+    if max_width <= 0 or not text:
+        return ""
+    out: list[str] = []
+    used = 0
+    for cluster, w in _iter_graphemes(text):
+        if used + w > max_width:
+            break
+        out.append(cluster)
+        used += w
+    return "".join(out)
+
+
+def _pad_display_width(text: str, width: int, fillchar: str = " ") -> str:
+    """Right-pad text to target terminal display width."""
+    pad = max(0, width - _display_width(text))
+    return f"{text}{fillchar * pad}"
+
+
+def _fit_display_width(text: str, width: int) -> str:
+    """Slice and right-pad text to exact display width, padding overflowed wide-glyph cells."""
+    if width <= 0:
+        return ""
+    sliced = _slice_display_width(text, width)
+    return _pad_display_width(sliced, width)
+
+
+def _center_display_width(text: str, width: int, fillchar: str = " ") -> str:
+    """Slice and center text within target display width."""
+    if width <= 0:
+        return ""
+    sliced = _slice_display_width(text, width)
+    pad = max(0, width - _display_width(sliced))
+    left = pad // 2
+    right = pad - left
+    return f"{fillchar * left}{sliced}{fillchar * right}"
+
+
+def _sanitize_cell_text(text: str) -> str:
+    """Replace line breaks, tabs, and C* control characters with single spaces."""
+    normalized = text.replace("\r\n", " ")
+    out: list[str] = []
+    for ch in normalized:
+        if ch in ("\r", "\n", "\t", "\u2028", "\u2029") or unicodedata.category(ch).startswith("C"):
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _truncate_visible(text: str, max_width: int) -> str:
-    """Truncate text to a maximum visible width, preserving ANSI sequences.
+    """Truncate text to a maximum visible display width, preserving ANSI sequences.
 
     Args:
         text: String possibly containing ANSI escape sequences.
-        max_width: Maximum number of visible characters to permit.
+        max_width: Maximum number of visible terminal columns to permit.
 
     Returns:
-        Truncated string whose visible character count does not exceed max_width.
+        Truncated string whose visible display width does not exceed max_width.
     """
     if max_width <= 0:
         return ""
     stripped = _ANSI_REGEX.sub("", text)
-    if len(stripped) <= max_width:
+    if _display_width(stripped) <= max_width:
         return text
 
     result: list[str] = []
-    visible_count = 0
+    visible_width = 0
     pos = 0
     has_ansi = False
-    while pos < len(text) and visible_count < max_width:
+    has_base = False
+    n = len(text)
+    while pos < n:
         match = _ANSI_REGEX.match(text, pos)
         if match:
+            if visible_width >= max_width:
+                break
             has_ansi = True
             result.append(match.group(0))
             pos = match.end()
-        else:
-            result.append(text[pos])
-            visible_count += 1
-            pos += 1
+            continue
 
+        ch = text[pos]
+        if unicodedata.category(ch) in ("Mn", "Me") and has_base:
+            result.append(ch)
+            pos += 1
+            continue
+
+        ch_w = _char_display_width(ch)
+        if visible_width + ch_w > max_width:
+            break
+        result.append(ch)
+        visible_width += ch_w
+        has_base = True
+        pos += 1
+
+    if visible_width == 0 and not has_base:
+        return ""
     if has_ansi:
         result.append("\033[0m")
     return "".join(result)
@@ -272,7 +370,7 @@ class Status:
             clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
             line = f"{clear_seq}{content}"
 
-            vis_len = len(_ANSI_REGEX.sub("", content))
+            vis_len = _display_width(_ANSI_REGEX.sub("", content))
             lines_by_width = max(1, (vis_len + cols - 1) // cols) if cols > 0 else 1
             lines_by_newlines = content.count("\n") + 1
             self._lines_rendered = max(lines_by_width, lines_by_newlines)
@@ -427,15 +525,16 @@ def _format_cell_value(value: Any, key: str | None = None) -> str:
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d %H:%M")
 
-    str_val = str(value)
     if isinstance(value, list) and all(isinstance(x, (str, int, float, bool, Enum)) for x in value):
         if not value:
             return "-"
-        s = ", ".join(str(x.value if isinstance(x, Enum) else x) for x in value)
+        s = ", ".join(
+            _sanitize_cell_text(str(x.value if isinstance(x, Enum) else x)) for x in value
+        )
         return _truncate(s)
     if isinstance(value, (list, dict)):
-        return _truncate(str(value))
-    return str_val
+        return _truncate(_sanitize_cell_text(str(value)))
+    return _sanitize_cell_text(str(value))
 
 
 def _colorize(text: str, color: str) -> str:
@@ -448,7 +547,7 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
     if not items:
         return
 
-    headers = [str(header).replace("_", " ").title() for header in fields]
+    headers = [_sanitize_cell_text(str(header).replace("_", " ").title()) for header in fields]
 
     rows = []
     for item in items:
@@ -461,14 +560,14 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
             row.append(_format_cell_value(val, key=str(k)))
         rows.append(row)
 
-    col_widths = [len(h) for h in headers]
+    col_widths = [_display_width(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(cell))
+            col_widths[i] = max(col_widths[i], _display_width(cell))
 
-    header_str = " | ".join(h.ljust(w) for h, w in zip(headers, col_widths))  # noqa: B905
+    header_str = " | ".join(_pad_display_width(h, w) for h, w in zip(headers, col_widths))  # noqa: B905
     print(_colorize(header_str, "bold_magenta"))
-    print("-" * len(header_str))
+    print("-" * _display_width(header_str))
 
     is_hc = os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
 
@@ -486,7 +585,7 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
                 )
                 if color:
                     c = _colorize(cell, color)
-            colored_row.append(c + " " * (col_widths[i] - len(cell)))
+            colored_row.append(c + " " * max(0, col_widths[i] - _display_width(cell)))
         print(" | ".join(colored_row))
 
 

@@ -505,6 +505,84 @@ def test_print_table_job_state_colors(
     assert "\033[35mCANCELLED\033[0m" in captured_hc.out
 
 
+def test_format_cell_value_sanitizes_control_characters() -> None:
+    """_format_cell_value replaces CR/LF/tabs and C* controls with spaces while emit_json keeps raw data."""
+    import json
+
+    from imednet.cli.utils.output import emit_json
+
+    assert _format_cell_value("Line 1\r\nLine 2\tTabbed") == "Line 1 Line 2 Tabbed"
+    assert _format_cell_value("A\nB\rC\x07\x1b\x00\u200bD") == "A B C    D"
+    assert _format_cell_value(["first\nitem", "second\titem"]) == "first item, second item"
+    assert "\n" not in _format_cell_value({"note": "raw\nvalue"})
+
+    buf = io.StringIO()
+    with patch("sys.stdout", buf):
+        emit_json([{"note": "Line 1\r\nLine 2\tTabbed"}], "records")
+    payload = json.loads(buf.getvalue())
+    assert payload["items"][0]["note"] == "Line 1\r\nLine 2\tTabbed"
+
+
+def test_truncate_visible_cjk_and_combining_marks() -> None:
+    """_truncate_visible slices by display width, preserves ANSI resets, and keeps Mn/Me marks attached."""
+    from imednet.cli.utils.output import _display_width, _truncate_visible
+
+    # 2-cell CJK glyphs: "東京" is 4 cols, max_width=3 fits only "東" (2 cols)
+    assert _truncate_visible("東京", 3) == "東"
+    assert _truncate_visible("東京", 1) == ""
+    assert _truncate_visible("\033[32m東京\033[0m", 3) == "\033[32m東\033[0m"
+
+    # Combining marks (Mn and Me) stay attached to their base character at the boundary
+    composed = "cafe\u0301x"  # 'e' + combining acute accent (Mn) + 'x' -> 5 cols total
+    truncated_mn = _truncate_visible(composed, 4)
+    assert truncated_mn == "cafe\u0301"
+    assert _display_width(truncated_mn) == 4
+
+    enclosing = "1\u20dd2"  # '1' + combining enclosing circle (Me) + '2' -> 2 cols total
+    assert _truncate_visible(enclosing, 1) == "1\u20dd"
+    assert _truncate_visible("\033[34mcafe\u0301\033[0m world", 4) == "\033[34mcafe\u0301\033[0m"
+
+
+def test_print_table_aligns_cjk_combining_and_multiline_cells(
+    capfd: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_print_table aligns column separators by display width across CJK, combining marks, and notes."""
+    import re
+
+    from imednet.cli.utils.output import _display_width, _print_table
+
+    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+    items = [
+        {"site_name": "東京大学病院", "note": "Line 1\r\nLine 2\tOK", "status": "Active"},
+        {"site_name": "Cafe\u0301 Nord", "note": "Single line", "status": "Pending"},
+        {"site_name": "Site 1", "note": "Check\x07value", "status": "Closed"},
+    ]
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    _print_table(items, ["site_name", "note", "status"])
+    out_lines = [line for line in capfd.readouterr().out.splitlines() if line]
+    assert len(out_lines) == 5
+
+    plain_lines = [ansi_re.sub("", line) for line in out_lines]
+    # Header, divider, and every row must have identical terminal display width
+    widths = {_display_width(line) for line in plain_lines}
+    assert len(widths) == 1
+
+    # Pipe separators align on the exact same display columns across header and all rows
+    def pipe_display_cols(line: str) -> list[int]:
+        cols: list[int] = []
+        for idx, ch in enumerate(line):
+            if ch == "|":
+                cols.append(_display_width(line[:idx]))
+        return cols
+
+    expected_pipes = pipe_display_cols(plain_lines[0])
+    assert len(expected_pipes) == 2
+    for row_line in plain_lines[2:]:
+        assert pipe_display_cols(row_line) == expected_pipes
+        assert "\r" not in row_line
+        assert "\t" not in row_line
+
+
 class SimulatedTerminal:
     """Terminal emulator tracking rows, cursor position, and ANSI sequences."""
 

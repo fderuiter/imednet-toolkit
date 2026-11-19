@@ -10,8 +10,9 @@ except ImportError:
     curses = None  # type: ignore[assignment]
 
 _CURSES_ERROR: tuple[type[BaseException], ...] = (curses.error,) if curses is not None else ()
+import locale
 import os
-import textwrap
+import unicodedata
 from collections.abc import Sequence
 from datetime import datetime
 from enum import Enum
@@ -19,7 +20,17 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .output import _HC_STATUS_COLOR_MAP, _STATUS_COLOR_MAP, _format_cell_value
+from .output import (
+    _HC_STATUS_COLOR_MAP,
+    _STATUS_COLOR_MAP,
+    _center_display_width,
+    _display_width,
+    _fit_display_width,
+    _format_cell_value,
+    _iter_graphemes,
+    _sanitize_cell_text,
+    _slice_display_width,
+)
 from .terminal import supports_fullscreen_ui
 
 _MIN_READABLE_CELL_WIDTH = 12
@@ -51,8 +62,10 @@ def _collect_search_tokens(val: Any) -> list[str]:
     """Recursively extract searchable strings from scalars, enums, models, and collections."""
     if val is None:
         return []
+    if isinstance(val, bool):
+        return ["Yes", "True"] if val else ["No", "False"]
     if isinstance(val, Enum):
-        return [str(val.value)]
+        return _collect_search_tokens(val.value)
     if isinstance(val, BaseModel):
         return _collect_search_tokens(val.model_dump(by_alias=False))
     if isinstance(val, dict):
@@ -70,7 +83,11 @@ def _collect_search_tokens(val: Any) -> list[str]:
         return seq_tokens
     if isinstance(val, datetime):
         return [val.strftime("%Y-%m-%d %H:%M"), val.isoformat()]
-    return [str(val)]
+    raw_str = str(val)
+    clean_str = _sanitize_cell_text(raw_str)
+    if clean_str != raw_str:
+        return [raw_str, clean_str]
+    return [raw_str]
 
 
 def is_interactive_terminal() -> bool:
@@ -106,19 +123,23 @@ def safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
     if y < 0 or y >= max_y or x < 0 or x >= max_x:
         return
 
-    avail = max_x - x
-    if len(text) > avail:
-        text = text[:avail]
-
     # Prevent curses error when writing to bottom-right cell
-    if y == max_y - 1 and x + len(text) >= max_x:
-        text = text[: max_x - x - 1]
+    limit = (max_x - x - 1) if y == max_y - 1 else (max_x - x)
+    if limit <= 0:
+        return
+
+    if _display_width(text) > limit:
+        text = _slice_display_width(text, limit)
 
     if not text:
         return
 
-    with contextlib.suppress(*_CURSES_ERROR):
+    try:
         win.addstr(y, x, text, attr)
+    except _CURSES_ERROR:
+        if len(text) > limit:
+            with contextlib.suppress(*_CURSES_ERROR):
+                win.addstr(y, x, text[:limit], attr)
 
 
 def extract_item_details(detail: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -324,20 +345,20 @@ class InteractiveDataGrid:
 
     def _compute_col_widths(self, grid_limit: int) -> tuple[list[str], list[int]]:
         """Compute formatted headers and readable column widths without crushing headers."""
-        headers = [str(f).replace("_", " ").title() for f in self.fields]
+        headers = [_sanitize_cell_text(str(f).replace("_", " ").title()) for f in self.fields]
         num_cols = len(self.fields)
         if num_cols == 0:
             return headers, []
 
-        natural_widths = [len(h) for h in headers]
+        natural_widths = [_display_width(h) for h in headers]
         sample_entries = self.filtered_entries[:100]
         for row_dict, _ in sample_entries:
             for idx, col in enumerate(self.fields):
                 val_str = self._format_cell(row_dict.get(col), key=str(col))
-                natural_widths[idx] = max(natural_widths[idx], len(val_str))
+                natural_widths[idx] = max(natural_widths[idx], _display_width(val_str))
 
         min_widths = [
-            max(len(headers[idx]), min(natural_widths[idx], _MIN_READABLE_CELL_WIDTH))
+            max(_display_width(headers[idx]), min(natural_widths[idx], _MIN_READABLE_CELL_WIDTH))
             for idx in range(num_cols)
         ]
         sep_len = 3 * (num_cols - 1)
@@ -420,11 +441,11 @@ class InteractiveDataGrid:
         panel_str = " [SIDE PANEL]" if (self.side_panel_open and panel_width > 0) else ""
         filter_status = f' [Filter: "{self.search_query}"]' if self.search_query else ""
         notice_str = f" [{self.status_notice}]" if self.status_notice else ""
-        title = (
+        title = _sanitize_cell_text(
             f"iMednet {self.label.title()} Review ({total_rows} items)"
             f"{notice_str}{filter_status}{panel_str}{mode_str}{hc_str}"
         )
-        safe_addstr(self.stdscr, 0, 0, title[:grid_limit], curses.A_BOLD)
+        safe_addstr(self.stdscr, 0, 0, _slice_display_width(title, grid_limit), curses.A_BOLD)
 
         num_cols = len(self.fields)
         max_col_offset = 0
@@ -452,7 +473,7 @@ class InteractiveDataGrid:
                     break
                 w = col_widths[col_idx]
                 cell_avail = min(w, grid_limit - used_x)
-                header_parts.append(headers[col_idx][:w].ljust(w)[:cell_avail])
+                header_parts.append(_fit_display_width(headers[col_idx], cell_avail))
                 sep_parts.append("-" * cell_avail)
                 used_x += cell_avail
 
@@ -472,7 +493,13 @@ class InteractiveDataGrid:
                         )
                         note_avail = max(0, grid_limit - 2)
                         if note_avail > 0:
-                            safe_addstr(self.stdscr, y, 2, empty_note[:note_avail], curses.A_DIM)
+                            safe_addstr(
+                                self.stdscr,
+                                y,
+                                2,
+                                _slice_display_width(empty_note, note_avail),
+                                curses.A_DIM,
+                            )
                     break
 
                 row_dict, _ = self.filtered_entries[row_idx]
@@ -498,7 +525,7 @@ class InteractiveDataGrid:
                     raw_val = row_dict.get(col)
                     cell_text = self._format_cell(raw_val, key=str(col))
                     cell_avail = min(w, grid_limit - curr_x)
-                    formatted_cell = cell_text[:w].ljust(w)[:cell_avail]
+                    formatted_cell = _fit_display_width(cell_text, cell_avail)
 
                     col_attr = base_attr
                     if any(s in col.lower() for s in ("status", "state")):
@@ -507,7 +534,7 @@ class InteractiveDataGrid:
                             col_attr = base_attr | status_attr
 
                     safe_addstr(self.stdscr, y, curr_x, formatted_cell, col_attr)
-                    curr_x += len(formatted_cell)
+                    curr_x += _display_width(formatted_cell)
 
         # Draw Side Inspection Panel if open
         if self.side_panel_open and panel_width > 0:
@@ -518,23 +545,103 @@ class InteractiveDataGrid:
 
         self.stdscr.refresh()
 
+    @staticmethod
+    def _wrap_single_panel_line(line: str, max_w: int, eff_indent: str) -> list[str]:
+        """Wrap a sanitized single line to max_w terminal display columns."""
+        if not line or _display_width(line) <= max_w:
+            return [line]
+
+        clusters = list(_iter_graphemes(line))
+        n = len(clusters)
+        indent_w = _display_width(eff_indent)
+        wrapped: list[str] = []
+        pos = 0
+
+        while pos < n:
+            if not wrapped:
+                prefix = ""
+                avail = max_w
+            else:
+                prefix = eff_indent
+                avail = max(1, max_w - indent_w)
+                while pos < n and clusters[pos][0] == " ":
+                    pos += 1
+                if pos >= n:
+                    break
+
+            used = 0
+            end = pos
+            last_space_idx = -1
+            seen_non_space = False
+            while end < n:
+                c_str, c_w = clusters[end]
+                if used + c_w > avail:
+                    break
+                if c_str == " ":
+                    if seen_non_space:
+                        last_space_idx = end
+                else:
+                    seen_non_space = True
+                used += c_w
+                end += 1
+
+            if end == n:
+                chunk = "".join(c for c, _ in clusters[pos:end]).rstrip(" ")
+                wrapped.append(f"{prefix}{chunk}")
+                break
+
+            if end == pos:
+                wrapped.append(f"{prefix}{clusters[pos][0]}")
+                pos += 1
+            elif clusters[end][0] == " ":
+                chunk = "".join(c for c, _ in clusters[pos:end]).rstrip(" ")
+                wrapped.append(f"{prefix}{chunk}")
+                pos = end
+            elif last_space_idx != -1:
+                chunk = "".join(c for c, _ in clusters[pos:last_space_idx]).rstrip(" ")
+                wrapped.append(f"{prefix}{chunk}")
+                pos = last_space_idx + 1
+            else:
+                chunk = "".join(c for c, _ in clusters[pos:end])
+                wrapped.append(f"{prefix}{chunk}")
+                pos = end
+
+        return wrapped if wrapped else [_slice_display_width(line, max_w)]
+
     def _wrap_panel_line(
         self, text: str, content_w: int, attr: int = 0, cont_indent: str = "    "
     ) -> list[tuple[str, int]]:
-        """Wrap a panel line to content_w without dropping characters."""
-        if not text or len(text) <= content_w:
-            return [(text, attr)]
-        wrapped = textwrap.wrap(
-            text,
-            width=max(8, content_w),
-            subsequent_indent=cont_indent if content_w > len(cont_indent) + 4 else "",
-            break_long_words=True,
-            break_on_hyphens=False,
+        """Expand tabs, split line breaks, and wrap panel text within content_w display width."""
+        if not text:
+            return [("", attr)]
+
+        max_w = max(1, content_w)
+        eff_indent = cont_indent if max_w > _display_width(cont_indent) + 4 else ""
+        normalized = (
+            text.replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\u2028", "\n")
+            .replace("\u2029", "\n")
         )
-        return [(line, attr) for line in wrapped] if wrapped else [(text[:content_w], attr)]
+        logical_lines = normalized.splitlines()
+        if not logical_lines:
+            return [("", attr)]
+
+        result: list[tuple[str, int]] = []
+        for idx, raw_line in enumerate(logical_lines):
+            clean_line = _sanitize_cell_text(raw_line.expandtabs(4))
+            if idx > 0:
+                if not clean_line.strip():
+                    result.append(("", attr))
+                    continue
+                clean_line = f"{eff_indent}{clean_line}"
+            for wrapped_line in self._wrap_single_panel_line(clean_line, max_w, eff_indent):
+                result.append((wrapped_line, attr))
+
+        return result if result else [("", attr)]
 
     def _format_panel_scalar(self, val: Any, key: str | None = None) -> str:
-        """Format scalar, boolean, datetime, or enum value without mid-string truncation."""
+        """Format scalar, boolean, datetime, or enum value while sanitizing C* controls."""
         if isinstance(val, Enum):
             val = val.value
         if val is None or val == "":
@@ -543,7 +650,11 @@ class InteractiveDataGrid:
             return "Yes" if val else "No"
         if isinstance(val, datetime):
             return val.strftime("%Y-%m-%d %H:%M")
-        return str(val)
+        raw = str(val).replace("\r\n", "\n").replace("\r", "\n")
+        return "".join(
+            ch if (ch in ("\n", "\t") or not unicodedata.category(ch).startswith("C")) else " "
+            for ch in raw
+        )
 
     def _append_panel_value(
         self,
@@ -635,18 +746,20 @@ class InteractiveDataGrid:
         content_w = max(10, panel_width - 3)
 
         is_records = self.label == "records"
-        panel_title = " RECORD INSPECTION " if is_records else f" {self.label.upper()} DETAILS "
+        panel_title = _sanitize_cell_text(
+            " RECORD INSPECTION " if is_records else f" {self.label.upper()} DETAILS "
+        )
         safe_addstr(
             self.stdscr,
             1,
             content_x,
-            panel_title.center(content_w, "─")[:content_w],
+            _center_display_width(panel_title, content_w, "─"),
             curses.A_BOLD,
         )
 
         if not self.filtered_entries:
             empty_sel = "No record selected." if is_records else f"No {self.label} selected."
-            safe_addstr(self.stdscr, 3, content_x, empty_sel[:content_w])
+            safe_addstr(self.stdscr, 3, content_x, _slice_display_width(empty_sel, content_w))
             return
 
         _, detail_obj = self.filtered_entries[self.selected_idx]
@@ -741,21 +854,22 @@ class InteractiveDataGrid:
             if line_idx >= len(lines):
                 break
             text, attr = lines[line_idx]
-            safe_addstr(self.stdscr, y, content_x, text[:content_w].ljust(content_w), attr)
+            safe_addstr(self.stdscr, y, content_x, _fit_display_width(text, content_w), attr)
 
     def _draw_status_bar(
         self, y: int, max_x: int, total_rows: int, max_col_offset: int = 0
     ) -> None:
         """Render the status or filter input bar at the bottom of the screen."""
+        bar_width = max(1, max_x - 1)
         if self.is_searching:
-            prompt = f"Filter (type to search): {self.search_query}_"
-            safe_addstr(self.stdscr, y, 0, prompt[:max_x].ljust(max_x), curses.A_REVERSE)
-            try:
-                cursor_col = min(max_x - 1, len(f"Filter (type to search): {self.search_query}"))
+            prefix = _sanitize_cell_text(f"Filter (type to search): {self.search_query}")
+            prompt = f"{prefix}_"
+            safe_addstr(self.stdscr, y, 0, _fit_display_width(prompt, bar_width), curses.A_REVERSE)
+            cursor_col = min(max_x - 1, _display_width(prefix))
+            with contextlib.suppress(curses.error):
                 curses.curs_set(1)
+            with contextlib.suppress(curses.error):
                 self.stdscr.move(y, cursor_col)
-            except curses.error:
-                pass
         else:
             with contextlib.suppress(curses.error):
                 curses.curs_set(0)
@@ -766,22 +880,39 @@ class InteractiveDataGrid:
                 if num_cols > 0 and (max_col_offset > 0 or self.col_offset > 0)
                 else ""
             )
-            notice_suffix = f"  [{self.status_notice}]" if self.status_notice else ""
+            notice_suffix = (
+                f"  [{_sanitize_cell_text(self.status_notice)}]" if self.status_notice else ""
+            )
             help_text = (
                 f"[↑/↓/←/→] Navigate  [/] Search  [Space] Panel  [q] Quit  "
                 f"{pos_info}{col_info}{notice_suffix}"
             )
-            safe_addstr(self.stdscr, y, 0, help_text[:max_x].ljust(max_x), curses.A_REVERSE)
+            safe_addstr(
+                self.stdscr, y, 0, _fit_display_width(help_text, bar_width), curses.A_REVERSE
+            )
 
     def run(self) -> None:
         """Execute the interactive event loop until the user exits with 'q'."""
         while True:
             self.draw()
             try:
-                ch = self.stdscr.getch()
+                get_wch = getattr(self.stdscr, "get_wch", None)
+                if callable(get_wch):
+                    ch = get_wch()
+                    if not isinstance(ch, (int, str)):
+                        ch = self.stdscr.getch()
+                else:
+                    ch = self.stdscr.getch()
+            except AttributeError:
+                try:
+                    ch = self.stdscr.getch()
+                except KeyboardInterrupt:
+                    break
+                except curses.error:
+                    continue
             except KeyboardInterrupt:
                 break
-            except curses.error:
+            except (curses.error, ValueError):
                 continue
 
             if ch == curses.KEY_RESIZE:
@@ -795,21 +926,27 @@ class InteractiveDataGrid:
                 if should_exit:
                     break
 
-    def _handle_search_input(self, ch: int) -> None:
+    def _handle_search_input(self, ch: int | str) -> None:
         """Handle keystrokes while search input mode is active."""
-        if ch in (10, 13, curses.KEY_ENTER) or ch == 27:  # Enter or Escape exits search input
+        if ch in (10, 13, curses.KEY_ENTER, 27, "\n", "\r", "\x1b"):
             self.is_searching = False
             with contextlib.suppress(curses.error):
                 curses.curs_set(0)
-        elif ch in (curses.KEY_BACKSPACE, 127, 8):  # Backspace
+        elif ch in (curses.KEY_BACKSPACE, 127, 8, "\x7f", "\b"):
             if self.search_query:
                 self.search_query = self.search_query[:-1]
                 self.filter_entries()
-        elif 32 <= ch <= 126:  # Printable character
+        elif isinstance(ch, str):
+            if ch and all(
+                c.isprintable() and not unicodedata.category(c).startswith("C") for c in ch
+            ):
+                self.search_query += ch
+                self.filter_entries()
+        elif 32 <= ch <= 126:  # Printable ASCII code from getch() fallback
             self.search_query += chr(ch)
             self.filter_entries()
 
-    def _handle_normal_input(self, ch: int) -> bool:
+    def _handle_normal_input(self, ch: int | str) -> bool:
         """Handle keystrokes in normal navigation mode.
 
         Returns:
@@ -819,40 +956,40 @@ class InteractiveDataGrid:
         viewport_height = max(1, max_y - 4)
         total = len(self.filtered_entries)
 
-        if ch in (ord("q"), ord("Q")):
+        if ch in (ord("q"), ord("Q"), "q", "Q"):
             return True
 
-        if ch == ord(" "):
+        if ch in (ord(" "), " "):
             self.side_panel_open = not self.side_panel_open
             self.side_panel_scroll = 0
             self.col_offset = max(0, min(self.col_offset, self._max_col_offset()))
             return False
 
-        if ch == ord("/"):
+        if ch in (ord("/"), "/"):
             self.is_searching = True
             return False
 
-        if ch == 27:  # Escape in normal mode clears active filter
+        if ch in (27, "\x1b"):  # Escape in normal mode clears active filter
             if self.search_query:
                 self.search_query = ""
                 self.filter_entries()
             return False
 
-        if ch in (curses.KEY_UP, ord("k")):
+        if ch in (curses.KEY_UP, ord("k"), "k"):
             if total > 0 and self.selected_idx > 0:
                 self.selected_idx -= 1
                 self.side_panel_scroll = 0
 
-        elif ch in (curses.KEY_DOWN, ord("j")):
+        elif ch in (curses.KEY_DOWN, ord("j"), "j"):
             if total > 0 and self.selected_idx < total - 1:
                 self.selected_idx += 1
                 self.side_panel_scroll = 0
 
-        elif ch in (curses.KEY_LEFT, ord("h")):
+        elif ch in (curses.KEY_LEFT, ord("h"), "h"):
             if self.col_offset > 0:
                 self.col_offset = min(self.col_offset - 1, self._max_col_offset())
 
-        elif ch in (curses.KEY_RIGHT, ord("l")):
+        elif ch in (curses.KEY_RIGHT, ord("l"), "l"):
             max_col = self._max_col_offset()
             if self.col_offset < max_col:
                 self.col_offset += 1
@@ -879,11 +1016,11 @@ class InteractiveDataGrid:
                 self.selected_idx = total - 1
                 self.side_panel_scroll = 0
 
-        elif ch in (ord("["), ord("{")):  # Scroll side panel up
+        elif ch in (ord("["), ord("{"), "[", "{"):  # Scroll side panel up
             if self.side_panel_open and self.side_panel_scroll > 0:
                 self.side_panel_scroll -= 1
 
-        elif ch in (ord("]"), ord("}")) and self.side_panel_open:  # Scroll side panel down
+        elif ch in (ord("]"), ord("}"), "]", "}") and self.side_panel_open:  # Scroll panel down
             self.side_panel_scroll += 1
 
         return False
@@ -913,6 +1050,9 @@ def run_interactive_grid(
     """
     if curses is None:
         return False
+
+    with contextlib.suppress(locale.Error):
+        locale.setlocale(locale.LC_ALL, "")
 
     try:
 
