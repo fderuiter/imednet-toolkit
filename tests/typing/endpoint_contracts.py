@@ -1,7 +1,13 @@
 from collections.abc import AsyncIterator, Iterator
 from typing import Literal, assert_type
 
-from imednet import AsyncImednetSDK, ImednetSDK
+from imednet import (
+    AsyncImednetSDK,
+    AsyncWorkflowsNamespaceProtocol,
+    ImednetSDK,
+    SinksNamespaceProtocol,
+    WorkflowsNamespaceProtocol,
+)
 from imednet.core.endpoint import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.dispatch import AsyncEndpointContext, SyncEndpointContext
 from imednet.endpoints.studies import AsyncStudiesEndpoint, StudiesEndpoint, StudiesOperationDef
@@ -97,6 +103,10 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(JobState.COMPLETED, Literal[JobState.COMPLETED])
     assert_type(QueryStatus.OPEN, Literal[QueryStatus.OPEN])
 
+    # Plugin namespaces on ImednetSDK
+    assert_type(sdk.workflows, WorkflowsNamespaceProtocol | None)
+    assert_type(sdk.sinks, SinksNamespaceProtocol | None)
+
 
 async def async_contract(sdk: AsyncImednetSDK) -> None:
     facade: AsyncImednetFacade = sdk
@@ -160,6 +170,10 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.async_create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(await sdk.async_poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
     assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2']), JobPollSummary)
+
+    # Plugin namespaces on AsyncImednetSDK
+    assert_type(sdk.workflows, AsyncWorkflowsNamespaceProtocol | None)
+    assert_type(sdk.sinks, SinksNamespaceProtocol | None)
 
 
 def sync_endpoint_contract(ep: StudiesEndpoint) -> None:

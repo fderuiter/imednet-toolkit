@@ -64,6 +64,13 @@ imednet.spi.sinks module
    :members:
    :show-inheritance:
 
+imednet.spi.tabular\_mapper module
+----------------------------------
+
+.. automodule:: imednet.spi.tabular_mapper
+   :members:
+   :show-inheritance:
+
 imednet.spi.utils module
 ------------------------
 

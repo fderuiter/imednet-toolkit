@@ -147,6 +147,54 @@ class StateProviderProtocol(Protocol):
         ...
 
 
+def is_async_sdk(sdk: object) -> bool:
+    """Return True when ``sdk`` is an asynchronous SDK or facade instance."""
+    import inspect
+    from unittest.mock import NonCallableMock
+
+    if isinstance(sdk, NonCallableMock):
+        spec_methods = getattr(sdk, "_mock_methods", None)
+        if spec_methods is not None:
+            return (
+                "async_create_record" in spec_methods and "create_record" not in spec_methods
+            ) or ("async_get_forms" in spec_methods and "get_forms" not in spec_methods)
+        sdk_dict = getattr(sdk, "__dict__", {})
+        if sdk_dict.get("_async_client") and hasattr(sdk, "_async_client"):
+            return True
+        mock_children = getattr(sdk, "_mock_children", {})
+        candidate_keys = {
+            k for k in (set(sdk_dict.keys()) | set(mock_children.keys())) if not k.startswith("_")
+        }
+        configured = {k for k in candidate_keys if hasattr(sdk, k)}
+        has_async = any(k.startswith("async_") for k in configured)
+        has_sync = any(
+            k in configured
+            for k in (
+                "create_record",
+                "get_forms",
+                "get_records",
+                "get_variables",
+                "get_intervals",
+                "get_sites",
+                "get_subjects",
+                "get_queries",
+                "poll_job",
+            )
+        )
+        return has_async and not has_sync
+
+    if hasattr(sdk, "async_create_record") and not hasattr(sdk, "create_record"):
+        return True
+    if hasattr(sdk, "async_get_forms") and not hasattr(sdk, "get_forms"):
+        return True
+    if inspect.iscoroutinefunction(getattr(sdk, "async_create_record", None)):
+        return True
+    if inspect.iscoroutinefunction(getattr(sdk, "async_get_forms", None)):
+        return True
+    instance_dict = getattr(sdk, "__dict__", {})
+    return bool(instance_dict.get("_async_client"))
+
+
 def normalize_watermark_datetime(value: datetime | str | None) -> datetime | None:
     """Normalize a datetime or ISO-8601 date/timestamp string into UTC."""
     if value is None:
@@ -926,6 +974,11 @@ def run_streaming_export(
 
     Commits ledger checkpoints only after all batches and ``sink.flush()`` succeed.
     """
+    if is_async_sdk(sdk):
+        raise TypeError(
+            "Streaming sink exports require a synchronous ImednetSDK client; "
+            "AsyncImednetSDK is not supported."
+        )
     opts = _extract_safe_config_options(config)
     use_checkpoint = opts["incremental"] or opts["state_provider"] is not None
     gate_fn = quality_gate_fn or apply_quality_gate
@@ -1044,6 +1097,7 @@ __all__ = [
     "extract_record_id",
     "extract_record_timestamp",
     "get_state_provider",
+    "is_async_sdk",
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",

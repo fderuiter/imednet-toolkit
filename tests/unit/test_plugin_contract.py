@@ -1,4 +1,4 @@
-"""Tests for the plugin contract: PluginProtocol, WorkflowsNamespaceProtocol, PluginLoadError."""
+"""Tests for the unified plugin contract: protocols and _BaseSDK._load_plugin."""
 
 from __future__ import annotations
 
@@ -9,16 +9,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from imednet.errors import PluginLoadError
-from imednet.plugins import PluginProtocol, WorkflowsNamespaceProtocol
-from imednet.sdk import _BaseSDK
+from imednet.plugins import (
+    AsyncWorkflowsNamespaceProtocol,
+    PluginProtocol,
+    SinksNamespaceProtocol,
+    SinksPluginProtocol,
+    WorkflowsNamespaceProtocol,
+)
+from imednet.sdk import AsyncImednetSDK, _BaseSDK
+from imednet_workflows.namespace import AsyncWorkflows
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
-
-class _ValidNamespace:
-    """A minimal object satisfying WorkflowsNamespaceProtocol."""
+class _ValidWorkflowsNamespace:
+    """Minimal object satisfying WorkflowsNamespaceProtocol."""
 
     data_extraction: Any = None
     duckdb_centralizer: Any = None
@@ -31,55 +34,75 @@ class _ValidNamespace:
     uat_inspector: Any = None
 
 
-def _valid_factory(sdk_instance: Any) -> _ValidNamespace:
-    """Helper function to  valid factory."""
-    return _ValidNamespace()
+class _ValidAsyncWorkflowsNamespace:
+    """Minimal object satisfying AsyncWorkflowsNamespaceProtocol."""
+
+    record_update: Any = None
+    uat_inspector: Any = None
 
 
-# ---------------------------------------------------------------------------
-# WorkflowsNamespaceProtocol runtime check
-# ---------------------------------------------------------------------------
+class _ValidSinksNamespace:
+    """Minimal object satisfying SinksNamespaceProtocol."""
+
+    export_to_mongodb: Any = None
+    MongoDbSinkConfig: Any = None
+    MongoDbExportSink: Any = None
+    export_to_neo4j: Any = None
+    Neo4jSinkConfig: Any = None
+    Neo4jExportSink: Any = None
+    export_to_snowflake: Any = None
+    SnowflakeSinkConfig: Any = None
+    SnowflakeExportSink: Any = None
 
 
-def test_valid_namespace_satisfies_protocol() -> None:
-    """Test that valid namespace satisfies protocol."""
-    assert isinstance(_ValidNamespace(), WorkflowsNamespaceProtocol)
+def _valid_workflows_factory(sdk_instance: Any) -> _ValidWorkflowsNamespace:
+    """Return a valid workflows namespace."""
+    _ = sdk_instance
+    return _ValidWorkflowsNamespace()
 
 
-def test_object_missing_attributes_does_not_satisfy_namespace_protocol() -> None:
-    """Test that object missing attributes does not satisfy namespace protocol."""
+def _valid_sinks_factory(sdk_instance: Any) -> _ValidSinksNamespace:
+    """Return a valid sinks namespace."""
+    _ = sdk_instance
+    return _ValidSinksNamespace()
+
+
+def test_valid_namespaces_satisfy_protocols() -> None:
+    """Verify valid namespaces satisfy sync, async, and sinks runtime protocols."""
+    assert isinstance(_ValidWorkflowsNamespace(), WorkflowsNamespaceProtocol)
+    assert isinstance(_ValidAsyncWorkflowsNamespace(), AsyncWorkflowsNamespaceProtocol)
+    assert isinstance(_ValidSinksNamespace(), SinksNamespaceProtocol)
+
+
+def test_incomplete_namespaces_fail_protocol_checks() -> None:
+    """Verify incomplete objects fail runtime protocol checks cleanly."""
 
     class _Incomplete:
-        """Test suite for  Incomplete."""
-
         data_extraction: Any = None
-        # missing: duckdb_centralizer, query_management, record_mapper, record_update, register_subjects, subject_data, uat, uat_inspector
 
     assert not isinstance(_Incomplete(), WorkflowsNamespaceProtocol)
+    assert not isinstance(_Incomplete(), AsyncWorkflowsNamespaceProtocol)
+    assert not isinstance(_Incomplete(), SinksNamespaceProtocol)
 
 
-# ---------------------------------------------------------------------------
-# PluginProtocol runtime check
-# ---------------------------------------------------------------------------
+def test_async_workflows_safe_isinstance_against_sync_protocol() -> None:
+    """Verify isinstance(AsyncWorkflows, WorkflowsNamespaceProtocol) returns False without raising."""
+    async_sdk = MagicMock(spec=AsyncImednetSDK)
+    ns = AsyncWorkflows(async_sdk)
+    assert isinstance(ns, AsyncWorkflowsNamespaceProtocol)
+    assert not isinstance(ns, WorkflowsNamespaceProtocol)
 
 
-def test_callable_factory_satisfies_plugin_protocol() -> None:
-    """Test that callable factory satisfies plugin protocol."""
-    assert isinstance(_valid_factory, PluginProtocol)
-
-
-def test_non_callable_does_not_satisfy_plugin_protocol() -> None:
-    """Test that non callable does not satisfy plugin protocol."""
+def test_callable_factories_satisfy_plugin_protocols() -> None:
+    """Verify callable factories satisfy PluginProtocol and SinksPluginProtocol."""
+    assert isinstance(_valid_workflows_factory, PluginProtocol)
+    assert isinstance(_valid_sinks_factory, SinksPluginProtocol)
     assert not isinstance("not-a-callable", PluginProtocol)
-
-
-# ---------------------------------------------------------------------------
-# PluginLoadError is a subclass of ImednetError
-# ---------------------------------------------------------------------------
+    assert not isinstance("not-a-callable", SinksPluginProtocol)
 
 
 def test_plugin_load_error_is_imednet_error() -> None:
-    """Test that plugin load error is imednet error."""
+    """Verify PluginLoadError inherits from ImednetError."""
     from imednet.errors import ImednetError
 
     err = PluginLoadError("boom")
@@ -87,111 +110,114 @@ def test_plugin_load_error_is_imednet_error() -> None:
     assert str(err) == "boom"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _make_sdk() -> _BaseSDK:
-    """Return a _BaseSDK instance without triggering full ImednetSDK init."""
+    """Return a bare _BaseSDK instance without running full HTTP client init."""
     return object.__new__(_BaseSDK)
 
 
-# ---------------------------------------------------------------------------
-# _BaseSDK._init_workflows — plugin not installed
-# ---------------------------------------------------------------------------
-
-
-def test_init_workflows_returns_missing_workflows_when_no_plugin() -> None:
-    """Test that init workflows returns missing workflows when no plugin."""
+def test_init_plugins_return_none_when_no_plugin_installed() -> None:
+    """Verify _init_workflows and _init_sinks both return None when absent."""
     sdk = _make_sdk()
     with patch("imednet.sdk.entry_points", return_value=[]):
-        ns = sdk._init_workflows()
+        assert sdk._init_workflows() is None
+        assert sdk._init_sinks() is None
 
-    # Accessing any attribute should raise ImportError (not PluginLoadError)
-    with pytest.raises(
-        ImportError,
-        match="Workflow 'data_extraction' not found. Please install the required package.",
+
+@pytest.mark.parametrize("plugin_name", ["workflows", "sinks"])
+def test_load_plugin_raises_on_duplicate_entry_points(plugin_name: str) -> None:
+    """Verify duplicate imednet.plugins registrations raise PluginLoadError."""
+    ep1 = MagicMock(spec=EntryPoint)
+    ep1.name = plugin_name
+    ep1.value = "pkg_a:create"
+    ep2 = MagicMock(spec=EntryPoint)
+    ep2.name = plugin_name
+    ep2.value = "pkg_b:create"
+
+    sdk = _make_sdk()
+    with (
+        patch("imednet.sdk.entry_points", return_value=[ep1, ep2]),
+        pytest.raises(PluginLoadError, match=f"Multiple '{plugin_name}' plugins registered"),
     ):
-        _ = ns.data_extraction
+        sdk._load_plugin(plugin_name)
 
 
-# ---------------------------------------------------------------------------
-# _BaseSDK._init_workflows — plugin installed but broken import
-# ---------------------------------------------------------------------------
-
-
-def test_init_workflows_raises_plugin_load_error_on_broken_entry_point() -> None:
-    """Test that init workflows raises plugin load error on broken entry point."""
+@pytest.mark.parametrize("plugin_name", ["workflows", "sinks"])
+def test_load_plugin_raises_on_broken_entry_point(plugin_name: str) -> None:
+    """Verify broken plugin entry point imports raise PluginLoadError."""
     ep = MagicMock(spec=EntryPoint)
-    ep.name = "data_extraction"
+    ep.name = plugin_name
     ep.value = "broken.module:factory"
     ep.load.side_effect = ModuleNotFoundError("No module named 'broken'")
 
     sdk = _make_sdk()
-    with patch("imednet.sdk.entry_points", return_value=[ep]):
-        ns = sdk._init_workflows()
-        with pytest.raises(PluginLoadError, match="Failed to load workflow plugin"):
-            _ = ns.data_extraction
+    with (
+        patch("imednet.sdk.entry_points", return_value=[ep]),
+        pytest.raises(PluginLoadError, match=f"Failed to load '{plugin_name}' plugin"),
+    ):
+        sdk._load_plugin(plugin_name)
 
 
-# ---------------------------------------------------------------------------
-# _BaseSDK._init_workflows — plugin loaded but not callable
-# ---------------------------------------------------------------------------
-
-
-def test_init_workflows_raises_plugin_load_error_when_entry_point_not_callable() -> None:
-    """Test that init workflows raises plugin load error when entry point not callable."""
+@pytest.mark.parametrize("plugin_name", ["workflows", "sinks"])
+def test_load_plugin_raises_when_entry_point_not_callable(plugin_name: str) -> None:
+    """Verify non-callable plugin entry points raise PluginLoadError."""
     ep = MagicMock(spec=EntryPoint)
-    ep.name = "data_extraction"
+    ep.name = plugin_name
     ep.value = "myplugin.ns:NOT_A_CALLABLE"
     ep.load.return_value = "I am a string, not a callable"  # type: ignore[assignment]
 
     sdk = _make_sdk()
-    with patch("imednet.sdk.entry_points", return_value=[ep]):
-        ns = sdk._init_workflows()
-        with pytest.raises(PluginLoadError, match="must be a callable"):
-            _ = ns.data_extraction
+    with (
+        patch("imednet.sdk.entry_points", return_value=[ep]),
+        pytest.raises(PluginLoadError, match="must be a callable"),
+    ):
+        sdk._load_plugin(plugin_name)
 
 
-# ---------------------------------------------------------------------------
-# _BaseSDK._init_workflows — plugin installed and valid
-# ---------------------------------------------------------------------------
+def test_init_workflows_and_sinks_return_namespaces_from_valid_plugins() -> None:
+    """Verify _init_workflows and _init_sinks invoke unified imednet.plugins factories."""
+    wf_ep = MagicMock(spec=EntryPoint)
+    wf_ep.name = "workflows"
+    wf_ep.value = "myplugin.ns:create_workflows"
+    wf_ep.load.return_value = _valid_workflows_factory
 
+    sinks_ep = MagicMock(spec=EntryPoint)
+    sinks_ep.name = "sinks"
+    sinks_ep.value = "mysinks.ns:create_sinks"
+    sinks_ep.load.return_value = _valid_sinks_factory
 
-def test_init_workflows_returns_namespace_from_valid_plugin() -> None:
-    """Test that init workflows returns namespace from valid plugin."""
-    ep = MagicMock(spec=EntryPoint)
-    ep.name = "data_extraction"
-    ep.value = "myplugin.ns:factory"
-    ep.load.return_value = _valid_factory
+    def fake_eps(*, group: str, name: str | None = None) -> list[EntryPoint]:
+        if group != "imednet.plugins":
+            return []
+        if name == "workflows":
+            return [wf_ep]
+        if name == "sinks":
+            return [sinks_ep]
+        return [wf_ep, sinks_ep]
 
     sdk = _make_sdk()
-    with patch("imednet.sdk.entry_points", return_value=[ep]):
-        ns = sdk._init_workflows()
+    with patch("imednet.sdk.entry_points", side_effect=fake_eps):
+        wf_ns = sdk._init_workflows()
+        sinks_ns = sdk._init_sinks()
 
-    assert isinstance(ns.data_extraction, _ValidNamespace)
-
-
-# ---------------------------------------------------------------------------
-# _BaseSDK._init_workflows — plugin factory raises TypeError
-# ---------------------------------------------------------------------------
+    assert isinstance(wf_ns, _ValidWorkflowsNamespace)
+    assert isinstance(sinks_ns, _ValidSinksNamespace)
 
 
-def test_init_workflows_raises_plugin_load_error_when_factory_raises_type_error() -> None:
-    """Test that init workflows raises plugin load error when factory raises type error."""
+@pytest.mark.parametrize("plugin_name", ["workflows", "sinks"])
+def test_load_plugin_raises_when_factory_raises_type_error(plugin_name: str) -> None:
+    """Verify factory TypeError at initialization raises PluginLoadError."""
 
-    def _bad_factory(*args: Any, **kwargs: Any) -> None:
-        """Helper function to  bad factory."""
+    def _bad_factory(*_args: Any, **_kwargs: Any) -> None:
         raise TypeError("unexpected argument")
 
     ep = MagicMock(spec=EntryPoint)
-    ep.name = "data_extraction"
+    ep.name = plugin_name
     ep.value = "myplugin.ns:bad_factory"
     ep.load.return_value = _bad_factory
 
     sdk = _make_sdk()
-    with patch("imednet.sdk.entry_points", return_value=[ep]):
-        ns = sdk._init_workflows()
-        with pytest.raises(PluginLoadError, match="Failed to instantiate workflows"):
-            _ = ns.data_extraction
+    with (
+        patch("imednet.sdk.entry_points", return_value=[ep]),
+        pytest.raises(PluginLoadError, match=f"Failed to instantiate '{plugin_name}' plugin"),
+    ):
+        sdk._load_plugin(plugin_name)

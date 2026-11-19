@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import Field
 
 from imednet.spi.models import ImednetBaseModel
+from imednet.spi.sink_base import is_async_sdk
 from imednet.spi.validation import DataDictionary, extract_variable_constraints
 
 from .generator import GeneratedRecordSet
@@ -329,6 +330,13 @@ class UATWorkflow:
         on_phase_change: Callable[[UATWorkflowState], None] | None = None,
     ) -> None:
         """Initialize the UAT workflow orchestrator."""
+        if is_async_sdk(sdk):
+            raise TypeError(
+                "UATWorkflow is synchronous-only and cannot be used with AsyncImednetSDK. "
+                "Instantiate synchronous ImednetSDK, or use "
+                "'await async_sdk.workflows.uat_inspector.async_inspect(...)' for async metadata "
+                "inspection."
+            )
         from .generator import SyntheticRecordGenerator
         from .inspector import StudySchemaInspector
 

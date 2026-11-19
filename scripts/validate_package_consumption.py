@@ -226,7 +226,7 @@ def main():
                 "install": ["imednet[export]"],
                 "smoke": [
                     {"cmd": "import pandas"},
-                    {"cmd": "import imednet_workflows"},
+                    {"cmd": "import imednet_workflows", "expect_fail": True},
                     {"cmd": "imednet export csv --help"},
                 ],
             },

@@ -16,6 +16,7 @@ from imednet.spi.models import (
     Variable,
     is_site_enrollment_eligible,
 )
+from imednet.spi.sink_base import is_async_sdk
 
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
@@ -97,10 +98,17 @@ class StudySchemaInspector:
             sdk: An instance of the synchronous or asynchronous iMednet SDK facade.
         """
         self._sdk = sdk
+        self._is_async = is_async_sdk(sdk)
         self._cache: dict[str, StudySnapshot] = {}
 
     def inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
         """Synchronously fetch and return a study snapshot."""
+        if self._is_async:
+            raise TypeError(
+                "StudySchemaInspector.inspect() cannot be called with AsyncImednetSDK. "
+                "Await 'await sdk.workflows.uat_inspector.async_inspect(...)' or use "
+                "synchronous ImednetSDK."
+            )
         if not force_refresh and study_key in self._cache:
             return self._cache[study_key]
 
@@ -117,6 +125,12 @@ class StudySchemaInspector:
 
     async def async_inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
         """Asynchronously fetch metadata concurrently and return a study snapshot."""
+        if not self._is_async:
+            raise TypeError(
+                "StudySchemaInspector.async_inspect() requires AsyncImednetSDK. "
+                "Call 'sdk.workflows.uat_inspector.inspect(...)' on ImednetSDK or "
+                "instantiate AsyncImednetSDK."
+            )
         if not force_refresh and study_key in self._cache:
             return self._cache[study_key]
 

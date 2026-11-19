@@ -61,19 +61,20 @@ _DUCKDB_DF_ALIAS = "df"
 
 
 def _record_mapper() -> Any:
-    from importlib.metadata import entry_points
+    from .tabular_mapper import BaseTabularRecordMapper
 
-    mappers = list(entry_points(group="imednet.mappers", name="RecordMapper"))
-    if not mappers:
-        raise ImportError(
-            "Record export requires an installed mapper plugin. "
-            "Please install a package that provides this capability."
-        )
-    return mappers[0].load()
+    return BaseTabularRecordMapper
 
 
 def _create_record_mapper(sdk: Any, *, mask_phi: bool = True) -> Any:
     """Instantiate the configured RecordMapper while preserving call contracts."""
+    from .sink_base import is_async_sdk
+
+    if is_async_sdk(sdk):
+        raise TypeError(
+            "Tabular export helpers require a synchronous ImednetSDK client; "
+            "AsyncImednetSDK is not supported."
+        )
     mapper_cls = _record_mapper()
     if mask_phi:
         return mapper_cls(sdk)
@@ -1766,37 +1767,11 @@ def export_to_excel(
 
 
 def _apply_json_enrichment(study_key: str, data: Any, *, mask_phi: bool = True) -> Any:
-    """Apply ConfigVersionStore EnrichmentPipeline when installed."""
-    import logging
-
-    logger = logging.getLogger(__name__)
-    try:
-        from importlib.metadata import entry_points
-
-        config_version_stores = list(
-            entry_points(group="imednet.stores", name="ConfigVersionStore")
-        )
-        if not config_version_stores:
-            raise ImportError("ConfigVersionStore plugin not found.")
-
-        config_version_store_cls = config_version_stores[0].load()
-        enrichment_pipeline_cls = import_module(
-            "imednet.integrations.enrichment"
-        ).EnrichmentPipeline
-
-        store = config_version_store_cls()
-        history = store.get_history(study_key)
-        if history:
-            latest_commit = history[-1]["commit_id"]
-            study_cfg = store.rollback_config(study_key, latest_commit)
-
-            logger.info("Enrichment pipeline triggered")
-            pipeline = enrichment_pipeline_cls(study_cfg)
-            data = pipeline.process(data) if mask_phi else pipeline.process(data, mask_phi=False)
-            logger.info("Enrichment pipeline completed successfully")
-    except Exception as e:
-        logger.warning(f"Could not apply EnrichmentPipeline: {e}")
-    return data
+    """Apply default core EnrichmentPipeline without requiring workflow store plugins."""
+    _ = study_key
+    enrichment_mod = import_module("imednet.integrations.enrichment")
+    pipeline = enrichment_mod._DEFAULT_PIPELINE
+    return pipeline.process(data) if mask_phi else pipeline.process(data, mask_phi=False)
 
 
 def _dump_json_payload(path: str, data: Any, config: TabularSinkConfig) -> int:

@@ -45,25 +45,71 @@ Example factory::
 from __future__ import annotations
 
 import inspect
-import sys
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, _ProtocolMeta, runtime_checkable
 
 if TYPE_CHECKING:
     from .spi.facade import AsyncImednetFacade, ImednetFacade
 
-if sys.version_info < (3, 12) and not TYPE_CHECKING:
-    from typing import _get_protocol_attrs, _ProtocolMeta
+
+if not TYPE_CHECKING:
+
+    def _protocol_attribute_names(protocol_cls: type[Any]) -> set[str]:
+        """Collect protocol attribute names across the MRO without invoking descriptors."""
+        attrs: set[str] = set()
+        for base in protocol_cls.__mro__[:-1]:
+            if base.__name__ in ("Protocol", "Generic"):
+                continue
+            annotations = getattr(base, "__annotations__", {})
+            for name in list(base.__dict__.keys()) + list(annotations.keys()):
+                if not name.startswith("_abc_") and name not in (
+                    "__abstractmethods__",
+                    "__annotations__",
+                    "__weakref__",
+                    "_is_protocol",
+                    "_is_runtime_protocol",
+                    "__doc__",
+                    "__args__",
+                    "__slots__",
+                    "__next_in_mro__",
+                    "__parameters__",
+                    "__origin__",
+                    "__orig_bases__",
+                    "__extra__",
+                    "__tree_hash__",
+                    "__module__",
+                    "__subclasshook__",
+                    "__init__",
+                    "__new__",
+                    "_MutableMapping__marker",
+                    "__callable_proto_members_only__",
+                    "__non_callable_proto_members__",
+                    "__protocol_attrs__",
+                ):
+                    attrs.add(name)
+        return attrs
 
     class _SafeRuntimeProtocolMeta(_ProtocolMeta):
         def __instancecheck__(self, instance: Any) -> bool:
             if getattr(self, "_is_runtime_protocol", False):
-                for attr in _get_protocol_attrs(self):
+                for attr in _protocol_attribute_names(self):
                     try:
                         inspect.getattr_static(instance, attr)
                     except AttributeError:
                         return False
                 return True
             return super().__instancecheck__(instance)
+
+
+@runtime_checkable
+class AsyncWorkflowsNamespaceProtocol(Protocol):
+    """Minimal interface that an asynchronous workflows namespace object must expose.
+
+    Exposes workflows supporting native ``async`` operations when bound to
+    :class:`~imednet.sdk.AsyncImednetSDK`.
+    """
+
+    record_update: Any
+    uat_inspector: Any
 
 
 @runtime_checkable
@@ -84,10 +130,6 @@ class WorkflowsNamespaceProtocol(Protocol):
     uat_inspector: Any
 
 
-if sys.version_info < (3, 12) and not TYPE_CHECKING:
-    WorkflowsNamespaceProtocol.__class__ = _SafeRuntimeProtocolMeta
-
-
 @runtime_checkable
 class SinksNamespaceProtocol(Protocol):
     """Minimal interface that a sinks namespace object must expose."""
@@ -103,12 +145,19 @@ class SinksNamespaceProtocol(Protocol):
     SnowflakeExportSink: Any
 
 
+if not TYPE_CHECKING:
+    AsyncWorkflowsNamespaceProtocol.__class__ = _SafeRuntimeProtocolMeta
+    WorkflowsNamespaceProtocol.__class__ = _SafeRuntimeProtocolMeta
+    SinksNamespaceProtocol.__class__ = _SafeRuntimeProtocolMeta
+
+
 @runtime_checkable
 class PluginProtocol(Protocol):
-    """Protocol that every iMednet plugin factory must satisfy.
+    """Protocol that every iMednet workflows plugin factory must satisfy.
 
     A conforming factory is a callable that accepts an SDK instance and returns
-    an object implementing :class:`WorkflowsNamespaceProtocol`.
+    an object implementing :class:`WorkflowsNamespaceProtocol` for synchronous
+    SDKs or :class:`AsyncWorkflowsNamespaceProtocol` for asynchronous SDKs.
 
     Example::
 
@@ -118,10 +167,14 @@ class PluginProtocol(Protocol):
         class MyWorkflows:
             def __init__(self, sdk: ImednetSDK) -> None:
                 self.data_extraction = ...
+                self.duckdb_centralizer = ...
                 self.query_management = ...
                 self.record_mapper = ...
                 self.record_update = ...
+                self.register_subjects = ...
                 self.subject_data = ...
+                self.uat = ...
+                self.uat_inspector = ...
 
         def create_workflows(sdk: ImednetSDK) -> MyWorkflows:
             return MyWorkflows(sdk)
@@ -132,7 +185,7 @@ class PluginProtocol(Protocol):
 
     def __call__(
         self, sdk_instance: ImednetFacade | AsyncImednetFacade
-    ) -> WorkflowsNamespaceProtocol:
+    ) -> WorkflowsNamespaceProtocol | AsyncWorkflowsNamespaceProtocol:
         """Initialize the workflows plugin with an SDK instance."""
         ...
 
@@ -147,6 +200,7 @@ class SinksPluginProtocol(Protocol):
 
 
 __all__ = [
+    "AsyncWorkflowsNamespaceProtocol",
     "PluginProtocol",
     "SinksNamespaceProtocol",
     "SinksPluginProtocol",

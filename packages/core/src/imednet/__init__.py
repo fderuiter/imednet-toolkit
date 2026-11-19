@@ -12,7 +12,13 @@ from .orchestration import (
     OrchestratorResult,
     StudyWorkerCallable,
 )
-from .plugins import PluginProtocol, WorkflowsNamespaceProtocol
+from .plugins import (
+    AsyncWorkflowsNamespaceProtocol,
+    PluginProtocol,
+    SinksNamespaceProtocol,
+    SinksPluginProtocol,
+    WorkflowsNamespaceProtocol,
+)
 from .sdk import AsyncImednetSDK, ImednetSDK
 from .simulation import (
     SimulationState,
@@ -26,6 +32,7 @@ ImednetClient = ImednetSDK
 
 __all__ = [
     "AsyncImednetSDK",
+    "AsyncWorkflowsNamespaceProtocol",
     "BaseClient",
     "Config",
     "DefaultRetryPolicy",
@@ -45,6 +52,8 @@ __all__ = [
     "RetryState",
     "SimulationState",
     "SimulationTransport",
+    "SinksNamespaceProtocol",
+    "SinksPluginProtocol",
     "StudyWorkerCallable",
     "WorkflowsNamespaceProtocol",
     "__version__",

@@ -43,36 +43,52 @@ Plugin authoring reference
 How it works
 ------------
 
-During :class:`~imednet.sdk.ImednetSDK` (and
-:class:`~imednet.sdk.AsyncImednetSDK`) initialisation the SDK queries the
-``imednet.plugins`` entry-point group for an entry named ``"workflows"``.  If
-exactly one is found the SDK loads the factory callable and calls it with
-itself as the argument.  The returned object is stored as ``sdk.workflows``.
+During :class:`~imednet.sdk.ImednetSDK` and
+:class:`~imednet.sdk.AsyncImednetSDK` initialisation the SDK queries the
+``imednet.plugins`` entry-point group for entries named ``"workflows"`` and
+``"sinks"``.  If an entry is found the SDK loads the factory callable and
+invokes it with itself as the argument, storing the returned namespace on
+``sdk.workflows`` or ``sdk.sinks``.
 
-If the plugin is **not** installed, ``sdk.workflows`` is a placeholder that
-raises :exc:`ImportError` with a helpful message on first attribute access.
+If a plugin is **not** installed, the corresponding attribute
+(``sdk.workflows`` or ``sdk.sinks``) is set to ``None`` on both
+:class:`~imednet.sdk.ImednetSDK` and :class:`~imednet.sdk.AsyncImednetSDK`.
 
-If the plugin **is** installed but fails to load (broken import, wrong
-interface, …) a :exc:`~imednet.errors.PluginLoadError` is raised at SDK
-construction time.
+If a plugin **is** installed under ``imednet.plugins`` (for example,
+``workflows`` or ``sinks``) and registered more than once, fails to import, is
+not callable, or raises :exc:`TypeError` when called with the SDK instance, a
+:exc:`~imednet.errors.PluginLoadError` is raised at SDK construction time.
 
 Plugin contract
 ---------------
 
-A plugin package must expose a single factory callable.  The factory must
-satisfy :class:`~imednet.plugins.PluginProtocol`:
+A plugin package exposes a single factory callable per namespace under
+``[project.entry-points."imednet.plugins"]``:
+
+* ``workflows`` factories satisfy :class:`~imednet.plugins.PluginProtocol`,
+  returning :class:`~imednet.plugins.WorkflowsNamespaceProtocol` for
+  synchronous :class:`~imednet.sdk.ImednetSDK` instances and
+  :class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol` for
+  :class:`~imednet.sdk.AsyncImednetSDK` instances.
+* ``sinks`` factories satisfy :class:`~imednet.plugins.SinksPluginProtocol`,
+  returning :class:`~imednet.plugins.SinksNamespaceProtocol`.
 
 .. testcode::
 
     from typing import Any, Protocol
-    from imednet.plugins import WorkflowsNamespaceProtocol
+    from imednet.plugins import (
+        AsyncWorkflowsNamespaceProtocol,
+        WorkflowsNamespaceProtocol,
+    )
 
     class PluginProtocol(Protocol):
-        def __call__(self, sdk_instance: Any) -> WorkflowsNamespaceProtocol: ...
+        def __call__(
+            self, sdk_instance: Any
+        ) -> WorkflowsNamespaceProtocol | AsyncWorkflowsNamespaceProtocol: ...
 
-The object returned by the factory must satisfy
-:class:`~imednet.plugins.WorkflowsNamespaceProtocol` — it must expose at
-least the following attributes (any type):
+On synchronous :class:`~imednet.sdk.ImednetSDK`, the workflows namespace must
+satisfy :class:`~imednet.plugins.WorkflowsNamespaceProtocol` by lazily exposing
+the following attributes:
 
 * ``data_extraction``
 * ``duckdb_centralizer``
@@ -83,6 +99,12 @@ least the following attributes (any type):
 * ``subject_data``
 * ``uat``
 * ``uat_inspector``
+
+On asynchronous :class:`~imednet.sdk.AsyncImednetSDK`, the workflows namespace
+satisfies :class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol`, exposing
+async-capable workflows (``record_update`` and ``uat_inspector``) while raising
+:exc:`TypeError` with actionable guidance when synchronous-only workflows or
+synchronous sink ``export_to_*`` helpers are invoked.
 
 Minimal working example
 -----------------------
@@ -130,7 +152,7 @@ Add the following to your package's ``pyproject.toml``:
 
 .. code-block:: toml
 
-    [tool.hatch.plugins."imednet.plugins"]
+    [project.entry-points."imednet.plugins"]
     workflows = "myplugin.namespace:create_workflows"
 
 Or, when using ``setuptools``, in ``setup.cfg``:
@@ -156,8 +178,8 @@ Error handling
 
 :exc:`~imednet.errors.PluginLoadError` is raised when:
 
-* More than one ``"workflows"`` plugin is registered in the
-  ``imednet.plugins`` entry-point group.
+* More than one entry is registered for the same plugin name (e.g.
+  ``"workflows"`` or ``"sinks"``) in the ``imednet.plugins`` entry-point group.
 * The entry point fails to import (e.g. broken dependency).
 * The loaded object is not callable.
 * The factory raises :exc:`TypeError` when called with the SDK instance.
@@ -183,6 +205,18 @@ API reference
    :undoc-members:
 
 .. autoclass:: imednet.plugins.WorkflowsNamespaceProtocol
+   :members:
+   :undoc-members:
+
+.. autoclass:: imednet.plugins.AsyncWorkflowsNamespaceProtocol
+   :members:
+   :undoc-members:
+
+.. autoclass:: imednet.plugins.SinksPluginProtocol
+   :members:
+   :undoc-members:
+
+.. autoclass:: imednet.plugins.SinksNamespaceProtocol
    :members:
    :undoc-members:
 

@@ -19,6 +19,7 @@ from .chunked_pipeline import ChunkedRecordPipeline, iter_chunks
 from .config_version_control import ConfigVersionStore
 from .duckdb_centralizer import DuckDBIngestionWorkflow
 from .extraction_engine import ExtractionResult, extract_canonical_records
+from .namespace import AsyncWorkflows, Workflows, create_workflows
 from .query_management import QueryManagementWorkflow
 from .record_mapper import RecordMapper, format_iso8601_dtc, transform_records_to_sdtm
 from .record_update import RecordUpdateWorkflow
@@ -48,6 +49,7 @@ __all__ = [
     "DEFAULT_LEDGER_PATH",
     "AsyncBatchCoordinator",
     "AsyncJobPoller",
+    "AsyncWorkflows",
     "BatchCoordinator",
     "BatchSubmissionSummary",
     "CachedRecordsLoader",
@@ -82,7 +84,9 @@ __all__ = [
     "SyncWorkerConfig",
     "TriageStore",
     "UATSpecification",
+    "Workflows",
     "async_get_study_structure",
+    "create_workflows",
     "extract_canonical_records",
     "format_iso8601_dtc",
     "get_study_structure",

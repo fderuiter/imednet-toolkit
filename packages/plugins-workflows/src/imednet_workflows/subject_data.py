@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from imednet.spi.models import Query, Record, Subject, Visit
-from imednet.spi.sink_base import is_record_deleted
+from imednet.spi.sink_base import is_async_sdk, is_record_deleted
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
@@ -37,6 +37,11 @@ class SubjectDataWorkflow:
         Args:
             sdk: An instance of the iMednet SDK facade.
         """
+        if is_async_sdk(sdk):
+            raise TypeError(
+                "SubjectDataWorkflow is synchronous-only and cannot be used with "
+                "AsyncImednetSDK. Instantiate synchronous ImednetSDK instead."
+            )
         self._sdk = sdk
 
     def get_all_subject_data(

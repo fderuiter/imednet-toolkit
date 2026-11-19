@@ -10,6 +10,8 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
+from imednet.spi.sink_base import is_async_sdk
+
 from .data_extraction import DataExtractionWorkflow
 
 if TYPE_CHECKING:
@@ -30,6 +32,11 @@ class DuckDBIngestionWorkflow:
             sdk: An instance of the iMednet SDK facade.
             db_path: Path to the DuckDB database file or ":memory:". Defaults to ":memory:".
         """
+        if is_async_sdk(sdk):
+            raise TypeError(
+                "DuckDBIngestionWorkflow is synchronous-only and cannot be used with "
+                "AsyncImednetSDK. Instantiate synchronous ImednetSDK instead."
+            )
         try:
             import duckdb
         except ImportError as error:

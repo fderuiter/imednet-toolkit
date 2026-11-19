@@ -4,7 +4,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Record, RecordRevision
-from imednet.spi.sink_base import is_record_deleted
+from imednet.spi.sink_base import is_async_sdk, is_record_deleted
 from imednet.spi.utils import normalize_utc_timestamp_bound
 
 if TYPE_CHECKING:
@@ -24,6 +24,11 @@ class DataExtractionWorkflow:
         Args:
             sdk: An instance of the iMednet SDK facade.
         """
+        if is_async_sdk(sdk):
+            raise TypeError(
+                "DataExtractionWorkflow is synchronous-only and cannot be used with "
+                "AsyncImednetSDK. Instantiate synchronous ImednetSDK instead."
+            )
         self._sdk = sdk
 
     def extract_records_by_criteria(

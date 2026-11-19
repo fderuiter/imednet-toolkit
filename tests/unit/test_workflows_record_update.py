@@ -822,3 +822,121 @@ async def test_all_record_update_workflow_methods_accept_clinical_variable_types
         "STUDY", [{"formKey": "F_CLIN", "data": clinical_data}]
     )
     assert async_job.batch_id == "B-ASYNC-CLIN"
+
+    async_reg = await async_wf.async_register_subject(
+        "STUDY",
+        form_identifier="F_CLIN",
+        site_identifier="SITE-01",
+        data=clinical_data,
+    )
+    assert async_reg.batch_id == "B-ASYNC-CLIN"
+
+    async_sched = await async_wf.async_update_scheduled_record(
+        "STUDY",
+        form_identifier="F_CLIN",
+        subject_identifier="SUBJ-01",
+        interval_identifier="Baseline",
+        data=clinical_data,
+    )
+    assert async_sched.batch_id == "B-ASYNC-CLIN"
+
+    async_new = await async_wf.async_create_new_record(
+        "STUDY",
+        form_identifier="F_CLIN",
+        subject_identifier="SUBJ-01",
+        data=clinical_data,
+    )
+    assert async_new.batch_id == "B-ASYNC-CLIN"
+    assert async_sdk.async_create_record.call_count == 5
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_workflows_boundaries_and_zero_unawaited_coroutines() -> None:
+    """Verify AsyncImednetSDK workflow boundaries raise TypeError without unawaited coroutines."""
+    import gc
+    import warnings
+
+    from imednet import AsyncImednetSDK
+    from imednet_workflows.data_extraction import DataExtractionWorkflow
+    from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
+    from imednet_workflows.query_management import QueryManagementWorkflow
+    from imednet_workflows.record_mapper import RecordMapper
+    from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
+    from imednet_workflows.subject_data import SubjectDataWorkflow
+    from imednet_workflows.uat import UATWorkflow
+
+    async_sdk = AsyncImednetSDK(
+        api_key="key", security_key="secret", base_url="https://example.com"
+    )
+    sync_sdk = ImednetSDK(api_key="key", security_key="secret", base_url="https://example.com")
+    try:
+        assert async_sdk.workflows is not None
+        assert sync_sdk.workflows is not None
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+
+            # 1. All 7 sync-only workflows fail fast on AsyncImednetSDK namespace
+            for wf_name in (
+                "data_extraction",
+                "duckdb_centralizer",
+                "query_management",
+                "record_mapper",
+                "register_subjects",
+                "subject_data",
+                "uat",
+            ):
+                with pytest.raises(TypeError, match="synchronous-only"):
+                    getattr(async_sdk.workflows, wf_name)
+
+            # 2. Direct instantiation of sync-only workflow classes with AsyncImednetSDK fails fast
+            for wf_cls in (
+                DataExtractionWorkflow,
+                DuckDBIngestionWorkflow,
+                QueryManagementWorkflow,
+                RecordMapper,
+                RegisterSubjectsWorkflow,
+                SubjectDataWorkflow,
+                UATWorkflow,
+            ):
+                with pytest.raises(TypeError, match="synchronous-only"):
+                    wf_cls(async_sdk)  # type: ignore[arg-type]
+
+            # 3. Sync methods on RecordUpdateWorkflow fail fast on AsyncImednetSDK
+            ru_async = async_sdk.workflows.record_update
+            with pytest.raises(TypeError, match="AsyncImednetSDK"):
+                ru_async.create_or_update_records_batch("STUDY", [{"formKey": "F1", "data": {}}])
+            with pytest.raises(TypeError, match="AsyncImednetSDK"):
+                ru_async.create_or_update_records("STUDY", [{"formKey": "F1", "data": {}}])
+            with pytest.raises(TypeError, match="AsyncImednetSDK"):
+                ru_async.register_subject("STUDY", "F1", "SITE1", {"a": 1})
+            with pytest.raises(TypeError, match="AsyncImednetSDK"):
+                ru_async.update_scheduled_record("STUDY", "F1", "SUBJ1", "INT1", {"a": 1})
+            with pytest.raises(TypeError, match="AsyncImednetSDK"):
+                ru_async.create_new_record("STUDY", "F1", "SUBJ1", {"a": 1})
+
+            # 4. Async methods on RecordUpdateWorkflow fail fast on synchronous ImednetSDK
+            ru_sync = sync_sdk.workflows.record_update
+            with pytest.raises(TypeError, match="requires AsyncImednetSDK"):
+                await ru_sync.async_create_or_update_records_batch(
+                    "STUDY", [{"formKey": "F1", "data": {}}]
+                )
+            with pytest.raises(TypeError, match="requires AsyncImednetSDK"):
+                await ru_sync.async_create_or_update_records(
+                    "STUDY", [{"formKey": "F1", "data": {}}]
+                )
+            with pytest.raises(TypeError, match="requires AsyncImednetSDK"):
+                await ru_sync.async_register_subject("STUDY", "F1", "SITE1", {"a": 1})
+            with pytest.raises(TypeError, match="requires AsyncImednetSDK"):
+                await ru_sync.async_update_scheduled_record(
+                    "STUDY", "F1", "SUBJ1", "INT1", {"a": 1}
+                )
+            with pytest.raises(TypeError, match="requires AsyncImednetSDK"):
+                await ru_sync.async_create_new_record("STUDY", "F1", "SUBJ1", {"a": 1})
+
+            gc.collect()
+            unawaited = [w for w in caught if "was never awaited" in str(w.message)]
+            assert unawaited == []
+    finally:
+        await async_sdk.aclose()
+        sync_sdk.close()

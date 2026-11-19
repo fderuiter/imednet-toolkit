@@ -123,8 +123,18 @@ Workflows
 
 Workflows orchestrate several endpoints to perform higher level tasks. For
 example, :class:`~imednet_workflows.record_update.RecordUpdateWorkflow` validates
-record payloads, submits them, and polls resulting jobs. Workflows have sync and
-async variants and are available under ``sdk.workflows``.
+record payloads, submits them, and polls resulting jobs. Both ``sdk.workflows``
+and ``sdk.sinks`` are discovered dynamically via the unified ``imednet.plugins``
+entry-point group (``name="workflows"`` and ``name="sinks"``) and default to
+``None`` when the corresponding plugin distribution is not installed.
+
+Synchronous :class:`~imednet.sdk.ImednetSDK` exposes all workflows lazily via
+:class:`~imednet.plugins.WorkflowsNamespaceProtocol`, while
+:class:`~imednet.sdk.AsyncImednetSDK` exposes async-capable workflows
+(``record_update`` and ``uat_inspector``) via
+:class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol` and rejects
+synchronous-only workflows and synchronous sink ``export_to_*`` helpers with
+:exc:`TypeError`.
 
 Caching
 -------
@@ -163,8 +173,11 @@ Adding New Workflows
 --------------------
 
 * Create a workflow under ``packages/plugins-workflows/src/imednet_workflows`` and provide sync and async
-  methods where appropriate.
-* Register the workflow factory in the distribution's ``imednet.workflows`` entry points.
+  methods where appropriate (enforcing runtime :exc:`TypeError` guards at sync/async boundaries).
+* Expose the workflow lazily via ``@cached_property`` on ``Workflows`` (and ``AsyncWorkflows`` when async-capable) in
+  ``packages/plugins-workflows/src/imednet_workflows/namespace.py``, registered under ``[project.entry-points."imednet.plugins"]``
+  as ``workflows = "imednet_workflows.namespace:create_workflows"``, and add the corresponding attribute to
+  :class:`~imednet.plugins.WorkflowsNamespaceProtocol` (and :class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol` if async-capable).
 * Add CLI commands or examples that demonstrate the workflow.
 * Update documentation and tests.
 
@@ -187,7 +200,8 @@ Export Path Decision Matrix
    * - **Tabular**
      - Destination is a flat/columnar store (CSV, Excel, SQL, DuckDB,
        Parquet).  All variables for a form can be represented as columns.
-     - :class:`~imednet_workflows.record_mapper.RecordMapper` →
+     - :class:`~imednet.spi.tabular_mapper.BaseTabularRecordMapper` (extended by
+       :class:`~imednet_workflows.record_mapper.RecordMapper` for SDTM) →
        ``pandas.DataFrame`` → sink function in
        :mod:`imednet.integrations.export`
    * - **Document**

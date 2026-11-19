@@ -1706,3 +1706,89 @@ class TestSinkPhiMaskingControls:
             "email": "jane.doe@clinical.example",
             "systolic_bp": 122,
         }
+
+
+class TestSinksNamespaceBindingAndAsyncBoundaries:
+    """Verify SinksNamespace binds ImednetSDK and rejects AsyncImednetSDK with TypeError."""
+
+    def test_sync_sdk_sinks_binds_sdk_for_export_helpers(self, monkeypatch):
+        """Calling sdk.sinks.export_to_* binds sdk automatically while supporting explicit sdk."""
+        import imednet_sinks.document as doc_mod
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+
+        from imednet.sdk import ImednetSDK
+
+        calls: list[tuple[str, tuple, dict]] = []
+
+        def fake_mongo(sdk, study_key, *args, **kwargs):
+            calls.append(("mongo", (sdk, study_key, *args), kwargs))
+            return 11
+
+        def fake_neo4j(sdk, study_key, *args, **kwargs):
+            calls.append(("neo4j", (sdk, study_key, *args), kwargs))
+            return 22
+
+        def fake_sf(sdk, study_key, *args, **kwargs):
+            calls.append(("snowflake", (sdk, study_key, *args), kwargs))
+            return 33
+
+        monkeypatch.setattr(doc_mod, "export_to_mongodb", fake_mongo)
+        monkeypatch.setattr(graph_mod, "export_to_neo4j", fake_neo4j)
+        monkeypatch.setattr(wh_mod, "export_to_snowflake", fake_sf)
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://example.com")
+        try:
+            assert sdk.sinks is not None
+            assert sdk.sinks.export_to_mongodb("STUDY1", config="m_cfg") == 11
+            assert sdk.sinks.export_to_neo4j(study_key="STUDY1", config="n_cfg") == 22
+            assert sdk.sinks.export_to_snowflake("STUDY1", config="s_cfg") == 33
+            # Backward compatibility with explicit leading sdk argument
+            assert sdk.sinks.export_to_mongodb(sdk, "STUDY1", config="m_cfg2") == 11
+
+            assert calls[0] == ("mongo", (sdk, "STUDY1"), {"config": "m_cfg"})
+            assert calls[1] == ("neo4j", (sdk, "STUDY1"), {"config": "n_cfg"})
+            assert calls[2] == ("snowflake", (sdk, "STUDY1"), {"config": "s_cfg"})
+            assert calls[3] == ("mongo", (sdk, "STUDY1"), {"config": "m_cfg2"})
+        finally:
+            sdk.close()
+
+    def test_async_sdk_sinks_rejects_sync_export_helpers_without_unawaited_coroutines(self):
+        """Calling export_to_* on AsyncImednetSDK raises TypeError with zero coroutine warnings."""
+        import asyncio
+        import gc
+        import warnings
+
+        from imednet_sinks.document import MongoDbSinkConfig, export_to_mongodb
+
+        from imednet.sdk import AsyncImednetSDK
+
+        async_sdk = AsyncImednetSDK(api_key="k", security_key="s", base_url="https://example.com")
+        try:
+            assert async_sdk.sinks is not None
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", RuntimeWarning)
+
+                for helper_name in (
+                    "export_to_mongodb",
+                    "export_to_neo4j",
+                    "export_to_snowflake",
+                ):
+                    helper = getattr(async_sdk.sinks, helper_name)
+                    with pytest.raises(TypeError, match="AsyncImednetSDK"):
+                        helper("STUDY1", config=MagicMock())
+
+                cfg = MongoDbSinkConfig(
+                    study_key="STUDY1",
+                    uri="mongodb://localhost:27017",
+                    database="clinical",
+                    collection="records",
+                )
+                with pytest.raises(TypeError, match="AsyncImednetSDK"):
+                    export_to_mongodb(async_sdk, "STUDY1", config=cfg)  # type: ignore[arg-type]
+
+                gc.collect()
+                unawaited = [w for w in caught if "was never awaited" in str(w.message)]
+                assert unawaited == []
+        finally:
+            asyncio.run(async_sdk.aclose())

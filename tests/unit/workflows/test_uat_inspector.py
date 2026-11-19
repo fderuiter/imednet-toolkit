@@ -165,8 +165,11 @@ def test_inspect_with_async_sdk_raises_type_error() -> None:
     sdk = AsyncImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
     inspector = StudySchemaInspector(sdk)
     try:
-        with pytest.raises(AttributeError):
+        with pytest.raises(TypeError, match="AsyncImednetSDK"):
             inspector.inspect("ST")
+        assert sdk.workflows is not None
+        with pytest.raises(TypeError, match="AsyncImednetSDK"):
+            sdk.workflows.uat_inspector.inspect("ST")
     finally:
         asyncio.run(sdk.aclose())
 
@@ -176,8 +179,11 @@ async def test_async_inspect_with_sync_sdk_raises_type_error() -> None:
     """Test that async inspect with sync sdk raises type error asynchronously."""
     sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
     inspector = StudySchemaInspector(sdk)
-    with pytest.raises(AttributeError):
+    with pytest.raises(TypeError, match="AsyncImednetSDK"):
         await inspector.async_inspect("ST")
+    assert sdk.workflows is not None
+    with pytest.raises(TypeError, match="AsyncImednetSDK"):
+        await sdk.workflows.uat_inspector.async_inspect("ST")
 
 
 def _form_payload(form_id: int) -> dict[str, object]:

@@ -49,3 +49,10 @@ imednet.integrations.sink\_base module
 .. automodule:: imednet.integrations.sink_base
    :members:
    :show-inheritance:
+
+imednet.integrations.tabular\_mapper module
+-------------------------------------------
+
+.. automodule:: imednet.integrations.tabular_mapper
+   :members:
+   :show-inheritance:

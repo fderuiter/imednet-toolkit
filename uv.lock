@@ -1273,7 +1273,6 @@ duckdb = [
 ]
 export = [
     { name = "duckdb" },
-    { name = "imednet-workflows" },
     { name = "openpyxl" },
     { name = "pandas" },
     { name = "pyarrow" },
@@ -1306,7 +1305,6 @@ requires-dist = [
     { name = "imednet-plugins-sinks", marker = "extra == 'neo4j'", editable = "packages/plugins-sinks" },
     { name = "imednet-plugins-sinks", marker = "extra == 'snowflake'", editable = "packages/plugins-sinks" },
     { name = "imednet-tui", marker = "extra == 'tui'", editable = "packages/plugins-tui" },
-    { name = "imednet-workflows", marker = "extra == 'export'", editable = "packages/plugins-workflows" },
     { name = "neo4j", marker = "extra == 'neo4j'", specifier = ">=6.2.0,<7.0.0" },
     { name = "openpyxl", marker = "extra == 'export'", specifier = ">=3.1,<4.0" },
     { name = "pandas", marker = "extra == 'export'", specifier = ">=2.2.3,<3.0.0" },

@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Query, QueryStatus, calculate_legacy_status
+from imednet.spi.sink_base import is_async_sdk
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
@@ -42,6 +43,11 @@ class QueryManagementWorkflow:
         Args:
             sdk: An instance of the iMednet SDK facade.
         """
+        if is_async_sdk(sdk):
+            raise TypeError(
+                "QueryManagementWorkflow is synchronous-only and cannot be used with "
+                "AsyncImednetSDK. Instantiate synchronous ImednetSDK instead."
+            )
         self._sdk = sdk
 
     @staticmethod

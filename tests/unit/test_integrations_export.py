@@ -1085,3 +1085,97 @@ def test_tabular_sink_config_receives_operational_options_without_pandas_leak(
         duck_conn.close()
     assert captured_configs[-1].batch_size == 30
     assert captured_configs[-1].idempotent is False
+
+
+def test_core_tabular_and_parquet_exports_succeed_without_imednet_workflows(
+    monkeypatch, tmp_path
+) -> None:
+    """Core tabular, hierarchical JSON, and Parquet exports run without imednet-workflows."""
+    import json
+
+    import imednet.integrations.parquet as parquet_mod
+    from imednet.models.forms import Form
+    from imednet.models.intervals import FormSummary, Interval
+
+    def block_workflows_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "imednet_workflows" or name.startswith("imednet_workflows."):
+            raise ModuleNotFoundError("No module named 'imednet_workflows'")
+        return builtin_import(name, globals, locals, fromlist, level)
+
+    for mod_name in [k for k in list(sys.modules) if k.startswith("imednet_workflows")]:
+        monkeypatch.delitem(sys.modules, mod_name, raising=False)
+    monkeypatch.setattr("builtins.__import__", block_workflows_import)
+
+    sdk = MagicMock()
+    variables = [
+        Variable(
+            variable_id=1,
+            variable_name="AGE",
+            variable_type="integer",
+            label="Age",
+            form_id=10,
+            form_key="DM",
+        )
+    ]
+    forms = [Form(form_id=10, form_key="DM", form_name="Demographics")]
+    sdk.get_variables.return_value = variables
+    sdk.variables.list.return_value = variables
+    sdk.get_forms.return_value = forms
+    sdk.forms.list.return_value = forms
+    sdk.get_intervals.return_value = [
+        Interval(
+            interval_id=1,
+            interval_name="Baseline",
+            forms=[FormSummary(form_id=10, form_key="DM", form_name="Demographics")],
+        )
+    ]
+    rec = Record(
+        record_id=101,
+        subject_key="SUBJ-1",
+        visit_id=1,
+        form_id=10,
+        form_key="DM",
+        record_status="Complete",
+        date_created=datetime(2026, 1, 15, 10, 0, 0),
+        record_data={"AGE": 42},
+    )
+    sdk.records.list.return_value = [rec]
+    sdk.get_records.return_value = [rec]
+
+    csv_out = tmp_path / "standalone.csv"
+    export_mod.export_to_csv(sdk, "STUDY", str(csv_out), mask_phi=False)
+    df_csv = pd.read_csv(csv_out)
+    assert list(df_csv["AGE"]) == [42]
+
+    json_out = tmp_path / "standalone_hier.json"
+    export_mod.export_to_json(sdk, "STUDY", str(json_out), hierarchical=True, mask_phi=False)
+    hier_payload = json.loads(json_out.read_text(encoding="utf-8"))
+    assert hier_payload[0]["subject_key"] == "SUBJ-1"
+
+    pytest.importorskip("pyarrow")
+    pq_out = tmp_path / "standalone.parquet"
+    export_mod.export_to_parquet(sdk, "STUDY", str(pq_out), mask_phi=False)
+    assert pq_out.exists()
+
+    hive_dir = tmp_path / "hive"
+    parquet_mod.export_to_hive_parquet(sdk, "STUDY", str(hive_dir), mask_phi=False)
+    assert list(hive_dir.rglob("*.parquet"))
+
+
+def test_core_exports_reject_async_sdk_with_type_error(tmp_path) -> None:
+    """Core tabular and Parquet exports reject AsyncImednetSDK immediately with TypeError."""
+    import asyncio
+
+    import imednet.integrations.parquet as parquet_mod
+    from imednet.sdk import AsyncImednetSDK
+
+    async_sdk = AsyncImednetSDK(api_key="k", security_key="s", base_url="https://example.com")
+    try:
+        with pytest.raises(TypeError, match="AsyncImednetSDK"):
+            export_mod.export_to_csv(async_sdk, "STUDY", str(tmp_path / "x.csv"))  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="AsyncImednetSDK"):
+            export_mod.export_to_parquet(async_sdk, "STUDY", str(tmp_path / "x.parquet"))  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="AsyncImednetSDK"):
+            parquet_mod.export_to_hive_parquet(async_sdk, "STUDY", str(tmp_path / "hive"))  # type: ignore[arg-type]
+    finally:
+        asyncio.run(async_sdk.aclose())

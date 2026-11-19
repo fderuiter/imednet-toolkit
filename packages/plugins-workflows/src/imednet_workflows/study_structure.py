@@ -1,24 +1,16 @@
-"""Study structure module."""
-
-from typing import Any
-
 """Workflow for retrieving and aggregating study structural metadata."""
 
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-# Import potential exceptions
 from imednet.spi.errors import ImednetError
-
-# Import the models we need
 from imednet.spi.models import (
     Form,
-    FormStructure,
     Interval,
-    IntervalStructure,
     StudyStructure,
     Variable,
 )
+from imednet.spi.tabular_mapper import build_core_study_structure
 
 # Use TYPE_CHECKING to avoid circular import at runtime
 if TYPE_CHECKING:
@@ -32,25 +24,7 @@ def _build_study_structure(
     variables: list[Variable],
 ) -> StudyStructure:
     """Helper to assemble the StudyStructure from its component parts."""
-    forms_by_id: dict[int, Form] = {f.form_id: f for f in forms if f.form_id is not None}
-    variables_by_form_id: dict[int, list[Variable]] = {}
-    for var in variables:
-        if var.form_id is not None:
-            variables_by_form_id.setdefault(var.form_id, []).append(var)
-
-    interval_structures: list[IntervalStructure] = []
-    for interval in intervals:
-        form_structures: list[FormStructure] = []
-        for form_summary in getattr(interval, 'forms', []):
-            if form_summary.form_id is not None:
-                full_form = forms_by_id.get(form_summary.form_id)
-            if full_form and full_form.form_id is not None:
-                form_vars = variables_by_form_id.get(full_form.form_id, [])
-                form_structures.append(FormStructure.from_form(full_form, form_vars))
-
-        interval_structures.append(IntervalStructure.from_interval(interval, form_structures))
-
-    return StudyStructure(studyKey=study_key, intervals=interval_structures)
+    return build_core_study_structure(study_key, intervals, forms, variables)
 
 
 def get_study_structure(sdk: "ImednetFacade", study_key: str) -> StudyStructure:

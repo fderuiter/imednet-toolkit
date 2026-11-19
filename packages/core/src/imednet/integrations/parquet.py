@@ -32,40 +32,25 @@ def _ensure_pyarrow() -> ModuleType:
         ) from error
 
 
-def _cached_records_loader() -> Any:
-    """Lazy import and return the CachedRecordsLoader from plugins.
-
-    Returns:
-        Any: The CachedRecordsLoader class.
-
-    Raises:
-        ImportError: If no loader plugin is installed.
-    """
-    from importlib.metadata import entry_points
-
-    loaders = list(entry_points(group="imednet.loaders", name="CachedRecordsLoader"))
-    if not loaders:
-        raise ImportError(
-            "Record export requires an installed loader plugin. "
-            "Please install a package that provides this capability."
-        )
-    return loaders[0].load()
-
-
 def _build_record_mapper(
     sdk: ImednetSDK,
     *,
     chunk_size: int,
     mask_phi: bool = True,
 ) -> Any:
-    """Build a workflows ``RecordMapper`` without importing the plugin at module import time."""
+    """Build a tabular record mapper without requiring optional workflow plugins."""
+    from .sink_base import is_async_sdk
+
+    if is_async_sdk(sdk):
+        raise TypeError(
+            "Parquet export helpers require a synchronous ImednetSDK client; "
+            "AsyncImednetSDK is not supported."
+        )
     mapper_cls = _record_mapper()
     parameters = inspect.signature(mapper_cls).parameters
     kwargs: dict[str, Any] = {}
     if "chunk_size" in parameters:
         kwargs["chunk_size"] = chunk_size
-    if "loader" in parameters:
-        kwargs["loader"] = _cached_records_loader()(sdk)
     if "mask_phi" in parameters:
         kwargs["mask_phi"] = mask_phi
     return mapper_cls(sdk, **kwargs)
@@ -83,6 +68,13 @@ def export_to_hive_parquet(
     mask_phi: bool = True,
 ) -> None:
     """Export study records to a Hive-partitioned Parquet directory layout."""
+    from .sink_base import is_async_sdk
+
+    if is_async_sdk(sdk):
+        raise TypeError(
+            "export_to_hive_parquet() requires a synchronous ImednetSDK client; "
+            "AsyncImednetSDK is not supported."
+        )
     pyarrow_module = _ensure_pyarrow()
     validate_partition_key(study_key)
 

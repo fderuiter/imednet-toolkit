@@ -14,6 +14,7 @@ from imednet.spi.models import (
     is_site_enrollment_eligible,
     normalize_subject_status,
 )
+from imednet.spi.sink_base import is_async_sdk
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
     BatchCoordinator,
@@ -74,6 +75,12 @@ class RegisterSubjectsWorkflow:
             batch_size: Maximum number of records per chunked POST request (default: 100).
             filter_enrolled: If True, filter out subjects already enrolled in the study.
         """
+        if is_async_sdk(sdk):
+            raise TypeError(
+                "RegisterSubjectsWorkflow is synchronous-only and cannot be used with "
+                "AsyncImednetSDK. Instantiate synchronous ImednetSDK or use "
+                "'await async_sdk.workflows.record_update.async_register_subject(...)'."
+            )
         self._sdk = sdk
         self._batch_size = batch_size
         self._filter_enrolled = filter_enrolled

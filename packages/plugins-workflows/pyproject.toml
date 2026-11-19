@@ -13,33 +13,12 @@ dependencies = [
     "cryptography"
 ]
 
-[project.entry-points."imednet.workflows"]
-data_extraction = "imednet_workflows.data_extraction:DataExtractionWorkflow"
-duckdb_centralizer = "imednet_workflows.duckdb_centralizer:DuckDBIngestionWorkflow"
-query_management = "imednet_workflows.query_management:QueryManagementWorkflow"
-record_mapper = "imednet_workflows.record_mapper:RecordMapper"
-record_update = "imednet_workflows.record_update:RecordUpdateWorkflow"
-register_subjects = "imednet_workflows.register_subjects:RegisterSubjectsWorkflow"
-subject_data = "imednet_workflows.subject_data:SubjectDataWorkflow"
-uat_inspector = "imednet_workflows.uat:StudySchemaInspector"
-uat = "imednet_workflows.uat:UATWorkflow"
+[project.entry-points."imednet.plugins"]
+workflows = "imednet_workflows.namespace:create_workflows"
 
 [project.entry-points."imednet.cli_plugins"]
 workflows = "imednet_workflows.cli:setup_parser"
 subject_data = "imednet_workflows.cli:setup_subject_parser"
-
-[project.entry-points."imednet.pollers"]
-JobPoller = "imednet_workflows:JobPoller"
-AsyncJobPoller = "imednet_workflows:AsyncJobPoller"
-
-[project.entry-points."imednet.mappers"]
-RecordMapper = "imednet_workflows.record_mapper:RecordMapper"
-
-[project.entry-points."imednet.loaders"]
-CachedRecordsLoader = "imednet_workflows.cached_loader:CachedRecordsLoader"
-
-[project.entry-points."imednet.stores"]
-ConfigVersionStore = "imednet_workflows.config_version_control:ConfigVersionStore"
 
 [project.entry-points."imednet.state_providers"]
 default = "imednet_workflows.state_ledger:get_state_provider"

@@ -146,7 +146,10 @@ def test_extensions_use_spi():
                     "imednet.OrchestratorResult",
                     "imednet.StudyWorkerCallable",
                     "imednet.PluginProtocol",
+                    "imednet.SinksPluginProtocol",
+                    "imednet.SinksNamespaceProtocol",
                     "imednet.WorkflowsNamespaceProtocol",
+                    "imednet.AsyncWorkflowsNamespaceProtocol",
                     "imednet.BaseClient",
                     "imednet.DefaultRetryPolicy",
                     "imednet.FilterScalar",
@@ -237,12 +240,12 @@ def test_async_sdk_no_sync_client(monkeypatch):
 
 
 def test_plugin_discovery_failure(monkeypatch):
-    """Test that plugin discovery failure."""
+    """Test that SDK sets workflows and sinks to None when no plugins are installed."""
     monkeypatch.setattr("imednet.sdk.entry_points", lambda *, group, name=None: [])
 
     sdk = ImednetSDK(api_key="1", security_key="2", base_url="http://x")
-    with pytest.raises(
-        ImportError,
-        match="Workflow 'some_workflow' not found. Please install the required package.",
-    ):
-        sdk.workflows.some_workflow
+    async_sdk = AsyncImednetSDK(api_key="1", security_key="2", base_url="http://x")
+    assert sdk.workflows is None
+    assert sdk.sinks is None
+    assert async_sdk.workflows is None
+    assert async_sdk.sinks is None

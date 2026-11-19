@@ -46,12 +46,9 @@ imednet subject-data <STUDY_KEY> --subject-key <SUBJECT_KEY>
 
 **Registered Entry Points:**
 The following components are exposed via Python entry points:
-- **Workflows (`imednet.workflows`)**: `data_extraction`, `query_management`, `record_mapper`, `record_update`, `subject_data`, `uat`, `uat_inspector`.
+- **SDK Plugin (`imednet.plugins`)**: `workflows = "imednet_workflows.namespace:create_workflows"` (lazily binds `Workflows` on `ImednetSDK` and `AsyncWorkflows` on `AsyncImednetSDK`).
 - **CLI Plugins (`imednet.cli_plugins`)**: `workflows`, `subject_data`.
-- **Custom Pollers (`imednet.pollers`)**: `JobPoller`, `AsyncJobPoller`.
-- **Custom Mappers (`imednet.mappers`)**: `RecordMapper`.
-- **Data Loaders (`imednet.loaders`)**: `CachedRecordsLoader`.
-- **Config Stores (`imednet.stores`)**: `ConfigVersionStore`.
+- **State Providers (`imednet.state_providers`)**: `default`, `file`, `airflow`.
 
 ## Features
 
