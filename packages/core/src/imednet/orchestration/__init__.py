@@ -9,11 +9,18 @@ Quick start
 
 .. code-block:: python
 
+    from typing import Any
     from imednet import ImednetSDK, MultiStudyOrchestrator
 
-    def my_pipeline(study_key, sdk, study_logger, **kwargs):
-        study_logger.info("Processing study")
-        subjects = sdk.subjects.list(study_key=study_key)
+    def my_pipeline(
+        study_key: str,
+        sdk_client: Any,
+        logger: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, int]:
+        logger.info("Processing study")
+        subjects = sdk_client.subjects.list(study_key=study_key)
         return {"subject_count": len(list(subjects))}
 
     with ImednetSDK() as sdk:

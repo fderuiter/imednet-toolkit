@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import zipfile
 from collections.abc import Sequence
@@ -238,10 +239,30 @@ def validate_ast_imports(
     return diagnostics
 
 
+def validate_ast_docstrings(tree: ast.AST) -> list[tuple[int, str]]:
+    """Inspect module, class, and function docstrings for leftover 'TODO' placeholders."""
+    diagnostics: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            doc = ast.get_docstring(node, clean=False)
+            if doc and "TODO" in doc:
+                lineno = (
+                    node.body[0].lineno
+                    if getattr(node, "body", None)
+                    else getattr(node, "lineno", 1)
+                )
+                target_name = getattr(node, "name", "<module>")
+                diagnostics.append(
+                    (lineno, f"Docstring for '{target_name}' contains 'TODO' placeholder")
+                )
+    diagnostics.sort(key=lambda item: item[0])
+    return diagnostics
+
+
 def validate_showcase_ast_and_imports(
     examples_dir: Path, repo_root: Path | None = None
 ) -> list[str]:
-    """Parse AST and verify module and symbol imports for all Python files under examples_dir."""
+    """Parse AST and verify docstrings, modules, and symbol imports for Python files under examples_dir."""
     errors: list[str] = []
     if not examples_dir.exists():
         return [f"Examples directory not found: {examples_dir}"]
@@ -267,8 +288,167 @@ def validate_showcase_ast_and_imports(
             errors.append(f"{py_file}:{exc.lineno}: Syntax error: {exc.msg}")
             continue
 
+        for lineno, reason in validate_ast_docstrings(tree):
+            errors.append(f"{py_file}:{lineno}: {reason}")
+
         for lineno, reason in validate_ast_imports(tree):
             errors.append(f"{py_file}:{lineno}: {reason}")
+
+    return errors
+
+
+_SIMULATION_SITECUSTOMIZE = """\
+import os
+import sys
+import types
+from unittest.mock import MagicMock
+
+if os.environ.get("IMEDNET_STUB_SINKS") == "1":
+    try:
+        import pymongo
+    except ImportError:
+        pymongo = types.ModuleType("pymongo")
+        pymongo.UpdateOne = MagicMock()
+        sys.modules["pymongo"] = pymongo
+    pymongo.MongoClient = MagicMock(name="StubMongoClient")
+
+    try:
+        import neo4j
+    except ImportError:
+        neo4j = types.ModuleType("neo4j")
+        sys.modules["neo4j"] = neo4j
+    neo4j.GraphDatabase = MagicMock(name="StubGraphDatabase")
+
+    try:
+        import snowflake.connector  # noqa: F401
+    except ImportError:
+        sf_pkg = sys.modules.setdefault("snowflake", types.ModuleType("snowflake"))
+        sf_conn = types.ModuleType("snowflake.connector")
+        sf_pkg.connector = sf_conn
+        sys.modules["snowflake.connector"] = sf_conn
+    sys.modules["snowflake.connector"].connect = MagicMock(name="StubSnowflakeConnect")
+"""
+
+_RUNTIME_ERROR_LINE_PATTERN = re.compile(
+    r"^\s*(?:Error:|ERROR:|CRITICAL:|FATAL:|An error occurred:|Unexpected error:|"
+    r"Validation Error:|API Error(?:\s*\(|:)|Failed to\b)"
+)
+_JSON_ERROR_LOG_PATTERN = re.compile(r'"level(?:name)?"\s*:\s*"(?:ERROR|CRITICAL|FATAL)"')
+
+
+def _find_output_error(stdout: str, stderr: str) -> str | None:
+    """Detect Python tracebacks or error messages in showcase stdout/stderr."""
+    combined = f"{stdout}\n{stderr}"
+    if "Traceback (most recent call last):" in combined:
+        return "Traceback detected in output"
+    for line in combined.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _JSON_ERROR_LOG_PATTERN.search(stripped):
+            return f"Error log emitted: {stripped}"
+        if _RUNTIME_ERROR_LINE_PATTERN.match(stripped):
+            return f"Error message emitted: {stripped}"
+    return None
+
+
+def execute_showcases_in_simulation(
+    examples_dir: Path,
+    repo_root: Path | None = None,
+    timeout_seconds: float = 60.0,
+) -> list[str]:
+    """Execute all Python showcase scripts under IMEDNET_SIMULATION_MODE=true in isolated temp dirs."""
+    if not examples_dir.exists():
+        return [f"Examples directory not found: {examples_dir}"]
+
+    py_files = sorted(examples_dir.rglob("*.py"))
+    if not py_files:
+        return [f"No Python showcase files found under {examples_dir}"]
+
+    default_root = Path(__file__).resolve().parent.parent
+    roots = [r for r in (repo_root, default_root) if r is not None]
+    src_paths: list[str] = []
+    for root in roots:
+        for pkg_sub in (
+            "packages/core/src",
+            "packages/plugins-workflows/src",
+            "packages/plugins-sinks/src",
+            "packages/plugins-tui/src",
+            "packages/providers-airflow/src",
+        ):
+            candidate = (root / pkg_sub).resolve()
+            if candidate.is_dir() and str(candidate) not in src_paths:
+                src_paths.append(str(candidate))
+
+    stripped_env_keys = {
+        "IMEDNET_API_KEY",
+        "IMEDNET_SECURITY_KEY",
+        "IMEDNET_BASE_URL",
+        "IMEDNET_STUDY_KEY",
+        "IMEDNET_OUTPUT_DIR",
+        "MONGO_URI",
+        "NEO4J_URI",
+        "NEO4J_USER",
+        "NEO4J_PASSWORD",
+        "SNOWFLAKE_ACCOUNT",
+        "SNOWFLAKE_USER",
+        "SNOWFLAKE_PASSWORD",
+        "SNOWFLAKE_DATABASE",
+        "SNOWFLAKE_WAREHOUSE",
+    }
+
+    errors: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="imednet_showcase_stubs_") as stub_root_str:
+        stub_root = Path(stub_root_str)
+        (stub_root / "sitecustomize.py").write_text(_SIMULATION_SITECUSTOMIZE, encoding="utf-8")
+        airflow_home = stub_root / "airflow_home"
+        airflow_home.mkdir(parents=True, exist_ok=True)
+
+        base_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in stripped_env_keys
+            and not k.upper().startswith(("COV_", "COVERAGE_"))
+            and "cov_core" not in k.lower()
+        }
+        py_path_entries = [str(stub_root), *src_paths]
+        if base_env.get("PYTHONPATH"):
+            py_path_entries.append(base_env["PYTHONPATH"])
+        base_env["PYTHONPATH"] = os.pathsep.join(py_path_entries)
+        base_env["IMEDNET_SIMULATION_MODE"] = "true"
+        base_env["IMEDNET_STUB_SINKS"] = "1"
+        base_env["IMEDNET_NON_INTERACTIVE"] = "1"
+        base_env["AIRFLOW_HOME"] = str(airflow_home)
+
+        for py_file in py_files:
+            resolved_script = py_file.resolve()
+            with tempfile.TemporaryDirectory(prefix="imednet_showcase_cwd_") as run_cwd:
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(resolved_script)],
+                        cwd=run_cwd,
+                        env=base_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_seconds,
+                    )
+                except subprocess.TimeoutExpired:
+                    errors.append(
+                        f"{py_file}: Timed out after {timeout_seconds:.1f}s in simulation mode"
+                    )
+                    continue
+
+                if proc.returncode != 0:
+                    detail = (proc.stderr.strip() or proc.stdout.strip()).splitlines()
+                    tail = detail[-1] if detail else "no output"
+                    errors.append(
+                        f"{py_file}: Exited with non-zero code {proc.returncode} in simulation mode ({tail})"
+                    )
+                    continue
+
+                err_reason = _find_output_error(proc.stdout, proc.stderr)
+                if err_reason is not None:
+                    errors.append(f"{py_file}: {err_reason}")
 
     return errors
 
@@ -911,6 +1091,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip staged wheels validation gate",
     )
+    parser.add_argument(
+        "--skip-execution",
+        action="store_true",
+        help="Skip executing showcase scripts under IMEDNET_SIMULATION_MODE=true",
+    )
     return parser.parse_args(argv)
 
 
@@ -924,8 +1109,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     configure_sys_path(repo_root)
 
-    print(f"Validating showcase AST and imports in {examples_dir}...")
+    print(f"Validating showcase AST, docstrings, and imports in {examples_dir}...")
     showcase_errors = validate_showcase_ast_and_imports(examples_dir, repo_root)
+
+    execution_errors: list[str] = []
+    if not args.skip_execution and not showcase_errors:
+        print(f"Executing showcase scripts in simulation mode from {examples_dir}...")
+        execution_errors = execute_showcases_in_simulation(examples_dir, repo_root)
 
     print(f"Validating documentation literal includes in {docs_dir}...")
     doc_errors = validate_documentation_literal_includes(docs_dir, repo_root)
@@ -951,7 +1141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if created_temp_wheels and args.wheels_dir is None:
                 shutil.rmtree(wheels_dir, ignore_errors=True)
 
-    all_errors = showcase_errors + doc_errors + wheel_errors
+    all_errors = showcase_errors + execution_errors + doc_errors + wheel_errors
 
     if all_errors:
         print(f"\nShowcase verification failed with {len(all_errors)} error(s):", file=sys.stderr)

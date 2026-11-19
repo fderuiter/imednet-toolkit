@@ -193,7 +193,7 @@ def get_state_provider(
     if not matched:
         raise ImportError(
             f"Checkpoint state provider '{target_name}' requires an installed workflows plugin. "
-            "Install 'imednet-workflows' or 'imednet[workflows]'."
+            "Install 'imednet-workflows' or 'imednet[export]'."
         )
 
     factory = matched[0].load()

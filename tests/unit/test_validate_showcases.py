@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from scripts.validate_showcases import (
+    execute_showcases_in_simulation,
     extract_literalinclude_slice,
     main,
     stage_wheels,
@@ -951,3 +952,71 @@ def test_symbol_validation_skips_uninstalled_optional_drivers(
 
     errors = validate_showcase_ast_and_imports(examples_dir)
     assert not errors, f"Expected optional drivers to be skipped cleanly, got: {errors}"
+
+
+def test_todo_docstring_rejected_in_showcases(tmp_path: Path) -> None:
+    """Verify leftover TODO placeholders in module, class, or function docstrings fail validation."""
+    examples_dir = tmp_path / "examples"
+    examples_dir.mkdir(parents=True)
+    todo_file = examples_dir / "todo_demo.py"
+    todo_file.write_text(
+        '"""Module summary with TODO placeholder."""\n\n'
+        "def run() -> None:\n"
+        '    """Execute TODO action."""\n'
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_showcase_ast_and_imports(examples_dir)
+    assert len(errors) == 2
+    assert any("<module>" in err and "TODO" in err for err in errors)
+    assert any("'run'" in err and "TODO" in err for err in errors)
+
+
+def test_execute_showcases_in_simulation_passes_and_isolates_cwd(tmp_path: Path) -> None:
+    """Verify simulation execution sets IMEDNET_SIMULATION_MODE=true and isolates generated files."""
+    examples_dir = tmp_path / "examples"
+    examples_dir.mkdir(parents=True)
+    showcase = examples_dir / "sim_ok.py"
+    showcase.write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "from imednet import ImednetSDK\n\n"
+        "assert os.environ.get('IMEDNET_SIMULATION_MODE') == 'true'\n"
+        "Path('generated_output.txt').write_text('ok', encoding='utf-8')\n"
+        "with ImednetSDK() as sdk:\n"
+        "    studies = list(sdk.studies.list())\n"
+        "    assert len(studies) >= 1\n",
+        encoding="utf-8",
+    )
+
+    errors = execute_showcases_in_simulation(examples_dir)
+    assert not errors, f"Expected simulation execution to pass, got: {errors}"
+    assert not (examples_dir / "generated_output.txt").exists()
+
+
+def test_execute_showcases_in_simulation_catches_nonzero_and_error_output(
+    tmp_path: Path,
+) -> None:
+    """Verify simulation execution catches non-zero exit codes, error lines, and JSON error logs."""
+    examples_dir = tmp_path / "examples"
+    examples_dir.mkdir(parents=True)
+
+    (examples_dir / "fail_exit.py").write_text(
+        "import sys\nsys.exit(2)\n",
+        encoding="utf-8",
+    )
+    (examples_dir / "fail_printed_error.py").write_text(
+        "print('Error: simulated failure without non-zero exit')\n",
+        encoding="utf-8",
+    )
+    (examples_dir / "fail_json_log.py").write_text(
+        'import sys\nprint(\'{"level": "ERROR", "message": "boom"}\', file=sys.stderr)\n',
+        encoding="utf-8",
+    )
+
+    errors = execute_showcases_in_simulation(examples_dir)
+    assert len(errors) == 3
+    assert any("fail_exit.py" in e and "non-zero code 2" in e for e in errors)
+    assert any("fail_printed_error.py" in e and "Error message emitted" in e for e in errors)
+    assert any("fail_json_log.py" in e and "Error log emitted" in e for e in errors)

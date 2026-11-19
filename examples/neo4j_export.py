@@ -25,15 +25,25 @@ from imednet_sinks import Neo4jSinkConfig, export_to_neo4j
 
 from imednet import ImednetSDK
 
+_SIM_MODE = os.environ.get("IMEDNET_SIMULATION_MODE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 sdk = ImednetSDK(
-    api_key=os.environ["IMEDNET_API_KEY"],
+    api_key=os.environ.get("IMEDNET_API_KEY")
+    or ("sim-api-placeholder" if _SIM_MODE else os.environ["IMEDNET_API_KEY"]),
     security_key=os.environ.get("IMEDNET_SECURITY_KEY", ""),
 )
 
 STUDY_KEY = os.environ.get("IMEDNET_STUDY_KEY") or "MY_STUDY"
 NEO4J_URI = os.environ.get("NEO4J_URI") or "bolt://localhost:7687"
 NEO4J_USER = os.environ.get("NEO4J_USER") or "neo4j"
-NEO4J_PASSWORD = os.environ["NEO4J_PASSWORD"]
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD") or (
+    "sim-neo4j-placeholder" if _SIM_MODE else os.environ["NEO4J_PASSWORD"]
+)
 NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE") or "neo4j"
 
 config = Neo4jSinkConfig(

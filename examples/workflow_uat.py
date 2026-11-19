@@ -1,8 +1,11 @@
+"""Demonstrate instantiating UATWorkflow with environment-loaded SDK configuration."""
+
 from imednet import ImednetSDK, load_config
 from imednet_workflows.uat import UATWorkflow
 
 
-def main():
+def main() -> None:
+    """Initialize ImednetSDK and UATWorkflow."""
     try:
         cfg = load_config()
     except ValueError as e:

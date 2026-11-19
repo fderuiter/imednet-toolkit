@@ -47,10 +47,11 @@ HTTP methods and errors
 The API primarily supports ``GET`` and ``POST`` requests. Non‐successful status
 codes raise typed exceptions:
 
-* ``400`` – :class:`~imednet.errors.ValidationError`
-* ``401`` – :class:`~imednet.errors.AuthenticationError`
-* ``403`` – :class:`~imednet.errors.AuthorizationError`
+* ``400`` – :class:`~imednet.errors.BadRequestError`
+* ``401`` – :class:`~imednet.errors.UnauthorizedError`
+* ``403`` – :class:`~imednet.errors.ForbiddenError`
 * ``404`` – :class:`~imednet.errors.NotFoundError`
+* ``409`` – :class:`~imednet.errors.ConflictError`
 * ``429`` – :class:`~imednet.errors.RateLimitError`
 * ``5xx`` – :class:`~imednet.errors.ServerError`
 
@@ -64,12 +65,8 @@ Endpoints accept a ``filter`` parameter that matches the syntax documented in th
 Mednet API guide. For clinical data queries, ``recordDataFilter`` can be supplied
 alongside ``filter``. See :mod:`imednet.endpoints.records` for usage examples.
 
-Some endpoints (:class:`~imednet.endpoints.studies.StudiesEndpoint`,
-:class:`~imednet.endpoints.forms.FormsEndpoint`,
-:class:`~imednet.endpoints.intervals.IntervalsEndpoint`, and
-:class:`~imednet.endpoints.variables.VariablesEndpoint`) maintain an internal
-cache. They accept a ``refresh`` argument to force a reload of cached data. This
-flag is not a general filtering option and has no effect on other endpoints.
+Endpoints are stateless and fetch fresh data on every call. For local schema
+and record caching helpers, see :doc:`/how-to/caching`.
 
 Dates must use UTC timestamps except where noted. When filtering visits by
 ``startDate``, ``dueDate``, ``endDate`` or ``visitDate``, use ``YYYY-MM-DD``.

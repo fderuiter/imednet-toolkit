@@ -1,18 +1,18 @@
 [
   {
-    "formKey": "REG",
-    "siteName": "Minneapolis",
+    "formKey": "F_DM",
+    "siteName": "SITE",
     "data": {
-      "textField": "First subject"
+      "V_AGE": 34,
+      "V_GENDER": "Female"
     }
   },
   {
-    "formKey": "REG",
-    "siteName": "Chicago",
+    "formKey": "F_DM",
+    "siteName": "SITE",
     "data": {
-      "textField": "Second subject",
-      "dateField": "2024-01-01",
-      "numberField": 42
+      "V_AGE": 42,
+      "V_GENDER": "Female"
     }
   }
 ]

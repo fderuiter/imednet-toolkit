@@ -1,27 +1,25 @@
-"""TODO: Add docstring."""
+"""Example using :class:`DataExtractionWorkflow.extract_records_by_criteria`.
 
+Initializes the SDK and workflow, then retrieves records for a study filtered
+by subject and visit attributes (using simulation defaults when
+``IMEDNET_SIMULATION_MODE=true``).
+"""
+
+import os
 from typing import Any
 
 from imednet import ImednetSDK
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 
-"""Example using :class:`DataExtractionWorkflow.extract_records_by_criteria`.
+api_key = os.getenv("IMEDNET_API_KEY") or None
+security_key = os.getenv("IMEDNET_SECURITY_KEY") or None
+base_url = os.getenv("IMEDNET_BASE_URL") or None
+study_key = os.getenv("IMEDNET_STUDY_KEY") or "STUDY"
 
-This script initializes the SDK and workflow, then retrieves records for a study
-filtered by subject and visit attributes. Update the credential placeholders
-before running.
-"""
-
-api_key = "XXXXXXXXXX"
-security_key = "XXXXXXXXXX"
-base_url = None  # Or set to your custom base URL if needed
-study_key = "XXXXXXXXXX"
-
-try:
-    sdk = ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url)
+with ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url) as sdk:
     workflow = DataExtractionWorkflow(sdk)
 
-    subject_filter: dict[str, Any] = {"subjectStatus": "Active"}
+    subject_filter: dict[str, Any] = {"subjectStatus": "Enrolled"}
     visit_filter: dict[str, Any] = {"intervalName": "Baseline"}
 
     records = workflow.extract_records_by_criteria(
@@ -30,5 +28,3 @@ try:
         visit_filter=visit_filter,
     )
     print(f"Number of records matching criteria: {len(records)}")
-except Exception as e:
-    print(f"Error extracting records: {e}")

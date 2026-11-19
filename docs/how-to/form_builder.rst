@@ -60,6 +60,8 @@ Forms are defined as "Presets" in ``imednet/form_designer/presets.py``. A preset
 
 .. code-block:: python
 
+    from imednet.form_designer import FormBuilder
+
     def build_my_form(builder: FormBuilder) -> None:
         builder.add_section_header("My New Section")
 

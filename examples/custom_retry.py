@@ -1,4 +1,15 @@
-"""TODO: Add docstring."""
+"""Demonstrate custom retry logic with simulated rate limit and server errors.
+
+The script uses a mock transport that returns a 429, then a 500, before
+succeeding. Set ``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY`` to any value
+(or enable ``IMEDNET_SIMULATION_MODE=true``) before running this script.
+
+Example:
+
+    export IMEDNET_API_KEY="dummy"
+    export IMEDNET_SECURITY_KEY="dummy"
+    uv run --with "imednet[cli]" python examples/custom_retry.py
+"""
 
 from __future__ import annotations
 
@@ -10,29 +21,16 @@ import httpx
 
 from imednet.auth.strategy import AuthStrategy
 from imednet.core.client import Client
-from imednet.core.retry import RetryPolicy, RetryState
+from imednet.core.retry import RetryConfig, RetryPolicy, RetryState
 from imednet.errors import RateLimitError, ServerError
 from imednet.utils import configure_json_logging
 
-"""Demonstrate custom retry logic with simulated rate limit and server errors.
-
-The script uses a mock transport that returns a 429, then a 500, before
-succeeding. Set ``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY`` to any value
-before running this script.
-
-Example:
-
-    export IMEDNET_API_KEY="dummy"
-    export IMEDNET_SECURITY_KEY="dummy"
-    uv run --with "imednet[cli]" python examples/custom_retry.py
-"""
-
 
 class RateLimitServerRetry(RetryPolicy):
-    """TODO: Add docstring."""
+    """Retry requests that fail with rate limit (429) or server (5xx) errors."""
 
     def should_retry(self, state: RetryState) -> bool:
-        """TODO: Add docstring."""
+        """Return True when the failed attempt encountered a retryable error or status."""
         if isinstance(state.exception, (RateLimitError, ServerError)):
             return True
         if isinstance(state.result, httpx.Response):
@@ -51,15 +49,15 @@ responses: Iterator[httpx.Response] = iter(
 
 
 def responder(_: httpx.Request) -> httpx.Response:
-    """TODO: Add docstring."""
+    """Return the next canned HTTP response in the mock sequence."""
     return next(responses)
 
 
 class MockClient(Client):
-    """TODO: Add docstring."""
+    """HTTP client wired to an in-memory mock transport for retry testing."""
 
     def _create_client(self, auth: AuthStrategy) -> httpx.Client:
-        """TODO: Add docstring."""
+        """Create an httpx.Client backed by the mock responder transport."""
         return httpx.Client(
             base_url=self.base_url,
             headers={
@@ -76,22 +74,42 @@ def main() -> None:
     """Run a request with custom retry logic."""
     configure_json_logging()
 
-    missing = [var for var in ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY") if not os.getenv(var)]
+    sim_mode = os.getenv("IMEDNET_SIMULATION_MODE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    api_key = os.getenv("IMEDNET_API_KEY") or ("sim-api-placeholder" if sim_mode else None)
+    security_key = os.getenv("IMEDNET_SECURITY_KEY") or (
+        "sim-sec-placeholder" if sim_mode else None
+    )
+    missing = [
+        name
+        for name, val in (
+            ("IMEDNET_API_KEY", api_key),
+            ("IMEDNET_SECURITY_KEY", security_key),
+        )
+        if not val
+    ]
     if missing:
         vars_ = ", ".join(missing)
         print(f"Missing required environment variable(s): {vars_}", file=sys.stderr)
         sys.exit(1)
 
     client = MockClient(
-        os.environ["IMEDNET_API_KEY"],
-        os.environ["IMEDNET_SECURITY_KEY"],
-        retries=3,
-        backoff_factor=0.01,
-        retry_policy=RateLimitServerRetry(),
+        api_key=api_key,
+        security_key=security_key,
+        retry_config=RetryConfig(
+            retries=3,
+            backoff_factor=0.01,
+            retry_policy=RateLimitServerRetry(),
+        ),
     )
 
     try:
-        client.get("/studies")
+        with client:
+            client.get("/studies")
     except RateLimitError:
         print("Request failed with rate limit error", file=sys.stderr)
     except ServerError:

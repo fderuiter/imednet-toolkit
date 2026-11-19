@@ -45,7 +45,7 @@ def main() -> None:
         security_key=cfg.security_key,
         base_url=cfg.base_url,
     ) as sdk:
-        print(sdk.studies.list())
+        print(list(sdk.studies.list()))
 
 
 if __name__ == "__main__":

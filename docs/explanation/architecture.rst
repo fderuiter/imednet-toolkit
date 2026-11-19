@@ -114,9 +114,8 @@ wraps a related set of API operations. Endpoints now use **composition**:
 `GenericListGetEndpoint` composes operation classes (for example
 ``ListOperation`` and ``FilterGetOperation``) rather than inheriting deep
 operation mixin chains. This keeps method resolution straightforward, improves
-IDE autocomplete, and avoids MRO-related typing ambiguity. Endpoints can cache
-responses when called without filters and expose ``list``/``get`` methods that
-return typed models.
+IDE autocomplete, and avoids MRO-related typing ambiguity. Endpoints expose
+``list``/``get`` methods that return typed models.
 
 Workflows
 ---------
@@ -129,9 +128,9 @@ async variants and are available under ``sdk.workflows``.
 Caching
 -------
 
-:doc:`/how-to/caching` describes how endpoint and schema data are cached. Cached values
-can be refreshed by passing ``refresh=True`` to endpoint methods or calling
-``schema.refresh()`` on a validator.
+:doc:`/how-to/caching` describes how schema metadata and local record caches
+work. Cached schema metadata can be reloaded by calling ``schema.refresh()`` on
+a :class:`~imednet.validation.cache.SchemaCache` instance.
 
 CLI
 ---
@@ -237,7 +236,7 @@ three methods:
 Sinks are used as context managers; ``flush`` is called automatically on
 clean exit and ``close`` is always called via ``__exit__``.
 
-Shared :class:`~imednet.integrations.sink_base.SinkConfig` fields:
+Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
 
 .. list-table::
    :header-rows: 1
@@ -280,7 +279,7 @@ Error propagation
   :class:`~imednet.errors.ExportConfigurationError` immediately before
   any data is written.
 * Credentials and connection URIs are never written to logs.  Pass URIs
-  through :func:`~imednet.integrations.sink_base._redact_uri` before
+  through :func:`~imednet.spi.sinks.redact_uri` before
   logging them.
 
 Optional dependency conventions
@@ -302,9 +301,10 @@ Extras naming:
 Public API exposure
 ~~~~~~~~~~~~~~~~~~~
 
-* :mod:`imednet.integrations` exports tabular helpers and shared sink contracts
-  (:class:`~imednet.integrations.sink_base.SinkConfig` and
-  :class:`~imednet.integrations.sink_base.ExportSink`).
+* :mod:`imednet.integrations` exports tabular helpers, while
+  :mod:`imednet.spi.sinks` (and :mod:`imednet.spi.sink_base`) defines shared
+  sink contracts (:class:`~imednet.spi.sink_base.SinkConfig` and
+  :class:`~imednet.spi.sink_base.ExportSink`).
 * Document, graph, and warehouse sinks are exposed from :mod:`imednet_sinks`
   (and dynamically via ``sdk.sinks`` when ``imednet-plugins-sinks`` is installed)
   or directly from their submodules:

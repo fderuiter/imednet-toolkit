@@ -18,10 +18,6 @@ pip install ./packages/providers-airflow
 
 **Required Dependencies:**
 This package requires `imednet` and a standard `apache-airflow` core environment as parent dependencies.
-Optionally, install the `amazon` extra for AWS integrations:
-```bash
-pip install apache-airflow-providers-imednet[amazon]
-```
 
 **Build Targets (Hatchling):**
 This package uses Hatchling as its build backend, targeting the `src/apache_airflow_providers_imednet` package directory as defined in `pyproject.toml`.
@@ -35,10 +31,18 @@ from apache_airflow_providers_imednet.hooks import ImednetHook
 from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 from apache_airflow_providers_imednet.sensors import ImednetJobSensor
 
-# Example declarative Airflow DAG configuration:
-# hook = ImednetHook(imednet_conn_id='my_imednet_conn')
-# export_task = ImednetExportOperator(task_id='export', study_key='{{ params.study_key }}')
-# sensor_task = ImednetJobSensor(task_id='wait_for_job', job_id='{{ ti.xcom_pull(task_ids="export") }}')
+hook = ImednetHook(imednet_conn_id="my_imednet_conn")
+export_task = ImednetExportOperator(
+    task_id="export",
+    study_key="{{ params.study_key }}",
+    output_path="/tmp/records.csv",
+    export_func="export_to_csv",
+)
+sensor_task = ImednetJobSensor(
+    task_id="wait_for_job",
+    study_key="{{ params.study_key }}",
+    batch_id="{{ ti.xcom_pull(task_ids='export') }}",
+)
 ```
 
 ## Using the ImednetHook
@@ -53,7 +57,7 @@ To retrieve a configured SDK client to use in your custom operators or tasks, us
 from apache_airflow_providers_imednet.hooks import ImednetHook
 
 
-def my_task_logic():
+def my_task_logic() -> None:
     hook = ImednetHook(imednet_conn_id="imednet_default")
     # Retrieve the active ImednetSDK client using the standard BaseHook entry point:
     client = hook.get_conn()
@@ -61,7 +65,8 @@ def my_task_logic():
     # client = hook.get_sdk_client()
 
     # Use the client to interact with iMednet
-    studies = client.studies.list()
+    studies = list(client.studies.list())
+    print(len(studies))
 ```
 
 ## Features

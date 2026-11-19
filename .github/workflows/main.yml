@@ -260,7 +260,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install uv hatch
-          uv sync --locked --all-extras
+          uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
       - name: Tighten Internal Dependencies
@@ -372,7 +372,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install uv hatch
-          uv sync --locked --all-extras
+          uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
           if ls dist/*.whl 1> /dev/null 2>&1; then
@@ -447,7 +447,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install uv hatch
-          uv sync --locked --all-extras
+          uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
       - name: Run Hermetic Integration Sandbox
@@ -494,7 +494,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install uv hatch
-          uv sync --locked --all-extras
+          uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
       - name: Run Coverage-Guided Fuzzing (1,000,000 iterations)

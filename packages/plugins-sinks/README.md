@@ -30,6 +30,8 @@ The package provides a unified SDK namespace integration (`SinksNamespace`) dire
 You can initialize and execute sinks programmatically:
 
 ```python
+import os
+from imednet import ImednetSDK
 from imednet_sinks import (
     MongoDbSinkConfig,
     Neo4jSinkConfig,
@@ -39,14 +41,15 @@ from imednet_sinks import (
     export_to_snowflake,
 )
 
-# Example programmatic Record export to MongoDB:
-# config = MongoDbSinkConfig(
-#     study_key="STUDY-123",
-#     uri="mongodb://localhost:27017",
-#     database="imednet",
-#     collection="records",
-# )
-# export_to_mongodb(sdk, "STUDY-123", config=config)
+sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+
+config = MongoDbSinkConfig(
+    study_key="STUDY-123",
+    uri="mongodb://localhost:27017",
+    database="imednet",
+    collection="records",
+)
+export_to_mongodb(sdk, "STUDY-123", config=config)
 ```
 
 Alternatively, commands can be launched via standard CLI structures mapped to these functions if exposed by your main SDK runner.

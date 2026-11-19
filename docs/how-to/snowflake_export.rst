@@ -27,7 +27,7 @@ The Snowflake export path uses a staged-loading and merge approach:
    ``idempotent=False``, Snowflake loads directly into the target table via
    ``COPY INTO ... FORCE = TRUE``.
 
-This is intentionally different from :func:`~imednet.integrations.export_to_sql`, which
+This is intentionally different from :func:`~imednet.integrations.export.export_to_sql`, which
 uses SQLAlchemy ``DataFrame.to_sql()`` and is appropriate for transactional SQL targets
 (SQLite, PostgreSQL, etc.).  Do **not** mix the two paths.
 
@@ -89,7 +89,7 @@ per-batch control, custom ``batch_id`` keys, or integration with a workflow engi
 
    import os
    from imednet import ImednetSDK
-   from imednet.integrations.sink_base import iter_batches
+   from imednet.spi.sink_base import iter_batches
    from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
@@ -229,5 +229,5 @@ Out of scope
 * Object-storage (S3/GCS/Azure) staging — planned for a future release.
 * Snowpark / Python connector Pandas integration — not used; Parquet staging is the
   preferred path for throughput.
-* Row-wise insert via SQLAlchemy — use :func:`~imednet.integrations.export_to_sql`
+* Row-wise insert via SQLAlchemy — use :func:`~imednet.integrations.export.export_to_sql`
   for transactional SQL targets instead.
