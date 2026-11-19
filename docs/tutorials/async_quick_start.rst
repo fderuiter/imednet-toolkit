@@ -3,7 +3,7 @@ Async Quick Start
 
 This page shows a minimal asynchronous example using ``AsyncImednetSDK``.
 
-.. thebe-button:: Activate Interactive Runtime
+.. pyodide-button:: Activate Interactive Runtime
 
 .. important::
 

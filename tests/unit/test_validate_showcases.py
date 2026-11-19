@@ -234,16 +234,35 @@ def test_validate_staged_wheels_missing_required_module(tmp_path: Path) -> None:
 
 
 def test_validate_staged_wheels_workspace_integration(tmp_path: Path) -> None:
-    """Verify that staged wheels in repo pass validation and simulated Pyodide import."""
+    """Verify that staged browser wheels pass validation and simulated Pyodide import."""
     repo_root = Path(__file__).resolve().parents[2]
-    wheels_dir = repo_root / "docs" / "_static" / "wheels"
+    wheels_dir = tmp_path / "wheels"
 
-    # Stage wheels if not already staged
-    if not list(wheels_dir.glob("*.whl")):
-        stage_wheels(repo_root, wheels_dir)
+    staged = stage_wheels(repo_root, wheels_dir)
+    staged_names = [w.name for w in staged]
+    assert any(n.startswith("imednet-") for n in staged_names)
+    assert any(n.startswith("imednet_workflows-") for n in staged_names)
+    assert any(n.startswith("imednet_plugins_sinks-") for n in staged_names)
+    assert not any(n.startswith("apache_airflow_providers_imednet-") for n in staged_names)
+    assert not any(n.startswith("imednet_tui-") for n in staged_names)
 
-    errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
-    assert not errors, f"Expected staged wheels to pass validation, got: {errors}"
+    errors = validate_staged_wheels(wheels_dir)
+    assert not errors, f"Expected all three staged browser wheels to pass validation, got: {errors}"
+
+
+def test_validate_staged_wheels_detects_missing_plugin_wheels(tmp_path: Path) -> None:
+    """Verify default validate_staged_wheels requires imednet, imednet_workflows, and imednet_plugins_sinks."""
+    wheels_dir = tmp_path / "wheels"
+    wheels_dir.mkdir(parents=True)
+    core_only = wheels_dir / "imednet-1.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(core_only, "w") as zf:
+        zf.writestr("imednet/__init__.py", "class ImednetSDK:\n    pass\n")
+        zf.writestr("imednet/sdk.py", "")
+        zf.writestr("imednet/config.py", "")
+
+    errors = validate_staged_wheels(wheels_dir)
+    assert any("imednet_workflows" in e for e in errors)
+    assert any("imednet_plugins_sinks" in e for e in errors)
 
 
 def test_literalinclude_slice_missing_start_marker_detection(tmp_path: Path) -> None:
