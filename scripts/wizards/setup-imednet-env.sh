@@ -305,7 +305,7 @@ pause "Press Enter to proceed to workspace dependency sync..."
 # ── Stage 3: Workspace Dependency Synchronization ─────────────────────────
 stage "Workspace Dependency Sync"
 say "Synchronizing the monorepo workspace virtual environment (.venv)..."
-say "This installs all 4 packages in editable mode along with dev (pytest, ruff, mypy) and docs dependencies."
+say "This installs all 5 packages in editable mode along with dev (pytest, ruff, mypy) and docs dependencies."
 if confirm "Run 'uv sync --all-packages --extra dev --extra docs' now?"; then
   if command -v uv >/dev/null 2>&1; then
     say "Running 'uv sync --all-packages --extra dev --extra docs'..."
