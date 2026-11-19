@@ -54,6 +54,15 @@ def test_list_accepts_camel_case_record_data_filter_and_rejects_conflicts(
     with pytest.raises(ConfigurationError, match="status"):
         ep.list(study_key="S1", status="open")
 
+    for bad_rdf in ("age == 10", "age<>10", True):
+        with pytest.raises(ValueError):
+            ep.list(study_key="S1", record_data_filter=bad_rdf)
+        with pytest.raises(ValueError):
+            ep.list(study_key="S1", recordDataFilter=bad_rdf)
+
+    with pytest.raises(ValueError, match="cannot combine both"):
+        ep.list(study_key="S1", filter="formKey==DM,formKey==VS", record_status="Open")
+
 
 def test_get_success(monkeypatch, dummy_client):
     """Test that get success."""

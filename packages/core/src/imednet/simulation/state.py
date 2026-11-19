@@ -581,14 +581,75 @@ class SimulationState:
             job_results: list[dict[str, Any]] = []
 
             for item in records_data:
-                self._next_record_id += 1
-                rec_id = self._next_record_id
+                requested_rec_id = item.get("recordId")
+                existing_record = (
+                    next(
+                        (
+                            r
+                            for r in self.records
+                            if r.get("studyKey") == study_key
+                            and r.get("recordId") == requested_rec_id
+                        ),
+                        None,
+                    )
+                    if requested_rec_id is not None
+                    else None
+                )
+
                 if "data" in item and isinstance(item["data"], dict):
-                    rec_data = item["data"]
+                    rec_data: Any = item["data"]
                 elif "recordData" in item and isinstance(item["recordData"], dict):
                     rec_data = item["recordData"]
                 else:
                     rec_data = item
+                modified_ts = str(item.get("dateModified", "2026-11-15T00:00:00Z"))
+                updated_ts = str(item.get("lastUpdated", modified_ts))
+
+                if existing_record is not None:
+                    rec_id = int(existing_record["recordId"])
+                    subj_id = existing_record.get("subjectId", 201)
+                    subj_key = str(
+                        item.get("subjectKey") or existing_record.get("subjectKey", "SUB1")
+                    )
+                    form_key = str(item.get("formKey") or existing_record.get("formKey", "F_DM"))
+                    merged_data = copy.deepcopy(existing_record.get("recordData") or {})
+                    if isinstance(rec_data, dict):
+                        merged_data.update(copy.deepcopy(rec_data))
+                    existing_record["recordData"] = merged_data
+                    existing_record["formKey"] = form_key
+                    if "recordStatus" in item:
+                        existing_record["recordStatus"] = item["recordStatus"]
+                    existing_record["dateModified"] = modified_ts
+                    existing_record["lastUpdated"] = updated_ts
+                    job_results.append(
+                        {
+                            "recordId": rec_id,
+                            "subjectId": subj_id,
+                            "subjectKey": subj_key,
+                            "formKey": form_key,
+                            "status": "SUCCESS",
+                        }
+                    )
+                    self._next_revision_id += 1
+                    rev_num = (
+                        sum(1 for r in self.record_revisions if r.get("recordId") == rec_id) + 1
+                    )
+                    self.record_revisions.append(
+                        self._build_record_revision(
+                            revision_id=self._next_revision_id,
+                            record_entry=existing_record,
+                            revision_number=rev_num,
+                            user=str(item.get("user", "sim_user")),
+                            role=str(item.get("role", "Investigator")),
+                            reason=str(item.get("reasonForChange", "Record updated")),
+                            record_oid=item.get("recordOid"),
+                            subject_oid=item.get("subjectOid"),
+                        )
+                    )
+                    continue
+
+                self._next_record_id += 1
+                rec_id = self._next_record_id
                 subj_key = item.get("subjectKey") or f"SUBJ-{rec_id}"
 
                 requested_site_name = item.get("siteName")
@@ -618,8 +679,8 @@ class SimulationState:
                 )
                 if existing_subject is not None:
                     subj_id = existing_subject.get("subjectId", 200 + (rec_id % 100))
-                    existing_subject["dateModified"] = "2026-11-15T00:00:00Z"
-                    existing_subject["lastUpdated"] = "2026-11-15T00:00:00Z"
+                    existing_subject["dateModified"] = modified_ts
+                    existing_subject["lastUpdated"] = updated_ts
                 else:
                     subj_id = item.get("subjectId", 200 + len(self.subjects) + 1)
                     self.subjects.append(
@@ -632,9 +693,9 @@ class SimulationState:
                             "subjectStatus": "Enrolled",
                             "deleted": False,
                             "keywords": copy.deepcopy(item.get("keywords", [])),
-                            "dateCreated": "2026-11-15T00:00:00Z",
-                            "dateModified": "2026-11-15T00:00:00Z",
-                            "lastUpdated": "2026-11-15T00:00:00Z",
+                            "dateCreated": modified_ts,
+                            "dateModified": modified_ts,
+                            "lastUpdated": updated_ts,
                         }
                     )
 
@@ -653,9 +714,9 @@ class SimulationState:
                     "recordStatus": item.get("recordStatus", "Complete"),
                     "recordData": copy.deepcopy(rec_data),
                     "deleted": False,
-                    "dateCreated": "2026-11-15T00:00:00Z",
-                    "dateModified": "2026-11-15T00:00:00Z",
-                    "lastUpdated": "2026-11-15T00:00:00Z",
+                    "dateCreated": str(item.get("dateCreated", modified_ts)),
+                    "dateModified": modified_ts,
+                    "lastUpdated": updated_ts,
                 }
                 self.records.append(record_entry)
                 job_results.append(

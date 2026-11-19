@@ -786,3 +786,45 @@ def test_simulation_filter_sort_and_state_edge_cases():
     )
     assert nested_dotted.status_code == 200
     assert [r["recordId"] for r in nested_dotted.json()["data"]] == [601]
+
+
+def test_simulation_filters_sorting_and_subresources():
+    """Verify simulation transport handles operators, recordDataFilter, sorting, and limit."""
+    with patch.dict(os.environ, {}, clear=True):
+        sdk = ImednetSDK(
+            simulation_mode=True,
+            transport=create_simulation_transport(SimulationState()),
+        )
+
+        codings_list = list(sdk.codings.list(study_key="STUDY"))
+        assert len(codings_list) >= 1
+
+        revisions_list = list(sdk.record_revisions.list(study_key="STUDY"))
+        assert len(revisions_list) >= 1
+
+        sorted_desc = list(sdk.records.list(study_key="STUDY", sort="recordId,desc"))
+        assert len(sorted_desc) >= 2
+        assert sorted_desc[0].record_id >= sorted_desc[-1].record_id
+
+        sorted_str = list(sdk.records.list(study_key="STUDY", sort="formKey,asc"))
+        assert len(sorted_str) >= 2
+
+        no_data_records = list(
+            sdk.records.list(study_key="STUDY", record_data_filter="none", limit=1)
+        )
+        assert len(no_data_records) == 1
+        assert no_data_records[0].record_data == {}
+
+        age_filtered = list(
+            sdk.records.list(study_key="STUDY", recordDataFilter="V_AGE>=30;V_GENDER==Female")
+        )
+        assert len(age_filtered) == 1
+        assert age_filtered[0].record_id == 601
+
+        regex_filtered = list(
+            sdk.records.list(study_key="STUDY", recordDataFilter='V_GENDER=~"^Fem"')
+        )
+        assert len(regex_filtered) == 1
+
+        bool_filtered = list(sdk.records.list(study_key="STUDY", deleted=False))
+        assert len(bool_filtered) >= 2

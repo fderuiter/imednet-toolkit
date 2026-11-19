@@ -203,6 +203,152 @@ def test_all_12_endpoints_extract_top_level_query_params_and_enforce_allowlists(
         list(ep.list(**base_kwargs, undocumented_attr="val"))
 
 
+ALL_COLLECTION_ASYNC = [
+    (studies.AsyncStudiesEndpoint, studies, False, "studyName"),
+    (sites.AsyncSitesEndpoint, sites, True, "siteName"),
+    (forms.AsyncFormsEndpoint, forms, True, "formKey"),
+    (intervals.AsyncIntervalsEndpoint, intervals, True, "intervalName"),
+    (variables.AsyncVariablesEndpoint, variables, True, "variableName"),
+    (subjects.AsyncSubjectsEndpoint, subjects, True, "subjectKey"),
+    (records.AsyncRecordsEndpoint, records, True, "formKey"),
+    (record_revisions.AsyncRecordRevisionsEndpoint, record_revisions, True, "formKey"),
+    (visits.AsyncVisitsEndpoint, visits, True, "subjectKey"),
+    (codings.AsyncCodingsEndpoint, codings, True, "variable"),
+    (queries.AsyncQueriesEndpoint, queries, True, "variable"),
+    (users.AsyncUsersEndpoint, users, True, None),
+]
+
+
+class _CountingSyncRequester:
+    """Minimal sync requester recording HTTP GET calls and returning multi-page metadata."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def get(self, path: str, params: dict[str, object] | None = None) -> object:
+        self.calls.append({"path": path, "params": dict(params or {})})
+        payload = {"data": [{}], "pagination": {"totalPages": 5}}
+        return type("Resp", (), {"json": lambda _self: payload})()
+
+
+class _CountingAsyncRequester:
+    """Minimal async requester recording HTTP GET calls and returning multi-page metadata."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def get(self, path: str, params: dict[str, object] | None = None) -> object:
+        self.calls.append({"path": path, "params": dict(params or {})})
+        payload = {"data": [{}], "pagination": {"totalPages": 5}}
+        return type("Resp", (), {"json": lambda _self: payload})()
+
+
+@pytest.mark.parametrize(("cls", "_module", "needs_study", "_valid_attr"), ALL_COLLECTION_SYNC)
+def test_all_12_sync_endpoints_single_page_and_limit_http_execution(
+    cls, _module, needs_study, _valid_attr
+):
+    """Test sync collection endpoints send 1 HTTP call for page/size/sort and limit=10."""
+    base_kwargs = {"study_key": "S1"} if needs_study else {}
+
+    page_client = _CountingSyncRequester()
+    ep = cls(page_client)
+    items = list(ep.list(**base_kwargs, page=1, size=25, sort="dateCreated,desc"))
+    assert len(items) == 1
+    assert len(page_client.calls) == 1
+    sent_params = page_client.calls[0]["params"]
+    assert isinstance(sent_params, dict)
+    assert sent_params["page"] == 1
+    assert sent_params["size"] == 25
+    assert sent_params["sort"] == "dateCreated,desc"
+    assert "filter" not in sent_params
+
+    limit_client = _CountingSyncRequester()
+    ep_limit = cls(limit_client)
+    limit_items = list(ep_limit.list(**base_kwargs, limit=10))
+    assert len(limit_items) == 1
+    assert len(limit_client.calls) == 1
+    limit_params = limit_client.calls[0]["params"]
+    assert isinstance(limit_params, dict)
+    assert limit_params["page"] == 0
+    assert limit_params["size"] == 10
+    assert "limit" not in limit_params
+    assert "filter" not in limit_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cls", "_module", "needs_study", "_valid_attr"), ALL_COLLECTION_ASYNC)
+async def test_all_12_async_endpoints_single_page_and_limit_http_execution(
+    cls, _module, needs_study, _valid_attr
+):
+    """Test async collection endpoints send 1 HTTP call for page/size/sort and limit=10."""
+    base_kwargs = {"study_key": "S1"} if needs_study else {}
+
+    page_client = _CountingAsyncRequester()
+    ep = cls(page_client)
+    items = [
+        item async for item in ep.list(**base_kwargs, page=1, size=25, sort="dateCreated,desc")
+    ]
+    assert len(items) == 1
+    assert len(page_client.calls) == 1
+    sent_params = page_client.calls[0]["params"]
+    assert isinstance(sent_params, dict)
+    assert sent_params["page"] == 1
+    assert sent_params["size"] == 25
+    assert sent_params["sort"] == "dateCreated,desc"
+    assert "filter" not in sent_params
+
+    limit_client = _CountingAsyncRequester()
+    ep_limit = cls(limit_client)
+    limit_items = [item async for item in ep_limit.list(**base_kwargs, limit=10)]
+    assert len(limit_items) == 1
+    assert len(limit_client.calls) == 1
+    limit_params = limit_client.calls[0]["params"]
+    assert isinstance(limit_params, dict)
+    assert limit_params["page"] == 0
+    assert limit_params["size"] == 10
+    assert "limit" not in limit_params
+    assert "filter" not in limit_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sync_cls", "async_cls", "needs_study", "attr"),
+    [
+        (s[0], a[0], s[2], s[3])
+        for s, a in zip(ALL_COLLECTION_SYNC, ALL_COLLECTION_ASYNC, strict=True)
+        if s[3] is not None
+    ],
+)
+async def test_all_filterable_endpoints_or_lists_sync_async_and_dataframe(
+    sync_cls, async_cls, needs_study, attr
+):
+    """Test multi-value OR filters across sync, async, and to_dataframe workflows."""
+    base_kwargs = {"study_key": "S1"} if needs_study else {}
+    expected_filter = f"{attr}==A,{attr}==B"
+
+    sync_client = _CountingSyncRequester()
+    sync_ep = sync_cls(sync_client)
+    list(sync_ep.list(**base_kwargs, **{attr: ["A", "B"]}))
+    assert len(sync_client.calls) == 5
+    assert sync_client.calls[0]["params"]["filter"] == expected_filter  # type: ignore[index]
+
+    df_sync = sync_ep.to_dataframe(**base_kwargs, **{attr: ["A", "B"]})
+    assert len(df_sync) == 5
+    assert len(sync_client.calls) == 10
+    assert sync_client.calls[5]["params"]["filter"] == expected_filter  # type: ignore[index]
+
+    async_client = _CountingAsyncRequester()
+    async_ep = async_cls(async_client)
+    _ = [item async for item in async_ep.list(**base_kwargs, **{attr: ["A", "B"]})]
+    assert len(async_client.calls) == 5
+    assert async_client.calls[0]["params"]["filter"] == expected_filter  # type: ignore[index]
+
+    df_async = await async_ep.to_dataframe(**base_kwargs, **{attr: ["A", "B"]})
+    assert len(df_async) == 5
+    assert len(async_client.calls) == 10
+    assert async_client.calls[5]["params"]["filter"] == expected_filter  # type: ignore[index]
+
+
 @pytest.mark.parametrize(
     ("cls", "module", "attr"),
     [

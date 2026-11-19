@@ -57,7 +57,7 @@ class _EdcEndpointBase:
     """
 
     def _auto_filter(self, filters: dict[str, Any]) -> dict[str, Any]:
-        """Inject the default study key from context if not already present.
+        """Inject the default study key from context if required and not already present.
 
         Args:
             filters: The current dictionary of filters.
@@ -65,6 +65,8 @@ class _EdcEndpointBase:
         Returns:
             The filters dictionary with studyKey injected if applicable.
         """
+        if not getattr(self, "requires_study_key", True):
+            return filters
         return _inject_study_key(filters)
 
 

@@ -67,16 +67,40 @@ class BasePaginator(Generic[ClientT]):
             self._explicit_page = None
 
         explicit_size = self.params.pop(self.size_param, None)
-        if explicit_size is None:
-            explicit_size = self.params.pop("limit", None)
-
-        raw_size = explicit_size if explicit_size is not None else page_size
+        explicit_limit = self.params.pop("limit", None)
+        if (
+            explicit_size is not None
+            and explicit_limit is not None
+            and _parse_int_param(self.size_param, explicit_size)
+            != _parse_int_param("limit", explicit_limit)
+        ):
+            raise ValueError(
+                f"Conflicting pagination bounds: '{self.size_param}'={explicit_size!r} "
+                f"and 'limit'={explicit_limit!r}."
+            )
+        self._explicit_limit: int | None = (
+            _parse_int_param("limit", explicit_limit) if explicit_limit is not None else None
+        )
+        raw_size = (
+            explicit_size
+            if explicit_size is not None
+            else (explicit_limit if explicit_limit is not None else page_size)
+        )
         parsed_size = _parse_int_param(self.size_param, raw_size)
         if parsed_size < 1 or parsed_size > MAX_PAGE_SIZE:
             raise ValueError(
                 f"Pagination '{self.size_param}' must be between 1 and {MAX_PAGE_SIZE}, got {parsed_size}."
             )
         self.page_size = parsed_size
+        self._single_page_slice: int | None = (
+            self._explicit_limit
+            if self._explicit_limit is not None
+            else (
+                parsed_size
+                if self._explicit_page is not None and explicit_size is not None
+                else None
+            )
+        )
         self._cursor: int | None = None
         self._remaining_in_page: int = 0
         self._exhausted = False
@@ -116,7 +140,7 @@ class BasePaginator(Generic[ClientT]):
 
     def _next_page(self, payload: dict[str, Any], page: int, items_count: int) -> int | None:
         """Determine the next page index based on the response payload and metadata."""
-        if self._explicit_page is not None:
+        if self._explicit_page is not None or self._explicit_limit is not None:
             return None
 
         pagination = payload.get("pagination")
@@ -165,6 +189,8 @@ class BasePaginator(Generic[ClientT]):
             return []
         items = self._extract_items(payload)
         self._cursor = self._next_page(payload, self._cursor, len(items))
+        if self._single_page_slice is not None:
+            return items[: self._single_page_slice]
         return items
 
     def _process_json_list_response(self, payload: Any) -> list[Any]:

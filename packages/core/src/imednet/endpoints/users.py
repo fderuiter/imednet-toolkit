@@ -36,8 +36,8 @@ class UsersParamProcessor(ParamProcessor):
         else:
             special_params["includeInactive"] = "false"
 
-        # Handle page, size, sort, and raw filter
-        for key in ("page", "size", "sort"):
+        # Handle page, size, limit, sort, and raw filter
+        for key in ("page", "size", "limit", "sort"):
             if key in filters:
                 val = filters.pop(key)
                 if val is not None:
@@ -75,6 +75,7 @@ class UsersOperationDef:
         Raises:
             ConfigurationError: If any unsupported query filter parameters are passed.
         """
+        explicit_study_key_filter = study_key is not None and "studyKey" in filters
         filters = self._auto_filter(filters.copy())  # type: ignore[attr-defined]
 
         processed_filters, special_params = self.param_processor.process_filters(filters)  # type: ignore[attr-defined]
@@ -90,9 +91,15 @@ class UsersOperationDef:
 
         # Check for unsupported query parameters
         unsupported = [k for k in processed_filters if k != "studyKey"]
+        if explicit_study_key_filter:
+            unsupported.append("studyKey")
         if extra_params:
             unsupported.extend(
-                [k for k in extra_params if k not in ("includeInactive", "page", "size", "sort")]
+                [
+                    k
+                    for k in extra_params
+                    if k not in ("includeInactive", "page", "size", "limit", "sort")
+                ]
             )
         if unsupported:
             from imednet.errors.validation import ConfigurationError

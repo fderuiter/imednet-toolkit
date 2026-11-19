@@ -220,7 +220,10 @@ class _ListEndpointBase(GenericEndpoint[T]):
             extra_params.update(special_params)
 
         if study_key:
-            processed_filters["studyKey"] = study_key
+            if not self.requires_study_key and "studyKey" in processed_filters:
+                processed_filters["study_key"] = study_key
+            else:
+                processed_filters["studyKey"] = study_key
 
         study, processed_filters = self.study_key_strategy.process(processed_filters)
         self._validate_study_key(study)
