@@ -727,3 +727,30 @@ def test_load_from_cdisc_odm_preserves_sibling_raw_and_scoped_names() -> None:
         ("AGE", "Float"),
         ("F2.AGE", "Date"),
     ]
+
+
+def test_load_from_cdisc_odm_unwraps_nested_scoped_oids_without_vendor_extension() -> None:
+    """Nested scoped OIDs (F1.AGE -> AGE and F1.F1.AGE -> F1.AGE) unwrap cleanly without colliding."""
+    xml_nested_scoped = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">
+  <Study OID="S_NESTED">
+    <MetaDataVersion OID="MDV1">
+      <FormDef OID="F1" Name="Form 1">
+        <ItemGroupRef ItemGroupOID="IG_F1" OrderNumber="1"/>
+      </FormDef>
+      <ItemGroupDef OID="IG_F1" Name="Group F1">
+        <ItemRef ItemOID="F1.AGE" OrderNumber="1"/>
+        <ItemRef ItemOID="F1.F1.AGE" OrderNumber="2"/>
+      </ItemGroupDef>
+      <ItemDef OID="F1.AGE" Name="AGE" DataType="integer"/>
+      <ItemDef OID="F1.F1.AGE" Name="F1.AGE" DataType="text"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    dd = load_from_cdisc_odm(xml_nested_scoped, strict=True)
+    assert dd.metadata.validationWarnings == []
+    assert [(v.variableName, v.variableType) for v in dd.forms[0].variables] == [
+        ("AGE", "Integer"),
+        ("F1.AGE", "Text"),
+    ]

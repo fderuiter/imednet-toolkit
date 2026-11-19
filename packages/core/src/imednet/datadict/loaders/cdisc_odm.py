@@ -384,19 +384,29 @@ def _resolve_variable_name(
             other_oid = other_oid_raw.strip()
             if not other_oid or other_oid == raw_oid:
                 continue
-            if other_oid == unwrapped:
+            other_def = item_def_elems.get(other_oid) if item_def_elems is not None else None
+            other_explicit = (
+                (_get_attr(other_def, "VariableName") or "").strip()
+                if other_def is not None
+                else ""
+            )
+            other_name = (
+                (_get_attr(other_def, "Name") or "").strip() if other_def is not None else ""
+            )
+            other_unwrapped = _unwrap_scoped_oid(other_oid, f_oid, other_ig_oid)
+            if other_oid == unwrapped and (
+                other_unwrapped == other_oid
+                or other_explicit == unwrapped
+                or other_name == other_oid
+            ):
                 return raw_oid
             if (
                 it_name == raw_oid
                 and item_def_elems is not None
-                and _unwrap_scoped_oid(other_oid, f_oid, other_ig_oid) == unwrapped
+                and other_unwrapped == unwrapped
+                and other_name != other_oid
             ):
-                other_def = item_def_elems.get(other_oid)
-                other_name = (
-                    (_get_attr(other_def, "Name") or "").strip() if other_def is not None else ""
-                )
-                if other_name != other_oid:
-                    return raw_oid
+                return raw_oid
 
     return unwrapped or (_get_attr(it_def, "Name") or "").strip() or it_oid
 

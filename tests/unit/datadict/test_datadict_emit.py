@@ -844,3 +844,81 @@ def test_odm_round_trip_multi_level_oid_disambiguation_and_shared_prefixed_raw_n
     assert [(v.variableName, v.label, v.variableType) for v in forms_by_key["F2"].variables] == [
         ("AGE", "F2 Scoped Age", "Float"),
     ]
+
+
+def test_odm_round_trip_when_both_unprefixed_and_prefixed_raw_names_are_scoped() -> None:
+    """When both AGE and F1.AGE have distinct definitions across forms, all 4 ItemDefs round-trip."""
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_DUAL_SCOPED_COLLISION"),
+        forms=[
+            Form(
+                formKey="F1",
+                formName="Form One",
+                variables=[
+                    Variable(
+                        variableName="AGE",
+                        label="F1 Age Integer",
+                        variableType="Integer",
+                        sequence=1,
+                        SDSVarName="AGE_F1",
+                    ),
+                    Variable(
+                        variableName="F1.AGE",
+                        label="F1 Dotted Age Text",
+                        variableType="Text",
+                        sequence=2,
+                        choices=[Choice(choiceValue="A", choiceText="Alpha", position=1)],
+                    ),
+                ],
+            ),
+            Form(
+                formKey="F2",
+                formName="Form Two",
+                variables=[
+                    Variable(
+                        variableName="AGE",
+                        label="F1 Age Integer",
+                        variableType="Integer",
+                        sequence=1,
+                        SDSVarName="AGE_F2",
+                    ),
+                    Variable(
+                        variableName="F1.AGE",
+                        label="F2 Dotted Age Date",
+                        variableType="Date",
+                        sequence=2,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    item_defs = root.findall(".//odm:ItemDef", ns)
+    assert len(item_defs) == 4
+    item_oids = [elem.attrib["OID"] for elem in item_defs]
+    assert len(set(item_oids)) == 4
+    # Scoped OID for (F1, AGE) must not hijack the raw variable name F1.AGE
+    assert "F1.AGE" not in item_oids
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    assert reloaded.metadata.validationWarnings == []
+    forms_by_key = {f.formKey: f for f in reloaded.forms}
+
+    assert [(v.variableName, v.label, v.variableType) for v in forms_by_key["F1"].variables] == [
+        ("AGE", "F1 Age Integer", "Integer"),
+        ("F1.AGE", "F1 Dotted Age Text", "Text"),
+    ]
+    assert forms_by_key["F1"].variables[0].extraAttributes["SDSVarName"] == "AGE_F1"
+    assert [(c.choiceValue, c.choiceText) for c in forms_by_key["F1"].variables[1].choices] == [
+        ("A", "Alpha")
+    ]
+
+    assert [(v.variableName, v.label, v.variableType) for v in forms_by_key["F2"].variables] == [
+        ("AGE", "F1 Age Integer", "Integer"),
+        ("F1.AGE", "F2 Dotted Age Date", "Date"),
+    ]
+    assert forms_by_key["F2"].variables[0].extraAttributes["SDSVarName"] == "AGE_F2"

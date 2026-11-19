@@ -189,21 +189,36 @@ def _item_def_signature(var: Variable) -> Any:
         var.choices, key=lambda c: _sort_key_int_then_str(c.position, c.choiceValue)
     )
     choices_sig = tuple(
-        (c.choiceValue, c.choiceText, c.position, _freeze_value(c.extraAttributes))
+        (
+            c.choiceValue,
+            c.choiceText,
+            c.position,
+            _freeze_value(c.extraAttributes),
+            _freeze_value(c.model_extra or {}),
+        )
         for c in sorted_choices
     )
-    item_extra = {
-        k: v
-        for k, v in var.extraAttributes.items()
-        if k not in {"Domain", "SASDatasetName", "methodOid", "collectionExceptionConditionOid"}
-    }
+    excluded_keys = {"Domain", "SASDatasetName", "methodOid", "collectionExceptionConditionOid"}
+    merged_extra = {k: v for k, v in (var.model_extra or {}).items() if k not in excluded_keys}
+    for k, v in var.extraAttributes.items():
+        if k not in excluded_keys:
+            merged_extra[k] = v
+    sdtm_sig = tuple(
+        _extract_sdtm_attr(var, key) for key in ("SDSVarName", "SASFieldName", "Origin", "Comment")
+    )
     return (
         var.label,
         normalize_variable_type(var.variableType, precision=var.precision) or var.variableType,
+        _map_to_odm_datatype(
+            var.variableType,
+            precision=var.precision,
+            has_choices=bool(var.choices),
+        ),
         var.format,
         var.precision,
+        sdtm_sig,
         choices_sig,
-        _freeze_value(item_extra),
+        _freeze_value(merged_extra),
     )
 
 
@@ -237,7 +252,12 @@ def _allocate_unscoped_oid(var_name: str, used_oids: set[str]) -> str:
         counter += 1
 
 
-def _allocate_scoped_oid(form_key: str, var_name: str, used_oids: set[str]) -> str:
+def _allocate_scoped_oid(
+    form_key: str,
+    var_name: str,
+    used_oids: set[str],
+    reserved_raw_names: set[str],
+) -> str:
     """Allocate a globally unique form-scoped OID without colliding with raw or prior OIDs."""
     base_var = var_name.strip() or "ITEM"
     candidates: list[str] = []
@@ -246,19 +266,18 @@ def _allocate_scoped_oid(form_key: str, var_name: str, used_oids: set[str]) -> s
         candidates.append(f"IT.{form_key}.{base_var}")
         prefix = f"IT.{form_key}.{base_var}"
     else:
-        candidates.append(base_var)
         candidates.append(f"IT.{base_var}")
         prefix = f"IT.{base_var}"
 
     for candidate in candidates:
-        if candidate not in used_oids:
+        if candidate not in used_oids and candidate not in reserved_raw_names:
             used_oids.add(candidate)
             return candidate
 
     counter = 2
     while True:
         fallback = f"{prefix}__{counter}"
-        if fallback not in used_oids:
+        if fallback not in used_oids and fallback not in reserved_raw_names:
             used_oids.add(fallback)
             return fallback
         counter += 1
@@ -275,11 +294,14 @@ def _allocate_item_oids(
 
     sigs_by_var_name: dict[str, set[Any]] = {}
     sig_by_occ: dict[tuple[int, int], Any] = {}
+    reserved_raw_names: set[str] = set()
     for f_idx, sorted_vars in enumerate(sorted_vars_by_form):
         for v_idx, var in enumerate(sorted_vars):
             sig = _item_def_signature(var)
             sig_by_occ[(f_idx, v_idx)] = sig
             sigs_by_var_name.setdefault(var.variableName, set()).add(sig)
+            if stripped_name := var.variableName.strip():
+                reserved_raw_names.add(stripped_name)
 
     scoped_var_names = {v_name for v_name, sigs in sigs_by_var_name.items() if len(sigs) > 1}
     used_item_oids: set[str] = set()
@@ -312,6 +334,7 @@ def _allocate_item_oids(
                         form.formKey,
                         var.variableName,
                         used_item_oids,
+                        reserved_raw_names,
                     )
                     scoped_oid_by_group[group_key] = item_oid
             else:
@@ -684,7 +707,11 @@ def to_odm_xml(
             "DataType": datatype,
         }
         ref_forms = referencing_forms_by_oid.get(item_oid, [form_key])
-        if any(_default_unwrapped_name(item_oid, fk) != var.variableName for fk in ref_forms):
+        if any(
+            _default_unwrapped_name(item_oid, fk) != var.variableName
+            or (fk and var.variableName.startswith((f"{fk}.", f"IT.{fk}.", f"IG_{fk}.")))
+            for fk in ref_forms
+        ):
             item_attribs[f"{{{IMEDNET_NS}}}VariableName"] = var.variableName
         if var.format and str(var.format).isdigit():
             item_attribs["Length"] = str(var.format)
