@@ -1,13 +1,111 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Record, RecordRevision
-from imednet.spi.utils import normalize_utc_timestamp_bound
+from imednet.spi.utils import (
+    ALLOWED_OPERATORS,
+    format_iso_datetime,
+    normalize_utc_timestamp_bound,
+    parse_iso_datetime,
+)
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
+
+
+def _parse_revision_utc_datetime(raw_value: Any) -> datetime | None:
+    """Parse a RecordRevision ``date_created`` value into a UTC-aware datetime."""
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, datetime):
+        return parse_iso_datetime(format_iso_datetime(raw_value))
+    if isinstance(raw_value, str):
+        stripped = raw_value.strip()
+        if not stripped:
+            return None
+        try:
+            normalized = normalize_utc_timestamp_bound(stripped, is_end=False)
+            return parse_iso_datetime(normalized)
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_date_predicate_tuple(
+    operator: str,
+    raw_value: Any,
+) -> tuple[tuple[str, str], Callable[[RecordRevision, datetime | None], bool]]:
+    """Normalize one ``(operator, value)`` predicate on ``date_created``."""
+    if not isinstance(operator, str) or operator not in ALLOWED_OPERATORS:
+        raise ValueError(
+            f"Invalid filter operator '{operator}'. Allowed operators: {sorted(ALLOWED_OPERATORS)}"
+        )
+
+    if operator == "=~":
+        pattern = str(raw_value)
+
+        def _matches_contains(rev: RecordRevision, rev_dt: datetime | None) -> bool:
+            raw_rev = getattr(rev, "date_created", None)
+            if rev_dt is None or raw_rev is None:
+                return False
+            return pattern in str(raw_rev)
+
+        return ("=~", pattern), _matches_contains
+
+    if isinstance(raw_value, datetime):
+        utc_str = format_iso_datetime(raw_value)
+    else:
+        is_end_bound = operator in {"<=", "<"}
+        utc_str = normalize_utc_timestamp_bound(str(raw_value), is_end=is_end_bound)
+    bound_dt = parse_iso_datetime(utc_str)
+
+    def _matches_comparison(_rev: RecordRevision, rev_dt: datetime | None) -> bool:
+        if rev_dt is None:
+            return False
+        if operator == "==":
+            return rev_dt == bound_dt
+        if operator == "!=":
+            return rev_dt != bound_dt
+        if operator == ">=":
+            return rev_dt >= bound_dt
+        if operator == ">":
+            return rev_dt > bound_dt
+        if operator == "<=":
+            return rev_dt <= bound_dt
+        return rev_dt < bound_dt
+
+    return (operator, utc_str), _matches_comparison
+
+
+def _select_single_date_filter_tuple(
+    candidates: list[tuple[str, str]],
+) -> tuple[str, str] | None:
+    """Choose at most one ``date_created`` operator tuple for the API request."""
+    if not candidates:
+        return None
+
+    for op, val in candidates:
+        if op == "==":
+            return (op, val)
+
+    lower_bounds = [(op, val) for op, val in candidates if op in {">=", ">"}]
+    if lower_bounds:
+        return max(
+            lower_bounds,
+            key=lambda item: (parse_iso_datetime(item[1]), 1 if item[0] == ">" else 0),
+        )
+
+    upper_bounds = [(op, val) for op, val in candidates if op in {"<=", "<"}]
+    if upper_bounds:
+        return min(
+            upper_bounds,
+            key=lambda item: (parse_iso_datetime(item[1]), 0 if item[0] == "<" else 1),
+        )
+
+    return candidates[0]
 
 
 class DataExtractionWorkflow:
@@ -133,38 +231,108 @@ class DataExtractionWorkflow:
         Returns:
             A list of RecordRevision objects matching the criteria.
         """
-        final_filter_dict: dict[str, Any] = dict(user_filter) if user_filter else {}
-        final_filter_dict.update(filters)
+        final_filter_dict: dict[str, Any] = {}
+        caller_date_entries: list[Any] = []
 
-        if start_date is not None or end_date is not None:
-            date_bounds: list[tuple[str, Any]] = []
-            for key_variant in ("date_created", "dateCreated"):
-                if key_variant in final_filter_dict:
-                    existing = final_filter_dict.pop(key_variant)
-                    if isinstance(existing, list):
-                        for item in existing:
-                            date_bounds.append(item if isinstance(item, tuple) else ("==", item))
-                    elif isinstance(existing, tuple):
-                        date_bounds.append(existing)
-                    else:
-                        date_bounds.append(("==", existing))
+        for source_dict in (user_filter, filters):
+            if not source_dict:
+                continue
+            for key, val in source_dict.items():
+                if key in {"date_created", "dateCreated"}:
+                    caller_date_entries.append(val)
+                else:
+                    final_filter_dict[key] = val
 
-            if start_date is not None:
-                start_utc = normalize_utc_timestamp_bound(start_date, is_end=False)
-                date_bounds.append((">=", start_utc))
-            if end_date is not None:
-                end_utc = normalize_utc_timestamp_bound(end_date, is_end=True)
-                date_bounds.append(("<=", end_utc))
+        server_candidates: list[tuple[str, str]] = []
+        python_predicates: list[Callable[[RecordRevision, datetime | None], bool]] = []
 
-            final_filter_dict["dateCreated"] = (
-                date_bounds[0] if len(date_bounds) == 1 else date_bounds
+        for entry in caller_date_entries:
+            if isinstance(entry, tuple):
+                if len(entry) != 2:
+                    raise ValueError(
+                        f"Filter tuple for 'date_created' must have exactly 2 elements "
+                        f"(operator, value), got {len(entry)}"
+                    )
+                cand, pred = _normalize_date_predicate_tuple(entry[0], entry[1])
+                server_candidates.append(cand)
+                python_predicates.append(pred)
+            elif isinstance(entry, list):
+                if not entry:
+                    continue
+                if any(isinstance(item, tuple) for item in entry):
+                    if not all(isinstance(item, tuple) for item in entry):
+                        raise ValueError(
+                            "Filter list for 'date_created' cannot mix operator tuples and scalar values"
+                        )
+                    for tup in entry:
+                        if len(tup) != 2:
+                            raise ValueError(
+                                f"Filter tuple for 'date_created' must have exactly 2 elements "
+                                f"(operator, value), got {len(tup)}"
+                            )
+                        cand, pred = _normalize_date_predicate_tuple(tup[0], tup[1])
+                        server_candidates.append(cand)
+                        python_predicates.append(pred)
+                else:
+                    normalized_scalars: list[str] = []
+                    target_dts: set[datetime] = set()
+                    for scalar in entry:
+                        utc_val = (
+                            format_iso_datetime(scalar)
+                            if isinstance(scalar, datetime)
+                            else normalize_utc_timestamp_bound(str(scalar), is_end=False)
+                        )
+                        normalized_scalars.append(utc_val)
+                        target_dts.add(parse_iso_datetime(utc_val))
+                    if len(normalized_scalars) == 1:
+                        server_candidates.append(("==", normalized_scalars[0]))
+
+                    def _matches_any_scalar(
+                        _rev: RecordRevision,
+                        rev_dt: datetime | None,
+                        allowed: set[datetime] = target_dts,
+                    ) -> bool:
+                        return rev_dt is not None and rev_dt in allowed
+
+                    python_predicates.append(_matches_any_scalar)
+            else:
+                cand, pred = _normalize_date_predicate_tuple("==", entry)
+                server_candidates.append(cand)
+                python_predicates.append(pred)
+
+        if start_date is not None:
+            cand, pred = _normalize_date_predicate_tuple(">=", start_date)
+            server_candidates.append(cand)
+            python_predicates.append(pred)
+
+        if end_date is not None:
+            cand, pred = _normalize_date_predicate_tuple("<=", end_date)
+            server_candidates.append(cand)
+            python_predicates.append(pred)
+
+        selected_tuple = _select_single_date_filter_tuple(server_candidates)
+        if selected_tuple is not None:
+            final_filter_dict["date_created"] = selected_tuple
+
+        revisions = list(
+            self._sdk.get_record_revisions(
+                study_key,
+                **final_filter_dict,
             )
-
-        revisions = self._sdk.get_record_revisions(
-            study_key,
-            **final_filter_dict,
         )
-        return list(revisions)
+
+        if not python_predicates:
+            return revisions
+
+        filtered_revisions: list[RecordRevision] = []
+        for revision in revisions:
+            rev_dt = _parse_revision_utc_datetime(getattr(revision, "date_created", None))
+            if rev_dt is None:
+                continue
+            if all(predicate(revision, rev_dt) for predicate in python_predicates):
+                filtered_revisions.append(revision)
+
+        return filtered_revisions
 
 
 # Integration:

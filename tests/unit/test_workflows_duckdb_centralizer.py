@@ -99,6 +99,8 @@ def test_ingest_revisions_and_build_silver_view() -> None:
             record_id=1,
             record_oid="OID-1",
             form_key="DEMO",
+            subject_id=501,
+            subject_oid="SUBJ-OID-01",
             subject_key="SUBJ-01",
             site_id=10,
             interval_id=5,
@@ -118,6 +120,8 @@ def test_ingest_revisions_and_build_silver_view() -> None:
             record_id=1,
             record_oid="OID-1",
             form_key="DEMO",
+            subject_id=501,
+            subject_oid="SUBJ-OID-01",
             subject_key="SUBJ-01",
             site_id=10,
             interval_id=5,
@@ -135,10 +139,54 @@ def test_ingest_revisions_and_build_silver_view() -> None:
     appended_revision = [
         RecordRevision(
             study_key="STUDY",
+            record_revision_id=102,
+            record_id=1,
+            record_oid="OID-1",
+            form_key="DEMO",
+            subject_id=501,
+            subject_oid="SUBJ-OID-01",
+            subject_key="SUBJ-01",
+            site_id=10,
+            interval_id=5,
+            record_status="Record Complete",
+            record_revision=2,
+            data_revision=2,
+            user="bob",
+            role="Investigator",
+            reason_for_change="Corrected demographics",
+            deleted=False,
+            date_created="2024-01-02T10:00:00Z",
+            last_updated="2024-01-02T10:05:00Z",
+        ),
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=103,
+            record_id=1,
+            record_oid="OID-1",
+            form_key="DEMO",
+            subject_id=501,
+            subject_oid="SUBJ-OID-01",
+            subject_key="SUBJ-01",
+            site_id=10,
+            interval_id=5,
+            record_status="Record Verified",
+            record_revision=2,
+            data_revision=1,
+            user="dave",
+            role="Monitor",
+            reason_for_change="Status verified",
+            deleted=False,
+            date_created="2024-01-02T12:00:00+02:00",
+            last_updated="2024-01-02T12:05:00+02:00",
+        ),
+        RecordRevision(
+            study_key="STUDY",
             record_revision_id=201,
             record_id=2,
             record_oid="OID-2",
             form_key="VITALS",
+            subject_id=502,
+            subject_oid="SUBJ-OID-02",
             subject_key="SUBJ-02",
             site_id=11,
             interval_id=6,
@@ -151,7 +199,7 @@ def test_ingest_revisions_and_build_silver_view() -> None:
             deleted=False,
             date_created="2024-01-03T12:00:00Z",
             last_updated="2024-01-03T12:00:00Z",
-        )
+        ),
     ]
 
     with patch.object(
@@ -168,32 +216,15 @@ def test_ingest_revisions_and_build_silver_view() -> None:
             )
             == 2
         )
-        assert workflow.ingest_revisions("STUDY", mode="append") == 1
+        assert workflow.ingest_revisions("STUDY", mode="append") == 3
 
     assert extract_mock.call_args_list == [
         call("STUDY", start_date="2024-01-01", end_date="2024-01-31"),
         call("STUDY", start_date=None, end_date=None),
     ]
 
-    expected_columns = [
-        "study_key",
-        "record_revision_id",
-        "record_id",
-        "record_oid",
-        "form_key",
-        "subject_key",
-        "site_id",
-        "interval_id",
-        "record_status",
-        "record_revision",
-        "data_revision",
-        "user",
-        "role",
-        "reason_for_change",
-        "deleted",
-        "date_created",
-        "last_updated",
-    ]
+    expected_columns = list(RecordRevision.model_fields.keys())
+    assert len(expected_columns) == 19
     bronze_cols = [
         desc[0]
         for desc in workflow._connection.execute(
@@ -201,17 +232,18 @@ def test_ingest_revisions_and_build_silver_view() -> None:
         ).description
     ]
     assert bronze_cols == expected_columns
+    assert "form_id" not in bronze_cols
     assert "variable_name" not in bronze_cols
     assert "value" not in bronze_cols
 
     bronze_count = workflow._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()[
         0
     ]
-    assert bronze_count == 3
+    assert bronze_count == 4
     rev2_reason = workflow._connection.execute("""
         SELECT reason_for_change
         FROM bronze_revisions
-        WHERE record_id = 1 AND record_revision = 2
+        WHERE record_revision_id = 102
         """).fetchone()[0]
     assert rev2_reason == "Corrected demographics"
 
@@ -225,21 +257,36 @@ def test_ingest_revisions_and_build_silver_view() -> None:
     assert silver_cols == expected_columns
 
     silver_rows = workflow._connection.execute("""
-        SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created
+        SELECT
+            record_revision_id,
+            record_id,
+            subject_id,
+            subject_oid,
+            form_key,
+            record_revision,
+            "user",
+            reason_for_change,
+            date_created
         FROM silver_current_state
         ORDER BY record_id
         """).fetchall()
     assert silver_rows == [
         (
+            103,
             1,
+            501,
+            "SUBJ-OID-01",
             "DEMO",
             2,
-            "bob",
-            "Corrected demographics",
+            "dave",
+            "Status verified",
             datetime(2024, 1, 2, 10, 0, 0),
         ),
         (
+            201,
             2,
+            502,
+            "SUBJ-OID-02",
             "VITALS",
             1,
             "carol",
@@ -294,3 +341,49 @@ def test_build_silver_view_accepts_valid_study_keys(valid_key: str) -> None:
     pytest.importorskip("duckdb")
     workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
     workflow.build_silver_view(valid_key)
+
+
+def test_duckdb_centralizer_row_conversion_edge_cases() -> None:
+    """Test row conversion edge cases for timestamps, optional ints, and required keys."""
+    from datetime import UTC
+    from types import SimpleNamespace
+
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    rev = SimpleNamespace(
+        study_key=None,
+        record_revision_id="42",
+        record_id="  ",
+        record_revision=True,
+        data_revision=None,
+        record_status=None,
+        subject_id="77",
+        subject_key="SUBJ-77",
+        site_id=None,
+        form_key="LABS",
+        interval_id=None,
+        deleted=None,
+        date_created=datetime(2026, 1, 15, 8, 30, tzinfo=UTC),
+        reason_for_change="",
+        record_oid=None,
+        role=None,
+        subject_oid=None,
+        user="auditor",
+        last_updated="   ",
+    )
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=[rev]):
+        assert workflow.ingest_revisions("STUDY", mode="append") == 1
+
+    stored = workflow._connection.execute(
+        "SELECT record_revision_id, record_id, record_revision, subject_id, deleted, date_created, last_updated "
+        "FROM bronze_revisions"
+    ).fetchone()
+    assert stored == (42, None, None, 77, None, datetime(2026, 1, 15, 8, 30), None)
+
+    for bad_id in (None, False, "   ", 0, -5):
+        with pytest.raises(ValueError, match="record_revision_id"):
+            list(workflow._to_rows("STUDY", [SimpleNamespace(record_revision_id=bad_id)]))  # type: ignore[list-item]
+
+    with pytest.raises(ValueError, match="study_key"):
+        list(workflow._to_rows("   ", [SimpleNamespace(record_revision_id=1)]))  # type: ignore[list-item]

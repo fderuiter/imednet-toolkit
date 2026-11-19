@@ -16,14 +16,18 @@ from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 
 
 def test_ingest_revisions_append_mode() -> None:
-    """Test that ingest revisions append mode."""
+    """Test that ingest_revisions append mode deduplicates matching (study_key, record_revision_id)."""
     pytest.importorskip("duckdb")
 
     workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
     first = [
         RecordRevision(
+            study_key="STUDY",
             record_revision_id=1,
             record_id=1,
+            subject_id=100,
+            subject_oid="SUBJ-OID-1",
+            subject_key="SUBJ-1",
             form_key="DEMO",
             record_revision=1,
             user="alice",
@@ -33,22 +37,55 @@ def test_ingest_revisions_append_mode() -> None:
     ]
     second = [
         RecordRevision(
+            study_key="STUDY",
+            record_revision_id=1,
+            record_id=1,
+            subject_id=100,
+            subject_oid="SUBJ-OID-1",
+            subject_key="SUBJ-1",
+            form_key="DEMO",
+            record_revision=1,
+            user="alice",
+            reason_for_change="Initial re-synced",
+            date_created="2024-01-01T10:00:00Z",
+        ),
+        RecordRevision(
+            study_key="STUDY",
             record_revision_id=2,
             record_id=2,
+            subject_id=101,
+            subject_oid="SUBJ-OID-2",
+            subject_key="SUBJ-2",
             form_key="DEMO",
             record_revision=1,
             user="bob",
             reason_for_change="Initial",
             date_created="2024-01-02T10:00:00Z",
-        )
+        ),
     ]
 
     with patch.object(DataExtractionWorkflow, "extract_audit_trail", side_effect=[first, second]):
         workflow.ingest_revisions("STUDY", mode="append")
         workflow.ingest_revisions("STUDY", mode="append")
 
-    count = workflow._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()[0]
-    assert count == 2
+    rows = workflow._connection.execute(
+        "SELECT record_revision_id, reason_for_change FROM bronze_revisions ORDER BY record_revision_id"
+    ).fetchall()
+    assert rows == [(1, "Initial re-synced"), (2, "Initial")]
+
+
+def test_ingest_revisions_missing_record_revision_id_raises() -> None:
+    """Test that ingest_revisions raises ValueError when record_revision_id is missing."""
+    pytest.importorskip("duckdb")
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    invalid = [RecordRevision(record_id=1, form_key="DEMO", record_revision=1)]
+
+    with (
+        patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=invalid),
+        pytest.raises(ValueError, match="record_revision_id"),
+    ):
+        workflow.ingest_revisions("STUDY", mode="append")
 
 
 def test_ingest_revisions_replace_mode() -> None:

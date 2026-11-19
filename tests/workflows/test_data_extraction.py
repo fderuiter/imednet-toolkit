@@ -59,10 +59,21 @@ def test_extract_records_by_criteria_filters_subject_and_visit(schema) -> None:
 
 
 def test_extract_audit_trail_builds_filters_and_dates() -> None:
-    """Test that extract audit trail builds filters and dates."""
+    """Test that extract audit trail sends a UTC date_created tuple and filters bounds in memory."""
     sdk = MagicMock()
-    revision = RecordRevision.from_json(fake_data.fake_record_revision())
-    sdk.get_record_revisions.return_value = [revision]
+    in_range = RecordRevision.from_json(fake_data.fake_record_revision())
+    in_range.record_revision_id = 101
+    in_range.date_created = "2021-01-02 23:59:59"
+
+    out_of_range = RecordRevision.from_json(fake_data.fake_record_revision())
+    out_of_range.record_revision_id = 102
+    out_of_range.date_created = "2021-01-03 00:00:00"
+
+    missing_date = RecordRevision.from_json(fake_data.fake_record_revision())
+    missing_date.record_revision_id = 103
+    missing_date.date_created = None
+
+    sdk.get_record_revisions.return_value = [in_range, out_of_range, missing_date]
 
     wf = DataExtractionWorkflow(sdk)
     result = wf.extract_audit_trail(
@@ -77,9 +88,6 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
         "STUDY",
         role="data",
         status="open",
-        dateCreated=[
-            (">=", "2021-01-01T00:00:00Z"),
-            ("<=", "2021-01-02T23:59:59Z"),
-        ],
+        date_created=(">=", "2021-01-01T00:00:00Z"),
     )
-    assert result == [revision]
+    assert result == [in_range]

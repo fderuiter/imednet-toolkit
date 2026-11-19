@@ -10,6 +10,8 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
+from imednet.spi.utils import format_iso_datetime, normalize_utc_timestamp_bound
+
 from .data_extraction import DataExtractionWorkflow
 
 if TYPE_CHECKING:
@@ -18,6 +20,28 @@ if TYPE_CHECKING:
 
 
 _SAFE_STUDY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+_REVISION_SQL_COLUMNS = """
+    study_key,
+    record_revision_id,
+    record_id,
+    record_revision,
+    data_revision,
+    record_status,
+    subject_id,
+    subject_key,
+    site_id,
+    form_key,
+    interval_id,
+    deleted,
+    date_created,
+    reason_for_change,
+    record_oid,
+    role,
+    subject_oid,
+    "user",
+    last_updated
+"""
 
 
 class DuckDBIngestionWorkflow:
@@ -49,7 +73,7 @@ class DuckDBIngestionWorkflow:
         end_date: str | None = None,
         mode: Literal["append", "replace"] = "append",
     ) -> int:
-        """Fetch RecordRevisions and write to the bronze_revisions table."""
+        """Fetch RecordRevisions and write keyed rows to the bronze_revisions table."""
         if mode not in {"append", "replace"}:
             raise ValueError("mode must be one of: 'append', 'replace'")
 
@@ -66,26 +90,10 @@ class DuckDBIngestionWorkflow:
         rows = list(self._to_rows(study_key, revisions))
         if rows:
             self._connection.executemany(
-                """
-                INSERT INTO bronze_revisions (
-                    study_key,
-                    record_revision_id,
-                    record_id,
-                    record_oid,
-                    form_key,
-                    subject_key,
-                    site_id,
-                    interval_id,
-                    record_status,
-                    record_revision,
-                    data_revision,
-                    "user",
-                    role,
-                    reason_for_change,
-                    deleted,
-                    date_created,
-                    last_updated
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                f"""
+                INSERT OR REPLACE INTO bronze_revisions (
+                    {_REVISION_SQL_COLUMNS}
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -102,99 +110,120 @@ class DuckDBIngestionWorkflow:
         query = f"""
             CREATE OR REPLACE VIEW silver_current_state AS
             SELECT
-                study_key,
-                record_revision_id,
-                record_id,
-                record_oid,
-                form_key,
-                subject_key,
-                site_id,
-                interval_id,
-                record_status,
-                record_revision,
-                data_revision,
-                "user",
-                role,
-                reason_for_change,
-                deleted,
-                date_created,
-                last_updated
+                {_REVISION_SQL_COLUMNS}
             FROM bronze_revisions
             WHERE study_key = '{escaped_study_key}'
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY record_id
                 ORDER BY
                     record_revision DESC NULLS LAST,
-                    data_revision DESC NULLS LAST,
-                    date_created DESC NULLS LAST,
                     record_revision_id DESC NULLS LAST
             ) = 1
             """
         self._connection.execute(query)  # nosem
 
     def _ensure_bronze_table(self) -> None:
-        """Ensure the bronze_revisions table exists in DuckDB."""
+        """Ensure the keyed bronze_revisions table exists in DuckDB."""
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS bronze_revisions (
-                study_key VARCHAR,
-                record_revision_id BIGINT,
+                study_key VARCHAR NOT NULL,
+                record_revision_id BIGINT NOT NULL,
                 record_id BIGINT,
-                record_oid VARCHAR,
-                form_key VARCHAR,
-                subject_key VARCHAR,
-                site_id BIGINT,
-                interval_id BIGINT,
-                record_status VARCHAR,
                 record_revision INTEGER,
                 data_revision INTEGER,
-                "user" VARCHAR,
-                role VARCHAR,
-                reason_for_change VARCHAR,
+                record_status VARCHAR,
+                subject_id BIGINT,
+                subject_key VARCHAR,
+                site_id BIGINT,
+                form_key VARCHAR,
+                interval_id BIGINT,
                 deleted BOOLEAN,
                 date_created TIMESTAMP,
-                last_updated TIMESTAMP
+                reason_for_change VARCHAR,
+                record_oid VARCHAR,
+                role VARCHAR,
+                subject_oid VARCHAR,
+                "user" VARCHAR,
+                last_updated TIMESTAMP,
+                PRIMARY KEY (study_key, record_revision_id)
             )
             """)
 
     @staticmethod
-    def _optional_int(value: Any) -> int | None:
-        """Convert optional integer fields without coercing None to zero."""
-        return None if value is None else int(value)
+    def _require_revision_id(value: Any) -> int:
+        """Validate and convert the required positive ``record_revision_id`` primary-key column."""
+        if value is None or isinstance(value, bool):
+            raise ValueError("RecordRevision is missing required 'record_revision_id'")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("RecordRevision is missing required 'record_revision_id'")
+        revision_id = int(value)
+        if revision_id <= 0:
+            raise ValueError("RecordRevision is missing required 'record_revision_id'")
+        return revision_id
 
     @staticmethod
-    def _optional_timestamp(value: Any) -> datetime | str | None:
-        """Normalize empty timestamp strings to None for DuckDB TIMESTAMP columns."""
-        if value is None:
+    def _optional_int(value: Any) -> int | None:
+        """Convert optional integer fields without coercing None to zero."""
+        if value is None or isinstance(value, bool):
             return None
         if isinstance(value, str) and not value.strip():
             return None
-        if isinstance(value, (datetime, str)):
-            return value
-        return str(value)
+        return int(value)
+
+    @staticmethod
+    def _optional_str(value: Any) -> str | None:
+        """Convert optional string-like fields while preserving None."""
+        return None if value is None else str(value)
+
+    @staticmethod
+    def _optional_timestamp(value: Any) -> str | None:
+        """Normalize optional timestamps to UTC ISO strings for DuckDB TIMESTAMP columns."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return format_iso_datetime(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            return normalize_utc_timestamp_bound(stripped, is_end=False)
+        return normalize_utc_timestamp_bound(str(value), is_end=False)
 
     def _to_rows(
         self, study_key: str, revisions: Iterable[RecordRevision]
     ) -> Iterable[tuple[Any, ...]]:
-        """Internal helper to convert RecordRevision models into database rows."""
+        """Internal helper to convert RecordRevision models into 19-column database rows."""
         for revision in revisions:
-            rev_study_key = getattr(revision, "study_key", None) or study_key
-            deleted_val = getattr(revision, "deleted", False)
+            raw_study_key = getattr(revision, "study_key", None)
+            rev_study_key = (
+                str(raw_study_key).strip()
+                if raw_study_key is not None and str(raw_study_key).strip()
+                else study_key
+            )
+            if not rev_study_key or not str(rev_study_key).strip():
+                raise ValueError("RecordRevision is missing required 'study_key'")
+
+            revision_id = self._require_revision_id(getattr(revision, "record_revision_id", None))
+            deleted_val = getattr(revision, "deleted", None)
+
             yield (
                 str(rev_study_key),
-                self._optional_int(getattr(revision, "record_revision_id", None)),
+                revision_id,
                 self._optional_int(getattr(revision, "record_id", None)),
-                getattr(revision, "record_oid", None),
-                getattr(revision, "form_key", None),
-                getattr(revision, "subject_key", None),
-                self._optional_int(getattr(revision, "site_id", None)),
-                self._optional_int(getattr(revision, "interval_id", None)),
-                getattr(revision, "record_status", None),
                 self._optional_int(getattr(revision, "record_revision", None)),
                 self._optional_int(getattr(revision, "data_revision", None)),
-                getattr(revision, "user", None),
-                getattr(revision, "role", None),
-                getattr(revision, "reason_for_change", None),
-                False if deleted_val is None else bool(deleted_val),
+                self._optional_str(getattr(revision, "record_status", None)),
+                self._optional_int(getattr(revision, "subject_id", None)),
+                self._optional_str(getattr(revision, "subject_key", None)),
+                self._optional_int(getattr(revision, "site_id", None)),
+                self._optional_str(getattr(revision, "form_key", None)),
+                self._optional_int(getattr(revision, "interval_id", None)),
+                None if deleted_val is None else bool(deleted_val),
                 self._optional_timestamp(getattr(revision, "date_created", None)),
+                self._optional_str(getattr(revision, "reason_for_change", None)),
+                self._optional_str(getattr(revision, "record_oid", None)),
+                self._optional_str(getattr(revision, "role", None)),
+                self._optional_str(getattr(revision, "subject_oid", None)),
+                self._optional_str(getattr(revision, "user", None)),
                 self._optional_timestamp(getattr(revision, "last_updated", None)),
             )

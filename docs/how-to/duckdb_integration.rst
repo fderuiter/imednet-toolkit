@@ -110,8 +110,12 @@ You can also generate the query string via
 `DuckDBIngestionWorkflow`
 -------------------------
 
-For incremental bronze/silver ingestion, use
-:class:`imednet_workflows.DuckDBIngestionWorkflow`.
+For incremental bronze/silver audit-revision ingestion, use
+:class:`imednet_workflows.DuckDBIngestionWorkflow`. ``bronze_revisions`` stores all 19
+:class:`~imednet.models.record_revisions.RecordRevision` fields keyed by
+``(study_key, record_revision_id)`` so repeated ``mode="append"`` loads deduplicate
+matching revisions, while ``silver_current_state`` projects the latest audit state per
+``record_id``.
 
 .. code-block:: python
 
@@ -122,23 +126,36 @@ For incremental bronze/silver ingestion, use
    sdk = ImednetSDK(api_key="mock", security_key="mock")
    workflow = DuckDBIngestionWorkflow(sdk, "./centralized.duckdb")
 
-   # Incremental bronze load
+   # Incremental bronze load (deduplicated by study_key and record_revision_id)
    inserted = workflow.ingest_revisions(
        "MY_STUDY",
        start_date="2026-01-01",
        end_date="2026-01-31",
        mode="append",
    )
-   print(f"Inserted {inserted} revision rows")
+   print(f"Processed {inserted} revision rows")
 
-   # Build silver current-state projection
+   # Build silver current-state projection per record_id
    workflow.build_silver_view("MY_STUDY")
 
    conn = duckdb.connect("./centralized.duckdb", read_only=True)
    print(
        conn.execute(
-           'SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created '
-           "FROM silver_current_state ORDER BY record_id LIMIT 10"
+           """
+           SELECT
+               record_revision_id,
+               record_id,
+               subject_key,
+               form_key,
+               record_status,
+               record_revision,
+               "user",
+               reason_for_change,
+               date_created
+           FROM silver_current_state
+           ORDER BY record_id
+           LIMIT 10
+           """
        ).fetchall()
    )
 

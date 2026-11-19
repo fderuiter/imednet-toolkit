@@ -183,10 +183,40 @@ def test_extract_records_by_criteria_scaling_benchmark() -> None:
 
 
 def test_extract_audit_trail_builds_filters_and_dates() -> None:
-    """Test that extract audit trail normalizes UTC bounds and builds dateCreated range filters."""
+    """Test that extract_audit_trail sends one UTC date_created tuple and filters bounds in Python."""
     sdk = MagicMock()
-    revisions = [RecordRevision(record_revision_id=1)]
-    sdk.get_record_revisions.return_value = revisions
+    matching_start = RecordRevision(
+        record_revision_id=1,
+        record_id=10,
+        date_created="2026-01-01T00:00:00Z",
+    )
+    matching_end_of_day = RecordRevision(
+        record_revision_id=2,
+        record_id=10,
+        date_created="2026-02-01T23:59:59Z",
+    )
+    before_start = RecordRevision(
+        record_revision_id=3,
+        record_id=11,
+        date_created="2025-12-31T23:59:59Z",
+    )
+    after_end = RecordRevision(
+        record_revision_id=4,
+        record_id=12,
+        date_created="2026-02-02T00:00:00Z",
+    )
+    missing_date = RecordRevision(
+        record_revision_id=5,
+        record_id=13,
+        date_created=None,
+    )
+    sdk.get_record_revisions.return_value = [
+        matching_start,
+        matching_end_of_day,
+        before_start,
+        after_end,
+        missing_date,
+    ]
 
     wf = DataExtractionWorkflow(sdk)
     result = wf.extract_audit_trail(
@@ -201,16 +231,46 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
         "STUDY",
         role="data",
         status="open",
-        dateCreated=[
-            (">=", "2026-01-01T00:00:00Z"),
-            ("<=", "2026-02-01T23:59:59Z"),
-        ],
+        date_created=(">=", "2026-01-01T00:00:00Z"),
     )
-    assert result == revisions
+    assert [r.record_revision_id for r in result] == [1, 2]
 
 
-def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -> None:
-    """Test that extract_audit_trail sends dateCreated>=...;dateCreated<=... over HTTP."""
+def test_extract_audit_trail_end_date_only_and_caller_date_created_predicates() -> None:
+    """Test end_date-only tuple pushdown and caller date_created predicates in user_filter."""
+    sdk = MagicMock()
+    rev_early = RecordRevision(record_revision_id=1, date_created="2026-01-05T12:00:00Z")
+    rev_mid = RecordRevision(record_revision_id=2, date_created="2026-01-15T14:30:00+02:00")
+    rev_late = RecordRevision(record_revision_id=3, date_created="2026-01-25T12:00:00Z")
+    rev_blank = RecordRevision(record_revision_id=4, date_created="   ")
+    sdk.get_record_revisions.return_value = [rev_early, rev_mid, rev_late, rev_blank]
+
+    wf = DataExtractionWorkflow(sdk)
+    end_only = wf.extract_audit_trail("STUDY", end_date="2026-01-15")
+    sdk.get_record_revisions.assert_called_once_with(
+        "STUDY",
+        date_created=("<=", "2026-01-15T23:59:59Z"),
+    )
+    assert [r.record_revision_id for r in end_only] == [1, 2]
+
+    sdk.get_record_revisions.reset_mock()
+    combined = wf.extract_audit_trail(
+        "STUDY",
+        start_date="2026-01-01",
+        end_date="2026-01-31",
+        user_filter={
+            "date_created": [(">", "2026-01-10T00:00:00Z"), ("!=", "2026-01-25T12:00:00Z")]
+        },
+    )
+    sdk.get_record_revisions.assert_called_once_with(
+        "STUDY",
+        date_created=(">", "2026-01-10T00:00:00Z"),
+    )
+    assert [r.record_revision_id for r in combined] == [2]
+
+
+def test_extract_audit_trail_emits_unique_date_created_http_filter_and_filters_range() -> None:
+    """Test that extract_audit_trail sends a single dateCreated filter attribute over HTTP."""
     import respx
 
     from imednet.sdk import ImednetSDK
@@ -218,7 +278,27 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
     with respx.mock(assert_all_called=True) as router:
         route = router.get("https://api.test/api/v1/edc/studies/STUDY/recordRevisions").respond(
             200,
-            json={"data": [{"recordRevisionId": 5, "recordId": 10, "recordRevision": 1}]},
+            json={
+                "data": [
+                    {
+                        "recordRevisionId": 5,
+                        "recordId": 10,
+                        "recordRevision": 1,
+                        "dateCreated": "2026-01-15T10:00:00Z",
+                    },
+                    {
+                        "recordRevisionId": 6,
+                        "recordId": 10,
+                        "recordRevision": 2,
+                        "dateCreated": "2026-02-05T00:00:00Z",
+                    },
+                    {
+                        "recordRevisionId": 7,
+                        "recordId": 11,
+                        "recordRevision": 1,
+                    },
+                ]
+            },
         )
         sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
         wf = DataExtractionWorkflow(sdk)
@@ -230,11 +310,90 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
         )
 
         sent_filter = route.calls.last.request.url.params["filter"]
-        assert (
-            sent_filter
-            == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z;studyKey==STUDY"
-        )
+        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z;studyKey==STUDY"
+        assert sent_filter.count("dateCreated") == 1
         assert "startDate" not in sent_filter
         assert "endDate" not in sent_filter
-        assert len(revisions) == 1
-        assert revisions[0].record_revision_id == 5
+        assert [r.record_revision_id for r in revisions] == [5]
+
+
+def test_extract_audit_trail_edge_cases_and_simulation_mode() -> None:
+    """Test no-date passthrough, scalar/list/operator user_filter variants, and simulation mode."""
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from imednet.sdk import ImednetSDK
+
+    sdk = MagicMock()
+    rev_valid = RecordRevision(
+        record_revision_id=10,
+        date_created="2026-01-15T12:00:00Z",
+    )
+    rev_other = RecordRevision(
+        record_revision_id=11,
+        date_created="2026-01-20T12:00:00Z",
+    )
+    rev_unparseable = RecordRevision(
+        record_revision_id=12,
+        date_created="not-a-timestamp",
+    )
+    rev_missing = RecordRevision(
+        record_revision_id=13,
+        date_created=None,
+    )
+    sdk.get_record_revisions.return_value = [rev_valid, rev_other, rev_unparseable, rev_missing]
+
+    wf = DataExtractionWorkflow(sdk)
+
+    # No date filters: returns all revisions untouched (including missing date_created)
+    assert len(wf.extract_audit_trail("STUDY", user_filter={"role": "CRC"})) == 4
+
+    # Scalar equality in user_filter with camelCase key
+    eq_res = wf.extract_audit_trail(
+        "STUDY",
+        start_date="2026-01-01",
+        user_filter={"dateCreated": datetime(2026, 1, 15, 12, 0, tzinfo=UTC)},
+    )
+    assert sdk.get_record_revisions.call_args.kwargs["date_created"] == (
+        "==",
+        "2026-01-15T12:00:00Z",
+    )
+    assert [r.record_revision_id for r in eq_res] == [10]
+
+    # Scalar OR list in user_filter
+    or_res = wf.extract_audit_trail(
+        "STUDY",
+        user_filter={"date_created": ["2026-01-15T12:00:00Z", "2026-01-20T12:00:00Z"]},
+    )
+    assert [r.record_revision_id for r in or_res] == [10, 11]
+
+    # Strict '<' and substring '=~' operators
+    lt_res = wf.extract_audit_trail("STUDY", user_filter={"date_created": ("<", "2026-01-18")})
+    assert sdk.get_record_revisions.call_args.kwargs["date_created"] == (
+        "<",
+        "2026-01-18T23:59:59Z",
+    )
+    assert [r.record_revision_id for r in lt_res] == [10]
+
+    contains_res = wf.extract_audit_trail(
+        "STUDY", user_filter={"date_created": ("=~", "2026-01-20")}
+    )
+    assert sdk.get_record_revisions.call_args.kwargs["date_created"] == ("=~", "2026-01-20")
+    assert [r.record_revision_id for r in contains_res] == [11]
+
+    # Validation errors on malformed date_created filters
+    with pytest.raises(ValueError, match="Allowed operators"):
+        wf.extract_audit_trail("STUDY", user_filter={"date_created": ("<>", "2026-01-01")})
+    with pytest.raises(ValueError, match="exactly 2 elements"):
+        wf.extract_audit_trail("STUDY", user_filter={"date_created": (">=", "2026-01-01", "extra")})
+    with pytest.raises(ValueError, match="cannot mix"):
+        wf.extract_audit_trail(
+            "STUDY",
+            user_filter={"date_created": [(">=", "2026-01-01"), "2026-01-02"]},
+        )
+
+    # Offline simulation mode executes cleanly with combined start_date and end_date
+    sim_sdk = ImednetSDK(simulation_mode=True)
+    sim_wf = DataExtractionWorkflow(sim_sdk)
+    assert sim_wf.extract_audit_trail("STUDY", start_date="2026-01-01", end_date="2026-01-31") == []
