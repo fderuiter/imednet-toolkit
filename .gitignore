@@ -72,6 +72,7 @@ logs/
 
 # Sphinx documentation build
 /docs/_build/
+/docs/_static/wheels/
 
 # Auto-generated Sphinx API documentation (produced by sphinx-apidoc in Makefile)
 /docs/api/

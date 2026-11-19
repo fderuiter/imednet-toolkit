@@ -272,6 +272,13 @@ class BaseTabularRecordMapper:
                     ):
                         if not effective_include_deleted and is_record_deleted(rec):
                             continue
+                        rec_form_id = getattr(rec, "form_id", None)
+                        if (
+                            rec_form_id is not None
+                            and not isinstance(rec_form_id, NonCallableMock)
+                            and rec_form_id != fid
+                        ):
+                            continue
                         yield rec
                 return
 
@@ -480,19 +487,24 @@ class BaseTabularRecordMapper:
             "dateCreated",
         ]
 
-        for key in variable_keys:
+        unique_variable_keys = list(
+            dict.fromkeys(key for key in variable_keys if key not in meta_cols)
+        )
+        for key in unique_variable_keys:
             if key not in df.columns:
                 df[key] = pd.NA
 
-        df = df[meta_cols + variable_keys]
+        df = df[meta_cols + unique_variable_keys]
         if should_mask:
             sensitive_vars = [
-                key for key in variable_keys if global_sensitivity_registry.is_sensitive(key)
+                key for key in unique_variable_keys if global_sensitivity_registry.is_sensitive(key)
             ]
             for key in sensitive_vars:
                 df[key] = "***MASKED***"
 
-            non_sensitive_vars = [key for key in variable_keys if key not in set(sensitive_vars)]
+            non_sensitive_vars = [
+                key for key in unique_variable_keys if key not in set(sensitive_vars)
+            ]
             if non_sensitive_vars:
                 var_frame = df[non_sensitive_vars]
                 try:
@@ -503,7 +515,7 @@ class BaseTabularRecordMapper:
                     df[col] = df[col].apply(mask_clinical_phi)
 
         if use_labels:
-            rename_map = {key: label_map.get(key, key) for key in variable_keys}
+            rename_map = {key: label_map.get(key, key) for key in unique_variable_keys}
             df = df.rename(columns=rename_map)
         return df
 
@@ -659,16 +671,18 @@ class BaseTabularRecordMapper:
                     continue
                 if form.form_id in form_models:
                     continue
-                var_keys = [
-                    v.variable_name
-                    for v in (form.variables or [])
-                    if v.variable_name is not None
-                    and (not variable_whitelist or v.variable_name in variable_whitelist)
-                ]
+                var_keys = list(
+                    dict.fromkeys(
+                        v.variable_name
+                        for v in (form.variables or [])
+                        if v.variable_name
+                        and (not variable_whitelist or v.variable_name in variable_whitelist)
+                    )
+                )
                 label_map = {
                     v.variable_name: (v.label or v.variable_name)
                     for v in (form.variables or [])
-                    if v.variable_name is not None
+                    if v.variable_name
                 }
                 form_models[form.form_id] = self._build_record_model(var_keys, label_map)
                 form_label_maps[form.form_id] = label_map
@@ -684,6 +698,15 @@ class BaseTabularRecordMapper:
             include_deleted=include_deleted,
         )
 
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        meta_keys = {
+            "recordId",
+            "subjectKey",
+            "visitId",
+            "formId",
+            "recordStatus",
+            "dateCreated",
+        }
         tree: dict[Any, dict[str, Any]] = {}
         for rec in records:
             if rec.form_id not in form_models:
@@ -693,7 +716,7 @@ class BaseTabularRecordMapper:
             label_map = form_label_maps[rec.form_id]
 
             try:
-                parsed_data = self._parse_record(rec, model, mask_phi=mask_phi)
+                parsed_data = self._parse_record(rec, model, mask_phi=should_mask)
             except (ValidationError, TypeError) as exc:
                 logger.warning(
                     "Failed to parse record data for recordId %s: %s",
@@ -705,11 +728,19 @@ class BaseTabularRecordMapper:
                 logger.error("Unexpected error processing recordId %s: %s", rec.record_id, exc)
                 continue
 
+            if should_mask:
+                parsed_data = mask_clinical_phi(parsed_data)
+
             if use_labels_as_keys:
                 remapped: dict[str, Any] = {}
                 for k, v in parsed_data.items():
-                    lbl = label_map.get(k)
-                    remapped[lbl if lbl is not None else k] = v
+                    if k in meta_keys:
+                        remapped[k] = v
+                    else:
+                        lbl = label_map.get(k)
+                        target_key = lbl if lbl is not None else k
+                        if target_key not in meta_keys:
+                            remapped[target_key] = v
                 parsed_data = remapped
 
             resolved_parent_id = getattr(rec, "parent_record_id", None)
