@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Batch Record Creation and Optional Job Polling Flow
+    accDescr: Flowchart showing create_or_update_records validating batches, calling records.create, and optionally polling via JobPoller.run
     A[create_or_update_records] --> B[validate_batch]
     B --> C[records.create]
     C --> D{wait?}

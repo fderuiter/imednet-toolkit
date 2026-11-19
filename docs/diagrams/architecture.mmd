@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Layered Toolkit Architecture
+    accDescr: High-level flow from CLI through Workflows, Endpoints, and HTTP Client to the iMednet API
     CLI[CLI] --> |invokes| Workflows
     Workflows --> |coordinate| Endpoints
     Endpoints --> |use| Client["(HTTP Client)"]

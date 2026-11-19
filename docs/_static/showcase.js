@@ -222,28 +222,28 @@
                 standard: "WCAG 2.1 Level AA",
                 status: "PASS",
                 wcagCompliance: "PASS",
-                notes: "High contrast mode (7:1), ARIA labels and tabular fallback"
+                notes: "Unofficial open-source imednet-toolkit portal & TUI: Furo tokens (>= 4.5:1 AA, >= 7:1 prefers-contrast: more), forced-colors support, titled Mermaid SVGs, and tabular fallbacks"
             },
             {
                 criteria: "Principle 2: Operable",
                 standard: "WCAG 2.1 Level AA",
                 status: "PASS",
                 wcagCompliance: "PASS",
-                notes: "Keyboard navigation, focus indicators, modal focus management"
+                notes: "Roving tabindex tablists (Arrow, Home, End), visible 2px focus-visible rings, keyboard-scrollable code/diagram regions, and full keyboard TUI bindings"
             },
             {
                 criteria: "Principle 3: Understandable",
                 standard: "WCAG 2.1 Level AA",
                 status: "PASS",
                 wcagCompliance: "PASS",
-                notes: "Consistent navigation, descriptive error prompts, clear field labels"
+                notes: "SC 2.5.3 Label-in-Name control labels, polite ARIA live execution status announcements, and clear CLI/TUI error diagnostics"
             },
             {
                 criteria: "Principle 4: Robust",
                 standard: "WCAG 2.1 Level AA",
                 status: "PASS",
                 wcagCompliance: "PASS",
-                notes: "Valid HTML5, standard ARIA roles, assistive technology compatible"
+                notes: "Community-maintained open-source SDK (not affiliated with Mednet Solutions); verified in CI via Chromium Playwright — report issues at https://github.com/fderuiter/imednet-toolkit/issues"
             }
         ]
     };
@@ -383,6 +383,43 @@
                 }
             }
         });
+
+        const mermaidBlocks = document.querySelectorAll(".mermaid");
+        mermaidBlocks.forEach(function (diagram) {
+            const svg = typeof diagram.querySelector === "function" ? diagram.querySelector("svg") : null;
+            let titleText = "";
+            if (svg && typeof svg.querySelector === "function") {
+                const titleEl = svg.querySelector("title");
+                if (titleEl && titleEl.textContent) {
+                    titleText = titleEl.textContent.trim();
+                }
+                if (titleText && !svg.getAttribute("aria-label")) {
+                    svg.setAttribute("aria-label", titleText);
+                }
+            }
+            if (titleText) {
+                diagram.setAttribute("data-mermaid-label", titleText);
+            }
+            const regionLabel = titleText || diagram.getAttribute("data-mermaid-label") || "Mermaid diagram";
+            const isOverflowing = diagram.clientWidth > 0 && diagram.scrollWidth > diagram.clientWidth;
+            if (isOverflowing) {
+                diagram.setAttribute("tabindex", "0");
+                diagram.setAttribute("role", "region");
+                if (!diagram.getAttribute("aria-label") || diagram.hasAttribute("data-mermaid-region")) {
+                    diagram.setAttribute("aria-label", regionLabel);
+                    diagram.setAttribute("data-mermaid-region", "true");
+                }
+            } else {
+                if (diagram.hasAttribute("tabindex")) {
+                    diagram.removeAttribute("tabindex");
+                }
+                if (diagram.hasAttribute("data-mermaid-region")) {
+                    diagram.removeAttribute("role");
+                    diagram.removeAttribute("aria-label");
+                    diagram.removeAttribute("data-mermaid-region");
+                }
+            }
+        });
     }
 
     function scheduleCheckCodeBlocks() {
@@ -398,6 +435,59 @@
         } else {
             checkCodeBlocks();
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared WAI-ARIA Tablist Binder (ArrowRight/Left/Down/Up, Home, End + roving tabindex)
+    // -------------------------------------------------------------------------
+    function syncTablistRovingTabindex(tabs) {
+        const tabArray = Array.from(tabs || []).filter(Boolean);
+        if (!tabArray.length) return;
+        let hasSelected = false;
+        tabArray.forEach(function (tab) {
+            const selected = tab.getAttribute("aria-selected") === "true";
+            if (selected) hasSelected = true;
+            tab.setAttribute("tabindex", selected ? "0" : "-1");
+        });
+        if (!hasSelected) {
+            tabArray[0].setAttribute("tabindex", "0");
+        }
+    }
+
+    function bindTablist(tabs, onActivate) {
+        const tabArray = Array.from(tabs || []).filter(Boolean);
+        if (!tabArray.length) return;
+        syncTablistRovingTabindex(tabArray);
+
+        tabArray.forEach(function (tab, index) {
+            tab.addEventListener("click", function () {
+                onActivate(tab, index);
+                syncTablistRovingTabindex(tabArray);
+            });
+
+            tab.addEventListener("keydown", function (e) {
+                let targetIndex = null;
+                if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+                    targetIndex = (index + 1) % tabArray.length;
+                } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                    targetIndex = (index - 1 + tabArray.length) % tabArray.length;
+                } else if (e.key === "Home") {
+                    targetIndex = 0;
+                } else if (e.key === "End") {
+                    targetIndex = tabArray.length - 1;
+                }
+
+                if (targetIndex !== null) {
+                    e.preventDefault();
+                    const nextTab = tabArray[targetIndex];
+                    onActivate(nextTab, targetIndex);
+                    syncTablistRovingTabindex(tabArray);
+                    if (typeof nextTab.focus === "function") {
+                        nextTab.focus();
+                    }
+                }
+            });
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -428,6 +518,7 @@
             personaTabs.forEach(function (tab) {
                 const isActive = tab.getAttribute("data-target") === activeId;
                 tab.setAttribute("aria-selected", isActive ? "true" : "false");
+                tab.setAttribute("tabindex", isActive ? "0" : "-1");
                 tab.classList.toggle("active", isActive);
             });
 
@@ -474,26 +565,9 @@
             }
         });
 
-        personaTabs.forEach(function (tab) {
-            tab.addEventListener("click", function () {
-                const targetId = tab.getAttribute("data-target");
-                switchPersona(targetId);
-            });
-
-            tab.addEventListener("keydown", function (e) {
-                let index = Array.from(personaTabs).indexOf(tab);
-                if (e.key === "ArrowRight" || e.key === "ArrowDown") {
-                    e.preventDefault();
-                    let next = personaTabs[(index + 1) % personaTabs.length];
-                    next.focus();
-                    next.click();
-                } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
-                    e.preventDefault();
-                    let prev = personaTabs[(index - 1 + personaTabs.length) % personaTabs.length];
-                    prev.focus();
-                    prev.click();
-                }
-            });
+        bindTablist(personaTabs, function (tab) {
+            const targetId = tab.getAttribute("data-target");
+            switchPersona(targetId);
         });
 
         // External triggers (e.g. from role cards at top of portal)
@@ -614,15 +688,19 @@
             if (view === "table") {
                 ieOutputTabTable.classList.add("active");
                 ieOutputTabTable.setAttribute("aria-selected", "true");
+                ieOutputTabTable.setAttribute("tabindex", "0");
                 ieOutputTabJson.classList.remove("active");
                 ieOutputTabJson.setAttribute("aria-selected", "false");
+                ieOutputTabJson.setAttribute("tabindex", "-1");
                 ieViewTable.removeAttribute("hidden");
                 ieViewJson.setAttribute("hidden", "true");
             } else {
                 ieOutputTabJson.classList.add("active");
                 ieOutputTabJson.setAttribute("aria-selected", "true");
+                ieOutputTabJson.setAttribute("tabindex", "0");
                 ieOutputTabTable.classList.remove("active");
                 ieOutputTabTable.setAttribute("aria-selected", "false");
+                ieOutputTabTable.setAttribute("tabindex", "-1");
                 ieViewJson.removeAttribute("hidden");
                 ieViewTable.setAttribute("hidden", "true");
             }
@@ -630,8 +708,9 @@
         }
 
         if (ieOutputTabTable && ieOutputTabJson) {
-            ieOutputTabTable.addEventListener("click", function () { switchIeView("table"); });
-            ieOutputTabJson.addEventListener("click", function () { switchIeView("json"); });
+            bindTablist([ieOutputTabTable, ieOutputTabJson], function (tab) {
+                switchIeView(tab === ieOutputTabTable ? "table" : "json");
+            });
         }
 
         if (ieCopyBtn && ieJsonPre) {
@@ -690,15 +769,19 @@
             if (view === "crf") {
                 cdmOutputTabCrf.classList.add("active");
                 cdmOutputTabCrf.setAttribute("aria-selected", "true");
+                cdmOutputTabCrf.setAttribute("tabindex", "0");
                 cdmOutputTabJson.classList.remove("active");
                 cdmOutputTabJson.setAttribute("aria-selected", "false");
+                cdmOutputTabJson.setAttribute("tabindex", "-1");
                 cdmViewCrf.removeAttribute("hidden");
                 cdmViewJson.setAttribute("hidden", "true");
             } else {
                 cdmOutputTabJson.classList.add("active");
                 cdmOutputTabJson.setAttribute("aria-selected", "true");
+                cdmOutputTabJson.setAttribute("tabindex", "0");
                 cdmOutputTabCrf.classList.remove("active");
                 cdmOutputTabCrf.setAttribute("aria-selected", "false");
+                cdmOutputTabCrf.setAttribute("tabindex", "-1");
                 cdmViewJson.removeAttribute("hidden");
                 cdmViewCrf.setAttribute("hidden", "true");
             }
@@ -706,8 +789,9 @@
         }
 
         if (cdmOutputTabCrf && cdmOutputTabJson) {
-            cdmOutputTabCrf.addEventListener("click", function () { switchCdmView("crf"); });
-            cdmOutputTabJson.addEventListener("click", function () { switchCdmView("json"); });
+            bindTablist([cdmOutputTabCrf, cdmOutputTabJson], function (tab) {
+                switchCdmView(tab === cdmOutputTabCrf ? "crf" : "json");
+            });
         }
 
         if (cdmCopyBtn && cdmJsonPre) {
@@ -782,15 +866,19 @@
             if (view === "table") {
                 audOutputTabTable.classList.add("active");
                 audOutputTabTable.setAttribute("aria-selected", "true");
+                audOutputTabTable.setAttribute("tabindex", "0");
                 audOutputTabJson.classList.remove("active");
                 audOutputTabJson.setAttribute("aria-selected", "false");
+                audOutputTabJson.setAttribute("tabindex", "-1");
                 audViewTable.removeAttribute("hidden");
                 audViewJson.setAttribute("hidden", "true");
             } else {
                 audOutputTabJson.classList.add("active");
                 audOutputTabJson.setAttribute("aria-selected", "true");
+                audOutputTabJson.setAttribute("tabindex", "0");
                 audOutputTabTable.classList.remove("active");
                 audOutputTabTable.setAttribute("aria-selected", "false");
+                audOutputTabTable.setAttribute("tabindex", "-1");
                 audViewJson.removeAttribute("hidden");
                 audViewTable.setAttribute("hidden", "true");
             }
@@ -798,8 +886,9 @@
         }
 
         if (audOutputTabTable && audOutputTabJson) {
-            audOutputTabTable.addEventListener("click", function () { switchAudView("table"); });
-            audOutputTabJson.addEventListener("click", function () { switchAudView("json"); });
+            bindTablist([audOutputTabTable, audOutputTabJson], function (tab) {
+                switchAudView(tab === audOutputTabTable ? "table" : "json");
+            });
         }
 
         if (audCopyBtn && audJsonPre) {
@@ -825,6 +914,7 @@
     function initAccessibleCodeBlocks() {
         checkCodeBlocks();
         window.addEventListener("resize", scheduleCheckCodeBlocks);
+        window.addEventListener("load", scheduleCheckCodeBlocks);
 
         if (typeof MutationObserver !== "undefined") {
             const observer = new MutationObserver(function () {
@@ -838,6 +928,16 @@
                     subtree: true
                 });
             }
+
+            const mermaidObserver = new MutationObserver(function () {
+                scheduleCheckCodeBlocks();
+            });
+            document.querySelectorAll(".mermaid").forEach(function (diagram) {
+                mermaidObserver.observe(diagram, {
+                    childList: true,
+                    subtree: true
+                });
+            });
         }
     }
 

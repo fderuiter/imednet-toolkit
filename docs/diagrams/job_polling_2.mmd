@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Asynchronous Job Polling State Loop
+    accDescr: Flowchart showing JobPoller checking job status until reaching a terminal state or raising JobTimeoutError
     A["start run()"] --> B[get job status]
     B --> C{terminal state?}
     C -- Yes --> D[return status]

@@ -658,12 +658,17 @@ finally:
         btn.setAttribute("aria-busy", status === "loading" ? "true" : "false");
         btn.title = text;
 
-        const loadingText = btn.querySelector(".loading-text");
-        if (loadingText) {
-          loadingText.innerHTML = `<span class="launch_msg">Pyodide (WebAssembly): </span><span class="status">${status}</span>`;
-        } else {
-          btn.textContent = text;
-        }
+        const target = btn.querySelector(".loading-text") || btn;
+        target.textContent = "";
+        const msgSpan = document.createElement("span");
+        msgSpan.className = "launch_msg";
+        msgSpan.textContent = "Pyodide (WebAssembly): ";
+        const statusSpan = document.createElement("span");
+        statusSpan.className = "status";
+        statusSpan.style.color = "inherit";
+        statusSpan.textContent = status;
+        target.appendChild(msgSpan);
+        target.appendChild(statusSpan);
       });
   }
 
@@ -826,6 +831,8 @@ finally:
       on: on,
       trigger: trigger,
       bootstrap: bootstrap,
+      transformCodeCells: transformCodeCells,
+      updateLaunchButtons: updateLaunchButtons,
       getConfig: getConfig,
       status: () => (pyodideReady ? "ready" : pyodideInitializing ? "loading" : "idle"),
     };

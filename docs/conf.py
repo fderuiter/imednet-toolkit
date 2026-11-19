@@ -6,6 +6,7 @@ import functools
 import html
 import importlib
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -121,6 +122,142 @@ extensions = [
     "sphinx.ext.githubpages",
     "pyodide_cells",
 ]
+
+# Configure Mermaid 10.2.0 with hex-only themeVariables (khroma-compatible)
+# and Furo --color-* custom properties in themeCSS so light/dark/high-contrast
+# toggles apply immediately without JavaScript re-renders.
+_MERMAID_THEME_CSS = """
+.node rect,
+.node circle,
+.node ellipse,
+.node polygon,
+.node path {
+  fill: var(--color-diagram-node-bg, var(--color-background-secondary)) !important;
+  stroke: var(--color-diagram-node-border, var(--color-brand-primary)) !important;
+}
+.cluster rect {
+  fill: var(--color-diagram-cluster-bg, var(--color-background-secondary)) !important;
+  stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+.node .label,
+.nodeLabel,
+.cluster-label .nodeLabel,
+.label text,
+.label span,
+.cluster-label span {
+  color: var(--color-foreground-primary) !important;
+  fill: var(--color-foreground-primary) !important;
+}
+.edgePath .path,
+.flowchart-link {
+  stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+.marker,
+marker path {
+  fill: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+  stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+.edgeLabel,
+.edgeLabel span,
+.edgeLabel p {
+  background-color: var(--color-diagram-label-bg, var(--color-background-primary)) !important;
+  color: var(--color-foreground-primary) !important;
+}
+.edgeLabel rect {
+  fill: var(--color-diagram-label-bg, var(--color-background-primary)) !important;
+  opacity: 1 !important;
+}
+rect.actor,
+.actor-man line,
+.actor-man circle {
+  fill: var(--color-diagram-node-bg, var(--color-background-secondary)) !important;
+  stroke: var(--color-diagram-node-border, var(--color-brand-primary)) !important;
+}
+text.actor,
+text.actor > tspan {
+  fill: var(--color-foreground-primary) !important;
+}
+line[id^="actor"],
+.actor-line {
+  stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+.messageLine0,
+.messageLine1,
+.loopLine {
+  stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+.messageText,
+.loopText,
+.loopText > tspan,
+.labelText,
+.labelText > tspan {
+  fill: var(--color-foreground-primary) !important;
+}
+.labelBox {
+  fill: var(--color-diagram-node-bg, var(--color-background-secondary)) !important;
+  stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+rect.note {
+  fill: var(--color-diagram-note-bg, #fff8c5) !important;
+  stroke: var(--color-diagram-note-border, #92400e) !important;
+}
+text.noteText,
+text.noteText > tspan {
+  fill: var(--color-diagram-note-text, #1f2328) !important;
+}
+.activation0,
+.activation1,
+.activation2 {
+  fill: var(--color-diagram-cluster-bg, var(--color-background-secondary)) !important;
+  stroke: var(--color-diagram-node-border, var(--color-brand-primary)) !important;
+}
+"""
+
+mermaid_version = "10.2.0"
+mermaid_init_js = (
+    "mermaid.initialize("
+    + json.dumps(
+        {
+            "startOnLoad": True,
+            "theme": "base",
+            "useMaxWidth": False,
+            "flowchart": {"useMaxWidth": False, "htmlLabels": True},
+            "sequence": {"useMaxWidth": False},
+            "themeVariables": {
+                "background": "#ffffff",
+                "primaryColor": "#f8f9fa",
+                "primaryTextColor": "#1f2328",
+                "primaryBorderColor": "#005fb8",
+                "lineColor": "#4a5056",
+                "secondaryColor": "#eef2f6",
+                "tertiaryColor": "#f8f9fa",
+                "mainBkg": "#f8f9fa",
+                "nodeBorder": "#005fb8",
+                "clusterBkg": "#f0f3f6",
+                "clusterBorder": "#4a5056",
+                "titleColor": "#1f2328",
+                "edgeLabelBackground": "#ffffff",
+                "actorBkg": "#f8f9fa",
+                "actorBorder": "#005fb8",
+                "actorTextColor": "#1f2328",
+                "actorLineColor": "#4a5056",
+                "signalColor": "#4a5056",
+                "signalTextColor": "#1f2328",
+                "labelBoxBkgColor": "#f8f9fa",
+                "labelBoxBorderColor": "#4a5056",
+                "labelTextColor": "#1f2328",
+                "loopTextColor": "#1f2328",
+                "noteBkgColor": "#fff8c5",
+                "noteTextColor": "#1f2328",
+                "noteBorderColor": "#92400e",
+                "activationBkgColor": "#eef2f6",
+                "activationBorderColor": "#005fb8",
+            },
+            "themeCSS": _MERMAID_THEME_CSS,
+        }
+    )
+    + ");"
+)
 
 _PYODIDE_WHEEL_SPECS: tuple[tuple[str, str], ...] = (
     ("imednet", "core"),
@@ -995,6 +1132,7 @@ html_theme_options: dict[str, Any] = {
     "source_directory": "docs/",
     "light_css_variables": {
         "color-brand-primary": "#005fb8",
+        "color-brand-primary-hover": "#004c94",
         "color-brand-content": "#005fb8",
         "color-brand-visited": "#5c3d99",
         "color-brand-btn-text": "#ffffff",
@@ -1006,9 +1144,18 @@ html_theme_options: dict[str, Any] = {
         "color-badge-warning": "#92400e",
         "color-badge-danger": "#b91c1c",
         "color-badge-required": "#b91c1c",
+        "color-diagram-node-bg": "#f8f9fa",
+        "color-diagram-node-border": "#005fb8",
+        "color-diagram-cluster-bg": "#f0f3f6",
+        "color-diagram-line": "#4a5056",
+        "color-diagram-label-bg": "#ffffff",
+        "color-diagram-note-bg": "#fff8c5",
+        "color-diagram-note-text": "#1f2328",
+        "color-diagram-note-border": "#92400e",
     },
     "dark_css_variables": {
         "color-brand-primary": "#58a6ff",
+        "color-brand-primary-hover": "#79c0ff",
         "color-brand-content": "#79c0ff",
         "color-brand-visited": "#c4a0ff",
         "color-brand-btn-text": "#131416",
@@ -1020,6 +1167,63 @@ html_theme_options: dict[str, Any] = {
         "color-badge-warning": "#fbbf24",
         "color-badge-danger": "#f87171",
         "color-badge-required": "#f87171",
+        "color-diagram-node-bg": "#1e2228",
+        "color-diagram-node-border": "#58a6ff",
+        "color-diagram-cluster-bg": "#17191d",
+        "color-diagram-line": "#9ca3af",
+        "color-diagram-label-bg": "#131416",
+        "color-diagram-note-bg": "#2d2611",
+        "color-diagram-note-text": "#fef3c7",
+        "color-diagram-note-border": "#fbbf24",
+    },
+}
+
+# WCAG 2.1 AAA (>= 7:1) high-contrast token definitions mirrored in
+# docs/_static/custom.css under @media (prefers-contrast: more)
+high_contrast_css_variables: dict[str, dict[str, str]] = {
+    "light": {
+        "color-background-primary": "#ffffff",
+        "color-background-secondary": "#f4f6f8",
+        "color-foreground-primary": "#000000",
+        "color-foreground-secondary": "#1f2328",
+        "color-foreground-muted": "#24292f",
+        "color-brand-primary": "#004385",
+        "color-brand-primary-hover": "#003366",
+        "color-brand-content": "#004385",
+        "color-brand-btn-text": "#ffffff",
+        "color-status-success": "#065f46",
+        "color-status-warning": "#78350f",
+        "color-status-danger": "#991b1b",
+        "color-diagram-node-bg": "#ffffff",
+        "color-diagram-node-border": "#004385",
+        "color-diagram-cluster-bg": "#f4f6f8",
+        "color-diagram-line": "#1f2328",
+        "color-diagram-label-bg": "#ffffff",
+        "color-diagram-note-bg": "#fffbeb",
+        "color-diagram-note-text": "#000000",
+        "color-diagram-note-border": "#78350f",
+    },
+    "dark": {
+        "color-background-primary": "#0a0c10",
+        "color-background-secondary": "#11141a",
+        "color-foreground-primary": "#ffffff",
+        "color-foreground-secondary": "#e6edf3",
+        "color-foreground-muted": "#c9d1d9",
+        "color-brand-primary": "#79c0ff",
+        "color-brand-primary-hover": "#a5d6ff",
+        "color-brand-content": "#79c0ff",
+        "color-brand-btn-text": "#0a0c10",
+        "color-status-success": "#6ee7b7",
+        "color-status-warning": "#fde68a",
+        "color-status-danger": "#fca5a5",
+        "color-diagram-node-bg": "#11141a",
+        "color-diagram-node-border": "#79c0ff",
+        "color-diagram-cluster-bg": "#0a0c10",
+        "color-diagram-line": "#e6edf3",
+        "color-diagram-label-bg": "#0a0c10",
+        "color-diagram-note-bg": "#1c1908",
+        "color-diagram-note-text": "#ffffff",
+        "color-diagram-note-border": "#fde68a",
     },
 }
 

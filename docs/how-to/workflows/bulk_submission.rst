@@ -19,6 +19,8 @@ The following diagram illustrates the internal two-phase orchestration:
 .. mermaid::
 
     sequenceDiagram
+        accTitle: Two-Phase Bulk Record Submission Sequence
+        accDescr: Sequence showing Phase 1 subject registration batch submission and job polling followed by Phase 2 clinical data batch submission
         participant User
         participant Orchestrator as BulkRecordSubmissionWorkflow
         participant API as iMednet API
