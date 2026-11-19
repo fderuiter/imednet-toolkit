@@ -8,7 +8,7 @@ from typing import Any
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status
-from ..utils.args import add_output_format
+from ..utils.args import add_output_format, add_sort_arg, build_list_query_kwargs
 
 
 def _get_val(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -35,6 +35,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         default=False,
         help="Include inactive user accounts.",
     )
+    add_sort_arg(list_parser)
 
     add_output_format(list_parser)
 
@@ -43,10 +44,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sdk: ImednetSDK,
         study_key: str,
         include_inactive: bool = False,
+        sort: str | None = None,
         output_format: str = "table",
     ) -> None:
+        query_kwargs = build_list_query_kwargs(sort=sort)
         with fetching_status("users", study_key):
-            users_list = list(sdk.users.list(study_key, include_inactive=include_inactive))
+            users_list = list(
+                sdk.users.list(study_key, include_inactive=include_inactive, **query_kwargs)
+            )
 
         if output_format == "json":
             display_list(users_list, "users", output_format="json")
@@ -110,6 +115,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         func=lambda args: list_users(
             study_key=args.study_key,
             include_inactive=args.include_inactive,
+            sort=args.sort,
             output_format=args.output_format,
         )
     )

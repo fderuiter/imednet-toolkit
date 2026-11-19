@@ -41,6 +41,11 @@ class DuckDBIngestionWorkflow:
         self._connection: Any = duckdb.connect(db_path)
         self._extractor = DataExtractionWorkflow(sdk)
 
+    def close(self) -> None:
+        """Close the underlying DuckDB database connection."""
+        if hasattr(self._connection, "close"):
+            self._connection.close()
+
     def ingest_revisions(
         self,
         study_key: str,

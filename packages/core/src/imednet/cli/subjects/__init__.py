@@ -7,8 +7,8 @@ import argparse
 from ...models.subjects import Subject
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status, parse_filter_args
-from ..utils.args import add_output_format
+from ..utils import STUDY_KEY_ARG, display_list, fetching_status
+from ..utils.args import add_list_query_args, add_output_format, build_list_query_kwargs
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -17,12 +17,10 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     sub = parser.add_subparsers(dest="command")
     list_parser = sub.add_parser("list", help="List subjects for a specific study.")
     list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
-    list_parser.add_argument(
-        "-f",
-        "--filter",
-        action="append",
-        dest="subject_filter",
-        help="Filter criteria (e.g., 'subject_status=Screened'). Repeat for multiple filters.",
+    add_list_query_args(
+        list_parser,
+        filter_dest="subject_filter",
+        filter_example="subject_status=Screened",
     )
 
     add_output_format(list_parser)
@@ -32,12 +30,17 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sdk: ImednetSDK,
         study_key: str,
         subject_filter: list[str] | None = None,
+        sort: str | None = None,
         output_format: str = "table",
     ) -> None:
-        parsed_filter = parse_filter_args(subject_filter, model=Subject)
+        query_kwargs = build_list_query_kwargs(
+            filters=subject_filter,
+            sort=sort,
+            model=Subject,
+        )
 
         with fetching_status("subjects", study_key):
-            subjects_list = list(sdk.subjects.list(study_key, **(parsed_filter or {})))
+            subjects_list = list(sdk.subjects.list(study_key, **query_kwargs))
 
         if output_format == "json":
             display_list(subjects_list, "subjects", output_format="json")
@@ -66,6 +69,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         func=lambda args: list_subjects(
             study_key=args.study_key,
             subject_filter=args.subject_filter,
+            sort=args.sort,
             output_format=args.output_format,
         )
     )

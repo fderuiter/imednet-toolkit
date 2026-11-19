@@ -9,29 +9,42 @@ from typing import Any, Protocol, runtime_checkable
 from imednet.core.protocols import ParamProcessor
 
 
+def _extract_sort_param(filters: dict[str, Any], special_params: dict[str, Any]) -> None:
+    """Pop top-level ``sort`` from ``filters`` into ``special_params`` when present."""
+    if "sort" in filters:
+        sort_val = filters.pop("sort")
+        if sort_val is not None:
+            special_params["sort"] = sort_val
+
+
 class DefaultParamProcessor(ParamProcessor):
     """Default parameter processor.
 
-    Simply passes filters through without modification.
+    Extracts top-level query parameters such as ``sort`` and passes remaining
+    resource filters through without modification.
     """
 
     def process_filters(self, filters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Return filters as-is and no special parameters.
+        """Return remaining filters and extracted top-level query parameters.
 
         Args:
             filters: The input filters dictionary.
 
         Returns:
-            A tuple of (copy of filters, empty dict).
+            A tuple of (copy of filters without top-level params, special params dict).
         """
-        return filters.copy(), {}
+        cleaned = filters.copy()
+        special_params: dict[str, Any] = {}
+        _extract_sort_param(cleaned, special_params)
+        return cleaned, special_params
 
 
 class MappingParamProcessor(ParamProcessor):
     """ParamProcessor that maps specific filter keys to API parameters.
 
-    Extracts keys defined in the mapping and returns them as special parameters,
-    optionally renaming them according to the mapping values.
+    Extracts keys defined in the mapping (plus top-level ``sort``) and returns
+    them as special parameters, optionally renaming them according to the
+    mapping values.
     """
 
     def __init__(
@@ -59,13 +72,14 @@ class MappingParamProcessor(ParamProcessor):
             A tuple of (cleaned filters, special parameters).
         """
         filters = filters.copy()
-        special_params = {}
+        special_params: dict[str, Any] = {}
+        _extract_sort_param(filters, special_params)
 
         for filter_key, api_key in self.mapping.items():
             value = None
             if filter_key in filters:
                 value = filters.pop(filter_key)
-            elif filter_key in self.defaults:
+            elif filter_key in self.defaults and api_key not in special_params:
                 value = self.defaults[filter_key]
 
             if value is not None:

@@ -219,6 +219,17 @@ def parse_filter_expression(
     return raw_key, (matched_op, parsed_scalar)
 
 
+def _extract_equality_scalar(value: Any) -> tuple[bool, Any]:
+    """Return ``(True, scalar)`` if ``value`` represents an equality condition."""
+    if isinstance(value, tuple):
+        if len(value) == 2 and value[0] == "==":
+            return True, value[1]
+        return False, value
+    if isinstance(value, list):
+        return False, value
+    return True, value
+
+
 def parse_filter_expressions(
     expressions: Sequence[str],
     *,
@@ -226,9 +237,11 @@ def parse_filter_expressions(
 ) -> dict[str, Any]:
     """Parse multiple filter expressions into a filter dictionary.
 
-    Repeated conditions on the same key are preserved as a list of
-    ``(operator, value)`` tuples so :func:`build_filter_string` joins them with
-    the semicolon ``AND`` connector.
+    Repeated equality conditions (``=`` or ``==``) on the same key are combined
+    into a scalar list so :func:`build_filter_string` joins them with the comma
+    ``OR`` connector. Repeated comparison conditions involving non-equality
+    operators are preserved as a list of ``(operator, value)`` tuples so
+    :func:`build_filter_string` joins them with the semicolon ``AND`` connector.
     """
     filter_dict: dict[str, Any] = {}
     for expr in expressions:
@@ -238,8 +251,23 @@ def parse_filter_expressions(
             continue
 
         prev = filter_dict[key]
+        new_is_eq, new_scalar = _extract_equality_scalar(parsed_val)
+        prev_is_eq, prev_scalar = _extract_equality_scalar(prev)
+
+        if new_is_eq and prev_is_eq:
+            filter_dict[key] = [prev_scalar, new_scalar]
+            continue
+
+        if isinstance(prev, list) and prev and all(not isinstance(item, tuple) for item in prev):
+            if new_is_eq:
+                filter_dict[key] = [*prev, new_scalar]
+                continue
+            raise ValueError(
+                f"Cannot mix equality OR filters and comparison operators on the same key '{key}'"
+            )
+
         if isinstance(prev, list):
-            combined = list(prev)
+            combined = [item if isinstance(item, tuple) else ("==", item) for item in prev]
         elif isinstance(prev, tuple):
             combined = [prev]
         else:

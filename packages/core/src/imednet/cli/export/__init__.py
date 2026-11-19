@@ -6,10 +6,49 @@ import argparse
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
+from ...models.records import Record
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, fetching_status, print_error
+from ..utils.args import add_list_query_args, build_list_query_kwargs
+
+
+def _build_export_call_kwargs(
+    *,
+    filters: list[str] | None,
+    record_data_filter: str | None,
+    sort: str | None,
+) -> dict[str, Any]:
+    """Build optional export keyword arguments only when supplied on the CLI."""
+    raw = build_list_query_kwargs(
+        filters=filters,
+        sort=sort,
+        record_data_filter=record_data_filter,
+        model=Record,
+    )
+    export_kwargs: dict[str, Any] = {}
+    rdf = raw.pop("record_data_filter", None)
+    sort_val = raw.pop("sort", None)
+    if raw:
+        export_kwargs["filters"] = raw
+    if rdf is not None:
+        export_kwargs["record_data_filter"] = rdf
+    if sort_val is not None:
+        export_kwargs["sort"] = sort_val
+    return export_kwargs
+
+
+def _require_sinks_plugin(sdk: ImednetSDK, sink_name: str) -> Any:
+    """Ensure ``imednet-plugins-sinks`` is installed and loaded on ``sdk.sinks``."""
+    if sdk.sinks is None:
+        print_error(
+            f"Error: imednet-plugins-sinks is required for {sink_name} export. "
+            'Install with "pip install imednet-plugins-sinks".'
+        )
+        sys.exit(1)
+    return sdk.sinks
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -26,24 +65,51 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         action="store_true",
         help="Use variable labels instead of names as column headers.",
     )
+    add_list_query_args(
+        pq_parser,
+        include_record_data_filter=True,
+        filter_example="form_key=DEMO",
+    )
 
     @with_sdk
     def export_parquet(
-        sdk: ImednetSDK, study_key: str, path: Path, use_labels: bool = False
+        sdk: ImednetSDK,
+        study_key: str,
+        path: Path,
+        use_labels: bool = False,
+        filters: list[str] | None = None,
+        record_data_filter: str | None = None,
+        sort: str | None = None,
     ) -> None:
         if importlib.util.find_spec("pyarrow") is None:
             print_error(
                 "Error: pyarrow is required for Parquet export. Install with \"pip install 'imednet[export]'\"."
             )
             sys.exit(1)
+        query_kwargs = _build_export_call_kwargs(
+            filters=filters,
+            record_data_filter=record_data_filter,
+            sort=sort,
+        )
         from .. import export_to_parquet
 
         with fetching_status("records for Parquet export", study_key):
-            export_to_parquet(sdk, study_key, str(path), use_labels_as_columns=use_labels)
+            export_to_parquet(
+                sdk,
+                study_key,
+                str(path),
+                use_labels_as_columns=use_labels,
+                **query_kwargs,
+            )
 
     pq_parser.set_defaults(
         func=lambda args: export_parquet(
-            study_key=args.study_key, path=args.path, use_labels=args.use_labels
+            study_key=args.study_key,
+            path=args.path,
+            use_labels=args.use_labels,
+            filters=args.filters,
+            record_data_filter=args.record_data_filter,
+            sort=args.sort,
         )
     )
 
@@ -56,20 +122,49 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         action="store_true",
         help="Use variable labels instead of names as column headers.",
     )
+    add_list_query_args(
+        csv_parser,
+        include_record_data_filter=True,
+        filter_example="form_key=DEMO",
+    )
 
     @with_sdk
-    def export_csv(sdk: ImednetSDK, study_key: str, path: Path, use_labels: bool = False) -> None:
+    def export_csv(
+        sdk: ImednetSDK,
+        study_key: str,
+        path: Path,
+        use_labels: bool = False,
+        filters: list[str] | None = None,
+        record_data_filter: str | None = None,
+        sort: str | None = None,
+    ) -> None:
         if importlib.util.find_spec("pandas") is None:
             print_error("Error: pandas is required for CSV export.")
             sys.exit(1)
+        query_kwargs = _build_export_call_kwargs(
+            filters=filters,
+            record_data_filter=record_data_filter,
+            sort=sort,
+        )
         from .. import export_to_csv
 
         with fetching_status("records for CSV export", study_key):
-            export_to_csv(sdk, study_key, str(path), use_labels_as_columns=use_labels)
+            export_to_csv(
+                sdk,
+                study_key,
+                str(path),
+                use_labels_as_columns=use_labels,
+                **query_kwargs,
+            )
 
     csv_parser.set_defaults(
         func=lambda args: export_csv(
-            study_key=args.study_key, path=args.path, use_labels=args.use_labels
+            study_key=args.study_key,
+            path=args.path,
+            use_labels=args.use_labels,
+            filters=args.filters,
+            record_data_filter=args.record_data_filter,
+            sort=args.sort,
         )
     )
 
@@ -82,23 +177,52 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         action="store_true",
         help="Use variable labels instead of names as column headers.",
     )
+    add_list_query_args(
+        xl_parser,
+        include_record_data_filter=True,
+        filter_example="form_key=DEMO",
+    )
 
     @with_sdk
-    def export_excel(sdk: ImednetSDK, study_key: str, path: Path, use_labels: bool = False) -> None:
+    def export_excel(
+        sdk: ImednetSDK,
+        study_key: str,
+        path: Path,
+        use_labels: bool = False,
+        filters: list[str] | None = None,
+        record_data_filter: str | None = None,
+        sort: str | None = None,
+    ) -> None:
         if (
             importlib.util.find_spec("pandas") is None
             or importlib.util.find_spec("openpyxl") is None
         ):
             print_error("Error: pandas and openpyxl are required for Excel export.")
             sys.exit(1)
+        query_kwargs = _build_export_call_kwargs(
+            filters=filters,
+            record_data_filter=record_data_filter,
+            sort=sort,
+        )
         from .. import export_to_excel
 
         with fetching_status("records for Excel export", study_key):
-            export_to_excel(sdk, study_key, str(path), use_labels_as_columns=use_labels)
+            export_to_excel(
+                sdk,
+                study_key,
+                str(path),
+                use_labels_as_columns=use_labels,
+                **query_kwargs,
+            )
 
     xl_parser.set_defaults(
         func=lambda args: export_excel(
-            study_key=args.study_key, path=args.path, use_labels=args.use_labels
+            study_key=args.study_key,
+            path=args.path,
+            use_labels=args.use_labels,
+            filters=args.filters,
+            record_data_filter=args.record_data_filter,
+            sort=args.sort,
         )
     )
 
@@ -116,6 +240,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         action="store_true",
         help="Export nested hierarchical tree structure.",
     )
+    add_list_query_args(
+        json_parser,
+        include_record_data_filter=True,
+        filter_example="form_key=DEMO",
+    )
 
     @with_sdk
     def export_json_cmd(
@@ -124,7 +253,15 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         path: Path,
         use_labels: bool = False,
         hierarchical: bool = False,
+        filters: list[str] | None = None,
+        record_data_filter: str | None = None,
+        sort: str | None = None,
     ) -> None:
+        query_kwargs = _build_export_call_kwargs(
+            filters=filters,
+            record_data_filter=record_data_filter,
+            sort=sort,
+        )
         from .. import export_to_json
 
         with fetching_status("records for JSON export", study_key):
@@ -134,6 +271,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 str(path),
                 use_labels_as_columns=use_labels,
                 hierarchical=hierarchical,
+                **query_kwargs,
             )
 
     json_parser.set_defaults(
@@ -142,6 +280,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             path=args.path,
             use_labels=args.use_labels,
             hierarchical=args.hierarchical,
+            filters=args.filters,
+            record_data_filter=args.record_data_filter,
+            sort=args.sort,
         )
     )
 
@@ -311,8 +452,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 "Error: pymongo is required for MongoDB export. Install with \"pip install 'imednet[mongodb]'\""
             )
             sys.exit(1)
-        assert sdk.sinks is not None
-        cfg = sdk.sinks.MongoDbSinkConfig(
+        sinks = _require_sinks_plugin(sdk, "MongoDB")
+        cfg = sinks.MongoDbSinkConfig(
             study_key=study_key,
             uri=uri,
             database=database,
@@ -321,7 +462,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             idempotent=upsert,
         )
         with fetching_status("records for MongoDB export", study_key):
-            sdk.sinks.export_to_mongodb(sdk, study_key, config=cfg)
+            sinks.export_to_mongodb(sdk, study_key, config=cfg)
 
     m_parser.set_defaults(
         func=lambda args: export_mongodb(
@@ -367,8 +508,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 "Error: neo4j is required for Neo4j export. Install with \"pip install 'imednet[neo4j]'\""
             )
             sys.exit(1)
-        assert sdk.sinks is not None
-        cfg = sdk.sinks.Neo4jSinkConfig(
+        sinks = _require_sinks_plugin(sdk, "Neo4j")
+        cfg = sinks.Neo4jSinkConfig(
             study_key=study_key,
             uri=uri,
             auth=(username, password),
@@ -377,7 +518,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             database=database,
         )
         with fetching_status("records for Neo4j export", study_key):
-            sdk.sinks.export_to_neo4j(sdk, study_key, config=cfg)
+            sinks.export_to_neo4j(sdk, study_key, config=cfg)
 
     n_parser.set_defaults(
         func=lambda args: export_neo4j(
@@ -448,8 +589,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 "Error: snowflake-connector-python and pyarrow are required for Snowflake export. Install with \"pip install 'imednet[snowflake]'\""
             )
             sys.exit(1)
-        assert sdk.sinks is not None
-        cfg = sdk.sinks.SnowflakeSinkConfig(
+        sinks = _require_sinks_plugin(sdk, "Snowflake")
+        cfg = sinks.SnowflakeSinkConfig(
             study_key=study_key,
             account=account,
             user=user,
@@ -466,7 +607,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             idempotent=idempotent,
         )
         with fetching_status("records for Snowflake export", study_key):
-            sdk.sinks.export_to_snowflake(sdk, study_key, config=cfg)
+            sinks.export_to_snowflake(sdk, study_key, config=cfg)
 
     s_parser.set_defaults(
         func=lambda args: export_snowflake(

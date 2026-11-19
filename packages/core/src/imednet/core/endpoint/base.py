@@ -174,6 +174,12 @@ class _ListEndpointBase(GenericEndpoint[T]):
         filters = self._auto_filter(filters.copy())
 
         processed_filters, special_params = self.param_processor.process_filters(filters)
+        if "sort" in processed_filters:
+            sort_val = processed_filters.pop("sort")
+            if sort_val is not None:
+                special_params = dict(special_params)
+                special_params.setdefault("sort", sort_val)
+
         if special_params:
             if extra_params is None:  # noqa: SIM108
                 extra_params = {}
@@ -189,9 +195,24 @@ class _ListEndpointBase(GenericEndpoint[T]):
 
         other_filters = {k: v for k, v in processed_filters.items() if k != "studyKey"}
 
+        filter_source = processed_filters
+        if (
+            self.requires_study_key
+            and study
+            and "studyKey" in processed_filters
+            and len(other_filters) == 1
+        ):
+            sole_val = next(iter(other_filters.values()))
+            if (
+                isinstance(sole_val, list)
+                and len(sole_val) > 1
+                and all(not isinstance(item, tuple) for item in sole_val)
+            ):
+                filter_source = other_filters
+
         params: dict[str, Any] = {}
-        if processed_filters:
-            params["filter"] = build_filter_string(processed_filters)
+        if filter_source:
+            params["filter"] = build_filter_string(filter_source)
         if extra_params:
             params.update(extra_params)
 

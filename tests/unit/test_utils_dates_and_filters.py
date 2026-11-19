@@ -401,6 +401,39 @@ def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None
         build_filter_string({"age": [(">", 18, "bad")]})  # type: ignore[list-item]
 
 
+def test_parse_filter_expressions_repeated_equality_builds_or_list() -> None:
+    """Test that repeated equality keys build OR scalar lists instead of overwriting."""
+    parsed_single_eq = parse_filter_expressions(
+        ["subjectStatus=Screened", "subjectStatus=Enrolled"]
+    )
+    assert parsed_single_eq == {"subjectStatus": ["Screened", "Enrolled"]}
+    assert (
+        build_filter_string(parsed_single_eq) == "subjectStatus==Screened,subjectStatus==Enrolled"
+    )
+
+    parsed_double_eq = parse_filter_expressions(
+        [
+            "subject_status==Screened",
+            "subject_status==Enrolled",
+            "subject_status=Completed",
+        ]
+    )
+    assert parsed_double_eq == {"subject_status": ["Screened", "Enrolled", "Completed"]}
+    assert (
+        build_filter_string(parsed_double_eq)
+        == "subjectStatus==Screened,subjectStatus==Enrolled,subjectStatus==Completed"
+    )
+
+
+def test_parse_filter_expressions_rejects_mixing_equality_and_comparison_on_same_key() -> None:
+    """Test that mixing equality OR lists and range operators on the same key raises ValueError."""
+    with pytest.raises(ValueError, match="Cannot mix equality OR filters and comparison"):
+        parse_filter_expressions(["revision=1", "revision=2", "revision>=3"])
+    assert parse_filter_expressions(["revision=1", "revision>=2"]) == {
+        "revision": [("==", 1), (">=", 2)]
+    }
+
+
 def test_normalize_utc_timestamp_bound() -> None:
     """Test date-only and timestamp normalization for UTC audit bounds."""
     assert normalize_utc_timestamp_bound("2026-01-01", is_end=False) == "2026-01-01T00:00:00Z"

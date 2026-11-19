@@ -8,8 +8,8 @@ from typing import Any
 from ...models.codings import Coding
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status, parse_filter_args
-from ..utils.args import add_output_format
+from ..utils import STUDY_KEY_ARG, display_list, fetching_status
+from ..utils.args import add_list_query_args, add_output_format, build_list_query_kwargs
 
 
 def _get_val(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -30,12 +30,10 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     sub = parser.add_subparsers(dest="command")
     list_parser = sub.add_parser("list", help="List codings for a specific study.")
     list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
-    list_parser.add_argument(
-        "-f",
-        "--filter",
-        action="append",
-        dest="coding_filter",
-        help="Filter criteria (e.g., 'dictionaryName=MedDRA'). Repeat for multiple filters.",
+    add_list_query_args(
+        list_parser,
+        filter_dest="coding_filter",
+        filter_example="dictionaryName=MedDRA",
     )
 
     add_output_format(list_parser)
@@ -45,12 +43,17 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sdk: ImednetSDK,
         study_key: str,
         coding_filter: list[str] | None = None,
+        sort: str | None = None,
         output_format: str = "table",
     ) -> None:
-        parsed_filter = parse_filter_args(coding_filter, model=Coding)
+        query_kwargs = build_list_query_kwargs(
+            filters=coding_filter,
+            sort=sort,
+            model=Coding,
+        )
 
         with fetching_status("codings", study_key):
-            codings_list = list(sdk.codings.list(study_key, **(parsed_filter or {})))
+            codings_list = list(sdk.codings.list(study_key, **query_kwargs))
 
         if output_format == "json":
             display_list(codings_list, "codings", output_format="json")
@@ -84,6 +87,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         func=lambda args: list_codings(
             study_key=args.study_key,
             coding_filter=args.coding_filter,
+            sort=args.sort,
             output_format=args.output_format,
         )
     )

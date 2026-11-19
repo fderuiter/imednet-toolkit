@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import sys
 
+from ...models.records import Record
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status, print_error
-from ..utils.args import add_output_format
+from ..utils.args import add_list_query_args, add_output_format, build_list_query_kwargs
 from ..utils.export import export_list_to_file
 
 
@@ -21,12 +22,24 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     list_parser.add_argument(
         "-o", "--output", help="Save records to the given format (json or csv)"
     )
+    add_list_query_args(
+        list_parser,
+        include_record_data_filter=True,
+        filter_dest="record_filter",
+        filter_example="form_key=DEMO",
+    )
 
     add_output_format(list_parser)
 
     @with_sdk
     def list_records(
-        sdk: ImednetSDK, study_key: str, output: str | None = None, output_format: str = "table"
+        sdk: ImednetSDK,
+        study_key: str,
+        output: str | None = None,
+        output_format: str = "table",
+        record_filter: list[str] | None = None,
+        record_data_filter: str | None = None,
+        sort: str | None = None,
     ) -> None:
         if output and output_format == "json":
             print_error("Choose --format json for stdout or --output for a file.")
@@ -35,8 +48,15 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             print_error("Invalid output format. Use 'json' or 'csv'.")
             sys.exit(1)
 
+        query_kwargs = build_list_query_kwargs(
+            filters=record_filter,
+            sort=sort,
+            record_data_filter=record_data_filter,
+            model=Record,
+        )
+
         with fetching_status("records", study_key):
-            records = list(sdk.records.list(study_key))
+            records = list(sdk.records.list(study_key, **query_kwargs))
 
         if output_format == "json":
             display_list(records, "records", output_format="json")
@@ -58,6 +78,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     list_parser.set_defaults(
         func=lambda args: list_records(
-            study_key=args.study_key, output=args.output, output_format=args.output_format
+            study_key=args.study_key,
+            output=args.output,
+            output_format=args.output_format,
+            record_filter=args.record_filter,
+            record_data_filter=args.record_data_filter,
+            sort=args.sort,
         )
     )

@@ -18,16 +18,30 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
 
 .. code-block:: bash
 
-   imednet studies list --format json
-   imednet subjects list STUDY --filter subject_status=Screened --format json
-   imednet users list STUDY --include-inactive --format json
-   imednet codings list STUDY -f dictionaryName=MedDRA --format json
-   imednet records list STUDY --format json
+   imednet studies list --sort studyKey,asc --format json
+   imednet subjects list STUDY --filter subject_status=Screened --filter subject_status=Enrolled --format json
+   imednet users list STUDY --include-inactive --sort lastName,asc --format json
+   imednet codings list STUDY -f dictionaryName==MedDRA --format json
+   imednet records list STUDY -f form_key=F_DM --record-data-filter "V_AGE>=18" --sort recordId,desc --format json
+   imednet export parquet STUDY out.parquet -f form_key=F_DM --record-data-filter "V_AGE>=18" --sort recordId,asc
+   imednet workflows extract-records STUDY --record-filter form_key=F_DM --format json
+   imednet workflows queries STUDY --counts --format json
+   imednet workflows map-records STUDY --sdtm-domain DM --format json
+   imednet workflows inspect-study STUDY --format json
    imednet jobs status STUDY BATCH --format json
    imednet jobs wait STUDY BATCH --timeout 60 --format json
 
 Supported core list resources are studies, queries, variables, record-revisions,
-sites, records, subjects, intervals, visits, codings, and users. Core JSON reads emit exactly one envelope
+sites, forms, records, subjects, intervals, visits, codings, and users. Filter-capable
+core list commands support ``--filter`` / ``-f`` with ``=``, ``==``, ``!=``, ``>=``,
+``<=``, ``>``, ``<``, and ``=~`` operators (repeating equality keys builds an OR list)
+plus ``--sort``; ``users list`` supports ``--sort``. ``records list`` and tabular/JSON
+file exports (``parquet``, ``csv``, ``excel``, ``json``) additionally support
+``--record-data-filter``. When ``imednet-plugins-workflows`` is installed, ``imednet workflows``
+exposes subcommands for all registered workflow plugins (``extract-records``, ``subject-data``,
+``update-records``, ``register-subjects``, ``queries``, ``centralize-duckdb``, ``map-records``,
+``inspect-study``, and ``uat``) alongside ``state`` and ``sync-worker``, all supporting
+``--format json`` on stdout with diagnostics routed to stderr. Core JSON reads emit exactly one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items``. Empty results use an empty items array. Item fields use the SDK models'
 JSON aliases; the JSON view includes model fields beyond the human summary table.

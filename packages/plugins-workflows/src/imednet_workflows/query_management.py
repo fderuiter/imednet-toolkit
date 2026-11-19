@@ -45,13 +45,18 @@ class QueryManagementWorkflow:
         self._sdk = sdk
 
     @staticmethod
-    def _is_query_open(query: Query) -> bool:
-        """Determines if a query is open based on its explicit status or comments."""
+    def is_query_open(query: Query) -> bool:
+        """Determine if a query is open based on its explicit status or comments."""
         status = getattr(query, "status", None)
         if status is not None:
             return status in (QueryStatus.OPEN, QueryStatus.OPEN.value)
         comments = getattr(query, "query_comments", None)
         return calculate_legacy_status(comments) == QueryStatus.OPEN
+
+    @staticmethod
+    def _is_query_open(query: Query) -> bool:
+        """Backward-compatible alias for :meth:`is_query_open`."""
+        return QueryManagementWorkflow.is_query_open(query)
 
     def get_open_queries(
         self,

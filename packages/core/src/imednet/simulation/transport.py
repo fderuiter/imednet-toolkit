@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 from typing import Any
 
 import httpx
 
 from imednet.simulation.state import SimulationState, get_default_simulation_state
+from imednet.utils.filters import ORDERED_FILTER_OPERATORS
 
 
 def _to_camel_or_snake(key: str) -> list[str]:
@@ -21,7 +23,56 @@ def _to_camel_or_snake(key: str) -> list[str]:
     return list(dict.fromkeys([key, snake, camel]))
 
 
-def _matches_filter(item: dict[str, Any], field: str, expected_val: str) -> bool:
+def _compare_values(actual_val: Any, op: str, expected_raw: str) -> bool:
+    """Evaluate a filter comparison operator against an item field value."""
+    expected_val = expected_raw.strip()
+    if len(expected_val) >= 2 and expected_val[0] == '"' and expected_val[-1] == '"':
+        expected_val = expected_val[1:-1].replace(r"\"", '"').replace("\\\\", "\\")
+
+    if op == "=~":
+        try:
+            return re.search(expected_val, str(actual_val)) is not None
+        except re.error:
+            return False
+
+    if isinstance(actual_val, bool):
+        actual_cmp: Any = str(actual_val).lower()
+        expected_cmp: Any = expected_val.lower()
+    elif isinstance(actual_val, int):
+        try:
+            actual_cmp = actual_val
+            expected_cmp = int(expected_val)
+        except ValueError:
+            return op == "!="
+    elif isinstance(actual_val, float):
+        try:
+            actual_cmp = actual_val
+            expected_cmp = float(expected_val)
+        except ValueError:
+            return op == "!="
+    else:
+        actual_cmp = str(actual_val).strip()
+        expected_cmp = expected_val.strip()
+        if op in ("==", "!="):
+            actual_cmp = actual_cmp.lower()
+            expected_cmp = expected_cmp.lower()
+
+    if op == "==":
+        return bool(actual_cmp == expected_cmp)
+    if op == "!=":
+        return bool(actual_cmp != expected_cmp)
+    if op == "<":
+        return bool(actual_cmp < expected_cmp)
+    if op == "<=":
+        return bool(actual_cmp <= expected_cmp)
+    if op == ">":
+        return bool(actual_cmp > expected_cmp)
+    if op == ">=":
+        return bool(actual_cmp >= expected_cmp)
+    return False
+
+
+def _matches_filter(item: dict[str, Any], field: str, expected_val: str, op: str = "==") -> bool:
     """Check if item matches the expected filter value across naming variants."""
     candidates = _to_camel_or_snake(field)
     actual_val: Any = None
@@ -35,19 +86,16 @@ def _matches_filter(item: dict[str, Any], field: str, expected_val: str) -> bool
     if not found:
         return False
 
-    if isinstance(actual_val, bool):
-        return str(actual_val).lower() == expected_val.lower()
-    if isinstance(actual_val, int):
-        try:
-            return actual_val == int(expected_val)
-        except ValueError:
-            return False
-    if isinstance(actual_val, float):
-        try:
-            return actual_val == float(expected_val)
-        except ValueError:
-            return False
-    return str(actual_val).strip().lower() == expected_val.strip().lower()
+    return _compare_values(actual_val, op, expected_val)
+
+
+def _parse_clause(term: str) -> tuple[str, str, str] | None:
+    """Parse ``field<op>value`` into ``(field, op, value)``."""
+    for op in ORDERED_FILTER_OPERATORS:
+        if op in term:
+            field, val = term.split(op, 1)
+            return field.strip(), op, val.strip()
+    return None
 
 
 class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
@@ -162,6 +210,14 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
                 items = self.state.get_users(study_key)
                 return self._filter_and_paginate(request, items, params)
 
+            if resource in ("recordRevisions", "record-revisions"):
+                items = self.state.get_record_revisions(study_key)
+                return self._filter_and_paginate(request, items, params)
+
+            if resource == "codings":
+                items = self.state.get_codings(study_key)
+                return self._filter_and_paginate(request, items, params)
+
         # 3. Direct /jobs/{batch_id} path
         if len(segments) >= 1 and segments[0] == "jobs":
             batch_id = segments[1] if len(segments) >= 2 else "BATCH"
@@ -174,20 +230,57 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
     def _filter_and_paginate(
         self, request: httpx.Request, items: list[dict[str, Any]], params: dict[str, str]
     ) -> httpx.Response:
-        """Apply query filter parameters and return a paginated response."""
+        """Apply query filter, recordDataFilter, and sort parameters before pagination."""
         filter_str = params.get("filter")
-        if filter_str:
-            clauses = [term.split("==", 1) for term in filter_str.split(";") if "==" in term]
-            filtered = []
-            for item in items:
-                matches_all = True
-                for field, val in clauses:
-                    if not _matches_filter(item, field.strip(), val.strip()):
-                        matches_all = False
-                        break
-                if matches_all:
-                    filtered.append(item)
-            items = filtered
+        if filter_str and filter_str.strip().lower() != "none":
+            use_or = "," in filter_str and ";" not in filter_str
+            raw_terms = filter_str.split("," if use_or else ";")
+            parsed_clauses = [c for term in raw_terms if (c := _parse_clause(term)) is not None]
+            if parsed_clauses:
+                filtered = []
+                for item in items:
+                    outcomes = [
+                        _matches_filter(item, field, val, op=op)
+                        for field, op, val in parsed_clauses
+                    ]
+                    if any(outcomes) if use_or else all(outcomes):
+                        filtered.append(item)
+                items = filtered
+
+        rdf_str = params.get("recordDataFilter")
+        if rdf_str and rdf_str.strip().lower() != "none":
+            use_or_rdf = "," in rdf_str and ";" not in rdf_str
+            raw_rdf_terms = rdf_str.split("," if use_or_rdf else ";")
+            rdf_clauses = [c for term in raw_rdf_terms if (c := _parse_clause(term)) is not None]
+            if rdf_clauses:
+                rdf_filtered = []
+                for item in items:
+                    rec_data = item.get("recordData")
+                    if not isinstance(rec_data, dict):
+                        continue
+                    outcomes = [
+                        _matches_filter(rec_data, field, val, op=op)
+                        for field, op, val in rdf_clauses
+                    ]
+                    if any(outcomes) if use_or_rdf else all(outcomes):
+                        rdf_filtered.append(item)
+                items = rdf_filtered
+
+        sort_str = params.get("sort")
+        if sort_str:
+            parts = [p.strip() for p in sort_str.split(",") if p.strip()]
+            if parts:
+                sort_field = parts[0]
+                reverse = len(parts) > 1 and parts[1].lower() == "desc"
+                candidates = _to_camel_or_snake(sort_field)
+
+                def _sort_key(entry: dict[str, Any]) -> tuple[int, str]:
+                    for cand in candidates:
+                        if cand in entry and entry[cand] is not None:
+                            return (0, str(entry[cand]))
+                    return (1, "")
+
+                items = sorted(items, key=_sort_key, reverse=reverse)
 
         return self._paginate_response(request, items, params)
 

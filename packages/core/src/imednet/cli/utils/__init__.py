@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .args import STUDY_KEY_ARG, parse_filter_args
+from .args import (
+    STUDY_KEY_ARG,
+    add_filter_arg,
+    add_list_query_args,
+    add_output_format,
+    add_record_data_filter_arg,
+    add_sort_arg,
+    build_list_query_kwargs,
+    parse_filter_args,
+)
 from .commands import register_list_command
 from .context import fetching_status, get_sdk
 from .output import (
@@ -17,6 +26,7 @@ from .output import (
     clear_line,
     console,
     display_list,
+    emit_json,
     format_job_progress,
     print_error,
 )
@@ -33,9 +43,16 @@ __all__ = [
     "Status",
     "_format_cell_value",
     "_truncate",
+    "add_filter_arg",
+    "add_list_query_args",
+    "add_output_format",
+    "add_record_data_filter_arg",
+    "add_sort_arg",
+    "build_list_query_kwargs",
     "clear_line",
     "console",
     "display_list",
+    "emit_json",
     "fetching_status",
     "format_job_progress",
     "get_sdk",

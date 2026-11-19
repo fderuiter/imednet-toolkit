@@ -762,6 +762,10 @@ class RecordMapper:
         if form_id_list is not None and len(form_id_list) == 0:
             return []
 
+        record_data_filter = filters.pop(
+            "record_data_filter", filters.pop("recordDataFilter", None)
+        )
+
         try:
             if form_id_list is not None:
                 batched_records: list[RecordModel] = []
@@ -769,7 +773,7 @@ class RecordMapper:
                     batched_records.extend(
                         self.sdk.get_records(
                             study_key=study_key,
-                            record_data_filter=None,
+                            record_data_filter=record_data_filter,
                             **filters,
                             formId=fid,
                         )
@@ -779,7 +783,7 @@ class RecordMapper:
             return list(
                 self.sdk.get_records(
                     study_key=study_key,
-                    record_data_filter=None,
+                    record_data_filter=record_data_filter,
                     **filters,
                 )
             )
@@ -806,11 +810,11 @@ class RecordMapper:
             An iterable of Record models.
         """
         raw_filters = dict(extra_filters) if extra_filters else {}
-        form_id_list, _ = self._extract_form_ids(raw_filters)
+        form_id_list, remaining_filters = self._extract_form_ids(raw_filters)
         form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
 
         loader = self._loader
-        if loader is not None:
+        if loader is not None and not remaining_filters:
             sync_method = getattr(loader, "sync_records", None)
             iter_method = getattr(type(loader), "iter_cached_records", None)
             if callable(sync_method) and callable(iter_method):
@@ -973,6 +977,7 @@ class RecordMapper:
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        extra_filters: dict[str, Any] | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield mapped record DataFrames in bounded chunks.
 
@@ -991,6 +996,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                extra_filters=extra_filters,
             )
             return
 
@@ -1008,9 +1014,9 @@ class RecordMapper:
             return
 
         record_model = self._build_record_model(variable_keys, label_map)
-        extra_filters: dict[str, Any] = {}
+        merged_filters: dict[str, Any] = dict(extra_filters) if extra_filters else {}
         if form_whitelist is not None:
-            extra_filters["formId"] = form_whitelist
+            merged_filters["formId"] = form_whitelist
 
         errors = 0
         yielded = False
@@ -1018,7 +1024,7 @@ class RecordMapper:
             self._iter_records(
                 study_key,
                 visit_key,
-                extra_filters=extra_filters or None,
+                extra_filters=merged_filters or None,
             ),
             record_model,
         ):
@@ -1044,6 +1050,8 @@ class RecordMapper:
         use_labels_as_keys: bool = False,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        extra_filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Generate a nested JSON tree structure up to three levels deep.
 
@@ -1075,15 +1083,15 @@ class RecordMapper:
                 form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
                 form_label_maps[form.form_id] = label_map  # type: ignore
 
-        extra_filters: dict[str, Any] = {}
+        merged_filters: dict[str, Any] = dict(extra_filters) if extra_filters else {}
         if form_whitelist is not None:
-            extra_filters["formId"] = form_whitelist
+            merged_filters["formId"] = form_whitelist
 
         # 2. Fetch and iterate records
         records = self._iter_records(
             study_key,
             visit_key,
-            extra_filters=extra_filters or None,
+            extra_filters=merged_filters or None,
         )
 
         tree: dict[str, dict[str, Any]] = {}
@@ -1176,6 +1184,8 @@ class RecordMapper:
         visit_key: str | None = None,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        extra_filters: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset.
 
@@ -1189,6 +1199,7 @@ class RecordMapper:
             visit_key: Optional visit filter.
             variable_whitelist: Optional variable name whitelist.
             form_whitelist: Optional form ID whitelist.
+            extra_filters: Optional record query filters/sort/record_data_filter.
 
         Returns:
             Normalized pandas DataFrame with standard SDTM domain variables.
@@ -1205,6 +1216,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                extra_filters=extra_filters,
             )
         )
         if not frames:
@@ -1218,6 +1230,8 @@ class RecordMapper:
         visit_key: str | None = None,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        extra_filters: dict[str, Any] | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked pandas DataFrames transformed into an SDTM domain dataset.
 
@@ -1227,6 +1241,7 @@ class RecordMapper:
             visit_key: Optional visit filter.
             variable_whitelist: Optional variable name whitelist.
             form_whitelist: Optional form ID whitelist.
+            extra_filters: Optional record query filters/sort/record_data_filter.
 
         Yields:
             Chunked DataFrames containing normalized SDTM domain records.
@@ -1239,14 +1254,14 @@ class RecordMapper:
         if variable_whitelist is not None and len(variable_whitelist) == 0:
             return
         allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
-        extra_filters: dict[str, Any] = {}
+        merged_filters: dict[str, Any] = dict(extra_filters) if extra_filters else {}
         if form_whitelist is not None:
-            extra_filters["formId"] = form_whitelist
+            merged_filters["formId"] = form_whitelist
 
         records = self._iter_records(
             study_key,
             visit_key=visit_key,
-            extra_filters=extra_filters or None,
+            extra_filters=merged_filters or None,
         )
         for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
             records_batch: list[Any] = chunk
@@ -1281,6 +1296,7 @@ class RecordMapper:
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        extra_filters: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` of records for a study.
 
@@ -1298,6 +1314,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                extra_filters=extra_filters,
             )
 
         if pd is None:
@@ -1312,6 +1329,7 @@ class RecordMapper:
                 use_labels_as_columns=use_labels_as_columns,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                extra_filters=extra_filters,
             )
         )
         if not frames:

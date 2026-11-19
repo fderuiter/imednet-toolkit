@@ -38,6 +38,13 @@ def get_sdk() -> ImednetSDK:
         sys.exit(1)
 
     try:
+        if config.simulation_mode:
+            return ImednetSDK(
+                api_key=config.api_key,
+                security_key=config.security_key,
+                base_url=config.base_url,
+                simulation_mode=True,
+            )
         return ImednetSDK(
             api_key=config.api_key,
             security_key=config.security_key,

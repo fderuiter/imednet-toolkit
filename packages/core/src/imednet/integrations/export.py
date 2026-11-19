@@ -108,6 +108,21 @@ def _to_sql_with_chunking(
         df.to_sql(table, engine, if_exists=if_exists, index=False, **kwargs)
 
 
+def _merge_export_query_filters(
+    *,
+    filters: dict[str, Any] | None = None,
+    record_data_filter: str | None = None,
+    sort: str | None = None,
+) -> dict[str, Any] | None:
+    """Combine optional export query options into a single ``extra_filters`` dict."""
+    merged: dict[str, Any] = dict(filters) if filters else {}
+    if record_data_filter is not None:
+        merged["record_data_filter"] = record_data_filter
+    if sort is not None:
+        merged["sort"] = sort
+    return merged or None
+
+
 def _records_df(
     sdk: ImednetSDK,
     study_key: str,
@@ -115,18 +130,21 @@ def _records_df(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    extra_filters: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Return a DataFrame of study records with duplicate columns removed."""
     if pd is None:
         raise ImportError(
             "pandas is required for _records_df. Install with \"pip install 'imednet[export]'\"."
         )
-    df: pd.DataFrame = _record_mapper()(sdk).dataframe(
-        study_key,
-        use_labels_as_columns=use_labels_as_columns,
-        variable_whitelist=variable_whitelist,
-        form_whitelist=form_whitelist,
-    )
+    mapper_kwargs: dict[str, Any] = {
+        "use_labels_as_columns": use_labels_as_columns,
+        "variable_whitelist": variable_whitelist,
+        "form_whitelist": form_whitelist,
+    }
+    if extra_filters:
+        mapper_kwargs["extra_filters"] = extra_filters
+    df: pd.DataFrame = _record_mapper()(sdk).dataframe(study_key, **mapper_kwargs)
     if isinstance(df, pd.DataFrame):
         df.columns = df.columns.astype(str)
         df = df.loc[:, ~df.columns.str.lower().duplicated()]
@@ -141,14 +159,20 @@ def _prepare_export_df(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     sanitize: bool = False,
+    extra_filters: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Prepare a DataFrame for export by fetching records and optionally sanitizing."""
+    records_kwargs: dict[str, Any] = {
+        "use_labels_as_columns": use_labels_as_columns,
+        "variable_whitelist": variable_whitelist,
+        "form_whitelist": form_whitelist,
+    }
+    if extra_filters:
+        records_kwargs["extra_filters"] = extra_filters
     df = _records_df(
         sdk,
         study_key,
-        use_labels_as_columns=use_labels_as_columns,
-        variable_whitelist=variable_whitelist,
-        form_whitelist=form_whitelist,
+        **records_kwargs,
     )
     df = _mask_df(df)
     if sanitize:
@@ -162,6 +186,9 @@ def export_to_parquet(
     path: str,
     *,
     use_labels_as_columns: bool = False,
+    filters: dict[str, Any] | None = None,
+    record_data_filter: str | None = None,
+    sort: str | None = None,
     **kwargs: Any,
 ) -> None:
     """Export study records to a Parquet file.
@@ -174,11 +201,15 @@ def export_to_parquet(
         When ``True``, variable labels are used for column names instead of
         variable names.
     """
-    df = _prepare_export_df(
-        sdk,
-        study_key,
-        use_labels_as_columns=use_labels_as_columns,
+    extra_filters = _merge_export_query_filters(
+        filters=filters,
+        record_data_filter=record_data_filter,
+        sort=sort,
     )
+    prep_kwargs: dict[str, Any] = {"use_labels_as_columns": use_labels_as_columns}
+    if extra_filters:
+        prep_kwargs["extra_filters"] = extra_filters
+    df = _prepare_export_df(sdk, study_key, **prep_kwargs)
     df.to_parquet(path, index=False, **kwargs)
 
 
@@ -206,6 +237,7 @@ class TabularSinkConfig(SinkConfig):
     sanitize: bool = False
     variable_whitelist: list[str] | None = None
     form_whitelist: list[int] | None = None
+    extra_filters: dict[str, Any] | None = None
     pandas_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -350,7 +382,7 @@ def _tabular_export(
         return
 
     record_model = mapper._build_record_model(variable_keys, label_map)
-    extra_filters: dict[str, Any] = {}
+    extra_filters: dict[str, Any] = dict(config.extra_filters) if config.extra_filters else {}
     if config.form_whitelist is not None:
         extra_filters["formId"] = config.form_whitelist
 
@@ -416,6 +448,9 @@ def export_to_csv(
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
     quality_gate_enabled: bool = True,
+    filters: dict[str, Any] | None = None,
+    record_data_filter: str | None = None,
+    sort: str | None = None,
     **kwargs: Any,
 ) -> None:
     """Export study records to a CSV file.
@@ -428,6 +463,11 @@ def export_to_csv(
         When ``True``, variable labels are used for column names instead of
         variable names.
     """
+    extra_filters = _merge_export_query_filters(
+        filters=filters,
+        record_data_filter=record_data_filter,
+        sort=sort,
+    )
     config = kwargs.pop("config", None)
     if not isinstance(config, TabularSinkConfig):
         sink_kwargs = _pop_sink_kwargs(kwargs)
@@ -438,9 +478,12 @@ def export_to_csv(
             use_labels_as_columns=use_labels_as_columns,
             variable_whitelist=variable_whitelist,
             form_whitelist=form_whitelist,
+            extra_filters=extra_filters,
             quality_gate_enabled=quality_gate_enabled,
             **sink_kwargs,
         )
+    elif extra_filters and config.extra_filters is None:
+        config.extra_filters = extra_filters
 
     sink = TabularCSVSink(path, config)
     _tabular_export(sdk, study_key, sink, config, sanitize=True)
@@ -452,6 +495,9 @@ def export_to_excel(
     path: str,
     *,
     use_labels_as_columns: bool = False,
+    filters: dict[str, Any] | None = None,
+    record_data_filter: str | None = None,
+    sort: str | None = None,
     **kwargs: Any,
 ) -> None:
     """Export study records to an Excel workbook.
@@ -464,12 +510,18 @@ def export_to_excel(
         When ``True``, variable labels are used for column names instead of
         variable names.
     """
-    df = _prepare_export_df(
-        sdk,
-        study_key,
-        use_labels_as_columns=use_labels_as_columns,
-        sanitize=True,
+    extra_filters = _merge_export_query_filters(
+        filters=filters,
+        record_data_filter=record_data_filter,
+        sort=sort,
     )
+    prep_kwargs: dict[str, Any] = {
+        "use_labels_as_columns": use_labels_as_columns,
+        "sanitize": True,
+    }
+    if extra_filters:
+        prep_kwargs["extra_filters"] = extra_filters
+    df = _prepare_export_df(sdk, study_key, **prep_kwargs)
     df.to_excel(path, index=False, **kwargs)
 
 
@@ -480,6 +532,9 @@ def export_to_json(
     *,
     use_labels_as_columns: bool = False,
     hierarchical: bool = False,
+    filters: dict[str, Any] | None = None,
+    record_data_filter: str | None = None,
+    sort: str | None = None,
     **kwargs: Any,
 ) -> None:
     """Export study records to a JSON file.
@@ -499,16 +554,23 @@ def export_to_json(
     import logging
 
     logger = logging.getLogger(__name__)
+    extra_filters = _merge_export_query_filters(
+        filters=filters,
+        record_data_filter=record_data_filter,
+        sort=sort,
+    )
 
     if hierarchical:
         mapper = _record_mapper()(sdk)
-        data = mapper.build_hierarchy(study_key, use_labels_as_keys=use_labels_as_columns)
+        hierarchy_kwargs: dict[str, Any] = {"use_labels_as_keys": use_labels_as_columns}
+        if extra_filters:
+            hierarchy_kwargs["extra_filters"] = extra_filters
+        data = mapper.build_hierarchy(study_key, **hierarchy_kwargs)
     else:
-        df = _prepare_export_df(
-            sdk,
-            study_key,
-            use_labels_as_columns=use_labels_as_columns,
-        )
+        prep_kwargs: dict[str, Any] = {"use_labels_as_columns": use_labels_as_columns}
+        if extra_filters:
+            prep_kwargs["extra_filters"] = extra_filters
+        df = _prepare_export_df(sdk, study_key, **prep_kwargs)
         import pandas as pd
 
         # Explicitly handle missing values when converting to dict

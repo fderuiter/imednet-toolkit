@@ -263,6 +263,10 @@ class SimulationState:
                     "intervalId": 501,
                     "intervalName": "Baseline",
                     "studyKey": "STUDY",
+                    "forms": [
+                        {"formId": 301, "formKey": "F_DM", "formName": "Demographics"},
+                        {"formId": 302, "formKey": "F_VS", "formName": "Vital Signs"},
+                    ],
                 }
             ]
 
@@ -587,6 +591,47 @@ class SimulationState:
             if not study_key:
                 return users
             return [dict(u, studyKey=study_key) for u in users]
+
+    def get_record_revisions(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of simulated record revisions for a study."""
+        target_study = study_key or "STUDY"
+        return [
+            {
+                "recordRevisionId": 1001,
+                "recordId": 601,
+                "studyKey": target_study,
+                "subjectKey": "SUB1",
+                "subjectId": 201,
+                "formKey": "F_DM",
+                "siteId": 101,
+                "recordStatus": "Complete",
+                "recordRevision": 1,
+                "user": "sim_user",
+                "dateCreated": "2026-01-10T12:00:00Z",
+            }
+        ]
+
+    def get_codings(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of simulated medical codings for a study."""
+        target_study = study_key or "STUDY"
+        return [
+            {
+                "codingId": 1101,
+                "studyKey": target_study,
+                "siteName": "SITE",
+                "subjectId": 201,
+                "subjectKey": "SUB1",
+                "formId": 301,
+                "recordId": 601,
+                "variable": "V_GENDER",
+                "value": "M",
+                "code": "C20197",
+                "codedBy": "sim_user",
+                "dictionaryName": "MedDRA",
+                "dictionaryVersion": "26.1",
+                "dateCoded": "2026-01-11T09:00:00Z",
+            }
+        ]
 
 
 _default_state: SimulationState | None = None

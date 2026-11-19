@@ -48,6 +48,11 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--high-contrast", action="store_true", help="Enable high-contrast mode for accessibility."
     )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Run offline against the deterministic in-memory simulation engine.",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -212,11 +217,15 @@ def app(args: list[str] | None = None) -> None:
         os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
 
     old_output_format = os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT")
+    old_simulation_mode = os.environ.get("IMEDNET_SIMULATION_MODE")
     try:
         if getattr(parsed, "output_format", None) == "json":
             os.environ["IMEDNET_CLI_OUTPUT_FORMAT"] = "json"
         else:
             os.environ.pop("IMEDNET_CLI_OUTPUT_FORMAT", None)
+
+        if getattr(parsed, "simulate", False):
+            os.environ["IMEDNET_SIMULATION_MODE"] = "true"
 
         if hasattr(parsed, "func"):
             parsed.func(parsed)
@@ -228,6 +237,10 @@ def app(args: list[str] | None = None) -> None:
             os.environ["IMEDNET_CLI_OUTPUT_FORMAT"] = old_output_format
         else:
             os.environ.pop("IMEDNET_CLI_OUTPUT_FORMAT", None)
+        if old_simulation_mode is not None:
+            os.environ["IMEDNET_SIMULATION_MODE"] = old_simulation_mode
+        elif getattr(parsed, "simulate", False):
+            os.environ.pop("IMEDNET_SIMULATION_MODE", None)
 
 
 if __name__ == "__main__":

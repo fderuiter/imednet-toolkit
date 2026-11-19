@@ -18,25 +18,58 @@ def test_parse_filter_args_types():
 
 
 def test_parse_filter_args_comparison_operators():
-    """Test that parse_filter_args preserves comparison operators without extra equals signs."""
+    """Test that parse_filter_args preserves all 8 comparison/equality operators."""
     assert parse_filter_args(["dictionaryName==MedDRA"]) == {"dictionaryName": ("==", "MedDRA")}
     assert parse_filter_args(["revision>=2"]) == {"revision": (">=", 2)}
+    assert parse_filter_args(["revision<=5"]) == {"revision": ("<=", 5)}
     assert parse_filter_args(["subjectStatus!=Enrolled"]) == {"subjectStatus": ("!=", "Enrolled")}
+    assert parse_filter_args(["subjectKey=~^SUBJ.*"]) == {"subjectKey": ("=~", "^SUBJ.*")}
     assert parse_filter_args(["revision>1"]) == {"revision": (">", 1)}
+    assert parse_filter_args(["revision<10"]) == {"revision": ("<", 10)}
+    assert parse_filter_args(["status=Open"]) == {"status": "Open"}
 
     combined = parse_filter_args(
         [
             "dictionaryName==MedDRA",
             "revision>=2",
+            "revision<=5",
             "subjectStatus!=Enrolled",
+            "subjectKey=~^SUBJ.*",
             "revision>1",
+            "revision<10",
+            "status=Open",
         ]
     )
     assert combined == {
         "dictionaryName": ("==", "MedDRA"),
-        "revision": [(">=", 2), (">", 1)],
+        "revision": [(">=", 2), ("<=", 5), (">", 1), ("<", 10)],
         "subjectStatus": ("!=", "Enrolled"),
+        "subjectKey": ("=~", "^SUBJ.*"),
+        "status": "Open",
     }
+
+
+def test_parse_filter_args_repeated_equality_builds_or_list():
+    """Test that repeated equality keys on --filter build OR lists."""
+    assert parse_filter_args(["status=Screened", "status=Enrolled"]) == {
+        "status": ["Screened", "Enrolled"]
+    }
+    assert parse_filter_args(["status==Screened", "status==Enrolled", "status=Active"]) == {
+        "status": ["Screened", "Enrolled", "Active"]
+    }
+
+
+@pytest.mark.parametrize("bad_expr", ["key! =val", "a===b", "a<>b", "field~=val"])
+def test_parse_filter_args_rejects_operator_chars_in_key(
+    bad_expr: str, capfd: pytest.CaptureFixture[str]
+):
+    """Test that operator characters left in keys exit 1 and write to stderr."""
+    with pytest.raises(SystemExit) as exc_info:
+        parse_filter_args([bad_expr])
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Error:" in captured.err
 
 
 def test_parse_filter_args_rejects_unknown_visit_attribute(capfd: pytest.CaptureFixture[str]):

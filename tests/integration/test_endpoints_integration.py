@@ -79,3 +79,66 @@ async def test_async_endpoint_mirror():
     assert [s.site_id for s in sync_res] == [1]
     assert [s.site_id for s in async_res] == [1]
     assert [s.site_id for s in sync_res] == [s.site_id for s in async_res]
+
+
+@respx.mock
+def test_endpoint_sort_forwarded_as_top_level_query_param():
+    """Test that sort is forwarded as top-level params['sort'] rather than a filter term."""
+    sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+
+    studies_route = respx.get("https://api.test/api/v1/edc/studies").respond(
+        json={"data": [{"studyKey": "S1"}]}
+    )
+    forms_route = respx.get("https://api.test/api/v1/edc/studies/ST/forms").respond(
+        json={"data": [{"formId": 1, "formKey": "F_DM"}]}
+    )
+    records_route = respx.get("https://api.test/api/v1/edc/studies/ST/records").respond(
+        json={"data": [{"recordId": 1}]}
+    )
+    users_route = respx.get("https://api.test/api/v1/edc/studies/ST/users").respond(
+        json={"data": [{"userId": "u1"}]}
+    )
+
+    list(sdk.studies.list(sort="studyKey,asc"))
+    studies_params = dict(studies_route.calls.last.request.url.params)
+    assert studies_params["sort"] == "studyKey,asc"
+    assert "filter" not in studies_params
+
+    list(sdk.forms.list("ST", form_key="F_DM", sort="formKey,desc"))
+    forms_params = dict(forms_route.calls.last.request.url.params)
+    assert forms_params["sort"] == "formKey,desc"
+    assert forms_params["filter"] == "formKey==F_DM"
+    assert "sort" not in forms_params["filter"]
+
+    list(
+        sdk.records.list(
+            "ST",
+            status="Open",
+            record_data_filter="V_AGE>=18",
+            sort="recordId,desc",
+        )
+    )
+    records_params = dict(records_route.calls.last.request.url.params)
+    assert records_params["sort"] == "recordId,desc"
+    assert records_params["recordDataFilter"] == "V_AGE>=18"
+    assert records_params["filter"] == "status==Open;studyKey==ST"
+
+    list(sdk.users.list("ST", include_inactive=True, sort="lastName,asc"))
+    users_params = dict(users_route.calls.last.request.url.params)
+    assert users_params["sort"] == "lastName,asc"
+    assert users_params["includeInactive"] == "true"
+    assert "filter" not in users_params
+
+
+@respx.mock
+def test_study_scoped_endpoint_repeated_equality_or_list():
+    """Test that study-scoped endpoints send OR filter lists without mixing ';' and ','."""
+    sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+    route = respx.get("https://api.test/api/v1/edc/studies/ST/subjects").respond(
+        json={"data": [{"subjectKey": "SUB1"}]}
+    )
+
+    subjects = list(sdk.subjects.list("ST", subject_status=["Screened", "Enrolled"]))
+    params = dict(route.calls.last.request.url.params)
+    assert params["filter"] == "subjectStatus==Screened,subjectStatus==Enrolled"
+    assert len(subjects) == 1

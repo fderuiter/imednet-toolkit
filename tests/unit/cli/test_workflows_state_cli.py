@@ -106,13 +106,35 @@ class TestShowState:
         assert "No ledger entries" in result.output
 
     def test_show_error_on_read_failure(self, runner: CliRunner, tmp_path) -> None:
-        """Test that show error on read failure."""
+        """Test that show error on read failure writes to stderr and leaves stdout empty."""
         ledger_path = str(tmp_path / "ledger.json")
         with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
             mock_ledger.return_value.read_state.side_effect = OSError("cannot read")
             result = runner.invoke(state_app, ["show", "--ledger-path", ledger_path])
 
         assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Failed to read ledger" in result.stderr
+
+    def test_show_json_format(self, runner: CliRunner, tmp_path) -> None:
+        """Test that state show --format json emits versioned JSON on stdout."""
+        import json
+
+        ledger_path = str(tmp_path / "ledger.json")
+        state = _make_ledger_state("STUDY-01", "records")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.return_value = state
+            result = runner.invoke(
+                state_app, ["show", "--ledger-path", ledger_path, "--format", "json"]
+            )
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        parsed = json.loads(result.stdout)
+        assert parsed["schemaVersion"] == "1.0"
+        assert parsed["resource"] == "workflow_state"
+        assert parsed["count"] == 1
+        assert parsed["items"][0]["studyKey"] == "STUDY-01"
 
 
 class TestSetState:
@@ -186,10 +208,11 @@ class TestSetState:
             ],
         )
         assert result.exit_code == 1
-        assert "Invalid ISO timestamp" in result.output
+        assert result.stdout == ""
+        assert "Invalid ISO timestamp" in result.stderr
 
     def test_set_write_failure_exits_with_error(self, runner: CliRunner, tmp_path) -> None:
-        """Test that set write failure exits with error."""
+        """Test that set write failure exits with error on stderr and leaves stdout empty."""
         ledger_path = str(tmp_path / "ledger.json")
         with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
             mock_ledger.return_value.set_last_timestamp.side_effect = OSError("disk full")
@@ -209,7 +232,37 @@ class TestSetState:
             )
 
         assert result.exit_code == 1
-        assert "Failed to write ledger" in result.output
+        assert result.stdout == ""
+        assert "Failed to write ledger" in result.stderr
+
+    def test_set_json_format(self, runner: CliRunner, tmp_path) -> None:
+        """Test that state set --format json emits versioned JSON on stdout."""
+        import json
+
+        ledger_path = str(tmp_path / "ledger.json")
+        with patch("imednet_workflows.cli.get_state_provider"):
+            result = runner.invoke(
+                state_app,
+                [
+                    "set",
+                    "--study-key",
+                    "STUDY-01",
+                    "--stream",
+                    "records",
+                    "--timestamp",
+                    "2026-05-22T12:00:00Z",
+                    "--ledger-path",
+                    ledger_path,
+                    "--format",
+                    "json",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        parsed = json.loads(result.stdout)
+        assert parsed["resource"] == "workflow_state"
+        assert parsed["items"][0]["studyKey"] == "STUDY-01"
 
 
 class TestResetState:
@@ -296,4 +349,31 @@ class TestResetState:
             )
 
         assert result.exit_code == 1
-        assert "Failed to reset ledger state" in result.output
+        assert result.stdout == ""
+        assert "Failed to reset ledger state" in result.stderr
+
+    def test_reset_json_format(self, runner: CliRunner, tmp_path) -> None:
+        """Test that state reset --format json emits versioned JSON on stdout."""
+        import json
+
+        ledger_path = str(tmp_path / "ledger.json")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.delete_entry.return_value = True
+            result = runner.invoke(
+                state_app,
+                [
+                    "reset",
+                    "--study-key",
+                    "STUDY-01",
+                    "--ledger-path",
+                    ledger_path,
+                    "--format",
+                    "json",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        parsed = json.loads(result.stdout)
+        assert parsed["resource"] == "workflow_state"
+        assert parsed["items"][0]["removed"] is True

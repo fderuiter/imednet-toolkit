@@ -478,3 +478,129 @@ def test_cli_export_json_help_includes_hierarchical(runner: CliRunner) -> None:
     result = runner.invoke(cli.app, ["export", "json", "--help"])
     assert result.exit_code == 0
     assert "--hierarchical" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "extra_args"),
+    [
+        ("mongodb", ["STUDY", "mongodb://localhost:27017", "db", "records"]),
+        ("neo4j", ["STUDY", "bolt://localhost:7687", "neo4j", "password"]),
+        (
+            "snowflake",
+            ["STUDY", "acct", "user", "secret", "DB", "PUBLIC", "WH", "STAGE", "TBL"],
+        ),
+    ],
+)
+def test_cli_export_sinks_missing_plugin_writes_stderr_and_exits_1(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    subcommand: str,
+    extra_args: list[str],
+) -> None:
+    """Test that mongodb, neo4j, and snowflake check sdk.sinks explicitly and exit 1."""
+    sdk.sinks = None
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    result = runner.invoke(cli.app, ["export", subcommand, *extra_args])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "imednet-plugins-sinks" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "attr_name", "filename", "expected_base_kwargs"),
+    [
+        ("parquet", "export_to_parquet", "out.parquet", {"use_labels_as_columns": False}),
+        ("csv", "export_to_csv", "out.csv", {"use_labels_as_columns": False}),
+        ("excel", "export_to_excel", "out.xlsx", {"use_labels_as_columns": False}),
+        (
+            "json",
+            "export_to_json",
+            "out.json",
+            {"use_labels_as_columns": False, "hierarchical": False},
+        ),
+    ],
+)
+def test_cli_export_file_commands_forward_filter_record_data_filter_and_sort(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    subcommand: str,
+    attr_name: str,
+    filename: str,
+    expected_base_kwargs: dict[str, object],
+) -> None:
+    """Test that parquet, csv, excel, and json exports forward --filter, --record-data-filter, and --sort."""
+    func = MagicMock()
+    monkeypatch.setattr(export_mod, attr_name, func)
+    monkeypatch.setattr(cli, attr_name, getattr(export_mod, attr_name))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "export",
+            subcommand,
+            "STUDY",
+            filename,
+            "--filter",
+            "form_key=F_DM",
+            "--filter",
+            "record_id>=1",
+            "--record-data-filter",
+            "V_AGE>=18",
+            "--sort",
+            "recordId,desc",
+        ],
+    )
+
+    assert result.exit_code == 0
+    func.assert_called_once_with(
+        sdk,
+        "STUDY",
+        filename,
+        **expected_base_kwargs,
+        filters={"form_key": "F_DM", "record_id": (">=", 1)},
+        record_data_filter="V_AGE>=18",
+        sort="recordId,desc",
+    )
+
+
+def test_export_functions_forward_query_options_in_simulation_mode(tmp_path) -> None:
+    """Test end-to-end export_to_{parquet,csv,excel,json} with filters, record_data_filter, and sort."""
+    import json
+
+    from imednet.sdk import ImednetSDK
+
+    sim_sdk = ImednetSDK(simulation_mode=True)
+    csv_path = tmp_path / "records.csv"
+    parquet_path = tmp_path / "records.parquet"
+    excel_path = tmp_path / "records.xlsx"
+    json_flat_path = tmp_path / "records_flat.json"
+    json_hier_path = tmp_path / "records_hier.json"
+
+    common_opts = {
+        "filters": {"form_key": "F_VS"},
+        "record_data_filter": "V_WEIGHT>=60",
+        "sort": "recordId,asc",
+    }
+
+    export_mod.export_to_csv(sim_sdk, "STUDY", str(csv_path), **common_opts)
+    export_mod.export_to_parquet(sim_sdk, "STUDY", str(parquet_path), **common_opts)
+    export_mod.export_to_excel(sim_sdk, "STUDY", str(excel_path), **common_opts)
+    export_mod.export_to_json(sim_sdk, "STUDY", str(json_flat_path), **common_opts)
+    export_mod.export_to_json(
+        sim_sdk, "STUDY", str(json_hier_path), hierarchical=True, **common_opts
+    )
+
+    assert csv_path.exists()
+    assert parquet_path.exists()
+    assert excel_path.exists()
+    flat_payload = json.loads(json_flat_path.read_text(encoding="utf-8"))
+    hier_payload = json.loads(json_hier_path.read_text(encoding="utf-8"))
+    assert len(flat_payload) == 1
+    assert flat_payload[0]["V_WEIGHT"] == 68.5
+    assert len(hier_payload) == 1
+    assert hier_payload[0]["subject_key"] == "SUB1"
