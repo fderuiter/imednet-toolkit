@@ -1404,6 +1404,7 @@ source = { editable = "." }
 dependencies = [
     { name = "imednet" },
     { name = "imednet-plugins-sinks" },
+    { name = "imednet-tui" },
     { name = "imednet-workflows" },
 ]
 
@@ -1451,6 +1452,7 @@ requires-dist = [
     { name = "httpx", extras = ["socks"], marker = "extra == 'dev'", specifier = ">=0.28.1,<0.29.0" },
     { name = "imednet", editable = "packages/core" },
     { name = "imednet-plugins-sinks", editable = "packages/plugins-sinks" },
+    { name = "imednet-tui", editable = "packages/plugins-tui" },
     { name = "imednet-workflows", editable = "packages/plugins-workflows" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.20.0" },
     { name = "mypy", marker = "extra == 'docs'", specifier = ">=1.15.0,<2.5.0" },

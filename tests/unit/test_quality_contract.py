@@ -60,3 +60,13 @@ def test_odm_emitter_uses_only_xml_building_operations():
         and node.value.id == "ET"
     }
     assert uses <= {"Element", "SubElement", "register_namespace", "indent", "tostring"}
+
+
+def test_ci_quality_job_verifies_model_type_stubs():
+    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text())
+    steps = pipeline["jobs"]["quality"]["steps"]
+    assert any(
+        "ModelEngine.generate_stubs" in s.get("run", "")
+        and "git diff --exit-code packages/core/src/imednet/models/" in s.get("run", "")
+        for s in steps
+    )

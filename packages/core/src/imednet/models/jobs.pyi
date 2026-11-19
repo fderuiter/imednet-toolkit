@@ -37,8 +37,11 @@ SUCCESSFUL_JOB_STATES: set[JobState]
 FAILED_JOB_STATES: set[JobState]
 ALLOWED_JOB_TRANSITIONS: dict[JobState, set[JobState]]
 
-class InvalidJobStateError(ValueError): ...
-class InvalidJobTransitionError(ValueError): ...
+class InvalidJobStateError(ValueError):
+    """Raised when an unrecognized job state string is encountered."""
+
+class InvalidJobTransitionError(ValueError):
+    """Raised when an invalid state transition is attempted."""
 
 InvalidStateTransitionError = InvalidJobTransitionError
 
@@ -49,8 +52,16 @@ def validate_job_transition(from_state: JobState | str, to_state: JobState | str
 class Job(ImednetBaseModel):
     """Represents an asynchronous background job."""
 
-    state: JobState | str | None
+    state: JobState | str | None = Field(default=None, alias="state")
+    job_id: str | None
+    batch_id: str | None
+    date_created: str | None
+    date_finished: str | None
+    date_started: str | None
 
+    @field_validator("state", mode="before")
+    @classmethod
+    def _validate_state(cls, v: Any) -> JobState | None: ...
     def transition_to(self, target: JobState | str) -> Job: ...
     @property
     def is_terminal(self) -> bool: ...
@@ -59,16 +70,18 @@ class Job(ImednetBaseModel):
     @property
     def is_failed(self) -> bool: ...
 
-    job_id: str | None
-    batch_id: str | None
-    date_created: Any
-    date_finished: Any
-    date_started: Any
-
 class JobStatus(Job):
     """Extended job information returned when polling."""
 
     results: Any = Field(default=None)
+    state: JobState | str | None
+    job_id: str | None
+    batch_id: str | None
+    date_created: str | None
+    date_finished: str | None
+    date_started: str | None
+    progress: int | None
+    result_url: str | None
 
     @field_validator("progress", mode="before", check_fields=False)
     def _parse_progress(cls, v: Any) -> int: ...
@@ -78,12 +91,3 @@ class JobStatus(Job):
     def successful_records(self) -> int: ...
     @property
     def failed_records(self) -> int: ...
-
-    job_id: str | None
-    batch_id: str | None
-    state: JobState | str | None
-    date_created: str | None
-    date_started: str | None
-    date_finished: str | None
-    progress: int | None
-    result_url: str | None

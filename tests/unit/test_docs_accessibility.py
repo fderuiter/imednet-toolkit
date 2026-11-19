@@ -180,12 +180,42 @@ def test_code_block_keyboard_accessibility() -> None:
 
 @pytest.mark.unit
 def test_vpat_document_conformance() -> None:
-    """Ensure VPAT document reflects verified WCAG 2.1 AA conformance data."""
+    """Ensure VPAT document reflects verified WCAG 2.1 AA conformance and TUI accessibility."""
+    from imednet_tui.app import ImednetTuiApp
+
     vpat_content = (REPO_ROOT / "docs/reference/VPAT.rst").read_text(encoding="utf-8")
 
     assert "WCAG 2.1 Level AA" in vpat_content
     assert "4.5:1" in vpat_content
     assert "verified-wcag-aa" in vpat_content
+    assert "imednet tui" in vpat_content
+    assert "--high-contrast" in vpat_content
+    assert "IMEDNET_HIGH_CONTRAST=1" in vpat_content
+    assert "IMEDNET_NON_INTERACTIVE=1" in vpat_content
+    assert "InteractiveDataGrid" in vpat_content
+
+    for binding in ImednetTuiApp.BINDINGS:
+        key = binding[0] if isinstance(binding, tuple) else binding.key
+        assert f"``{key}``" in vpat_content, f"TUI binding '{key}' missing from VPAT.rst"
+
+
+@pytest.mark.unit
+def test_cli_and_plugins_docs_tui_accessibility_coverage() -> None:
+    """Verify CLI and plugin guides document TUI commands, grid controls, and accessibility flags."""
+    cli_rst = (REPO_ROOT / "docs/how-to/cli.rst").read_text(encoding="utf-8")
+    for token in (
+        "imednet tui",
+        "--high-contrast",
+        "InteractiveDataGrid",
+        "IMEDNET_NON_INTERACTIVE=1",
+        "--interactive",
+    ):
+        assert token in cli_rst, f"Expected '{token}' in docs/how-to/cli.rst"
+
+    plugins_rst = (REPO_ROOT / "docs/explanation/plugins.rst").read_text(encoding="utf-8")
+    assert "/reference/api/plugins-tui" in plugins_rst
+    assert "imednet.cli_plugins" in plugins_rst
+    assert 'tui = "imednet_tui.cli:setup_parser"' in plugins_rst
 
 
 @pytest.mark.unit
