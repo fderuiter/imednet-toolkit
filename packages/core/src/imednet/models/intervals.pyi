@@ -38,3 +38,5 @@ class Interval(ImednetBaseModel):
     window_calculation_date: str | None
     window_calculation_form: str | None
     last_updated: str | None
+
+__all__ = ["FormSummary", "Interval"]

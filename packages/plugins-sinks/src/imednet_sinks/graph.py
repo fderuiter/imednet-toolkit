@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -75,6 +75,7 @@ from imednet.spi.sink_base import (
     SinkConfig,
     _redact_uri,
     _require_optional_dep,
+    apply_quality_gate,
     extract_record_id,
     run_streaming_export,
 )
@@ -231,6 +232,9 @@ class Neo4jExportSink(ExportSink):
             mode="document",
             post_processor=_post_process_graph,
         )
+        custom_pipeline = self.config.extra.get("enrichment_pipeline")
+        if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
+            mapper.register_pipeline(self._study_key, custom_pipeline)
         rows = [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
         if not rows:
             return 0
@@ -292,24 +296,28 @@ def export_to_neo4j(
     auth: tuple[str, str] = ("", ""),
     *,
     config: Neo4jSinkConfig | None = None,
-    mask_phi: bool = True,
+    mask_phi: bool | None = None,
     **kwargs: Any,
 ) -> int:
     """Export study records to Neo4j using :class:`Neo4jExportSink`."""
     if config is None:
-        kwargs.setdefault("mask_phi", mask_phi)
+        kwargs.setdefault("mask_phi", True if mask_phi is None else mask_phi)
         config = Neo4jSinkConfig(
             study_key=study_key,
             uri=uri,
             auth=auth,
             **kwargs,
         )
+    elif mask_phi is not None:
+        config = replace(config, mask_phi=mask_phi)
+    resolved_cfg = config
     return run_streaming_export(
         sdk,
         study_key,
-        lambda: Neo4jExportSink(config=config),
-        config,
-        stream_name=f"neo4j_{config.database}",
+        lambda: Neo4jExportSink(config=resolved_cfg),
+        resolved_cfg,
+        stream_name=f"neo4j_{resolved_cfg.database}",
+        quality_gate_fn=apply_quality_gate,
     )
 
 

@@ -2,7 +2,7 @@ imednet.spi package
 ===================
 
 .. automodule:: imednet.spi
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -13,7 +13,7 @@ imednet.spi.cli module
 ----------------------
 
 .. automodule:: imednet.spi.cli
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -21,7 +21,7 @@ imednet.spi.constants module
 ----------------------------
 
 .. automodule:: imednet.spi.constants
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -29,7 +29,7 @@ imednet.spi.endpoints module
 ----------------------------
 
 .. automodule:: imednet.spi.endpoints
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -37,7 +37,7 @@ imednet.spi.errors module
 -------------------------
 
 .. automodule:: imednet.spi.errors
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -45,7 +45,7 @@ imednet.spi.facade module
 -------------------------
 
 .. automodule:: imednet.spi.facade
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -53,7 +53,7 @@ imednet.spi.models module
 -------------------------
 
 .. automodule:: imednet.spi.models
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -61,7 +61,7 @@ imednet.spi.sink\_base module
 -----------------------------
 
 .. automodule:: imednet.spi.sink_base
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -69,7 +69,7 @@ imednet.spi.sinks module
 ------------------------
 
 .. automodule:: imednet.spi.sinks
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -77,7 +77,7 @@ imednet.spi.utils module
 ------------------------
 
 .. automodule:: imednet.spi.utils
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -85,6 +85,6 @@ imednet.spi.validation module
 -----------------------------
 
 .. automodule:: imednet.spi.validation
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:

@@ -1183,3 +1183,78 @@ def test_record_mapper_masks_phi_before_applying_question_labels() -> None:
     df_ctor_unmasked = opt_out_mapper.dataframe("STUDY1", use_labels_as_columns=True)
     assert df_ctor_unmasked.iloc[0]["Full Legal Participant Name"] == "Jane Doe"
     assert global_sensitivity_registry._sensitive_keys == registry_snapshot
+
+
+def test_record_mapper_applies_committed_study_config_phi_in_dataframe_and_hierarchy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify RecordMapper resolves committed StudyConfiguration phi_fields in dataframe and build_hierarchy."""
+    from unittest.mock import patch
+
+    import imednet_workflows.record_mapper as rm_mod
+    from imednet.integrations.enrichment import EnrichmentPipeline
+    from imednet.models.study_config import MappingRule, StudyConfiguration
+
+    cfg = StudyConfiguration(
+        study_key="STUDY-GOV",
+        phi_fields=["chart_code"],
+        mappings=[
+            MappingRule(
+                domain="DM",
+                target_field="normalized_status",
+                source_form_key="DM",
+                source_variable_name="raw_status",
+                business_logic="value.upper()",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        rm_mod,
+        "resolve_enrichment_pipeline",
+        lambda sk: EnrichmentPipeline(cfg) if sk == "STUDY-GOV" else None,
+    )
+
+    sdk = MagicMock()
+    variables = [
+        Variable(variable_name="chart_code", label="Hospital Chart Code", form_id=10),
+        Variable(variable_name="raw_status", label="Raw Enrollment Status", form_id=10),
+        Variable(variable_name="heartRate", label="Heart Rate", form_id=10),
+    ]
+    sdk.get_variables.return_value = variables
+    rec = Record(
+        record_id=202,
+        subject_key="SUBJ-202",
+        visit_id=1,
+        form_id=10,
+        record_status="Complete",
+        date_created=datetime(2025, 2, 1),
+        record_data={
+            "chart_code": "MRN-7788",
+            "raw_status": "active",
+            "heartRate": 71,
+        },
+    )
+    sdk.get_records.return_value = [rec]
+
+    mapper = RecordMapper(sdk)
+    df = mapper.dataframe("STUDY-GOV", use_labels_as_columns=True)
+    assert df.iloc[0]["Hospital Chart Code"] == "***MASKED***"
+    assert df.iloc[0]["Heart Rate"] == 71
+
+    df_unmasked = mapper.dataframe("STUDY-GOV", use_labels_as_columns=True, mask_phi=False)
+    assert df_unmasked.iloc[0]["Hospital Chart Code"] == "MRN-7788"
+
+    mock_struct = MagicMock()
+    interval = MagicMock()
+    form = MagicMock()
+    form.form_id = 10
+    form.variables = variables
+    interval.forms = [form]
+    mock_struct.intervals = [interval]
+
+    with patch("imednet_workflows.study_structure.get_study_structure", return_value=mock_struct):
+        mapper._iter_records = MagicMock(return_value=[rec])  # type: ignore[method-assign]
+        tree = mapper.build_hierarchy("STUDY-GOV", use_labels_as_keys=True)
+        out_rec = tree[0]["visits"][0]["forms"][0]["records"][0]
+        assert out_rec["Hospital Chart Code"] == "***MASKED***"
+        assert out_rec["Heart Rate"] == 71

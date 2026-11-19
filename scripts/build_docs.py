@@ -104,63 +104,18 @@ def build_and_stage_wheels(
     return staged
 
 
-_REEXPORT_SUBMODULES: frozenset[str] = frozenset(
-    {
-        "imednet.models.engine",
-        "imednet.utils.ast_eval",
-    }
-)
-
-_REEXPORTED_MEMBERS_BY_MODULE: dict[str, str] = {
-    "imednet.utils.job_poller": (
-        "InvalidJobStateError, InvalidJobTransitionError, InvalidStateTransitionError"
-    ),
-    "imednet_workflows.uat.orchestrator": ("InvalidUATStateTransitionError, UATWorkflowState"),
-}
+SCOPED_INHERITED_MEMBERS = "BaseModel, RootModel, Enum, str, int, Exception, BaseException, object"
 
 
-def mark_reexport_stubs_noindex(api_dir: Path) -> None:
-    """Add :noindex: / :exclude-members: to package __init__ and re-export stubs."""
-    if not api_dir.exists():
-        return
-
-    automodule_pattern = re.compile(
-        r"^(\.\. automodule:: ([A-Za-z0-9_.]+)\n)((?:   :[A-Za-z0-9_-]+:.*\n?)+)",
-        re.MULTILINE,
-    )
-
+def scope_apidoc_inherited_members(api_dir: Path) -> None:
+    """Scope :inherited-members: directives in generated apidoc RST files."""
     for rst_file in sorted(api_dir.glob("*.rst")):
-        text = rst_file.read_text(encoding="utf-8")
-        has_children = "Subpackages\n-----------" in text or "Submodules\n----------" in text
-        first_seen = False
-
-        def _inject_noindex(match: re.Match[str], has_children: bool = has_children) -> str:
-            nonlocal first_seen
-            header = match.group(1)
-            mod_name = match.group(2)
-            opts_block = match.group(3)
-            is_first = not first_seen
-            first_seen = True
-
-            extra_opts: list[str] = []
-            should_noindex = (
-                (is_first and has_children)
-                or mod_name.startswith("imednet.spi.")
-                or mod_name in _REEXPORT_SUBMODULES
-            )
-            if should_noindex and ":noindex:" not in opts_block:
-                extra_opts.append("   :noindex:")
-
-            excluded = _REEXPORTED_MEMBERS_BY_MODULE.get(mod_name)
-            if excluded and ":exclude-members:" not in opts_block:
-                extra_opts.append(f"   :exclude-members: {excluded}")
-
-            if extra_opts:
-                return header + "\n".join(extra_opts) + "\n" + opts_block
-            return match.group(0)
-
-        updated = automodule_pattern.sub(_inject_noindex, text)
-        if updated != text:
+        content = rst_file.read_text(encoding="utf-8")
+        updated = content.replace(
+            "   :inherited-members:\n",
+            f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n",
+        )
+        if updated != content:
             rst_file.write_text(updated, encoding="utf-8")
 
 
@@ -173,7 +128,7 @@ def main() -> None:
 
     print("Generating new API docs...")
     env = os.environ.copy()
-    env["SPHINX_APIDOC_OPTIONS"] = "members,show-inheritance"
+    env["SPHINX_APIDOC_OPTIONS"] = "inherited-members,members,show-inheritance"
 
     # Core package
     run_command(
@@ -182,7 +137,6 @@ def main() -> None:
             "-o",
             str(api_dir),
             "packages/core/src/imednet",
-            "packages/core/src/imednet/core",
             "packages/core/src/imednet/http",
             "-f",
             "-M",
@@ -194,11 +148,11 @@ def main() -> None:
 
     # Other packages
     packages_dir = Path("packages")
-    for pkg in sorted(packages_dir.iterdir(), key=lambda p: p.name):
+    for pkg in sorted(packages_dir.iterdir()):
         if pkg.is_dir() and pkg.name != "core":
             src_dir = pkg / "src"
             if src_dir.exists():
-                subdirs = sorted([d for d in src_dir.iterdir() if d.is_dir()], key=lambda p: p.name)
+                subdirs = sorted(d for d in src_dir.iterdir() if d.is_dir())
                 if subdirs:
                     target_dir = subdirs[0]
                     run_command(
@@ -215,7 +169,7 @@ def main() -> None:
                         env=env,
                     )
 
-    mark_reexport_stubs_noindex(api_dir)
+    scope_apidoc_inherited_members(api_dir)
 
     print("Generating ADR index...")
     generate_adr_index()
@@ -235,9 +189,6 @@ def main() -> None:
 
     print("Type-checking documentation snippets...")
     run_command([sys.executable, "scripts/typecheck_docs.py"])
-
-    print("Validating documentation...")
-    run_command([sys.executable, "scripts/validate_docs.py"])
 
     print("Running doctests...")
     run_command(
@@ -269,7 +220,7 @@ def main() -> None:
             shutil.copy2(whl, html_wheels_dir / whl.name)
     shutil.rmtree(Path("docs/_static/wheels"), ignore_errors=True)
 
-    print("Validating rendered HTML SEO and Pages artifacts...")
+    print("Validating documentation, rendered API reference, and SEO artifacts...")
     run_command([sys.executable, "scripts/validate_docs.py", "--require-html"])
 
 

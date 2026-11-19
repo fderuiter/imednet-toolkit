@@ -9,6 +9,7 @@ try:
     import pandas as pd
 except ImportError:
     pd: Any = None  # type: ignore[no-redef]
+from ..integrations.enrichment import resolve_enrichment_pipeline
 from ..models.base import ImednetBaseModel
 from ..models.forms import Form
 from ..models.intervals import Interval
@@ -20,6 +21,7 @@ from ..models.users import User
 from ..models.variables import Variable
 from ..models.visits import Visit
 from .security import (
+    _normalize_key,
     global_sensitivity_registry,
     mask_clinical_phi,
     sanitize_csv_formula,
@@ -134,11 +136,25 @@ def users_to_dataframe(users: list[User]) -> pd.DataFrame:
     return pd.DataFrame(user_dicts)
 
 
+def _is_custom_phi_column(col: str, phi_keys: set[str]) -> bool:
+    """Return True if *col* matches a custom study PHI field (top-level or json_normalize path)."""
+    if not phi_keys or not col or global_sensitivity_registry.is_exempt(col):
+        return False
+    if _normalize_key(col) in phi_keys:
+        return True
+    return any(
+        not global_sensitivity_registry.is_exempt(part) and _normalize_key(part) in phi_keys
+        for part in col.split("_")
+        if part
+    )
+
+
 def records_to_dataframe(
     records: list[Record],
     *,
     flatten: bool = False,
     mask_phi: bool = True,
+    study_key: str | None = None,
 ) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.records.Record` to a DataFrame.
 
@@ -152,14 +168,37 @@ def records_to_dataframe(
     if df.empty:
         return df
 
-    if mask_phi and "record_data" in df.columns:
-        df["record_data"] = df["record_data"].apply(mask_clinical_phi)
+    resolved_study_key = study_key
+    if not resolved_study_key:
+        for rec in records:
+            cand = getattr(rec, "study_key", None)
+            if isinstance(cand, str) and cand:
+                resolved_study_key = cand
+                break
+
+    pipeline = resolve_enrichment_pipeline(resolved_study_key)
+    phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
+
+    if "record_data" in df.columns:
+        if mask_phi:
+            df["record_data"] = df["record_data"].apply(mask_clinical_phi)
+        if pipeline is not None:
+            df["record_data"] = df["record_data"].apply(
+                lambda val: (
+                    pipeline.process(val, mask_phi=mask_phi, _skip_default_phi=mask_phi)
+                    if isinstance(val, dict)
+                    else val
+                )
+            )
 
     if flatten:
         record_df = pd.json_normalize(df["record_data"].tolist(), sep="_")
         if mask_phi and not record_df.empty:
             for col in record_df.columns:
-                if global_sensitivity_registry.is_sensitive(str(col)):
+                col_str = str(col)
+                if global_sensitivity_registry.is_sensitive(col_str) or _is_custom_phi_column(
+                    col_str, phi_keys
+                ):
                     record_df[col] = "***MASKED***"
         df = pd.concat([df.drop(columns=["record_data"]), record_df], axis=1)
     return df
@@ -172,6 +211,7 @@ def export_records_csv(
     *,
     flatten: bool = True,
     mask_phi: bool = True,
+    use_labels_as_columns: bool = False,
 ) -> None:
     """Fetch all records for ``study_key`` and write them to ``file_path``.
 
@@ -182,7 +222,24 @@ def export_records_csv(
     check_pandas("export_records_csv")
 
     records = list(sdk.records.list(study_key=study_key))
-    df = records_to_dataframe(records, flatten=flatten, mask_phi=mask_phi)
+    df = records_to_dataframe(
+        records,
+        flatten=flatten,
+        mask_phi=mask_phi,
+        study_key=study_key,
+    )
+
+    if use_labels_as_columns and flatten and not df.empty:
+        variables_ep = getattr(sdk, "variables", None)
+        if variables_ep is not None and callable(getattr(variables_ep, "list", None)):
+            variables = list(variables_ep.list(study_key=study_key))
+            rename_map = {
+                v.variable_name: v.label
+                for v in variables
+                if getattr(v, "variable_name", None) and getattr(v, "label", None)
+            }
+            if rename_map:
+                df = df.rename(columns=rename_map)
 
     # Sanitize data to prevent CSV injection
     df = df.map(sanitize_csv_formula)

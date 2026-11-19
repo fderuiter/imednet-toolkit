@@ -2,7 +2,7 @@ imednet package
 ===============
 
 .. automodule:: imednet
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -14,6 +14,7 @@ Subpackages
 
    imednet.auth
    imednet.cli
+   imednet.core
    imednet.datadict
    imednet.endpoints
    imednet.errors
@@ -36,6 +37,7 @@ imednet.config module
 ---------------------
 
 .. automodule:: imednet.config
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -43,6 +45,7 @@ imednet.constants module
 ------------------------
 
 .. automodule:: imednet.constants
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -50,6 +53,7 @@ imednet.discovery module
 ------------------------
 
 .. automodule:: imednet.discovery
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -57,6 +61,7 @@ imednet.plugins module
 ----------------------
 
 .. automodule:: imednet.plugins
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -64,6 +69,7 @@ imednet.sdk module
 ------------------
 
 .. automodule:: imednet.sdk
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -71,5 +77,6 @@ imednet.sdk\_convenience module
 -------------------------------
 
 .. automodule:: imednet.sdk_convenience
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:

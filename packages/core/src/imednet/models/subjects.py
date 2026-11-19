@@ -232,3 +232,13 @@ class Subject(ImednetBaseModel):
 
 
 Subject = ModelEngine.get_model('Subject', Subject)
+
+__all__ = [
+    "ALLOWED_SUBJECT_TRANSITIONS",
+    "Subject",
+    "SubjectKeyword",
+    "SubjectStatus",
+    "is_valid_subject_transition",
+    "normalize_subject_status",
+    "validate_subject_transition",
+]

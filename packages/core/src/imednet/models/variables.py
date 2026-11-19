@@ -16,3 +16,5 @@ class Variable(ImednetBaseModel):
 
 
 Variable = ModelEngine.get_model('Variable', Variable)
+
+__all__ = ["Variable"]

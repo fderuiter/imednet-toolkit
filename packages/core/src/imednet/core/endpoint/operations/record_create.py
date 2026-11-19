@@ -105,11 +105,24 @@ class RecordCreateOperation(Operation[T]):
                 headers[HEADER_EMAIL_NOTIFY] = str(self.email_notify).lower()
         return headers
 
-    def _process_response(self, response: Any, parse_func: Callable[[Any], T] | None = None) -> T:
+    def _process_response(
+        self,
+        response: Any,
+        parse_func: Callable[[Any], T] | None = None,
+        *,
+        client: Any = None,
+    ) -> T:
         """Process the raw HTTP response."""
+        from imednet.core.context import strict_mode_context
         from imednet.models.jobs import Job
 
-        return (parse_func or Job.from_json)(response.json())  # type: ignore
+        parser = parse_func or Job.from_json
+        payload = response.json()
+        client_strict = getattr(client, "strict_mode", None)
+        if isinstance(client_strict, bool):
+            with strict_mode_context(client_strict):
+                return parser(payload)  # type: ignore
+        return parser(payload)  # type: ignore
 
     def execute_sync(
         self,
@@ -130,7 +143,7 @@ class RecordCreateOperation(Operation[T]):
             json=self.records_data,
             headers=self.headers,
         )
-        return self._process_response(response, parse_func)
+        return self._process_response(response, parse_func, client=client)
 
     async def execute_async(
         self,
@@ -151,4 +164,4 @@ class RecordCreateOperation(Operation[T]):
             json=self.records_data,
             headers=self.headers,
         )
-        return self._process_response(response, parse_func)
+        return self._process_response(response, parse_func, client=client)

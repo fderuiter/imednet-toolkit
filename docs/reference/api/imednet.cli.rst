@@ -2,7 +2,7 @@ imednet.cli package
 ===================
 
 .. automodule:: imednet.cli
-   :noindex:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -36,5 +36,6 @@ imednet.cli.decorators module
 -----------------------------
 
 .. automodule:: imednet.cli.decorators
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:

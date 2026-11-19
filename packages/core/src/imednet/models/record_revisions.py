@@ -167,3 +167,11 @@ def is_valid_record_revision_chain(revisions: Sequence[RevisionInput]) -> bool:
         return True
     except (ValueError, ValidationError):
         return False
+
+
+__all__ = [
+    "RecordRevision",
+    "RevisionInput",
+    "is_valid_record_revision_chain",
+    "validate_record_revision_chain",
+]

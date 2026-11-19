@@ -27,3 +27,5 @@ class Coding(ImednetBaseModel):
     reason: str | None
     revision: int | None
     last_updated: str | None
+
+__all__ = ["Coding"]

@@ -29,6 +29,7 @@ API Reference
 .. automodule:: imednet.core.parsing
    :members:
    :show-inheritance:
+   :noindex:
 
 Usage Examples
 --------------

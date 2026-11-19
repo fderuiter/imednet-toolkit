@@ -478,3 +478,87 @@ def test_cli_export_json_help_includes_hierarchical(runner: CliRunner) -> None:
     result = runner.invoke(cli.app, ["export", "json", "--help"])
     assert result.exit_code == 0
     assert "--hierarchical" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "subcommand",
+    ["parquet", "csv", "excel", "json", "duckdb", "sql", "mongodb", "neo4j", "snowflake"],
+)
+def test_cli_export_subcommands_expose_mask_phi_and_quality_gate_flags(
+    runner: CliRunner, subcommand: str
+) -> None:
+    """Verify every export subcommand exposes --no-mask-phi and --quality-gate in --help."""
+    result = runner.invoke(cli.app, ["export", subcommand, "--help"])
+    assert result.exit_code == 0
+    assert "--no-mask-phi" in result.stdout
+    assert "--quality-gate" in result.stdout
+    assert "--min-readiness-score" in result.stdout
+
+
+def test_cli_export_no_mask_phi_and_quality_gate_passthrough(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify --no-mask-phi and --quality-gate propagate to SDK helpers and SinkConfig classes."""
+    sdk.sinks.Neo4jSinkConfig = Neo4jSinkConfig
+    sdk.sinks.MongoDbSinkConfig = MongoDbSinkConfig
+    sdk.sinks.SnowflakeSinkConfig = SnowflakeSinkConfig
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    json_func = MagicMock()
+    monkeypatch.setattr(export_mod, "export_to_json", json_func)
+    monkeypatch.setattr(cli, "export_to_json", export_mod.export_to_json)
+
+    res_json = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "json",
+            "STUDY",
+            "out.json",
+            "--hierarchical",
+            "--no-mask-phi",
+            "--quality-gate",
+            "--min-readiness-score",
+            "92.5",
+        ],
+    )
+    assert res_json.exit_code == 0
+    json_func.assert_called_once_with(
+        sdk,
+        "STUDY",
+        "out.json",
+        use_labels_as_columns=False,
+        hierarchical=True,
+        mask_phi=False,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=92.5,
+    )
+
+    res_neo = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "neo4j",
+            "STUDY",
+            "bolt://localhost:7687",
+            "neo4j",
+            "pass",
+            "--no-mask-phi",
+            "--quality-gate",
+            "--min-readiness-score",
+            "88.0",
+        ],
+    )
+    assert res_neo.exit_code == 0
+    sdk.sinks.export_to_neo4j.assert_called_once_with(
+        sdk,
+        "STUDY",
+        config=Neo4jSinkConfig(
+            study_key="STUDY",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "pass"),
+            mask_phi=False,
+            quality_gate_enabled=True,
+            min_schema_readiness_score=88.0,
+        ),
+    )

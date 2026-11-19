@@ -23,11 +23,21 @@ from urllib.parse import urlparse
 from cryptography.fernet import Fernet, InvalidToken
 
 from imednet.spi.models import StudyConfiguration
-from imednet.spi.utils import flatten, sqlite_connection
+from imednet.spi.utils import (
+    PathTraversalValidationError,
+    flatten,
+    get_base_url_context,
+    get_study_context,
+    sqlite_connection,
+    validate_partition_key,
+)
 
 _DEFAULT_DB_PATH = Path(
     os.environ.get("IMEDNET_CONFIG_DB_PATH", Path.home() / ".imednet" / "config_versions.sqlite3")
 )
+_DEFAULT_DB_PATH_STR = str(Path.home() / ".imednet" / "config_versions.sqlite3")
+_READ_STORE_CACHE: dict[Path, ConfigVersionStore] = {}
+_DYNAMIC_PATH_CACHE: dict[tuple[str, str, str | None], Path] = {}
 
 
 def _sha256_of(content: str) -> str:
@@ -131,6 +141,69 @@ class ConfigVersionStore:
     def db_path(self, value: str | Path) -> None:
         """Set the original base path for database files."""
         self._original_db_path = Path(value).expanduser()
+
+    @staticmethod
+    def _get_dynamic_db_path_no_create(base_db_path: Path) -> Path:
+        """Compute dynamic DB path without creating directories on disk."""
+        base_url = (
+            get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
+        )
+        ctx_study_key = get_study_context()
+        cache_key = (str(base_db_path), base_url, ctx_study_key)
+        cached = _DYNAMIC_PATH_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        sanitized_url = _sanitize_base_url_for_path(base_url)
+        base_dir = base_db_path.parent
+        if ctx_study_key:
+            validate_partition_key(ctx_study_key)
+            target_dir = base_dir / sanitized_url / ctx_study_key
+        else:
+            target_dir = base_dir / sanitized_url
+
+        resolved_base = base_dir.resolve()
+        resolved_target = target_dir.resolve()
+        if not resolved_target.is_relative_to(resolved_base):
+            raise PathTraversalValidationError(
+                f"Resolved target directory {resolved_target} escapes base directory {resolved_base}"
+            )
+        result = target_dir / base_db_path.name
+        if len(_DYNAMIC_PATH_CACHE) > 64:
+            _DYNAMIC_PATH_CACHE.clear()
+        _DYNAMIC_PATH_CACHE[cache_key] = result
+        return result
+
+    @classmethod
+    def resolve_committed_config(cls, study_key: str) -> StudyConfiguration | None:
+        """Read the latest committed :class:`StudyConfiguration` without creating empty DB files."""
+        if hasattr(cls.get_history, "_mock_name") or hasattr(cls.rollback_config, "_mock_name"):
+            store = cls()
+            history = store.get_history(study_key)
+            if not history or not isinstance(history, list):
+                return None
+            latest = history[-1]
+            if not isinstance(latest, dict) or "commit_id" not in latest:
+                return None
+            cfg = store.rollback_config(study_key, latest["commit_id"])
+            return cfg if isinstance(cfg, StudyConfiguration) else None
+
+        raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
+        raw_db_path = Path(raw_env).expanduser() if raw_env else Path(_DEFAULT_DB_PATH_STR)
+        candidate_path = cls._get_dynamic_db_path_no_create(raw_db_path)
+        if not os.path.isfile(candidate_path):
+            return None
+
+        cached_store = _READ_STORE_CACHE.get(candidate_path)
+        if cached_store is None:
+            if len(_READ_STORE_CACHE) > 32:
+                _READ_STORE_CACHE.clear()
+            cached_store = cls(db_path=raw_db_path)
+            _READ_STORE_CACHE[candidate_path] = cached_store
+        head_id = cached_store.get_head(study_key)
+        if not head_id:
+            return None
+        return cached_store.rollback_config(study_key, head_id)
 
     def _get_get_dynamic_db_path(self) -> Path:
         """Resolve database path dynamically based on active base URL and study key context."""

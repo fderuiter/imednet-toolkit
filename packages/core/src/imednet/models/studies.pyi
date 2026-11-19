@@ -16,3 +16,5 @@ class Study(ImednetBaseModel):
     date_created: str | None
     date_modified: str | None
     last_updated: str | None
+
+__all__ = ["Study"]
