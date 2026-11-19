@@ -375,6 +375,9 @@ class TriageStore:
 
     def get_queue(self, study_key: str, status: TriageStatus | None = None) -> list[TriageItem]:
         """Fetch the triage queue for a study, optionally filtered by status."""
+        cleaned_study = study_key.strip()
+        if not cleaned_study:
+            return []
         with self._connection() as conn:
             if status is None:
                 rows = conn.execute(
@@ -384,7 +387,7 @@ class TriageStore:
                     WHERE study_key = ?
                     ORDER BY updated_at ASC
                     """,
-                    (study_key,),
+                    (cleaned_study,),
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -394,7 +397,7 @@ class TriageStore:
                     WHERE study_key = ? AND status = ?
                     ORDER BY updated_at ASC
                     """,
-                    (study_key, status.value),
+                    (cleaned_study, status.value),
                 ).fetchall()
 
             item_ids = [str(row["item_id"]) for row in rows]

@@ -299,6 +299,8 @@ def test_triage_store_create_item_rejects_duplicates_atomically(tmp_path: Path) 
     with pytest.raises(ValueError, match="Invalid triage item identifier"):
         store.create_item(bad_item)
     assert [it.item_id for it in store.get_queue("STUDY-A")] == ["AE-CREATE-1"]
+    assert [it.item_id for it in store.get_queue("  STUDY-A  ")] == ["AE-CREATE-1"]
+    assert store.get_queue("   ") == []
 
     # Upserting an existing item without annotations/history preserves existing history and audits transition
     minimal_update = TriageItem(

@@ -9,6 +9,7 @@ import json
 import re
 from collections.abc import AsyncIterable, Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,7 +50,7 @@ def _coerce_preview_value(value: Any) -> Any:
     """Recursively normalize models, mappings, dataclasses, and synthetic objects into plain data."""
     if value is None:
         return None
-    if hasattr(value, "value") and not isinstance(value, type) and not _is_mock_object(value):
+    if isinstance(value, Enum):
         return value.value
     if isinstance(value, (str, bytes, int, float, bool)):
         return value
@@ -67,39 +68,60 @@ def _coerce_preview_value(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [_coerce_preview_value(v) for v in value]
+    if hasattr(value, "_asdict") and callable(value._asdict) and not _is_mock_object(value):
+        as_dict = value._asdict()
+        if isinstance(as_dict, Mapping):
+            return {str(k): _coerce_preview_value(v) for k, v in as_dict.items() if v is not None}
     if isinstance(value, tuple):
         return [_coerce_preview_value(v) for v in value]
     if not isinstance(value, type) and not _is_mock_object(value):
+        obj_dict: dict[str, Any] = {}
         if hasattr(value, "__dict__"):
-            obj_dict = {
-                str(k): _coerce_preview_value(v)
-                for k, v in vars(value).items()
-                if not str(k).startswith("_") and v is not None and not callable(v)
-            }
-            if obj_dict:
-                return obj_dict
-        slots = getattr(value, "__slots__", None)
-        if isinstance(slots, (list, tuple, set)):
-            slot_dict = {
-                str(slot): _coerce_preview_value(getattr(value, str(slot)))
-                for slot in slots
-                if not str(slot).startswith("_")
-                and hasattr(value, str(slot))
-                and getattr(value, str(slot)) is not None
-                and not callable(getattr(value, str(slot)))
-            }
-            if slot_dict:
-                return slot_dict
+            for k, v in vars(value).items():
+                if not str(k).startswith("_") and v is not None and not callable(v):
+                    obj_dict[str(k)] = _coerce_preview_value(v)
+        slot_names: list[str] = []
+        for cls in type(value).__mro__:
+            raw_slots = getattr(cls, "__slots__", None)
+            if isinstance(raw_slots, str):
+                slot_names.append(raw_slots)
+            elif isinstance(raw_slots, (list, tuple, set)):
+                slot_names.extend(str(s) for s in raw_slots)
+        for slot in slot_names:
+            if (
+                not slot.startswith("_")
+                and slot not in obj_dict
+                and hasattr(value, slot)
+                and getattr(value, slot) is not None
+                and not callable(getattr(value, slot))
+            ):
+                obj_dict[slot] = _coerce_preview_value(getattr(value, slot))
+        if obj_dict:
+            return obj_dict
     return value
 
 
-def _stringify_cell(raw_value: Any, *, phi_masked: bool = False, sensitive: bool = False) -> str:
+def _stringify_cell(
+    raw_value: Any,
+    *,
+    phi_masked: bool = False,
+    sensitive: bool = False,
+    sensitive_norms: frozenset[str] = frozenset(),
+) -> str:
     """Format a model attribute or dictionary value for display in a DataTable."""
     if raw_value is None or raw_value == "":
         return "-"
     coerced = _coerce_preview_value(raw_value)
     if isinstance(coerced, dict):
-        payload = mask_clinical_phi(coerced) if phi_masked else coerced
+        if phi_masked:
+            masked_phi = mask_clinical_phi(coerced)
+            payload = (
+                _mask_sensitive_tree(masked_phi, sensitive_norms)
+                if sensitive and sensitive_norms
+                else masked_phi
+            )
+        else:
+            payload = coerced
         return json.dumps(payload, default=str, sort_keys=True)
     if phi_masked and sensitive:
         masked_scalar = mask_clinical_phi({"patient_name": coerced})
@@ -231,6 +253,16 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         title="Records",
         endpoint_attr="records",
         supports_subject_filter=True,
+        sensitive_fields=(
+            "first_name",
+            "firstName",
+            "last_name",
+            "lastName",
+            "full_name",
+            "fullName",
+            "login",
+            "username",
+        ),
         columns=(
             EntityColumnSpec("Record ID", ("record_id", "recordId")),
             EntityColumnSpec("Subject Key", ("subject_key", "subjectKey")),
@@ -345,7 +377,15 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         key="users",
         title="Users",
         endpoint_attr="users",
-        sensitive_fields=("name", "email", "full_name", "username", "display_name"),
+        sensitive_fields=(
+            "name",
+            "email",
+            "full_name",
+            "username",
+            "display_name",
+            "middle_name",
+            "initials",
+        ),
         columns=(
             EntityColumnSpec("Account ID", ("user_id", "userId")),
             EntityColumnSpec("Login", ("login",), sensitive=True),
@@ -557,10 +597,18 @@ class EntityTablePane(Container):
     def _row_for_item(self, item: Any) -> tuple[str, ...]:
         """Build a tuple of formatted cell strings for an item."""
         cells: list[str] = []
+        sensitive_norms = (
+            self.spec.normalized_sensitive_fields() if self.phi_masked else frozenset()
+        )
         for col in self.spec.columns:
             raw_val = _extract_attr(item, *col.attr_names)
             cells.append(
-                _stringify_cell(raw_val, phi_masked=self.phi_masked, sensitive=col.sensitive)
+                _stringify_cell(
+                    raw_val,
+                    phi_masked=self.phi_masked,
+                    sensitive=col.sensitive,
+                    sensitive_norms=sensitive_norms,
+                )
             )
         return tuple(cells)
 

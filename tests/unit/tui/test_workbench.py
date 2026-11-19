@@ -1185,8 +1185,20 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
         modified_by: str
         reason_for_change: str
 
-    class _SlotsCoding:
-        __slots__ = ("coding_id", "record_id", "variable", "code", "coded_by", "reason", "value")
+    class _BaseSlotsCoding:
+        __slots__ = (
+            "coding_id",
+            "record_id",
+            "variable",
+            "code",
+            "coded_by",
+            "reason",
+            "dictionary_name",
+            "email",
+        )
+
+    class _SlotsCoding(_BaseSlotsCoding):
+        __slots__ = "value"  # noqa: PLC0205
 
         def __init__(self) -> None:
             self.coding_id = "COD-SLOTS-1"
@@ -1195,7 +1207,13 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
             self.code = "10019211"
             self.coded_by = "slots_coder_login"
             self.reason = "SlotsCodingReason"
+            self.dictionary_name = "MedDRA"
+            self.email = "coder.slots@example.test"
             self.value = "SlotsVerbatimTerm"
+
+    from collections import namedtuple
+
+    _AuditTuple = namedtuple("_AuditTuple", ["login", "role_code"])
 
     sdk = _build_clinical_sdk()
     sdk.codings.list.return_value = [_SlotsCoding()]
@@ -1207,7 +1225,7 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
             last_name="NsLast",
             email="ns.investigator@example.test",
             username="ns_username",
-            audit_meta={"login": "nested_login_handle"},
+            audit_meta=_AuditTuple("nested_login_handle", "CRA"),
             user_active_in_study=True,
         )
     ]
@@ -1228,7 +1246,11 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
             form_key="DM",
             visit_id=11,
             record_status="Complete",
-            record_data=SimpleNamespace(patient_name="NsPatientFullName", AGE=64),
+            record_data=SimpleNamespace(
+                patient_name="NsPatientFullName",
+                first_name="NsRecordFirstName",
+                AGE=64,
+            ),
         )
     ]
     monkeypatch.setattr(
@@ -1306,6 +1328,7 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
 
         user_detail = str(users_pane.query_one("#users_detail", Static).render())
         assert "U-NS-1" in user_detail
+        assert "CRA" in user_detail
         assert "***MASKED***" in user_detail
         for sensitive_val in (
             "ns_login_handle",
@@ -1319,15 +1342,27 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
 
         coding_detail = str(codings_pane.query_one("#codings_detail", Static).render())
         assert "COD-SLOTS-1" in coding_detail
-        for sensitive_val in ("slots_coder_login", "SlotsCodingReason", "SlotsVerbatimTerm"):
+        assert "MedDRA" in coding_detail
+        for sensitive_val in (
+            "slots_coder_login",
+            "SlotsCodingReason",
+            "SlotsVerbatimTerm",
+            "coder.slots@example.test",
+        ):
             assert sensitive_val not in coding_detail
 
         rev_detail = str(revisions_pane.query_one("#record_revisions_detail", Static).render())
         for sensitive_val in ("ns_revision_author", "NsRevisionReasonText"):
             assert sensitive_val not in rev_detail
 
+        rec_row = records_pane.query_one("#records_table", DataTable).get_row_at(0)
+        assert "NsPatientFullName" not in rec_row[5]
+        assert "NsRecordFirstName" not in rec_row[5]
+        assert "64" in rec_row[5]
+
         rec_detail = str(records_pane.query_one("#records_detail", Static).render())
         assert "NsPatientFullName" not in rec_detail
+        assert "NsRecordFirstName" not in rec_detail
         assert "64" in rec_detail
 
         # Fallback triage store adapter rejects duplicate add without calling upsert_item
@@ -1355,3 +1390,73 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
         await pilot.pause(0.14)
         await monitor.workers.wait_for_complete()
         assert monitor.is_polling_paused is True
+
+
+def test_preview_extraction_property_opaque_enum_and_mapping_edge_cases() -> None:
+    """Property-only, Enum, tuple, dict, and opaque adapters extract and mask cleanly."""
+    from enum import Enum
+
+    from imednet_tui.views import (
+        ENTITY_VIEW_SPECS,
+        _extract_attr,
+        _extract_preview_payload,
+        _mask_entity_preview_payload,
+    )
+
+    class _RoleState(Enum):
+        ACTIVE = "ACTIVE_ROLE"
+
+    class _PropertyOnlyUser:
+        __slots__ = ()
+
+        @property
+        def user_id(self) -> str:
+            return "U-PROP-1"
+
+        @property
+        def login(self) -> str:
+            return "prop_login_handle"
+
+        @property
+        def first_name(self) -> str:
+            return ""
+
+        @property
+        def user_active_in_study(self) -> _RoleState:
+            return _RoleState.ACTIVE
+
+    users_spec = ENTITY_VIEW_SPECS["users"]
+    forms_spec = ENTITY_VIEW_SPECS["forms"]
+
+    prop_payload, prop_opaque = _extract_preview_payload(_PropertyOnlyUser(), users_spec)
+    assert prop_opaque is False
+    assert prop_payload["user_id"] == "U-PROP-1"
+    assert prop_payload["user_active_in_study"] == "ACTIVE_ROLE"
+    masked_prop = _mask_entity_preview_payload(prop_payload, users_spec)
+    assert masked_prop["login"] == "***MASKED***"
+    assert masked_prop["first_name"] == ""
+
+    nested_payload, nested_opaque = _extract_preview_payload(
+        {"user_id": "U-2", "aliases": ({"login": "tuple_alias_login"},)},
+        users_spec,
+    )
+    assert nested_opaque is False
+    masked_nested = _mask_entity_preview_payload(nested_payload, users_spec)
+    assert masked_nested["aliases"] == [{"login": "***MASKED***"}]
+
+    class _OpaqueToken:
+        __slots__ = ()
+
+        def __str__(self) -> str:
+            return "opaque-secret-token"
+
+    opaque_payload, is_opaque = _extract_preview_payload(_OpaqueToken(), users_spec)
+    assert is_opaque is True
+    assert _mask_entity_preview_payload(
+        opaque_payload, users_spec, is_opaque_fallback=is_opaque
+    ) == {"item": "***MASKED***"}
+
+    form_payload, form_opaque = _extract_preview_payload({"formKey": "DM"}, forms_spec)
+    assert form_opaque is False
+    assert _mask_entity_preview_payload(form_payload, forms_spec) == {"formKey": "DM"}
+    assert _extract_attr({"form_key": None, "formKey": "AE"}, "form_key", "formKey") == "AE"

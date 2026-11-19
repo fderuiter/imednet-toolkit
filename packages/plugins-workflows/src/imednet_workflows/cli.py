@@ -560,13 +560,14 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
 
     def handle_list(args: argparse.Namespace) -> None:
         try:
+            clean_study = args.study_key.strip()
             store = _open_store(args.db_path)
             status_enum = TriageStatus(args.status) if args.status else None
-            items = store.get_queue(args.study_key, status=status_enum)
+            items = store.get_queue(clean_study, status=status_enum)
             display_list(
                 items,
                 "triage_items",
-                empty_msg=f"No triage items found for study '{args.study_key}'.",
+                empty_msg=f"No triage items found for study '{clean_study}'.",
                 fields=["item_id", "study_key", "status", "severity", "assignee"],
                 output_format=args.output_format,
                 interactive=False,
