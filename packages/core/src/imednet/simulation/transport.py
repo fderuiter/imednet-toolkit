@@ -41,12 +41,12 @@ class _FilterClause:
 
 
 def _to_camel_or_snake(key: str) -> list[str]:
-    """Return exact, snake_case, and camelCase representations of a key."""
+    """Return exact, snake_case, camelCase, and UPPER_SNAKE_CASE representations of a key."""
     s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
     snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
     parts = snake.split("_")
     camel = parts[0] + "".join(word.capitalize() for word in parts[1:])
-    return list(dict.fromkeys([key, snake, camel]))
+    return list(dict.fromkeys([key, snake, camel, snake.upper()]))
 
 
 def _parse_iso_datetime(raw: str) -> datetime | None:
@@ -260,6 +260,12 @@ def _parse_single_clause(raw_clause: str, *, attribute: str, full_expr: str) -> 
         validate_filter_key(raw_key)
     except ValueError as exc:
         raise _FilterParseError(str(exc), attribute=attribute, value=full_expr) from exc
+    if "." in raw_key and any(not segment for segment in raw_key.split(".")):
+        raise _FilterParseError(
+            f"Invalid dotted filter key '{raw_key}': empty path segment",
+            attribute=attribute,
+            value=full_expr,
+        )
 
     unquoted_val, was_quoted = _unquote_filter_value(
         raw_val, attribute=attribute, full_expr=full_expr
@@ -357,11 +363,36 @@ def _evaluate_value(actual_val: Any, clause: _FilterClause) -> bool:
 
 
 def _lookup_field(mapping: dict[str, Any], field: str) -> tuple[bool, Any]:
-    """Resolve field value from a dict across exact, snake_case, and camelCase keys."""
+    """Resolve field value from a dict across naming variants, traversing dotted paths."""
     for candidate in _to_camel_or_snake(field):
         if candidate in mapping:
             return True, mapping[candidate]
-    return False, None
+
+    if "." not in field:
+        return False, None
+
+    segments = field.split(".")
+    if any(not segment for segment in segments):
+        return False, None
+
+    current: Any = mapping
+    for idx, segment in enumerate(segments):
+        if not isinstance(current, dict):
+            return False, None
+        if idx > 0:
+            remaining = ".".join(segments[idx:])
+            for candidate in _to_camel_or_snake(remaining):
+                if candidate in current:
+                    return True, current[candidate]
+        matched = False
+        for candidate in _to_camel_or_snake(segment):
+            if candidate in current:
+                current = current[candidate]
+                matched = True
+                break
+        if not matched:
+            return False, None
+    return True, current
 
 
 def _matches_clauses(mapping: dict[str, Any], connector: str, clauses: list[_FilterClause]) -> bool:
@@ -629,12 +660,10 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
                     items = [item for item in items if _matches_clauses(item, connector, clauses)]
 
             rec_filter_str = params.get("recordDataFilter")
+            project_none_record_data = False
             if rec_filter_str is not None and rec_filter_str.strip():
                 if rec_filter_str.strip().lower() == "none":
-                    items = [
-                        {**item, "recordData": None} if "recordData" in item else item
-                        for item in items
-                    ]
+                    project_none_record_data = True
                 else:
                     rec_conn, rec_clauses = _split_filter_clauses(
                         rec_filter_str, attribute="recordDataFilter"
@@ -653,6 +682,11 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
             sort_specs = _parse_sort_specs(raw_sorts)
             if sort_specs:
                 items = _apply_sort(items, sort_specs)
+
+            if project_none_record_data:
+                items = [
+                    {**item, "recordData": None} if "recordData" in item else item for item in items
+                ]
         except _FilterParseError as exc:
             return self._bad_request_response(request, exc)
 

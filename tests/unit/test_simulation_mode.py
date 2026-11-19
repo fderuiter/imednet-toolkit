@@ -302,6 +302,44 @@ def test_simulation_filter_operators_quotes_and_connectors():
         assert or_resp.status_code == 200
         assert len(or_resp.json()["data"]) == 2
 
+        # Dotted recordData.<key> filter lookup on pinned SimulationState via SimulationTransport
+        dotted_age_resp = client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"filter": "recordData.V_AGE>40"},
+        )
+        assert dotted_age_resp.status_code == 200
+        dotted_age_body = dotted_age_resp.json()
+        assert dotted_age_body["pagination"]["totalElements"] == 1
+        assert [r["recordId"] for r in dotted_age_body["data"]] == [601]
+        assert dotted_age_body["data"][0]["recordData"]["V_AGE"] == 45
+
+        # Dotted snake_case record_data.<key>, != missing-key skip, OR across dotted keys, and SDK kwargs
+        dotted_snake_resp = client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"filter": "record_data.V_WEIGHT>=68.5"},
+        )
+        assert dotted_snake_resp.status_code == 200
+        assert [r["recordId"] for r in dotted_snake_resp.json()["data"]] == [602]
+
+        dotted_ne_resp = client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"filter": "recordData.V_AGE!=50"},
+        )
+        assert dotted_ne_resp.status_code == 200
+        assert [r["recordId"] for r in dotted_ne_resp.json()["data"]] == [601]
+
+        dotted_or_resp = client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"filter": "recordData.V_AGE>40,recordData.V_WEIGHT>60"},
+        )
+        assert dotted_or_resp.status_code == 200
+        assert [r["recordId"] for r in dotted_or_resp.json()["data"]] == [601, 602]
+
+        sdk_dotted_records = list(
+            sdk.records.list(study_key="STUDY", **{"recordData.V_AGE": (">", 40)})
+        )
+        assert [r.record_id for r in sdk_dotted_records] == [601]
+
 
 def test_simulation_record_data_filter_and_missing_keys():
     """Verify recordDataFilter operators, missing-key skipping, and 'none' projection."""
@@ -364,10 +402,19 @@ def test_simulation_record_data_filter_and_missing_keys():
         none_cmp = list(sdk.records.list(study_key="STUDY", record_data_filter="V_EMPTY>0"))
         assert none_cmp == []
 
-        # record_data_filter="none" projects records with record_data=None
+        # record_data_filter="none" projects records with record_data=None (preserving dotted sort)
         projected = list(sdk.records.list(study_key="STUDY", record_data_filter="none"))
         assert len(projected) == 3
         assert all(r.record_data is None for r in projected)
+
+        client = httpx.Client(transport=transport, base_url="https://sim.local")
+        sorted_proj_resp = client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"recordDataFilter": "none", "sort": "recordData.V_WEIGHT,desc"},
+        )
+        assert sorted_proj_resp.status_code == 200
+        assert [r["recordId"] for r in sorted_proj_resp.json()["data"]] == [603, 602, 601]
+        assert all(r["recordData"] is None for r in sorted_proj_resp.json()["data"])
 
 
 def test_simulation_sort_and_pagination_metadata_envelopes():
@@ -588,6 +635,13 @@ async def test_async_sdk_simulation_mode():
         )
         assert bad_resp.status_code == 400
 
+        async_dotted_resp = await aclient.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"filter": "recordData.V_AGE>40", "sort": "recordData.V_AGE,desc"},
+        )
+        assert async_dotted_resp.status_code == 200
+        assert [r["recordData"]["V_AGE"] for r in async_dotted_resp.json()["data"]] == [60, 45]
+
 
 def test_simulation_filter_sort_and_state_edge_cases():
     """Verify state getter fallbacks, malformed syntax 400s, and type/sort edge cases."""
@@ -702,8 +756,27 @@ def test_simulation_filter_sort_and_state_edge_cases():
         {"filter": "formKey===F_DM"},
         {"filter": "formId<>301"},
         {"filter": "bad key==1"},
+        {"filter": "recordData..V_AGE>40"},
+        {"filter": "recordData.>40"},
+        {"filter": ".V_AGE>40"},
         {"sort": ",asc"},
     ]
     for params in bad_params:
         resp = client.get("/api/v1/edc/studies/STUDY/forms", params=params)
         assert resp.status_code == 400, f"Expected 400 for {params}, got {resp.status_code}"
+
+    # Non-dict intermediate segment and nested dotted dict lookup
+    non_dict_dotted = client.get(
+        "/api/v1/edc/studies/STUDY/records",
+        params={"filter": "recordId.nested==601"},
+    )
+    assert non_dict_dotted.status_code == 200
+    assert non_dict_dotted.json()["data"] == []
+
+    state.records[0]["recordData"]["nested"] = {"severity": "MILD", "literal.key": "OK"}
+    nested_dotted = client.get(
+        "/api/v1/edc/studies/STUDY/records",
+        params={"filter": "recordData.nested.severity==MILD;recordData.nested.literal.key==OK"},
+    )
+    assert nested_dotted.status_code == 200
+    assert [r["recordId"] for r in nested_dotted.json()["data"]] == [601]
