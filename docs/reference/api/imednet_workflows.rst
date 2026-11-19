@@ -3,6 +3,7 @@ imednet\_workflows package
 
 .. automodule:: imednet_workflows
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 Subpackages
@@ -21,6 +22,7 @@ imednet\_workflows.cached\_loader module
 
 .. automodule:: imednet_workflows.cached_loader
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.chunked\_pipeline module
@@ -28,6 +30,7 @@ imednet\_workflows.chunked\_pipeline module
 
 .. automodule:: imednet_workflows.chunked_pipeline
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.cli module
@@ -35,6 +38,7 @@ imednet\_workflows.cli module
 
 .. automodule:: imednet_workflows.cli
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.config\_version\_control module
@@ -42,6 +46,7 @@ imednet\_workflows.config\_version\_control module
 
 .. automodule:: imednet_workflows.config_version_control
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.data\_extraction module
@@ -49,6 +54,7 @@ imednet\_workflows.data\_extraction module
 
 .. automodule:: imednet_workflows.data_extraction
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.duckdb\_centralizer module
@@ -56,6 +62,7 @@ imednet\_workflows.duckdb\_centralizer module
 
 .. automodule:: imednet_workflows.duckdb_centralizer
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.extraction\_engine module
@@ -63,6 +70,7 @@ imednet\_workflows.extraction\_engine module
 
 .. automodule:: imednet_workflows.extraction_engine
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.namespace module
@@ -70,6 +78,7 @@ imednet\_workflows.namespace module
 
 .. automodule:: imednet_workflows.namespace
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.query\_management module
@@ -77,6 +86,7 @@ imednet\_workflows.query\_management module
 
 .. automodule:: imednet_workflows.query_management
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.record\_mapper module
@@ -84,6 +94,7 @@ imednet\_workflows.record\_mapper module
 
 .. automodule:: imednet_workflows.record_mapper
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.record\_update module
@@ -91,6 +102,7 @@ imednet\_workflows.record\_update module
 
 .. automodule:: imednet_workflows.record_update
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.register\_subjects module
@@ -98,6 +110,7 @@ imednet\_workflows.register\_subjects module
 
 .. automodule:: imednet_workflows.register_subjects
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.schema\_profiler module
@@ -105,6 +118,7 @@ imednet\_workflows.schema\_profiler module
 
 .. automodule:: imednet_workflows.schema_profiler
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.standards\_validation module
@@ -112,6 +126,7 @@ imednet\_workflows.standards\_validation module
 
 .. automodule:: imednet_workflows.standards_validation
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.state\_ledger module
@@ -119,6 +134,7 @@ imednet\_workflows.state\_ledger module
 
 .. automodule:: imednet_workflows.state_ledger
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.study\_structure module
@@ -126,6 +142,7 @@ imednet\_workflows.study\_structure module
 
 .. automodule:: imednet_workflows.study_structure
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.subject\_data module
@@ -133,6 +150,7 @@ imednet\_workflows.subject\_data module
 
 .. automodule:: imednet_workflows.subject_data
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.sync\_worker module
@@ -140,6 +158,7 @@ imednet\_workflows.sync\_worker module
 
 .. automodule:: imednet_workflows.sync_worker
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.triage\_store module
@@ -147,6 +166,7 @@ imednet\_workflows.triage\_store module
 
 .. automodule:: imednet_workflows.triage_store
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:
 
 imednet\_workflows.wizard module
@@ -154,4 +174,5 @@ imednet\_workflows.wizard module
 
 .. automodule:: imednet_workflows.wizard
    :members:
+   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :show-inheritance:

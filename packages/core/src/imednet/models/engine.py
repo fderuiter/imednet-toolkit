@@ -497,7 +497,12 @@ class ModelEngine:
         """Internal implementation for dynamic model creation."""
         contract = get_contract()
         if model_name not in contract.models:
-            return create_model(model_name, __base__=base_cls)
+            return create_model(
+                model_name,
+                __base__=base_cls,
+                __module__=base_cls.__module__,
+                __doc__=base_cls.__doc__,
+            )
 
         model_def = contract.models[model_name]
         fields: dict[str, Any] = {}
@@ -521,10 +526,17 @@ class ModelEngine:
             else:
                 py_type = Any
 
-            new_field = Field(default=None, alias=field_def.alias)
+            description = f"API field ``{field_def.alias}``." if field_def.alias else None
+            new_field = Field(default=None, alias=field_def.alias, description=description)
             fields[snake_key] = (py_type, new_field)
 
-        model = create_model(model_name, __base__=base_cls, **fields)
+        model = create_model(
+            model_name,
+            __base__=base_cls,
+            __module__=base_cls.__module__,
+            __doc__=base_cls.__doc__,
+            **fields,
+        )
         return model  # noqa: RET504
 
     @classmethod
@@ -698,7 +710,15 @@ class ModelEngine:
                 )
             elif isinstance(stmt, ast.Assign):
                 targets_str = " = ".join(_format_expr(t) for t in stmt.targets)
-                body_blocks.append(("assign", [f"{targets_str} = {_format_expr(stmt.value)}"]))
+                single_assign = f"{targets_str} = {_format_expr(stmt.value)}"
+                if len(single_assign) > 100 and isinstance(stmt.value, ast.List):
+                    assign_lines = [f"{targets_str} = ["]
+                    for elt in stmt.value.elts:
+                        assign_lines.append(f"    {_format_expr(elt)},")
+                    assign_lines.append("]")
+                    body_blocks.append(("assign_multi", assign_lines))
+                else:
+                    body_blocks.append(("assign", [single_assign]))
 
         rendered_body_lines: list[str] = []
         prev_kind: str | None = None

@@ -1,3 +1,4 @@
+# pylint: disable=duplicate-code
 """Models for subject visits and study events."""
 
 from __future__ import annotations
@@ -34,3 +35,5 @@ class Visit(ImednetBaseModel):
 
 
 Visit = ModelEngine.get_model('Visit', Visit)
+
+__all__ = ["Visit"]

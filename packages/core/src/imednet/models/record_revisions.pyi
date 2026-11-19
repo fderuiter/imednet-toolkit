@@ -53,3 +53,10 @@ RevisionInput = RecordRevision | dict[str, Any]
 
 def validate_record_revision_chain(revisions: Sequence[RevisionInput]) -> list[RecordRevision]: ...
 def is_valid_record_revision_chain(revisions: Sequence[RevisionInput]) -> bool: ...
+
+__all__ = [
+    "RecordRevision",
+    "RevisionInput",
+    "is_valid_record_revision_chain",
+    "validate_record_revision_chain",
+]
