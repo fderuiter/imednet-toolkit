@@ -35,10 +35,12 @@ Both are imported lazily at connection / write time.
 
 Idempotency
 -----------
-When ``SinkConfig.idempotent`` is ``True`` (default) the sink uses
-``COPY INTO ... FORCE = FALSE`` so that Snowflake skips files that have
-already been loaded, making re-runs safe.  Set ``idempotent = False``
-to force re-ingestion of previously loaded files.
+When ``SinkConfig.idempotent`` is ``True`` (default) the sink overwrites
+staged Parquet files (``PUT ... OVERWRITE = TRUE``), bulk-loads each batch
+into a temporary staging table, and executes ``MERGE INTO`` keyed on
+``(study_key, record_id)`` so that modified Study Records update in place
+without creating duplicate rows.  Set ``idempotent = False`` to load batches
+directly into the target table via ``COPY INTO ... FORCE = TRUE``.
 
 Usage
 -----
@@ -82,7 +84,8 @@ from imednet.spi.sink_base import (
     ExportSink,
     SinkConfig,
     _require_optional_dep,
-    iter_batches,
+    extract_record_id,
+    run_streaming_export,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,28 @@ logger = logging.getLogger(__name__)
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
 _PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9_./-]+$")
 _BATCH_UNSAFE_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
+_WAREHOUSE_RECORD_COLUMNS: tuple[str, ...] = (
+    "study_key",
+    "interval_id",
+    "form_id",
+    "form_key",
+    "site_id",
+    "record_id",
+    "record_oid",
+    "record_type",
+    "record_status",
+    "deleted",
+    "date_created",
+    "date_modified",
+    "subject_id",
+    "subject_oid",
+    "subject_key",
+    "visit_id",
+    "parent_record_id",
+    "record_data",
+    "last_updated",
+    "keywords",
+)
 
 
 def _quote_identifier(ident: str) -> str:
@@ -186,17 +211,83 @@ class SnowflakeSinkConfig(SinkConfig):
     _validate_identifiers = validate_identifiers
 
 
+def _normalize_warehouse_value(value: Any) -> Any:
+    """Recursively normalize Pydantic models and tuples into JSON-serializable primitives."""
+    model_dump = getattr(type(value), "model_dump", None)
+    if callable(model_dump):
+        dumped = value.model_dump(mode="json")
+        if dumped is not value and isinstance(dumped, (dict, list, tuple, str, int, float, bool)):
+            return _normalize_warehouse_value(dumped)
+    if isinstance(value, dict):
+        return {str(k): _normalize_warehouse_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_warehouse_value(item) for item in value]
+    return value
+
+
+def _post_process_warehouse(row: dict[str, Any], *, mask_phi: bool = True) -> dict[str, Any]:
+    """Apply PHI masking and JSON-encode structured fields for single-table Parquet staging."""
+    from imednet.spi.utils import mask_clinical_phi
+
+    normalized_row: dict[str, Any] = _normalize_warehouse_value(row)
+    masked_row: dict[str, Any] = mask_clinical_phi(normalized_row) if mask_phi else normalized_row
+    record_payload = masked_row.get("record_data")
+    if record_payload is None:
+        record_payload = {}
+    if isinstance(record_payload, str):
+        masked_row["record_data"] = record_payload
+    else:
+        masked_row["record_data"] = json.dumps(record_payload, default=str)
+
+    keywords = masked_row.get("keywords")
+    if isinstance(keywords, (list, dict, tuple)):
+        masked_row["keywords"] = json.dumps(keywords, default=str)
+    return masked_row
+
+
+def _post_process_warehouse_unmasked(row: dict[str, Any]) -> dict[str, Any]:
+    """JSON-encode structured fields for single-table Parquet staging without PHI masking."""
+    return _post_process_warehouse(row, mask_phi=False)
+
+
+def _resolve_merge_columns(arrow_table: Any) -> list[str]:
+    """Resolve and validate column identifiers from *arrow_table* for MERGE INTO generation."""
+    raw_cols = getattr(arrow_table, "column_names", None)
+    if (
+        isinstance(raw_cols, (list, tuple))
+        and raw_cols
+        and all(isinstance(col, str) for col in raw_cols)
+    ):
+        columns = list(raw_cols)
+    else:
+        columns = list(_WAREHOUSE_RECORD_COLUMNS)
+
+    for col in columns:
+        if not _IDENTIFIER_PATTERN.match(col):
+            raise ExportConfigurationError(
+                f"Warehouse column name contains invalid characters: {col!r}"
+            )
+    return columns
+
+
 def _records_to_arrow_table(
     records: Sequence[Any],
     *,
     mask_phi: bool = True,
     study_key: str | None = None,
+    mapper: Any | None = None,
 ) -> Any:
-    """Convert *records* to a ``pyarrow.Table``."""
+    """Convert *records* to a ``pyarrow.Table`` with JSON-encoded ``record_data``."""
     pa = _require_optional_dep("pyarrow", "snowflake")
-    from imednet.spi.sinks import CentralizedMapper
+    if mapper is None:
+        from imednet.spi.sinks import CentralizedMapper
 
-    mapper = CentralizedMapper(mode="tabular", mask_phi=mask_phi)
+        post_proc = _post_process_warehouse if mask_phi else _post_process_warehouse_unmasked
+        mapper = CentralizedMapper(
+            mode="document",
+            post_processor=post_proc,
+            mask_phi=mask_phi,
+        )
     rows = [mapper.map_record(r, study_key=study_key) for r in records]
 
     return pa.Table.from_pylist(rows)
@@ -286,7 +377,7 @@ class SnowflakeExportSink(ExportSink):
     # ------------------------------------------------------------------
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
-        """Write *records* to Snowflake via Parquet staging + COPY INTO."""
+        """Write *records* to Snowflake via Parquet staging + MERGE INTO (or COPY INTO)."""
         if not records:
             return 0
 
@@ -297,36 +388,97 @@ class SnowflakeExportSink(ExportSink):
                 batch_id=batch_id,
             )
 
+        cfg = self._cfg
+        from imednet.spi.sinks import CentralizedMapper
+
+        post_proc = (
+            _post_process_warehouse if self.config.mask_phi else _post_process_warehouse_unmasked
+        )
+        mapper = CentralizedMapper(
+            mode="document",
+            post_processor=post_proc,
+            mask_phi=self.config.mask_phi,
+        )
+        custom_pipeline = cfg.extra.get("enrichment_pipeline")
+        if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
+            mapper.register_pipeline(cfg.study_key, custom_pipeline)
+
         arrow_table = _records_to_arrow_table(
             records,
             mask_phi=self.config.mask_phi,
-            study_key=self._cfg.study_key,
+            study_key=cfg.study_key,
+            mapper=mapper,
         )
+        merge_columns = _resolve_merge_columns(arrow_table)
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
         pq = _require_optional_dep("pyarrow.parquet", "snowflake")
         pq.write_table(arrow_table, str(local_path))
 
-        cfg = self._cfg
         stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet"
 
         def execute_export() -> int:
-            """Execute PUT and COPY INTO commands to load data into Snowflake."""
+            """Execute PUT and staged MERGE INTO (or COPY INTO) commands in Snowflake."""
             cur = self._conn.cursor()
             try:
-                cur.execute(f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/'")  # nosem
-                force_clause = "FORCE = FALSE" if self.config.idempotent else "FORCE = TRUE"
+                cur.execute(
+                    f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/' "
+                    f"AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
+                )  # nosem
                 target_table = (
                     f"{_quote_identifier(cfg.database)}."
                     f"{_quote_identifier(cfg.schema)}."
                     f"{_quote_identifier(cfg.table)}"
                 )
-                cur.execute(
-                    f"COPY INTO {target_table} "
-                    f"FROM '{stage_path}' "
-                    f"FILE_FORMAT = (TYPE = PARQUET) "
-                    f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
-                    f"{force_clause}"
-                )  # nosem
+                if self.config.idempotent:
+                    staging_table = (
+                        f"{_quote_identifier(cfg.database)}."
+                        f"{_quote_identifier(cfg.schema)}."
+                        f"{_quote_identifier(f'{cfg.table}__imednet_stage')}"
+                    )
+                    cur.execute(
+                        f"CREATE OR REPLACE TEMPORARY TABLE {staging_table} LIKE {target_table}"
+                    )  # nosem
+                    cur.execute(
+                        f"COPY INTO {staging_table} "
+                        f"FROM '{stage_path}' "
+                        f"FILE_FORMAT = (TYPE = PARQUET) "
+                        f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
+                        f"FORCE = TRUE"
+                    )  # nosem
+                    non_key_cols = [
+                        col for col in merge_columns if col not in ("study_key", "record_id")
+                    ]
+                    update_clause = ", ".join(
+                        f"target.{col} = source.{col}" for col in non_key_cols
+                    )
+                    insert_cols = ", ".join(merge_columns)
+                    insert_vals = ", ".join(f"source.{col}" for col in merge_columns)
+                    order_expr = (
+                        "ORDER BY date_modified DESC NULLS LAST"
+                        if "date_modified" in merge_columns
+                        else "ORDER BY record_id"
+                    )
+                    cur.execute(
+                        f"MERGE INTO {target_table} AS target "  # noqa: S608
+                        f"USING ("
+                        f"SELECT * FROM {staging_table} "
+                        f"QUALIFY ROW_NUMBER() OVER ("
+                        f"PARTITION BY study_key, record_id {order_expr}"
+                        f") = 1"
+                        f") AS source "
+                        f"ON target.study_key = source.study_key "
+                        f"AND target.record_id = source.record_id "
+                        f"WHEN MATCHED THEN UPDATE SET {update_clause} "
+                        f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+                    )  # nosem
+                else:
+                    cur.execute(
+                        f"COPY INTO {target_table} "
+                        f"FROM '{stage_path}' "
+                        f"FILE_FORMAT = (TYPE = PARQUET) "
+                        f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
+                        f"FORCE = TRUE"
+                    )  # nosem
                 rows_loaded = len(records)
                 logger.debug(
                     "Loaded batch %s (%d rows) via stage %s",
@@ -343,6 +495,37 @@ class SnowflakeExportSink(ExportSink):
 
     def flush(self) -> None:
         """No-op: each batch is committed individually."""
+
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Delete newly voided rows from Snowflake when running idempotently."""
+        if not self.config.idempotent or not records:
+            return 0
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if not record_ids:
+            return 0
+
+        cfg = self._cfg
+        target_table = (
+            f"{_quote_identifier(cfg.database)}."
+            f"{_quote_identifier(cfg.schema)}."
+            f"{_quote_identifier(cfg.table)}"
+        )
+        placeholders = ", ".join(["%s"] * len(record_ids))
+
+        def execute_reconcile() -> int:
+            cur = self._conn.cursor()
+            try:
+                cur.execute(
+                    f"DELETE FROM {target_table} "  # noqa: S608
+                    f"WHERE STUDY_KEY = %s AND RECORD_ID IN ({placeholders})",
+                    [cfg.study_key, *record_ids],
+                )  # nosem
+                logger.debug("Reconciled %d voided records in batch %s", len(record_ids), batch_id)
+                return len(record_ids)
+            finally:
+                cur.close()
+
+        return self._execute_with_retry("reconcile_warehouse_deleted", batch_id, execute_reconcile)
 
     def close(self) -> None:
         """Close the Snowflake connection and clean up temporary staging files."""
@@ -363,7 +546,7 @@ class SnowflakeExportSink(ExportSink):
 
     def _append_manifest(self, batch_id: str, stage_path: str, row_count: int) -> None:
         """Append a manifest entry for the loaded batch (JSON-lines format)."""
-        manifest_path = self._cfg.manifest_path
+        manifest_path = self._cfg.manifest_path or self._cfg.extra.get("manifest_path")
         if not manifest_path:
             return
         entry = {
@@ -383,16 +566,13 @@ def export_to_snowflake(
     config: SnowflakeSinkConfig,
 ) -> int:
     """Export study records to Snowflake using :class:`SnowflakeExportSink`."""
-    from imednet.spi.sink_base import apply_quality_gate
-
-    records = sdk.records.list(study_key=study_key, record_data_filter=None)
-    filtered_records = list(apply_quality_gate(sdk, study_key, records, config))
-
-    total_written = 0
-    with SnowflakeExportSink(config=config) as sink:
-        for index, batch in enumerate(iter_batches(filtered_records, config.batch_size)):
-            total_written += sink.write_batch(batch, batch_id=f"{study_key}/records/{index}")
-    return total_written
+    return run_streaming_export(
+        sdk,
+        study_key,
+        lambda: SnowflakeExportSink(config=config),
+        config,
+        stream_name=f"snowflake_{config.table}",
+    )
 
 
 __all__ = ["SnowflakeExportSink", "SnowflakeSinkConfig", "export_to_snowflake"]

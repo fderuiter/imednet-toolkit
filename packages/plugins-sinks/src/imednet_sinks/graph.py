@@ -59,6 +59,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -71,7 +73,8 @@ from imednet.spi.sink_base import (
     SinkConfig,
     _redact_uri,
     _require_optional_dep,
-    iter_batches,
+    extract_record_id,
+    run_streaming_export,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,8 @@ class Neo4jSinkConfig(SinkConfig):
     uri: str = ""
     auth: tuple[str, str] = ("", "")
     database: str = "neo4j"
+    modified_since: datetime | str | None = None
+    ledger_path: str | Path | None = None
 
     def __post_init__(self) -> None:
         """Validate Neo4j config properties after initialization."""
@@ -108,12 +113,14 @@ _MERGE_RECORD_CYPHER = """\
 UNWIND $rows AS row
 MERGE (s:Study   {study_key:   row.study_key})
 MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
-MERGE (v:Visit    {visit_id:   row.visit_id,    study_key: row.study_key})
 MERGE (r:Record   {record_id:  row.record_id,   study_key: row.study_key})
 SET r += row
 MERGE (s)-[:HAS_SUBJECT]->(su)
-MERGE (su)-[:HAS_VISIT]->(v)
-MERGE (v)-[:HAS_RECORD]->(r)
+FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (v:Visit {visit_id: row.visit_id, study_key: row.study_key})
+    MERGE (su)-[:HAS_VISIT]->(v)
+    MERGE (v)-[:HAS_RECORD]->(r)
+)
 """
 
 _CREATE_RECORD_CYPHER = """\
@@ -121,8 +128,15 @@ UNWIND $rows AS row
 CREATE (r:Record)
 SET r = row
 WITH r, row
+WHERE row.visit_id IS NOT NULL
 MATCH (v:Visit {visit_id: row.visit_id, study_key: row.study_key})
 MERGE (v)-[:HAS_RECORD]->(r)
+"""
+
+_DELETE_RECORD_CYPHER = """\
+UNWIND $record_ids AS rid
+MATCH (r:Record {record_id: rid, study_key: $study_key})
+DETACH DELETE r
 """
 
 
@@ -130,6 +144,14 @@ def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
     import json
 
     row["record_data"] = json.dumps(row.get("record_data", {}))
+    keywords = row.get("keywords")
+    if isinstance(keywords, list):
+        row["keywords"] = json.dumps(
+            [
+                k.model_dump(mode="json", by_alias=True) if hasattr(k, "model_dump") else k
+                for k in keywords
+            ]
+        )
     return row
 
 
@@ -226,6 +248,32 @@ class Neo4jExportSink(ExportSink):
     def flush(self) -> None:
         """No-op: Neo4j writes are committed per transaction."""
 
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Delete newly voided Record nodes from Neo4j when running idempotently."""
+        if not self.config.idempotent or not records:
+            return 0
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if not record_ids:
+            return 0
+
+        cfg = (
+            self.config
+            if isinstance(self.config, Neo4jSinkConfig)
+            else Neo4jSinkConfig(study_key=self._study_key, uri=self._uri, auth=self._auth)
+        )
+
+        def execute_reconcile() -> int:
+            with self._driver.session(database=cfg.database) as session:
+                session.run(
+                    _DELETE_RECORD_CYPHER,
+                    record_ids=record_ids,
+                    study_key=self._study_key,
+                )
+            logger.debug("Reconciled %d voided records in batch %s", len(record_ids), batch_id)
+            return len(record_ids)
+
+        return self._execute_with_retry("reconcile_graph_deleted", batch_id, execute_reconcile)
+
     def close(self) -> None:
         """Close the underlying Neo4j driver connection."""
         if self._driver is not None:
@@ -243,21 +291,24 @@ def export_to_neo4j(
     *,
     config: Neo4jSinkConfig | None = None,
     mask_phi: bool = True,
+    **kwargs: Any,
 ) -> int:
     """Export study records to Neo4j using :class:`Neo4jExportSink`."""
     if config is None:
+        kwargs.setdefault("mask_phi", mask_phi)
         config = Neo4jSinkConfig(
             study_key=study_key,
             uri=uri,
             auth=auth,
-            mask_phi=mask_phi,
+            **kwargs,
         )
-    records = sdk.records.list(study_key=study_key, record_data_filter=None)
-    total_written = 0
-    with Neo4jExportSink(config=config) as sink:
-        for index, batch in enumerate(iter_batches(list(records), config.batch_size)):
-            total_written += sink.write_batch(batch, batch_id=f"{study_key}/records/{index}")
-    return total_written
+    return run_streaming_export(
+        sdk,
+        study_key,
+        lambda: Neo4jExportSink(config=config),
+        config,
+        stream_name=f"neo4j_{config.database}",
+    )
 
 
 __all__ = ["Neo4jExportSink", "Neo4jSinkConfig", "export_to_neo4j"]

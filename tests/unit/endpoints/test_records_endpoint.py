@@ -7,6 +7,7 @@ import pytest
 from imednet.core.context import set_study_context
 from imednet.endpoints import records
 from imednet.errors import ClientError, NotFoundError, ValidationError
+from imednet.errors.validation import ConfigurationError
 from imednet.models.records import Record
 from imednet.models.variables import Variable
 from imednet.validation.cache import SchemaCache
@@ -23,13 +24,35 @@ def test_list_builds_path_filters_and_data_filter(
     result = ep.list(
         study_key="S1",
         record_data_filter="age>10",
-        status="open",
+        record_status="Open",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/records"
     assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "age>10"}
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"record_status": "Open"}
     assert isinstance(result[0], Record)
+
+
+def test_list_accepts_camel_case_record_data_filter_and_rejects_conflicts(
+    dummy_client, paginator_factory
+):
+    """Test camelCase recordDataFilter extraction and conflict detection."""
+    ep = records.RecordsEndpoint(dummy_client)
+    captured = paginator_factory(records, [{"recordId": 1}])
+
+    result = ep.list(study_key="S1", recordDataFilter="aeTerm=~headache", page=1, size=50)
+    assert captured["params"] == {
+        "recordDataFilter": "aeTerm=~headache",
+        "page": 1,
+        "size": 50,
+    }
+    assert isinstance(result[0], Record)
+
+    with pytest.raises(ConfigurationError, match="recordDataFilter"):
+        ep.list(study_key="S1", record_data_filter="a==1", recordDataFilter="a==2")
+
+    with pytest.raises(ConfigurationError, match="status"):
+        ep.list(study_key="S1", status="open")
 
 
 def test_get_success(monkeypatch, dummy_client):
@@ -169,12 +192,12 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
     df = ep.to_dataframe(
         study_key="S1",
         record_data_filter="age>10",
-        status="open",
+        record_status="Open",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/records"
     assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "age>10"}
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"record_status": "Open"}
     assert len(df) == 1
 
 
@@ -237,8 +260,8 @@ def test_to_dataframe_masks_phi_by_default_and_honors_opt_out(
     paginator_factory(records, raw_items)
     filter_capture = patch_build_filter(records)
 
-    masked_df = ep.to_dataframe("STUDY1", flatten=True, status="open")
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "STUDY1"}
+    masked_df = ep.to_dataframe("STUDY1", flatten=True, record_status="Open")
+    assert filter_capture["filters"] == {"record_status": "Open"}
     assert masked_df.loc[0, "patientName"] == "***MASKED***"
     assert masked_df.loc[0, "DOB"] == "***MASKED***"
     assert masked_df.loc[0, "SSN"] == "***MASKED***"

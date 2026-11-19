@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
+from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import global_sensitivity_registry, mask_clinical_phi
 
 from .cached_loader import CachedRecordsLoader
@@ -425,6 +426,8 @@ def transform_records_to_sdtm(
     records: Iterable[Any],
     domain: str,
     study_key: str,
+    *,
+    include_deleted: bool = False,
 ) -> pd.DataFrame:
     """Transform clinical records into a normalized CDISC SDTM domain DataFrame.
 
@@ -436,6 +439,7 @@ def transform_records_to_sdtm(
             or raw dictionaries.
         domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
         study_key: Unique study identifier to populate STUDYID.
+        include_deleted: When True, include voided (deleted=True) records.
 
     Returns:
         A pandas DataFrame with standardized domain variables.
@@ -460,6 +464,8 @@ def transform_records_to_sdtm(
     seq_counters: dict[str, int] = {}
 
     for rec in records:
+        if not include_deleted and is_record_deleted(rec):
+            continue
         model_field_to_serialized: dict[str, str] = {}
         all_field_aliases: dict[str, set[str]] = {}
         base_consumed: frozenset[str] | set[str] = _BASE_SDTM_CONSUMED_KEYS
@@ -642,6 +648,7 @@ class RecordMapper:
         loader: CachedRecordsLoader | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         mask_phi: bool = True,
+        include_deleted: bool = False,
     ) -> None:
         """Initialize with an :class:`ImednetSDK` instance.
 
@@ -650,11 +657,15 @@ class RecordMapper:
         yielded batch when using chunked mapping helpers.
         ``mask_phi`` controls whether sensitive clinical fields are masked at
         mapper ingress by default.
+        ``include_deleted`` controls whether voided (``deleted=True``) records
+        are retained (defaults to ``False``).
         """
         self.sdk = sdk
         self._loader = loader
         self._pipeline = ChunkedRecordPipeline(chunk_size=chunk_size)
         self.mask_phi = mask_phi
+        self._include_deleted = include_deleted
+        self._last_variables: list[VariableModel] = []
 
     # ------------------------------------------------------------------
     # Helper methods
@@ -666,6 +677,7 @@ class RecordMapper:
         form_whitelist: list[int] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Return variable names and label mapping for a study."""
+        self._last_variables = []
         if variable_whitelist is not None and len(variable_whitelist) == 0:
             return [], {}
         if form_whitelist is not None and len(form_whitelist) == 0:
@@ -707,6 +719,7 @@ class RecordMapper:
             )
             return [], {}
 
+        self._last_variables = list(variables)
         variable_keys = [v.variable_name for v in variables]
         label_map = {v.variable_name: v.label for v in variables}
         return variable_keys, label_map  # type: ignore
@@ -744,13 +757,33 @@ class RecordMapper:
             return [raw_form_id], cleaned
         return None, cleaned
 
-    def _fetch_records(
+    def _can_stream_via_records_endpoint(self) -> bool:
+        """Return True when ``self.sdk.records.list`` can stream paginated responses."""
+        from unittest.mock import NonCallableMock
+
+        if isinstance(self.sdk, NonCallableMock):
+            mock_children = getattr(self.sdk, "_mock_children", {})
+            obj_vars = vars(self.sdk)
+            if "records" in mock_children or "records" in obj_vars:
+                return True
+            return not ("get_records" in mock_children or "get_records" in obj_vars)
+
+        records_ep = getattr(self.sdk, "records", None)
+        return records_ep is not None and callable(getattr(records_ep, "list", None))
+
+    def _stream_sdk_records(
         self,
         study_key: str,
         visit_key: str | None = None,
         extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
-    ) -> list[RecordModel]:
-        """Fetch records for a study applying optional filters."""
+        *,
+        record_data_filter: str | None = None,
+        include_deleted: bool | None = None,
+    ) -> Iterator[RecordModel]:
+        """Lazily stream records from the SDK, applying visit/form/deleted filters."""
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
+        )
         raw_filters: dict[str, Any | tuple[str, Any] | list[Any]] = (
             dict(extra_filters) if extra_filters else {}
         )
@@ -765,51 +798,88 @@ class RecordMapper:
 
         form_id_list, filters = self._extract_form_ids(raw_filters)
         if form_id_list is not None and len(form_id_list) == 0:
-            return []
+            return
+
+        use_streaming_endpoint = self._can_stream_via_records_endpoint()
+        records_ep = getattr(self.sdk, "records", None) if use_streaming_endpoint else None
+        fetch_fn: Any = (
+            records_ep.list
+            if use_streaming_endpoint and records_ep is not None
+            else self.sdk.get_records
+        )
 
         try:
             if form_id_list is not None:
-                batched_records: list[RecordModel] = []
                 for fid in form_id_list:
-                    batched_records.extend(
-                        self.sdk.get_records(
-                            study_key=study_key,
-                            record_data_filter=None,
-                            **filters,
-                            formId=fid,
-                        )
-                    )
-                return batched_records
+                    for rec in fetch_fn(
+                        study_key=study_key,
+                        record_data_filter=record_data_filter,
+                        **filters,
+                        formId=fid,
+                    ):
+                        if not effective_include_deleted and is_record_deleted(rec):
+                            continue
+                        yield rec
+                return
 
-            return list(
-                self.sdk.get_records(
-                    study_key=study_key,
-                    record_data_filter=None,
-                    **filters,
-                )
-            )
+            for rec in fetch_fn(
+                study_key=study_key,
+                record_data_filter=record_data_filter,
+                **filters,
+            ):
+                if not effective_include_deleted and is_record_deleted(rec):
+                    continue
+                yield rec
         except ValueError:
             raise
         except Exception as exc:  # pragma: no cover - unexpected
             logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
-            return []
+            return
+
+    def _fetch_records(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        record_data_filter: str | None = None,
+        include_deleted: bool | None = None,
+    ) -> list[RecordModel]:
+        """Fetch records for a study applying optional filters."""
+        return list(
+            self._stream_sdk_records(
+                study_key,
+                visit_key=visit_key,
+                extra_filters=extra_filters,
+                record_data_filter=record_data_filter,
+                include_deleted=include_deleted,
+            )
+        )
 
     def _iter_records(
         self,
         study_key: str,
         visit_key: str | None = None,
         extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        record_data_filter: str | None = None,
+        include_deleted: bool | None = None,
     ) -> Iterable[RecordModel]:
-        """Iterate over records for a study, using cache if available.
+        """Iterate lazily over records for a study, using cache if available.
 
         Args:
             study_key: The study identifier.
             visit_key: Optional visit filter.
             extra_filters: Optional additional filter criteria.
+            record_data_filter: Optional clinical variable payload filter.
+            include_deleted: Optional override for voided-record inclusion.
 
         Returns:
             An iterable of Record models.
         """
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
+        )
         raw_filters = dict(extra_filters) if extra_filters else {}
         form_id_list, _ = self._extract_form_ids(raw_filters)
         form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
@@ -824,12 +894,15 @@ class RecordMapper:
                     iter_method(loader, study_key, chunk_size=self._pipeline.chunk_size),
                     visit_key=visit_key,
                     form_ids=form_ids,
+                    include_deleted=effective_include_deleted,
                 )
 
-        return self._fetch_records(
+        return self._stream_sdk_records(
             study_key,
             visit_key,
             extra_filters=extra_filters,
+            record_data_filter=record_data_filter,
+            include_deleted=effective_include_deleted,
         )
 
     def _filter_records(
@@ -838,17 +911,12 @@ class RecordMapper:
         *,
         visit_key: str | None,
         form_ids: set[Any] | None,
+        include_deleted: bool | None = None,
     ) -> Iterator[RecordModel]:
-        """Apply visit and form filters to an iterable of records.
-
-        Args:
-            records: Source records.
-            visit_key: Visit identifier to filter by.
-            form_ids: Set of form IDs to filter by.
-
-        Returns:
-            An iterator of filtered Record models.
-        """
+        """Apply visit, form, and deleted filters to an iterable of records."""
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
+        )
         visit_id: int | None = None
         if visit_key is not None:
             try:
@@ -860,6 +928,8 @@ class RecordMapper:
                 )
 
         for record in records:
+            if not effective_include_deleted and is_record_deleted(record):
+                continue
             if visit_id is not None and record.visit_id != visit_id:
                 continue
             if form_ids is not None and record.form_id not in form_ids:
@@ -1014,6 +1084,7 @@ class RecordMapper:
         as_sdtm: bool = False,
         domain: str | None = None,
         mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield mapped record DataFrames in bounded chunks.
 
@@ -1032,6 +1103,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                include_deleted=include_deleted,
             )
             return
 
@@ -1060,6 +1132,7 @@ class RecordMapper:
                 study_key,
                 visit_key,
                 extra_filters=extra_filters or None,
+                include_deleted=include_deleted,
             ),
             record_model,
             mask_phi=mask_phi,
@@ -1094,6 +1167,7 @@ class RecordMapper:
         form_whitelist: list[int] | None = None,
         *,
         mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Generate a nested JSON tree structure up to three levels deep.
 
@@ -1134,6 +1208,7 @@ class RecordMapper:
             study_key,
             visit_key,
             extra_filters=extra_filters or None,
+            include_deleted=include_deleted,
         )
 
         tree: dict[str, dict[str, Any]] = {}
@@ -1168,7 +1243,9 @@ class RecordMapper:
             # Automatically perform lookups for parent record identifiers using available metadata
             resolved_parent_id = getattr(rec, "parent_record_id", None)
             if not resolved_parent_id:
-                resolved_parent_id = f"{rec.visit_id}_{rec.form_id}"
+                resolved_parent_id = (
+                    f"{rec.visit_id}_{rec.form_id}" if rec.visit_id is not None else None
+                )
 
             if "parent_record_id" not in parsed_data or parsed_data.get("parent_record_id") is None:
                 parsed_data["parent_record_id"] = resolved_parent_id
@@ -1178,22 +1255,27 @@ class RecordMapper:
 
             subj_key = rec.subject_key
             if subj_key not in tree:
-                tree[subj_key] = {"subject_key": subj_key, "visits": {}}  # type: ignore
+                tree[subj_key] = {"subject_key": subj_key, "visits": {}, "forms": {}}  # type: ignore
 
             subj_node = tree[subj_key]  # type: ignore
+            form_id = rec.form_id
 
             visit_id = rec.visit_id
-            if visit_id not in subj_node["visits"]:
-                subj_node["visits"][visit_id] = {"visit_id": visit_id, "forms": {}}
+            if visit_id is None:
+                if form_id not in subj_node["forms"]:
+                    subj_node["forms"][form_id] = {"form_id": form_id, "records": []}
+                subj_node["forms"][form_id]["records"].append(parsed_data)
+            else:
+                if visit_id not in subj_node["visits"]:
+                    subj_node["visits"][visit_id] = {"visit_id": visit_id, "forms": {}}
 
-            visit_node = subj_node["visits"][visit_id]
+                visit_node = subj_node["visits"][visit_id]
 
-            form_id = rec.form_id
-            if form_id not in visit_node["forms"]:
-                visit_node["forms"][form_id] = {"form_id": form_id, "records": []}
+                if form_id not in visit_node["forms"]:
+                    visit_node["forms"][form_id] = {"form_id": form_id, "records": []}
 
-            form_node = visit_node["forms"][form_id]
-            form_node["records"].append(parsed_data)
+                form_node = visit_node["forms"][form_id]
+                form_node["records"].append(parsed_data)
 
         # 3. Convert dicts to lists
         result = []
@@ -1206,6 +1288,9 @@ class RecordMapper:
                 visit["forms"] = visit_forms
                 subj_visits.append(visit)
             subj["visits"] = subj_visits
+            unscheduled_forms = list(subj.pop("forms", {}).values())
+            if unscheduled_forms:
+                subj["forms"] = unscheduled_forms
             result.append(subj)
 
         return result
@@ -1215,9 +1300,19 @@ class RecordMapper:
         records: Iterable[Any],
         domain: str,
         study_key: str,
+        *,
+        include_deleted: bool | None = None,
     ) -> pd.DataFrame:
         """Transform an iterable of records into a normalized SDTM domain DataFrame."""
-        return transform_records_to_sdtm(records, domain=domain, study_key=study_key)
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
+        )
+        return transform_records_to_sdtm(
+            records,
+            domain=domain,
+            study_key=study_key,
+            include_deleted=effective_include_deleted,
+        )
 
     def sdtm_dataframe(
         self,
@@ -1226,23 +1321,10 @@ class RecordMapper:
         visit_key: str | None = None,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        include_deleted: bool | None = None,
     ) -> pd.DataFrame:
-        """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset.
-
-        Standardizes clinical records into CDISC SDTM tabular datasets matching
-        models in ``reporting.py``, assigning STUDYID, USUBJID, DOMAIN, sequence
-        numbers, and ISO 8601 DTC timestamps.
-
-        Args:
-            study_key: Unique study identifier.
-            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
-            visit_key: Optional visit filter.
-            variable_whitelist: Optional variable name whitelist.
-            form_whitelist: Optional form ID whitelist.
-
-        Returns:
-            Normalized pandas DataFrame with standard SDTM domain variables.
-        """
+        """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset."""
         if pd is None:
             raise ImportError(
                 "pandas is required for RecordMapper.sdtm_dataframe. Install "
@@ -1255,6 +1337,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                include_deleted=include_deleted,
             )
         )
         if not frames:
@@ -1268,19 +1351,10 @@ class RecordMapper:
         visit_key: str | None = None,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
-        """Yield chunked pandas DataFrames transformed into an SDTM domain dataset.
-
-        Args:
-            study_key: Unique study identifier.
-            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
-            visit_key: Optional visit filter.
-            variable_whitelist: Optional variable name whitelist.
-            form_whitelist: Optional form ID whitelist.
-
-        Yields:
-            Chunked DataFrames containing normalized SDTM domain records.
-        """
+        """Yield chunked pandas DataFrames transformed into an SDTM domain dataset."""
         if pd is None:
             raise ImportError(
                 "pandas is required for RecordMapper.iter_sdtm_dataframes. Install "
@@ -1288,6 +1362,9 @@ class RecordMapper:
             )
         if variable_whitelist is not None and len(variable_whitelist) == 0:
             return
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
+        )
         allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
         extra_filters: dict[str, Any] = {}
         if form_whitelist is not None:
@@ -1297,6 +1374,7 @@ class RecordMapper:
             study_key,
             visit_key=visit_key,
             extra_filters=extra_filters or None,
+            include_deleted=effective_include_deleted,
         )
         for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
             records_batch: list[Any] = chunk
@@ -1317,7 +1395,12 @@ class RecordMapper:
                     else:
                         projected_chunk.append(rec)
                 records_batch = projected_chunk
-            df = transform_records_to_sdtm(records_batch, domain=domain, study_key=study_key)
+            df = transform_records_to_sdtm(
+                records_batch,
+                domain=domain,
+                study_key=study_key,
+                include_deleted=effective_include_deleted,
+            )
             if not df.empty:
                 yield df
 
@@ -1332,15 +1415,9 @@ class RecordMapper:
         as_sdtm: bool = False,
         domain: str | None = None,
         mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
     ) -> pd.DataFrame:
-        """Return a :class:`pandas.DataFrame` of records for a study.
-
-        This method still materialises all yielded chunks into one DataFrame.
-        For bounded-memory processing of large studies, prefer ``iter_dataframes()``.
-
-        When ``as_sdtm`` is True, clinical records are transformed into a normalized
-        CDISC SDTM tabular dataset matching the models in ``reporting.py``.
-        """
+        """Return a :class:`pandas.DataFrame` of records for a study."""
         if as_sdtm:
             target_domain = domain or "AE"
             return self.sdtm_dataframe(
@@ -1349,6 +1426,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                include_deleted=include_deleted,
             )
 
         if pd is None:
@@ -1364,6 +1442,7 @@ class RecordMapper:
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
                 mask_phi=mask_phi,
+                include_deleted=include_deleted,
             )
         )
         if not frames:

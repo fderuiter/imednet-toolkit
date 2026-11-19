@@ -238,6 +238,47 @@ def test_build_hierarchy_form_whitelist_filtering(mock_get_study_structure):
 
 
 @patch("imednet_workflows.study_structure.get_study_structure")
+def test_build_hierarchy_skips_visit_node_when_visit_id_is_none(mock_get_study_structure):
+    """Verify unscheduled records with visit_id=None and parent_record_id=None do not create phantom Visit nodes."""
+    sdk = MagicMock()
+
+    mock_study_struct = MagicMock()
+    interval = MagicMock()
+    form = MagicMock()
+    form.form_id = 10
+    form.variables = [Variable(variable_name="VAR1", label="Label1", form_id=10)]
+    interval.forms = [form]
+    mock_study_struct.intervals = [interval]
+    mock_get_study_structure.return_value = mock_study_struct
+
+    unscheduled = Record.from_json(
+        {
+            "studyKey": "STUDY",
+            "recordId": 500,
+            "subjectKey": "S1",
+            "formId": 10,
+            "recordData": {"VAR1": "unscheduled_val"},
+        }
+    )
+    assert unscheduled.visit_id is None
+    assert unscheduled.parent_record_id is None
+
+    mapper = RecordMapper(sdk)
+    mapper._iter_records = MagicMock(return_value=[unscheduled])
+
+    tree = mapper.build_hierarchy("STUDY")
+    assert len(tree) == 1
+    subj = tree[0]
+    assert subj["subject_key"] == "S1"
+    assert subj["visits"] == []
+    assert len(subj["forms"]) == 1
+    assert subj["forms"][0]["form_id"] == 10
+    rec_out = subj["forms"][0]["records"][0]
+    assert rec_out["VAR1"] == "unscheduled_val"
+    assert rec_out["parent_record_id"] is None
+
+
+@patch("imednet_workflows.study_structure.get_study_structure")
 def test_build_hierarchy_masks_phi_before_label_remapping_and_supports_opt_out(
     mock_get_study_structure,
 ):

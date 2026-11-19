@@ -16,6 +16,19 @@ class StudiesOperationDef:
     MODEL = Study
     _id_param = "studyKey"
     requires_study_key: bool = False
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "sponsorKey",
+            "studyKey",
+            "studyId",
+            "studyName",
+            "studyDescription",
+            "studyType",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+        }
+    )
 
     @execute_operation  # type: ignore
     def get(

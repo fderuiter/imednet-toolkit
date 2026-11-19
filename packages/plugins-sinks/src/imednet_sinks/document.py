@@ -70,6 +70,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -82,7 +83,8 @@ from imednet.spi.sink_base import (
     SinkConfig,
     _redact_uri,
     _require_optional_dep,
-    iter_batches,
+    extract_record_id,
+    run_streaming_export,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,7 @@ class MongoDbSinkConfig(SinkConfig):
     uri: str = ""
     database: str = ""
     collection: str = ""
+    ledger_path: str | Path | None = None
 
     def __post_init__(self) -> None:
         """Validate MongoDB config properties after initialization."""
@@ -238,6 +241,25 @@ class MongoDbExportSink(ExportSink):
     def flush(self) -> None:
         """No-op: MongoDB writes are committed per bulk operation."""
 
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Delete newly voided documents from MongoDB when running idempotently."""
+        if not self.config.idempotent or not records:
+            return 0
+        doc_ids = [
+            _make_document_id(self._study_key, rid)
+            for r in records
+            if (rid := extract_record_id(r)) is not None
+        ]
+        if not doc_ids:
+            return 0
+
+        def execute_reconcile() -> int:
+            self._collection.delete_many({"_id": {"$in": doc_ids}})
+            logger.debug("Reconciled %d voided records in batch %s", len(doc_ids), batch_id)
+            return len(doc_ids)
+
+        return self._execute_with_retry("reconcile_mongodb_deleted", batch_id, execute_reconcile)
+
     def close(self) -> None:
         """Close the underlying PyMongo client."""
         if self._client is not None:
@@ -257,27 +279,26 @@ def export_to_mongodb(
     *,
     config: MongoDbSinkConfig | None = None,
     mask_phi: bool = True,
+    **kwargs: Any,
 ) -> int:
     """Export study records to MongoDB using :class:`MongoDbExportSink`."""
-    from imednet.spi.sink_base import apply_quality_gate
-
     if config is None:
+        kwargs.setdefault("mask_phi", mask_phi)
         config = MongoDbSinkConfig(
             study_key=study_key,
             uri=uri,
             database=database,
             collection=collection,
-            mask_phi=mask_phi,
+            **kwargs,
         )
 
-    records = sdk.records.list(study_key=study_key, record_data_filter=None)
-    filtered_records = list(apply_quality_gate(sdk, study_key, records, config))
-
-    total_written = 0
-    with MongoDbExportSink(config=config) as sink:
-        for index, batch in enumerate(iter_batches(filtered_records, config.batch_size)):
-            total_written += sink.write_batch(batch, batch_id=f"{study_key}/records/{index}")
-    return total_written
+    return run_streaming_export(
+        sdk,
+        study_key,
+        lambda: MongoDbExportSink(config=config),
+        config,
+        stream_name=f"mongodb_{config.collection}",
+    )
 
 
 __all__ = ["MongoDbExportSink", "MongoDbSinkConfig", "export_to_mongodb"]

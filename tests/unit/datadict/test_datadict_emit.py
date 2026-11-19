@@ -433,3 +433,492 @@ def test_odm_round_trip_sdtm_preservation() -> None:
     assert v_age.extraAttributes.get("SASFieldName") == "AGE"
     assert v_age.extraAttributes.get("Origin") == "Assigned"
     assert v_age.extraAttributes.get("Comment") == "Age in years"
+
+
+def test_odm_round_trip_scoped_shared_variables_and_required_policy() -> None:
+    """Round-tripping two Forms with distinct STATUS variables preserves definitions and Auto Query."""
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_SCOPED_STATUS"),
+        forms=[
+            Form(
+                formKey="DM",
+                formName="Demographics",
+                extraAttributes={"Domain": "DM", "SASDatasetName": "DM"},
+                variables=[
+                    Variable(
+                        variableName="STATUS",
+                        label="Enrollment Status",
+                        variableType="Radio",
+                        sequence=1,
+                        required="Auto Query",
+                        choices=[
+                            Choice(choiceValue="1", choiceText="Enrolled", position=1),
+                            Choice(choiceValue="2", choiceText="Screen Failure", position=2),
+                        ],
+                        extraAttributes={
+                            "Domain": "DM",
+                            "SASDatasetName": "DM",
+                            "SDSVarName": "DMSTAT",
+                            "SASFieldName": "DMSTAT",
+                            "Origin": "CRF",
+                            "Comment": "Demographics enrollment status",
+                        },
+                    )
+                ],
+            ),
+            Form(
+                formKey="DV",
+                formName="Protocol Deviations",
+                extraAttributes={"Domain": "DV", "SASDatasetName": "DV"},
+                variables=[
+                    Variable(
+                        variableName="STATUS",
+                        label="Deviation Resolution Status",
+                        variableType="Single Select",
+                        sequence=1,
+                        required="Yes",
+                        choices=[
+                            Choice(choiceValue="OPEN", choiceText="Open", position=1),
+                            Choice(choiceValue="CLOSED", choiceText="Closed", position=2),
+                        ],
+                        extraAttributes={
+                            "Domain": "DV",
+                            "SASDatasetName": "DV",
+                            "SDSVarName": "DVSTAT",
+                            "SASFieldName": "DVSTAT",
+                            "Origin": "Assigned",
+                            "Comment": "Deviation workflow status",
+                        },
+                    )
+                ],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {
+        "odm": "http://www.cdisc.org/ns/odm/v1.3",
+        "imednet": "http://www.imednet.com/ns/odm/metadata",
+    }
+
+    # Scoped ItemDef and CodeList identifiers per Form
+    assert root.find(".//odm:ItemDef[@OID='DM.STATUS']", ns) is not None
+    assert root.find(".//odm:ItemDef[@OID='DV.STATUS']", ns) is not None
+    assert root.find(".//odm:ItemDef[@OID='STATUS']", ns) is None
+    assert root.find(".//odm:CodeList[@OID='CL_DM.STATUS']", ns) is not None
+    assert root.find(".//odm:CodeList[@OID='CL_DV.STATUS']", ns) is not None
+
+    # Vendor RequiredPolicy attribute preserved alongside ODM Mandatory="No"
+    dm_ref = root.find(".//odm:ItemGroupDef[@OID='IG_DM']/odm:ItemRef[@ItemOID='DM.STATUS']", ns)
+    assert dm_ref is not None
+    assert dm_ref.attrib.get("Mandatory") == "No"
+    assert dm_ref.attrib.get("{http://www.imednet.com/ns/odm/metadata}RequiredPolicy") == (
+        "Auto Query"
+    )
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    assert reloaded.metadata.validationWarnings == []
+
+    dm_form = next(f for f in reloaded.forms if f.formKey == "DM")
+    dv_form = next(f for f in reloaded.forms if f.formKey == "DV")
+
+    dm_status = dm_form.variables[0]
+    assert dm_status.variableName == "STATUS"
+    assert dm_status.label == "Enrollment Status"
+    assert dm_status.variableType == "Radio"
+    assert dm_status.required == "Auto Query"
+    assert [(c.choiceValue, c.choiceText) for c in dm_status.choices] == [
+        ("1", "Enrolled"),
+        ("2", "Screen Failure"),
+    ]
+    assert dm_status.extraAttributes["Domain"] == "DM"
+    assert dm_status.extraAttributes["SASDatasetName"] == "DM"
+    assert dm_status.extraAttributes["SDSVarName"] == "DMSTAT"
+    assert dm_status.extraAttributes["SASFieldName"] == "DMSTAT"
+    assert dm_status.extraAttributes["Origin"] == "CRF"
+    assert dm_status.extraAttributes["Comment"] == "Demographics enrollment status"
+
+    dv_status = dv_form.variables[0]
+    assert dv_status.variableName == "STATUS"
+    assert dv_status.label == "Deviation Resolution Status"
+    assert dv_status.variableType == "Single Select"
+    assert dv_status.required == "Yes"
+    assert [(c.choiceValue, c.choiceText) for c in dv_status.choices] == [
+        ("OPEN", "Open"),
+        ("CLOSED", "Closed"),
+    ]
+    assert dv_status.extraAttributes["Domain"] == "DV"
+    assert dv_status.extraAttributes["SASDatasetName"] == "DV"
+    assert dv_status.extraAttributes["SDSVarName"] == "DVSTAT"
+    assert dv_status.extraAttributes["SASFieldName"] == "DVSTAT"
+    assert dv_status.extraAttributes["Origin"] == "Assigned"
+    assert dv_status.extraAttributes["Comment"] == "Deviation workflow status"
+
+
+def test_to_odm_xml_retains_unprefixed_oids_for_unique_and_identical_shared_variables() -> None:
+    """Unique or identical shared Variables retain unprefixed ItemDef and CodeList OIDs."""
+    shared_choices = [
+        Choice(choiceValue="Y", choiceText="Yes", position=1),
+        Choice(choiceValue="N", choiceText="No", position=2),
+    ]
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_UNPREFIXED"),
+        forms=[
+            Form(
+                formKey="VS_BASE",
+                formName="Baseline Vitals",
+                variables=[
+                    Variable(
+                        variableName="PERF",
+                        label="Was assessment performed?",
+                        variableType="Radio",
+                        sequence=1,
+                        required="Yes",
+                        choices=copy.deepcopy(shared_choices),
+                    ),
+                    Variable(
+                        variableName="SUBJID",
+                        label="Subject ID",
+                        variableType="Text",
+                        sequence=2,
+                    ),
+                ],
+            ),
+            Form(
+                formKey="VS_WK4",
+                formName="Week 4 Vitals",
+                variables=[
+                    Variable(
+                        variableName="PERF",
+                        label="Was assessment performed?",
+                        variableType="Radio",
+                        sequence=1,
+                        required="Auto Query",
+                        choices=copy.deepcopy(shared_choices),
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    assert root.find(".//odm:ItemDef[@OID='PERF']", ns) is not None
+    assert root.find(".//odm:ItemDef[@OID='SUBJID']", ns) is not None
+    assert root.find(".//odm:CodeList[@OID='CL_PERF']", ns) is not None
+    assert root.find(".//odm:ItemDef[@OID='VS_BASE.PERF']", ns) is None
+    assert root.find(".//odm:ItemDef[@OID='VS_WK4.PERF']", ns) is None
+    assert root.find(".//odm:CodeList[@OID='CL_VS_BASE.PERF']", ns) is None
+
+
+def test_to_odm_xml_serializes_bounds_and_measurement_units() -> None:
+    """Normalized bounds and units serialize into BasicDefinitions, MeasurementUnitRef, and RangeCheck."""
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_UNITS_BOUNDS"),
+        forms=[
+            Form(
+                formKey="VS",
+                formName="Vital Signs",
+                variables=[
+                    Variable(
+                        variableName="SYSBP",
+                        label="Systolic Blood Pressure",
+                        variableType="Integer",
+                        sequence=1,
+                        precision=None,
+                        extraAttributes={
+                            "unit": "mmHg",
+                            "textValidationMin": "70",
+                            "textValidationMax": "250",
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    assert "SignificantDigits" not in xml_str
+
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    mu_elem = root.find(".//odm:BasicDefinitions/odm:MeasurementUnit[@OID='MU.mmHg']", ns)
+    assert mu_elem is not None
+    assert mu_elem.attrib.get("Name") == "mmHg"
+
+    item_elem = root.find(".//odm:ItemDef[@OID='SYSBP']", ns)
+    assert item_elem is not None
+    mu_ref = item_elem.find("odm:MeasurementUnitRef", ns)
+    assert mu_ref is not None
+    assert mu_ref.attrib.get("MeasurementUnitOID") == "MU.mmHg"
+
+    range_checks = item_elem.findall("odm:RangeCheck", ns)
+    assert len(range_checks) == 2
+    assert range_checks[0].attrib.get("Comparator") == "GE"
+    assert range_checks[0].findtext("odm:CheckValue", namespaces=ns) == "70"
+    assert range_checks[1].attrib.get("Comparator") == "LE"
+    assert range_checks[1].findtext("odm:CheckValue", namespaces=ns) == "250"
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    reloaded_var = reloaded.forms[0].variables[0]
+    assert reloaded_var.precision is None
+    assert reloaded_var.extraAttributes["measurementUnits"] == [
+        {"oid": "MU.mmHg", "name": "mmHg", "symbol": "mmHg"}
+    ]
+    assert reloaded_var.extraAttributes["rangeChecks"] == [
+        {"comparator": "GE", "softHard": "Soft", "checkValue": "70"},
+        {"comparator": "LE", "softHard": "Soft", "checkValue": "250"},
+    ]
+
+
+def test_odm_round_trip_scoped_and_raw_variable_name_collision() -> None:
+    """Scoped AGE across F1/F2 and raw F1.AGE emit three distinct ItemDefs and round-trip cleanly."""
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_SCOPED_RAW_COLLISION"),
+        forms=[
+            Form(
+                formKey="F1",
+                formName="Form One",
+                variables=[
+                    Variable(
+                        variableName="AGE",
+                        label="Screening Age (Years)",
+                        variableType="Integer",
+                        sequence=1,
+                        required="Yes",
+                        choices=[
+                            Choice(choiceValue="18", choiceText="Adult 18", position=1),
+                        ],
+                    ),
+                    Variable(
+                        variableName="F1.AGE",
+                        label="Legacy Imported F1.AGE",
+                        variableType="Text",
+                        sequence=2,
+                        required="Auto Query",
+                        choices=[
+                            Choice(choiceValue="RAW", choiceText="Raw Value", position=1),
+                        ],
+                    ),
+                ],
+            ),
+            Form(
+                formKey="F2",
+                formName="Form Two",
+                variables=[
+                    Variable(
+                        variableName="AGE",
+                        label="Exact Follow-up Age",
+                        variableType="Float",
+                        precision="1",
+                        sequence=1,
+                        required="No",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    item_defs = root.findall(".//odm:ItemDef", ns)
+    assert len(item_defs) == 3
+    item_oids = [elem.attrib["OID"] for elem in item_defs]
+    assert len(set(item_oids)) == 3
+
+    f1_refs = root.findall(".//odm:ItemGroupDef[@OID='IG_F1']/odm:ItemRef", ns)
+    assert len(f1_refs) == 2
+    assert f1_refs[0].attrib["ItemOID"] != f1_refs[1].attrib["ItemOID"]
+
+    codelists = root.findall(".//odm:CodeList", ns)
+    assert len(codelists) == 2
+    assert len({cl.attrib["OID"] for cl in codelists}) == 2
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    assert reloaded.metadata.validationWarnings == []
+
+    forms_by_key = {f.formKey: f for f in reloaded.forms}
+    f1_vars = {v.variableName: v for v in forms_by_key["F1"].variables}
+    assert list(f1_vars.keys()) == ["AGE", "F1.AGE"]
+    assert f1_vars["AGE"].label == "Screening Age (Years)"
+    assert f1_vars["AGE"].variableType == "Integer"
+    assert f1_vars["AGE"].required == "Yes"
+    assert [(c.choiceValue, c.choiceText) for c in f1_vars["AGE"].choices] == [("18", "Adult 18")]
+
+    assert f1_vars["F1.AGE"].label == "Legacy Imported F1.AGE"
+    assert f1_vars["F1.AGE"].variableType == "Text"
+    assert f1_vars["F1.AGE"].required == "Auto Query"
+    assert [(c.choiceValue, c.choiceText) for c in f1_vars["F1.AGE"].choices] == [
+        ("RAW", "Raw Value")
+    ]
+
+    f2_vars = {v.variableName: v for v in forms_by_key["F2"].variables}
+    assert list(f2_vars.keys()) == ["AGE"]
+    assert f2_vars["AGE"].label == "Exact Follow-up Age"
+    assert f2_vars["AGE"].variableType == "Float"
+    assert f2_vars["AGE"].precision == "1"
+
+
+def test_odm_round_trip_multi_level_oid_disambiguation_and_shared_prefixed_raw_name() -> None:
+    """Fallback indexed OIDs and shared prefixed raw names preserve all definitions across forms."""
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_MULTI_COLLISION"),
+        forms=[
+            Form(
+                formKey="F0",
+                formName="Form Zero",
+                variables=[
+                    Variable(
+                        variableName="F1.AGE",
+                        label="Shared Dotted F1.AGE",
+                        variableType="Text",
+                        sequence=1,
+                    ),
+                ],
+            ),
+            Form(
+                formKey="F1",
+                formName="Form One",
+                variables=[
+                    Variable(
+                        variableName="AGE",
+                        label="F1 Scoped Age",
+                        variableType="Integer",
+                        sequence=1,
+                    ),
+                    Variable(
+                        variableName="F1.AGE",
+                        label="Shared Dotted F1.AGE",
+                        variableType="Text",
+                        sequence=2,
+                    ),
+                    Variable(
+                        variableName="IT.F1.AGE",
+                        label="Raw IT.F1.AGE",
+                        variableType="Date",
+                        sequence=3,
+                    ),
+                ],
+            ),
+            Form(
+                formKey="F2",
+                formName="Form Two",
+                variables=[
+                    Variable(
+                        variableName="AGE",
+                        label="F2 Scoped Age",
+                        variableType="Float",
+                        sequence=1,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    item_defs = root.findall(".//odm:ItemDef", ns)
+    assert len(item_defs) == 4
+    assert len({elem.attrib["OID"] for elem in item_defs}) == 4
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    assert reloaded.metadata.validationWarnings == []
+    forms_by_key = {f.formKey: f for f in reloaded.forms}
+
+    assert [(v.variableName, v.label, v.variableType) for v in forms_by_key["F0"].variables] == [
+        ("F1.AGE", "Shared Dotted F1.AGE", "Text"),
+    ]
+    assert [(v.variableName, v.label, v.variableType) for v in forms_by_key["F1"].variables] == [
+        ("AGE", "F1 Scoped Age", "Integer"),
+        ("F1.AGE", "Shared Dotted F1.AGE", "Text"),
+        ("IT.F1.AGE", "Raw IT.F1.AGE", "Date"),
+    ]
+    assert [(v.variableName, v.label, v.variableType) for v in forms_by_key["F2"].variables] == [
+        ("AGE", "F2 Scoped Age", "Float"),
+    ]
+
+
+def test_odm_round_trip_when_both_unprefixed_and_prefixed_raw_names_are_scoped() -> None:
+    """When both AGE and F1.AGE have distinct definitions across forms, all 4 ItemDefs round-trip."""
+    dd = DataDictionary(
+        metadata=Metadata(studyKey="STUDY_DUAL_SCOPED_COLLISION"),
+        forms=[
+            Form(
+                formKey="F1",
+                formName="Form One",
+                variables=[
+                    Variable(
+                        variableName="AGE",
+                        label="F1 Age Integer",
+                        variableType="Integer",
+                        sequence=1,
+                        SDSVarName="AGE_F1",
+                    ),
+                    Variable(
+                        variableName="F1.AGE",
+                        label="F1 Dotted Age Text",
+                        variableType="Text",
+                        sequence=2,
+                        choices=[Choice(choiceValue="A", choiceText="Alpha", position=1)],
+                    ),
+                ],
+            ),
+            Form(
+                formKey="F2",
+                formName="Form Two",
+                variables=[
+                    Variable(
+                        variableName="AGE",
+                        label="F1 Age Integer",
+                        variableType="Integer",
+                        sequence=1,
+                        SDSVarName="AGE_F2",
+                    ),
+                    Variable(
+                        variableName="F1.AGE",
+                        label="F2 Dotted Age Date",
+                        variableType="Date",
+                        sequence=2,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    item_defs = root.findall(".//odm:ItemDef", ns)
+    assert len(item_defs) == 4
+    item_oids = [elem.attrib["OID"] for elem in item_defs]
+    assert len(set(item_oids)) == 4
+    # Scoped OID for (F1, AGE) must not hijack the raw variable name F1.AGE
+    assert "F1.AGE" not in item_oids
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    assert reloaded.metadata.validationWarnings == []
+    forms_by_key = {f.formKey: f for f in reloaded.forms}
+
+    assert [(v.variableName, v.label, v.variableType) for v in forms_by_key["F1"].variables] == [
+        ("AGE", "F1 Age Integer", "Integer"),
+        ("F1.AGE", "F1 Dotted Age Text", "Text"),
+    ]
+    assert forms_by_key["F1"].variables[0].extraAttributes["SDSVarName"] == "AGE_F1"
+    assert [(c.choiceValue, c.choiceText) for c in forms_by_key["F1"].variables[1].choices] == [
+        ("A", "Alpha")
+    ]
+
+    assert [(v.variableName, v.label, v.variableType) for v in forms_by_key["F2"].variables] == [
+        ("AGE", "F1 Age Integer", "Integer"),
+        ("F1.AGE", "F2 Dotted Age Date", "Date"),
+    ]
+    assert forms_by_key["F2"].variables[0].extraAttributes["SDSVarName"] == "AGE_F2"

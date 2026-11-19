@@ -928,3 +928,160 @@ def test_tabular_and_hierarchical_exports_mask_phi_with_labels_and_opt_out(
     assert unmasked_long_map["patientName"] == "Jane Doe"
     assert unmasked_long_map["SSN"] == "123-45-6789"
     assert global_sensitivity_registry._sensitive_keys == snapshot_keywords
+
+
+def test_tabular_sink_config_receives_operational_options_without_pandas_leak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify batch_size, max_retries, idempotent, and quality gate options populate TabularSinkConfig without leaking into pandas/json kwargs."""
+    df, _mapper_cls, _mapper_inst = _setup_mapper(monkeypatch)
+    sdk = _make_quality_sdk()
+
+    captured_configs: list[export_mod.TabularSinkConfig] = []
+    orig_build = export_mod._build_tabular_sink_config
+
+    def spy_build(*args: object, **kwargs: object) -> export_mod.TabularSinkConfig:
+        cfg = orig_build(*args, **kwargs)  # type: ignore[arg-type]
+        captured_configs.append(cfg)
+        return cfg
+
+    monkeypatch.setattr(export_mod, "_build_tabular_sink_config", spy_build)
+
+    # 1. Parquet: compression reaches DataFrame.to_parquet, operational options do not
+    parquet_file = tmp_path / "records.parquet"
+    export_mod.export_to_parquet(
+        sdk,
+        "STUDY",
+        str(parquet_file),
+        batch_size=125,
+        max_retries=4,
+        idempotent=False,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=91.5,
+        compression="gzip",
+    )
+    pd.DataFrame.to_parquet.assert_called_once_with(
+        str(parquet_file), index=False, compression="gzip"
+    )
+    assert captured_configs[-1].batch_size == 125
+    assert captured_configs[-1].max_retries == 4
+    assert captured_configs[-1].idempotent is False
+    assert captured_configs[-1].quality_gate_enabled is True
+    assert captured_configs[-1].min_schema_readiness_score == 91.5
+
+    # 2. Excel: operational options do not leak into DataFrame.to_excel
+    excel_file = tmp_path / "records.xlsx"
+    export_mod.export_to_excel(
+        sdk,
+        "STUDY",
+        str(excel_file),
+        batch_size=75,
+        max_retries=2,
+        idempotent=True,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=85.0,
+    )
+    pd.DataFrame.to_excel.assert_called_once_with(str(excel_file), index=False)
+    assert captured_configs[-1].batch_size == 75
+    assert captured_configs[-1].max_retries == 2
+    assert captured_configs[-1].quality_gate_enabled is True
+    assert captured_configs[-1].min_schema_readiness_score == 85.0
+
+    # 3. JSON: operational options do not leak into json.dump
+    json_file = tmp_path / "records.json"
+    export_mod.export_to_json(
+        sdk,
+        "STUDY",
+        str(json_file),
+        batch_size=60,
+        max_retries=5,
+        idempotent=True,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=90.0,
+        indent=2,
+    )
+    assert json_file.exists()
+    assert captured_configs[-1].batch_size == 60
+    assert captured_configs[-1].max_retries == 5
+
+    # 4. CSV: non-idempotent runs append without rewriting headers or leaking sink options
+    csv_file = tmp_path / "append_records.csv"
+    export_mod.export_to_csv(
+        sdk,
+        "STUDY",
+        str(csv_file),
+        batch_size=50,
+        max_retries=2,
+        idempotent=True,
+        sep=",",
+    )
+    export_mod.export_to_csv(
+        sdk,
+        "STUDY",
+        str(csv_file),
+        batch_size=50,
+        max_retries=2,
+        idempotent=False,
+        sep=",",
+    )
+    csv_result = pd.read_csv(csv_file)
+    assert len(csv_result) == 2
+    assert captured_configs[-1].idempotent is False
+
+    # 5. SQL: idempotent=False defaults if_exists to 'append' and retries transient errors via max_retries
+    sql_file = tmp_path / "append_records.sqlite"
+    export_mod.export_to_sql(
+        sdk,
+        "STUDY",
+        "clinical_tbl",
+        f"sqlite:///{sql_file}",
+        batch_size=40,
+        max_retries=2,
+        idempotent=True,
+    )
+    export_mod.export_to_sql(
+        sdk,
+        "STUDY",
+        "clinical_tbl",
+        f"sqlite:///{sql_file}",
+        batch_size=40,
+        max_retries=2,
+        idempotent=False,
+    )
+    import sqlite3
+
+    with sqlite3.connect(sql_file) as conn:
+        total_rows = conn.execute("SELECT COUNT(*) FROM clinical_tbl").fetchone()[0]
+    assert total_rows == 2
+    assert captured_configs[-1].batch_size == 40
+    assert captured_configs[-1].max_retries == 2
+    assert captured_configs[-1].idempotent is False
+
+    # 6. DuckDB: idempotent=False appends into an existing table via INSERT INTO
+    duckdb_mod = pytest.importorskip("duckdb")
+    duck_file = tmp_path / "append_records.duckdb"
+    export_mod.export_to_duckdb(
+        sdk,
+        "STUDY",
+        str(duck_file),
+        "duck_tbl",
+        batch_size=30,
+        max_retries=2,
+        idempotent=True,
+    )
+    export_mod.export_to_duckdb(
+        sdk,
+        "STUDY",
+        str(duck_file),
+        "duck_tbl",
+        batch_size=30,
+        max_retries=2,
+        idempotent=False,
+    )
+    duck_conn = duckdb_mod.connect(str(duck_file))
+    try:
+        assert duck_conn.execute("SELECT COUNT(*) FROM duck_tbl").fetchone()[0] == 2
+    finally:
+        duck_conn.close()
+    assert captured_configs[-1].batch_size == 30
+    assert captured_configs[-1].idempotent is False

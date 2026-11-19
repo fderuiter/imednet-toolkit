@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Record, RecordRevision
+from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import normalize_utc_timestamp_bound
 
 if TYPE_CHECKING:
@@ -32,6 +33,8 @@ class DataExtractionWorkflow:
         subject_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         visit_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        *,
+        include_deleted: bool = False,
         **other_filters: Any,
     ) -> list[Record]:
         """Extracts records based on criteria spanning subjects, visits, and records.
@@ -42,6 +45,7 @@ class DataExtractionWorkflow:
             subject_filter: Dictionary of conditions for the subjects endpoint.
             visit_filter: Dictionary of conditions for the visits endpoint.
             on_progress: Optional callback invoked with progress status strings.
+            include_deleted: When True, include voided (deleted=True) records.
             **other_filters: Additional keyword arguments passed as filters to the
                              records endpoint `list` method.
 
@@ -95,6 +99,9 @@ class DataExtractionWorkflow:
             record_data_filter=None,
             **final_record_filter_dict,
         )
+
+        if not include_deleted:
+            records = [r for r in records if not is_record_deleted(r)]
 
         # Client-side filtering fallback
         if matching_subject_keys:

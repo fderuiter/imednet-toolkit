@@ -10,14 +10,22 @@ For general architecture context see :doc:`/explanation/architecture`.
 Overview
 --------
 
-The Snowflake export path uses a two-phase staged-loading approach:
+The Snowflake export path uses a staged-loading and merge approach:
 
-1. **Stage** – Study records are serialised to Parquet files in a local directory (one
-   file per batch).
+1. **Stage** – Study records are mapped with top-level ``Record`` metadata columns
+   (``study_key``, ``record_id``, ``subject_id``, ``subject_key``, ``form_id``,
+   ``form_key``, ``visit_id``, ``record_status``, timestamps, etc.) and a JSON-encoded
+   ``record_data`` column after clinical PHI masking and enrichment. Encoding
+   ``record_data`` as JSON preserves heterogeneous Form schemas within the same batch
+   without Arrow type collisions.
 2. **PUT** – Each Parquet file is uploaded to a Snowflake *internal* stage via
-   ``PUT file://...``.
-3. **COPY INTO** – Snowflake bulk-loads the staged file into the target table using
-   ``COPY INTO ... FILE_FORMAT = (TYPE = PARQUET)``.
+   ``PUT file://... AUTO_COMPRESS = FALSE OVERWRITE = TRUE``.
+3. **Load / Merge** – When ``idempotent=True`` (default), Snowflake bulk-loads the
+   staged Parquet file into a temporary staging table via
+   ``COPY INTO ... FILE_FORMAT = (TYPE = PARQUET) MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE FORCE = TRUE``
+   and executes ``MERGE INTO`` keyed on ``(study_key, record_id)``. When
+   ``idempotent=False``, Snowflake loads directly into the target table via
+   ``COPY INTO ... FORCE = TRUE``.
 
 This is intentionally different from :func:`~imednet.integrations.export_to_sql`, which
 uses SQLAlchemy ``DataFrame.to_sql()`` and is appropriate for transactional SQL targets
@@ -142,10 +150,14 @@ Each entry contains:
 Idempotency
 -----------
 
-``SnowflakeSinkConfig.idempotent`` (default ``True``) maps to Snowflake's
-``FORCE = FALSE`` option in ``COPY INTO``.  When ``True``, Snowflake skips files that
-have already been loaded, making re-runs of the same batch safe.  Set
-``idempotent = False`` (``--force-reload`` in the CLI) to force re-ingestion.
+When ``SnowflakeSinkConfig.idempotent`` is ``True`` (default), each batch upload runs
+``PUT ... AUTO_COMPRESS = FALSE OVERWRITE = TRUE`` so refreshed Parquet files replace stale
+staged artifacts, bulk-loads the batch into a session-scoped temporary staging table via
+``COPY INTO ... FORCE = TRUE``, and executes ``MERGE INTO`` keyed on
+``(study_key, record_id)``. Scheduled re-runs update modified records in place without
+inserting duplicate rows. Set ``idempotent = False`` (``--force-reload`` in the CLI) to
+bypass staging-table merges and append directly into the target table via
+``COPY INTO ... FORCE = TRUE``.
 
 Error handling and retries
 --------------------------

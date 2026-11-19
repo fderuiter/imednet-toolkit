@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import Field
 
 from imednet.spi.models import ImednetBaseModel
+from imednet.spi.validation import DataDictionary, extract_variable_constraints
 
 from .generator import GeneratedRecordSet
 from .models import (
@@ -129,6 +130,10 @@ class UATSpecificationBuilder:
 
     DEFAULT_SUBJECT_COUNT = 2
 
+    def __init__(self, data_dictionary: DataDictionary | None = None) -> None:
+        """Initialize the specification builder with an optional DataDictionary."""
+        self._data_dictionary = data_dictionary
+
     def build(
         self,
         snapshot: StudySnapshot,
@@ -137,6 +142,7 @@ class UATSpecificationBuilder:
         site_name: str | None = None,
         enabled_form_keys: list[str] | None = None,
         seed: int | None = None,
+        data_dictionary: DataDictionary | None = None,
     ) -> UATSpecification:
         """Build a complete UATSpecification from a StudySnapshot.
 
@@ -152,7 +158,10 @@ class UATSpecificationBuilder:
             Restrict to a subset of forms. If None, all non-disabled forms are included.
         seed : Optional[int]
             Passed through to UATSpecification for traceability.
+        data_dictionary : Optional[DataDictionary]
+            Optional offline DataDictionary providing Choice lists, bounds, and required policies.
         """
+        active_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
         resolved_site_name = self._resolve_site_name(snapshot, site_name)
 
         subject_spec = UATSubjectSpec(
@@ -167,11 +176,21 @@ class UATSpecificationBuilder:
             if enabled_form_keys and form.form_key not in enabled_form_keys:
                 continue
 
+            form_key_str = form.form_key or ""
+            dd_vars = active_dd.variables_for_form(form_key_str) if active_dd is not None else {}
+
             test_type = self._infer_test_type(form)
-            variables = snapshot.variables_by_form.get(form.form_key or "", [])
+            variables = snapshot.variables_by_form.get(form_key_str, [])
             var_specs = [
-                self._build_var_spec(v) for v in variables if not getattr(v, "disabled", False)
+                self._build_var_spec(
+                    v,
+                    dd_var=dd_vars.get(getattr(v, "variable_name", "") or ""),
+                    form_key=form_key_str,
+                )
+                for v in variables
+                if not getattr(v, "disabled", False)
             ]
+            required_names = [vs.variable_name for vs in var_specs if vs.required]
 
             form_specs.append(
                 UATFormSpec(
@@ -179,7 +198,9 @@ class UATSpecificationBuilder:
                     form_name=form.form_name or "unknown",
                     form_type=form.form_type or "unknown",
                     test_type=test_type,
+                    subject_count=subject_count,
                     variables=var_specs,
+                    required_variable_names=required_names,
                     interval_name=self._resolve_interval(snapshot, form.form_key),
                 )
             )
@@ -204,14 +225,60 @@ class UATSpecificationBuilder:
             return RecordTestType.CREATE_NEW_RECORD
         return RecordTestType.UPDATE_SCHEDULED_RECORD
 
-    def _build_var_spec(self, variable: Any) -> UATVariableSpec:
-        """Build a UATVariableSpec from a Variable model."""
+    def _build_var_spec(
+        self,
+        variable: Any,
+        dd_var: Any | None = None,
+        form_key: str | None = None,
+    ) -> UATVariableSpec:
+        """Build a UATVariableSpec from a Variable model and optional DataDictionary Variable."""
+        source_dd_var = dd_var
+        if source_dd_var is None and hasattr(variable, "choices"):
+            source_dd_var = variable
+
+        var_name = (
+            getattr(variable, "variable_name", None)
+            or getattr(variable, "variableName", None)
+            or "unknown"
+        )
+        var_key = getattr(variable, "variable_key", None) or var_name
+        resolved_form_key = (
+            getattr(variable, "form_key", None)
+            or form_key
+            or getattr(source_dd_var, "formKey", None)
+            or "unknown"
+        )
+
+        snap_type = getattr(variable, "variable_type", None)
+        dd_type = (
+            getattr(source_dd_var, "variable_type", getattr(source_dd_var, "variableType", None))
+            if source_dd_var is not None
+            else None
+        )
+        if dd_type and (
+            not snap_type
+            or (
+                snap_type == "Coded"
+                and dd_type in ("Radio", "Single Select", "Checkbox", "Multi Select", "Yes/No")
+            )
+            or (snap_type == "Text" and dd_type != "Text")
+        ):
+            resolved_type = dd_type
+        else:
+            resolved_type = snap_type or dd_type or "Text"
+
+        constraints = extract_variable_constraints(source_dd_var)
         return UATVariableSpec(
-            variable_name=getattr(variable, "variable_name", "unknown"),
-            variable_key=getattr(variable, "variable_key", "unknown"),
-            variable_type=getattr(variable, "variable_type", "Text"),
-            form_key=getattr(variable, "form_key", "unknown"),
+            variable_name=var_name,
+            variable_key=var_key,
+            variable_type=resolved_type,
+            form_key=resolved_form_key,
             strategy=VariableTestStrategy.SYNTHETIC,
+            min_value=constraints.min_value,
+            max_value=constraints.max_value,
+            max_length=constraints.max_length,
+            coded_values=list(constraints.choices),
+            required=constraints.required_policy == "yes",
         )
 
     def _resolve_site_name(self, snapshot: StudySnapshot, site_name: str | None) -> str:
@@ -257,6 +324,7 @@ class UATWorkflow:
         poll_interval: float = 10.0,
         poll_timeout: float = 600.0,
         seed: int | None = None,
+        data_dictionary: DataDictionary | None = None,
         on_progress: JobProgressCallback | None = None,
         on_phase_change: Callable[[UATWorkflowState], None] | None = None,
     ) -> None:
@@ -265,9 +333,10 @@ class UATWorkflow:
         from .inspector import StudySchemaInspector
 
         self._sdk = sdk
+        self._data_dictionary = data_dictionary
         self._inspector = StudySchemaInspector(sdk)
-        self._builder = UATSpecificationBuilder()
-        self._generator = SyntheticRecordGenerator(seed=seed)
+        self._builder = UATSpecificationBuilder(data_dictionary=data_dictionary)
+        self._generator = SyntheticRecordGenerator(seed=seed, data_dictionary=data_dictionary)
 
         # Config for lazy initialization of sync components
         self._batch_size = batch_size
@@ -331,6 +400,8 @@ class UATWorkflow:
             self._submitter = BulkRecordSubmissionWorkflow(
                 self._sdk,
                 batch_size=self._batch_size,
+                registration_timeout=self._poll_timeout,
+                registration_poll_interval=self._poll_interval,
             )
         return self._submitter
 
@@ -351,6 +422,7 @@ class UATWorkflow:
         site_name: str | None = None,
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
+        data_dictionary: DataDictionary | None = None,
     ) -> UATRunResult:
         """Execute the full UAT pipeline and return a UATRunResult."""
         started_at = datetime.now(UTC)
@@ -359,6 +431,7 @@ class UATWorkflow:
         record_sets: list[GeneratedRecordSet] = []
         submission_result: SubmissionResult | None = None
         poll_summary: Any = None
+        active_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
 
         try:
             # 1. Inspect
@@ -371,18 +444,23 @@ class UATWorkflow:
             self.transition_to(UATWorkflowState.BUILDING_SPEC)
             t0 = time.monotonic()
             if spec is None:
-                spec = self.build_spec(
-                    snapshot,
-                    subject_count=subject_count,
-                    site_name=site_name,
-                    enabled_form_keys=enabled_form_keys,
-                )
+                build_kwargs: dict[str, Any] = {
+                    "subject_count": subject_count,
+                    "site_name": site_name,
+                    "enabled_form_keys": enabled_form_keys,
+                }
+                if active_dd is not None:
+                    build_kwargs["data_dictionary"] = active_dd
+                spec = self.build_spec(snapshot, **build_kwargs)
             phase_durations[UATRunPhase.BUILD_SPEC] = time.monotonic() - t0
 
             # 3. Generate
             self.transition_to(UATWorkflowState.GENERATING)
             t0 = time.monotonic()
-            record_sets = self.generate(spec, snapshot)
+            if active_dd is not None:
+                record_sets = self.generate(spec, snapshot, data_dictionary=active_dd)
+            else:
+                record_sets = self.generate(spec, snapshot)
             phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
 
             # 4. Submit
@@ -446,8 +524,16 @@ class UATWorkflow:
         """Auto-generate a UATSpecification from the StudySnapshot."""
         return self._builder.build(snapshot, **kwargs)
 
-    def generate(self, spec: UATSpecification, snapshot: Any) -> list[GeneratedRecordSet]:
+    def generate(
+        self,
+        spec: UATSpecification,
+        snapshot: Any,
+        *,
+        data_dictionary: DataDictionary | None = None,
+    ) -> list[GeneratedRecordSet]:
         """Create synthetic record payloads via SyntheticRecordGenerator."""
+        if data_dictionary is not None:
+            return self._generator.generate(spec, snapshot, data_dictionary=data_dictionary)
         return self._generator.generate(spec, snapshot)
 
     def submit(
@@ -460,7 +546,30 @@ class UATWorkflow:
         return self._get_submitter().submit(study_key, record_sets, email_notify=email_notify)  # type: ignore[no-any-return]
 
     def monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:
-        """Poll all resulting jobs to completion via JobPoller."""
+        """Poll all resulting jobs to completion via facade poll_jobs (or JobPoller fallback)."""
+        if self._poller is not None:
+            return self._poller.poll_many(
+                study_key,
+                submission_result.all_batch_ids,
+                interval=self._poll_interval,
+                timeout=self._poll_timeout,
+                on_progress=self._on_progress,
+            )
+
+        from imednet.spi.utils import JobPollSummary
+
+        poll_jobs_fn = getattr(self._sdk, "poll_jobs", None)
+        if callable(poll_jobs_fn):
+            candidate = poll_jobs_fn(
+                study_key,
+                submission_result.all_batch_ids,
+                interval=self._poll_interval,
+                timeout=self._poll_timeout,
+                on_progress=self._on_progress,
+            )
+            if isinstance(candidate, JobPollSummary):
+                return candidate
+
         return self._get_poller().poll_many(
             study_key,
             submission_result.all_batch_ids,

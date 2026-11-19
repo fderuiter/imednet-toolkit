@@ -10,7 +10,13 @@ from collections.abc import Callable
 from importlib.metadata import entry_points
 from typing import Any, cast
 
-from imednet.integrations.sink_base import ExportSink, SinkConfig, apply_quality_gate, iter_batches
+from imednet.integrations.sink_base import (
+    ExportSink,
+    SinkConfig,
+    apply_quality_gate,
+    iter_batches,
+    run_streaming_export,
+)
 from imednet.sdk import ImednetSDK
 
 
@@ -141,16 +147,15 @@ def export(
             config_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
             cfg = config_class(study_key=study_key, **config_kwargs)
 
-        records = sdk.records.list(study_key=study_key, record_data_filter=None)
-        filtered_records = list(apply_quality_gate(sdk, study_key, records, cfg))
-
-        total_written = 0
-
-        # Instantiate sink class using ONLY the configured config object
-        with sink_class(config=cfg) as sink:
-            for index, batch in enumerate(iter_batches(filtered_records, cfg.batch_size)):
-                total_written += sink.write_batch(batch, batch_id=f"{study_key}/records/{index}")
-
-        return total_written
+        return run_streaming_export(
+            sdk,
+            study_key,
+            lambda: sink_class(config=cfg),
+            cfg,
+            stream_name=cfg.stream_name or target,
+            batch_id_prefix=f"{study_key}/records",
+            quality_gate_fn=apply_quality_gate,
+            iter_batches_fn=iter_batches,
+        )
 
     raise ValueError(f"Unsupported export target: {target!r}")

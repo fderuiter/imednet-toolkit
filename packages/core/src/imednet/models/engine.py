@@ -509,15 +509,19 @@ class ModelEngine:
 
             # Map internal type name to Python type
             if field_def.type_name == "string":
-                py_type = str | None
+                py_type: Any = str | None
             elif field_def.type_name == "integer":
-                py_type = int | None  # type: ignore
+                py_type = int | None
             elif field_def.type_name == "boolean":
-                py_type = bool | None  # type: ignore
+                py_type = bool | None
+            elif field_def.type_name == "dict":
+                py_type = dict[str, Any] | None
+            elif field_def.type_name == "list":
+                py_type = list[Any] | None
             else:
-                py_type = Any  # type: ignore
+                py_type = Any
 
-            new_field = Field(default=field_def.default_value, alias=field_def.alias)
+            new_field = Field(default=None, alias=field_def.alias)
             fields[snake_key] = (py_type, new_field)
 
         model = create_model(model_name, __base__=base_cls, **fields)

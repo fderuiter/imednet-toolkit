@@ -54,6 +54,11 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "RestrictedAstEvaluator": ("imednet.utils.evaluator", "RestrictedAstEvaluator"),
     "evaluate_expression": ("imednet.utils.evaluator", "evaluate_expression"),
     "parse_expression": ("imednet.utils.evaluator", "parse_expression"),
+    "DEFAULT_BATCH_CHUNK_SIZE": ("imednet.utils.batch_coordinator", "DEFAULT_BATCH_CHUNK_SIZE"),
+    "AsyncBatchCoordinator": ("imednet.utils.batch_coordinator", "AsyncBatchCoordinator"),
+    "BatchCoordinator": ("imednet.utils.batch_coordinator", "BatchCoordinator"),
+    "BatchSubmissionSummary": ("imednet.utils.batch_coordinator", "BatchSubmissionSummary"),
+    "chunk_records": ("imednet.utils.batch_coordinator", "chunk_records"),
 }
 
 
@@ -71,7 +76,11 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "ALLOWED_OPERATORS",
+    "DEFAULT_BATCH_CHUNK_SIZE",
     "ORDERED_FILTER_OPERATORS",
+    "AsyncBatchCoordinator",
+    "BatchCoordinator",
+    "BatchSubmissionSummary",
     "FilterValue",
     "ItemId",
     "JsonDict",
@@ -79,6 +88,7 @@ __all__ = [
     "build_filter_string",
     "build_safe_path",
     "check_pandas",
+    "chunk_records",
     "configure_json_logging",
     "evaluate_expression",
     "export_records_csv",

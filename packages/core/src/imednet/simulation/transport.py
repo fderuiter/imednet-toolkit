@@ -143,8 +143,13 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
 
             if resource == "jobs":
                 if sub_id is not None:
-                    # Single job status lookup
+                    sub_action = segments[4] if len(segments) >= 5 else None
                     job_status = self.state.get_job(study_key, sub_id)
+                    if sub_action == "results":
+                        return httpx.Response(
+                            200, json=job_status.get("results", []), request=request
+                        )
+                    # Single job status lookup
                     return httpx.Response(200, json=job_status, request=request)
                 # List jobs: JobsEndpoint uses JsonListPaginator which expects a raw JSON list
                 items = self.state.get_jobs(study_key)
@@ -166,6 +171,8 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         if len(segments) >= 1 and segments[0] == "jobs":
             batch_id = segments[1] if len(segments) >= 2 else "BATCH"
             job_status = self.state.get_job(None, batch_id)
+            if len(segments) >= 3 and segments[2] == "results":
+                return httpx.Response(200, json=job_status.get("results", []), request=request)
             return httpx.Response(200, json=job_status, request=request)
 
         # Fallback for unrecognized endpoints: return empty paginated response
@@ -177,17 +184,25 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         """Apply query filter parameters and return a paginated response."""
         filter_str = params.get("filter")
         if filter_str:
-            clauses = [term.split("==", 1) for term in filter_str.split(";") if "==" in term]
-            filtered = []
-            for item in items:
-                matches_all = True
-                for field, val in clauses:
-                    if not _matches_filter(item, field.strip(), val.strip()):
-                        matches_all = False
-                        break
-                if matches_all:
-                    filtered.append(item)
-            items = filtered
+            is_or = "," in filter_str and ";" not in filter_str
+            separator = "," if is_or else ";"
+            clauses = [term.split("==", 1) for term in filter_str.split(separator) if "==" in term]
+            if clauses:
+                filtered = []
+                for item in items:
+                    if is_or:
+                        matched = any(
+                            _matches_filter(item, field.strip(), val.strip())
+                            for field, val in clauses
+                        )
+                    else:
+                        matched = all(
+                            _matches_filter(item, field.strip(), val.strip())
+                            for field, val in clauses
+                        )
+                    if matched:
+                        filtered.append(item)
+                items = filtered
 
         return self._paginate_response(request, items, params)
 

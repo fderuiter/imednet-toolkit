@@ -98,12 +98,12 @@ async def test_async_to_dataframe_parameter_forwarding(
     df = await ep.to_dataframe(
         study_key="S1",
         record_data_filter="age>10",
-        status="open",
+        record_status="Open",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/records"
     assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "age>10"}
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"record_status": "Open"}
     assert len(df) == 1
 
 
@@ -172,8 +172,8 @@ async def test_async_to_dataframe_masks_phi_by_default_and_honors_opt_out(
     async_paginator_factory(records, raw_items)
     filter_capture = patch_build_filter(records)
 
-    masked_df = await ep.to_dataframe("STUDY1", flatten=True, status="open")
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "STUDY1"}
+    masked_df = await ep.to_dataframe("STUDY1", flatten=True, record_status="Open")
+    assert filter_capture["filters"] == {"record_status": "Open"}
     assert masked_df.loc[0, "patientName"] == "***MASKED***"
     assert masked_df.loc[0, "DOB"] == "***MASKED***"
     assert masked_df.loc[0, "SSN"] == "***MASKED***"

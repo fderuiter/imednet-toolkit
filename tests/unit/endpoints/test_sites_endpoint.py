@@ -19,10 +19,10 @@ def test_list_requires_study_key(dummy_client, paginator_factory, patch_build_fi
     with pytest.raises(ConfigurationError):
         ep.list()
 
-    result = ep.list(study_key="S1", status="ok")
+    result = ep.list(study_key="S1", site_enrollment_status="Active")
 
     assert paginator_capture["path"] == "/api/v1/edc/studies/S1/sites"
-    assert patch["filters"] == {"status": "ok"}
+    assert patch["filters"] == {"site_enrollment_status": "Active"}
     assert paginator_capture["params"] == {"filter": "FILTERED"}
     assert isinstance(result[0], Site)
 
@@ -61,12 +61,12 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
 
     df = ep.to_dataframe(
         study_key="S1",
-        status="active",
+        site_enrollment_status="Active",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/sites"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "active"}
+    assert filter_capture["filters"] == {"site_enrollment_status": "Active"}
     assert len(df) == 1
 
 
@@ -119,12 +119,12 @@ async def test_async_to_dataframe_parameter_forwarding(
 
     df = await ep.to_dataframe(
         study_key="S1",
-        status="active",
+        site_enrollment_status="Active",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/sites"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "active"}
+    assert filter_capture["filters"] == {"site_enrollment_status": "Active"}
     assert len(df) == 1
 
 

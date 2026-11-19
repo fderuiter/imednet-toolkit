@@ -43,18 +43,48 @@ def test_studies_list_pagination():
 
 @respx.mock
 def test_records_list_filter_param():
-    """Test that records list filter param."""
+    """Test that records list filter param omits studyKey and uses documented attributes."""
     sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
 
     route = respx.get("https://api.test/api/v1/edc/studies/ST/records").respond(
         json={"data": [{"recordId": 1}]}
     )
 
-    records = list(sdk.records.list("ST", status="Open"))
+    records = list(
+        sdk.records.list(
+            "ST",
+            recordStatus="Open",
+            page=0,
+            size=50,
+            sort="recordId,asc",
+            recordDataFilter="age>=18",
+        )
+    )
 
     sent = route.calls.last.request
-    assert sent.url.params["filter"] == "status==Open;studyKey==ST"
+    assert sent.url.params["filter"] == "recordStatus==Open"
+    assert sent.url.params["page"] == "0"
+    assert sent.url.params["size"] == "50"
+    assert sent.url.params["sort"] == "recordId,asc"
+    assert sent.url.params["recordDataFilter"] == "age>=18"
     assert records[0].record_id == 1
+
+
+@respx.mock
+def test_subjects_get_uses_integer_subject_id():
+    """Test that subjects.get filters by integer subjectId without studyKey in filter."""
+    sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+
+    route = respx.get("https://api.test/api/v1/edc/studies/ST/subjects").respond(
+        json={"data": [{"subjectId": 370, "subjectKey": "SUB-370"}]}
+    )
+
+    subject = sdk.subjects.get("ST", 370)
+
+    sent = route.calls.last.request
+    assert sent.url.params["filter"] == "subjectId==370"
+    assert subject.subject_id == 370
+    assert subject.subject_key == "SUB-370"
 
 
 @respx.mock

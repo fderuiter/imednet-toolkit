@@ -22,6 +22,13 @@ imednet.utils.ast\_eval module
    :members:
    :show-inheritance:
 
+imednet.utils.batch\_coordinator module
+---------------------------------------
+
+.. automodule:: imednet.utils.batch_coordinator
+   :members:
+   :show-inheritance:
+
 imednet.utils.dates module
 --------------------------
 
