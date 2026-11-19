@@ -63,7 +63,7 @@ def run_headless(
 
 
 def main() -> None:
-    """TODO: Add docstring."""
+    """Parse CLI arguments and submit a Form Builder layout payload."""
     parser = argparse.ArgumentParser(description="iMedNet Form Builder")
 
     # Optional arguments for headless mode
@@ -123,7 +123,11 @@ def main() -> None:
             args.revision,
         )
     else:
-        print("TUI mode has been removed. Please use the CLI arguments to run in headless mode.")
+        print(
+            "Provide Form Builder CLI arguments (for example --preset, --form-id, --comm-id, "
+            "and --revision) to build and submit a form payload.\n"
+            "For interactive Study, Site, Subject, and Job browsing, run: imednet tui"
+        )
         parser.print_help()
         sys.exit(1)
 
