@@ -510,3 +510,81 @@ def test_export_records_csv_masks_phi_by_default_and_honors_opt_out(tmp_path) ->
     assert unmasked_df.loc[0, "SSN"] == "123-45-6789"
     assert unmasked_df.loc[0, "email"] == "jane@example.org"
     assert unmasked_df.loc[0, "systolicBp"] == 120
+
+
+def test_export_records_csv_applies_study_config_labels_and_formula_sanitization(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Verify export_records_csv masks default + StudyConfiguration PHI before applying Variable labels and sanitizes CSV formulas."""
+    from types import SimpleNamespace
+
+    from imednet.integrations import enrichment as enrichment_mod
+    from imednet.models.study_config import StudyConfiguration
+
+    study_cfg = StudyConfiguration(
+        study_key="STUDY_PANDAS",
+        phi_fields=["localPatientTag"],
+        terminology_lookups={"gender": {"2": "Female"}},
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: study_cfg if sk == "STUDY_PANDAS" else None,
+    )
+
+    rec = Record(
+        record_id=808,
+        study_key="STUDY_PANDAS",
+        subject_key="SUBJ-808",
+        visit_id=1,
+        form_id=10,
+        record_status="Complete",
+        record_data={
+            "SSN": "123-45-6789",
+            "DOB": "1977-08-20",
+            "patientName": "Ada Lovelace",
+            "email": "ada@example.org",
+            "phone": "555-0177",
+            "address": "12 Analytical Way",
+            "localPatientTag": "TAG-808",
+            "gender": "2",
+            "comment": "=HYPERLINK(\"http://evil\")",
+        },
+    )
+    sdk = MagicMock()
+    sdk.records.list.side_effect = lambda **_kw: [rec.model_copy(deep=True)]
+    sdk.variables.list.return_value = [
+        SimpleNamespace(variable_name="SSN", label="Government Identifier"),
+        SimpleNamespace(variable_name="DOB", label="Birth Calendar"),
+        SimpleNamespace(variable_name="patientName", label="Participant Alias"),
+        SimpleNamespace(variable_name="email", label="Contact Address"),
+        SimpleNamespace(variable_name="phone", label="Telephone Line"),
+        SimpleNamespace(variable_name="address", label="Street Residence"),
+        SimpleNamespace(variable_name="localPatientTag", label="Site Tag"),
+        SimpleNamespace(variable_name="gender", label="Gender Label"),
+        SimpleNamespace(variable_name="comment", label="Clinical Comment"),
+    ]
+
+    out_csv = tmp_path / "labeled_pandas.csv"
+    export_records_csv(
+        sdk,
+        "STUDY_PANDAS",
+        str(out_csv),
+        use_labels_as_columns=True,
+    )
+    df = pd.read_csv(out_csv)
+    for col in (
+        "Government Identifier",
+        "Birth Calendar",
+        "Participant Alias",
+        "Contact Address",
+        "Telephone Line",
+        "Street Residence",
+        "Site Tag",
+    ):
+        assert df.loc[0, col] == "***MASKED***"
+    assert df.loc[0, "Gender Label"] == "Female"
+    assert str(df.loc[0, "Clinical Comment"]).startswith("'=")
+    assert df.loc[0, "subject_key"] == "SUBJ-808"
+    assert df.loc[0, "study_key"] == "STUDY_PANDAS"
+    assert df.loc[0, "record_id"] == 808

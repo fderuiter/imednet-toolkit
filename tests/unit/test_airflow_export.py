@@ -876,3 +876,102 @@ def test_hook_resolve_destination_connection_variants(monkeypatch: pytest.Monkey
         "database": "neo_db",
     }
     assert ImednetHook.resolve_destination_connection("sqlite_conn", "csv") == {}
+
+
+def test_operator_propagates_mask_phi_opt_out_to_tabular_and_plugin_sinks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ImednetExportOperator defaults to mask_phi=True and forwards mask_phi=False to tabular and sink targets."""
+    from types import SimpleNamespace
+
+    from apache_airflow_providers_imednet import export
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.records import Record
+    from imednet.utils.security import global_sensitivity_registry
+
+    registry_snapshot = set(global_sensitivity_registry._sensitive_keys)
+
+    # 1. Tabular opt-out via operator parameter
+    mock_csv = MagicMock()
+    monkeypatch.setattr(export, "export_to_csv", mock_csv)
+    mock_sdk_tab = MagicMock(sinks=None)
+    op_csv = ImednetExportOperator(
+        task_id="csv_opt_out",
+        study_key="STUDY-PHI",
+        destination="csv",
+        output_path="/tmp/authorized.csv",
+        mask_phi=False,
+    )
+    assert op_csv.mask_phi is False
+    monkeypatch.setattr(op_csv, "_get_sdk", lambda: mock_sdk_tab)
+    op_csv.execute({})
+    mock_csv.assert_called_once_with(
+        mock_sdk_tab, "STUDY-PHI", "/tmp/authorized.csv", mask_phi=False
+    )
+
+    # 2. Neo4j sink opt-out via operator parameter and MongoDB via export_kwargs
+    mock_sink_instance = MagicMock()
+    mock_neo_cls = MagicMock(return_value=mock_sink_instance)
+    mock_neo_cfg = MagicMock()
+    mock_mongo_cls = MagicMock(return_value=mock_sink_instance)
+    mock_mongo_cfg = MagicMock()
+    mock_sinks = MagicMock(
+        Neo4jExportSink=mock_neo_cls,
+        Neo4jSinkConfig=mock_neo_cfg,
+        MongoDbExportSink=mock_mongo_cls,
+        MongoDbSinkConfig=mock_mongo_cfg,
+    )
+    mock_sdk_sinks = MagicMock(sinks=mock_sinks)
+    mock_sdk_sinks.records.list.return_value = [
+        Record(record_id=1, form_id=1, form_key="F1", record_data={"SSN": "123-45-6789"})
+    ]
+
+    conns = {
+        "neo_dest": SimpleNamespace(
+            conn_type="bolt",
+            host="neo4j.local",
+            port=7687,
+            login="neo4j",
+            password="pw",  # pragma: allowlist secret
+            schema="neo4j",
+            extra={},
+        ),
+        "mongo_dest": SimpleNamespace(
+            conn_type="mongo",
+            host="mongo.local",
+            port=27017,
+            login=None,
+            password=None,
+            schema="clinical",
+            extra={"collection": "raw_records"},
+        ),
+    }
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, conn_id: conns[conn_id]),
+    )
+
+    op_neo = ImednetExportOperator(
+        task_id="neo_opt_out",
+        study_key="STUDY-PHI",
+        destination="neo4j",
+        destination_conn_id="neo_dest",
+        mask_phi=False,
+    )
+    monkeypatch.setattr(op_neo, "_get_sdk", lambda: mock_sdk_sinks)
+    op_neo.execute({})
+    assert mock_neo_cfg.call_args.kwargs["mask_phi"] is False
+
+    op_mongo = ImednetExportOperator(
+        task_id="mongo_opt_out",
+        study_key="STUDY-PHI",
+        destination="mongodb",
+        destination_conn_id="mongo_dest",
+        export_kwargs={"mask_phi": False},
+    )
+    monkeypatch.setattr(op_mongo, "_get_sdk", lambda: mock_sdk_sinks)
+    op_mongo.execute({})
+    assert mock_mongo_cfg.call_args.kwargs["mask_phi"] is False
+    assert global_sensitivity_registry._sensitive_keys == registry_snapshot

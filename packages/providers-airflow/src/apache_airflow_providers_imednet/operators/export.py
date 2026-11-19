@@ -69,6 +69,7 @@ _TABULAR_OPTION_DEFAULTS: dict[str, Any] = {
     "batch_size": 500,
     "max_retries": 3,
     "idempotent": True,
+    "mask_phi": True,
     "quality_gate_enabled": False,
     "min_schema_readiness_score": 100.0,
 }
@@ -189,6 +190,7 @@ class ImednetExportOperator(BaseOperator):
         batch_size: int = 500,
         max_retries: int = 3,
         idempotent: bool = True,
+        mask_phi: bool = True,
         quality_gate_enabled: bool = False,
         min_schema_readiness_score: float = 100.0,
         modified_since: Any = None,
@@ -213,6 +215,7 @@ class ImednetExportOperator(BaseOperator):
         :param batch_size: Number of records to read and write per batch.
         :param max_retries: Maximum number of export attempts.
         :param idempotent: Whether the export execution should be safely repeatable, automatically deduplicating or replacing existing outputs as appropriate.
+        :param mask_phi: Whether to replace sensitive PHI values with ``***MASKED***`` by default.
         :param quality_gate_enabled: Whether to filter records through the schema readiness quality gate prior to export.
         :param min_schema_readiness_score: Minimum schema readiness score (0-100) required when the quality gate is enabled.
         :param kwargs: Additional Airflow BaseOperator arguments.
@@ -230,6 +233,7 @@ class ImednetExportOperator(BaseOperator):
         self.batch_size: int = batch_size
         self.max_retries = max_retries
         self.idempotent = idempotent
+        self.mask_phi = mask_phi
         self.quality_gate_enabled = quality_gate_enabled
         self.min_schema_readiness_score = min_schema_readiness_score
         self.modified_since = modified_since
@@ -301,6 +305,14 @@ class ImednetExportOperator(BaseOperator):
                 opts[key] = attr_val
             elif key in runtime_kwargs and runtime_kwargs[key] != default_val:
                 opts[key] = runtime_kwargs[key]
+        effective_mask_phi = (
+            bool(runtime_kwargs["mask_phi"])
+            if "mask_phi" in runtime_kwargs
+            else bool(getattr(self, "mask_phi", True))
+        )
+        explicit: frozenset[str] = getattr(self, "_explicit_tabular_options", frozenset())
+        if not effective_mask_phi or "mask_phi" in runtime_kwargs or "mask_phi" in explicit:
+            opts["mask_phi"] = effective_mask_phi
         return opts
 
     def _build_tabular_kwargs(self, runtime_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -343,6 +355,8 @@ class ImednetExportOperator(BaseOperator):
         runtime_kwargs = self._get_runtime_export_kwargs()
         conn_settings = self._resolve_destination_connection(dest)
         stream_opts = self._collect_streaming_options(runtime_kwargs)
+        if not config.mask_phi and "mask_phi" not in stream_opts:
+            stream_opts["mask_phi"] = False
 
         if dest == "snowflake":
             sink_cls = getattr(sinks, "SnowflakeExportSink", None)

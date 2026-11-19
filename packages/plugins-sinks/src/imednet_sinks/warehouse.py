@@ -75,7 +75,7 @@ import os
 import re
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -86,6 +86,7 @@ from imednet.spi.sink_base import (
     ExportSink,
     SinkConfig,
     _require_optional_dep,
+    apply_quality_gate,
     extract_record_id,
     run_streaming_export,
 )
@@ -566,14 +567,17 @@ def export_to_snowflake(
     study_key: str,
     *,
     config: SnowflakeSinkConfig,
+    mask_phi: bool | None = None,
 ) -> int:
     """Export study records to Snowflake using :class:`SnowflakeExportSink`."""
+    resolved_cfg = replace(config, mask_phi=mask_phi) if mask_phi is not None else config
     return run_streaming_export(
         sdk,
         study_key,
-        lambda: SnowflakeExportSink(config=config),
-        config,
-        stream_name=f"snowflake_{config.table}",
+        lambda: SnowflakeExportSink(config=resolved_cfg),
+        resolved_cfg,
+        stream_name=f"snowflake_{resolved_cfg.table}",
+        quality_gate_fn=apply_quality_gate,
     )
 
 

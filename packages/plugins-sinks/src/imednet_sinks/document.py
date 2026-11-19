@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -86,14 +87,12 @@ from imednet.spi.sink_base import (
     SinkConfig,
     _redact_uri,
     _require_optional_dep,
+    apply_quality_gate,
     extract_record_id,
     run_streaming_export,
 )
 
 logger = logging.getLogger(__name__)
-
-
-from dataclasses import dataclass
 
 
 @dataclass
@@ -214,6 +213,9 @@ class MongoDbExportSink(ExportSink):
             post_processor=_post_process_document,
             mask_phi=self.config.mask_phi,
         )
+        custom_pipeline = self.config.extra.get("enrichment_pipeline")
+        if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
+            mapper.register_pipeline(self._study_key, custom_pipeline)
         docs = [_record_to_document(r, self._study_key, mapper=mapper) for r in records]
         if not docs:
             return 0
@@ -281,12 +283,12 @@ def export_to_mongodb(
     collection: str = "",
     *,
     config: MongoDbSinkConfig | None = None,
-    mask_phi: bool = True,
+    mask_phi: bool | None = None,
     **kwargs: Any,
 ) -> int:
     """Export study records to MongoDB using :class:`MongoDbExportSink`."""
     if config is None:
-        kwargs.setdefault("mask_phi", mask_phi)
+        kwargs.setdefault("mask_phi", True if mask_phi is None else mask_phi)
         config = MongoDbSinkConfig(
             study_key=study_key,
             uri=uri,
@@ -294,13 +296,17 @@ def export_to_mongodb(
             collection=collection,
             **kwargs,
         )
+    elif mask_phi is not None:
+        config = replace(config, mask_phi=mask_phi)
 
+    resolved_cfg = config
     return run_streaming_export(
         sdk,
         study_key,
-        lambda: MongoDbExportSink(config=config),
-        config,
-        stream_name=f"mongodb_{config.collection}",
+        lambda: MongoDbExportSink(config=resolved_cfg),
+        resolved_cfg,
+        stream_name=f"mongodb_{resolved_cfg.collection}",
+        quality_gate_fn=apply_quality_gate,
     )
 
 

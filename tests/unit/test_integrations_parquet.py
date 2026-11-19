@@ -332,3 +332,75 @@ def test_export_to_hive_parquet_masks_phi_by_default_and_honors_opt_out(tmp_path
     assert unmasked_row["Contact Inbox"] == "jane@example.org"
     assert unmasked_row["Systolic BP"] == 120
     assert global_sensitivity_registry._sensitive_keys == snapshot_keywords
+
+
+def test_export_to_hive_parquet_applies_committed_study_config_before_labels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify export_to_hive_parquet enforces StudyConfiguration PHI and terminology rules before label renaming."""
+    pytest.importorskip("pyarrow")
+    from imednet.integrations import enrichment as enrichment_mod
+    from imednet.models.records import Record
+    from imednet.models.study_config import StudyConfiguration
+
+    study_cfg = StudyConfiguration(
+        study_key="STUDY_GOV",
+        phi_fields=["hospitalBadge"],
+        terminology_lookups={"gender": {"1": "Male"}},
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: study_cfg if sk == "STUDY_GOV" else None,
+    )
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [SimpleNamespace(form_id=1, form_key="DEMOGRAPHICS")]
+    sdk.variables.list.return_value = [
+        SimpleNamespace(form_id=1, variable_name="SSN", label="Tax Number"),
+        SimpleNamespace(form_id=1, variable_name="DOB", label="Birth Calendar"),
+        SimpleNamespace(form_id=1, variable_name="patientName", label="Legal Alias"),
+        SimpleNamespace(form_id=1, variable_name="email", label="Inbox"),
+        SimpleNamespace(form_id=1, variable_name="phone", label="Callback Number"),
+        SimpleNamespace(form_id=1, variable_name="address", label="Home Street"),
+        SimpleNamespace(form_id=1, variable_name="hospitalBadge", label="Internal Badge"),
+        SimpleNamespace(form_id=1, variable_name="gender", label="Sex Label"),
+    ]
+    rec = Record(
+        record_id=202,
+        study_key="STUDY_GOV",
+        subject_key="SUBJ-202",
+        form_id=1,
+        form_key="DEMOGRAPHICS",
+        record_data={
+            "SSN": "123-45-6789",
+            "DOB": "1988-06-01",
+            "patientName": "John Smith",
+            "email": "john@example.org",
+            "phone": "555-0188",
+            "address": "10 Main St",
+            "hospitalBadge": "BDG-77",
+            "gender": "1",
+        },
+    )
+    sdk.records.iter.side_effect = lambda **_kw: iter([rec.model_copy(deep=True)])
+    sdk.get_records.side_effect = lambda **_kw: [rec.model_copy(deep=True)]
+
+    out_dir = tmp_path / "hive_gov"
+    parquet_mod.export_to_hive_parquet(sdk, "STUDY_GOV", str(out_dir), use_labels_as_columns=True)
+    row = _read_partition_dataframe(
+        out_dir / "study_key=STUDY_GOV" / "form_key=DEMOGRAPHICS"
+    ).to_dict("records")[0]
+    for col in (
+        "Tax Number",
+        "Birth Calendar",
+        "Legal Alias",
+        "Inbox",
+        "Callback Number",
+        "Home Street",
+        "Internal Badge",
+    ):
+        assert row[col] == "***MASKED***"
+    assert row["Sex Label"] == "Male"
+    assert row["subjectKey"] == "SUBJ-202"
+    assert row["recordId"] == 202

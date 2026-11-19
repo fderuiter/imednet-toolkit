@@ -143,3 +143,22 @@ larger batches. Non-interactive runs (``--no-interactive``,
 ``IMEDNET_NON_INTERACTIVE=1``, or piped ``stdout``), headless ``--format json``, and
 file exports (``--output json|csv``) continue to fetch all matching pages unless
 ``--limit`` is explicitly specified.
+
+Export PHI masking and quality-gate controls
+--------------------------------------------
+
+Every ``imednet export`` subcommand (``csv``, ``parquet``, ``excel``, ``json``,
+``duckdb``, ``sql``, ``mongodb``, ``neo4j``, and ``snowflake``) masks sensitive
+``Subject`` identifiers and committed ``StudyConfiguration`` ``phiFields`` to
+``***MASKED***`` by default (``--mask-phi``), even when ``--use-labels`` or
+``--hierarchical`` is active. Authorized compliance workflows operating inside
+a restricted enclave can opt out explicitly with ``--no-mask-phi``, and any
+export can enforce pre-write ``Record`` schema readiness filtering with
+``--quality-gate`` and ``--min-readiness-score``:
+
+.. code-block:: bash
+
+   imednet export json STUDY ./study_tree.json --hierarchical --use-labels
+   imednet export neo4j STUDY bolt://localhost:7687 neo4j "$NEO4J_PASSWORD" \
+       --quality-gate --min-readiness-score 90
+   imednet export parquet STUDY /secure/enclave/raw_study.parquet --no-mask-phi
