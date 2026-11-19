@@ -128,11 +128,11 @@ class ConfigVersionStore:
     def _get_get_dynamic_db_path(self) -> Path:
         """Resolve database path dynamically based on active base URL and study key context."""
         from imednet.spi.utils import (
-            PathTraversalValidationError,
             get_base_url_context,
             get_study_context,
-            validate_partition_key,
         )
+
+        from ._spi_compat import PathTraversalValidationError, validate_partition_key
 
         base_url = (
             get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"

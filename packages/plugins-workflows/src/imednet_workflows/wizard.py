@@ -142,7 +142,7 @@ def validate_filter_syntax(
     Returns:
         A tuple of (is_valid, key, parsed_value, error_message).
     """
-    from imednet.spi.utils import parse_filter_expression
+    from ._spi_compat import parse_filter_expression
 
     try:
         key, parsed_val = parse_filter_expression(filter_str, model=model)

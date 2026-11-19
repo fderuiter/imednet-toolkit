@@ -17,8 +17,8 @@ from typing import Any
 from pydantic import BaseModel
 
 from imednet.sdk import ImednetSDK
-from imednet.spi import cli as spi_cli
-from imednet.spi.cli import (
+
+from ._spi_compat import (
     STUDY_KEY_ARG,
     add_output_format,
     clear_line,
@@ -26,11 +26,11 @@ from imednet.spi.cli import (
     display_list,
     emit_json,
     format_job_progress,
+    is_interactive_terminal,
     parse_filter_args,
     print_error,
     with_sdk,
 )
-
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectDataWorkflow
@@ -81,7 +81,7 @@ def _should_use_interactive_grid(interactive: bool) -> bool:
     """Return True when interactive curses grid mode is requested on an active TTY."""
     if not interactive:
         return False
-    return bool(spi_cli.is_interactive_terminal())
+    return is_interactive_terminal()
 
 
 def _record_summary_row(record: Any) -> dict[str, Any]:

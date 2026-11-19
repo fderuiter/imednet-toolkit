@@ -4,7 +4,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Record, RecordRevision
-from imednet.spi.utils import normalize_utc_timestamp_bound
+
+from ._spi_compat import normalize_utc_timestamp_bound
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
