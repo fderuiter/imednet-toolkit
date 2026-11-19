@@ -22,9 +22,11 @@ def test_ci_uses_canonical_full_verification():
     pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
     steps = pipeline["jobs"]["quality"]["steps"]
     run_blocks = [s.get("run", "") for s in steps if "run" in s]
+    assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in run_blocks)
     assert any("--cov-fail-under=90" in r for r in run_blocks)
     assert any("semgrep scan" in r and "vulture" in r and "pylint" in r for r in run_blocks)
+    assert not any("pip install" in r for r in run_blocks)
     assert not any("hatch run" in r for r in run_blocks)
     assert not any("build_docs.py" in r for r in run_blocks)
 
@@ -33,8 +35,10 @@ def test_ci_docs_job_enforces_clean_working_tree_and_validation():
     pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
     steps = pipeline["jobs"]["docs"]["steps"]
     run_blocks = [s.get("run", "") for s in steps if "run" in s]
+    assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in run_blocks)
     assert sum("uv run python scripts/build_docs.py" == r.strip() for r in run_blocks) == 1
+    assert not any("pip install" in r for r in run_blocks)
     assert not any("hatch run" in r for r in run_blocks)
     assert any(
         "git diff --exit-code docs/" in r and "git status --porcelain" in r for r in run_blocks
