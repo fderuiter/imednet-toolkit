@@ -1298,8 +1298,8 @@ tui = [
 [package.metadata]
 requires-dist = [
     { name = "defusedxml", specifier = ">=0.7.1" },
-    { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.1.0" },
-    { name = "duckdb", marker = "extra == 'export'", specifier = ">=1.1.0" },
+    { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.1.0,<2.0.0" },
+    { name = "duckdb", marker = "extra == 'export'", specifier = ">=1.1.0,<2.0.0" },
     { name = "httpx", specifier = ">=0.28.1,<0.29.0" },
     { name = "imednet-plugins-sinks", marker = "extra == 'mongodb'", editable = "packages/plugins-sinks" },
     { name = "imednet-plugins-sinks", marker = "extra == 'neo4j'", editable = "packages/plugins-sinks" },
@@ -1439,7 +1439,7 @@ docs = [
 requires-dist = [
     { name = "atheris", marker = "python_full_version >= '3.12' and sys_platform != 'win32' and extra == 'dev'", specifier = ">=3.0.0,<4.0.0" },
     { name = "click", marker = "extra == 'dev'", specifier = ">=8.3.3" },
-    { name = "duckdb", marker = "extra == 'dev'", specifier = ">=1.1.0" },
+    { name = "duckdb", marker = "extra == 'dev'", specifier = ">=1.1.0,<2.0.0" },
     { name = "faker", marker = "extra == 'dev'", specifier = ">=24.9.0,<41.0.0" },
     { name = "furo", marker = "extra == 'docs'", specifier = "<2026.0.0" },
     { name = "httpx", extras = ["socks"], marker = "extra == 'dev'", specifier = ">=0.28.1,<0.29.0" },
