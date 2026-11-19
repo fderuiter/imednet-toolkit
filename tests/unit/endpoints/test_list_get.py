@@ -12,9 +12,11 @@ from imednet.endpoints import (
     sites,
     studies,
     subjects,
+    users,
     variables,
     visits,
 )
+from imednet.errors.validation import ConfigurationError
 from imednet.models.codings import Coding
 from imednet.models.forms import Form
 from imednet.models.intervals import Interval
@@ -24,35 +26,59 @@ from imednet.models.records import Record
 from imednet.models.sites import Site
 from imednet.models.studies import Study
 from imednet.models.subjects import Subject
+from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 
 CASES = [
-    (codings.CodingsEndpoint, codings, Coding, "C1"),
     (forms.FormsEndpoint, forms, Form, 1),
     (intervals.IntervalsEndpoint, intervals, Interval, 1),
-    (queries.QueriesEndpoint, queries, Query, 1),
     (record_revisions.RecordRevisionsEndpoint, record_revisions, RecordRevision, 1),
     (records.RecordsEndpoint, records, Record, 1),
     (sites.SitesEndpoint, sites, Site, 1),
     (studies.StudiesEndpoint, studies, Study, "S1"),
-    (subjects.SubjectsEndpoint, subjects, Subject, "SUB"),
+    (subjects.SubjectsEndpoint, subjects, Subject, 100),
     (variables.VariablesEndpoint, variables, Variable, 1),
-    (visits.VisitsEndpoint, visits, Visit, 1),
 ]
 
 ASYNC_CASES = [
-    (codings.AsyncCodingsEndpoint, codings, Coding, "C1"),
     (forms.AsyncFormsEndpoint, forms, Form, 1),
     (intervals.AsyncIntervalsEndpoint, intervals, Interval, 1),
-    (queries.AsyncQueriesEndpoint, queries, Query, 1),
     (record_revisions.AsyncRecordRevisionsEndpoint, record_revisions, RecordRevision, 1),
     (records.AsyncRecordsEndpoint, records, Record, 1),
     (sites.AsyncSitesEndpoint, sites, Site, 1),
     (studies.AsyncStudiesEndpoint, studies, Study, "S1"),
-    (subjects.AsyncSubjectsEndpoint, subjects, Subject, "SUB"),
+    (subjects.AsyncSubjectsEndpoint, subjects, Subject, 100),
     (variables.AsyncVariablesEndpoint, variables, Variable, 1),
-    (visits.AsyncVisitsEndpoint, visits, Visit, 1),
+]
+
+LIST_ONLY_CASES = [
+    (codings.CodingsEndpoint, codings, Coding, {"codingId": "C1"}),
+    (queries.QueriesEndpoint, queries, Query, {"annotationId": 1}),
+    (users.UsersEndpoint, users, User, {"userId": 1}),
+    (visits.VisitsEndpoint, visits, Visit, {"visitId": 1}),
+]
+
+ASYNC_LIST_ONLY_CASES = [
+    (codings.AsyncCodingsEndpoint, codings, Coding, {"codingId": "C1"}),
+    (queries.AsyncQueriesEndpoint, queries, Query, {"annotationId": 1}),
+    (users.AsyncUsersEndpoint, users, User, {"userId": 1}),
+    (visits.AsyncVisitsEndpoint, visits, Visit, {"visitId": 1}),
+]
+
+ALL_COLLECTION_SYNC = [
+    (studies.StudiesEndpoint, studies, False, "studyName"),
+    (sites.SitesEndpoint, sites, True, "siteName"),
+    (forms.FormsEndpoint, forms, True, "formKey"),
+    (intervals.IntervalsEndpoint, intervals, True, "intervalName"),
+    (variables.VariablesEndpoint, variables, True, "variableName"),
+    (subjects.SubjectsEndpoint, subjects, True, "subjectKey"),
+    (records.RecordsEndpoint, records, True, "formKey"),
+    (record_revisions.RecordRevisionsEndpoint, record_revisions, True, "formKey"),
+    (visits.VisitsEndpoint, visits, True, "subjectKey"),
+    (codings.CodingsEndpoint, codings, True, "variable"),
+    (queries.QueriesEndpoint, queries, True, "variable"),
+    (users.UsersEndpoint, users, True, None),
 ]
 
 
@@ -106,3 +132,92 @@ async def test_async_list_and_get(
     get_args = ("S1", item_id) if getattr(ep, "requires_study_key", True) else (None, item_id)
     got = await ep.get(*get_args)
     assert isinstance(got, model)
+
+
+@pytest.mark.parametrize(("cls", "module", "model", "payload"), LIST_ONLY_CASES)
+def test_list_only_endpoints(dummy_client, paginator_factory, cls, module, model, payload):
+    """Test list-only endpoints list items and do not expose get."""
+    ep = cls(dummy_client)
+    assert not hasattr(ep, "get")
+    capture = paginator_factory(module, [payload])
+    result = list(ep.list(study_key="S1"))
+    assert capture["path"] == f"/api/v1/edc/studies/S1/{cls.PATH}"
+    assert isinstance(result[0], model)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cls", "module", "model", "payload"), ASYNC_LIST_ONLY_CASES)
+async def test_async_list_only_endpoints(
+    dummy_client, async_paginator_factory, cls, module, model, payload
+):
+    """Test async list-only endpoints list items and do not expose get."""
+    ep = cls(dummy_client)
+    assert not hasattr(ep, "get")
+    capture = async_paginator_factory(module, [payload])
+    result = [item async for item in ep.list(study_key="S1")]
+    assert capture["path"] == f"/api/v1/edc/studies/S1/{cls.PATH}"
+    assert isinstance(result[0], model)
+
+
+@pytest.mark.parametrize(("cls", "module", "needs_study", "valid_attr"), ALL_COLLECTION_SYNC)
+def test_all_12_endpoints_extract_top_level_query_params_and_enforce_allowlists(
+    dummy_client, paginator_factory, cls, module, needs_study, valid_attr
+):
+    """Test all 12 collection endpoints extract page/size/sort/filter and enforce allowlists."""
+    ep = cls(dummy_client)
+    capture = paginator_factory(module, [{}])
+    base_kwargs = {"study_key": "S1"} if needs_study else {}
+
+    if valid_attr is None:
+        list(ep.list(**base_kwargs, page=2, size=25, sort="lastName,asc"))
+        assert capture["params"]["page"] == 2
+        assert capture["params"]["size"] == 25
+        assert capture["params"]["sort"] == "lastName,asc"
+        with pytest.raises(ConfigurationError, match="filter"):
+            list(ep.list(**base_kwargs, filter="login==admin"))
+    else:
+        list(
+            ep.list(
+                **base_kwargs,
+                page=1,
+                size=50,
+                sort=f"{valid_attr},asc",
+                filter=f"{valid_attr}==val",
+            )
+        )
+        assert capture["params"]["page"] == 1
+        assert capture["params"]["size"] == 50
+        assert capture["params"]["sort"] == f"{valid_attr},asc"
+        assert capture["params"]["filter"] == f"{valid_attr}==val"
+
+        with pytest.raises(ConfigurationError, match="undocumentedAttr"):
+            list(ep.list(**base_kwargs, filter="undocumentedAttr==val"))
+
+        if needs_study:
+            with pytest.raises(ConfigurationError, match="studyKey"):
+                list(ep.list(**base_kwargs, studyKey="S1"))
+            with pytest.raises(ConfigurationError, match="studyKey"):
+                list(ep.list(**base_kwargs, filter="studyKey==S1"))
+
+    with pytest.raises(ConfigurationError, match="undocumented_attr"):
+        list(ep.list(**base_kwargs, undocumented_attr="val"))
+
+
+@pytest.mark.parametrize(
+    ("cls", "module", "attr"),
+    [
+        (subjects.SubjectsEndpoint, subjects, "subjectKey"),
+        (records.RecordsEndpoint, records, "subjectKey"),
+        (record_revisions.RecordRevisionsEndpoint, record_revisions, "subjectKey"),
+        (queries.QueriesEndpoint, queries, "subjectKey"),
+        (visits.VisitsEndpoint, visits, "subjectKey"),
+    ],
+)
+def test_study_subresource_or_list_filters_omit_study_key(
+    dummy_client, paginator_factory, cls, module, attr
+):
+    """Test OR-list filters on sub-resource endpoints succeed and omit studyKey from filter."""
+    ep = cls(dummy_client)
+    capture = paginator_factory(module, [{}])
+    list(ep.list(study_key="S1", **{attr: ["SUB1", "SUB2"]}))
+    assert capture["params"] == {"filter": f"{attr}==SUB1,{attr}==SUB2"}

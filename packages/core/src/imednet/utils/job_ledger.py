@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _RETRY_BASE_DELAY_SECONDS = 0.05
+_initialized_ledger_paths: set[str] = set()
+_initialized_paths_lock = RLock()
 
 
 def get_default_job_ledger_path() -> Path:
@@ -125,7 +127,6 @@ class JobLedger:
         self._timeout = timeout
         self._retry_attempts = retry_attempts
         self._lock = RLock()
-        self._initialized_paths: set[str] = set()
 
     @property
     def db_path(self) -> Path:
@@ -136,8 +137,9 @@ class JobLedger:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        """Yield an initialized WAL-enabled SQLite connection."""
+        """Yield an initialized WAL-enabled SQLite connection for writes or schema setup."""
         target = self.db_path
+        existed_before = target.is_file()
         target.parent.mkdir(parents=True, exist_ok=True)
         resolved_key = str(target.resolve())
         with sqlite_connection(
@@ -146,11 +148,34 @@ class JobLedger:
             busy_timeout_ms=_SQLITE_BUSY_TIMEOUT_MS,
             foreign_keys=False,
         ) as conn:
-            if resolved_key not in self._initialized_paths:
-                with self._lock:
+            with _initialized_paths_lock:
+                needs_init = not existed_before or resolved_key not in _initialized_ledger_paths
+                if needs_init:
                     self._ensure_schema(conn)
-                    self._initialized_paths.add(resolved_key)
+                    _initialized_ledger_paths.add(resolved_key)
             yield conn
+
+    @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection | None]:
+        """Yield a lightweight read connection without WAL/DDL writes when already initialized."""
+        target = self.db_path
+        if not target.is_file():
+            yield None
+            return
+        resolved_key = str(target.resolve())
+        with _initialized_paths_lock:
+            is_initialized = resolved_key in _initialized_ledger_paths
+        if not is_initialized:
+            with self._connection() as conn:
+                yield conn
+            return
+        conn = sqlite3.connect(target, timeout=self._timeout)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS};")
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     @staticmethod
     def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -398,7 +423,9 @@ class JobLedger:
 
     def get_job(self, study_key: str, batch_id: str) -> JobLedgerEntry | None:
         """Retrieve a single persisted job entry for a study."""
-        with self._connection() as conn:
+        with self._read_connection() as conn:
+            if conn is None:
+                return None
             row = conn.execute(
                 """
                 SELECT study_key, batch_id, job_id, job_type, state, progress,
@@ -423,7 +450,9 @@ class JobLedger:
         if not study_key:
             return []
         active_json = json.dumps(sorted(st.value for st in ACTIVE_JOB_STATES))
-        with self._connection() as conn:
+        with self._read_connection() as conn:
+            if conn is None:
+                return []
             if active_only:
                 rows = conn.execute(
                     """

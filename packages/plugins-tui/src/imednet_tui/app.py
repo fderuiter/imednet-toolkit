@@ -583,11 +583,12 @@ class JobMonitor(Static):
         ledger_map: dict[str, JobLedgerEntry] = {}
         with contextlib.suppress(Exception):
             entries = list(self.ledger.list_jobs(study_key, limit=200))
-            seen = {entry.batch_id for entry in entries}
-            for active_entry in self.ledger.list_active_jobs(study_key):
-                if active_entry.batch_id not in seen:
-                    entries.append(active_entry)
-                    seen.add(active_entry.batch_id)
+            if len(entries) >= 200:
+                seen = {entry.batch_id for entry in entries}
+                for active_entry in self.ledger.list_active_jobs(study_key):
+                    if active_entry.batch_id not in seen:
+                        entries.append(active_entry)
+                        seen.add(active_entry.batch_id)
             for entry in entries:
                 ledger_map[entry.batch_id] = entry
                 self._persisted_job_ids.add(entry.batch_id)
@@ -620,7 +621,8 @@ class JobMonitor(Static):
                 if job is not None:
                     if jid in self._persisted_job_ids or ledger_entry is not None:
                         with contextlib.suppress(Exception):
-                            self.ledger.record_from_model(
+                            await asyncio.to_thread(
+                                self.ledger.record_from_model,
                                 study_key,
                                 job,
                                 fallback_batch_id=jid,
@@ -640,7 +642,7 @@ class JobMonitor(Static):
             return
 
         study_key = self.current_study_key
-        ledger_map = self._sync_ids_from_ledger(study_key)
+        ledger_map = await asyncio.to_thread(self._sync_ids_from_ledger, study_key)
 
         try:
             jobs_ep: Any = self.sdk.jobs

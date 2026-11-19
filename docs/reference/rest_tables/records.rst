@@ -161,7 +161,14 @@ List records
                "parentRecordId": "<integer>",
                "recordData": {},
                "lastUpdated": "<string>",
-               "keywords": "<string>"
+               "keywords": [
+                   {
+                       "keywordName": "<string>",
+                       "keywordKey": "<string>",
+                       "keywordId": 1,
+                       "dateAdded": "2020-07-20 14:05:00"
+                   }
+               ]
            },
            {
                "studyKey": "<string>",

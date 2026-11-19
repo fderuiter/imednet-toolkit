@@ -9,7 +9,12 @@ from typing import Any
 from ...sdk import ImednetSDK
 from ...utils.job_ledger import JobLedger
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, fetching_status, format_job_progress, print_error
+from ..utils import (
+    STUDY_KEY_ARG,
+    fetching_status,
+    format_job_progress,
+    supports_live_status,
+)
 from ..utils.args import add_output_format
 from ..utils.output import display_list
 
@@ -70,6 +75,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             fields=JOB_SUMMARY_FIELDS,
             output_format=output_format,
             details=[job],
+            interactive=False,
         )
 
     status_parser.set_defaults(
@@ -101,8 +107,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 msg = format_job_progress(event)
                 if status_ctrl is not None and hasattr(status_ctrl, "update"):
                     status_ctrl.update(msg)
-                elif sys.stderr.isatty():
-                    print_error(f"\r\033[K{msg}", end="", flush=True)
+                elif supports_live_status(sys.stderr):
+                    try:
+                        sys.stderr.write(f"\r\033[K{msg}")
+                        sys.stderr.flush()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
 
             job = sdk.poll_job(
                 study_key,
@@ -117,6 +127,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             fields=JOB_SUMMARY_FIELDS,
             output_format=output_format,
             details=[job],
+            interactive=False,
         )
 
     wait_parser.set_defaults(
