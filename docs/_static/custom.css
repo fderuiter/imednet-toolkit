@@ -202,7 +202,7 @@ body[data-theme="dark"] .role-card:hover {
     text-decoration: underline;
 }
 
-/* Sphinx-Thebe Interactive Cells & Pyodide Output Styles */
+/* Interactive Pyodide Cells & Output Styles */
 .thebe-launch-button {
     display: inline-flex;
     align-items: center;
@@ -210,7 +210,7 @@ body[data-theme="dark"] .role-card:hover {
     padding: 0.45rem 1rem;
     font-size: 0.875rem;
     font-weight: 600;
-    color: #ffffff;
+    color: var(--color-brand-btn-text, #ffffff);
     background-color: var(--color-brand-primary, #005fb8);
     border: 1px solid transparent;
     border-radius: 6px;
@@ -223,9 +223,19 @@ body[data-theme="dark"] .role-card:hover {
     opacity: 0.9;
 }
 
+.thebe-launch-button:focus-visible {
+    outline: 2px solid var(--color-brand-primary, #005fb8);
+    outline-offset: 2px;
+}
+
 .thebe-launch-button.thebe-status-ready {
-    background-color: #2da44e;
-    color: #ffffff;
+    background-color: var(--color-status-success, #065f46);
+    color: var(--color-brand-btn-text, #ffffff);
+}
+
+.thebe-launch-button.thebe-status-failed {
+    background-color: var(--color-status-danger, #b91c1c);
+    color: var(--color-brand-btn-text, #ffffff);
 }
 
 .thebelab-cell {

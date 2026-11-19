@@ -65,6 +65,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             has_output_file=bool(output),
             no_interactive=no_interactive,
             model=Record,
+            disallow_study_key=True,
         )
 
         with fetching_status("records", study_key):

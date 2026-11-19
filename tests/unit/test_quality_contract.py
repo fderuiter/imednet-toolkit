@@ -20,10 +20,14 @@ def test_ci_uses_canonical_full_verification():
 
 
 def test_ci_docs_job_enforces_clean_working_tree_and_validation():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    docs_deps = project["project"]["optional-dependencies"]["docs"]
+    assert not any("sphinx-thebe" in dep for dep in docs_deps)
     pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text())
     steps = pipeline["jobs"]["docs"]["steps"]
     assert any(s.get("run") == "hatch run validate-docs" for s in steps)
     assert any(s.get("run") == "hatch run docs" for s in steps)
+    assert any("scripts/verify_pyodide_tutorials.py" in s.get("run", "") for s in steps)
     assert any(
         "git diff --exit-code docs/" in s.get("run", "")
         and "git status --porcelain" in s.get("run", "")

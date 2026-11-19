@@ -25,6 +25,7 @@ from .utils import (
     add_no_interactive,
     get_sdk,
     parse_filter_args,
+    parse_record_data_filter,
 )
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "get_parser",
     "get_sdk",
     "parse_filter_args",
+    "parse_record_data_filter",
     "with_sdk",
 ]
 
@@ -215,7 +217,7 @@ def app(args: list[str] | None = None) -> None:
 
     parsed = parser.parse_args(args)
 
-    if parsed.high_contrast:
+    if parsed.high_contrast and getattr(parsed, "command", None) != "tui":
         os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
 
     old_output_format = os.environ.get(OUTPUT_FORMAT_ENV)

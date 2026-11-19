@@ -85,10 +85,16 @@ def build_and_stage_wheels(
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             print(f"Warning: Failed to build wheels with uv: {exc}")
 
-    # Remove workspace root placeholder wheel if present
-    for placeholder in wheels_dir.glob("imednet_workspace-*.whl"):
-        with contextlib.suppress(OSError):
-            placeholder.unlink()
+    # Remove non-browser wheels (workspace root placeholder, Airflow server provider, CLI TUI)
+    excluded_patterns = (
+        "imednet_workspace-*.whl",
+        "apache_airflow_providers_imednet-*.whl",
+        "imednet_tui-*.whl",
+    )
+    for pattern in excluded_patterns:
+        for excluded_whl in wheels_dir.glob(pattern):
+            with contextlib.suppress(OSError):
+                excluded_whl.unlink()
 
     staged = sorted(wheels_dir.glob("*.whl"))
     print(f"Staged {len(staged)} wheel artifact(s) in {wheels_dir}: {[w.name for w in staged]}")
@@ -252,11 +258,13 @@ def main():
     run_command(["sphinx-build", "-b", "html", "-W", "--keep-going", "docs", "docs/_build/html"])
 
     # Ensure staged wheels are present in docs/_build/html/_static/wheels/
+    # and clean up any legacy docs/_static/wheels directory so the git working tree stays clean.
     html_wheels_dir = Path("docs/_build/html/_static/wheels")
     if staged_wheels_dir.exists():
         html_wheels_dir.mkdir(parents=True, exist_ok=True)
         for whl in staged_wheels_dir.glob("*.whl"):
             shutil.copy2(whl, html_wheels_dir / whl.name)
+    shutil.rmtree(Path("docs/_static/wheels"), ignore_errors=True)
 
 
 if __name__ == "__main__":
