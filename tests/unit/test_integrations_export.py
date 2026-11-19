@@ -1085,3 +1085,243 @@ def test_tabular_sink_config_receives_operational_options_without_pandas_leak(
         duck_conn.close()
     assert captured_configs[-1].batch_size == 30
     assert captured_configs[-1].idempotent is False
+
+
+def test_export_to_json_hierarchical_masks_phi_under_both_label_modes(tmp_path, monkeypatch):
+    """Hierarchical export_to_json masks DOB, SSN, and patientName under both use_labels_as_columns settings."""
+    import json
+    from types import SimpleNamespace
+
+    from imednet.models.variables import Variable
+
+    sdk = MagicMock()
+    form_sched = SimpleNamespace(
+        form_id=10,
+        form_key="DEMOGRAPHICS",
+        variables=[
+            Variable(variable_name="DOB", label="Enrollment Birth Date", form_id=10),
+            Variable(variable_name="SSN", label="Tax Identifier", form_id=10),
+            Variable(variable_name="patientName", label="Legal Participant Name", form_id=10),
+            Variable(variable_name="heartRate", label="Resting Heart Rate", form_id=10),
+        ],
+    )
+    form_unsched = SimpleNamespace(
+        form_id=20,
+        form_key="CONTACT",
+        variables=[
+            Variable(variable_name="patientName", label="Emergency Contact Person", form_id=20),
+            Variable(variable_name="SSN", label="Unpopulated National ID", form_id=20),
+        ],
+    )
+    study_struct = SimpleNamespace(intervals=[SimpleNamespace(forms=[form_sched, form_unsched])])
+    monkeypatch.setattr(
+        "imednet_workflows.study_structure.get_study_structure",
+        lambda _sdk, _study_key: study_struct,
+    )
+
+    records = [
+        Record(
+            record_id=501,
+            study_key="STUDY_HIER",
+            subject_key="SUBJ-501",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMOGRAPHICS",
+            record_status="Complete",
+            record_data={
+                "DOB": "1978-05-14",
+                "SSN": "123-45-6789",
+                "patientName": "Jane Doe",
+                "heartRate": 66,
+            },
+        ),
+        Record(
+            record_id=502,
+            study_key="STUDY_HIER",
+            subject_key="SUBJ-501",
+            visit_id=None,
+            form_id=20,
+            form_key="CONTACT",
+            record_status="Complete",
+            record_data={"patientName": "John Doe"},
+        ),
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+
+    # 1. use_labels_as_columns=False
+    raw_keys_json = tmp_path / "hier_keys.json"
+    export_mod.export_to_json(
+        sdk,
+        "STUDY_HIER",
+        str(raw_keys_json),
+        hierarchical=True,
+        use_labels_as_columns=False,
+    )
+    payload_keys = json.loads(raw_keys_json.read_text(encoding="utf-8"))
+    subj_keys = payload_keys[0]
+    assert subj_keys["subject_key"] == "SUBJ-501"
+    visit_node = subj_keys["visits"][0]
+    assert visit_node["visit_id"] == 1
+    form_node = visit_node["forms"][0]
+    assert form_node["form_id"] == 10
+    rec_keys = form_node["records"][0]
+    assert rec_keys["recordId"] == 501
+    assert rec_keys["subjectKey"] == "SUBJ-501"
+    assert rec_keys["DOB"] == "***MASKED***"
+    assert rec_keys["SSN"] == "***MASKED***"
+    assert rec_keys["patientName"] == "***MASKED***"
+    assert rec_keys["heartRate"] == 66
+
+    unsched_keys = subj_keys["forms"][0]["records"][0]
+    assert subj_keys["forms"][0]["form_id"] == 20
+    assert unsched_keys["recordId"] == 502
+    assert unsched_keys["patientName"] == "***MASKED***"
+    assert unsched_keys["SSN"] == "***MASKED***"
+
+    # 2. use_labels_as_columns=True
+    labeled_json = tmp_path / "hier_labels.json"
+    export_mod.export_to_json(
+        sdk,
+        "STUDY_HIER",
+        str(labeled_json),
+        hierarchical=True,
+        use_labels_as_columns=True,
+    )
+    payload_labels = json.loads(labeled_json.read_text(encoding="utf-8"))
+    subj_labels = payload_labels[0]
+    assert subj_labels["subject_key"] == "SUBJ-501"
+    assert subj_labels["visits"][0]["visit_id"] == 1
+    assert subj_labels["visits"][0]["forms"][0]["form_id"] == 10
+    rec_labels = subj_labels["visits"][0]["forms"][0]["records"][0]
+    assert rec_labels["recordId"] == 501
+    assert rec_labels["subjectKey"] == "SUBJ-501"
+    assert rec_labels["Enrollment Birth Date"] == "***MASKED***"
+    assert rec_labels["Tax Identifier"] == "***MASKED***"
+    assert rec_labels["Legal Participant Name"] == "***MASKED***"
+    assert rec_labels["Resting Heart Rate"] == 66
+
+    unsched_labels = subj_labels["forms"][0]["records"][0]
+    assert unsched_labels["Emergency Contact Person"] == "***MASKED***"
+    assert unsched_labels["Unpopulated National ID"] == "***MASKED***"
+
+
+def test_custom_global_sensitivity_registry_key_redacts_across_all_outputs(tmp_path, monkeypatch):
+    """Registering a custom variable on global_sensitivity_registry redacts it across tabular, JSON, Hive Parquet, and sink plugins."""
+    import json
+    from types import SimpleNamespace
+
+    import imednet.integrations.parquet as parquet_mod
+    from imednet.integrations.enrichment import CentralizedMapper
+    from imednet.models.variables import Variable
+    from imednet.utils.security import _normalize_key, global_sensitivity_registry
+
+    custom_var = "biobankSpecimenCode"
+    normalized_custom = _normalize_key(custom_var)
+    snapshot = set(global_sensitivity_registry._sensitive_keys)
+    global_sensitivity_registry.add_sensitive_key(custom_var)
+
+    try:
+        assert normalized_custom in global_sensitivity_registry._sensitive_keys
+
+        sdk = MagicMock()
+        vars_list = [
+            Variable(
+                variable_name="biobankSpecimenCode",
+                label="Biobank Barcode",
+                variable_type="text",
+                form_id=10,
+                form_key="BIOSPECIMEN",
+            ),
+            Variable(
+                variable_name="volumeMl",
+                label="Sample Volume",
+                variable_type="int",
+                form_id=10,
+                form_key="BIOSPECIMEN",
+            ),
+        ]
+        sdk.get_variables.return_value = vars_list
+        sdk.variables.list.return_value = vars_list
+        sdk.forms.list.return_value = [SimpleNamespace(form_id=10, form_key="BIOSPECIMEN")]
+
+        study_struct = SimpleNamespace(
+            intervals=[
+                SimpleNamespace(
+                    forms=[SimpleNamespace(form_id=10, form_key="BIOSPECIMEN", variables=vars_list)]
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "imednet_workflows.study_structure.get_study_structure",
+            lambda _sdk, _sk: study_struct,
+        )
+
+        rec = Record(
+            record_id=777,
+            study_key="STUDY_CUSTOM",
+            subject_key="SUBJ-777",
+            visit_id=1,
+            form_id=10,
+            form_key="BIOSPECIMEN",
+            record_status="Complete",
+            record_data={"biobankSpecimenCode": "BIO-RAW-999", "volumeMl": 5},
+        )
+        sdk.records.list.side_effect = lambda **_kw: iter([rec.model_copy(deep=True)])
+        sdk.records.iter.side_effect = lambda **_kw: iter([rec.model_copy(deep=True)])
+        sdk.get_records.side_effect = lambda **_kw: [rec.model_copy(deep=True)]
+
+        # 1. Tabular CSV
+        csv_out = tmp_path / "custom.csv"
+        export_mod.export_to_csv(sdk, "STUDY_CUSTOM", str(csv_out), quality_gate_enabled=False)
+        csv_df = pd.read_csv(csv_out)
+        assert csv_df["biobankSpecimenCode"].iloc[0] == "***MASKED***"
+        assert csv_df["subjectKey"].iloc[0] == "SUBJ-777"
+        assert csv_df["volumeMl"].iloc[0] == 5
+
+        # 2. Hierarchical JSON with labels
+        hier_out = tmp_path / "custom_hier.json"
+        export_mod.export_to_json(
+            sdk,
+            "STUDY_CUSTOM",
+            str(hier_out),
+            hierarchical=True,
+            use_labels_as_columns=True,
+        )
+        hier_data = json.loads(hier_out.read_text(encoding="utf-8"))
+        hier_rec = hier_data[0]["visits"][0]["forms"][0]["records"][0]
+        assert hier_rec["Biobank Barcode"] == "***MASKED***"
+        assert hier_rec["Sample Volume"] == 5
+        assert hier_data[0]["subject_key"] == "SUBJ-777"
+
+        # 3. Hive Parquet
+        pytest.importorskip("pyarrow")
+        hive_dir = tmp_path / "hive_custom"
+        parquet_mod.export_to_hive_parquet(sdk, "STUDY_CUSTOM", str(hive_dir))
+        hive_files = list(
+            (hive_dir / "study_key=STUDY_CUSTOM" / "form_key=BIOSPECIMEN").glob("**/*.parquet")
+        )
+        hive_df = pd.read_parquet(hive_files[0])
+        assert hive_df["biobankSpecimenCode"].iloc[0] == "***MASKED***"
+        assert hive_df["volumeMl"].iloc[0] == 5
+        assert hive_df["subjectKey"].iloc[0] == "SUBJ-777"
+
+        # 4. CentralizedMapper (used by MongoDB, Neo4j, Snowflake sinks) across case variants
+        c_mapper = CentralizedMapper(mode="document")
+        mapped_doc = c_mapper.map_record(
+            {
+                "record_id": 777,
+                "subject_key": "SUBJ-777",
+                "record_data": {
+                    "biobankSpecimenCode": "BIO-1",
+                    "BIOBANK_SPECIMEN_CODE": "BIO-2",
+                    "volume_ml": 5,
+                },
+            },
+            study_key="STUDY_CUSTOM",
+        )
+        assert mapped_doc["subject_key"] == "SUBJ-777"
+        assert mapped_doc["record_data"]["biobank_specimen_code"] == "***MASKED***"
+        assert mapped_doc["record_data"]["volume_ml"] == 5
+    finally:
+        global_sensitivity_registry._sensitive_keys.clear()
+        global_sensitivity_registry._sensitive_keys.update(snapshot)

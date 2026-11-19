@@ -710,3 +710,291 @@ class TestSpiSinks:
         import imednet.http
 
         assert imednet.http.__all__ == []
+
+
+class TestDirectTabularSinkPhiRedaction:
+    """Verify direct TabularCSVSink.write_batch and TabularSQLSink.write_batch PHI redaction."""
+
+    def test_tabular_csv_sink_write_batch_masks_dataframe_and_sanitizes_without_mutating_caller(
+        self, tmp_path
+    ):
+        """Direct TabularCSVSink.write_batch masks PHI columns, sanitizes formulas, and preserves caller DataFrame."""
+        csv_path = tmp_path / "direct_df.csv"
+        cfg = TabularSinkConfig(study_key="STUDY1", sanitize=True)
+        input_df = pd.DataFrame(
+            [
+                {
+                    "record_id": 101,
+                    "subject_key": "SUBJ-001",
+                    "study_key": "STUDY1",
+                    "DOB": "1985-04-12",
+                    "SSN": "123-45-6789",
+                    "patientName": "Jane Doe",
+                    "systolic_bp": 118,
+                    "notes": "=SUM(1,2)",
+                }
+            ]
+        )
+
+        with TabularCSVSink(str(csv_path), cfg) as sink:
+            written = sink.write_batch(input_df, batch_id="STUDY1/csv/0")
+
+        assert written == 1
+        # Caller DataFrame must remain unmutated
+        assert input_df["DOB"].iloc[0] == "1985-04-12"
+        assert input_df["notes"].iloc[0] == "=SUM(1,2)"
+
+        out_df = pd.read_csv(csv_path)
+        assert out_df["subject_key"].iloc[0] == "SUBJ-001"
+        assert out_df["study_key"].iloc[0] == "STUDY1"
+        assert out_df["record_id"].iloc[0] == 101
+        assert out_df["systolic_bp"].iloc[0] == 118
+        assert out_df["DOB"].iloc[0] == "***MASKED***"
+        assert out_df["SSN"].iloc[0] == "***MASKED***"
+        assert out_df["patientName"].iloc[0] == "***MASKED***"
+        assert out_df["notes"].iloc[0] == "'=SUM(1,2)"
+
+    def test_tabular_csv_sink_write_batch_masks_record_dicts_and_models_and_honors_opt_out(
+        self, tmp_path
+    ):
+        """Direct TabularCSVSink.write_batch redacts flat dicts, nested record_data dicts, and Record models."""
+        from imednet.models.records import Record
+
+        flat_csv = tmp_path / "flat_dicts.csv"
+        flat_records = [
+            {
+                "record_id": 1,
+                "subject_key": "SUBJ-10",
+                "DOB": "1990-01-01",
+                "SSN": "123-45-6789",
+                "patientName": "John Roe",
+                "heart_rate": 72,
+            }
+        ]
+        with TabularCSVSink(str(flat_csv), TabularSinkConfig(study_key="STUDY1")) as sink:
+            assert sink.write_batch(flat_records, batch_id="b0") == 1
+
+        flat_out = pd.read_csv(flat_csv)
+        assert flat_out["subject_key"].iloc[0] == "SUBJ-10"
+        assert flat_out["heart_rate"].iloc[0] == 72
+        assert flat_out["DOB"].iloc[0] == "***MASKED***"
+        assert flat_out["SSN"].iloc[0] == "***MASKED***"
+        assert flat_out["patientName"].iloc[0] == "***MASKED***"
+
+        model_csv = tmp_path / "models.csv"
+        rec_model = Record(
+            record_id=2,
+            study_key="STUDY1",
+            subject_key="SUBJ-20",
+            visit_id=1,
+            form_id=10,
+            record_data={
+                "DOB": "1979-11-30",
+                "SSN": "999-00-1111",
+                "patientName": "Alice Smith",
+                "heart_rate": 64,
+            },
+        )
+        with TabularCSVSink(str(model_csv), TabularSinkConfig(study_key="STUDY1")) as sink:
+            assert sink.write_batch([rec_model], batch_id="b1") == 1
+
+        assert rec_model.record_data["patientName"] == "Alice Smith"
+        model_out = pd.read_csv(model_csv)
+        assert model_out["subject_key"].iloc[0] == "SUBJ-20"
+        assert model_out["heart_rate"].iloc[0] == 64
+        assert model_out["DOB"].iloc[0] == "***MASKED***"
+        assert model_out["SSN"].iloc[0] == "***MASKED***"
+        assert model_out["patientName"].iloc[0] == "***MASKED***"
+
+        opt_out_csv = tmp_path / "opt_out.csv"
+        with TabularCSVSink(
+            str(opt_out_csv), TabularSinkConfig(study_key="STUDY1", mask_phi=False)
+        ) as sink:
+            assert sink.write_batch(flat_records, batch_id="b2") == 1
+        opt_out_df = pd.read_csv(opt_out_csv)
+        assert opt_out_df["patientName"].iloc[0] == "John Roe"
+        assert opt_out_df["SSN"].iloc[0] == "123-45-6789"
+
+    def test_tabular_sql_sink_write_batch_masks_dataframe_and_record_sequences(self, tmp_path):
+        """Direct TabularSQLSink.write_batch masks PHI for DataFrames, Record dicts, and Record models."""
+        from sqlalchemy import create_engine, text
+
+        from imednet.models.records import Record
+
+        db_path = tmp_path / "direct_sink.sqlite"
+        engine = create_engine(f"sqlite:///{db_path}")
+
+        df_in = pd.DataFrame(
+            [
+                {
+                    "record_id": 10,
+                    "subject_key": "SUBJ-SQL-1",
+                    "DOB": "1982-06-15",
+                    "SSN": "123-45-6789",
+                    "patientName": "Jane SQL",
+                    "lab_value": 4.5,
+                    "comment": "@malicious",
+                }
+            ]
+        )
+        cfg = TabularSinkConfig(study_key="STUDY1", sanitize=True)
+        with TabularSQLSink("df_table", engine, cfg) as sink:
+            assert sink.write_batch(df_in, batch_id="sql/df/0") == 1
+
+        nested_seq = [
+            {
+                "record_id": 11,
+                "subject_key": "SUBJ-SQL-2",
+                "record_data": {
+                    "DOB": "1975-03-09",
+                    "SSN": "555-66-7777",
+                    "patientName": "Bob SQL",
+                    "lab_value": 7,
+                },
+            },
+            Record(
+                record_id=12,
+                subject_key="SUBJ-SQL-3",
+                record_data={
+                    "DOB": "1995-08-22",
+                    "SSN": "888-77-6666",
+                    "patientName": "Carol SQL",
+                    "lab_value": 9,
+                },
+            ),
+        ]
+        with TabularSQLSink("seq_table", engine, TabularSinkConfig(study_key="STUDY1")) as sink:
+            assert sink.write_batch(nested_seq, batch_id="sql/seq/0") == 2
+
+        with engine.connect() as conn:
+            df_row = (
+                conn.execute(
+                    text(
+                        "SELECT record_id, subject_key, DOB, SSN, patientName, lab_value, comment FROM df_table"
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            seq_rows = (
+                conn.execute(
+                    text(
+                        "SELECT record_id, subject_key, DOB, SSN, patientName, lab_value "
+                        "FROM seq_table ORDER BY record_id"
+                    )
+                )
+                .mappings()
+                .all()
+            )
+
+        assert df_row["record_id"] == 10
+        assert df_row["subject_key"] == "SUBJ-SQL-1"
+        assert df_row["DOB"] == "***MASKED***"
+        assert df_row["SSN"] == "***MASKED***"
+        assert df_row["patientName"] == "***MASKED***"
+        assert df_row["lab_value"] == pytest.approx(4.5)
+        assert df_row["comment"] == "'@malicious"
+
+        assert len(seq_rows) == 2
+        assert seq_rows[0]["subject_key"] == "SUBJ-SQL-2"
+        assert seq_rows[0]["DOB"] == "***MASKED***"
+        assert seq_rows[0]["SSN"] == "***MASKED***"
+        assert seq_rows[0]["patientName"] == "***MASKED***"
+        assert seq_rows[0]["lab_value"] == 7
+        assert seq_rows[1]["subject_key"] == "SUBJ-SQL-3"
+        assert seq_rows[1]["patientName"] == "***MASKED***"
+        assert seq_rows[1]["lab_value"] == 9
+        engine.dispose()
+
+
+class TestExportSinkBatchRedactionContract:
+    """Verify custom ExportSink subclasses inherit default PHI redaction from the shared SPI contract."""
+
+    def test_custom_export_sink_inherits_default_phi_redaction_and_honors_opt_out(self):
+        """Custom ExportSink extensions automatically redact batches unless mask_phi=False."""
+        from types import SimpleNamespace
+
+        import imednet.spi.sink_base as spi_sink_base
+        import imednet.spi.sinks as spi_sinks
+        from imednet.models.records import Record
+
+        class CustomAuditSink(spi_sinks.ExportSink):
+            def __init__(self, config: spi_sinks.SinkConfig) -> None:
+                super().__init__(config)
+                self.captured_batches: list[Any] = []
+
+            def write_batch(self, records, *, batch_id: str) -> int:
+                self.captured_batches.append((records, batch_id))
+                return len(records)
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        clean_record = Record(
+            record_id=1,
+            subject_key="SUBJ-CLEAN",
+            record_data={"heart_rate": 70},
+        )
+        phi_record = Record(
+            record_id=2,
+            subject_key="SUBJ-PHI",
+            record_data={"patientName": "Jane Doe", "SSN": "123-45-6789", "heart_rate": 75},
+        )
+        ns_record = SimpleNamespace(
+            record_id=3,
+            subject_key="SUBJ-NS",
+            record_data={"DOB": "1980-01-01", "heart_rate": 80},
+        )
+        dict_record = {
+            "record_id": 4,
+            "subject_key": "SUBJ-DICT",
+            "DOB": "1991-02-03",
+            "heart_rate": 65,
+        }
+
+        default_sink = CustomAuditSink(spi_sinks.SinkConfig(study_key="STUDY1"))
+        count = default_sink.write_batch(
+            (clean_record, phi_record, ns_record, dict_record),
+            batch_id="audit/0",
+        )
+        assert count == 4
+
+        redacted_batch, captured_id = default_sink.captured_batches[0]
+        assert captured_id == "audit/0"
+        assert isinstance(redacted_batch, tuple)
+        # Clean record preserves identity when no PHI fields require masking
+        assert redacted_batch[0] is clean_record
+        # Caller inputs are not mutated
+        assert phi_record.record_data["patientName"] == "Jane Doe"
+        assert ns_record.record_data["DOB"] == "1980-01-01"
+        assert dict_record["DOB"] == "1991-02-03"
+
+        assert redacted_batch[1].subject_key == "SUBJ-PHI"
+        assert redacted_batch[1].record_data == {
+            "patientName": "***MASKED***",
+            "SSN": "***MASKED***",
+            "heart_rate": 75,
+        }
+        assert redacted_batch[2].subject_key == "SUBJ-NS"
+        assert redacted_batch[2].record_data == {"DOB": "***MASKED***", "heart_rate": 80}
+        assert redacted_batch[3] == {
+            "record_id": 4,
+            "subject_key": "SUBJ-DICT",
+            "DOB": "***MASKED***",
+            "heart_rate": 65,
+        }
+
+        # Direct SPI helper also works on DataFrames and honors mask_phi=False
+        df_batch = pd.DataFrame([{"subject_key": "SUBJ-DF", "SSN": "123-45-6789", "score": 10}])
+        redacted_df = spi_sink_base.redact_batch_records(df_batch)
+        assert redacted_df["subject_key"].iloc[0] == "SUBJ-DF"
+        assert redacted_df["SSN"].iloc[0] == "***MASKED***"
+        assert redacted_df["score"].iloc[0] == 10
+        assert df_batch["SSN"].iloc[0] == "123-45-6789"
+
+        opt_out_sink = CustomAuditSink(spi_sinks.SinkConfig(study_key="STUDY1", mask_phi=False))
+        opt_out_sink.write_batch([phi_record], batch_id="audit/1")
+        assert opt_out_sink.captured_batches[0][0][0].record_data["patientName"] == "Jane Doe"
