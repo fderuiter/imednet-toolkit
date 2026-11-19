@@ -387,3 +387,227 @@ def test_user_from_json_roles_timestamp_arrays_and_strict_mode(monkeypatch):
                 "roles": [{"roleId": "R1", "dateCreated": [2026, 5, 13]}],
             }
         )
+
+    with pytest.raises(ValidationError, match="Nanosecond component out of range"):
+        User.from_json(
+            {
+                "userId": "u-4",
+                "roles": [
+                    {
+                        "roleId": "R1",
+                        "dateCreated": [2026, 5, 13, 14, 6, 50, 1_000_000_000],
+                    }
+                ],
+            }
+        )
+
+
+def test_bundled_and_local_fallback_contract_resolution(monkeypatch):
+    """Verify bundled resource loading and local workspace fallback when env vars are unset."""
+    monkeypatch.delenv("IMEDNET_OPENAPI_PATH", raising=False)
+    monkeypatch.delenv("IMEDNET_POSTMAN_PATH", raising=False)
+
+    contract = get_contract()
+    assert EXPECTED_14_MODELS.issubset(set(contract.models.keys()))
+    assert engine.to_snake("recordRevisionId") == "record_revision_id"
+    assert "study_key" in engine.ResourceRegistry.get_fields("Study")
+
+    # Exercise fallback from imednet.resources to imednet/resources
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+    orig_files = engine.importlib.resources.files
+
+    def fallback_files(pkg: str):
+        if pkg == "imednet.resources":
+            raise ModuleNotFoundError(pkg)
+        return orig_files(pkg)
+
+    monkeypatch.setattr(engine.importlib.resources, "files", fallback_files)
+    contract_fallback = get_contract()
+    assert "Record" in contract_fallback.models
+
+    # Exercise local dev checkout fallback when bundled resource reports is_file() == False
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+
+    class NonFileResource:
+        def is_file(self) -> bool:
+            return False
+
+    class FakePkgRoot:
+        def joinpath(self, *_args):
+            return NonFileResource()
+
+    monkeypatch.setattr(engine.importlib.resources, "files", lambda _pkg: FakePkgRoot())
+    contract_local = get_contract()
+    assert "Subject" in contract_local.models
+
+
+def test_model_engine_tracer_none_and_unknown_or_any_fields(monkeypatch):
+    """Verify ModelEngine handles tracer=None, unknown models, and fallback Any field definitions."""
+    from typing import Any
+
+    from imednet.models.contract import APIContract, FieldDefinition, ModelDefinition
+
+    monkeypatch.setattr(engine, "tracer", None)
+    unknown_cls = ModelEngine.get_model("UnregisteredSyntheticModel")
+    assert issubclass(unknown_cls, BaseModel)
+    assert unknown_cls.model_fields == {}
+
+    synthetic_contract = APIContract(
+        models={
+            "SyntheticAny": ModelDefinition(
+                name="SyntheticAny",
+                fields={
+                    "mystery_payload": FieldDefinition(
+                        name="mystery_payload",
+                        type_name="any",
+                        default_value=None,
+                        alias="mysteryPayload",
+                    )
+                },
+            )
+        }
+    )
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", synthetic_contract)
+    monkeypatch.setattr(ModelEngine, "_model_cache", {})
+    any_cls = ModelEngine.get_model("SyntheticAny")
+    assert any_cls.model_fields["mystery_payload"].annotation is Any
+
+
+def test_generate_stubs_matches_committed_model_pyi_files(monkeypatch):
+    """Verify ModelEngine.generate_stubs reproduces committed .pyi stubs byte-for-byte."""
+    import builtins
+
+    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
+    written_stubs: dict[Path, str] = {}
+    real_open = builtins.open
+
+    class _MemoryWriter:
+        def __init__(self, target: Path) -> None:
+            self._target = target
+            self._chunks: list[str] = []
+
+        def write(self, data: str) -> int:
+            self._chunks.append(data)
+            return len(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            written_stubs[self._target] = "".join(self._chunks)
+
+    def intercept_open(file, mode="r", *args, **kwargs):
+        if "w" in mode and str(file).endswith(".pyi"):
+            return _MemoryWriter(Path(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", intercept_open)
+    ModelEngine.generate_stubs(str(models_dir))
+
+    assert len(written_stubs) >= 12
+    for pyi_path, generated_text in written_stubs.items():
+        assert pyi_path.exists(), f"Expected committed stub {pyi_path} to exist"
+        assert generated_text == pyi_path.read_text(encoding="utf-8"), (
+            f"Generated stub for {pyi_path.name} drifted from committed {pyi_path}"
+        )
+
+
+def test_generate_stubs_synthetic_module_constructs(tmp_path, monkeypatch):
+    """Verify ModelEngine.generate_stubs handles synthetic AST constructs and formatting branches."""
+    assert (
+        ModelEngine._format_stub_annotation("typing.Union[int, str, NoneType]")
+        == "int | str | None"
+    )
+
+    # Ignored and non-matching files
+    (tmp_path / "__init__.py").write_text('"""Init."""\n', encoding="utf-8")
+    (tmp_path / "plain_helper.py").write_text("X = 1\n", encoding="utf-8")
+
+    synthetic_src = '''# pylint: disable=duplicate-code
+
+# synthetic header comment
+"""Synthetic model module."""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+from typing import Dict as DictAlias
+
+from pydantic import Field as PydanticField
+
+from .base import ImednetBaseModel as BaseAlias
+from imednet.models.engine import ModelEngine
+
+MODULE_CONSTANT: str = "v1"
+
+
+def _private_helper() -> None:
+    return None
+
+
+def first_public_fn(value: os.PathLike[str]) -> str:
+    return str(value)
+
+
+def second_public_fn(flag: bool) -> bool:
+    return flag
+
+
+async def long_signature_function(
+    first_parameter_name: str,
+    second_parameter_name: DictAlias[str, str],
+    third_parameter_name: int | None = None,
+) -> bool:
+    return bool(first_parameter_name and second_parameter_name and third_parameter_name)
+
+
+@dataclasses.dataclass
+class EmptyMarker:
+    pass
+
+
+class SyntheticRecord(BaseAlias):
+    CLASS_TAG = "RECORD"
+    custom_note: str | None = PydanticField(
+        default=None,
+        alias="customNote",
+    )
+
+    async def fetch_extra(self) -> str:
+        return ""
+
+
+SyntheticRecord = ModelEngine.get_model("Record", SyntheticRecord)
+RecordAlias = SyntheticRecord
+'''
+    (tmp_path / "synthetic_records.py").write_text(synthetic_src, encoding="utf-8")
+
+    monkeypatch.setattr(engine, "tracer", None)
+    ModelEngine.generate_stubs(str(tmp_path))
+
+    assert not (tmp_path / "__init__.pyi").exists()
+    assert not (tmp_path / "plain_helper.pyi").exists()
+
+    stub_path = tmp_path / "synthetic_records.pyi"
+    assert stub_path.exists()
+    stub_text = stub_path.read_text(encoding="utf-8")
+    assert stub_text.startswith("# pylint: disable=duplicate-code\n# synthetic header comment\n")
+    assert "from __future__ import annotations" in stub_text
+    assert "import dataclasses" in stub_text
+    assert "import os" in stub_text
+    assert "from typing import Any, Dict as DictAlias" in stub_text
+    assert "from pydantic import Field as PydanticField" in stub_text
+    assert "from .base import ImednetBaseModel as BaseAlias" in stub_text
+    assert "ModelEngine" not in stub_text
+    assert "MODULE_CONSTANT: str" in stub_text
+    assert "_private_helper" not in stub_text
+    assert (
+        "def first_public_fn(value: os.PathLike[str]) -> str: ...\n"
+        "def second_public_fn(flag: bool) -> bool: ..."
+    ) in stub_text
+    assert "async def long_signature_function(\n" in stub_text
+    assert "@dataclasses.dataclass\nclass EmptyMarker: ..." in stub_text
+    assert "class SyntheticRecord(BaseAlias):" in stub_text
+    assert "    record_data: dict[str, Any] | None" in stub_text
+    assert "RecordAlias = SyntheticRecord" in stub_text
