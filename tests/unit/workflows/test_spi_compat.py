@@ -48,9 +48,15 @@ def test_fallback_add_output_format_and_emit_json(capsys: pytest.CaptureFixture[
     """Verify ``--format`` registration and JSON envelope serialization."""
     parser = argparse.ArgumentParser()
     _spi_compat._fallback_add_output_format(parser)
+    _spi_compat._fallback_add_no_interactive(parser)
 
     assert parser.parse_args([]).output_format == "table"
     assert parser.parse_args(["--format", "json"]).output_format == "json"
+    assert parser.parse_args(["--no-interactive"]).no_interactive is True
+
+    root_parser = argparse.ArgumentParser()
+    _spi_compat._fallback_add_no_interactive(root_parser, suppress_default=False)
+    assert root_parser.parse_args([]).no_interactive is False
 
     row = _SampleModel(recordId=7)
     _spi_compat._fallback_emit_json([row], "records")
@@ -132,6 +138,13 @@ def test_fallback_terminal_and_progress_helpers(monkeypatch: pytest.MonkeyPatch)
     tty_buf = _TtyBuffer(tty=True)
     _spi_compat._fallback_print_error("\x1b[31mBoom\x1b[0m", file=tty_buf)
     assert "\x1b[31mBoom\x1b[0m" in tty_buf.getvalue()
+
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    assert _spi_compat._fallback_supports_interactive_stdin(tty_buf) is True
+    assert _spi_compat._fallback_supports_interactive_stdin(pipe_buf) is False
+    monkeypatch.setenv("IMEDNET_NON_INTERACTIVE", "1")
+    assert _spi_compat._fallback_supports_interactive_stdin(tty_buf) is False
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
 
     clear_buf = _TtyBuffer(tty=True)
     _spi_compat._fallback_clear_line(stream=clear_buf, lines=2)
@@ -250,6 +263,7 @@ def test_spi_compat_reload_against_core_1_1_0_surface(monkeypatch: pytest.Monkey
 
     import imednet.spi as spi_pkg
     import imednet_workflows.cli as wf_cli
+    import imednet_workflows.wizard as wf_wizard
 
     try:
         monkeypatch.setattr(spi_pkg, "cli", legacy_cli)
@@ -258,9 +272,16 @@ def test_spi_compat_reload_against_core_1_1_0_surface(monkeypatch: pytest.Monkey
         monkeypatch.setitem(sys.modules, "imednet.spi.utils", legacy_utils)
 
         reloaded_compat = importlib.reload(_spi_compat)
+        reloaded_wizard = importlib.reload(wf_wizard)
         reloaded_wf_cli = importlib.reload(wf_cli)
 
         assert reloaded_compat.add_output_format is reloaded_compat._fallback_add_output_format
+        assert reloaded_compat.add_no_interactive is reloaded_compat._fallback_add_no_interactive
+        assert (
+            reloaded_compat.supports_interactive_stdin
+            is reloaded_compat._fallback_supports_interactive_stdin
+        )
+        assert callable(reloaded_wizard.ensure_interactive_stdin)
         assert reloaded_compat.display_list is reloaded_compat._fallback_display_list
         assert reloaded_compat.emit_json is reloaded_compat._fallback_emit_json
         assert (
@@ -283,4 +304,5 @@ def test_spi_compat_reload_against_core_1_1_0_surface(monkeypatch: pytest.Monkey
     finally:
         monkeypatch.undo()
         importlib.reload(_spi_compat)
+        importlib.reload(wf_wizard)
         importlib.reload(wf_cli)

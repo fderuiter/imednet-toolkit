@@ -311,12 +311,58 @@ class BulkRecordSubmissionWorkflow:
                 failed_batches=failed_batches,
             )
 
+    @staticmethod
+    def _subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
+        """Return True if the subject has a keyword matching keyword_tag."""
+        if not keyword_tag:
+            return True
+        keywords = (
+            subj.get("keywords") if isinstance(subj, dict) else getattr(subj, "keywords", None)
+        )
+        if not keywords:
+            return False
+        for kw in keywords:
+            if isinstance(kw, str):
+                if kw == keyword_tag:
+                    return True
+                continue
+            if isinstance(kw, dict):
+                candidates = (
+                    kw.get("keyword_key"),
+                    kw.get("keywordKey"),
+                    kw.get("keyword_name"),
+                    kw.get("keywordName"),
+                )
+            else:
+                candidates = (
+                    getattr(kw, "keyword_key", None),
+                    getattr(kw, "keywordKey", None),
+                    getattr(kw, "keyword_name", None),
+                    getattr(kw, "keywordName", None),
+                )
+            if keyword_tag in candidates:
+                return True
+        return False
+
     def _find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
-        """Query subjects filtered by keyword to find pre-existing UAT subjects."""
-        subjects = self.sdk.get_subjects(study_key, keyword=keyword_tag)
-        existing_keys = set()
+        """Query non-deleted subjects and inspect Subject keywords locally for UAT tags."""
+        subjects = self.sdk.get_subjects(study_key, deleted=False)
+        existing_keys: set[str] = set()
         for subj in subjects:
-            key = getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None)
+            deleted = (
+                subj.get("deleted", False)
+                if isinstance(subj, dict)
+                else getattr(subj, "deleted", False)
+            )
+            if deleted:
+                continue
+            if not self._subject_has_keyword(subj, keyword_tag):
+                continue
+            key = (
+                (subj.get("subject_key") or subj.get("subjectKey"))
+                if isinstance(subj, dict)
+                else (getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None))
+            )
             if key:
                 existing_keys.add(key)
         return existing_keys

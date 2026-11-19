@@ -574,9 +574,13 @@ def test_subject_data_interactive_section_selection_and_grid(
 
     monkeypatch.setattr("imednet.cli.utils.grid.run_interactive_grid", fake_grid)
 
+    class _TTYInput(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
     # 1. Active TTY + missing keys + invalid section retry ("99") then "3" (records)
     monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
-    monkeypatch.setattr("sys.stdin", io.StringIO("STUDY-WIZ\nSUBJ-001\n99\n3\n"))
+    monkeypatch.setattr("sys.stdin", _TTYInput("STUDY-WIZ\nSUBJ-001\n99\n3\n"))
     res_tty = runner.invoke(cli.app, ["subject-data", "--interactive"])
 
     assert res_tty.exit_code == 0
@@ -587,18 +591,31 @@ def test_subject_data_interactive_section_selection_and_grid(
     assert len(grid_calls[0]["details"]) == 1
     assert res_tty.stdout == ""
 
-    # 2. Piped / non-interactive fallback + section "visits" ("2") -> prints only visits table
+    # 2. Non-fullscreen fallback (e.g. piped stdout with TTY stdin) + section "visits" ("2") -> prints only visits table
     monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: False)
-    monkeypatch.setattr("sys.stdin", io.StringIO("2\n"))
+    monkeypatch.setattr("sys.stdin", _TTYInput("2\n"))
     res_pipe = runner.invoke(cli.app, ["subject-data", "STUDY-WIZ", "SUBJ-001", "--interactive"])
     assert res_pipe.exit_code == 0
     assert "Found 1 visits:" in res_pipe.stdout
     assert "Found 1 records:" not in res_pipe.stdout
 
     # 3. EOF during subject key prompt exits with code 1
-    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr("sys.stdin", _TTYInput(""))
     res_eof = runner.invoke(cli.app, ["subject-data", "STUDY-WIZ", "--interactive"])
     assert res_eof.exit_code == 1
+
+    # 4. Piped non-TTY stdin or --no-interactive exits immediately with code 1
+    monkeypatch.setattr("sys.stdin", io.StringIO("2\n"))
+    res_non_tty = runner.invoke(cli.app, ["subject-data", "STUDY-WIZ", "SUBJ-001", "--interactive"])
+    assert res_non_tty.exit_code == 1
+    assert "Interactive prompts require an interactive TTY on stdin" in res_non_tty.stderr
+
+    monkeypatch.setattr("sys.stdin", _TTYInput("2\n"))
+    res_opt_out = runner.invoke(
+        cli.app, ["subject-data", "STUDY-WIZ", "SUBJ-001", "--interactive", "--no-interactive"]
+    )
+    assert res_opt_out.exit_code == 1
+    assert "Interactive prompts require an interactive TTY on stdin" in res_opt_out.stderr
 
 
 def test_extract_records_json_and_interactive_grid(
@@ -653,9 +670,13 @@ def test_extract_records_json_and_interactive_grid(
         grid_calls.append(kwargs)
         return True
 
+    class _TTYInput(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
     monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
     monkeypatch.setattr("imednet.cli.utils.grid.run_interactive_grid", fake_grid)
-    monkeypatch.setattr("sys.stdin", io.StringIO("\n\n\n"))
+    monkeypatch.setattr("sys.stdin", _TTYInput("\n\n\n"))
     res_grid = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY-1", "--interactive"])
     assert res_grid.exit_code == 0
     assert len(grid_calls) == 1

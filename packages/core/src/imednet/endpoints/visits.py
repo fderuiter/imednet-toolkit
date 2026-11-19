@@ -1,6 +1,6 @@
 """Endpoint for managing visits (interval instances) in a study."""
 
-from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
+from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.models.visits import Visit
 
 
@@ -9,12 +9,29 @@ class VisitsOperationDef:
 
     PATH = "visits"
     MODEL = Visit
-    _id_param = "visitId"
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "intervalId",
+            "intervalName",
+            "subjectId",
+            "subjectKey",
+            "startDate",
+            "endDate",
+            "dueDate",
+            "visitDate",
+            "visitDateForm",
+            "visitDateQuestion",
+            "deleted",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+        }
+    )
 
 
-class VisitsEndpoint(VisitsOperationDef, EdcSyncListGetEndpoint[Visit]):  # type: ignore[misc]
+class VisitsEndpoint(VisitsOperationDef, EdcSyncListEndpoint[Visit]):  # type: ignore[misc]
     """Synchronous endpoint for managing Visits."""
 
 
-class AsyncVisitsEndpoint(VisitsOperationDef, EdcAsyncListGetEndpoint[Visit]):  # type: ignore[misc]
+class AsyncVisitsEndpoint(VisitsOperationDef, EdcAsyncListEndpoint[Visit]):  # type: ignore[misc]
     """Asynchronous endpoint for managing Visits."""

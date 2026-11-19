@@ -654,9 +654,10 @@ def test_all_cli_list_commands_forward_full_details(
 @pytest.mark.parametrize("subcmd", ["status", "wait"])
 def test_jobs_cli_commands_forward_full_details(
     monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
     subcmd: str,
 ) -> None:
-    """jobs status and jobs wait forward the full JobStatus model via details."""
+    """jobs status and jobs wait forward details=[job] with interactive=False static output."""
     from imednet import cli
     from imednet.models.jobs import JobState, JobStatus
 
@@ -674,12 +675,19 @@ def test_jobs_cli_commands_forward_full_details(
     monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: mock_sdk)
     monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
 
-    with patch("imednet.cli.utils.grid.run_interactive_grid", return_value=True) as mock_grid:
+    with (
+        patch("imednet.cli.jobs.display_list", wraps=display_list) as spy_display,
+        patch("imednet.cli.utils.grid.run_interactive_grid", return_value=True) as mock_grid,
+    ):
         cli.app(["jobs", subcmd, "STUDY", "BATCH-1"])
-        mock_grid.assert_called_once()
-        _, kwargs = mock_grid.call_args
-        assert kwargs["label"] == "jobs"
+        spy_display.assert_called_once()
+        args, kwargs = spy_display.call_args
+        assert args[1] == "jobs"
         assert kwargs["details"] == [job]
+        assert kwargs["interactive"] is False
+        mock_grid.assert_not_called()
+        captured = capfd.readouterr()
+        assert "BATCH-1" in captured.out
 
 
 def test_enum_unwrapping_and_nested_search_indexing() -> None:

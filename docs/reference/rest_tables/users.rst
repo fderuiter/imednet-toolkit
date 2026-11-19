@@ -144,7 +144,35 @@ List users
                "lastName": "<string>",
                "email": "<string>",
                "userActiveInStudy": "<boolean>",
-               "roles": []
+               "roles": [
+                   {
+                       "dateCreated": [
+                           2026,
+                           5,
+                           13,
+                           14,
+                           6,
+                           50,
+                           612000000
+                       ],
+                       "dateModified": [
+                           2026,
+                           5,
+                           13,
+                           14,
+                           6,
+                           50,
+                           613000000
+                       ],
+                       "roleId": "<string>",
+                       "communityId": "<integer>",
+                       "name": "<string>",
+                       "description": "<string>",
+                       "level": "<integer>",
+                       "type": "<string>",
+                       "inactive": "<boolean>"
+                   }
+               ]
            },
            {
                "userId": "<string>",

@@ -34,8 +34,26 @@ _ONE_CHAR_OPS = ("<", ">", "=")
 _OP_CHARS = frozenset("<>=!~")
 
 
+NON_INTERACTIVE_ENV: str = getattr(_spi_cli, "NON_INTERACTIVE_ENV", "IMEDNET_NON_INTERACTIVE")
+OUTPUT_FORMAT_ENV: str = getattr(_spi_cli, "OUTPUT_FORMAT_ENV", "IMEDNET_CLI_OUTPUT_FORMAT")
+
+
+def _fallback_add_no_interactive(
+    parser: argparse.ArgumentParser, *, suppress_default: bool = True
+) -> None:
+    """Register ``--no-interactive`` on a parser if not already present."""
+    opts: dict[str, Any] = {
+        "action": "store_true",
+        "help": "Disable interactive terminal UI, live spinners, and stdin prompts.",
+    }
+    if suppress_default:
+        opts["default"] = argparse.SUPPRESS
+    with contextlib.suppress(argparse.ArgumentError):
+        parser.add_argument("--no-interactive", **opts)
+
+
 def _fallback_add_output_format(parser: argparse.ArgumentParser) -> None:
-    """Register ``--format {table,json}`` on a CLI leaf command parser."""
+    """Register ``--format {table,json}`` and ``--no-interactive`` on a CLI command parser."""
     parser.add_argument(
         "--format",
         dest="output_format",
@@ -43,6 +61,17 @@ def _fallback_add_output_format(parser: argparse.ArgumentParser) -> None:
         default="table",
         help="Response format: human table (default) or versioned JSON on stdout.",
     )
+    _fallback_add_no_interactive(parser)
+
+
+def _fallback_supports_interactive_stdin(stdin: Any = None) -> bool:
+    """Return True when stdin is an interactive TTY and non-interactive mode is inactive."""
+    if os.environ.get(NON_INTERACTIVE_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    target = sys.stdin if stdin is None else stdin
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        return bool(target is not None and hasattr(target, "isatty") and target.isatty())
+    return False
 
 
 def _encode_json_value(value: Any) -> Any:
@@ -396,6 +425,9 @@ def _fallback_validate_partition_key(key: str) -> None:
         raise PathTraversalValidationError(f"Invalid partition key: {key!r}")
 
 
+add_no_interactive: Callable[..., None] = getattr(
+    _spi_cli, "add_no_interactive", _fallback_add_no_interactive
+)
 add_output_format: Callable[[argparse.ArgumentParser], None] = getattr(
     _spi_cli, "add_output_format", _fallback_add_output_format
 )
@@ -409,6 +441,9 @@ format_job_progress: Callable[..., str] = getattr(
     _spi_cli, "format_job_progress", _fallback_format_job_progress
 )
 print_error: Callable[..., None] = getattr(_spi_cli, "print_error", _fallback_print_error)
+supports_interactive_stdin: Callable[..., bool] = getattr(
+    _spi_cli, "supports_interactive_stdin", _fallback_supports_interactive_stdin
+)
 parse_filter_expression: Callable[..., tuple[str, Any]] = getattr(
     _spi_utils, "parse_filter_expression", _fallback_parse_filter_expression
 )
@@ -442,8 +477,11 @@ def is_interactive_terminal() -> bool:
 
 
 __all__ = [
+    "NON_INTERACTIVE_ENV",
+    "OUTPUT_FORMAT_ENV",
     "STUDY_KEY_ARG",
     "PathTraversalValidationError",
+    "add_no_interactive",
     "add_output_format",
     "clear_line",
     "console",
@@ -455,6 +493,7 @@ __all__ = [
     "parse_filter_args",
     "parse_filter_expression",
     "print_error",
+    "supports_interactive_stdin",
     "validate_partition_key",
     "with_sdk",
 ]

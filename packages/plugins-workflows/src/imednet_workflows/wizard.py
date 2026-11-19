@@ -10,7 +10,19 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from ._spi_compat import print_error, supports_interactive_stdin
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
+
+
+def ensure_interactive_stdin(*, force_non_interactive: bool = False) -> None:
+    """Ensure interactive stdin prompts are permitted, exiting with code 1 otherwise."""
+    if force_non_interactive or not supports_interactive_stdin():
+        print_error(
+            "Error: Interactive prompts require an interactive TTY on stdin and cannot run "
+            "when stdin is piped or non-interactive mode is active. "
+            "Pass required options via CLI flags."
+        )
+        sys.exit(1)
 
 
 def print_progress(message: str) -> None:
@@ -33,8 +45,9 @@ def prompt_input(prompt_text: str, default: str | None = None) -> str:
         The stripped string provided by the user, or the default.
 
     Raises:
-        SystemExit: If end-of-file (EOF) is encountered on stdin.
+        SystemExit: If stdin is non-interactive or end-of-file (EOF) is encountered.
     """
+    ensure_interactive_stdin()
     if default is not None:
         sys.stderr.write(f"{prompt_text} [{default}]: ")
     else:
@@ -62,8 +75,9 @@ def prompt_confirm(prompt_text: str, default: bool = False) -> bool:
         True if confirmed, False otherwise.
 
     Raises:
-        SystemExit: If end-of-file (EOF) is encountered on stdin.
+        SystemExit: If stdin is non-interactive or end-of-file (EOF) is encountered.
     """
+    ensure_interactive_stdin()
     suffix = " [Y/n]: " if default else " [y/N]: "
     sys.stderr.write(f"{prompt_text}{suffix}")
     sys.stderr.flush()

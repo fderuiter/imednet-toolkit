@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import Field, RootModel
@@ -12,9 +13,16 @@ from imednet.models.base import ImednetBaseModel
 class Keyword(ImednetBaseModel):
     """A keyword or tag associated with a record."""
 
+    keyword_name: str = Field("", alias="keywordName")
+    keyword_key: str = Field("", alias="keywordKey")
+    keyword_id: int = Field(0, alias="keywordId")
+    date_added: datetime = Field(default_factory=datetime.now, alias="dateAdded")
+
 class Record(ImednetBaseModel):
     """A data record for a subject, form, and visit."""
 
+    keywords: list[Keyword] = Field(default_factory=list, alias="keywords")
+    record_data: dict[str, Any] = Field(default_factory=dict, alias="recordData")
     study_key: str | None
     interval_id: int | None
     form_id: int | None
@@ -32,9 +40,7 @@ class Record(ImednetBaseModel):
     subject_key: str | None
     visit_id: int | None
     parent_record_id: int | None
-    record_data: Any
     last_updated: str | None
-    keywords: str | None
 
 class RecordJobResponse(ImednetBaseModel):
     """Response for a record-related job (batch operations, etc)."""

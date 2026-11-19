@@ -26,7 +26,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def list_records(
-        sdk: ImednetSDK, study_key: str, output: str | None = None, output_format: str = "table"
+        sdk: ImednetSDK,
+        study_key: str,
+        output: str | None = None,
+        output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         if output and output_format == "json":
             print_error("Choose --format json for stdout or --output for a file.")
@@ -54,10 +58,19 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                         "Created": r.date_created,
                     }
                 )
-            display_list(view_models, "records", "No records found.", details=records)
+            display_list(
+                view_models,
+                "records",
+                "No records found.",
+                details=records,
+                interactive=False if no_interactive else None,
+            )
 
     list_parser.set_defaults(
         func=lambda args: list_records(
-            study_key=args.study_key, output=args.output, output_format=args.output_format
+            study_key=args.study_key,
+            output=args.output,
+            output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )
