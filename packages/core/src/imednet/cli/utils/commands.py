@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
 from imednet.cli.decorators import with_sdk
+from imednet.endpoints.registry import ENDPOINT_REGISTRY
 from imednet.sdk import ImednetSDK
 
 from .args import (
@@ -27,8 +29,15 @@ def register_list_command(
     requires_study_key: bool = True,
     empty_msg: str | None = None,
     summary_fields: list[str] | None = None,
+    model: type[Any] | None = None,
 ) -> None:
     """Attach a standard ``list`` command to parser."""
+    resolved_model = model
+    if resolved_model is None:
+        endpoint_cls = ENDPOINT_REGISTRY.get(attr)
+        if endpoint_cls is not None:
+            resolved_model = getattr(endpoint_cls, "MODEL", None)
+
     subparsers = getattr(parser, '_subparsers', None)
     if subparsers is None:
         subparsers = [
@@ -66,6 +75,7 @@ def register_list_command(
                 fetch_all=fetch_all,
                 output_format=output_format,
                 no_interactive=no_interactive,
+                model=resolved_model,
             )
             with fetching_status(name, study_key):
                 items, truncated = collect_list_items(
@@ -115,6 +125,7 @@ def register_list_command(
                 fetch_all=fetch_all,
                 output_format=output_format,
                 no_interactive=no_interactive,
+                model=resolved_model,
             )
             with fetching_status(name):
                 items, truncated = collect_list_items(
