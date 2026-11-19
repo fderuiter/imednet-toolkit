@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from typing import Any, Generic, TypeVar
+from typing import Any, TypeVar
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.context import get_study_context
+from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.job_ledger import record_study_job
 from imednet.utils.security import validate_header_value
@@ -21,7 +22,7 @@ T = TypeVar("T")
 _STUDY_PATH_RE = re.compile(r"/studies/([^/]+)/records(?:/|$)")
 
 
-class RecordCreateOperation(Generic[T]):
+class RecordCreateOperation(Operation[T]):
     """Operation for creating records.
 
     Handles validation against schema and security checks for headers

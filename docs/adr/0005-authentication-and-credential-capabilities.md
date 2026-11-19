@@ -13,7 +13,8 @@ snapshot, then environment. Explicit empty values suppress fallback and fail nor
 validation. Once resolved, OIDC takes priority over an API/security pair as before;
 select one mechanism rather than leaving an unintended environment token. CLI dotenv
 loading remains opt-in fallback to environment loading, then uses the same load_config.
-No TUI/MCP is currently shipped; future clients must use this same boundary.
+The shipped `imednet-tui` plugin shares `load_config` via `@with_sdk`; no MCP client is
+currently shipped, and future clients must use this same boundary.
 
 Offer a caller-owned MemoryCredentialStore and a read-only CredentialSource protocol.
 The source is read once when constructing a client. Overwrite/clear affects future
