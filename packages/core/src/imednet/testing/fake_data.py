@@ -7,7 +7,15 @@ from typing import Any
 
 from imednet.models.forms import Form
 from imednet.models.variables import Variable
-from imednet.validation.cache import SchemaCache
+from imednet.validation.cache import (
+    _CANONICAL_VARIABLE_TAXONOMY,
+    SchemaCache,
+    _normalize_variable_type_key,
+    _validate_bool,
+    _validate_calculation,
+    _validate_float,
+    _validate_int,
+)
 
 from .data_generator import generator as faker
 
@@ -109,13 +117,15 @@ def fake_query() -> dict[str, Any]:
 
 def _fake_value(var_type: str) -> Any:
     """Return a fake value matching ``var_type``."""
-    var_type = (var_type or "").lower()
-    if var_type in {"int", "integer", "number"}:
-        return faker.random_int(min=0, max=100)
-    if var_type in {"float", "decimal"}:
-        return faker.pyfloat(left_digits=2, right_digits=2, positive=True)
-    if var_type in {"bool", "boolean"}:
-        return faker.boolean()
+    spec = _CANONICAL_VARIABLE_TAXONOMY.get(_normalize_variable_type_key(var_type))
+    if spec is not None:
+        validator = spec[2]
+        if validator is _validate_int:
+            return faker.random_int(min=0, max=100)
+        if validator in (_validate_float, _validate_calculation):
+            return faker.pyfloat(left_digits=2, right_digits=2, positive=True)
+        if validator is _validate_bool:
+            return faker.boolean()
     return faker.word()
 
 

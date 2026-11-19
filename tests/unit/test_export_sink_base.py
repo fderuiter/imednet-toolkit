@@ -594,6 +594,86 @@ class TestApplyQualityGate:
         )
         assert retained == [valid_record, camel_dict_record]
 
+    def test_enabled_quality_gate_scores_clinical_categorical_and_memo_records_at_full_readiness(
+        self,
+    ):
+        """Assert apply_quality_gate scores categorical, memo, and precision date records at 100.0."""
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+        from imednet.validation.cache import SchemaCache, calculate_readiness_score
+
+        variables = [
+            Variable(variable_name="V_CODED", variable_type="Coded", form_id=301, form_key="F_DM"),
+            Variable(variable_name="V_RADIO", variable_type="Radio", form_id=301, form_key="F_DM"),
+            Variable(
+                variable_name="V_DROP", variable_type="Dropdown", form_id=301, form_key="F_DM"
+            ),
+            Variable(
+                variable_name="V_SINGLE",
+                variable_type="Single Select",
+                form_id=301,
+                form_key="F_DM",
+            ),
+            Variable(variable_name="V_YESNO", variable_type="Yes/No", form_id=301, form_key="F_DM"),
+            Variable(
+                variable_name="V_MULTI",
+                variable_type="Multi Select",
+                form_id=301,
+                form_key="F_DM",
+            ),
+            Variable(
+                variable_name="V_CHECK", variable_type="Checkbox", form_id=301, form_key="F_DM"
+            ),
+            Variable(variable_name="V_MEMO", variable_type="Memo", form_id=301, form_key="F_DM"),
+            Variable(
+                variable_name="V_DTP",
+                variable_type="Date/Time Precision",
+                form_id=301,
+                form_key="F_DM",
+            ),
+            Variable(variable_name="V_AGE", variable_type="Number", form_id=301, form_key="F_DM"),
+        ]
+        sdk = MagicMock()
+        sdk.get_variables.return_value = variables
+
+        valid_payload = {
+            "V_CODED": "Female",
+            "V_RADIO": 1,
+            "V_DROP": "2",
+            "V_SINGLE": 3,
+            "V_YESNO": 1,
+            "V_MULTI": ["A", 2],
+            "V_CHECK": True,
+            "V_MEMO": "Baseline demographics verified.",
+            "V_DTP": "2026-01",
+            "V_AGE": 45,
+        }
+        cache = SchemaCache()
+        cache.populate(variables)
+        score, reasons = calculate_readiness_score(cache, "F_DM", valid_payload)
+        assert score == pytest.approx(100.0)
+        assert reasons == []
+
+        valid_rec = Record(
+            record_id=601,
+            form_id=301,
+            form_key="F_DM",
+            record_data=valid_payload,
+        )
+        bool_on_num_rec = Record(
+            record_id=602,
+            form_id=301,
+            form_key="F_DM",
+            record_data={**valid_payload, "V_AGE": True},
+        )
+        cfg = SinkConfig(
+            study_key="STUDY", quality_gate_enabled=True, min_schema_readiness_score=100.0
+        )
+        retained = list(
+            sink_base_mod.apply_quality_gate(sdk, "STUDY", [valid_rec, bool_on_num_rec], cfg)
+        )
+        assert retained == [valid_rec]
+
 
 class TestSpiSinks:
     """Test suite for imednet.spi.sinks re-exports and namespace modules."""

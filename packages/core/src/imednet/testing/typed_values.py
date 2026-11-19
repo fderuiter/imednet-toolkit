@@ -7,44 +7,25 @@ from __future__ import annotations
 
 from typing import Any
 
-# Maps variable type synonyms to example values.
-_TYPED_VALUES: dict[str, Any] = {
-    "string": "example",
-    "text": "example",
-    "memo": "example memo",
-    "date": "2024-01-01",
-    "number": 1,
-    "int": 1,
-    "integer": 1,
-    "float": 1.0,
-    "decimal": 1.0,
-    "radio": "1",
-    "dropdown": "1",
-    "checkbox": True,
-}
+from imednet.validation.cache import (
+    _CANONICAL_VARIABLE_TAXONOMY,
+    _normalize_variable_type_key,
+)
 
-# Maps variable type synonyms to canonical categories.
+# Maps normalized variable type synonyms to deterministic example values.
+_TYPED_VALUES: dict[str, Any] = {key: spec[1] for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items()}
+
+# Maps normalized variable type synonyms to canonical categories.
 _CANONICAL_TYPES: dict[str, str] = {
-    "string": "string",
-    "text": "string",
-    "memo": "memo",
-    "date": "date",
-    "number": "number",
-    "int": "number",
-    "integer": "number",
-    "float": "number",
-    "decimal": "number",
-    "radio": "radio",
-    "dropdown": "dropdown",
-    "checkbox": "checkbox",
+    key: spec[0] for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items()
 }
 
 
 def canonical_type(var_type: str) -> str | None:
     """Return the canonical type for ``var_type`` or ``None`` if unsupported."""
-    return _CANONICAL_TYPES.get((var_type or "").lower())
+    return _CANONICAL_TYPES.get(_normalize_variable_type_key(var_type))
 
 
 def value_for(var_type: str) -> Any | None:
     """Return a deterministic example value for ``var_type`` if supported."""
-    return _TYPED_VALUES.get((var_type or "").lower())
+    return _TYPED_VALUES.get(_normalize_variable_type_key(var_type))
