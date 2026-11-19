@@ -1,3 +1,4 @@
+# pylint: disable=duplicate-code
 """Models for subject visits and study events."""
 
 from __future__ import annotations
@@ -31,3 +32,5 @@ class Visit(ImednetBaseModel):
     @model_validator(mode="before")
     @classmethod
     def _clean_empty_dates(cls, data: Any) -> Any: ...
+
+__all__ = ["Visit"]

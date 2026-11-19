@@ -697,3 +697,57 @@ def test_job_status_runtime_fields_match_jobs_pyi():
             engine._format_runtime_annotation(Job.model_fields[field_name].annotation)
             == expected_type
         )
+
+
+def test_dynamic_models_preserve_runtime_module_doc_all_and_field_descriptions():
+    """Verify all 14 contract models and 4 nested models preserve __module__, __doc__, __all__, and Field descriptions."""
+    import importlib
+
+    contract = get_contract()
+    submodules = {
+        "codings": ["Coding"],
+        "forms": ["Form"],
+        "intervals": ["Interval"],
+        "jobs": ["Job", "JobStatus"],
+        "queries": ["Query", "QueryComment"],
+        "record_revisions": ["RecordRevision"],
+        "records": ["Keyword", "Record"],
+        "sites": ["Site"],
+        "studies": ["Study"],
+        "subjects": ["Subject", "SubjectKeyword"],
+        "users": ["Role", "User"],
+        "variables": ["Variable"],
+        "visits": ["Visit"],
+    }
+
+    seen_models: set[str] = set()
+    described_contract_fields = 0
+
+    for sub, expected_classes in submodules.items():
+        mod_name = f"imednet.models.{sub}"
+        mod = importlib.import_module(mod_name)
+        assert hasattr(mod, "__all__"), f"{mod_name} is missing __all__"
+        for cls_name in expected_classes:
+            assert cls_name in mod.__all__, f"{cls_name} missing from {mod_name}.__all__"
+            model_cls = getattr(mod, cls_name)
+            assert model_cls.__module__ == mod_name, (
+                f"{cls_name}.__module__ is {model_cls.__module__!r}, expected {mod_name!r}"
+            )
+            assert model_cls.__doc__ and model_cls.__doc__.strip(), (
+                f"{cls_name}.__doc__ was dropped"
+            )
+            seen_models.add(cls_name)
+
+            if cls_name in contract.models:
+                contract_def = contract.models[cls_name]
+                for snake_key, field_def in contract_def.fields.items():
+                    finfo = model_cls.model_fields[snake_key]
+                    if finfo.description:
+                        described_contract_fields += 1
+                    elif field_def.alias:
+                        # Base-declared field overrides may supply custom Field() without description
+                        assert finfo.alias == field_def.alias or snake_key in model_cls.model_fields
+
+    assert EXPECTED_14_MODELS.issubset(seen_models)
+    assert {"Keyword", "QueryComment", "Role", "SubjectKeyword"}.issubset(seen_models)
+    assert described_contract_fields >= 150

@@ -27,3 +27,5 @@ class Form(ImednetBaseModel):
     other_forms: bool | None
     user_agreement: bool | None
     last_updated: str | None
+
+__all__ = ["Form"]

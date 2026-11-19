@@ -104,6 +104,21 @@ def build_and_stage_wheels(
     return staged
 
 
+SCOPED_INHERITED_MEMBERS = "BaseModel, RootModel, Enum, str, int, Exception, BaseException, object"
+
+
+def scope_apidoc_inherited_members(api_dir: Path) -> None:
+    """Scope :inherited-members: directives in generated apidoc RST files."""
+    for rst_file in sorted(api_dir.glob("*.rst")):
+        content = rst_file.read_text(encoding="utf-8")
+        updated = content.replace(
+            "   :inherited-members:\n",
+            f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n",
+        )
+        if updated != content:
+            rst_file.write_text(updated, encoding="utf-8")
+
+
 def main() -> None:
     api_dir = Path("docs/reference/api")
 
@@ -113,7 +128,7 @@ def main() -> None:
 
     print("Generating new API docs...")
     env = os.environ.copy()
-    env["SPHINX_APIDOC_OPTIONS"] = "members,show-inheritance"
+    env["SPHINX_APIDOC_OPTIONS"] = "inherited-members,members,show-inheritance"
 
     # Core package
     run_command(
@@ -122,7 +137,6 @@ def main() -> None:
             "-o",
             str(api_dir),
             "packages/core/src/imednet",
-            "packages/core/src/imednet/core",
             "packages/core/src/imednet/http",
             "-f",
             "-M",
@@ -134,11 +148,11 @@ def main() -> None:
 
     # Other packages
     packages_dir = Path("packages")
-    for pkg in packages_dir.iterdir():
+    for pkg in sorted(packages_dir.iterdir()):
         if pkg.is_dir() and pkg.name != "core":
             src_dir = pkg / "src"
             if src_dir.exists():
-                subdirs = [d for d in src_dir.iterdir() if d.is_dir()]
+                subdirs = sorted(d for d in src_dir.iterdir() if d.is_dir())
                 if subdirs:
                     target_dir = subdirs[0]
                     run_command(
@@ -154,6 +168,8 @@ def main() -> None:
                         ],
                         env=env,
                     )
+
+    scope_apidoc_inherited_members(api_dir)
 
     print("Generating ADR index...")
     generate_adr_index()
@@ -172,9 +188,6 @@ def main() -> None:
 
     print("Type-checking documentation snippets...")
     run_command([sys.executable, "scripts/typecheck_docs.py"])
-
-    print("Validating documentation...")
-    run_command([sys.executable, "scripts/validate_docs.py"])
 
     print("Running doctests...")
     run_command(
@@ -209,7 +222,7 @@ def main() -> None:
                 shutil.copy2(whl, target_whl)
         shutil.rmtree(static_wheels_dir, ignore_errors=True)
 
-    print("Validating rendered HTML SEO and Pages artifacts...")
+    print("Validating documentation, rendered API reference, and SEO artifacts...")
     run_command([sys.executable, "scripts/validate_docs.py", "--require-html"])
 
 

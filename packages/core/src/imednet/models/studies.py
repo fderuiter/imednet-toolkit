@@ -11,3 +11,5 @@ class Study(ImednetBaseModel):
 
 
 Study = ModelEngine.get_model('Study', Study)
+
+__all__ = ["Study"]

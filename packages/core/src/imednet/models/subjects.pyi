@@ -89,3 +89,13 @@ class Subject(ImednetBaseModel):
     def transition_to(self, target_status: SubjectStatus | str) -> SubjectStatus | str: ...
     def update_status(self, target_status: SubjectStatus | str) -> SubjectStatus | str: ...
     def __setattr__(self, name: str, value: Any) -> None: ...
+
+__all__ = [
+    "ALLOWED_SUBJECT_TRANSITIONS",
+    "Subject",
+    "SubjectKeyword",
+    "SubjectStatus",
+    "is_valid_subject_transition",
+    "normalize_subject_status",
+    "validate_subject_transition",
+]

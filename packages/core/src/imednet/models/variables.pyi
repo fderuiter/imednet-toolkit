@@ -26,3 +26,5 @@ class Variable(ImednetBaseModel):
     deleted: bool | None
     disabled: bool | None
     last_updated: str | None
+
+__all__ = ["Variable"]
