@@ -963,13 +963,18 @@ class TestSnowflakeExportSink:
         calls = [c.args[0] for c in cursor.execute.call_args_list if c.args]
         put_call = next(c for c in calls if "PUT" in c)
         copy_call = next(c for c in calls if "COPY INTO" in c)
+        merge_call = next(c for c in calls if "MERGE INTO" in c)
 
-        # Stage path in PUT should be quoted
+        # Stage path in PUT should be quoted and overwrite existing staged files
         assert "'@STG/imednet/'" in put_call
-        # Database identifiers and stage path in COPY INTO should be safely quoted
-        assert 'COPY INTO "DB"."PUBLIC"."TBL"' in copy_call
+        assert "OVERWRITE = TRUE" in put_call
+        # Database identifiers and stage path in COPY INTO and MERGE INTO should be safely quoted
+        assert 'COPY INTO "DB"."PUBLIC"."TBL__imednet_stage"' in copy_call
         assert "FROM '@STG/imednet/STUDY_FORM_0.parquet'" in copy_call
         assert "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE" in copy_call
+        assert "FORCE = TRUE" in copy_call
+        assert 'MERGE INTO "DB"."PUBLIC"."TBL" AS target' in merge_call
+        assert 'SELECT * FROM "DB"."PUBLIC"."TBL__imednet_stage"' in merge_call
         sink.close()
 
     def test_write_batch_handles_non_standard_casing(self, monkeypatch, tmp_path):
@@ -1008,11 +1013,304 @@ class TestSnowflakeExportSink:
 
         calls = [c.args[0] for c in cursor.execute.call_args_list if c.args]
         copy_call = next(c for c in calls if "COPY INTO" in c)
+        merge_call = next(c for c in calls if "MERGE INTO" in c)
 
-        assert 'COPY INTO "clinical_db"."study_schema"."SubjectRecords_v1"' in copy_call
+        assert (
+            'COPY INTO "clinical_db"."study_schema"."SubjectRecords_v1__imednet_stage"' in copy_call
+        )
         assert "FROM '@my_stage/imednet/staging/study1_subj_1.parquet'" in copy_call
         assert "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE" in copy_call
+        assert 'MERGE INTO "clinical_db"."study_schema"."SubjectRecords_v1" AS target' in merge_call
         sink.close()
+
+    def test_unmocked_pyarrow_mixed_forms_preserve_metadata_and_apply_phi_and_enrichment(
+        self, tmp_path
+    ):
+        """Convert mixed-Form Record batches with int/string Variable collisions using real PyArrow without ArrowInvalid."""
+        import json
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from imednet_sinks.warehouse import _post_process_warehouse, _records_to_arrow_table
+
+        from imednet.integrations.enrichment import CentralizedMapper, EnrichmentPipeline
+        from imednet.models.records import Record
+        from imednet.models.study_config import MappingRule, StudyConfiguration
+
+        records = [
+            Record(
+                record_id=101,
+                subject_id=11,
+                subject_key="SUBJ-01",
+                visit_id=1,
+                form_id=10,
+                form_key="VITALS",
+                interval_id=5,
+                record_status="Complete",
+                deleted=False,
+                date_created="2026-01-01T00:00:00Z",
+                date_modified="2026-01-02T00:00:00Z",
+                keywords="urgent,baseline",
+                record_data={
+                    "lab_value": 42,
+                    "assessment": {"grade": 1},
+                    "arm_code": "A",
+                    "patient_name": "Jane Doe",
+                },
+            ),
+            Record(
+                record_id=102,
+                subject_id=12,
+                subject_key="SUBJ-02",
+                visit_id=2,
+                form_id=20,
+                form_key="LABS",
+                interval_id=6,
+                record_status="In Progress",
+                deleted=False,
+                date_created="2026-01-03T00:00:00Z",
+                date_modified="2026-01-04T00:00:00Z",
+                keywords=None,
+                record_data={
+                    "lab_value": "below_detection_limit",
+                    "assessment": "not_done",
+                    "arm_code": "B",
+                    "ssn": "123-45-6789",
+                },
+            ),
+            {
+                "record_id": 103,
+                "subject_id": 13,
+                "subject_key": "SUBJ-03",
+                "visit_id": 3,
+                "form_id": 30,
+                "form_key": "AE",
+                "record_status": "Complete",
+                "keywords": [{"keyword_name": "serious", "keyword_id": 9}],
+                "record_data": {
+                    "lab_value": [1.5, 2.5],
+                    "arm_code": "A",
+                },
+            },
+        ]
+
+        study_cfg = StudyConfiguration(
+            studyKey="STUDY_HETERO",
+            terminologyLookups={"arm_code": {"A": "Active", "B": "Placebo"}},
+            mappings=[
+                MappingRule(
+                    domain="DM",
+                    targetField="treatment_arm",
+                    sourceFormKey="VITALS",
+                    sourceVariableName="arm_code",
+                )
+            ],
+        )
+        pipeline = EnrichmentPipeline(study_cfg)
+        mapper = CentralizedMapper(mode="document", post_processor=_post_process_warehouse)
+        mapper._pipeline_cache["STUDY_HETERO"] = pipeline
+
+        arrow_table = _records_to_arrow_table(
+            records,
+            study_key="STUDY_HETERO",
+            mapper=mapper,
+        )
+        assert isinstance(arrow_table, pa.Table)
+        assert arrow_table.num_rows == 3
+        assert pa.types.is_string(
+            arrow_table.schema.field("record_data").type
+        ) or pa.types.is_large_string(arrow_table.schema.field("record_data").type)
+
+        parquet_path = tmp_path / "heterogeneous_batch.parquet"
+        pq.write_table(arrow_table, str(parquet_path))
+        reloaded = pq.read_table(str(parquet_path)).to_pylist()
+
+        assert reloaded[0]["study_key"] == "STUDY_HETERO"
+        assert reloaded[0]["record_id"] == 101
+        assert reloaded[0]["subject_key"] == "SUBJ-01"
+        assert reloaded[0]["form_key"] == "VITALS"
+        assert reloaded[0]["keywords"] == "urgent,baseline"
+        payload_0 = json.loads(reloaded[0]["record_data"])
+        assert payload_0["lab_value"] == 42
+        assert payload_0["assessment"] == {"grade": 1}
+        assert payload_0["treatment_arm"] == "Active"
+        assert payload_0["patient_name"] == "***MASKED***"
+
+        assert reloaded[1]["study_key"] == "STUDY_HETERO"
+        assert reloaded[1]["record_id"] == 102
+        assert reloaded[1]["subject_key"] == "SUBJ-02"
+        assert reloaded[1]["form_key"] == "LABS"
+        payload_1 = json.loads(reloaded[1]["record_data"])
+        assert payload_1["lab_value"] == "below_detection_limit"
+        assert payload_1["assessment"] == "not_done"
+        assert payload_1["treatment_arm"] == "Placebo"
+        assert payload_1["ssn"] == "***MASKED***"
+
+        assert reloaded[2]["record_id"] == 103
+        assert json.loads(reloaded[2]["keywords"]) == [{"keyword_name": "serious", "keyword_id": 9}]
+        payload_2 = json.loads(reloaded[2]["record_data"])
+        assert payload_2["lab_value"] == [1.5, 2.5]
+        assert payload_2["treatment_arm"] == "Active"
+
+    def test_write_batch_idempotent_merges_and_deduplicates_scheduled_reruns(
+        self, monkeypatch, tmp_path
+    ):
+        """Verify idempotent write_batch overwrites staged Parquet and merges by (study_key, record_id) without duplicating rows."""
+        import json
+
+        import imednet_sinks.warehouse as wh_mod
+        import pyarrow.parquet as pq
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        from imednet.models.records import Record
+
+        sf, conn, cursor = _fake_snowflake_module()
+        orig_require = wh_mod._require_optional_dep
+
+        def require_with_real_pyarrow(pkg, extras):
+            if pkg == "snowflake.connector":
+                return sf
+            return orig_require(pkg, extras)
+
+        monkeypatch.setattr(wh_mod, "_require_optional_dep", require_with_real_pyarrow)
+
+        # Simulate Snowflake target table and staging table across scheduled re-runs
+        warehouse_store: dict[tuple[str, int], dict[str, object]] = {}
+        staged_rows: list[dict[str, object]] = []
+        last_staged_parquet: list[str] = []
+
+        def fake_execute(sql: str):
+            nonlocal staged_rows
+            if sql.startswith("PUT file://"):
+                assert "OVERWRITE = TRUE" in sql
+                local_file = sql.split("PUT file://", 1)[1].split(" ", 1)[0]
+                last_staged_parquet.append(local_file)
+                staged_rows = pq.read_table(local_file).to_pylist()
+                cursor.fetchall.return_value = []
+            elif sql.startswith("MERGE INTO"):
+                assert (
+                    "ON target.study_key = source.study_key AND target.record_id = source.record_id"
+                    in sql
+                )
+                assert "WHEN MATCHED THEN UPDATE SET" in sql
+                assert "WHEN NOT MATCHED THEN INSERT" in sql
+                for row in staged_rows:
+                    key = (str(row["study_key"]), int(row["record_id"]))
+                    warehouse_store[key] = dict(row)
+                cursor.fetchall.return_value = []
+            else:
+                cursor.fetchall.return_value = []
+
+        cursor.execute.side_effect = fake_execute
+
+        cfg = SnowflakeSinkConfig(
+            study_key="STUDY_MERGE",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="RECORDS",
+            local_staging_dir=str(tmp_path),
+            idempotent=True,
+        )
+
+        first_run = [
+            Record(
+                record_id=1,
+                form_id=10,
+                form_key="F1",
+                subject_key="S1",
+                record_status="Incomplete",
+                record_data={"score": 10},
+            ),
+            Record(
+                record_id=2,
+                form_id=20,
+                form_key="F2",
+                subject_key="S2",
+                record_status="Complete",
+                record_data={"score": "pending"},
+            ),
+        ]
+        second_run = [
+            Record(
+                record_id=1,
+                form_id=10,
+                form_key="F1",
+                subject_key="S1",
+                record_status="Complete",
+                record_data={"score": 99},
+            ),
+            Record(
+                record_id=3,
+                form_id=20,
+                form_key="F2",
+                subject_key="S3",
+                record_status="Complete",
+                record_data={"score": "final"},
+            ),
+        ]
+
+        with SnowflakeExportSink(config=cfg) as sink:
+            assert sink.write_batch(first_run, batch_id="STUDY_MERGE/batch/0") == 2
+            assert sink.write_batch(second_run, batch_id="STUDY_MERGE/batch/0") == 2
+
+        assert len(warehouse_store) == 3
+        assert warehouse_store[("STUDY_MERGE", 1)]["record_status"] == "Complete"
+        assert json.loads(str(warehouse_store[("STUDY_MERGE", 1)]["record_data"])) == {"score": 99}
+        assert json.loads(str(warehouse_store[("STUDY_MERGE", 2)]["record_data"])) == {
+            "score": "pending"
+        }
+        assert json.loads(str(warehouse_store[("STUDY_MERGE", 3)]["record_data"])) == {
+            "score": "final"
+        }
+
+    def test_write_batch_non_idempotent_uses_direct_copy_into_force_true(
+        self, monkeypatch, tmp_path
+    ):
+        """Verify idempotent=False overwrites staged file via PUT and executes direct COPY INTO with FORCE = TRUE."""
+        import imednet_sinks.warehouse as wh_mod
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        sf, conn, cursor = _fake_snowflake_module()
+        pa, pq, _table = _fake_pyarrow_modules()
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: (
+                sf if pkg == "snowflake.connector" else (pq if "parquet" in pkg else pa)
+            ),
+        )
+
+        cfg = SnowflakeSinkConfig(
+            study_key="STUDY1",
+            account="acct",
+            user="user",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="TBL",
+            local_staging_dir=str(tmp_path),
+            idempotent=False,
+        )
+        with SnowflakeExportSink(config=cfg) as sink:
+            sink.write_batch(
+                [MagicMock(record_id=1, form_id=1, visit_id=1, subject_key="S", record_data={})],
+                batch_id="STUDY1/batch/0",
+            )
+
+        calls = [c.args[0] for c in cursor.execute.call_args_list if c.args]
+        put_call = next(c for c in calls if "PUT" in c)
+        copy_call = next(c for c in calls if "COPY INTO" in c)
+        assert "OVERWRITE = TRUE" in put_call
+        assert 'COPY INTO "DB"."PUBLIC"."TBL"' in copy_call
+        assert "FORCE = TRUE" in copy_call
+        assert not any("MERGE INTO" in c for c in calls)
 
 
 def test_plugin_namespace():

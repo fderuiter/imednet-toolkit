@@ -7,7 +7,7 @@ data using configured mappings, terminology lookups, and PHI masking rules.
 import functools
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -54,6 +54,10 @@ class CentralizedMapper:
             CentralizedMapper._cached_fields = pairs
             CentralizedMapper._cached_field_pairs = pairs
 
+    def register_pipeline(self, study_key: str, pipeline: Any) -> None:
+        """Register an explicit enrichment pipeline for *study_key*."""
+        self._pipeline_cache[study_key] = pipeline
+
     def map_record(self, record: Any, study_key: str | None = None) -> dict[str, Any]:
         """Map a clinical record to the unified destination format."""
         fields = self._cached_fields
@@ -62,9 +66,15 @@ class CentralizedMapper:
             CentralizedMapper._cached_fields = fields
             CentralizedMapper._cached_field_pairs = fields
 
+        is_mapping = isinstance(record, Mapping)
         mapped = {}
         for f, snake_key in fields:
-            val = getattr(record, f, None)
+            if is_mapping:
+                val = record.get(f)
+                if val is None and snake_key != f:
+                    val = record.get(snake_key)
+            else:
+                val = getattr(record, f, None)
 
             if f == "record_data":
                 val = dict(val or {})
@@ -76,11 +86,17 @@ class CentralizedMapper:
                 mapped[snake_key] = val
 
         # Mandatory Metadata Injection
-        mapped['deleted'] = getattr(record, 'deleted', False)
+        mapped['deleted'] = (
+            record.get('deleted', False) if is_mapping else getattr(record, 'deleted', False)
+        )
         if mapped['deleted'] is None:
             mapped['deleted'] = False
 
-        date_mod = getattr(record, 'date_modified', None)
+        date_mod = (
+            record.get('date_modified') or record.get('dateModified')
+            if is_mapping
+            else getattr(record, 'date_modified', None)
+        )
         if date_mod is None:
             date_mod = datetime.now(tz=UTC).isoformat()
         mapped['date_modified'] = date_mod
@@ -88,7 +104,11 @@ class CentralizedMapper:
         if study_key is not None:
             mapped['study_key'] = study_key
         elif 'study_key' not in mapped or not mapped['study_key']:
-            mapped['study_key'] = getattr(record, 'study_key', None)
+            mapped['study_key'] = (
+                record.get('study_key') or record.get('studyKey')
+                if is_mapping
+                else getattr(record, 'study_key', None)
+            )
 
         sk = mapped.get('study_key') or "UNKNOWN"
         if sk not in self._pipeline_cache:

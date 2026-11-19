@@ -188,6 +188,23 @@ def main():
                 "smoke": [{"cmd": "import pymongo"}],
             },
             {
+                "name": "sinks-snowflake",
+                "install": ["imednet-plugins-sinks[snowflake]"],
+                "smoke": [
+                    {"cmd": "import snowflake.connector"},
+                    {"cmd": "import pyarrow"},
+                ],
+            },
+            {
+                "name": "core-snowflake",
+                "install": ["imednet[snowflake]"],
+                "smoke": [
+                    {"cmd": "import snowflake.connector"},
+                    {"cmd": "import pyarrow"},
+                    {"cmd": "import imednet_sinks.warehouse"},
+                ],
+            },
+            {
                 "name": "core-export-extra",
                 "install": ["imednet[export]"],
                 "smoke": [
