@@ -9,15 +9,28 @@ import pytest
 from faker import Faker
 from pydantic import BaseModel, Field, ValidationError
 
+from imednet.models.codings import Coding
+from imednet.models.intervals import Interval
 from imednet.models.records import Record
 from imednet.models.reporting import (
     AdverseEvent,
+    ConcomitantMedication,
+    Demographics,
     DeviceDeficiency,
+    Disposition,
+    EcgResult,
+    Exposure,
+    InclusionExclusion,
+    LaboratoryResult,
+    MedicalHistory,
+    PhysicalExam,
     ProtocolDeviation,
     VitalSigns,
 )
 from imednet.models.variables import Variable
+from imednet.models.visits import Visit
 from imednet_workflows.record_mapper import (
+    SDTM_DOMAIN_SPECS,
     RecordMapper,
     _get_model_field_aliases,
     _normalize_key,
@@ -552,7 +565,7 @@ def test_record_mapper_sdtm_ae_domain() -> None:
     # Row 1 assertions
     assert df.iloc[0]["STUDYID"] == "STUDY_ONCO_01"
     assert df.iloc[0]["DOMAIN"] == "AE"
-    assert df.iloc[0]["USUBJID"] == "SUBJ-001"
+    assert df.iloc[0]["USUBJID"] == "STUDY_ONCO_01-SUBJ-001"
     assert df.iloc[0]["AESEQ"] == 1
     assert df.iloc[0]["AETERM"] == "Headache"
     assert df.iloc[0]["AESEV"] == "MILD"
@@ -591,7 +604,7 @@ def test_record_mapper_dataframe_mode_as_sdtm() -> None:
     df = mapper.dataframe(study_key="STUDY_TEST", as_sdtm=True, domain="AE")
 
     assert df.iloc[0]["STUDYID"] == "STUDY_TEST"
-    assert df.iloc[0]["USUBJID"] == "SUBJ-002"
+    assert df.iloc[0]["USUBJID"] == "STUDY_TEST-SUBJ-002"
     assert df.iloc[0]["AETERM"] == "Dizziness"
     assert df.iloc[0]["AESEV"] == "MODERATE"
     assert df.iloc[0]["AESER"] == "N"
@@ -614,7 +627,7 @@ def test_record_mapper_reporting_models_transformation() -> None:
     )
     df_ae = transform_records_to_sdtm([ae], domain="AE", study_key="STUDY_REP_01")
     assert df_ae.iloc[0]["STUDYID"] == "STUDY_REP_01"
-    assert df_ae.iloc[0]["USUBJID"] == "SUBJ-AE-10"
+    assert df_ae.iloc[0]["USUBJID"] == "STUDY_REP_01-SUBJ-AE-10"
     assert df_ae.iloc[0]["DOMAIN"] == "AE"
     assert df_ae.iloc[0]["AETERM"] == "Rash"
     assert df_ae.iloc[0]["AEDECOD"] == "Dermatitis"
@@ -649,7 +662,7 @@ def test_record_mapper_reporting_models_transformation() -> None:
     )
     df_pd = transform_records_to_sdtm([pd_item], domain="DV", study_key="STUDY_REP_01")
     assert df_pd.iloc[0]["STUDYID"] == "STUDY_REP_01"
-    assert df_pd.iloc[0]["USUBJID"] == "SUBJ-PD-20"
+    assert df_pd.iloc[0]["USUBJID"] == "STUDY_REP_01-SUBJ-PD-20"
     assert df_pd.iloc[0]["DOMAIN"] == "DV"
     assert df_pd.iloc[0]["DVTERM"] == "Eligibility criteria violation"
     assert df_pd.iloc[0]["DVCAT"] == "ELIGIBILITY"
@@ -683,7 +696,7 @@ def test_record_mapper_reporting_models_transformation() -> None:
     )
     df_dd = transform_records_to_sdtm([dd_item], domain="DD", study_key="STUDY_REP_01")
     assert df_dd.iloc[0]["STUDYID"] == "STUDY_REP_01"
-    assert df_dd.iloc[0]["USUBJID"] == "SUBJ-DD-30"
+    assert df_dd.iloc[0]["USUBJID"] == "STUDY_REP_01-SUBJ-DD-30"
     assert df_dd.iloc[0]["DOMAIN"] == "DD"
     assert df_dd.iloc[0]["DDTERM"] == "Software freeze"
     assert df_dd.iloc[0]["DDCAT"] == "SOFTWARE"
@@ -719,7 +732,7 @@ def test_record_mapper_concomitant_medications_domain() -> None:
     df_cm = transform_records_to_sdtm(raw_records, domain="CM", study_key="STUDY_CM_01")
     assert df_cm.iloc[0]["STUDYID"] == "STUDY_CM_01"
     assert df_cm.iloc[0]["DOMAIN"] == "CM"
-    assert df_cm.iloc[0]["USUBJID"] == "SUBJ-CM-01"
+    assert df_cm.iloc[0]["USUBJID"] == "STUDY_CM_01-SUBJ-CM-01"
     assert df_cm.iloc[0]["CMSEQ"] == 1
     assert df_cm.iloc[0]["CMTRT"] == "Aspirin"
     assert df_cm.iloc[0]["CMDECOD"] == "Acetylsalicylic acid"
@@ -745,7 +758,7 @@ def test_record_mapper_vital_signs_domain() -> None:
     df_model = transform_records_to_sdtm([vs_item], domain="VS", study_key="STUDY_VS_01")
     assert df_model.iloc[0]["STUDYID"] == "STUDY_VS_01"
     assert df_model.iloc[0]["DOMAIN"] == "VS"
-    assert df_model.iloc[0]["USUBJID"] == "SUBJ-VS-01"
+    assert df_model.iloc[0]["USUBJID"] == "STUDY_VS_01-SUBJ-VS-01"
     assert df_model.iloc[0]["VSSEQ"] == 1
     assert df_model.iloc[0]["VSTESTCD"] == "DIABP"
     assert df_model.iloc[0]["VSTEST"] == "Diastolic Blood Pressure"
@@ -778,7 +791,7 @@ def test_record_mapper_vital_signs_domain() -> None:
     df_raw = transform_records_to_sdtm(raw_records, domain="VS", study_key="STUDY_VS_01")
     assert df_raw.iloc[0]["STUDYID"] == "STUDY_VS_01"
     assert df_raw.iloc[0]["DOMAIN"] == "VS"
-    assert df_raw.iloc[0]["USUBJID"] == "SUBJ-VS-02"
+    assert df_raw.iloc[0]["USUBJID"] == "STUDY_VS_01-SUBJ-VS-02"
     assert df_raw.iloc[0]["VSSEQ"] == 1
     assert df_raw.iloc[0]["VSTESTCD"] == "SYSBP"
     assert df_raw.iloc[0]["VSTEST"] == "Systolic Blood Pressure"
@@ -794,7 +807,7 @@ def test_record_mapper_vital_signs_domain() -> None:
         vsDate=datetime(2026, 3, 12, 8, 40),
     )
     df_partial = transform_records_to_sdtm([vs_partial], domain="VS", study_key="STUDY_VS_01")
-    assert df_partial.iloc[0]["USUBJID"] == "SUBJ-VS-03"
+    assert df_partial.iloc[0]["USUBJID"] == "STUDY_VS_01-SUBJ-VS-03"
     assert df_partial.iloc[0]["VSTEST"] == "Heart Rate"
     assert df_partial.iloc[0]["VSTESTCD"] is None
     assert df_partial.iloc[0]["VSORRESU"] is None
@@ -965,7 +978,7 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         customExtra="keep_this",
     )
     df_alias = transform_records_to_sdtm([rec_alias], domain="AE", study_key="STUDY01")
-    assert df_alias.iloc[0]["USUBJID"] == "S100"
+    assert df_alias.iloc[0]["USUBJID"] == "STUDY01-S100"
     assert df_alias.iloc[0]["AETERM"] == "Headache"
     assert df_alias.iloc[0]["AESEV"] == "MILD"
     assert df_alias.iloc[0]["AESTDTC"] == "2026-05-01T10:00:00"
@@ -997,7 +1010,7 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         extra_metric=99.1,
     )
     df_serialized = transform_records_to_sdtm([rec_serialized], domain="AE", study_key="STUDY01")
-    assert df_serialized.iloc[0]["USUBJID"] == "S200"
+    assert df_serialized.iloc[0]["USUBJID"] == "STUDY01-S200"
     assert df_serialized.iloc[0]["AETERM"] == "Dizziness"
     assert df_serialized.iloc[0]["AESEV"] == "MODERATE"
     assert df_serialized.iloc[0]["extra_metric"] == 99.1
@@ -1020,7 +1033,7 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         aeStartDate=datetime(2026, 4, 1, 12, 0),
     )
     df_sdk = transform_records_to_sdtm([ae_sdk], domain="AE", study_key="STUDY01")
-    assert df_sdk.iloc[0]["USUBJID"] == "SUBJ-SDK"
+    assert df_sdk.iloc[0]["USUBJID"] == "STUDY01-SUBJ-SDK"
     assert df_sdk.iloc[0]["AETERM"] == "Fever"
     assert df_sdk.iloc[0]["AESEV"] == "SEVERE"
     assert df_sdk.iloc[0]["AESER"] == "Y"
@@ -1045,7 +1058,7 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         "extra_note": "Post-dose",
     }
     df_dict_camel = transform_records_to_sdtm([dict_camel], domain="AE", study_key="STUDY01")
-    assert df_dict_camel.iloc[0]["USUBJID"] == "DICT-01"
+    assert df_dict_camel.iloc[0]["USUBJID"] == "STUDY01-DICT-01"
     assert df_dict_camel.iloc[0]["AETERM"] == "Nausea"
     assert df_dict_camel.iloc[0]["AESEV"] == "MILD"
     assert df_dict_camel.iloc[0]["extra_note"] == "Post-dose"
@@ -1061,7 +1074,7 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         "unmapped_val": 42,
     }
     df_dict_snake = transform_records_to_sdtm([dict_snake], domain="AE", study_key="STUDY01")
-    assert df_dict_snake.iloc[0]["USUBJID"] == "DICT-02"
+    assert df_dict_snake.iloc[0]["USUBJID"] == "STUDY01-DICT-02"
     assert df_dict_snake.iloc[0]["AETERM"] == "Cough"
     assert df_dict_snake.iloc[0]["AESEV"] == "MILD"
     assert df_dict_snake.iloc[0]["unmapped_val"] == 42
@@ -1113,7 +1126,7 @@ def test_sdtm_transformation_large_batch_benchmark() -> None:
     assert "extra_score" in df.columns
 
     # Verify first row transformations
-    assert df.iloc[0]["USUBJID"] == "SUBJ-0"
+    assert df.iloc[0]["USUBJID"] == "STUDY01-SUBJ-0"
     assert df.iloc[0]["AETERM"] == "Headache"
     assert df.iloc[0]["AESEV"] == "MILD"
     assert df.iloc[0]["AESTDTC"] == "2026-01-15T09:30:00"
@@ -1128,3 +1141,443 @@ def test_sdtm_transformation_large_batch_benchmark() -> None:
 
     # Assert processing time is well under threshold (typically ~0.4-0.6s for 5,000 records)
     assert elapsed < 2.5
+
+
+def test_all_thirteen_sdtm_domains_and_dmseq_omission() -> None:
+    """Verify transform_records_to_sdtm and sdtm_dataframe map all 13 domains and omit DMSEQ on DM."""
+    expected_domains = {
+        "AE",
+        "DV",
+        "DD",
+        "CM",
+        "DM",
+        "VS",
+        "LB",
+        "EX",
+        "MH",
+        "DS",
+        "EG",
+        "PE",
+        "IE",
+    }
+    assert set(SDTM_DOMAIN_SPECS.keys()) == expected_domains
+
+    domain_models: list[tuple[str, Any, str, Any]] = [
+        ("AE", AdverseEvent(subjectKey="S01", aeTerm="Rash", aeSeverity="MILD"), "AETERM", "Rash"),
+        (
+            "DV",
+            ProtocolDeviation(
+                subjectKey="S01",
+                dvTerm="Late visit",
+                dvCategory="VISIT SCHEDULE",
+                dvSeverity="MINOR",
+                dvDate=datetime(2026, 1, 2),
+            ),
+            "DVTERM",
+            "Late visit",
+        ),
+        (
+            "DD",
+            DeviceDeficiency(
+                subjectKey="S01",
+                ddTerm="Sensor fault",
+                ddCategory="HARDWARE",
+                ddSerious=False,
+                ddDate=datetime(2026, 1, 3),
+            ),
+            "DDTERM",
+            "Sensor fault",
+        ),
+        (
+            "CM",
+            ConcomitantMedication(subjectKey="S01", cmTrt="Ibuprofen", cmDose=200, cmDosU="mg"),
+            "CMTRT",
+            "Ibuprofen",
+        ),
+        ("DM", Demographics(subjectKey="S01", sex="F", age=41), "SEX", "F"),
+        (
+            "VS",
+            VitalSigns(
+                subjectKey="S01",
+                vsTest="Heart Rate",
+                vsTestCd="HR",
+                vsResult=70,
+                vsUnit="bpm",
+                vsDate=datetime(2026, 1, 4),
+            ),
+            "VSTEST",
+            "Heart Rate",
+        ),
+        (
+            "LB",
+            LaboratoryResult(
+                subjectKey="S01",
+                lbTest="Hemoglobin",
+                lbTestCd="HGB",
+                lbCat="HEMATOLOGY",
+                lbResult="13.8",
+                lbUnit="g/dL",
+                lbOrnrlo="12.0",
+                lbOrnrhi="16.0",
+                lbDate=datetime(2026, 1, 5),
+            ),
+            "LBTESTCD",
+            "HGB",
+        ),
+        (
+            "EX",
+            Exposure(
+                subjectKey="S01",
+                exTrt="Study Drug A",
+                exDose=50,
+                exDosU="mg",
+                exRoute="ORAL",
+                exStartDate=datetime(2026, 1, 6),
+            ),
+            "EXTRT",
+            "Study Drug A",
+        ),
+        (
+            "MH",
+            MedicalHistory(
+                subjectKey="S01",
+                mhTerm="Asthma",
+                mhCat="GENERAL",
+                mhPresp=True,
+                mhOccur=True,
+                mhStartDate=datetime(2020, 5, 1),
+            ),
+            "MHTERM",
+            "Asthma",
+        ),
+        (
+            "DS",
+            Disposition(
+                subjectKey="S01",
+                dsTerm="Completed Study",
+                dsDecod="COMPLETED",
+                dsCat="DISPOSITION EVENT",
+                dsStartDate=datetime(2026, 6, 1),
+            ),
+            "DSTERM",
+            "Completed Study",
+        ),
+        (
+            "EG",
+            EcgResult(
+                subjectKey="S01",
+                egTest="QTcF Interval",
+                egTestCd="QTCF",
+                egResult=410,
+                egUnit="ms",
+                egDate=datetime(2026, 1, 7),
+            ),
+            "EGTESTCD",
+            "QTCF",
+        ),
+        (
+            "PE",
+            PhysicalExam(
+                subjectKey="S01",
+                peTest="Cardiovascular",
+                peTestCd="CV",
+                peResult="Normal",
+                peDate=datetime(2026, 1, 8),
+            ),
+            "PETEST",
+            "Cardiovascular",
+        ),
+        (
+            "IE",
+            InclusionExclusion(
+                subjectKey="S01",
+                ieTest="Age >= 18",
+                ieTestCd="INCL01",
+                ieCat="INCLUSION",
+                ieResult="N",
+                ieDate=datetime(2026, 1, 1),
+            ),
+            "IETESTCD",
+            "INCL01",
+        ),
+    ]
+
+    for domain_code, model_obj, check_col, expected_val in domain_models:
+        df_direct = transform_records_to_sdtm([model_obj], domain=domain_code, study_key="STD01")
+        assert df_direct.iloc[0]["STUDYID"] == "STD01"
+        assert df_direct.iloc[0]["DOMAIN"] == domain_code
+        assert df_direct.iloc[0]["USUBJID"] == "STD01-S01"
+        assert df_direct.iloc[0][check_col] == expected_val
+
+        sdk = MagicMock()
+        sdk.get_records.return_value = [
+            Record(
+                record_id=1,
+                subject_key="S01",
+                visit_id=1,
+                form_id=10,
+                record_status="Complete",
+                record_data=model_obj.model_dump(by_alias=True, exclude={"subject_key"}),
+            )
+        ]
+        mapper = RecordMapper(sdk)
+        df_via_mapper = mapper.sdtm_dataframe(study_key="STD01", domain=domain_code)
+        assert df_via_mapper.iloc[0]["DOMAIN"] == domain_code
+        assert df_via_mapper.iloc[0]["USUBJID"] == "STD01-S01"
+        assert df_via_mapper.iloc[0][check_col] == expected_val
+
+        if domain_code == "DM":
+            assert "DMSEQ" not in df_direct.columns
+            assert "DMSEQ" not in df_via_mapper.columns
+            assert df_direct.iloc[0]["SUBJID"] == "S01"
+            df_empty_dm = transform_records_to_sdtm([], domain="DM", study_key="STD01")
+            assert "DMSEQ" not in df_empty_dm.columns
+        else:
+            seq_col = f"{domain_code}SEQ"
+            assert seq_col in df_direct.columns
+            assert df_direct.iloc[0][seq_col] == 1
+
+
+def test_usubjid_preserves_explicit_value_and_supports_subject_id_map() -> None:
+    """Verify explicit USUBJID stays untouched while subject_id_map overrides derived USUBJID."""
+    records = [
+        {"USUBJID": "ExplicitSite01-SubjA", "subjectKey": "S1", "aeTerm": "Headache"},
+        {"subjectKey": "S2", "aeTerm": "Nausea"},
+        {"subjectKey": "S3", "aeTerm": "Fatigue"},
+    ]
+    df = transform_records_to_sdtm(
+        records,
+        domain="AE",
+        study_key="TRIAL_99",
+        subject_id_map={"S2": "CUSTOM-USUBJID-002"},
+    )
+    assert list(df["USUBJID"]) == [
+        "ExplicitSite01-SubjA",
+        "CUSTOM-USUBJID-002",
+        "TRIAL_99-S3",
+    ]
+
+
+def test_sdtm_dataframe_enriches_codings_visits_and_intervals() -> None:
+    """Verify sdtm_dataframe joins Coding, Visit, and Interval lookups via SPI facade."""
+    sdk = MagicMock()
+    sdk.get_codings.return_value = [
+        Coding(record_id=101, variable="aeTerm", value="HEADACHE", code="10019211"),
+        Coding(record_id=201, variable="cmTerm", value="ACETYLSALICYLIC ACID", code="N02BA01"),
+        Coding(record_id=301, variable="mhTerm", value="ASTHMA BRONCHIAL", code="10003553"),
+    ]
+    sdk.get_visits.return_value = [
+        Visit(visit_id=11, interval_id=2, interval_name="Week 4", visit_date="2026-02-10"),
+    ]
+    sdk.get_intervals.return_value = [
+        Interval(interval_id=2, interval_name="Week 4", interval_sequence=4),
+    ]
+
+    ae_records = [
+        Record(
+            record_id=101,
+            subject_key="SUBJ-01",
+            visit_id=11,
+            form_id=10,
+            record_status="Complete",
+            record_data={"aeTerm": "mild headache", "aeSeverity": "MILD", "aeSerious": False},
+        )
+    ]
+    cm_records = [
+        Record(
+            record_id=201,
+            subject_key="SUBJ-01",
+            visit_id=11,
+            form_id=12,
+            record_status="Complete",
+            record_data={"cmTerm": "Baby Aspirin", "cmDose": "81", "cmDoseUnit": "mg"},
+        )
+    ]
+    mh_records = [
+        Record(
+            record_id=301,
+            subject_key="SUBJ-01",
+            visit_id=11,
+            form_id=14,
+            record_status="Complete",
+            record_data={"mhTerm": "Childhood asthma"},
+        )
+    ]
+
+    mapper = RecordMapper(sdk)
+
+    sdk.get_records.return_value = ae_records
+    df_ae = mapper.sdtm_dataframe(study_key="STUDY_SPI", domain="AE")
+    assert df_ae.iloc[0]["AEDECOD"] == "HEADACHE"
+    assert df_ae.iloc[0]["VISIT"] == "Week 4"
+    assert df_ae.iloc[0]["VISITNUM"] == 4
+    assert df_ae.iloc[0]["VISITDTC"] == "2026-02-10"
+
+    sdk.get_records.return_value = cm_records
+    df_cm = mapper.sdtm_dataframe(study_key="STUDY_SPI", domain="CM")
+    assert df_cm.iloc[0]["CMDECOD"] == "ACETYLSALICYLIC ACID"
+    assert df_cm.iloc[0]["VISIT"] == "Week 4"
+    assert df_cm.iloc[0]["VISITNUM"] == 4
+    assert df_cm.iloc[0]["VISITDTC"] == "2026-02-10"
+
+    sdk.get_records.return_value = mh_records
+    df_mh = mapper.sdtm_dataframe(study_key="STUDY_SPI", domain="MH")
+    assert df_mh.iloc[0]["MHDECOD"] == "ASTHMA BRONCHIAL"
+    assert df_mh.iloc[0]["VISIT"] == "Week 4"
+    assert df_mh.iloc[0]["VISITNUM"] == 4
+
+
+def test_sdtm_dataframe_graceful_fallback_when_lookup_methods_omitted() -> None:
+    """Verify stub SDKs without get_codings/get_visits/get_intervals degrade gracefully."""
+
+    class MinimalStubSDK:
+        def get_records(self, study_key: str, **filters: Any) -> list[Record]:
+            return [
+                Record(
+                    record_id=1,
+                    subject_key="S01",
+                    visit_id=5,
+                    form_id=10,
+                    record_status="Complete",
+                    record_data={"aeTerm": "Cough", "aeSeverity": "MILD"},
+                )
+            ]
+
+    mapper = RecordMapper(MinimalStubSDK())  # type: ignore[arg-type]
+    df = mapper.sdtm_dataframe(study_key="STUB_STUDY", domain="AE")
+    assert len(df) == 1
+    assert df.iloc[0]["USUBJID"] == "STUB_STUDY-S01"
+    assert df.iloc[0]["AETERM"] == "Cough"
+    assert df.iloc[0]["AEDECOD"] is None
+
+
+def test_iter_sdtm_dataframes_maintains_continuous_seq_across_chunks() -> None:
+    """Verify per-subject sequence numbers increment continuously across chunk boundaries."""
+    sdk = MagicMock()
+    sdk.get_records.return_value = [
+        Record(
+            record_id=i,
+            subject_key="SUBJ-SAME",
+            visit_id=1,
+            form_id=10,
+            record_status="Complete",
+            record_data={"aeTerm": f"Event {i}", "aeSeverity": "MILD"},
+        )
+        for i in range(1, 5)
+    ]
+    mapper = RecordMapper(sdk, chunk_size=2)
+    chunks = list(mapper.iter_sdtm_dataframes(study_key="STUDY_SEQ", domain="AE"))
+    assert len(chunks) == 2
+    assert list(chunks[0]["AESEQ"]) == [1, 2]
+    assert list(chunks[1]["AESEQ"]) == [3, 4]
+
+
+def test_dataframe_and_sdtm_dataframe_return_matching_rows_with_combined_filters() -> None:
+    """Verify dataframe and sdtm_dataframe return matching rows for form, variable, and visit filters."""
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    with respx.mock(assert_all_called=False) as mock_router:
+        mock_router.get("https://api.test/api/v1/edc/studies/STUDY/variables").respond(
+            200,
+            json={
+                "data": [
+                    {"variableName": "aeTerm", "label": "AE Term", "formId": 10},
+                    {"variableName": "aeSeverity", "label": "Severity", "formId": 20},
+                    {"variableName": "otherVar", "label": "Other", "formId": 30},
+                ]
+            },
+        )
+        mock_router.get("https://api.test/api/v1/edc/studies/STUDY/codings").respond(
+            200, json={"data": []}
+        )
+        mock_router.get("https://api.test/api/v1/edc/studies/STUDY/visits").respond(
+            200, json={"data": []}
+        )
+        mock_router.get("https://api.test/api/v1/edc/studies/STUDY/intervals").respond(
+            200, json={"data": []}
+        )
+
+        def records_responder(request: httpx.Request) -> httpx.Response:
+            flt = request.url.params.get("filter", "")
+            assert not (";" in flt and "," in flt)
+            all_rows = [
+                {
+                    "recordId": 1,
+                    "subjectKey": "S1",
+                    "visitId": 2,
+                    "formId": 10,
+                    "recordStatus": "Complete",
+                    "recordData": {"aeTerm": "Headache", "extra": "drop"},
+                },
+                {
+                    "recordId": 2,
+                    "subjectKey": "S2",
+                    "visitId": 2,
+                    "formId": 20,
+                    "recordStatus": "Complete",
+                    "recordData": {"aeSeverity": "MODERATE", "extra": "drop"},
+                },
+                {
+                    "recordId": 3,
+                    "subjectKey": "S3",
+                    "visitId": 99,
+                    "formId": 10,
+                    "recordStatus": "Complete",
+                    "recordData": {"aeTerm": "Wrong Visit"},
+                },
+                {
+                    "recordId": 4,
+                    "subjectKey": "S4",
+                    "visitId": 2,
+                    "formId": 30,
+                    "recordStatus": "Complete",
+                    "recordData": {"otherVar": "Wrong Form"},
+                },
+            ]
+            return httpx.Response(200, json={"data": all_rows})
+
+        mock_router.get("https://api.test/api/v1/edc/studies/STUDY/records").mock(
+            side_effect=records_responder
+        )
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+        mapper = RecordMapper(sdk)
+
+        df_raw = mapper.dataframe(
+            "STUDY",
+            visit_key="2",
+            use_labels_as_columns=False,
+            variable_whitelist=["aeTerm", "aeSeverity"],
+            form_whitelist=[10, 20],
+        )
+        df_sdtm = mapper.sdtm_dataframe(
+            "STUDY",
+            domain="AE",
+            visit_key="2",
+            variable_whitelist=["aeTerm", "aeSeverity"],
+            form_whitelist=[10, 20],
+        )
+
+        assert len(df_raw) == 2
+        assert len(df_sdtm) == 2
+        assert list(df_raw["subjectKey"]) == ["S1", "S2"]
+        assert list(df_sdtm["USUBJID"]) == ["STUDY-S1", "STUDY-S2"]
+        assert "extra" not in df_sdtm.columns
+
+        # Secondary list filters in _fetch_records evaluate locally without mixing ';' and ','
+        sec_records = mapper._fetch_records(
+            "STUDY",
+            visit_key="2",
+            extra_filters={"formId": [10, 20], "subjectKey": ["S2"]},
+        )
+        assert [r.subject_key for r in sec_records] == ["S2"]
+
+        sec_multi = mapper._fetch_records(
+            "STUDY",
+            visit_key="2",
+            extra_filters={"formIds": [10, 20], "subjectKey": ["S1", "S2"]},
+        )
+        assert [r.subject_key for r in sec_multi] == ["S1", "S2"]

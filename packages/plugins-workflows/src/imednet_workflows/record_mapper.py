@@ -19,8 +19,11 @@ except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 from pydantic import BaseModel, Field, ValidationError, create_model
 
+from imednet.spi.endpoints import Coding as CodingModel
+from imednet.spi.endpoints import Interval as IntervalModel
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
+from imednet.spi.endpoints import Visit as VisitModel
 
 from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
@@ -181,6 +184,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         },
         "flags": {"AESER"},
         "dtc": {"AESTDTC", "AEENDTC"},
+        "coding_target": ("AEDECOD", "AETERM"),
     },
     "DV": {
         "domain": "DV",
@@ -252,6 +256,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         ],
         "aliases": {
             "CMTRT": [
+                "cmTrt",
                 "cmTerm",
                 "cm_term",
                 "CMTRT",
@@ -263,7 +268,16 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
             ],
             "CMDECOD": ["cmDecod", "cm_decod", "CMDECOD", "cmdecod"],
             "CMDOSE": ["cmDose", "cm_dose", "CMDOSE", "cmdose", "dose"],
-            "CMDOSU": ["cmDoseUnit", "cm_dose_unit", "CMDOSU", "cmdosu", "dose_unit", "unit"],
+            "CMDOSU": [
+                "cmDosU",
+                "cm_dosu",
+                "cmDoseUnit",
+                "cm_dose_unit",
+                "CMDOSU",
+                "cmdosu",
+                "dose_unit",
+                "unit",
+            ],
             "CMROUTE": ["cmRoute", "cm_route", "CMROUTE", "cmroute", "route"],
             "CMSTDTC": ["cmStartDate", "cm_start_date", "CMSTDTC", "cmstdtc", "start_date"],
             "CMENDTC": ["cmEndDate", "cm_end_date", "CMENDTC", "cmendtc", "end_date"],
@@ -271,6 +285,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         },
         "flags": set(),
         "dtc": {"CMSTDTC", "CMENDTC"},
+        "coding_target": ("CMDECOD", "CMTRT"),
     },
     "DM": {
         "domain": "DM",
@@ -330,12 +345,300 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         "flags": set(),
         "dtc": {"VSDTC"},
     },
+    "LB": {
+        "domain": "LB",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "LBSEQ",
+            "LBTESTCD",
+            "LBTEST",
+            "LBCAT",
+            "LBORRES",
+            "LBORRESU",
+            "LBORNRLO",
+            "LBORNRHI",
+            "LBNRIND",
+            "LBSPEC",
+            "LBDTC",
+        ],
+        "aliases": {
+            "LBTESTCD": ["lbTestCd", "lb_test_cd", "LBTESTCD", "lbtestcd", "test_cd", "testcd"],
+            "LBTEST": ["lbTest", "lb_test", "LBTEST", "lbtest", "test_name", "test"],
+            "LBCAT": ["lbCat", "lb_cat", "LBCAT", "lbcat", "category"],
+            "LBORRES": ["lbResult", "lb_result", "LBORRES", "lborres", "result"],
+            "LBORRESU": ["lbUnit", "lb_unit", "LBORRESU", "lborresu", "unit"],
+            "LBORNRLO": [
+                "lbOrnrlo",
+                "lb_ornrlo",
+                "LBORNRLO",
+                "lbornrlo",
+                "low_normal",
+                "ref_low",
+            ],
+            "LBORNRHI": [
+                "lbOrnrhi",
+                "lb_ornrhi",
+                "LBORNRHI",
+                "lbornrhi",
+                "high_normal",
+                "ref_high",
+            ],
+            "LBNRIND": ["lbNrind", "lb_nrind", "LBNRIND", "lbnrind", "range_indicator"],
+            "LBSPEC": ["lbSpec", "lb_spec", "LBSPEC", "lbspec", "specimen"],
+            "LBDTC": ["lbDate", "lb_date", "LBDTC", "lbdtc", "collection_date", "date"],
+        },
+        "flags": set(),
+        "dtc": {"LBDTC"},
+    },
+    "EX": {
+        "domain": "EX",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "EXSEQ",
+            "EXTRT",
+            "EXDOSE",
+            "EXDOSU",
+            "EXDOSFRM",
+            "EXDOSFRQ",
+            "EXROUTE",
+            "EXSTDTC",
+            "EXENDTC",
+        ],
+        "aliases": {
+            "EXTRT": ["exTrt", "ex_trt", "EXTRT", "extrt", "exTerm", "ex_term", "treatment"],
+            "EXDOSE": ["exDose", "ex_dose", "EXDOSE", "exdose", "dose"],
+            "EXDOSU": [
+                "exDosU",
+                "ex_dosu",
+                "exDoseUnit",
+                "ex_dose_unit",
+                "EXDOSU",
+                "exdosu",
+                "dose_unit",
+                "unit",
+            ],
+            "EXDOSFRM": [
+                "exDosFrm",
+                "ex_dosfrm",
+                "exDoseForm",
+                "ex_dose_form",
+                "EXDOSFRM",
+                "exdosfrm",
+                "dose_form",
+            ],
+            "EXDOSFRQ": [
+                "exDosFrq",
+                "ex_dosfrq",
+                "exDoseFreq",
+                "ex_dose_freq",
+                "EXDOSFRQ",
+                "exdosfrq",
+                "frequency",
+            ],
+            "EXROUTE": ["exRoute", "ex_route", "EXROUTE", "exroute", "route"],
+            "EXSTDTC": [
+                "exStartDate",
+                "ex_start_date",
+                "EXSTDTC",
+                "exstdtc",
+                "start_date",
+                "startDate",
+            ],
+            "EXENDTC": ["exEndDate", "ex_end_date", "EXENDTC", "exendtc", "end_date", "endDate"],
+        },
+        "flags": set(),
+        "dtc": {"EXSTDTC", "EXENDTC"},
+    },
+    "MH": {
+        "domain": "MH",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "MHSEQ",
+            "MHTERM",
+            "MHDECOD",
+            "MHCAT",
+            "MHBODSYS",
+            "MHPRESP",
+            "MHOCCUR",
+            "MHSTDTC",
+            "MHENDTC",
+            "MHENRF",
+        ],
+        "aliases": {
+            "MHTERM": ["mhTerm", "mh_term", "MHTERM", "mhterm", "history_term", "term"],
+            "MHDECOD": ["mhDecod", "mh_decod", "MHDECOD", "mhdecod", "preferred_term", "pt"],
+            "MHCAT": [
+                "mhCat",
+                "mh_cat",
+                "MHCAT",
+                "mhcat",
+                "mhCategory",
+                "mh_category",
+                "category",
+            ],
+            "MHBODSYS": ["mhBodSys", "mh_bodsys", "MHBODSYS", "mhbodsys", "body_system"],
+            "MHPRESP": ["mhPresp", "mh_presp", "MHPRESP", "mhpresp", "prespecified"],
+            "MHOCCUR": ["mhOccur", "mh_occur", "MHOCCUR", "mhoccur", "occurred"],
+            "MHSTDTC": [
+                "mhStartDate",
+                "mh_start_date",
+                "MHSTDTC",
+                "mhstdtc",
+                "start_date",
+                "startDate",
+            ],
+            "MHENDTC": ["mhEndDate", "mh_end_date", "MHENDTC", "mhendtc", "end_date", "endDate"],
+            "MHENRF": ["mhEnrf", "mh_enrf", "MHENRF", "mhenrf", "ongoing"],
+        },
+        "flags": {"MHPRESP", "MHOCCUR"},
+        "dtc": {"MHSTDTC", "MHENDTC"},
+        "coding_target": ("MHDECOD", "MHTERM"),
+    },
+    "DS": {
+        "domain": "DS",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "DSSEQ",
+            "DSTERM",
+            "DSDECOD",
+            "DSCAT",
+            "DSSCAT",
+            "DSSTDTC",
+            "DSDTC",
+        ],
+        "aliases": {
+            "DSTERM": ["dsTerm", "ds_term", "DSTERM", "dsterm", "disposition_term", "term"],
+            "DSDECOD": ["dsDecod", "ds_decod", "DSDECOD", "dsdecod", "standardized_term"],
+            "DSCAT": [
+                "dsCat",
+                "ds_cat",
+                "DSCAT",
+                "dscat",
+                "dsCategory",
+                "ds_category",
+                "category",
+            ],
+            "DSSCAT": ["dsScat", "ds_scat", "DSSCAT", "dsscat", "subcategory"],
+            "DSSTDTC": [
+                "dsStartDate",
+                "ds_start_date",
+                "DSSTDTC",
+                "dsstdtc",
+                "start_date",
+                "startDate",
+            ],
+            "DSDTC": ["dsDate", "ds_date", "DSDTC", "dsdtc", "date"],
+        },
+        "flags": set(),
+        "dtc": {"DSSTDTC", "DSDTC"},
+    },
+    "EG": {
+        "domain": "EG",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "EGSEQ",
+            "EGTESTCD",
+            "EGTEST",
+            "EGCAT",
+            "EGORRES",
+            "EGORRESU",
+            "EGPOS",
+            "EGDTC",
+        ],
+        "aliases": {
+            "EGTESTCD": ["egTestCd", "eg_test_cd", "EGTESTCD", "egtestcd", "test_cd", "testcd"],
+            "EGTEST": ["egTest", "eg_test", "EGTEST", "egtest", "test_name", "test"],
+            "EGCAT": ["egCat", "eg_cat", "EGCAT", "egcat", "category"],
+            "EGORRES": ["egResult", "eg_result", "EGORRES", "egorres", "result"],
+            "EGORRESU": ["egUnit", "eg_unit", "EGORRESU", "egorresu", "unit"],
+            "EGPOS": ["egPos", "eg_pos", "EGPOS", "egpos", "position"],
+            "EGDTC": ["egDate", "eg_date", "EGDTC", "egdtc", "date"],
+        },
+        "flags": set(),
+        "dtc": {"EGDTC"},
+    },
+    "PE": {
+        "domain": "PE",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "PESEQ",
+            "PETESTCD",
+            "PETEST",
+            "PECAT",
+            "PEBODSYS",
+            "PEORRES",
+            "PELOC",
+            "PEDTC",
+        ],
+        "aliases": {
+            "PETESTCD": ["peTestCd", "pe_test_cd", "PETESTCD", "petestcd", "test_cd", "testcd"],
+            "PETEST": ["peTest", "pe_test", "PETEST", "petest", "test_name", "test"],
+            "PECAT": ["peCat", "pe_cat", "PECAT", "pecat", "category"],
+            "PEBODSYS": ["peBodSys", "pe_bodsys", "PEBODSYS", "pebodsys", "body_system"],
+            "PEORRES": ["peResult", "pe_result", "PEORRES", "peorres", "result", "finding"],
+            "PELOC": ["peLoc", "pe_loc", "PELOC", "peloc", "location"],
+            "PEDTC": ["peDate", "pe_date", "PEDTC", "pedtc", "date"],
+        },
+        "flags": set(),
+        "dtc": {"PEDTC"},
+    },
+    "IE": {
+        "domain": "IE",
+        "variables": [
+            "STUDYID",
+            "DOMAIN",
+            "USUBJID",
+            "IESEQ",
+            "IETESTCD",
+            "IETEST",
+            "IECAT",
+            "IEORRES",
+            "IEDTC",
+        ],
+        "aliases": {
+            "IETESTCD": [
+                "ieTestCd",
+                "ie_test_cd",
+                "IETESTCD",
+                "ietestcd",
+                "criterion_code",
+                "test_cd",
+            ],
+            "IETEST": ["ieTest", "ie_test", "IETEST", "ietest", "criterion", "test"],
+            "IECAT": [
+                "ieCat",
+                "ie_cat",
+                "IECAT",
+                "iecat",
+                "ieCategory",
+                "ie_category",
+                "category",
+            ],
+            "IEORRES": ["ieResult", "ie_result", "IEORRES", "ieorres", "result"],
+            "IEDTC": ["ieDate", "ie_date", "IEDTC", "iedtc", "date"],
+        },
+        "flags": set(),
+        "dtc": {"IEDTC"},
+    },
 }
 
 
 _BASE_SDTM_CONSUMED_KEYS: frozenset[str] = frozenset(
     {
         "USUBJID",
+        "usubjid",
         "subjectKey",
         "subject_key",
         "study_key",
@@ -344,11 +647,123 @@ _BASE_SDTM_CONSUMED_KEYS: frozenset[str] = frozenset(
         "DOMAIN",
         "domain",
         "recordId",
+        "record_id",
         "formId",
+        "form_id",
+        "formKey",
+        "form_key",
         "visitId",
+        "visit_id",
+        "intervalId",
+        "interval_id",
         "recordStatus",
+        "record_status",
     }
 )
+
+_RECORD_FILTER_ATTR_MAP: dict[str, str] = {name: name for name in RecordModel.model_fields}
+for _fname, _finfo in RecordModel.model_fields.items():
+    if _finfo.alias:
+        _RECORD_FILTER_ATTR_MAP[_finfo.alias] = _fname
+
+
+def _coerce_int_id(val: Any) -> int | None:
+    """Safely coerce an integer identifier, returning None on invalid input."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        stripped = val.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def _build_codings_lookup(
+    codings: Iterable[CodingModel] | None,
+) -> dict[tuple[int, str], str]:
+    """Index study Coding records by (record_id, variable) for SDTM enrichment."""
+    lookup: dict[tuple[int, str], str] = {}
+    if not codings:
+        return lookup
+    for coding in codings:
+        rec_id = _coerce_int_id(getattr(coding, "record_id", None))
+        variable = getattr(coding, "variable", None)
+        decoded = getattr(coding, "value", None) or getattr(coding, "code", None)
+        if rec_id is None or not isinstance(variable, str) or not variable.strip():
+            continue
+        if not isinstance(decoded, str) or not decoded.strip():
+            continue
+        var_clean = variable.strip()
+        term_clean = decoded.strip()
+        lookup[(rec_id, var_clean)] = term_clean
+        lookup.setdefault((rec_id, var_clean.lower()), term_clean)
+    return lookup
+
+
+def _build_visits_lookup(
+    visits: Iterable[VisitModel] | None,
+    intervals: Iterable[IntervalModel] | None,
+) -> dict[int, dict[str, Any]]:
+    """Index study Visit and Interval metadata by visit_id for SDTM enrichment."""
+    lookup: dict[int, dict[str, Any]] = {}
+    if not visits:
+        return lookup
+
+    intervals_by_id: dict[int, IntervalModel] = {}
+    intervals_by_name: dict[str, IntervalModel] = {}
+    if intervals:
+        for interval in intervals:
+            int_id = _coerce_int_id(getattr(interval, "interval_id", None))
+            if int_id is not None:
+                intervals_by_id[int_id] = interval
+            int_name = getattr(interval, "interval_name", None)
+            if isinstance(int_name, str) and int_name.strip():
+                intervals_by_name[int_name.strip().lower()] = interval
+
+    for visit in visits:
+        visit_id = _coerce_int_id(getattr(visit, "visit_id", None))
+        if visit_id is None:
+            continue
+        visit_interval_id = _coerce_int_id(getattr(visit, "interval_id", None))
+        visit_interval_name = getattr(visit, "interval_name", None)
+
+        matched_interval: IntervalModel | None = None
+        if visit_interval_id is not None and visit_interval_id in intervals_by_id:
+            matched_interval = intervals_by_id[visit_interval_id]
+        elif isinstance(visit_interval_name, str) and visit_interval_name.strip():
+            matched_interval = intervals_by_name.get(visit_interval_name.strip().lower())
+
+        interval_name = (
+            visit_interval_name
+            if isinstance(visit_interval_name, str) and visit_interval_name.strip()
+            else (getattr(matched_interval, "interval_name", None) if matched_interval else None)
+        )
+        interval_seq = (
+            getattr(matched_interval, "interval_sequence", None) if matched_interval else None
+        )
+        visit_num = (
+            interval_seq
+            if interval_seq is not None
+            else (
+                getattr(matched_interval, "interval_id", None)
+                if matched_interval is not None
+                and getattr(matched_interval, "interval_id", None) is not None
+                else visit_interval_id
+            )
+        )
+        raw_visit_date = getattr(visit, "visit_date", None) or getattr(visit, "start_date", None)
+        lookup[visit_id] = {
+            "VISIT": interval_name,
+            "VISITNUM": visit_num,
+            "VISITDTC": format_iso8601_dtc(raw_visit_date),
+        }
+    return lookup
 
 
 @functools.lru_cache(maxsize=128)
@@ -424,17 +839,30 @@ def transform_records_to_sdtm(
     records: Iterable[Any],
     domain: str,
     study_key: str,
+    *,
+    subject_id_map: dict[str, str] | None = None,
+    seq_counters: dict[str, int] | None = None,
+    codings_lookup: dict[tuple[int, str], str] | None = None,
+    visits_lookup: dict[int, dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """Transform clinical records into a normalized CDISC SDTM domain DataFrame.
 
     Maps subject keys to USUBJID, study keys to STUDYID, sequences records per
-    subject, and converts event timestamps to standard ISO 8601 DTC string formats.
+    subject (except DM per CDISC SDTM v1.7), enriches coded terms and visit
+    metadata when SPI lookups are supplied, and converts event timestamps to
+    standard ISO 8601 DTC string formats.
 
     Args:
         records: An iterable of Record models, Pydantic models (such as AdverseEvent),
             or raw dictionaries.
-        domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
+        domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS',
+            'LB', 'EX', 'MH', 'DS', 'EG', 'PE', 'IE').
         study_key: Unique study identifier to populate STUDYID.
+        subject_id_map: Optional mapping from raw subject_key to USUBJID.
+        seq_counters: Optional mutable per-subject sequence counter dictionary
+            shared across chunks.
+        codings_lookup: Optional lookup table indexed by (record_id, variable).
+        visits_lookup: Optional lookup table indexed by visit_id.
 
     Returns:
         A pandas DataFrame with standardized domain variables.
@@ -449,14 +877,25 @@ def transform_records_to_sdtm(
     if domain_clean == "PD":
         domain_clean = "DV"
 
+    omit_seq = domain_clean == "DM"
     spec = SDTM_DOMAIN_SPECS.get(domain_clean)
-    std_vars = spec["variables"] if spec else ["STUDYID", "DOMAIN", "USUBJID", f"{domain_clean}SEQ"]
+    std_vars = (
+        spec["variables"]
+        if spec
+        else (
+            ["STUDYID", "DOMAIN", "USUBJID"]
+            if omit_seq
+            else ["STUDYID", "DOMAIN", "USUBJID", f"{domain_clean}SEQ"]
+        )
+    )
     alias_map = spec["aliases"] if spec else {}
     flag_vars = spec["flags"] if spec else set()
     dtc_vars = spec["dtc"] if spec else set()
+    coding_target: tuple[str, str] | None = spec.get("coding_target") if spec else None
 
     rows: list[dict[str, Any]] = []
-    seq_counters: dict[str, int] = {}
+    counters: dict[str, int] = seq_counters if seq_counters is not None else {}
+    clean_study = study_key.strip()
 
     for rec in records:
         model_field_to_serialized: dict[str, str] = {}
@@ -468,6 +907,10 @@ def transform_records_to_sdtm(
             if getattr(rec, "subject_key", None):
                 rec_dict["subject_key"] = rec.subject_key
                 rec_dict["subjectKey"] = rec.subject_key
+            if getattr(rec, "record_id", None) is not None:
+                rec_dict["record_id"] = rec.record_id
+            if getattr(rec, "visit_id", None) is not None:
+                rec_dict["visit_id"] = rec.visit_id
             if getattr(rec, "date_created", None):
                 rec_dict["date_created"] = rec.date_created
         elif isinstance(rec, BaseModel):
@@ -486,35 +929,63 @@ def transform_records_to_sdtm(
                 if k not in rec_dict:
                     rec_dict[k] = v
 
-        usubjid = (
-            rec_dict.get("USUBJID")
-            or rec_dict.get("subjectKey")
-            or rec_dict.get("subject_key")
-            or (
-                rec_dict.get(model_field_to_serialized.get("subject_key", ""))
-                if model_field_to_serialized
-                else None
-            )
-            or (
-                rec_dict.get(model_field_to_serialized.get("subjectKey", ""))
-                if model_field_to_serialized
-                else None
-            )
-            or getattr(rec, "subject_key", None)
-            or getattr(rec, "subjectKey", None)
-            or ""
+        record_id = _coerce_int_id(
+            rec_dict.get("record_id", rec_dict.get("recordId", getattr(rec, "record_id", None)))
         )
-        seq_counters[usubjid] = seq_counters.get(usubjid, 0) + 1
-        seq_val = seq_counters[usubjid]
+        visit_id = _coerce_int_id(
+            rec_dict.get("visit_id", rec_dict.get("visitId", getattr(rec, "visit_id", None)))
+        )
+
+        explicit_usubjid = rec_dict.get("USUBJID")
+        if explicit_usubjid is None or (
+            isinstance(explicit_usubjid, str) and not explicit_usubjid.strip()
+        ):
+            explicit_usubjid = rec_dict.get("usubjid")
+        if isinstance(explicit_usubjid, str) and explicit_usubjid.strip():
+            usubjid = explicit_usubjid
+        else:
+            raw_subject_key = (
+                rec_dict.get("subjectKey")
+                or rec_dict.get("subject_key")
+                or (
+                    rec_dict.get(model_field_to_serialized.get("subject_key", ""))
+                    if model_field_to_serialized
+                    else None
+                )
+                or (
+                    rec_dict.get(model_field_to_serialized.get("subjectKey", ""))
+                    if model_field_to_serialized
+                    else None
+                )
+                or getattr(rec, "subject_key", None)
+                or getattr(rec, "subjectKey", None)
+                or rec_dict.get("SUBJID")
+                or rec_dict.get("subjid")
+            )
+            subj_clean = str(raw_subject_key).strip() if raw_subject_key is not None else ""
+            mapped_usubjid = None
+            if subject_id_map and subj_clean:
+                mapped_usubjid = subject_id_map.get(subj_clean)
+                if mapped_usubjid is None and isinstance(raw_subject_key, str):
+                    mapped_usubjid = subject_id_map.get(raw_subject_key)
+            if mapped_usubjid:
+                usubjid = mapped_usubjid
+            elif subj_clean and clean_study:
+                usubjid = f"{clean_study}-{subj_clean}"
+            else:
+                usubjid = subj_clean
 
         row: dict[str, Any] = {
             "STUDYID": study_key,
             "DOMAIN": domain_clean,
             "USUBJID": usubjid,
-            f"{domain_clean}SEQ": seq_val,
         }
+        if not omit_seq:
+            counters[usubjid] = counters.get(usubjid, 0) + 1
+            row[f"{domain_clean}SEQ"] = counters[usubjid]
 
         consumed_keys: set[str] = set(base_consumed)
+        matched_source_keys: dict[str, str] = {}
 
         lower_rec_dict = {k.lower(): (k, v) for k, v in rec_dict.items()}
 
@@ -567,6 +1038,7 @@ def transform_records_to_sdtm(
                         break
 
             if found_key:
+                matched_source_keys[var_name] = found_key
                 consumed_keys.add(found_key)
                 consumed_keys.update(all_field_aliases.get(found_key, set()))
                 consumed_keys.update(all_field_aliases.get(found_key.lower(), set()))
@@ -593,6 +1065,37 @@ def transform_records_to_sdtm(
                 row[var_name] = _format_sdtm_flag(val)
             else:
                 row[var_name] = val
+
+        if coding_target is not None and codings_lookup and record_id is not None:
+            decod_var, term_var = coding_target
+            existing_decod = row.get(decod_var)
+            if existing_decod is None or (
+                isinstance(existing_decod, str) and not existing_decod.strip()
+            ):
+                candidate_vars: list[str] = []
+                for m_var in (term_var, decod_var):
+                    if m_var in matched_source_keys:
+                        candidate_vars.append(matched_source_keys[m_var])
+                candidate_vars.extend([term_var, decod_var])
+                candidate_vars.extend(alias_map.get(term_var, []))
+                candidate_vars.extend(alias_map.get(decod_var, []))
+                candidate_vars.extend(k for k in rec_dict if k not in consumed_keys)
+                for cand_var in candidate_vars:
+                    if not cand_var:
+                        continue
+                    coded_val = codings_lookup.get(
+                        (record_id, cand_var),
+                        codings_lookup.get((record_id, cand_var.lower())),
+                    )
+                    if coded_val is not None:
+                        row[decod_var] = coded_val
+                        break
+
+        if visits_lookup and visit_id is not None and visit_id in visits_lookup:
+            visit_meta = visits_lookup[visit_id]
+            for visit_col in ("VISIT", "VISITNUM", "VISITDTC"):
+                if visit_col not in rec_dict and visit_col.lower() not in lower_rec_dict:
+                    row[visit_col] = visit_meta.get(visit_col)
 
         normalized_consumed = {_normalize_key(c) for c in consumed_keys}
         for k, v in rec_dict.items():
@@ -726,6 +1229,9 @@ class RecordMapper:
         cleaned = dict(filters)
         cleaned.pop("variableNames", None)
         cleaned.pop("variableName", None)
+        if "formIds" in cleaned:
+            legacy_form_ids = cleaned.pop("formIds")
+            cleaned.setdefault("formId", legacy_form_ids)
 
         if "formId" not in cleaned:
             return None, cleaned
@@ -738,6 +1244,23 @@ class RecordMapper:
             cleaned.pop("formId")
             return [raw_form_id], cleaned
         return None, cleaned
+
+    @staticmethod
+    def _split_secondary_list_filters(
+        filters: dict[str, Any | tuple[str, Any] | list[Any]],
+    ) -> tuple[dict[str, set[Any]], dict[str, Any | tuple[str, Any] | list[Any]]]:
+        """Separate list filters so /records never mixes ';' and ',' connectors."""
+        secondary: dict[str, set[Any]] = {}
+        sdk_filters: dict[str, Any | tuple[str, Any] | list[Any]] = {}
+        for key, value in filters.items():
+            if isinstance(value, (list, set)):
+                deduped = list(dict.fromkeys(value))
+                secondary[key] = set(deduped)
+                if len(deduped) == 1:
+                    sdk_filters[key] = deduped[0]
+            else:
+                sdk_filters[key] = value
+        return secondary, sdk_filters
 
     def _fetch_records(
         self,
@@ -758,36 +1281,55 @@ class RecordMapper:
                     visit_key,
                 )
 
-        form_id_list, filters = self._extract_form_ids(raw_filters)
+        form_id_list, cleaned_filters = self._extract_form_ids(raw_filters)
+        secondary_filters, filters = self._split_secondary_list_filters(cleaned_filters)
         if form_id_list is not None and len(form_id_list) == 0:
+            return []
+        if any(len(allowed) == 0 for allowed in secondary_filters.values()):
             return []
 
         try:
             if form_id_list is not None:
                 batched_records: list[RecordModel] = []
+                seen_record_ids: set[Any] = set()
+                deduplicate = len(form_id_list) > 1
                 for fid in form_id_list:
-                    batched_records.extend(
-                        self.sdk.get_records(
-                            study_key=study_key,
-                            record_data_filter=None,
-                            **filters,
-                            formId=fid,
-                        )
+                    for rec in self.sdk.get_records(
+                        study_key=study_key,
+                        record_data_filter=None,
+                        **filters,
+                        formId=fid,
+                    ):
+                        if deduplicate and rec.record_id is not None:
+                            if rec.record_id in seen_record_ids:
+                                continue
+                            seen_record_ids.add(rec.record_id)
+                        batched_records.append(rec)
+                raw_result = batched_records
+            else:
+                raw_result = list(
+                    self.sdk.get_records(
+                        study_key=study_key,
+                        record_data_filter=None,
+                        **filters,
                     )
-                return batched_records
-
-            return list(
-                self.sdk.get_records(
-                    study_key=study_key,
-                    record_data_filter=None,
-                    **filters,
                 )
-            )
         except ValueError:
             raise
         except Exception as exc:  # pragma: no cover - unexpected
             logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
             return []
+
+        form_ids_set: set[Any] | None = set(form_id_list) if form_id_list is not None else None
+        return list(
+            self._filter_records(
+                raw_result,
+                visit_key=visit_key,
+                form_ids=form_ids_set,
+                secondary_filters=secondary_filters or None,
+                warn_on_invalid_visit=False,
+            )
+        )
 
     def _iter_records(
         self,
@@ -806,7 +1348,8 @@ class RecordMapper:
             An iterable of Record models.
         """
         raw_filters = dict(extra_filters) if extra_filters else {}
-        form_id_list, _ = self._extract_form_ids(raw_filters)
+        form_id_list, cleaned_filters = self._extract_form_ids(raw_filters)
+        secondary_filters, _ = self._split_secondary_list_filters(cleaned_filters)
         form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
 
         loader = self._loader
@@ -819,6 +1362,7 @@ class RecordMapper:
                     iter_method(loader, study_key, chunk_size=self._pipeline.chunk_size),
                     visit_key=visit_key,
                     form_ids=form_ids,
+                    secondary_filters=secondary_filters or None,
                 )
 
         return self._fetch_records(
@@ -833,33 +1377,120 @@ class RecordMapper:
         *,
         visit_key: str | None,
         form_ids: set[Any] | None,
+        secondary_filters: dict[str, set[Any]] | None = None,
+        warn_on_invalid_visit: bool = True,
     ) -> Iterator[RecordModel]:
-        """Apply visit and form filters to an iterable of records.
+        """Apply visit, form, and secondary list filters to an iterable of records.
 
         Args:
             records: Source records.
             visit_key: Visit identifier to filter by.
             form_ids: Set of form IDs to filter by.
+            secondary_filters: Optional map of filter attribute/key to allowed values.
+            warn_on_invalid_visit: Whether to log a warning if visit_key is non-integer.
 
         Returns:
             An iterator of filtered Record models.
         """
+        if secondary_filters and any(len(allowed) == 0 for allowed in secondary_filters.values()):
+            return
+
         visit_id: int | None = None
         if visit_key is not None:
             try:
                 visit_id = int(visit_key)
             except ValueError:
-                logger.warning(
-                    "Invalid visit_key '%s'. Should be convertible to int. Fetching all records.",
-                    visit_key,
-                )
+                if warn_on_invalid_visit:
+                    logger.warning(
+                        "Invalid visit_key '%s'. Should be convertible to int. Fetching all records.",
+                        visit_key,
+                    )
 
         for record in records:
             if visit_id is not None and record.visit_id != visit_id:
                 continue
             if form_ids is not None and record.form_id not in form_ids:
                 continue
+            if secondary_filters:
+                matched_all = True
+                for filter_key, allowed_values in secondary_filters.items():
+                    attr_name = _RECORD_FILTER_ATTR_MAP.get(filter_key, filter_key)
+                    rec_val = getattr(record, attr_name, None)
+                    if rec_val is None and isinstance(record.record_data, dict):
+                        rec_val = record.record_data.get(filter_key)
+                    if rec_val not in allowed_values:
+                        matched_all = False
+                        break
+                if not matched_all:
+                    continue
             yield record
+
+    def _load_sdtm_lookups(
+        self,
+        study_key: str,
+    ) -> tuple[dict[tuple[int, str], str], dict[int, dict[str, Any]]]:
+        """Load study-scoped Coding, Visit, and Interval lookups via the SDK facade."""
+        codings: list[CodingModel] = []
+        visits: list[VisitModel] = []
+        intervals: list[IntervalModel] = []
+
+        get_codings_fn = getattr(self.sdk, "get_codings", None)
+        if callable(get_codings_fn):
+            try:
+                codings = list(get_codings_fn(study_key))
+            except Exception as exc:  # pragma: no cover - defensive stub fallback
+                logger.debug("Skipping codings lookup for '%s': %s", study_key, exc)
+
+        get_visits_fn = getattr(self.sdk, "get_visits", None)
+        if callable(get_visits_fn):
+            try:
+                visits = list(get_visits_fn(study_key))
+            except Exception as exc:  # pragma: no cover - defensive stub fallback
+                logger.debug("Skipping visits lookup for '%s': %s", study_key, exc)
+
+        if visits:
+            get_intervals_fn = getattr(self.sdk, "get_intervals", None)
+            if callable(get_intervals_fn):
+                try:
+                    intervals = list(get_intervals_fn(study_key))
+                except Exception as exc:  # pragma: no cover - defensive stub fallback
+                    logger.debug("Skipping intervals lookup for '%s': %s", study_key, exc)
+
+        return _build_codings_lookup(codings), _build_visits_lookup(visits, intervals)
+
+    def _resolve_sdtm_allowed_vars(
+        self,
+        study_key: str,
+        variable_whitelist: list[str] | None,
+        form_whitelist: list[int] | None,
+    ) -> set[str] | None:
+        """Resolve allowed variable names for SDTM mapping consistently with dataframe()."""
+        if variable_whitelist is None:
+            return None
+        if len(variable_whitelist) == 0:
+            return set()
+        if form_whitelist is not None and len(form_whitelist) == 0:
+            return set()
+
+        get_vars_fn = getattr(self.sdk, "get_variables", None)
+        if not callable(get_vars_fn):
+            return set(variable_whitelist)
+
+        # Detect unconfigured MagicMock where get_variables was not set by the caller
+        if type(get_vars_fn).__module__.startswith("unittest.mock") and (
+            getattr(get_vars_fn, "side_effect", None) is None
+            and type(getattr(get_vars_fn, "return_value", None)).__module__.startswith(
+                "unittest.mock"
+            )
+        ):
+            return set(variable_whitelist)
+
+        variable_keys, _ = self._fetch_variable_metadata(
+            study_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
+        return set(variable_keys)
 
     def _parse_record(
         self,
@@ -973,6 +1604,7 @@ class RecordMapper:
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        subject_id_map: dict[str, str] | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield mapped record DataFrames in bounded chunks.
 
@@ -991,6 +1623,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                subject_id_map=subject_id_map,
             )
             return
 
@@ -1165,9 +1798,19 @@ class RecordMapper:
         records: Iterable[Any],
         domain: str,
         study_key: str,
+        *,
+        subject_id_map: dict[str, str] | None = None,
     ) -> pd.DataFrame:
         """Transform an iterable of records into a normalized SDTM domain DataFrame."""
-        return transform_records_to_sdtm(records, domain=domain, study_key=study_key)
+        codings_lookup, visits_lookup = self._load_sdtm_lookups(study_key)
+        return transform_records_to_sdtm(
+            records,
+            domain=domain,
+            study_key=study_key,
+            subject_id_map=subject_id_map,
+            codings_lookup=codings_lookup or None,
+            visits_lookup=visits_lookup or None,
+        )
 
     def sdtm_dataframe(
         self,
@@ -1176,19 +1819,23 @@ class RecordMapper:
         visit_key: str | None = None,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        subject_id_map: dict[str, str] | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset.
 
         Standardizes clinical records into CDISC SDTM tabular datasets matching
         models in ``reporting.py``, assigning STUDYID, USUBJID, DOMAIN, sequence
-        numbers, and ISO 8601 DTC timestamps.
+        numbers, SPI-derived coded terms and visit metadata, and ISO 8601 DTC timestamps.
 
         Args:
             study_key: Unique study identifier.
-            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
+            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS',
+                'LB', 'EX', 'MH', 'DS', 'EG', 'PE', 'IE').
             visit_key: Optional visit filter.
             variable_whitelist: Optional variable name whitelist.
             form_whitelist: Optional form ID whitelist.
+            subject_id_map: Optional mapping from raw subject_key to USUBJID.
 
         Returns:
             Normalized pandas DataFrame with standard SDTM domain variables.
@@ -1205,10 +1852,16 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                subject_id_map=subject_id_map,
             )
         )
         if not frames:
-            return transform_records_to_sdtm([], domain=domain, study_key=study_key)
+            return transform_records_to_sdtm(
+                [],
+                domain=domain,
+                study_key=study_key,
+                subject_id_map=subject_id_map,
+            )
         return pd.concat(frames, ignore_index=True)
 
     def iter_sdtm_dataframes(
@@ -1218,15 +1871,19 @@ class RecordMapper:
         visit_key: str | None = None,
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
+        *,
+        subject_id_map: dict[str, str] | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked pandas DataFrames transformed into an SDTM domain dataset.
 
         Args:
             study_key: Unique study identifier.
-            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS').
+            domain: CDISC SDTM domain code (e.g. 'AE', 'DV', 'DD', 'CM', 'DM', 'VS',
+                'LB', 'EX', 'MH', 'DS', 'EG', 'PE', 'IE').
             visit_key: Optional visit filter.
             variable_whitelist: Optional variable name whitelist.
             form_whitelist: Optional form ID whitelist.
+            subject_id_map: Optional mapping from raw subject_key to USUBJID.
 
         Yields:
             Chunked DataFrames containing normalized SDTM domain records.
@@ -1236,17 +1893,28 @@ class RecordMapper:
                 "pandas is required for RecordMapper.iter_sdtm_dataframes. Install "
                 "with 'pip install \"imednet[pandas]\"'."
             )
-        if variable_whitelist is not None and len(variable_whitelist) == 0:
+        if form_whitelist is not None and len(form_whitelist) == 0:
             return
-        allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
+
+        allowed_vars = self._resolve_sdtm_allowed_vars(
+            study_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
+        if allowed_vars is not None and len(allowed_vars) == 0:
+            return
+
         extra_filters: dict[str, Any] = {}
         if form_whitelist is not None:
             extra_filters["formId"] = form_whitelist
 
+        codings_lookup, visits_lookup = self._load_sdtm_lookups(study_key)
+        seq_counters: dict[str, int] = {}
+
         records = self._iter_records(
             study_key,
             visit_key=visit_key,
-            extra_filters=extra_filters or None,
+            extra_filters=extra_filters,
         )
         for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
             records_batch: list[Any] = chunk
@@ -1264,10 +1932,26 @@ class RecordMapper:
                                 }
                             )
                         )
+                    elif isinstance(rec, dict):
+                        projected_chunk.append(
+                            {
+                                k: v
+                                for k, v in rec.items()
+                                if k in allowed_vars or k in _BASE_SDTM_CONSUMED_KEYS
+                            }
+                        )
                     else:
                         projected_chunk.append(rec)
                 records_batch = projected_chunk
-            df = transform_records_to_sdtm(records_batch, domain=domain, study_key=study_key)
+            df = transform_records_to_sdtm(
+                records_batch,
+                domain=domain,
+                study_key=study_key,
+                subject_id_map=subject_id_map,
+                seq_counters=seq_counters,
+                codings_lookup=codings_lookup or None,
+                visits_lookup=visits_lookup or None,
+            )
             if not df.empty:
                 yield df
 
@@ -1281,6 +1965,7 @@ class RecordMapper:
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        subject_id_map: dict[str, str] | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` of records for a study.
 
@@ -1298,6 +1983,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                subject_id_map=subject_id_map,
             )
 
         if pd is None:

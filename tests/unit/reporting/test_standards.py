@@ -289,3 +289,34 @@ def test_standards_profile_canonical_alias_resolution_for_cm() -> None:
         {"subjectKey": "S001", "cmTrt": "Aspirin", "cmDose": 100, "cmDosU": "mg"},
     )
     assert no_violations == []
+
+
+def test_expanded_domain_profiles_and_device_dd_serious_tokens() -> None:
+    """Verify LB, EX, MH, DS, EG, PE, IE profiles and DeviceSafetyProfile ddSerious tokens."""
+    assert _canonical_domain("Laboratory Results") == "LB"
+    assert _canonical_domain("Exposure") == "EX"
+    assert _canonical_domain("Medical History") == "MH"
+    assert _canonical_domain("Disposition") == "DS"
+    assert _canonical_domain("Electrocardiogram") == "EG"
+    assert _canonical_domain("Physical Examination") == "PE"
+    assert _canonical_domain("Inclusion/Exclusion") == "IE"
+    assert is_valid_cdash_variable("egTest", "EG")
+
+    general = GeneralClinicalProfile()
+    for domain in ("CM", "LB", "EX", "MH", "DS", "EG", "PE", "IE"):
+        assert general.expected_fields(domain)
+
+    device = DeviceSafetyProfile()
+    for token in (True, False, "Y", "N", "YES", "NO", "TRUE", "FALSE"):
+        violations = device.validate(
+            domain="DD",
+            data={
+                "subjectKey": "S002",
+                "ddTerm": "Battery failed",
+                "ddCategory": "HARDWARE",
+                "ddDate": "2024-03-15",
+                "ddSerious": token,
+            },
+        )
+        error_fields = {v.field for v in violations if v.severity == "ERROR"}
+        assert "ddSerious" not in error_fields

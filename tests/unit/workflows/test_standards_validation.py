@@ -6,6 +6,7 @@ import pytest
 
 from imednet.models.standards import (
     NORMALIZATION_TERMINOLOGY,
+    DeviceSafetyProfile,
     DrugSafetyProfile,
     GeneralClinicalProfile,
 )
@@ -616,3 +617,38 @@ def test_normalization_performance_under_two_milliseconds_per_record() -> None:
 
     # Constraint: under 2 ms per record
     assert ms_per_record < 2.0
+
+
+@pytest.mark.parametrize(
+    "serious_val",
+    [True, False, "Y", "N", "YES", "NO", "TRUE", "FALSE", "yes", "no", "true", "false"],
+)
+def test_device_profile_score_records_accepts_booleans_and_configured_dd_serious_tokens(
+    serious_val: bool | str,
+) -> None:
+    """Verify DeviceSafetyProfile with NORMALIZATION_TERMINOLOGY reports zero ddSerious errors."""
+    validator = StandardsReadinessValidator(
+        profile=DeviceSafetyProfile(),
+        normalizer=CategoricalNormalizer(NORMALIZATION_TERMINOLOGY),
+    )
+    report = validator.score_records(
+        records_by_domain={
+            "DD": [
+                {
+                    "subjectKey": "S001",
+                    "ddTerm": "Lead fracture",
+                    "ddCategory": "HARDWARE",
+                    "ddDate": "2025-03-10",
+                    "ddSerious": serious_val,
+                    "ddRelationship": "RELATED",
+                    "ddActionTaken": "REPLACED",
+                }
+            ]
+        }
+    )
+    dd_serious_errors = [
+        v for v in report.violations if v.field == "ddSerious" and v.severity == "ERROR"
+    ]
+    assert dd_serious_errors == []
+    assert report.warnings == []
+    assert report.score == 100.0

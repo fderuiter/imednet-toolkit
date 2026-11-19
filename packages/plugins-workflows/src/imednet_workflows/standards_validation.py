@@ -38,6 +38,12 @@ def _normalize_lookups(
     }
 
 
+def _matches_boolean_terminology(val: bool, terms: Collection[str]) -> bool:
+    """Return True when a native boolean aligns with boolean tokens in a codelist."""
+    expected_tokens = {"Y", "YES", "TRUE", "1"} if val else {"N", "NO", "FALSE", "0"}
+    return bool(expected_tokens.intersection(terms))
+
+
 class CategoricalNormalizer:
     """Normalize explicit terminology/date selections without inferring clinical meaning."""
 
@@ -172,6 +178,10 @@ class CategoricalNormalizer:
             return raw_value, f"{subject_prefix}record {field_name} is unmapped"
 
         if field_name in self._canonical_terms and not is_missing_value(raw_value):
+            if isinstance(raw_value, bool) and _matches_boolean_terminology(
+                raw_value, self._canonical_terms[field_name]
+            ):
+                return raw_value, None
             canonical = (
                 self._canonical_terms[field_name].get(raw_value.strip().upper())
                 if isinstance(raw_value, str)
@@ -275,10 +285,14 @@ class StandardsReadinessValidator:
                     val = normalization_result.normalized_record.get(field_name)
                     if is_missing_value(val):
                         continue
+                    is_accepted_bool = isinstance(val, bool) and _matches_boolean_terminology(
+                        val, accepted_terms.get(field_name, set())
+                    )
                     if (
                         field_name not in existing_error_fields
                         and field_name in accepted_terms
                         and not normalized_lookups.get(field_name)
+                        and not is_accepted_bool
                         and (
                             not isinstance(val, str)
                             or val.strip().upper() not in accepted_terms[field_name]

@@ -7,8 +7,19 @@ from pydantic import ValidationError
 
 from imednet.models.reporting import (
     AdverseEvent,
+    ConcomitantMedication,
     Demographics,
     DeviceDeficiency,
+    Disposition,
+    EcgResult,
+    Electrocardiogram,
+    Exposure,
+    InclusionExclusion,
+    LaboratoryResult,
+    LabResult,
+    MedicalHistory,
+    PhysicalExam,
+    PhysicalExamination,
     ProtocolDeviation,
     VitalSign,
     VitalSigns,
@@ -243,3 +254,98 @@ def test_vital_signs_rejects_invalid_datetime() -> None:
                 "vsDate": "not-a-datetime",
             }
         )
+
+
+def test_secondary_canonical_reporting_models_parse_and_coerce() -> None:
+    """Verify CM, LB, EX, MH, DS, EG, PE, and IE models parse camelCase aliases and coerce types."""
+    cm = ConcomitantMedication.model_validate(
+        {
+            "subjectKey": "S-10",
+            "cmTrt": "  Metformin ",
+            "cmDose": "500",
+            "cmDosU": "mg",
+            "cmRoute": "ORAL",
+            "cmStartDate": "2025-01-01T08:00:00+00:00",
+        }
+    )
+    assert cm.cm_trt == "Metformin"
+    assert cm.cm_dose == 500.0
+    assert cm.cm_decod is None
+
+    lb = LaboratoryResult.model_validate(
+        {
+            "subjectKey": "S-10",
+            "lbTest": "Glucose",
+            "lbTestCd": "GLUC",
+            "lbResult": "95.4",
+            "lbOrnrlo": "70",
+            "lbOrnrhi": "100",
+            "lbUnit": "mg/dL",
+        }
+    )
+    assert LabResult is LaboratoryResult
+    assert lb.lb_result == 95.4
+    assert lb.lb_ornrlo == 70.0
+    assert lb.lb_ornrhi == 100.0
+
+    lb_text = LaboratoryResult.model_validate(
+        {"subjectKey": "S-10", "lbTest": "Urine Dipstick", "lbResult": "NEGATIVE"}
+    )
+    assert lb_text.lb_result == "NEGATIVE"
+
+    ex = Exposure.model_validate(
+        {
+            "subjectKey": "S-10",
+            "exTrt": "Drug X",
+            "exDose": "12.5",
+            "exDosU": "mg",
+            "exStartDate": "2025-02-01T09:00:00+00:00",
+        }
+    )
+    assert ex.ex_dose == 12.5
+    assert ex.ex_end_date is None
+
+    mh = MedicalHistory.model_validate(
+        {
+            "subjectKey": "S-10",
+            "mhTerm": "Hypertension",
+            "mhPresp": "Y",
+            "mhOccur": "true",
+        }
+    )
+    assert mh.mh_presp is True
+    assert mh.mh_occur is True
+
+    ds = Disposition.model_validate(
+        {
+            "subjectKey": "S-10",
+            "dsTerm": "Completed",
+            "dsDecod": "COMPLETED",
+            "dsCat": "DISPOSITION EVENT",
+        }
+    )
+    assert ds.ds_decod == "COMPLETED"
+
+    eg = EcgResult.model_validate(
+        {"subjectKey": "S-10", "egTest": "Heart Rate", "egResult": "64", "egUnit": "bpm"}
+    )
+    assert Electrocardiogram is EcgResult
+    assert eg.eg_result == 64.0
+
+    pe = PhysicalExam.model_validate(
+        {"subjectKey": "S-10", "peTest": "Lungs", "peResult": "Clear to auscultation"}
+    )
+    assert PhysicalExamination is PhysicalExam
+    assert pe.pe_result == "Clear to auscultation"
+
+    ie = InclusionExclusion.model_validate(
+        {
+            "subjectKey": "S-10",
+            "ieTest": "Signed informed consent",
+            "ieTestCd": "INCL01",
+            "ieCat": "INCLUSION",
+            "ieResult": "N",
+        }
+    )
+    assert ie.ie_test_cd == "INCL01"
+    assert ie.ie_date is None

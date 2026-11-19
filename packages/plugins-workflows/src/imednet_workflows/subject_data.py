@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
-from imednet.spi.models import Query, Record, Subject, Visit
+from imednet.spi.models import Coding, Query, Record, Subject, Visit
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
@@ -20,6 +20,9 @@ class SubjectComprehensiveData(BaseModel):
     )
     queries: list[Query] = Field(
         default_factory=list, description="List of queries related to the subject."
+    )
+    codings: list[Coding] = Field(
+        default_factory=list, description="List of medical codings related to the subject."
     )
 
 
@@ -64,6 +67,11 @@ class SubjectDataWorkflow:
 
         # Fetch Queries
         results.queries = list(self._sdk.get_queries(study_key, **subject_filter_dict))
+
+        # Fetch Codings
+        get_codings_fn = getattr(self._sdk, "get_codings", None)
+        if callable(get_codings_fn):
+            results.codings = list(get_codings_fn(study_key, **subject_filter_dict))
 
         return results
 

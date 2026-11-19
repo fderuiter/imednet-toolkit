@@ -44,6 +44,54 @@ _CANONICAL_DOMAINS: dict[str, str] = {
     "CONCOMITANT_MEDICATIONS": "CM",
     "CONCOMITANT MEDICATION": "CM",
     "CONCOMITANT_MEDICATION": "CM",
+    "LB": "LB",
+    "LABS": "LB",
+    "LABORATORY": "LB",
+    "LABORATORY RESULTS": "LB",
+    "LABORATORY_RESULTS": "LB",
+    "EX": "EX",
+    "EXPOSURE": "EX",
+    "EXPOSURES": "EX",
+    "MH": "MH",
+    "MEDICAL HISTORY": "MH",
+    "MEDICAL_HISTORY": "MH",
+    "DS": "DS",
+    "DISPOSITION": "DS",
+    "EG": "EG",
+    "ECG": "EG",
+    "ELECTROCARDIOGRAM": "EG",
+    "ELECTROCARDIOGRAMS": "EG",
+    "PE": "PE",
+    "PHYSICAL EXAM": "PE",
+    "PHYSICAL_EXAM": "PE",
+    "PHYSICAL EXAMINATION": "PE",
+    "PHYSICAL_EXAMINATION": "PE",
+    "IE": "IE",
+    "INCLUSION/EXCLUSION": "IE",
+    "INCLUSION_EXCLUSION": "IE",
+    "INCLUSION EXCLUSION": "IE",
+}
+
+_COMMON_SECONDARY_REQUIRED: dict[str, list[str]] = {
+    "CM": ["subjectKey", "cmTrt"],
+    "LB": ["subjectKey", "lbTest", "lbResult"],
+    "EX": ["subjectKey", "exTrt"],
+    "MH": ["subjectKey", "mhTerm"],
+    "DS": ["subjectKey", "dsTerm"],
+    "EG": ["subjectKey", "egTest", "egResult"],
+    "PE": ["subjectKey", "peTest", "peResult"],
+    "IE": ["subjectKey", "ieTest", "ieTestCd", "ieCat", "ieResult"],
+}
+
+_COMMON_SECONDARY_RECOMMENDED: dict[str, list[str]] = {
+    "CM": ["cmDecod", "cmDose", "cmDosU", "cmRoute", "cmStartDate"],
+    "LB": ["lbTestCd", "lbCat", "lbUnit", "lbOrnrlo", "lbOrnrhi", "lbDate"],
+    "EX": ["exDose", "exDosU", "exRoute", "exStartDate", "exEndDate"],
+    "MH": ["mhDecod", "mhCat", "mhBodSys", "mhStartDate"],
+    "DS": ["dsDecod", "dsCat", "dsStartDate"],
+    "EG": ["egTestCd", "egCat", "egUnit", "egDate"],
+    "PE": ["peTestCd", "peBodSys", "peDate"],
+    "IE": ["ieDate"],
 }
 
 _STANDARD_SEX_VALUES: list[str] = ["M", "F", "U", "UNDIFFERENTIATED"]
@@ -226,12 +274,14 @@ class GeneralClinicalProfile(StandardsProfile):
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                **_COMMON_SECONDARY_REQUIRED,
             },
             recommended_fields={
                 "AE": ["aeDecod", "aeRelationship"],
                 "PD": ["dvStatus"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                **_COMMON_SECONDARY_RECOMMENDED,
             },
             optional_fields={
                 "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
@@ -251,11 +301,13 @@ class DrugSafetyProfile(StandardsProfile):
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                **_COMMON_SECONDARY_REQUIRED,
             },
             recommended_fields={
                 "AE": ["aeActionTaken", "aeOutcome"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                **_COMMON_SECONDARY_RECOMMENDED,
             },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
             value_constraints={
@@ -279,11 +331,13 @@ class DeviceSafetyProfile(StandardsProfile):
                 "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                **_COMMON_SECONDARY_REQUIRED,
             },
             recommended_fields={
                 "DD": ["ddRelationship", "ddActionTaken"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                **_COMMON_SECONDARY_RECOMMENDED,
             },
             optional_fields={},
             value_constraints={
@@ -314,7 +368,11 @@ class DeviceSafetyProfile(StandardsProfile):
             )
 
         dd_serious = data.get("ddSerious")
-        if not is_missing_value(dd_serious) and not isinstance(dd_serious, bool):
+        valid_dd_serious_tokens = NORMALIZATION_TERMINOLOGY["ddSerious"]
+        is_valid_serious = isinstance(dd_serious, bool) or (
+            isinstance(dd_serious, str) and dd_serious in valid_dd_serious_tokens
+        )
+        if not is_missing_value(dd_serious) and not is_valid_serious:
             violations.append(
                 ValidationViolation(
                     field="ddSerious",
@@ -600,6 +658,7 @@ DOMAIN_PREFIXES: dict[str, set[str]] = {
     "PE": {"pe"},
     "DA": {"da"},
     "DS": {"ds"},
+    "EG": {"eg"},
     "IE": {"ie"},
     "SU": {"su"},
 }

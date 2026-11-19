@@ -692,3 +692,150 @@ def test_extract_canonical_records_blocks_payload_clear(
     # Derived logic failed safely, keeping initial extracted value
     assert result.adverse_events[0].ae_term == "Headache"
     assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)
+
+
+def test_extract_canonical_records_supports_all_registered_clinical_domains() -> None:
+    """Verify extract_canonical_records groups and populates DM, VS, CM, LB, EX, MH, DS, EG, PE, IE."""
+    rule_specs = [
+        ("DM", "DM_F", [("sex", "sex"), ("age", "age")]),
+        ("VS", "VS_F", [("vsTest", "vsTest"), ("vsResult", "vsResult"), ("vsDate", "vsDate")]),
+        ("CM", "CM_F", [("cmTrt", "cmTrt"), ("cmDose", "cmDose")]),
+        ("LB", "LB_F", [("lbTest", "lbTest"), ("lbResult", "lbResult")]),
+        ("EX", "EX_F", [("exTrt", "exTrt"), ("exDose", "exDose")]),
+        ("MH", "MH_F", [("mhTerm", "mhTerm")]),
+        ("DS", "DS_F", [("dsTerm", "dsTerm")]),
+        ("EG", "EG_F", [("egTest", "egTest"), ("egResult", "egResult")]),
+        ("PE", "PE_F", [("peTest", "peTest"), ("peResult", "peResult")]),
+        (
+            "IE",
+            "IE_F",
+            [
+                ("ieTest", "ieTest"),
+                ("ieTestCd", "ieTestCd"),
+                ("ieCat", "ieCat"),
+                ("ieResult", "ieResult"),
+            ],
+        ),
+    ]
+    mappings: list[MappingRule] = []
+    for domain, form_key, fields in rule_specs:
+        mappings.append(
+            MappingRule(
+                domain=domain,
+                target_field="subjectKey",
+                source_form_key=form_key,
+                source_variable_name="subjectKey",
+            )
+        )
+        for target_field, src_var in fields:
+            mappings.append(
+                MappingRule(
+                    domain=domain,
+                    target_field=target_field,
+                    source_form_key=form_key,
+                    source_variable_name=src_var,
+                )
+            )
+
+    config = StudyConfiguration(study_key="STUDY-ALL", mappings=mappings)
+    records = [
+        Record(
+            record_id=1,
+            form_key="DM_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 1),
+            record_data={"sex": "F", "age": 30},
+        ),
+        Record(
+            record_id=2,
+            form_key="VS_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 2),
+            record_data={"vsTest": "Pulse", "vsResult": "72", "vsDate": "2025-01-02T08:00:00"},
+        ),
+        Record(
+            record_id=3,
+            form_key="CM_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 3),
+            record_data={"cmTrt": "Paracetamol", "cmDose": "500"},
+        ),
+        Record(
+            record_id=4,
+            form_key="LB_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 4),
+            record_data={"lbTest": "ALT", "lbResult": "24.5"},
+        ),
+        Record(
+            record_id=5,
+            form_key="EX_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 5),
+            record_data={"exTrt": "Investigational Drug", "exDose": "100"},
+        ),
+        Record(
+            record_id=6,
+            form_key="MH_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 6),
+            record_data={"mhTerm": "Seasonal allergies"},
+        ),
+        Record(
+            record_id=7,
+            form_key="DS_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 7),
+            record_data={"dsTerm": "Completed"},
+        ),
+        Record(
+            record_id=8,
+            form_key="EG_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 8),
+            record_data={"egTest": "PR Interval", "egResult": "160"},
+        ),
+        Record(
+            record_id=9,
+            form_key="PE_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 9),
+            record_data={"peTest": "Abdomen", "peResult": "Soft, non-tender"},
+        ),
+        Record(
+            record_id=10,
+            form_key="IE_F",
+            subject_key="S01",
+            date_created=datetime(2025, 1, 10),
+            record_data={
+                "ieTest": "Prior therapy",
+                "ieTestCd": "EXCL02",
+                "ieCat": "EXCLUSION",
+                "ieResult": "Y",
+            },
+        ),
+    ]
+
+    extracted = extract_canonical_records(records=records, study_configuration=config)
+    assert extracted.validation_errors == []
+    assert len(extracted.demographics) == 1 and extracted.demographics[0].sex == "F"
+    assert len(extracted.vital_signs) == 1 and extracted.vital_signs[0].vs_result == 72.0
+    assert (
+        len(extracted.concomitant_medications) == 1
+        and extracted.concomitant_medications[0].cm_trt == "Paracetamol"
+    )
+    assert (
+        len(extracted.laboratory_results) == 1 and extracted.laboratory_results[0].lb_result == 24.5
+    )
+    assert len(extracted.exposures) == 1 and extracted.exposures[0].ex_dose == 100.0
+    assert (
+        len(extracted.medical_history) == 1
+        and extracted.medical_history[0].mh_term == "Seasonal allergies"
+    )
+    assert len(extracted.disposition) == 1 and extracted.disposition[0].ds_term == "Completed"
+    assert len(extracted.ecg_results) == 1 and extracted.ecg_results[0].eg_result == 160.0
+    assert len(extracted.physical_exams) == 1 and extracted.physical_exams[0].pe_test == "Abdomen"
+    assert (
+        len(extracted.inclusion_exclusion) == 1
+        and extracted.inclusion_exclusion[0].ie_test_cd == "EXCL02"
+    )

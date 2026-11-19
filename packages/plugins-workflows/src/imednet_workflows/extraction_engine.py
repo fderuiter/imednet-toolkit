@@ -18,12 +18,22 @@ from imednet.spi.models import (
     AdverseEvent,
     AnalysisAdverseEvent,
     AnalysisLabResult,
+    ConcomitantMedication,
+    Demographics,
     DeviceDeficiency,
+    Disposition,
+    EcgResult,
+    Exposure,
+    InclusionExclusion,
+    LaboratoryResult,
     MappingRule,
+    MedicalHistory,
+    PhysicalExam,
     ProtocolDeviation,
     Record,
     StudyConfiguration,
     SubjectLevelAnalysis,
+    VitalSigns,
 )
 from imednet.spi.utils import (
     evaluate_expression,
@@ -33,13 +43,70 @@ from imednet.spi.utils import (
 
 logger = logging.getLogger(__name__)
 
-_DOMAIN_MODEL_MAP = {
+_DOMAIN_MODEL_MAP: dict[str, type[Any]] = {
     "AE": AdverseEvent,
     "PD": ProtocolDeviation,
+    "DV": ProtocolDeviation,
     "DD": DeviceDeficiency,
+    "DM": Demographics,
+    "VS": VitalSigns,
+    "CM": ConcomitantMedication,
+    "LB": LaboratoryResult,
+    "EX": Exposure,
+    "MH": MedicalHistory,
+    "DS": Disposition,
+    "EG": EcgResult,
+    "PE": PhysicalExam,
+    "IE": InclusionExclusion,
     "ADSL": SubjectLevelAnalysis,
     "ADAE": AnalysisAdverseEvent,
     "ADLB": AnalysisLabResult,
+}
+
+_DOMAIN_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("DM", ("DEMOGRAPHICS", "DEMOGRAPHIC")),
+    ("VS", ("VITALS", "VITAL SIGNS", "VITAL_SIGNS", "VITALSIGNS")),
+    ("AE", ("ADVERSE EVENTS", "ADVERSE_EVENTS", "ADVERSE EVENT")),
+    ("PD", ("PROTOCOL DEVIATIONS", "PROTOCOL_DEVIATIONS", "PROTOCOL DEVIATION")),
+    ("DD", ("DEVICE DEFICIENCIES", "DEVICE_DEFICIENCIES", "DEVICE DEFICIENCY")),
+    (
+        "CM",
+        (
+            "CONCOMITANT MEDICATIONS",
+            "CONCOMITANT_MEDICATIONS",
+            "CONCOMITANT MEDICATION",
+            "CONCOMITANT_MEDICATION",
+        ),
+    ),
+    ("LB", ("LABS", "LABORATORY", "LABORATORY RESULTS", "LABORATORY_RESULTS")),
+    ("EX", ("EXPOSURE", "EXPOSURES")),
+    ("MH", ("MEDICAL HISTORY", "MEDICAL_HISTORY")),
+    ("DS", ("DISPOSITION",)),
+    ("EG", ("ECG", "ELECTROCARDIOGRAM", "ELECTROCARDIOGRAMS")),
+    ("PE", ("PHYSICAL EXAM", "PHYSICAL_EXAM", "PHYSICAL EXAMINATION", "PHYSICAL_EXAMINATION")),
+    ("IE", ("INCLUSION/EXCLUSION", "INCLUSION_EXCLUSION", "INCLUSION EXCLUSION")),
+)
+_DOMAIN_ALIASES: dict[str, str] = {
+    alias: code for code, aliases in _DOMAIN_ALIAS_GROUPS for alias in aliases
+}
+
+_DOMAIN_RESULT_ATTR: dict[str, str] = {
+    "AE": "adverse_events",
+    "PD": "protocol_deviations",
+    "DV": "protocol_deviations",
+    "DD": "device_deficiencies",
+    "DM": "demographics",
+    "VS": "vital_signs",
+    "CM": "concomitant_medications",
+    "LB": "laboratory_results",
+    "EX": "exposures",
+    "MH": "medical_history",
+    "DS": "disposition",
+    "EG": "ecg_results",
+    "PE": "physical_exams",
+    "IE": "inclusion_exclusion",
+    "ADAE": "adae_records",
+    "ADLB": "adlb_records",
 }
 
 _RECORD_FIELD_MAP: dict[str, str] = {name: name for name in Record.model_fields}
@@ -54,6 +121,16 @@ class ExtractionResult(BaseModel):
     adverse_events: list[AdverseEvent] = Field(default_factory=list)
     protocol_deviations: list[ProtocolDeviation] = Field(default_factory=list)
     device_deficiencies: list[DeviceDeficiency] = Field(default_factory=list)
+    demographics: list[Demographics] = Field(default_factory=list)
+    vital_signs: list[VitalSigns] = Field(default_factory=list)
+    concomitant_medications: list[ConcomitantMedication] = Field(default_factory=list)
+    laboratory_results: list[LaboratoryResult] = Field(default_factory=list)
+    exposures: list[Exposure] = Field(default_factory=list)
+    medical_history: list[MedicalHistory] = Field(default_factory=list)
+    disposition: list[Disposition] = Field(default_factory=list)
+    ecg_results: list[EcgResult] = Field(default_factory=list)
+    physical_exams: list[PhysicalExam] = Field(default_factory=list)
+    inclusion_exclusion: list[InclusionExclusion] = Field(default_factory=list)
     adsl_records: list[SubjectLevelAnalysis] = Field(default_factory=list)
     adae_records: list[AnalysisAdverseEvent] = Field(default_factory=list)
     adlb_records: list[AnalysisLabResult] = Field(default_factory=list)
@@ -205,7 +282,8 @@ def _group_mappings_by_domain_and_form(
     """
     grouped: dict[str, dict[str, list[MappingRule]]] = {}
     for rule in study_configuration.mappings:
-        domain_key = rule.domain.upper()
+        raw_domain = rule.domain.strip().upper().replace("-", "_")
+        domain_key = _DOMAIN_ALIASES.get(raw_domain, raw_domain)
         if domain_key not in _DOMAIN_MODEL_MAP:
             continue
         grouped.setdefault(domain_key, {}).setdefault(rule.source_form_key, []).append(rule)
@@ -367,16 +445,9 @@ def extract_canonical_records(
                     )
                     continue
 
-                if domain == "AE":
-                    result.adverse_events.append(model_instance)
-                elif domain == "PD":
-                    result.protocol_deviations.append(model_instance)
-                elif domain == "DD":
-                    result.device_deficiencies.append(model_instance)
-                elif domain == "ADAE":
-                    result.adae_records.append(model_instance)
-                elif domain == "ADLB":
-                    result.adlb_records.append(model_instance)
+                target_attr = _DOMAIN_RESULT_ATTR.get(domain)
+                if target_attr is not None:
+                    getattr(result, target_attr).append(model_instance)
 
         if has_adsl_rules:
             try:

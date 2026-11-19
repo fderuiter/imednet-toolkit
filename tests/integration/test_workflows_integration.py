@@ -91,6 +91,19 @@ def test_subject_data_aggregation():
     respx.get("https://api.test/api/v1/edc/studies/ST/queries").respond(
         json={"data": [{"queryComments": [{"sequence": 1, "closed": False}]}]}
     )
+    respx.get("https://api.test/api/v1/edc/studies/ST/codings").respond(
+        json={
+            "data": [
+                {
+                    "codingId": "C1",
+                    "recordId": 1,
+                    "subjectKey": "SUB1",
+                    "variable": "aeTerm",
+                    "value": "Headache",
+                }
+            ]
+        }
+    )
 
     wf = SubjectDataWorkflow(sdk)
     data = wf.get_all_subject_data("ST", "SUB1")
@@ -99,6 +112,7 @@ def test_subject_data_aggregation():
     assert len(data.visits) == 1
     assert len(data.records) == 1
     assert len(data.queries) == 1
+    assert len(data.codings) == 1
 
 
 @respx.mock
