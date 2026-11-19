@@ -647,14 +647,14 @@ def test_workflows_uat_run_headless_success(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_workflows_uat_run_headless_failure_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test workflows uat run exits with 1 when pipeline fails."""
+    """Test workflows uat run exits with 1 and prints [Failed] (never [Complete]) on failure."""
     monkeypatch.setenv("IMEDNET_API_KEY", "test_key")
     monkeypatch.setenv("IMEDNET_SECURITY_KEY", "test_sec")
     monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=MagicMock()))
 
     mock_run_result = MagicMock(spec=UATRunResult)
     mock_run_result.overall_success = False
-    mock_run_result.summary.return_value = "=== UAT RUN SUMMARY ===\nStatus: FAIL"
+    mock_run_result.summary.return_value = "=== UAT RUN SUMMARY ===\nOverall: FAIL"
 
     mock_uat_workflow = MagicMock()
     mock_uat_workflow.run.return_value = mock_run_result
@@ -667,7 +667,70 @@ def test_workflows_uat_run_headless_failure_exits_1(monkeypatch: pytest.MonkeyPa
     result = run_cli_command(cli_app, ["workflows", "uat", "run", "FAIL_STUDY"])
 
     assert result.exit_code == 1
-    assert "Status: FAIL" in result.stdout
+    assert "Overall: FAIL" in result.stdout
+    assert "[Failed] UAT pipeline execution encountered an error." in result.stderr
+    assert "[Complete]" not in result.stderr
+
+
+def test_workflows_uat_run_end_to_end_monitoring_failure_cli_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End-to-end uat_run with failed monitored job emits [Failed] before Overall: FAIL."""
+    import builtins
+
+    from imednet import ImednetSDK
+    from imednet.spi.models import JobStatus
+    from imednet.spi.utils import JobFailedError, JobPollSummary
+
+    monkeypatch.setenv("IMEDNET_API_KEY", "test_key")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "test_sec")
+    sim_sdk = ImednetSDK(simulation_mode=True)
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=sim_sdk))
+
+    failed_summary = JobPollSummary(
+        study_key="STUDY",
+        results={},
+        failures={
+            "batch-mon-fail-99": JobFailedError(
+                "batch-mon-fail-99", JobStatus(batch_id="batch-mon-fail-99", state="FAILED")
+            )
+        },
+        elapsed_total=0.2,
+    )
+    monkeypatch.setattr(
+        "imednet_workflows.uat.orchestrator.UATWorkflow.monitor",
+        MagicMock(return_value=failed_summary),
+    )
+
+    events: list[str] = []
+    orig_print = builtins.print
+
+    def tracking_print(*args: object, **kwargs: object) -> None:
+        events.append(" ".join(str(a) for a in args))
+        orig_print(*args, **kwargs)
+
+    def tracking_progress(message: str) -> None:
+        events.append(message)
+        print_progress(message)
+
+    monkeypatch.setattr(builtins, "print", tracking_print)
+    monkeypatch.setattr("imednet_workflows.wizard.print_progress", tracking_progress)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_app(["workflows", "uat", "run", "STUDY", "--subject-count", "1"])
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 1
+    assert "[Phase 1/5] Inspecting study schema and metadata..." in captured.err
+    assert "[Phase 5/5] Monitoring asynchronous job completion..." in captured.err
+    assert "[Failed] UAT pipeline execution encountered an error." in captured.err
+    assert "[Complete]" not in captured.err
+    assert "Overall: FAIL" in captured.out
+    assert "Failed phase: MONITORING" in captured.out
+    assert "batch-mon-fail-99" in captured.out
+    combined_events = "\n".join(events)
+    assert combined_events.index("[Failed]") < combined_events.index("Overall: FAIL")
 
 
 def test_long_extraction_piped_stdout_cleanliness(monkeypatch: pytest.MonkeyPatch) -> None:
