@@ -72,6 +72,26 @@ def test_workflow_dependency_and_lockfile_exclude_vulnerable_filelock() -> None:
     assert all(Version(version) >= Version("4.2.1") for version in versions)
 
 
+def test_duckdb_dependencies_and_lockfile_exclude_unstable_v2_major() -> None:
+    """Unlocked Hatch/pip and locked uv resolutions must exclude duckdb 2.x crashes."""
+    root_project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    core_project = tomllib.loads((ROOT / "packages/core/pyproject.toml").read_text())["project"]
+
+    dev_reqs = [Requirement(v) for v in root_project["optional-dependencies"]["dev"]]
+    duckdb_extra_reqs = [Requirement(v) for v in core_project["optional-dependencies"]["duckdb"]]
+    export_extra_reqs = [Requirement(v) for v in core_project["optional-dependencies"]["export"]]
+
+    for reqs in (dev_reqs, duckdb_extra_reqs, export_extra_reqs):
+        duckdb_req = next(r for r in reqs if r.name == "duckdb")
+        assert "1.5.4" in duckdb_req.specifier
+        assert "2.0.0" not in duckdb_req.specifier
+
+    locked = tomllib.loads((ROOT / "uv.lock").read_text())
+    versions = [p["version"] for p in locked["package"] if p["name"] == "duckdb"]
+    assert versions
+    assert all(Version("1.1.0") <= Version(v) < Version("2.0.0") for v in versions)
+
+
 @pytest.mark.parametrize("proxy", ["socks5://127.0.0.1:1", "socks5h://127.0.0.1:1"])
 def test_development_clients_support_socks_proxy_configuration(monkeypatch, proxy) -> None:
     """Construct transports without contacting a proxy or EDC server."""
