@@ -471,3 +471,84 @@ def test_normalize_utc_timestamp_bound() -> None:
         normalize_utc_timestamp_bound("")
     with pytest.raises(ValueError):
         normalize_utc_timestamp_bound("2026-99-99")
+
+
+def test_model_less_scalar_coercion_unpadded_digits_and_unicode() -> None:
+    """When model is None, only unpadded ASCII digits convert to int; padded and Unicode stay str."""
+    assert parse_filter_expression("count=0") == ("count", 0)
+    assert parse_filter_expression("count=42") == ("count", 42)
+    assert parse_filter_expression("subject_key=001") == ("subject_key", "001")
+    assert parse_filter_expression("code=0042") == ("code", "0042")
+    assert parse_filter_expression('count="42"') == ("count", "42")
+    assert parse_filter_expression("value=²") == ("value", "²")
+    assert parse_filter_expression("value=³") == ("value", "³")
+    assert parse_filter_expression("value=٠١٢") == ("value", "٠١٢")
+    assert build_filter_string(parse_filter_expressions(["subject_key=001", "code=0042"])) == (
+        "subjectKey==001;code==0042"
+    )
+
+
+def test_schema_guided_scalar_coercion_across_model_types() -> None:
+    """Schema-guided coercion preserves text strings and validates int, float, and bool fields."""
+    from enum import Enum
+    from typing import Annotated, Literal
+
+    from pydantic import BaseModel, Field
+
+    from imednet.models.codings import Coding
+    from imednet.models.forms import Form
+    from imednet.models.intervals import Interval
+    from imednet.models.subjects import Subject
+
+    # String fields preserve leading zeros, numeric text, boolean tokens, and superscripts
+    assert parse_filter_expressions(["subject_key=001"], model=Subject) == {"subject_key": "001"}
+    assert parse_filter_expressions(["subjectKey=123"], model=Subject) == {"subjectKey": "123"}
+    assert parse_filter_expressions(["code=0042"], model=Coding) == {"code": "0042"}
+    assert parse_filter_expressions(["value=true"], model=Coding) == {"value": "true"}
+    assert parse_filter_expressions(["value=²"], model=Coding) == {"value": "²"}
+
+    # Integer fields coerce ASCII integers (including negative bounds) and reject non-integers
+    assert parse_filter_expressions(["revision>=2"], model=Coding) == {"revision": (">=", 2)}
+    assert parse_filter_expressions(["negative_slack=-5"], model=Interval) == {"negative_slack": -5}
+    for bad_int in ["revision=abc", "revision=²", "revision=1.5", "revision=true"]:
+        with pytest.raises(ValueError, match="Invalid integer value"):
+            parse_filter_expressions([bad_int], model=Coding)
+
+    # Boolean fields accept true/false case-insensitively and reject invalid tokens
+    assert parse_filter_expressions(["disabled=true"], model=Form) == {"disabled": True}
+    assert parse_filter_expressions(["disabled=FALSE"], model=Form) == {"disabled": False}
+    for bad_bool in ["disabled=abc", "disabled=1", "disabled=yes"]:
+        with pytest.raises(ValueError, match="Invalid boolean value"):
+            parse_filter_expressions([bad_bool], model=Form)
+
+    # Custom Pydantic annotations (float, Annotated, Literal, plain Enum, validation_alias, Union)
+    class PlainColor(Enum):
+        RED = 1
+
+    class CustomFilterModel(BaseModel):
+        score: Annotated[float | None, Field(validation_alias="scoreVal")] = None
+        tier: Literal["gold", "silver"] | None = None
+        flag_lit: Literal[True, False] | None = None
+        rank_lit: Literal[1, 2] | None = None
+        ratio_lit: Literal[0.5, 1.5] | None = None
+        color: PlainColor | None = None
+        mixed: int | str | None = None
+
+    assert parse_filter_expression("score>=3.5", model=CustomFilterModel) == (
+        "score",
+        (">=", 3.5),
+    )
+    assert parse_filter_expression("scoreVal=-0.25", model=CustomFilterModel) == (
+        "scoreVal",
+        -0.25,
+    )
+    with pytest.raises(ValueError, match="Invalid numeric value"):
+        parse_filter_expression("score=abc", model=CustomFilterModel)
+
+    assert parse_filter_expression("tier=001", model=CustomFilterModel) == ("tier", "001")
+    assert parse_filter_expression("flag_lit=true", model=CustomFilterModel) == ("flag_lit", True)
+    assert parse_filter_expression("rank_lit=2", model=CustomFilterModel) == ("rank_lit", 2)
+    assert parse_filter_expression("ratio_lit=1.5", model=CustomFilterModel) == ("ratio_lit", 1.5)
+    assert parse_filter_expression("color=001", model=CustomFilterModel) == ("color", "001")
+    assert parse_filter_expression("mixed=42", model=CustomFilterModel) == ("mixed", 42)
+    assert parse_filter_expression("mixed=0042", model=CustomFilterModel) == ("mixed", "0042")

@@ -1,7 +1,7 @@
 MongoDB Export Example
 ======================
 
-Export study records to MongoDB while preserving nested ``record_data`` payloads.
+Export Study Records to MongoDB while preserving nested ``record_data`` payloads.
 
 Prerequisites
 -------------
