@@ -44,7 +44,6 @@ ConfigVersionStore = "imednet_workflows.config_version_control:ConfigVersionStor
 [project.entry-points."imednet.state_providers"]
 default = "imednet_workflows.state_ledger:get_state_provider"
 file = "imednet_workflows.state_ledger:FileStateProvider"
-airflow = "imednet_workflows.state_ledger:AirflowStateProvider"
 
 [project.urls]
 repository = "https://github.com/fderuiter/imednet-toolkit"

@@ -4,6 +4,7 @@ import importlib.util
 from unittest.mock import MagicMock
 
 import pytest
+
 from imednet_sinks import MongoDbSinkConfig, Neo4jSinkConfig, SnowflakeSinkConfig
 
 

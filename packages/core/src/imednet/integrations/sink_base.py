@@ -190,9 +190,7 @@ def get_state_provider(
         )
 
     factory = matched[0].load()
-    if target_name == "airflow":
-        provider = factory()
-    elif ledger_path is not None:
+    if ledger_path is not None:
         provider = (
             factory(ledger_path=ledger_path) if target_name == "default" else factory(ledger_path)
         )

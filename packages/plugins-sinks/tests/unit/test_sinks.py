@@ -5,11 +5,11 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, MagicMock
 
 import pytest
+
+from imednet.errors import ExportBatchError, ExportConfigurationError
 from imednet_sinks import (
     Neo4jSinkConfig,
 )
-
-from imednet.errors import ExportBatchError, ExportConfigurationError
 
 
 def _fake_neo4j_module(fail_connect: bool = False) -> ModuleType:
@@ -226,7 +226,6 @@ class TestNeo4jExportSink:
     def test_write_batch_reuses_mapper_instance(self, monkeypatch):
         """Verify CentralizedMapper is instantiated once per write_batch execution."""
         import imednet_sinks.graph as graph_mod
-
         from imednet.integrations.enrichment import CentralizedMapper
 
         neo4j, driver = _fake_neo4j_module()
@@ -258,9 +257,8 @@ class TestNeo4jExportSink:
 
     def test_record_to_row_accepts_and_uses_injected_mapper(self):
         """Verify _record_to_row uses injected mapper and maintains backward compatibility."""
-        from imednet_sinks.graph import _post_process_graph, _record_to_row
-
         from imednet.integrations.enrichment import CentralizedMapper
+        from imednet_sinks.graph import _post_process_graph, _record_to_row
 
         record = MagicMock(record_id=10, form_id=1, visit_id=1, subject_key="S1", record_data={})
 
@@ -279,9 +277,8 @@ class TestNeo4jExportSink:
         import json
 
         import imednet_sinks.graph as graph_mod
-        from imednet_sinks.graph import Neo4jExportSink
-
         from imednet.models.records import Record
+        from imednet_sinks.graph import Neo4jExportSink
 
         neo4j, driver = _fake_neo4j_module()
         monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
@@ -530,7 +527,6 @@ class TestMongoDbExportSink:
     def test_write_batch_reuses_mapper_instance(self, monkeypatch):
         """Verify CentralizedMapper is instantiated once per write_batch execution."""
         import imednet_sinks.document as doc_mod
-
         from imednet.integrations.enrichment import CentralizedMapper
 
         pymongo, client, collection = _fake_pymongo_module()
@@ -564,9 +560,8 @@ class TestMongoDbExportSink:
 
     def test_record_to_document_accepts_and_uses_injected_mapper(self):
         """Verify _record_to_document uses injected mapper and maintains backward compatibility."""
-        from imednet_sinks.document import _post_process_document, _record_to_document
-
         from imednet.integrations.enrichment import CentralizedMapper
+        from imednet_sinks.document import _post_process_document, _record_to_document
 
         record = MagicMock(record_id=10, form_id=1, visit_id=1, subject_key="S1", record_data={})
 
@@ -1078,11 +1073,11 @@ class TestSnowflakeExportSink:
 
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from imednet_sinks.warehouse import _post_process_warehouse, _records_to_arrow_table
 
         from imednet.integrations.enrichment import CentralizedMapper, EnrichmentPipeline
         from imednet.models.records import Keyword, Record
         from imednet.models.study_config import MappingRule, StudyConfiguration
+        from imednet_sinks.warehouse import _post_process_warehouse, _records_to_arrow_table
 
         records = [
             Record(
@@ -1221,11 +1216,11 @@ class TestSnowflakeExportSink:
         """Verify idempotent write_batch overwrites staged Parquet and merges by (study_key, record_id) without duplicating rows."""
         import json
 
-        import imednet_sinks.warehouse as wh_mod
         import pyarrow.parquet as pq
-        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
+        import imednet_sinks.warehouse as wh_mod
         from imednet.models.records import Record
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
         sf, conn, cursor = _fake_snowflake_module()
         orig_require = wh_mod._require_optional_dep
@@ -1471,10 +1466,9 @@ class TestBatchScopedMapperPerformance:
 
     def test_pipeline_cache_reuse_across_1000_records(self):
         """Verify pipeline cache is populated once and reused across 1,000 records."""
+        from imednet.integrations.enrichment import CentralizedMapper
         from imednet_sinks.document import _post_process_document, _record_to_document
         from imednet_sinks.graph import _post_process_graph, _record_to_row
-
-        from imednet.integrations.enrichment import CentralizedMapper
 
         records = [
             SimpleNamespace(
@@ -1539,9 +1533,8 @@ class TestSinkPhiMaskingControls:
     def test_mongodb_sink_masks_phi_by_default_and_honors_opt_out(self, monkeypatch):
         """MongoDbExportSink replaces patientName, DOB, SSN, and email with ***MASKED*** unless mask_phi=False."""
         import imednet_sinks.document as doc_mod
-        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
-
         from imednet.utils.security import global_sensitivity_registry
+        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
 
         registry_before = set(global_sensitivity_registry._sensitive_keys)
         pymongo, _client, _collection = _fake_pymongo_module()

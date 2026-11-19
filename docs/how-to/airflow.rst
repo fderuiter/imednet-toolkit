@@ -148,6 +148,60 @@ resolved only inside ``execute()``:
        },
    )
 
+Incremental Checkpointing in Airflow 3
+--------------------------------------
+
+``ImednetExportOperator(incremental=True)`` and ``imednet-workflows`` standardize
+on the file-backed :class:`~imednet_workflows.ExtractionStateLedger`
+(``FileStateProvider``) rather than querying or mutating Airflow's internal XCom
+metadata tables across DAG runs. In Airflow 3 deployments, choose one of three
+supported patterns to carry Study high-water marks between runs:
+
+1. **Operator outputs and TaskFlow return values**: pass lightweight ISO-8601
+   watermarks explicitly between tasks within a DAG run and supply them via
+   ``modified_since`` on ``ImednetExportOperator``.
+2. **Airflow 3 Variables** (``airflow.sdk.Variable``): persist compact per-Study
+   watermarks in Airflow's variable store and pass ``Variable.get(...)`` into
+   ``modified_since`` at task execution time.
+3. **Shared filesystem or Airflow ObjectStorage**
+   (``airflow.sdk.ObjectStoragePath``): point ``ledger_path`` (or
+   ``IMEDNET_WORKFLOW_LEDGER_PATH``) at a shared volume, or stage the JSON ledger
+   to and from object storage around ``ImednetExportOperator(incremental=True)``:
+
+.. code-block:: python
+
+   from pathlib import Path
+   from airflow.sdk import ObjectStoragePath, Variable, task
+   from apache_airflow_providers_imednet import ImednetExportOperator
+
+   # Option A: Airflow 3 Variable + explicit modified_since watermark
+   watermark = Variable.get("imednet_my_study_watermark", default=None)
+   ImednetExportOperator(
+       task_id="export_incremental_variable",
+       study_key="MY_STUDY",
+       destination="parquet",
+       output_path="/tmp/my_study_incremental.parquet",
+       modified_since=watermark,
+       imednet_conn_id="imednet_default",
+   )
+
+   # Option B: Stage ExtractionStateLedger via Airflow ObjectStorage
+   @task
+   def stage_ledger_down(remote_uri: str, local_ledger: str) -> str:
+       remote = ObjectStoragePath(remote_uri)
+       target = Path(local_ledger)
+       if remote.exists():
+           target.parent.mkdir(parents=True, exist_ok=True)
+           target.write_bytes(remote.read_bytes())
+       return str(target)
+
+   @task
+   def stage_ledger_up(local_ledger: str, remote_uri: str) -> str:
+       source = Path(local_ledger)
+       if source.exists():
+           ObjectStoragePath(remote_uri).write_bytes(source.read_bytes())
+       return remote_uri
+
 Testing with Airflow
 --------------------
 

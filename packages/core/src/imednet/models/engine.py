@@ -22,7 +22,13 @@ _CONTRACT_CACHE: APIContract | None = None
 _SKIP_STUB_FILES = frozenset({"__init__.py", "engine.py", "contract.py"})
 _STDLIB_MODULES = frozenset(sys.stdlib_module_names)
 _FIRST_PARTY_ROOTS = frozenset(
-    {"imednet", "imednet_workflows", "apache_airflow_providers_imednet", "imednet_tui"}
+    {
+        "imednet",
+        "imednet_workflows",
+        "imednet_sinks",
+        "apache_airflow_providers_imednet",
+        "imednet_tui",
+    }
 )
 
 

@@ -331,10 +331,16 @@ Adding New Export Sinks
 Static boundary checks
 ----------------------
 
-The repository guard scans core, workflows, sinks and Airflow source roots.
+The repository guard scans all five workspace source roots: core (``imednet``),
+workflows (``imednet_workflows``), sinks (``imednet_sinks``), TUI
+(``imednet_tui``), and Airflow (``apache_airflow_providers_imednet``).
 It resolves relative imports before checking segment-aware package boundaries;
-missing source trees fail explicitly. Type-only references follow the same
-layering rules, without executing optional modules. Core's SPI is an intentional
-CLI composition root. Dynamic entry points and legacy lazy import shims require
-separate runtime tests. New sink implementations use ``imednet.spi.sinks``;
-legacy ``imednet.spi.sink_base`` and ``imednet.integrations`` remain compatible.
+missing source trees fail explicitly. All twelve cross-extension import pairs
+across ``imednet_workflows``, ``imednet_sinks``, ``imednet_tui``, and
+``apache_airflow_providers_imednet`` are blocked, and ``airflow`` / ``airflow.*``
+imports are forbidden in ``imednet``, ``imednet_workflows``, ``imednet_sinks``,
+and ``imednet_tui``. Type-only references follow the same layering rules, without
+executing optional modules. Core's SPI is an intentional CLI composition root.
+Dynamic entry points and legacy lazy import shims require separate runtime tests.
+New sink implementations use ``imednet.spi.sinks``; legacy
+``imednet.spi.sink_base`` and ``imednet.integrations`` remain compatible.

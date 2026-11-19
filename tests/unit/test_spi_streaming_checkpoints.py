@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -15,9 +15,6 @@ import httpx
 import pandas as pd
 import pytest
 import respx
-from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig, export_to_mongodb
-from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig, export_to_neo4j
-from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig, export_to_snowflake
 
 from imednet import cli
 from imednet.errors import ExportBatchError
@@ -52,13 +49,16 @@ from imednet.spi.sink_base import (
     iter_batches,
     run_streaming_export,
 )
+from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig, export_to_mongodb
+from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig, export_to_neo4j
+from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig, export_to_snowflake
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 from imednet_workflows.extraction_engine import extract_canonical_records
 from imednet_workflows.record_mapper import RecordMapper, transform_records_to_sdtm
 from imednet_workflows.state_ledger import (
-    AirflowStateProvider,
     ExtractionStateLedger,
     FileStateProvider,
+    StreamExecutionStatus,
 )
 from imednet_workflows.subject_data import SubjectDataWorkflow
 
@@ -348,7 +348,7 @@ def test_record_mapper_iter_dataframes_streams_lazily() -> None:
 def test_spi_discovers_pluggable_state_providers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """spi.sink_base.get_state_provider resolves default, file, and airflow providers via entry points."""
+    """spi.sink_base.get_state_provider resolves default and file providers via entry points."""
     ledger_file = tmp_path / "ledger.json"
     default_provider = spi_sink_base.get_state_provider(ledger_path=ledger_file)
     assert isinstance(default_provider, StateProviderProtocol)
@@ -357,8 +357,8 @@ def test_spi_discovers_pluggable_state_providers(
     file_provider = get_state_provider(ledger_path=ledger_file, provider_name="file")
     assert isinstance(file_provider, FileStateProvider)
 
-    airflow_provider = get_state_provider(provider_name="airflow")
-    assert isinstance(airflow_provider, AirflowStateProvider)
+    with pytest.raises(ImportError, match="airflow"):
+        get_state_provider(provider_name="airflow")
 
     monkeypatch.setattr("importlib.metadata.entry_points", lambda **_kwargs: [])
     with pytest.raises(ImportError, match="workflows"):
@@ -466,30 +466,16 @@ def test_batch_or_flush_failure_preserves_watermark_and_marks_failed(tmp_path: P
     assert entry_after_flush_fail.last_run_status.value == "failed"
 
 
-def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
-    monkeypatch: pytest.MonkeyPatch,
+def test_airflow_operator_file_ledger_incremental_checkpoint_and_failure_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AirflowStateProvider passes dateModified filter, updates checkpoint, and rolls back on error."""
+    """ImednetExportOperator incremental export uses FileStateProvider and rolls back on error."""
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 
-    xcom_store: dict[str, dict[str, Any]] = {}
-
-    class _FakeTI:
-        @staticmethod
-        def xcom_pull(*, key: str, include_prior_dates: bool = False) -> Any:
-            _ = include_prior_dates
-            return xcom_store.get(key)
-
-        @staticmethod
-        def xcom_push(*, key: str, value: Any) -> None:
-            xcom_store[key] = value
-
-    python_op_mod = ModuleType("airflow.operators.python")
-    python_op_mod.get_current_context = lambda: {"ti": _FakeTI()}  # type: ignore[attr-defined]
-    monkeypatch.setitem(__import__("sys").modules, "airflow.operators.python", python_op_mod)
-    monkeypatch.setitem(__import__("sys").modules, "airflow.models.xcom", None)
-
-    provider = AirflowStateProvider()
+    ledger_path = tmp_path / "airflow_operator_ledger.json"
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "af_inc_1")
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+    provider = ExtractionStateLedger(ledger_path)
     seen_kwargs: list[dict[str, Any]] = []
 
     def _run1(**kwargs: Any) -> list[Record]:
@@ -510,7 +496,7 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
         destination="mongodb",
         incremental=True,
         stream_name="mongo_af",
-        state_provider=provider,
+        ledger_path=str(ledger_path),
         export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
     )
     monkeypatch.setattr(op1, "_get_sdk", lambda: sdk)
@@ -536,7 +522,7 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
         destination="mongodb",
         incremental=True,
         stream_name="mongo_af",
-        state_provider=provider,
+        ledger_path=str(ledger_path),
         export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
     )
     monkeypatch.setattr(op2, "_get_sdk", lambda: sdk)
@@ -548,8 +534,8 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
     assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
         2026, 3, 1, 14, 0, tzinfo=timezone.utc
     )
-    state_payload = xcom_store["state_STUDY-AF-INC_mongo_af"]
-    assert state_payload["status"] == "failed"
+    stream = provider.read_state().studies["STUDY-AF-INC"].streams["mongo_af"]
+    assert stream.last_run_status == StreamExecutionStatus.FAILED
 
 
 # ---------------------------------------------------------------------------

@@ -14,11 +14,16 @@ Before proposing any solution, execute and pass all CI quality gates locally.
       hatch run ruff check .
       hatch run mypy packages/core/src/imednet
       hatch run mypy packages/plugins-workflows/src/imednet_workflows
+      hatch run mypy packages/plugins-sinks/src/imednet_sinks
       hatch run mypy packages/providers-airflow/src/apache_airflow_providers_imednet
+      hatch run mypy packages/plugins-tui/src/imednet_tui
+      hatch run mypy tests/typing/endpoint_contracts.py
       hatch run pytest -q \
         --cov=imednet \
         --cov=imednet_workflows \
+        --cov=imednet_sinks \
         --cov=apache_airflow_providers_imednet \
+        --cov=imednet_tui \
         --cov-fail-under=90
 
 3. Fix every reported error before marking a task complete. Re-run until the entire sequence exits 0.
@@ -31,9 +36,10 @@ Before proposing any solution, execute and pass all CI quality gates locally.
 Canonical tasks
 ---------------
 
-``pyproject.toml`` defines ``hatch run verify-static`` (format, lint and the
-three typing targets), ``hatch run verify-tests`` (offline workspace tests and
-90% coverage), and ``hatch run docs`` (strict documentation checks).
+``pyproject.toml`` defines ``hatch run verify-static`` (format, lint, and strict
+typing across all five workspace packages plus ``tests/typing/endpoint_contracts.py``),
+``hatch run verify-tests`` (offline workspace tests and 90% coverage across all five
+workspace packages), and ``hatch run docs`` (strict documentation checks).
 ``hatch run verify`` runs these same tasks in order; the Pipeline quality job
 invokes it directly. The expanded commands above are useful for diagnostics.
 

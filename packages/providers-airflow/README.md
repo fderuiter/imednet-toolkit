@@ -64,6 +64,16 @@ def my_task_logic():
     studies = client.studies.list()
 ```
 
+## Incremental Checkpointing (Airflow 3)
+
+`ImednetExportOperator(incremental=True)` standardizes on the file-backed `ExtractionStateLedger` (`FileStateProvider`) resolved via `ledger_path` or `IMEDNET_WORKFLOW_LEDGER_PATH` rather than mutating Airflow XCom tables across runs.
+
+In Airflow 3, pass Study checkpoints across runs using:
+
+- **Operator outputs / TaskFlow return values**: pass explicit ISO-8601 watermarks between tasks and set `modified_since` on `ImednetExportOperator`.
+- **`airflow.sdk.Variable`**: read and update per-Study watermarks with `Variable.get(...)` / `Variable.set(...)` inside TaskFlow tasks rather than querying historical XCom rows.
+- **Shared storage or Airflow ObjectStorage (`airflow.sdk.ObjectStoragePath`)**: point `ledger_path` at a shared filesystem mount or stage the JSON ledger file to and from `ObjectStoragePath` around `ImednetExportOperator(incremental=True, ledger_path=...)`.
+
 ## Features
 
 - **Connection Hook Management**: Secures connection variables via `ImednetHook`, resolving authorization keys/secrets and auto-masking sensitive values (`api_key`, `security_key`, `token`) as `***` during serialization.

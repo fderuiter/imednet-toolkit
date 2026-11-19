@@ -19,12 +19,11 @@ def run_fuzzer():
     logging.disable(logging.CRITICAL)
 
     with atheris.instrument_imports():
-        from imednet_sinks.warehouse import _records_to_arrow_table
-
         import imednet
         import imednet.models.engine
         from imednet.datadict import load_from_csv
         from imednet.models.engine import get_contract
+        from imednet_sinks.warehouse import _records_to_arrow_table
 
     def fuzz_dynamic_model(data: bytes):
         postman_path = "/tmp/fuzz_postman.json"

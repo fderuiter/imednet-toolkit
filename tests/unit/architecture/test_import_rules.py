@@ -1,7 +1,20 @@
 """Prove the architecture guard rejects real syntax, including equivalent imports."""
 
 import pytest
-from import_rules import import_edges, scan_package, violations
+from import_rules import (
+    EXTENSION_LABELS,
+    NON_AIRFLOW_PACKAGES,
+    import_edges,
+    scan_package,
+    violations,
+)
+
+CROSS_EXTENSION_PAIRS = [
+    (src_pkg, src_label, dst_pkg, dst_label)
+    for src_pkg, src_label in EXTENSION_LABELS.items()
+    for dst_pkg, dst_label in EXTENSION_LABELS.items()
+    if src_pkg != dst_pkg
+]
 
 
 @pytest.mark.parametrize(
@@ -73,3 +86,56 @@ def test_airflow_provider_cannot_import_sinks(tmp_path, statement):
     path.write_text(statement)
     errors = violations(path, tmp_path)
     assert any("Airflow provider cannot import sinks" in error for error in errors)
+
+
+def test_cross_extension_pair_matrix_has_twelve_pairs():
+    assert len(CROSS_EXTENSION_PAIRS) == 12
+
+
+@pytest.mark.parametrize(
+    ("src_pkg", "src_label", "dst_pkg", "dst_label"),
+    CROSS_EXTENSION_PAIRS,
+)
+@pytest.mark.parametrize(
+    "template",
+    [
+        "import {dst_pkg}",
+        "from {dst_pkg} import something",
+        "from {dst_pkg}.submodule import helper",
+        "if TYPE_CHECKING:\n    import {dst_pkg}",
+    ],
+)
+def test_all_twelve_cross_extension_pairs_fail_scan_package(
+    tmp_path, src_pkg, src_label, dst_pkg, dst_label, template
+):
+    path = tmp_path / src_pkg / "sub" / "mod.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(template.format(dst_pkg=dst_pkg))
+    errors = scan_package(tmp_path, src_pkg)
+    expected = f"{src_label} cannot import {dst_label}"
+    assert any(expected in error and str(path) in error for error in errors)
+
+
+@pytest.mark.parametrize("package", NON_AIRFLOW_PACKAGES)
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "import airflow",
+        "import airflow.sdk",
+        "from airflow.models.xcom import XCom",
+        "if TYPE_CHECKING:\n    from airflow.sdk import Variable",
+    ],
+)
+def test_non_airflow_packages_cannot_import_airflow(tmp_path, package, statement):
+    path = tmp_path / package / "feature.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(statement)
+    errors = violations(path, tmp_path)
+    assert any("only Airflow provider may import airflow" in error for error in errors)
+
+
+def test_airflow_provider_may_import_airflow(tmp_path):
+    path = tmp_path / "apache_airflow_providers_imednet" / "operators" / "export.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("import airflow\nfrom airflow.sdk import BaseOperator\n")
+    assert violations(path, tmp_path) == []

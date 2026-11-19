@@ -313,12 +313,6 @@ class ImednetExportOperator(BaseOperator):
                 merged[key] = current_val
         for key, val in self._collect_streaming_options(runtime_kwargs).items():
             merged.setdefault(key, val)
-        if (
-            merged.get("incremental")
-            and "state_provider" not in merged
-            and "ledger_path" not in merged
-        ):
-            merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
         return merged
 
     def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
@@ -508,7 +502,6 @@ class ImednetExportOperator(BaseOperator):
                 config,
                 stream_name=f"airflow_{dest}",
                 batch_id_prefix=f"{self.study_key}/batch",
-                default_provider_name="airflow",
             )
         else:
             # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)

@@ -4,6 +4,7 @@ import logging
 import os
 
 import pytest
+
 from imednet_sinks import (
     MongoDbExportSink,
     Neo4jExportSink,
@@ -103,6 +104,7 @@ def mock_record_mapper(monkeypatch, fake_records):
 def test_mongodb_containerized_upserts(fake_records, monkeypatch):
     """TODO: Add docstring."""
     import pymongo
+
     from imednet_sinks import MongoDbSinkConfig
 
     uri = "mongodb://root:password@localhost:27017"

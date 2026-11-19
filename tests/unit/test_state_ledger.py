@@ -269,80 +269,49 @@ def test_corrupted_ledger_recovery(tmp_path) -> None:
     assert len(state.studies) == 0
 
 
-def test_get_state_provider_airflow(monkeypatch):
-    """Test get_state_provider returns AirflowStateProvider when USE_AIRFLOW_STATE_PROVIDER=1."""
+def test_get_state_provider_ignores_airflow_environment(monkeypatch, tmp_path):
+    """get_state_provider returns FileStateProvider even when Airflow env vars are set."""
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "task_1")
     monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
-    from imednet_workflows.state_ledger import AirflowStateProvider, get_state_provider
+    monkeypatch.delenv("IMEDNET_WORKFLOW_LEDGER_PATH", raising=False)
 
     provider = get_state_provider()
-    assert isinstance(provider, AirflowStateProvider)
+    assert isinstance(provider, FileStateProvider)
+    assert provider.ledger_path == Path(DEFAULT_LEDGER_PATH)
+
+    explicit = tmp_path / "explicit_ledger.json"
+    explicit_provider = get_state_provider(explicit)
+    assert isinstance(explicit_provider, FileStateProvider)
+    assert explicit_provider.ledger_path == explicit
 
 
-def test_airflow_state_provider_methods():
-    import sys
-    from unittest.mock import patch
+def test_cli_explicit_ledger_path_under_airflow_env(monkeypatch, tmp_path) -> None:
+    """CLI state commands with --ledger-path target FileStateProvider even when AIRFLOW_CTX_TASK_ID exists."""
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "task_1")
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+    ledger_file = tmp_path / "cli_airflow_env_ledger.json"
 
-    with patch.dict(
-        sys.modules,
-        {
-            'airflow': None,
-            'airflow.models.xcom': None,
-            'airflow.utils.session': None,
-            'airflow.operators.python': None,
-        },
-    ):
-        from imednet_workflows.state_ledger import AirflowStateProvider
+    state_app(
+        [
+            "set",
+            "-s",
+            "STUDY-01",
+            "-m",
+            "records",
+            "-t",
+            "2026-05-22T12:00:00Z",
+            "--ledger-path",
+            str(ledger_file),
+        ]
+    )
+    ledger = FileStateProvider(ledger_file)
+    assert ledger.get_last_timestamp("STUDY-01", "records") == datetime(
+        2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc
+    )
 
-        provider = AirflowStateProvider()
-        assert provider.get_last_timestamp("STUDY-01", "records") is None
-        ts = datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc)
-        provider.set_last_timestamp("STUDY-01", "records", ts)
-        assert provider.delete_entry("STUDY-01") is False
-        state = provider.read_state()
-        assert len(state.studies) == 0
-
-
-def test_airflow_state_provider_transaction_success():
-    import sys
-    from unittest.mock import patch
-
-    with patch.dict(
-        sys.modules,
-        {
-            'airflow': None,
-            'airflow.models.xcom': None,
-            'airflow.utils.session': None,
-            'airflow.operators.python': None,
-        },
-    ):
-        from imednet_workflows.state_ledger import AirflowStateProvider
-
-        provider = AirflowStateProvider()
-        fallback_ts = datetime(2026, 5, 22, 10, 0, 0, tzinfo=timezone.utc)
-        with provider.transaction("STUDY-01", "records", fallback_timestamp=fallback_ts) as tx:
-            tx["new_timestamp"] = datetime(2026, 5, 22, 11, 0, 0, tzinfo=timezone.utc)
-
-
-def test_airflow_state_provider_transaction_error():
-    import sys
-    from unittest.mock import patch
-
-    with patch.dict(
-        sys.modules,
-        {
-            'airflow': None,
-            'airflow.models.xcom': None,
-            'airflow.utils.session': None,
-            'airflow.operators.python': None,
-        },
-    ):
-        from imednet_workflows.state_ledger import AirflowStateProvider
-
-        provider = AirflowStateProvider()
-        fallback_ts = datetime(2026, 5, 22, 10, 0, 0, tzinfo=timezone.utc)
-        with pytest.raises(ValueError):
-            with provider.transaction("STUDY-01", "records", fallback_timestamp=fallback_ts):
-                raise ValueError("Test error")
+    state_app(["show", "--ledger-path", str(ledger_file)])
+    state_app(["reset", "-s", "STUDY-01", "--ledger-path", str(ledger_file)])
+    assert ledger.get_last_timestamp("STUDY-01", "records") is None
 
 
 def test_stream_execution_status_enum() -> None:

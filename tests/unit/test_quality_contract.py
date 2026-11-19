@@ -10,8 +10,39 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_ci_uses_canonical_full_verification():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    ruff_cfg = project["tool"]["ruff"]
+    expected_src = {
+        "packages/core/src",
+        "packages/plugins-workflows/src",
+        "packages/plugins-sinks/src",
+        "packages/providers-airflow/src",
+        "packages/plugins-tui/src",
+        "tests",
+    }
+    assert expected_src <= set(ruff_cfg["src"])
+    expected_first_party = {
+        "imednet",
+        "imednet_workflows",
+        "imednet_sinks",
+        "apache_airflow_providers_imednet",
+        "imednet_tui",
+    }
+    assert expected_first_party == set(ruff_cfg["lint"]["isort"]["known-first-party"])
+
     scripts = project["tool"]["hatch"]["envs"]["default"]["scripts"]
     assert scripts["verify"] == ["verify-static", "verify-tests", "docs"]
+    assert scripts["verify-static"] == [
+        "ruff format --check .",
+        "ruff check .",
+        "mypy packages/core/src/imednet",
+        "mypy packages/plugins-workflows/src/imednet_workflows",
+        "mypy packages/plugins-sinks/src/imednet_sinks",
+        "mypy packages/providers-airflow/src/apache_airflow_providers_imednet",
+        "mypy packages/plugins-tui/src/imednet_tui",
+        "mypy tests/typing/endpoint_contracts.py",
+    ]
+    for pkg in expected_first_party:
+        assert f"--cov={pkg}" in scripts["verify-tests"]
     assert "--cov-fail-under=90" in scripts["verify-tests"]
     pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text())
     steps = pipeline["jobs"]["quality"]["steps"]

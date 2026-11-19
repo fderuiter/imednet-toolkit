@@ -12,6 +12,18 @@ PUBLIC_CORE = (
     "imednet.config",
     "imednet.errors",
 )
+EXTENSION_LABELS = {
+    "imednet_workflows": "workflows",
+    "imednet_sinks": "sinks",
+    "imednet_tui": "TUI",
+    "apache_airflow_providers_imednet": "Airflow provider",
+}
+NON_AIRFLOW_PACKAGES = (
+    "imednet",
+    "imednet_workflows",
+    "imednet_sinks",
+    "imednet_tui",
+)
 PUBLIC_SYMBOLS = {
     "ImednetSDK",
     "AsyncImednetSDK",
@@ -63,31 +75,27 @@ def violations(path: Path, source_root: Path) -> list[str]:
     module = ".".join(path.relative_to(source_root).with_suffix("").parts)
     errors = []
     for edge in sorted(import_edges(path, source_root)):
-        rule = None
+        rules: list[str] = []
         if within(module, "imednet"):
             if within(edge, "imednet.cli") and not any(
                 within(module, prefix) for prefix in ("imednet.cli", "imednet.spi")
             ):
-                rule = "core cannot import CLI"
-            elif any(
-                within(edge, prefix)
-                for prefix in (
-                    "imednet_workflows",
-                    "imednet_sinks",
-                    "imednet_tui",
-                    "apache_airflow_providers_imednet",
-                )
-            ):
-                rule = "core cannot statically import extensions"
+                rules.append("core cannot import CLI")
+            elif any(within(edge, prefix) for prefix in EXTENSION_LABELS):
+                rules.append("core cannot statically import extensions")
         elif within(edge, "imednet") and edge != "imednet":
             public_symbol = edge.removeprefix("imednet.") in PUBLIC_SYMBOLS
             if not public_symbol and not any(within(edge, prefix) for prefix in PUBLIC_CORE):
-                rule = "extensions must use public API or SPI"
-        if within(module, "imednet_workflows") and within(edge, "apache_airflow_providers_imednet"):
-            rule = "workflows cannot import Airflow provider"
-        if within(module, "apache_airflow_providers_imednet") and within(edge, "imednet_sinks"):
-            rule = "Airflow provider cannot import sinks"
-        if rule:
+                rules.append("extensions must use public API or SPI")
+        for src_pkg, src_label in EXTENSION_LABELS.items():
+            if not within(module, src_pkg):
+                continue
+            for dst_pkg, dst_label in EXTENSION_LABELS.items():
+                if src_pkg != dst_pkg and within(edge, dst_pkg):
+                    rules.append(f"{src_label} cannot import {dst_label}")
+        if any(within(module, pkg) for pkg in NON_AIRFLOW_PACKAGES) and within(edge, "airflow"):
+            rules.append("only Airflow provider may import airflow")
+        for rule in rules:
             errors.append(f"{path}: {module} -> {edge}: {rule}")
     return errors
 
