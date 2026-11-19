@@ -2,7 +2,7 @@ apache\_airflow\_providers\_imednet package
 ===========================================
 
 .. automodule:: apache_airflow_providers_imednet
-   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -22,7 +22,7 @@ apache\_airflow\_providers\_imednet.export module
 -------------------------------------------------
 
 .. automodule:: apache_airflow_providers_imednet.export
-   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
 
@@ -30,6 +30,6 @@ apache\_airflow\_providers\_imednet.sensors module
 --------------------------------------------------
 
 .. automodule:: apache_airflow_providers_imednet.sensors
-   :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:

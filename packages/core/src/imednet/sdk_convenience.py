@@ -114,14 +114,136 @@ class _AsyncListMethod(Protocol[T]):
     async def __call__(self, **filters: FilterValue) -> list[T]: ...
 
 
+_ENDPOINT_MODELS: dict[str, type[Any]] = {
+    "codings": Coding,
+    "forms": Form,
+    "intervals": Interval,
+    "queries": Query,
+    "record_revisions": RecordRevision,
+    "records": Record,
+    "sites": Site,
+    "studies": Study,
+    "subjects": Subject,
+    "users": User,
+    "variables": Variable,
+    "visits": Visit,
+}
+
+
+def _configure_list_convenience_callable(
+    wrapper: Callable[..., Any],
+    template: Callable[..., Any],
+    *,
+    name: str,
+    qualname: str,
+    doc: str,
+    model_cls: Any,
+    bound: bool,
+) -> Callable[..., Any]:
+    """Attach wrapper metadata, resolved annotations, and signature to a convenience callable."""
+    import functools
+    import inspect
+
+    functools.update_wrapper(wrapper, template)
+    if not bound:
+        wrapper.__dict__.pop("__wrapped__", None)
+
+    return_tp = list[model_cls] if isinstance(model_cls, type) else list[Any]
+    annotations: dict[str, Any] = {
+        "study_key": str | None,
+        "filters": FilterValue,
+        "return": return_tp,
+    }
+    sig = inspect.signature(wrapper)
+    updated_params = [
+        param.replace(annotation=inspect.Parameter.empty)
+        if param.name == "self"
+        else param.replace(annotation=annotations[param.name])
+        if param.name in annotations
+        else param
+        for param in sig.parameters.values()
+    ]
+    annotations.pop("self", None)
+    wrapper.__module__ = __name__
+    wrapper.__name__ = name
+    wrapper.__qualname__ = qualname
+    wrapper.__doc__ = doc
+    wrapper.__annotations__ = annotations
+    wrapper.__signature__ = sig.replace(  # type: ignore[attr-defined]
+        parameters=updated_params,
+        return_annotation=return_tp,
+    )
+    return wrapper
+
+
 class _ListOperation(Generic[T, R_co]):
     """Descriptor that provides convenience list methods on the SDK."""
 
     def __init__(self, endpoint_name: str, name: str, is_async: bool = False) -> None:
         """Initialize the list operation descriptor."""
+        import functools
+        from typing import cast
+
         self.endpoint_name = endpoint_name
         self.name = name
         self.is_async = is_async
+        self._model_cls: Any = _ENDPOINT_MODELS.get(endpoint_name, Any)
+        doc = f"Asynchronously list {endpoint_name}." if is_async else f"List {endpoint_name}."
+        owner_name = "AsyncSDKConvenienceMixin" if is_async else "SyncSDKConvenienceMixin"
+
+        op = self
+        if is_async:
+
+            async def _template_async(
+                self: Any, study_key: str | None = None, **filters: FilterValue
+            ) -> list[Any]:
+                return await op._invoke_async(self, study_key, filters)
+
+            template_fn: Callable[..., Any] = _template_async
+        else:
+
+            def _template_sync(
+                self: Any, study_key: str | None = None, **filters: FilterValue
+            ) -> list[Any]:
+                return op._invoke_sync(self, study_key, filters)
+
+            template_fn = _template_sync
+
+        self._unbound = _configure_list_convenience_callable(
+            template_fn,
+            template_fn,
+            name=name,
+            qualname=f"{owner_name}.{name}",
+            doc=doc,
+            model_cls=self._model_cls,
+            bound=False,
+        )
+        functools.update_wrapper(cast(Any, self), self._unbound)
+
+    def _invoke_sync(
+        self, instance: Any, study_key: str | None, filters: dict[str, Any]
+    ) -> list[T]:
+        endpoint = getattr(instance, self.endpoint_name)
+        _filters = dict(filters)
+        if self.endpoint_name == "studies":
+            if study_key is not None:
+                _filters["study_key"] = study_key
+            return list(endpoint.list(**_filters))
+        return list(endpoint.list(study_key, **_filters))
+
+    async def _invoke_async(
+        self, instance: Any, study_key: str | None, filters: dict[str, Any]
+    ) -> list[T]:
+        endpoint = getattr(instance, self.endpoint_name)
+        _filters = dict(filters)
+        if self.endpoint_name == "studies":
+            if study_key is not None:
+                _filters["study_key"] = study_key
+            res = endpoint.list(**_filters)
+        else:
+            res = endpoint.list(study_key, **_filters)
+        items: list[T] = [item async for item in res] if hasattr(res, "__aiter__") else await res
+        return items
 
     if TYPE_CHECKING:
 
@@ -132,6 +254,13 @@ class _ListOperation(Generic[T, R_co]):
         def __call__(self, **filters: FilterValue) -> R_co: ...
 
         def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+    else:
+
+        def __call__(
+            self, instance: Any, study_key: str | None = None, **filters: FilterValue
+        ) -> Any:
+            """Execute the convenience list operation against an SDK instance."""
+            return self.__get__(instance, type(instance))(study_key, **filters)
 
     @overload
     def __get__(self, instance: None, owner: Any) -> Self: ...
@@ -142,12 +271,15 @@ class _ListOperation(Generic[T, R_co]):
     @overload
     def __get__(self, instance: AsyncSDKConvenienceMixin, owner: Any) -> _AsyncListMethod[T]: ...
 
-    def __get__(self, instance: Any, owner: Any) -> Any:
-        """Return a wrapped list method bound to the SDK instance."""
+    def __get__(self, instance: Any, owner: Any = None) -> Any:
+        """Return a wrapped list method bound to the SDK instance or unbound for class inspection."""
         if instance is None:
-            return self
-        endpoint = getattr(instance, self.endpoint_name)
+            if owner is None:
+                return self
+            return self._unbound
 
+        owner_cls_name = type(instance).__name__
+        doc = self._unbound.__doc__ or ""
         if self.is_async:
 
             @_async_trace_method
@@ -155,35 +287,32 @@ class _ListOperation(Generic[T, R_co]):
                 study_key: str | None = None, **filters: FilterValue
             ) -> list[T]:
                 """Execute the asynchronous list operation and return a list of items."""
-                _filters: dict[str, Any] = dict(filters)
-                if self.endpoint_name == "studies":
-                    if study_key is not None:
-                        _filters["study_key"] = study_key
-                    res = endpoint.list(**_filters)
-                else:
-                    res = endpoint.list(study_key, **_filters)
-                items: list[T] = (
-                    [item async for item in res] if hasattr(res, "__aiter__") else await res
-                )
-                return items
+                return await self._invoke_async(instance, study_key, dict(filters))
 
-            async_wrapper.__doc__ = f"Asynchronously list {self.endpoint_name}."
-            async_wrapper.__name__ = self.name
-            return async_wrapper
+            return _configure_list_convenience_callable(
+                async_wrapper,
+                self._unbound,
+                name=self.name,
+                qualname=f"{owner_cls_name}.{self.name}",
+                doc=doc,
+                model_cls=self._model_cls,
+                bound=True,
+            )
 
         @_trace_method
         def sync_wrapper(study_key: str | None = None, **filters: FilterValue) -> list[T]:
             """Execute the synchronous list operation and return a list of items."""
-            _filters: dict[str, Any] = dict(filters)
-            if self.endpoint_name == "studies":
-                if study_key is not None:
-                    _filters["study_key"] = study_key
-                return list(endpoint.list(**_filters))
-            return list(endpoint.list(study_key, **_filters))
+            return self._invoke_sync(instance, study_key, dict(filters))
 
-        sync_wrapper.__doc__ = f"List {self.endpoint_name}."
-        sync_wrapper.__name__ = self.name
-        return sync_wrapper
+        return _configure_list_convenience_callable(
+            sync_wrapper,
+            self._unbound,
+            name=self.name,
+            qualname=f"{owner_cls_name}.{self.name}",
+            doc=doc,
+            model_cls=self._model_cls,
+            bound=True,
+        )
 
 
 class SyncSDKConvenienceMixin:

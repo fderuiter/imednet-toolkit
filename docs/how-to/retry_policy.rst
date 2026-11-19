@@ -1,8 +1,9 @@
 Retry Policy and Error Handling
 ===============================
 
-``RetryPolicy`` decouples retry decisions from the underlying tenacity logic.
-The default implementation only retries for network errors raised by ``httpx``.
+:class:`~imednet.core.RetryPolicy` decouples retry decisions from the underlying tenacity logic
+configured via :class:`~imednet.core.RetryConfig`.
+The :class:`~imednet.core.DefaultRetryPolicy` implementation retries idempotent network and 5xx errors and HTTP 429 rate limits.
 You can implement your own strategy by inspecting :class:`imednet.core.retry.RetryState`.
 
 Handling exceptions

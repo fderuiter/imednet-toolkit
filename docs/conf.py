@@ -6,6 +6,7 @@ import functools
 import html
 import importlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -13,16 +14,18 @@ import sys
 import tomllib
 import types
 import urllib.parse
-from collections.abc import Mapping
+
+# mypy: ignore-errors
+from collections.abc import AsyncIterator, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from enum import Enum
 from pathlib import Path
-
-# mypy: ignore-errors
-from typing import Any, Union, get_args, get_origin
+from typing import Any, Generic, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import pydantic._internal._utils as _pydantic_internal_utils
 from pydantic import BaseModel, RootModel
+from sphinx.ext.autodoc import MethodDocumenter
+from sphinx.util.nodes import make_refnode
 
 if not hasattr(_pydantic_internal_utils, "MappingIntStrAny"):
     _pydantic_internal_utils.MappingIntStrAny = Mapping[int, Any] | Mapping[str, Any]
@@ -358,7 +361,26 @@ _PYDANTIC_INTERNAL_ATTRS = frozenset(
     }
 )
 _SCOPED_INHERITED_EXCLUSIONS = (
-    "BaseModel, RootModel, Enum, str, int, Exception, BaseException, object"
+    "BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object"
+)
+_INTERNAL_ENDPOINT_MEMBERS = frozenset(
+    {
+        "PARAM_PROCESSOR",
+        "PARAM_PROCESSOR_CLS",
+        "STUDY_KEY_STRATEGY",
+        "param_processor",
+        "study_key_strategy",
+    }
+)
+_OPERATION_TYPE_NAMES = frozenset(
+    {
+        "Operation",
+        "ListOperation",
+        "FilterGetOperation",
+        "PathGetOperation",
+        "RecordCreateOperation",
+        "ListBySiteOperation",
+    }
 )
 _AUTOMODULE_RE = re.compile(r"^\.\.\s+automodule::\s+([A-Za-z0-9_.]+)", re.MULTILINE)
 _PY_ATTR_DIRECTIVE_RE = re.compile(r"^\.\.\s+(?:py:)?attribute::\s+([A-Za-z0-9_]+)")
@@ -540,26 +562,99 @@ def _is_exposed_by_documented_module(mod_name: str, sym_name: str) -> bool:
     return mod_all is None or sym_name in mod_all
 
 
+def _find_canonical_documented_module(
+    canon_mod: str,
+    canon_name: str,
+    documented_modules: frozenset[str],
+) -> str | None:
+    """Return the canonical documented module exposing (canon_mod, canon_name), if any."""
+    if canon_mod in documented_modules and _is_exposed_by_documented_module(canon_mod, canon_name):
+        return canon_mod
+    if (
+        canon_mod == "imednet.core.paginator"
+        and "imednet.pagination" in documented_modules
+        and _is_exposed_by_documented_module("imednet.pagination", canon_name)
+    ):
+        return "imednet.pagination"
+    parts = canon_mod.split(".")
+    for idx in range(len(parts) - 1, 1, -1):
+        parent_mod = ".".join(parts[:idx])
+        if parent_mod in documented_modules and _is_exposed_by_documented_module(
+            parent_mod, canon_name
+        ):
+            return parent_mod
+    return None
+
+
+def _is_undocumented_internal_type(tp: Any) -> bool:
+    """Return True if tp is a private class or an undocumented internal imednet.core type."""
+    if not isinstance(tp, type):
+        return False
+    cls_name = getattr(tp, "__name__", "")
+    mod_name = getattr(tp, "__module__", "") or ""
+    if cls_name.startswith("_"):
+        return True
+    if mod_name.startswith("imednet.core."):
+        documented_modules = _get_documented_modules()
+        return _find_canonical_documented_module(mod_name, cls_name, documented_modules) is None
+    return False
+
+
+def _has_undocumented_type_arg(arg: Any) -> bool:
+    """Return True if a generic type argument or TypeVar bound is undocumented internal."""
+    if isinstance(arg, TypeVar):
+        bound = getattr(arg, "__bound__", None)
+        return _is_undocumented_internal_type(bound) if bound is not None else False
+    origin = get_origin(arg)
+    if origin is not None:
+        if _is_undocumented_internal_type(origin):
+            return True
+        return any(_has_undocumented_type_arg(sub) for sub in get_args(arg))
+    return _is_undocumented_internal_type(arg)
+
+
 def _unwrap_shadowed_bases(app: Any, name: str, obj: Any, options: Any, bases: list[Any]) -> None:
-    """Replace shadowed same-name base classes with their parent classes."""
+    """Replace shadowed or undocumented internal base classes with clean public bases."""
     if not isinstance(obj, type):
         return
 
     unwrapped: list[Any] = []
     seen: set[Any] = set()
 
-    def _expand(base: Any) -> None:
-        if isinstance(base, type) and base is not obj and base.__name__ == obj.__name__:
-            for parent in base.__bases__:
-                if parent is not object:
-                    _expand(parent)
+    def _add(candidate: Any) -> None:
+        if candidate is object or candidate is Generic or candidate in seen:
             return
-        if base not in seen:
-            seen.add(base)
-            unwrapped.append(base)
+        seen.add(candidate)
+        unwrapped.append(candidate)
+
+    def _expand(base: Any) -> None:
+        origin = get_origin(base)
+        if origin is Generic or base is Generic:
+            return
+        if origin is not None and isinstance(origin, type):
+            if _is_undocumented_internal_type(origin):
+                return
+            args = get_args(base)
+            if any(_has_undocumented_type_arg(a) for a in args):
+                _add(origin)
+            else:
+                _add(base)
+            return
+        if isinstance(base, type):
+            if base is not obj and base.__name__ == obj.__name__:
+                for parent in base.__bases__:
+                    if parent is not object:
+                        _expand(parent)
+                return
+            if _is_undocumented_internal_type(base):
+                return
+        _add(base)
 
     for b in list(bases):
         _expand(b)
+    if not unwrapped:
+        type_params = getattr(obj, "__parameters__", ())
+        unwrapped = [Generic[type_params]] if type_params else [object]
     bases[:] = unwrapped
 
 
@@ -652,6 +747,215 @@ def _find_defining_class(cls: type, member_name: str) -> type | None:
     return None
 
 
+def _resolve_owner_class(app: Any, full_name: str | None = None) -> type | None:
+    """Resolve the currently documented owner class from Sphinx autodoc temp_data or full_name."""
+    env = getattr(app, "env", None)
+    temp_data = getattr(env, "temp_data", {}) if env is not None else {}
+    current_mod = temp_data.get("autodoc:module")
+    current_cls_name = temp_data.get("autodoc:class")
+    if current_mod and current_cls_name:
+        mod = sys.modules.get(current_mod)
+        cls = getattr(mod, current_cls_name, None) if mod is not None else None
+        if isinstance(cls, type):
+            return cls
+    if full_name and "." in full_name:
+        parent_path, _ = full_name.rsplit(".", 1)
+        if "." in parent_path:
+            mod_part, cls_part = parent_path.rsplit(".", 1)
+            mod = sys.modules.get(mod_part)
+            cls = getattr(mod, cls_part, None) if mod is not None else None
+            if isinstance(cls, type):
+                return cls
+    return None
+
+
+def _normalize_operation_return_type(ret: Any, owner_cls: type | None) -> Any:
+    """Map internal Operation[T] annotations to Iterator[T], AsyncIterator[T], or T."""
+    from imednet.core.endpoint.dispatch import AsyncEndpointContext
+
+    is_async_owner = isinstance(owner_cls, type) and issubclass(owner_cls, AsyncEndpointContext)
+    raw_model = getattr(owner_cls, "MODEL", None) if owner_cls is not None else None
+    model_cls = raw_model if isinstance(raw_model, type) else None
+
+    if isinstance(ret, str):
+        stripped = ret.strip()
+        op_head = stripped.split("[", 1)[0].rsplit(".", 1)[-1].strip()
+        if op_head in _OPERATION_TYPE_NAMES:
+            inner_fallback: Any = model_cls if model_cls is not None else Any
+            if op_head == "ListOperation":
+                return AsyncIterator[inner_fallback] if is_async_owner else Iterator[inner_fallback]
+            return inner_fallback
+        return ret
+
+    origin = get_origin(ret)
+    target_tp = origin if origin is not None else ret
+    tp_name = getattr(target_tp, "__name__", "")
+    if tp_name not in _OPERATION_TYPE_NAMES:
+        if isinstance(ret, TypeVar) and model_cls is not None:
+            return model_cls
+        return ret
+
+    args = get_args(ret)
+    if args:
+        inner = model_cls if (isinstance(args[0], TypeVar) and model_cls is not None) else args[0]
+    elif isinstance(target_tp, type) and hasattr(target_tp, "execute_sync"):
+        try:
+            resolved_ret = get_type_hints(target_tp.execute_sync).get("return", Any)
+        except Exception:
+            resolved_ret = Any
+        inner = (
+            model_cls
+            if (isinstance(resolved_ret, TypeVar) and model_cls is not None)
+            else resolved_ret
+        )
+    else:
+        inner = model_cls if model_cls is not None else Any
+
+    if tp_name == "ListOperation":
+        return AsyncIterator[inner] if is_async_owner else Iterator[inner]
+    return inner
+
+
+def _resolve_callable_return_hint(obj: Any) -> Any:
+    """Resolve PEP 563 stringified return annotations (including closure TypeVars) on callables."""
+    anns = getattr(obj, "__annotations__", None)
+    if not isinstance(anns, dict) or "return" not in anns:
+        return None
+    raw_ret = anns["return"]
+    if not isinstance(raw_ret, str):
+        return raw_ret
+
+    localns: dict[str, Any] = {}
+    code = getattr(obj, "__code__", None)
+    closure = getattr(obj, "__closure__", None)
+    if code is not None and closure is not None:
+        for var_name, cell in zip(code.co_freevars, closure, strict=False):
+            try:
+                localns[var_name] = cell.cell_contents
+            except ValueError:
+                continue
+
+    try:
+        return get_type_hints(obj, localns=localns or None).get("return", raw_ret)
+    except Exception:
+        return raw_ret
+
+
+def _before_process_endpoint_signature(app: Any, obj: Any, bound_method: bool) -> None:  # noqa: ARG001
+    """Normalize endpoint Operation return annotations before sphinx_autodoc_typehints runs."""
+    if not callable(obj) or inspect.isclass(obj):
+        return
+    anns = getattr(obj, "__annotations__", None)
+    if not isinstance(anns, dict) or "return" not in anns:
+        return
+    resolved_ret = _resolve_callable_return_hint(obj)
+    owner_cls = _resolve_owner_class(app)
+    normalized = _normalize_operation_return_type(resolved_ret, owner_cls)
+    if normalized is not anns["return"]:
+        updated_anns = dict(anns)
+        updated_anns["return"] = normalized
+        obj.__annotations__ = updated_anns
+        try:
+            sig = inspect.signature(obj)
+            obj.__signature__ = sig.replace(return_annotation=normalized)
+        except (TypeError, ValueError):
+            pass
+
+
+def _process_endpoint_signature(
+    app: Any,
+    what: str,
+    name: str,
+    obj: Any,
+    options: Any,  # noqa: ARG001
+    signature: str | None,
+    return_annotation: str | None,
+) -> tuple[str | None, str | None] | None:
+    """Rewrite residual Operation return strings on endpoint methods during autodoc signature hook."""
+    if what != "method" or not return_annotation:
+        return None
+    for op_name in _OPERATION_TYPE_NAMES:
+        if op_name in return_annotation:
+            owner_cls = _resolve_owner_class(app, name)
+            resolved_ret = _resolve_callable_return_hint(obj) if callable(obj) else None
+            if resolved_ret is not None:
+                normalized = _normalize_operation_return_type(resolved_ret, owner_cls)
+                return signature, _format_rst_annotation(normalized)
+            return signature, None
+    return None
+
+
+class _AsyncAwareMethodDocumenter(MethodDocumenter):
+    """MethodDocumenter that marks descriptor-dispatched async coroutines with :async:."""
+
+    def add_directive_header(self, sig: str) -> None:
+        super().add_directive_header(sig)
+        raw = (
+            self.parent.__dict__.get(self.object_name, self.object)
+            if isinstance(self.parent, type)
+            else self.object
+        )
+        raw_is_async = inspect.iscoroutinefunction(raw) or inspect.isasyncgenfunction(raw)
+        bound_is_async = inspect.iscoroutinefunction(self.object) or inspect.isasyncgenfunction(
+            self.object
+        )
+        if bound_is_async and not raw_is_async:
+            self.add_line("   :async:", self.get_sourcename())
+
+
+def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: Any) -> Any:
+    """Resolve internal imednet.core.* cross-references to curated imednet.core or imednet.pagination anchors."""
+    if node.get("refdomain") != "py" or not hasattr(app.builder, "get_relative_uri"):
+        return None
+    reftarget = node.get("reftarget", "")
+    if not isinstance(reftarget, str) or not reftarget:
+        return None
+
+    py_objects = env.domaindata.get("py", {}).get("objects", {})
+    if not py_objects:
+        return None
+
+    alias_rewrites = {
+        "EdcGenericListGetEndpoint": "EdcSyncListGetEndpoint",
+        "EdcGenericGetEndpoint": "EdcSyncGetEndpoint",
+        "EdcGenericListEndpoint": "EdcSyncListEndpoint",
+    }
+
+    candidates: list[str] = []
+    if reftarget == "imednet.core.context.study_context":
+        candidates.append("imednet.sdk.ImednetSDK.study_context")
+    elif reftarget.startswith("imednet.core.paginator."):
+        tail = reftarget.removeprefix("imednet.core.paginator.")
+        candidates.extend([f"imednet.pagination.{tail}", f"imednet.core.{tail}"])
+    elif reftarget.startswith("imednet.core."):
+        parts = reftarget.split(".")
+        for idx in range(2, len(parts)):
+            tail_parts = list(parts[idx:])
+            if tail_parts[0] in alias_rewrites:
+                tail_parts[0] = alias_rewrites[tail_parts[0]]
+            tail = ".".join(tail_parts)
+            candidates.extend([f"imednet.core.{tail}", f"imednet.pagination.{tail}"])
+    elif "." not in reftarget or reftarget.split(".")[0][0].isupper():
+        head, dot, rest = reftarget.partition(".")
+        mapped_head = alias_rewrites.get(head, head)
+        norm_target = f"{mapped_head}{dot}{rest}"
+        for prefix in ("imednet.core", "imednet.pagination", "imednet.sdk", "imednet.endpoints"):
+            candidates.append(f"{prefix}.{norm_target}")
+
+    for cand in candidates:
+        entry = py_objects.get(cand)
+        if entry is not None:
+            return make_refnode(
+                app.builder,
+                node["refdoc"],
+                entry.docname,
+                entry.node_id,
+                contnode,
+                cand,
+            )
+    return None
+
+
 def _skip_non_canonical_or_internal(
     app: Any,
     what: str,
@@ -677,29 +981,36 @@ def _skip_non_canonical_or_internal(
 
         documented_modules = _get_documented_modules()
         canon_mod, canon_name = _resolve_canonical_origin(current_mod, name)
-        if canon_mod != current_mod:
-            if canon_mod.split(".")[0] not in _FIRST_PARTY_ROOTS:
-                return True
-            if canon_mod in documented_modules and _is_exposed_by_documented_module(
-                canon_mod, canon_name
-            ):
-                return True
+        if canon_mod != current_mod and canon_mod.split(".")[0] not in _FIRST_PARTY_ROOTS:
+            return True
+        doc_home = _find_canonical_documented_module(canon_mod, canon_name, documented_modules)
+        if doc_home is not None and doc_home != current_mod:
+            return True
 
         origin_mod = getattr(obj, "__module__", None)
         if isinstance(origin_mod, str) and origin_mod != current_mod:
             origin_root = origin_mod.split(".")[0]
             if (isinstance(obj, type) or callable(obj)) and origin_root not in _FIRST_PARTY_ROOTS:
                 return True
-            if origin_mod in documented_modules and _is_exposed_by_documented_module(
-                origin_mod, getattr(obj, "__name__", name)
-            ):
+            obj_doc_home = _find_canonical_documented_module(
+                origin_mod, getattr(obj, "__name__", name), documented_modules
+            )
+            if obj_doc_home is not None and obj_doc_home != current_mod:
                 return True
         return None
 
     if what in ("class", "exception") and current_mod and current_cls_name:
+        if name in _INTERNAL_ENDPOINT_MEMBERS:
+            return True
+
         mod = sys.modules.get(current_mod)
         cls = getattr(mod, current_cls_name, None) if mod is not None else None
         if isinstance(cls, type):
+            if name in ("__iter__", "__aiter__") and issubclass(
+                cls, (BaseModel, Enum, dict, list, tuple, set, frozenset, str, bytes)
+            ):
+                return True
+
             if issubclass(cls, BaseModel):
                 if name in _PYDANTIC_INTERNAL_ATTRS:
                     return True
@@ -719,7 +1030,18 @@ def _skip_non_canonical_or_internal(
                                 return True
                             break
             elif defining_cls is not None:
-                if defining_cls in (BaseModel, RootModel, Enum, object, Exception, BaseException):
+                if (
+                    defining_cls
+                    in (
+                        BaseModel,
+                        RootModel,
+                        Enum,
+                        object,
+                        Exception,
+                        BaseException,
+                    )
+                    or getattr(defining_cls, "__name__", "") == "ImednetBaseModel"
+                ):
                     return True
                 def_mod = getattr(defining_cls, "__module__", "") or ""
                 if def_mod.split(".")[0] not in _FIRST_PARTY_ROOTS:
@@ -969,9 +1291,15 @@ def setup(app: Any) -> None:  # pragma: no cover
     _get_documented_modules.cache_clear()
     _analyze_module_symbols.cache_clear()
 
+    app.add_autodocumenter(_AsyncAwareMethodDocumenter, override=True)
     app.connect("autodoc-process-bases", _unwrap_shadowed_bases)
+    app.connect(
+        "autodoc-before-process-signature", _before_process_endpoint_signature, priority=400
+    )
+    app.connect("autodoc-process-signature", _process_endpoint_signature, priority=600)
     app.connect("autodoc-process-docstring", _emit_pydantic_model_fields, priority=600)
     app.connect("autodoc-skip-member", _skip_non_canonical_or_internal)
+    app.connect("missing-reference", _resolve_reexported_py_reference)
     app.connect("html-collect-pages", _sanitize_viewcode_modules, priority=100)
 
     app.connect("html-page-context", _inject_seo_metadata)
@@ -986,6 +1314,7 @@ autodoc_typehints = "description"
 autodoc_default_options = {
     "members": True,
     "inherited-members": _SCOPED_INHERITED_EXCLUSIONS,
+    "special-members": "__iter__, __aiter__",
     "show-inheritance": True,
 }
 autodoc_class_signature = "separated"
