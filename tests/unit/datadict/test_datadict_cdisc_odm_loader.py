@@ -448,3 +448,241 @@ def test_load_from_cdisc_odm_xml_string_bypass_file_check() -> None:
     dd = load_from_cdisc_odm(single_line_xml)
     assert len(dd.forms) == 1
     assert dd.forms[0].formKey == "F1"
+
+
+FULL_ODM_13_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3"
+     ODMVersion="1.3"
+     FileType="Snapshot"
+     FileOID="FULL_ODM_13"
+     CreationDateTime="2026-06-01T10:00:00">
+  <Study OID="STUDY_ODM_FULL">
+    <GlobalVariables>
+      <StudyName>Cardiology Trial</StudyName>
+      <StudyDescription>Phase III Study</StudyDescription>
+      <ProtocolName>CARDIO-301</ProtocolName>
+    </GlobalVariables>
+    <BasicDefinitions>
+      <MeasurementUnit OID="MU.KG" Name="Kilograms">
+        <Symbol><TranslatedText xml:lang="en">kg</TranslatedText></Symbol>
+      </MeasurementUnit>
+      <MeasurementUnit OID="MU.MMHG" Name="Millimeters of Mercury">
+        <Symbol><TranslatedText xml:lang="en">mmHg</TranslatedText></Symbol>
+      </MeasurementUnit>
+    </BasicDefinitions>
+    <MetaDataVersion OID="MDV.301" Name="v1.0">
+      <Protocol>
+        <Description><TranslatedText xml:lang="en">Standard Visit Schedule</TranslatedText></Description>
+        <StudyEventRef StudyEventOID="SE.SCREEN" OrderNumber="1" Mandatory="Yes"/>
+        <StudyEventRef StudyEventOID="SE.FOLLOWUP" OrderNumber="2" Mandatory="No"
+                       CollectionExceptionConditionOID="COND.FOLLOWUP"/>
+      </Protocol>
+
+      <StudyEventDef OID="SE.SCREEN" Name="Screening Visit" Repeating="No" Type="Scheduled" Category="Baseline">
+        <Description><TranslatedText xml:lang="en">Initial screening visit</TranslatedText></Description>
+        <FormRef FormOID="VS" OrderNumber="1" Mandatory="Yes"/>
+      </StudyEventDef>
+      <StudyEventDef OID="SE.FOLLOWUP" Name="Follow-up Visit" Repeating="Yes" Type="Unscheduled">
+        <FormRef FormOID="VS" OrderNumber="1" Mandatory="No"/>
+      </StudyEventDef>
+
+      <FormDef OID="VS" Name="Vital Signs" Repeating="No">
+        <ItemGroupRef ItemGroupOID="IG_VS" OrderNumber="1" Mandatory="Yes"/>
+      </FormDef>
+
+      <ItemGroupDef OID="IG_VS" Name="Vital Signs Group" Domain="VS" SASDatasetName="VS">
+        <ItemRef ItemOID="WEIGHT" OrderNumber="1" Mandatory="Yes"/>
+        <ItemRef ItemOID="SYSBP" OrderNumber="2" Mandatory="No"
+                 CollectionExceptionConditionOID="COND.SYSBP"/>
+        <ItemRef ItemOID="MAP" OrderNumber="3" Mandatory="No" MethodOID="METH.MAP"/>
+      </ItemGroupDef>
+
+      <ItemDef OID="WEIGHT" Name="WEIGHT" DataType="float" SignificantDigits="1">
+        <Question><TranslatedText xml:lang="en">Body Weight</TranslatedText></Question>
+        <MeasurementUnitRef MeasurementUnitOID="MU.KG"/>
+        <RangeCheck Comparator="GE" SoftHard="Soft">
+          <CheckValue>30</CheckValue>
+          <MeasurementUnitRef MeasurementUnitOID="MU.KG"/>
+          <ErrorMessage><TranslatedText xml:lang="en">Weight below expected minimum</TranslatedText></ErrorMessage>
+        </RangeCheck>
+      </ItemDef>
+
+      <ItemDef OID="SYSBP" Name="SYSBP" DataType="integer" Length="3">
+        <Question><TranslatedText xml:lang="en">Systolic BP</TranslatedText></Question>
+        <MeasurementUnitRef MeasurementUnitOID="MU.MMHG"/>
+        <RangeCheck Comparator="IN" SoftHard="Hard">
+          <CheckValue>90</CheckValue>
+          <CheckValue>120</CheckValue>
+          <CheckValue>140</CheckValue>
+        </RangeCheck>
+        <RangeCheck SoftHard="Soft">
+          <FormalExpression Context="XPath">../SYSBP &gt; 70</FormalExpression>
+        </RangeCheck>
+      </ItemDef>
+
+      <ItemDef OID="MAP" Name="MAP" DataType="float" SignificantDigits="1">
+        <Question><TranslatedText xml:lang="en">Mean Arterial Pressure</TranslatedText></Question>
+        <MeasurementUnitRef MeasurementUnitOID="MU.MMHG"/>
+      </ItemDef>
+
+      <ConditionDef OID="COND.SYSBP" Name="Seated Position Condition">
+        <Description><TranslatedText xml:lang="en">Collect when subject is seated</TranslatedText></Description>
+        <FormalExpression Context="XPath">../POS = 'SEATED'</FormalExpression>
+        <Alias Context="SDTM" Name="VSPOS_COND"/>
+      </ConditionDef>
+
+      <ConditionDef OID="COND.FOLLOWUP" Name="Follow-up Required Condition">
+        <Description><TranslatedText xml:lang="en">Required if randomized</TranslatedText></Description>
+        <FormalExpression Context="XPath">//ItemData[@ItemOID='RAND'] = 'Y'</FormalExpression>
+      </ConditionDef>
+
+      <MethodDef OID="METH.MAP" Name="Compute MAP" Type="Computation">
+        <Description><TranslatedText xml:lang="en">Calculate Mean Arterial Pressure</TranslatedText></Description>
+        <FormalExpression Context="XPath">(2 * ../DIABP + ../SYSBP) div 3</FormalExpression>
+        <Alias Context="Algorithm" Name="MAP_V1"/>
+      </MethodDef>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+
+
+def test_load_from_cdisc_odm_full_1_3_fidelity_and_round_trip() -> None:
+    """Protocol, StudyEventDef, MeasurementUnit, RangeCheck, ConditionDef, and MethodDef round-trip."""
+    from imednet.datadict.emit import to_json, to_odm_xml
+
+    dd = load_from_cdisc_odm(FULL_ODM_13_XML, strict=True)
+    assert dd.metadata.validationWarnings == []
+    assert validate(dd, schema=get_schema()) == []
+
+    # 1. Study metadata: ProtocolName, Protocol, StudyEventDef visits, MeasurementUnits
+    extra_meta = dd.metadata.extraAttributes
+    assert extra_meta["studyName"] == "Cardiology Trial"
+    assert extra_meta["studyDescription"] == "Phase III Study"
+    assert extra_meta["protocolName"] == "CARDIO-301"
+    assert extra_meta["protocol"]["description"] == "Standard Visit Schedule"
+    assert len(extra_meta["protocol"]["studyEventRefs"]) == 2
+    assert extra_meta["protocol"]["studyEventRefs"][1]["collectionExceptionConditionOid"] == (
+        "COND.FOLLOWUP"
+    )
+    assert len(extra_meta["visits"]) == 2
+    assert extra_meta["visits"][0]["oid"] == "SE.SCREEN"
+    assert extra_meta["visits"][0]["category"] == "Baseline"
+    assert extra_meta["visits"][0]["description"] == "Initial screening visit"
+    assert len(extra_meta["measurementUnits"]) == 2
+
+    # 2. Form schedule and normalized defaults
+    vs_form = dd.forms[0]
+    assert vs_form.formId is None
+    assert vs_form.formType == "Subject"
+    assert len(vs_form.extraAttributes["visits"]) == 2
+    assert [v["oid"] for v in vs_form.extraAttributes["visits"]] == ["SE.SCREEN", "SE.FOLLOWUP"]
+
+    # 3. Variable MeasurementUnits and RangeChecks
+    v_weight = next(v for v in vs_form.variables if v.variableName == "WEIGHT")
+    assert v_weight.extraAttributes["measurementUnits"] == [
+        {"oid": "MU.KG", "name": "Kilograms", "symbol": "kg"}
+    ]
+    assert v_weight.extraAttributes["rangeChecks"] == [
+        {
+            "comparator": "GE",
+            "softHard": "Soft",
+            "checkValue": "30",
+            "measurementUnitOid": "MU.KG",
+            "errorMessage": "Weight below expected minimum",
+        }
+    ]
+
+    v_sysbp = next(v for v in vs_form.variables if v.variableName == "SYSBP")
+    assert v_sysbp.extraAttributes["collectionExceptionConditionOid"] == "COND.SYSBP"
+    assert v_sysbp.extraAttributes["rangeChecks"][0]["checkValues"] == ["90", "120", "140"]
+    assert v_sysbp.extraAttributes["rangeChecks"][1]["formalExpression"] == "../SYSBP > 70"
+
+    v_map = next(v for v in vs_form.variables if v.variableName == "MAP")
+    assert v_map.extraAttributes["methodOid"] == "METH.MAP"
+
+    # 4. ConditionDef and MethodDef mapped into BusinessLogicRule entries
+    form_rule_ids = {r.id: r for r in vs_form.businessLogic}
+    assert "COND.SYSBP" in form_rule_ids
+    assert "METH.MAP" in form_rule_ids
+    assert form_rule_ids["METH.MAP"].logic["methodType"] == "Computation"
+    assert form_rule_ids["METH.MAP"].logic["formalExpressions"] == [
+        {"context": "XPath", "expression": "(2 * ../DIABP + ../SYSBP) div 3"}
+    ]
+    assert form_rule_ids["METH.MAP"].logicRawXml is not None
+
+    unassigned_ids = {r.id: r for r in dd.unassignedBusinessLogic}
+    assert "COND.FOLLOWUP" in unassigned_ids
+    assert unassigned_ids["COND.FOLLOWUP"].type == "Condition"
+
+    # Verify no_raw_xml=True omits logicRawXml
+    dd_no_raw = load_from_cdisc_odm(FULL_ODM_13_XML, strict=True, no_raw_xml=True)
+    assert all(r.logicRawXml is None for r in dd_no_raw.forms[0].businessLogic)
+    assert all(r.logicRawXml is None for r in dd_no_raw.unassignedBusinessLogic)
+
+    # Canonical JSON validates cleanly
+    json_payload = to_json(dd)
+    assert "CARDIO-301" in json_payload
+
+    # Round-trip through to_odm_xml preserves all six constructs
+    re_emitted_xml = to_odm_xml(dd)
+    dd_reloaded = load_from_cdisc_odm(re_emitted_xml, strict=True)
+    assert dd_reloaded.metadata.extraAttributes["protocolName"] == "CARDIO-301"
+    assert len(dd_reloaded.metadata.extraAttributes["protocol"]["studyEventRefs"]) == 2
+    assert len(dd_reloaded.metadata.extraAttributes["visits"]) == 2
+    assert len(dd_reloaded.metadata.extraAttributes["measurementUnits"]) == 2
+    assert len(dd_reloaded.forms[0].businessLogic) == 2
+    assert len(dd_reloaded.unassignedBusinessLogic) == 1
+
+
+def test_load_from_cdisc_odm_broken_schedule_unit_and_rule_references() -> None:
+    """Broken references in Protocol, StudyEventDef, MeasurementUnitRef, and ItemRef warn/error."""
+    xml_missing_refs = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">
+  <Study OID="S_BROKEN">
+    <MetaDataVersion OID="MDV1">
+      <Protocol>
+        <StudyEventRef StudyEventOID="SE_MISSING" OrderNumber="1"
+                       CollectionExceptionConditionOID="COND_MISSING_PROTO"/>
+      </Protocol>
+      <StudyEventDef OID="SE_VALID" Name="Visit 1" Repeating="No" Type="Scheduled">
+        <FormRef FormOID="FORM_MISSING" OrderNumber="1"
+                 CollectionExceptionConditionOID="COND_MISSING_FORM"/>
+      </StudyEventDef>
+      <FormDef OID="F1" Name="Form 1">
+        <ItemGroupRef ItemGroupOID="IG1" OrderNumber="1"
+                      CollectionExceptionConditionOID="COND_MISSING_IG"/>
+      </FormDef>
+      <ItemGroupDef OID="IG1" Name="Group 1">
+        <ItemRef ItemOID="IT1" OrderNumber="1"
+                 MethodOID="METH_MISSING"
+                 CollectionExceptionConditionOID="COND_MISSING_ITEM"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT1" Name="IT1" DataType="integer">
+        <MeasurementUnitRef MeasurementUnitOID="MU_MISSING"/>
+        <RangeCheck Comparator="GT" SoftHard="Soft">
+          <CheckValue>0</CheckValue>
+          <MeasurementUnitRef MeasurementUnitOID="MU_RC_MISSING"/>
+        </RangeCheck>
+      </ItemDef>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    dd = load_from_cdisc_odm(xml_missing_refs, strict=False)
+    warnings_joined = "\n".join(dd.metadata.validationWarnings)
+    for expected_token in (
+        "SE_MISSING",
+        "COND_MISSING_PROTO",
+        "FORM_MISSING",
+        "COND_MISSING_FORM",
+        "COND_MISSING_IG",
+        "METH_MISSING",
+        "COND_MISSING_ITEM",
+        "MU_MISSING",
+        "MU_RC_MISSING",
+    ):
+        assert expected_token in warnings_joined
+
+    with pytest.raises(ValueError, match="Strict loading error"):
+        load_from_cdisc_odm(xml_missing_refs, strict=True)

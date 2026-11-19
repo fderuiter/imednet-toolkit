@@ -14,7 +14,13 @@ from ..models import (
     Metadata,
     Variable,
 )
-from ..normalize import _is_file_target, _safe_is_file, to_camel_case
+from ..normalize import (
+    _is_file_target,
+    _safe_is_file,
+    normalize_form_type,
+    normalize_variable_type,
+    to_camel_case,
+)
 
 # Canonical internal keys mapped from various common REDCap header formats
 COLUMN_ALIASES: dict[str, str] = {
@@ -185,28 +191,7 @@ def _map_field_type(
             return "Float"
         return "Text"
 
-    if ft == "notes":
-        return "Text"
-    if ft == "calc":
-        return "Calculation"
-    if ft == "dropdown":
-        return "Single Select"
-    if ft == "radio":
-        return "Radio"
-    if ft == "checkbox":
-        return "Multi Select"
-    if ft in ("yesno", "truefalse"):
-        return "Radio"
-    if ft == "file":
-        return "File"
-    if ft == "slider":
-        return "Slider"
-    if ft == "descriptive":
-        return "Descriptive"
-    if ft == "sql":
-        return "Single Select"
-
-    return "Text"
+    return normalize_variable_type(ft) or "Text"
 
 
 def _parse_redcap_choices(raw_choices: str | None, field_type: str | None) -> list[Choice]:
@@ -355,26 +340,27 @@ def load_from_redcap(
         val_type = known.get("textValidationType")
         var_type = _map_field_type(field_type, val_type, var_name, record_warning)
 
-        # Store calculation equation or branching logic in extraAttributes if present
+        # Store calculation equation, bounds, annotations, and metadata in extraAttributes
         raw_choices = known.get("choices")
         if (field_type or "").lower() == "calc" and raw_choices:
             extra["calculation"] = raw_choices
 
-        branching = known.get("branchingLogic")
-        if branching:
-            extra["branchingLogic"] = branching
-
-        field_note = known.get("fieldNote")
-        if field_note:
-            extra["fieldNote"] = field_note
-
-        sec_header = known.get("sectionHeader")
-        if sec_header:
-            extra["sectionHeader"] = sec_header
-
-        ident_val = known.get("identifier")
-        if ident_val:
-            extra["identifier"] = ident_val
+        for extra_key in (
+            "branchingLogic",
+            "fieldNote",
+            "sectionHeader",
+            "identifier",
+            "textValidationMin",
+            "textValidationMax",
+            "fieldAnnotation",
+            "customAlignment",
+            "questionNumber",
+            "matrixGroupName",
+            "matrixRanking",
+        ):
+            extra_val = known.get(extra_key)
+            if extra_val:
+                extra[extra_key] = extra_val
 
         choices = _parse_redcap_choices(raw_choices, field_type)
 
@@ -389,8 +375,8 @@ def load_from_redcap(
             variableType=var_type,
             sequence=seq,
             required=req_val,
-            format=val_type,
-            precision=known.get("textValidationMin") or known.get("textValidationMax"),
+            format=val_type or None,
+            precision=None,
             choices=choices,
             extraAttributes=extra,
         )
@@ -403,8 +389,8 @@ def load_from_redcap(
         form = Form(
             formKey=f_key,
             formName=f_name,
-            formId=f_key,
-            formType="Patient",
+            formId=None,
+            formType=normalize_form_type(None, default="Subject"),
             variables=forms_vars[f_key],
         )
         forms.append(form)

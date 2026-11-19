@@ -24,7 +24,15 @@ from .models import (
     Metadata,
     Variable,
 )
-from .normalize import to_camel_case, validate_timestamp
+from .normalize import (
+    normalize_form_id,
+    normalize_form_type,
+    normalize_measurement_units,
+    normalize_variable_bounds,
+    normalize_variable_type,
+    to_camel_case,
+    validate_timestamp,
+)
 from .schema import get_schema, validate
 
 __all__ = [
@@ -43,6 +51,11 @@ __all__ = [
     "load_from_csv",
     "load_from_csv_files",
     "load_from_redcap",
+    "normalize_form_id",
+    "normalize_form_type",
+    "normalize_measurement_units",
+    "normalize_variable_bounds",
+    "normalize_variable_type",
     "parse_logic_xml",
     "sort_data_dictionary",
     "to_camel_case",
