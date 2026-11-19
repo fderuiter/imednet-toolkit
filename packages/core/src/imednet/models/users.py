@@ -17,11 +17,12 @@ def _normalize_role_timestamp(v: Any) -> Any:
     if isinstance(v, (list, tuple)):
         if len(v) != 7 or any(isinstance(item, bool) or not isinstance(item, int) for item in v):
             raise ValueError(
-                f"Expected 7-element integer timestamp array [Y, M, D, h, m, s, ns], got {v!r}"
+                "Expected 7-element integer timestamp array [Y, M, D, h, m, s, ns], "
+                f"got {type(v).__name__} of length {len(v)}"
             )
         year, month, day, hour, minute, second, nanosecond = v
         if not (0 <= nanosecond < 1_000_000_000):
-            raise ValueError(f"Nanosecond component out of range in Role timestamp: {nanosecond}")
+            raise ValueError("Nanosecond component out of range in Role timestamp")
         return datetime(year, month, day, hour, minute, second, nanosecond // 1000, tzinfo=UTC)
     return v
 

@@ -168,33 +168,86 @@ def test_parse_bool_invalid_float():
     assert validators.parse_bool("1invalid") is False
 
 
-@pytest.mark.parametrize("container", [["a", "b"], {"k": "v"}])
-def test_str_normalizers_guard_against_containers(caplog, monkeypatch, container):
-    """Verify parse_str_or_default and _optional_str emit drift warnings and fail in strict mode instead of calling str(v)."""
+@pytest.mark.parametrize(
+    ("container", "expected_type", "sensitive_markers"),
+    [
+        (
+            [
+                {
+                    "api_key": "synth-cred-list-901",  # pragma: allowlist secret
+                    "patient_name": "Jane Synthetic",
+                    "nested": {"ssn": "999-00-1111", "note": "CONFIDENTIAL-LIST-PAYLOAD"},
+                }
+            ],
+            "list",
+            ("synth-cred-list-901", "Jane Synthetic", "999-00-1111", "CONFIDENTIAL-LIST-PAYLOAD"),
+        ),
+        (
+            {
+                "nested": {
+                    "token": "synth-token-dict-902",  # pragma: allowlist secret
+                    "patient_name": "John Synthetic",
+                    "ssn": "999-00-2222",
+                    "note": "CONFIDENTIAL-DICT-PAYLOAD",
+                }
+            },
+            "dict",
+            ("synth-token-dict-902", "John Synthetic", "999-00-2222", "CONFIDENTIAL-DICT-PAYLOAD"),
+        ),
+    ],
+)
+def test_str_normalizers_guard_against_containers_without_leaking_values(
+    caplog, monkeypatch, container, expected_type, sensitive_markers
+):
+    """Verify parse_str_or_default and _optional_str report only expected/actual types and never disclose nested values."""
     import logging
 
     from pydantic import Field, ValidationError
 
-    from imednet.models.base import ImednetBaseModel, _optional_str
+    from imednet.models.base import ImednetBaseModel, _drift_reported, _optional_str
 
     class SampleStrModel(ImednetBaseModel):
         opt_text: str | None = Field(default=None, alias="optText")
         req_text: str = Field(default="fallback", alias="reqText")
 
+    _drift_reported.clear()
+    validators._drift_reported.clear()
+    expected_fragment = f"Expected str, got {expected_type}"
+
+    # Permissive mode: returns defaults/None, logs type-only drift warning, omits nested values
     monkeypatch.setenv("IMEDNET_STRICT_MODE", "false")
+    caplog.clear()
     with caplog.at_level(logging.WARNING, logger="imednet.drift"):
         assert validators.parse_str_or_default(container, default="def") == "def"
         assert _optional_str(container) is None
         parsed = SampleStrModel.from_json({"optText": container, "reqText": container})
         assert parsed.opt_text is None
         assert parsed.req_text == ""
-    assert "Expected str, got" in caplog.text
+        assert validators.parse_bool(container) is False
+        assert validators.parse_int_or_default(container, default=7) == 7
 
-    with pytest.raises(ValueError, match="Expected str, got"):
-        validators.parse_str_or_default(container, strict=True)
+    assert expected_fragment in caplog.text
+    for marker in sensitive_markers:
+        assert marker not in caplog.text
 
-    monkeypatch.setenv("IMEDNET_STRICT_MODE", "true")
-    with pytest.raises(ValueError, match="Expected str, got"):
-        _optional_str(container)
-    with pytest.raises(ValidationError, match="Expected str, got"):
-        SampleStrModel.from_json({"optText": container})
+    # Strict mode: raises ValueError / ValidationError with type-only text and omits nested values from logs & exceptions
+    caplog.clear()
+    _drift_reported.clear()
+    with caplog.at_level(logging.WARNING, logger="imednet.drift"):
+        with pytest.raises(ValueError, match=expected_fragment) as strict_arg_exc:
+            validators.parse_str_or_default(container, strict=True)
+
+        monkeypatch.setenv("IMEDNET_STRICT_MODE", "true")
+        with pytest.raises(ValueError, match=expected_fragment) as opt_str_exc:
+            _optional_str(container)
+        with pytest.raises(ValidationError, match=expected_fragment) as model_opt_exc:
+            SampleStrModel.from_json({"optText": container})
+        with pytest.raises(ValidationError, match=expected_fragment) as model_req_exc:
+            SampleStrModel.from_json({"reqText": container})
+
+    for exc_info in (strict_arg_exc, opt_str_exc, model_opt_exc, model_req_exc):
+        exc_text = f"{exc_info.value}\n{exc_info.value!r}"
+        for marker in sensitive_markers:
+            assert marker not in exc_text
+    for marker in sensitive_markers:
+        assert marker not in caplog.text

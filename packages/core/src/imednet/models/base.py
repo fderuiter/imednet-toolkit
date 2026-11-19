@@ -19,6 +19,7 @@ from typing import (
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from imednet.utils.validators import (
+    _guard_str_container,
     is_missing_value,
     parse_bool,
     parse_datetime,
@@ -41,15 +42,7 @@ def _optional_str(v: Any) -> Any:
     if is_missing_value(v):
         return None
     if isinstance(v, (list, dict)):
-        import logging
-
-        msg = (
-            f"Drift detected (destructive): type-changed field. "
-            f"Expected str, got {type(v).__name__} (value: {v!r})"
-        )
-        logging.getLogger("imednet.drift").warning(msg)
-        if parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false")):
-            raise ValueError(msg)
+        _guard_str_container(v)
         return None
     return parse_str_or_default(v)
 
@@ -165,6 +158,7 @@ class ImednetBaseModel(BaseModel):
         extra="ignore",
         populate_by_name=True,
         str_strip_whitespace=True,
+        hide_input_in_errors=True,
     )
 
     @classmethod
