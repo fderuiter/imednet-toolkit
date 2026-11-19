@@ -308,6 +308,35 @@ _LOGICAL_TO_PANDAS_DTYPE: dict[str, str] = {
     "string": "string",
 }
 
+_LOGICAL_TO_DUCKDB_SQL: dict[str, str] = {
+    "int64": "BIGINT",
+    "float64": "DOUBLE",
+    "bool": "BOOLEAN",
+    "string": "VARCHAR",
+}
+
+
+def _quote_duckdb_column(name: str) -> str:
+    """Safely double-quote an arbitrary DataFrame column identifier for DuckDB DDL."""
+    if not isinstance(name, str) or not name or "\x00" in name:
+        raise ValueError(f"Invalid DuckDB column name {name!r}.")
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _is_missing_scalar(value: Any) -> bool:
+    """Return True when ``value`` is a scalar missing sentinel without failing on sequences."""
+    if value is None or value is pd.NA:
+        return True
+    if isinstance(value, (bytes, str, Mapping, Sequence)):
+        return False
+    try:
+        res = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    if hasattr(res, "__len__"):
+        return False
+    return bool(res)
+
 
 def _variable_type_to_logical(var_type: str | None) -> str | None:
     """Map an iMednet ``Variable.variable_type`` string to a logical tabular type."""
@@ -411,6 +440,182 @@ def _apply_contract_to_all_null_df_columns(
     return adjusted if adjusted is not None else df
 
 
+def _infer_series_logical_type(series: pd.Series) -> str | None:
+    """Infer a logical tabular type for ``series``, returning ``None`` when all values are null."""
+    if len(series) == 0:
+        return None
+    non_missing = [v for v in series.tolist() if not _is_missing_scalar(v)]
+    if not non_missing:
+        return None
+    if pd.api.types.is_bool_dtype(series.dtype):
+        return "bool"
+    if pd.api.types.is_integer_dtype(series.dtype):
+        return "int64"
+    if pd.api.types.is_float_dtype(series.dtype):
+        return "float64"
+    if pd.api.types.is_string_dtype(series.dtype) and series.dtype != object:
+        return "string"
+    if series.dtype == object:
+        if all(isinstance(v, bool) for v in non_missing):
+            return "bool"
+        if all(isinstance(v, int) and not isinstance(v, bool) for v in non_missing):
+            return "int64"
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in non_missing):
+            return "float64"
+        return "string"
+    return None
+
+
+def _duckdb_sql_to_logical(sql_type: str) -> str | None:
+    """Map a DuckDB ``PRAGMA table_info`` SQL type string to a logical tabular type."""
+    upper = sql_type.strip().upper()
+    if upper in {
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "INT",
+        "INT4",
+        "INT8",
+        "BIGINT",
+        "HUGEINT",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+    }:
+        return "int64"
+    if upper in {"FLOAT", "REAL", "FLOAT4", "DOUBLE", "FLOAT8"} or upper.startswith(
+        ("DECIMAL", "NUMERIC")
+    ):
+        return "float64"
+    if upper in {"BOOLEAN", "BOOL"}:
+        return "bool"
+    if "CHAR" in upper or upper in {"TEXT", "STRING"}:
+        return "string"
+    return None
+
+
+def _duckdb_table_exists(conn: Any, table_name: str) -> bool:
+    """Return True when ``table_name`` exists as a base table in DuckDB's current schema."""
+    rows = conn.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = current_schema() AND table_name = ? AND table_type = 'BASE TABLE'",
+        [table_name],
+    ).fetchall()
+    return bool(rows)
+
+
+def _replace_duckdb_with_empty_table(
+    conn: Any,
+    table_name: str,
+    contract_types: Mapping[str, str | None] | None,
+) -> None:
+    """Replace ``table_name`` with a zero-row DuckDB table preserving schema when available."""
+    quoted_tbl = _quote_duckdb_identifier(table_name)
+    if not contract_types and _duckdb_table_exists(conn, table_name):
+        conn.execute(
+            f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_tbl} WHERE 1=0"
+        )
+        return
+    empty_df = _build_empty_contract_df(contract_types)
+    quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
+    conn.register(_DUCKDB_DF_ALIAS, empty_df)
+    try:
+        conn.execute(f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
+    finally:
+        conn.unregister(_DUCKDB_DF_ALIAS)
+
+
+def _collect_untyped_all_null_columns(
+    df: pd.DataFrame,
+    contract_types: Mapping[str, str | None] | None,
+) -> set[str]:
+    """Identify columns created from all-null values without a contract type."""
+    ctypes = contract_types or {}
+    untyped: set[str] = set()
+    for col_raw in df.columns:
+        col = str(col_raw)
+        if ctypes.get(col) is None and _infer_series_logical_type(df[col_raw]) is None:
+            untyped.add(col)
+    return untyped
+
+
+def _evolve_duckdb_table_for_df(
+    conn: Any,
+    table_name: str,
+    df: pd.DataFrame,
+    contract_types: Mapping[str, str | None] | None,
+    untyped_null_cols: set[str],
+) -> pd.DataFrame:
+    """Widen or add DuckDB table columns prior to ``INSERT INTO ... BY NAME``."""
+    if df.empty or isinstance(conn, NonCallableMock):
+        return df
+    _validate_duckdb_identifier(table_name)
+    quoted_tbl = _quote_duckdb_identifier(table_name)
+    ctypes = contract_types or {}
+    existing_info = {
+        str(row[1]): str(row[2])
+        for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    }
+    adjusted: pd.DataFrame | None = None
+
+    for col_raw in df.columns:
+        col = str(col_raw)
+        series = df[col_raw]
+        incoming_logical = _infer_series_logical_type(series)
+        quoted_col = _quote_duckdb_column(col)
+
+        if col not in existing_info:
+            desired_logical = ctypes.get(col) or incoming_logical
+            if desired_logical is None:
+                untyped_null_cols.add(col)
+                sql_type = "INTEGER"
+            else:
+                sql_type = _LOGICAL_TO_DUCKDB_SQL[desired_logical]
+            conn.execute(f"ALTER TABLE {quoted_tbl} ADD COLUMN {quoted_col} {sql_type}")
+            existing_info[col] = sql_type
+            continue
+
+        if incoming_logical is None:
+            continue
+
+        existing_sql = existing_info[col]
+        existing_logical = _duckdb_sql_to_logical(existing_sql)
+        if (
+            incoming_logical == "float64"
+            and pd.api.types.is_float_dtype(series.dtype)
+            and bool(series.isna().any())
+            and (ctypes.get(col) == "int64" or existing_logical == "int64")
+        ):
+            non_missing = [v for v in series.tolist() if not _is_missing_scalar(v)]
+            if all(float(v).is_integer() for v in non_missing):
+                if adjusted is None:
+                    adjusted = df.copy()
+                adjusted[col_raw] = pd.Series(
+                    [pd.NA if _is_missing_scalar(v) else int(v) for v in series.tolist()],
+                    index=df.index,
+                    dtype="Int64",
+                )
+                incoming_logical = "int64"
+
+        if col in untyped_null_cols:
+            untyped_null_cols.discard(col)
+            target_sql = _LOGICAL_TO_DUCKDB_SQL[incoming_logical]
+            if existing_sql.strip().upper() != target_sql:
+                conn.execute(f"ALTER TABLE {quoted_tbl} ALTER {quoted_col} TYPE {target_sql}")
+                existing_info[col] = target_sql
+            continue
+
+        if existing_logical is not None:
+            unified = _unify_logical_types(existing_logical, incoming_logical)
+            if unified is not None and unified != existing_logical:
+                target_sql = _LOGICAL_TO_DUCKDB_SQL[unified]
+                conn.execute(f"ALTER TABLE {quoted_tbl} ALTER {quoted_col} TYPE {target_sql}")
+                existing_info[col] = target_sql
+
+    return adjusted if adjusted is not None else df
+
+
 def _logical_to_arrow_type(pa: Any, logical_type: str | None) -> Any | None:
     """Convert a logical tabular type name into a ``pyarrow.DataType``."""
     if logical_type == "int64":
@@ -422,6 +627,39 @@ def _logical_to_arrow_type(pa: Any, logical_type: str | None) -> Any | None:
     if logical_type == "string":
         return pa.string()
     return None
+
+
+def _series_to_arrow_array(pa: Any, series: pd.Series) -> Any:
+    """Convert a single pandas Series to an Arrow Array, stringifying mixed object scalars."""
+    try:
+        arr = pa.Array.from_pandas(series)
+        if pa.types.is_large_string(arr.type):
+            return arr.cast(pa.string())
+        return arr
+    except (
+        pa.ArrowInvalid,
+        pa.ArrowTypeError,
+        pa.ArrowNotImplementedError,
+        TypeError,
+        ValueError,
+    ):
+        return pa.array(
+            [None if _is_missing_scalar(v) else str(v) for v in series.tolist()],
+            type=pa.string(),
+        )
+
+
+def _safe_cast_arrow_array(pa: Any, col: Any, target_type: Any) -> Any:
+    """Cast an Arrow Array/ChunkedArray to ``target_type``, stringifying Python values on fallback."""
+    try:
+        return col.cast(target_type)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
+        if pa.types.is_string(target_type) or pa.types.is_large_string(target_type):
+            return pa.array(
+                [None if v is None else str(v) for v in col.to_pylist()],
+                type=target_type,
+            )
+        raise
 
 
 def _unify_arrow_types(pa: Any, left: Any, right: Any) -> Any:
@@ -458,16 +696,18 @@ def _align_arrow_column(
     if inferred_col.type == target_type:
         return inferred_col, target_type
 
-    if pa.types.is_string(target_type):
+    if pa.types.is_string(target_type) or pa.types.is_large_string(target_type):
         if series is not None and pa.types.is_floating(inferred_col.type):
             try:
                 as_int = pa.array(series, type=pa.int64(), from_pandas=True, safe=True)
-                return as_int.cast(pa.string()), target_type
+                return as_int.cast(target_type), target_type
             except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError):
                 pass
-        return inferred_col.cast(pa.string()), target_type
+        return _safe_cast_arrow_array(pa, inferred_col, target_type), target_type
 
-    if series is not None:
+    if series is not None and pa.types.is_boolean(target_type) == pa.types.is_boolean(
+        inferred_col.type
+    ):
         try:
             cast_arr = pa.array(series, type=target_type, from_pandas=True, safe=True)
             return cast_arr, target_type
@@ -481,9 +721,7 @@ def _align_arrow_column(
             pass
 
     widened = _unify_arrow_types(pa, target_type, inferred_col.type)
-    if pa.types.is_string(widened):
-        return inferred_col.cast(pa.string()), widened
-    return inferred_col.cast(widened), widened
+    return _safe_cast_arrow_array(pa, inferred_col, widened), widened
 
 
 class TabularParquetSink(ExportSink):
@@ -518,21 +756,30 @@ class TabularParquetSink(ExportSink):
 
     def _align_batch_table(self, pa: Any, df: pd.DataFrame) -> tuple[Any, bool]:
         """Convert ``df`` into an Arrow table aligned with contract or active writer schema."""
-        raw_table = pa.Table.from_pandas(df, preserve_index=False)
         row_count = len(df)
+        col_names: list[str] = []
+        series_by_name: dict[str, pd.Series] = {}
+        inferred_by_name: dict[str, Any] = {}
+        for col_raw in df.columns:
+            col_name = str(col_raw)
+            series = df[col_raw]
+            col_names.append(col_name)
+            series_by_name[col_name] = series
+            inferred_by_name[col_name] = _series_to_arrow_array(pa, series)
+
         arrays: list[Any] = []
         fields: list[Any] = []
 
         if self._schema is None:
-            for field in raw_table.schema:
-                contract_pa = _logical_to_arrow_type(pa, self._contract_types.get(field.name))
-                desired = contract_pa if contract_pa is not None else field.type
-                series = df[field.name] if field.name in df.columns else None
+            for col_name in col_names:
+                inferred_col = inferred_by_name[col_name]
+                contract_pa = _logical_to_arrow_type(pa, self._contract_types.get(col_name))
+                desired = contract_pa if contract_pa is not None else inferred_col.type
                 arr, resolved = _align_arrow_column(
-                    pa, series, raw_table[field.name], desired, row_count
+                    pa, series_by_name[col_name], inferred_col, desired, row_count
                 )
                 arrays.append(arr)
-                fields.append(pa.field(field.name, resolved))
+                fields.append(pa.field(col_name, resolved))
             target_schema = pa.schema(fields)
             return pa.Table.from_arrays(arrays, schema=target_schema), False
 
@@ -540,32 +787,28 @@ class TabularParquetSink(ExportSink):
         existing_names: set[str] = set()
         for existing_field in self._schema:
             existing_names.add(existing_field.name)
-            inferred_col = (
-                raw_table[existing_field.name]
-                if existing_field.name in raw_table.column_names
-                else None
-            )
-            series = df[existing_field.name] if existing_field.name in df.columns else None
+            inferred_col = inferred_by_name.get(existing_field.name)
+            series_opt = series_by_name.get(existing_field.name)
             arr, resolved = _align_arrow_column(
-                pa, series, inferred_col, existing_field.type, row_count
+                pa, series_opt, inferred_col, existing_field.type, row_count
             )
             if resolved != existing_field.type:
                 evolved = True
             arrays.append(arr)
             fields.append(pa.field(existing_field.name, resolved))
 
-        for new_field in raw_table.schema:
-            if new_field.name in existing_names:
+        for new_col_name in col_names:
+            if new_col_name in existing_names:
                 continue
             evolved = True
-            contract_pa = _logical_to_arrow_type(pa, self._contract_types.get(new_field.name))
-            desired = contract_pa if contract_pa is not None else new_field.type
-            series = df[new_field.name] if new_field.name in df.columns else None
+            inferred_col = inferred_by_name[new_col_name]
+            contract_pa = _logical_to_arrow_type(pa, self._contract_types.get(new_col_name))
+            desired = contract_pa if contract_pa is not None else inferred_col.type
             arr, resolved = _align_arrow_column(
-                pa, series, raw_table[new_field.name], desired, row_count
+                pa, series_by_name[new_col_name], inferred_col, desired, row_count
             )
             arrays.append(arr)
-            fields.append(pa.field(new_field.name, resolved))
+            fields.append(pa.field(new_col_name, resolved))
 
         target_schema = pa.schema(fields)
         return pa.Table.from_arrays(arrays, schema=target_schema), evolved
@@ -595,7 +838,7 @@ class TabularParquetSink(ExportSink):
                                     pa.nulls(prev_tbl.num_rows, type=target_field.type)
                                 )
                             elif col.type != target_field.type:
-                                cast_cols.append(col.cast(target_field.type))
+                                cast_cols.append(_safe_cast_arrow_array(pa, col, target_field.type))
                             else:
                                 cast_cols.append(col)
                         else:
@@ -824,6 +1067,7 @@ class TabularDuckDBSink(ExportSink):
         self.table_name = table_name
         self._cfg = config
         self._contract_types: dict[str, str | None] = dict(contract_types) if contract_types else {}
+        self._untyped_null_cols: set[str] = set()
         self._is_first_batch = True
         self._is_incremental_sync = bool(
             config.incremental
@@ -839,11 +1083,7 @@ class TabularDuckDBSink(ExportSink):
         self._contract_types = dict(contract_types)
 
     def _table_exists(self) -> bool:
-        rows = self._conn.execute(
-            "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
-            [self.table_name],
-        ).fetchall()
-        return bool(rows)
+        return _duckdb_table_exists(self._conn, self.table_name)
 
     def _delete_record_ids(self, record_ids: Sequence[Any]) -> int:
         if not record_ids or not self._table_exists():
@@ -875,23 +1115,30 @@ class TabularDuckDBSink(ExportSink):
         def execute_export() -> int:
             quoted_tbl = _quote_duckdb_identifier(self.table_name)
             quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
-            creating_table = (
-                self._is_first_batch and not (self._is_incremental_sync and self._cfg.idempotent)
-            ) or not self._table_exists()
-            df_to_register = (
-                _apply_contract_to_all_null_df_columns(df, self._contract_types)
-                if creating_table
-                else df
+            replace_existing = self._is_first_batch and not (
+                self._is_incremental_sync and self._cfg.idempotent
             )
+            creating_table = replace_existing or not self._table_exists()
+            if creating_table:
+                df_to_register = _apply_contract_to_all_null_df_columns(df, self._contract_types)
+                self._untyped_null_cols = _collect_untyped_all_null_columns(
+                    df, self._contract_types
+                )
+            else:
+                df_to_register = _evolve_duckdb_table_for_df(
+                    self._conn,
+                    self.table_name,
+                    df,
+                    self._contract_types,
+                    self._untyped_null_cols,
+                )
             self._conn.register(_DUCKDB_DF_ALIAS, df_to_register)
             try:
-                if self._is_first_batch and not (
-                    self._is_incremental_sync and self._cfg.idempotent
-                ):
+                if replace_existing:
                     self._conn.execute(
                         f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
                     )
-                elif not self._table_exists():
+                elif creating_table:
                     self._conn.execute(f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
                 else:
                     if self._is_incremental_sync and self._cfg.idempotent:
@@ -932,21 +1179,7 @@ class TabularDuckDBSink(ExportSink):
             and self._conn is not None
             and not isinstance(self._conn, NonCallableMock)
         ):
-            quoted_tbl = _quote_duckdb_identifier(self.table_name)
-            if not self._contract_types and self._table_exists():
-                self._conn.execute(
-                    f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_tbl} WHERE 1=0"
-                )
-                return
-            empty_df = _build_empty_contract_df(self._contract_types)
-            quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
-            self._conn.register(_DUCKDB_DF_ALIAS, empty_df)
-            try:
-                self._conn.execute(
-                    f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
-                )
-            finally:
-                self._conn.unregister(_DUCKDB_DF_ALIAS)
+            _replace_duckdb_with_empty_table(self._conn, self.table_name, self._contract_types)
 
     def close(self) -> None:
         """Close the DuckDB connection."""
@@ -1599,32 +1832,16 @@ def export_to_duckdb(
             try:
                 quoted_tbl = _quote_duckdb_identifier(table_name)
                 if len(df_legacy.columns) == 0 and not isinstance(conn, NonCallableMock):
-                    table_exists = bool(
-                        conn.execute(
-                            "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
-                            [table_name],
-                        ).fetchall()
-                    )
-                    if table_exists:
-                        conn.execute(
-                            f"CREATE OR REPLACE TABLE {quoted_tbl} "
-                            f"AS SELECT * FROM {quoted_tbl} WHERE 1=0"
-                        )
-                    else:
-                        empty_legacy = _build_empty_contract_df(None)
-                        conn.register(_DUCKDB_DF_ALIAS, empty_legacy)
+                    _replace_duckdb_with_empty_table(conn, table_name, None)
+                else:
+                    conn.register(_DUCKDB_DF_ALIAS, df_legacy)
+                    try:
                         conn.execute(
                             f"CREATE OR REPLACE TABLE {quoted_tbl} "
                             f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
                         )
+                    finally:
                         conn.unregister(_DUCKDB_DF_ALIAS)
-                else:
-                    conn.register(_DUCKDB_DF_ALIAS, df_legacy)
-                    conn.execute(
-                        f"CREATE OR REPLACE TABLE {quoted_tbl} "
-                        f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
-                    )
-                    conn.unregister(_DUCKDB_DF_ALIAS)
             finally:
                 conn.close()
             return
@@ -1754,12 +1971,22 @@ def export_to_duckdb_by_form(
                     df = df.loc[:, ~dup_mask]
                     df = _mask_df(df)
 
+                if (
+                    isinstance(df, pd.DataFrame)
+                    and len(df.columns) == 0
+                    and not isinstance(conn, NonCallableMock)
+                ):
+                    _replace_duckdb_with_empty_table(conn, form.form_key, None)
+                    continue
+
                 conn.register(_DUCKDB_DF_ALIAS, df)
-                conn.execute(
-                    f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(form.form_key)} "
-                    f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
-                )
-                conn.unregister(_DUCKDB_DF_ALIAS)
+                try:
+                    conn.execute(
+                        f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(form.form_key)} "
+                        f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
+                    )
+                finally:
+                    conn.unregister(_DUCKDB_DF_ALIAS)
                 continue
 
             form_contract_types = _build_tabular_contract_types(
@@ -1784,6 +2011,7 @@ def export_to_duckdb_by_form(
             )
             stream = (rec for rec in raw_stream if include_deleted or not is_record_deleted(rec))
             wrote_any = False
+            untyped_null_cols: set[str] = set()
             quoted_tbl = _quote_duckdb_identifier(form.form_key)
             quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
             for chunk in iter_batches(stream, batch_size):
@@ -1801,11 +2029,17 @@ def export_to_duckdb_by_form(
                     df = _mask_df(df)
                 if df.empty:
                     continue
-                df_for_ddb = (
-                    _apply_contract_to_all_null_df_columns(df, form_contract_types)
-                    if not wrote_any
-                    else df
-                )
+                if not wrote_any:
+                    df_for_ddb = _apply_contract_to_all_null_df_columns(df, form_contract_types)
+                    untyped_null_cols = _collect_untyped_all_null_columns(df, form_contract_types)
+                else:
+                    df_for_ddb = _evolve_duckdb_table_for_df(
+                        conn,
+                        form.form_key,
+                        df,
+                        form_contract_types,
+                        untyped_null_cols,
+                    )
                 conn.register(_DUCKDB_DF_ALIAS, df_for_ddb)
                 try:
                     if not wrote_any:
@@ -1820,14 +2054,7 @@ def export_to_duckdb_by_form(
                 finally:
                     conn.unregister(_DUCKDB_DF_ALIAS)
             if not wrote_any and not is_incremental:
-                empty_df = _build_empty_contract_df(form_contract_types)
-                conn.register(_DUCKDB_DF_ALIAS, empty_df)
-                try:
-                    conn.execute(
-                        f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
-                    )
-                finally:
-                    conn.unregister(_DUCKDB_DF_ALIAS)
+                _replace_duckdb_with_empty_table(conn, form.form_key, form_contract_types)
     finally:
         conn.close()
 

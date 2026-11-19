@@ -1452,3 +1452,167 @@ def test_duckdb_zero_row_full_export_replaces_snapshot_and_incremental_noop_pres
     export_to_duckdb_by_form(sdk, "S-DDB", str(by_form_path))
     with duckdb.connect(str(by_form_path)) as conn:
         assert conn.execute('SELECT COUNT(*) FROM "AE"').fetchone()[0] == 0
+
+
+def test_parquet_and_duckdb_streaming_edge_case_schema_evolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify mixed-object, bool/int, nested Arrow batches and untyped-null/cross-schema DuckDB cases."""
+    duckdb = pytest.importorskip("duckdb")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import imednet.integrations.export as export_mod
+    from imednet.integrations.export import TabularDuckDBSink, TabularParquetSink
+
+    # 1. Parquet: mixed scalar object batch ([42, "N/A"]), bool <-> int widening, and list -> string
+    pq_edge = tmp_path / "edge_evolve.parquet"
+    pq_cfg = TabularSinkConfig(study_key="S-EDGE", batch_size=2)
+    with TabularParquetSink(str(pq_edge), pq_cfg) as sink:
+        sink.write_batch(
+            [
+                {"recordId": 1, "MIXED": None, "FLAG": True, "NESTED": [1, 2]},
+                {"recordId": 2, "MIXED": None, "FLAG": False, "NESTED": [3]},
+            ],
+            batch_id="b0",
+        )
+        sink.write_batch(
+            [
+                {"recordId": 3, "MIXED": 42, "FLAG": 2, "NESTED": "flat"},
+                {"recordId": 4, "MIXED": "N/A", "FLAG": None, "NESTED": None},
+            ],
+            batch_id="b1",
+        )
+
+    pq_tbl = pq.read_table(pq_edge)
+    assert pq_tbl.schema.field("MIXED").type == pa.string()
+    assert pq_tbl.schema.field("FLAG").type == pa.string()
+    assert pq_tbl.schema.field("NESTED").type == pa.string()
+    pq_dict = pq_tbl.to_pydict()
+    assert pq_dict["MIXED"] == [None, None, "42", "N/A"]
+    assert pq_dict["FLAG"][2:] == ["2", None]
+    assert pq_dict["NESTED"] == ["[1, 2]", "[3]", "flat", None]
+
+    # 2. DuckDB: untyped Variable (variable_type=None) with label spaces, all-null chunk 0 -> string/float chunk 1
+    sdk = MagicMock()
+    vars_list = [
+        Variable(
+            variable_name="UNTYPED_NOTE",
+            label="Untyped Note",
+            variable_type=None,
+            form_id=10,
+            form_key="AE",
+        ),
+        Variable(
+            variable_name="UNTYPED_MEASURE",
+            label="Untyped Measure",
+            variable_type=None,
+            form_id=10,
+            form_key="AE",
+        ),
+        Variable(
+            variable_name="AGE",
+            label="Patient Age",
+            variable_type="int",
+            form_id=10,
+            form_key="AE",
+        ),
+    ]
+    sdk.get_variables.return_value = vars_list
+    sdk.variables.list.return_value = vars_list
+    sdk.forms.list.return_value = [SimpleNamespace(form_id=10, form_key="AE")]
+
+    chunk_records = [
+        _make_record(
+            1,
+            record_data={"UNTYPED_NOTE": None, "UNTYPED_MEASURE": None, "AGE": None},
+        ),
+        _make_record(
+            2,
+            record_data={"UNTYPED_NOTE": "resolved", "UNTYPED_MEASURE": 12.5, "AGE": 44},
+        ),
+        _make_record(
+            3,
+            record_data={"UNTYPED_NOTE": "ongoing", "UNTYPED_MEASURE": 15.0, "AGE": None},
+        ),
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(chunk_records)
+
+    ddb_untyped = tmp_path / "untyped_null.duckdb"
+    export_to_duckdb(
+        sdk,
+        "S-EDGE",
+        str(ddb_untyped),
+        "records",
+        use_labels_as_columns=True,
+        batch_size=1,
+    )
+    export_to_duckdb_by_form(
+        sdk,
+        "S-EDGE",
+        str(ddb_untyped),
+        use_labels_as_columns=True,
+        batch_size=1,
+    )
+
+    with duckdb.connect(str(ddb_untyped)) as conn:
+        for tbl_name in ("records", "AE"):
+            rows = conn.execute(
+                f'SELECT "recordId", "Untyped Note", "Untyped Measure", "Patient Age" '
+                f'FROM "{tbl_name}" ORDER BY "recordId"'
+            ).fetchall()
+            assert rows == [
+                (1, None, None, None),
+                (2, "resolved", 12.5, 44),
+                (3, "ongoing", 15.0, None),
+            ]
+            col_types = {
+                r[1]: r[2].upper()
+                for r in conn.execute(f"PRAGMA table_info('{tbl_name}')").fetchall()
+            }
+            assert col_types["Patient Age"] == "BIGINT"
+
+    # 3. Standalone TabularDuckDBSink: null -> int64 -> float64 -> string + late column + cross-schema table
+    ddb_standalone = tmp_path / "standalone_edge.duckdb"
+    with duckdb.connect(str(ddb_standalone)) as conn:
+        conn.execute("CREATE SCHEMA other_schema")
+        conn.execute("CREATE TABLE other_schema.records AS SELECT 999 AS id")
+
+    # Zero-row flush when another schema has same table name must not raise CatalogException
+    with TabularDuckDBSink(str(ddb_standalone), "records", TabularSinkConfig(study_key="S-EDGE")):
+        pass
+    with duckdb.connect(str(ddb_standalone)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "records"').fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM other_schema.records").fetchone()[0] == 1
+
+    # Multi-batch widening in standalone TabularDuckDBSink
+    with TabularDuckDBSink(
+        str(ddb_standalone), "evolve_tbl", TabularSinkConfig(study_key="S-EDGE")
+    ) as sink:
+        sink.write_batch([{"recordId": 1, "SCORE": None}], batch_id="b0")
+        sink.write_batch([{"recordId": 2, "SCORE": 10}], batch_id="b1")
+        sink.write_batch([{"recordId": 3, "SCORE": 12.5, "EXTRA": "late"}], batch_id="b2")
+        sink.write_batch([{"recordId": 4, "SCORE": "high", "EXTRA": None}], batch_id="b3")
+
+    with duckdb.connect(str(ddb_standalone)) as conn:
+        evolved_rows = conn.execute(
+            'SELECT "recordId", "SCORE", "EXTRA" FROM "evolve_tbl" ORDER BY "recordId"'
+        ).fetchall()
+    assert evolved_rows == [
+        (1, None, None),
+        (2, "10.0", None),
+        (3, "12.5", "late"),
+        (4, "high", None),
+    ]
+
+    # 4. export_to_duckdb_by_form mock-fetch zero-column DataFrame replaces pre-populated table
+    mapper_inst = MagicMock()
+    mapper_inst._build_record_model.return_value = object()
+    mapper_inst._fetch_records.return_value = []
+    mapper_inst._parse_records.return_value = ([], 0)
+    mapper_inst._build_dataframe.return_value = pd.DataFrame()
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: MagicMock(return_value=mapper_inst))
+
+    export_to_duckdb_by_form(sdk, "S-EDGE", str(ddb_untyped))
+    with duckdb.connect(str(ddb_untyped)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "AE"').fetchone()[0] == 0
