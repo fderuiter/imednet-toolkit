@@ -58,14 +58,16 @@ Optional dependency conventions
 
 Public-API exposure rules
 -------------------------
-* :mod:`imednet.integrations` re-exports only the tabular helpers by default
-  (backward compatibility).
-* The three new sink classes (``Neo4jExportSink``, ``MongoDbExportSink``,
-  ``SnowflakeExportSink``) and ``SinkConfig`` are importable from their
-  respective submodules and are also re-exported from
-  :mod:`imednet.integrations` via explicit names.
+* :mod:`imednet.integrations` exports tabular helpers and shared sink contracts
+  (``SinkConfig`` and ``ExportSink``).
+* Document, graph, and warehouse sinks (``MongoDbExportSink``,
+  ``Neo4jExportSink``, ``SnowflakeExportSink``) and their configuration classes
+  and ``export_to_*`` helpers live in :mod:`imednet_sinks`
+  (:mod:`imednet_sinks.document`, :mod:`imednet_sinks.graph`,
+  :mod:`imednet_sinks.warehouse`) and are exposed dynamically via ``sdk.sinks``.
 * Airflow helpers in :mod:`apache_airflow_providers_imednet.export` wrap only
-  the tabular path; graph/document/warehouse sinks are not wrapped there.
+  the tabular path, while ``ImednetExportOperator`` resolves ``mongodb``,
+  ``neo4j``, and ``snowflake`` destinations dynamically via ``sdk.sinks``.
 """  # noqa: RUF002
 
 from __future__ import annotations

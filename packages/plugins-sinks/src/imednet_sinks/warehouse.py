@@ -46,9 +46,11 @@ Usage
 -----
 .. code-block:: python
 
-    from imednet.integrations.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+    import os
+    from imednet_sinks import SnowflakeExportSink, SnowflakeSinkConfig
 
     config = SnowflakeSinkConfig(
+        study_key="MYSTUDY",
         account="myorg-myaccount",
         user="loader",
         **{"password": os.environ["SF_PASS"]},  # keep credentials out of source code
