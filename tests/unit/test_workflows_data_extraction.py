@@ -183,7 +183,7 @@ def test_extract_records_by_criteria_scaling_benchmark() -> None:
 
 
 def test_extract_audit_trail_builds_filters_and_dates() -> None:
-    """Test that extract audit trail builds filters and dates."""
+    """Test that extract audit trail normalizes UTC bounds and builds dateCreated range filters."""
     sdk = MagicMock()
     revisions = [RecordRevision(record_revision_id=1)]
     sdk.get_record_revisions.return_value = revisions
@@ -191,8 +191,8 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
     wf = DataExtractionWorkflow(sdk)
     result = wf.extract_audit_trail(
         "STUDY",
-        start_date="2021-01-01",
-        end_date="2021-01-02",
+        start_date="2026-01-01",
+        end_date="2026-02-01",
         user_filter={"role": "data"},
         status="open",
     )
@@ -201,13 +201,38 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
         "STUDY",
         role="data",
         status="open",
-        start_date="2021-01-01",
-        end_date="2021-01-02",
+        dateCreated=[
+            (">=", "2026-01-01T00:00:00Z"),
+            ("<=", "2026-02-01T23:59:59Z"),
+        ],
     )
-    assert sdk.get_record_revisions.call_args.kwargs == {
-        "role": "data",
-        "status": "open",
-        "start_date": "2021-01-01",
-        "end_date": "2021-01-02",
-    }
     assert result == revisions
+
+
+def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -> None:
+    """Test that extract_audit_trail sends dateCreated>=...;dateCreated<=... over HTTP."""
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get("https://api.test/api/v1/edc/studies/STUDY/recordRevisions").respond(
+            200,
+            json={"data": [{"recordRevisionId": 5, "recordId": 10, "recordRevision": 1}]},
+        )
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+        wf = DataExtractionWorkflow(sdk)
+
+        revisions = wf.extract_audit_trail(
+            "STUDY",
+            start_date="2026-01-01",
+            end_date="2026-02-01",
+        )
+
+        sent_filter = route.calls.last.request.url.params["filter"]
+        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z"
+        assert "studyKey" not in sent_filter
+        assert "startDate" not in sent_filter
+        assert "endDate" not in sent_filter
+        assert len(revisions) == 1
+        assert revisions[0].record_revision_id == 5

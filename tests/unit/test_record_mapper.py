@@ -41,13 +41,6 @@ def test_dataframe_builds_expected_structure() -> None:
 
     def var_list(**kwargs):
         """Helper function to var list."""
-        if kwargs.get("variableNames"):
-            assert kwargs == {
-                "study_key": "STUDY",
-                "variableNames": ["VAR1"],
-                "formIds": [10],
-            }
-            return [variables[0]]
         assert kwargs == {"study_key": "STUDY"}
         return variables
 
@@ -102,8 +95,8 @@ def test_dataframe_whitelists_variables_and_forms() -> None:
         """Helper function to var list."""
         assert kwargs == {
             "study_key": "STUDY",
-            "variableNames": ["VAR1"],
-            "formIds": [10],
+            "variableName": "VAR1",
+            "formId": 10,
         }
         return [variables[0]]
 
@@ -120,17 +113,10 @@ def test_dataframe_whitelists_variables_and_forms() -> None:
 
     def rec_list(**kwargs):
         """Helper function to rec list."""
-        if kwargs.get("variableNames"):
-            assert kwargs == {
-                "study_key": "STUDY",
-                "record_data_filter": None,
-                "variableNames": ["VAR1"],
-                "formIds": [10],
-            }
-            return [record]
         assert kwargs == {
             "study_key": "STUDY",
             "record_data_filter": None,
+            "formId": 10,
         }
         return [record]
 
@@ -141,14 +127,13 @@ def test_dataframe_whitelists_variables_and_forms() -> None:
 
     sdk.get_variables.assert_called_once_with(
         study_key="STUDY",
-        variableNames=["VAR1"],
-        formIds=[10],
+        variableName="VAR1",
+        formId=10,
     )
     sdk.get_records.assert_called_once_with(
         study_key="STUDY",
         record_data_filter=None,
-        variableNames=["VAR1"],
-        formIds=[10],
+        formId=10,
     )
     assert list(df.columns) == [
         "recordId",
@@ -197,6 +182,105 @@ def test_records_fetch_error_returns_empty(caplog) -> None:
 
     assert df.empty
     assert "Failed to fetch records" in caplog.text
+
+
+def test_fetch_records_propagates_value_error() -> None:
+    """Test that _fetch_records re-raises ValueError instead of swallowing it."""
+    sdk = MagicMock()
+    sdk.get_records.side_effect = ValueError("Invalid filter operator")
+    mapper = RecordMapper(sdk)
+
+    with pytest.raises(ValueError, match="Invalid filter operator"):
+        mapper._fetch_records("STUDY", extra_filters={"badKey!": "val"})
+
+
+def test_dataframe_multi_form_and_variable_whitelists_batch_without_mixed_connectors() -> None:
+    """Test multi-item variable_whitelist and form_whitelist emit singular filters and batch per formId."""
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    with respx.mock(assert_all_called=True) as mock_router:
+        var_route = mock_router.get("https://api.test/api/v1/edc/studies/STUDY/variables").respond(
+            200,
+            json={
+                "data": [
+                    {"variableName": "AGE", "label": "Age", "formId": 10},
+                    {"variableName": "WT", "label": "Weight", "formId": 20},
+                    {"variableName": "IGNORED", "label": "Ignored", "formId": 20},
+                ]
+            },
+        )
+        rec_calls: list[dict[str, str]] = []
+
+        def records_responder(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            rec_calls.append(params)
+            flt = params.get("filter", "")
+            assert "variableNames" not in flt
+            assert "formIds" not in flt
+            if "formId==10" in flt:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "recordId": 1,
+                                "subjectKey": "S1",
+                                "visitId": 1,
+                                "formId": 10,
+                                "recordStatus": "Complete",
+                                "recordData": {"AGE": 45},
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "recordId": 2,
+                            "subjectKey": "S1",
+                            "visitId": 1,
+                            "formId": 20,
+                            "recordStatus": "Complete",
+                            "recordData": {"WT": 72, "IGNORED": "x"},
+                        }
+                    ]
+                },
+            )
+
+        mock_router.get("https://api.test/api/v1/edc/studies/STUDY/records").mock(
+            side_effect=records_responder
+        )
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+        mapper = RecordMapper(sdk)
+        df = mapper.dataframe(
+            "STUDY",
+            use_labels_as_columns=False,
+            variable_whitelist=["AGE", "WT"],
+            form_whitelist=[10, 20],
+        )
+
+        var_filter = var_route.calls.last.request.url.params["filter"]
+        assert var_filter == "formId==10,formId==20"
+        assert len(rec_calls) == 2
+        assert rec_calls[0]["filter"] == "formId==10"
+        assert rec_calls[1]["filter"] == "formId==20"
+        assert list(df.columns) == [
+            "recordId",
+            "subjectKey",
+            "visitId",
+            "formId",
+            "recordStatus",
+            "dateCreated",
+            "AGE",
+            "WT",
+        ]
+        assert len(df) == 2
 
 
 def test_parsing_error_logs_warning(monkeypatch, caplog) -> None:

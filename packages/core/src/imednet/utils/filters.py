@@ -6,6 +6,8 @@ for iMednet API endpoints based on the reference documentation.
 
 import functools
 import re
+import weakref
+from collections.abc import Sequence
 from datetime import date, datetime
 from typing import Any, TypeVar
 
@@ -17,8 +19,11 @@ _ISO_8601_TIMESTAMP_REGEX = re.compile(
     r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?$"
 )
 
+ORDERED_FILTER_OPERATORS: tuple[str, ...] = ("<=", ">=", "!=", "==", "=~", "<", ">")
 ALLOWED_OPERATORS = frozenset({"<", "<=", ">", ">=", "==", "!="})
-RECORD_DATA_OPERATORS = frozenset({"<", "<=", ">", ">=", "==", "!=", "=~"})
+RECORD_DATA_OPERATORS = frozenset(ORDERED_FILTER_OPERATORS)
+_TWO_CHAR_OPERATORS = frozenset(op for op in ORDERED_FILTER_OPERATORS if len(op) == 2)
+_SINGLE_CHAR_OPERATORS = frozenset({*(op for op in ORDERED_FILTER_OPERATORS if len(op) == 1), "="})
 _OPERATOR_CHARS = frozenset("<>=!~")
 
 T = TypeVar("T")
@@ -157,19 +162,174 @@ def validate_filter_operator(operator: str, *, allow_regex: bool = False) -> Non
         )
 
 
-def validate_filter_key(key: str) -> None:
-    """Validate that a filter key is non-empty and contains no whitespace.
+_MODEL_FILTER_KEYS_CACHE: weakref.WeakKeyDictionary[type[Any], frozenset[str]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_model_filter_keys(model: type[Any]) -> frozenset[str]:
+    """Return allowed snake_case and camelCase filter attribute names for a model."""
+    cached = _MODEL_FILTER_KEYS_CACHE.get(model)
+    if cached is not None:
+        return cached
+
+    model_fields = getattr(model, "model_fields", None)
+    if not isinstance(model_fields, dict):
+        return frozenset()
+
+    allowed: set[str] = set()
+    for field_name, field_info in model_fields.items():
+        allowed.add(field_name)
+        allowed.add(_snake_to_camel(field_name))
+        alias = getattr(field_info, "alias", None)
+        if isinstance(alias, str) and alias:
+            allowed.add(alias)
+        validation_alias = getattr(field_info, "validation_alias", None)
+        if isinstance(validation_alias, str) and validation_alias:
+            allowed.add(validation_alias)
+    result = frozenset(allowed)
+    _MODEL_FILTER_KEYS_CACHE[model] = result
+    return result
+
+
+def validate_filter_key(key: str, *, model: type[Any] | None = None) -> None:
+    """Validate that a filter key is non-empty, operator-free, and optionally on ``model``.
 
     Args:
         key: The key string to validate.
+        model: Optional Pydantic resource model class to validate attribute names against.
 
     Raises:
-        ValueError: If key is not a non-empty string or contains whitespace.
+        ValueError: If key is empty, contains whitespace or operator characters, or is
+            unknown on ``model``.
     """
     if not isinstance(key, str) or not key or not key.strip():
         raise ValueError("Filter key must be a non-empty string")
     if any(c.isspace() for c in key):
         raise ValueError(f"Filter key '{key}' cannot contain whitespace")
+    if any(c in _OPERATOR_CHARS for c in key):
+        raise ValueError(f"Filter key '{key}' cannot contain operator characters")
+    if model is not None:
+        valid_keys = _get_model_filter_keys(model)
+        if valid_keys and key not in valid_keys:
+            raise ValueError(
+                f"Unknown filter attribute '{key}' for {model.__name__}. "
+                f"Valid attributes: {', '.join(sorted(valid_keys))}"
+            )
+
+
+def _coerce_filter_scalar(raw_value: str) -> str | bool | int:
+    """Coerce boolean and integer string tokens to native scalars."""
+    lowered = raw_value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if raw_value.isdigit():
+        return int(raw_value)
+    return raw_value
+
+
+def parse_filter_expression(
+    filter_str: str,
+    *,
+    model: type[Any] | None = None,
+) -> tuple[str, Any]:
+    """Parse a single filter expression string into ``(key, value_or_operator_tuple)``.
+
+    Matches two-character comparison operators (``<=``, ``>=``, ``!=``, ``==``,
+    ``=~``) and single-character inequalities (``<``, ``>``) before single ``=``
+    equality shorthand per the iMedNet Common API specification.
+
+    Args:
+        filter_str: Raw filter expression string.
+        model: Optional Pydantic model class used to validate the parsed key.
+
+    Returns:
+        Tuple of ``(key, parsed_value)`` where ``parsed_value`` is ``(operator, scalar)``
+        for explicit operators in :data:`ALLOWED_OPERATORS` or ``scalar`` for ``=`` shorthand.
+
+    Raises:
+        ValueError: If syntax, operator, or key validation fails.
+    """
+    if not isinstance(filter_str, str) or not filter_str or not filter_str.strip():
+        raise ValueError(
+            f"Invalid filter format: '{filter_str}'. "
+            "Use 'key=value' with non-empty key and value (e.g., 'form_key=DEMO')."
+        )
+
+    matched_op: str | None = None
+    op_idx = -1
+    for idx in range(len(filter_str)):
+        two_char = filter_str[idx : idx + 2]
+        if len(two_char) == 2 and two_char in _TWO_CHAR_OPERATORS:
+            matched_op = two_char
+            op_idx = idx
+            break
+        one_char = filter_str[idx]
+        if one_char in _SINGLE_CHAR_OPERATORS:
+            matched_op = one_char
+            op_idx = idx
+            break
+
+    if matched_op is None:
+        raise ValueError(
+            f"Invalid filter format: '{filter_str}'. "
+            "Use 'key=value' with non-empty key and value (e.g., 'form_key=DEMO')."
+        )
+
+    raw_key = filter_str[:op_idx].strip()
+    raw_value = filter_str[op_idx + len(matched_op) :].strip()
+    if not raw_key or not raw_value:
+        raise ValueError(
+            f"Invalid filter format: '{filter_str}'. "
+            "Key and value cannot be empty; use 'key=value' (e.g., 'form_key=DEMO')."
+        )
+
+    if (matched_op == "==" and raw_value.startswith("=")) or (
+        matched_op == "<" and raw_value.startswith(">")
+    ):
+        raise ValueError(
+            f"Invalid filter format: '{filter_str}'. "
+            f"Unsupported comparison operator; allowed operators: {list(ORDERED_FILTER_OPERATORS)}."
+        )
+
+    validate_filter_key(raw_key, model=model)
+    parsed_scalar = _coerce_filter_scalar(raw_value)
+    if matched_op == "=":
+        return raw_key, parsed_scalar
+    return raw_key, (matched_op, parsed_scalar)
+
+
+def parse_filter_expressions(
+    expressions: Sequence[str],
+    *,
+    model: type[Any] | None = None,
+) -> dict[str, Any]:
+    """Parse multiple filter expressions into a filter dictionary.
+
+    Repeated conditions on the same key are preserved as a list of
+    ``(operator, value)`` tuples so :func:`build_filter_string` joins them with
+    the semicolon ``AND`` connector.
+    """
+    filter_dict: dict[str, Any] = {}
+    for expr in expressions:
+        key, parsed_val = parse_filter_expression(expr, model=model)
+        if key not in filter_dict:
+            filter_dict[key] = parsed_val
+            continue
+
+        prev = filter_dict[key]
+        if isinstance(prev, list):
+            combined = list(prev)
+        elif isinstance(prev, tuple):
+            combined = [prev]
+        else:
+            combined = [("==", prev)]
+
+        combined.append(parsed_val if isinstance(parsed_val, tuple) else ("==", parsed_val))
+        filter_dict[key] = combined
+    return filter_dict
 
 
 def validate_connector_exclusivity(filter_str: str) -> None:
@@ -294,7 +454,10 @@ def _format_filter_value(val: Any) -> str:
 
 
 def _build_filter_part(
-    key: str, value: Any | tuple[str, Any] | list[Any], or_connector: str = ","
+    key: str,
+    value: Any | tuple[str, Any] | list[Any],
+    and_connector: str = ";",
+    or_connector: str = ",",
 ) -> str:
     """Build a single filter string part from a key and value."""
     validate_filter_key(key)
@@ -308,6 +471,21 @@ def _build_filter_part(
         validate_filter_operator(op)
         return f"{camel_key}{op}{_format_filter_value(val)}"
     if isinstance(value, list):
+        if value and any(isinstance(item, tuple) for item in value):
+            if not all(isinstance(item, tuple) for item in value):
+                raise ValueError(
+                    f"Filter list for '{key}' cannot mix operator tuples and scalar values"
+                )
+            tuple_parts: list[str] = []
+            for item in value:
+                if len(item) != 2:
+                    raise ValueError(
+                        f"Filter tuple for '{key}' must have exactly 2 elements (operator, value), got {len(item)}"
+                    )
+                op, val = item
+                validate_filter_operator(op)
+                tuple_parts.append(f"{camel_key}{op}{_format_filter_value(val)}")
+            return and_connector.join(tuple_parts)
         subparts = [f"{camel_key}=={_format_filter_value(v)}" for v in value]
         return or_connector.join(subparts)
     return f"{camel_key}=={_format_filter_value(value)}"
@@ -321,9 +499,10 @@ def build_filter_string(
     """Return a filter string constructed according to iMednet rules.
 
     Each key in ``filters`` is converted to camelCase. Raw values imply
-    equality, tuples allow explicit operators, and lists generate multiple
-    equality filters joined by ``or_connector``. Conditions are then joined by
-    ``and_connector``.
+    equality, tuples allow explicit operators, lists of ``(operator, value)``
+    tuples on one key join with ``and_connector``, and lists of scalars
+    generate multiple equality filters joined by ``or_connector``. Conditions
+    across keys are joined by ``and_connector``.
 
     Example:
     >>> from imednet.utils.filters import build_filter_string
@@ -342,17 +521,23 @@ def build_filter_string(
             if camel_key in seen_keys:
                 raise ValueError(f"Duplicate filter attribute '{camel_key}' in AND clause")
             seen_keys.add(camel_key)
-        parts.append(_build_filter_part(key, value, or_connector))
-    result = and_connector.join(parts)
+        parts.append(
+            _build_filter_part(key, value, and_connector=and_connector, or_connector=or_connector)
+        )
+    non_empty_parts = [part for part in parts if part]
+    result = and_connector.join(non_empty_parts)
     validate_connector_exclusivity(result)
     return result
 
 
 __all__ = [
     "ALLOWED_OPERATORS",
+    "ORDERED_FILTER_OPERATORS",
     "RECORD_DATA_OPERATORS",
     "build_filter_string",
     "extract_filter_attributes",
+    "parse_filter_expression",
+    "parse_filter_expressions",
     "validate_connector_exclusivity",
     "validate_filter_key",
     "validate_filter_operator",
