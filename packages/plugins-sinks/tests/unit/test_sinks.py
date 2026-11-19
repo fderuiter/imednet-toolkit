@@ -1081,7 +1081,7 @@ class TestSnowflakeExportSink:
         from imednet_sinks.warehouse import _post_process_warehouse, _records_to_arrow_table
 
         from imednet.integrations.enrichment import CentralizedMapper, EnrichmentPipeline
-        from imednet.models.records import Record
+        from imednet.models.records import Keyword, Record
         from imednet.models.study_config import MappingRule, StudyConfiguration
 
         records = [
@@ -1097,7 +1097,20 @@ class TestSnowflakeExportSink:
                 deleted=False,
                 date_created="2026-01-01T00:00:00Z",
                 date_modified="2026-01-02T00:00:00Z",
-                keywords="urgent,baseline",
+                keywords=[
+                    Keyword(
+                        keyword_name="urgent",
+                        keyword_key="URGENT",
+                        keyword_id=1,
+                        date_added="2026-01-01T00:00:00Z",
+                    ),
+                    Keyword(
+                        keyword_name="baseline",
+                        keyword_key="BASELINE",
+                        keyword_id=2,
+                        date_added="2026-01-01T00:00:00Z",
+                    ),
+                ],
                 record_data={
                     "lab_value": 42,
                     "assessment": {"grade": 1},
@@ -1176,7 +1189,10 @@ class TestSnowflakeExportSink:
         assert reloaded[0]["record_id"] == 101
         assert reloaded[0]["subject_key"] == "SUBJ-01"
         assert reloaded[0]["form_key"] == "VITALS"
-        assert reloaded[0]["keywords"] == "urgent,baseline"
+        assert [kw["keyword_name"] for kw in json.loads(reloaded[0]["keywords"])] == [
+            "urgent",
+            "baseline",
+        ]
         payload_0 = json.loads(reloaded[0]["record_data"])
         assert payload_0["lab_value"] == 42
         assert payload_0["assessment"] == {"grade": 1}

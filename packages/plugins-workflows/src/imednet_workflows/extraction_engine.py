@@ -10,6 +10,7 @@ from __future__ import annotations
 import collections
 import functools
 import logging
+from collections.abc import Iterable
 from typing import Any, cast
 
 from pydantic import BaseModel, Field, ValidationError
@@ -283,15 +284,22 @@ def _evaluate_business_logic(
 
 
 def extract_canonical_records(
-    records: list[Record], study_configuration: StudyConfiguration
+    records: Iterable[Record],
+    study_configuration: StudyConfiguration,
+    *,
+    include_deleted: bool = False,
 ) -> ExtractionResult:
     """Extract canonical models from raw records using study mappings."""
+    from imednet.spi.sink_base import is_record_deleted
+
     result = ExtractionResult()
     grouped_mappings = _group_mappings_by_domain_and_form(study_configuration)
 
     # Subject-centric processing: group records by subject, sort chronologically
     subject_records: dict[str, list[Record]] = collections.defaultdict(list)
     for record in records:
+        if not include_deleted and is_record_deleted(record):
+            continue
         subject_records[record.subject_key].append(record)  # type: ignore
 
     for subject_key, s_records in subject_records.items():
