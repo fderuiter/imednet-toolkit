@@ -916,9 +916,9 @@ class LogicTreeEvaluator:
             only_val = node[only_key]
             if only_key in _OR_GROUP_KEYS:
                 if isinstance(only_val, Mapping):
-                    return "OR"
+                    return self._explicit_combinator(only_val) or "OR"
                 if isinstance(only_val, list) and (
-                    not only_val or not all(self._is_xml_group_dict(item) for item in only_val)
+                    not only_val or not any(self._is_xml_group_dict(item) for item in only_val)
                 ):
                     return "OR"
             if only_key in ("conditions", "conditionGroup", "group", "if") and isinstance(
@@ -930,7 +930,15 @@ class LogicTreeEvaluator:
     def _is_xml_group_dict(self, item: Any) -> bool:
         if not isinstance(item, Mapping) or self._is_leaf_condition(item):
             return False
-        if any(k in item for k in _CONTAINER_GROUP_KEYS):
+        if any(
+            k in item
+            for k in (
+                *_CONTAINER_GROUP_KEYS,
+                *_AND_GROUP_KEYS,
+                *_OR_GROUP_KEYS,
+                *_NOT_GROUP_KEYS,
+            )
+        ):
             return True
         content_keys = [k for k in item if not str(k).startswith("@") and k != "#text"]
         if len(content_keys) > 1:
@@ -1145,7 +1153,7 @@ class LogicTreeEvaluator:
         if branch_val is True:
             return
         if isinstance(branch_val, list) and (
-            not branch_val or not all(self._is_xml_group_dict(item) for item in branch_val)
+            not branch_val or not any(self._is_xml_group_dict(item) for item in branch_val)
         ):
             results.append(
                 self._eval_node(
@@ -1247,7 +1255,15 @@ class LogicTreeEvaluator:
 
         for key in _CONTAINER_GROUP_KEYS:
             if key in node and node[key] is not True:
-                for child in _as_list(node[key]):
+                child_val = node[key]
+                inherited_combinator: Literal["AND", "OR"] | None = (
+                    combinator
+                    if key in ("conditions", "if")
+                    and group_combinator is not None
+                    and isinstance(child_val, Mapping)
+                    else None
+                )
+                for child in _as_list(child_val):
                     results.append(
                         self._eval_node(
                             child,
@@ -1255,6 +1271,7 @@ class LogicTreeEvaluator:
                             form_key=form_key,
                             rule_type=rule_type,
                             default_operator=default_operator,
+                            group_combinator=inherited_combinator,
                         )
                     )
 

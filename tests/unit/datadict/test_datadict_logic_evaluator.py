@@ -846,3 +846,103 @@ def test_nested_and_or_not_explicit_group_combinations() -> None:
     assert evaluator.evaluate_rule(not_or_rule, {"A": 0, "B": 2}, form_key="F1").triggered is False
     assert evaluator.evaluate_rule(not_or_rule, {"A": 1, "B": 2}, form_key="F1").triggered is False
     assert evaluator.evaluate_rule(not_or_rule, {"A": 0, "B": 0}, form_key="F1").triggered is True
+
+    # 5. Asymmetric operator-tag DNF/CNF groups, <and> wrapping <not>, and <or> wrapping <conditions>
+    asym_dnf = BusinessLogicRule(
+        name="Asymmetric Op-Tag DNF",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><if><or>"
+            "<and><eq><variable>A</variable><value>1</value></eq><gt><variable>B</variable><value>2</value></gt></and>"
+            "<and><eq><variable>C</variable><value>3</value></eq></and>"
+            "</or></if></rule>"
+        ),
+    )
+    assert (
+        evaluator.evaluate_rule(asym_dnf, {"A": 1, "B": 3, "C": 0}, form_key="F1").triggered is True
+    )
+    assert (
+        evaluator.evaluate_rule(asym_dnf, {"A": 0, "B": 0, "C": 3}, form_key="F1").triggered is True
+    )
+    assert (
+        evaluator.evaluate_rule(asym_dnf, {"A": 1, "B": 0, "C": 0}, form_key="F1").triggered
+        is False
+    )
+    assert (
+        evaluator.evaluate_rule(asym_dnf, {"A": 1, "B": 3, "C": 3}, form_key="F1").triggered is True
+    )
+
+    asym_cnf = BusinessLogicRule(
+        name="Asymmetric Op-Tag CNF",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><if>"
+            "<or><eq><variable>A</variable><value>1</value></eq><eq><variable>B</variable><value>1</value></eq></or>"
+            "<or><eq><variable>C</variable><value>1</value></eq></or>"
+            "</if></rule>"
+        ),
+    )
+    assert (
+        evaluator.evaluate_rule(asym_cnf, {"A": 1, "B": 0, "C": 1}, form_key="F1").triggered is True
+    )
+    assert (
+        evaluator.evaluate_rule(asym_cnf, {"A": 1, "B": 1, "C": 0}, form_key="F1").triggered
+        is False
+    )
+    assert (
+        evaluator.evaluate_rule(asym_cnf, {"A": 0, "B": 0, "C": 1}, form_key="F1").triggered
+        is False
+    )
+
+    or_and_not = BusinessLogicRule(
+        name="OR With AND Wrapping NOT",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><conditions><or>"
+            "<and><not><condition><variable>A</variable><operator>==</operator><value>1</value></condition></not></and>"
+            "<and><condition><variable>B</variable><operator>==</operator><value>2</value></condition></and>"
+            "</or></conditions></rule>"
+        ),
+    )
+    assert evaluator.evaluate_rule(or_and_not, {"A": 0, "B": 0}, form_key="F1").triggered is True
+    assert evaluator.evaluate_rule(or_and_not, {"A": 1, "B": 2}, form_key="F1").triggered is True
+    assert evaluator.evaluate_rule(or_and_not, {"A": 1, "B": 0}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(or_and_not, {"A": 0, "B": 2}, form_key="F1").triggered is True
+
+    or_wrapping_conds = BusinessLogicRule(
+        name="OR Wrapping Conditions",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><or><conditions>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "</conditions></or></rule>"
+        ),
+    )
+    assert (
+        evaluator.evaluate_rule(or_wrapping_conds, {"A": 1, "B": 0}, form_key="F1").triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(or_wrapping_conds, {"A": 0, "B": 2}, form_key="F1").triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(or_wrapping_conds, {"A": 0, "B": 0}, form_key="F1").triggered
+        is False
+    )
+    assert (
+        evaluator.evaluate_rule(or_wrapping_conds, {"A": 1, "B": 2}, form_key="F1").triggered
+        is True
+    )
+    or_wrap_meta = evaluator.extract_rule_metadata(or_wrapping_conds)
+    assert or_wrap_meta is not None
+    assert or_wrap_meta.logical_operator == "OR"
