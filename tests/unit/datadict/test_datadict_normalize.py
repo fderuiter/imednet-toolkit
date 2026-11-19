@@ -132,3 +132,94 @@ def test_safe_is_file(tmp_path: Path) -> None:
     assert _safe_is_file(fake_file) is False
 
     assert _safe_is_file(tmp_path) is False
+
+
+def test_normalize_form_type_and_form_id() -> None:
+    """Test canonical Subject formType and synthetic formId stripping."""
+    from imednet.datadict.normalize import normalize_form_id, normalize_form_type
+
+    assert normalize_form_type("Patient") == "Subject"
+    assert normalize_form_type("subject") == "Subject"
+    assert normalize_form_type("CRF") == "Subject"
+    assert normalize_form_type("Site") == "Site"
+    assert normalize_form_type("CustomType") == "CustomType"
+    assert normalize_form_type(None, default="Subject") == "Subject"
+    assert normalize_form_type("   ", default="Subject") == "Subject"
+
+    assert normalize_form_id(None, "DM") is None
+    assert normalize_form_id(True, "DM") is None
+    assert normalize_form_id("DM", "DM") is None
+    assert normalize_form_id("  ", "DM") is None
+    assert normalize_form_id("1042", "DM") == 1042
+    assert normalize_form_id(1042, "DM") == 1042
+    assert normalize_form_id("EXT_DM_01", "DM") == "EXT_DM_01"
+
+
+def test_normalize_variable_type() -> None:
+    """Test canonical variableType alignment across CSV, ODM, REDCap, and SDK terms."""
+    from imednet.datadict.normalize import normalize_variable_type
+
+    assert normalize_variable_type(None) is None
+    assert normalize_variable_type("   ") is None
+    assert normalize_variable_type("Number") == "Integer"
+    assert normalize_variable_type("Number", precision="0") == "Integer"
+    assert normalize_variable_type("Number", precision="2") == "Float"
+    assert normalize_variable_type("Numeric") == "Float"
+    assert normalize_variable_type("RadioButton") == "Radio"
+    assert normalize_variable_type("yesno") == "Radio"
+    assert normalize_variable_type("dropdown") == "Single Select"
+    assert normalize_variable_type("SingleSelect") == "Single Select"
+    assert normalize_variable_type("checkbox") == "Multi Select"
+    assert normalize_variable_type("MultiSelect") == "Multi Select"
+    assert normalize_variable_type("memo") == "Text"
+    assert normalize_variable_type("CustomWidget") == "CustomWidget"
+
+
+def test_normalize_measurement_units_and_bounds() -> None:
+    """Test extraction and deduplication of measurement units and variable bounds."""
+    from imednet.datadict.normalize import normalize_measurement_units, normalize_variable_bounds
+
+    assert normalize_measurement_units(None) == []
+    assert normalize_variable_bounds(None) == []
+
+    units = normalize_measurement_units(
+        {
+            "measurementUnits": [{"oid": "MU.KG", "name": "Kilograms", "symbol": "kg"}],
+            "unit": "mmHg",
+            "units": ["mmHg", "cm"],
+        }
+    )
+    assert units == [
+        {"oid": "MU.KG", "name": "Kilograms", "symbol": "kg"},
+        {"oid": "MU.mmHg", "name": "mmHg", "symbol": "mmHg"},
+        {"oid": "MU.cm", "name": "cm", "symbol": "cm"},
+    ]
+
+    bounds = normalize_variable_bounds({"textValidationMin": "70", "textValidationMax": "250"})
+    assert bounds == [
+        {"comparator": "GE", "softHard": "Soft", "checkValue": "70"},
+        {"comparator": "LE", "softHard": "Soft", "checkValue": "250"},
+    ]
+
+    explicit_rc = normalize_variable_bounds(
+        {
+            "rangeChecks": [
+                {
+                    "comparator": "GT",
+                    "softHard": "Hard",
+                    "checkValue": "0",
+                    "measurementUnitOid": "MU.KG",
+                    "errorMessage": "Must be positive",
+                }
+            ]
+        }
+    )
+    assert explicit_rc == [
+        {
+            "comparator": "GT",
+            "softHard": "Hard",
+            "checkValue": "0",
+            "measurementUnitOid": "MU.KG",
+            "errorMessage": "Must be positive",
+        }
+    ]

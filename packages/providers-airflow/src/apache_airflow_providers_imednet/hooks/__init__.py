@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping, MutableMapping
 from datetime import date, datetime
 from typing import Any, TypeAlias, Union, cast
+from urllib.parse import quote_plus
 
 from imednet import Config, ImednetSDK, load_config
 
@@ -18,8 +19,16 @@ PrimitiveContainer: TypeAlias = (
 )
 _SENSITIVE_KEYS = {
     "api_key",
-    "security_key",
+    "auth_token",
     "authorization",
+    "client_secret",
+    "passphrase",
+    "password",
+    "private_key",
+    "private_key_passphrase",
+    "secret",
+    "secret_key",
+    "security_key",
     "token",
     "x-api-key",
     "x-imn-security-key",
@@ -78,14 +87,211 @@ class ImednetHook(BaseHook):
             return extras
         return {}
 
+    @staticmethod
+    def _port_or_none(value: object) -> int | None:
+        """Return a positive integer port or ``None``."""
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            parsed = int(value.strip())
+            return parsed if parsed > 0 else None
+        return None
+
+    @classmethod
+    def _get_airflow_connection(cls, conn_id: str) -> Any:
+        """Retrieve an Airflow connection across SDK and compatibility shims."""
+        hook_cls: Any
+        try:
+            from airflow.sdk.bases.hook import BaseHook as SdkBaseHook
+
+            hook_cls = SdkBaseHook
+        except (ImportError, ModuleNotFoundError):
+            hook_cls = BaseHook
+        return hook_cls.get_connection(conn_id)
+
+    @classmethod
+    def resolve_destination_connection(cls, conn_id: str, destination: str) -> dict[str, Any]:
+        """Resolve destination sink or SQL connection settings at task runtime."""
+        conn = cls._get_airflow_connection(conn_id)
+        extras = cls._connection_extras(conn)
+        dest = destination.lower().strip()
+
+        if dest == "snowflake":
+            candidates: dict[str, Any] = {
+                "account": (
+                    cls._string_or_none(extras.get("account"))
+                    or cls._string_or_none(extras.get("extra__snowflake__account"))
+                    or cls._string_or_none(getattr(conn, "host", None))
+                ),
+                "user": (
+                    cls._string_or_none(extras.get("user"))
+                    or cls._string_or_none(getattr(conn, "login", None))
+                ),
+                "password": (
+                    cls._string_or_none(extras.get("password"))
+                    or cls._string_or_none(getattr(conn, "password", None))
+                ),
+                "database": (
+                    cls._string_or_none(extras.get("database"))
+                    or cls._string_or_none(extras.get("extra__snowflake__database"))
+                ),
+                "schema": (
+                    cls._string_or_none(extras.get("schema"))
+                    or cls._string_or_none(getattr(conn, "schema", None))
+                ),
+                "warehouse": (
+                    cls._string_or_none(extras.get("warehouse"))
+                    or cls._string_or_none(extras.get("extra__snowflake__warehouse"))
+                ),
+                "stage": cls._string_or_none(extras.get("stage")),
+                "table": cls._string_or_none(extras.get("table")),
+                "stage_prefix": (
+                    cls._string_or_none(extras.get("stage_prefix"))
+                    or cls._string_or_none(extras.get("prefix"))
+                ),
+                "local_staging_dir": cls._string_or_none(extras.get("local_staging_dir")),
+                "manifest_path": cls._string_or_none(extras.get("manifest_path")),
+            }
+            return {k: v for k, v in candidates.items() if v is not None}
+
+        if dest == "neo4j":
+            resolved: dict[str, Any] = {}
+            uri = cls._string_or_none(extras.get("uri"))
+            if not uri:
+                host = cls._string_or_none(getattr(conn, "host", None))
+                port = cls._port_or_none(getattr(conn, "port", None))
+                conn_type = cls._string_or_none(getattr(conn, "conn_type", None))
+                scheme = cls._string_or_none(extras.get("scheme"))
+                if not scheme:
+                    if conn_type in {"bolt", "bolt+s", "bolt+ssc", "neo4j", "neo4j+s", "neo4j+ssc"}:
+                        scheme = conn_type
+                    else:
+                        scheme = "bolt+s" if extras.get("encrypted") else "bolt"
+                if host:
+                    uri = f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
+            if uri:
+                resolved["uri"] = uri
+
+            raw_auth = extras.get("auth")
+            if isinstance(raw_auth, (list, tuple)) and len(raw_auth) == 2:
+                resolved["auth"] = (str(raw_auth[0]), str(raw_auth[1]))
+            else:
+                user = (
+                    cls._string_or_none(extras.get("user"))
+                    or cls._string_or_none(getattr(conn, "login", None))
+                    or ""
+                )
+                password = (
+                    cls._string_or_none(extras.get("password"))
+                    or cls._string_or_none(getattr(conn, "password", None))
+                    or ""
+                )
+                if user or password:
+                    resolved["auth"] = (user, password)
+
+            database = cls._string_or_none(extras.get("database")) or cls._string_or_none(
+                getattr(conn, "schema", None)
+            )
+            if database:
+                resolved["database"] = database
+            return resolved
+
+        if dest == "mongodb":
+            resolved = {}
+            uri = cls._string_or_none(extras.get("uri"))
+            mongo_user = cls._string_or_none(extras.get("user")) or cls._string_or_none(
+                getattr(conn, "login", None)
+            )
+            mongo_password = cls._string_or_none(extras.get("password")) or cls._string_or_none(
+                getattr(conn, "password", None)
+            )
+            if not uri:
+                host = cls._string_or_none(getattr(conn, "host", None))
+                port = cls._port_or_none(getattr(conn, "port", None))
+                conn_type = cls._string_or_none(getattr(conn, "conn_type", None))
+                is_srv = bool(extras.get("srv")) or conn_type in {"mongo_srv", "mongodb+srv"}
+                scheme = "mongodb+srv" if is_srv else "mongodb"
+                if host:
+                    userinfo = ""
+                    if mongo_user:
+                        userinfo = (
+                            f"{quote_plus(mongo_user)}:{quote_plus(mongo_password)}@"
+                            if mongo_password is not None
+                            else f"{quote_plus(mongo_user)}@"
+                        )
+                    host_part = f"{host}:{port}" if (port and not is_srv) else host
+                    auth_source = cls._string_or_none(extras.get("authSource"))
+                    query = f"?authSource={quote_plus(auth_source)}" if auth_source else ""
+                    uri = f"{scheme}://{userinfo}{host_part}{query}"
+            if uri:
+                resolved["uri"] = uri
+            if mongo_user:
+                resolved["user"] = mongo_user
+            if mongo_password is not None:
+                resolved["password"] = mongo_password
+            database = cls._string_or_none(extras.get("database")) or cls._string_or_none(
+                getattr(conn, "schema", None)
+            )
+            collection = cls._string_or_none(extras.get("collection"))
+            if database:
+                resolved["database"] = database
+            if collection:
+                resolved["collection"] = collection
+            return resolved
+
+        if dest in {"sql", "sql_by_form", "long_sql"}:
+            resolved = {}
+            conn_str = (
+                cls._string_or_none(extras.get("conn_str"))
+                or cls._string_or_none(extras.get("sqlalchemy_uri"))
+                or cls._string_or_none(extras.get("uri"))
+            )
+            if not conn_str:
+                get_uri = getattr(conn, "get_uri", None)
+                if callable(get_uri):
+                    try:
+                        raw_uri = get_uri()
+                    except Exception:
+                        raw_uri = None
+                    if isinstance(raw_uri, str) and raw_uri.strip():
+                        conn_str = raw_uri.strip()
+            if not conn_str:
+                conn_type = cls._string_or_none(getattr(conn, "conn_type", None)) or "postgresql"
+                if conn_type == "postgres":
+                    conn_type = "postgresql"
+                host = cls._string_or_none(getattr(conn, "host", None))
+                schema = cls._string_or_none(getattr(conn, "schema", None))
+                sql_user = cls._string_or_none(getattr(conn, "login", None))
+                sql_password = cls._string_or_none(getattr(conn, "password", None))
+                port = cls._port_or_none(getattr(conn, "port", None))
+                if conn_type == "sqlite":
+                    sqlite_target = host or schema or ":memory:"
+                    conn_str = f"sqlite:///{sqlite_target}"
+                elif host or schema:
+                    userinfo = ""
+                    if sql_user:
+                        userinfo = (
+                            f"{quote_plus(sql_user)}:{quote_plus(sql_password)}@"
+                            if sql_password is not None
+                            else f"{quote_plus(sql_user)}@"
+                        )
+                    host_part = f"{host or 'localhost'}:{port}" if port else (host or "localhost")
+                    db_part = f"/{schema}" if schema else ""
+                    conn_str = f"{conn_type}://{userinfo}{host_part}{db_part}"
+            if conn_str:
+                if conn_str.startswith("postgres://"):
+                    conn_str = "postgresql://" + conn_str[len("postgres://") :]
+                resolved["conn_str"] = conn_str
+            table = cls._string_or_none(extras.get("table"))
+            if table:
+                resolved["table"] = table
+            return resolved
+
+        return {}
+
     def _resolved_config(self) -> Config:
         """Resolve hook configuration from Airflow connection fields and env fallback."""
-        try:
-            from airflow.sdk.bases.hook import BaseHook
-        except (ImportError, ModuleNotFoundError):
-            from .._airflow_compat import BaseHook
-
-        conn = BaseHook.get_connection(self.imednet_conn_id)
+        conn = self._get_airflow_connection(self.imednet_conn_id)
         extras_dict = self._connection_extras(conn)
 
         config = load_config(
