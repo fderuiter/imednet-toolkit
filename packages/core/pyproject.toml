@@ -56,7 +56,7 @@ export = [
 ]
 mongodb = ["imednet-plugins-sinks", "pymongo>=4.0,<5.0"]
 neo4j = ["imednet-plugins-sinks", "neo4j>=6.2.0,<7.0.0"]
-snowflake = ["imednet-plugins-sinks", "pyarrow>=14.0.1"]
+snowflake = ["imednet-plugins-sinks", "snowflake-connector-python>=3.0.0", "pyarrow>=14.0.1"]
 tui = ["imednet-tui"]
 
 [build-system]

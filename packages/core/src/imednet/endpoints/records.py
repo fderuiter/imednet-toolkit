@@ -11,7 +11,7 @@ from imednet.core.endpoint.strategies import MappingParamProcessor
 from imednet.models.jobs import Job
 from imednet.models.records import Record
 from imednet.utils.typing import JsonDict
-from imednet.validation.cache import SchemaCache
+from imednet.validation.cache import ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -23,7 +23,33 @@ class RecordsOperationDef:
     PATH = "records"
     MODEL = Record
     _id_param = "recordId"
-    PARAM_PROCESSOR = MappingParamProcessor({"record_data_filter": "recordDataFilter"})
+    PARAM_PROCESSOR = MappingParamProcessor(
+        {
+            "record_data_filter": "recordDataFilter",
+            "recordDataFilter": "recordDataFilter",
+        }
+    )
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "intervalId",
+            "formId",
+            "formKey",
+            "siteId",
+            "recordId",
+            "recordOid",
+            "recordType",
+            "recordStatus",
+            "deleted",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+            "subjectId",
+            "subjectOid",
+            "subjectKey",
+            "visitId",
+            "parentRecordId",
+        }
+    )
 
     @execute_operation
     def create(
@@ -32,7 +58,7 @@ class RecordsOperationDef:
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: SchemaCache | None = None,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> RecordCreateOperation[Job]:
         """Create one or more records in a study.
 
@@ -40,7 +66,7 @@ class RecordsOperationDef:
             study_key: The study key.
             records_data: The data for the records to create.
             email_notify: Whether to send email notifications.
-            schema: Optional schema cache for validation.
+            schema: Optional validation schema (SchemaCache or DataDictionary).
 
         Returns:
             The background job for the creation operation.

@@ -558,6 +558,11 @@ jobs:
         run: |
           imednet --help
 
+      - name: Verify Snowflake Extra Imports
+        if: matrix.extra == 'snowflake'
+        run: |
+          python3 -c "import pyarrow, snowflake.connector, imednet_sinks.warehouse; from imednet.spi.sink_base import _require_optional_dep; assert pyarrow.__version__ and _require_optional_dep('snowflake.connector', 'snowflake').__version__"
+
   # ------------------------------------------------------------------
   # JOB 3.8: VALIDATE PACKAGE CONSUMPTION
   # ------------------------------------------------------------------

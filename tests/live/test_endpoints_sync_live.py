@@ -67,8 +67,9 @@ def test_list_subjects(sdk: ImednetSDK, study_key: str) -> None:
     assert isinstance(subjects, list)
     if subjects:
         assert isinstance(subjects[0], Subject)
-        subject = sdk.subjects.get(study_key, subjects[0].subject_key)
-        assert subject.subject_key == subjects[0].subject_key
+        assert subjects[0].subject_id is not None
+        subject = sdk.subjects.get(study_key, subjects[0].subject_id)
+        assert subject.subject_id == subjects[0].subject_id
 
 
 def test_list_records(sdk: ImednetSDK, study_key: str) -> None:
@@ -93,12 +94,11 @@ def test_list_intervals(sdk: ImednetSDK, study_key: str) -> None:
 
 def test_list_visits(sdk: ImednetSDK, study_key: str) -> None:
     """Test that list visits."""
+    assert not hasattr(sdk.visits, "get")
     visits = list(sdk.visits.list(study_key=study_key))
     assert isinstance(visits, list)
     if visits:
         assert isinstance(visits[0], Visit)
-        visit = sdk.visits.get(study_key, visits[0].visit_id)
-        assert visit.visit_id == visits[0].visit_id
 
 
 def test_list_variables(sdk: ImednetSDK, study_key: str) -> None:
@@ -122,12 +122,11 @@ def test_list_users(sdk: ImednetSDK, study_key: str) -> None:
 
 def test_list_queries(sdk: ImednetSDK, study_key: str) -> None:
     """Test that list queries."""
+    assert not hasattr(sdk.queries, "get")
     queries = list(sdk.queries.list(study_key=study_key))
     assert isinstance(queries, list)
     if queries:
         assert isinstance(queries[0], Query)
-        query = sdk.queries.get(study_key, queries[0].annotation_id)
-        assert query.annotation_id == queries[0].annotation_id
 
 
 def test_list_record_revisions(sdk: ImednetSDK, study_key: str) -> None:
@@ -167,9 +166,8 @@ def test_create_record_and_poll_job(
 
 def test_list_codings(sdk: ImednetSDK, study_key: str) -> None:
     """Test that list codings."""
+    assert not hasattr(sdk.codings, "get")
     codings = list(sdk.codings.list(study_key=study_key))
     assert isinstance(codings, list)
     if codings:
         assert isinstance(codings[0], Coding)
-        coding = sdk.codings.get(study_key, str(codings[0].coding_id))
-        assert coding.coding_id == codings[0].coding_id

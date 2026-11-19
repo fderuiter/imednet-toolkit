@@ -11,7 +11,9 @@ from .cache import (
     BaseSchemaValidator,
     SchemaCache,
     SchemaValidator,
+    ValidationSchemaProtocol,
     validate_record_data,
+    validate_record_entry,
 )
 
 __all__ = [
@@ -21,5 +23,7 @@ __all__ = [
     "BaseSchemaValidator",
     "SchemaCache",
     "SchemaValidator",
+    "ValidationSchemaProtocol",
     "validate_record_data",
+    "validate_record_entry",
 ]

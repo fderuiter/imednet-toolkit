@@ -193,10 +193,11 @@ def test_snowflake_incremental_streaming_and_reconciliation(
     written = export_to_snowflake(sdk, "S-SF", config=cfg)
     assert written == 1
 
+    executed_sqls = [c.args[0] for c in cursor.execute.call_args_list]
+    assert any("MERGE INTO" in sql for sql in executed_sqls)
     deletes = [c for c in cursor.execute.call_args_list if "DELETE FROM" in c.args[0]]
-    assert len(deletes) == 2
-    assert deletes[0].args[1] == ["S-SF", 301]
-    assert deletes[1].args[1] == ["S-SF", 302]
+    assert len(deletes) == 1
+    assert deletes[0].args[1] == ["S-SF", 302]
     assert ledger.get_last_timestamp("S-SF", "snowflake_RECORDS") == datetime(
         2026, 4, 12, 9, 30, tzinfo=timezone.utc
     )

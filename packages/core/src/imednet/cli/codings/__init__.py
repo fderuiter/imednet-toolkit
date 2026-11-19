@@ -46,6 +46,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         study_key: str,
         coding_filter: list[str] | None = None,
         output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         parsed_filter = parse_filter_args(coding_filter, model=Coding)
 
@@ -78,6 +79,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "codings",
             "No codings found matching the criteria.",
             details=codings_list,
+            interactive=False if no_interactive else None,
         )
 
     list_parser.set_defaults(
@@ -85,5 +87,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             study_key=args.study_key,
             coding_filter=args.coding_filter,
             output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )

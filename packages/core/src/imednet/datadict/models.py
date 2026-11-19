@@ -170,6 +170,16 @@ class Variable(DictCompatMixin, BaseModel):
         default_factory=dict, description="Unknown columns for this variable"
     )
 
+    @property
+    def variable_name(self) -> str:
+        """Snake-case alias for variableName matching core Variable models."""
+        return self.variableName
+
+    @property
+    def variable_type(self) -> str | None:
+        """Snake-case alias for variableType matching core Variable models."""
+        return self.variableType
+
 
 class BusinessLogicRule(DictCompatMixin, BaseModel):
     """An edit check, workflow trigger, or business logic rule."""
@@ -498,6 +508,54 @@ class DataDictionary(DictCompatMixin, BaseModel):
             res.extend(f.businessLogic)
         res.extend(self.unassignedBusinessLogic)
         return res
+
+    def form_for_key(self, form_key: str) -> Form | None:
+        """Return the Form model matching ``form_key``, or None if absent."""
+        for form in self.forms:
+            if form.formKey == form_key:
+                return form
+        return None
+
+    def variables_for_form(self, form_key: str) -> dict[str, Variable]:
+        """Return a mapping of variable names to Variable definitions for ``form_key``."""
+        form = self.form_for_key(form_key)
+        if form is None:
+            return {}
+        return {var.variableName: var for var in form.variables if var.variableName}
+
+    def form_key_from_id(self, form_id: int | str) -> str | None:
+        """Resolve a ``formKey`` from a numeric or string ``formId``."""
+        if isinstance(form_id, bool) or form_id is None or form_id == "":
+            return None
+        target_str = str(form_id).strip()
+        if not target_str:
+            return None
+        for form in self.forms:
+            if form.formId is None or form.formId == "":
+                continue
+            if form.formId == form_id or str(form.formId).strip() == target_str:
+                return form.formKey
+        return None
+
+    def rules_for_form(self, form_key: str) -> list[BusinessLogicRule]:
+        """Return all business logic rules scoped or attached to ``form_key``."""
+        rules: list[BusinessLogicRule] = []
+        seen_ids: set[int] = set()
+        form = self.form_for_key(form_key)
+        if form is not None:
+            for rule in form.businessLogic:
+                rules.append(rule)
+                seen_ids.add(id(rule))
+        for rule in self.unassignedBusinessLogic:
+            if id(rule) in seen_ids:
+                continue
+            if rule.form == form_key:
+                rules.append(rule)
+            elif rule.form is None and (rule.logic is not None or rule.logicRawXml):
+                # Include unassigned rules that have no explicit form override;
+                # cross-form conditions are filtered out safely by LogicTreeEvaluator.
+                rules.append(rule)
+        return rules
 
     def __eq__(self, other: Any) -> bool:
         """Compare data dictionaries ignoring generatedAt timestamp."""

@@ -784,10 +784,10 @@ def test_destination_sinks_reconcile_newly_voided_records(
     assert written_sf == 1
     executed_sqls = [c.args[0] for c in cursor.execute.call_args_list]
     delete_calls = [c for c in cursor.execute.call_args_list if "DELETE FROM" in c.args[0]]
-    # One DELETE for upserting active record 101, and one DELETE for reconciling voided record 102
-    assert len(delete_calls) == 2
-    assert delete_calls[0].args[1] == ["S-RECON", 101]
-    assert delete_calls[1].args[1] == ["S-RECON", 102]
+    # Active record 101 upserts via staged MERGE INTO; voided record 102 reconciles via DELETE FROM
+    assert len(delete_calls) == 1
+    assert delete_calls[0].args[1] == ["S-RECON", 102]
+    assert any("MERGE INTO" in sql for sql in executed_sqls)
     assert any("COPY INTO" in sql for sql in executed_sqls)
 
     # Direct unit check when idempotent=False -> reconcile_deleted is a no-op

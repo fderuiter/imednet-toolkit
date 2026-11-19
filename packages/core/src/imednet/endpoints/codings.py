@@ -1,7 +1,6 @@
 """Endpoint for managing codings (medical coding) in a study."""
 
-from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
-from imednet.core.endpoint.strategies import PopStudyKeyStrategy
+from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.models.codings import Coding
 
 
@@ -10,13 +9,33 @@ class CodingsOperationDef:
 
     PATH = "codings"
     MODEL = Coding
-    _id_param = "codingId"
-    STUDY_KEY_STRATEGY = PopStudyKeyStrategy()
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "siteName",
+            "siteId",
+            "subjectId",
+            "subjectKey",
+            "formId",
+            "formName",
+            "formKey",
+            "revision",
+            "recordId",
+            "variable",
+            "value",
+            "code",
+            "codedBy",
+            "reason",
+            "dictionaryName",
+            "dictionaryVersion",
+            "dateCoded",
+            "lastUpdated",
+        }
+    )
 
 
-class CodingsEndpoint(CodingsOperationDef, EdcSyncListGetEndpoint[Coding]):  # type: ignore[misc]
+class CodingsEndpoint(CodingsOperationDef, EdcSyncListEndpoint[Coding]):  # type: ignore[misc]
     """Synchronous endpoint for managing Codings."""
 
 
-class AsyncCodingsEndpoint(CodingsOperationDef, EdcAsyncListGetEndpoint[Coding]):  # type: ignore[misc]
+class AsyncCodingsEndpoint(CodingsOperationDef, EdcAsyncListEndpoint[Coding]):  # type: ignore[misc]
     """Asynchronous endpoint for managing Codings."""
