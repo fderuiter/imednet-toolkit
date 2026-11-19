@@ -302,6 +302,7 @@ class BulkRecordSubmissionWorkflow:
         self.skip_existing_subjects = skip_existing_subjects
         self.registration_poll_interval = registration_poll_interval
         self.phase: SubmissionPhase = SubmissionPhase.PENDING
+        self._initial_subjects_snapshot: _PreExistingSubjectsSnapshot | None = None
 
     def submit(
         self,
@@ -326,6 +327,7 @@ class BulkRecordSubmissionWorkflow:
         ]
         data_sets = [rs for rs in record_sets if rs.test_type != RecordTestType.REGISTER_SUBJECT]
 
+        self._initial_subjects_snapshot = None
         existing_subjects: set[str] = set()
         if self.skip_existing_subjects:
             existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
@@ -336,7 +338,11 @@ class BulkRecordSubmissionWorkflow:
             subject_oids=set(),
         )
         if registration_sets and data_sets:
-            snap = self._snapshot_existing_subjects(study_key)
+            snap = (
+                self._initial_subjects_snapshot
+                if self._initial_subjects_snapshot is not None
+                else self._snapshot_existing_subjects(study_key)
+            )
             pre_existing.subject_keys.update(snap.subject_keys)
             pre_existing.subject_ids.update(snap.subject_ids)
             pre_existing.subject_oids.update(snap.subject_oids)
@@ -621,28 +627,32 @@ class BulkRecordSubmissionWorkflow:
                         enrolled_keys.append(key)
         return enrolled_keys
 
-    def _snapshot_existing_subjects(self, study_key: str) -> _PreExistingSubjectsSnapshot:
-        """Capture pre-Phase-1 study subject identifiers."""
+    @staticmethod
+    def _extract_snapshot_from_subjects(subjects: Any) -> _PreExistingSubjectsSnapshot:
+        """Extract subject keys, IDs, and OIDs from a list of Subject models or dicts."""
         keys: set[str] = set()
         ids: set[int] = set()
         oids: set[str] = set()
+        if isinstance(subjects, list):
+            for subj in subjects:
+                key = _clean_str(_get_attr_or_key(subj, "subject_key", "subjectKey"))
+                if key:
+                    keys.add(key)
+                sid = _clean_int(_get_attr_or_key(subj, "subject_id", "subjectId"))
+                if sid is not None:
+                    ids.add(sid)
+                subj_oid = _clean_str(_get_attr_or_key(subj, "subject_oid", "subjectOid"))
+                if subj_oid:
+                    oids.add(subj_oid)
+        return _PreExistingSubjectsSnapshot(keys, ids, oids)
 
+    def _snapshot_existing_subjects(self, study_key: str) -> _PreExistingSubjectsSnapshot:
+        """Capture pre-Phase-1 study subject identifiers."""
         get_subjects_fn = getattr(self.sdk, "get_subjects", None)
         if callable(get_subjects_fn) and not _is_unconfigured_mock_method(get_subjects_fn):
             subjects = get_subjects_fn(study_key)
-            if isinstance(subjects, list):
-                for subj in subjects:
-                    key = _clean_str(_get_attr_or_key(subj, "subject_key", "subjectKey"))
-                    if key:
-                        keys.add(key)
-                    sid = _clean_int(_get_attr_or_key(subj, "subject_id", "subjectId"))
-                    if sid is not None:
-                        ids.add(sid)
-                    subj_oid = _clean_str(_get_attr_or_key(subj, "subject_oid", "subjectOid"))
-                    if subj_oid:
-                        oids.add(subj_oid)
-
-        return _PreExistingSubjectsSnapshot(keys, ids, oids)
+            return self._extract_snapshot_from_subjects(subjects)
+        return _PreExistingSubjectsSnapshot(set(), set(), set())
 
     def _requires_phase2_correlation(
         self,
@@ -1004,12 +1014,59 @@ class BulkRecordSubmissionWorkflow:
             return None, "Incomplete or ambiguous enrolled subject correlation for Phase 1 batch."
         return ordered_keys, None
 
+    @staticmethod
+    def _subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
+        """Return True if the subject has a keyword matching keyword_tag."""
+        if not keyword_tag:
+            return True
+        keywords = (
+            subj.get("keywords") if isinstance(subj, dict) else getattr(subj, "keywords", None)
+        )
+        if not keywords:
+            return False
+        for kw in keywords:
+            if isinstance(kw, str):
+                if kw == keyword_tag:
+                    return True
+                continue
+            if isinstance(kw, dict):
+                candidates = (
+                    kw.get("keyword_key"),
+                    kw.get("keywordKey"),
+                    kw.get("keyword_name"),
+                    kw.get("keywordName"),
+                )
+            else:
+                candidates = (
+                    getattr(kw, "keyword_key", None),
+                    getattr(kw, "keywordKey", None),
+                    getattr(kw, "keyword_name", None),
+                    getattr(kw, "keywordName", None),
+                )
+            if keyword_tag in candidates:
+                return True
+        return False
+
     def _find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
-        """Query subjects filtered by keyword to find pre-existing UAT subjects."""
-        subjects = self.sdk.get_subjects(study_key, keyword=keyword_tag)
-        existing_keys = set()
+        """Query non-deleted subjects and inspect Subject keywords locally for UAT tags."""
+        subjects = self.sdk.get_subjects(study_key, deleted=False)
+        self._initial_subjects_snapshot = self._extract_snapshot_from_subjects(subjects)
+        existing_keys: set[str] = set()
         for subj in subjects:
-            key = getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None)
+            deleted = (
+                subj.get("deleted", False)
+                if isinstance(subj, dict)
+                else getattr(subj, "deleted", False)
+            )
+            if deleted:
+                continue
+            if not self._subject_has_keyword(subj, keyword_tag):
+                continue
+            key = (
+                (subj.get("subject_key") or subj.get("subjectKey"))
+                if isinstance(subj, dict)
+                else (getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None))
+            )
             if key:
                 existing_keys.add(key)
         return existing_keys

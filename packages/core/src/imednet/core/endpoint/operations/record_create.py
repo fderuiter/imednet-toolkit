@@ -12,7 +12,11 @@ from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
-from imednet.validation.cache import BaseSchemaCache, validate_record_entry
+from imednet.validation.cache import (
+    ValidationSchemaProtocol,
+    is_schema_record_prevalidated,
+    validate_record_entry,
+)
 
 T = TypeVar("T")
 
@@ -29,7 +33,7 @@ class RecordCreateOperation(Operation[T]):
         path: str,
         records_data: list[dict[str, Any]],
         email_notify: bool | str | None = None,
-        schema: BaseSchemaCache[Any] | None = None,
+        schema: ValidationSchemaProtocol | None = None,
         *,
         skip_validation: bool = False,
     ) -> None:
@@ -39,7 +43,7 @@ class RecordCreateOperation(Operation[T]):
             path: The full API path for the request.
             records_data: List of record data objects to create.
             email_notify: Email notification setting.
-            schema: Optional schema cache for validation.
+            schema: Optional validation schema (BaseSchemaCache or DataDictionary).
             skip_validation: If True, skip per-record schema validation because
                 the caller has already validated the batch.
 
@@ -69,7 +73,8 @@ class RecordCreateOperation(Operation[T]):
         if getattr(self.schema, "is_prevalidated", False) is True:
             return
         for rec in self.records_data:
-            validate_record_entry(self.schema, rec)
+            if not is_schema_record_prevalidated(self.schema, rec):
+                validate_record_entry(self.schema, rec)
 
     def _build_headers(self) -> dict[str, str]:
         """Build headers for record creation request.

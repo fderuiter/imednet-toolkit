@@ -14,7 +14,7 @@ from imednet.spi.utils import (
     BatchSubmissionSummary,
     JobPollSummary,
 )
-from imednet.spi.validation import SchemaCache
+from imednet.spi.validation import ValidationSchemaProtocol
 
 # Use TYPE_CHECKING to avoid circular import at runtime
 if TYPE_CHECKING:
@@ -117,7 +117,7 @@ class RegisterSubjectsWorkflow:
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
-        schema: SchemaCache | None = None,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> BatchSubmissionSummary:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
         sites = {s.site_name for s in self._sdk.get_sites(study_key=study_key)}
@@ -211,7 +211,7 @@ class RegisterSubjectsWorkflow:
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
-        schema: SchemaCache | None = None,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Registers multiple subjects in the specified study.
 

@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING, Any
 
 from imednet.models.jobs import Job, JobStatus
 from imednet.utils.job_poller import JobFailedError, JobPollSummary, JobProgressHandler
-from imednet.validation.cache import BaseSchemaCache, validate_record_entry
+from imednet.validation.cache import (
+    ValidationSchemaProtocol,
+    is_schema_record_prevalidated,
+    prevalidated_records,
+    validate_record_entry,
+)
 
 if TYPE_CHECKING:
     pass
@@ -88,20 +93,21 @@ class BatchSubmissionSummary:
 
 
 def _validate_records_with_schema(
-    schema: BaseSchemaCache[Any],
+    schema: ValidationSchemaProtocol,
     records_data: list[dict[str, Any]],
 ) -> None:
     """Validate records not already marked prevalidated in the active task scope."""
     is_rec_prevalidated = getattr(schema, "is_record_prevalidated", None)
     if callable(is_rec_prevalidated):
         for rec in records_data:
-            if not is_rec_prevalidated(rec):
+            if is_rec_prevalidated(rec) is not True:
                 validate_record_entry(schema, rec)
         return
     if getattr(schema, "is_prevalidated", False) is True:
         return
     for rec in records_data:
-        validate_record_entry(schema, rec)
+        if not is_schema_record_prevalidated(schema, rec):
+            validate_record_entry(schema, rec)
 
 
 def _raise_from_poll_summary(poll_summary: JobPollSummary) -> None:
@@ -131,7 +137,7 @@ class BatchCoordinator:
         records_data: list[dict[str, Any]],
         submit_chunk: Callable[[list[dict[str, Any]]], Job],
         *,
-        schema: BaseSchemaCache[Any] | None = None,
+        schema: ValidationSchemaProtocol | None = None,
         validate_batch_fn: Callable[[str, list[dict[str, Any]]], None] | None = None,
         skip_validation: bool = False,
         skipped_count: int = 0,
@@ -161,9 +167,7 @@ class BatchCoordinator:
         jobs: list[Job] = []
         chunk_sizes: list[int] = []
         for chunk in chunks:
-            ctx = (
-                schema.prevalidated(chunk) if isinstance(schema, BaseSchemaCache) else nullcontext()
-            )
+            ctx = prevalidated_records(schema, chunk) if schema is not None else nullcontext()
             with ctx:
                 job = submit_chunk(chunk)
             jobs.append(job)
@@ -237,7 +241,7 @@ class AsyncBatchCoordinator:
         records_data: list[dict[str, Any]],
         submit_chunk: Callable[[list[dict[str, Any]]], Awaitable[Job]],
         *,
-        schema: BaseSchemaCache[Any] | None = None,
+        schema: ValidationSchemaProtocol | None = None,
         validate_batch_fn: Callable[[str, list[dict[str, Any]]], Awaitable[None]] | None = None,
         skip_validation: bool = False,
         skipped_count: int = 0,
@@ -269,9 +273,7 @@ class AsyncBatchCoordinator:
         jobs: list[Job] = []
         chunk_sizes: list[int] = []
         for chunk in chunks:
-            ctx = (
-                schema.prevalidated(chunk) if isinstance(schema, BaseSchemaCache) else nullcontext()
-            )
+            ctx = prevalidated_records(schema, chunk) if schema is not None else nullcontext()
             with ctx:
                 job = await submit_chunk(chunk)
             jobs.append(job)

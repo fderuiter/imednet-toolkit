@@ -184,17 +184,25 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         """Apply query filter parameters and return a paginated response."""
         filter_str = params.get("filter")
         if filter_str:
-            clauses = [term.split("==", 1) for term in filter_str.split(";") if "==" in term]
-            filtered = []
-            for item in items:
-                matches_all = True
-                for field, val in clauses:
-                    if not _matches_filter(item, field.strip(), val.strip()):
-                        matches_all = False
-                        break
-                if matches_all:
-                    filtered.append(item)
-            items = filtered
+            is_or = "," in filter_str and ";" not in filter_str
+            separator = "," if is_or else ";"
+            clauses = [term.split("==", 1) for term in filter_str.split(separator) if "==" in term]
+            if clauses:
+                filtered = []
+                for item in items:
+                    if is_or:
+                        matched = any(
+                            _matches_filter(item, field.strip(), val.strip())
+                            for field, val in clauses
+                        )
+                    else:
+                        matched = all(
+                            _matches_filter(item, field.strip(), val.strip())
+                            for field, val in clauses
+                        )
+                    if matched:
+                        filtered.append(item)
+                items = filtered
 
         return self._paginate_response(request, items, params)
 

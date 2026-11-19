@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
+from .terminal import is_json_output_mode, supports_ansi_color, supports_live_status
+
 if TYPE_CHECKING:
     from imednet.utils.job_poller import JobStatusEvent
 
@@ -89,7 +91,8 @@ _HC_STATUS_COLOR_MAP = {
     "withdrawn": "magenta",
 }
 
-_ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_ANSI_REGEX = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_SGR_REGEX = re.compile(r"\x1b\[[0-9;]*m")
 
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _ASCII_SPINNER_FRAMES = ("-", "\\", "|", "/")
@@ -144,7 +147,7 @@ def clear_line(stream: Any = None, lines: int = 1) -> None:
     """
     target = stream if stream is not None else sys.stderr
     try:
-        if target and hasattr(target, "isatty") and target.isatty():
+        if supports_live_status(target):
             clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, lines - 1))
             target.write(f"{clear_seq}{_CURSOR_SHOW}")
             target.flush()
@@ -252,6 +255,8 @@ class Status:
         try:
             with self._lock:
                 current_msg = self._msg
+            if not supports_ansi_color(stream):
+                current_msg = _SGR_REGEX.sub("", current_msg)
             elapsed = time.monotonic() - self._start_time
             has_timer = bool(re.search(r"\(\d+\.?\d*s\)", current_msg))
             timer_suffix = "" if has_timer else f" ({elapsed:.1f}s)"
@@ -314,14 +319,7 @@ class Status:
             self._thread = threading.Thread(target=self._run_spinner, daemon=True)
             self._thread.start()
         else:
-            is_json_mode = os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
-            if not is_json_mode:
-                try:
-                    is_json_mode = (
-                        any(arg in sys.argv for arg in ("--format", "-f")) and "json" in sys.argv
-                    )
-                except Exception:
-                    is_json_mode = False
+            is_json_mode = is_json_output_mode()
 
             is_string_io = (
                 isinstance(stream, io.StringIO) or stream.__class__.__name__ == "StringIO"
@@ -397,12 +395,8 @@ class Console:
         self._width = val
 
     def is_interactive(self) -> bool:
-        """Check whether the output stream is an interactive terminal."""
-        s = self.stream
-        try:
-            return bool(s and hasattr(s, "isatty") and s.isatty())
-        except (AttributeError, ValueError, OSError):
-            return False
+        """Check whether the output stream supports live interactive rendering."""
+        return supports_live_status(self.stream)
 
     def status(
         self,
@@ -445,7 +439,7 @@ def _format_cell_value(value: Any, key: str | None = None) -> str:
 
 
 def _colorize(text: str, color: str) -> str:
-    if not sys.stdout.isatty():
+    if not supports_ansi_color(sys.stdout):
         return text
     return f"{_ANSI_COLORS.get(color, '')}{text}{_ANSI_COLORS['reset']}"
 
@@ -586,14 +580,8 @@ def print_error(
     """
     target = sys.stderr if file is None else file
     try:
-        is_tty = False
-        try:
-            is_tty = bool(target and hasattr(target, "isatty") and target.isatty())
-        except (AttributeError, ValueError, OSError):
-            is_tty = False
-
         formatted = sep.join(str(obj) for obj in objects)
-        if not is_tty:
+        if not supports_ansi_color(target):
             formatted = _ANSI_REGEX.sub("", formatted)
 
         print(formatted, end=end, file=target, flush=flush)

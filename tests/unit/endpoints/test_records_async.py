@@ -98,12 +98,12 @@ async def test_async_to_dataframe_parameter_forwarding(
     df = await ep.to_dataframe(
         study_key="S1",
         record_data_filter="age>10",
-        status="open",
+        record_status="Open",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/records"
     assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "age>10"}
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"record_status": "Open"}
     assert len(df) == 1
 
 

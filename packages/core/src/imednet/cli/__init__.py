@@ -19,7 +19,13 @@ from ..integrations.export import (
     export_to_sql_by_form,
 )
 from .decorators import _redact_secrets, with_sdk
-from .utils import get_sdk, parse_filter_args
+from .utils import (
+    NON_INTERACTIVE_ENV,
+    OUTPUT_FORMAT_ENV,
+    add_no_interactive,
+    get_sdk,
+    parse_filter_args,
+)
 
 __all__ = [
     "SinkConfig",
@@ -48,6 +54,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--high-contrast", action="store_true", help="Enable high-contrast mode for accessibility."
     )
+    add_no_interactive(parser, suppress_default=False)
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -211,12 +218,16 @@ def app(args: list[str] | None = None) -> None:
     if parsed.high_contrast:
         os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
 
-    old_output_format = os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT")
+    old_output_format = os.environ.get(OUTPUT_FORMAT_ENV)
+    old_non_interactive = os.environ.get(NON_INTERACTIVE_ENV)
     try:
+        if getattr(parsed, "no_interactive", False):
+            os.environ[NON_INTERACTIVE_ENV] = "1"
+
         if getattr(parsed, "output_format", None) == "json":
-            os.environ["IMEDNET_CLI_OUTPUT_FORMAT"] = "json"
+            os.environ[OUTPUT_FORMAT_ENV] = "json"
         else:
-            os.environ.pop("IMEDNET_CLI_OUTPUT_FORMAT", None)
+            os.environ.pop(OUTPUT_FORMAT_ENV, None)
 
         if hasattr(parsed, "func"):
             parsed.func(parsed)
@@ -225,9 +236,13 @@ def app(args: list[str] | None = None) -> None:
             active_parser.print_help()
     finally:
         if old_output_format is not None:
-            os.environ["IMEDNET_CLI_OUTPUT_FORMAT"] = old_output_format
+            os.environ[OUTPUT_FORMAT_ENV] = old_output_format
         else:
-            os.environ.pop("IMEDNET_CLI_OUTPUT_FORMAT", None)
+            os.environ.pop(OUTPUT_FORMAT_ENV, None)
+        if old_non_interactive is not None:
+            os.environ[NON_INTERACTIVE_ENV] = old_non_interactive
+        else:
+            os.environ.pop(NON_INTERACTIVE_ENV, None)
 
 
 if __name__ == "__main__":

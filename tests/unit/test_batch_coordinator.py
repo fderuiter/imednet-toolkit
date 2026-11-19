@@ -441,3 +441,63 @@ async def test_prevalidated_without_records_does_not_leak_to_spawned_child_task(
         with pytest.raises(ValidationError, match="Value must be an integer"):
             await asyncio.create_task(child_attempt())
     assert cache.is_prevalidated is False
+
+
+def test_sdk_create_records_batch_with_data_dictionary_prevalidates_once() -> None:
+    """create_records_batch accepts DataDictionary and prevalidates each record once across chunks."""
+    from unittest.mock import patch
+
+    from imednet.datadict import DataDictionary, Form, Variable
+    from imednet.errors import ValidationError
+    from imednet.validation.cache import validate_record_data
+
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="F1",
+                formName="Form 1",
+                variables=[Variable(variableName="age", variableType="Integer", required="Yes")],
+            )
+        ]
+    )
+
+    post_chunks: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            payload = json.loads(request.content.decode("utf-8"))
+            post_chunks.append(len(payload))
+            return httpx.Response(
+                200,
+                json={"jobId": f"J-{len(post_chunks)}", "batchId": f"B-{len(post_chunks)}"},
+            )
+        return httpx.Response(500, json={"error": f"Unexpected request {request.url.path}"})
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        valid_records = [{"formKey": "F1", "data": {"age": i}} for i in range(105)]
+        with patch(
+            "imednet.validation.cache.validate_record_data",
+            wraps=validate_record_data,
+        ) as spy_dd_validate:
+            jobs = sdk.create_records_batch("STUDY", valid_records, schema=dd)
+        assert len(jobs) == 2
+        assert post_chunks == [100, 5]
+        # Validated once by BatchCoordinator; RecordCreateOperation skips re-validation via prevalidated_records
+        assert spy_dd_validate.call_count == 105
+
+        invalid_records = [
+            {"formKey": "F1", "data": {"age": 20}},
+            {"formKey": "F1", "data": {"age": "bad"}},
+        ]
+        with pytest.raises(ValidationError, match="integer"):
+            sdk.create_records_batch("STUDY", invalid_records, schema=dd)
+        # Invalid chunk rejected before POST
+        assert post_chunks == [100, 5]
+    finally:
+        sdk.close()

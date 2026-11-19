@@ -87,6 +87,7 @@ def _async_trace_method(
 if TYPE_CHECKING:
     from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
     from imednet.endpoints.records import AsyncRecordsEndpoint, RecordsEndpoint
+    from imednet.validation.cache import ValidationSchemaProtocol
 
 
 T = TypeVar("T")
@@ -220,7 +221,7 @@ class SyncSDKConvenienceMixin:
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: ValidationSchemaProtocol | None = None,
         skip_validation: bool = False,
     ) -> Job:
         """Create records in the specified study."""
@@ -246,7 +247,7 @@ class SyncSDKConvenienceMixin:
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: ValidationSchemaProtocol | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
         wait_for_completion: bool = False,
@@ -371,7 +372,7 @@ class AsyncSDKConvenienceMixin:
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: ValidationSchemaProtocol | None = None,
         skip_validation: bool = False,
     ) -> Job:
         """Asynchronously create records in the specified study."""
@@ -397,7 +398,7 @@ class AsyncSDKConvenienceMixin:
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: ValidationSchemaProtocol | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
         wait_for_completion: bool = False,

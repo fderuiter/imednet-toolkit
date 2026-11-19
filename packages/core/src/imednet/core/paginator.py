@@ -9,6 +9,16 @@ from imednet.errors.client import PaginationError
 ClientT = TypeVar("ClientT", RequesterProtocol, AsyncRequesterProtocol)
 
 
+def _parse_int_param(name: str, value: Any) -> int:
+    """Parse an integer pagination parameter, rejecting booleans, floats, and non-integers."""
+    if isinstance(value, (bool, float)):
+        raise ValueError(f"Pagination '{name}' must be an integer, got {type(value).__name__}.")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Pagination '{name}' must be an integer, got {value!r}.") from exc
+
+
 class BasePaginator(Generic[ClientT]):
     """Shared paginator implementation."""
 
@@ -45,13 +55,25 @@ class BasePaginator(Generic[ClientT]):
         self.metadata_key = metadata_key
 
         explicit_page = self.params.pop(self.page_param, None)
-        self._explicit_page = int(explicit_page) if explicit_page is not None else None
+        if explicit_page is not None:
+            parsed_page = _parse_int_param(self.page_param, explicit_page)
+            if parsed_page < 0:
+                raise ValueError(f"Pagination '{self.page_param}' must be >= 0, got {parsed_page}.")
+            self._explicit_page: int | None = parsed_page
+        else:
+            self._explicit_page = None
 
         explicit_size = self.params.pop(self.size_param, None)
         if explicit_size is None:
             explicit_size = self.params.pop("limit", None)
 
-        self.page_size = int(explicit_size) if explicit_size is not None else page_size
+        raw_size = explicit_size if explicit_size is not None else page_size
+        parsed_size = _parse_int_param(self.size_param, raw_size)
+        if parsed_size < 1 or parsed_size > 500:
+            raise ValueError(
+                f"Pagination '{self.size_param}' must be between 1 and 500, got {parsed_size}."
+            )
+        self.page_size = parsed_size
         self._cursor: int | None = None
         self._exhausted = False
 

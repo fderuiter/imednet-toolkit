@@ -1,7 +1,6 @@
 """Endpoint for managing variables (data points on forms) in a study."""
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
-from imednet.core.endpoint.strategies import PopStudyKeyStrategy
 from imednet.models.variables import Variable
 
 
@@ -11,8 +10,27 @@ class VariablesOperationDef:
     PATH = "variables"
     MODEL = Variable
     _id_param = "variableId"
-    STUDY_KEY_STRATEGY = PopStudyKeyStrategy()
     PAGE_SIZE = 500
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "variableId",
+            "variableType",
+            "variableName",
+            "sequence",
+            "revision",
+            "disabled",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+            "formId",
+            "variableOid",
+            "deleted",
+            "formKey",
+            "formName",
+            "label",
+            "blinded",
+        }
+    )
 
 
 class VariablesEndpoint(VariablesOperationDef, EdcSyncListGetEndpoint[Variable]):  # type: ignore[misc]

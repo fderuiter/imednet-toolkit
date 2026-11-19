@@ -17,7 +17,7 @@ from imednet.utils.batch_coordinator import (
     BatchSubmissionSummary,
 )
 from imednet.utils.typing import JsonDict
-from imednet.validation.cache import AsyncSchemaCache, SchemaCache
+from imednet.validation.cache import ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -29,7 +29,33 @@ class RecordsOperationDef:
     PATH = "records"
     MODEL = Record
     _id_param = "recordId"
-    PARAM_PROCESSOR = MappingParamProcessor({"record_data_filter": "recordDataFilter"})
+    PARAM_PROCESSOR = MappingParamProcessor(
+        {
+            "record_data_filter": "recordDataFilter",
+            "recordDataFilter": "recordDataFilter",
+        }
+    )
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "intervalId",
+            "formId",
+            "formKey",
+            "siteId",
+            "recordId",
+            "recordOid",
+            "recordType",
+            "recordStatus",
+            "deleted",
+            "dateCreated",
+            "dateModified",
+            "lastUpdated",
+            "subjectId",
+            "subjectOid",
+            "subjectKey",
+            "visitId",
+            "parentRecordId",
+        }
+    )
 
     @execute_operation
     def create(
@@ -38,7 +64,7 @@ class RecordsOperationDef:
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: SchemaCache | AsyncSchemaCache | None = None,
+        schema: ValidationSchemaProtocol | None = None,
         skip_validation: bool = False,
     ) -> RecordCreateOperation[Job]:
         """Create one or more records in a study.
@@ -47,7 +73,7 @@ class RecordsOperationDef:
             study_key: The study key.
             records_data: The data for the records to create.
             email_notify: Whether to send email notifications.
-            schema: Optional schema cache for validation.
+            schema: Optional validation schema (SchemaCache or DataDictionary).
             skip_validation: Whether to skip schema validation if already validated.
 
         Returns:
@@ -72,7 +98,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: SchemaCache | None = None,
+        schema: ValidationSchemaProtocol | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
     ) -> BatchSubmissionSummary:
@@ -128,7 +154,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: AsyncSchemaCache | SchemaCache | None = None,
+        schema: ValidationSchemaProtocol | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
     ) -> BatchSubmissionSummary:
