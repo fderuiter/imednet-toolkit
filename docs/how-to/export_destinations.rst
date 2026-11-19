@@ -67,6 +67,10 @@ MongoDB (document export):
    rows = export_to_mongodb(sdk, "MY_STUDY", config=mongodb_cfg)
    print(rows)
 
+.. testoutput::
+
+   2
+
 Neo4j (graph export):
 
 .. testcode::
@@ -85,6 +89,10 @@ Neo4j (graph export):
    )
    rows = export_to_neo4j(sdk, "MY_STUDY", config=neo4j_cfg)
    print(rows)
+
+.. testoutput::
+
+   2
 
 Snowflake (warehouse-native export):
 
@@ -107,6 +115,10 @@ Snowflake (warehouse-native export):
    )
    rows = export_to_snowflake(sdk, "MY_STUDY", config=snowflake_cfg)
    print(rows)
+
+.. testoutput::
+
+   2
 
 PHI protection and masking controls
 -----------------------------------

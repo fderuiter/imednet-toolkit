@@ -161,7 +161,7 @@ def normalize_job_state(state: JobState | str) -> JobState:
         The normalized JobState enum member.
 
     Raises:
-        InvalidJobStateError: If the state string is unrecognized.
+        ~imednet.models.jobs.InvalidJobStateError: If the state string is unrecognized.
     """
     if isinstance(state, JobState):
         return state
@@ -212,8 +212,8 @@ def validate_job_transition(
         True if the transition is valid.
 
     Raises:
-        InvalidJobStateError: If either state is not a recognized JobState.
-        InvalidJobTransitionError: If the transition moves backwards or is not permitted.
+        ~imednet.models.jobs.InvalidJobStateError: If either state is not a recognized JobState.
+        ~imednet.models.jobs.InvalidJobTransitionError: If the transition moves backwards or is not permitted.
     """
     from_enum = normalize_job_state(from_state)
     to_enum = normalize_job_state(to_state)

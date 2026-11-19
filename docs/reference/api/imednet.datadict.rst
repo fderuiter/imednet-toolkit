@@ -2,6 +2,7 @@ imednet.datadict package
 ========================
 
 .. automodule:: imednet.datadict
+   :noindex:
    :members:
    :show-inheritance:
 

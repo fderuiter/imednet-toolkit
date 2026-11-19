@@ -377,7 +377,7 @@ class UATWorkflow:
             The newly set state.
 
         Raises:
-            InvalidUATStateTransitionError: If the transition is not permitted.
+            ~imednet_workflows.uat.models.InvalidUATStateTransitionError: If the transition is not permitted.
         """
         target_state = normalize_uat_state(target)
         validate_uat_transition(self._state, target_state)

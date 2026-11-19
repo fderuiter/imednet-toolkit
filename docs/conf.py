@@ -3,11 +3,9 @@
 # Configuration file for the Sphinx documentation builder.
 import importlib.util
 import json
-import logging
 import os
 import sys
 import types
-import warnings
 
 # mypy: ignore-errors
 from typing import Any
@@ -41,8 +39,6 @@ sys.path[:0] = [
     os.path.abspath("../packages/plugins-sinks/src"),
     os.path.abspath("../packages/plugins-tui/src"),
 ]
-warnings.filterwarnings("ignore", message="duplicate object description*")
-warnings.filterwarnings("ignore", message="Failed guarded type import*")
 
 # Mock heavy optional dependencies so autodoc does not require them.
 # Mock pandas to avoid heavy dependency while building docs if not installed.
@@ -95,7 +91,6 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.viewcode",
     "sphinx.ext.napoleon",
-    "sphinx_autodoc_typehints",
     "sphinx.ext.autosummary",
     "sphinxcontrib.mermaid",
     "sphinxarg.ext",
@@ -138,60 +133,35 @@ thebe_config = {
 
 autosummary_generate = False
 
-# Mock heavy optional dependencies so autodoc does not import them.
-# opentelemetry is listed here so that `if TYPE_CHECKING: from opentelemetry…`
-# blocks (evaluated when set_type_checking_flag=True) do not cause
-# ModuleNotFoundError during the docs build.
+# Only mock optional third-party imports that are not installed in the active environment.
 autodoc_mock_imports = [
-    "matplotlib",
-    "airflow",
-    "opentelemetry",
-    "pyarrow",
-    "duckdb",
+    _mod
+    for _mod in ("matplotlib", "airflow", "opentelemetry", "pyarrow", "duckdb")
+    if importlib.util.find_spec(_mod) is None
 ]
-
-suppress_warnings = [
-    "autodoc.import",
-    "autodoc",
-    "sphinx_autodoc_typehints",
-]
-
-# Sphinx 6.x does not assign a filterable type code to "duplicate object
-# description" warnings, so suppress_warnings cannot catch them.  These
-# duplicates arise because __init__.py files re-export symbols that are also
-# documented in their own sub-module stubs.  The filter below silences them
-# so the strict (-W) build is not broken by this benign re-export pattern.
-
-
-class _SuppressDuplicateDescriptions(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover
-        message = record.getMessage()
-        return (
-            "duplicate object description" not in message
-            and "Failed guarded type import" not in message
-            and "more than one target found for cross-reference" not in message
-        )
 
 
 def setup(app: Any) -> None:  # pragma: no cover
-    """Install the duplicate-description log filter after Sphinx initialises.
+    """Register Sphinx client assets at startup.
 
     Args:
         app: The Sphinx application instance (provided by Sphinx at startup).
     """
-    # Sphinx wraps every internal logger as `sphinx.<module>`, e.g.
-    # sphinx.domains.python becomes sphinx.sphinx.domains.python.
-    suppressor = _SuppressDuplicateDescriptions()
-    logging.getLogger("sphinx").addFilter(suppressor)
-    logging.getLogger("sphinx.sphinx.domains.python").addFilter(suppressor)
-    logging.getLogger("sphinx.sphinx_autodoc_typehints").addFilter(suppressor)
+    from pydantic import BaseModel
+    from sphinx.ext.autodoc import AttributeDocumenter
 
+    class _PydanticSafeAttributeDocumenter(AttributeDocumenter):
+        """Avoid mutating Pydantic BaseModel subclass __annotations__ with internal dunder hints."""
+
+        def update_annotations(self, parent: Any) -> None:
+            if isinstance(parent, type) and issubclass(parent, BaseModel):
+                return
+            super().update_annotations(parent)
+
+    app.add_autodocumenter(_PydanticSafeAttributeDocumenter, override=True)
     # Expose thebe_config containing wheel artifacts and requirements to client JS runtime
     app.add_js_file(None, body=f"window.thebe_config = {json.dumps(thebe_config)};")
 
-
-# Ignore noisy pydantic schema generation warnings.
-warnings.filterwarnings("ignore", message="Failed guarded type import", category=UserWarning)
 
 # Display type hints in the description instead of the signature to keep
 # function signatures concise in the rendered documentation.
@@ -203,10 +173,6 @@ autodoc_default_options = {
     "show-inheritance": True,
 }
 autodoc_class_signature = "separated"
-
-# Force sphinx-autodoc-typehints to evaluate TYPE_CHECKING blocks so that
-# forward references used only under `if TYPE_CHECKING:` are resolved.
-set_type_checking_flag = True
 
 # Napoleon – enforce Google-style docstrings.
 napoleon_google_docstring = True
@@ -226,18 +192,22 @@ html_css_files: list[str] = ["custom.css"]
 html_js_files: list[str] = ["showcase.js", "thebe_pyodide.js"]
 
 doctest_global_setup = """
+import contextlib
 import os
-import respx
-import warnings
-import sys
-warnings.filterwarnings("ignore")
-import logging
-logging.getLogger("py.warnings").setLevel(logging.ERROR)
-logging.captureWarnings(True)
-import warnings
-warnings.simplefilter("ignore")
-import httpx
-from unittest.mock import MagicMock, patch
+import tempfile
+from pathlib import Path
+from unittest.mock import create_autospec, patch
+
+import neo4j
+import pymongo
+import pymongo.collection
+import pymongo.database
+import snowflake.connector
+from snowflake.connector.connection import SnowflakeConnection
+from snowflake.connector.cursor import SnowflakeCursor
+
+import imednet_workflows.cached_loader as _cached_loader_mod
+from imednet.simulation.transport import get_default_simulation_state
 
 os.environ["IMEDNET_SIMULATION_MODE"] = "true"
 os.environ["IMEDNET_API_KEY"] = "dummy_api_key"  # pragma: allowlist secret
@@ -245,93 +215,123 @@ os.environ["IMEDNET_SECURITY_KEY"] = "dummy_security_key"  # pragma: allowlist s
 os.environ["SNOWFLAKE_PASSWORD"] = "dummy_password"  # pragma: allowlist secret
 os.environ["IMEDNET_STUDY_KEY"] = "MY_STUDY"
 
-__file__ = "/a/b/c/d/e/dummy.py"
+_doctest_orig_cwd = os.getcwd()
+_doctest_tmpdir = tempfile.TemporaryDirectory()
+os.chdir(_doctest_tmpdir.name)
 
-import duckdb
-_duckdb_connect_patcher = patch('duckdb.connect', return_value=MagicMock())
-_duckdb_connect_patcher.start()
+_orig_cache_dir = _cached_loader_mod.DEFAULT_CACHE_DIR
+_cached_loader_mod.DEFAULT_CACHE_DIR = Path(_doctest_tmpdir.name) / ".imednet_cache"
 
-from imednet_workflows.config_version_control import ConfigVersionStore
-_cvs_patcher1 = patch.object(ConfigVersionStore, 'diff_configs', return_value={"added": [], "removed": [], "changed": []})
-_cvs_patcher1.start()
-_cvs_patcher2 = patch.object(ConfigVersionStore, 'commit_config', return_value="mock_commit_id")
-_cvs_patcher2.start()
-_cvs_patcher3 = patch.object(ConfigVersionStore, 'rollback_config', return_value={})
-_cvs_patcher3.start()
-_cvs_patcher4 = patch.object(ConfigVersionStore, 'get_history', return_value=[{"version_tag": "v1", "commit_id": "mock_commit_id", "timestamp": "2026-01-01"}])
-_cvs_patcher4.start()
+_sim_state = get_default_simulation_state()
+_sim_state.reset()
+_sim_state.forms.extend(
+    [
+        {
+            "formId": 1301,
+            "formKey": "F_DM",
+            "formName": "Demographics",
+            "formType": "Enrollment",
+            "studyKey": "MY_STUDY",
+            "revision": 1,
+            "disabled": False,
+            "eproForm": False,
+            "allowCopy": False,
+            "dateCreated": "2026-01-01T00:00:00Z",
+            "dateModified": "2026-01-01T00:00:00Z",
+            "lastUpdated": "2026-01-01T00:00:00Z",
+        },
+        {
+            "formId": 1302,
+            "formKey": "F_VS",
+            "formName": "Vital Signs",
+            "formType": "Standard",
+            "studyKey": "MY_STUDY",
+            "revision": 1,
+            "disabled": False,
+            "eproForm": False,
+            "allowCopy": False,
+            "dateCreated": "2026-01-01T00:00:00Z",
+            "dateModified": "2026-01-01T00:00:00Z",
+            "lastUpdated": "2026-01-01T00:00:00Z",
+        },
+    ]
+)
+_sim_state.records.extend(
+    [
+        {
+            "recordId": 1601,
+            "studyKey": "MY_STUDY",
+            "subjectKey": "SUB-001",
+            "subjectId": 1201,
+            "formId": 1301,
+            "formKey": "F_DM",
+            "visitId": 1401,
+            "intervalId": 1501,
+            "siteId": 103,
+            "recordType": "Standard",
+            "recordStatus": "Complete",
+            "recordData": {"V_AGE": 45, "V_GENDER": "Female"},
+            "deleted": False,
+            "dateCreated": "2026-01-10T09:30:00Z",
+            "dateModified": "2026-01-10T09:30:00Z",
+            "lastUpdated": "2026-01-10T09:30:00Z",
+        },
+        {
+            "recordId": 1602,
+            "studyKey": "MY_STUDY",
+            "subjectKey": "SUB-001",
+            "subjectId": 1201,
+            "formId": 1302,
+            "formKey": "F_VS",
+            "visitId": 1401,
+            "intervalId": 1501,
+            "siteId": 103,
+            "recordType": "Standard",
+            "recordStatus": "Complete",
+            "recordData": {"V_WEIGHT": 68.5},
+            "deleted": False,
+            "dateCreated": "2026-01-10T09:35:00Z",
+            "dateModified": "2026-01-10T09:35:00Z",
+            "lastUpdated": "2026-01-10T09:35:00Z",
+        },
+    ]
+)
 
-import imednet.integrations.export
-_export_patcher = patch.object(imednet.integrations.export, '_prepare_export_df', return_value=sys.modules['pandas'].DataFrame())
-_export_patcher.start()
+_sf_conn = create_autospec(SnowflakeConnection, instance=True)
+_sf_cursor = create_autospec(SnowflakeCursor, instance=True)
+_sf_conn.cursor.return_value = _sf_cursor
+_sf_patcher = patch("snowflake.connector.connect", autospec=True, return_value=_sf_conn)
+_sf_patcher.start()
 
-from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
-_reg_patcher = patch.object(RegisterSubjectsWorkflow, 'register_subjects', return_value={'batch_id': 'MOCK_BATCH'})
-_reg_patcher.start()
+_mongo_client = create_autospec(pymongo.MongoClient, instance=True)
+_mongo_admin = create_autospec(pymongo.database.Database, instance=True)
+_mongo_admin.command.return_value = {"ok": 1}
+_mongo_client.admin = _mongo_admin
+_mongo_db = create_autospec(pymongo.database.Database, instance=True)
+_mongo_coll = create_autospec(pymongo.collection.Collection, instance=True)
+_mongo_db.__getitem__.return_value = _mongo_coll
+_mongo_client.__getitem__.return_value = _mongo_db
+_mongo_patcher = patch("pymongo.MongoClient", autospec=True, return_value=_mongo_client)
+_mongo_patcher.start()
 
-from unittest.mock import MagicMock, patch
-import builtins
-
-_original_print = builtins.print
-def _mock_print(*args, **kwargs):
-    if args and str(args[0]) in ("True", "2020", "5", "'1.23'", "['x']", "{}"):
-        _original_print(*args, **kwargs)
-
-_print_patcher = patch.object(builtins, 'print', side_effect=_mock_print)
-_print_patcher.start()
-
-sys.modules["snowflake"] = MagicMock()
-sys.modules["snowflake.connector"] = MagicMock()
-sys.modules["pymongo"] = MagicMock()
-sys.modules["pymongo.errors"] = MagicMock()
-sys.modules["neo4j"] = MagicMock()
-
-import imednet.integrations.sink_base
-_snowflake_patcher = patch.object(imednet.integrations.sink_base, '_require_optional_dep', return_value=MagicMock())
-_snowflake_patcher.start()
-
-import imednet_sinks.warehouse
-_wh_patcher = patch.object(imednet_sinks.warehouse, '_require_optional_dep', return_value=MagicMock())
-_wh_patcher.start()
-
-import imednet_sinks.document
-_doc_patcher = patch.object(imednet_sinks.document, '_require_optional_dep', return_value=MagicMock())
-_doc_patcher.start()
-
-import imednet_sinks.graph
-_graph_patcher = patch.object(imednet_sinks.graph, '_require_optional_dep', return_value=MagicMock())
-_graph_patcher.start()
-
-# Mock airflow and provider
-import sys
-from unittest.mock import MagicMock
-sys.modules['airflow'] = MagicMock()
-sys.modules['airflow.decorators'] = MagicMock()
-sys.modules['airflow.sdk'] = MagicMock()
-sys.modules['apache_airflow_providers_imednet'] = MagicMock()
-
-
-commit_a = "mock_commit_a"
-commit_b = "mock_commit_b"
-commit_id = "mock_commit_id"
-subject_data = {}
-api_response = {}
-
+_neo4j_driver = create_autospec(neo4j.Driver, instance=True)
+_neo4j_session = create_autospec(neo4j.Session, instance=True)
+_neo4j_session.__enter__.return_value = _neo4j_session
+_neo4j_driver.session.return_value = _neo4j_session
+_neo4j_patcher = patch("neo4j.GraphDatabase.driver", autospec=True, return_value=_neo4j_driver)
+_neo4j_patcher.start()
 """
 
 doctest_global_cleanup = """
-_duckdb_connect_patcher.stop()
-_cvs_patcher1.stop()
-_cvs_patcher2.stop()
-_cvs_patcher3.stop()
-_cvs_patcher4.stop()
-_export_patcher.stop()
-_reg_patcher.stop()
-_snowflake_patcher.stop()
-_wh_patcher.stop()
-_doc_patcher.stop()
-_graph_patcher.stop()
-_print_patcher.stop()
+_neo4j_patcher.stop()
+_mongo_patcher.stop()
+_sf_patcher.stop()
+_cached_loader_mod.DEFAULT_CACHE_DIR = _orig_cache_dir
+_sim_state.reset()
+os.chdir(_doctest_orig_cwd)
+_doctest_tmpdir.cleanup()
+with contextlib.suppress(OSError):
+    Path("/tmp/imednet_manifest.jsonl").unlink()
 """
 
 html_theme = "furo"

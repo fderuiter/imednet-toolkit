@@ -2,6 +2,7 @@ imednet\_workflows.uat package
 ==============================
 
 .. automodule:: imednet_workflows.uat
+   :noindex:
    :members:
    :show-inheritance:
 
@@ -40,6 +41,7 @@ imednet\_workflows.uat.orchestrator module
 ------------------------------------------
 
 .. automodule:: imednet_workflows.uat.orchestrator
+   :exclude-members: InvalidUATStateTransitionError, UATWorkflowState
    :members:
    :show-inheritance:
 

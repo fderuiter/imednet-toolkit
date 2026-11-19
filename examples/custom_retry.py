@@ -10,7 +10,7 @@ import httpx
 
 from imednet.auth.strategy import AuthStrategy
 from imednet.core.client import Client
-from imednet.core.retry import RetryPolicy, RetryState
+from imednet.core.retry import RetryConfig, RetryPolicy, RetryState
 from imednet.errors import RateLimitError, ServerError
 from imednet.utils import configure_json_logging
 
@@ -85,9 +85,11 @@ def main() -> None:
     client = MockClient(
         os.environ["IMEDNET_API_KEY"],
         os.environ["IMEDNET_SECURITY_KEY"],
-        retries=3,
-        backoff_factor=0.01,
-        retry_policy=RateLimitServerRetry(),
+        retry_config=RetryConfig(
+            retries=3,
+            backoff_factor=0.01,
+            retry_policy=RateLimitServerRetry(),
+        ),
     )
 
     try:

@@ -17,6 +17,8 @@ site_name = "SITE001"
 
 try:
     sdk = ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url)
+    if sdk.workflows is None:
+        raise RuntimeError("imednet-workflows plugin is not installed")
     workflow = sdk.workflows.query_management
 
     queries = workflow.get_queries_by_site(study_key=study_key, site_key=site_name)

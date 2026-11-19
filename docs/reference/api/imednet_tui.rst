@@ -2,6 +2,7 @@ imednet\_tui package
 ====================
 
 .. automodule:: imednet_tui
+   :noindex:
    :members:
    :show-inheritance:
 

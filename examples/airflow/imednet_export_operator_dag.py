@@ -16,7 +16,7 @@ default_args = {"start_date": datetime(2024, 1, 1)}
 
 with DAG(
     dag_id="imednet_export_example",
-    schedule_interval=None,
+    schedule=None,
     default_args=default_args,
     catchup=False,
 ) as dag:

@@ -53,7 +53,7 @@ To retrieve a configured SDK client to use in your custom operators or tasks, us
 from apache_airflow_providers_imednet.hooks import ImednetHook
 
 
-def my_task_logic():
+def my_task_logic() -> None:
     hook = ImednetHook(imednet_conn_id="imednet_default")
     # Retrieve the active ImednetSDK client using the standard BaseHook entry point:
     client = hook.get_conn()

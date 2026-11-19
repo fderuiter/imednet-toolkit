@@ -23,9 +23,9 @@ class MappingRule(ImednetBaseModel):
     target_field: str = Field(..., alias="targetField")
     source_form_key: str = Field(..., alias="sourceFormKey")
     source_variable_name: str = Field(..., alias="sourceVariableName")
-    fallback_value: str | None = Field(None, alias="fallbackValue")
-    business_logic: str | None = Field(None, alias="businessLogic")
-    is_baseline: bool = Field(False, alias="isBaseline")
+    fallback_value: str | None = Field(default=None, alias="fallbackValue")
+    business_logic: str | None = Field(default=None, alias="businessLogic")
+    is_baseline: bool = Field(default=False, alias="isBaseline")
     strict: bool = Field(default=False, alias="strict")
     strict_mode: bool = Field(default=False, alias="strictMode")
     strict_cdash: bool = Field(default=False, alias="strictCdash")
@@ -61,9 +61,9 @@ class WidgetConfig(ImednetBaseModel):
 class StudyConfiguration(ImednetBaseModel):
     """Serialized study reporting dashboard configuration."""
 
-    version: str = Field("1.0.0", alias="version")
+    version: str = Field(default="1.0.0", alias="version")
     study_key: str = Field(..., alias="studyKey")
-    reporting_profile: str = Field("general", alias="reportingProfile")
+    reporting_profile: str = Field(default="general", alias="reportingProfile")
     mappings: list[MappingRule] = Field(default_factory=list, alias="mappings")
     terminology_lookups: dict[str, dict[str, str]] = Field(
         default_factory=dict, alias="terminologyLookups"

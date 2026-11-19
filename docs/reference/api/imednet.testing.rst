@@ -2,6 +2,7 @@ imednet.testing package
 =======================
 
 .. automodule:: imednet.testing
+   :noindex:
    :members:
    :show-inheritance:
 

@@ -2,6 +2,7 @@ imednet.utils package
 =====================
 
 .. automodule:: imednet.utils
+   :noindex:
    :members:
    :show-inheritance:
 
@@ -19,6 +20,7 @@ imednet.utils.ast\_eval module
 ------------------------------
 
 .. automodule:: imednet.utils.ast_eval
+   :noindex:
    :members:
    :show-inheritance:
 
@@ -61,6 +63,7 @@ imednet.utils.job\_poller module
 --------------------------------
 
 .. automodule:: imednet.utils.job_poller
+   :exclude-members: InvalidJobStateError, InvalidJobTransitionError, InvalidStateTransitionError
    :members:
    :show-inheritance:
 

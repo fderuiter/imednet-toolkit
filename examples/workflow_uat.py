@@ -2,7 +2,7 @@ from imednet import ImednetSDK, load_config
 from imednet_workflows.uat import UATWorkflow
 
 
-def main():
+def main() -> None:
     try:
         cfg = load_config()
     except ValueError as e:

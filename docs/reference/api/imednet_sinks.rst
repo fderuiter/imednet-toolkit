@@ -2,6 +2,7 @@ imednet\_sinks package
 ======================
 
 .. automodule:: imednet_sinks
+   :noindex:
    :members:
    :show-inheritance:
 

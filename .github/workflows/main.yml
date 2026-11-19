@@ -100,6 +100,7 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       build_matrix: ${{ steps.set-matrix.outputs.build_matrix }}
+      run_docs: ${{ steps.set-matrix.outputs.run_docs }}
       run_integration: ${{ steps.filter.outputs.export_logic }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,6 +140,7 @@ jobs:
           echo "Impacted packages: $PLAN"
           echo "matrix=$(echo "$PLAN" | jq -c '.test')" >> "$GITHUB_OUTPUT"
           echo "build_matrix=$(echo "$PLAN" | jq -c '.build')" >> "$GITHUB_OUTPUT"
+          echo "run_docs=$(echo "$PLAN" | jq -r '.docs')" >> "$GITHUB_OUTPUT"
 
   scorecard:
     name: OpenSSF Scorecard
@@ -609,6 +611,7 @@ jobs:
   docs:
     name: Build Documentation
     needs: plan
+    if: needs.plan.outputs.run_docs == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -633,11 +636,14 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install uv hatch
-          uv sync --locked --all-extras
+          uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
       - name: Validate Showcases
         run: hatch run validate-showcases
+
+      - name: Type-check Documentation and Examples
+        run: hatch run typecheck-docs
 
       - name: Validate Documentation
         run: hatch run validate-docs

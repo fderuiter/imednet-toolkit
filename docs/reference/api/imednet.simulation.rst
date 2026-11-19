@@ -2,6 +2,7 @@ imednet.simulation package
 ==========================
 
 .. automodule:: imednet.simulation
+   :noindex:
    :members:
    :show-inheritance:
 

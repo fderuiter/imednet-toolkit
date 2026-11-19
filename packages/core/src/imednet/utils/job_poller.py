@@ -230,9 +230,9 @@ def evaluate_job_state(
         False if the job is still in progress.
 
     Raises:
-        InvalidJobStateError: If the job state string is unrecognized.
-        InvalidJobTransitionError: If the transition from previous_state to current state is invalid.
-        JobFailedError: If the job ended in a failed or cancelled state.
+        ~imednet.models.jobs.InvalidJobStateError: If the job state string is unrecognized.
+        ~imednet.models.jobs.InvalidJobTransitionError: If the transition from previous_state to current state is invalid.
+        ~imednet.utils.job_poller.JobFailedError: If the job ended in a failed or cancelled state.
     """
     current_state_val = getattr(job, "state", None)
     if isinstance(current_state_val, (str, JobState)):

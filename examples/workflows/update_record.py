@@ -37,7 +37,7 @@ try:
     if not job.batch_id:
         raise RuntimeError("Submission succeeded but no batch ID returned")
 
-    status = JobPoller(sdk.jobs.get, False).run(study_key, job.batch_id)
+    status = JobPoller(sdk.jobs.get).run(study_key, job.batch_id)
     print(f"Job {status.batch_id} finished with state: {status.state}")
 except Exception as e:
     print(f"Error creating record: {e}")

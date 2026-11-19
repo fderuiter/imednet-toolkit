@@ -17,7 +17,7 @@ Note: Ensure your environment variables (IMEDNET_API_KEY, IMEDNET_SECURITY_KEY) 
 """
 
 
-def main():
+def main() -> None:
     """TODO: Add docstring."""
     configure_json_logging()
 
@@ -27,14 +27,14 @@ def main():
             api_key=cfg.api_key, security_key=cfg.security_key, base_url=cfg.base_url
         )
 
-        studies = client.studies.list()
+        studies = list(client.studies.list())
         if not studies:
             print("No studies returned from API.")
             return
 
         for study in studies[:1]:
             study_key = study.study_key
-            record_revisions = client.record_revisions.list(study_key=study_key)
+            record_revisions = list(client.record_revisions.list(study_key=study_key))
             print(f"Record Revisions for study '{study_key}': {len(record_revisions)}")
             for rev in record_revisions[:5]:
                 print(f"- Revision ID: {rev.record_revision_id}, Record ID: {rev.record_id}")

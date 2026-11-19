@@ -19,3 +19,7 @@ Example
     subjects = [RegisterSubjectRequest(formKey="REG", siteName="SITE", data=RecordData({}))]
     job = workflow.register_subjects(study_key="STUDY", subjects=subjects)
     print(job)
+
+.. testoutput::
+
+    state=<JobState.COMPLETED: 'COMPLETED'> job_id='JOB-1' batch_id='BATCH-1' date_created='2026-11-15T00:00:00Z' date_finished='2026-11-15T00:00:00Z' date_started='2026-11-15T00:00:00Z'

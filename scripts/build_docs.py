@@ -51,12 +51,12 @@ def generate_adr_index(adr_dir: Path | None = None) -> None:
 def build_and_stage_wheels(
     repo_root: Path | None = None, wheels_dir: Path | None = None
 ) -> list[Path]:
-    """Build pure Python wheels for workspace packages and stage into docs/_static/wheels/."""
+    """Build pure Python wheels for workspace packages and stage into docs/_build/wheels/."""
     if repo_root is None:
         repo_root = Path(__file__).resolve().parent.parent
 
     if wheels_dir is None:
-        wheels_dir = repo_root / "docs" / "_static" / "wheels"
+        wheels_dir = repo_root / "docs" / "_build" / "wheels"
 
     wheels_dir.mkdir(parents=True, exist_ok=True)
 
@@ -95,6 +95,66 @@ def build_and_stage_wheels(
     return staged
 
 
+_REEXPORT_SUBMODULES: frozenset[str] = frozenset(
+    {
+        "imednet.models.engine",
+        "imednet.utils.ast_eval",
+    }
+)
+
+_REEXPORTED_MEMBERS_BY_MODULE: dict[str, str] = {
+    "imednet.utils.job_poller": (
+        "InvalidJobStateError, InvalidJobTransitionError, InvalidStateTransitionError"
+    ),
+    "imednet_workflows.uat.orchestrator": ("InvalidUATStateTransitionError, UATWorkflowState"),
+}
+
+
+def mark_reexport_stubs_noindex(api_dir: Path) -> None:
+    """Add :noindex: / :exclude-members: to package __init__ and re-export stubs."""
+    if not api_dir.exists():
+        return
+
+    automodule_pattern = re.compile(
+        r"^(\.\. automodule:: ([A-Za-z0-9_.]+)\n)((?:   :[A-Za-z0-9_-]+:.*\n?)+)",
+        re.MULTILINE,
+    )
+
+    for rst_file in sorted(api_dir.glob("*.rst")):
+        text = rst_file.read_text(encoding="utf-8")
+        has_children = "Subpackages\n-----------" in text or "Submodules\n----------" in text
+        first_seen = False
+
+        def _inject_noindex(match: re.Match[str], has_children: bool = has_children) -> str:
+            nonlocal first_seen
+            header = match.group(1)
+            mod_name = match.group(2)
+            opts_block = match.group(3)
+            is_first = not first_seen
+            first_seen = True
+
+            extra_opts: list[str] = []
+            should_noindex = (
+                (is_first and has_children)
+                or mod_name.startswith("imednet.spi.")
+                or mod_name in _REEXPORT_SUBMODULES
+            )
+            if should_noindex and ":noindex:" not in opts_block:
+                extra_opts.append("   :noindex:")
+
+            excluded = _REEXPORTED_MEMBERS_BY_MODULE.get(mod_name)
+            if excluded and ":exclude-members:" not in opts_block:
+                extra_opts.append(f"   :exclude-members: {excluded}")
+
+            if extra_opts:
+                return header + "\n".join(extra_opts) + "\n" + opts_block
+            return match.group(0)
+
+        updated = automodule_pattern.sub(_inject_noindex, text)
+        if updated != text:
+            rst_file.write_text(updated, encoding="utf-8")
+
+
 def main():
     api_dir = Path("docs/reference/api")
 
@@ -125,11 +185,11 @@ def main():
 
     # Other packages
     packages_dir = Path("packages")
-    for pkg in packages_dir.iterdir():
+    for pkg in sorted(packages_dir.iterdir(), key=lambda p: p.name):
         if pkg.is_dir() and pkg.name != "core":
             src_dir = pkg / "src"
             if src_dir.exists():
-                subdirs = [d for d in src_dir.iterdir() if d.is_dir()]
+                subdirs = sorted([d for d in src_dir.iterdir() if d.is_dir()], key=lambda p: p.name)
                 if subdirs:
                     target_dir = subdirs[0]
                     run_command(
@@ -146,6 +206,8 @@ def main():
                         env=env,
                     )
 
+    mark_reexport_stubs_noindex(api_dir)
+
     print("Generating ADR index...")
     generate_adr_index()
 
@@ -153,7 +215,8 @@ def main():
     run_command([sys.executable, "scripts/generate_rest_reference.py"])
 
     print("Building and staging workspace wheels for interactive documentation...")
-    build_and_stage_wheels()
+    staged_wheels_dir = Path("docs/_build/wheels")
+    build_and_stage_wheels(wheels_dir=staged_wheels_dir)
 
     print("Validating mermaid diagrams...")
     run_command([sys.executable, "scripts/validate_diagrams.py"])
@@ -190,13 +253,10 @@ def main():
 
     # Ensure staged wheels are present in docs/_build/html/_static/wheels/
     html_wheels_dir = Path("docs/_build/html/_static/wheels")
-    static_wheels_dir = Path("docs/_static/wheels")
-    if static_wheels_dir.exists():
+    if staged_wheels_dir.exists():
         html_wheels_dir.mkdir(parents=True, exist_ok=True)
-        for whl in static_wheels_dir.glob("*.whl"):
-            target_whl = html_wheels_dir / whl.name
-            if not target_whl.exists():
-                shutil.copy2(whl, target_whl)
+        for whl in staged_wheels_dir.glob("*.whl"):
+            shutil.copy2(whl, html_wheels_dir / whl.name)
 
 
 if __name__ == "__main__":

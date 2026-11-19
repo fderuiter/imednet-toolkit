@@ -2,6 +2,7 @@ apache\_airflow\_providers\_imednet package
 ===========================================
 
 .. automodule:: apache_airflow_providers_imednet
+   :noindex:
    :members:
    :show-inheritance:
 

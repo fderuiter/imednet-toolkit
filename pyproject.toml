@@ -75,7 +75,7 @@ warn_unused_ignores = false
 warn_redundant_casts = false
 ignore_missing_imports = true
 plugins = []
-exclude = '^(examples/.*|tests/.*|packages/.*/tests/.*|sandbox/.*)$'
+exclude = '^(tests/.*|packages/.*/tests/.*|sandbox/.*)$'
 
 [[tool.mypy.overrides]]
 module = [
@@ -184,7 +184,9 @@ verify-static = [
     "mypy packages/core/src/imednet",
     "mypy packages/plugins-workflows/src/imednet_workflows",
     "mypy packages/providers-airflow/src/apache_airflow_providers_imednet",
+    "mypy packages/plugins-sinks/src/imednet_sinks",
     "mypy packages/plugins-tui/src/imednet_tui",
+    "mypy examples",
     "mypy tests/typing/endpoint_contracts.py",
 ]
 verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_tui --cov-fail-under=90"

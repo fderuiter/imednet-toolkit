@@ -2,6 +2,7 @@ imednet\_workflows package
 ==========================
 
 .. automodule:: imednet_workflows
+   :noindex:
    :members:
    :show-inheritance:
 

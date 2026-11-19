@@ -2,6 +2,7 @@ imednet.errors package
 ======================
 
 .. automodule:: imednet.errors
+   :noindex:
    :members:
    :show-inheritance:
 

@@ -2,6 +2,7 @@ imednet.endpoints package
 =========================
 
 .. automodule:: imednet.endpoints
+   :noindex:
    :members:
    :show-inheritance:
 

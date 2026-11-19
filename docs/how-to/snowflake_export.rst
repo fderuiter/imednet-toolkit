@@ -79,6 +79,10 @@ batching, staging, and cleanup automatically:
    rows_loaded = export_to_snowflake(sdk, "MY_STUDY", config=snowflake_cfg)
    print(f"Loaded {rows_loaded} rows")
 
+.. testoutput::
+
+   Loaded 2 rows
+
 Advanced usage — ``SnowflakeExportSink`` directly
 --------------------------------------------------
 
@@ -114,7 +118,11 @@ per-batch control, custom ``batch_id`` keys, or integration with a workflow engi
    with SnowflakeExportSink(config=snowflake_cfg_advanced) as sink:
        for i, batch in enumerate(iter_batches(records, snowflake_cfg_advanced.batch_size)):
            rows = sink.write_batch(batch, batch_id=f"MY_STUDY/records/{i}")
-           print(f"  batch {i}: {rows} rows")
+           print(f"batch {i}: {rows} rows")
+
+.. testoutput::
+
+   batch 0: 2 rows
 
 Manifest output
 ---------------
@@ -212,12 +220,15 @@ Configuration reference
 -----------------------
 
 .. autoclass:: imednet_sinks.warehouse.SnowflakeSinkConfig
+   :noindex:
    :members:
    :undoc-members:
 
 .. autofunction:: imednet_sinks.warehouse.export_to_snowflake
+   :noindex:
 
 .. autoclass:: imednet_sinks.warehouse.SnowflakeExportSink
+   :noindex:
    :members:
 
 Out of scope

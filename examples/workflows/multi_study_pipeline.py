@@ -26,31 +26,32 @@ from imednet import ImednetSDK, MultiStudyOrchestrator
 from imednet.utils.json_logging import configure_json_logging
 
 configure_json_logging(level=logging.INFO)
-logger = logging.getLogger(__name__)
+pipeline_logger = logging.getLogger(__name__)
 
 
 def extract_study_data(
     study_key: str,
-    sdk: ImednetSDK,
-    study_logger: Any,
+    sdk_client: ImednetSDK,
+    logger: Any,
+    *args: Any,
     **kwargs: Any,
-) -> dict:
+) -> dict[str, int]:
     """Pipeline function: extract subject and record counts for a study.
 
     This function conforms to the StudyWorkerCallable protocol. It is called
     concurrently for each study resolved by the orchestrator.
     """
-    study_logger.info("Starting data extraction")
+    logger.info("Starting data extraction")
 
-    with sdk.study_context(study_key):
-        subjects = sdk.subjects.list(study_key=study_key)
-        records = sdk.records.list(study_key=study_key)
+    with sdk_client.study_context(study_key):
+        subjects = sdk_client.subjects.list(study_key=study_key)
+        records = sdk_client.records.list(study_key=study_key)
 
     result = {
         "subject_count": len(list(subjects)),
         "record_count": len(list(records)),
     }
-    study_logger.info("Extraction complete: %s", result)
+    logger.info("Extraction complete: %s", result)
     return result
 
 
@@ -74,7 +75,7 @@ def main() -> int:
     success_count = sum(1 for r in results.values() if r["status"] == "SUCCESS")
     failure_count = sum(1 for r in results.values() if r["status"] == "FAILED")
 
-    logger.info(
+    pipeline_logger.info(
         "Pipeline complete: %d succeeded, %d failed across %d studies.",
         success_count,
         failure_count,
@@ -85,9 +86,9 @@ def main() -> int:
         status = result["status"]
         duration = result["duration_seconds"]
         if status == "SUCCESS":
-            logger.info("[%s] SUCCESS in %.2fs: %s", study_key, duration, result["data"])
+            pipeline_logger.info("[%s] SUCCESS in %.2fs: %s", study_key, duration, result["data"])
         else:
-            logger.error("[%s] FAILED in %.2fs: %s", study_key, duration, result["error"])
+            pipeline_logger.error("[%s] FAILED in %.2fs: %s", study_key, duration, result["error"])
 
     return 0 if failure_count == 0 else 1
 

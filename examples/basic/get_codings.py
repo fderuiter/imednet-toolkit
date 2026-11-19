@@ -28,7 +28,7 @@ The script will output:
 """
 
 
-def main():
+def main() -> None:
     """TODO: Add docstring."""
     configure_json_logging()
 
@@ -38,14 +38,14 @@ def main():
             api_key=cfg.api_key, security_key=cfg.security_key, base_url=cfg.base_url
         )
 
-        studies = client.studies.list()
+        studies = list(client.studies.list())
         if not studies:
             print("No studies returned from API.")
             return
 
         for study in studies[:1]:
             study_key = study.study_key
-            codings = client.codings.list(study_key=study_key)
+            codings = list(client.codings.list(study_key=study_key))
             print(f"Codings for study '{study_key}': {len(codings)}")
             for coding in codings[:5]:
                 print(f"- Coding ID: {coding.coding_id}, Variable: {coding.variable}")

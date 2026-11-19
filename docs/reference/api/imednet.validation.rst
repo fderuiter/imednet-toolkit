@@ -2,6 +2,7 @@ imednet.validation package
 ==========================
 
 .. automodule:: imednet.validation
+   :noindex:
    :members:
    :show-inheritance:
 

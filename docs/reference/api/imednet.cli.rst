@@ -2,6 +2,7 @@ imednet.cli package
 ===================
 
 .. automodule:: imednet.cli
+   :noindex:
    :members:
    :show-inheritance:
 

@@ -13,10 +13,12 @@ from scripts.validate_showcases import (
     main,
     stage_wheels,
     validate_documentation_literal_includes,
+    validate_markdown_readmes,
     validate_python_slice,
     validate_python_syntax,
     validate_quick_start_ast_structure,
     validate_showcase_ast_and_imports,
+    validate_showcase_js_snippets,
     validate_staged_wheels,
 )
 from sphinx.config import Config
@@ -236,7 +238,7 @@ def test_validate_staged_wheels_missing_required_module(tmp_path: Path) -> None:
 def test_validate_staged_wheels_workspace_integration(tmp_path: Path) -> None:
     """Verify that staged wheels in repo pass validation and simulated Pyodide import."""
     repo_root = Path(__file__).resolve().parents[2]
-    wheels_dir = repo_root / "docs" / "_static" / "wheels"
+    wheels_dir = repo_root / "docs" / "_build" / "wheels"
 
     # Stage wheels if not already staged
     if not list(wheels_dir.glob("*.whl")):
@@ -932,3 +934,71 @@ def test_symbol_validation_skips_uninstalled_optional_drivers(
 
     errors = validate_showcase_ast_and_imports(examples_dir)
     assert not errors, f"Expected optional drivers to be skipped cleanly, got: {errors}"
+
+
+def test_missing_workspace_symbol_in_showcase_js_detected(tmp_path: Path) -> None:
+    """Verify showcase.js SDK template validation fails when importing a nonexistent workspace symbol."""
+    docs_dir = tmp_path / "docs"
+    static_dir = docs_dir / "_static"
+    static_dir.mkdir(parents=True)
+    showcase_js = static_dir / "showcase.js"
+    showcase_js.write_text(
+        "const SNIPPETS = {\n"
+        "  sdk: {\n"
+        "    records: `from imednet import NonExistentShowcaseSymbol\\nprint(1)`,\n"
+        "    queries: `from apache_airflow_providers_imednet.operators.export import MissingOperator\\n`,\n"
+        "  },\n"
+        "  rest: {\n"
+        "    records: `GET /api/v1/edc/studies HTTP/1.1`,\n"
+        "  },\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_showcase_js_snippets(docs_dir)
+    assert len(errors) == 2
+    assert any(
+        "Missing symbol 'NonExistentShowcaseSymbol' in module 'imednet'" in e for e in errors
+    )
+    assert any(
+        "Missing symbol 'MissingOperator' in module 'apache_airflow_providers_imednet.operators.export'"
+        in e
+        for e in errors
+    )
+
+
+def test_missing_workspace_symbol_in_markdown_guides_and_readmes_detected(tmp_path: Path) -> None:
+    """Verify Markdown guides and package READMEs fail when importing missing workspace symbols."""
+    repo_root = tmp_path / "repo"
+    docs_dir = repo_root / "docs"
+    archived_dir = docs_dir / "superpowers"
+    pkg_dir = repo_root / "packages" / "providers-airflow"
+    docs_dir.mkdir(parents=True)
+    archived_dir.mkdir(parents=True)
+    pkg_dir.mkdir(parents=True)
+
+    (docs_dir / "guide.md").write_text(
+        "# Guide\n\n```python\nfrom imednet_workflows import MissingWorkflowClass\n```\n",
+        encoding="utf-8",
+    )
+    # Archived plans under docs/superpowers must be skipped
+    (archived_dir / "old_plan.md").write_text(
+        "```python\nfrom imednet import ArchivedMissingSymbol\n```\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "README.md").write_text(
+        "# Provider\n\n```python\nfrom imednet_tui import MissingTuiWidget\n```\n",
+        encoding="utf-8",
+    )
+
+    doc_errors = validate_documentation_literal_includes(docs_dir, repo_root)
+    assert len(doc_errors) == 2
+    assert any(
+        "Missing symbol 'MissingWorkflowClass' in module 'imednet_workflows'" in e
+        for e in doc_errors
+    )
+    assert any("Missing symbol 'MissingTuiWidget' in module 'imednet_tui'" in e for e in doc_errors)
+
+    readme_errors = validate_markdown_readmes(repo_root)
+    assert len(readme_errors) == 1
+    assert "Missing symbol 'MissingTuiWidget' in module 'imednet_tui'" in readme_errors[0]

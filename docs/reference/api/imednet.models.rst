@@ -2,6 +2,7 @@ imednet.models package
 ======================
 
 .. automodule:: imednet.models
+   :noindex:
    :members:
    :show-inheritance:
 
@@ -33,6 +34,7 @@ imednet.models.engine module
 ----------------------------
 
 .. automodule:: imednet.models.engine
+   :noindex:
    :members:
    :show-inheritance:
 

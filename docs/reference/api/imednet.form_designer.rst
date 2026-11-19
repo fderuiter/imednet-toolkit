@@ -2,6 +2,7 @@ imednet.form\_designer package
 ==============================
 
 .. automodule:: imednet.form_designer
+   :noindex:
    :members:
    :show-inheritance:
 

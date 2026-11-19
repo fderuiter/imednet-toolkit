@@ -1,4 +1,4 @@
-"""Compute impacted monorepo packages from a list of changed file paths."""
+"""Compute impacted monorepo packages and documentation gates from changed file paths."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 _IGNORED_PREFIXES = ("docs/", "examples/", ".agents/")
+_AGENT_OR_ARCHIVE_PREFIXES = (".agents/", "docs/agents/", "docs/superpowers/")
+_AGENT_ROOT_FILES = frozenset({"AGENTS.md", "CLAUDE.md"})
 
 
 def _normalize_path(file_path: str) -> str:
@@ -27,6 +29,20 @@ def is_ignored_path(file_path: str) -> bool:
     return normalized.startswith(_IGNORED_PREFIXES) or normalized.endswith(".md")
 
 
+def is_docs_impact_path(file_path: str) -> bool:
+    """Return True when a changed path requires showcase validation and docs type-checking."""
+    normalized = _normalize_path(file_path)
+    if not normalized:
+        return False
+    if normalized in _AGENT_ROOT_FILES or normalized.startswith(_AGENT_OR_ARCHIVE_PREFIXES):
+        return False
+    if normalized.startswith(("docs/", "examples/")):
+        return True
+    if normalized == "README.md" or re.match(r"^packages/[^/]+/README\.md$", normalized):
+        return True
+    return normalized.endswith(".md")
+
+
 def parse_dependency_name(dep_str: str) -> str:
     """Extract the base package name from a PEP 508 dependency string.
 
@@ -41,19 +57,21 @@ def parse_dependency_name(dep_str: str) -> str:
 def plan_ci_impact(
     changed_files: Sequence[str],
     packages: Mapping[str, Mapping[str, Any]],
-) -> dict[str, list[str]]:
-    """Determine which monorepo packages must build and test for changed paths."""
+) -> dict[str, Any]:
+    """Determine which monorepo packages and documentation checks must run for changed paths."""
     cleaned_files = [line.strip() for line in changed_files if line.strip()]
 
-    def fallback() -> dict[str, list[str]]:
+    def fallback() -> dict[str, Any]:
         all_pkgs = list(packages.keys())
-        return {"test": all_pkgs, "build": list(all_pkgs)}
+        return {"test": all_pkgs, "build": list(all_pkgs), "docs": True}
 
     if not cleaned_files:
         return fallback()
 
+    docs_impacted = any(is_docs_impact_path(path) for path in cleaned_files)
+
     if all(is_ignored_path(path) for path in cleaned_files):
-        return {"test": [], "build": []}
+        return {"test": [], "build": [], "docs": docs_impacted}
 
     name_to_dir = {
         str(info["name"]): dir_name for dir_name, info in packages.items() if info.get("name")
@@ -75,6 +93,7 @@ def plan_ci_impact(
                     test_only_impacted.add(changed_pkg_dir)
                 else:
                     build_impacted.add(changed_pkg_dir)
+                    docs_impacted = True
                 continue
         return fallback()
 
@@ -93,7 +112,11 @@ def plan_ci_impact(
                     break
 
     test_impacted = behavior_changed.union(test_only_impacted)
-    return {"build": list(build_impacted), "test": list(test_impacted)}
+    return {
+        "build": list(build_impacted),
+        "test": list(test_impacted),
+        "docs": docs_impacted,
+    }
 
 
 def main() -> None:

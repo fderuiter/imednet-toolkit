@@ -19,6 +19,8 @@ study_key = "XXXXXXXXXX"
 
 try:
     sdk = ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url)
+    if sdk.workflows is None:
+        raise RuntimeError("imednet-workflows plugin is not installed")
     workflow = sdk.workflows.query_management
 
     open_queries = workflow.get_open_queries(study_key)

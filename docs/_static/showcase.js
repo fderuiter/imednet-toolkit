@@ -256,7 +256,7 @@
             records: `# Extract clinical records into pandas DataFrame\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\ndf = client.records.to_dataframe(\n    study_key="STUDY-101",\n    flatten=True\n)\nprint(df.head())`,
             studies: `# Query active clinical trials\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nstudies = client.studies.list(status="ACTIVE")\nfor s in studies:\n    print(f"{s.study_key}: {s.study_name} ({s.study_type})")`,
             forms: `# Fetch study Case Report Form (CRF) schemas\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nforms = client.forms.list(study_key="STUDY-101")\nfor f in forms:\n    print(f"{f.form_name} ({f.form_key})")`,
-            queries: `# Monitor clinical queries and discrepancy flags\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nqueries = client.queries.list(\n    study_key="STUDY-101",\n    status="OPEN"\n)\nprint(f"Open queries: {len(queries)}")`
+            queries: `# Monitor clinical queries and discrepancy flags\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nqueries = list(client.queries.list(\n    study_key="STUDY-101",\n    status="OPEN"\n))\nprint(f"Open queries: {len(queries)}")`
         },
         rest: {
             records: `GET /api/v1/edc/studies/STUDY-101/records?size=10 HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,

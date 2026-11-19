@@ -39,6 +39,10 @@ table and query it immediately:
    conn = duckdb.connect("./clinical.duckdb", read_only=True)
    print(conn.execute("SELECT COUNT(*) FROM study_records").fetchone())
 
+.. testoutput::
+
+   (2,)
+
 `export_to_duckdb_by_form`
 --------------------------
 
@@ -56,6 +60,10 @@ form key:
 
    conn = duckdb.connect("./clinical_by_form.duckdb", read_only=True)
    print(conn.execute("SHOW TABLES").fetchall())
+
+.. testoutput::
+
+   [('F_DM',), ('F_VS',)]
 
 Hive-partitioned Parquet for multi-study workloads
 ---------------------------------------------------
@@ -84,6 +92,11 @@ DuckDB query with Hive partition discovery and schema union:
 .. testcode::
 
    import duckdb
+   from imednet import ImednetSDK
+   from imednet.integrations import export_to_hive_parquet
+
+   sdk = ImednetSDK(api_key="mock", security_key="mock")
+   export_to_hive_parquet(sdk, "MY_STUDY", "./lake")
 
    conn = duckdb.connect()
    rows = conn.execute(
@@ -96,6 +109,10 @@ DuckDB query with Hive partition discovery and schema union:
    ).fetchall()
    print(rows)
 
+.. testoutput::
+
+   [('MY_STUDY', 'F_DM', 1), ('MY_STUDY', 'F_VS', 1)]
+
 You can also generate the query string via
 :func:`imednet.integrations.hive_parquet_query`:
 
@@ -105,7 +122,12 @@ You can also generate the query string via
    from imednet.integrations import hive_parquet_query
 
    conn = duckdb.connect()
-   print(conn.execute(hive_parquet_query("./lake")).fetchdf())
+   df = conn.execute(hive_parquet_query("./lake")).fetchdf()
+   print(len(df), sorted(df["form_key"].tolist()))
+
+.. testoutput::
+
+   2 ['F_DM', 'F_VS']
 
 `DuckDBIngestionWorkflow`
 -------------------------

@@ -23,7 +23,7 @@ Usage:
 """
 
 
-def main():
+def main() -> None:
     """TODO: Add docstring."""
     configure_json_logging()
 
@@ -32,7 +32,7 @@ def main():
         with ImednetClient(
             api_key=cfg.api_key, security_key=cfg.security_key, base_url=cfg.base_url
         ) as client:
-            studies = client.studies.list()
+            studies = list(client.studies.list())
             print("Studies found:")
             for study in studies[:5]:
                 print(f"- Name: {study.study_name}, Key: {study.study_key}")

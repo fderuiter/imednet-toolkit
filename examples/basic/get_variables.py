@@ -53,7 +53,7 @@ Raises:
 """
 
 
-def main():
+def main() -> None:
     """TODO: Add docstring."""
     configure_json_logging()
 
@@ -63,7 +63,7 @@ def main():
             api_key=cfg.api_key, security_key=cfg.security_key, base_url=cfg.base_url
         )
 
-        studies = client.studies.list()
+        studies = list(client.studies.list())
         print(f"Studies found: {len(studies)}")
         if not studies:
             print("No studies returned from API.")
@@ -71,7 +71,7 @@ def main():
 
         for study in studies[:1]:
             print(f"- Name: {study.study_name}, Key: {study.study_key}")
-            variables = client.variables.list(study_key=study.study_key)
+            variables = list(client.variables.list(study_key=study.study_key))
             print(f"Variables for study '{study.study_key}': {len(variables)}")
             if not variables:
                 print("No variables returned for this study.")

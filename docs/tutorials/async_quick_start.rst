@@ -64,6 +64,13 @@ List studies asynchronously and poll a job:
 
    asyncio.run(main())
 
+.. testoutput::
+
+   Demo Oncology Trial (DEMO-STUDY)
+   Primary Clinical Trial (MY_STUDY)
+   Benchmark Validation Study (STUDY)
+   state=<JobState.COMPLETED: 'COMPLETED'> job_id='JOB-BATCH' batch_id='BATCH' date_created='2026-01-01T00:00:00Z' date_finished='2026-01-01T00:00:00Z' date_started='2026-01-01T00:00:00Z' results={'status': 'Completed'} record_total_count=1 record_success_count=1 record_failure_count=0 result_error=None progress=100 result_url=None
+
 For synchronous usage, see :doc:`quick_start`.
 
 The example script :doc:`examples/async_quick_start` provides a runnable version that

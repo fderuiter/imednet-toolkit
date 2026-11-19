@@ -149,6 +149,7 @@ load the plugin automatically:
     from imednet import ImednetSDK
 
     sdk = ImednetSDK(api_key="...", security_key="...")
+    assert sdk.workflows is not None
     records = sdk.workflows.data_extraction.extract_records_by_criteria("MY_STUDY")
 
 Error handling
@@ -179,11 +180,14 @@ API reference
 -------------
 
 .. autoclass:: imednet.plugins.PluginProtocol
+   :noindex:
    :members:
    :undoc-members:
 
 .. autoclass:: imednet.plugins.WorkflowsNamespaceProtocol
+   :noindex:
    :members:
    :undoc-members:
 
 .. autoexception:: imednet.errors.PluginLoadError
+   :noindex:

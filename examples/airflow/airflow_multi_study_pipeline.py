@@ -43,7 +43,7 @@ def _safe_study_path_fragment(study_key: str) -> str:
 
 with DAG(
     dag_id="imednet_multi_study_reference",
-    schedule_interval=None,
+    schedule=None,
     default_args=default_args,
     catchup=False,
     max_active_runs=1,

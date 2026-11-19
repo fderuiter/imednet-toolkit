@@ -2,6 +2,7 @@ imednet.orchestration package
 =============================
 
 .. automodule:: imednet.orchestration
+   :noindex:
    :members:
    :show-inheritance:
 

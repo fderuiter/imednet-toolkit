@@ -2,6 +2,7 @@ imednet.auth package
 ====================
 
 .. automodule:: imednet.auth
+   :noindex:
    :members:
    :show-inheritance:
 

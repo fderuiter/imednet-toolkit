@@ -53,6 +53,9 @@ LITERALINCLUDE_PATTERN = re.compile(r"^\s*\.\.\s+literalinclude::\s+(\S+)")
 RST_PYTHON_BLOCK_PATTERN = re.compile(
     r"^(\s*)\.\.\s+(?:testcode|code-block)::(?:\s+(python|py))?\s*$"
 )
+MD_FENCE_OPEN_PATTERN = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([A-Za-z0-9_+-]+)?(?:\s+.*)?$")
+SHOWCASE_SDK_BLOCK_PATTERN = re.compile(r"\bsdk\s*:\s*\{(.*?)\n\s*\}", re.DOTALL)
+SHOWCASE_ENTRY_PATTERN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*`((?:\\`|[^`])*)`", re.DOTALL)
 
 
 def configure_sys_path(repo_root: Path) -> None:
@@ -581,6 +584,151 @@ def _validate_inline_rst_python_blocks(doc_file: Path, doc_lines: list[str]) -> 
     return errors
 
 
+def _validate_markdown_python_blocks(doc_file: Path, doc_lines: list[str]) -> list[str]:
+    """Validate syntax and workspace symbol imports inside fenced Markdown Python blocks."""
+    errors: list[str] = []
+    idx = 0
+    total = len(doc_lines)
+
+    while idx < total:
+        open_match = MD_FENCE_OPEN_PATTERN.match(doc_lines[idx])
+        if not open_match:
+            idx += 1
+            continue
+
+        fence_indent = len(open_match.group(1))
+        fence_marker = open_match.group(2)
+        lang = (open_match.group(3) or "").lower()
+        fence_lineno = idx + 1
+        idx += 1
+
+        fence_char = fence_marker[0]
+        fence_len = len(fence_marker)
+        block_start_idx = idx
+        block_lines: list[str] = []
+
+        while idx < total:
+            curr = doc_lines[idx]
+            stripped = curr.lstrip()
+            if (
+                stripped.startswith(fence_char * fence_len)
+                and not stripped.strip(fence_char).strip()
+            ):
+                idx += 1
+                break
+            block_lines.append(curr[fence_indent:] if len(curr) >= fence_indent else curr)
+            idx += 1
+
+        if lang not in ("python", "py"):
+            continue
+
+        snippet = "\n".join(block_lines)
+        if not snippet.strip():
+            continue
+
+        try:
+            tree = ast.parse(textwrap.dedent(snippet), filename=str(doc_file))
+        except SyntaxError as exc:
+            line_offset = (exc.lineno or 1) - 1
+            errors.append(
+                f"{doc_file}:{block_start_idx + 1 + line_offset}: "
+                f"Markdown Python fence syntax error: {exc.msg}"
+            )
+            continue
+
+        for rel_lineno, reason in validate_ast_imports(tree, workspace_only=True):
+            abs_lineno = block_start_idx + max(rel_lineno, 1)
+            errors.append(
+                f"{doc_file}:{abs_lineno}: {reason} (in code fence at line {fence_lineno})"
+            )
+
+    return errors
+
+
+def validate_showcase_js_snippets(docs_dir: Path, repo_root: Path | None = None) -> list[str]:
+    """Validate Python syntax and workspace symbol imports in docs/_static/showcase.js SDK templates."""
+    showcase_js = docs_dir / "_static" / "showcase.js"
+    if not showcase_js.is_file():
+        return []
+
+    configure_sys_path(Path(__file__).resolve().parent.parent)
+    if repo_root is not None:
+        configure_sys_path(repo_root)
+
+    try:
+        content = showcase_js.read_text(encoding="utf-8")
+    except Exception as exc:
+        return [f"{showcase_js}: Failed to read file: {exc}"]
+
+    sdk_match = SHOWCASE_SDK_BLOCK_PATTERN.search(content)
+    if not sdk_match:
+        return [f"{showcase_js}: Missing SNIPPETS.sdk block"]
+
+    errors: list[str] = []
+    sdk_block_offset = content[: sdk_match.start(1)].count("\n")
+    entries = list(SHOWCASE_ENTRY_PATTERN.finditer(sdk_match.group(1)))
+    if not entries:
+        return [f"{showcase_js}: No SDK snippet templates found in SNIPPETS.sdk"]
+
+    for entry_match in entries:
+        scenario = entry_match.group(1)
+        raw_body = entry_match.group(2)
+        entry_lineno = sdk_block_offset + sdk_match.group(1)[: entry_match.start()].count("\n") + 1
+        decoded = (
+            raw_body.replace("\\`", "`")
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace('\\"', '"')
+            .replace("\\'", "'")
+            .strip()
+        )
+        if not decoded:
+            errors.append(f"{showcase_js}:{entry_lineno}: Empty SDK template for '{scenario}'")
+            continue
+
+        try:
+            tree = ast.parse(decoded, filename=f"{showcase_js}:{scenario}")
+        except SyntaxError as exc:
+            errors.append(
+                f"{showcase_js}:{entry_lineno}: Syntax error in SDK template '{scenario}': "
+                f"{exc.msg} (line {exc.lineno})"
+            )
+            continue
+
+        for snippet_lineno, reason in validate_ast_imports(tree):
+            errors.append(
+                f"{showcase_js}:{entry_lineno}: {reason} "
+                f"(in SDK template '{scenario}', line {snippet_lineno})"
+            )
+
+    return errors
+
+
+def validate_markdown_readmes(repo_root: Path) -> list[str]:
+    """Validate Python code fences in root README.md and packages/*/README.md."""
+    configure_sys_path(Path(__file__).resolve().parent.parent)
+    configure_sys_path(repo_root)
+
+    errors: list[str] = []
+    candidates: list[Path] = []
+    root_readme = repo_root / "README.md"
+    if root_readme.is_file():
+        candidates.append(root_readme)
+    packages_dir = repo_root / "packages"
+    if packages_dir.is_dir():
+        candidates.extend(sorted(packages_dir.glob("*/README.md")))
+
+    for md_file in candidates:
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            errors.append(f"{md_file}: Failed to read file: {exc}")
+            continue
+        errors.extend(_validate_markdown_python_blocks(md_file, content.splitlines()))
+
+    return errors
+
+
 def validate_documentation_literal_includes(
     docs_dir: Path, repo_root: Path | None = None
 ) -> list[str]:
@@ -703,6 +851,12 @@ def validate_documentation_literal_includes(
 
         if doc_file.suffix == ".rst":
             errors.extend(_validate_inline_rst_python_blocks(doc_file, doc_lines))
+        elif doc_file.suffix == ".md":
+            errors.extend(_validate_markdown_python_blocks(doc_file, doc_lines))
+
+    errors.extend(validate_showcase_js_snippets(docs_dir, repo_root))
+    if repo_root is not None:
+        errors.extend(validate_markdown_readmes(repo_root))
 
     return errors
 
@@ -801,7 +955,7 @@ def validate_staged_wheels(
 def stage_wheels(repo_root: Path, wheels_dir: Path | None = None) -> list[Path]:
     """Build and stage pure Python wheels for workspace packages."""
     if wheels_dir is None:
-        wheels_dir = repo_root / "docs" / "_static" / "wheels"
+        wheels_dir = repo_root / "docs" / "_build" / "wheels"
 
     wheels_dir.mkdir(parents=True, exist_ok=True)
     uv_bin = shutil.which("uv") or "uv"
@@ -856,7 +1010,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--wheels-dir",
         type=Path,
         default=None,
-        help="Path to staged wheels directory (defaults to <docs_dir>/_static/wheels)",
+        help="Path to staged wheels directory (defaults to <docs_dir>/_build/wheels)",
     )
     parser.add_argument(
         "--skip-wheels",
@@ -872,7 +1026,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo_root = args.root_dir or Path(__file__).resolve().parent.parent
     examples_dir = args.examples_dir or (repo_root / "examples")
     docs_dir = args.docs_dir or (repo_root / "docs")
-    wheels_dir = args.wheels_dir or (docs_dir / "_static" / "wheels")
+    wheels_dir = args.wheels_dir or (docs_dir / "_build" / "wheels")
 
     configure_sys_path(repo_root)
 
