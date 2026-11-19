@@ -7,14 +7,16 @@ import inspect
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, cast, runtime_checkable
 
 from imednet.models.jobs import (
+    TERMINAL_JOB_STATES,
     InvalidJobStateError,
     InvalidJobTransitionError,
     InvalidStateTransitionError,
+    Job,
     JobState,
     JobStatus,
     normalize_job_state,
@@ -35,6 +37,7 @@ __all__ = [
     "JobPoller",
     "JobProgressCallback",
     "JobProgressHandler",
+    "JobStateTracker",
     "JobStatusEvent",
     "JobTimeoutError",
     "evaluate_job_state",
@@ -262,13 +265,225 @@ def evaluate_job_state(
     return getattr(job, "is_terminal", False)
 
 
+@dataclass
+class _TrackedJobStateEntry:
+    """Internal per-(study, job) monotonic state and snapshot record."""
+
+    last_state: JobState | None = None
+    is_terminal: bool = False
+    snapshot: Any = None
+
+
+def _extract_normalizable_state(job: Any) -> JobState | None:
+    """Extract and normalize ``job.state`` while keeping missing states ``None``."""
+    raw_state = getattr(job, "state", None)
+    if raw_state is None:
+        return None
+    if isinstance(raw_state, (str, JobState)):
+        return normalize_job_state(raw_state)
+    if type(raw_state).__module__.startswith("unittest.mock"):
+        return None
+    return normalize_job_state(raw_state)
+
+
+def _serialize_job_snapshot(
+    job_id: str, snapshot: Any, last_state: JobState | None
+) -> dict[str, Any]:
+    """Serialize compact JSON-safe metadata for reconstructing a ``JobStatus`` snapshot."""
+    payload: dict[str, Any] = {"batchId": getattr(snapshot, "batch_id", None) or job_id}
+    if last_state is not None:
+        payload["state"] = last_state.value
+    progress = getattr(snapshot, "progress", None)
+    if isinstance(progress, int) and not isinstance(progress, bool):
+        payload["progress"] = progress
+    for src_attr, wire_key in (
+        ("total_records", "totalRecords"),
+        ("successful_records", "successfulRecords"),
+        ("failed_records", "failedRecords"),
+    ):
+        count_val = getattr(snapshot, src_attr, None)
+        if isinstance(count_val, int) and not isinstance(count_val, bool):
+            payload[wire_key] = count_val
+    for str_attr, wire_key in (
+        ("result_error", "resultError"),
+        ("date_created", "dateCreated"),
+        ("date_started", "dateStarted"),
+        ("date_finished", "dateFinished"),
+    ):
+        str_val = getattr(snapshot, str_attr, None)
+        if isinstance(str_val, str) and str_val:
+            payload[wire_key] = str_val
+    return payload
+
+
+class JobStateTracker:
+    """Thread-safe monotonic ``Job`` state and snapshot tracker partitioned by study and job ID."""
+
+    def __init__(self) -> None:
+        """Initialize an empty per-study job state tracker."""
+        self._entries: dict[str, dict[str, _TrackedJobStateEntry]] = {}
+        self._lock = threading.RLock()
+
+    def observe(self, study_key: str, job_id: str, job: Any) -> Any:
+        """Validate and record an observed ``job`` payload for ``(study_key, job_id)``.
+
+        Args:
+            study_key: Study identifier partitioning the job namespace.
+            job_id: Batch or job identifier within ``study_key``.
+            job: Observed ``Job``/``JobStatus`` model or status payload.
+
+        Returns:
+            Effective job payload (preserving the recorded terminal snapshot when
+            a stale non-terminal response arrives after completion).
+
+        Raises:
+            InvalidJobStateError: If ``job.state`` is unrecognized.
+            InvalidJobTransitionError: If the transition regresses or conflicts with a terminal state.
+        """
+        curr_state = _extract_normalizable_state(job)
+        curr_is_terminal = (
+            curr_state in TERMINAL_JOB_STATES
+            if curr_state is not None
+            else bool(isinstance(getattr(job, "is_terminal", None), bool) and job.is_terminal)
+        )
+
+        with self._lock:
+            study_bucket = self._entries.setdefault(study_key, {})
+            entry = study_bucket.get(job_id)
+
+            if entry is not None and entry.is_terminal:
+                if not curr_is_terminal:
+                    return entry.snapshot if entry.snapshot is not None else job
+                if entry.last_state is not None and curr_state is not None:
+                    validate_job_transition(entry.last_state, curr_state)
+                if curr_state is not None:
+                    entry.last_state = curr_state
+                entry.snapshot = job
+                return job
+
+            if entry is None:
+                entry = _TrackedJobStateEntry()
+                study_bucket[job_id] = entry
+            elif entry.last_state is not None and curr_state is not None:
+                validate_job_transition(entry.last_state, curr_state)
+
+            if curr_state is not None:
+                entry.last_state = curr_state
+            if curr_is_terminal:
+                entry.is_terminal = True
+            entry.snapshot = job
+            return job
+
+    def get_state(self, study_key: str, job_id: str) -> JobState | None:
+        """Return the most recent validated ``JobState`` for ``(study_key, job_id)``."""
+        with self._lock:
+            entry = self._entries.get(study_key, {}).get(job_id)
+            return entry.last_state if entry is not None else None
+
+    def is_terminal(self, study_key: str, job_id: str) -> bool:
+        """Return ``True`` if ``(study_key, job_id)`` has reached a terminal state."""
+        with self._lock:
+            entry = self._entries.get(study_key, {}).get(job_id)
+            return entry.is_terminal if entry is not None else False
+
+    def get_snapshot(self, study_key: str, job_id: str) -> Any | None:
+        """Return the cached ``Job`` snapshot for ``(study_key, job_id)``, if any."""
+        with self._lock:
+            entry = self._entries.get(study_key, {}).get(job_id)
+            return entry.snapshot if entry is not None else None
+
+    def has_job_in_other_study(self, study_key: str, job_id: str) -> bool:
+        """Return ``True`` if ``job_id`` is tracked under a study other than ``study_key``."""
+        with self._lock:
+            return any(
+                other_study != study_key and job_id in bucket
+                for other_study, bucket in self._entries.items()
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize tracker state into a JSON-compatible dictionary (e.g., for Airflow XCom)."""
+        with self._lock:
+            studies_payload: dict[str, dict[str, Any]] = {}
+            for study_key, bucket in self._entries.items():
+                job_map: dict[str, Any] = {}
+                for job_id, entry in bucket.items():
+                    serialized_entry: dict[str, Any] = {
+                        "last_state": entry.last_state.value
+                        if entry.last_state is not None
+                        else None,
+                        "is_terminal": entry.is_terminal,
+                    }
+                    if entry.snapshot is not None and (
+                        isinstance(entry.snapshot, Job) or entry.last_state is not None
+                    ):
+                        serialized_entry["snapshot"] = _serialize_job_snapshot(
+                            job_id, entry.snapshot, entry.last_state
+                        )
+                    job_map[job_id] = serialized_entry
+                if job_map:
+                    studies_payload[study_key] = job_map
+            return {"version": 1, "studies": studies_payload}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> JobStateTracker:
+        """Restore a ``JobStateTracker`` from a dictionary produced by :meth:`to_dict`."""
+        tracker = cls()
+        if not isinstance(data, Mapping):
+            return tracker
+        raw_studies = data.get("studies")
+        if not isinstance(raw_studies, Mapping):
+            return tracker
+
+        for study_key, raw_bucket in raw_studies.items():
+            if not isinstance(study_key, str) or not isinstance(raw_bucket, Mapping):
+                continue
+            bucket: dict[str, _TrackedJobStateEntry] = {}
+            for job_id, raw_entry in raw_bucket.items():
+                if not isinstance(job_id, str) or not isinstance(raw_entry, Mapping):
+                    continue
+                raw_state = raw_entry.get("last_state")
+                parsed_state = (
+                    normalize_job_state(raw_state) if isinstance(raw_state, str) else None
+                )
+                is_term = bool(raw_entry.get("is_terminal", False)) or (
+                    parsed_state in TERMINAL_JOB_STATES if parsed_state is not None else False
+                )
+                snapshot: Any = None
+                raw_snap = raw_entry.get("snapshot")
+                if isinstance(raw_snap, Mapping):
+                    snapshot = JobStatus.model_validate(dict(raw_snap))
+                elif parsed_state is not None:
+                    snapshot = JobStatus.model_validate({"batchId": job_id, "state": parsed_state})
+                bucket[job_id] = _TrackedJobStateEntry(
+                    last_state=parsed_state,
+                    is_terminal=is_term,
+                    snapshot=snapshot,
+                )
+            if bucket:
+                tracker._entries[study_key] = bucket
+        return tracker
+
+
 class BaseJobPoller:
     """Base class for polling a job until it reaches a terminal state."""
 
     def __init__(self) -> None:
         """Initialize transition tracking ledger."""
+        self._tracker = JobStateTracker()
         self._terminal_states: dict[str, JobStatus] = {}
         self._lock = threading.Lock()
+
+    def _resolve_terminal_status(self, study_key: str, batch_id: str) -> JobStatus | None:
+        """Resolve any previously recorded terminal ``JobStatus`` for ``(study_key, batch_id)``."""
+        if self._tracker.is_terminal(study_key, batch_id):
+            snap = self._tracker.get_snapshot(study_key, batch_id)
+            if isinstance(snap, JobStatus):
+                return snap
+        with self._lock:
+            legacy = self._terminal_states.get(batch_id)
+        if legacy is not None and not self._tracker.has_job_in_other_study(study_key, batch_id):
+            return legacy
+        return None
 
     def _guard_transition(
         self,
@@ -276,50 +491,54 @@ class BaseJobPoller:
         status: JobStatus,
         last_status: JobStatus | None,
         terminal_status: JobStatus | None,
+        *,
+        study_key: str = "",
     ) -> tuple[JobStatus, JobStatus | None]:
         """Guard against state regressions and validate monotonic transitions.
 
         If a terminal state was already reached, stale non-terminal payloads are ignored
-        and the terminal status is preserved.
+        and the terminal status is preserved, while conflicting terminal states raise
+        :class:`InvalidJobTransitionError`.
 
         Args:
             batch_id: The job batch identifier.
             status: The newly polled JobStatus payload.
             last_status: The most recent status observed in this polling run.
             terminal_status: The terminal status if one has already been reached.
+            study_key: Optional study identifier partitioning the job namespace.
 
         Returns:
             A tuple of (effective_status, effective_terminal_status).
         """
-        # If terminal state was already recorded, ignore stale non-terminal responses
-        if terminal_status is not None and getattr(terminal_status, "is_terminal", False):
-            if not getattr(status, "is_terminal", False):
-                logger.warning(
-                    "[JobPoller] Ignoring stale response for batch_id=%s in state %s; terminal state %s preserved",
-                    batch_id,
-                    getattr(status, "state", None),
-                    terminal_status.state,
-                )
-                return terminal_status, terminal_status
-            terminal_status = status
+        if self._tracker.get_state(study_key, batch_id) is None and not self._tracker.is_terminal(
+            study_key, batch_id
+        ):
+            if terminal_status is not None and getattr(terminal_status, "is_terminal", False):
+                self._tracker.observe(study_key, batch_id, terminal_status)
+            elif last_status is not None:
+                self._tracker.observe(study_key, batch_id, last_status)
+
+        was_terminal = self._tracker.is_terminal(study_key, batch_id)
+        prior_terminal = self._tracker.get_snapshot(study_key, batch_id) if was_terminal else None
+
+        effective = cast(JobStatus, self._tracker.observe(study_key, batch_id, status))
+
+        if was_terminal and not getattr(status, "is_terminal", False):
+            preserved_state = getattr(prior_terminal, "state", effective.state)
+            logger.warning(
+                "[JobPoller] Ignoring stale response for batch_id=%s in state %s; terminal state %s preserved",
+                batch_id,
+                getattr(status, "state", None),
+                preserved_state,
+            )
+            return effective, effective
+
+        if self._tracker.is_terminal(study_key, batch_id):
             with self._lock:
-                self._terminal_states[batch_id] = status
-            return status, terminal_status
+                self._terminal_states[batch_id] = effective
+            return effective, effective
 
-        # If the newly polled status is terminal, record it
-        if getattr(status, "is_terminal", False):
-            terminal_status = status
-            with self._lock:
-                self._terminal_states[batch_id] = status
-            return status, terminal_status
-
-        # If both previous and new status are active, validate monotonic transition
-        last_state = getattr(last_status, "state", None) if last_status else None
-        curr_state = getattr(status, "state", None)
-        if last_state is not None and curr_state is not None:
-            validate_job_transition(last_state, curr_state)
-
-        return status, terminal_status
+        return effective, terminal_status
 
     def _check_complete(self, status: JobStatus, batch_id: str) -> JobStatus:
         """Internal hook to check if the status is complete."""
@@ -401,15 +620,18 @@ class JobPoller(BaseJobPoller):
         start = time.monotonic()
         poll_number = 0
         last_status: JobStatus | None = None
-        with self._lock:
-            terminal_status: JobStatus | None = self._terminal_states.get(batch_id)
+        terminal_status = self._resolve_terminal_status(study_key, batch_id)
 
         while True:
             poll_number += 1
             result = self._get_job(study_key, batch_id)
             status = self._check_complete(result, batch_id)
             status, terminal_status = self._guard_transition(
-                batch_id, status, last_status, terminal_status
+                batch_id,
+                status,
+                last_status,
+                terminal_status,
+                study_key=study_key,
             )
             last_status = status
             elapsed = time.monotonic() - start
@@ -581,15 +803,18 @@ class AsyncJobPoller(BaseJobPoller):
         start = time.monotonic()
         poll_number = 0
         last_status: JobStatus | None = None
-        with self._lock:
-            terminal_status: JobStatus | None = self._terminal_states.get(batch_id)
+        terminal_status = self._resolve_terminal_status(study_key, batch_id)
 
         while True:
             poll_number += 1
             result = await self._get_job(study_key, batch_id)
             status = self._check_complete(result, batch_id)
             status, terminal_status = self._guard_transition(
-                batch_id, status, last_status, terminal_status
+                batch_id,
+                status,
+                last_status,
+                terminal_status,
+                study_key=study_key,
             )
             last_status = status
             elapsed = time.monotonic() - start

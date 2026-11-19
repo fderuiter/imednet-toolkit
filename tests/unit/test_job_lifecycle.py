@@ -356,3 +356,216 @@ async def test_async_poll_many_ignores_stale_responses() -> None:
 
     assert summary.results["A1"].state == JobState.COMPLETED
     assert summary.results["A1"].is_terminal is True
+
+
+# ==============================================================================
+# Criterion 7: Unified TERMINAL_JOB_STATES, SPI JobStateTracker, and Airflow XCom
+# ==============================================================================
+
+
+def test_constants_terminal_job_states_aligned_and_import_isolated() -> None:
+    """constants.TERMINAL_JOB_STATES matches canonical terminal JobStates without importing models.jobs."""
+    import ast
+    from pathlib import Path
+
+    from imednet import constants
+
+    expected = {"COMPLETED", "COMPLETE", "SUCCESS", "FAILED", "CANCELLED", "TIMEOUT"}
+    assert constants.TERMINAL_JOB_STATES == expected
+    assert "" not in constants.TERMINAL_JOB_STATES
+    assert set(constants.TERMINAL_JOB_STATES) == {s.value for s in TERMINAL_JOB_STATES}
+
+    constants_src = Path(constants.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(constants_src, filename=constants.__file__)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.startswith("imednet.models")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            assert not node.module.startswith("imednet.models")
+
+
+def test_spi_job_state_tracker_isolation_missing_state_and_json_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SPI JobStateTracker enforces monotonic transitions per (study, job), keeps None nonterminal, and roundtrips JSON."""
+    import json
+
+    from imednet.spi.utils import JobStateTracker
+    from imednet.utils.job_poller import JobTimeoutError
+
+    tracker = JobStateTracker()
+
+    # Missing state remains non-terminal and times out in JobPoller per ADR 0006
+    missing = JobStatus(batchId="MISSING-1", state=None)
+    observed_missing = tracker.observe("STUDY-A", "MISSING-1", missing)
+    assert observed_missing.is_terminal is False
+    assert tracker.is_terminal("STUDY-A", "MISSING-1") is False
+    assert tracker.get_state("STUDY-A", "MISSING-1") is None
+
+    tick = {"t": 0.0}
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(
+        "time.monotonic", lambda: tick.__setitem__("t", tick["t"] + 5.0) or tick["t"]
+    )
+    timeout_poller = JobPoller(lambda _s, _b: JobStatus(batchId="MISSING-1", state=None))
+    with pytest.raises(JobTimeoutError):
+        timeout_poller.run("STUDY-A", "MISSING-1", interval=0, timeout=2.0)
+
+    # Per-study isolation for identical batch IDs
+    tracker.observe("STUDY-A", "SHARED-BATCH", JobStatus(batchId="SHARED-BATCH", state="COMPLETED"))
+    tracker.observe("STUDY-B", "SHARED-BATCH", JobStatus(batchId="SHARED-BATCH", state="RUNNING"))
+    assert tracker.is_terminal("STUDY-A", "SHARED-BATCH") is True
+    assert tracker.is_terminal("STUDY-B", "SHARED-BATCH") is False
+    assert tracker.get_state("STUDY-B", "SHARED-BATCH") == JobState.RUNNING
+
+    # JSON serialization roundtrip for Airflow XCom compatibility
+    wire_payload = json.loads(json.dumps(tracker.to_dict()))
+    restored = JobStateTracker.from_dict(wire_payload)
+    assert restored.is_terminal("STUDY-A", "SHARED-BATCH") is True
+    assert restored.get_state("STUDY-A", "SHARED-BATCH") == JobState.COMPLETED
+    assert restored.get_state("STUDY-B", "SHARED-BATCH") == JobState.RUNNING
+
+    with pytest.raises(InvalidJobTransitionError):
+        restored.observe(
+            "STUDY-B", "SHARED-BATCH", JobStatus(batchId="SHARED-BATCH", state="PENDING")
+        )
+    with pytest.raises(InvalidJobTransitionError):
+        restored.observe(
+            "STUDY-A", "SHARED-BATCH", JobStatus(batchId="SHARED-BATCH", state="FAILED")
+        )
+
+
+@pytest.mark.asyncio
+async def test_base_job_poller_rejects_conflicting_terminal_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BaseJobPoller (sync and async) raises InvalidJobTransitionError on COMPLETED->FAILED and FAILED->COMPLETED."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    # Sync: COMPLETED -> FAILED raises InvalidJobTransitionError and preserves COMPLETED
+    sync_poller = JobPoller(lambda _s, _b: JobStatus(batchId="B-CF", state="COMPLETED"))
+    completed = sync_poller.run("ST", "B-CF", interval=0, timeout=5)
+    assert completed.state == JobState.COMPLETED
+
+    sync_poller._get_job = lambda _s, _b: JobStatus(batchId="B-CF", state="FAILED")
+    with pytest.raises(InvalidJobTransitionError):
+        sync_poller.run("ST", "B-CF", interval=0, timeout=5)
+    assert sync_poller._terminal_states["B-CF"].state == JobState.COMPLETED
+
+    # Sync: FAILED -> COMPLETED raises InvalidJobTransitionError and preserves FAILED
+    fail_first_poller = JobPoller(lambda _s, _b: JobStatus(batchId="B-FC", state="FAILED"))
+    with pytest.raises(JobFailedError):
+        fail_first_poller.run("ST", "B-FC", interval=0, timeout=5)
+
+    fail_first_poller._get_job = lambda _s, _b: JobStatus(batchId="B-FC", state="COMPLETED")
+    with pytest.raises(InvalidJobTransitionError):
+        fail_first_poller.run("ST", "B-FC", interval=0, timeout=5)
+    assert fail_first_poller._terminal_states["B-FC"].state == JobState.FAILED
+
+    # Async: COMPLETED -> FAILED and FAILED -> COMPLETED raise InvalidJobTransitionError
+    async_poller = AsyncJobPoller(
+        AsyncMock(return_value=JobStatus(batchId="A-CF", state="COMPLETED"))
+    )
+    async_completed = await async_poller.run("ST", "A-CF", interval=0, timeout=5)
+    assert async_completed.state == JobState.COMPLETED
+
+    async_poller._get_job = AsyncMock(return_value=JobStatus(batchId="A-CF", state="FAILED"))
+    with pytest.raises(InvalidJobTransitionError):
+        await async_poller.run("ST", "A-CF", interval=0, timeout=5)
+
+    async_fail_poller = AsyncJobPoller(
+        AsyncMock(return_value=JobStatus(batchId="A-FC", state="FAILED"))
+    )
+    with pytest.raises(JobFailedError):
+        await async_fail_poller.run("ST", "A-FC", interval=0, timeout=5)
+
+    async_fail_poller._get_job = AsyncMock(
+        return_value=JobStatus(batchId="A-FC", state="COMPLETED")
+    )
+    with pytest.raises(InvalidJobTransitionError):
+        await async_fail_poller.run("ST", "A-FC", interval=0, timeout=5)
+
+
+def test_airflow_job_sensor_xcom_reschedule_rejects_regression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-instantiated ImednetJobSensor instances sharing Airflow XCom raise AirflowException on RUNNING->PENDING."""
+    import json
+    import sys
+
+    from tests.unit.test_airflow_operators import _patch_basehook, _setup_airflow
+
+    for mod_name in [
+        m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")
+    ]:
+        monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
+    _setup_airflow(monkeypatch)
+    _patch_basehook(monkeypatch)
+
+    from apache_airflow_providers_imednet import sensors
+
+    sdk = MagicMock()
+    hook_inst = MagicMock(get_sdk_client=MagicMock(return_value=sdk))
+    monkeypatch.setattr(sensors, "ImednetHook", MagicMock(return_value=hook_inst))
+
+    xcom_store: dict[str, Any] = {}
+
+    class FakeTaskInstance:
+        def xcom_push(self, *, key: str, value: Any) -> None:
+            # Enforce JSON roundtrip just like Airflow XCom storage
+            xcom_store[key] = json.loads(json.dumps(value))
+
+        def xcom_pull(self, *, key: str, task_ids: str | None = None) -> Any:
+            del task_ids
+            return xcom_store.get(key)
+
+    ti = FakeTaskInstance()
+
+    # Poke 1 on initial worker instance: RUNNING -> returns False and persists state in XCom
+    sensor_poke_1 = sensors.ImednetJobSensor(
+        task_id="wait_import", study_key="STUDY-X", batch_id="BATCH-X"
+    )
+    sdk.jobs.get.return_value = JobStatus(batchId="BATCH-X", state="RUNNING")
+    assert sensor_poke_1.poke({"ti": ti}) is False
+    assert sensors.ImednetJobSensor.XCOM_TRACKER_KEY in xcom_store
+
+    # Poke 2 on a brand-new rescheduled sensor instance: regresses RUNNING -> PENDING -> raises AirflowException
+    sensor_poke_2 = sensors.ImednetJobSensor(
+        task_id="wait_import", study_key="STUDY-X", batch_id="BATCH-X"
+    )
+    sdk.jobs.get.return_value = JobStatus(batchId="BATCH-X", state="PENDING")
+    with pytest.raises(sensors.AirflowException, match="Invalid job state transition"):
+        sensor_poke_2.poke({"ti": ti})
+
+    # Poke 3 on a third rescheduled sensor instance: RUNNING was preserved, so COMPLETED succeeds
+    sensor_poke_3 = sensors.ImednetJobSensor(
+        task_id="wait_import", study_key="STUDY-X", batch_id="BATCH-X"
+    )
+    sdk.jobs.get.return_value = JobStatus(batchId="BATCH-X", state="COMPLETED")
+    assert sensor_poke_3.poke({"ti": ti}) is True
+
+    # Poke 4 on a fourth rescheduled sensor instance: stale RUNNING preserved as True, conflicting FAILED rejected
+    sensor_poke_4 = sensors.ImednetJobSensor(
+        task_id="wait_import", study_key="STUDY-X", batch_id="BATCH-X"
+    )
+    sdk.jobs.get.return_value = JobStatus(batchId="BATCH-X", state="RUNNING")
+    assert sensor_poke_4.poke({"ti": ti}) is True
+
+    sensor_poke_5 = sensors.ImednetJobSensor(
+        task_id="wait_import", study_key="STUDY-X", batch_id="BATCH-X"
+    )
+    sdk.jobs.get.return_value = JobStatus(batchId="BATCH-X", state="FAILED")
+    with pytest.raises(sensors.AirflowException, match="Invalid job state transition"):
+        sensor_poke_5.poke({"ti": ti})
+
+    # Empty context fallback still tracks instance attributes across pokes
+    ephemeral_sensor = sensors.ImednetJobSensor(
+        task_id="t_empty", study_key="S", batch_id="B_EMPTY"
+    )
+    ephemeral_sensor._last_state = "RUNNING"
+    sdk.jobs.get.return_value = JobStatus(batchId="B_EMPTY", state="PENDING")
+    with pytest.raises(sensors.AirflowException, match="Invalid job state transition"):
+        ephemeral_sensor.poke({})

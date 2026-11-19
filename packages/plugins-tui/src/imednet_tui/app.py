@@ -35,6 +35,11 @@ from textual.widgets import (
 
 from imednet.sdk import AsyncImednetSDK, ImednetSDK
 from imednet.spi.models import TERMINAL_JOB_STATES, Job, JobStatus
+from imednet.spi.utils import (
+    InvalidJobStateError,
+    InvalidJobTransitionError,
+    JobStateTracker,
+)
 
 from .terminal import is_interactive_terminal
 
@@ -699,23 +704,31 @@ class SubjectTable(DataTable[str]):
 
 
 class _TrackedJobPlaceholder:
-    """Representation for tracked jobs whose status could not be retrieved."""
+    """Non-terminal representation for tracked jobs whose status could not be retrieved."""
 
-    def __init__(self, job_id: str, status: str = "FAILED") -> None:
-        """Initialize placeholder with job ID and status.
+    def __init__(
+        self,
+        job_id: str,
+        status: str = "POLL_ERROR",
+        *,
+        error: str | None = None,
+    ) -> None:
+        """Initialize non-terminal placeholder with job ID and diagnostic status.
 
         Args:
             job_id: Identifier of the tracked job.
-            status: Status display string, such as FAILED or UNKNOWN.
+            status: Non-terminal status display string, such as POLL_ERROR or UNKNOWN.
+            error: Optional transient poll exception message.
         """
         self.job_id = job_id
         self.batch_id = job_id
         self.job_type = "Job"
-        self.state = status
+        self.state: str | None = None
         self.status = status
         self.job_status = status
+        self.poll_error = error
         self.date_created = ""
-        self.is_terminal = status.strip().upper() in _TERMINAL_STATE_NAMES
+        self.is_terminal = False
 
 
 class JobTable(DataTable[str]):
@@ -818,8 +831,10 @@ class JobMonitor(Container):
         self.timer: Timer | None = None
         self._polling_active = False
         self.current_study_key: str | None = None
+        self._tracker = JobStateTracker()
         self._study_job_ids: dict[str, list[str]] = {}
         self._study_job_cache: dict[str, dict[str, Any]] = {}
+        self._study_poll_errors: dict[str, dict[str, str]] = {}
         self._unscoped_job_ids: list[str] = []
         self._rendered_study_key: str | None = None
         self._summary_text = "Job Monitor: Select a study to view background jobs."
@@ -902,8 +917,19 @@ class JobMonitor(Container):
             return False
         study_cache = self._study_job_cache.get(study_key, {})
         return any(
-            jid not in study_cache or not _is_terminal_job(study_cache[jid]) for jid in tracked
+            not self._tracker.is_terminal(study_key, jid)
+            and (jid not in study_cache or not _is_terminal_job(study_cache[jid]))
+            for jid in tracked
         )
+
+    def _schedule_refresh(self) -> None:
+        """Schedule an exclusive ``refresh_jobs`` worker in the ``refresh-jobs`` group."""
+        if self.is_mounted:
+            self.run_worker(
+                self.refresh_jobs(),
+                exclusive=True,
+                group="refresh-jobs",
+            )
 
     def _sync_timer_for_study(self, study_key: str | None) -> None:
         """Resume polling timer only when active jobs exist; pause otherwise."""
@@ -924,11 +950,11 @@ class JobMonitor(Container):
 
     def on_mount(self) -> None:
         """Set up status message and interval polling timer on mount."""
-        self.timer = self.set_interval(10.0, self.refresh_jobs, pause=True)
+        self.timer = self.set_interval(10.0, self._schedule_refresh, pause=True)
         self._polling_active = False
         if self.current_study_key:
             self._sync_timer_for_study(self.current_study_key)
-            self.run_worker(self.refresh_jobs())
+            self._schedule_refresh()
         else:
             self._update_ui(
                 summary_text="Job Monitor: Select a study to view background jobs.",
@@ -974,8 +1000,7 @@ class JobMonitor(Container):
 
         if refresh and target_study and target_study == self.current_study_key:
             self._sync_timer_for_study(target_study)
-            if self.is_mounted:
-                self.run_worker(self.refresh_jobs())
+            self._schedule_refresh()
         return parsed_ids
 
     def track_job(self, job_id: str, *, study_key: str | None = None) -> None:
@@ -1018,8 +1043,7 @@ class JobMonitor(Container):
         self._sync_timer_for_study(study_key)
         if not self._study_job_ids.get(study_key):
             self._summary_text = f"Job Monitor: Loading jobs for study '{study_key}'..."
-        if self.is_mounted:
-            self.run_worker(self.refresh_jobs())
+        self._schedule_refresh()
 
     async def _poll_tracked_job(
         self,
@@ -1062,7 +1086,7 @@ class JobMonitor(Container):
                 return _TrackedJobPlaceholder(jid, "UNKNOWN")
             except Exception as err:
                 logging.getLogger("imednet_tui").warning("Failed to poll job %s: %s", jid, err)
-                return _TrackedJobPlaceholder(jid, "FAILED")
+                return _TrackedJobPlaceholder(jid, "POLL_ERROR", error=str(err))
 
     async def refresh_jobs(self) -> None:
         """Poll active jobs and update the job table for the active study."""
@@ -1081,6 +1105,7 @@ class JobMonitor(Container):
             )
             return
 
+        transition_error: Exception | None = None
         try:
             jobs_ep: Any = self.sdk.jobs
             jobs_with_ids: list[tuple[str, Any]] = []
@@ -1115,24 +1140,58 @@ class JobMonitor(Container):
                     return
 
                 study_cache = self._study_job_cache.setdefault(study_key, {})
+                poll_errors = self._study_poll_errors.setdefault(study_key, {})
+                for jid in tracked_ids:
+                    if jid not in study_cache and self._tracker.is_terminal(study_key, jid):
+                        cached_snap = self._tracker.get_snapshot(study_key, jid)
+                        if cached_snap is not None:
+                            study_cache[jid] = cached_snap
+
                 ids_to_poll = [
                     jid
                     for jid in tracked_ids
-                    if jid not in study_cache or not _is_terminal_job(study_cache[jid])
+                    if not self._tracker.is_terminal(study_key, jid)
+                    and (jid not in study_cache or not _is_terminal_job(study_cache[jid]))
                 ]
                 if ids_to_poll:
                     polled_results = await asyncio.gather(
                         *(self._poll_tracked_job(jobs_ep, study_key, jid) for jid in ids_to_poll)
                     )
                     for jid, polled_job in zip(ids_to_poll, polled_results, strict=True):
-                        study_cache[jid] = polled_job
+                        if isinstance(polled_job, _TrackedJobPlaceholder):
+                            if polled_job.poll_error:
+                                poll_errors[jid] = polled_job.poll_error
+                            prior_job = self._tracker.get_snapshot(study_key, jid)
+                            if prior_job is None:
+                                cached = study_cache.get(jid)
+                                if cached is not None and not isinstance(
+                                    cached, _TrackedJobPlaceholder
+                                ):
+                                    prior_job = cached
+                            if prior_job is not None:
+                                study_cache[jid] = prior_job
+                            else:
+                                study_cache[jid] = polled_job
+                        else:
+                            try:
+                                effective_job = self._tracker.observe(study_key, jid, polled_job)
+                            except (InvalidJobTransitionError, InvalidJobStateError) as err:
+                                if transition_error is None:
+                                    transition_error = err
+                                prior_job = self._tracker.get_snapshot(study_key, jid)
+                                if prior_job is not None:
+                                    study_cache[jid] = prior_job
+                            else:
+                                poll_errors.pop(jid, None)
+                                study_cache[jid] = effective_job
 
                 ordered_ids = list(self._study_job_ids.get(study_key, tracked_ids))
                 jobs_with_ids = [
                     (jid, study_cache[jid]) for jid in ordered_ids if jid in study_cache
                 ]
                 has_active = any(
-                    jid not in study_cache or not _is_terminal_job(study_cache[jid])
+                    not self._tracker.is_terminal(study_key, jid)
+                    and (jid not in study_cache or not _is_terminal_job(study_cache[jid]))
                     for jid in ordered_ids
                 )
 
@@ -1150,7 +1209,8 @@ class JobMonitor(Container):
             for fallback_id, job in jobs_with_ids:
                 row = _extract_job_row(job, fallback_id=fallback_id)
                 rows.append(row)
-                if not _is_terminal_job(job):
+                is_term = _is_terminal_job(job)
+                if not is_term:
                     active_count += 1
                 batch_id, status_str, progress_str, total_str, failed_str, created_str = row
                 job_type = getattr(job, "job_type", None)
@@ -1161,7 +1221,7 @@ class JobMonitor(Container):
                     "green"
                     if status_str.upper() in _SUCCESS_STATE_NAMES
                     else "yellow"
-                    if status_str.upper() in _ACTIVE_STATE_NAMES
+                    if status_str.upper() in _ACTIVE_STATE_NAMES or not is_term
                     else "red"
                 )
                 label = f"{type_label} ({batch_id})" if batch_id != "-" else type_label
@@ -1182,6 +1242,10 @@ class JobMonitor(Container):
                 rows=rows,
                 preserve_cursor=same_study,
             )
+            if transition_error is not None:
+                raise transition_error
+        except (InvalidJobTransitionError, InvalidJobStateError):
+            raise
         except Exception as e:
             if self.current_study_key == study_key or not self.is_mounted:
                 err_msg = f"[red]Error fetching jobs: {e}[/red]"

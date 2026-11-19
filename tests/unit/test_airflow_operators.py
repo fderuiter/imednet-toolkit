@@ -177,3 +177,73 @@ def test_job_sensor(monkeypatch):
     job.is_terminal = False
     job.is_successful = False
     assert sensor.poke({}) is False
+
+
+def test_job_sensor_xcom_and_fallback_tracking(monkeypatch):
+    """Test ImednetJobSensor XCom state persistence and instance attribute fallback."""
+    import json
+
+    from imednet.models.jobs import JobStatus
+
+    for mod_name in [
+        m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")
+    ]:
+        monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
+    _setup_airflow(monkeypatch)
+    import apache_airflow_providers_imednet.operators as ops
+    from apache_airflow_providers_imednet import sensors
+
+    _patch_basehook(monkeypatch)
+    sdk = MagicMock()
+    hook_inst = MagicMock(get_sdk_client=MagicMock(return_value=sdk))
+    monkeypatch.setattr(sensors, "ImednetHook", MagicMock(return_value=hook_inst))
+
+    xcom_store = {}
+
+    class TaskInstanceWithTaskIds:
+        def xcom_push(self, *, key, value):
+            xcom_store[key] = json.loads(json.dumps(value))
+
+        def xcom_pull(self, *, task_ids=None, key):
+            assert task_ids == "sensor_task"
+            return xcom_store.get(key)
+
+    ti = TaskInstanceWithTaskIds()
+
+    sensor_1 = sensors.ImednetJobSensor(task_id="sensor_task", study_key="S", batch_id="B1")
+    sensor_1.task_id = "sensor_task"
+    sdk.jobs.get.return_value = JobStatus(batchId="B1", state="RUNNING")
+    assert sensor_1.poke({"ti": ti}) is False
+    assert sensors.ImednetJobSensor.XCOM_TRACKER_KEY in xcom_store
+
+    # Re-instantiated sensor restores tracker from XCom and rejects RUNNING -> PENDING
+    sensor_2 = sensors.ImednetJobSensor(task_id="sensor_task", study_key="S", batch_id="B1")
+    sensor_2.task_id = "sensor_task"
+    sdk.jobs.get.return_value = JobStatus(batchId="B1", state="PENDING")
+    with pytest.raises(ops.AirflowException, match="Invalid job state transition"):
+        sensor_2.poke({"task_instance": ti})
+
+    # Empty-context {} fallback seeds from _last_state and _terminal_reached
+    fallback_sensor = sensors.ImednetJobSensor(task_id="t", study_key="S", batch_id="B2")
+    fallback_sensor._last_state = "RUNNING"
+    sdk.jobs.get.return_value = JobStatus(batchId="B2", state="PENDING")
+    with pytest.raises(ops.AirflowException, match="Invalid job state transition"):
+        fallback_sensor.poke({})
+
+    terminal_sensor = sensors.ImednetJobSensor(task_id="t", study_key="S", batch_id="B3")
+    terminal_sensor._terminal_reached = True
+    sdk.jobs.get.return_value = JobStatus(batchId="B3", state="RUNNING")
+    assert terminal_sensor.poke({}) is True
+
+    # Handle TaskInstance without xcom_pull / TypeError signature fallback / non-mapping context
+    class LegacyTaskInstance:
+        def xcom_pull(self, *, key):
+            return xcom_store.get(key)
+
+    legacy_sensor = sensors.ImednetJobSensor(task_id="sensor_task", study_key="S", batch_id="B1")
+    legacy_sensor.task_id = "sensor_task"
+    sdk.jobs.get.return_value = JobStatus(batchId="B1", state="COMPLETED")
+    assert legacy_sensor.poke({"ti": LegacyTaskInstance()}) is True
+    assert legacy_sensor.poke({"ti": object()}) is True
+    assert legacy_sensor.poke(None) is True

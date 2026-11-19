@@ -395,7 +395,7 @@ async def test_job_monitor_with_real_jobs_endpoint_contract():
 
 @pytest.mark.asyncio
 async def test_job_monitor_tracked_job_failure_retains_failed_state():
-    """Test that a tracked job whose get() raises is retained as FAILED rather than dropped."""
+    """Test that a tracked job whose get() raises is retained as non-terminal POLL_ERROR rather than fabricating FAILED."""
     sdk = MagicMock()
     del sdk.jobs.list
     del sdk.jobs.async_list
@@ -407,11 +407,12 @@ async def test_job_monitor_tracked_job_failure_retains_failed_state():
     await monitor.refresh_jobs()
 
     rendered = str(monitor.render())
-    # Crucial assertion: failure is not dropped, so active jobs is (1), not (0)
+    # Crucial assertion: failure is not dropped, so active jobs is (1), and does not fabricate FAILED
     assert "Active & Recent Jobs (1)" in rendered
     assert "Active & Recent Jobs (0)" not in rendered
     assert "BATCH-ERR-101" in rendered
-    assert "FAILED" in rendered
+    assert "POLL_ERROR" in rendered
+    assert "FAILED" not in rendered
 
 
 @pytest.mark.asyncio
@@ -485,7 +486,8 @@ async def test_job_monitor_with_real_jobs_endpoint_instance():
 
     rendered = str(monitor.render())
     assert "Active & Recent Jobs (1)" in rendered
-    assert "FAILED" in rendered
+    assert "POLL_ERROR" in rendered
+    assert "FAILED" not in rendered
     assert "BATCH-REAL-ERR" in rendered
 
 
@@ -876,7 +878,7 @@ async def test_job_monitor_semaphore_bounds_maximum_concurrency():
 
 @pytest.mark.asyncio
 async def test_job_monitor_partial_network_timeout_does_not_abort_batch(caplog):
-    """Test scenario: Network timeout on one tracked job displays FAILED while others succeed."""
+    """Test scenario: Network timeout on one tracked job displays non-terminal POLL_ERROR while others succeed."""
     from imednet.models.jobs import JobState, JobStatus
 
     async def mock_get(study_key: str, job_id: str) -> JobStatus:
@@ -903,7 +905,8 @@ async def test_job_monitor_partial_network_timeout_does_not_abort_batch(caplog):
     assert "BATCH-OK-1" in rendered
     assert "BATCH-TIMEOUT" in rendered
     assert "BATCH-OK-2" in rendered
-    assert "FAILED" in rendered
+    assert "POLL_ERROR" in rendered
+    assert "FAILED" not in rendered
     assert "COMPLETED" in rendered
 
     assert any("Failed to poll job BATCH-TIMEOUT" in record.message for record in caplog.records)
@@ -1990,3 +1993,155 @@ async def test_batch_submission_without_study_notifies_and_pending_cli_batches_a
         job_table = app.screen.query_one("#job_table", JobTable)
         assert job_table.row_count == 1
         assert str(job_table.get_row_at(0)[0]) == "PENDING-BATCH-1"
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_retains_prior_state_during_timeout_and_resumes_running() -> None:
+    """JobMonitor retains prior RUNNING state during a transient timeout and resumes RUNNING without FAILED regression."""
+    from imednet.spi.models import JobState, JobStatus
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock()
+    del sdk.studies.async_list
+    del sdk.sites.async_list
+    del sdk.subjects.async_list
+    del sdk.jobs.async_list
+    del sdk.jobs.list
+
+    sdk.studies.list = MagicMock(
+        return_value=[MagicMock(study_key="STUDY-TIMEOUT", study_name="Timeout Study")]
+    )
+    sdk.sites.list = MagicMock(return_value=[])
+    sdk.subjects.list = MagicMock(return_value=[])
+
+    attempt = 0
+
+    async def mock_get(study_key: str, batch_id: str) -> JobStatus:
+        nonlocal attempt
+        attempt += 1
+        if attempt == 1:
+            return JobStatus(
+                batch_id=batch_id, state=JobState.RUNNING, progress=35, total_records=100
+            )
+        if attempt == 2:
+            raise TimeoutError("Transient read timeout")
+        if attempt == 3:
+            return JobStatus(
+                batch_id=batch_id, state=JobState.RUNNING, progress=75, total_records=100
+            )
+        return JobStatus(
+            batch_id=batch_id, state=JobState.COMPLETED, progress=100, total_records=100
+        )
+
+    sdk.jobs.get = mock_get
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-TIMEOUT", batch_ids=["BATCH-RECOVER"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+        job_monitor = app.screen.query_one(JobMonitor)
+        job_table = app.screen.query_one("#job_table", JobTable)
+
+        # Poll 1: RUNNING at 35%
+        assert attempt == 1
+        assert [str(c) for c in job_table.get_row_at(0)[:3]] == ["BATCH-RECOVER", "RUNNING", "35%"]
+
+        # Poll 2: Transient timeout retains RUNNING (35%) and does NOT fabricate FAILED
+        await job_monitor.refresh_jobs()
+        assert attempt == 2
+        assert [str(c) for c in job_table.get_row_at(0)[:3]] == ["BATCH-RECOVER", "RUNNING", "35%"]
+        assert "FAILED" not in str(job_monitor.render())
+        assert job_monitor.is_polling_active is True
+
+        # Poll 3: Resumes RUNNING at 75% without any FAILED->RUNNING regression
+        await job_monitor.refresh_jobs()
+        assert attempt == 3
+        assert [str(c) for c in job_table.get_row_at(0)[:3]] == ["BATCH-RECOVER", "RUNNING", "75%"]
+
+        # Poll 4: Completes cleanly and stops subsequent polls
+        await job_monitor.refresh_jobs()
+        assert attempt == 4
+        assert [str(c) for c in job_table.get_row_at(0)[:3]] == [
+            "BATCH-RECOVER",
+            "COMPLETED",
+            "100%",
+        ]
+
+        await job_monitor.refresh_jobs()
+        assert attempt == 4
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_set_study_isolates_ids_and_schedules_exclusive_worker() -> None:
+    """Switching JobMonitor via set_study isolates tracked Job IDs per Study and schedules refresh_jobs with exclusive=True."""
+    from imednet.spi.models import JobState, JobStatus
+
+    sdk = MagicMock()
+    del sdk.studies.async_list
+    del sdk.sites.async_list
+    del sdk.subjects.async_list
+    del sdk.jobs.async_list
+    del sdk.jobs.list
+
+    sdk.studies.list = MagicMock(
+        return_value=[
+            MagicMock(study_key="STUDY-A", study_name="Study A"),
+            MagicMock(study_key="STUDY-B", study_name="Study B"),
+        ]
+    )
+    sdk.sites.list = MagicMock(return_value=[])
+    sdk.subjects.list = MagicMock(return_value=[])
+    sdk.jobs.get = AsyncMock(
+        side_effect=lambda sk, bid: JobStatus(batch_id=bid, state=JobState.COMPLETED, progress=100)
+    )
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-A", batch_ids=["BATCH-A1"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+        job_monitor = app.screen.query_one(JobMonitor)
+        assert job_monitor.tracked_job_ids == ["BATCH-A1"]
+
+        with patch.object(job_monitor, "run_worker", wraps=job_monitor.run_worker) as spy_worker:
+            job_monitor.set_study("STUDY-B")
+            await pilot.pause()
+
+            assert job_monitor.current_study_key == "STUDY-B"
+            assert job_monitor.tracked_job_ids == []
+            spy_worker.assert_called_once()
+            _, kwargs = spy_worker.call_args
+            assert kwargs.get("exclusive") is True
+            assert kwargs.get("group") == "refresh-jobs"
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_rejects_backward_job_transitions() -> None:
+    """JobMonitor rejects backward Job transitions via JobStateTracker and preserves prior valid state."""
+    from imednet.spi.models import JobState, JobStatus
+    from imednet.spi.utils import InvalidJobTransitionError
+
+    sdk = MagicMock()
+    del sdk.jobs.list
+    del sdk.jobs.async_list
+
+    responses = [
+        JobStatus(batch_id="BATCH-REG", state=JobState.RUNNING, progress=50),
+        JobStatus(batch_id="BATCH-REG", state=JobState.PENDING, progress=0),
+    ]
+    sdk.jobs.get = AsyncMock(side_effect=lambda _sk, _bid: responses.pop(0))
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-REG"
+    monitor.track_job("BATCH-REG")
+
+    await monitor.refresh_jobs()
+    assert "RUNNING" in str(monitor.render())
+
+    with pytest.raises(InvalidJobTransitionError):
+        await monitor.refresh_jobs()
+
+    rendered = str(monitor.render())
+    assert "RUNNING" in rendered
+    assert "PENDING" not in rendered
