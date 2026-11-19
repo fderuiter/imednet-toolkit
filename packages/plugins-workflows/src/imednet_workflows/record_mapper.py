@@ -847,25 +847,15 @@ class RecordMapper(BaseTabularRecordMapper):
                 include_deleted=include_deleted,
             )
 
-        if pd is None:
-            raise ImportError(
-                "pandas is required for RecordMapper.dataframe. Install "
-                "with 'pip install \"imednet[pandas]\"'."
-            )
-        frames = list(
-            self.iter_dataframes(
-                study_key,
-                visit_key=visit_key,
-                use_labels_as_columns=use_labels_as_columns,
-                variable_whitelist=variable_whitelist,
-                form_whitelist=form_whitelist,
-                mask_phi=mask_phi,
-                include_deleted=include_deleted,
-            )
+        return super().dataframe(
+            study_key,
+            visit_key=visit_key,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            mask_phi=mask_phi,
+            include_deleted=include_deleted,
         )
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
 
 
 __all__ = [

@@ -866,9 +866,15 @@ async def test_async_sdk_workflows_boundaries_and_zero_unawaited_coroutines() ->
     from imednet_workflows.uat import UATWorkflow
 
     async_sdk = AsyncImednetSDK(
-        api_key="key", security_key="secret", base_url="https://example.com"
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
     )
-    sync_sdk = ImednetSDK(api_key="key", security_key="secret", base_url="https://example.com")
+    sync_sdk = ImednetSDK(
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
+    )
     try:
         assert async_sdk.workflows is not None
         assert sync_sdk.workflows is not None

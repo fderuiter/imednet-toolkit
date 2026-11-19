@@ -39,7 +39,11 @@ def test_sinks_namespace_contract() -> None:
     assert sinks_ns.MongoDbSinkConfig is not None
     assert isinstance(sinks_ns, SinksNamespaceProtocol)
 
-    sdk = ImednetSDK(api_key="key", security_key="secret", base_url="https://example.com")
+    sdk = ImednetSDK(
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
+    )
     try:
         assert sdk.sinks is not None
         assert isinstance(sdk.sinks, SinksNamespaceProtocol)
@@ -47,7 +51,9 @@ def test_sinks_namespace_contract() -> None:
         sdk.close()
 
     async_sdk = AsyncImednetSDK(
-        api_key="key", security_key="secret", base_url="https://example.com"
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
     )
     try:
         assert async_sdk.sinks is not None
@@ -123,7 +129,11 @@ def test_workflows_and_sinks_contract_parity() -> None:
     sinks_protocol_attrs = set(SinksNamespaceProtocol.__annotations__.keys())
     assert sinks_attrs == sinks_protocol_attrs
 
-    sdk = ImednetSDK(api_key="key", security_key="secret", base_url="https://example.com")
+    sdk = ImednetSDK(
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
+    )
     try:
         assert sdk.workflows is not None
         assert sdk.sinks is not None
@@ -140,7 +150,9 @@ def test_workflows_and_sinks_contract_parity() -> None:
         sdk.close()
 
     async_sdk = AsyncImednetSDK(
-        api_key="key", security_key="secret", base_url="https://example.com"
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
     )
     try:
         assert async_sdk.workflows is not None
@@ -167,7 +179,11 @@ def test_workflows_namespace_lazy_instantiation_without_duckdb(monkeypatch) -> N
     monkeypatch.delitem(sys.modules, "duckdb", raising=False)
     monkeypatch.setattr("builtins.__import__", fake_import)
 
-    sdk = ImednetSDK(api_key="key", security_key="secret", base_url="https://example.com")
+    sdk = ImednetSDK(
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
+    )
     try:
         assert sdk.workflows is not None
         assert isinstance(sdk.workflows, WorkflowsNamespaceProtocol)

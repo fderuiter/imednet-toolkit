@@ -108,7 +108,9 @@ def test_sdk_workflows_uses_entry_point_discovery(monkeypatch) -> None:
 
     sdk = _create_sdk()
     async_sdk = sdk_mod.AsyncImednetSDK(
-        api_key="key", security_key="secret", base_url="https://example.com"
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
     )
 
     assert loaded == {"workflows": 2, "sinks": 2}
@@ -124,7 +126,9 @@ def test_sdk_plugins_default_to_none_when_absent(monkeypatch) -> None:
 
     sdk = _create_sdk()
     async_sdk = sdk_mod.AsyncImednetSDK(
-        api_key="key", security_key="secret", base_url="https://example.com"
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
     )
     assert sdk.workflows is None
     assert sdk.sinks is None
