@@ -222,7 +222,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     extract_parser.add_argument(
         "--visit-filter",
         action="append",
-        help="Visit filter criteria (e.g., 'visit_key=SCREENING'). Repeat for multiple filters.",
+        help="Visit filter criteria (e.g., 'interval_name=Screening'). Repeat for multiple filters.",
     )
     extract_parser.add_argument(
         "--interactive",
@@ -239,6 +239,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         visit_filter: list[str] | None = None,
         interactive: bool = False,
     ) -> None:
+        from imednet.spi.models import Record, Subject, Visit
+
         from .wizard import print_progress
 
         if interactive:
@@ -246,22 +248,31 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
             study_key = prompt_study_key(study_key)
             record_filter = prompt_filters(
-                "record filter", "form_key=DEMO", existing_filters=record_filter
+                "record filter",
+                "form_key=DEMO",
+                existing_filters=record_filter,
+                model=Record,
             )
             subject_filter = prompt_filters(
-                "subject filter", "subject_status=Screened", existing_filters=subject_filter
+                "subject filter",
+                "subject_status=Screened",
+                existing_filters=subject_filter,
+                model=Subject,
             )
             visit_filter = prompt_filters(
-                "visit filter", "visit_key=SCREENING", existing_filters=visit_filter
+                "visit filter",
+                "interval_name=Screening",
+                existing_filters=visit_filter,
+                model=Visit,
             )
         elif not study_key:
             extract_parser.error("the following arguments are required: study_key")
 
         assert study_key is not None
         workflow = DataExtractionWorkflow(cast(ImednetFacade, sdk))
-        parsed_record_filter = parse_filter_args(record_filter)
-        parsed_subject_filter = parse_filter_args(subject_filter)
-        parsed_visit_filter = parse_filter_args(visit_filter)
+        parsed_record_filter = parse_filter_args(record_filter, model=Record)
+        parsed_subject_filter = parse_filter_args(subject_filter, model=Subject)
+        parsed_visit_filter = parse_filter_args(visit_filter, model=Visit)
 
         print_progress(f"Extracting records for study '{study_key}'...")
         if interactive:

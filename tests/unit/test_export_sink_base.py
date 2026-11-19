@@ -603,6 +603,55 @@ class TestApplyQualityGate:
         passed = list(sink_base_mod.apply_quality_gate(sdk, "STUDY", [good, good_model, bad], cfg))
         assert passed == [good, good_model]
 
+    def test_enabled_quality_gate_retains_valid_pydantic_records(self):
+        """Assert apply_quality_gate scores Record.record_data and retains valid Record models."""
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+
+        sdk = MagicMock()
+        sdk.get_variables.return_value = [
+            Variable(
+                variable_name="AGE",
+                variable_type="int",
+                form_id=10,
+                form_key="DEMO",
+            ),
+            Variable(
+                variable_name="SEX",
+                variable_type="text",
+                form_id=10,
+                form_key="DEMO",
+            ),
+        ]
+
+        valid_record = Record(
+            record_id=1,
+            form_id=10,
+            form_key="DEMO",
+            record_data={"AGE": 34, "SEX": "F"},
+        )
+        camel_dict_record = {
+            "recordId": 2,
+            "formKey": "DEMO",
+            "recordData": {"AGE": 41, "SEX": "M"},
+        }
+        empty_record = Record(
+            record_id=3,
+            form_id=10,
+            form_key="DEMO",
+            record_data={},
+        )
+
+        cfg = SinkConfig(
+            study_key="STUDY", quality_gate_enabled=True, min_schema_readiness_score=50.0
+        )
+        retained = list(
+            sink_base_mod.apply_quality_gate(
+                sdk, "STUDY", [valid_record, camel_dict_record, empty_record], cfg
+            )
+        )
+        assert retained == [valid_record, camel_dict_record]
+
 
 class TestSpiSinks:
     """Test suite for imednet.spi.sinks re-exports and namespace modules."""

@@ -385,7 +385,9 @@ def apply_quality_gate(
             rec_dict = {
                 "form_key": getattr(record, "form_key", None),
                 "form_id": getattr(record, "form_id", None),
-                "data": getattr(record, "record_data", {}),
+                "record_data": getattr(record, "record_data", None),
+                "recordData": getattr(record, "recordData", None),
+                "data": getattr(record, "data", {}),
                 "record_id": getattr(record, "record_id", None),
             }
         elif isinstance(record, dict):
@@ -403,12 +405,11 @@ def apply_quality_gate(
             dropped_count += 1
             continue
 
-        if "data" in rec_dict:
-            data = rec_dict["data"]
-        elif "record_data" in rec_dict:
-            data = rec_dict["record_data"]
-        else:
-            data = rec_dict.get("recordData", {})
+        data = rec_dict.get("record_data")
+        if data is None:
+            data = rec_dict.get("recordData")
+        if data is None:
+            data = rec_dict.get("data", {})
         if data is None:
             data = {}
         score, reasons = calculate_readiness_score(validator.schema, fk, data)
