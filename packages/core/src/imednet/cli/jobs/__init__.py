@@ -39,7 +39,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     ) -> None:
         with fetching_status("job status", study_key):
             job = sdk.get_job(study_key, batch_id)
-        display_list([job], "jobs", fields=JOB_SUMMARY_FIELDS, output_format=output_format)
+        display_list(
+            [job],
+            "jobs",
+            fields=JOB_SUMMARY_FIELDS,
+            output_format=output_format,
+            details=[job],
+        )
 
     status_parser.set_defaults(
         func=lambda args: job_status(
@@ -80,7 +86,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 timeout=timeout,
                 on_progress=on_progress,
             )
-        display_list([job], "jobs", fields=JOB_SUMMARY_FIELDS, output_format=output_format)
+        display_list(
+            [job],
+            "jobs",
+            fields=JOB_SUMMARY_FIELDS,
+            output_format=output_format,
+            details=[job],
+        )
 
     wait_parser.set_defaults(
         func=lambda args: job_wait(

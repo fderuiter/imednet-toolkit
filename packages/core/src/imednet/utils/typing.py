@@ -21,8 +21,14 @@ ItemId = Union[str, int]  # noqa: UP007
 #:
 #: * A scalar ``str``, ``int``, ``float``, or ``bool`` – implies equality.  # noqa: RUF003
 #: * A two-element tuple ``(operator, scalar)`` – e.g. ``(">", 30)``.  # noqa: RUF003
+#: * A :class:`list` of two-element ``(operator, scalar)`` tuples – generates ``AND``-joined filters.  # noqa: RUF003
 #: * A :class:`list` of scalars – generates ``OR``-joined equality filters.  # noqa: RUF003
 FilterScalar = Union[str, int, float, bool, None]  # noqa: UP007
-FilterValue = Union[FilterScalar, tuple[str, FilterScalar], list[FilterScalar]]  # noqa: UP007
+FilterValue = Union[  # noqa: UP007
+    FilterScalar,
+    tuple[str, FilterScalar],
+    list[tuple[str, FilterScalar]],
+    list[FilterScalar],
+]
 
 __all__ = ["FilterScalar", "FilterValue", "ItemId", "JsonDict"]

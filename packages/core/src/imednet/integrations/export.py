@@ -350,11 +350,9 @@ def _tabular_export(
         return
 
     record_model = mapper._build_record_model(variable_keys, label_map)
-    extra_filters = {}
-    if config.variable_whitelist is not None:
-        extra_filters["variableNames"] = config.variable_whitelist
+    extra_filters: dict[str, Any] = {}
     if config.form_whitelist is not None:
-        extra_filters["formIds"] = config.form_whitelist  # type: ignore
+        extra_filters["formId"] = config.form_whitelist
 
     raw_records = mapper._iter_records(
         study_key,
@@ -394,12 +392,30 @@ def _tabular_export(
             sink.write_batch(cast(Any, df), batch_id=f"{study_key}/tabular/{i}")
 
 
+def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Extract SinkConfig keyword arguments so they do not leak into pandas kwargs."""
+    sink_keys = (
+        "batch_size",
+        "max_retries",
+        "retry_backoff",
+        "idempotent",
+        "extra",
+        "min_schema_readiness_score",
+        "tracer",
+    )
+    return {k: kwargs.pop(k) for k in sink_keys if k in kwargs}
+
+
 def export_to_csv(
     sdk: ImednetSDK,
     study_key: str,
     path: str,
     *,
     use_labels_as_columns: bool = False,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
+    manifest_path: str | None = None,
+    quality_gate_enabled: bool = True,
     **kwargs: Any,
 ) -> None:
     """Export study records to a CSV file.
@@ -414,12 +430,16 @@ def export_to_csv(
     """
     config = kwargs.pop("config", None)
     if not isinstance(config, TabularSinkConfig):
+        sink_kwargs = _pop_sink_kwargs(kwargs)
         config = TabularSinkConfig(
             study_key=study_key,
-            manifest_path=str(Path(path).with_suffix(".manifest.jsonl")),
+            manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
             pandas_kwargs=kwargs,
             use_labels_as_columns=use_labels_as_columns,
-            quality_gate_enabled=True,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            quality_gate_enabled=quality_gate_enabled,
+            **sink_kwargs,
         )
 
     sink = TabularCSVSink(path, config)
@@ -536,6 +556,7 @@ def export_to_sql(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
+    quality_gate_enabled: bool = True,
     **kwargs: Any,
 ) -> None:
     """Export study records to a SQL table.
@@ -556,6 +577,7 @@ def export_to_sql(
     manifest_path = kwargs.pop("manifest_path", manifest_path)
     config = kwargs.pop("config", None)
     if not isinstance(config, TabularSinkConfig):
+        sink_kwargs = _pop_sink_kwargs(kwargs)
         kwargs["if_exists"] = if_exists
         config = TabularSinkConfig(
             study_key=study_key,
@@ -564,7 +586,8 @@ def export_to_sql(
             use_labels_as_columns=use_labels_as_columns,
             variable_whitelist=variable_whitelist,
             form_whitelist=form_whitelist,
-            quality_gate_enabled=True,
+            quality_gate_enabled=quality_gate_enabled,
+            **sink_kwargs,
         )
 
     engine = create_engine(conn_str)
@@ -683,8 +706,12 @@ def export_to_duckdb_by_form(
     forms = sdk.forms.list(study_key=study_key)
 
     # Fetch all variables for the study once to avoid N+1 queries
-    _form_filter: dict[str, Any] = {"formIds": form_whitelist} if form_whitelist else {}
-    all_variables = sdk.variables.list(study_key=study_key, **_form_filter)
+    _form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
+    all_variables = (
+        []
+        if form_whitelist is not None and len(form_whitelist) == 0
+        else sdk.variables.list(study_key=study_key, **_form_filter)
+    )
     variables_by_form: dict[int, list[Any]] = {}
     for v in all_variables:
         if v.form_id is not None:
@@ -712,10 +739,7 @@ def export_to_duckdb_by_form(
             record_model = mapper._build_record_model(variable_keys, label_map)
             records = mapper._fetch_records(
                 study_key,
-                extra_filters={
-                    "formId": form.form_id,
-                    **({"variableNames": variable_whitelist} if variable_whitelist else {}),
-                },
+                extra_filters={"formId": form.form_id},
             )
             rows, _ = mapper._parse_records(records, record_model)
             df = mapper._build_dataframe(
@@ -759,8 +783,12 @@ def export_to_sql_by_form(
     forms = sdk.forms.list(study_key=study_key)
 
     # Fetch all variables for the study once to avoid N+1 queries
-    _form_filter: dict[str, Any] = {"formIds": form_whitelist} if form_whitelist else {}
-    all_variables = sdk.variables.list(study_key=study_key, **_form_filter)
+    _form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
+    all_variables = (
+        []
+        if form_whitelist is not None and len(form_whitelist) == 0
+        else sdk.variables.list(study_key=study_key, **_form_filter)
+    )
     variables_by_form: dict[int, list[Any]] = {}
     for v in all_variables:
         if v.form_id is not None:
@@ -783,10 +811,7 @@ def export_to_sql_by_form(
         record_model = mapper._build_record_model(variable_keys, label_map)
         records = mapper._fetch_records(
             study_key,
-            extra_filters={
-                "formId": form.form_id,
-                **({"variableNames": variable_whitelist} if variable_whitelist else {}),
-            },
+            extra_filters={"formId": form.form_id},
         )
         rows, _ = mapper._parse_records(records, record_model)
         df = mapper._build_dataframe(

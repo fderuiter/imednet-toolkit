@@ -11,10 +11,21 @@ import pandas as pd
 import pytest
 
 import imednet.integrations.export as export_mod
+from imednet.models.records import Record
+from imednet.models.variables import Variable
+
+
+def _make_quality_sdk() -> MagicMock:
+    """Create a mock SDK configured with schema variables for quality gate validation."""
+    sdk = MagicMock()
+    sdk.get_variables.return_value = [
+        Variable(variable_name="A", variable_type="int", form_id=1, form_key="F1")
+    ]
+    return sdk
 
 
 def _setup_mapper(monkeypatch):
-    """Helper function to setup mapper."""
+    """Helper function to setup mapper without monkeypatching apply_quality_gate."""
     import pandas as pd
 
     df = pd.DataFrame([{"A": 1}])
@@ -28,17 +39,14 @@ def _setup_mapper(monkeypatch):
 
     mapper_inst._fetch_variable_metadata.return_value = (["A"], {"A": "A"})
     mapper_inst._build_record_model.return_value = MagicMock()
-    mapper_inst._iter_records.return_value = [MagicMock()]
+    mapper_inst._iter_records.return_value = [
+        Record(record_id=1, form_id=1, form_key="F1", record_data={"A": 1})
+    ]
     mapper_inst._parse_records.return_value = ([], 0)
     mapper_inst._build_dataframe.return_value = df
 
     mapper_cls = MagicMock(return_value=mapper_inst)
     monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
-    import imednet.integrations.export as export_mod_module
-
-    monkeypatch.setattr(
-        export_mod_module, "apply_quality_gate", lambda sdk, study, recs, conf: recs
-    )
     return df, mapper_cls, mapper_inst
 
 
@@ -55,7 +63,7 @@ def _setup_real_mapper(monkeypatch):
 def test_export_to_csv(monkeypatch):
     """Test that export to csv."""
     _df, mapper_cls, mapper_inst = _setup_mapper(monkeypatch)
-    sdk = MagicMock()
+    sdk = _make_quality_sdk()
 
     m_open = MagicMock()
     monkeypatch.setattr("builtins.open", m_open)
@@ -128,7 +136,7 @@ def test_export_to_parquet(monkeypatch):
 def test_export_to_sql(monkeypatch):
     """Test that export to sql."""
     df, mapper_cls, mapper_inst = _setup_mapper(monkeypatch)
-    sdk = MagicMock()
+    sdk = _make_quality_sdk()
 
     sa_module = ModuleType("sqlalchemy")
     engine = MagicMock()
@@ -161,7 +169,7 @@ def test_export_to_sql(monkeypatch):
 def test_export_to_sql_manifest_custom_path(tmp_path, monkeypatch):
     """Test that export to sql writes to manifest_path when provided."""
     df, mapper_cls, mapper_inst = _setup_mapper(monkeypatch)
-    sdk = MagicMock()
+    sdk = _make_quality_sdk()
 
     sa_module = ModuleType("sqlalchemy")
     engine = MagicMock()
@@ -260,17 +268,14 @@ def test_export_functions_handle_duplicate_columns(tmp_path, monkeypatch):
         {c: c for c in df.columns},
     )
     mapper_inst._build_record_model.return_value = MagicMock()
-    mapper_inst._iter_records.return_value = [MagicMock()]
+    mapper_inst._iter_records.return_value = [
+        Record(record_id=1, form_id=1, form_key="F1", record_data={"A": 1})
+    ]
     mapper_inst._parse_records.return_value = ([], 0)
     mapper_inst._build_dataframe.return_value = df
     mapper_cls = MagicMock(return_value=mapper_inst)
     monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
-    import imednet.integrations.export as export_mod_module
-
-    monkeypatch.setattr(
-        export_mod_module, "apply_quality_gate", lambda sdk, study, recs, conf: recs
-    )
-    sdk = MagicMock()
+    sdk = _make_quality_sdk()
 
     out_json = tmp_path / "d.json"
     export_mod.export_to_json(sdk, "S", str(out_json))
@@ -299,17 +304,14 @@ def test_export_functions_handle_case_insensitive_duplicates(tmp_path, monkeypat
         {c: c for c in df.columns},
     )
     mapper_inst._build_record_model.return_value = MagicMock()
-    mapper_inst._iter_records.return_value = [MagicMock()]
+    mapper_inst._iter_records.return_value = [
+        Record(record_id=1, form_id=1, form_key="F1", record_data={"A": 1})
+    ]
     mapper_inst._parse_records.return_value = ([], 0)
     mapper_inst._build_dataframe.return_value = df
     mapper_cls = MagicMock(return_value=mapper_inst)
     monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
-    import imednet.integrations.export as export_mod_module
-
-    monkeypatch.setattr(
-        export_mod_module, "apply_quality_gate", lambda sdk, study, recs, conf: recs
-    )
-    sdk = MagicMock()
+    sdk = _make_quality_sdk()
 
     out_json = tmp_path / "case.json"
     export_mod.export_to_json(sdk, "S", str(out_json))
@@ -339,16 +341,13 @@ def test_export_sql_too_many_columns(monkeypatch):
         {c: c for c in df.columns},
     )
     mapper_inst._build_record_model.return_value = MagicMock()
-    mapper_inst._iter_records.return_value = [MagicMock()]
+    mapper_inst._iter_records.return_value = [
+        Record(record_id=1, form_id=1, form_key="F1", record_data={"A": 1})
+    ]
     mapper_inst._parse_records.return_value = ([], 0)
     mapper_inst._build_dataframe.return_value = df
     mapper_cls = MagicMock(return_value=mapper_inst)
     monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
-    import imednet.integrations.export as export_mod_module
-
-    monkeypatch.setattr(
-        export_mod_module, "apply_quality_gate", lambda sdk, study, recs, conf: recs
-    )
 
     engine = MagicMock()
     engine.dialect.name = "sqlite"
@@ -356,7 +355,7 @@ def test_export_sql_too_many_columns(monkeypatch):
     sa_module.create_engine = MagicMock(return_value=engine)
     monkeypatch.setitem(sys.modules, "sqlalchemy", sa_module)
 
-    export_mod.export_to_sql(MagicMock(), "STUDY", "table", "sqlite://")
+    export_mod.export_to_sql(_make_quality_sdk(), "STUDY", "table", "sqlite://")
     assert mock_to_sql.call_count == 2
     calls = mock_to_sql.call_args_list
     assert calls[0].args[0] == "table_part1"
@@ -436,7 +435,7 @@ def test_export_to_duckdb_by_form(monkeypatch):
 
     mapper_cls.assert_called_once_with(sdk)
     assert sdk.variables.list.call_count == 1
-    sdk.variables.list.assert_called_once_with(study_key="STUDY", formIds=[1, 2])
+    sdk.variables.list.assert_called_once_with(study_key="STUDY", formId=[1, 2])
     assert conn.register.call_count == 2
     assert conn.register.call_args_list[0][0][0] == "df"
     pd.testing.assert_frame_equal(conn.register.call_args_list[0][0][1], df1)
@@ -533,3 +532,155 @@ def test_export_to_long_sql_missing_pandas(monkeypatch):
         match=r"pandas is required for export_to_long_sql\. Install with \"pip install 'imednet\[export\]'\"\.",
     ):
         export_mod.export_to_long_sql(MagicMock(), "STUDY", "table", "sqlite://")
+
+
+def test_exports_with_multi_item_whitelists_and_quality_gate_end_to_end(tmp_path: Path) -> None:
+    """Verify CSV, SQL, DuckDB-by-form, and SQL-by-form retain Record models and emit singular filters."""
+    import sqlite3
+
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    seen_filters: list[str] = []
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get("https://api.test/api/v1/edc/studies/STUDY/forms").respond(
+            200,
+            json={
+                "data": [
+                    {"formId": 10, "formKey": "DEMO"},
+                    {"formId": 20, "formKey": "VITALS"},
+                ]
+            },
+        )
+
+        def var_handler(request: httpx.Request) -> httpx.Response:
+            flt = request.url.params.get("filter", "")
+            seen_filters.append(flt)
+            assert "variableNames" not in flt
+            assert "formIds" not in flt
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "variableName": "AGE",
+                            "variableType": "int",
+                            "label": "Age",
+                            "formId": 10,
+                            "formKey": "DEMO",
+                        },
+                        {
+                            "variableName": "HR",
+                            "variableType": "int",
+                            "label": "Heart Rate",
+                            "formId": 20,
+                            "formKey": "VITALS",
+                        },
+                    ]
+                },
+            )
+
+        def rec_handler(request: httpx.Request) -> httpx.Response:
+            flt = request.url.params.get("filter", "")
+            seen_filters.append(flt)
+            assert "variableNames" not in flt
+            assert "formIds" not in flt
+            if "formId==10" in flt:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "recordId": 101,
+                                "subjectKey": "SUBJ-1",
+                                "visitId": 1,
+                                "formId": 10,
+                                "formKey": "DEMO",
+                                "recordStatus": "Complete",
+                                "recordData": {"AGE": 42},
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "recordId": 102,
+                            "subjectKey": "SUBJ-1",
+                            "visitId": 1,
+                            "formId": 20,
+                            "formKey": "VITALS",
+                            "recordStatus": "Complete",
+                            "recordData": {"HR": 70},
+                        }
+                    ]
+                },
+            )
+
+        router.get("https://api.test/api/v1/edc/studies/STUDY/variables").mock(
+            side_effect=var_handler
+        )
+        router.get("https://api.test/api/v1/edc/studies/STUDY/records").mock(
+            side_effect=rec_handler
+        )
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+
+        csv_path = tmp_path / "study.csv"
+        export_mod.export_to_csv(
+            sdk,
+            "STUDY",
+            str(csv_path),
+            quality_gate_enabled=True,
+            variable_whitelist=["AGE", "HR"],
+            form_whitelist=[10, 20],
+        )
+        csv_df = pd.read_csv(csv_path)
+        assert len(csv_df) == 2
+
+        sql_path = tmp_path / "study.sqlite"
+        export_mod.export_to_sql(
+            sdk,
+            "STUDY",
+            "records_tbl",
+            f"sqlite:///{sql_path}",
+            quality_gate_enabled=True,
+            variable_whitelist=["AGE", "HR"],
+            form_whitelist=[10, 20],
+        )
+        with sqlite3.connect(sql_path) as conn:
+            row_count = conn.execute("SELECT COUNT(*) FROM records_tbl").fetchone()[0]
+        assert row_count == 2
+
+        by_form_sql = tmp_path / "by_form.sqlite"
+        export_mod.export_to_sql_by_form(
+            sdk,
+            "STUDY",
+            f"sqlite:///{by_form_sql}",
+            variable_whitelist=["AGE", "HR"],
+            form_whitelist=[10, 20],
+        )
+        with sqlite3.connect(by_form_sql) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM DEMO").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM VITALS").fetchone()[0] == 1
+
+        duckdb_mod = pytest.importorskip("duckdb")
+        by_form_duck = tmp_path / "by_form.duckdb"
+        export_mod.export_to_duckdb_by_form(
+            sdk,
+            "STUDY",
+            str(by_form_duck),
+            variable_whitelist=["AGE", "HR"],
+            form_whitelist=[10, 20],
+        )
+        duck_conn = duckdb_mod.connect(str(by_form_duck))
+        try:
+            assert duck_conn.execute("SELECT COUNT(*) FROM DEMO").fetchone()[0] == 1
+            assert duck_conn.execute("SELECT COUNT(*) FROM VITALS").fetchone()[0] == 1
+        finally:
+            duck_conn.close()
