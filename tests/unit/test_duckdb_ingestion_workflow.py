@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from builtins import __import__ as builtin_import
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -224,3 +225,247 @@ def test_duckdb_workflow_import_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ImportError, match=r"pip install"):
         DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+
+def test_migrate_persistent_base_version_database_append_and_silver_view(tmp_path: Path) -> None:
+    """Test opening a persistent DB created by the base 17-column version, appending, and querying silver."""
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "base_version.duckdb"
+
+    legacy_conn = duckdb.connect(str(db_path))
+    legacy_conn.execute("""
+        CREATE TABLE IF NOT EXISTS bronze_revisions (
+            study_key VARCHAR,
+            record_revision_id BIGINT,
+            record_id BIGINT,
+            record_oid VARCHAR,
+            form_key VARCHAR,
+            subject_key VARCHAR,
+            site_id BIGINT,
+            interval_id BIGINT,
+            record_status VARCHAR,
+            record_revision INTEGER,
+            data_revision INTEGER,
+            "user" VARCHAR,
+            role VARCHAR,
+            reason_for_change VARCHAR,
+            deleted BOOLEAN,
+            date_created TIMESTAMP,
+            last_updated TIMESTAMP
+        )
+        """)
+    legacy_conn.executemany(
+        """
+        INSERT INTO bronze_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "STUDY",
+                101,
+                1,
+                "OID-1",
+                "DEMO",
+                "SUBJ-01",
+                10,
+                5,
+                "Record Incomplete",
+                1,
+                1,
+                "alice",
+                "CRC",
+                "Original base row",
+                False,
+                "2024-01-01T10:00:00Z",
+                "2024-01-01T10:00:00Z",
+            ),
+            (
+                "STUDY",
+                101,
+                1,
+                "OID-1",
+                "DEMO",
+                "SUBJ-01",
+                10,
+                5,
+                "Record Incomplete",
+                1,
+                1,
+                "alice",
+                "CRC",
+                "Duplicate base append row",
+                False,
+                "2024-01-01T10:00:00Z",
+                "2024-01-01T10:01:00Z",
+            ),
+            (
+                "STUDY",
+                201,
+                2,
+                "OID-2",
+                "VITALS",
+                "SUBJ-02",
+                11,
+                6,
+                "Record Complete",
+                1,
+                1,
+                "carol",
+                "CRC",
+                "Preserved base vitals",
+                False,
+                "2024-01-02T09:00:00Z",
+                "2024-01-02T09:00:00Z",
+            ),
+        ],
+    )
+    legacy_conn.execute("""
+        CREATE OR REPLACE VIEW silver_current_state AS
+        SELECT
+            study_key,
+            record_revision_id,
+            record_id,
+            record_oid,
+            form_key,
+            subject_key,
+            site_id,
+            interval_id,
+            record_status,
+            record_revision,
+            data_revision,
+            "user",
+            role,
+            reason_for_change,
+            deleted,
+            date_created,
+            last_updated
+        FROM bronze_revisions
+        WHERE study_key = 'STUDY'
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY record_id
+            ORDER BY
+                record_revision DESC NULLS LAST,
+                data_revision DESC NULLS LAST,
+                date_created DESC NULLS LAST,
+                record_revision_id DESC NULLS LAST
+        ) = 1
+        """)
+    legacy_conn.close()
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), str(db_path))
+    incremental_batch = [
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=101,
+            record_id=1,
+            record_oid="OID-1",
+            form_key="DEMO",
+            subject_id=501,
+            subject_oid="SUBJ-OID-01",
+            subject_key="SUBJ-01",
+            site_id=10,
+            interval_id=5,
+            record_status="Record Incomplete",
+            record_revision=1,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="Backfilled with subject identifiers",
+            deleted=False,
+            date_created="2024-01-01T10:00:00Z",
+            last_updated="2024-01-01T10:02:00Z",
+        ),
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=102,
+            record_id=1,
+            record_oid="OID-1",
+            form_key="DEMO",
+            subject_id=501,
+            subject_oid="SUBJ-OID-01",
+            subject_key="SUBJ-01",
+            site_id=10,
+            interval_id=5,
+            record_status="Record Complete",
+            record_revision=2,
+            data_revision=2,
+            user="bob",
+            role="Investigator",
+            reason_for_change="Post-upgrade revision",
+            deleted=False,
+            date_created="2024-01-03T11:00:00Z",
+            last_updated="2024-01-03T11:05:00Z",
+        ),
+    ]
+
+    with patch.object(
+        DataExtractionWorkflow, "extract_audit_trail", return_value=incremental_batch
+    ):
+        assert workflow.ingest_revisions("STUDY", mode="append") == 2
+
+    table_info = workflow._connection.execute("PRAGMA table_info('bronze_revisions')").fetchall()
+    assert [row[1] for row in table_info] == list(RecordRevision.model_fields.keys())
+    assert [row[1] for row in table_info if row[5]] == ["study_key", "record_revision_id"]
+
+    bronze_rows = workflow._connection.execute("""
+        SELECT record_revision_id, record_id, subject_id, subject_oid, reason_for_change
+        FROM bronze_revisions
+        ORDER BY record_revision_id
+        """).fetchall()
+    assert bronze_rows == [
+        (101, 1, 501, "SUBJ-OID-01", "Backfilled with subject identifiers"),
+        (102, 1, 501, "SUBJ-OID-01", "Post-upgrade revision"),
+        (201, 2, None, None, "Preserved base vitals"),
+    ]
+
+    # Pre-existing silver_current_state view is upgraded automatically on migration
+    auto_silver = workflow._connection.execute("""
+        SELECT record_revision_id, record_id, subject_id, subject_oid, reason_for_change
+        FROM silver_current_state
+        ORDER BY record_id
+        """).fetchall()
+    assert auto_silver == [
+        (102, 1, 501, "SUBJ-OID-01", "Post-upgrade revision"),
+        (201, 2, None, None, "Preserved base vitals"),
+    ]
+
+    # Explicit build_silver_view and subsequent reopen + append remain idempotent
+    workflow.build_silver_view("STUDY")
+    workflow._connection.close()
+
+    reopened = DuckDBIngestionWorkflow(MagicMock(), str(db_path))
+    follow_up = [
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=202,
+            record_id=2,
+            record_oid="OID-2",
+            form_key="VITALS",
+            subject_id=502,
+            subject_oid="SUBJ-OID-02",
+            subject_key="SUBJ-02",
+            site_id=11,
+            interval_id=6,
+            record_status="Record Verified",
+            record_revision=2,
+            data_revision=1,
+            user="dave",
+            role="Monitor",
+            reason_for_change="Verified vitals",
+            deleted=False,
+            date_created="2024-01-04T08:00:00Z",
+            last_updated="2024-01-04T08:00:00Z",
+        )
+    ]
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=follow_up):
+        assert reopened.ingest_revisions("STUDY", mode="append") == 1
+
+    final_silver = reopened._connection.execute("""
+        SELECT record_revision_id, record_id, subject_id, subject_oid, reason_for_change
+        FROM silver_current_state
+        ORDER BY record_id
+        """).fetchall()
+    assert final_silver == [
+        (102, 1, 501, "SUBJ-OID-01", "Post-upgrade revision"),
+        (202, 2, 502, "SUBJ-OID-02", "Verified vitals"),
+    ]
+    reopened._connection.close()

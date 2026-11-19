@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -387,3 +388,181 @@ def test_duckdb_centralizer_row_conversion_edge_cases() -> None:
 
     with pytest.raises(ValueError, match="study_key"):
         list(workflow._to_rows("   ", [SimpleNamespace(record_revision_id=1)]))  # type: ignore[list-item]
+
+
+def test_build_silver_view_migrates_persistent_base_table_before_append(tmp_path: Path) -> None:
+    """Test calling build_silver_view directly on a persistent 17-column base table migrates it."""
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "silver_first.duckdb"
+
+    legacy_conn = duckdb.connect(str(db_path))
+    legacy_conn.execute("""
+        CREATE TABLE bronze_revisions (
+            study_key VARCHAR,
+            record_revision_id BIGINT,
+            record_id BIGINT,
+            record_oid VARCHAR,
+            form_key VARCHAR,
+            subject_key VARCHAR,
+            site_id BIGINT,
+            interval_id BIGINT,
+            record_status VARCHAR,
+            record_revision INTEGER,
+            data_revision INTEGER,
+            "user" VARCHAR,
+            role VARCHAR,
+            reason_for_change VARCHAR,
+            deleted BOOLEAN,
+            date_created TIMESTAMP,
+            last_updated TIMESTAMP
+        )
+        """)
+    legacy_conn.execute("""
+        INSERT INTO bronze_revisions VALUES (
+            'STUDY', 501, 10, 'OID-10', 'LABS', 'SUBJ-10', 2, 1,
+            'Record Complete', 1, 1, 'alice', 'CRC', 'Legacy lab row',
+            false, '2024-02-01T08:00:00Z', '2024-02-01T08:00:00Z'
+        )
+        """)
+    legacy_conn.close()
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), str(db_path))
+    workflow.build_silver_view("STUDY")
+
+    silver_cols = [
+        desc[0]
+        for desc in workflow._connection.execute(
+            "SELECT * FROM silver_current_state LIMIT 0"
+        ).description
+    ]
+    assert silver_cols == list(RecordRevision.model_fields.keys())
+    silver_row = workflow._connection.execute(
+        "SELECT record_revision_id, record_id, subject_id, subject_oid, reason_for_change "
+        "FROM silver_current_state"
+    ).fetchone()
+    assert silver_row == (501, 10, None, None, "Legacy lab row")
+    workflow._connection.close()
+
+
+def test_incompatible_legacy_bronze_tables_and_replace_rebuild_path(tmp_path: Path) -> None:
+    """Test incompatible legacy schemas raise actionable errors on append and rebuild on replace."""
+    duckdb = pytest.importorskip("duckdb")
+
+    # 1. Ancient 8-column schema without record_revision_id (non-empty) + legacy view
+    ancient_db = tmp_path / "ancient.duckdb"
+    conn = duckdb.connect(str(ancient_db))
+    conn.execute("""
+        CREATE TABLE bronze_revisions (
+            study_key VARCHAR,
+            record_id INTEGER,
+            form_id INTEGER,
+            variable_name VARCHAR,
+            value VARCHAR,
+            revision_number INTEGER,
+            date_modified TIMESTAMP,
+            modified_by VARCHAR
+        )
+        """)
+    conn.execute(
+        "INSERT INTO bronze_revisions VALUES ('STUDY', 1, 10, 'AGE', '42', 1, '2024-01-01 00:00:00', 'alice')"
+    )
+    conn.execute("""
+        CREATE VIEW silver_current_state AS
+        SELECT study_key, record_id, variable_name, value
+        FROM bronze_revisions
+        WHERE study_key = 'STUDY'
+        """)
+    conn.close()
+
+    replacement_rows = [
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=901,
+            record_id=1,
+            subject_id=88,
+            subject_oid="SUBJ-OID-88",
+            subject_key="SUBJ-88",
+            form_key="DEMO",
+            record_revision=1,
+            user="bob",
+            reason_for_change="Rebuilt cleanly",
+            date_created="2024-03-01T12:00:00Z",
+        )
+    ]
+
+    wf_ancient = DuckDBIngestionWorkflow(MagicMock(), str(ancient_db))
+    with (
+        patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=replacement_rows),
+        pytest.raises(ValueError, match="mode='replace'"),
+    ):
+        wf_ancient.ingest_revisions("STUDY", mode="append")
+
+    # Existing legacy row remains intact after rejected append
+    assert (
+        wf_ancient._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()[0] == 1
+    )
+
+    # Rebuild via mode="replace" upgrades both bronze_revisions and existing silver_current_state
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=replacement_rows):
+        assert wf_ancient.ingest_revisions("STUDY", mode="replace") == 1
+
+    rebuilt_silver = wf_ancient._connection.execute(
+        "SELECT record_revision_id, subject_id, subject_oid, reason_for_change FROM silver_current_state"
+    ).fetchone()
+    assert rebuilt_silver == (901, 88, "SUBJ-OID-88", "Rebuilt cleanly")
+    wf_ancient._connection.close()
+
+    # 2. Empty ancient table migrates cleanly on append
+    empty_ancient_db = tmp_path / "empty_ancient.duckdb"
+    conn_empty = duckdb.connect(str(empty_ancient_db))
+    conn_empty.execute("CREATE TABLE bronze_revisions (study_key VARCHAR, record_id INTEGER)")
+    conn_empty.close()
+
+    wf_empty = DuckDBIngestionWorkflow(MagicMock(), str(empty_ancient_db))
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=replacement_rows):
+        assert wf_empty.ingest_revisions("STUDY", mode="append") == 1
+    wf_empty._connection.close()
+
+    # 3. Unkeyable NULL/zero record_revision_id rows in legacy table reject append and rebuild on replace
+    bad_keys_db = tmp_path / "bad_keys.duckdb"
+    conn_bad = duckdb.connect(str(bad_keys_db))
+    conn_bad.execute("CREATE TABLE bronze_revisions (study_key VARCHAR, record_revision_id BIGINT)")
+    conn_bad.execute("INSERT INTO bronze_revisions VALUES ('STUDY', NULL)")
+    conn_bad.close()
+
+    wf_bad = DuckDBIngestionWorkflow(MagicMock(), str(bad_keys_db))
+    with (
+        patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=replacement_rows),
+        pytest.raises(ValueError, match="mode='replace'"),
+    ):
+        wf_bad.ingest_revisions("STUDY", mode="append")
+
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=replacement_rows):
+        assert wf_bad.ingest_revisions("STUDY", mode="replace") == 1
+    wf_bad._connection.close()
+
+
+def test_migrate_bronze_table_rolls_back_on_mid_transaction_error(tmp_path: Path) -> None:
+    """Test that _migrate_bronze_table rolls back cleanly if an error occurs inside the transaction."""
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "rollback.duckdb"
+
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE bronze_revisions (study_key VARCHAR, record_revision_id BIGINT, record_id BIGINT)"
+    )
+    conn.execute("INSERT INTO bronze_revisions VALUES ('STUDY', 1, 10)")
+    conn.close()
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), str(db_path))
+    with (
+        patch.object(workflow, "_refresh_existing_silver_view", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        workflow._ensure_bronze_table()
+
+    # Original table and row remain intact after rollback
+    assert workflow._connection.execute(
+        "SELECT study_key, record_revision_id FROM bronze_revisions"
+    ).fetchall() == [("STUDY", 1)]
+    workflow._connection.close()

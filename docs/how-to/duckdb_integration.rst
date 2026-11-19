@@ -115,7 +115,10 @@ For incremental bronze/silver audit-revision ingestion, use
 :class:`~imednet.models.record_revisions.RecordRevision` fields keyed by
 ``(study_key, record_revision_id)`` so repeated ``mode="append"`` loads deduplicate
 matching revisions, while ``silver_current_state`` projects the latest audit state per
-``record_id``.
+``record_id``. Pre-upgrade persistent ``bronze_revisions`` tables with valid
+``(study_key, record_revision_id)`` keys are migrated in place automatically while
+preserving existing rows (and incompatible legacy tables can be rebuilt with
+``mode="replace"``).
 
 .. code-block:: python
 
