@@ -35,8 +35,14 @@ def test_extract_records_by_criteria_filters_subject_and_visit() -> None:
     assert sdk.get_subjects.call_args.kwargs == {"status": "active"}
     sdk.get_visits.assert_called_once_with("STUDY", visit_id=1)
     assert sdk.get_visits.call_args.kwargs == {"visit_id": 1}
-    sdk.get_records.assert_called_once_with(study_key="STUDY", record_data_filter=None)
-    assert sdk.get_records.call_args.kwargs == {"study_key": "STUDY", "record_data_filter": None}
+    sdk.get_records.assert_called_once_with(
+        study_key="STUDY", record_data_filter=None, visit_id=[1, 2]
+    )
+    assert sdk.get_records.call_args.kwargs == {
+        "study_key": "STUDY",
+        "record_data_filter": None,
+        "visit_id": [1, 2],
+    }
 
     assert [r.record_id for r in result] == [1, 2]
 
@@ -230,10 +236,7 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
         )
 
         sent_filter = route.calls.last.request.url.params["filter"]
-        assert (
-            sent_filter
-            == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z;studyKey==STUDY"
-        )
+        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z"
         assert "startDate" not in sent_filter
         assert "endDate" not in sent_filter
         assert len(revisions) == 1

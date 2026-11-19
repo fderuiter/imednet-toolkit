@@ -69,16 +69,22 @@ def test_get_query_state_counts_aggregates_states() -> None:
 
 
 def test_get_queries_by_site_filters_using_subjects() -> None:
-    """Test that get queries by site filters using subjects."""
+    """Test that get queries by site avoids mixing AND/OR when additional_filter is given."""
     sdk = MagicMock()
     sdk.get_subjects.return_value = [Subject(subject_key="S1"), Subject(subject_key="S2")]
+    sdk.get_queries.return_value = [
+        Query(annotation_id=1, subject_key="S1"),
+        Query(annotation_id=2, subject_key="S2"),
+        Query(annotation_id=3, subject_key="OTHER"),
+    ]
     wf = QueryManagementWorkflow(sdk)
 
-    wf.get_queries_by_site("STUDY", "SITE", additional_filter={"state": "open"})
+    result = wf.get_queries_by_site("STUDY", "SITE", additional_filter={"state": "open"})
 
     sdk.get_subjects.assert_called_once_with("STUDY", site_name="SITE")
-    sdk.get_queries.assert_called_once_with("STUDY", subject_key=["S1", "S2"], state="open")
-    assert sdk.get_queries.call_args.kwargs == {"subject_key": ["S1", "S2"], "state": "open"}
+    sdk.get_queries.assert_called_once_with("STUDY", state="open")
+    assert sdk.get_queries.call_args.kwargs == {"state": "open"}
+    assert [q.subject_key for q in result] == ["S1", "S2"]
 
 
 def test_get_queries_by_site_returns_empty_if_no_subjects() -> None:

@@ -48,8 +48,9 @@ class BasePaginator(Generic[ClientT]):
         self._explicit_page = int(explicit_page) if explicit_page is not None else None
 
         explicit_size = self.params.pop(self.size_param, None)
+        explicit_limit = self.params.pop("limit", None)
         if explicit_size is None:
-            explicit_size = self.params.pop("limit", None)
+            explicit_size = explicit_limit
 
         self.page_size = int(explicit_size) if explicit_size is not None else page_size
         self._cursor: int | None = None

@@ -6,8 +6,18 @@ from typing import TYPE_CHECKING, Any
 from imednet.spi.models import Record, RecordRevision
 from imednet.spi.utils import normalize_utc_timestamp_bound
 
+from .chunked_pipeline import (
+    DEFAULT_OR_FILTER_BATCH_SIZE,
+    MAX_OR_FILTER_PUSHDOWN_ITEMS,
+    iter_chunks,
+)
+
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
+
+_RECORD_TOP_LEVEL_CONTROLS = frozenset(
+    {"page", "size", "limit", "sort", "record_data_filter", "recordDataFilter"}
+)
 
 
 class DataExtractionWorkflow:
@@ -24,6 +34,32 @@ class DataExtractionWorkflow:
             sdk: An instance of the iMednet SDK facade.
         """
         self._sdk = sdk
+
+    def _fetch_records_in_or_batches(
+        self,
+        study_key: str,
+        field_name: str,
+        values: list[Any],
+        record_kwargs: dict[str, Any],
+    ) -> list[Record]:
+        """Fetch records across bounded OR-filter chunks and deduplicate by record_id."""
+        batches = list(iter_chunks(values, chunk_size=DEFAULT_OR_FILTER_BATCH_SIZE))
+        if len(batches) == 1:
+            batch_kwargs = {**record_kwargs, field_name: batches[0]}
+            return list(self._sdk.get_records(study_key=study_key, **batch_kwargs))
+
+        results: list[Record] = []
+        seen_record_ids: set[int] = set()
+        for batch in batches:
+            batch_kwargs = {**record_kwargs, field_name: batch}
+            for record in self._sdk.get_records(study_key=study_key, **batch_kwargs):
+                rec_id = getattr(record, "record_id", None)
+                if rec_id is not None:
+                    if rec_id in seen_record_ids:
+                        continue
+                    seen_record_ids.add(rec_id)
+                results.append(record)
+        return results
 
     def extract_records_by_criteria(
         self,
@@ -48,12 +84,16 @@ class DataExtractionWorkflow:
         Returns:
             A list of Record objects matching all specified criteria.
         """
+        ordered_subject_keys: list[str] | None = None
         matching_subject_keys: set[str] | None = None
         if subject_filter:
             if on_progress:
                 on_progress("Querying subjects matching filter criteria...")
             subjects = self._sdk.get_subjects(study_key, **subject_filter)
-            matching_subject_keys = {s.subject_key for s in subjects}  # type: ignore
+            ordered_subject_keys = list(
+                dict.fromkeys(s.subject_key for s in subjects if s.subject_key is not None)
+            )
+            matching_subject_keys = set(ordered_subject_keys)
             if on_progress:
                 on_progress(f"Retrieved {len(matching_subject_keys)} matching subjects.")
             if not matching_subject_keys:
@@ -61,19 +101,20 @@ class DataExtractionWorkflow:
                     on_progress("No subjects matched criteria; returning 0 records.")
                 return []
 
+        ordered_visit_ids: list[int] | None = None
         matching_visit_ids: set[int] | None = None
         if visit_filter:
-            # Client-side filtering for subject_key on visits is still needed
-            # as build_filter_string doesn't handle complex AND/OR structures easily
-            # from separate filter dictionaries.
             if on_progress:
                 on_progress("Querying visits matching filter criteria...")
             visits = self._sdk.get_visits(study_key, **visit_filter)
 
-            if matching_subject_keys:
+            if matching_subject_keys is not None:
                 visits = [v for v in visits if v.subject_key in matching_subject_keys]
 
-            matching_visit_ids = {v.visit_id for v in visits}  # type: ignore
+            ordered_visit_ids = list(
+                dict.fromkeys(v.visit_id for v in visits if v.visit_id is not None)
+            )
+            matching_visit_ids = set(ordered_visit_ids)
             if on_progress:
                 on_progress(f"Retrieved {len(matching_visit_ids)} matching visits.")
             if not matching_visit_ids:
@@ -81,28 +122,55 @@ class DataExtractionWorkflow:
                     on_progress("No visits matched criteria; returning 0 records.")
                 return []
 
-        # Build the final record filter dictionary
-        final_record_filter_dict = dict(record_filter) if record_filter else {}
-        final_record_filter_dict.update(other_filters)  # Add other_filters here
+        final_record_filter_dict: dict[str, Any] = dict(record_filter) if record_filter else {}
+        final_record_filter_dict.update(other_filters)
+        if (
+            "record_data_filter" not in final_record_filter_dict
+            and "recordDataFilter" not in final_record_filter_dict
+        ):
+            final_record_filter_dict["record_data_filter"] = None
 
-        # Client-side filtering is used below for subject/visit matching,
-        # so no need to add complex 'in' clauses here even if build_filter_string supported it.
+        has_record_attr_filters = any(
+            key not in _RECORD_TOP_LEVEL_CONTROLS for key in final_record_filter_dict
+        )
 
         if on_progress:
             on_progress(f"Querying records for study '{study_key}'...")
-        records = self._sdk.get_records(
-            study_key=study_key,
-            record_data_filter=None,
-            **final_record_filter_dict,
-        )
 
-        # Client-side filtering fallback
-        if matching_subject_keys:
+        records: list[Record]
+        if not has_record_attr_filters and (
+            ordered_visit_ids is not None and len(ordered_visit_ids) <= MAX_OR_FILTER_PUSHDOWN_ITEMS
+        ):
+            records = self._fetch_records_in_or_batches(
+                study_key=study_key,
+                field_name="visit_id",
+                values=ordered_visit_ids,
+                record_kwargs=final_record_filter_dict,
+            )
+        elif not has_record_attr_filters and (
+            ordered_subject_keys is not None
+            and len(ordered_subject_keys) <= MAX_OR_FILTER_PUSHDOWN_ITEMS
+        ):
+            records = self._fetch_records_in_or_batches(
+                study_key=study_key,
+                field_name="subject_key",
+                values=ordered_subject_keys,
+                record_kwargs=final_record_filter_dict,
+            )
+        else:
+            records = list(
+                self._sdk.get_records(
+                    study_key=study_key,
+                    **final_record_filter_dict,
+                )
+            )
+
+        if matching_subject_keys is not None:
             if on_progress:
                 on_progress("Filtering records by matched subject keys...")
             records = [r for r in records if r.subject_key in matching_subject_keys]
-        # Corrected attribute from visit_oid to visit_id and variable name
-        if matching_visit_ids:
+
+        if matching_visit_ids is not None:
             if on_progress:
                 on_progress("Filtering records by matched visit IDs...")
             records = [r for r in records if r.visit_id in matching_visit_ids]

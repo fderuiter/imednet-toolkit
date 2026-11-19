@@ -258,27 +258,11 @@ class CachedRecordsLoader:
     def _list_records_with_filter_override(
         self, *, study_key: str, filter_string: str
     ) -> list[Record]:
-        """List records using an explicit raw ``filter`` query parameter.
-
-        This bypasses automatic filter construction so incremental sync can
-        send only the timestamp predicate (without ``studyKey``).
-        """
-        retryer = Retrying(
-            stop=stop_after_attempt(self._retry_attempts),
-            wait=wait_exponential(multiplier=1, min=1, max=8),
-            retry=retry_if_exception_type(Exception),
-            reraise=True,
-        )
-        endpoint = getattr(self._sdk, "records")  # noqa: B009
-
-        return cast(
-            list[Record],
-            retryer(
-                endpoint.list,
-                study_key=study_key,
-                filter=filter_string,
-                record_data_filter=None,
-            ),
+        """List records using an explicit top-level ``filter`` query parameter."""
+        return self._list_records(
+            study_key=study_key,
+            filter=filter_string,
+            record_data_filter=None,
         )
 
     def _upsert_records(self, conn: sqlite3.Connection, records: Iterable[Record]) -> None:

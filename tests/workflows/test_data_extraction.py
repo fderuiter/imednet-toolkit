@@ -52,8 +52,14 @@ def test_extract_records_by_criteria_filters_subject_and_visit(schema) -> None:
     assert sdk.get_subjects.call_args.kwargs == {"status": "active"}
     sdk.get_visits.assert_called_once_with("STUDY", visit_id=1)
     assert sdk.get_visits.call_args.kwargs == {"visit_id": 1}
-    sdk.get_records.assert_called_once_with(study_key="STUDY", record_data_filter=None)
-    assert sdk.get_records.call_args.kwargs == {"study_key": "STUDY", "record_data_filter": None}
+    sdk.get_records.assert_called_once_with(
+        study_key="STUDY", record_data_filter=None, visit_id=[1, 2]
+    )
+    assert sdk.get_records.call_args.kwargs == {
+        "study_key": "STUDY",
+        "record_data_filter": None,
+        "visit_id": [1, 2],
+    }
 
     assert [r.record_id for r in result] == [1, 2]
 

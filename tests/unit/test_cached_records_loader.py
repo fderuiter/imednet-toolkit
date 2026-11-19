@@ -48,9 +48,9 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
     sdk.get_records.side_effect = [
         first_batch,
         first_batch,
+        second_batch,
         [first_batch[1], second_batch[0]],
     ]
-    sdk.records.list.side_effect = [second_batch]
 
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "custom-cache")
 
@@ -62,18 +62,19 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
     assert [record.record_id for record in second_load] == [2, 3]
 
     first_delta_call = sdk.get_records.call_args_list[0]
-    second_delta_call = sdk.records.list.call_args_list[0]
+    second_delta_call = sdk.get_records.call_args_list[2]
     assert first_delta_call.kwargs == {"study_key": "STUDY", "record_data_filter": None}
     assert second_delta_call.kwargs == {
         "study_key": "STUDY",
         "filter": 'dateModified>="2024-01-02 00:00:00+00:00"',
         "record_data_filter": None,
     }
-    assert sdk.get_records.call_args_list[2].kwargs == {
+    assert sdk.get_records.call_args_list[3].kwargs == {
         "study_key": "STUDY",
         "record_data_filter": "none",
         "deleted": False,
     }
+    sdk.records.list.assert_not_called()
 
 
 def test_cached_loader_retries_record_fetches(tmp_path: Path) -> None:
@@ -139,16 +140,16 @@ def test_sync_records_handles_empty_delta_without_reconciliation(tmp_path: Path)
     sdk = MagicMock()
     sdk.get_records.side_effect = [
         [_record(1, "2024-01-01 00:00:00+00:00")],
+        [],
     ]
-    sdk.records.list.side_effect = [[]]
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
 
     loader.sync_records("STUDY", reconcile=False)
     loader.sync_records("STUDY", reconcile=False)
 
-    assert sdk.get_records.call_count == 1
-    assert sdk.records.list.call_count == 1
-    assert sdk.records.list.call_args_list[0].kwargs == {
+    assert sdk.get_records.call_count == 2
+    sdk.records.list.assert_not_called()
+    assert sdk.get_records.call_args_list[1].kwargs == {
         "study_key": "STUDY",
         "filter": 'dateModified>="2024-01-01 00:00:00+00:00"',
         "record_data_filter": None,

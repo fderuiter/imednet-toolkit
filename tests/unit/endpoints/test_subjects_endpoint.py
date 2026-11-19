@@ -20,8 +20,8 @@ def test_list_builds_path_with_default(dummy_client, paginator_factory, patch_bu
     result = ep.list()
 
     assert capture["path"] == "/api/v1/edc/studies/S1/subjects"
-    assert capture["params"] == {"filter": "FILTERED"}
-    assert patch["filters"] == {"studyKey": "S1"}
+    assert capture["params"] == {}
+    assert "filters" not in patch
     assert isinstance(result[0], Subject)
 
 
@@ -66,7 +66,7 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
 
     assert captured["path"] == "/api/v1/edc/studies/S1/subjects"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"site_id": "101", "status": "active", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"site_id": "101", "status": "active"}
     assert len(df) == 1
 
 
@@ -126,7 +126,7 @@ async def test_async_to_dataframe_parameter_forwarding(
 
     assert captured["path"] == "/api/v1/edc/studies/S1/subjects"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"site_id": "101", "status": "active", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"site_id": "101", "status": "active"}
     assert len(df) == 1
 
 

@@ -23,7 +23,13 @@ class RecordsOperationDef:
     PATH = "records"
     MODEL = Record
     _id_param = "recordId"
-    PARAM_PROCESSOR = MappingParamProcessor({"record_data_filter": "recordDataFilter"})
+    SUPPORTS_RECORD_DATA_FILTER = True
+    PARAM_PROCESSOR = MappingParamProcessor(
+        {
+            "record_data_filter": "recordDataFilter",
+            "recordDataFilter": "recordDataFilter",
+        }
+    )
 
     @execute_operation  # type: ignore
     def create(

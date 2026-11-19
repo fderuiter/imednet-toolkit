@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from imednet.simulation.state import SimulationState, get_default_simulation_state
+from imednet.utils.dates import parse_iso_datetime
+from imednet.utils.filters import ORDERED_FILTER_OPERATORS
+
+_TWO_CHAR_FILTER_OPS = frozenset(op for op in ORDERED_FILTER_OPERATORS if len(op) == 2)
+_ONE_CHAR_FILTER_OPS = frozenset({*(op for op in ORDERED_FILTER_OPERATORS if len(op) == 1), "="})
 
 
 def _to_camel_or_snake(key: str) -> list[str]:
@@ -21,33 +28,208 @@ def _to_camel_or_snake(key: str) -> list[str]:
     return list(dict.fromkeys([key, snake, camel]))
 
 
-def _matches_filter(item: dict[str, Any], field: str, expected_val: str) -> bool:
-    """Check if item matches the expected filter value across naming variants."""
+def _split_unquoted(expr: str, delimiter: str) -> list[str]:
+    """Split a filter string on an unquoted delimiter character."""
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    escape = False
+    for ch in expr:
+        if escape:
+            buf.append(ch)
+            escape = False
+            continue
+        if ch == "\\" and in_quotes:
+            buf.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            buf.append(ch)
+            continue
+        if ch == delimiter and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return [part for part in (p.strip() for p in parts) if part]
+
+
+def _unquote_filter_value(raw_val: str) -> str:
+    """Strip outer double quotes and unescape escaped characters."""
+    stripped = raw_val.strip()
+    if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+        inner = stripped[1:-1]
+        out: list[str] = []
+        escape = False
+        for ch in inner:
+            if escape:
+                out.append(ch)
+                escape = False
+            elif ch == "\\":
+                escape = True
+            else:
+                out.append(ch)
+        return "".join(out)
+    return stripped
+
+
+def _parse_clause(term: str) -> tuple[str, str, str] | None:
+    """Parse ``field<op>value`` outside quotation marks into ``(field, op, unquoted_value)``."""
+    in_quotes = False
+    escape = False
+    for idx in range(len(term)):
+        ch = term[idx]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_quotes:
+            escape = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            continue
+        if in_quotes:
+            continue
+        two_char = term[idx : idx + 2]
+        if len(two_char) == 2 and two_char in _TWO_CHAR_FILTER_OPS:
+            return term[:idx].strip(), two_char, _unquote_filter_value(term[idx + 2 :])
+        if ch in _ONE_CHAR_FILTER_OPS:
+            return term[:idx].strip(), ch, _unquote_filter_value(term[idx + 1 :])
+    return None
+
+
+def _try_parse_utc_datetime(raw: str) -> datetime | None:
+    """Parse an ISO-8601 date or timestamp string into a UTC-aware datetime if valid."""
+    text = raw.strip()
+    if len(text) < 10 or not text[:4].isdigit() or text[4] != "-":
+        return None
+    try:
+        dt = parse_iso_datetime(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _compare_ordered(actual: Any, expected: Any, op: str) -> bool:
+    """Apply an equality or ordering operator across two comparable values."""
+    if op in ("==", "="):
+        return bool(actual == expected)
+    if op == "!=":
+        return bool(actual != expected)
+    if op == "<":
+        return bool(actual < expected)
+    if op == "<=":
+        return bool(actual <= expected)
+    if op == ">":
+        return bool(actual > expected)
+    if op == ">=":
+        return bool(actual >= expected)
+    return False
+
+
+def _matches_clause(item: dict[str, Any], field: str, op: str, expected_val: str) -> bool:
+    """Check if ``item`` satisfies ``field <op> expected_val`` across naming variants."""
     candidates = _to_camel_or_snake(field)
     actual_val: Any = None
     found = False
-    for c in candidates:
-        if c in item:
-            actual_val = item[c]
+    for candidate in candidates:
+        if candidate in item:
+            actual_val = item[candidate]
             found = True
             break
 
     if not found:
         return False
 
+    if actual_val is None:
+        is_none_literal = expected_val.strip().lower() == "none"
+        if op in ("==", "="):
+            return is_none_literal
+        if op == "!=":
+            return not is_none_literal
+        return False
+
+    if op == "=~":
+        try:
+            return re.search(expected_val, str(actual_val)) is not None
+        except re.error:
+            return expected_val in str(actual_val)
+
     if isinstance(actual_val, bool):
-        return str(actual_val).lower() == expected_val.lower()
-    if isinstance(actual_val, int):
+        expected_lower = expected_val.strip().lower()
+        if expected_lower not in ("true", "false"):
+            return op == "!="
+        expected_bool = expected_lower == "true"
+        if op in ("==", "="):
+            return actual_val is expected_bool
+        if op == "!=":
+            return actual_val is not expected_bool
+        return False
+
+    if isinstance(actual_val, (int, float)):
         try:
-            return actual_val == int(expected_val)
+            expected_num = float(expected_val)
         except ValueError:
-            return False
-    if isinstance(actual_val, float):
-        try:
-            return actual_val == float(expected_val)
-        except ValueError:
-            return False
-    return str(actual_val).strip().lower() == expected_val.strip().lower()
+            return op == "!="
+        return _compare_ordered(float(actual_val), expected_num, op)
+
+    actual_str = str(actual_val).strip()
+    expected_str = expected_val.strip()
+
+    actual_dt = _try_parse_utc_datetime(actual_str)
+    expected_dt = _try_parse_utc_datetime(expected_str)
+    if actual_dt is not None and expected_dt is not None:
+        return _compare_ordered(actual_dt, expected_dt, op)
+
+    try:
+        actual_float = float(actual_str)
+        expected_float = float(expected_str)
+    except ValueError:
+        pass
+    else:
+        return _compare_ordered(actual_float, expected_float, op)
+
+    if op in ("==", "="):
+        return actual_str.lower() == expected_str.lower()
+    if op == "!=":
+        return actual_str.lower() != expected_str.lower()
+    return _compare_ordered(actual_str, expected_str, op)
+
+
+def _evaluate_filter_expression(
+    items: list[dict[str, Any]], filter_str: str
+) -> list[dict[str, Any]]:
+    """Filter ``items`` using ';' (AND) or ',' (OR) expressions."""
+    stripped = filter_str.strip()
+    if not stripped or stripped.lower() == "none":
+        return items
+
+    and_terms = _split_unquoted(stripped, ";")
+    if len(and_terms) > 1:
+        parsed_and = [_parse_clause(t) for t in and_terms]
+        return [
+            item
+            for item in items
+            if all(
+                clause is not None and _matches_clause(item, clause[0], clause[1], clause[2])
+                for clause in parsed_and
+            )
+        ]
+
+    or_terms = _split_unquoted(stripped, ",")
+    parsed_or = [_parse_clause(t) for t in or_terms]
+    return [
+        item
+        for item in items
+        if any(
+            clause is not None and _matches_clause(item, clause[0], clause[1], clause[2])
+            for clause in parsed_or
+        )
+    ]
 
 
 class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
@@ -169,25 +351,54 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
             return httpx.Response(200, json=job_status, request=request)
 
         # Fallback for unrecognized endpoints: return empty paginated response
-        return self._paginate_response(request, [], params)
+        return self._filter_and_paginate(request, [], params)
 
     def _filter_and_paginate(
         self, request: httpx.Request, items: list[dict[str, Any]], params: dict[str, str]
     ) -> httpx.Response:
-        """Apply query filter parameters and return a paginated response."""
+        """Apply query filter, recordDataFilter, sort, and pagination parameters."""
         filter_str = params.get("filter")
         if filter_str:
-            clauses = [term.split("==", 1) for term in filter_str.split(";") if "==" in term]
-            filtered = []
-            for item in items:
-                matches_all = True
-                for field, val in clauses:
-                    if not _matches_filter(item, field.strip(), val.strip()):
-                        matches_all = False
-                        break
-                if matches_all:
-                    filtered.append(item)
-            items = filtered
+            items = _evaluate_filter_expression(items, filter_str)
+
+        record_data_filter = params.get("recordDataFilter")
+        if record_data_filter is not None:
+            stripped_rdf = record_data_filter.strip()
+            if stripped_rdf.lower() == "none":
+                items = [{**item, "recordData": None} for item in items]
+            elif stripped_rdf:
+                items = [
+                    item
+                    for item in items
+                    if isinstance(item.get("recordData"), dict)
+                    and bool(_evaluate_filter_expression([item["recordData"]], stripped_rdf))
+                ]
+
+        sort_str = params.get("sort")
+        if sort_str:
+            sort_parts = [part.strip() for part in sort_str.split(",") if part.strip()]
+            if sort_parts:
+                sort_field = sort_parts[0]
+                reverse = len(sort_parts) > 1 and sort_parts[1].lower() == "desc"
+                candidates = _to_camel_or_snake(sort_field)
+
+                def _sort_value(entry: dict[str, Any]) -> Any:
+                    for candidate in candidates:
+                        if candidate in entry and entry[candidate] is not None:
+                            val = entry[candidate]
+                            if isinstance(val, (int, float)):
+                                return (0, float(val))
+                            text = str(val)
+                            dt = _try_parse_utc_datetime(text)
+                            if dt is not None:
+                                return (1, dt.timestamp())
+                            return (2, text.lower())
+                    return None
+
+                present = [item for item in items if _sort_value(item) is not None]
+                missing = [item for item in items if _sort_value(item) is None]
+                present.sort(key=_sort_value, reverse=reverse)
+                items = present + missing
 
         return self._paginate_response(request, items, params)
 

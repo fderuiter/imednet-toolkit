@@ -3,9 +3,46 @@
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Query, QueryStatus, calculate_legacy_status
+from imednet.spi.utils import build_filter_string, validate_filter_syntax
+
+from .chunked_pipeline import (
+    DEFAULT_OR_FILTER_BATCH_SIZE,
+    MAX_OR_FILTER_PUSHDOWN_ITEMS,
+    iter_chunks,
+)
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
+
+_TOP_LEVEL_QUERY_CONTROLS = frozenset({"page", "size", "limit", "sort"})
+
+
+def _can_push_single_subject_with_filters(
+    subject_key: str,
+    filter_kwargs: dict[str, Any],
+) -> bool:
+    """Return True if ``subject_key`` can be combined with ``filter_kwargs`` using pure AND."""
+    if "subject_key" in filter_kwargs or "subjectKey" in filter_kwargs:
+        return False
+    attr_filters = {k: v for k, v in filter_kwargs.items() if k != "filter"}
+    attr_filters["subject_key"] = subject_key
+    try:
+        built_attr = build_filter_string(attr_filters)
+        raw_filter = filter_kwargs.get("filter")
+        if raw_filter is not None:
+            validate_filter_syntax(raw_filter)
+            raw_clean = raw_filter.strip()
+            combined = (
+                f"{raw_clean};{built_attr}"
+                if raw_clean and built_attr
+                else (raw_clean or built_attr)
+            )
+        else:
+            combined = built_attr
+        validate_filter_syntax(combined)
+    except ValueError:
+        return False
+    return True
 
 
 class QueryStateCounts(dict[str, int]):
@@ -136,15 +173,57 @@ class QueryManagementWorkflow:
             A list of Query objects for the specified site.
         """
         subjects = self._sdk.get_subjects(study_key, site_name=site_key)
-        subject_keys = [s.subject_key for s in subjects]
+        subject_keys: list[Any] = list(
+            dict.fromkeys(s.subject_key for s in subjects if s.subject_key is not None)
+        )
         if not subject_keys:
             return []
 
-        final_filter_dict: dict[str, Any] = {"subject_key": subject_keys}
-        if additional_filter:
-            final_filter_dict.update(additional_filter)
+        subject_key_set = set(subject_keys)
+        control_kwargs = {k: v for k, v in kwargs.items() if k in _TOP_LEVEL_QUERY_CONTROLS}
+        filter_kwargs: dict[str, Any] = dict(additional_filter) if additional_filter else {}
+        for k, v in kwargs.items():
+            if k not in _TOP_LEVEL_QUERY_CONTROLS:
+                filter_kwargs[k] = v
 
-        return list(self._sdk.get_queries(study_key, **final_filter_dict, **kwargs))
+        if not filter_kwargs:
+            if len(subject_keys) <= MAX_OR_FILTER_PUSHDOWN_ITEMS:
+                batches = list(iter_chunks(subject_keys, chunk_size=DEFAULT_OR_FILTER_BATCH_SIZE))
+                if len(batches) == 1:
+                    return list(
+                        self._sdk.get_queries(study_key, subject_key=batches[0], **control_kwargs)
+                    )
+                results: list[Query] = []
+                seen_ids: set[int] = set()
+                for batch in batches:
+                    for query in self._sdk.get_queries(
+                        study_key, subject_key=batch, **control_kwargs
+                    ):
+                        ann_id = getattr(query, "annotation_id", None)
+                        if ann_id is not None:
+                            if ann_id in seen_ids:
+                                continue
+                            seen_ids.add(ann_id)
+                        results.append(query)
+                return results
+
+            all_queries = self._sdk.get_queries(study_key, **control_kwargs)
+            return [q for q in all_queries if getattr(q, "subject_key", None) in subject_key_set]
+
+        if len(subject_keys) == 1 and _can_push_single_subject_with_filters(
+            subject_keys[0], filter_kwargs
+        ):
+            return list(
+                self._sdk.get_queries(
+                    study_key,
+                    subject_key=subject_keys[0],
+                    **filter_kwargs,
+                    **control_kwargs,
+                )
+            )
+
+        filtered_queries = self._sdk.get_queries(study_key, **filter_kwargs, **control_kwargs)
+        return [q for q in filtered_queries if getattr(q, "subject_key", None) in subject_key_set]
 
     def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
         """Counts queries grouped by their current QueryStatus values.

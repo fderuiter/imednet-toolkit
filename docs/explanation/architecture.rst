@@ -127,9 +127,9 @@ async variants and are available under ``sdk.workflows``.
 Caching
 -------
 
-:doc:`/how-to/caching` describes how endpoint and schema data are cached. Cached values
-can be refreshed by passing ``refresh=True`` to endpoint methods or calling
-``schema.refresh()`` on a validator.
+:doc:`/how-to/caching` describes how validation schema metadata is cached via
+:class:`~imednet.validation.cache.SchemaCache` (refreshed by calling
+``schema.refresh()``) and how study records can be cached incrementally on disk.
 
 CLI
 ---

@@ -8,30 +8,42 @@ from typing import Any, Protocol, runtime_checkable
 
 from imednet.core.protocols import ParamProcessor
 
+COMMON_LIST_PARAMS: tuple[str, ...] = ("page", "size", "limit", "sort", "filter")
+
 
 class DefaultParamProcessor(ParamProcessor):
-    """Default parameter processor.
+    """Default parameter processor for list endpoints.
 
-    Simply passes filters through without modification.
+    Extracts standard top-level pagination, limit, sorting, and raw filter
+    parameters so they are emitted as separate query parameters instead of
+    being serialized into ``filter`` predicates.
     """
 
     def process_filters(self, filters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Return filters as-is and no special parameters.
+        """Extract standard top-level controls from filters.
 
         Args:
             filters: The input filters dictionary.
 
         Returns:
-            A tuple of (copy of filters, empty dict).
+            A tuple of (remaining attribute filters, extracted top-level parameters).
         """
-        return filters.copy(), {}
+        cleaned_filters = filters.copy()
+        special_params: dict[str, Any] = {}
+        for key in COMMON_LIST_PARAMS:
+            if key in cleaned_filters:
+                value = cleaned_filters.pop(key)
+                if value is not None:
+                    special_params[key] = value
+        return cleaned_filters, special_params
 
 
-class MappingParamProcessor(ParamProcessor):
+class MappingParamProcessor(DefaultParamProcessor):
     """ParamProcessor that maps specific filter keys to API parameters.
 
-    Extracts keys defined in the mapping and returns them as special parameters,
-    optionally renaming them according to the mapping values.
+    Extracts common top-level list parameters plus keys defined in the mapping
+    and returns them as special parameters, optionally renaming them according
+    to the mapping values.
     """
 
     def __init__(
@@ -50,7 +62,7 @@ class MappingParamProcessor(ParamProcessor):
         self.defaults = defaults or {}
 
     def process_filters(self, filters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Process filters using the configured mapping.
+        """Process filters using standard controls and the configured mapping.
 
         Args:
             filters: The input filters dictionary.
@@ -58,24 +70,27 @@ class MappingParamProcessor(ParamProcessor):
         Returns:
             A tuple of (cleaned filters, special parameters).
         """
-        filters = filters.copy()
-        special_params = {}
+        cleaned_filters, special_params = super().process_filters(filters)
 
         for filter_key, api_key in self.mapping.items():
             value = None
-            if filter_key in filters:
-                value = filters.pop(filter_key)
-            elif filter_key in self.defaults:
+            if filter_key in cleaned_filters:
+                value = cleaned_filters.pop(filter_key)
+            elif filter_key in self.defaults and api_key not in special_params:
                 value = self.defaults[filter_key]
 
             if value is not None:
-                # Convert boolean to lowercase string if necessary, or just pass through
-                if isinstance(value, bool):
-                    special_params[api_key] = str(value).lower()
-                else:
-                    special_params[api_key] = value
+                formatted = str(value).lower() if isinstance(value, bool) else value
+                if api_key in special_params and special_params[api_key] != formatted:
+                    from imednet.errors.validation import ConfigurationError
 
-        return filters, special_params
+                    raise ConfigurationError(
+                        f"Conflicting values provided for '{api_key}': "
+                        f"{special_params[api_key]!r} vs {formatted!r}."
+                    )
+                special_params[api_key] = formatted
+
+        return cleaned_filters, special_params
 
 
 @runtime_checkable

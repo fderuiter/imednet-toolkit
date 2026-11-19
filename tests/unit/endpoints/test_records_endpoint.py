@@ -28,7 +28,7 @@ def test_list_builds_path_filters_and_data_filter(
 
     assert captured["path"] == "/api/v1/edc/studies/S1/records"
     assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "age>10"}
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"status": "open"}
     assert isinstance(result[0], Record)
 
 
@@ -174,7 +174,7 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
 
     assert captured["path"] == "/api/v1/edc/studies/S1/records"
     assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "age>10"}
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"status": "open"}
     assert len(df) == 1
 
 

@@ -26,7 +26,9 @@ from imednet.utils.filters import (
     build_filter_string,
     parse_filter_expression,
     parse_filter_expressions,
+    validate_connector_exclusivity,
     validate_filter_key,
+    validate_filter_syntax,
 )
 from imednet.utils.job_poller import (
     AsyncJobPoller,
@@ -92,6 +94,8 @@ __all__ = [
     "sanitize_csv_formula",
     "set_base_url_context",
     "sqlite_connection",
+    "validate_connector_exclusivity",
     "validate_filter_key",
+    "validate_filter_syntax",
     "validate_partition_key",
 ]

@@ -60,16 +60,22 @@ custom retry logic.
 Filtering
 ---------
 
-Endpoints accept a ``filter`` parameter that matches the syntax documented in the
-Mednet API guide. For clinical data queries, ``recordDataFilter`` can be supplied
-alongside ``filter``. See :mod:`imednet.endpoints.records` for usage examples.
+List endpoints accept top-level ``page``, ``size`` (or ``limit``), ``sort``, and
+``filter`` parameters matching the Mednet API common query specification. When both
+a raw ``filter`` string and keyword attribute filters are supplied, the SDK joins
+them with ``;`` (``AND``) and validates filter syntax before sending the request.
 
-Some endpoints (:class:`~imednet.endpoints.studies.StudiesEndpoint`,
-:class:`~imednet.endpoints.forms.FormsEndpoint`,
-:class:`~imednet.endpoints.intervals.IntervalsEndpoint`, and
-:class:`~imednet.endpoints.variables.VariablesEndpoint`) maintain an internal
-cache. They accept a ``refresh`` argument to force a reload of cached data. This
-flag is not a general filtering option and has no effect on other endpoints.
+For clinical form data queries, :class:`~imednet.endpoints.records.RecordsEndpoint`
+additionally accepts ``record_data_filter`` (or ``recordDataFilter``) alongside
+``filter`` as a separate top-level parameter. Passing clinical data filters to
+non-record endpoints raises :class:`~imednet.errors.ConfigurationError`. See
+:mod:`imednet.endpoints.records` for usage examples.
+
+List endpoints execute live API requests on each call and do not cache responses
+in memory. For validation metadata caching, call
+:meth:`~imednet.validation.cache.SchemaCache.refresh`, or use
+:class:`~imednet_workflows.cached_loader.CachedRecordsLoader` for persistent
+incremental record synchronization.
 
 Dates must use UTC timestamps except where noted. When filtering visits by
 ``startDate``, ``dueDate``, ``endDate`` or ``visitDate``, use ``YYYY-MM-DD``.

@@ -53,7 +53,7 @@ def test_records_list_filter_param():
     records = list(sdk.records.list("ST", status="Open"))
 
     sent = route.calls.last.request
-    assert sent.url.params["filter"] == "status==Open;studyKey==ST"
+    assert sent.url.params["filter"] == "status==Open"
     assert records[0].record_id == 1
 
 

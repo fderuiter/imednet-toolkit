@@ -103,7 +103,7 @@ async def test_async_to_dataframe_parameter_forwarding(
 
     assert captured["path"] == "/api/v1/edc/studies/S1/records"
     assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "age>10"}
-    assert filter_capture["filters"] == {"status": "open", "studyKey": "S1"}
+    assert filter_capture["filters"] == {"status": "open"}
     assert len(df) == 1
 
 

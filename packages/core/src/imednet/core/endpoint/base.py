@@ -19,8 +19,8 @@ from imednet.core.endpoint.operations import FilterGetOperation, ListOperation
 from imednet.core.endpoint.operations.get import PathGetOperation
 from imednet.core.endpoint.strategies import (
     DefaultParamProcessor,
-    KeepStudyKeyStrategy,
     OptionalStudyKeyStrategy,
+    PopStudyKeyStrategy,
     StudyKeyStrategy,
 )
 from imednet.core.endpoint.structs import ListRequestState, ParamState
@@ -28,7 +28,11 @@ from imednet.core.paginator import AsyncPaginator, Paginator
 from imednet.core.parsing import get_model_parser
 from imednet.core.protocols import AsyncRequesterProtocol, ParamProcessor, RequesterProtocol
 from imednet.models.base import ImednetBaseModel
-from imednet.utils.filters import build_filter_string, validate_record_filter
+from imednet.utils.filters import (
+    build_filter_string,
+    validate_filter_syntax,
+    validate_record_filter,
+)
 from imednet.utils.typing import FilterValue, ItemId
 from imednet.utils.url import build_safe_path
 
@@ -138,6 +142,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
     PARAM_PROCESSOR: ParamProcessor | None = None
     PARAM_PROCESSOR_CLS: type[ParamProcessor] = DefaultParamProcessor
     STUDY_KEY_STRATEGY: StudyKeyStrategy | None = None
+    SUPPORTS_RECORD_DATA_FILTER: bool = False
 
     @property
     def study_key_strategy(self) -> StudyKeyStrategy:
@@ -145,7 +150,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
         if self.STUDY_KEY_STRATEGY:
             return self.STUDY_KEY_STRATEGY
         if self.requires_study_key:
-            return KeepStudyKeyStrategy()
+            return PopStudyKeyStrategy()
         return OptionalStudyKeyStrategy()
 
     @property
@@ -171,15 +176,47 @@ class _ListEndpointBase(GenericEndpoint[T]):
         Returns:
             A ParamState containing the resolved study, parameters, and other filters.
         """
+        if not self.SUPPORTS_RECORD_DATA_FILTER:
+            unsupported_rdf = [
+                key
+                for key in ("record_data_filter", "recordDataFilter")
+                if key in filters or (extra_params is not None and key in extra_params)
+            ]
+            if unsupported_rdf:
+                from imednet.errors.validation import ConfigurationError
+
+                raise ConfigurationError(
+                    f"Endpoint '{self.__class__.__name__}' does not support clinical data "
+                    f"filtering ({', '.join(unsupported_rdf)}); only RecordsEndpoint supports "
+                    "record_data_filter / recordDataFilter."
+                )
+
         filters = self._auto_filter(filters.copy())
 
         processed_filters, special_params = self.param_processor.process_filters(filters)
+        merged_extra: dict[str, Any] = {} if extra_params is None else extra_params.copy()
         if special_params:
-            if extra_params is None:  # noqa: SIM108
-                extra_params = {}
+            if (
+                "filter" in merged_extra
+                and merged_extra["filter"] is not None
+                and "filter" in special_params
+                and special_params["filter"] is not None
+            ):
+                extra_f = merged_extra["filter"]
+                spec_f = special_params["filter"]
+                validate_filter_syntax(extra_f)
+                validate_filter_syntax(spec_f)
+                extra_clean = extra_f.strip()
+                spec_clean = spec_f.strip()
+                merged_filter = (
+                    f"{extra_clean};{spec_clean}"
+                    if extra_clean and spec_clean
+                    else (extra_clean or spec_clean)
+                )
+                merged_extra.update(special_params)
+                merged_extra["filter"] = merged_filter
             else:
-                extra_params = extra_params.copy()
-            extra_params.update(special_params)
+                merged_extra.update(special_params)
 
         if study_key:
             processed_filters["studyKey"] = study_key
@@ -189,11 +226,28 @@ class _ListEndpointBase(GenericEndpoint[T]):
 
         other_filters = {k: v for k, v in processed_filters.items() if k != "studyKey"}
 
+        caller_filter = merged_extra.pop("filter", None)
+        if caller_filter is not None:
+            validate_filter_syntax(caller_filter)
+
+        attr_filter = build_filter_string(processed_filters) if processed_filters else ""
+        if caller_filter is not None:
+            caller_clean = caller_filter.strip()
+            if caller_clean and attr_filter:
+                combined_filter = f"{caller_clean};{attr_filter}"
+            else:
+                combined_filter = caller_clean or attr_filter
+        else:
+            combined_filter = attr_filter
+
+        if combined_filter:
+            validate_filter_syntax(combined_filter)
+
         params: dict[str, Any] = {}
-        if processed_filters:
-            params["filter"] = build_filter_string(processed_filters)
-        if extra_params:
-            params.update(extra_params)
+        if combined_filter:
+            params["filter"] = combined_filter
+        if merged_extra:
+            params.update(merged_extra)
 
         record_data_filter = params.get("recordDataFilter")
         if record_data_filter is None:

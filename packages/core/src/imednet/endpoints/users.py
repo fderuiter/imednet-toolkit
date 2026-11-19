@@ -37,10 +37,12 @@ class UsersParamProcessor(ParamProcessor):
         else:
             special_params["includeInactive"] = "false"
 
-        # Handle page, size, sort
-        for key in ("page", "size", "sort"):
+        # Handle page, size, limit, sort
+        for key in ("page", "size", "limit", "sort"):
             if key in filters:
-                special_params[key] = filters.pop(key)
+                val = filters.pop(key)
+                if val is not None:
+                    special_params[key] = val
 
         return filters, special_params
 
@@ -89,7 +91,11 @@ class UsersOperationDef:
         unsupported = [k for k in processed_filters if k != "studyKey"]
         if extra_params:
             unsupported.extend(
-                [k for k in extra_params if k not in ("includeInactive", "page", "size", "sort")]
+                [
+                    k
+                    for k in extra_params
+                    if k not in ("includeInactive", "page", "size", "limit", "sort")
+                ]
             )
         if unsupported:
             from imednet.errors.validation import ConfigurationError

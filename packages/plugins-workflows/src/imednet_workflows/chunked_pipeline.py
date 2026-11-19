@@ -13,6 +13,11 @@ R = TypeVar("R")
 # amortizing DB/API overhead across each batch.
 DEFAULT_CHUNK_SIZE = 5_000
 
+# Keep server-side OR filter strings well within URL query limits while avoiding
+# excessive sequential round-trips on non-selective full-study cohorts.
+DEFAULT_OR_FILTER_BATCH_SIZE = 50
+MAX_OR_FILTER_PUSHDOWN_ITEMS = 250
+
 
 def iter_chunks(items: Iterable[T], *, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Iterator[list[T]]:
     """Yield ``items`` in bounded chunks."""
