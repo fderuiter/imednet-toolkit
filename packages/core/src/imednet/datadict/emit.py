@@ -207,6 +207,124 @@ def _item_def_signature(var: Variable) -> Any:
     )
 
 
+def _default_unwrapped_name(item_oid: str, form_key: str) -> str:
+    """Return the variableName that ODM import infers from item_oid without VariableName."""
+    raw_oid = item_oid.strip()
+    prefixes: list[str] = []
+    if form_key:
+        prefixes.extend([f"IT.{form_key}.", f"{form_key}."])
+    prefixes.append(f"IG_{form_key}.")
+    for prefix in prefixes:
+        if raw_oid.startswith(prefix):
+            suffix = raw_oid[len(prefix) :].strip()
+            if suffix:
+                return suffix
+    return raw_oid
+
+
+def _allocate_unscoped_oid(var_name: str, used_oids: set[str]) -> str:
+    """Allocate a globally unique unprefixed OID for a non-colliding variable definition."""
+    base_var = var_name.strip() or "ITEM"
+    if base_var not in used_oids:
+        used_oids.add(base_var)
+        return base_var
+    counter = 2
+    while True:
+        fallback = f"IT.{base_var}__{counter}"
+        if fallback not in used_oids:
+            used_oids.add(fallback)
+            return fallback
+        counter += 1
+
+
+def _allocate_scoped_oid(form_key: str, var_name: str, used_oids: set[str]) -> str:
+    """Allocate a globally unique form-scoped OID without colliding with raw or prior OIDs."""
+    base_var = var_name.strip() or "ITEM"
+    candidates: list[str] = []
+    if form_key:
+        candidates.append(f"{form_key}.{base_var}")
+        candidates.append(f"IT.{form_key}.{base_var}")
+        prefix = f"IT.{form_key}.{base_var}"
+    else:
+        candidates.append(base_var)
+        candidates.append(f"IT.{base_var}")
+        prefix = f"IT.{base_var}"
+
+    for candidate in candidates:
+        if candidate not in used_oids:
+            used_oids.add(candidate)
+            return candidate
+
+    counter = 2
+    while True:
+        fallback = f"{prefix}__{counter}"
+        if fallback not in used_oids:
+            used_oids.add(fallback)
+            return fallback
+        counter += 1
+
+
+def _allocate_item_oids(
+    sorted_forms: list[Form],
+) -> tuple[list[list[Variable]], dict[tuple[int, int], str], dict[str, list[str]]]:
+    """Allocate globally unique ODM ItemDef OIDs across unscoped and form-scoped variables."""
+    sorted_vars_by_form: list[list[Variable]] = [
+        sorted(f.variables, key=lambda v: _sort_key_int_then_str(v.sequence, v.variableName))
+        for f in sorted_forms
+    ]
+
+    sigs_by_var_name: dict[str, set[Any]] = {}
+    sig_by_occ: dict[tuple[int, int], Any] = {}
+    for f_idx, sorted_vars in enumerate(sorted_vars_by_form):
+        for v_idx, var in enumerate(sorted_vars):
+            sig = _item_def_signature(var)
+            sig_by_occ[(f_idx, v_idx)] = sig
+            sigs_by_var_name.setdefault(var.variableName, set()).add(sig)
+
+    scoped_var_names = {v_name for v_name, sigs in sigs_by_var_name.items() if len(sigs) > 1}
+    used_item_oids: set[str] = set()
+    unscoped_oid_by_name: dict[str, str] = {}
+    scoped_oid_by_group: dict[tuple[str, str, Any], str] = {}
+
+    # Pass 1: Reserve unprefixed OIDs for variables with a single consistent definition
+    for sorted_vars in sorted_vars_by_form:
+        for var in sorted_vars:
+            if (
+                var.variableName not in scoped_var_names
+                and var.variableName not in unscoped_oid_by_name
+            ):
+                unscoped_oid_by_name[var.variableName] = _allocate_unscoped_oid(
+                    var.variableName,
+                    used_item_oids,
+                )
+
+    # Pass 2: Allocate collision-free form-scoped OIDs for variables with distinct definitions
+    oid_by_occ: dict[tuple[int, int], str] = {}
+    referencing_forms_by_oid: dict[str, list[str]] = {}
+    for f_idx, form in enumerate(sorted_forms):
+        sorted_vars = sorted_vars_by_form[f_idx]
+        for v_idx, var in enumerate(sorted_vars):
+            if var.variableName in scoped_var_names:
+                group_key = (form.formKey, var.variableName, sig_by_occ[(f_idx, v_idx)])
+                item_oid = scoped_oid_by_group.get(group_key)
+                if item_oid is None:
+                    item_oid = _allocate_scoped_oid(
+                        form.formKey,
+                        var.variableName,
+                        used_item_oids,
+                    )
+                    scoped_oid_by_group[group_key] = item_oid
+            else:
+                item_oid = unscoped_oid_by_name[var.variableName]
+
+            oid_by_occ[(f_idx, v_idx)] = item_oid
+            ref_forms = referencing_forms_by_oid.setdefault(item_oid, [])
+            if form.formKey not in ref_forms:
+                ref_forms.append(form.formKey)
+
+    return sorted_vars_by_form, oid_by_occ, referencing_forms_by_oid
+
+
 def _collect_study_measurement_units(
     datadict: DataDictionary,
     sorted_forms: list[Form],
@@ -465,17 +583,8 @@ def to_odm_xml(
 
     _emit_protocol_and_visits(mdv_elem, datadict.metadata.extraAttributes)
 
-    # Determine which shared variable names have distinct definitions across forms
-    sigs_by_var_name: dict[str, set[Any]] = {}
-    for form in sorted_forms:
-        for var in form.variables:
-            sigs_by_var_name.setdefault(var.variableName, set()).add(_item_def_signature(var))
-    scoped_var_names = {v_name for v_name, sigs in sigs_by_var_name.items() if len(sigs) > 1}
-
-    def _item_oid_for(form_key: str, var_name: str) -> str:
-        if var_name in scoped_var_names and form_key:
-            return f"{form_key}.{var_name}"
-        return var_name
+    # Allocate globally unique ItemDef OIDs across unscoped and form-scoped variable names
+    sorted_vars_by_form, oid_by_occ, referencing_forms_by_oid = _allocate_item_oids(sorted_forms)
 
     # 2. FormDef elements
     for form in sorted_forms:
@@ -496,7 +605,7 @@ def to_odm_xml(
         )
 
     # 3. ItemGroupDef elements
-    for form in sorted_forms:
+    for f_idx, form in enumerate(sorted_forms):
         ig_attribs: dict[str, str] = {
             "OID": f"IG_{form.formKey}",
             "Name": f"{form.formName or form.formKey} Details",
@@ -522,15 +631,14 @@ def to_odm_xml(
             f"{{{ODM_NS}}}ItemGroupDef",
             ig_attribs,
         )
-        sorted_vars = sorted(
-            form.variables, key=lambda v: _sort_key_int_then_str(v.sequence, v.variableName)
-        )
-        for var_idx, var in enumerate(sorted_vars, 1):
+        sorted_vars = sorted_vars_by_form[f_idx]
+        for v_idx, var in enumerate(sorted_vars):
+            var_idx = v_idx + 1
             req_str = str(var.required).strip() if var.required is not None else ""
             req_lower = req_str.lower()
             is_yes = req_lower in ("yes", "y", "true", "1")
             is_no = req_lower in ("no", "n", "false", "0", "")
-            item_oid = _item_oid_for(form.formKey, var.variableName)
+            item_oid = oid_by_occ[(f_idx, v_idx)]
             item_ref_attribs: dict[str, str] = {
                 "ItemOID": item_oid,
                 "OrderNumber": str(var.sequence if var.sequence is not None else var_idx),
@@ -547,15 +655,13 @@ def to_odm_xml(
 
             ET.SubElement(ig_elem, f"{{{ODM_NS}}}ItemRef", item_ref_attribs)
 
-    # 4. ItemDef elements (scoped by Form when definitions differ; unprefixed otherwise)
+    # 4. ItemDef elements (globally unique OIDs preserving source names and distinct definitions)
     emitted_item_defs: set[str] = set()
     item_def_elements: list[tuple[Variable, str, str, str]] = []
-    for form in sorted_forms:
-        sorted_vars = sorted(
-            form.variables, key=lambda v: _sort_key_int_then_str(v.sequence, v.variableName)
-        )
-        for var in sorted_vars:
-            item_oid = _item_oid_for(form.formKey, var.variableName)
+    for f_idx, form in enumerate(sorted_forms):
+        sorted_vars = sorted_vars_by_form[f_idx]
+        for v_idx, var in enumerate(sorted_vars):
+            item_oid = oid_by_occ[(f_idx, v_idx)]
             if item_oid not in emitted_item_defs:
                 emitted_item_defs.add(item_oid)
                 datatype, _ = _map_to_odm_datatype(
@@ -577,9 +683,8 @@ def to_odm_xml(
             "Name": var.variableName,
             "DataType": datatype,
         }
-        if form_key and var.variableName.startswith(
-            (f"{form_key}.", f"IT.{form_key}.", f"IG_{form_key}.")
-        ):
+        ref_forms = referencing_forms_by_oid.get(item_oid, [form_key])
+        if any(_default_unwrapped_name(item_oid, fk) != var.variableName for fk in ref_forms):
             item_attribs[f"{{{IMEDNET_NS}}}VariableName"] = var.variableName
         if var.format and str(var.format).isdigit():
             item_attribs["Length"] = str(var.format)

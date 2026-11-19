@@ -686,3 +686,44 @@ def test_load_from_cdisc_odm_broken_schedule_unit_and_rule_references() -> None:
 
     with pytest.raises(ValueError, match="Strict loading error"):
         load_from_cdisc_odm(xml_missing_refs, strict=True)
+
+
+def test_load_from_cdisc_odm_preserves_sibling_raw_and_scoped_names() -> None:
+    """Sibling items on the same Form do not collapse when one OID is raw F1.AGE."""
+    xml_sibling_collision = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">
+  <Study OID="S_SIBLING">
+    <MetaDataVersion OID="MDV1">
+      <FormDef OID="F1" Name="Form 1">
+        <ItemGroupRef ItemGroupOID="IG_F1" OrderNumber="1"/>
+      </FormDef>
+      <FormDef OID="F2" Name="Form 2">
+        <ItemGroupRef ItemGroupOID="IG_F2" OrderNumber="1"/>
+      </FormDef>
+      <ItemGroupDef OID="IG_F1" Name="Group F1">
+        <ItemRef ItemOID="IT.F1.AGE" OrderNumber="1"/>
+        <ItemRef ItemOID="F1.AGE" OrderNumber="2"/>
+      </ItemGroupDef>
+      <ItemGroupDef OID="IG_F2" Name="Group F2">
+        <ItemRef ItemOID="AGE" OrderNumber="1"/>
+        <ItemRef ItemOID="F2.AGE" OrderNumber="2"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT.F1.AGE" Name="AGE" DataType="integer"/>
+      <ItemDef OID="F1.AGE" Name="F1.AGE" DataType="text"/>
+      <ItemDef OID="AGE" Name="AGE" DataType="float"/>
+      <ItemDef OID="F2.AGE" Name="F2.AGE" DataType="date"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    dd = load_from_cdisc_odm(xml_sibling_collision, strict=True)
+    assert dd.metadata.validationWarnings == []
+    forms_by_key = {f.formKey: f for f in dd.forms}
+    assert [(v.variableName, v.variableType) for v in forms_by_key["F1"].variables] == [
+        ("AGE", "Integer"),
+        ("F1.AGE", "Text"),
+    ]
+    assert [(v.variableName, v.variableType) for v in forms_by_key["F2"].variables] == [
+        ("AGE", "Float"),
+        ("F2.AGE", "Date"),
+    ]

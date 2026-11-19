@@ -347,18 +347,8 @@ def _map_datatype(
     return "Text"
 
 
-def _resolve_variable_name(
-    it_def: ET.Element,
-    it_oid: str,
-    f_oid: str,
-    ig_oid: str | None,
-) -> str:
-    """Resolve canonical variableName from ItemDef, unwrapping form-scoped OID prefixes."""
-    explicit_var_name = _get_attr(it_def, "VariableName")
-    if explicit_var_name and explicit_var_name.strip():
-        return explicit_var_name.strip()
-
-    raw_oid = (_get_attr(it_def, "OID") or it_oid).strip()
+def _unwrap_scoped_oid(raw_oid: str, f_oid: str, ig_oid: str | None) -> str:
+    """Strip a matching form or item-group prefix from an ItemDef OID when non-empty."""
     prefixes: list[str] = []
     if f_oid:
         prefixes.extend([f"IT.{f_oid}.", f"{f_oid}."])
@@ -370,8 +360,45 @@ def _resolve_variable_name(
             suffix = raw_oid[len(prefix) :].strip()
             if suffix:
                 return suffix
+    return raw_oid
 
-    return raw_oid or (_get_attr(it_def, "Name") or "").strip() or it_oid
+
+def _resolve_variable_name(
+    it_def: ET.Element,
+    it_oid: str,
+    f_oid: str,
+    ig_oid: str | None,
+    sibling_refs: list[tuple[str, str | None]] | None = None,
+    item_def_elems: dict[str, ET.Element] | None = None,
+) -> str:
+    """Resolve canonical variableName from ItemDef, unwrapping form-scoped OID prefixes."""
+    explicit_var_name = _get_attr(it_def, "VariableName")
+    if explicit_var_name and explicit_var_name.strip():
+        return explicit_var_name.strip()
+
+    raw_oid = (_get_attr(it_def, "OID") or it_oid).strip()
+    unwrapped = _unwrap_scoped_oid(raw_oid, f_oid, ig_oid)
+    if unwrapped != raw_oid and sibling_refs:
+        it_name = (_get_attr(it_def, "Name") or "").strip()
+        for other_oid_raw, other_ig_oid in sibling_refs:
+            other_oid = other_oid_raw.strip()
+            if not other_oid or other_oid == raw_oid:
+                continue
+            if other_oid == unwrapped:
+                return raw_oid
+            if (
+                it_name == raw_oid
+                and item_def_elems is not None
+                and _unwrap_scoped_oid(other_oid, f_oid, other_ig_oid) == unwrapped
+            ):
+                other_def = item_def_elems.get(other_oid)
+                other_name = (
+                    (_get_attr(other_def, "Name") or "").strip() if other_def is not None else ""
+                )
+                if other_name != other_oid:
+                    return raw_oid
+
+    return unwrapped or (_get_attr(it_def, "Name") or "").strip() or it_oid
 
 
 def _extract_item_units_and_ranges(
@@ -909,6 +936,7 @@ def load_from_cdisc_odm(
         inherited_sas_dataset: str | None,
         fallback_seq: int,
         not_found_context: str,
+        sibling_refs: list[tuple[str, str | None]] | None = None,
     ) -> Variable | None:
         it_oid = _get_attr(item_ref, "ItemOID") or ""
         ref_extra = _extract_unmapped_attributes(
@@ -952,7 +980,14 @@ def load_from_cdisc_odm(
         if range_checks:
             it_extra["rangeChecks"] = range_checks
 
-        var_name = _resolve_variable_name(it_def, it_oid, f_oid, ig_oid)
+        var_name = _resolve_variable_name(
+            it_def,
+            it_oid,
+            f_oid,
+            ig_oid,
+            sibling_refs=sibling_refs,
+            item_def_elems=item_def_elems,
+        )
 
         method_oid = (_get_attr(item_ref, "MethodOID") or "").strip()
         if method_oid:
@@ -1055,6 +1090,19 @@ def load_from_cdisc_odm(
 
         ig_refs = _find_children(form_elem, "ItemGroupRef")
         ig_refs.sort(key=lambda r: _parse_order(r, 0))
+        direct_item_refs = _find_children(form_elem, "ItemRef")
+        if direct_item_refs:
+            direct_item_refs.sort(key=lambda r: _parse_order(r, 0))
+
+        form_sibling_refs: list[tuple[str, str | None]] = []
+        for ig_ref in ig_refs:
+            ig_oid_preview = _get_attr(ig_ref, "ItemGroupOID") or ""
+            ig_def_preview = item_group_def_elems.get(ig_oid_preview)
+            if ig_def_preview is not None:
+                for ir in _find_children(ig_def_preview, "ItemRef"):
+                    form_sibling_refs.append((_get_attr(ir, "ItemOID") or "", ig_oid_preview))
+        for ir in direct_item_refs:
+            form_sibling_refs.append((_get_attr(ir, "ItemOID") or "", None))
 
         for ig_ref in ig_refs:
             ig_oid = _get_attr(ig_ref, "ItemGroupOID") or ""
@@ -1111,14 +1159,13 @@ def load_from_cdisc_odm(
                     inherited_sas_dataset=ig_sas_dataset,
                     fallback_seq=var_seq,
                     not_found_context=f"in ItemGroup '{ig_oid}'",
+                    sibling_refs=form_sibling_refs,
                 )
                 if parsed_var is not None:
                     variables.append(parsed_var)
                     var_seq += 1
 
-        direct_item_refs = _find_children(form_elem, "ItemRef")
         if direct_item_refs:
-            direct_item_refs.sort(key=lambda r: _parse_order(r, 0))
             for item_ref in direct_item_refs:
                 parsed_var = _build_variable_from_item_ref(
                     item_ref,
@@ -1128,6 +1175,7 @@ def load_from_cdisc_odm(
                     inherited_sas_dataset=f_extra.get("SASDatasetName"),
                     fallback_seq=var_seq,
                     not_found_context=f"on Form '{f_oid}'",
+                    sibling_refs=form_sibling_refs,
                 )
                 if parsed_var is not None:
                     variables.append(parsed_var)
