@@ -460,3 +460,64 @@ def test_cached_loader_http_contract_iso_timestamp_and_lowercase_bool(tmp_path: 
         assert calls[1]["filter"] == "deleted==false"
         assert calls[1]["recordDataFilter"] == "none"
         assert calls[2]["filter"] == "dateModified>=2024-01-02T00:00:00Z"
+
+
+def test_cached_loader_incremental_sync_with_simulation_transport(tmp_path: Path) -> None:
+    """Verify CachedRecordsLoader fetches and caches modified and created records via SimulationTransport."""
+    import httpx
+
+    from imednet.sdk import ImednetSDK
+    from imednet.simulation import SimulationState, SimulationTransport
+
+    state = SimulationState()
+    transport = SimulationTransport(state=state)
+    recorded_get_params: list[dict[str, str]] = []
+    original_handle = transport.handle_request
+
+    def spy_handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method.upper() == "GET":
+            recorded_get_params.append(dict(request.url.params))
+        return original_handle(request)
+
+    transport.handle_request = spy_handle_request  # type: ignore[method-assign]
+    sdk = ImednetSDK(simulation_mode=True, transport=transport)
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "sim-cache")
+
+    initial_records = loader.load_records("STUDY")
+    assert [r.record_id for r in initial_records] == [601, 602]
+    assert initial_records[1].record_data == {"V_WEIGHT": 68.5}
+
+    # Modify existing record 602 and create a new record after the initial high-water mark
+    sdk.records.create(
+        "STUDY",
+        [
+            {
+                "recordId": 602,
+                "subjectKey": "SUB1",
+                "formKey": "F_VS",
+                "data": {"V_WEIGHT": 71.0},
+                "dateModified": "2026-11-15T12:00:00Z",
+            },
+            {
+                "subjectKey": "SUB1",
+                "formKey": "F_VS",
+                "data": {"V_WEIGHT": 72.5},
+                "dateModified": "2026-11-16T08:00:00Z",
+            },
+        ],
+    )
+
+    recorded_get_params.clear()
+    refreshed_records = loader.load_records("STUDY")
+
+    # Delta request must send top-level timestamp filter without studyKey
+    assert recorded_get_params[0]["filter"] == "dateModified>=2026-01-10T09:35:00Z"
+    assert "studyKey" not in recorded_get_params[0]["filter"]
+    assert recorded_get_params[1]["filter"] == "deleted==false"
+    assert recorded_get_params[1]["recordDataFilter"] == "none"
+
+    by_id = {r.record_id: r for r in refreshed_records}
+    assert sorted(k for k in by_id if k is not None) == [601, 602, 1001]
+    assert by_id[601].record_data == {"V_AGE": 45, "V_GENDER": "Female"}
+    assert by_id[602].record_data == {"V_WEIGHT": 71.0}
+    assert by_id[1001].record_data == {"V_WEIGHT": 72.5}

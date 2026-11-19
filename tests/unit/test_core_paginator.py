@@ -216,3 +216,51 @@ def test_paginator_rejects_invalid_bounds(
     async_client = AsyncDummyClient([{"data": [1]}])
     with pytest.raises(ValueError, match=match):
         AsyncPaginator(async_client, "/p", params=params, page_size=page_size)  # type: ignore
+
+
+@pytest.mark.parametrize(
+    ("params", "expected_size"),
+    [
+        ({"size": 2}, 2),
+        ({"limit": 2}, 2),
+        ({"size": 2, "limit": 2}, 2),
+    ],
+)
+def test_paginator_explicit_size_or_limit_bounds_to_single_page(
+    params: dict[str, Any], expected_size: int
+) -> None:
+    """Test explicit size or limit in params restricts iteration to one page without leaking limit."""
+    sync_client = DummyClient(
+        [
+            {"data": [1, 2, 3], "pagination": {"totalPages": 4}},
+            {"data": [4, 5], "pagination": {"totalPages": 4}},
+        ]
+    )
+    paginator = Paginator(sync_client, "/p", params=params, page_size=100)
+    assert paginator.page_size == expected_size
+    assert list(paginator) == [1, 2]
+    assert len(sync_client.calls) == 1
+    assert sync_client.calls[0]["params"] == {"page": 0, "size": expected_size}
+
+
+@pytest.mark.asyncio
+async def test_async_paginator_explicit_limit_bounds_to_single_page() -> None:
+    """Test AsyncPaginator restricts iteration to one page when limit is explicitly provided."""
+    async_client = AsyncDummyClient(
+        [
+            {"data": [10, 20, 30], "pagination": {"totalPages": 3}},
+            {"data": [40], "pagination": {"totalPages": 3}},
+        ]
+    )
+    paginator = AsyncPaginator(async_client, "/p", params={"limit": 2}, page_size=100)  # type: ignore[arg-type]
+    assert paginator.page_size == 2
+    assert [item async for item in paginator] == [10, 20]
+    assert len(async_client.calls) == 1
+    assert async_client.calls[0]["params"] == {"page": 0, "size": 2}
+
+
+def test_paginator_rejects_conflicting_size_and_limit() -> None:
+    """Test Paginator rejects conflicting explicit size and limit values."""
+    client = DummyClient([{"data": [1]}])
+    with pytest.raises(ValueError, match="Conflicting pagination bounds"):
+        Paginator(client, "/p", params={"size": 10, "limit": 25})

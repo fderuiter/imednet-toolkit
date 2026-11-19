@@ -99,3 +99,24 @@ async def test_async_get_no_args_raises_type_error():
     ep = studies.AsyncStudiesEndpoint(async_client)
     with pytest.raises(TypeError):
         await ep.get()
+
+
+@pytest.mark.asyncio
+async def test_async_studies_list_or_filter_inside_study_context_ignores_ambient_context():
+    """Test AsyncImednetSDK studies.list with OR filter inside study_context succeeds."""
+    from imednet import AsyncImednetSDK
+    from imednet.simulation import SimulationState, SimulationTransport
+
+    transport = SimulationTransport(state=SimulationState())
+    async with AsyncImednetSDK(simulation_mode=True, transport=transport) as sdk:
+        with sdk.study_context("STUDY"):
+            matched = [
+                s async for s in sdk.studies.list(studyType=["Interventional", "Observational"])
+            ]
+            assert {s.study_key for s in matched} == {"DEMO-STUDY", "MY_STUDY", "STUDY"}
+
+            by_keys = await sdk.async_get_studies(studyKey=["DEMO-STUDY", "STUDY"])
+            assert {s.study_key for s in by_keys} == {"DEMO-STUDY", "STUDY"}
+
+            df = await sdk.studies.to_dataframe(studyKey=["MY_STUDY", "STUDY"])
+            assert set(df["study_key"]) == {"MY_STUDY", "STUDY"}

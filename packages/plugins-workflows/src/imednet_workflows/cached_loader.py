@@ -271,15 +271,16 @@ class CachedRecordsLoader:
         )
         endpoint = getattr(self._sdk, "records")  # noqa: B009
 
-        return cast(
-            list[Record],
-            retryer(
-                endpoint.list,
-                study_key=study_key,
-                filter=filter_string,
-                record_data_filter=None,
-            ),
-        )
+        def _fetch_delta() -> list[Record]:
+            return list(
+                endpoint.list(
+                    study_key=study_key,
+                    filter=filter_string,
+                    record_data_filter=None,
+                )
+            )
+
+        return retryer(_fetch_delta)
 
     def _upsert_records(self, conn: sqlite3.Connection, records: Iterable[Record]) -> None:
         """Insert or update records in the local SQLite cache."""

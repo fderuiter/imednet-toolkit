@@ -12,17 +12,22 @@ from imednet.errors.validation import ConfigurationError
 COMMON_LIST_PARAM_MAPPING: dict[str, str] = {
     "page": "page",
     "size": "size",
+    "limit": "limit",
     "sort": "sort",
     "filter": "filter",
 }
+
+_RAW_PASSTHROUGH_API_KEYS: frozenset[str] = frozenset(
+    {*COMMON_LIST_PARAM_MAPPING.values(), "recordDataFilter"}
+)
 
 
 class DefaultParamProcessor(ParamProcessor):
     """Default parameter processor for collection list endpoints.
 
-    Extracts standard top-level query parameters (``page``, ``size``, ``sort``,
-    and raw ``filter``) so they are routed as URL query arguments rather than
-    serialized inside ``filter``.
+    Extracts standard top-level query parameters (``page``, ``size``, ``limit``,
+    ``sort``, and raw ``filter``) so they are routed as URL query arguments
+    rather than serialized inside ``filter``.
     """
 
     def process_filters(self, filters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -47,9 +52,9 @@ class DefaultParamProcessor(ParamProcessor):
 class MappingParamProcessor(ParamProcessor):
     """ParamProcessor that maps specific filter keys to API parameters.
 
-    Extracts standard collection query keys (``page``, ``size``, ``sort``, ``filter``)
-    plus any endpoint-specific keys defined in ``mapping`` and returns them as
-    special parameters.
+    Extracts standard collection query keys (``page``, ``size``, ``limit``,
+    ``sort``, ``filter``) plus any endpoint-specific keys defined in ``mapping``
+    and returns them as special parameters.
     """
 
     def __init__(
@@ -65,7 +70,7 @@ class MappingParamProcessor(ParamProcessor):
             mapping: A dictionary where keys are the filter keys to look for,
                      and values are the API parameter names to map them to.
             defaults: A dictionary of default values for keys not found in filters.
-            include_common_params: Whether to include ``page``, ``size``, ``sort``, and ``filter``.
+            include_common_params: Whether to include standard pagination, sort, and filter keys.
         """
         base_mapping = dict(COMMON_LIST_PARAM_MAPPING) if include_common_params else {}
         base_mapping.update(mapping)
@@ -92,7 +97,11 @@ class MappingParamProcessor(ParamProcessor):
                 value = self.defaults[filter_key]
 
             if value is not None:
-                formatted = str(value).lower() if isinstance(value, bool) else value
+                formatted = (
+                    str(value).lower()
+                    if isinstance(value, bool) and api_key not in _RAW_PASSTHROUGH_API_KEYS
+                    else value
+                )
                 if api_key in special_params and special_params[api_key] != formatted:
                     raise ConfigurationError(
                         f"Conflicting values provided for query parameter '{api_key}'."

@@ -64,11 +64,29 @@ class BasePaginator(Generic[ClientT]):
             self._explicit_page = None
 
         explicit_size = self.params.pop(self.size_param, None)
-        if explicit_size is None:
-            explicit_size = self.params.pop("limit", None)
+        explicit_limit = self.params.pop("limit", None)
+        if (
+            explicit_size is not None
+            and explicit_limit is not None
+            and _parse_int_param(self.size_param, explicit_size)
+            != _parse_int_param("limit", explicit_limit)
+        ):
+            raise ValueError(
+                f"Conflicting pagination bounds: '{self.size_param}'={explicit_size!r} "
+                f"and 'limit'={explicit_limit!r}."
+            )
+        raw_explicit_size = explicit_size if explicit_size is not None else explicit_limit
+        self._explicit_size: int | None = (
+            _parse_int_param(self.size_param, raw_explicit_size)
+            if raw_explicit_size is not None
+            else None
+        )
 
-        raw_size = explicit_size if explicit_size is not None else page_size
-        parsed_size = _parse_int_param(self.size_param, raw_size)
+        parsed_size = (
+            self._explicit_size
+            if self._explicit_size is not None
+            else _parse_int_param(self.size_param, page_size)
+        )
         if parsed_size < 1 or parsed_size > 500:
             raise ValueError(
                 f"Pagination '{self.size_param}' must be between 1 and 500, got {parsed_size}."
@@ -107,7 +125,7 @@ class BasePaginator(Generic[ClientT]):
 
     def _next_page(self, payload: dict[str, Any], page: int, items_count: int) -> int | None:
         """Determine the next page index based on the response payload and metadata."""
-        if self._explicit_page is not None:
+        if self._explicit_page is not None or self._explicit_size is not None:
             return None
 
         pagination = payload.get("pagination")
@@ -156,6 +174,8 @@ class BasePaginator(Generic[ClientT]):
             return []
         items = self._extract_items(payload)
         self._cursor = self._next_page(payload, self._cursor, len(items))
+        if self._explicit_size is not None:
+            return items[: self._explicit_size]
         return items
 
     def _process_json_list_response(self, payload: Any) -> list[Any]:

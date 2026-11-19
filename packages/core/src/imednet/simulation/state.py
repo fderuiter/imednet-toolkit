@@ -321,6 +321,52 @@ class SimulationState:
                 },
             ]
 
+            self.codings: list[dict[str, Any]] = [
+                {
+                    "codingId": 951,
+                    "studyKey": "STUDY",
+                    "siteId": 101,
+                    "siteName": "SITE",
+                    "subjectId": 201,
+                    "subjectKey": "SUB1",
+                    "formId": 301,
+                    "formKey": "F_DM",
+                    "formName": "Demographics",
+                    "recordId": 601,
+                    "variable": "V_GENDER",
+                    "value": "Female",
+                    "code": "C16576",
+                    "codedBy": "sim_coder",
+                    "dictionaryName": "MedDRA",
+                    "dictionaryVersion": "26.0",
+                    "dateCoded": "2026-01-11T09:00:00Z",
+                    "revision": 1,
+                    "lastUpdated": "2026-01-11T09:00:00Z",
+                },
+            ]
+
+            self.record_revisions: list[dict[str, Any]] = [
+                {
+                    "recordRevisionId": 961,
+                    "studyKey": "STUDY",
+                    "recordId": 601,
+                    "recordRevision": 1,
+                    "dataRevision": 1,
+                    "recordStatus": "Complete",
+                    "subjectId": 201,
+                    "subjectKey": "SUB1",
+                    "siteId": 101,
+                    "formKey": "F_DM",
+                    "intervalId": 501,
+                    "role": "Coordinator",
+                    "user": "sim_user",
+                    "reasonForChange": "Initial entry",
+                    "deleted": False,
+                    "dateCreated": "2026-01-10T09:30:00Z",
+                    "lastUpdated": "2026-01-10T09:30:00Z",
+                },
+            ]
+
             self.jobs: dict[str, dict[str, Any]] = {
                 "BATCH": {
                     "jobId": "JOB-BATCH",
@@ -438,9 +484,54 @@ class SimulationState:
             job_results: list[dict[str, Any]] = []
 
             for item in records_data:
+                requested_rec_id = item.get("recordId")
+                existing_record = (
+                    next(
+                        (
+                            r
+                            for r in self.records
+                            if r.get("studyKey") == study_key
+                            and r.get("recordId") == requested_rec_id
+                        ),
+                        None,
+                    )
+                    if requested_rec_id is not None
+                    else None
+                )
+
+                rec_data = item.get("data") or item.get("recordData") or item
+                modified_ts = str(item.get("dateModified", "2026-11-15T00:00:00Z"))
+                updated_ts = str(item.get("lastUpdated", modified_ts))
+
+                if existing_record is not None:
+                    rec_id = int(existing_record["recordId"])
+                    subj_id = existing_record.get("subjectId", 201)
+                    subj_key = str(
+                        item.get("subjectKey") or existing_record.get("subjectKey", "SUB1")
+                    )
+                    form_key = str(item.get("formKey") or existing_record.get("formKey", "F_DM"))
+                    merged_data = copy.deepcopy(existing_record.get("recordData") or {})
+                    if isinstance(rec_data, dict):
+                        merged_data.update(copy.deepcopy(rec_data))
+                    existing_record["recordData"] = merged_data
+                    existing_record["formKey"] = form_key
+                    if "recordStatus" in item:
+                        existing_record["recordStatus"] = item["recordStatus"]
+                    existing_record["dateModified"] = modified_ts
+                    existing_record["lastUpdated"] = updated_ts
+                    job_results.append(
+                        {
+                            "recordId": rec_id,
+                            "subjectId": subj_id,
+                            "subjectKey": subj_key,
+                            "formKey": form_key,
+                            "status": "SUCCESS",
+                        }
+                    )
+                    continue
+
                 self._next_record_id += 1
                 rec_id = self._next_record_id
-                rec_data = item.get("data") or item.get("recordData") or item
                 subj_key = item.get("subjectKey") or f"SUBJ-{rec_id}"
 
                 requested_site_name = item.get("siteName")
@@ -470,8 +561,8 @@ class SimulationState:
                 )
                 if existing_subject is not None:
                     subj_id = existing_subject.get("subjectId", 200 + (rec_id % 100))
-                    existing_subject["dateModified"] = "2026-11-15T00:00:00Z"
-                    existing_subject["lastUpdated"] = "2026-11-15T00:00:00Z"
+                    existing_subject["dateModified"] = modified_ts
+                    existing_subject["lastUpdated"] = updated_ts
                 else:
                     subj_id = item.get("subjectId", 200 + len(self.subjects) + 1)
                     self.subjects.append(
@@ -484,9 +575,9 @@ class SimulationState:
                             "subjectStatus": "Enrolled",
                             "deleted": False,
                             "keywords": copy.deepcopy(item.get("keywords", [])),
-                            "dateCreated": "2026-11-15T00:00:00Z",
-                            "dateModified": "2026-11-15T00:00:00Z",
-                            "lastUpdated": "2026-11-15T00:00:00Z",
+                            "dateCreated": modified_ts,
+                            "dateModified": modified_ts,
+                            "lastUpdated": updated_ts,
                         }
                     )
 
@@ -502,12 +593,12 @@ class SimulationState:
                     "intervalId": item.get("intervalId", 501),
                     "siteId": site_id,
                     "recordType": item.get("recordType", "Standard"),
-                    "recordStatus": "Complete",
+                    "recordStatus": item.get("recordStatus", "Complete"),
                     "recordData": copy.deepcopy(rec_data),
                     "deleted": False,
-                    "dateCreated": "2026-11-15T00:00:00Z",
-                    "dateModified": "2026-11-15T00:00:00Z",
-                    "lastUpdated": "2026-11-15T00:00:00Z",
+                    "dateCreated": str(item.get("dateCreated", modified_ts)),
+                    "dateModified": modified_ts,
+                    "lastUpdated": updated_ts,
                 }
                 self.records.append(record_entry)
                 job_results.append(
@@ -658,6 +749,28 @@ class SimulationState:
             if not study_key:
                 return users
             return [dict(u, studyKey=study_key) for u in users]
+
+    def get_codings(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of codings for a study."""
+        with self._lock:
+            codings = copy.deepcopy(self.codings)
+            if not study_key:
+                return codings
+            matched = [c for c in codings if c.get("studyKey") == study_key]
+            if matched:
+                return matched
+            return [dict(c, studyKey=study_key) for c in codings]
+
+    def get_record_revisions(self, study_key: str | None = None) -> list[dict[str, Any]]:
+        """Return list of record revisions for a study."""
+        with self._lock:
+            revisions = copy.deepcopy(self.record_revisions)
+            if not study_key:
+                return revisions
+            matched = [r for r in revisions if r.get("studyKey") == study_key]
+            if matched:
+                return matched
+            return [dict(r, studyKey=study_key) for r in revisions]
 
 
 _default_state: SimulationState | None = None

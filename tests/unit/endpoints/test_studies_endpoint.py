@@ -124,3 +124,25 @@ def test_list_each_call_makes_request(dummy_client, paginator_factory):
     ep.list()
 
     assert captured["count"] == 2
+
+
+def test_studies_list_or_filter_inside_study_context_ignores_ambient_context():
+    """Test sdk.studies.list with OR filter inside sdk.study_context ignores ambient studyKey."""
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, SimulationTransport
+
+    transport = SimulationTransport(state=SimulationState())
+    sdk = ImednetSDK(simulation_mode=True, transport=transport)
+
+    with sdk.study_context("STUDY"):
+        matched = list(sdk.studies.list(studyType=["Interventional", "Observational"]))
+        assert {s.study_key for s in matched} == {"DEMO-STUDY", "MY_STUDY", "STUDY"}
+
+        by_keys = sdk.get_studies(studyKey=["DEMO-STUDY", "STUDY"])
+        assert {s.study_key for s in by_keys} == {"DEMO-STUDY", "STUDY"}
+
+        df = sdk.studies.to_dataframe(study_key=["MY_STUDY", "STUDY"])
+        assert set(df["study_key"]) == {"MY_STUDY", "STUDY"}
+
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'studyKey'"):
+        list(sdk.studies.list("S1", studyKey="S2"))
