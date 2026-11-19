@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 from imednet.spi.models import Record, RecordRevision, Subject, Visit
+from imednet.spi.utils import normalize_utc_timestamp_bound
 
 from ._guards import ensure_async_sdk, ensure_sync_sdk
 
@@ -81,14 +82,33 @@ def _build_audit_trail_kwargs(
     user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None,
     filters: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build combined filter and date arguments for ``get_record_revisions``."""
-    combined = dict(user_filter) if user_filter else {}
-    combined.update(filters)
-    if start_date:
-        combined["start_date"] = start_date
-    if end_date:
-        combined["end_date"] = end_date
-    return combined
+    """Build combined filter and UTC ``dateCreated`` bounds for ``get_record_revisions``."""
+    final_filter_dict: dict[str, Any] = dict(user_filter) if user_filter else {}
+    final_filter_dict.update(filters)
+
+    if start_date is not None or end_date is not None:
+        date_bounds: list[tuple[str, Any]] = []
+        for key_variant in ("date_created", "dateCreated"):
+            if key_variant in final_filter_dict:
+                existing = final_filter_dict.pop(key_variant)
+                if isinstance(existing, list):
+                    for item in existing:
+                        date_bounds.append(item if isinstance(item, tuple) else ("==", item))
+                elif isinstance(existing, tuple):
+                    date_bounds.append(existing)
+                else:
+                    date_bounds.append(("==", existing))
+
+        if start_date is not None:
+            start_utc = normalize_utc_timestamp_bound(start_date, is_end=False)
+            date_bounds.append((">=", start_utc))
+        if end_date is not None:
+            end_utc = normalize_utc_timestamp_bound(end_date, is_end=True)
+            date_bounds.append(("<=", end_utc))
+
+        final_filter_dict["dateCreated"] = date_bounds[0] if len(date_bounds) == 1 else date_bounds
+
+    return final_filter_dict
 
 
 class DataExtractionWorkflow:
@@ -223,7 +243,18 @@ class DataExtractionWorkflow:
         user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         **filters: Any,
     ) -> list[RecordRevision]:
-        """Extracts the audit trail (record revisions) based on specified filters."""
+        """Extracts the audit trail (record revisions) based on specified filters.
+
+        Args:
+            study_key: The key identifying the study.
+            start_date: Optional inclusive lower UTC date/timestamp bound for ``dateCreated``.
+            end_date: Optional inclusive upper UTC date/timestamp bound for ``dateCreated``.
+            user_filter: Optional dictionary of base filter conditions.
+            **filters: Additional key-value pairs to be added as equality filters.
+
+        Returns:
+            A list of RecordRevision objects matching the criteria.
+        """
         ensure_sync_sdk(self._sdk, _OWNER, "extract_audit_trail", "async_extract_audit_trail")
         sdk = cast("ImednetFacade", self._sdk)
         call_kwargs = _build_audit_trail_kwargs(start_date, end_date, user_filter, filters)
@@ -237,7 +268,18 @@ class DataExtractionWorkflow:
         user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         **filters: Any,
     ) -> list[RecordRevision]:
-        """Asynchronously extract the audit trail (record revisions) based on specified filters."""
+        """Asynchronously extract the audit trail (record revisions) based on specified filters.
+
+        Args:
+            study_key: The key identifying the study.
+            start_date: Optional inclusive lower UTC date/timestamp bound for ``dateCreated``.
+            end_date: Optional inclusive upper UTC date/timestamp bound for ``dateCreated``.
+            user_filter: Optional dictionary of base filter conditions.
+            **filters: Additional key-value pairs to be added as equality filters.
+
+        Returns:
+            A list of RecordRevision objects matching the criteria.
+        """
         ensure_async_sdk(self._sdk, _OWNER, "async_extract_audit_trail", "extract_audit_trail")
         sdk = cast("AsyncImednetFacade", self._sdk)
         call_kwargs = _build_audit_trail_kwargs(start_date, end_date, user_filter, filters)

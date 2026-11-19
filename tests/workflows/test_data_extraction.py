@@ -77,7 +77,9 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
         "STUDY",
         role="data",
         status="open",
-        start_date="2021-01-01",
-        end_date="2021-01-02",
+        dateCreated=[
+            (">=", "2021-01-01T00:00:00Z"),
+            ("<=", "2021-01-02T23:59:59Z"),
+        ],
     )
     assert result == [revision]

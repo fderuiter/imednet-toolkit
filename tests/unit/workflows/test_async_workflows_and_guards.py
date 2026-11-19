@@ -319,7 +319,7 @@ async def test_subject_data_and_data_extraction_fetch_resources_concurrently() -
 
 @pytest.mark.asyncio
 async def test_data_extraction_async_audit_trail_date_filters() -> None:
-    """Verify async_extract_audit_trail passes date bounds and kwargs to async_get_record_revisions."""
+    """Verify async_extract_audit_trail normalizes UTC dateCreated bounds and kwargs."""
     rev = RecordRevision(record_id=1, form_id=10, variable_name="V_AGE", revision_number=1)
 
     sdk = MagicMock(spec=AsyncImednetSDK)
@@ -328,15 +328,110 @@ async def test_data_extraction_async_audit_trail_date_filters() -> None:
     wf = DataExtractionWorkflow(sdk)
     out = await wf.async_extract_audit_trail(
         "ST",
-        start_date=datetime(2026, 1, 1),
+        start_date="2026-01-01",
         end_date="2026-02-01T00:00:00",
+        user_filter={"role": "data"},
     )
     assert len(out) == 1
     _, call_kwargs = sdk.async_get_record_revisions.call_args
-    assert "start_date" in call_kwargs and "end_date" in call_kwargs
+    assert call_kwargs == {
+        "role": "data",
+        "dateCreated": [
+            (">=", "2026-01-01T00:00:00Z"),
+            ("<=", "2026-02-01T00:00:00Z"),
+        ],
+    }
 
     out2 = await wf.async_extract_audit_trail("ST")
     assert len(out2) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_mapper_async_whitelists_and_sdtm_projection() -> None:
+    """Verify async RecordMapper batches multi-form filters, projects SDTM whitelists, and propagates ValueError."""
+    sdk = MagicMock(spec=AsyncImednetSDK)
+    sdk.async_get_variables = AsyncMock(
+        return_value=[
+            Variable(variable_name="AGE", label="Age", form_id=10),
+            Variable(variable_name="WT", label="Weight", form_id=20),
+            Variable(variable_name="IGNORED", label="Ignored", form_id=20),
+        ]
+    )
+
+    async def _async_get_records(**kwargs: Any) -> list[Record]:
+        assert "variableNames" not in kwargs
+        assert "formIds" not in kwargs
+        if kwargs.get("formId") == 10:
+            return [
+                Record(
+                    record_id=1, subject_key="S1", visit_id=1, form_id=10, record_data={"AGE": 45}
+                )
+            ]
+        return [
+            Record(
+                record_id=2,
+                subject_key="S1",
+                visit_id=1,
+                form_id=20,
+                record_data={"WT": 72, "IGNORED": "x"},
+            )
+        ]
+
+    sdk.async_get_records = AsyncMock(side_effect=_async_get_records)
+    mapper = RecordMapper(sdk)
+
+    df = await mapper.async_dataframe(
+        "STUDY",
+        use_labels_as_columns=False,
+        variable_whitelist=["AGE", "WT"],
+        form_whitelist=[10, 20],
+    )
+    assert list(df.columns) == [
+        "recordId",
+        "subjectKey",
+        "visitId",
+        "formId",
+        "recordStatus",
+        "dateCreated",
+        "AGE",
+        "WT",
+    ]
+    assert len(df) == 2
+
+    # Empty whitelists short-circuit without network calls
+    sdk.async_get_variables.reset_mock()
+    empty_df = await mapper.async_dataframe("STUDY", variable_whitelist=[])
+    assert empty_df.empty
+    sdk.async_get_variables.assert_not_awaited()
+
+    empty_sdtm = await mapper.async_sdtm_dataframe("STUDY", domain="AE", variable_whitelist=[])
+    assert empty_sdtm.empty
+
+    # SDTM variable_whitelist projects record_data before transformation
+    sdk.async_get_records = AsyncMock(
+        return_value=[
+            Record(
+                record_id=3,
+                subject_key="S1",
+                visit_id=1,
+                form_id=30,
+                record_data={"aeTerm": "Headache", "extraUnwhitelisted": "secret"},
+            )
+        ]
+    )
+    sdtm_df = await mapper.async_sdtm_dataframe(
+        "STUDY",
+        domain="AE",
+        variable_whitelist=["aeTerm"],
+        form_whitelist=[30],
+    )
+    assert sdtm_df.iloc[0]["AETERM"] == "Headache"
+    assert "extraUnwhitelisted" not in sdtm_df.columns
+
+    # ValueError from invalid filter expression propagates instead of being swallowed
+    sdk.async_get_records = AsyncMock(side_effect=ValueError("Invalid filter operator"))
+    with pytest.raises(ValueError, match="Invalid filter operator"):
+        await mapper._async_fetch_records("STUDY", extra_filters={"badKey!": "val"})
 
 
 @pytest.mark.asyncio

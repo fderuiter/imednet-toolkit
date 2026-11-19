@@ -8,14 +8,26 @@ from imednet.core.context import (
     set_base_url_context,
 )
 from imednet.errors import PathTraversalValidationError
-from imednet.utils.dates import format_iso_datetime, normalize_iso_date, parse_iso_datetime
+from imednet.utils.dates import (
+    format_iso_datetime,
+    normalize_iso_date,
+    normalize_utc_timestamp_bound,
+    parse_iso_datetime,
+)
 from imednet.utils.db import get_sqlite_connection, sqlite_connection
 from imednet.utils.evaluator import (
     RestrictedAstEvaluator,
     evaluate_expression,
     parse_expression,
 )
-from imednet.utils.filters import build_filter_string
+from imednet.utils.filters import (
+    ALLOWED_OPERATORS,
+    ORDERED_FILTER_OPERATORS,
+    build_filter_string,
+    parse_filter_expression,
+    parse_filter_expressions,
+    validate_filter_key,
+)
 from imednet.utils.job_poller import (
     AsyncJobPoller,
     InvalidJobStateError,
@@ -41,6 +53,8 @@ from imednet.utils.url import redact_sensitive_text
 from imednet.utils.validators import is_boolean_token, is_missing_value, parse_bool
 
 __all__ = [
+    "ALLOWED_OPERATORS",
+    "ORDERED_FILTER_OPERATORS",
     "AsyncJobPoller",
     "InvalidJobStateError",
     "InvalidJobTransitionError",
@@ -66,8 +80,11 @@ __all__ = [
     "is_missing_value",
     "mask_clinical_phi",
     "normalize_iso_date",
+    "normalize_utc_timestamp_bound",
     "parse_bool",
     "parse_expression",
+    "parse_filter_expression",
+    "parse_filter_expressions",
     "parse_iso_datetime",
     "redact_sensitive_payload",
     "redact_sensitive_text",
@@ -75,5 +92,6 @@ __all__ = [
     "sanitize_csv_formula",
     "set_base_url_context",
     "sqlite_connection",
+    "validate_filter_key",
     "validate_partition_key",
 ]

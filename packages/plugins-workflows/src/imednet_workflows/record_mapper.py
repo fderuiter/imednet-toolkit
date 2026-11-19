@@ -661,21 +661,46 @@ class RecordMapper:
     def _build_variable_filters(
         variable_whitelist: list[str] | None,
         form_whitelist: list[int] | None,
-    ) -> dict[str, Any]:
-        """Build query filters for ``get_variables`` / ``async_get_variables``."""
+    ) -> dict[str, Any] | None:
+        """Build query filters for ``get_variables``, or ``None`` if a whitelist is empty."""
+        if variable_whitelist is not None and len(variable_whitelist) == 0:
+            return None
+        if form_whitelist is not None and len(form_whitelist) == 0:
+            return None
+
         filters: dict[str, Any] = {}
-        if variable_whitelist is not None:
-            filters["variableNames"] = variable_whitelist
         if form_whitelist is not None:
-            filters["formIds"] = form_whitelist
+            filters["formId"] = (
+                form_whitelist[0] if len(form_whitelist) == 1 else list(form_whitelist)
+            )
+            if (
+                variable_whitelist is not None
+                and len(variable_whitelist) == 1
+                and len(form_whitelist) == 1
+            ):
+                filters["variableName"] = variable_whitelist[0]
+        elif variable_whitelist is not None:
+            filters["variableName"] = (
+                variable_whitelist[0] if len(variable_whitelist) == 1 else list(variable_whitelist)
+            )
         return filters
 
     @staticmethod
     def _extract_variable_metadata(
         study_key: str,
         variables: list[VariableModel],
+        *,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
-        """Extract variable names and label map from ``Variable`` models."""
+        """Filter fetched ``Variable`` models and extract variable names and labels."""
+        if form_whitelist is not None:
+            allowed_forms = set(form_whitelist)
+            variables = [v for v in variables if v.form_id is None or v.form_id in allowed_forms]
+        if variable_whitelist is not None:
+            allowed_vars = set(variable_whitelist)
+            variables = [v for v in variables if v.variable_name in allowed_vars]
+
         if not variables:
             logger.warning(
                 "No variables found for study '%s'. Returning empty DataFrame.",
@@ -689,23 +714,19 @@ class RecordMapper:
 
     @staticmethod
     def _build_extra_filters(
-        variable_whitelist: list[str] | None,
         form_whitelist: list[int] | None,
     ) -> dict[str, Any] | None:
-        """Build optional record filter dictionary from variable/form whitelists."""
-        extra_filters: dict[str, Any] = {}
-        if variable_whitelist is not None:
-            extra_filters["variableNames"] = variable_whitelist
+        """Build optional record filter dictionary from ``form_whitelist``."""
         if form_whitelist is not None:
-            extra_filters["formIds"] = form_whitelist
-        return extra_filters or None
+            return {"formId": form_whitelist}
+        return None
 
     @staticmethod
     def _build_record_fetch_filters(
         visit_key: str | None,
         extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None,
     ) -> dict[str, Any | tuple[str, Any] | list[Any]]:
-        """Build filter kwargs for ``get_records`` / ``async_get_records``."""
+        """Build raw filter kwargs prior to ``formId`` extraction."""
         filters: dict[str, Any | tuple[str, Any] | list[Any]] = (
             dict(extra_filters) if extra_filters else {}
         )
@@ -719,18 +740,6 @@ class RecordMapper:
                 )
         return filters
 
-    @staticmethod
-    def _extract_form_ids(
-        extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None,
-    ) -> set[Any] | None:
-        """Extract form ID whitelist set from ``extra_filters`` if present."""
-        filters = dict(extra_filters) if extra_filters else {}
-        if "formIds" in filters and isinstance(filters["formIds"], list):
-            return set(filters["formIds"])
-        if "formId" in filters:
-            return {filters["formId"]}
-        return None
-
     def _fetch_variable_metadata(
         self,
         study_key: str,
@@ -738,10 +747,17 @@ class RecordMapper:
         form_whitelist: list[int] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Return variable names and label mapping for a study."""
-        sdk = cast("ImednetFacade", self.sdk)
         filters = self._build_variable_filters(variable_whitelist, form_whitelist)
+        if filters is None:
+            return [], {}
+        sdk = cast("ImednetFacade", self.sdk)
         variables: list[VariableModel] = list(sdk.get_variables(study_key=study_key, **filters))
-        return self._extract_variable_metadata(study_key, variables)
+        return self._extract_variable_metadata(
+            study_key,
+            variables,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
 
     async def _async_fetch_variable_metadata(
         self,
@@ -750,12 +766,19 @@ class RecordMapper:
         form_whitelist: list[int] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Asynchronously return variable names and label mapping for a study."""
-        sdk = cast("AsyncImednetFacade", self.sdk)
         filters = self._build_variable_filters(variable_whitelist, form_whitelist)
+        if filters is None:
+            return [], {}
+        sdk = cast("AsyncImednetFacade", self.sdk)
         variables: list[VariableModel] = list(
             await sdk.async_get_variables(study_key=study_key, **filters)
         )
-        return self._extract_variable_metadata(study_key, variables)
+        return self._extract_variable_metadata(
+            study_key,
+            variables,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
 
     def _build_record_model(
         self, variable_keys: list[str], label_map: dict[str, str]
@@ -769,6 +792,45 @@ class RecordMapper:
             )
         return create_model("RecordData", __base__=BaseModel, **fields)  # type: ignore
 
+    @staticmethod
+    def _extract_form_ids(
+        filters: dict[str, Any | tuple[str, Any] | list[Any]],
+    ) -> tuple[list[Any] | None, dict[str, Any | tuple[str, Any] | list[Any]]]:
+        """Extract scalar or multi-item formId filters and strip variable filters for /records."""
+        cleaned = dict(filters)
+        cleaned.pop("variableNames", None)
+        cleaned.pop("variableName", None)
+
+        if "formId" not in cleaned:
+            return None, cleaned
+
+        raw_form_id = cleaned.get("formId")
+        if isinstance(raw_form_id, (list, set)):
+            cleaned.pop("formId")
+            return list(dict.fromkeys(raw_form_id)), cleaned
+        if not isinstance(raw_form_id, tuple):
+            cleaned.pop("formId")
+            return [raw_form_id], cleaned
+        return None, cleaned
+
+    def _prepare_record_fetch(
+        self,
+        visit_key: str | None,
+        extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None,
+    ) -> tuple[list[Any] | None, dict[str, Any | tuple[str, Any] | list[Any]]]:
+        """Prepare normalized ``formId`` batch list and cleaned record filters."""
+        raw_filters = self._build_record_fetch_filters(visit_key, extra_filters)
+        return self._extract_form_ids(raw_filters)
+
+    def _resolve_cached_form_ids(
+        self,
+        extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None,
+    ) -> set[Any] | None:
+        """Resolve optional ``formId`` filter set for cached record iteration."""
+        raw_filters = dict(extra_filters) if extra_filters else {}
+        form_id_list, _ = self._extract_form_ids(raw_filters)
+        return set(form_id_list) if form_id_list is not None else None
+
     def _fetch_records(
         self,
         study_key: str,
@@ -777,8 +839,24 @@ class RecordMapper:
     ) -> list[RecordModel]:
         """Fetch records for a study applying optional filters."""
         sdk = cast("ImednetFacade", self.sdk)
-        filters = self._build_record_fetch_filters(visit_key, extra_filters)
+        form_id_list, filters = self._prepare_record_fetch(visit_key, extra_filters)
+        if form_id_list is not None and len(form_id_list) == 0:
+            return []
+
         try:
+            if form_id_list is not None:
+                batched_records: list[RecordModel] = []
+                for fid in form_id_list:
+                    batched_records.extend(
+                        sdk.get_records(
+                            study_key=study_key,
+                            record_data_filter=None,
+                            **filters,
+                            formId=fid,
+                        )
+                    )
+                return batched_records
+
             return list(
                 sdk.get_records(
                     study_key=study_key,
@@ -786,6 +864,8 @@ class RecordMapper:
                     **filters,
                 )
             )
+        except ValueError:
+            raise
         except Exception as exc:  # pragma: no cover - unexpected
             logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
             return []
@@ -798,8 +878,24 @@ class RecordMapper:
     ) -> list[RecordModel]:
         """Asynchronously fetch records for a study applying optional filters."""
         sdk = cast("AsyncImednetFacade", self.sdk)
-        filters = self._build_record_fetch_filters(visit_key, extra_filters)
+        form_id_list, filters = self._prepare_record_fetch(visit_key, extra_filters)
+        if form_id_list is not None and len(form_id_list) == 0:
+            return []
+
         try:
+            if form_id_list is not None:
+                batched_async_records: list[RecordModel] = []
+                for fid in form_id_list:
+                    batched_async_records.extend(
+                        await sdk.async_get_records(
+                            study_key=study_key,
+                            record_data_filter=None,
+                            **filters,
+                            formId=fid,
+                        )
+                    )
+                return batched_async_records
+
             return list(
                 await sdk.async_get_records(
                     study_key=study_key,
@@ -807,6 +903,8 @@ class RecordMapper:
                     **filters,
                 )
             )
+        except ValueError:
+            raise
         except Exception as exc:  # pragma: no cover - unexpected
             logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
             return []
@@ -817,8 +915,17 @@ class RecordMapper:
         visit_key: str | None = None,
         extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
     ) -> Iterable[RecordModel]:
-        """Iterate over records for a study, using cache if available."""
-        form_ids = self._extract_form_ids(extra_filters)
+        """Iterate over records for a study, using cache if available.
+
+        Args:
+            study_key: The study identifier.
+            visit_key: Optional visit filter.
+            extra_filters: Optional additional filter criteria.
+
+        Returns:
+            An iterable of Record models.
+        """
+        form_ids = self._resolve_cached_form_ids(extra_filters)
         loader = self._loader
         if loader is not None:
             sync_method = getattr(loader, "sync_records", None)
@@ -844,7 +951,7 @@ class RecordMapper:
         extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
     ) -> Iterable[RecordModel]:
         """Asynchronously sync/fetch records for a study and return an iterable."""
-        form_ids = self._extract_form_ids(extra_filters)
+        form_ids = self._resolve_cached_form_ids(extra_filters)
         loader = self._loader
         if loader is not None:
             async_sync_method = getattr(loader, "async_sync_records", None)
@@ -1199,7 +1306,7 @@ class RecordMapper:
         if not variable_keys:
             return
 
-        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        extra_filters = self._build_extra_filters(form_whitelist)
         records = self._iter_records(
             study_key,
             visit_key,
@@ -1249,7 +1356,7 @@ class RecordMapper:
         if not variable_keys:
             return
 
-        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        extra_filters = self._build_extra_filters(form_whitelist)
         records = await self._async_iter_records(
             study_key,
             visit_key,
@@ -1288,7 +1395,7 @@ class RecordMapper:
             variable_whitelist=variable_whitelist,
             form_whitelist=form_whitelist,
         )
-        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        extra_filters = self._build_extra_filters(form_whitelist)
         records = self._iter_records(
             study_key,
             visit_key,
@@ -1321,7 +1428,7 @@ class RecordMapper:
             variable_whitelist=variable_whitelist,
             form_whitelist=form_whitelist,
         )
-        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        extra_filters = self._build_extra_filters(form_whitelist)
         records = await self._async_iter_records(
             study_key,
             visit_key,
@@ -1439,6 +1546,38 @@ class RecordMapper:
             form_whitelist=form_whitelist,
         )
 
+    def _iter_sdtm_frames_from_records(
+        self,
+        records: Iterable[RecordModel],
+        *,
+        domain: str,
+        study_key: str,
+        allowed_vars: set[str] | None,
+    ) -> Iterator[pd.DataFrame]:
+        """Project optional variable whitelists and transform record chunks to SDTM frames."""
+        for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
+            records_batch: list[Any] = chunk
+            if allowed_vars is not None:
+                projected_chunk: list[Any] = []
+                for rec in chunk:
+                    rec_data = getattr(rec, "record_data", None)
+                    if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
+                        projected_chunk.append(
+                            rec.model_copy(
+                                update={
+                                    "record_data": {
+                                        k: v for k, v in rec_data.items() if k in allowed_vars
+                                    }
+                                }
+                            )
+                        )
+                    else:
+                        projected_chunk.append(rec)
+                records_batch = projected_chunk
+            df = transform_records_to_sdtm(records_batch, domain=domain, study_key=study_key)
+            if not df.empty:
+                yield df
+
     def _iter_sdtm_dataframes_sync(
         self,
         *,
@@ -1449,16 +1588,21 @@ class RecordMapper:
         form_whitelist: list[int] | None,
     ) -> Iterator[pd.DataFrame]:
         """Internal generator yielding chunked SDTM DataFrames synchronously."""
-        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        if variable_whitelist is not None and len(variable_whitelist) == 0:
+            return
+        allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
+        extra_filters = self._build_extra_filters(form_whitelist)
         records = self._iter_records(
             study_key,
             visit_key=visit_key,
             extra_filters=extra_filters,
         )
-        for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
-            df = transform_records_to_sdtm(chunk, domain=domain, study_key=study_key)
-            if not df.empty:
-                yield df
+        yield from self._iter_sdtm_frames_from_records(
+            records,
+            domain=domain,
+            study_key=study_key,
+            allowed_vars=allowed_vars,
+        )
 
     async def async_iter_sdtm_dataframes(
         self,
@@ -1473,16 +1617,22 @@ class RecordMapper:
             self.sdk, "RecordMapper", "async_iter_sdtm_dataframes", "iter_sdtm_dataframes"
         )
         self._ensure_pandas("async_iter_sdtm_dataframes")
-        extra_filters = self._build_extra_filters(variable_whitelist, form_whitelist)
+        if variable_whitelist is not None and len(variable_whitelist) == 0:
+            return
+        allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
+        extra_filters = self._build_extra_filters(form_whitelist)
         records = await self._async_iter_records(
             study_key,
             visit_key=visit_key,
             extra_filters=extra_filters,
         )
-        for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
-            df = transform_records_to_sdtm(chunk, domain=domain, study_key=study_key)
-            if not df.empty:
-                yield df
+        for df in self._iter_sdtm_frames_from_records(
+            records,
+            domain=domain,
+            study_key=study_key,
+            allowed_vars=allowed_vars,
+        ):
+            yield df
 
     def dataframe(
         self,
