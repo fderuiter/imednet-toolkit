@@ -147,3 +147,69 @@ def test_query_management_duck_typed_objects_fallback() -> None:
     counts = wf.get_query_state_counts("STUDY")
     assert counts["OPEN"] == 1
     assert counts["CLOSED"] == 1
+
+
+def test_get_queries_by_site_multi_batch_interleaved_global_sort_and_page() -> None:
+    """Multi-batch (>50 subjects) site queries apply global ordering and page boundaries."""
+    sdk = MagicMock()
+    sdk.get_subjects.return_value = [Subject(subject_key=f"S{i:03d}") for i in range(65)]
+    batch_1 = [
+        Query(annotation_id=904, subject_key="S001", record_id=602),
+        Query(annotation_id=903, subject_key="S010", record_id=601),
+    ]
+    batch_2 = [
+        Query(annotation_id=901, subject_key="S052", record_id=601),
+        Query(annotation_id=902, subject_key="S060", record_id=602),
+        Query(annotation_id=903, subject_key="S010", record_id=601),
+    ]
+    sdk.get_queries.side_effect = [batch_1, batch_2, batch_1, batch_2, batch_1, batch_2]
+
+    wf = QueryManagementWorkflow(sdk)
+    all_site = wf.get_queries_by_site("STUDY", "BIG_SITE")
+    assert [q.annotation_id for q in all_site] == [901, 902, 903, 904]
+
+    page_0 = wf.get_queries_by_site("STUDY", "BIG_SITE", page=0, size=2)
+    page_1 = wf.get_queries_by_site("STUDY", "BIG_SITE", sort="annotationId,desc", page=1, limit=2)
+    assert [q.annotation_id for q in page_0] == [901, 902]
+    assert [q.annotation_id for q in page_1] == [902, 901]
+    assert "page" not in sdk.get_queries.call_args_list[2].kwargs
+
+
+def test_get_queries_by_site_single_subject_pushdown_and_over_250_fallback() -> None:
+    """Single-subject pure-AND pushes subject_key, OR falls back, and >250 subjects skips batching."""
+    sdk_and = MagicMock()
+    sdk_and.get_subjects.return_value = [Subject(subject_key="S1")]
+    sdk_and.get_queries.return_value = [Query(annotation_id=7, subject_key="S1")]
+    wf_and = QueryManagementWorkflow(sdk_and)
+    res_and = wf_and.get_queries_by_site(
+        "STUDY", "SITE", additional_filter={"record_id": 601, "filter": "variable==V_AGE"}
+    )
+    assert [q.annotation_id for q in res_and] == [7]
+    sdk_and.get_queries.assert_called_once_with(
+        "STUDY", subject_key="S1", record_id=601, filter="variable==V_AGE"
+    )
+
+    sdk_or = MagicMock()
+    sdk_or.get_subjects.return_value = [Subject(subject_key="S1")]
+    sdk_or.get_queries.return_value = [
+        Query(annotation_id=8, subject_key="OTHER"),
+        Query(annotation_id=9, subject_key="S1"),
+    ]
+    wf_or = QueryManagementWorkflow(sdk_or)
+    res_or = wf_or.get_queries_by_site(
+        "STUDY", "SITE", additional_filter={"record_id": [601, 602]}, page=0, size=1
+    )
+    assert [q.annotation_id for q in res_or] == [9]
+    sdk_or.get_queries.assert_called_once_with("STUDY", record_id=[601, 602])
+
+    sdk_huge = MagicMock()
+    sdk_huge.get_subjects.return_value = [Subject(subject_key=f"S{i}") for i in range(255)]
+    sdk_huge.get_queries.return_value = [
+        Query(annotation_id=30, subject_key="S200"),
+        Query(annotation_id=10, subject_key="OTHER"),
+        Query(annotation_id=20, subject_key="S5"),
+    ]
+    wf_huge = QueryManagementWorkflow(sdk_huge)
+    res_huge = wf_huge.get_queries_by_site("STUDY", "HUGE_SITE", page=0, size=2)
+    assert [q.annotation_id for q in res_huge] == [20, 30]
+    sdk_huge.get_queries.assert_called_once_with("STUDY")

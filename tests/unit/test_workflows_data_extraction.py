@@ -241,3 +241,49 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
         assert "endDate" not in sent_filter
         assert len(revisions) == 1
         assert revisions[0].record_revision_id == 5
+
+
+def test_extract_records_by_criteria_multi_batch_and_client_filtered_global_page() -> None:
+    """Multi-batch (>50 subjects) and client-filtered extractions order and page globally."""
+    sdk = MagicMock()
+    sdk.get_subjects.return_value = [Subject(subject_key=f"S{i:03d}") for i in range(60)]
+    b1 = [Record(record_id=20, subject_key="S001"), Record(record_id=40, subject_key="S002")]
+    b2 = [
+        Record(record_id=10, subject_key="S051"),
+        Record(record_id=20, subject_key="S001"),
+        Record(record_id=30, subject_key="S055"),
+    ]
+    sdk.get_records.side_effect = [b1, b2]
+    progress_msgs: list[str] = []
+
+    wf = DataExtractionWorkflow(sdk)
+    page_res = wf.extract_records_by_criteria(
+        "STUDY",
+        subject_filter={"site_name": "BIG_SITE"},
+        on_progress=progress_msgs.append,
+        page=0,
+        size=2,
+    )
+    assert [r.record_id for r in page_res] == [10, 20]
+    assert sdk.get_records.call_count == 2
+    assert "page" not in sdk.get_records.call_args_list[0].kwargs
+    assert any("found 2 matching records" in msg for msg in progress_msgs)
+
+    sdk_and = MagicMock()
+    sdk_and.get_subjects.return_value = [Subject(subject_key="S1"), Subject(subject_key="S2")]
+    sdk_and.get_records.return_value = [
+        Record(record_id=1, subject_key="OTHER_SUB", form_key="F_DM"),
+        Record(record_id=2, subject_key="S2", form_key="F_DM"),
+        Record(record_id=3, subject_key="S1", form_key="F_DM"),
+    ]
+    wf_and = DataExtractionWorkflow(sdk_and)
+    and_page = wf_and.extract_records_by_criteria(
+        "STUDY",
+        subject_filter={"site_name": "SITE"},
+        record_filter={"form_key": "F_DM"},
+        sort="recordId,desc",
+        page=0,
+        size=1,
+    )
+    assert [r.record_id for r in and_page] == [3]
+    assert "page" not in sdk_and.get_records.call_args.kwargs

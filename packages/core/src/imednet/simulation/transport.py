@@ -376,29 +376,42 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
 
         sort_str = params.get("sort")
         if sort_str:
-            sort_parts = [part.strip() for part in sort_str.split(",") if part.strip()]
-            if sort_parts:
-                sort_field = sort_parts[0]
-                reverse = len(sort_parts) > 1 and sort_parts[1].lower() == "desc"
-                candidates = _to_camel_or_snake(sort_field)
+            sort_clauses = [seg.strip() for seg in sort_str.split(";") if seg.strip()]
+            for clause in reversed(sort_clauses):
+                sort_parts = [part.strip() for part in clause.split(",") if part.strip()]
+                if not sort_parts:
+                    continue
+                if len(sort_parts) >= 2 and sort_parts[-1].lower() in ("asc", "desc"):
+                    reverse = sort_parts[-1].lower() == "desc"
+                    sort_fields = sort_parts[:-1]
+                else:
+                    reverse = False
+                    sort_fields = sort_parts
 
-                def _sort_value(entry: dict[str, Any]) -> Any:
-                    for candidate in candidates:
-                        if candidate in entry and entry[candidate] is not None:
-                            val = entry[candidate]
-                            if isinstance(val, (int, float)):
-                                return (0, float(val))
-                            text = str(val)
-                            dt = _try_parse_utc_datetime(text)
-                            if dt is not None:
-                                return (1, dt.timestamp())
-                            return (2, text.lower())
-                    return None
+                for sort_field in reversed(sort_fields):
+                    candidates = _to_camel_or_snake(sort_field)
 
-                present = [item for item in items if _sort_value(item) is not None]
-                missing = [item for item in items if _sort_value(item) is None]
-                present.sort(key=_sort_value, reverse=reverse)
-                items = present + missing
+                    def _sort_value(
+                        entry: dict[str, Any], _candidates: list[str] = candidates
+                    ) -> Any:
+                        for candidate in _candidates:
+                            if candidate in entry and entry[candidate] is not None:
+                                val = entry[candidate]
+                                if isinstance(val, bool):
+                                    return (0, int(val))
+                                if isinstance(val, (int, float)):
+                                    return (1, float(val))
+                                text = str(val)
+                                dt = _try_parse_utc_datetime(text)
+                                if dt is not None:
+                                    return (2, dt.timestamp())
+                                return (3, text.lower())
+                        return None
+
+                    present = [item for item in items if _sort_value(item) is not None]
+                    missing = [item for item in items if _sort_value(item) is None]
+                    present.sort(key=_sort_value, reverse=reverse)
+                    items = present + missing
 
         return self._paginate_response(request, items, params)
 

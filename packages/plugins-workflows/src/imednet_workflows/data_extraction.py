@@ -9,15 +9,19 @@ from imednet.spi.utils import normalize_utc_timestamp_bound
 from .chunked_pipeline import (
     DEFAULT_OR_FILTER_BATCH_SIZE,
     MAX_OR_FILTER_PUSHDOWN_ITEMS,
+    apply_global_sort_and_page,
     iter_chunks,
+    prepare_deferred_controls,
 )
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
 
-_RECORD_TOP_LEVEL_CONTROLS = frozenset(
-    {"page", "size", "limit", "sort", "record_data_filter", "recordDataFilter"}
-)
+_PAGINATION_AND_SORT_CONTROLS = frozenset({"page", "size", "limit", "sort"})
+_RECORD_TOP_LEVEL_CONTROLS = _PAGINATION_AND_SORT_CONTROLS | {
+    "record_data_filter",
+    "recordDataFilter",
+}
 
 
 class DataExtractionWorkflow:
@@ -41,17 +45,23 @@ class DataExtractionWorkflow:
         field_name: str,
         values: list[Any],
         record_kwargs: dict[str, Any],
-    ) -> list[Record]:
+    ) -> tuple[list[Record], bool]:
         """Fetch records across bounded OR-filter chunks and deduplicate by record_id."""
         batches = list(iter_chunks(values, chunk_size=DEFAULT_OR_FILTER_BATCH_SIZE))
         if len(batches) == 1:
             batch_kwargs = {**record_kwargs, field_name: batches[0]}
-            return list(self._sdk.get_records(study_key=study_key, **batch_kwargs))
+            return list(self._sdk.get_records(study_key=study_key, **batch_kwargs)), False
+
+        non_controls = {
+            k: v for k, v in record_kwargs.items() if k not in _PAGINATION_AND_SORT_CONTROLS
+        }
+        controls = {k: v for k, v in record_kwargs.items() if k in _PAGINATION_AND_SORT_CONTROLS}
+        deferred_record_kwargs = {**non_controls, **prepare_deferred_controls(controls)}
 
         results: list[Record] = []
         seen_record_ids: set[int] = set()
         for batch in batches:
-            batch_kwargs = {**record_kwargs, field_name: batch}
+            batch_kwargs = {**deferred_record_kwargs, field_name: batch}
             for record in self._sdk.get_records(study_key=study_key, **batch_kwargs):
                 rec_id = getattr(record, "record_id", None)
                 if rec_id is not None:
@@ -59,7 +69,7 @@ class DataExtractionWorkflow:
                         continue
                     seen_record_ids.add(rec_id)
                 results.append(record)
-        return results
+        return results, True
 
     def extract_records_by_criteria(
         self,
@@ -71,6 +81,10 @@ class DataExtractionWorkflow:
         **other_filters: Any,
     ) -> list[Record]:
         """Extracts records based on criteria spanning subjects, visits, and records.
+
+        When merging multiple OR-filter batches or applying cohort membership
+        filtering client-side, ``sort`` and zero-based ``page`` controls are
+        applied globally to the complete matched record set.
 
         Args:
             study_key: The key identifying the study.
@@ -133,35 +147,53 @@ class DataExtractionWorkflow:
         has_record_attr_filters = any(
             key not in _RECORD_TOP_LEVEL_CONTROLS for key in final_record_filter_dict
         )
+        control_kwargs = {
+            k: v for k, v in final_record_filter_dict.items() if k in _PAGINATION_AND_SORT_CONTROLS
+        }
+        has_cohort_filter = matching_subject_keys is not None or matching_visit_ids is not None
 
         if on_progress:
             on_progress(f"Querying records for study '{study_key}'...")
 
         records: list[Record]
+        used_multi_batch = False
+        used_deferred_controls = False
         if not has_record_attr_filters and (
             ordered_visit_ids is not None and len(ordered_visit_ids) <= MAX_OR_FILTER_PUSHDOWN_ITEMS
         ):
-            records = self._fetch_records_in_or_batches(
+            records, used_multi_batch = self._fetch_records_in_or_batches(
                 study_key=study_key,
                 field_name="visit_id",
                 values=ordered_visit_ids,
                 record_kwargs=final_record_filter_dict,
             )
+            used_deferred_controls = used_multi_batch
         elif not has_record_attr_filters and (
             ordered_subject_keys is not None
             and len(ordered_subject_keys) <= MAX_OR_FILTER_PUSHDOWN_ITEMS
         ):
-            records = self._fetch_records_in_or_batches(
+            records, used_multi_batch = self._fetch_records_in_or_batches(
                 study_key=study_key,
                 field_name="subject_key",
                 values=ordered_subject_keys,
                 record_kwargs=final_record_filter_dict,
             )
+            used_deferred_controls = used_multi_batch
         else:
+            if has_cohort_filter:
+                non_controls = {
+                    k: v
+                    for k, v in final_record_filter_dict.items()
+                    if k not in _PAGINATION_AND_SORT_CONTROLS
+                }
+                backend_kwargs = {**non_controls, **prepare_deferred_controls(control_kwargs)}
+                used_deferred_controls = True
+            else:
+                backend_kwargs = final_record_filter_dict
             records = list(
                 self._sdk.get_records(
                     study_key=study_key,
-                    **final_record_filter_dict,
+                    **backend_kwargs,
                 )
             )
 
@@ -175,7 +207,16 @@ class DataExtractionWorkflow:
                 on_progress("Filtering records by matched visit IDs...")
             records = [r for r in records if r.visit_id in matching_visit_ids]
 
-        result_records = list(records)
+        result_records = (
+            apply_global_sort_and_page(
+                records,
+                control_kwargs,
+                default_sort_field="record_id",
+                enforce_default_sort=used_multi_batch,
+            )
+            if used_deferred_controls
+            else list(records)
+        )
         if on_progress:
             on_progress(f"Extraction complete: found {len(result_records)} matching records.")
 

@@ -8,7 +8,9 @@ from imednet.spi.utils import build_filter_string, validate_filter_syntax
 from .chunked_pipeline import (
     DEFAULT_OR_FILTER_BATCH_SIZE,
     MAX_OR_FILTER_PUSHDOWN_ITEMS,
+    apply_global_sort_and_page,
     iter_chunks,
+    prepare_deferred_controls,
 )
 
 if TYPE_CHECKING:
@@ -163,6 +165,11 @@ class QueryManagementWorkflow:
     ) -> list[Query]:
         """Retrieves all queries for a specific site within a study.
 
+        When merging multiple subject OR batches or filtering site membership
+        client-side, ``sort`` and zero-based ``page`` controls (with ``size`` /
+        ``limit``) are applied once across the complete site result, defaulting
+        to ascending ``annotation_id`` order.
+
         Args:
             study_key: The key identifying the study.
             site_key: The name of the site.
@@ -180,11 +187,13 @@ class QueryManagementWorkflow:
             return []
 
         subject_key_set = set(subject_keys)
-        control_kwargs = {k: v for k, v in kwargs.items() if k in _TOP_LEVEL_QUERY_CONTROLS}
-        filter_kwargs: dict[str, Any] = dict(additional_filter) if additional_filter else {}
-        for k, v in kwargs.items():
-            if k not in _TOP_LEVEL_QUERY_CONTROLS:
-                filter_kwargs[k] = v
+        merged_inputs: dict[str, Any] = dict(additional_filter) if additional_filter else {}
+        merged_inputs.update(kwargs)
+        control_kwargs = {k: v for k, v in merged_inputs.items() if k in _TOP_LEVEL_QUERY_CONTROLS}
+        filter_kwargs = {
+            k: v for k, v in merged_inputs.items() if k not in _TOP_LEVEL_QUERY_CONTROLS
+        }
+        deferred_controls = prepare_deferred_controls(control_kwargs)
 
         if not filter_kwargs:
             if len(subject_keys) <= MAX_OR_FILTER_PUSHDOWN_ITEMS:
@@ -197,7 +206,7 @@ class QueryManagementWorkflow:
                 seen_ids: set[int] = set()
                 for batch in batches:
                     for query in self._sdk.get_queries(
-                        study_key, subject_key=batch, **control_kwargs
+                        study_key, subject_key=batch, **deferred_controls
                     ):
                         ann_id = getattr(query, "annotation_id", None)
                         if ann_id is not None:
@@ -205,10 +214,23 @@ class QueryManagementWorkflow:
                                 continue
                             seen_ids.add(ann_id)
                         results.append(query)
-                return results
+                return apply_global_sort_and_page(
+                    results,
+                    control_kwargs,
+                    default_sort_field="annotation_id",
+                    enforce_default_sort=True,
+                )
 
-            all_queries = self._sdk.get_queries(study_key, **control_kwargs)
-            return [q for q in all_queries if getattr(q, "subject_key", None) in subject_key_set]
+            all_queries = self._sdk.get_queries(study_key, **deferred_controls)
+            site_queries = [
+                q for q in all_queries if getattr(q, "subject_key", None) in subject_key_set
+            ]
+            return apply_global_sort_and_page(
+                site_queries,
+                control_kwargs,
+                default_sort_field="annotation_id",
+                enforce_default_sort=True,
+            )
 
         if len(subject_keys) == 1 and _can_push_single_subject_with_filters(
             subject_keys[0], filter_kwargs
@@ -222,8 +244,16 @@ class QueryManagementWorkflow:
                 )
             )
 
-        filtered_queries = self._sdk.get_queries(study_key, **filter_kwargs, **control_kwargs)
-        return [q for q in filtered_queries if getattr(q, "subject_key", None) in subject_key_set]
+        filtered_queries = self._sdk.get_queries(study_key, **filter_kwargs, **deferred_controls)
+        site_queries = [
+            q for q in filtered_queries if getattr(q, "subject_key", None) in subject_key_set
+        ]
+        return apply_global_sort_and_page(
+            site_queries,
+            control_kwargs,
+            default_sort_field="annotation_id",
+            enforce_default_sort=True,
+        )
 
     def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
         """Counts queries grouped by their current QueryStatus values.
