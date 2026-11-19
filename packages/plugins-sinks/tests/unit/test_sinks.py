@@ -1706,3 +1706,125 @@ class TestSinkPhiMaskingControls:
             "email": "jane.doe@clinical.example",
             "systolic_bp": 122,
         }
+
+    def test_all_sink_plugins_redact_custom_registry_and_study_config_phi_fields(
+        self, monkeypatch, tmp_path
+    ):
+        """MongoDB, Neo4j, and Snowflake sinks redact custom global_sensitivity_registry keys and case-insensitive StudyConfiguration phi_fields."""
+        import json
+
+        import imednet_sinks.document as doc_mod
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        from imednet.models.records import Record
+        from imednet.models.study_config import StudyConfiguration
+        from imednet.spi.utils import global_sensitivity_registry
+
+        snapshot = set(global_sensitivity_registry._sensitive_keys)
+        global_sensitivity_registry.add_sensitive_key("customGeneticMarker")
+
+        try:
+            study_cfg = StudyConfiguration(
+                studyKey="STUDY_SINK_PHI",
+                phiFields=["siteChartId"],
+            )
+            record = Record(
+                record_id=9500,
+                study_key="STUDY_SINK_PHI",
+                subject_key="SUBJ-9500",
+                visit_id=1,
+                form_id=10,
+                form_key="GENOMICS",
+                record_data={
+                    "customGeneticMarker": "BRCA-RAW",
+                    "SITE_CHART_ID": "CHART-99",
+                    "patientName": "Jane Doe",
+                    "age": 51,
+                },
+            )
+
+            # 1. MongoDB
+            pymongo, _client, _collection = _fake_pymongo_module()
+            monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+            with MongoDbExportSink(
+                MongoDbSinkConfig(
+                    study_key="STUDY_SINK_PHI",
+                    uri="mongodb://localhost:27017",
+                    database="clinical",
+                    collection="records",
+                    extra={"study_config": study_cfg},
+                )
+            ) as mongo_sink:
+                mongo_sink.write_batch([record], batch_id="STUDY_SINK_PHI/GENOMICS/0")
+
+            _flt, update_doc = pymongo.UpdateOne.call_args.args[:2]
+            mongo_doc = update_doc["$set"]
+            assert mongo_doc["subject_key"] == "SUBJ-9500"
+            assert mongo_doc["record_data"]["custom_genetic_marker"] == "***MASKED***"
+            assert mongo_doc["record_data"]["site_chart_id"] == "[MASKED]"
+            assert mongo_doc["record_data"]["patient_name"] == "***MASKED***"
+            assert mongo_doc["record_data"]["age"] == 51
+
+            # 2. Neo4j
+            neo4j_mod, driver = _fake_neo4j_module()
+            session_mock = driver.session.return_value.__enter__.return_value
+            monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+            with Neo4jExportSink(
+                Neo4jSinkConfig(
+                    study_key="STUDY_SINK_PHI",
+                    uri="bolt://localhost:7687",
+                    auth=("neo4j", "placeholder"),
+                    extra={"study_config": study_cfg},
+                )
+            ) as neo4j_sink:
+                neo4j_sink.write_batch([record], batch_id="STUDY_SINK_PHI/GENOMICS/0")
+
+            neo4j_row = session_mock.run.call_args.kwargs["rows"][0]
+            assert neo4j_row["subject_key"] == "SUBJ-9500"
+            neo4j_payload = json.loads(neo4j_row["record_data"])
+            assert neo4j_payload["custom_genetic_marker"] == "***MASKED***"
+            assert neo4j_payload["site_chart_id"] == "[MASKED]"
+            assert neo4j_payload["patient_name"] == "***MASKED***"
+            assert neo4j_payload["age"] == 51
+
+            # 3. Snowflake
+            sf, _conn, _cursor = _fake_snowflake_module()
+            pa, pq, _table = _fake_pyarrow_modules()
+            monkeypatch.setattr(
+                wh_mod,
+                "_require_optional_dep",
+                lambda pkg, _ex: (
+                    sf if pkg == "snowflake.connector" else (pq if "parquet" in pkg else pa)
+                ),
+            )
+            with SnowflakeExportSink(
+                SnowflakeSinkConfig(
+                    study_key="STUDY_SINK_PHI",
+                    account="acct",
+                    user="usr",
+                    password="placeholder",  # pragma: allowlist secret
+                    database="DB",
+                    schema="PUBLIC",
+                    warehouse="WH",
+                    stage="STG",
+                    table="RECORDS",
+                    local_staging_dir=str(tmp_path),
+                    extra={"study_config": study_cfg},
+                )
+            ) as sf_sink:
+                sf_sink.write_batch([record], batch_id="STUDY_SINK_PHI/GENOMICS/0")
+
+            sf_row = pa.Table.from_pylist.call_args.args[0][0]
+            assert sf_row["subject_key"] == "SUBJ-9500"
+            sf_payload = json.loads(sf_row["record_data"])
+            assert sf_payload["custom_genetic_marker"] == "***MASKED***"
+            assert sf_payload["site_chart_id"] == "[MASKED]"
+            assert sf_payload["patient_name"] == "***MASKED***"
+            assert sf_payload["age"] == 51
+        finally:
+            global_sensitivity_registry._sensitive_keys.clear()
+            global_sensitivity_registry._sensitive_keys.update(snapshot)
