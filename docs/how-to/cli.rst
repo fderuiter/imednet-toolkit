@@ -20,13 +20,17 @@ dashboard for browsing studies, sites, subjects, and background jobs:
 
    pip install "imednet[tui]"
    imednet tui
+   imednet tui --study DEMO-STUDY --batch BATCH-001 --batch BATCH-002
    imednet tui --high-contrast
    IMEDNET_HIGH_CONTRAST=1 imednet --high-contrast tui
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
-``Enter`` to select a study or site, ``q`` to quit, ``d`` to toggle dark mode, ``h`` to
-toggle high-contrast mode, ``r`` to refresh active study data, and ``a`` to load all pages
-when a panel is truncated. Pass ``--force`` only when intentionally bypassing TTY stream
+``Enter`` to select a study or site (or to register batch IDs in the Jobs tab input),
+``q`` to quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to
+refresh active study data, and ``a`` to load all pages when a panel is truncated. Single-key
+shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input. Pass
+``--study`` and repeatable ``--batch`` flags at launch to open a study and monitor specific
+batch jobs immediately, and pass ``--force`` only when intentionally bypassing TTY stream
 checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
@@ -115,6 +119,11 @@ Eleven filter-capable ``list`` commands (``studies``, ``sites``, ``forms``,
 ``records``, ``subjects``, and ``codings``) accept repeatable ``-f`` / ``--filter``
 arguments using ``=`` or the standard iMednet comparison operators (``<``, ``<=``,
 ``>``, ``>=``, ``==``, ``!=``) with exclusive ``;`` (AND) or ``,`` (OR) connectors.
+Filter attribute names (in ``snake_case`` or ``camelCase``) and scalar values are
+validated locally against each resource model before sending HTTP requests: string
+identifiers preserve leading zeros and non-ASCII text (such as ``subject_key=001``,
+``code=0042``, or ``value=²``), while integer and boolean attributes reject invalid
+values on ``stderr`` with exit code ``1``.
 ``records list`` additionally exposes ``--record-data-filter`` (supporting ``=~``
 regular-expression matching in addition to the six standard operators) to filter
 Form Variable values on the server. All twelve ``list`` commands—including

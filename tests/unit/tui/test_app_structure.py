@@ -10,6 +10,7 @@ from imednet_tui.app import (
     DashboardScreen,
     ImednetTuiApp,
     JobMonitor,
+    JobTable,
     SiteList,
     StudyList,
     SubjectTable,
@@ -28,6 +29,14 @@ def test_app_instantiation(mock_sdk):
     assert app.sdk == mock_sdk
     assert isinstance(app, App)
 
+    app_with_opts = ImednetTuiApp(
+        sdk=mock_sdk,
+        study_key="STUDY-01",
+        batch_ids=["BATCH-1", "BATCH-2"],
+    )
+    assert app_with_opts.initial_study_key == "STUDY-01"
+    assert app_with_opts.initial_batch_ids == ["BATCH-1", "BATCH-2"]
+
 
 def test_dashboard_screen_structure(mock_sdk):
     """Test that the dashboard screen has the expected widgets."""
@@ -39,6 +48,9 @@ def test_dashboard_screen_structure(mock_sdk):
 
     sub_table = SubjectTable(mock_sdk)
     assert sub_table.sdk == mock_sdk
+
+    job_table = JobTable()
+    assert job_table.cursor_type == "row"
 
     job_mon = JobMonitor(mock_sdk)
     assert job_mon.sdk == mock_sdk

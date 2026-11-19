@@ -195,13 +195,13 @@ Export Path Decision Matrix
        nested ``record_data`` payloads with metadata envelope fields.
      - :class:`~imednet_workflows.data_extraction.DataExtractionWorkflow`
        → typed :class:`~imednet.models.Record` list →
-       :class:`~imednet.integrations.document.MongoDbExportSink`
+       :class:`~imednet_sinks.document.MongoDbExportSink`
    * - **Graph**
      - Destination models relationships natively (for example Neo4j) and the
        hierarchy *Study → Subject → Visit → Record* should be preserved.
      - :class:`~imednet_workflows.data_extraction.DataExtractionWorkflow`
        → typed :class:`~imednet.models.Record` list →
-       :class:`~imednet.integrations.graph.Neo4jExportSink`
+       :class:`~imednet_sinks.graph.Neo4jExportSink`
    * - **Warehouse**
      - Destination is a cloud data warehouse with a native bulk loader.
        Records are staged as Parquet files and then COPY'd in a single
@@ -257,7 +257,7 @@ Shared :class:`~imednet.integrations.sink_base.SinkConfig` fields:
      - Base delay (seconds); grows as ``backoff * 2^attempt``.
    * - ``idempotent``
      - ``True``
-     - Use upsert / MERGE / FORCE=FALSE semantics.
+     - Use upsert / MERGE semantics.
 
 Error propagation
 ~~~~~~~~~~~~~~~~~
@@ -290,7 +290,7 @@ Each sink module calls
 ``imednet.spi.sinks.require_optional_dep`` at
 *connection time* (not at import time).  This means:
 
-* ``import imednet.integrations.graph`` never raises even when
+* ``import imednet_sinks.graph`` never raises even when
   ``neo4j`` is not installed.
 * The error is raised when the first sink instance is created.
 * The error message tells the user which ``imednet[<extra>]`` to install.
@@ -302,18 +302,22 @@ Extras naming:
 Public API exposure
 ~~~~~~~~~~~~~~~~~~~
 
-* :mod:`imednet.integrations` re-exports all tabular helpers and all three
-  new sink classes (backward-compatible).
-* Graph/document/warehouse sinks can also be imported directly from their
-  submodules:
+* :mod:`imednet.integrations` exports tabular helpers and shared sink contracts
+  (:class:`~imednet.integrations.sink_base.SinkConfig` and
+  :class:`~imednet.integrations.sink_base.ExportSink`).
+* Document, graph, and warehouse sinks are exposed from :mod:`imednet_sinks`
+  (and dynamically via ``sdk.sinks`` when ``imednet-plugins-sinks`` is installed)
+  or directly from their submodules:
 
-  * :mod:`imednet.integrations.graph`
-  * :mod:`imednet.integrations.document`
+  * :mod:`imednet_sinks.document`
+  * :mod:`imednet_sinks.graph`
   * :mod:`imednet_sinks.warehouse`
 
 * :mod:`apache_airflow_providers_imednet.export` wraps **only** the
-  tabular helpers.  Airflow DAGs that need graph or warehouse sinks should
-  import them directly from ``imednet.integrations``.
+  tabular helpers, while
+  :class:`~apache_airflow_providers_imednet.operators.export.ImednetExportOperator`
+  resolves ``mongodb``, ``neo4j``, and ``snowflake`` destinations dynamically
+  via ``sdk.sinks`` at runtime.
 
 Adding New Export Sinks
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -325,7 +329,8 @@ Adding New Export Sinks
    inside the constructor (not at module level).
 4. Add the optional dependency to ``packages/plugins-sinks/pyproject.toml`` under
    ``project.optional-dependencies``; add a core extra only for a supported install recipe.
-5. Expose it through the sink plugin; retain existing core import shims.
+5. Expose it through :mod:`imednet_sinks` and its plugin entry points without adding
+   static plugin imports to core.
 6. Add unit tests; run the canonical verification tasks in :doc:`/how-to/verification`.
 
 Static boundary checks

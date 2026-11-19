@@ -1,7 +1,7 @@
 Snowflake Export Example
 ========================
 
-Export study records to Snowflake using the staged Parquet + COPY INTO path.
+Export Study Records to Snowflake using staged Parquet and ``MERGE INTO`` / ``COPY INTO``.
 
 Prerequisites
 -------------
@@ -35,10 +35,10 @@ Environment variables
 Description
 -----------
 
-Records are fetched from the iMednet API, serialised to Parquet in a local staging
-directory, uploaded to the Snowflake internal stage via ``PUT``, and bulk-loaded with
-``COPY INTO``.  See :doc:`/how-to/snowflake_export` for a full explanation of the framework,
-idempotency, and cleanup behaviour.
+Study Records are fetched from the iMednet API, serialised to Parquet in a local staging
+directory, uploaded to the Snowflake internal stage via ``PUT``, and merged into the
+destination table via ``COPY INTO`` and ``MERGE INTO``.  See :doc:`/how-to/snowflake_export`
+for a full explanation of the framework, idempotency, and cleanup behaviour.
 
 .. literalinclude:: /../examples/snowflake_export.py
    :language: python

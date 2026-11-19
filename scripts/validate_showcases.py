@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import importlib
 import importlib.util
 import os
 import re
@@ -19,6 +20,7 @@ import sys
 import textwrap
 import zipfile
 from collections.abc import Sequence
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 
 # Known optional integration dependencies that may not be installed in all environments
@@ -36,9 +38,21 @@ OPTIONAL_INTEGRATION_MODULES = {
     "openpyxl",
     "matplotlib",
     "opentelemetry",
+    "textual",
+}
+
+WORKSPACE_PACKAGES = {
+    "imednet",
+    "imednet_workflows",
+    "imednet_sinks",
+    "imednet_tui",
+    "apache_airflow_providers_imednet",
 }
 
 LITERALINCLUDE_PATTERN = re.compile(r"^\s*\.\.\s+literalinclude::\s+(\S+)")
+RST_PYTHON_BLOCK_PATTERN = re.compile(
+    r"^(\s*)\.\.\s+(?:testcode|code-block)::(?:\s+(python|py))?\s*$"
+)
 
 
 def configure_sys_path(repo_root: Path) -> None:
@@ -47,6 +61,7 @@ def configure_sys_path(repo_root: Path) -> None:
         repo_root / "packages" / "core" / "src",
         repo_root / "packages" / "plugins-workflows" / "src",
         repo_root / "packages" / "plugins-sinks" / "src",
+        repo_root / "packages" / "plugins-tui" / "src",
         repo_root / "packages" / "providers-airflow" / "src",
     ]
     for p in candidate_dirs:
@@ -83,17 +98,155 @@ def is_module_available(mod: str) -> tuple[bool, str]:
         return False, f"Missing required module reference '{top_level}'"
 
     # Top-level module exists, but requested submodule could not be resolved
+    if top_level in OPTIONAL_INTEGRATION_MODULES:
+        return True, f"optional_dependency_skipped:{mod}"
     return False, f"Missing submodule reference '{mod}'"
+
+
+def _ast_exports_symbol(spec: ModuleSpec | None, symbol: str) -> bool | None:
+    """Fallback AST inspection for symbol presence when optional transitive imports fail."""
+    if spec is None or not spec.origin or not spec.origin.endswith(".py"):
+        return None
+    origin_path = Path(spec.origin)
+    if not origin_path.is_file():
+        return None
+    try:
+        tree = ast.parse(origin_path.read_text(encoding="utf-8"), filename=str(origin_path))
+    except (OSError, SyntaxError):
+        return None
+
+    defined_names: set[str] = set()
+    explicit_all: set[str] | None = None
+    has_star_import = False
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined_names.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                defined_names.add(alias.asname or alias.name.split(".", maxsplit=1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    has_star_import = True
+                else:
+                    defined_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    defined_names.add(target.id)
+                    if target.id == "__all__" and isinstance(node.value, (ast.List, ast.Tuple)):
+                        explicit_all = {
+                            elt.value
+                            for elt in node.value.elts
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                        }
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined_names.add(node.target.id)
+
+    if symbol in defined_names or (explicit_all is not None and symbol in explicit_all):
+        return True
+    if has_star_import:
+        return None
+    return False
+
+
+def is_symbol_available(mod: str, symbol: str) -> tuple[bool, str]:
+    """Check whether an imported symbol exists on a resolved module or as a submodule.
+
+    Skips uninstalled optional third-party integration dependencies while enforcing
+    symbol existence for workspace packages and available required modules.
+    """
+    if symbol == "*":
+        return is_module_available(mod)
+
+    ok, reason = is_module_available(mod)
+    if not ok:
+        return False, reason
+
+    top_level = mod.split(".", maxsplit=1)[0]
+    if (
+        reason.startswith("optional_dependency_skipped:")
+        or top_level in OPTIONAL_INTEGRATION_MODULES
+    ):
+        return True, f"optional_dependency_skipped:{top_level}"
+
+    # Check if mod.symbol is a resolvable submodule
+    with contextlib.suppress(ModuleNotFoundError, ValueError, AttributeError, ImportError):
+        if importlib.util.find_spec(f"{mod}.{symbol}") is not None:
+            return True, "resolved_submodule"
+
+    try:
+        module_obj = importlib.import_module(mod)
+    except ModuleNotFoundError as exc:
+        missing_root = (exc.name or "").split(".", maxsplit=1)[0]
+        if missing_root in OPTIONAL_INTEGRATION_MODULES:
+            spec = None
+            with contextlib.suppress(ModuleNotFoundError, ValueError, AttributeError, ImportError):
+                spec = importlib.util.find_spec(mod)
+            ast_result = _ast_exports_symbol(spec, symbol)
+            if ast_result is False:
+                return False, f"Missing symbol '{symbol}' in module '{mod}'"
+            return True, f"optional_dependency_skipped:{missing_root}"
+        return False, f"Failed to import module '{mod}' while checking symbol '{symbol}': {exc}"
+    except ImportError as exc:
+        return False, f"Failed to import module '{mod}' while checking symbol '{symbol}': {exc}"
+
+    if hasattr(module_obj, symbol):
+        return True, "resolved"
+
+    return False, f"Missing symbol '{symbol}' in module '{mod}'"
+
+
+def validate_ast_imports(
+    tree: ast.AST,
+    *,
+    workspace_only: bool = False,
+) -> list[tuple[int, str]]:
+    """Validate module and symbol imports in an AST, returning sorted (lineno, error) pairs."""
+    diagnostics: list[tuple[int, str]] = []
+    nodes_with_lines = [
+        node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    nodes_with_lines.sort(key=lambda n: getattr(n, "lineno", 0))
+
+    for node in nodes_with_lines:
+        lineno = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top_level = alias.name.split(".", maxsplit=1)[0]
+                if workspace_only and top_level not in WORKSPACE_PACKAGES:
+                    continue
+                ok, reason = is_module_available(alias.name)
+                if not ok:
+                    diagnostics.append((lineno, reason))
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            top_level = node.module.split(".", maxsplit=1)[0]
+            if workspace_only and top_level not in WORKSPACE_PACKAGES:
+                continue
+            ok, reason = is_module_available(node.module)
+            if not ok:
+                diagnostics.append((lineno, reason))
+                continue
+            if reason.startswith("optional_dependency_skipped:"):
+                continue
+            for alias in node.names:
+                sym_ok, sym_reason = is_symbol_available(node.module, alias.name)
+                if not sym_ok:
+                    diagnostics.append((lineno, sym_reason))
+
+    return diagnostics
 
 
 def validate_showcase_ast_and_imports(
     examples_dir: Path, repo_root: Path | None = None
 ) -> list[str]:
-    """Parse AST and verify imports for all Python files under examples_dir."""
+    """Parse AST and verify module and symbol imports for all Python files under examples_dir."""
     errors: list[str] = []
     if not examples_dir.exists():
         return [f"Examples directory not found: {examples_dir}"]
 
+    configure_sys_path(Path(__file__).resolve().parent.parent)
     if repo_root is not None:
         configure_sys_path(repo_root)
 
@@ -114,18 +267,8 @@ def validate_showcase_ast_and_imports(
             errors.append(f"{py_file}:{exc.lineno}: Syntax error: {exc.msg}")
             continue
 
-        for node in ast.walk(tree):
-            modules_to_check: list[tuple[str, int]] = []
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    modules_to_check.append((alias.name, getattr(node, "lineno", 0)))
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                modules_to_check.append((node.module, getattr(node, "lineno", 0)))
-
-            for mod_name, lineno in modules_to_check:
-                ok, reason = is_module_available(mod_name)
-                if not ok:
-                    errors.append(f"{py_file}:{lineno}: {reason}")
+        for lineno, reason in validate_ast_imports(tree):
+            errors.append(f"{py_file}:{lineno}: {reason}")
 
     return errors
 
@@ -350,13 +493,97 @@ def validate_python_slice(
     if errors or tree is None:
         return errors
 
+    for slice_lineno, reason in validate_ast_imports(tree):
+        errors.append(f"Sliced code from '{target_name}' (line {slice_lineno}): {reason}")
+
     if is_quick_start:
         errors.extend(validate_quick_start_ast_structure(tree, target_name, is_sliced=is_sliced))
 
     return errors
 
 
-def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
+def _validate_inline_rst_python_blocks(doc_file: Path, doc_lines: list[str]) -> list[str]:
+    """Validate workspace symbol imports inside inline reStructuredText Python blocks."""
+    errors: list[str] = []
+    idx = 0
+    total = len(doc_lines)
+
+    while idx < total:
+        line = doc_lines[idx]
+        m = RST_PYTHON_BLOCK_PATTERN.match(line)
+        if not m:
+            idx += 1
+            continue
+
+        is_testcode = ".. testcode::" in line
+        lang = m.group(2)
+        if not is_testcode and lang not in ("python", "py"):
+            idx += 1
+            continue
+
+        directive_indent = len(m.group(1))
+        directive_lineno = idx + 1
+        idx += 1
+
+        # Skip directive options and leading blank lines
+        while idx < total:
+            curr = doc_lines[idx]
+            stripped = curr.strip()
+            curr_indent = len(curr) - len(curr.lstrip())
+            if not stripped:
+                idx += 1
+                continue
+            if curr_indent > directive_indent and stripped.startswith(":"):
+                idx += 1
+                continue
+            break
+
+        block_start_idx = idx
+        block_lines: list[str] = []
+        content_indent: int | None = None
+        while idx < total:
+            curr = doc_lines[idx]
+            if not curr.strip():
+                block_lines.append("")
+                idx += 1
+                continue
+            curr_indent = len(curr) - len(curr.lstrip())
+            if curr_indent <= directive_indent:
+                break
+            if content_indent is None:
+                content_indent = curr_indent
+            block_lines.append(
+                curr[content_indent:] if curr_indent >= content_indent else curr.lstrip()
+            )
+            idx += 1
+
+        snippet = "\n".join(block_lines)
+        if not snippet.strip():
+            continue
+
+        try:
+            tree = ast.parse(textwrap.dedent(snippet), filename=str(doc_file))
+        except SyntaxError as exc:
+            if is_testcode:
+                line_offset = (exc.lineno or 1) - 1
+                errors.append(
+                    f"{doc_file}:{block_start_idx + 1 + line_offset}: "
+                    f"Inline testcode syntax error: {exc.msg}"
+                )
+            continue
+
+        for rel_lineno, reason in validate_ast_imports(tree, workspace_only=True):
+            abs_lineno = block_start_idx + max(rel_lineno, 1)
+            errors.append(
+                f"{doc_file}:{abs_lineno}: {reason} (in directive at line {directive_lineno})"
+            )
+
+    return errors
+
+
+def validate_documentation_literal_includes(
+    docs_dir: Path, repo_root: Path | None = None
+) -> list[str]:
     """Verify all documentation literal includes exist on disk and extracted slices parse as valid AST.
 
     Slicing semantics mirror Sphinx's `literalinclude` directive (supporting `start-after`,
@@ -373,10 +600,17 @@ def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
     if not docs_dir.exists():
         return [f"Documentation directory not found: {docs_dir}"]
 
+    configure_sys_path(Path(__file__).resolve().parent.parent)
+    if repo_root is not None:
+        configure_sys_path(repo_root)
+
+    excluded_doc_dirs = {"_build", "agents", "superpowers"}
     doc_files = sorted(
         p
         for p in docs_dir.rglob("*")
-        if p.is_file() and "_build" not in p.parts and p.suffix in {".rst", ".md", ".txt"}
+        if p.is_file()
+        and not (excluded_doc_dirs & set(p.relative_to(docs_dir).parts))
+        and p.suffix in {".rst", ".md", ".txt"}
     )
 
     for doc_file in doc_files:
@@ -466,6 +700,9 @@ def validate_documentation_literal_includes(docs_dir: Path) -> list[str]:
                 )
                 for v_err in slice_validation_errs:
                     errors.append(f"{doc_file}:{lineno}: {v_err}")
+
+        if doc_file.suffix == ".rst":
+            errors.extend(_validate_inline_rst_python_blocks(doc_file, doc_lines))
 
     return errors
 
@@ -643,7 +880,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     showcase_errors = validate_showcase_ast_and_imports(examples_dir, repo_root)
 
     print(f"Validating documentation literal includes in {docs_dir}...")
-    doc_errors = validate_documentation_literal_includes(docs_dir)
+    doc_errors = validate_documentation_literal_includes(docs_dir, repo_root)
 
     wheel_errors: list[str] = []
     should_check_wheels = not args.skip_wheels and (

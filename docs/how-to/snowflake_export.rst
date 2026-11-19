@@ -53,7 +53,7 @@ transitively).
 Quickstart — ``export_to_snowflake``
 -------------------------------------
 
-The :func:`~imednet.integrations.export_to_snowflake` convenience function handles
+The :func:`~imednet_sinks.warehouse.export_to_snowflake` convenience function handles
 batching, staging, and cleanup automatically:
 
 .. testcode::
