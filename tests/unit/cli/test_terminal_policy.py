@@ -144,6 +144,7 @@ def test_spi_cli_reexports_terminal_policy_symbols() -> None:
         "OUTPUT_FORMAT_ENV",
         "add_no_interactive",
         "is_dumb_terminal",
+        "is_interactive_terminal",
         "is_json_output_mode",
         "is_non_interactive",
         "is_tty",
@@ -154,6 +155,7 @@ def test_spi_cli_reexports_terminal_policy_symbols() -> None:
     )
     for name in expected:
         assert hasattr(spi_cli, name), f"Missing {name} on imednet.spi.cli"
+    assert spi_cli.is_interactive_terminal is grid_mod.is_interactive_terminal
     assert spi_cli.supports_fullscreen_ui is terminal_mod.supports_fullscreen_ui
     assert spi_cli.supports_live_status is terminal_mod.supports_live_status
     assert spi_cli.supports_ansi_color is terminal_mod.supports_ansi_color

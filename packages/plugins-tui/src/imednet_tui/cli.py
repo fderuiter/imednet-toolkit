@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import os
 from typing import Any
 
-from imednet.sdk import ImednetSDK
-from imednet.spi.cli import print_error, with_sdk
-
-from .terminal import is_interactive_terminal
+from imednet.spi.cli import is_interactive_terminal, print_error, with_sdk
+from imednet.spi.facade import ImednetFacade
 
 
 def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
@@ -31,16 +28,16 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
 
     @with_sdk
-    def _launch(sdk: ImednetSDK, args: argparse.Namespace | None = None) -> None:
+    def _launch(sdk: ImednetFacade, args: argparse.Namespace | None = None) -> None:
         from .app import run_tui
 
         force = bool(args and getattr(args, "force", False))
-        run_tui(sdk, force=force)
+        if args is not None and getattr(args, "high_contrast", False):
+            run_tui(sdk, force=force, high_contrast=True)
+        else:
+            run_tui(sdk, force=force)
 
     def run_tui_command(args: argparse.Namespace | None = None) -> None:
-        if args is not None and getattr(args, "high_contrast", False):
-            os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
-
         force = bool(args and getattr(args, "force", False))
         if not force and not is_interactive_terminal():
             print_error("Error: Interactive terminal required to run the TUI interface.")

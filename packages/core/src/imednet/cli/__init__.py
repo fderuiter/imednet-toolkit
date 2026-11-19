@@ -215,7 +215,7 @@ def app(args: list[str] | None = None) -> None:
 
     parsed = parser.parse_args(args)
 
-    if parsed.high_contrast:
+    if parsed.high_contrast and getattr(parsed, "command", None) != "tui":
         os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
 
     old_output_format = os.environ.get(OUTPUT_FORMAT_ENV)
