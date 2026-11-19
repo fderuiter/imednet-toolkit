@@ -707,9 +707,38 @@ def validate_documentation_literal_includes(
     return errors
 
 
+BROWSER_WHEEL_PACKAGES: tuple[str, ...] = (
+    "imednet",
+    "imednet_workflows",
+    "imednet_plugins_sinks",
+)
+
+WHEEL_IMPORT_MODULES: dict[str, str] = {
+    "imednet": "imednet",
+    "imednet_workflows": "imednet_workflows",
+    "imednet_plugins_sinks": "imednet_sinks",
+}
+
+WHEEL_REQUIRED_ENTRIES: dict[str, tuple[str, ...]] = {
+    "imednet": (
+        "imednet/__init__.py",
+        "imednet/sdk.py",
+        "imednet/config.py",
+    ),
+    "imednet_workflows": (
+        "imednet_workflows/__init__.py",
+        "imednet_workflows/data_extraction.py",
+    ),
+    "imednet_plugins_sinks": (
+        "imednet_sinks/__init__.py",
+        "imednet_sinks/plugin.py",
+    ),
+}
+
+
 def validate_staged_wheels(
     wheels_dir: Path,
-    expected_packages: Sequence[str] = ("imednet",),
+    expected_packages: Sequence[str] = BROWSER_WHEEL_PACKAGES,
 ) -> list[str]:
     """Verify that staged wheels exist, contain required modules, and can be imported in simulated Pyodide.
 
@@ -728,8 +757,11 @@ def validate_staged_wheels(
     if not wheel_files:
         return [f"No staged wheel artifacts (*.whl) found in {wheels_dir}"]
 
+    core_wheels = [w for w in wheel_files if w.name.startswith("imednet-")]
+
     for pkg_name in expected_packages:
         prefix = pkg_name.replace("-", "_")
+        import_module = WHEEL_IMPORT_MODULES.get(prefix, prefix)
         matching = [
             w
             for w in wheel_files
@@ -747,17 +779,12 @@ def validate_staged_wheels(
         try:
             with zipfile.ZipFile(wheel_path, "r") as zf:
                 namelist = set(zf.namelist())
-                if pkg_name == "imednet":
-                    required_entries = [
-                        "imednet/__init__.py",
-                        "imednet/sdk.py",
-                        "imednet/config.py",
-                    ]
-                    for req in required_entries:
-                        if req not in namelist:
-                            errors.append(
-                                f"Staged wheel '{wheel_path.name}' is missing required module entry '{req}'"
-                            )
+                required_entries = WHEEL_REQUIRED_ENTRIES.get(prefix, ())
+                for req in required_entries:
+                    if req not in namelist:
+                        errors.append(
+                            f"Staged wheel '{wheel_path.name}' is missing required module entry '{req}'"
+                        )
         except Exception as exc:
             errors.append(f"Failed to inspect wheel archive '{wheel_path.name}': {exc}")
             continue
@@ -765,15 +792,30 @@ def validate_staged_wheels(
         # Verify simulated Pyodide import in an isolated subprocess
         # Running in a separate process guarantees true environment isolation and prevents
         # polluting sys.modules or coverage measurement in the host test runner.
+        staged_sys_paths = [str(wheel_path.resolve())]
+        if prefix != "imednet" and core_wheels:
+            staged_sys_paths.append(str(core_wheels[0].resolve()))
+
         code = (
             "import sys\n"
             "sys.path = [p for p in sys.path if 'packages/core/src' not in p "
             "and 'packages/plugins' not in p and 'packages/providers' not in p]\n"
-            f"sys.path.insert(0, {str(wheel_path.resolve())!r})\n"
-            f"import {prefix}\n"
+            f"sys.path[:0] = {staged_sys_paths!r}\n"
+            f"import {import_module}\n"
         )
-        if pkg_name == "imednet":
-            code += f"assert hasattr({prefix}, 'ImednetSDK'), 'ImednetSDK not found'\n"
+        if prefix == "imednet":
+            code += f"assert hasattr({import_module}, 'ImednetSDK'), 'ImednetSDK not found'\n"
+        elif prefix == "imednet_plugins_sinks":
+            code += (
+                "import imednet_sinks.plugin\n"
+                "assert hasattr(imednet_sinks.plugin, 'create_sinks'), 'create_sinks not found'\n"
+            )
+        elif prefix == "imednet_workflows":
+            code += (
+                "import imednet_workflows.data_extraction\n"
+                "assert hasattr(imednet_workflows.data_extraction, 'DataExtractionWorkflow'), "
+                "'DataExtractionWorkflow not found'\n"
+            )
 
         clean_env = {
             k: v
@@ -822,9 +864,15 @@ def stage_wheels(repo_root: Path, wheels_dir: Path | None = None) -> list[Path]:
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             print(f"Warning: Failed to stage wheels: {exc}")
 
-    for placeholder in wheels_dir.glob("imednet_workspace-*.whl"):
-        with contextlib.suppress(OSError):
-            placeholder.unlink()
+    excluded_patterns = (
+        "imednet_workspace-*.whl",
+        "apache_airflow_providers_imednet-*.whl",
+        "imednet_tui-*.whl",
+    )
+    for pattern in excluded_patterns:
+        for excluded_whl in wheels_dir.glob(pattern):
+            with contextlib.suppress(OSError):
+                excluded_whl.unlink()
 
     return sorted(wheels_dir.glob("*.whl"))
 
@@ -890,12 +938,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     if should_check_wheels:
+        created_temp_wheels = False
         if (repo_root / "packages" / "core").exists() and not list(wheels_dir.glob("*.whl")):
             print(f"Staged wheels not found in {wheels_dir}, building workspace wheels...")
+            created_temp_wheels = not wheels_dir.exists()
             stage_wheels(repo_root, wheels_dir)
 
-        print(f"Validating staged wheels and simulated Pyodide imports in {wheels_dir}...")
-        wheel_errors = validate_staged_wheels(wheels_dir)
+        try:
+            print(f"Validating staged wheels and simulated Pyodide imports in {wheels_dir}...")
+            wheel_errors = validate_staged_wheels(wheels_dir)
+        finally:
+            if created_temp_wheels and args.wheels_dir is None:
+                shutil.rmtree(wheels_dir, ignore_errors=True)
 
     all_errors = showcase_errors + doc_errors + wheel_errors
 

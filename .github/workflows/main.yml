@@ -645,6 +645,11 @@ jobs:
       - name: Build HTML and Run Doctests
         run: hatch run docs
 
+      - name: Verify Interactive Pyodide Tutorials
+        run: |
+          uv run --no-project --with playwright playwright install --with-deps chromium
+          uv run --no-project --with playwright python scripts/verify_pyodide_tutorials.py --html-dir docs/_build/html
+
       - name: Assert Clean Working Tree
         run: |
           if ! git diff --quiet docs/; then
