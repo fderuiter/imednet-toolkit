@@ -139,6 +139,7 @@ def main():
                 "install": ["imednet"],
                 "smoke": [
                     {"cmd": "import imednet"},
+                    {"cmd": "import snowflake.connector", "expect_fail": True},
                     {
                         "cmd": "from imednet.models.subjects import Subject; assert 'subject_id' in Subject.model_fields and 'subject_key' in Subject.model_fields",
                     },
@@ -193,6 +194,19 @@ def main():
                 "smoke": [
                     {"cmd": "import snowflake.connector"},
                     {"cmd": "import pyarrow"},
+                    {
+                        "cmd": "from imednet.spi.sink_base import _require_optional_dep; assert _require_optional_dep('snowflake.connector', 'snowflake').__version__",
+                    },
+                ],
+            },
+            {
+                "name": "sinks-all",
+                "install": ["imednet-plugins-sinks[all]"],
+                "smoke": [
+                    {"cmd": "import snowflake.connector"},
+                    {"cmd": "import pyarrow"},
+                    {"cmd": "import pymongo"},
+                    {"cmd": "import neo4j"},
                 ],
             },
             {
@@ -202,6 +216,9 @@ def main():
                     {"cmd": "import snowflake.connector"},
                     {"cmd": "import pyarrow"},
                     {"cmd": "import imednet_sinks.warehouse"},
+                    {
+                        "cmd": "from imednet.sdk import ImednetSDK; sdk = ImednetSDK(api_key='k', security_key='s', simulation_mode=True); assert sdk.sinks.SnowflakeExportSink is not None",
+                    },
                 ],
             },
             {
