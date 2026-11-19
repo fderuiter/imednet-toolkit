@@ -5,9 +5,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field, RootModel
+from pydantic import Field, RootModel, field_validator, model_validator
 
 from imednet.models.base import ImednetBaseModel
+
+_INT_ID_ALIASES: dict[str, str]
+_STR_ID_FIELDS: set[str]
 
 class Keyword(ImednetBaseModel):
     """A keyword or tag associated with a record."""
@@ -53,8 +56,25 @@ class BaseRecordRequest(ImednetBaseModel):
     form_id: int | None = Field(default=None, alias="formId")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _detect_drift(cls, data: Any) -> Any: ...
+    @field_validator("*", check_fields=False, mode="before")
+    @classmethod
+    def _normalise(cls, v: Any, info: Any) -> Any: ...
+    @field_validator("*", check_fields=False)
+    @classmethod
+    def _validate_positive_id(cls, v: Any, info: Any) -> Any: ...
+
 class RegisterSubjectRequest(BaseRecordRequest):
-    """Payload for registering (enrolling) a new subject."""
+    """Payload for registering (enrolling) a new subject.
+
+    Per the API documentation, registering a subject only requires ``formKey``
+    (or ``formId``) and ``siteName`` (or ``siteId``). The system assigns the
+    subject identifier upon creation. Do **not** include a ``subjectKey`` here
+    — doing so causes the server to treat the request as an update and reject
+    it when the key is unknown.
+    """
 
     site_name: str | None = Field(
         default=None, alias="siteName", description="Name of the site where the subject is enrolled"

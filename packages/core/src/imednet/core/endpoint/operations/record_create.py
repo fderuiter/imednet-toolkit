@@ -6,12 +6,13 @@ Encapsulates validation, header construction, and execution logic for record cre
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Generic, Self, TypeVar
+from typing import Any, Self, TypeVar
 
 from pydantic import ValidationError as PydanticValidationError
 from pydantic import field_validator, model_validator
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
+from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.errors import ValidationError
 from imednet.models.records import BaseRecordRequest, RecordRequest
@@ -51,7 +52,7 @@ def _format_pydantic_record_error(idx: int, exc: PydanticValidationError) -> str
     return f"Record at index {idx} failed validation: {detail}"
 
 
-class RecordCreateOperation(Generic[T]):
+class RecordCreateOperation(Operation[T]):
     """Operation for creating records.
 
     Handles strict request envelope validation, schema checks, and header

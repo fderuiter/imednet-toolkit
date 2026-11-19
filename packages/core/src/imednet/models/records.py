@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Self
+from typing import Any
 
 from pydantic import (
     ConfigDict,
@@ -16,8 +16,14 @@ from pydantic import (
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
 
-_INT_ID_FIELDS = {"form_id", "site_id", "subject_id", "interval_id", "record_id"}
-_STR_ID_FIELDS = {
+_INT_ID_ALIASES: dict[str, str] = {
+    "form_id": "formId",
+    "site_id": "siteId",
+    "subject_id": "subjectId",
+    "interval_id": "intervalId",
+    "record_id": "recordId",
+}
+_STR_ID_FIELDS: set[str] = {
     "form_key",
     "site_name",
     "subject_key",
@@ -79,7 +85,7 @@ class BaseRecordRequest(ImednetBaseModel):
         field_name = getattr(info, "field_name", None)
         if v is None or not field_name:
             return v
-        if field_name in _INT_ID_FIELDS:
+        if field_name in _INT_ID_ALIASES:
             if isinstance(v, bool):
                 raise ValueError(f"{field_name} must be an integer, not boolean")
             return v
@@ -89,20 +95,14 @@ class BaseRecordRequest(ImednetBaseModel):
             return v
         return v
 
-    @model_validator(mode="after")
-    def _validate_request_identifiers(self) -> Self:  # noqa: N804
+    @field_validator("*", check_fields=False)
+    @classmethod
+    def _validate_positive_id(cls, v: Any, info: Any) -> Any:
         """Validate positive integer identifiers."""
-        for id_attr, alias_name in (
-            ("form_id", "formId"),
-            ("site_id", "siteId"),
-            ("subject_id", "subjectId"),
-            ("interval_id", "intervalId"),
-            ("record_id", "recordId"),
-        ):
-            val = getattr(self, id_attr, None)
-            if val is not None and val <= 0:
-                raise ValueError(f"{alias_name} must be a positive integer")
-        return self
+        field_name = getattr(info, "field_name", "")
+        if v is not None and field_name in _INT_ID_ALIASES and isinstance(v, int) and v <= 0:
+            raise ValueError(f"{_INT_ID_ALIASES[field_name]} must be a positive integer")
+        return v
 
 
 class RegisterSubjectRequest(BaseRecordRequest):

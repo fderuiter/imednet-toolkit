@@ -6,11 +6,16 @@ They are architecturally linked to the core execution engine.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
 from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
+    ParamSpec,
+    Protocol,
+    Self,
     TypeVar,
+    overload,
 )
 
 from imednet.models.codings import Coding
@@ -37,12 +42,16 @@ except Exception:
     tracer = None
 
 
-def _trace_method(func: Any) -> Any:
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _trace_method(func: Callable[P, R]) -> Callable[P, R]:
     """Decorator to trace synchronous method execution with OpenTelemetry."""
     from functools import wraps
 
     @wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         """Wrapper to start a span around the function call."""
         if tracer:
             with tracer.start_as_current_span(func.__name__):
@@ -52,12 +61,14 @@ def _trace_method(func: Any) -> Any:
     return wrapper
 
 
-def _async_trace_method(func: Any) -> Any:
+def _async_trace_method(
+    func: Callable[P, Coroutine[Any, Any, R]],
+) -> Callable[P, Coroutine[Any, Any, R]]:
     """Decorator to trace asynchronous method execution with OpenTelemetry."""
     from functools import wraps
 
     @wraps(func)
-    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         """Wrapper to start a span around the async function call."""
         if tracer:
             with tracer.start_as_current_span(func.__name__):
@@ -73,16 +84,56 @@ if TYPE_CHECKING:
 
 
 T = TypeVar("T")
+R_co = TypeVar("R_co", covariant=True)
 
 
-class _ListOperation(Generic[T]):
+class _SyncListMethod(Protocol[T]):
+    """Typed callable protocol for synchronous convenience list methods."""
+
+    @overload
+    def __call__(self, study_key: str | None = None, **filters: FilterValue) -> list[T]: ...
+
+    @overload
+    def __call__(self, **filters: FilterValue) -> list[T]: ...
+
+
+class _AsyncListMethod(Protocol[T]):
+    """Typed callable protocol for asynchronous convenience list methods."""
+
+    @overload
+    async def __call__(self, study_key: str | None = None, **filters: FilterValue) -> list[T]: ...
+
+    @overload
+    async def __call__(self, **filters: FilterValue) -> list[T]: ...
+
+
+class _ListOperation(Generic[T, R_co]):
     """Descriptor that provides convenience list methods on the SDK."""
 
-    def __init__(self, endpoint_name: str, name: str, is_async: bool = False):
+    def __init__(self, endpoint_name: str, name: str, is_async: bool = False) -> None:
         """Initialize the list operation descriptor."""
         self.endpoint_name = endpoint_name
         self.name = name
         self.is_async = is_async
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __call__(self, study_key: str | None = None, **filters: FilterValue) -> R_co: ...
+
+        @overload
+        def __call__(self, **filters: FilterValue) -> R_co: ...
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    @overload
+    def __get__(self, instance: None, owner: Any) -> Self: ...
+
+    @overload
+    def __get__(self, instance: SyncSDKConvenienceMixin, owner: Any) -> _SyncListMethod[T]: ...
+
+    @overload
+    def __get__(self, instance: AsyncSDKConvenienceMixin, owner: Any) -> _AsyncListMethod[T]: ...
 
     def __get__(self, instance: Any, owner: Any) -> Any:
         """Return a wrapped list method bound to the SDK instance."""
@@ -93,30 +144,39 @@ class _ListOperation(Generic[T]):
         if self.is_async:
 
             @_async_trace_method
-            async def wrapper(study_key: str | None = None, **filters: FilterValue) -> list[T]:
+            async def async_wrapper(
+                study_key: str | None = None, **filters: FilterValue
+            ) -> list[T]:
                 """Execute the asynchronous list operation and return a list of items."""
                 _filters: dict[str, Any] = dict(filters)
                 if self.endpoint_name == "studies":
+                    if study_key is not None:
+                        _filters["study_key"] = study_key
                     res = endpoint.list(**_filters)
                 else:
                     res = endpoint.list(study_key, **_filters)
-                return [item async for item in res] if hasattr(res, "__aiter__") else await res
+                items: list[T] = (
+                    [item async for item in res] if hasattr(res, "__aiter__") else await res
+                )
+                return items
 
-            wrapper.__doc__ = f"Asynchronously list {self.endpoint_name}."
-        else:
+            async_wrapper.__doc__ = f"Asynchronously list {self.endpoint_name}."
+            async_wrapper.__name__ = self.name
+            return async_wrapper
 
-            @_trace_method
-            def wrapper(study_key: str | None = None, **filters: FilterValue) -> list[T]:
-                """Execute the synchronous list operation and return a list of items."""
-                _filters: dict[str, Any] = dict(filters)
-                if self.endpoint_name == "studies":
-                    return list(endpoint.list(**_filters))
-                return list(endpoint.list(study_key, **_filters))
+        @_trace_method
+        def sync_wrapper(study_key: str | None = None, **filters: FilterValue) -> list[T]:
+            """Execute the synchronous list operation and return a list of items."""
+            _filters: dict[str, Any] = dict(filters)
+            if self.endpoint_name == "studies":
+                if study_key is not None:
+                    _filters["study_key"] = study_key
+                return list(endpoint.list(**_filters))
+            return list(endpoint.list(study_key, **_filters))
 
-            wrapper.__doc__ = f"List {self.endpoint_name}."
-
-        wrapper.__name__ = self.name
-        return wrapper
+        sync_wrapper.__doc__ = f"List {self.endpoint_name}."
+        sync_wrapper.__name__ = self.name
+        return sync_wrapper
 
 
 class SyncSDKConvenienceMixin:
@@ -127,20 +187,20 @@ class SyncSDKConvenienceMixin:
         jobs: JobsEndpoint
         _client: Any
 
-    get_codings = _ListOperation[Coding]("codings", "get_codings")
-    get_forms = _ListOperation[Form]("forms", "get_forms")
-    get_intervals = _ListOperation[Interval]("intervals", "get_intervals")
-    get_queries = _ListOperation[Query]("queries", "get_queries")
-    get_record_revisions = _ListOperation[RecordRevision](
+    get_codings = _ListOperation[Coding, list[Coding]]("codings", "get_codings")
+    get_forms = _ListOperation[Form, list[Form]]("forms", "get_forms")
+    get_intervals = _ListOperation[Interval, list[Interval]]("intervals", "get_intervals")
+    get_queries = _ListOperation[Query, list[Query]]("queries", "get_queries")
+    get_record_revisions = _ListOperation[RecordRevision, list[RecordRevision]](
         "record_revisions", "get_record_revisions"
     )
-    get_records = _ListOperation[Record]("records", "get_records")
-    get_sites = _ListOperation[Site]("sites", "get_sites")
-    get_studies = _ListOperation[Study]("studies", "get_studies")
-    get_subjects = _ListOperation[Subject]("subjects", "get_subjects")
-    get_users = _ListOperation[User]("users", "get_users")
-    get_variables = _ListOperation[Variable]("variables", "get_variables")
-    get_visits = _ListOperation[Visit]("visits", "get_visits")
+    get_records = _ListOperation[Record, list[Record]]("records", "get_records")
+    get_sites = _ListOperation[Site, list[Site]]("sites", "get_sites")
+    get_studies = _ListOperation[Study, list[Study]]("studies", "get_studies")
+    get_subjects = _ListOperation[Subject, list[Subject]]("subjects", "get_subjects")
+    get_users = _ListOperation[User, list[User]]("users", "get_users")
+    get_variables = _ListOperation[Variable, list[Variable]]("variables", "get_variables")
+    get_visits = _ListOperation[Visit, list[Visit]]("visits", "get_visits")
 
     @_trace_method
     def get_job(self, study_key: str, batch_id: str) -> JobStatus:
@@ -167,8 +227,8 @@ class SyncSDKConvenienceMixin:
         study_key: str,
         batch_id: str,
         *,
-        interval: int = 5,
-        timeout: int = 300,
+        interval: float = 5,
+        timeout: float = 300,
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Poll a job until it reaches a terminal state."""
@@ -185,24 +245,42 @@ class AsyncSDKConvenienceMixin:
         jobs: AsyncJobsEndpoint
         _async_client: Any
 
-    async_get_codings = _ListOperation[Coding]("codings", "async_get_codings", is_async=True)
-    async_get_forms = _ListOperation[Form]("forms", "async_get_forms", is_async=True)
-    async_get_intervals = _ListOperation[Interval](
+    async_get_codings = _ListOperation[Coding, Coroutine[Any, Any, list[Coding]]](
+        "codings", "async_get_codings", is_async=True
+    )
+    async_get_forms = _ListOperation[Form, Coroutine[Any, Any, list[Form]]](
+        "forms", "async_get_forms", is_async=True
+    )
+    async_get_intervals = _ListOperation[Interval, Coroutine[Any, Any, list[Interval]]](
         "intervals", "async_get_intervals", is_async=True
     )
-    async_get_queries = _ListOperation[Query]("queries", "async_get_queries", is_async=True)
-    async_get_record_revisions = _ListOperation[RecordRevision](
-        "record_revisions", "async_get_record_revisions", is_async=True
+    async_get_queries = _ListOperation[Query, Coroutine[Any, Any, list[Query]]](
+        "queries", "async_get_queries", is_async=True
     )
-    async_get_records = _ListOperation[Record]("records", "async_get_records", is_async=True)
-    async_get_sites = _ListOperation[Site]("sites", "async_get_sites", is_async=True)
-    async_get_studies = _ListOperation[Study]("studies", "async_get_studies", is_async=True)
-    async_get_subjects = _ListOperation[Subject]("subjects", "async_get_subjects", is_async=True)
-    async_get_users = _ListOperation[User]("users", "async_get_users", is_async=True)
-    async_get_variables = _ListOperation[Variable](
+    async_get_record_revisions = _ListOperation[
+        RecordRevision, Coroutine[Any, Any, list[RecordRevision]]
+    ]("record_revisions", "async_get_record_revisions", is_async=True)
+    async_get_records = _ListOperation[Record, Coroutine[Any, Any, list[Record]]](
+        "records", "async_get_records", is_async=True
+    )
+    async_get_sites = _ListOperation[Site, Coroutine[Any, Any, list[Site]]](
+        "sites", "async_get_sites", is_async=True
+    )
+    async_get_studies = _ListOperation[Study, Coroutine[Any, Any, list[Study]]](
+        "studies", "async_get_studies", is_async=True
+    )
+    async_get_subjects = _ListOperation[Subject, Coroutine[Any, Any, list[Subject]]](
+        "subjects", "async_get_subjects", is_async=True
+    )
+    async_get_users = _ListOperation[User, Coroutine[Any, Any, list[User]]](
+        "users", "async_get_users", is_async=True
+    )
+    async_get_variables = _ListOperation[Variable, Coroutine[Any, Any, list[Variable]]](
         "variables", "async_get_variables", is_async=True
     )
-    async_get_visits = _ListOperation[Visit]("visits", "async_get_visits", is_async=True)
+    async_get_visits = _ListOperation[Visit, Coroutine[Any, Any, list[Visit]]](
+        "visits", "async_get_visits", is_async=True
+    )
 
     @_async_trace_method
     async def async_get_job(self, study_key: str, batch_id: str) -> JobStatus:
@@ -229,8 +307,8 @@ class AsyncSDKConvenienceMixin:
         study_key: str,
         batch_id: str,
         *,
-        interval: int = 5,
-        timeout: int = 300,
+        interval: float = 5,
+        timeout: float = 300,
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Asynchronously poll a job until it reaches a terminal state."""
