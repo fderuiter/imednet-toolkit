@@ -392,3 +392,52 @@ async def test_async_batch_coordinator_concurrent_tasks_sharing_cache_validate_o
     assert flattened == [21, 22, 45, 23]
     # 3 valid in Task 1 + 1 child invalid + 1 Task 2 invalid + 1 Task 3 valid = 6 validations total
     assert spy_validate.call_count == 6
+
+
+@pytest.mark.asyncio
+async def test_prevalidated_without_records_does_not_leak_to_spawned_child_task() -> None:
+    """Wildcard prevalidated() scopes remain bound to the owning task and never leak to child tasks."""
+    import asyncio
+
+    from imednet.core.endpoint.operations.record_create import RecordCreateOperation
+    from imednet.errors import ValidationError
+    from imednet.models.variables import Variable
+    from imednet.validation.cache import AsyncSchemaCache
+
+    cache = AsyncSchemaCache()
+    cache.populate(
+        [
+            Variable(
+                study_key="STUDY",
+                form_id=1,
+                form_key="F1",
+                form_name="Form 1",
+                variable_id=1,
+                variable_name="age",
+                variable_type="integer",
+            )
+        ]
+    )
+
+    shared_record: dict[str, Any] = {"formKey": "F1", "data": {"age": "invalid-in-child"}}
+
+    async def child_attempt() -> None:
+        assert cache.is_prevalidated is False
+        assert cache.is_record_prevalidated(shared_record) is False
+        RecordCreateOperation(
+            path="/api/v1/edc/studies/STUDY/records",
+            records_data=[shared_record],
+            schema=cache,
+        )
+
+    with cache.prevalidated([shared_record]):
+        assert cache.is_prevalidated is True
+        assert cache.is_record_prevalidated(shared_record) is True
+        with pytest.raises(ValidationError, match="Value must be an integer"):
+            await asyncio.create_task(child_attempt())
+
+    with cache.prevalidated():
+        assert cache.is_prevalidated is True
+        with pytest.raises(ValidationError, match="Value must be an integer"):
+            await asyncio.create_task(child_attempt())
+    assert cache.is_prevalidated is False

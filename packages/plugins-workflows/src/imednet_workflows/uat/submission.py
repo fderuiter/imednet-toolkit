@@ -135,6 +135,9 @@ def _record_matches_submitted_item(rec: Any, item: _SubmittedRegistrationItem) -
     rec_site_id = _clean_int(_get_attr_or_key(rec, "site_id", "siteId"))
     if item.site_id is not None and rec_site_id is not None and rec_site_id != item.site_id:
         return False
+    rec_site_name = _clean_str(_get_attr_or_key(rec, "site_name", "siteName"))
+    if item.site_name and rec_site_name and rec_site_name != item.site_name:
+        return False
     rec_data = _get_attr_or_key(rec, "record_data", "recordData", "data")
     if not isinstance(rec_data, dict) or not rec_data:
         return False
@@ -619,32 +622,26 @@ class BulkRecordSubmissionWorkflow:
         return enrolled_keys
 
     def _snapshot_existing_subjects(self, study_key: str) -> _PreExistingSubjectsSnapshot:
-        """Capture pre-Phase-1 study subject identifiers on stateful/real SDKs."""
+        """Capture pre-Phase-1 study subject identifiers."""
         keys: set[str] = set()
         ids: set[int] = set()
         oids: set[str] = set()
+
         get_subjects_fn = getattr(self.sdk, "get_subjects", None)
-        if not callable(get_subjects_fn) or _is_unconfigured_mock_method(get_subjects_fn):
-            return _PreExistingSubjectsSnapshot(keys, ids, oids)
-        # Avoid consuming static unittest.mock return_value prior to Phase 1
-        if (
-            type(get_subjects_fn).__module__.startswith("unittest.mock")
-            and getattr(get_subjects_fn, "side_effect", None) is None
-        ):
-            return _PreExistingSubjectsSnapshot(keys, ids, oids)
-        subjects = get_subjects_fn(study_key)
-        if not isinstance(subjects, list):
-            return _PreExistingSubjectsSnapshot(keys, ids, oids)
-        for subj in subjects:
-            key = _clean_str(_get_attr_or_key(subj, "subject_key", "subjectKey"))
-            if key:
-                keys.add(key)
-            sid = _clean_int(_get_attr_or_key(subj, "subject_id", "subjectId"))
-            if sid is not None:
-                ids.add(sid)
-            subj_oid = _clean_str(_get_attr_or_key(subj, "subject_oid", "subjectOid"))
-            if subj_oid:
-                oids.add(subj_oid)
+        if callable(get_subjects_fn) and not _is_unconfigured_mock_method(get_subjects_fn):
+            subjects = get_subjects_fn(study_key)
+            if isinstance(subjects, list):
+                for subj in subjects:
+                    key = _clean_str(_get_attr_or_key(subj, "subject_key", "subjectKey"))
+                    if key:
+                        keys.add(key)
+                    sid = _clean_int(_get_attr_or_key(subj, "subject_id", "subjectId"))
+                    if sid is not None:
+                        ids.add(sid)
+                    subj_oid = _clean_str(_get_attr_or_key(subj, "subject_oid", "subjectOid"))
+                    if subj_oid:
+                        oids.add(subj_oid)
+
         return _PreExistingSubjectsSnapshot(keys, ids, oids)
 
     def _requires_phase2_correlation(
@@ -713,8 +710,10 @@ class BulkRecordSubmissionWorkflow:
         def _subject_key_from_subject_lookup(
             subj_id: int | None,
             subj_oid: str | None,
-            item: _SubmittedRegistrationItem,
+            item: _SubmittedRegistrationItem | None = None,
         ) -> str | None:
+            if subj_id is None and not subj_oid:
+                return None
             if subj_id is not None and subj_id in pre_existing.subject_ids:
                 return None
             if subj_oid and subj_oid in pre_existing.subject_oids:
@@ -733,10 +732,15 @@ class BulkRecordSubmissionWorkflow:
                 if subj_oid is not None and cand_oid != subj_oid:
                     continue
                 s_name = _clean_str(_get_attr_or_key(subj, "site_name", "siteName"))
-                if item.site_name and s_name and s_name != item.site_name:
+                if item is not None and item.site_name and s_name and s_name != item.site_name:
                     continue
                 s_id = _clean_int(_get_attr_or_key(subj, "site_id", "siteId"))
-                if item.site_id is not None and s_id is not None and s_id != item.site_id:
+                if (
+                    item is not None
+                    and item.site_id is not None
+                    and s_id is not None
+                    and s_id != item.site_id
+                ):
                     continue
                 cand_key = _clean_str(_get_attr_or_key(subj, "subject_key", "subjectKey"))
                 if cand_key and cand_key not in matches:
@@ -910,7 +914,6 @@ class BulkRecordSubmissionWorkflow:
                         sk = _subject_key_from_subject_lookup(
                             _clean_int(_get_attr_or_key(rec, "subject_id", "subjectId")),
                             _clean_str(_get_attr_or_key(rec, "subject_oid", "subjectOid")),
-                            remaining[0][1],
                         )
                     if not sk or sk in pre_existing.subject_keys or sk in assigned_keys:
                         continue
@@ -964,17 +967,24 @@ class BulkRecordSubmissionWorkflow:
                             matched_keys.append(sk)
 
                     expected_k = len(group)
+                    if expected_k > 1:
+                        return (
+                            None,
+                            f"Ambiguous enrolled subject correlation for form '{sample.form_key}': "
+                            f"{expected_k} submitted registration payloads are indistinguishable "
+                            "without batch result identifiers.",
+                        )
                     if len(matched_keys) == 0:
                         return (
                             None,
                             f"Unable to correlate enrolled subject for form '{sample.form_key}': "
                             "no matching enrollment record found for this batch.",
                         )
-                    if len(matched_keys) != expected_k:
+                    if len(matched_keys) != 1:
                         return (
                             None,
                             f"Ambiguous enrolled subject correlation for form '{sample.form_key}': "
-                            f"expected {expected_k} matching subject(s), found {len(matched_keys)}.",
+                            f"expected 1 matching subject, found {len(matched_keys)}.",
                         )
                     if not set(matched_keys).isdisjoint(tier2_assigned):
                         return (

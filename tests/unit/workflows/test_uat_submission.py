@@ -885,3 +885,96 @@ def test_result_count_mismatch_and_submitted_subject_oid_correlation(mock_sdk):
     res = wf_oid.submit("study1", [rs_reg_oid, rs_data_oid])
     assert res.enrolled_subject_keys == ["OID-RESOLVED-77"]
     assert rs_data_oid.payloads[0]["subjectKey"] == "OID-RESOLVED-77"
+
+
+def test_static_mock_preexisting_subjects_and_cross_site_records_fail_closed(mock_sdk):
+    """Static return_value pre-existing subjects and cross-site records never receive Phase 2 writes."""
+    from imednet.models.records import Record
+    from imednet_workflows.uat.submission import SubmissionPhase
+
+    # 1. Static get_subjects.return_value + matching pre-existing record still fails closed
+    wf_static = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+    mock_sdk.create_record.return_value = Job(batch_id="b_static", state="PENDING")
+    mock_sdk.get_job.return_value = JobStatus(batch_id="b_static", state="COMPLETED", results=None)
+    mock_sdk.get_subjects.return_value = [
+        Subject(subject_id=1, subject_key="STATIC-PRE-001", site_name="Site1")
+    ]
+    mock_sdk.get_records.return_value = [
+        Record(
+            record_id=10,
+            form_key="REG",
+            subject_key="STATIC-PRE-001",
+            record_data={"V": "SAME"},
+        )
+    ]
+
+    rs_reg = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"formKey": "REG", "siteName": "Site1", "data": {"V": "SAME"}}],
+        subject_keys=["UAT-1"],
+    )
+    rs_data = GeneratedRecordSet(
+        form_key="VIS",
+        form_name="Visit",
+        test_type=RecordTestType.CREATE_NEW_RECORD,
+        payloads=[{"formKey": "VIS", "subjectKey": "UAT-1", "data": {"BP": 120}}],
+        subject_keys=["UAT-1"],
+    )
+
+    with pytest.raises(BulkSubmissionError, match="no matching enrollment record"):
+        wf_static.submit("study1", [rs_reg, rs_data])
+    assert wf_static.phase == SubmissionPhase.FAILED
+    assert mock_sdk.create_record.call_count == 1
+
+    # 2. Cross-site record (site_name mismatch on record itself) fails closed when get_subjects lags
+    mock_sdk.create_record.reset_mock()
+    wf_site = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+    mock_sdk.get_subjects.side_effect = [[], []]
+    mock_sdk.get_records.return_value = [
+        {
+            "recordId": 99,
+            "formKey": "REG",
+            "subjectKey": "OTHER-SITE-SUBJ",
+            "siteName": "Site2",
+            "recordData": {"V": "SAME"},
+        }
+    ]
+    with pytest.raises(BulkSubmissionError, match="no matching enrollment record"):
+        wf_site.submit("study1", [rs_reg, rs_data])
+    assert wf_site.phase == SubmissionPhase.FAILED
+    assert mock_sdk.create_record.call_count == 1
+
+    # 3. Two indistinguishable submitted payloads without result identifiers fail closed
+    mock_sdk.create_record.reset_mock()
+    wf_indist = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+    mock_sdk.get_subjects.side_effect = [[], []]
+    mock_sdk.get_records.return_value = [
+        Record(record_id=101, form_key="REG", subject_key="SUBJ-1", record_data={"V": "SAME"}),
+        Record(record_id=102, form_key="REG", subject_key="SUBJ-2", record_data={"V": "SAME"}),
+    ]
+    rs_reg_dup = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[
+            {"formKey": "REG", "siteName": "Site1", "data": {"V": "SAME"}},
+            {"formKey": "REG", "siteName": "Site1", "data": {"V": "SAME"}},
+        ],
+        subject_keys=["UAT-1", "UAT-2"],
+    )
+    rs_data_dup = GeneratedRecordSet(
+        form_key="VIS",
+        form_name="Visit",
+        test_type=RecordTestType.CREATE_NEW_RECORD,
+        payloads=[
+            {"formKey": "VIS", "subjectKey": "UAT-1", "data": {"BP": 120}},
+            {"formKey": "VIS", "subjectKey": "UAT-2", "data": {"BP": 130}},
+        ],
+        subject_keys=["UAT-1", "UAT-2"],
+    )
+    with pytest.raises(BulkSubmissionError, match="Ambiguous"):
+        wf_indist.submit("study1", [rs_reg_dup, rs_data_dup])
+    assert wf_indist.phase == SubmissionPhase.FAILED
+    assert mock_sdk.create_record.call_count == 1

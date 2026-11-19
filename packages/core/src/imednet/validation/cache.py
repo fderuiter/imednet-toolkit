@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -24,10 +26,27 @@ if TYPE_CHECKING:
     from ..spi.facade import AsyncImednetFacade, ImednetFacade
 
 _TClient = TypeVar("_TClient")
-_PREVALIDATED_SCOPES: ContextVar[tuple[tuple[int, frozenset[int] | None], ...]] = ContextVar(
+_ExecutionOwner = tuple[int, int | None]
+_PrevalidatedScope = tuple[
+    int,
+    _ExecutionOwner,
+    tuple[dict[str, Any], ...] | None,
+    frozenset[int] | None,
+]
+_PREVALIDATED_SCOPES: ContextVar[tuple[_PrevalidatedScope, ...]] = ContextVar(
     "imednet_prevalidated_scopes",
     default=(),
 )
+
+
+def _current_execution_owner() -> _ExecutionOwner:
+    """Return ``(thread_id, task_id)`` for the currently executing thread and asyncio task."""
+    thread_id = threading.get_ident()
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return (thread_id, id(task) if task is not None else None)
 
 
 class BaseSchemaCache(Generic[_TClient]):
@@ -45,25 +64,32 @@ class BaseSchemaCache(Generic[_TClient]):
 
     @property
     def is_prevalidated(self) -> bool:
-        """Return True while inside a ``prevalidated()`` scope in the active task context."""
+        """Return True while inside a ``prevalidated()`` scope owned by the active task."""
         cache_id = id(self)
-        return any(cid == cache_id for cid, _ in _PREVALIDATED_SCOPES.get())
+        owner = _current_execution_owner()
+        return any(
+            cid == cache_id and scope_owner == owner
+            for cid, scope_owner, _, _ in _PREVALIDATED_SCOPES.get()
+        )
 
     def is_record_prevalidated(self, record: dict[str, Any]) -> bool:
         """Return True if ``record`` was already validated for this cache in the active task."""
         cache_id = id(self)
+        owner = _current_execution_owner()
         rec_id = id(record)
-        for cid, rec_ids in _PREVALIDATED_SCOPES.get():
-            if cid == cache_id and (rec_ids is None or rec_id in rec_ids):
+        for cid, scope_owner, _, rec_ids in _PREVALIDATED_SCOPES.get():
+            if cid == cache_id and scope_owner == owner and (rec_ids is None or rec_id in rec_ids):
                 return True
         return False
 
     @contextmanager
     def prevalidated(self, records: Iterable[dict[str, Any]] | None = None) -> Iterator[None]:
         """Mark ``records`` (or the active block) as validated in the current task context."""
-        rec_ids = frozenset(id(rec) for rec in records) if records is not None else None
+        records_ref = tuple(records) if records is not None else None
+        rec_ids = frozenset(id(rec) for rec in records_ref) if records_ref is not None else None
+        owner = _current_execution_owner()
         current = _PREVALIDATED_SCOPES.get()
-        token = _PREVALIDATED_SCOPES.set((*current, (id(self), rec_ids)))
+        token = _PREVALIDATED_SCOPES.set((*current, (id(self), owner, records_ref, rec_ids)))
         try:
             yield
         finally:
