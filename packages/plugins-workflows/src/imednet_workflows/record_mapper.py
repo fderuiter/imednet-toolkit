@@ -185,6 +185,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         "flags": {"AESER"},
         "dtc": {"AESTDTC", "AEENDTC"},
         "coding_target": ("AEDECOD", "AETERM"),
+        "coding_vars": ("AEDECOD", "aeDecod", "ae_decod", "aedecod"),
     },
     "DV": {
         "domain": "DV",
@@ -286,6 +287,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         "flags": set(),
         "dtc": {"CMSTDTC", "CMENDTC"},
         "coding_target": ("CMDECOD", "CMTRT"),
+        "coding_vars": ("CMDECOD", "cmDecod", "cm_decod", "cmdecod"),
     },
     "DM": {
         "domain": "DM",
@@ -499,6 +501,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         "flags": {"MHPRESP", "MHOCCUR"},
         "dtc": {"MHSTDTC", "MHENDTC"},
         "coding_target": ("MHDECOD", "MHTERM"),
+        "coding_vars": ("MHDECOD", "mhDecod", "mh_decod", "mhdecod"),
     },
     "DS": {
         "domain": "DS",
@@ -835,6 +838,60 @@ def _get_model_consumed_keys(model_cls: type[BaseModel]) -> frozenset[str]:
     return frozenset(consumed)
 
 
+def _resolve_coded_value(
+    record_id: int,
+    decod_var: str,
+    term_var: str,
+    coding_vars: tuple[str, ...],
+    row: dict[str, Any],
+    matched_source_keys: dict[str, str],
+    all_field_aliases: dict[str, set[str]],
+    codings_lookup: dict[tuple[int, str], str],
+    codings_lower_lookup: dict[tuple[int, str], str],
+) -> str | None:
+    """Resolve a decoded term from the matched source term variable or domain coding variable."""
+    existing_decod = row.get(decod_var)
+    if existing_decod is not None and (
+        not isinstance(existing_decod, str) or bool(existing_decod.strip())
+    ):
+        return None
+
+    candidate_vars: list[str] = []
+    term_val = row.get(term_var)
+    has_term = term_val is not None and (not isinstance(term_val, str) or bool(term_val.strip()))
+
+    if has_term and term_var in matched_source_keys:
+        term_source = matched_source_keys[term_var]
+        candidate_vars.append(term_source)
+        for alias in sorted(all_field_aliases.get(term_source, ())):
+            if alias not in candidate_vars:
+                candidate_vars.append(alias)
+
+    coding_vars_lower = {v.lower() for v in coding_vars}
+    if decod_var in matched_source_keys:
+        decod_source = matched_source_keys[decod_var]
+        if decod_source.lower() in coding_vars_lower:
+            if decod_source not in candidate_vars:
+                candidate_vars.append(decod_source)
+            for alias in sorted(all_field_aliases.get(decod_source, ())):
+                if alias not in candidate_vars:
+                    candidate_vars.append(alias)
+
+    for explicit_var in coding_vars:
+        if explicit_var not in candidate_vars:
+            candidate_vars.append(explicit_var)
+
+    for cand_var in candidate_vars:
+        if not cand_var:
+            continue
+        coded_val = codings_lookup.get((record_id, cand_var))
+        if coded_val is None:
+            coded_val = codings_lower_lookup.get((record_id, cand_var.lower()))
+        if coded_val is not None:
+            return coded_val
+    return None
+
+
 def transform_records_to_sdtm(
     records: Iterable[Any],
     domain: str,
@@ -892,6 +949,16 @@ def transform_records_to_sdtm(
     flag_vars = spec["flags"] if spec else set()
     dtc_vars = spec["dtc"] if spec else set()
     coding_target: tuple[str, str] | None = spec.get("coding_target") if spec else None
+    coding_vars: tuple[str, ...] = (
+        tuple(spec.get("coding_vars", (coding_target[0],)))
+        if spec and coding_target is not None
+        else ()
+    )
+    codings_lower_lookup: dict[tuple[int, str], str] = {}
+    if codings_lookup:
+        for (c_rec_id, c_var), c_val in codings_lookup.items():
+            if isinstance(c_var, str):
+                codings_lower_lookup.setdefault((c_rec_id, c_var.lower()), c_val)
 
     rows: list[dict[str, Any]] = []
     counters: dict[str, int] = seq_counters if seq_counters is not None else {}
@@ -1068,28 +1135,19 @@ def transform_records_to_sdtm(
 
         if coding_target is not None and codings_lookup and record_id is not None:
             decod_var, term_var = coding_target
-            existing_decod = row.get(decod_var)
-            if existing_decod is None or (
-                isinstance(existing_decod, str) and not existing_decod.strip()
-            ):
-                candidate_vars: list[str] = []
-                for m_var in (term_var, decod_var):
-                    if m_var in matched_source_keys:
-                        candidate_vars.append(matched_source_keys[m_var])
-                candidate_vars.extend([term_var, decod_var])
-                candidate_vars.extend(alias_map.get(term_var, []))
-                candidate_vars.extend(alias_map.get(decod_var, []))
-                candidate_vars.extend(k for k in rec_dict if k not in consumed_keys)
-                for cand_var in candidate_vars:
-                    if not cand_var:
-                        continue
-                    coded_val = codings_lookup.get(
-                        (record_id, cand_var),
-                        codings_lookup.get((record_id, cand_var.lower())),
-                    )
-                    if coded_val is not None:
-                        row[decod_var] = coded_val
-                        break
+            coded_val = _resolve_coded_value(
+                record_id=record_id,
+                decod_var=decod_var,
+                term_var=term_var,
+                coding_vars=coding_vars,
+                row=row,
+                matched_source_keys=matched_source_keys,
+                all_field_aliases=all_field_aliases,
+                codings_lookup=codings_lookup,
+                codings_lower_lookup=codings_lower_lookup,
+            )
+            if coded_val is not None:
+                row[decod_var] = coded_val
 
         if visits_lookup and visit_id is not None and visit_id in visits_lookup:
             visit_meta = visits_lookup[visit_id]

@@ -1427,6 +1427,90 @@ def test_sdtm_dataframe_enriches_codings_visits_and_intervals() -> None:
     assert df_mh.iloc[0]["VISITNUM"] == 4
 
 
+def test_sdtm_coding_lookup_ignores_unrelated_coded_fields_on_same_record() -> None:
+    """Verify unrelated medication/history/unconsumed codings on the same record never populate AEDECOD."""
+    sdk = MagicMock()
+    shared_record = Record(
+        record_id=101,
+        subject_key="SUBJ-01",
+        visit_id=11,
+        form_id=10,
+        record_status="Complete",
+        record_data={
+            "aeTerm": "mild headache",
+            "aeSeverity": "MILD",
+            "cmTerm": "Ibuprofen",
+            "concomitantMed": "Paracetamol",
+            "mhTerm": "Seasonal allergies",
+            "term": "Shadowed generic term",
+            "pt": "",
+        },
+    )
+    sdk.get_records.return_value = [shared_record]
+    sdk.get_visits.return_value = []
+    sdk.get_intervals.return_value = []
+
+    # 1. Only unrelated fields (medication, unconsumed field, MH, shadowed alias, generic pt) are coded
+    sdk.get_codings.return_value = [
+        Coding(record_id=101, variable="cmTerm", value="IBUPROFEN", code="M01AE01"),
+        Coding(record_id=101, variable="cmDecod", value="IBUPROFEN", code="M01AE01"),
+        Coding(record_id=101, variable="concomitantMed", value="PARACETAMOL", code="N02BE01"),
+        Coding(record_id=101, variable="mhTerm", value="ALLERGY", code="10001708"),
+        Coding(record_id=101, variable="mhDecod", value="ALLERGY", code="10001708"),
+        Coding(record_id=101, variable="term", value="WRONG_SHADOW_TERM", code="99999999"),
+        Coding(record_id=101, variable="pt", value="WRONG_GENERIC_PT", code="88888888"),
+    ]
+    mapper = RecordMapper(sdk)
+
+    df_ae_uncoded = mapper.sdtm_dataframe(study_key="STUDY_SPI", domain="AE")
+    assert df_ae_uncoded.iloc[0]["AETERM"] == "mild headache"
+    assert df_ae_uncoded.iloc[0]["AEDECOD"] in (None, "")
+
+    # Pure medication record with blank generic term never leaks into AEDECOD
+    med_only_record = Record(
+        record_id=102,
+        subject_key="SUBJ-01",
+        visit_id=11,
+        form_id=12,
+        record_status="Complete",
+        record_data={"cmTerm": "Ibuprofen", "term": ""},
+    )
+    df_med_as_ae = transform_records_to_sdtm(
+        [med_only_record],
+        domain="AE",
+        study_key="STUDY_SPI",
+        codings_lookup={
+            (102, "cmTerm"): "IBUPROFEN",
+            (102, "term"): "IBUPROFEN",
+        },
+    )
+    assert df_med_as_ae.iloc[0]["AEDECOD"] is None
+
+    # Same record mapped as CM resolves CMDECOD from cmTerm without leaking into AE
+    df_cm_coded = mapper.sdtm_dataframe(study_key="STUDY_SPI", domain="CM")
+    assert df_cm_coded.iloc[0]["CMTRT"] == "Ibuprofen"
+    assert df_cm_coded.iloc[0]["CMDECOD"] == "IBUPROFEN"
+
+    # 2. Explicit domain coding variable (aeDecod / AEDECOD / AE_DECOD) populates AEDECOD
+    df_explicit_decod = transform_records_to_sdtm(
+        [shared_record],
+        domain="AE",
+        study_key="STUDY_SPI",
+        codings_lookup={
+            (101, "cmTerm"): "IBUPROFEN",
+            (101, "AE_DECOD"): "HEADACHE",
+        },
+    )
+    assert df_explicit_decod.iloc[0]["AEDECOD"] == "HEADACHE"
+
+    # 3. Source term variable (aeTerm) takes precedence and resolves solely for AE
+    sdk.get_codings.return_value.append(
+        Coding(record_id=101, variable="aeTerm", value="TENSION HEADACHE", code="10043269")
+    )
+    df_ae_coded = mapper.sdtm_dataframe(study_key="STUDY_SPI", domain="AE")
+    assert df_ae_coded.iloc[0]["AEDECOD"] == "TENSION HEADACHE"
+
+
 def test_sdtm_dataframe_graceful_fallback_when_lookup_methods_omitted() -> None:
     """Verify stub SDKs without get_codings/get_visits/get_intervals degrade gracefully."""
 
