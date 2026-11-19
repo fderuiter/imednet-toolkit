@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from defusedxml import ElementTree as DefusedET
 from docs import conf as docs_conf
 from scripts.validate_docs import check_built_html_seo, check_sphinx_seo_configuration
-from sphinx.application import Sphinx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -77,15 +78,25 @@ def test_sphinx_seo_hooks_emit_meta_tags_sitemap_robots_and_404(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    app = Sphinx(
-        srcdir=str(src_dir),
-        confdir=str(src_dir),
-        outdir=str(out_dir),
-        doctreedir=str(doctree_dir),
-        buildername="html",
-        warningiserror=True,
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sphinx",
+            "-b",
+            "html",
+            "-W",
+            "--keep-going",
+            "-d",
+            str(doctree_dir),
+            str(src_dir),
+            str(out_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    app.build()
+    assert result.returncode == 0, f"Sphinx HTML build failed:\n{result.stdout}\n{result.stderr}"
 
     assert check_built_html_seo(out_dir, require_exists=True) is False
 
