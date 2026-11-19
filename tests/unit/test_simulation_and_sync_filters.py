@@ -35,8 +35,8 @@ def _make_simulated_sdk() -> tuple[ImednetSDK, _RecordingSimulationTransport]:
     state = SimulationState()
     transport = _RecordingSimulationTransport(state=state)
     sdk = ImednetSDK(
-        api_key="sim-key",
-        security_key="sim-sec",
+        api_key="sim-key",  # pragma: allowlist secret
+        security_key="sim-sec",  # pragma: allowlist secret
         base_url="https://simulation.local",
         transport=transport,
     )
