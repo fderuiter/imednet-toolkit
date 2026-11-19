@@ -206,12 +206,12 @@ class MongoDbExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
-        from imednet.spi.sinks import CentralizedMapper
+        from imednet.spi.sinks import build_sink_mapper
 
-        mapper = CentralizedMapper(
+        mapper = build_sink_mapper(
+            self.config,
             mode="document",
             post_processor=_post_process_document,
-            mask_phi=self.config.mask_phi,
         )
         custom_pipeline = self.config.extra.get("enrichment_pipeline")
         if custom_pipeline is not None and hasattr(custom_pipeline, "process"):

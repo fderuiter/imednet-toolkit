@@ -1096,15 +1096,18 @@ class RecordMapper:
             "dateCreated",
         ]
 
-        for key in effective_var_keys:
+        unique_effective_var_keys = list(
+            dict.fromkeys(key for key in effective_var_keys if key not in meta_cols)
+        )
+        for key in unique_effective_var_keys:
             if key not in df.columns:
                 df[key] = pd.NA
 
-        df = df[meta_cols + effective_var_keys]
+        df = df[meta_cols + unique_effective_var_keys]
         if should_mask:
             sensitive_vars = [
                 key
-                for key in effective_var_keys
+                for key in unique_effective_var_keys
                 if global_sensitivity_registry.is_sensitive(key)
                 or (
                     bool(pipeline_phi_keys)
@@ -1116,7 +1119,7 @@ class RecordMapper:
                 df[key] = "***MASKED***"
 
             non_sensitive_vars = [
-                key for key in effective_var_keys if key not in set(sensitive_vars)
+                key for key in unique_effective_var_keys if key not in set(sensitive_vars)
             ]
             if non_sensitive_vars:
                 var_frame = df[non_sensitive_vars]
@@ -1132,7 +1135,7 @@ class RecordMapper:
                         )
 
         if use_labels:
-            rename_map = {key: label_map.get(key, key) for key in effective_var_keys}
+            rename_map = {key: label_map.get(key, key) for key in unique_effective_var_keys}
             df = df.rename(columns=rename_map)
         return df
 
@@ -1257,12 +1260,17 @@ class RecordMapper:
                     continue
                 if form.form_id in form_models:
                     continue
-                var_keys = [
-                    v.variable_name
-                    for v in (form.variables or [])
-                    if not variable_whitelist or v.variable_name in variable_whitelist
-                ]
-                label_map = {v.variable_name: v.label for v in (form.variables or [])}
+                var_keys = list(
+                    dict.fromkeys(
+                        v.variable_name
+                        for v in (form.variables or [])
+                        if v.variable_name
+                        and (not variable_whitelist or v.variable_name in variable_whitelist)
+                    )
+                )
+                label_map = {
+                    v.variable_name: v.label for v in (form.variables or []) if v.variable_name
+                }
                 form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
                 form_label_maps[form.form_id] = label_map  # type: ignore
 
@@ -1278,6 +1286,14 @@ class RecordMapper:
             include_deleted=include_deleted,
         )
 
+        meta_keys = {
+            "recordId",
+            "subjectKey",
+            "visitId",
+            "formId",
+            "recordStatus",
+            "dateCreated",
+        }
         tree: dict[str, dict[str, Any]] = {}
 
         for rec in records:
@@ -1291,7 +1307,7 @@ class RecordMapper:
                 parsed_data = self._parse_record(
                     rec,
                     model,
-                    mask_phi=mask_phi,
+                    mask_phi=should_mask,
                     study_key=study_key,
                 )
             except (ValidationError, TypeError) as exc:
@@ -1313,8 +1329,13 @@ class RecordMapper:
             if use_labels_as_keys:
                 remapped: dict[str, Any] = {}
                 for k, v in parsed_data.items():
-                    lbl = label_map.get(k)
-                    remapped[lbl if lbl is not None else k] = v
+                    if k in meta_keys:
+                        remapped[k] = v
+                    else:
+                        lbl = label_map.get(k)
+                        target_key = lbl if lbl is not None else k
+                        if target_key not in meta_keys:
+                            remapped[target_key] = v
                 parsed_data = remapped
 
             # Automatically perform lookups for parent record identifiers using available metadata

@@ -3,7 +3,7 @@ Quick Start
 
 This page walks through a minimal example of using the SDK.
 
-.. thebe-button:: Activate Interactive Runtime
+.. pyodide-button:: Activate Interactive Runtime
 
 Installation
 ------------

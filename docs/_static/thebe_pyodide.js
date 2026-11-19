@@ -1,5 +1,5 @@
 /**
- * Sphinx-Thebe integration with Pyodide CDN runtime.
+ * Native Sphinx Pyodide client runtime.
  * Provides on-demand client-side WebAssembly execution for Python code blocks.
  */
 (function () {
@@ -7,7 +7,16 @@
 
   const PYODIDE_CDN_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js";
 
-  // Event handlers for thebelab compatibility
+  const EXCLUDED_WHEEL_PREFIXES = [
+    "apache_airflow_providers_imednet-",
+    "apache-airflow-providers-imednet-",
+    "imednet_tui-",
+    "imednet-tui-",
+    "imednet_workspace-",
+    "imednet-workspace-",
+  ];
+
+  // Event handlers for runtime status notifications
   const listeners = {};
   function on(evt, fn) {
     if (!listeners[evt]) listeners[evt] = [];
@@ -19,7 +28,7 @@
       try {
         fn(evt, data);
       } catch (e) {
-        console.error("[thebe-pyodide] Event handler error:", e);
+        console.error("[pyodide-cells] Event handler error:", e);
       }
     });
   }
@@ -28,49 +37,131 @@
   let pyodideReady = false;
   let pyodideInitializing = false;
   let mainThreadPyodide = null;
+  let mainExecQueue = Promise.resolve();
   let executionId = 0;
   const pendingRequests = new Map();
   const installedMainWheels = new Set();
 
+  function isAllowedBrowserWheel(wheelPath) {
+    const filename = String(wheelPath || "").split("/").pop() || "";
+    return !EXCLUDED_WHEEL_PREFIXES.some((prefix) => filename.startsWith(prefix));
+  }
+
+  function normalizeRootPrefix(prefix) {
+    if (!prefix) return "";
+    return prefix.endsWith("/") ? prefix : `${prefix}/`;
+  }
+
   function getConfig() {
-    const defaultWheels = ["_static/wheels/imednet-1.1.0-py3-none-any.whl"];
-    const defaultRequirements = ["pydantic", "httpx", "tenacity", "defusedxml", "python-dotenv"];
+    const defaultWheels = [
+      "_static/wheels/imednet-1.1.0-py3-none-any.whl",
+      "_static/wheels/imednet_workflows-1.1.0-py3-none-any.whl",
+      "_static/wheels/imednet_plugins_sinks-1.0.1-py3-none-any.whl",
+    ];
+    const defaultPyodidePackages = [
+      "micropip",
+      "pydantic",
+      "cryptography",
+      "pandas",
+      "ssl",
+      "sqlite3",
+    ];
+    const defaultRequirements = [
+      "httpx",
+      "tenacity",
+      "defusedxml",
+      "python-dotenv",
+      "filelock",
+      "python-json-logger",
+    ];
+    const defaultEnv = {
+      IMEDNET_SIMULATION_MODE: "true",
+      IMEDNET_API_KEY: "dummy_api_key", // pragma: allowlist secret
+      IMEDNET_SECURITY_KEY: "dummy_security_key", // pragma: allowlist secret
+      SNOWFLAKE_PASSWORD: "dummy_password", // pragma: allowlist secret
+      IMEDNET_STUDY_KEY: "MY_STUDY",
+    };
 
     let rawConfig = null;
-    if (typeof window !== "undefined" && window.thebe_config) {
-      rawConfig = window.thebe_config;
-    } else {
-      const scriptTag = document.querySelector('script[type="text/x-thebe-config"]');
-      if (scriptTag) {
+    if (typeof document !== "undefined") {
+      const jsonConfigScript = document.getElementById("imednet-pyodide-config");
+      if (jsonConfigScript && jsonConfigScript.textContent) {
         try {
-          rawConfig = JSON.parse(scriptTag.textContent);
+          rawConfig = JSON.parse(jsonConfigScript.textContent);
         } catch (e) {
-          // ignore parsing error
+          console.warn("[pyodide-cells] Failed to parse #imednet-pyodide-config:", e);
         }
       }
     }
 
-    const wheels = (rawConfig && (rawConfig.wheels || rawConfig.wheel_paths)) || defaultWheels;
-    const requirements = (rawConfig && (rawConfig.requirements || rawConfig.micropip_requirements)) || defaultRequirements;
+    if (
+      !rawConfig &&
+      typeof window !== "undefined" &&
+      window.pyodide_config &&
+      typeof window.pyodide_config === "object"
+    ) {
+      rawConfig = window.pyodide_config;
+    } else if (
+      !rawConfig &&
+      typeof window !== "undefined" &&
+      window.thebe_config &&
+      typeof window.thebe_config === "object" &&
+      !(typeof Element !== "undefined" && window.thebe_config instanceof Element)
+    ) {
+      rawConfig = window.thebe_config;
+    }
 
-    const docRoot = (typeof DOCUMENTATION_OPTIONS !== "undefined" && DOCUMENTATION_OPTIONS.URL_ROOT)
-      ? DOCUMENTATION_OPTIONS.URL_ROOT
-      : "";
+    const rawWheels =
+      (rawConfig && (rawConfig.wheels || rawConfig.wheel_paths)) || defaultWheels;
+    const wheels = rawWheels.filter(isAllowedBrowserWheel);
+    const pyodidePackages =
+      (rawConfig && rawConfig.pyodide_packages) || defaultPyodidePackages;
+    const requirements =
+      (rawConfig && (rawConfig.requirements || rawConfig.micropip_requirements)) ||
+      defaultRequirements;
+    const env = Object.assign({}, defaultEnv, (rawConfig && rawConfig.env) || {});
+    const selector = (rawConfig && rawConfig.selector) || "div.highlight-python";
+
+    let docRoot = "";
+    const htmlEl = typeof document !== "undefined" ? document.documentElement : null;
+    const contentRootAttr =
+      htmlEl && typeof htmlEl.getAttribute === "function"
+        ? htmlEl.getAttribute("data-content_root")
+        : null;
+
+    if (contentRootAttr !== null && contentRootAttr !== "") {
+      docRoot = normalizeRootPrefix(contentRootAttr);
+    } else if (
+      typeof DOCUMENTATION_OPTIONS !== "undefined" &&
+      DOCUMENTATION_OPTIONS &&
+      DOCUMENTATION_OPTIONS.URL_ROOT
+    ) {
+      docRoot = normalizeRootPrefix(String(DOCUMENTATION_OPTIONS.URL_ROOT));
+    }
+
+    const baseHref =
+      typeof window !== "undefined" && window.location && window.location.href
+        ? window.location.href
+        : "http://localhost/";
 
     const resolvedWheels = wheels.map((w) => {
       try {
-        const fullRel = (w.startsWith("http://") || w.startsWith("https://"))
-          ? w
-          : (docRoot + w);
-        return new URL(fullRel, window.location.href).href;
+        if (w.startsWith("http://") || w.startsWith("https://") || w.startsWith("/")) {
+          return new URL(w, baseHref).href;
+        }
+        const cleanedRel = w.replace(/^\.\//, "");
+        return new URL(docRoot + cleanedRel, baseHref).href;
       } catch (e) {
         return w;
       }
     });
 
     return {
+      selector: selector,
       wheels: resolvedWheels,
+      pyodidePackages: pyodidePackages,
       requirements: requirements,
+      env: env,
     };
   }
 
@@ -88,6 +179,7 @@
     let pyodide = null;
     let ready = false;
     let initPromise = null;
+    let execQueue = Promise.resolve();
     const installedWheels = new Set();
 
     async function initRuntime(config) {
@@ -95,37 +187,61 @@
       importScripts("${PYODIDE_CDN_URL}");
       pyodide = await loadPyodide();
 
-      // Load micropip
-      await pyodide.loadPackage("micropip");
-      const micropip = pyodide.pyimport("micropip");
+      const pyodidePackages = (config && config.pyodidePackages) || [
+        "micropip",
+        "pydantic",
+        "cryptography",
+        "pandas",
+        "ssl",
+        "sqlite3"
+      ];
+      await pyodide.loadPackage(pyodidePackages);
+
+      const envVars = (config && config.env) || {};
+      const envProxy = pyodide.toPy(envVars);
+      pyodide.globals.set("__pyodide_init_env__", envProxy);
+      await pyodide.runPythonAsync(\`
+import os
+for _env_k, _env_v in __pyodide_init_env__.items():
+    os.environ[str(_env_k)] = str(_env_v)
+del __pyodide_init_env__
+\`);
+      envProxy.destroy();
 
       const wheels = (config && config.wheels) || [];
       const requirements = (config && config.requirements) || [];
 
-      // Pre-install package requirements if available
       if (requirements && requirements.length > 0) {
+        const reqsProxy = pyodide.toPy(requirements);
+        pyodide.globals.set("__pyodide_init_reqs__", reqsProxy);
         try {
-          await micropip.install(requirements);
+          await pyodide.runPythonAsync(\`
+import micropip
+if "typing-extensions" in micropip.list():
+    micropip.uninstall("typing-extensions")
+_reqs = list(dict.fromkeys(["typing-extensions", *[str(_r) for _r in __pyodide_init_reqs__]]))
+await micropip.install(_reqs)
+\`);
         } catch (reqErr) {
-          console.warn("[thebe-pyodide worker] micropip requirements install warning:", reqErr);
+          console.warn("[pyodide-cells worker] micropip requirements warning:", reqErr);
+          throw reqErr;
+        } finally {
+          pyodide.globals.delete("__pyodide_init_reqs__");
+          reqsProxy.destroy();
         }
       }
 
-      // Install SDK wheels with caching
       for (const wheelUrl of wheels) {
         if (!installedWheels.has(wheelUrl)) {
           try {
             await pyodide.runPythonAsync(\`
 import micropip
-try:
-    await micropip.install("\${wheelUrl}")
-except Exception:
-    await micropip.install("\${wheelUrl}", deps=False)
+await micropip.install("\${wheelUrl}", deps=False)
 \`);
             installedWheels.add(wheelUrl);
-            console.log("[thebe-pyodide worker] Successfully installed wheel:", wheelUrl);
+            console.log("[pyodide-cells worker] Installed wheel:", wheelUrl);
           } catch (whlErr) {
-            console.error("[thebe-pyodide worker] Wheel install error:", wheelUrl, whlErr);
+            console.error("[pyodide-cells worker] Wheel install error:", wheelUrl, whlErr);
             throw whlErr;
           }
         }
@@ -135,18 +251,7 @@ except Exception:
       postMessage({ type: 'status', status: 'ready', message: 'Pyodide runtime initialized' });
     }
 
-    onmessage = async function(e) {
-      const data = e.data;
-      if (data.type === 'init') {
-        if (!initPromise) {
-          initPromise = initRuntime(data.config).catch(err => {
-            postMessage({ type: 'status', status: 'failed', message: err.toString() });
-          });
-        }
-        return;
-      }
-
-      const { id, code } = data;
+    async function executeCellRequest(id, code) {
       if (!ready) {
         postMessage({ id, type: 'result', stdout: '', stderr: 'Pyodide runtime not ready yet.\\n', result: null, error: true });
         return;
@@ -155,8 +260,47 @@ except Exception:
       try {
         pyodide.globals.set("__thebe_user_code__", code);
         const runnerScript = \`
-import sys, ast, traceback
+import ast
+import inspect
+import sys
+import traceback
 from io import StringIO
+
+async def _pyodide_bridge_asyncio_run(_coro, *, debug=None, loop_factory=None):
+    return await _coro
+
+class _PyodideAsyncioRunRewriter(ast.NodeTransformer):
+    def visit_FunctionDef(self, node):
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        return node
+
+    def visit_ClassDef(self, node):
+        return node
+
+    def visit_Lambda(self, node):
+        return node
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "asyncio"
+            and node.func.attr == "run"
+        ):
+            return ast.copy_location(
+                ast.Await(
+                    value=ast.Call(
+                        func=ast.Name(id="_pyodide_bridge_asyncio_run", ctx=ast.Load()),
+                        args=node.args,
+                        keywords=node.keywords,
+                    )
+                ),
+                node,
+            )
+        return node
 
 _stdout_buf = StringIO()
 _stderr_buf = StringIO()
@@ -168,18 +312,28 @@ _eval_res = None
 _tb_str = ""
 
 try:
+    globals().setdefault("__name__", "__main__")
     _parsed = ast.parse(__thebe_user_code__)
+    _parsed = _PyodideAsyncioRunRewriter().visit(_parsed)
+    ast.fix_missing_locations(_parsed)
     if _parsed.body and isinstance(_parsed.body[-1], ast.Expr):
         _last_expr = ast.Expression(_parsed.body.pop().value)
-        _exec_code = compile(_parsed, '<stdin>', 'exec')
-        _eval_code = compile(_last_expr, '<stdin>', 'eval')
-        exec(_exec_code, globals())
-        _eval_res = eval(_eval_code, globals())
+        ast.fix_missing_locations(_last_expr)
+        _exec_code = compile(_parsed, "<stdin>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        _eval_code = compile(_last_expr, "<stdin>", "eval", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        _exec_ret = eval(_exec_code, globals())
+        if inspect.iscoroutine(_exec_ret):
+            await _exec_ret
+        _eval_ret = eval(_eval_code, globals())
+        _eval_res = (await _eval_ret) if inspect.iscoroutine(_eval_ret) else _eval_ret
     else:
-        _exec_code = compile(__thebe_user_code__, '<stdin>', 'exec')
-        exec(_exec_code, globals())
-except Exception:
-    _tb_str = traceback.format_exc()
+        _exec_code = compile(_parsed, "<stdin>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        _exec_ret = eval(_exec_code, globals())
+        if inspect.iscoroutine(_exec_ret):
+            await _exec_ret
+except (Exception, SystemExit) as _exc:
+    if not isinstance(_exc, SystemExit) or _exc.code not in (None, 0):
+        _tb_str = traceback.format_exc()
 finally:
     sys.stdout = _old_out
     sys.stderr = _old_err
@@ -191,7 +345,7 @@ finally:
     "error": bool(_tb_str)
 }
 \`;
-        const resProxy = pyodide.runPython(runnerScript);
+        const resProxy = await pyodide.runPythonAsync(runnerScript);
         const resObj = resProxy.toJs();
         resProxy.destroy();
 
@@ -213,14 +367,29 @@ finally:
           error: true
         });
       }
+    }
+
+    onmessage = function(e) {
+      const data = e.data;
+      if (data.type === 'init') {
+        if (!initPromise) {
+          initPromise = initRuntime(data.config).catch(err => {
+            postMessage({ type: 'status', status: 'failed', message: err.toString() });
+          });
+        }
+        return;
+      }
+
+      const { id, code } = data;
+      execQueue = execQueue.then(() => executeCellRequest(id, code));
     };
   `;
 
   function initWorker() {
-    if (pyodideWorker || pyodideInitializing) return;
+    if (pyodideWorker || pyodideInitializing || pyodideReady) return;
     pyodideInitializing = true;
     setCellRunButtonsDisabled(true);
-    updateLaunchButtons("loading", "Initializing Pyodide WebAssembly runtime...");
+    updateLaunchButtons("loading", "Pyodide (WebAssembly): loading");
 
     const config = getConfig();
 
@@ -229,7 +398,6 @@ finally:
       const workerUrl = URL.createObjectURL(blob);
       pyodideWorker = new Worker(workerUrl);
 
-      // Trigger initialization in worker with wheel configuration
       pyodideWorker.postMessage({ type: "init", config: config });
 
       pyodideWorker.onmessage = function (e) {
@@ -239,11 +407,11 @@ finally:
             pyodideReady = true;
             pyodideInitializing = false;
             setCellRunButtonsDisabled(false);
-            updateLaunchButtons("ready", "Pyodide Ready");
+            updateLaunchButtons("ready", "Pyodide (WebAssembly): ready");
             trigger("status", { status: "ready", message: data.message });
           } else {
             pyodideInitializing = false;
-            updateLaunchButtons("failed", "Initialization failed");
+            updateLaunchButtons("failed", "Pyodide (WebAssembly): failed");
             trigger("status", { status: "failed", message: data.message });
           }
         } else if (data.type === "result") {
@@ -256,11 +424,13 @@ finally:
       };
 
       pyodideWorker.onerror = function (err) {
-        console.warn("[thebe-pyodide] Worker error, falling back to main-thread Pyodide:", err);
+        console.warn("[pyodide-cells] Worker error, falling back to main-thread Pyodide:", err);
+        pyodideWorker = null;
         fallbackToMainThread();
       };
     } catch (e) {
-      console.warn("[thebe-pyodide] Worker creation failed, falling back to main-thread Pyodide:", e);
+      console.warn("[pyodide-cells] Worker creation failed, falling back to main-thread Pyodide:", e);
+      pyodideWorker = null;
       fallbackToMainThread();
     }
   }
@@ -274,14 +444,43 @@ finally:
     script.onload = async () => {
       try {
         mainThreadPyodide = await window.loadPyodide();
-        await mainThreadPyodide.loadPackage("micropip");
-        const micropip = mainThreadPyodide.pyimport("micropip");
+        const pyodidePackages = config.pyodidePackages || [
+          "micropip",
+          "pydantic",
+          "cryptography",
+          "pandas",
+          "ssl",
+          "sqlite3",
+        ];
+        await mainThreadPyodide.loadPackage(pyodidePackages);
+
+        const envProxy = mainThreadPyodide.toPy(config.env || {});
+        mainThreadPyodide.globals.set("__pyodide_init_env__", envProxy);
+        await mainThreadPyodide.runPythonAsync(`
+import os
+for _env_k, _env_v in __pyodide_init_env__.items():
+    os.environ[str(_env_k)] = str(_env_v)
+del __pyodide_init_env__
+`);
+        envProxy.destroy();
 
         if (config.requirements && config.requirements.length > 0) {
+          const reqsProxy = mainThreadPyodide.toPy(config.requirements);
+          mainThreadPyodide.globals.set("__pyodide_init_reqs__", reqsProxy);
           try {
-            await micropip.install(config.requirements);
+            await mainThreadPyodide.runPythonAsync(`
+import micropip
+if "typing-extensions" in micropip.list():
+    micropip.uninstall("typing-extensions")
+_reqs = list(dict.fromkeys(["typing-extensions", *[str(_r) for _r in __pyodide_init_reqs__]]))
+await micropip.install(_reqs)
+`);
           } catch (reqErr) {
-            console.warn("[thebe-pyodide] main thread micropip requirements warning:", reqErr);
+            console.warn("[pyodide-cells] main thread micropip requirements warning:", reqErr);
+            throw reqErr;
+          } finally {
+            mainThreadPyodide.globals.delete("__pyodide_init_reqs__");
+            reqsProxy.destroy();
           }
         }
 
@@ -290,14 +489,11 @@ finally:
             try {
               await mainThreadPyodide.runPythonAsync(`
 import micropip
-try:
-    await micropip.install("${wheelUrl}")
-except Exception:
-    await micropip.install("${wheelUrl}", deps=False)
+await micropip.install("${wheelUrl}", deps=False)
 `);
               installedMainWheels.add(wheelUrl);
             } catch (whlErr) {
-              console.error("[thebe-pyodide] main thread failed installing wheel:", wheelUrl, whlErr);
+              console.error("[pyodide-cells] main thread failed installing wheel:", wheelUrl, whlErr);
               throw whlErr;
             }
           }
@@ -306,17 +502,17 @@ except Exception:
         pyodideReady = true;
         pyodideInitializing = false;
         setCellRunButtonsDisabled(false);
-        updateLaunchButtons("ready", "Pyodide Ready");
+        updateLaunchButtons("ready", "Pyodide (WebAssembly): ready");
         trigger("status", { status: "ready", message: "Pyodide runtime initialized (main thread)" });
       } catch (err) {
         pyodideInitializing = false;
-        updateLaunchButtons("failed", "Failed to load Pyodide");
+        updateLaunchButtons("failed", "Pyodide (WebAssembly): failed");
         trigger("status", { status: "failed", message: err.toString() });
       }
     };
-    script.onerror = (err) => {
+    script.onerror = () => {
       pyodideInitializing = false;
-      updateLaunchButtons("failed", "Failed to load Pyodide script");
+      updateLaunchButtons("failed", "Pyodide (WebAssembly): failed");
       trigger("status", { status: "failed", message: "CDN script load error" });
     };
     document.head.appendChild(script);
@@ -338,11 +534,51 @@ except Exception:
       pendingRequests.set(id, callback);
       pyodideWorker.postMessage({ id, code });
     } else if (mainThreadPyodide) {
-      try {
-        mainThreadPyodide.globals.set("__thebe_user_code__", code);
-        const runnerScript = `
-import sys, ast, traceback
+      mainExecQueue = mainExecQueue.then(async () => {
+        try {
+          mainThreadPyodide.globals.set("__thebe_user_code__", code);
+          const runnerScript = `
+import ast
+import inspect
+import sys
+import traceback
 from io import StringIO
+
+async def _pyodide_bridge_asyncio_run(_coro, *, debug=None, loop_factory=None):
+    return await _coro
+
+class _PyodideAsyncioRunRewriter(ast.NodeTransformer):
+    def visit_FunctionDef(self, node):
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        return node
+
+    def visit_ClassDef(self, node):
+        return node
+
+    def visit_Lambda(self, node):
+        return node
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "asyncio"
+            and node.func.attr == "run"
+        ):
+            return ast.copy_location(
+                ast.Await(
+                    value=ast.Call(
+                        func=ast.Name(id="_pyodide_bridge_asyncio_run", ctx=ast.Load()),
+                        args=node.args,
+                        keywords=node.keywords,
+                    )
+                ),
+                node,
+            )
+        return node
 
 _stdout_buf = StringIO()
 _stderr_buf = StringIO()
@@ -354,18 +590,28 @@ _eval_res = None
 _tb_str = ""
 
 try:
+    globals().setdefault("__name__", "__main__")
     _parsed = ast.parse(__thebe_user_code__)
+    _parsed = _PyodideAsyncioRunRewriter().visit(_parsed)
+    ast.fix_missing_locations(_parsed)
     if _parsed.body and isinstance(_parsed.body[-1], ast.Expr):
         _last_expr = ast.Expression(_parsed.body.pop().value)
-        _exec_code = compile(_parsed, '<stdin>', 'exec')
-        _eval_code = compile(_last_expr, '<stdin>', 'eval')
-        exec(_exec_code, globals())
-        _eval_res = eval(_eval_code, globals())
+        ast.fix_missing_locations(_last_expr)
+        _exec_code = compile(_parsed, "<stdin>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        _eval_code = compile(_last_expr, "<stdin>", "eval", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        _exec_ret = eval(_exec_code, globals())
+        if inspect.iscoroutine(_exec_ret):
+            await _exec_ret
+        _eval_ret = eval(_eval_code, globals())
+        _eval_res = (await _eval_ret) if inspect.iscoroutine(_eval_ret) else _eval_ret
     else:
-        _exec_code = compile(__thebe_user_code__, '<stdin>', 'exec')
-        exec(_exec_code, globals())
-except Exception:
-    _tb_str = traceback.format_exc()
+        _exec_code = compile(_parsed, "<stdin>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        _exec_ret = eval(_exec_code, globals())
+        if inspect.iscoroutine(_exec_ret):
+            await _exec_ret
+except (Exception, SystemExit) as _exc:
+    if not isinstance(_exc, SystemExit) or _exc.code not in (None, 0):
+        _tb_str = traceback.format_exc()
 finally:
     sys.stdout = _old_out
     sys.stderr = _old_err
@@ -377,44 +623,53 @@ finally:
     "error": bool(_tb_str)
 }
 `;
-        const resProxy = mainThreadPyodide.runPython(runnerScript);
-        const resObj = resProxy.toJs();
-        resProxy.destroy();
-        callback({
-          stdout: resObj.get ? resObj.get("stdout") : resObj.stdout,
-          stderr: resObj.get ? resObj.get("stderr") : resObj.stderr,
-          result: resObj.get ? resObj.get("result") : resObj.result,
-          error: resObj.get ? Boolean(resObj.get("error")) : Boolean(resObj.error),
-        });
-      } catch (err) {
-        callback({
-          stdout: "",
-          stderr: err.toString(),
-          result: null,
-          error: true,
-        });
-      }
+          const resProxy = await mainThreadPyodide.runPythonAsync(runnerScript);
+          const resObj = resProxy.toJs();
+          resProxy.destroy();
+          callback({
+            stdout: resObj.get ? resObj.get("stdout") : resObj.stdout,
+            stderr: resObj.get ? resObj.get("stderr") : resObj.stderr,
+            result: resObj.get ? resObj.get("result") : resObj.result,
+            error: resObj.get ? Boolean(resObj.get("error")) : Boolean(resObj.error),
+          });
+        } catch (err) {
+          callback({
+            stdout: "",
+            stderr: err.toString(),
+            result: null,
+            error: true,
+          });
+        }
+      });
     }
   }
 
   function updateLaunchButtons(status, text) {
-    document.querySelectorAll(".thebe-launch-button").forEach((btn) => {
-      btn.classList.remove("thebe-status-loading", "thebe-status-building", "thebe-status-ready", "thebe-status-failed");
-      btn.classList.add(`thebe-status-${status}`);
+    document
+      .querySelectorAll(".thebe-launch-button, .pyodide-launch-button")
+      .forEach((btn) => {
+        btn.classList.remove(
+          "thebe-status-loading",
+          "thebe-status-building",
+          "thebe-status-ready",
+          "thebe-status-failed"
+        );
+        btn.classList.add(`thebe-status-${status}`);
+        btn.setAttribute("aria-busy", status === "loading" ? "true" : "false");
+        btn.title = text;
 
-      const loadingText = btn.querySelector(".loading-text");
-      if (loadingText) {
-        loadingText.innerHTML = `<span class="launch_msg">Pyodide (WebAssembly): </span><span class="status">${status}</span>`;
-      } else {
-        btn.textContent = text;
-      }
-    });
+        const loadingText = btn.querySelector(".loading-text");
+        if (loadingText) {
+          loadingText.innerHTML = `<span class="launch_msg">Pyodide (WebAssembly): </span><span class="status">${status}</span>`;
+        } else {
+          btn.textContent = text;
+        }
+      });
   }
 
   function transformCodeCells() {
-    const selector = (typeof thebe_selector !== "undefined" && thebe_selector)
-      ? thebe_selector
-      : "div.highlight-python";
+    const config = getConfig();
+    const selector = config.selector || "div.highlight-python";
 
     const codeBlocks = document.querySelectorAll(selector);
     codeBlocks.forEach((block, index) => {
@@ -452,7 +707,9 @@ finally:
       runBtn.className = "thebelab-button thebelab-run-button";
       runBtn.innerHTML = "&#9654; Run";
       runBtn.disabled = !pyodideReady;
-      runBtn.title = pyodideReady ? "Execute cell (Shift+Enter)" : "Runtime initializing, please wait...";
+      runBtn.title = pyodideReady
+        ? "Execute cell (Shift+Enter)"
+        : "Runtime initializing, please wait...";
 
       const clearBtn = document.createElement("button");
       clearBtn.type = "button";
@@ -564,33 +821,39 @@ finally:
     transformCodeCells();
   }
 
-  // Define global thebelab object for sphinx-thebe compatibility
-  window.thebelab = {
-    on: on,
-    trigger: trigger,
-    bootstrap: bootstrap,
-    status: () => (pyodideReady ? "ready" : pyodideInitializing ? "loading" : "idle"),
-  };
+  if (typeof window !== "undefined") {
+    window.pyodideRuntime = {
+      on: on,
+      trigger: trigger,
+      bootstrap: bootstrap,
+      getConfig: getConfig,
+      status: () => (pyodideReady ? "ready" : pyodideInitializing ? "loading" : "idle"),
+    };
+    window.thebelab = window.pyodideRuntime;
 
-  // Provide or wrap initThebe
-  window.initThebe = function () {
-    console.log("[thebe-pyodide]: Initializing Thebe with Pyodide runtime...");
-    if (typeof configureThebe === "function") {
-      try {
-        configureThebe();
-      } catch (e) {
-        console.warn("[thebe-pyodide] configureThebe warning:", e);
-      }
+    window.initPyodide = function () {
+      bootstrap();
+    };
+    window.initThebe = window.initPyodide;
+  }
+
+  function bindLaunchButtons() {
+    if (typeof document === "undefined") return;
+    document
+      .querySelectorAll(".thebe-launch-button, .pyodide-launch-button")
+      .forEach((btn) => {
+        if (!btn.getAttribute("onclick") && !btn.dataset.pyodideBound) {
+          btn.dataset.pyodideBound = "true";
+          btn.addEventListener("click", bootstrap);
+        }
+      });
+  }
+
+  if (typeof document !== "undefined") {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", bindLaunchButtons);
+    } else {
+      bindLaunchButtons();
     }
-    bootstrap();
-  };
-
-  // Auto-listen for DOM ready to bind clicks if necessary
-  document.addEventListener("DOMContentLoaded", function () {
-    document.querySelectorAll(".thebe-launch-button").forEach((btn) => {
-      if (!btn.getAttribute("onclick")) {
-        btn.addEventListener("click", window.initThebe);
-      }
-    });
-  });
+  }
 })();

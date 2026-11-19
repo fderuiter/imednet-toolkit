@@ -486,6 +486,7 @@ class ImednetExportOperator(BaseOperator):
 
         sdk = self._get_sdk()
         stream_opts = self._collect_streaming_options(runtime_kwargs)
+        sink_stream_opts = {k: v for k, v in stream_opts.items() if k != "mask_phi"}
 
         config = sink_base.SinkConfig(
             study_key=self.study_key,
@@ -493,6 +494,7 @@ class ImednetExportOperator(BaseOperator):
             max_retries=int(runtime_kwargs.get("max_retries", self.max_retries)),
             retry_backoff=float(runtime_kwargs.get("retry_backoff", 1.0)),
             idempotent=bool(runtime_kwargs.get("idempotent", self.idempotent)),
+            mask_phi=bool(runtime_kwargs.get("mask_phi", self.mask_phi)),
             extra=runtime_kwargs,
             quality_gate_enabled=bool(
                 runtime_kwargs.get("quality_gate_enabled", self.quality_gate_enabled)
@@ -503,7 +505,7 @@ class ImednetExportOperator(BaseOperator):
                     self.min_schema_readiness_score,
                 )
             ),
-            **stream_opts,
+            **sink_stream_opts,
         )
 
         sink = None

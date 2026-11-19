@@ -115,11 +115,14 @@ def export_to_hive_parquet(
         validate_partition_key(form.form_key)
 
         variables = variables_by_form.get(form.form_id, [])
-        variable_keys = [
-            variable.variable_name
-            for variable in variables
-            if variable_whitelist is None or variable.variable_name in variable_whitelist
-        ]
+        variable_keys = list(
+            dict.fromkeys(
+                variable.variable_name
+                for variable in variables
+                if variable.variable_name
+                and (variable_whitelist is None or variable.variable_name in variable_whitelist)
+            )
+        )
         label_map = {
             variable.variable_name: variable.label
             for variable in variables
@@ -148,6 +151,8 @@ def export_to_hive_parquet(
                 )
                 if df.empty:
                     continue
+                df.columns = df.columns.astype(str)
+                df = df.loc[:, ~df.columns.str.lower().duplicated()]
                 if mask_phi:
                     df = _mask_df(df, phi_keys=phi_keys)
                 table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
@@ -172,6 +177,8 @@ def export_to_hive_parquet(
             label_map,
             use_labels_as_columns,
         )
+        df.columns = df.columns.astype(str)
+        df = df.loc[:, ~df.columns.str.lower().duplicated()]
         if mask_phi and not df.empty:
             df = _mask_df(df, phi_keys=phi_keys)
         table = pyarrow_module.Table.from_pandas(df, preserve_index=False)

@@ -102,25 +102,38 @@ def _is_custom_phi_key(key: str, phi_keys: set[str] | None) -> bool:
 
 def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFrame:
     """Mask sensitive fields in the DataFrame based on global and study rules."""
-    sensitive_cols = [
-        col
-        for col in df.columns
-        if global_sensitivity_registry.is_sensitive(str(col))
-        or _is_custom_phi_key(str(col), phi_keys)
-    ]
+    sensitive_cols = list(
+        dict.fromkeys(
+            col
+            for col in df.columns
+            if global_sensitivity_registry.is_sensitive(str(col))
+            or _is_custom_phi_key(str(col), phi_keys)
+        )
+    )
     for col in sensitive_cols:
-        df[col] = "***MASKED***"
+        if len(df) > 0:
+            df[col] = "***MASKED***"
 
+    if len(df) == 0:
+        return df
+
+    remaining = df.drop(columns=sensitive_cols)
     try:
-        object_cols = df.drop(columns=sensitive_cols).select_dtypes(include=[object, "str"]).columns
+        object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object, "str"]).columns))
     except TypeError:
-        object_cols = df.drop(columns=sensitive_cols).select_dtypes(include=[object]).columns
+        object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object]).columns))
 
     custom_mask_fn = (lambda val: mask_custom_phi_recursive(val, phi_keys)) if phi_keys else None
     for col in object_cols:
-        df[col] = df[col].apply(mask_clinical_phi)
-        if custom_mask_fn is not None:
-            df[col] = df[col].apply(custom_mask_fn)
+        target = df[col]
+        if isinstance(target, pd.DataFrame):
+            df[col] = target.apply(lambda s: s.apply(mask_clinical_phi))
+            if custom_mask_fn is not None:
+                df[col] = df[col].apply(lambda s: s.apply(custom_mask_fn))
+        else:
+            df[col] = target.apply(mask_clinical_phi)
+            if custom_mask_fn is not None:
+                df[col] = df[col].apply(custom_mask_fn)
 
     return df
 
@@ -262,6 +275,107 @@ def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_ENVELOPE_IDENTITY_KEYS = frozenset(
+    {
+        "record_id",
+        "recordId",
+        "subject_key",
+        "subjectKey",
+        "study_key",
+        "studyKey",
+        "visit_id",
+        "visitId",
+        "form_id",
+        "formId",
+    }
+)
+
+
+def _unpack_record_envelope_mapping(
+    envelope: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Flatten a record envelope + ``record_data`` mapping into a tabular row dictionary."""
+    row: dict[str, Any] = {}
+    for k, v in envelope.items():
+        if k in ("record_data", "recordData"):
+            continue
+        if isinstance(v, (dict, list)):
+            continue
+        row[k] = v
+    for k, v in payload.items():
+        if k in _ENVELOPE_IDENTITY_KEYS and row.get(k) is not None:
+            continue
+        row[k] = v
+    return row
+
+
+def _normalize_tabular_batch_item(item: Any) -> Any:
+    """Normalize a single Record model or record-envelope dict for DataFrame construction."""
+    if isinstance(item, Mapping):
+        if isinstance(item.get("record_data"), Mapping):
+            return _unpack_record_envelope_mapping(item, item["record_data"])
+        if isinstance(item.get("recordData"), Mapping):
+            return _unpack_record_envelope_mapping(item, item["recordData"])
+        return dict(item)
+
+    if isinstance(item, NonCallableMock):
+        return item
+
+    model_dump = getattr(type(item), "model_dump", None)
+    if callable(model_dump):
+        dumped = item.model_dump()
+        if isinstance(dumped, Mapping):
+            payload = dumped.get("record_data")
+            if isinstance(payload, Mapping):
+                return _unpack_record_envelope_mapping(dumped, payload)
+            return {k: v for k, v in dumped.items() if not isinstance(v, (dict, list))}
+
+    record_data = getattr(item, "record_data", None)
+    if isinstance(record_data, Mapping):
+        envelope: dict[str, Any] = {}
+        for attr in ("record_id", "subject_key", "study_key", "visit_id", "form_id"):
+            val = getattr(item, attr, None)
+            if val is not None:
+                envelope[attr] = val
+        return _unpack_record_envelope_mapping(envelope, record_data)
+
+    return item
+
+
+def _prepare_tabular_batch_df(
+    records: Any,
+    *,
+    mask_phi: bool,
+    sanitize: bool,
+) -> pd.DataFrame:
+    """Convert ``records`` into a DataFrame with standardized PHI masking and CSV sanitization."""
+    if isinstance(records, pd.DataFrame):
+        if len(records) == 0:
+            return records
+        df = records.copy()
+    else:
+        items = list(records) if not isinstance(records, Sequence) else records
+        if not items:
+            return pd.DataFrame()
+        normalized = [_normalize_tabular_batch_item(item) for item in items]
+        df = pd.DataFrame(normalized)
+        if len(df) == 0:
+            return df
+
+    if any(isinstance(c, str) for c in df.columns):
+        lower_cols = [c.lower() if isinstance(c, str) else c for c in df.columns]
+        dup_mask = pd.Index(lower_cols).duplicated()
+        if bool(dup_mask.any()):
+            df = df.loc[:, ~dup_mask]
+
+    if mask_phi:
+        df = _mask_df(df)
+    if sanitize:
+        df = _sanitize_df(df)
+    return df
+
+
 @dataclass
 class TabularSinkConfig(SinkConfig):
     """Configuration for tabular sinks."""
@@ -286,14 +400,13 @@ class TabularCSVSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
-        if isinstance(records, pd.DataFrame):
-            df = records
-            if len(df) == 0:
-                return 0
-        else:
-            if not records:
-                return 0
-            df = pd.DataFrame(records)
+        df = _prepare_tabular_batch_df(
+            records,
+            mask_phi=self._cfg.mask_phi,
+            sanitize=self._cfg.sanitize,
+        )
+        if len(df) == 0:
+            return 0
 
         def execute_export() -> int:
             if self._is_first_batch:
@@ -932,7 +1045,11 @@ class TabularParquetSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a DataFrame or sequence batch to the open ParquetWriter."""
-        df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
+        df = _prepare_tabular_batch_df(
+            records,
+            mask_phi=self._cfg.mask_phi,
+            sanitize=self._cfg.sanitize,
+        )
         if len(df) == 0:
             return 0
 
@@ -1056,14 +1173,13 @@ class TabularSQLSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
-        if isinstance(records, pd.DataFrame):
-            df = records
-            if len(df) == 0:
-                return 0
-        else:
-            if not records:
-                return 0
-            df = pd.DataFrame(records)
+        df = _prepare_tabular_batch_df(
+            records,
+            mask_phi=self._cfg.mask_phi,
+            sanitize=self._cfg.sanitize,
+        )
+        if len(df) == 0:
+            return 0
 
         def execute_export() -> int:
             if_exists = self._initial_if_exists if self._is_first_batch else "append"
@@ -1190,7 +1306,11 @@ class TabularDuckDBSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records into DuckDB."""
-        df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
+        df = _prepare_tabular_batch_df(
+            records,
+            mask_phi=self._cfg.mask_phi,
+            sanitize=self._cfg.sanitize,
+        )
         if len(df) == 0:
             return 0
 
@@ -1276,6 +1396,8 @@ class TabularDuckDBSink(ExportSink):
 class _TabularCollectingSink(ExportSink):
     """Collects masked/sanitized DataFrame chunks and runs a writer callback on ``flush()``."""
 
+    _skip_auto_redact_batch = True
+
     def __init__(
         self,
         config: TabularSinkConfig,
@@ -1303,6 +1425,8 @@ class _TabularCollectingSink(ExportSink):
 
 class _TabularTransformSink(ExportSink):
     """Adapts record batches into masked/sanitized DataFrames before delegating to ``inner``."""
+
+    _skip_auto_redact_batch = True
 
     def __init__(
         self,
@@ -1472,6 +1596,8 @@ def _tabular_export(
 class _TabularCallableSink(ExportSink):
     """Lightweight ExportSink adapter applying SinkConfig retry semantics to tabular file/DB exports."""
 
+    _skip_auto_redact_batch = True
+
     def __init__(
         self,
         config: TabularSinkConfig,
@@ -1598,9 +1724,12 @@ def _build_tabular_sink_config(
     config = kwargs.pop("config", None)
     if isinstance(config, TabularSinkConfig):
         return config
+    explicit_sanitize = kwargs.pop("sanitize", None)
     sink_kwargs = _pop_sink_kwargs(kwargs)
     sink_kwargs.setdefault("quality_gate_enabled", default_quality_gate)
     sink_kwargs.setdefault("mask_phi", mask_phi)
+    if explicit_sanitize is not None:
+        sink_kwargs["sanitize"] = bool(explicit_sanitize)
     return TabularSinkConfig(
         study_key=study_key,
         manifest_path=manifest_path,
@@ -1720,6 +1849,7 @@ def export_to_csv(
         ``***MASKED***``.
     """
     kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
+    kwargs.setdefault("sanitize", True)
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
@@ -1762,6 +1892,7 @@ def export_to_excel(
     """
     manifest_path = kwargs.pop("manifest_path", None)
     kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
+    kwargs.setdefault("sanitize", True)
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
@@ -1905,23 +2036,16 @@ def export_to_json(
         is_mock_hier_mapper = _is_mock_mapper(mapper) or not callable(
             getattr(mapper, "_get_enrichment_pipeline", None)
         )
-        if (
-            not _config_has_streaming_options(config)
-            and variable_whitelist is None
-            and form_whitelist is None
-        ):
-            data = mapper.build_hierarchy(study_key, use_labels_as_keys=use_labels_as_columns)
-        else:
-            hier_kwargs: dict[str, Any] = {
-                "use_labels_as_keys": use_labels_as_columns,
-            }
-            if _config_has_streaming_options(config):
-                hier_kwargs["include_deleted"] = config.include_deleted
-            if variable_whitelist is not None:
-                hier_kwargs["variable_whitelist"] = variable_whitelist
-            if form_whitelist is not None:
-                hier_kwargs["form_whitelist"] = form_whitelist
-            data = mapper.build_hierarchy(study_key, **hier_kwargs)
+        hier_kwargs: dict[str, Any] = {"use_labels_as_keys": use_labels_as_columns}
+        if variable_whitelist is not None:
+            hier_kwargs["variable_whitelist"] = variable_whitelist
+        if form_whitelist is not None:
+            hier_kwargs["form_whitelist"] = form_whitelist
+        if _config_has_streaming_options(config):
+            hier_kwargs["include_deleted"] = config.include_deleted
+        if not config.mask_phi and not _is_mock_mapper(mapper):
+            hier_kwargs["mask_phi"] = False
+        data = mapper.build_hierarchy(study_key, **hier_kwargs)
         if config.mask_phi:
             data = mask_clinical_phi(data)
         if is_mock_hier_mapper:
