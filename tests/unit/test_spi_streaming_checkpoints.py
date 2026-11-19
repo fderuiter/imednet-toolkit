@@ -1198,3 +1198,257 @@ def test_spi_record_and_watermark_helpers() -> None:
     assert spi_sink_base.extract_record_timestamp(rec_dict) == datetime(
         2026, 7, 2, 1, 2, 3, tzinfo=timezone.utc
     )
+
+
+def test_parquet_consistent_schema_all_null_first_chunk_followed_by_populated_chunk(
+    tmp_path: Path,
+) -> None:
+    """Parquet streaming keeps a stable schema when chunk 0 is all-null and chunk 1 is populated."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from imednet.integrations.export import TabularParquetSink
+
+    sdk = MagicMock()
+    sdk.get_variables.return_value = [
+        Variable(variable_name="AGE", label="Age", variable_type="int", form_id=10, form_key="AE"),
+        Variable(
+            variable_name="WEIGHT",
+            label="Weight",
+            variable_type="float",
+            form_id=10,
+            form_key="AE",
+        ),
+        Variable(
+            variable_name="SERIOUS",
+            label="Serious",
+            variable_type="bool",
+            form_id=10,
+            form_key="AE",
+        ),
+        Variable(
+            variable_name="NOTE",
+            label="Note",
+            variable_type="text",
+            form_id=10,
+            form_key="AE",
+        ),
+        Variable(
+            variable_name="UNTYPED_SCORE",
+            label="Untyped Score",
+            variable_type=None,
+            form_id=10,
+            form_key="AE",
+        ),
+    ]
+
+    # Chunk 0 (records 1 & 2): every clinical variable is None across the entire first batch.
+    # Chunk 1 (records 3 & 4): populated values + partial-null int row (pandas float64-with-NaN).
+    records_batch = [
+        _make_record(
+            1,
+            record_data={
+                "AGE": None,
+                "WEIGHT": None,
+                "SERIOUS": None,
+                "NOTE": None,
+                "UNTYPED_SCORE": None,
+            },
+        ),
+        _make_record(
+            2,
+            record_data={
+                "AGE": None,
+                "WEIGHT": None,
+                "SERIOUS": None,
+                "NOTE": None,
+                "UNTYPED_SCORE": None,
+            },
+        ),
+        _make_record(
+            3,
+            record_data={
+                "AGE": 42,
+                "WEIGHT": 71.5,
+                "SERIOUS": True,
+                "NOTE": "Recovered",
+                "UNTYPED_SCORE": 88,
+            },
+        ),
+        _make_record(
+            4,
+            record_data={
+                "AGE": None,
+                "WEIGHT": 68.0,
+                "SERIOUS": False,
+                "NOTE": "Stable",
+                "UNTYPED_SCORE": 95,
+            },
+        ),
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(records_batch)
+
+    pq_file = tmp_path / "all_null_first_chunk.parquet"
+    export_to_parquet(sdk, "S-PQ", str(pq_file), batch_size=2)
+
+    arrow_tbl = pq.read_table(pq_file)
+    assert arrow_tbl.schema.field("AGE").type == pa.int64()
+    assert arrow_tbl.schema.field("WEIGHT").type == pa.float64()
+    assert arrow_tbl.schema.field("SERIOUS").type == pa.bool_()
+    assert arrow_tbl.schema.field("NOTE").type == pa.string()
+    assert arrow_tbl.schema.field("UNTYPED_SCORE").type == pa.int64()
+
+    pydict = arrow_tbl.to_pydict()
+    assert pydict["recordId"] == [1, 2, 3, 4]
+    assert pydict["AGE"] == [None, None, 42, None]
+    assert pydict["WEIGHT"] == [None, None, 71.5, 68.0]
+    assert pydict["SERIOUS"] == [None, None, True, False]
+    assert pydict["NOTE"] == [None, None, "Recovered", "Stable"]
+    assert pydict["UNTYPED_SCORE"] == [None, None, 88, 95]
+
+    # Standalone TabularParquetSink without contract metadata: null -> int64 -> float64 + new col
+    standalone_pq = tmp_path / "standalone_evolve.parquet"
+    standalone_cfg = TabularSinkConfig(study_key="S-PQ", batch_size=1)
+    with TabularParquetSink(str(standalone_pq), standalone_cfg) as sink:
+        sink.write_batch([{"recordId": 1, "SCORE": None, "TAG": None}], batch_id="b0")
+        sink.write_batch([{"recordId": 2, "SCORE": 10, "TAG": "ok"}], batch_id="b1")
+        sink.write_batch(
+            [{"recordId": 3, "SCORE": 12.5, "TAG": 99, "EXTRA": "late"}], batch_id="b2"
+        )
+
+    evolved_tbl = pq.read_table(standalone_pq)
+    assert evolved_tbl.schema.field("SCORE").type == pa.float64()
+    assert evolved_tbl.schema.field("TAG").type == pa.string()
+    assert evolved_tbl.schema.field("EXTRA").type == pa.string()
+    assert evolved_tbl.to_pydict()["SCORE"] == [None, 10.0, 12.5]
+    assert evolved_tbl.to_pydict()["TAG"] == [None, "ok", "99"]
+    assert evolved_tbl.to_pydict()["EXTRA"] == [None, None, "late"]
+
+    # Zero-row incremental no-op preserves existing Parquet file; full zero-row replaces it
+    sdk.records.list.side_effect = lambda **_kw: iter([])
+    export_to_parquet(
+        sdk,
+        "S-PQ",
+        str(pq_file),
+        incremental=True,
+        ledger_path=tmp_path / "pq_ledger.json",
+    )
+    assert pq.read_table(pq_file).num_rows == 4
+
+    export_to_parquet(sdk, "S-PQ", str(pq_file))
+    empty_pq_tbl = pq.read_table(pq_file)
+    assert empty_pq_tbl.num_rows == 0
+    assert "AGE" in empty_pq_tbl.column_names
+
+
+def test_duckdb_zero_row_full_export_replaces_snapshot_and_incremental_noop_preserves(
+    tmp_path: Path,
+) -> None:
+    """Pre-populated DuckDB table clears on full zero-row export and stays intact on incremental no-op."""
+    duckdb = pytest.importorskip("duckdb")
+    from imednet.integrations.export import TabularDuckDBSink
+
+    sdk = MagicMock()
+    sdk.get_variables.return_value = [
+        Variable(variable_name="AGE", label="Age", variable_type="int", form_id=10, form_key="AE"),
+        Variable(
+            variable_name="NOTE", label="Note", variable_type="text", form_id=10, form_key="AE"
+        ),
+    ]
+    sdk.forms.list.return_value = [SimpleNamespace(form_id=10, form_key="AE")]
+    sdk.variables.list.return_value = list(sdk.get_variables.return_value)
+
+    # 1. Pre-populate DuckDB target (and verify all-null batch 0 + string batch 1 works in DuckDB too)
+    r1 = _make_record(
+        1, date_modified="2026-05-01T10:00:00Z", record_data={"AGE": None, "NOTE": None}
+    )
+    r2 = _make_record(
+        2, date_modified="2026-05-01T11:00:00Z", record_data={"AGE": 50, "NOTE": "active"}
+    )
+    sdk.records.list.side_effect = lambda **_kw: iter([r1, r2])
+
+    ddb_path = tmp_path / "snapshot.duckdb"
+    ledger_path = tmp_path / "ddb_snapshot_ledger.json"
+    export_to_duckdb(sdk, "S-DDB", str(ddb_path), "records", batch_size=1)
+
+    with duckdb.connect(str(ddb_path)) as conn:
+        initial_rows = conn.execute(
+            'SELECT "recordId", "AGE", "NOTE" FROM "records" ORDER BY "recordId"'
+        ).fetchall()
+    assert initial_rows == [(1, None, None), (2, 50, "active")]
+
+    # 2. Incremental no-op (zero rows returned): pre-populated target MUST stay intact
+    sdk.records.list.side_effect = lambda **_kw: iter([])
+    export_to_duckdb(
+        sdk,
+        "S-DDB",
+        str(ddb_path),
+        "records",
+        incremental=True,
+        ledger_path=ledger_path,
+    )
+    export_to_duckdb(
+        sdk,
+        "S-DDB",
+        str(ddb_path),
+        "records",
+        modified_since="2026-06-01T00:00:00Z",
+    )
+    with duckdb.connect(str(ddb_path)) as conn:
+        after_inc_rows = conn.execute(
+            'SELECT "recordId", "AGE", "NOTE" FROM "records" ORDER BY "recordId"'
+        ).fetchall()
+    assert after_inc_rows == [(1, None, None), (2, 50, "active")]
+
+    # 3. Full zero-row export: pre-populated target MUST be replaced with an empty snapshot
+    export_to_duckdb(sdk, "S-DDB", str(ddb_path), "records")
+    with duckdb.connect(str(ddb_path)) as conn:
+        after_full_empty = conn.execute(
+            'SELECT "recordId", "AGE", "NOTE" FROM "records"'
+        ).fetchall()
+    assert after_full_empty == []
+
+    # 4. Full zero-row export when study has zero variables also clears pre-populated snapshot
+    sdk.records.list.side_effect = lambda **_kw: iter([r2])
+    export_to_duckdb(sdk, "S-DDB", str(ddb_path), "records")
+    with duckdb.connect(str(ddb_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "records"').fetchone()[0] == 1
+
+    sdk.get_variables.return_value = []
+    sdk.records.list.side_effect = lambda **_kw: iter([])
+    export_to_duckdb(sdk, "S-DDB", str(ddb_path), "records")
+    with duckdb.connect(str(ddb_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "records"').fetchone()[0] == 0
+
+    # 5. Standalone TabularDuckDBSink without contract metadata + export_to_duckdb_by_form
+    with TabularDuckDBSink(
+        str(ddb_path), "standalone_tbl", TabularSinkConfig(study_key="S-DDB")
+    ) as sink:
+        sink.write_batch([{"recordId": 10, "VAL": "x"}], batch_id="b0")
+    with TabularDuckDBSink(
+        str(ddb_path),
+        "standalone_tbl",
+        TabularSinkConfig(study_key="S-DDB", incremental=True),
+    ):
+        pass
+    with duckdb.connect(str(ddb_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "standalone_tbl"').fetchone()[0] == 1
+    with TabularDuckDBSink(str(ddb_path), "standalone_tbl", TabularSinkConfig(study_key="S-DDB")):
+        pass
+    with duckdb.connect(str(ddb_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "standalone_tbl"').fetchone()[0] == 0
+
+    by_form_path = tmp_path / "by_form_empty.duckdb"
+    sdk.records.list.side_effect = lambda **_kw: iter([r2])
+    export_to_duckdb_by_form(sdk, "S-DDB", str(by_form_path))
+    with duckdb.connect(str(by_form_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "AE"').fetchone()[0] == 1
+
+    sdk.records.list.side_effect = lambda **_kw: iter([])
+    export_to_duckdb_by_form(sdk, "S-DDB", str(by_form_path), modified_since="2026-06-01T00:00:00Z")
+    with duckdb.connect(str(by_form_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "AE"').fetchone()[0] == 1
+
+    export_to_duckdb_by_form(sdk, "S-DDB", str(by_form_path))
+    with duckdb.connect(str(by_form_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM "AE"').fetchone()[0] == 0

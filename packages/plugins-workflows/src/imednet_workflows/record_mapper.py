@@ -660,6 +660,7 @@ class RecordMapper:
         self._loader = loader
         self._pipeline = ChunkedRecordPipeline(chunk_size=chunk_size)
         self._include_deleted = include_deleted
+        self._last_variables: list[VariableModel] = []
 
     # ------------------------------------------------------------------
     # Helper methods
@@ -671,6 +672,7 @@ class RecordMapper:
         form_whitelist: list[int] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Return variable names and label mapping for a study."""
+        self._last_variables = []
         if variable_whitelist is not None and len(variable_whitelist) == 0:
             return [], {}
         if form_whitelist is not None and len(form_whitelist) == 0:
@@ -712,6 +714,7 @@ class RecordMapper:
             )
             return [], {}
 
+        self._last_variables = list(variables)
         variable_keys = [v.variable_name for v in variables]
         label_map = {v.variable_name: v.label for v in variables}
         return variable_keys, label_map  # type: ignore

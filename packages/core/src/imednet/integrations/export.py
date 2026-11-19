@@ -292,18 +292,318 @@ class TabularCSVSink(ExportSink):
         pass
 
 
+_RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
+    ("recordId", "int64"),
+    ("subjectKey", "string"),
+    ("visitId", "int64"),
+    ("formId", "int64"),
+    ("recordStatus", "string"),
+    ("dateCreated", "string"),
+)
+
+_LOGICAL_TO_PANDAS_DTYPE: dict[str, str] = {
+    "int64": "Int64",
+    "float64": "Float64",
+    "bool": "boolean",
+    "string": "string",
+}
+
+
+def _variable_type_to_logical(var_type: str | None) -> str | None:
+    """Map an iMednet ``Variable.variable_type`` string to a logical tabular type."""
+    if not var_type or not isinstance(var_type, str):
+        return None
+    normalized = var_type.strip().lower()
+    if normalized in {"int", "integer", "number"}:
+        return "int64"
+    if normalized in {"float", "decimal", "double", "numeric"}:
+        return "float64"
+    if normalized in {"bool", "boolean", "checkbox"}:
+        return "bool"
+    if normalized in {"text", "string", "date", "datetime", "time", "memo", "dropdown", "radio"}:
+        return "string"
+    return None
+
+
+def _unify_logical_types(left: str | None, right: str | None) -> str | None:
+    """Combine two logical tabular types into the narrowest common supertype."""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    if left == right:
+        return left
+    if {left, right} <= {"int64", "float64"}:
+        return "float64"
+    return "string"
+
+
+def _build_tabular_contract_types(
+    variable_keys: Sequence[str],
+    label_map: Mapping[str, Any],
+    variables: Sequence[Any],
+    *,
+    use_labels_as_columns: bool,
+) -> dict[str, str | None]:
+    """Derive expected column names and logical types from the Record + Variable contract."""
+    contract: dict[str, str | None] = dict(_RECORD_META_CONTRACT_TYPES)
+    seen_lower: set[str] = {name.lower() for name, _ in _RECORD_META_CONTRACT_TYPES}
+
+    vars_by_name: dict[str, list[Any]] = {}
+    for var in variables:
+        vname = getattr(var, "variable_name", None)
+        if isinstance(vname, str) and vname:
+            vars_by_name.setdefault(vname, []).append(var)
+
+    for key in variable_keys:
+        col_name = str(label_map.get(key, key) if use_labels_as_columns else key)
+        col_lower = col_name.lower()
+        if col_lower in seen_lower:
+            continue
+        seen_lower.add(col_lower)
+        if global_sensitivity_registry.is_sensitive(col_name):
+            contract[col_name] = "string"
+            continue
+        logical: str | None = None
+        for var in vars_by_name.get(key, ()):
+            vt_logical = _variable_type_to_logical(getattr(var, "variable_type", None))
+            logical = _unify_logical_types(logical, vt_logical)
+        contract[col_name] = logical
+
+    for col in list(contract):
+        if global_sensitivity_registry.is_sensitive(col):
+            contract[col] = "string"
+    return contract
+
+
+def _build_empty_contract_df(
+    contract_types: Mapping[str, str | None] | None,
+) -> pd.DataFrame:
+    """Build a zero-row DataFrame preserving contract columns and nullable dtypes."""
+    if not contract_types:
+        return pd.DataFrame({"recordId": pd.Series(dtype="Int64")})
+    return pd.DataFrame(
+        {
+            col: pd.Series(dtype=_LOGICAL_TO_PANDAS_DTYPE.get(ltype or "string", "string"))
+            for col, ltype in contract_types.items()
+        }
+    )
+
+
+def _apply_contract_to_all_null_df_columns(
+    df: pd.DataFrame,
+    contract_types: Mapping[str, str | None] | None,
+) -> pd.DataFrame:
+    """Assign contract nullable dtypes to all-null columns so initial DDL uses concrete types."""
+    if not contract_types or df.empty:
+        return df
+    adjusted: pd.DataFrame | None = None
+    for col in df.columns:
+        ltype = contract_types.get(str(col))
+        if ltype is not None and bool(df[col].isna().all()):
+            if adjusted is None:
+                adjusted = df.copy()
+            adjusted[col] = pd.Series(
+                [pd.NA] * len(df),
+                index=df.index,
+                dtype=_LOGICAL_TO_PANDAS_DTYPE[ltype],
+            )
+    return adjusted if adjusted is not None else df
+
+
+def _logical_to_arrow_type(pa: Any, logical_type: str | None) -> Any | None:
+    """Convert a logical tabular type name into a ``pyarrow.DataType``."""
+    if logical_type == "int64":
+        return pa.int64()
+    if logical_type == "float64":
+        return pa.float64()
+    if logical_type == "bool":
+        return pa.bool_()
+    if logical_type == "string":
+        return pa.string()
+    return None
+
+
+def _unify_arrow_types(pa: Any, left: Any, right: Any) -> Any:
+    """Return a ``pyarrow.DataType`` capable of representing both ``left`` and ``right``."""
+    if pa.types.is_null(left):
+        return right
+    if pa.types.is_null(right):
+        return left
+    if left == right:
+        return left
+    if pa.types.is_integer(left) and pa.types.is_integer(right):
+        return pa.int64()
+    if (pa.types.is_integer(left) or pa.types.is_floating(left)) and (
+        pa.types.is_integer(right) or pa.types.is_floating(right)
+    ):
+        return pa.float64()
+    return pa.string()
+
+
+def _align_arrow_column(
+    pa: Any,
+    series: Any,
+    inferred_col: Any,
+    target_type: Any,
+    row_count: int,
+) -> tuple[Any, Any]:
+    """Align a batch column to ``target_type``, widening only when lossless cast is impossible."""
+    if inferred_col is None:
+        return pa.nulls(row_count, type=target_type), target_type
+    if pa.types.is_null(target_type):
+        return inferred_col, inferred_col.type
+    if pa.types.is_null(inferred_col.type):
+        return pa.nulls(row_count, type=target_type), target_type
+    if inferred_col.type == target_type:
+        return inferred_col, target_type
+
+    if pa.types.is_string(target_type):
+        if series is not None and pa.types.is_floating(inferred_col.type):
+            try:
+                as_int = pa.array(series, type=pa.int64(), from_pandas=True, safe=True)
+                return as_int.cast(pa.string()), target_type
+            except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError):
+                pass
+        return inferred_col.cast(pa.string()), target_type
+
+    if series is not None:
+        try:
+            cast_arr = pa.array(series, type=target_type, from_pandas=True, safe=True)
+            return cast_arr, target_type
+        except (
+            pa.ArrowInvalid,
+            pa.ArrowTypeError,
+            pa.ArrowNotImplementedError,
+            TypeError,
+            ValueError,
+        ):
+            pass
+
+    widened = _unify_arrow_types(pa, target_type, inferred_col.type)
+    if pa.types.is_string(widened):
+        return inferred_col.cast(pa.string()), widened
+    return inferred_col.cast(widened), widened
+
+
 class TabularParquetSink(ExportSink):
     """Streaming Parquet sink backed by ``pyarrow.parquet.ParquetWriter``."""
 
-    def __init__(self, path: str, config: TabularSinkConfig) -> None:
+    def __init__(
+        self,
+        path: str,
+        config: TabularSinkConfig,
+        *,
+        contract_types: Mapping[str, str | None] | None = None,
+    ) -> None:
         """Initialize the Parquet sink."""
         super().__init__(config)
         self.path = path
         self._cfg = config
         self._writer: Any = None
+        self._schema: Any = None
+        self._contract_types: dict[str, str | None] = dict(contract_types) if contract_types else {}
+        self._is_incremental_sync = bool(
+            config.incremental
+            or config.modified_since is not None
+            or config.state_provider is not None
+        )
         self._parquet_kwargs = dict(config.pandas_kwargs)
         self._parquet_kwargs.pop("engine", None)
         self._compression = self._parquet_kwargs.pop("compression", "snappy")
+
+    def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
+        """Configure contract-derived column types prior to streaming batches."""
+        self._contract_types = dict(contract_types)
+
+    def _align_batch_table(self, pa: Any, df: pd.DataFrame) -> tuple[Any, bool]:
+        """Convert ``df`` into an Arrow table aligned with contract or active writer schema."""
+        raw_table = pa.Table.from_pandas(df, preserve_index=False)
+        row_count = len(df)
+        arrays: list[Any] = []
+        fields: list[Any] = []
+
+        if self._schema is None:
+            for field in raw_table.schema:
+                contract_pa = _logical_to_arrow_type(pa, self._contract_types.get(field.name))
+                desired = contract_pa if contract_pa is not None else field.type
+                series = df[field.name] if field.name in df.columns else None
+                arr, resolved = _align_arrow_column(
+                    pa, series, raw_table[field.name], desired, row_count
+                )
+                arrays.append(arr)
+                fields.append(pa.field(field.name, resolved))
+            target_schema = pa.schema(fields)
+            return pa.Table.from_arrays(arrays, schema=target_schema), False
+
+        evolved = False
+        existing_names: set[str] = set()
+        for existing_field in self._schema:
+            existing_names.add(existing_field.name)
+            inferred_col = (
+                raw_table[existing_field.name]
+                if existing_field.name in raw_table.column_names
+                else None
+            )
+            series = df[existing_field.name] if existing_field.name in df.columns else None
+            arr, resolved = _align_arrow_column(
+                pa, series, inferred_col, existing_field.type, row_count
+            )
+            if resolved != existing_field.type:
+                evolved = True
+            arrays.append(arr)
+            fields.append(pa.field(existing_field.name, resolved))
+
+        for new_field in raw_table.schema:
+            if new_field.name in existing_names:
+                continue
+            evolved = True
+            contract_pa = _logical_to_arrow_type(pa, self._contract_types.get(new_field.name))
+            desired = contract_pa if contract_pa is not None else new_field.type
+            series = df[new_field.name] if new_field.name in df.columns else None
+            arr, resolved = _align_arrow_column(
+                pa, series, raw_table[new_field.name], desired, row_count
+            )
+            arrays.append(arr)
+            fields.append(pa.field(new_field.name, resolved))
+
+        target_schema = pa.schema(fields)
+        return pa.Table.from_arrays(arrays, schema=target_schema), evolved
+
+    def _evolve_writer_schema(self, pa: Any, pq: Any, new_schema: Any) -> None:
+        """Stream existing row groups into a reopened ParquetWriter when schema widens."""
+        self._writer.close()
+        self._writer = None
+        tmp_prev = f"{self.path}.schema_evolve.tmp"
+        os.replace(self.path, tmp_prev)
+        try:
+            self._writer = cast(Any, pq).ParquetWriter(
+                self.path,
+                new_schema,
+                compression=self._compression,
+                **self._parquet_kwargs,
+            )
+            with pq.ParquetFile(tmp_prev) as prev_pf:
+                for record_batch in prev_pf.iter_batches(batch_size=max(1, self._cfg.batch_size)):
+                    prev_tbl = pa.Table.from_batches([record_batch])
+                    cast_cols: list[Any] = []
+                    for target_field in new_schema:
+                        if target_field.name in prev_tbl.column_names:
+                            col = prev_tbl[target_field.name]
+                            if pa.types.is_null(col.type):
+                                cast_cols.append(
+                                    pa.nulls(prev_tbl.num_rows, type=target_field.type)
+                                )
+                            elif col.type != target_field.type:
+                                cast_cols.append(col.cast(target_field.type))
+                            else:
+                                cast_cols.append(col)
+                        else:
+                            cast_cols.append(pa.nulls(prev_tbl.num_rows, type=target_field.type))
+                    self._writer.write_table(pa.Table.from_arrays(cast_cols, schema=new_schema))
+            self._schema = new_schema
+        finally:
+            Path(tmp_prev).unlink(missing_ok=True)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a DataFrame or sequence batch to the open ParquetWriter."""
@@ -315,14 +615,17 @@ class TabularParquetSink(ExportSink):
             import pyarrow as pa
             import pyarrow.parquet as pq
 
-            table = pa.Table.from_pandas(df, preserve_index=False)
+            table, schema_evolved = self._align_batch_table(pa, df)
             if self._writer is None:
+                self._schema = table.schema
                 self._writer = cast(Any, pq).ParquetWriter(
                     self.path,
-                    table.schema,
+                    self._schema,
                     compression=self._compression,
                     **self._parquet_kwargs,
                 )
+            elif schema_evolved:
+                self._evolve_writer_schema(pa, pq, table.schema)
             self._writer.write_table(table)
             return len(df)
 
@@ -333,10 +636,36 @@ class TabularParquetSink(ExportSink):
         if self._writer is not None:
             self._writer.close()
             self._writer = None
-        elif not Path(self.path).exists():
-            pd.DataFrame().to_parquet(
-                self.path, index=False, compression=self._compression, **self._parquet_kwargs
-            )
+        elif not (
+            self._is_incremental_sync
+            and Path(self.path).exists()
+            and Path(self.path).stat().st_size > 0
+        ):
+            if self._contract_types:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+
+                empty_schema = pa.schema(
+                    [
+                        (col, _logical_to_arrow_type(pa, ltype) or pa.string())
+                        for col, ltype in self._contract_types.items()
+                    ]
+                )
+                empty_arrays = [pa.nulls(0, type=f.type) for f in empty_schema]
+                empty_table = pa.Table.from_arrays(empty_arrays, schema=empty_schema)
+                cast(Any, pq).write_table(
+                    empty_table,
+                    self.path,
+                    compression=self._compression,
+                    **self._parquet_kwargs,
+                )
+            else:
+                pd.DataFrame().to_parquet(
+                    self.path,
+                    index=False,
+                    compression=self._compression,
+                    **self._parquet_kwargs,
+                )
 
     def close(self) -> None:
         """Ensure underlying ParquetWriter is closed."""
@@ -345,6 +674,7 @@ class TabularParquetSink(ExportSink):
                 self._writer.close()
             finally:
                 self._writer = None
+        self._schema = None
 
 
 class TabularSQLSink(ExportSink):
@@ -479,13 +809,21 @@ class TabularSQLSink(ExportSink):
 class TabularDuckDBSink(ExportSink):
     """Streaming sink for exporting DataFrame batches into a DuckDB table."""
 
-    def __init__(self, db_path: str, table_name: str, config: TabularSinkConfig) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        table_name: str,
+        config: TabularSinkConfig,
+        *,
+        contract_types: Mapping[str, str | None] | None = None,
+    ) -> None:
         """Initialize the DuckDB sink."""
         super().__init__(config)
         _validate_duckdb_identifier(table_name)
         self.db_path = db_path
         self.table_name = table_name
         self._cfg = config
+        self._contract_types: dict[str, str | None] = dict(contract_types) if contract_types else {}
         self._is_first_batch = True
         self._is_incremental_sync = bool(
             config.incremental
@@ -495,6 +833,10 @@ class TabularDuckDBSink(ExportSink):
         import duckdb
 
         self._conn: Any = duckdb.connect(db_path)
+
+    def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
+        """Configure contract-derived column types prior to streaming batches."""
+        self._contract_types = dict(contract_types)
 
     def _table_exists(self) -> bool:
         rows = self._conn.execute(
@@ -533,7 +875,15 @@ class TabularDuckDBSink(ExportSink):
         def execute_export() -> int:
             quoted_tbl = _quote_duckdb_identifier(self.table_name)
             quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
-            self._conn.register(_DUCKDB_DF_ALIAS, df)
+            creating_table = (
+                self._is_first_batch and not (self._is_incremental_sync and self._cfg.idempotent)
+            ) or not self._table_exists()
+            df_to_register = (
+                _apply_contract_to_all_null_df_columns(df, self._contract_types)
+                if creating_table
+                else df
+            )
+            self._conn.register(_DUCKDB_DF_ALIAS, df_to_register)
             try:
                 if self._is_first_batch and not (
                     self._is_incremental_sync and self._cfg.idempotent
@@ -575,16 +925,20 @@ class TabularDuckDBSink(ExportSink):
         )
 
     def flush(self) -> None:
-        """Ensure empty table is created on full non-incremental export when 0 rows matched."""
+        """Replace target with empty snapshot on full zero-row export; keep intact on incremental."""
         if (
             self._is_first_batch
             and not self._is_incremental_sync
             and self._conn is not None
             and not isinstance(self._conn, NonCallableMock)
-            and not self._table_exists()
         ):
-            empty_df = pd.DataFrame({"recordId": pd.Series(dtype="object")})
             quoted_tbl = _quote_duckdb_identifier(self.table_name)
+            if not self._contract_types and self._table_exists():
+                self._conn.execute(
+                    f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_tbl} WHERE 1=0"
+                )
+                return
+            empty_df = _build_empty_contract_df(self._contract_types)
             quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
             self._conn.register(_DUCKDB_DF_ALIAS, empty_df)
             try:
@@ -700,7 +1054,19 @@ def _tabular_export(
         form_whitelist=config.form_whitelist,
     )
     if not variable_keys:
+        with sink:
+            pass
         return
+
+    raw_variables = mapper._last_variables if hasattr(mapper, "_last_variables") else None
+    contract_types = _build_tabular_contract_types(
+        variable_keys,
+        label_map,
+        raw_variables if isinstance(raw_variables, list) else (),
+        use_labels_as_columns=config.use_labels_as_columns,
+    )
+    if isinstance(sink, (TabularParquetSink, TabularDuckDBSink)):
+        sink.set_contract_types(contract_types)
 
     record_model = mapper._build_record_model(variable_keys, label_map)
     extra_filters: dict[str, Any] = {}
@@ -1231,12 +1597,34 @@ def export_to_duckdb(
         if df_legacy is not None:
             conn: Any = duckdb.connect(db_path)
             try:
-                conn.register(_DUCKDB_DF_ALIAS, df_legacy)
-                conn.execute(
-                    f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(table_name)} "
-                    f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
-                )
-                conn.unregister(_DUCKDB_DF_ALIAS)
+                quoted_tbl = _quote_duckdb_identifier(table_name)
+                if len(df_legacy.columns) == 0 and not isinstance(conn, NonCallableMock):
+                    table_exists = bool(
+                        conn.execute(
+                            "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+                            [table_name],
+                        ).fetchall()
+                    )
+                    if table_exists:
+                        conn.execute(
+                            f"CREATE OR REPLACE TABLE {quoted_tbl} "
+                            f"AS SELECT * FROM {quoted_tbl} WHERE 1=0"
+                        )
+                    else:
+                        empty_legacy = _build_empty_contract_df(None)
+                        conn.register(_DUCKDB_DF_ALIAS, empty_legacy)
+                        conn.execute(
+                            f"CREATE OR REPLACE TABLE {quoted_tbl} "
+                            f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
+                        )
+                        conn.unregister(_DUCKDB_DF_ALIAS)
+                else:
+                    conn.register(_DUCKDB_DF_ALIAS, df_legacy)
+                    conn.execute(
+                        f"CREATE OR REPLACE TABLE {quoted_tbl} "
+                        f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
+                    )
+                    conn.unregister(_DUCKDB_DF_ALIAS)
             finally:
                 conn.close()
             return
@@ -1374,6 +1762,17 @@ def export_to_duckdb_by_form(
                 conn.unregister(_DUCKDB_DF_ALIAS)
                 continue
 
+            form_contract_types = _build_tabular_contract_types(
+                variable_keys,
+                label_map,
+                variables,
+                use_labels_as_columns=use_labels_as_columns,
+            )
+            is_incremental = bool(
+                sink_kwargs.get("incremental")
+                or sink_kwargs.get("modified_since") is not None
+                or sink_kwargs.get("state_provider") is not None
+            )
             form_filter = _merge_form_whitelist_into_filter(record_filter, [form.form_id])
             raw_stream = iter_filtered_sdk_records(
                 sdk,
@@ -1402,7 +1801,12 @@ def export_to_duckdb_by_form(
                     df = _mask_df(df)
                 if df.empty:
                     continue
-                conn.register(_DUCKDB_DF_ALIAS, df)
+                df_for_ddb = (
+                    _apply_contract_to_all_null_df_columns(df, form_contract_types)
+                    if not wrote_any
+                    else df
+                )
+                conn.register(_DUCKDB_DF_ALIAS, df_for_ddb)
                 try:
                     if not wrote_any:
                         conn.execute(
@@ -1415,13 +1819,8 @@ def export_to_duckdb_by_form(
                         )
                 finally:
                     conn.unregister(_DUCKDB_DF_ALIAS)
-            if not wrote_any:
-                empty_df = mapper._build_dataframe(
-                    [],
-                    variable_keys,
-                    label_map,
-                    use_labels_as_columns,
-                )
+            if not wrote_any and not is_incremental:
+                empty_df = _build_empty_contract_df(form_contract_types)
                 conn.register(_DUCKDB_DF_ALIAS, empty_df)
                 try:
                     conn.execute(
