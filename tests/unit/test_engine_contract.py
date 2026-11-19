@@ -191,3 +191,166 @@ def test_postman_bundled_asset_identical_to_root():
     assert ROOT_COLLECTION.read_bytes() == BUNDLED_COLLECTION.read_bytes(), (
         "Bundled Postman collection differs from root collection"
     )
+
+
+def test_generate_stubs_matches_committed_pyi_files(tmp_path):
+    """Verify ModelEngine.generate_stubs reproduces all 13 committed .pyi stubs byte-for-byte."""
+    import shutil
+
+    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
+    committed_stubs = sorted(models_dir.glob("*.pyi"))
+    assert len(committed_stubs) == 13
+
+    for py_file in sorted(models_dir.glob("*.py")):
+        shutil.copy2(py_file, tmp_path / py_file.name)
+
+    ModelEngine.generate_stubs(str(tmp_path))
+
+    generated_stubs = sorted(tmp_path.glob("*.pyi"))
+    assert [p.name for p in generated_stubs] == [p.name for p in committed_stubs]
+
+    for committed in committed_stubs:
+        generated = tmp_path / committed.name
+        assert generated.read_text(encoding="utf-8") == committed.read_text(encoding="utf-8"), (
+            f"Generated stub {committed.name} differs from committed {committed}"
+        )
+
+    assert engine._run_cli(["--check", str(models_dir)]) == 0
+
+
+def test_stub_cli_check_detects_drift_and_missing_stubs(tmp_path):
+    """Verify engine CLI --check returns non-zero when stubs drift or are missing."""
+    import shutil
+
+    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
+    for f in sorted(models_dir.glob("*.py*")):
+        shutil.copy2(f, tmp_path / f.name)
+
+    assert engine._run_cli(["--check", str(tmp_path)]) == 0
+
+    # Drift a stub
+    studies_pyi = tmp_path / "studies.pyi"
+    studies_pyi.write_text(
+        studies_pyi.read_text(encoding="utf-8") + "    drifted_field: str | None\n",
+        encoding="utf-8",
+    )
+    assert engine._run_cli(["--check", str(tmp_path)]) == 1
+
+    # Regenerate via CLI without --check, then verify --check passes again
+    assert engine._run_cli([str(tmp_path)]) == 0
+    assert engine._run_cli(["--check", str(tmp_path)]) == 0
+
+    # Delete a stub and verify --check catches missing committed stub
+    studies_pyi.unlink()
+    assert engine._run_cli(["--check", str(tmp_path)]) == 1
+
+
+def test_ast_stub_generator_resolves_base_cls_strips_bodies_and_prunes_imports(tmp_path):
+    """Verify AST stub generator resolves base_cls, strips method bodies, preserves Enums, and prunes imports."""
+    sample_py = tmp_path / "sample_model.py"
+    sample_py.write_text(
+        '''"""Sample dynamic model module."""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Any, Optional
+
+from pydantic import Field, computed_field
+
+from imednet.models.base import ImednetBaseModel
+from imednet.models.engine import ModelEngine
+
+
+class SampleState(str, Enum):
+    """Sample state enum."""
+
+    OPEN = "OPEN"
+    COMPLETED = "COMPLETED"
+
+    def is_done(self) -> bool:
+        """Check completion."""
+        return self is SampleState.COMPLETED
+
+
+class BaseSample(ImednetBaseModel):
+    """Custom base preserving narrow state annotation."""
+
+    study_key: Optional[str] = Field(default=None, alias="studyKey")
+
+    def helper(self, prefix: str = "x") -> str:
+        """Runtime body that must be stripped."""
+        value = f"{prefix}:{self.study_key}"
+        return value
+
+
+SampleStudy = ModelEngine.get_model("Study", BaseSample)
+''',
+        encoding="utf-8",
+    )
+
+    ModelEngine.generate_stubs(str(tmp_path))
+    pyi_file = tmp_path / "sample_model.pyi"
+    assert pyi_file.exists()
+    content = pyi_file.read_text(encoding="utf-8")
+
+    # Unused ModelEngine, Optional, computed_field, and Any must be pruned
+    assert "ModelEngine" not in content
+    assert "Optional" not in content
+    assert "Any" not in content
+    assert "computed_field" not in content
+
+    # Enum literal assignments preserved and method bodies stripped
+    assert 'OPEN = "OPEN"' in content
+    assert 'COMPLETED = "COMPLETED"' in content
+    assert "def is_done(self) -> bool: ..." in content
+    assert 'def helper(self, prefix: str = "x") -> str: ...' in content
+    assert "value =" not in content
+
+    # Optional normalized to PEP 604 union and base_cls resolved for synthesized SampleStudy
+    assert "study_key: str | None" in content
+    assert "class SampleStudy(BaseSample):" in content
+    assert "sponsor_key: str | None" in content
+
+
+def test_job_status_runtime_fields_match_jobs_pyi():
+    """Verify runtime Job and JobStatus model_fields types match committed jobs.pyi."""
+    import ast
+
+    from imednet.models.jobs import Job, JobStatus
+
+    jobs_pyi = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models" / "jobs.pyi"
+    tree = ast.parse(jobs_pyi.read_text(encoding="utf-8"))
+
+    stub_class_fields: dict[str, dict[str, str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name in {"Job", "JobStatus"}:
+            fields_map: dict[str, str] = {}
+            for stmt in node.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    fields_map[stmt.target.id] = ast.unparse(stmt.annotation)
+            stub_class_fields[node.name] = fields_map
+
+    expected_job_status_types = {
+        "state": "JobState | str | None",
+        "date_created": "str | None",
+        "date_started": "str | None",
+        "date_finished": "str | None",
+        "progress": "int | None",
+        "result_url": "str | None",
+    }
+
+    for field_name, expected_type in expected_job_status_types.items():
+        assert stub_class_fields["JobStatus"][field_name] == expected_type
+        runtime_ann = engine._format_runtime_annotation(
+            JobStatus.model_fields[field_name].annotation
+        )
+        assert runtime_ann == expected_type
+
+    for field_name in ("state", "date_created", "date_started", "date_finished"):
+        expected_type = expected_job_status_types[field_name]
+        assert stub_class_fields["Job"][field_name] == expected_type
+        assert (
+            engine._format_runtime_annotation(Job.model_fields[field_name].annotation)
+            == expected_type
+        )

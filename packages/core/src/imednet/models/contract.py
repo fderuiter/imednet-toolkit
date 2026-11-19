@@ -45,7 +45,11 @@ class ContractBuilder:
         self.contract = APIContract()
 
     def parse_postman_type(self, val: Any) -> tuple[str, Any]:
-        """Map Postman placeholder strings to internal type names and defaults."""
+        """Map Postman placeholder strings and primitive examples to internal type names."""
+        if isinstance(val, bool):
+            return "boolean", False
+        if isinstance(val, int):
+            return "integer", 0
         if isinstance(val, str):
             if val == "<string>":
                 return "string", None
@@ -53,6 +57,7 @@ class ContractBuilder:
                 return "integer", 0
             if val == "<boolean>":
                 return "boolean", False
+            return "string", None
         return "any", None
 
     def ingest_postman(self, file_path: str) -> None:
