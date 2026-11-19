@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import closing
+from dataclasses import replace
 from typing import Any, cast
 from urllib.parse import quote_plus
 
@@ -369,6 +371,11 @@ class ImednetExportOperator(BaseOperator):
                     "Snowflake sink is not available in the installed sinks plugin. "
                     "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[snowflake]'"
                 )
+            hard_delete_kw: dict[str, Any] = {}
+            if "hard_delete" in runtime_kwargs and runtime_kwargs["hard_delete"] is not None:
+                hard_delete_kw["hard_delete"] = runtime_kwargs["hard_delete"]
+            elif "hard_delete" in conn_settings and conn_settings["hard_delete"] is not None:
+                hard_delete_kw["hard_delete"] = conn_settings["hard_delete"]
             snowflake_config = config_cls(
                 study_key=config.study_key,
                 batch_size=config.batch_size,
@@ -399,6 +406,7 @@ class ImednetExportOperator(BaseOperator):
                 manifest_path=(
                     runtime_kwargs.get("manifest_path") or conn_settings.get("manifest_path")
                 ),
+                **hard_delete_kw,
                 **stream_opts,
             )
             return sink_cls(config=snowflake_config)
@@ -520,13 +528,29 @@ class ImednetExportOperator(BaseOperator):
                     )
 
             if sink:
+                run_token = uuid.uuid4().hex[:12]
+                if isinstance(context, Mapping):
+                    raw_run_id = context.get("run_id") or context.get("ts_nodash")
+                    if isinstance(raw_run_id, str) and raw_run_id.strip():
+                        run_token = f"{raw_run_id.strip()}/{uuid.uuid4().hex[:8]}"
+                stream_config = config
+                if (
+                    dest == "snowflake"
+                    and config.idempotent
+                    and not config.include_deleted
+                    and "include_deleted" not in runtime_kwargs
+                    and not config.incremental
+                    and config.modified_since is None
+                    and config.state_provider is None
+                ):
+                    stream_config = replace(config, include_deleted=True)
                 sink_base.run_streaming_export(
                     sdk,
                     self.study_key,
                     sink,
-                    config,
+                    stream_config,
                     stream_name=f"airflow_{dest}",
-                    batch_id_prefix=f"{self.study_key}/batch",
+                    batch_id_prefix=f"{self.study_key}/batch/{run_token}",
                     default_provider_name="airflow",
                 )
             else:

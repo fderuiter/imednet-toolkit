@@ -1991,3 +1991,530 @@ class TestSinkPhiMaskingControls:
         finally:
             global_sensitivity_registry._sensitive_keys.clear()
             global_sensitivity_registry._sensitive_keys.update(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Snowflake tabular flattening, schema evolution, and hard_delete tests
+# ---------------------------------------------------------------------------
+
+
+class TestSnowflakeSchemaEvolutionAndTabularMerge:
+    """Tests for flattened Arrow staging, DDL schema evolution, and soft/hard delete merges."""
+
+    def test_records_to_arrow_table_flattens_variables_prefixes_collisions_and_masks_phi(
+        self, tmp_path
+    ):
+        """Flatten record_data via CentralizedMapper, prefix metadata collisions with var_, and mask PHI."""
+        import pyarrow.parquet as pq
+        from imednet_sinks.warehouse import _records_to_arrow_table
+
+        from imednet.models.records import Record
+        from imednet.spi.sinks import CentralizedMapper
+
+        rec = Record(
+            record_id=42,
+            study_key="STUDY_FLAT",
+            subject_key="SUBJ-042",
+            form_id=10,
+            form_key="VITALS",
+            visit_id=1,
+            deleted=False,
+            date_modified="2026-04-01T12:00:00Z",
+            record_data={
+                "systolicBp": 120,
+                "vitals": {"heartRate": 72},
+                "readings": [98.6, 98.4],
+                "patientName": "Alice Example",
+                "ssn": "123-45-6789",
+                "recordId": "EXT-REC-99",
+                "studyKey": "INNER-STUDY",
+                "subjectKey": "INNER-SUBJ",
+                "deleted": "no",
+            },
+        )
+
+        table = _records_to_arrow_table([rec], study_key="STUDY_FLAT")
+        parquet_file = tmp_path / "flattened.parquet"
+        pq.write_table(table, str(parquet_file))
+        loaded = pq.read_table(str(parquet_file)).to_pylist()
+
+        assert len(loaded) == 1
+        row = loaded[0]
+        assert row["study_key"] == "STUDY_FLAT"
+        assert row["record_id"] == 42
+        assert row["subject_key"] == "SUBJ-042"
+        assert row["deleted"] is False
+        assert row["systolic_bp"] == 120
+        assert row["vitals_heart_rate"] == 72
+        assert row["readings_0"] == 98.6
+        assert row["readings_1"] == 98.4
+        assert row["patient_name"] == "***MASKED***"
+        assert row["ssn"] == "***MASKED***"
+        assert row["var_record_id"] == "EXT-REC-99"
+        assert row["var_study_key"] == "INNER-STUDY"
+        assert row["var_subject_key"] == "INNER-SUBJ"
+        assert row["var_deleted"] == "no"
+
+        # Explicit CentralizedMapper(mode="tabular") without custom post_processor also flattens safely
+        explicit_mapper = CentralizedMapper(mode="tabular", mask_phi=True)
+        explicit_table = _records_to_arrow_table(
+            [rec], study_key="STUDY_FLAT", mapper=explicit_mapper
+        )
+        explicit_row = explicit_table.to_pylist()[0]
+        assert explicit_row["study_key"] == "STUDY_FLAT"
+        assert explicit_row["record_id"] == 42
+        assert explicit_row["var_record_id"] == "EXT-REC-99"
+        assert explicit_row["patient_name"] == "***MASKED***"
+
+    def test_empty_record_data_batches_serialize_to_parquet_and_merge_without_arrow_error(
+        self, monkeypatch, tmp_path
+    ):
+        """Batches where every record has record_data={} serialize to Parquet without ArrowNotImplementedError."""
+        import imednet_sinks.warehouse as wh_mod
+        import pyarrow.parquet as pq
+        from imednet_sinks.warehouse import (
+            SnowflakeExportSink,
+            SnowflakeSinkConfig,
+            _records_to_arrow_table,
+        )
+
+        from imednet.models.records import Record
+        from imednet.spi.sinks import CentralizedMapper
+
+        draft_records = [
+            Record(
+                record_id=1,
+                study_key="STUDY_EMPTY",
+                subject_key="S-1",
+                form_id=1,
+                form_key="DRAFT",
+                record_status="Incomplete",
+                record_data={},
+            ),
+            Record(
+                record_id=2,
+                study_key="STUDY_EMPTY",
+                subject_key="S-2",
+                form_id=1,
+                form_key="DRAFT",
+                record_status="Incomplete",
+                record_data={},
+            ),
+        ]
+
+        # Direct CentralizedMapper(mode="tabular") path
+        arrow_tbl = _records_to_arrow_table(
+            draft_records,
+            study_key="STUDY_EMPTY",
+            mapper=CentralizedMapper(mode="tabular"),
+        )
+        direct_pq = tmp_path / "draft_direct.parquet"
+        pq.write_table(arrow_tbl, str(direct_pq))
+        assert [r["record_id"] for r in pq.read_table(str(direct_pq)).to_pylist()] == [1, 2]
+
+        # Full SnowflakeExportSink.write_batch path
+        sf, _conn, cursor = _fake_snowflake_module()
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+        cursor.fetchall.return_value = []
+
+        cfg = SnowflakeSinkConfig(
+            study_key="STUDY_EMPTY",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="DRAFT_RECORDS",
+            local_staging_dir=str(tmp_path / "stage"),
+        )
+        with SnowflakeExportSink(config=cfg) as sink:
+            written = sink.write_batch(draft_records, batch_id="STUDY_EMPTY/draft/0")
+
+        assert written == 2
+        executed = [c.args[0] for c in cursor.execute.call_args_list]
+        assert any(
+            'CREATE TABLE IF NOT EXISTS "DB"."PUBLIC"."DRAFT_RECORDS"' in s for s in executed
+        )
+        assert any('MERGE INTO "DB"."PUBLIC"."DRAFT_RECORDS"' in s for s in executed)
+
+    def test_snowflake_schema_evolution_creates_table_alters_columns_and_deduplicates_batch(
+        self, monkeypatch, tmp_path
+    ):
+        """write_batch creates missing table, runs ALTER TABLE for unseen variables, and deduplicates by date_modified."""
+        import re
+
+        import imednet_sinks.warehouse as wh_mod
+        import pyarrow.parquet as pq
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        from imednet.models.records import Record
+
+        sf, _conn, cursor = _fake_snowflake_module()
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+
+        known_columns: list[str] = []
+        warehouse_rows: dict[tuple[str, int], dict[str, object]] = {}
+        staged_rows: list[dict[str, object]] = []
+        ddl_statements: list[str] = []
+
+        def fake_execute(sql: str):
+            nonlocal staged_rows
+            if "INFORMATION_SCHEMA.COLUMNS" in sql:
+                cursor.fetchall.return_value = [(col,) for col in known_columns]
+            elif sql.startswith("CREATE TABLE IF NOT EXISTS"):
+                ddl_statements.append(sql)
+                cols = re.findall(r'"([A-Z0-9_$]+)"\s+[A-Z_]+', sql.split("(", 1)[1])
+                for col in cols:
+                    if col not in known_columns:
+                        known_columns.append(col)
+                cursor.fetchall.return_value = []
+            elif sql.startswith("ALTER TABLE"):
+                ddl_statements.append(sql)
+                cols = re.findall(r'"([A-Z0-9_$]+)"\s+[A-Z_]+', sql.split("ADD COLUMN", 1)[1])
+                for col in cols:
+                    if col not in known_columns:
+                        known_columns.append(col)
+                cursor.fetchall.return_value = []
+            elif sql.startswith("PUT file://"):
+                local_file = sql.split("PUT file://", 1)[1].split(" ", 1)[0]
+                staged_rows = pq.read_table(local_file).to_pylist()
+                cursor.fetchall.return_value = []
+            elif sql.startswith("MERGE INTO"):
+                assert (
+                    "QUALIFY ROW_NUMBER() OVER (PARTITION BY study_key, record_id ORDER BY date_modified DESC NULLS LAST) = 1"
+                    in sql
+                )
+                deduped: dict[tuple[str, int], dict[str, object]] = {}
+                for row in sorted(
+                    staged_rows,
+                    key=lambda r: str(r.get("date_modified") or ""),
+                    reverse=True,
+                ):
+                    key = (str(row["study_key"]), int(row["record_id"]))
+                    if key not in deduped:
+                        deduped[key] = row
+                for key, row in deduped.items():
+                    existing = warehouse_rows.get(key, {})
+                    existing.update(row)
+                    warehouse_rows[key] = existing
+                cursor.fetchall.return_value = []
+            else:
+                cursor.fetchall.return_value = []
+
+        cursor.execute.side_effect = fake_execute
+
+        cfg = SnowflakeSinkConfig(
+            study_key="STUDY_EVOLVE",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="CLINICAL_RECORDS",
+            local_staging_dir=str(tmp_path),
+        )
+
+        # Batch 1 includes duplicate (STUDY_EVOLVE, 1) with older and newer date_modified
+        batch_1 = [
+            Record(
+                record_id=1,
+                form_id=10,
+                form_key="VITALS",
+                subject_key="S1",
+                date_modified="2026-04-01T09:00:00Z",
+                record_data={"systolicBp": 118},
+            ),
+            Record(
+                record_id=1,
+                form_id=10,
+                form_key="VITALS",
+                subject_key="S1",
+                date_modified="2026-04-01T11:00:00Z",
+                record_data={"systolicBp": 124},
+            ),
+        ]
+        # Batch 2 adds protocol amendment variables diastolicBp and assessmentNote
+        batch_2 = [
+            Record(
+                record_id=1,
+                form_id=10,
+                form_key="VITALS",
+                subject_key="S1",
+                date_modified="2026-04-02T08:00:00Z",
+                record_data={"systolicBp": 120, "diastolicBp": 78, "assessmentNote": "normal"},
+            ),
+            Record(
+                record_id=2,
+                form_id=10,
+                form_key="VITALS",
+                subject_key="S2",
+                date_modified="2026-04-02T08:30:00Z",
+                record_data={"systolicBp": 130, "diastolicBp": 84, "assessmentNote": "elevated"},
+            ),
+        ]
+
+        with SnowflakeExportSink(config=cfg) as sink:
+            sink.write_batch(batch_1, batch_id="STUDY_EVOLVE/run1/0")
+            assert warehouse_rows[("STUDY_EVOLVE", 1)]["systolic_bp"] == 124
+
+            sink.write_batch(batch_2, batch_id="STUDY_EVOLVE/run2/0")
+
+        assert len(ddl_statements) == 2
+        assert ddl_statements[0].startswith(
+            'CREATE TABLE IF NOT EXISTS "DB"."PUBLIC"."CLINICAL_RECORDS"'
+        )
+        assert '"SYSTOLIC_BP" BIGINT' in ddl_statements[0]
+        assert ddl_statements[1].startswith(
+            'ALTER TABLE "DB"."PUBLIC"."CLINICAL_RECORDS" ADD COLUMN'
+        )
+        assert '"DIASTOLIC_BP" BIGINT' in ddl_statements[1]
+        assert '"ASSESSMENT_NOTE" VARCHAR' in ddl_statements[1]
+        assert len(warehouse_rows) == 2
+        assert warehouse_rows[("STUDY_EVOLVE", 1)]["diastolic_bp"] == 78
+        assert warehouse_rows[("STUDY_EVOLVE", 2)]["assessment_note"] == "elevated"
+
+    def test_export_to_snowflake_run_scoped_batches_and_soft_vs_hard_delete(
+        self, monkeypatch, tmp_path
+    ):
+        """export_to_snowflake generates run-scoped batch IDs and handles soft vs hard deletes without duplicates."""
+        import imednet_sinks.warehouse as wh_mod
+        import pyarrow.parquet as pq
+        from imednet_sinks.warehouse import SnowflakeSinkConfig, export_to_snowflake
+
+        from imednet.models.records import Record
+
+        sf, _conn, cursor = _fake_snowflake_module()
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+
+        warehouse_rows: dict[tuple[str, int], dict[str, object]] = {}
+        staged_rows: list[dict[str, object]] = []
+        copied_stage_paths: list[str] = []
+
+        def fake_execute(sql: str):
+            nonlocal staged_rows
+            if "INFORMATION_SCHEMA.COLUMNS" in sql:
+                cursor.fetchall.return_value = (
+                    [{"COLUMN_NAME": k.upper()} for k in next(iter(warehouse_rows.values()))]
+                    if warehouse_rows
+                    else []
+                )
+            elif sql.startswith("PUT file://"):
+                assert "AUTO_COMPRESS = FALSE OVERWRITE = TRUE" in sql
+                local_file = sql.split("PUT file://", 1)[1].split(" ", 1)[0]
+                staged_rows = pq.read_table(local_file).to_pylist()
+                cursor.fetchall.return_value = []
+            elif sql.startswith("COPY INTO") and "__imednet_stage" in sql:
+                stage_ref = sql.split("FROM '", 1)[1].split("'", 1)[0]
+                copied_stage_paths.append(stage_ref)
+                cursor.fetchall.return_value = []
+            elif sql.startswith("MERGE INTO"):
+                hard_del = 'THEN DELETE' in sql
+                for row in staged_rows:
+                    key = (str(row["study_key"]), int(row["record_id"]))
+                    is_del = bool(row.get("deleted"))
+                    if key in warehouse_rows:
+                        if hard_del and is_del:
+                            del warehouse_rows[key]
+                        else:
+                            warehouse_rows[key].update(row)
+                    elif not (hard_del and is_del):
+                        warehouse_rows[key] = dict(row)
+                cursor.fetchall.return_value = []
+            else:
+                cursor.fetchall.return_value = []
+
+        cursor.execute.side_effect = fake_execute
+
+        sdk_mock = MagicMock()
+        run1_records = [
+            Record(
+                record_id=1,
+                form_id=1,
+                form_key="F1",
+                subject_key="S1",
+                deleted=False,
+                date_modified="2026-04-01T10:00:00Z",
+                record_data={"score": 10},
+            ),
+            Record(
+                record_id=2,
+                form_id=1,
+                form_key="F1",
+                subject_key="S2",
+                deleted=False,
+                date_modified="2026-04-01T10:05:00Z",
+                record_data={"score": 20},
+            ),
+        ]
+        # Run 2 (soft delete default): record 1 updated, record 2 marked deleted=True
+        run2_records = [
+            Record(
+                record_id=1,
+                form_id=1,
+                form_key="F1",
+                subject_key="S1",
+                deleted=False,
+                date_modified="2026-04-02T10:00:00Z",
+                record_data={"score": 15},
+            ),
+            Record(
+                record_id=2,
+                form_id=1,
+                form_key="F1",
+                subject_key="S2",
+                deleted=True,
+                date_modified="2026-04-02T10:05:00Z",
+                record_data={"score": 20},
+            ),
+        ]
+
+        soft_cfg = SnowflakeSinkConfig(
+            study_key="STUDY_DEL",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="RECORDS",
+            local_staging_dir=str(tmp_path / "soft"),
+            hard_delete=False,
+        )
+
+        sdk_mock.records.list.side_effect = lambda **_kw: iter(run1_records)
+        assert export_to_snowflake(sdk_mock, "STUDY_DEL", config=soft_cfg) == 2
+
+        sdk_mock.records.list.side_effect = lambda **_kw: iter(run2_records)
+        assert export_to_snowflake(sdk_mock, "STUDY_DEL", config=soft_cfg) == 2
+
+        # Distinct run-scoped stage paths and soft-delete metadata retained
+        assert len(copied_stage_paths) == 2
+        assert copied_stage_paths[0] != copied_stage_paths[1]
+        assert len(warehouse_rows) == 2
+        assert warehouse_rows[("STUDY_DEL", 1)]["score"] == 15
+        assert warehouse_rows[("STUDY_DEL", 2)]["deleted"] is True
+
+        # Run 3 (hard_delete=True): matched deleted=True row 2 is deleted; unmatched deleted=True row 99 is not inserted
+        run3_records = [
+            Record(
+                record_id=1,
+                form_id=1,
+                form_key="F1",
+                subject_key="S1",
+                deleted=False,
+                date_modified="2026-04-03T10:00:00Z",
+                record_data={"score": 18},
+            ),
+            Record(
+                record_id=2,
+                form_id=1,
+                form_key="F1",
+                subject_key="S2",
+                deleted=True,
+                date_modified="2026-04-03T10:05:00Z",
+                record_data={"score": 20},
+            ),
+            Record(
+                record_id=99,
+                form_id=1,
+                form_key="F1",
+                subject_key="S99",
+                deleted=True,
+                date_modified="2026-04-03T10:10:00Z",
+                record_data={"score": 0},
+            ),
+        ]
+        hard_cfg = SnowflakeSinkConfig(
+            study_key="STUDY_DEL",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="RECORDS",
+            local_staging_dir=str(tmp_path / "hard"),
+            hard_delete=True,
+        )
+        sdk_mock.records.list.side_effect = lambda **_kw: iter(run3_records)
+        assert export_to_snowflake(sdk_mock, "STUDY_DEL", config=hard_cfg) == 3
+
+        assert list(warehouse_rows.keys()) == [("STUDY_DEL", 1)]
+        assert warehouse_rows[("STUDY_DEL", 1)]["score"] == 18
+
+    @pytest.mark.parametrize(
+        "bad_record_data",
+        [
+            {"score; DROP TABLE records": 1},
+            {"bad column": 2},
+            {"": 3},
+            {"nested": {"bad-key": 4}},
+            {"empty_unsafe;sql": {}},
+        ],
+    )
+    def test_unsafe_variable_names_and_invalid_hard_delete_fail_before_sql_executes(
+        self, monkeypatch, tmp_path, bad_record_data
+    ):
+        """Unsafe clinical variable names and non-boolean hard_delete raise ExportConfigurationError before SQL execution."""
+        import imednet_sinks.warehouse as wh_mod
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        from imednet.errors import ExportConfigurationError
+        from imednet.models.records import Record
+
+        with pytest.raises(ExportConfigurationError, match="hard_delete"):
+            SnowflakeSinkConfig(study_key="S", hard_delete="yes")  # type: ignore[arg-type]
+
+        sf, _conn, cursor = _fake_snowflake_module()
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+
+        cfg = SnowflakeSinkConfig(
+            study_key="STUDY_SEC",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="RECORDS",
+            local_staging_dir=str(tmp_path),
+        )
+        rec = Record(
+            record_id=1,
+            form_id=1,
+            form_key="F1",
+            subject_key="S1",
+            record_data=bad_record_data,
+        )
+        with SnowflakeExportSink(config=cfg) as sink:
+            with pytest.raises(ExportConfigurationError, match="invalid characters"):
+                sink.write_batch([rec], batch_id="STUDY_SEC/0")
+
+        cursor.execute.assert_not_called()
