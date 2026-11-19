@@ -430,6 +430,12 @@ def _clean_scalar_str(value: Any) -> str:
     return ""
 
 
+def _extract_job_state_str(job: Any) -> str:
+    """Extract a string representation of a job's state attribute."""
+    status = getattr(job, "state", getattr(job, "status", getattr(job, "job_status", "Unknown")))
+    return str(status.value if hasattr(status, "value") else status)
+
+
 def _is_job_state_active(state_text: str) -> bool:
     """Return True when a job state string represents an in-flight background job."""
     cleaned = state_text.strip().upper()
@@ -554,7 +560,13 @@ class JobMonitor(Static):
         """Merge persisted study job IDs from SQLite JobLedger while keeping registration order."""
         ledger_map: dict[str, JobLedgerEntry] = {}
         with contextlib.suppress(Exception):
-            for entry in self.ledger.list_jobs(study_key):
+            entries = list(self.ledger.list_jobs(study_key, limit=200))
+            seen = {entry.batch_id for entry in entries}
+            for active_entry in self.ledger.list_active_jobs(study_key):
+                if active_entry.batch_id not in seen:
+                    entries.append(active_entry)
+                    seen.add(active_entry.batch_id)
+            for entry in entries:
                 ledger_map[entry.batch_id] = entry
                 self._persisted_job_ids.add(entry.batch_id)
                 if entry.batch_id not in self.tracked_job_ids:
@@ -636,7 +648,9 @@ class JobMonitor(Static):
             )
             dark_mode = bool(getattr(self.app, "dark", True) if self.is_mounted else True)
 
-            active_count = 0
+            active_count = sum(
+                1 for job in jobs if _is_job_state_active(_extract_job_state_str(job))
+            )
             lines = [f"[bold]Active & Recent Jobs ({len(jobs)})[/bold]"]
             for idx, job in enumerate(jobs[:15]):
                 fallback_id = self.tracked_job_ids[idx] if idx < len(self.tracked_job_ids) else ""
@@ -651,12 +665,7 @@ class JobMonitor(Static):
                     or (ledger_meta.job_type if ledger_meta else None)
                     or "Job"
                 )
-                status = getattr(
-                    job, "state", getattr(job, "status", getattr(job, "job_status", "Unknown"))
-                )
-                status_str = str(status.value if hasattr(status, "value") else status)
-                if _is_job_state_active(status_str):
-                    active_count += 1
+                status_str = _extract_job_state_str(job)
 
                 raw_progress = getattr(job, "progress", None)
                 progress_int: int | None = (
@@ -699,6 +708,12 @@ class JobMonitor(Static):
                 label = f"{job_type} ({batch_id})" if batch_id else str(job_type)
                 created_suffix = f" ({created})" if created else ""
                 lines.append(f"{badge} {bar_str} - {label}{created_suffix}")
+
+            if len(jobs) > 15:
+                lines.append(
+                    f"[dim]... and {len(jobs) - 15} more tracked job(s) "
+                    f"({active_count} active total).[/dim]"
+                )
 
             if active_count == 0:
                 self._pause_polling()

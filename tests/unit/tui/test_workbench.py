@@ -14,7 +14,7 @@ from imednet.models.codings import Coding
 from imednet.models.forms import Form
 from imednet.models.intervals import Interval
 from imednet.models.jobs import Job, JobStatus
-from imednet.models.queries import Query
+from imednet.models.queries import Query, QueryComment
 from imednet.models.record_revisions import RecordRevision
 from imednet.models.records import Record
 from imednet.models.sites import Site
@@ -563,6 +563,25 @@ async def test_triage_pane_enforces_allowed_transitions_and_non_empty_comments(
         await triage_pane.transition_selected_item(TriageStatus.UNDER_REVIEW)
         assert store.get_triage_item("TRI-100").status == TriageStatus.UNDER_REVIEW  # type: ignore[union-attr]
 
+        triage_pane.query_one("#triage_comment_input", Input).value = "Reviewer note during review"
+        await triage_pane.annotate_selected_item()
+
+        # Repeating Add Item on an existing reviewed item must reject duplicates and preserve history
+        triage_pane.query_one("#triage_item_id_input", Input).value = "TRI-100"
+        triage_pane.query_one("#triage_comment_input", Input).value = "Duplicate add attempt"
+        triage_pane.on_button_pressed(
+            Button.Pressed(triage_pane.query_one("#triage_add_btn", Button))
+        )
+        await triage_pane.workers.wait_for_complete()
+        await pilot.pause()
+        assert "already exists" in str(triage_pane.query_one("#triage_detail", Static).render())
+        reviewed_item = store.get_triage_item("TRI-100")
+        assert reviewed_item is not None
+        assert reviewed_item.status == TriageStatus.UNDER_REVIEW
+        assert reviewed_item.severity == "HIGH"
+        assert [ann.comment for ann in reviewed_item.annotations] == ["Reviewer note during review"]
+        assert len(reviewed_item.history) == 1
+
         triage_pane.query_one("#triage_comment_input", Input).value = "Verified and resolved"
         await triage_pane.transition_selected_item(TriageStatus.RESOLVED)
         final_item = store.get_triage_item("TRI-100")
@@ -912,3 +931,226 @@ async def test_triage_crud_filters_degradation_and_view_details(
     )
     cls_res, err_msg = _load_triage_store_class()
     assert cls_res is None and err_msg is not None and "imednet-workflows" in err_msg
+
+
+@pytest.mark.asyncio
+async def test_entity_sensitive_field_masking_in_table_and_detail_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify table cells and selected-row detail previews apply each entity's sensitive field rules."""
+    sdk = _build_clinical_sdk()
+    sdk.users.list.return_value = [
+        User(
+            userId="U-SYNTH-1",
+            login="synth_login_handle",
+            firstName="SynthFirst",
+            lastName="SynthLast",
+            email="synth.investigator@example.test",
+            active=True,
+        )
+    ]
+    sdk.queries.list.return_value = [
+        Query(
+            studyKey="ONCO_01",
+            annotationId=701,
+            subjectKey="SUBJ-ALPHA",
+            variable="AGE",
+            description="SynthQueryDescriptionText",
+            queryComments=[
+                QueryComment(
+                    sequence=1,
+                    user="synth_query_author",
+                    comment="SynthQueryThreadComment",
+                )
+            ],
+        )
+    ]
+    sdk.record_revisions.list.return_value = [
+        RecordRevision(
+            studyKey="ONCO_01",
+            recordRevisionId=901,
+            recordId=1,
+            subjectKey="SUBJ-ALPHA",
+            recordStatus="Complete",
+            user="synth_revision_author",
+            reasonForChange="SynthRevisionReasonText",
+        )
+    ]
+    sdk.records.list.return_value = [
+        Record(
+            studyKey="ONCO_01",
+            recordId=1,
+            subjectKey="SUBJ-ALPHA",
+            formKey="DM",
+            visitId=11,
+            recordStatus="Complete",
+            recordData={"patient_name": "SynthPatientFullName", "AGE": 51},
+        )
+    ]
+    monkeypatch.setattr(
+        "imednet_tui.views.load_from_api",
+        lambda _s, _k: DataDictionary(metadata=Metadata(studyName="ONCO_01")),
+    )
+
+    app = ImednetTuiApp(sdk)
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+
+        screen.on_study_list_study_selected(StudyList.StudySelected("ONCO_01", "Oncology Phase II"))
+        await pilot.pause()
+        await screen.workers.wait_for_complete()
+        await pilot.pause()
+
+        users_pane = screen.query_one("#users_pane", EntityTablePane)
+        queries_pane = screen.query_one("#queries_pane", EntityTablePane)
+        revisions_pane = screen.query_one("#revisions_pane", EntityTablePane)
+        records_pane = screen.query_one("#records_pane", EntityTablePane)
+
+        def _select_first_row(pane: EntityTablePane) -> str:
+            table = pane.query_one(f"#{pane.table_id}", DataTable)
+            pane.on_data_table_row_selected(MagicMock(data_table=table, cursor_row=0))
+            return str(pane.query_one(f"#{pane.spec.key}_detail", Static).render())
+
+        # Unmasked: synthetic values appear in both table cells and detail previews
+        unmasked_user_row = users_pane.query_one("#users_table", DataTable).get_row_at(0)
+        assert unmasked_user_row[1:4] == ["synth_login_handle", "SynthFirst", "SynthLast"]
+        unmasked_user_detail = _select_first_row(users_pane)
+        for token in ("synth_login_handle", "SynthFirst", "SynthLast"):
+            assert token in unmasked_user_detail
+
+        unmasked_query_detail = _select_first_row(queries_pane)
+        assert "SynthQueryDescriptionText" in unmasked_query_detail
+        unmasked_rev_detail = _select_first_row(revisions_pane)
+        assert "SynthRevisionReasonText" in unmasked_rev_detail
+        unmasked_rec_detail = _select_first_row(records_pane)
+        assert "SynthPatientFullName" in unmasked_rec_detail
+
+        # Enable PHI masking ('m'): both table cells AND active/newly-selected previews mask sensitive fields
+        await pilot.press("m")
+        await pilot.pause()
+        assert screen.phi_masked is True
+
+        masked_user_row = users_pane.query_one("#users_table", DataTable).get_row_at(0)
+        assert masked_user_row[0] == "U-SYNTH-1"
+        assert masked_user_row[1:4] == ["***MASKED***", "***MASKED***", "***MASKED***"]
+
+        for user_detail in (
+            str(users_pane.query_one("#users_detail", Static).render()),
+            _select_first_row(users_pane),
+        ):
+            assert "U-SYNTH-1" in user_detail
+            assert "***MASKED***" in user_detail
+            for secret in (
+                "synth_login_handle",
+                "SynthFirst",
+                "SynthLast",
+                "synth.investigator@example.test",
+            ):
+                assert secret not in user_detail
+
+        masked_query_row = queries_pane.query_one("#queries_table", DataTable).get_row_at(0)
+        assert masked_query_row[4] == "***MASKED***"
+        masked_query_detail = _select_first_row(queries_pane)
+        assert "***MASKED***" in masked_query_detail
+        for secret in (
+            "SynthQueryDescriptionText",
+            "synth_query_author",
+            "SynthQueryThreadComment",
+        ):
+            assert secret not in masked_query_detail
+
+        masked_rev_row = revisions_pane.query_one("#record_revisions_table", DataTable).get_row_at(
+            0
+        )
+        assert masked_rev_row[4:6] == ["***MASKED***", "***MASKED***"]
+        masked_rev_detail = _select_first_row(revisions_pane)
+        assert "***MASKED***" in masked_rev_detail
+        for secret in ("synth_revision_author", "SynthRevisionReasonText"):
+            assert secret not in masked_rev_detail
+
+        masked_rec_row = records_pane.query_one("#records_table", DataTable).get_row_at(0)
+        assert "***MASKED***" in masked_rec_row[5]
+        assert "SynthPatientFullName" not in masked_rec_row[5]
+        masked_rec_detail = _select_first_row(records_pane)
+        assert "***MASKED***" in masked_rec_detail
+        assert "SynthPatientFullName" not in masked_rec_detail
+        assert "51" in masked_rec_detail
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_keeps_polling_when_16th_job_is_processing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify JobMonitor keeps polling when jobs 1..15 are COMPLETED and job 16 is PROCESSING."""
+    sdk = _build_clinical_sdk()
+    monkeypatch.setattr(
+        "imednet_tui.views.load_from_api",
+        lambda _s, _k: DataDictionary(metadata=Metadata(studyName="ONCO_01")),
+    )
+
+    completed_ids = [f"BATCH-DONE-{idx:02d}" for idx in range(1, 16)]
+    active_16th_id = "BATCH-PROC-16"
+    job_16_state = {"state": "PROCESSING", "progress": 45, "polls": 0}
+
+    def _get_job(_study: str, batch_id: str) -> JobStatus:
+        if batch_id == active_16th_id:
+            job_16_state["polls"] += 1
+            return JobStatus(
+                jobId="JOB-16",
+                batchId=active_16th_id,
+                state=str(job_16_state["state"]),
+                progress=int(job_16_state["progress"]),
+            )
+        return JobStatus(
+            jobId=f"JOB-{batch_id}",
+            batchId=batch_id,
+            state="COMPLETED",
+            progress=100,
+        )
+
+    sdk.jobs.get.side_effect = _get_job
+
+    app = ImednetTuiApp(sdk)
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+
+        monitor = screen.query_one(JobMonitor)
+        if monitor.timer is not None:
+            monitor.timer.stop()
+        monitor.poll_interval = 0.05
+        monitor.timer = monitor.set_interval(0.05, monitor.refresh_jobs, pause=True)
+        monitor._pause_polling()
+
+        monitor.tracked_job_ids = [*completed_ids, active_16th_id]
+        monitor.current_study_key = "ONCO_01"
+        monitor._resume_polling()
+        await monitor.refresh_jobs()
+
+        rendered_active = str(monitor.render())
+        assert "Active & Recent Jobs (16)" in rendered_active
+        assert "BATCH-DONE-01" in rendered_active
+        assert "BATCH-DONE-15" in rendered_active
+        assert active_16th_id not in rendered_active
+        assert "1 more tracked job(s) (1 active total)" in rendered_active
+        assert "Polling paused" not in rendered_active
+        assert monitor.is_polling_paused is False
+
+        # Verify background interval timer continues polling job 16 while it is PROCESSING
+        polls_before = int(job_16_state["polls"])
+        await pilot.pause(0.14)
+        assert int(job_16_state["polls"]) > polls_before
+        assert monitor.is_polling_paused is False
+
+        # Once job 16 reaches COMPLETED, polling pauses automatically
+        job_16_state["state"] = "COMPLETED"
+        job_16_state["progress"] = 100
+        await pilot.pause(0.14)
+        await monitor.workers.wait_for_complete()
+
+        rendered_idle = str(monitor.render())
+        assert monitor.is_polling_paused is True
+        assert "Polling paused (0 active jobs)" in rendered_idle

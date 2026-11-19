@@ -613,7 +613,7 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
 
     show_p.set_defaults(func=handle_show)
 
-    add_p = t_sub.add_parser("add", help="Create or upsert a triage item in a study queue.")
+    add_p = t_sub.add_parser("add", help="Create a new triage item in a study queue.")
     add_p.add_argument("study_key", help=STUDY_KEY_ARG)
     add_p.add_argument("item_id", help="Unique triage item identifier.")
     add_p.add_argument(
@@ -638,9 +638,11 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
                 assignee=args.assignee,
                 severity=args.severity,
             )
-            store.upsert_item(item)
-            if args.comment and args.comment.strip():
-                store.add_annotation(args.item_id, args.user_id, args.comment.strip())
+            store.create_item(
+                item,
+                initial_comment=args.comment,
+                user_id=args.user_id,
+            )
             saved = store.get_triage_item(args.item_id) or item
             if args.output_format == "json":
                 emit_json([saved], "triage_items")

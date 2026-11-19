@@ -291,14 +291,27 @@ class TriagePane(Container):
                 assignee=assignee.strip() if assignee and assignee.strip() else None,
                 severity=severity,
             )
-            await asyncio.to_thread(store.upsert_item, new_item)
-            if initial_comment and initial_comment.strip():
+            clean_reviewer = reviewer_id.strip() or "reviewer"
+            clean_comment = initial_comment.strip() if initial_comment else None
+            if hasattr(store, "create_item"):
                 await asyncio.to_thread(
-                    store.add_annotation,
-                    clean_id,
-                    reviewer_id.strip() or "reviewer",
-                    initial_comment.strip(),
+                    store.create_item,
+                    new_item,
+                    initial_comment=clean_comment,
+                    user_id=clean_reviewer,
                 )
+            else:
+                existing = await asyncio.to_thread(store.get_triage_item, clean_id)
+                if existing is not None:
+                    raise ValueError(f"Triage item '{clean_id}' already exists.")
+                await asyncio.to_thread(store.upsert_item, new_item)
+                if clean_comment:
+                    await asyncio.to_thread(
+                        store.add_annotation,
+                        clean_id,
+                        clean_reviewer,
+                        clean_comment,
+                    )
             self.selected_item_id = clean_id
             await self.refresh_queue()
         except Exception as exc:

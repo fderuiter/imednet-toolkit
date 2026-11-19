@@ -256,3 +256,36 @@ def test_triage_store_upsert_item_validates_transitions(tmp_path: Path) -> None:
     preserved = store.get_triage_item("AE-UPSERT-1")
     assert preserved is not None
     assert preserved.status == TriageStatus.RESOLVED
+
+
+def test_triage_store_create_item_rejects_duplicates_atomically(tmp_path: Path) -> None:
+    """Test create_item inserts new items and atomically rejects duplicates without erasing history."""
+    store = TriageStore(tmp_path / "triage.sqlite3")
+    initial = TriageItem(
+        item_id="AE-CREATE-1",
+        study_key="STUDY-A",
+        status=TriageStatus.NEW,
+        assignee="cra_initial",
+        severity="HIGH",
+    )
+    store.create_item(initial, initial_comment="Initial finding", user_id="cra_initial")
+    store.update_status("AE-CREATE-1", TriageStatus.UNDER_REVIEW, "dm_lead", "Review started")
+
+    duplicate = TriageItem(
+        item_id="AE-CREATE-1",
+        study_key="STUDY-A",
+        status=TriageStatus.NEW,
+        assignee="other_user",
+        severity="LOW",
+    )
+    with pytest.raises(ValueError, match="already exists"):
+        store.create_item(duplicate, initial_comment="Overwrite attempt", user_id="other_user")
+
+    preserved = store.get_triage_item("AE-CREATE-1")
+    assert preserved is not None
+    assert preserved.status == TriageStatus.UNDER_REVIEW
+    assert preserved.assignee == "cra_initial"
+    assert preserved.severity == "HIGH"
+    assert [ann.comment for ann in preserved.annotations] == ["Initial finding"]
+    assert len(preserved.history) == 1
+    assert preserved.history[0].to_status == TriageStatus.UNDER_REVIEW

@@ -401,6 +401,32 @@ def test_triage_cli_full_lifecycle_and_transition_validation(tmp_path: Path) -> 
         == 0
     )
 
+    # Re-adding an existing UNDER_REVIEW item must fail and preserve annotations & history
+    res_dup_review = invoke_cli(
+        [
+            "workflows",
+            "triage",
+            "add",
+            "STUDY_T",
+            "ITEM-001",
+            "--severity",
+            "LOW",
+            "--comment",
+            "Should not overwrite reviewed item",
+            *db_arg,
+        ]
+    )
+    assert res_dup_review.exit_code == 1
+    assert "already exists" in res_dup_review.stderr
+    preserved_review = json.loads(
+        invoke_cli(["workflows", "triage", "show", "ITEM-001", *db_arg, "--format", "json"]).stdout
+    )["items"][0]
+    assert preserved_review["status"] == "UNDER_REVIEW"
+    assert preserved_review["severity"] == "HIGH"
+    assert preserved_review["assignee"] == "dm_lead"
+    assert len(preserved_review["annotations"]) == 2
+    assert len(preserved_review["history"]) == 1
+
     res_resolved = invoke_cli(
         [
             "workflows",
@@ -417,6 +443,22 @@ def test_triage_cli_full_lifecycle_and_transition_validation(tmp_path: Path) -> 
     )
     assert res_resolved.exit_code == 0
     assert json.loads(res_resolved.stdout)["items"][0]["status"] == "RESOLVED"
+
+    # Re-adding an existing RESOLVED item must also fail and preserve full audit trail
+    res_dup_resolved = invoke_cli(
+        [
+            "workflows",
+            "triage",
+            "add",
+            "STUDY_T",
+            "ITEM-001",
+            "--comment",
+            "Should not erase resolved item",
+            *db_arg,
+        ]
+    )
+    assert res_dup_resolved.exit_code == 1
+    assert "already exists" in res_dup_resolved.stderr
 
     # Invalid transition RESOLVED -> NEW must fail with exit code 1
     res_bad_resolved = invoke_cli(

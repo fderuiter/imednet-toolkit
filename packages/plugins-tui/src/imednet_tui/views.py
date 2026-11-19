@@ -81,6 +81,42 @@ class EntityViewSpec:
     columns: tuple[EntityColumnSpec, ...]
     supports_subject_filter: bool = False
     read_only_notice: str | None = None
+    sensitive_fields: tuple[str, ...] = ()
+
+    def normalized_sensitive_fields(self) -> frozenset[str]:
+        """Return normalized field keys marked sensitive for cells or detail previews."""
+        names = {
+            attr.replace("_", "").lower()
+            for col in self.columns
+            if col.sensitive
+            for attr in col.attr_names
+        }
+        names.update(field.replace("_", "").lower() for field in self.sensitive_fields)
+        return frozenset(names)
+
+
+def _mask_entity_preview_payload(
+    payload: dict[str, Any],
+    spec: EntityViewSpec,
+) -> dict[str, Any]:
+    """Apply global PHI masking and entity-specific sensitive field rules to a preview dict."""
+    masked_any = mask_clinical_phi(payload)
+    masked: dict[str, Any] = masked_any if isinstance(masked_any, dict) else dict(payload)
+    sensitive_norms = spec.normalized_sensitive_fields()
+    if not sensitive_norms:
+        return masked
+
+    result: dict[str, Any] = {}
+    for key, val in masked.items():
+        norm_key = str(key).replace("_", "").lower()
+        if norm_key in sensitive_norms:
+            if val is None or val in ("", []) or isinstance(val, dict):
+                result[key] = val
+            else:
+                result[key] = "***MASKED***"
+        else:
+            result[key] = val
+    return result
 
 
 ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
@@ -116,6 +152,7 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         title="Queries",
         endpoint_attr="queries",
         supports_subject_filter=True,
+        sensitive_fields=("query_comments", "queryComments"),
         columns=(
             EntityColumnSpec("Annotation ID", ("annotation_id", "annotationId")),
             EntityColumnSpec("Subject Key", ("subject_key", "subjectKey")),
@@ -193,6 +230,7 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         key="users",
         title="Users",
         endpoint_attr="users",
+        sensitive_fields=("name", "email"),
         columns=(
             EntityColumnSpec("Account ID", ("user_id", "userId")),
             EntityColumnSpec("Login", ("login",), sensitive=True),
@@ -290,6 +328,7 @@ class EntityTablePane(Container):
         self.filter_query: str = ""
         self._raw_items: list[Any] = []
         self._filtered_items: list[Any] = []
+        self._selected_item: Any | None = None
 
     @property
     def is_read_only(self) -> bool:
@@ -346,16 +385,22 @@ class EntityTablePane(Container):
         self.query_one(f"#{self.filter_input_id}", Input).focus()
 
     def set_phi_masked(self, enabled: bool) -> None:
-        """Toggle clinical PHI masking and re-render rows immediately."""
+        """Toggle clinical PHI masking and re-render rows and active detail preview."""
         self.phi_masked = enabled
         if self.is_mounted:
             self._render_rows()
+            if self._selected_item is not None and any(
+                item is self._selected_item or item == self._selected_item
+                for item in self._filtered_items
+            ):
+                self._render_detail_preview(self._selected_item)
 
     def set_subject_filter(self, subject_key: str | None) -> None:
         """Filter displayed items to a single Subject key (or None for Study-wide)."""
         if not self.spec.supports_subject_filter:
             return
         self.subject_filter = subject_key
+        self._selected_item = None
         if self.is_mounted:
             self._render_rows()
 
@@ -367,6 +412,7 @@ class EntityTablePane(Container):
     ) -> None:
         """Fetch items for the given study and populate the table."""
         self.current_study_key = study_key
+        self._selected_item = None
         if self.spec.supports_subject_filter:
             self.subject_filter = subject_key
         self.loading = True
@@ -439,6 +485,7 @@ class EntityTablePane(Container):
         """Filter table rows live as the user types in the filter input."""
         if event.input.id == self.filter_input_id:
             self.filter_query = event.value
+            self._selected_item = None
             self._render_rows()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -447,28 +494,32 @@ class EntityTablePane(Container):
             self.set_subject_filter(None)
             self.post_message(self.SubjectScopeCleared())
 
+    def _render_detail_preview(self, selected: Any) -> None:
+        """Render a read-only detail preview of an entity item with sensitive field masking."""
+        payload = (
+            selected.model_dump(exclude_none=True)
+            if hasattr(selected, "model_dump")
+            else dict(selected)
+            if isinstance(selected, dict)
+            else {"item": str(selected)}
+        )
+        if self.phi_masked:
+            payload = _mask_entity_preview_payload(payload, self.spec)
+        preview = json.dumps(payload, default=str, sort_keys=True)
+        if len(preview) > 220:
+            preview = f"{preview[:217]}..."
+        ro_prefix = "(READ-ONLY) " if self.is_read_only else ""
+        detail = self.query_one(f"#{self.spec.key}_detail", Static)
+        detail.update(f"{ro_prefix}{self.spec.title} Detail: {preview}")
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Render a read-only detail preview of the selected row."""
         if event.data_table.id != self.table_id:
             return
         idx = event.cursor_row
         if 0 <= idx < len(self._filtered_items):
-            selected = self._filtered_items[idx]
-            payload = (
-                selected.model_dump()
-                if hasattr(selected, "model_dump")
-                else dict(selected)
-                if isinstance(selected, dict)
-                else {"item": str(selected)}
-            )
-            if self.phi_masked:
-                payload = mask_clinical_phi(payload)
-            preview = json.dumps(payload, default=str, sort_keys=True)
-            if len(preview) > 220:
-                preview = f"{preview[:217]}..."
-            ro_prefix = "(READ-ONLY) " if self.is_read_only else ""
-            detail = self.query_one(f"#{self.spec.key}_detail", Static)
-            detail.update(f"{ro_prefix}{self.spec.title} Detail: {preview}")
+            self._selected_item = self._filtered_items[idx]
+            self._render_detail_preview(self._selected_item)
 
 
 class DataDictionaryPane(Container):

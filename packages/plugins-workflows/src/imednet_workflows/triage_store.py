@@ -147,6 +147,100 @@ class TriageStore:
                 f"{self._redact_error_text(str(last_error))}"
             ) from last_error
 
+    @staticmethod
+    def _insert_item_details(
+        conn: sqlite3.Connection,
+        item: TriageItem,
+        *,
+        extra_annotation: tuple[str, str, str, str, str] | None = None,
+    ) -> None:
+        """Insert annotations and transition history rows for a triage item."""
+        annotation_rows = [
+            (
+                annotation.annotation_id,
+                item.item_id,
+                annotation.user_id,
+                annotation.comment,
+                annotation.timestamp.isoformat(),
+            )
+            for annotation in item.annotations
+        ]
+        if extra_annotation is not None:
+            annotation_rows.append(extra_annotation)
+        if annotation_rows:
+            conn.executemany(
+                """
+                INSERT INTO triage_annotations (annotation_id, item_id, user_id, comment, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                annotation_rows,
+            )
+
+        if item.history:
+            conn.executemany(
+                """
+                INSERT INTO triage_history (
+                    transition_id, item_id, from_status, to_status, user_id, comment, timestamp
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        entry.transition_id,
+                        item.item_id,
+                        entry.from_status.value,
+                        entry.to_status.value,
+                        entry.user_id,
+                        entry.comment,
+                        entry.timestamp.isoformat(),
+                    )
+                    for entry in item.history
+                ],
+            )
+
+    def create_item(
+        self,
+        item: TriageItem,
+        *,
+        initial_comment: str | None = None,
+        user_id: str = "cli-user",
+    ) -> None:
+        """Atomically insert a new triage item, rejecting duplicate item IDs."""
+        now = datetime.now(UTC).isoformat()
+        cleaned_comment = initial_comment.strip() if initial_comment else ""
+        cleaned_user = user_id.strip() or "cli-user"
+
+        def _write(conn: sqlite3.Connection) -> None:
+            cursor = conn.execute(
+                """
+                INSERT INTO triage_items (
+                    item_id, study_key, status, assignee, severity, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_id) DO NOTHING
+                """,
+                (
+                    item.item_id,
+                    item.study_key,
+                    item.status.value,
+                    item.assignee,
+                    item.severity,
+                    now,
+                    now,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"Triage item '{item.item_id}' already exists.")
+
+            extra = (
+                (str(uuid.uuid4()), item.item_id, cleaned_user, cleaned_comment, now)
+                if cleaned_comment
+                else None
+            )
+            self._insert_item_details(conn, item, extra_annotation=extra)
+
+        self._execute_write(_write)
+
     def upsert_item(self, item: TriageItem) -> None:
         """Insert or update a triage item and its associated annotations and history."""
         now = datetime.now(UTC).isoformat()
@@ -192,44 +286,8 @@ class TriageStore:
             )
 
             conn.execute("DELETE FROM triage_annotations WHERE item_id = ?", (item.item_id,))
-            conn.executemany(
-                """
-                INSERT INTO triage_annotations (annotation_id, item_id, user_id, comment, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        annotation.annotation_id,
-                        item.item_id,
-                        annotation.user_id,
-                        annotation.comment,
-                        annotation.timestamp.isoformat(),
-                    )
-                    for annotation in item.annotations
-                ],
-            )
-
             conn.execute("DELETE FROM triage_history WHERE item_id = ?", (item.item_id,))
-            conn.executemany(
-                """
-                INSERT INTO triage_history (
-                    transition_id, item_id, from_status, to_status, user_id, comment, timestamp
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        entry.transition_id,
-                        item.item_id,
-                        entry.from_status.value,
-                        entry.to_status.value,
-                        entry.user_id,
-                        entry.comment,
-                        entry.timestamp.isoformat(),
-                    )
-                    for entry in item.history
-                ],
-            )
+            self._insert_item_details(conn, item)
 
         self._execute_write(_write)
 
