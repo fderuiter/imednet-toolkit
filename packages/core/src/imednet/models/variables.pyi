@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import Field
 
 from imednet.models.base import ImednetBaseModel
@@ -13,7 +11,6 @@ class Variable(ImednetBaseModel):
 
     label: str | None = Field(default=None, alias="label")
     variable_oid: str | None = Field(default=None, alias="variableOid")
-
     study_key: str | None
     variable_id: int | None
     variable_type: str | None
@@ -25,7 +22,7 @@ class Variable(ImednetBaseModel):
     form_id: int | None
     form_key: str | None
     form_name: str | None
-    blinded: Any
-    deleted: Any
-    disabled: Any
+    blinded: bool | None
+    deleted: bool | None
+    disabled: bool | None
     last_updated: str | None

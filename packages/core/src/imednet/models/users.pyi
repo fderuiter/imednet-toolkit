@@ -24,15 +24,6 @@ class Role(ImednetBaseModel):
 class User(ImednetBaseModel):
     """A user account in the system."""
 
-    @computed_field
-    def name(self) -> str:
-        """A convenience full-name property so you can do `user.name`.
-
-        instead of f"{user.first_name} {user.last_name}" everywhere.
-        """
-        # will strip extra spaces if either is empty
-        return " ".join(filter(None, (self.first_name, self.last_name)))
-
     user_id: str | None
     login: str | None
     first_name: str | None
@@ -40,3 +31,6 @@ class User(ImednetBaseModel):
     email: str | None
     user_active_in_study: bool | None
     roles: Any
+
+    @computed_field
+    def name(self) -> str: ...

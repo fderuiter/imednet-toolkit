@@ -27,7 +27,7 @@ class RecordsOperationDef:
         {"record_data_filter": "recordDataFilter", "recordDataFilter": "recordDataFilter"}
     )
 
-    @execute_operation  # type: ignore
+    @execute_operation
     def create(
         self,
         study_key: str,
