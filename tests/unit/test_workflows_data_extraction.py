@@ -230,10 +230,8 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
         )
 
         sent_filter = route.calls.last.request.url.params["filter"]
-        assert (
-            sent_filter
-            == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z;studyKey==STUDY"
-        )
+        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z"
+        assert "studyKey" not in sent_filter
         assert "startDate" not in sent_filter
         assert "endDate" not in sent_filter
         assert len(revisions) == 1

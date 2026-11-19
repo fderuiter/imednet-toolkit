@@ -11,12 +11,12 @@ atheris = pytest.importorskip("atheris")
 
 pytestmark = pytest.mark.fuzzing
 
-# Suppress logging
-logging.disable(logging.CRITICAL)
-
 
 def run_fuzzer():
     import atheris
+
+    # Suppress logging inside the fuzzer child process without mutating pytest collection state
+    logging.disable(logging.CRITICAL)
 
     with atheris.instrument_imports():
         from imednet_sinks.warehouse import _records_to_arrow_table

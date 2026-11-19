@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from imednet.spi.models import Job, JobStatus, Subject
+from imednet.spi.models import Job, JobStatus, Subject, SubjectKeyword
 from imednet.spi.utils import JobTimeoutError
 from imednet_workflows.uat import (
     BatchSubmission,
@@ -177,13 +177,20 @@ def test_batch_size_logic(mock_sdk):
 
 
 def test_skip_existing_subjects_true(mock_sdk):
-    """Test that existing subjects are skipped during phase 1."""
+    """Test that existing UAT-tagged subjects are skipped during phase 1."""
     workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=True)
 
-    # Mock existing subject
-    subj = MagicMock(spec=Subject)
-    subj.subject_key = "S1"
-    mock_sdk.get_subjects.return_value = [subj]
+    tagged_subj = Subject(
+        subjectKey="S1",
+        deleted=False,
+        keywords=[SubjectKeyword(keywordKey="UAT", keywordName="User Acceptance Testing")],
+    )
+    untagged_subj = Subject(
+        subjectKey="S2",
+        deleted=False,
+        keywords=[SubjectKeyword(keywordKey="PROD", keywordName="Production")],
+    )
+    mock_sdk.get_subjects.return_value = [tagged_subj, untagged_subj]
 
     rs = GeneratedRecordSet(
         form_key="REG",
@@ -197,7 +204,7 @@ def test_skip_existing_subjects_true(mock_sdk):
 
     assert len(result.registration_batches) == 0
     assert "REG" in result.skipped_forms
-    mock_sdk.get_subjects.assert_called_once_with("study1", keyword="UAT")
+    mock_sdk.get_subjects.assert_called_once_with("study1", deleted=False)
     mock_sdk.create_record.assert_not_called()
 
 
@@ -528,3 +535,150 @@ def test_submission_poller_rejects_illegal_job_transition(mock_sdk):
 
     with pytest.raises(InvalidJobTransitionError):
         workflow._await_registration_jobs("study1", [batch])
+
+
+def test_find_existing_uat_subjects_local_keyword_filtering(mock_sdk):
+    """Verify local Subject keyword matching across models, dicts, deleted flags, and empty tags."""
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk)
+    mock_sdk.get_subjects.return_value = [
+        Subject(
+            subjectKey="BY-NAME",
+            deleted=False,
+            keywords=[SubjectKeyword(keywordKey="TAG_1", keywordName="UAT")],
+        ),
+        Subject(
+            subjectKey="DELETED-UAT",
+            deleted=True,
+            keywords=[SubjectKeyword(keywordKey="UAT", keywordName="UAT")],
+        ),
+        Subject(subjectKey="NO-KEYWORDS", deleted=False, keywords=[]),
+        {"subjectKey": "DICT-KEY", "deleted": False, "keywords": [{"keywordKey": "UAT"}]},
+        {"subject_key": "STR-KW", "deleted": False, "keywords": ["UAT"]},
+    ]
+
+    matched = workflow._find_existing_uat_subjects("study1", "UAT")
+    assert matched == {"BY-NAME", "DICT-KEY", "STR-KW"}
+    mock_sdk.get_subjects.assert_called_once_with("study1", deleted=False)
+
+    all_non_deleted = workflow._find_existing_uat_subjects("study1", "")
+    assert all_non_deleted == {"BY-NAME", "NO-KEYWORDS", "DICT-KEY", "STR-KW"}
+
+
+def test_default_uat_submission_with_tagged_synthetic_subject_and_real_sdk():
+    """Verify default UAT submission and UATWorkflow against real ImednetSDK filter registry."""
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+    from imednet_workflows.uat import UATWorkflow
+
+    state = SimulationState()
+    state.subjects.extend(
+        [
+            {
+                "subjectId": 290,
+                "subjectKey": "UAT-TEST-001",
+                "studyKey": "STUDY",
+                "siteId": 101,
+                "siteName": "SITE",
+                "subjectStatus": "Enrolled",
+                "deleted": False,
+                "keywords": [
+                    {
+                        "keywordName": "UAT",
+                        "keywordKey": "UAT",
+                        "keywordId": 10,
+                        "dateAdded": "2026-01-05T08:00:00Z",
+                    }
+                ],
+                "dateCreated": "2026-01-05T08:00:00Z",
+                "dateModified": "2026-01-05T08:00:00Z",
+                "lastUpdated": "2026-01-05T08:00:00Z",
+            },
+            {
+                "subjectId": 291,
+                "subjectKey": "UAT-TEST-002",
+                "studyKey": "STUDY",
+                "siteId": 101,
+                "siteName": "SITE",
+                "subjectStatus": "Enrolled",
+                "deleted": False,
+                "keywords": [
+                    {
+                        "keywordName": "Cohort A",
+                        "keywordKey": "COHORT_A",
+                        "keywordId": 11,
+                        "dateAdded": "2026-01-05T08:00:00Z",
+                    }
+                ],
+                "dateCreated": "2026-01-05T08:00:00Z",
+                "dateModified": "2026-01-05T08:00:00Z",
+                "lastUpdated": "2026-01-05T08:00:00Z",
+            },
+        ]
+    )
+
+    sim_transport = create_simulation_transport(state)
+    captured_requests: list[httpx.Request] = []
+
+    def tracking_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return sim_transport.handle_request(request)
+
+    sdk = ImednetSDK(transport=httpx.MockTransport(tracking_handler), simulation_mode=True)
+
+    # 1. Default BulkRecordSubmissionWorkflow skips UAT-TEST-001 (tagged UAT)
+    #    while still registering UAT-TEST-002 (untagged for UAT).
+    rs_reg = GeneratedRecordSet(
+        form_key="F_DM",
+        form_name="Demographics",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[
+            {"formKey": "F_DM", "siteName": "SITE", "data": {"V_AGE": "30"}},
+            {"formKey": "F_DM", "siteName": "SITE", "data": {"V_AGE": "41"}},
+        ],
+        subject_keys=["UAT-TEST-001", "UAT-TEST-002"],
+    )
+    rs_data = GeneratedRecordSet(
+        form_key="F_VS",
+        form_name="Vital Signs",
+        test_type=RecordTestType.UPDATE_SCHEDULED_RECORD,
+        payloads=[
+            {
+                "formKey": "F_VS",
+                "subjectKey": "UAT-TEST-001",
+                "intervalName": "Baseline",
+                "data": {"V_WEIGHT": "70.0"},
+            },
+            {
+                "formKey": "F_VS",
+                "subjectKey": "UAT-TEST-002",
+                "intervalName": "Baseline",
+                "data": {"V_WEIGHT": "72.5"},
+            },
+        ],
+        subject_keys=["UAT-TEST-001", "UAT-TEST-002"],
+    )
+
+    submitter = BulkRecordSubmissionWorkflow(sdk)
+    sub_result = submitter.submit("STUDY", [rs_reg, rs_data])
+
+    subject_requests = [
+        r for r in captured_requests if r.method == "GET" and r.url.path.endswith("/subjects")
+    ]
+    assert len(subject_requests) == 1
+    assert dict(subject_requests[0].url.params)["filter"] == "deleted==false"
+    assert len(sub_result.registration_batches) == 1
+    assert sub_result.registration_batches[0].record_count == 1
+    assert len(sub_result.data_batches) == 1
+    assert sub_result.data_batches[0].record_count == 2
+
+    # 2. End-to-end default UATWorkflow.run with subject_count=1 skips registration form
+    #    entirely when UAT-TEST-001 is already tagged and completes Phase 2 cleanly.
+    uat_workflow = UATWorkflow(sdk, poll_interval=0.01, seed=42)
+    run_result = uat_workflow.run("STUDY", subject_count=1)
+    assert run_result.overall_success is True
+    assert run_result.submission_result is not None
+    assert "F_DM" in run_result.submission_result.skipped_forms
+    assert len(run_result.submission_result.registration_batches) == 0
+    assert len(run_result.submission_result.data_batches) == 1
