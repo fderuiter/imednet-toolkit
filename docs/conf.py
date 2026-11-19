@@ -2,12 +2,13 @@
 
 # Configuration file for the Sphinx documentation builder.
 import importlib.util
-import json
 import logging
 import os
 import sys
+import tomllib
 import types
 import warnings
+from pathlib import Path
 
 # mypy: ignore-errors
 from typing import Any
@@ -33,8 +34,11 @@ Note:
 """
 
 
-# Add package source roots so API modules can be imported for docs builds.
+# Add package source roots and local Sphinx extensions so API modules and directives resolve.
+_DOCS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_DOCS_DIR, ".."))
 sys.path[:0] = [
+    os.path.join(_DOCS_DIR, "_ext"),
     os.path.abspath("../packages/core/src"),
     os.path.abspath("../packages/providers-airflow/src"),
     os.path.abspath("../packages/plugins-workflows/src"),
@@ -102,38 +106,66 @@ extensions = [
     "sphinx.ext.doctest",
     "myst_parser",
     "sphinx.ext.githubpages",
-    "sphinx_thebe",
+    "pyodide_cells",
 ]
 
-# Configure sphinx-thebe options for interactive in-browser execution with Pyodide
-thebe_config = {
-    "always_load": False,
+_PYODIDE_WHEEL_SPECS: tuple[tuple[str, str], ...] = (
+    ("imednet", "core"),
+    ("imednet_workflows", "plugins-workflows"),
+    ("imednet_plugins_sinks", "plugins-sinks"),
+)
+
+
+def _resolve_pyodide_wheels() -> list[str]:
+    """Resolve dynamic browser wheel paths in installation order."""
+    wheels_dir = Path(_DOCS_DIR) / "_static" / "wheels"
+    resolved: list[str] = []
+    for dist_prefix, pkg_dir_name in _PYODIDE_WHEEL_SPECS:
+        staged_matches = (
+            sorted(wheels_dir.glob(f"{dist_prefix}-*.whl")) if wheels_dir.is_dir() else []
+        )
+        if staged_matches:
+            resolved.append(f"_static/wheels/{staged_matches[-1].name}")
+            continue
+
+        pyproject_file = Path(_REPO_ROOT) / "packages" / pkg_dir_name / "pyproject.toml"
+        pkg_version = imednet_version
+        if pyproject_file.is_file():
+            with pyproject_file.open("rb") as fh:
+                pkg_version = str(
+                    tomllib.load(fh).get("project", {}).get("version", imednet_version)
+                )
+        resolved.append(f"_static/wheels/{dist_prefix}-{pkg_version}-py3-none-any.whl")
+    return resolved
+
+
+# Configure client-side Pyodide WebAssembly execution for interactive tutorials
+pyodide_config = {
     "selector": "div.highlight-python",
-    "selector_input": "pre",
-    "selector_output": ".output, .cell_output",
-    "kernel_name": "pyodide",
-    "wheels": [
-        f"_static/wheels/imednet-{imednet_version}-py3-none-any.whl",
-    ],
-    "wheel_paths": [
-        f"_static/wheels/imednet-{imednet_version}-py3-none-any.whl",
+    "pyodide_packages": [
+        "micropip",
+        "pydantic",
+        "cryptography",
+        "pandas",
+        "ssl",
+        "sqlite3",
     ],
     "requirements": [
-        "micropip",
-        "pydantic>=2.11.3,<3.0.0",
-        "httpx>=0.28.1,<0.29.0",
-        "tenacity>=9.1.2,<10.0.0",
-        "defusedxml>=0.7.1",
+        "httpx",
+        "tenacity",
+        "defusedxml",
         "python-dotenv",
+        "filelock",
+        "python-json-logger",
     ],
-    "micropip_requirements": [
-        "micropip",
-        "pydantic>=2.11.3,<3.0.0",
-        "httpx>=0.28.1,<0.29.0",
-        "tenacity>=9.1.2,<10.0.0",
-        "defusedxml>=0.7.1",
-        "python-dotenv",
-    ],
+    "wheels": _resolve_pyodide_wheels(),
+    "env": {
+        "IMEDNET_SIMULATION_MODE": "true",
+        "IMEDNET_API_KEY": "dummy_api_key",  # pragma: allowlist secret
+        "IMEDNET_SECURITY_KEY": "dummy_security_key",  # pragma: allowlist secret
+        "SNOWFLAKE_PASSWORD": "dummy_password",  # pragma: allowlist secret
+        "IMEDNET_STUDY_KEY": "MY_STUDY",
+    },
 }
 
 autosummary_generate = False
@@ -185,9 +217,6 @@ def setup(app: Any) -> None:  # pragma: no cover
     logging.getLogger("sphinx").addFilter(suppressor)
     logging.getLogger("sphinx.sphinx.domains.python").addFilter(suppressor)
     logging.getLogger("sphinx.sphinx_autodoc_typehints").addFilter(suppressor)
-
-    # Expose thebe_config containing wheel artifacts and requirements to client JS runtime
-    app.add_js_file(None, body=f"window.thebe_config = {json.dumps(thebe_config)};")
 
 
 # Ignore noisy pydantic schema generation warnings.

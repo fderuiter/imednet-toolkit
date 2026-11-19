@@ -76,6 +76,7 @@ def register_list_command(
                 output_format=output_format,
                 no_interactive=no_interactive,
                 model=resolved_model,
+                disallow_study_key=True,
             )
             with fetching_status(name, study_key):
                 items, truncated = collect_list_items(

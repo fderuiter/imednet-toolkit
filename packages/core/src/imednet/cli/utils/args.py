@@ -9,7 +9,13 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from imednet.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
-from imednet.utils.filters import parse_filter_expressions, validate_record_filter
+from imednet.utils.filters import (
+    _parse_clause_operator,
+    _split_filter_clauses,
+    extract_filter_attributes,
+    parse_filter_expressions,
+    validate_record_filter,
+)
 
 from .output import print_error
 
@@ -17,10 +23,24 @@ STUDY_KEY_ARG = "The key identifying the study."
 DEFAULT_INTERACTIVE_LIMIT = DEFAULT_PAGE_SIZE
 
 
+_STUDY_KEY_FILTER_ATTRS: frozenset[str] = frozenset({"study_key", "studyKey"})
+
+
+def _contains_study_key_filter(parsed: dict[str, Any]) -> bool:
+    """Return True if parsed filters include ``study_key`` or ``studyKey``."""
+    if _STUDY_KEY_FILTER_ATTRS.intersection(parsed):
+        return True
+    raw_filter = parsed.get("filter")
+    if isinstance(raw_filter, str):
+        return bool(_STUDY_KEY_FILTER_ATTRS.intersection(extract_filter_attributes(raw_filter)))
+    return False
+
+
 def parse_filter_args(
     filter_args: list[str] | None,
     *,
     model: type[Any] | None = None,
+    disallow_study_key: bool = False,
 ) -> dict[str, Any] | None:
     """Parse repeatable CLI ``--filter`` strings via the shared SPI filter parser.
 
@@ -33,10 +53,46 @@ def parse_filter_args(
     if not filter_args:
         return None
     try:
-        return parse_filter_expressions(filter_args, model=model)
+        parsed = parse_filter_expressions(filter_args, model=model)
     except ValueError as exc:
         print_error(f"Error: {exc}")
         sys.exit(1)
+
+    if disallow_study_key and _contains_study_key_filter(parsed):
+        print_error(
+            "Error: Invalid filter: 'study_key' and 'studyKey' cannot be used in "
+            "--filter when positional study_key is provided."
+        )
+        sys.exit(1)
+    return parsed
+
+
+def parse_record_data_filter(record_data_filter: str | None) -> str | None:
+    """Validate a CLI ``--record-data-filter`` string via ``validate_record_filter``.
+
+    Supports comparison operators including ``=~``, exclusive ``;`` (AND) or
+    ``,`` (OR) connectors, and literal ``none`` (case-insensitive) bypass.
+    Exits with status code ``1`` on ``stderr`` if validation fails.
+    """
+    if record_data_filter is None:
+        return None
+    stripped = record_data_filter.strip()
+    if not stripped:
+        print_error("Error: Invalid record data filter: cannot be empty.")
+        sys.exit(1)
+    try:
+        validate_record_filter(record_data_filter)
+        if stripped.lower() != "none":
+            clauses, _ = _split_filter_clauses(stripped)
+            for clause in clauses:
+                if _parse_clause_operator(clause) is None:
+                    raise ValueError(
+                        f"Malformed filter clause '{clause}': missing comparison operator"
+                    )
+    except ValueError as exc:
+        print_error(f"Error: Invalid record data filter: {exc}")
+        sys.exit(1)
+    return stripped
 
 
 def add_no_interactive(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
@@ -129,6 +185,7 @@ def prepare_list_query(
     has_output_file: bool = False,
     no_interactive: bool = False,
     model: type[Any] | None = None,
+    disallow_study_key: bool = False,
 ) -> tuple[dict[str, Any], int | None]:
     """Validate CLI query options and resolve SDK ``list()`` kwargs and item bound.
 
@@ -148,20 +205,17 @@ def prepare_list_query(
         sys.exit(1)
 
     request_kwargs: dict[str, Any] = {}
-    parsed_filters = parse_filter_args(filter_args, model=model)
+    parsed_filters = parse_filter_args(
+        filter_args,
+        model=model,
+        disallow_study_key=disallow_study_key,
+    )
     if parsed_filters:
         request_kwargs.update(parsed_filters)
 
-    if record_data_filter is not None:
-        if not record_data_filter.strip():
-            print_error("Error: Invalid record data filter: cannot be empty.")
-            sys.exit(1)
-        try:
-            validate_record_filter(record_data_filter)
-        except ValueError as exc:
-            print_error(f"Error: Invalid record data filter: {exc}")
-            sys.exit(1)
-        request_kwargs["record_data_filter"] = record_data_filter
+    parsed_record_data_filter = parse_record_data_filter(record_data_filter)
+    if parsed_record_data_filter is not None:
+        request_kwargs["record_data_filter"] = parsed_record_data_filter
 
     if sort is not None:
         request_kwargs["sort"] = sort.strip()
