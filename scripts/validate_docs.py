@@ -1,10 +1,15 @@
 """Validation script for documentation."""
 
+import argparse
 import ast
 import re
 import sys
 import tomllib
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
+
+from defusedxml import ElementTree as DefusedET
 
 
 def check_todos_in_init() -> bool:
@@ -338,14 +343,221 @@ def check_sphinx_html_baseurl() -> bool:
     return True
 
 
-def main():
+def check_sphinx_seo_configuration(repo_root: Path | None = None) -> bool:
+    """Validate Sphinx templates_path, SEO hooks, index meta description, and orphan 404.rst."""
+    print("Checking Sphinx SEO and 404 configuration...")
+    root = repo_root or Path(__file__).resolve().parents[1]
+    conf_py = root / "docs" / "conf.py"
+    index_rst = root / "docs" / "index.rst"
+    not_found_rst = root / "docs" / "404.rst"
+
+    if not conf_py.exists():
+        print(f"Error: {conf_py} not found.")
+        return True
+
+    has_errors = False
+    try:
+        conf_text = conf_py.read_text(encoding="utf-8")
+        tree = ast.parse(conf_text, filename=str(conf_py))
+    except Exception as exc:
+        print(f"Error parsing {conf_py}: {exc}")
+        return True
+
+    templates_val: list[Any] | None = None
+    connected_events: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "templates_path"
+                    and isinstance(node.value, ast.List)
+                ):
+                    templates_val = node.value.elts
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "templates_path"
+            and isinstance(node.value, ast.List)
+        ):
+            templates_val = node.value.elts
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "connect"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            connected_events.add(node.args[0].value)
+
+    if templates_val is None or len(templates_val) != 0:
+        print("Error: docs/conf.py must set templates_path = [].")
+        has_errors = True
+
+    for event_name in ("html-page-context", "build-finished"):
+        if event_name not in connected_events:
+            print(f"Error: docs/conf.py setup() must connect '{event_name}'.")
+            has_errors = True
+
+    if not index_rst.exists():
+        print(f"Error: {index_rst} not found.")
+        has_errors = True
+    else:
+        index_text = index_rst.read_text(encoding="utf-8")
+        if ".. meta::" not in index_text or ":description:" not in index_text:
+            print("Error: docs/index.rst must declare '.. meta::' with ':description:'.")
+            has_errors = True
+
+    if not not_found_rst.exists():
+        print(f"Error: {not_found_rst} not found.")
+        has_errors = True
+    else:
+        not_found_text = not_found_rst.read_text(encoding="utf-8")
+        first_non_empty = next(
+            (line.strip() for line in not_found_text.splitlines() if line.strip()),
+            "",
+        )
+        if first_non_empty != ":orphan:":
+            print("Error: docs/404.rst must begin with ':orphan:'.")
+            has_errors = True
+
+    if not has_errors:
+        print("Sphinx SEO and 404 configuration is valid.")
+    return has_errors
+
+
+def check_built_html_seo(
+    html_dir: Path | None = None,
+    *,
+    require_exists: bool = False,
+    expected_baseurl: str = "https://fderuiter.github.io/imednet-toolkit/",
+) -> bool:
+    """Verify sitemap.xml, robots.txt, 404.html asset paths, and social metadata across built HTML."""
+    target_dir = html_dir or Path("docs/_build/html")
+    if not target_dir.exists():
+        if require_exists:
+            print(f"Error: Built HTML directory not found at {target_dir}.")
+            return True
+        print(f"Skipping rendered HTML SEO check ({target_dir} not yet built).")
+        return False
+
+    print(f"Checking rendered HTML SEO and Pages artifacts in {target_dir}...")
+    has_errors = False
+    normalized_base = expected_baseurl.rstrip("/") + "/"
+
+    sitemap_path = target_dir / "sitemap.xml"
+    if not sitemap_path.exists():
+        print(f"Error: Missing {sitemap_path}.")
+        has_errors = True
+    else:
+        try:
+            root_el = DefusedET.fromstring(sitemap_path.read_text(encoding="utf-8"))
+            ns = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+            if root_el.tag != f"{ns}urlset":
+                print(f"Error: Unexpected root tag in sitemap.xml: {root_el.tag}")
+                has_errors = True
+            locs = [
+                (loc_el.text or "").strip()
+                for loc_el in root_el.findall(f"{ns}url/{ns}loc")
+                if (loc_el.text or "").strip()
+            ]
+            if not locs:
+                print("Error: sitemap.xml contains zero <loc> entries.")
+                has_errors = True
+            if normalized_base not in locs:
+                print(f"Error: sitemap.xml is missing canonical root URL '{normalized_base}'.")
+                has_errors = True
+            if any(loc.endswith("/404.html") for loc in locs):
+                print("Error: sitemap.xml must not index 404.html.")
+                has_errors = True
+            if any(not loc.startswith(normalized_base) for loc in locs):
+                print(f"Error: sitemap.xml contains URLs outside '{normalized_base}'.")
+                has_errors = True
+        except Exception as exc:
+            print(f"Error parsing {sitemap_path}: {exc}")
+            has_errors = True
+
+    robots_path = target_dir / "robots.txt"
+    if not robots_path.exists():
+        print(f"Error: Missing {robots_path}.")
+        has_errors = True
+    else:
+        robots_text = robots_path.read_text(encoding="utf-8")
+        expected_sitemap_line = f"Sitemap: {normalized_base}sitemap.xml"
+        if "User-agent: *" not in robots_text or expected_sitemap_line not in robots_text:
+            print(f"Error: {robots_path} is missing User-agent or '{expected_sitemap_line}'.")
+            has_errors = True
+
+    not_found_html = target_dir / "404.html"
+    if not not_found_html.exists():
+        print(f"Error: Missing {not_found_html}.")
+        has_errors = True
+    else:
+        nf_text = not_found_html.read_text(encoding="utf-8")
+        if "/imednet-toolkit/_static/" not in nf_text:
+            print("Error: 404.html does not use '/imednet-toolkit/_static/' asset paths.")
+            has_errors = True
+        if re.search(r'(?:href|src)=["\'](?:\./)?_static/', nf_text):
+            print("Error: 404.html still contains relative '_static/' asset references.")
+            has_errors = True
+
+    html_files = sorted(target_dir.rglob("*.html"))
+    if not html_files:
+        print(f"Error: No .html files found in {target_dir}.")
+        has_errors = True
+
+    required_meta_tokens = (
+        '<meta name="description"',
+        'property="og:title"',
+        'property="og:description"',
+        'property="og:url"',
+        'property="og:image"',
+        'name="twitter:card"',
+    )
+    for html_file in html_files:
+        html_text = html_file.read_text(encoding="utf-8")
+        for token in required_meta_tokens:
+            if token not in html_text:
+                rel = html_file.relative_to(target_dir)
+                print(f"Error: {rel} is missing required metadata tag ({token}).")
+                has_errors = True
+
+    if not has_errors:
+        print(
+            f"Rendered HTML SEO check passed ({len(html_files)} HTML page(s), sitemap.xml, robots.txt, and 404.html verified)."
+        )
+    return has_errors
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for documentation validation."""
+    parser = argparse.ArgumentParser(description="Validate documentation configuration and SEO.")
+    parser.add_argument(
+        "--html-dir",
+        type=Path,
+        default=Path("docs/_build/html"),
+        help="Path to rendered Sphinx HTML directory (default: docs/_build/html).",
+    )
+    parser.add_argument(
+        "--require-html",
+        action="store_true",
+        help="Fail if the rendered HTML directory does not exist.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
     """Run validation scripts."""
+    args = parse_args(argv)
     todos_failed = check_todos_in_init()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
     adr_failed = check_adr_records()
     githubpages_failed = check_sphinx_githubpages_extension()
     baseurl_failed = check_sphinx_html_baseurl()
+    seo_config_failed = check_sphinx_seo_configuration()
+    html_seo_failed = check_built_html_seo(args.html_dir, require_exists=args.require_html)
 
     if (
         todos_failed
@@ -354,6 +566,8 @@ def main():
         or adr_failed
         or githubpages_failed
         or baseurl_failed
+        or seo_config_failed
+        or html_seo_failed
     ):
         print("Validation failed.")
         sys.exit(1)

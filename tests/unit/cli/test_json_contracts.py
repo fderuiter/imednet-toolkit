@@ -255,3 +255,97 @@ def test_jobs_json_preserves_nested_results_and_full_model_equality(sdk, capsys,
     assert response["items"][0]["dateStarted"] == job.date_started
     assert "Fetching" not in captured.out
     assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("argv", "attr", "expected_args", "expected_kwargs"),
+    [
+        (
+            ["studies", "list", "-f", "study_key=S1", "-f", "study_type=Clinical"],
+            "studies",
+            (),
+            {"study_key": "S1", "study_type": "Clinical"},
+        ),
+        (
+            ["sites", "list", "S", "-f", "site_name=SiteA"],
+            "sites",
+            ("S",),
+            {"site_name": "SiteA"},
+        ),
+        (
+            ["forms", "list", "S", "-f", "form_key=DM", "-f", "disabled=false"],
+            "forms",
+            ("S",),
+            {"form_key": "DM", "disabled": False},
+        ),
+        (
+            ["variables", "list", "S", "-f", "variable_name=AGE"],
+            "variables",
+            ("S",),
+            {"variable_name": "AGE"},
+        ),
+        (
+            ["intervals", "list", "S", "-f", "interval_name=Screening"],
+            "intervals",
+            ("S",),
+            {"interval_name": "Screening"},
+        ),
+        (
+            ["visits", "list", "S", "-f", "subject_key=001"],
+            "visits",
+            ("S",),
+            {"subject_key": "001"},
+        ),
+        (
+            ["queries", "list", "S", "-f", "subject_key=001"],
+            "queries",
+            ("S",),
+            {"subject_key": "001"},
+        ),
+        (
+            ["record-revisions", "list", "S", "-f", "record_revision>=2"],
+            "record_revisions",
+            ("S",),
+            {"record_revision": (">=", 2)},
+        ),
+        (
+            [
+                "records",
+                "list",
+                "S",
+                "-f",
+                "form_key=AE",
+                "--record-data-filter",
+                "AESER==Serious",
+            ],
+            "records",
+            ("S",),
+            {"form_key": "AE", "record_data_filter": "AESER==Serious"},
+        ),
+        (
+            ["records", "list", "S", "--record-data-filter", "none"],
+            "records",
+            ("S",),
+            {"record_data_filter": "none"},
+        ),
+    ],
+)
+def test_list_filters_reach_sdk_in_json_mode(
+    sdk,
+    capsys,
+    argv,
+    attr,
+    expected_args,
+    expected_kwargs,
+):
+    getattr(sdk, attr).list.return_value = []
+    cli.app([*argv, "--format", "json"])
+    getattr(sdk, attr).list.assert_called_once_with(*expected_args, **expected_kwargs)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["status"] == "complete"
+    assert payload["resource"] == attr
+    assert payload["count"] == 0
+    assert payload["items"] == []
