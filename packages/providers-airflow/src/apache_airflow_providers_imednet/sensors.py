@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import closing
 from typing import Any
 
 try:  # pragma: no cover - optional Airflow dependency
@@ -123,8 +124,8 @@ class ImednetJobSensor(BaseSensorOperator):
 
     def poke(self, context: Context) -> bool:
         """Check the status of the job."""
-        sdk = self._get_sdk()
-        job: Any = sdk.jobs.get(self.study_key, self.batch_id)
+        with closing(self._get_sdk()) as sdk:
+            job: Any = sdk.jobs.get(self.study_key, self.batch_id)
         ti = self._extract_task_instance(context)
 
         is_mock_job = type(job).__module__.startswith("unittest.mock")

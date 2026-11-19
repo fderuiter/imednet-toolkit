@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from contextlib import closing
 from typing import Any, cast
 from urllib.parse import quote_plus
 
@@ -49,6 +50,7 @@ _SECRET_EXPORT_KEYS = frozenset(
         "authorization",
         "client_secret",
         "credentials",
+        "oidc_token",
         "passphrase",
         "passwd",
         "password",
@@ -69,6 +71,7 @@ _TABULAR_OPTION_DEFAULTS: dict[str, Any] = {
     "batch_size": 500,
     "max_retries": 3,
     "idempotent": True,
+    "mask_phi": True,
     "quality_gate_enabled": False,
     "min_schema_readiness_score": 100.0,
 }
@@ -189,6 +192,7 @@ class ImednetExportOperator(BaseOperator):
         batch_size: int = 500,
         max_retries: int = 3,
         idempotent: bool = True,
+        mask_phi: bool = True,
         quality_gate_enabled: bool = False,
         min_schema_readiness_score: float = 100.0,
         modified_since: Any = None,
@@ -213,6 +217,7 @@ class ImednetExportOperator(BaseOperator):
         :param batch_size: Number of records to read and write per batch.
         :param max_retries: Maximum number of export attempts.
         :param idempotent: Whether the export execution should be safely repeatable, automatically deduplicating or replacing existing outputs as appropriate.
+        :param mask_phi: Whether to replace sensitive PHI values with ``***MASKED***`` by default.
         :param quality_gate_enabled: Whether to filter records through the schema readiness quality gate prior to export.
         :param min_schema_readiness_score: Minimum schema readiness score (0-100) required when the quality gate is enabled.
         :param kwargs: Additional Airflow BaseOperator arguments.
@@ -230,6 +235,7 @@ class ImednetExportOperator(BaseOperator):
         self.batch_size: int = batch_size
         self.max_retries = max_retries
         self.idempotent = idempotent
+        self.mask_phi = mask_phi
         self.quality_gate_enabled = quality_gate_enabled
         self.min_schema_readiness_score = min_schema_readiness_score
         self.modified_since = modified_since
@@ -301,6 +307,14 @@ class ImednetExportOperator(BaseOperator):
                 opts[key] = attr_val
             elif key in runtime_kwargs and runtime_kwargs[key] != default_val:
                 opts[key] = runtime_kwargs[key]
+        effective_mask_phi = (
+            bool(runtime_kwargs["mask_phi"])
+            if "mask_phi" in runtime_kwargs
+            else bool(getattr(self, "mask_phi", True))
+        )
+        explicit: frozenset[str] = getattr(self, "_explicit_tabular_options", frozenset())
+        if not effective_mask_phi or "mask_phi" in runtime_kwargs or "mask_phi" in explicit:
+            opts["mask_phi"] = effective_mask_phi
         return opts
 
     def _build_tabular_kwargs(self, runtime_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -331,7 +345,8 @@ class ImednetExportOperator(BaseOperator):
             return None
 
         if sdk is None:
-            sdk = self._get_sdk()
+            with closing(self._get_sdk()) as resolved_sdk:
+                return self._resolve_sink(config, sdk=resolved_sdk)
 
         sinks = getattr(sdk, "sinks", None)
         if sinks is None:
@@ -343,7 +358,7 @@ class ImednetExportOperator(BaseOperator):
         runtime_kwargs = self._get_runtime_export_kwargs()
         conn_settings = self._resolve_destination_connection(dest)
         stream_opts = self._collect_streaming_options(runtime_kwargs)
-        if not config.mask_phi:
+        if not config.mask_phi and "mask_phi" not in stream_opts:
             stream_opts["mask_phi"] = False
 
         if dest == "snowflake":
@@ -472,8 +487,8 @@ class ImednetExportOperator(BaseOperator):
                 f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
             )
 
-        sdk = self._get_sdk()
         stream_opts = self._collect_streaming_options(runtime_kwargs)
+        sink_stream_opts = {k: v for k, v in stream_opts.items() if k != "mask_phi"}
 
         config = sink_base.SinkConfig(
             study_key=self.study_key,
@@ -481,7 +496,7 @@ class ImednetExportOperator(BaseOperator):
             max_retries=int(runtime_kwargs.get("max_retries", self.max_retries)),
             retry_backoff=float(runtime_kwargs.get("retry_backoff", 1.0)),
             idempotent=bool(runtime_kwargs.get("idempotent", self.idempotent)),
-            mask_phi=bool(runtime_kwargs.get("mask_phi", True)),
+            mask_phi=bool(runtime_kwargs.get("mask_phi", self.mask_phi)),
             extra=runtime_kwargs,
             quality_gate_enabled=bool(
                 runtime_kwargs.get("quality_gate_enabled", self.quality_gate_enabled)
@@ -492,57 +507,58 @@ class ImednetExportOperator(BaseOperator):
                     self.min_schema_readiness_score,
                 )
             ),
-            **stream_opts,
+            **sink_stream_opts,
         )
 
-        sink = None
-        if not export_callable:
-            sink = self._resolve_sink(config, sdk=sdk)
-            if not sink:
-                raise AirflowException(
-                    f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
-                )
-
-        if sink:
-            sink_base.run_streaming_export(
-                sdk,
-                self.study_key,
-                sink,
-                config,
-                stream_name=f"airflow_{dest}",
-                batch_id_prefix=f"{self.study_key}/batch",
-                default_provider_name="airflow",
-            )
-        else:
-            # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)
+        with closing(self._get_sdk()) as sdk:
+            sink = None
             if not export_callable:
-                raise AirflowException(f"Unsupported destination or export_func '{dest}'")
-
-            tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
-            if dest in ("sql", "sql_by_form", "long_sql"):
-                conn_settings = self._resolve_destination_connection(dest)
-                if dest == "sql_by_form":
-                    conn_str_arg = (
-                        self.output_path
-                        or tabular_kwargs.pop("conn_str", None)
-                        or conn_settings.get("conn_str")
+                sink = self._resolve_sink(config, sdk=sdk)
+                if not sink:
+                    raise AirflowException(
+                        f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
                     )
-                    export_callable(sdk, self.study_key, conn_str_arg, **tabular_kwargs)
-                    return redact_uri(str(conn_str_arg)) if conn_str_arg is not None else None
-                table_arg = (
-                    self.output_path
-                    or tabular_kwargs.pop("table", None)
-                    or tabular_kwargs.pop("table_name", None)
-                    or conn_settings.get("table")
+
+            if sink:
+                sink_base.run_streaming_export(
+                    sdk,
+                    self.study_key,
+                    sink,
+                    config,
+                    stream_name=f"airflow_{dest}",
+                    batch_id_prefix=f"{self.study_key}/batch",
+                    default_provider_name="airflow",
                 )
-                if "conn_str" not in tabular_kwargs and conn_settings.get("conn_str"):
-                    tabular_kwargs["conn_str"] = conn_settings["conn_str"]
-                export_callable(sdk, self.study_key, table_arg, **tabular_kwargs)
-                if self.output_path is not None:
-                    return redact_uri(self.output_path)
-                return redact_uri(str(table_arg)) if table_arg is not None else None
-            export_callable(sdk, self.study_key, self.output_path, **tabular_kwargs)
-        return redact_uri(self.output_path) if self.output_path is not None else None
+            else:
+                # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)
+                if not export_callable:
+                    raise AirflowException(f"Unsupported destination or export_func '{dest}'")
+
+                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
+                if dest in ("sql", "sql_by_form", "long_sql"):
+                    conn_settings = self._resolve_destination_connection(dest)
+                    if dest == "sql_by_form":
+                        conn_str_arg = (
+                            self.output_path
+                            or tabular_kwargs.pop("conn_str", None)
+                            or conn_settings.get("conn_str")
+                        )
+                        export_callable(sdk, self.study_key, conn_str_arg, **tabular_kwargs)
+                        return redact_uri(str(conn_str_arg)) if conn_str_arg is not None else None
+                    table_arg = (
+                        self.output_path
+                        or tabular_kwargs.pop("table", None)
+                        or tabular_kwargs.pop("table_name", None)
+                        or conn_settings.get("table")
+                    )
+                    if "conn_str" not in tabular_kwargs and conn_settings.get("conn_str"):
+                        tabular_kwargs["conn_str"] = conn_settings["conn_str"]
+                    export_callable(sdk, self.study_key, table_arg, **tabular_kwargs)
+                    if self.output_path is not None:
+                        return redact_uri(self.output_path)
+                    return redact_uri(str(table_arg)) if table_arg is not None else None
+                export_callable(sdk, self.study_key, self.output_path, **tabular_kwargs)
+            return redact_uri(self.output_path) if self.output_path is not None else None
 
 
 __all__ = ["ImednetExportOperator"]

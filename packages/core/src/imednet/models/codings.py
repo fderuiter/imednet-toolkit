@@ -11,3 +11,5 @@ class Coding(ImednetBaseModel):
 
 
 Coding = ModelEngine.get_model('Coding', Coding)
+
+__all__ = ["Coding"]

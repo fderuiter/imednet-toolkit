@@ -8,6 +8,12 @@ from imednet.core.context import (
     set_base_url_context,
 )
 from imednet.errors import PathTraversalValidationError
+from imednet.integrations.enrichment import (
+    EnrichmentPipeline,
+    mask_custom_phi_recursive,
+    resolve_enrichment_pipeline,
+    resolve_study_configuration,
+)
 from imednet.utils.batch_coordinator import (
     DEFAULT_BATCH_CHUNK_SIZE,
     AsyncBatchCoordinator,
@@ -70,6 +76,7 @@ __all__ = [
     "AsyncJobPoller",
     "BatchCoordinator",
     "BatchSubmissionSummary",
+    "EnrichmentPipeline",
     "InvalidJobStateError",
     "InvalidJobTransitionError",
     "InvalidStateTransitionError",
@@ -97,6 +104,7 @@ __all__ = [
     "is_boolean_token",
     "is_missing_value",
     "mask_clinical_phi",
+    "mask_custom_phi_recursive",
     "normalize_iso_date",
     "normalize_utc_timestamp_bound",
     "parse_bool",
@@ -107,6 +115,8 @@ __all__ = [
     "redact_sensitive_payload",
     "redact_sensitive_text",
     "reset_base_url_context",
+    "resolve_enrichment_pipeline",
+    "resolve_study_configuration",
     "sanitize_csv_formula",
     "set_base_url_context",
     "sqlite_connection",

@@ -136,3 +136,19 @@ class CreateNewRecordRequest(BaseRecordRequest):
     """Payload for creating a new unscheduled record."""
 
     subject_key: str = Field("", alias="subjectKey")
+
+__all__ = [
+    "ALLOWED_RECORD_TRANSITIONS",
+    "BaseRecordRequest",
+    "CreateNewRecordRequest",
+    "Keyword",
+    "Record",
+    "RecordData",
+    "RecordJobResponse",
+    "RecordStatus",
+    "RegisterSubjectRequest",
+    "UpdateScheduledRecordRequest",
+    "is_valid_record_transition",
+    "normalize_record_status",
+    "validate_record_transition",
+]

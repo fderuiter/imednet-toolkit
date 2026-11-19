@@ -48,6 +48,16 @@ Destination decision matrix
 SDK examples
 ------------
 
+.. note::
+
+   Every sink configuration (``MongoDbSinkConfig``, ``Neo4jSinkConfig``, and
+   ``SnowflakeSinkConfig``) enables PHI masking by default (``mask_phi=True``),
+   resolves committed ``StudyConfiguration`` governance rules automatically via
+   ``ConfigVersionStore`` (failing closed to ``global_sensitivity_registry``
+   redaction when no configuration history or encryption key is present), and
+   supports pre-write ``Record`` readiness filtering via
+   ``quality_gate_enabled=True`` and ``min_schema_readiness_score``.
+
 MongoDB (document export):
 
 .. testcode::
@@ -82,6 +92,8 @@ Neo4j (graph export):
        database="neo4j",
        batch_size=500,
        idempotent=True,
+       quality_gate_enabled=True,
+       min_schema_readiness_score=90.0,
    )
    rows = export_to_neo4j(sdk, "MY_STUDY", config=neo4j_cfg)
    print(rows)
@@ -118,17 +130,30 @@ mapper ingress **by default** (``mask_phi=True``):
 * **Default sensitive keys**: Registered clinical identifiers—including
   ``patientName`` / ``patient_name``, ``patientInitials``, ``DOB`` /
   ``date_of_birth`` / ``birth_date``, ``SSN``, ``phone``, ``email``, and
-  ``address``—are replaced with ``***MASKED***`` before column label mapping,
-  hierarchy construction, or sink batch serialization.
+  ``address``—are replaced with ``***MASKED***`` before column label mapping
+  (``use_labels_as_columns=True``), hierarchy construction, or sink batch
+  serialization.
 * **Relational identifiers preserved**: Join and graph keys (``study_key``,
   ``subject_key``, and ``record_id``) are explicitly exempted from masking so
-  relational joins, Hive partitions, and Neo4j graph edges remain intact.
+  relational joins, MongoDB ``_id`` documents, Hive partitions, and Neo4j
+  ``MERGE`` graph edges remain intact.
+* **Automatic Study governance resolution**: Exports automatically inspect
+  committed ``StudyConfiguration`` rules from ``ConfigVersionStore`` (when
+  ``imednet-workflows`` is installed) to enforce custom ``phiFields``,
+  ``terminologyLookups``, and ``mappings`` across flat, hierarchical, and sink
+  paths. Store errors, missing plugins, or missing encryption keys fail closed
+  so ``global_sensitivity_registry`` PHI redaction still applies.
+* **Pre-write quality-gate filtering**: Setting ``quality_gate_enabled=True``
+  (and optional ``min_schema_readiness_score``) on ``SnowflakeSinkConfig``,
+  ``MongoDbSinkConfig``, ``Neo4jSinkConfig``, or tabular exports runs
+  ``apply_quality_gate`` before batch writes to drop low-readiness ``Record``
+  items consistently across warehouse, document, and graph targets.
 * **Study-specific rules**: Study-level ``StudyConfiguration(phiFields=[...])``
   rules normalize camelCase, PascalCase, uppercase acronyms, and ``snake_case``
   field names automatically across both ``document`` and ``tabular`` mapper
-  modes. Additional global identifiers can also be registered via
-  ``global_sensitivity_registry`` (exposed on ``imednet.spi.utils`` for
-  extension plugins).
+  modes and replace matched values with ``***MASKED***``. Additional global
+  identifiers can also be registered via ``global_sensitivity_registry``
+  (exposed on ``imednet.spi.utils`` for extension plugins).
 
 Customizing study PHI fields with ``CentralizedMapper``:
 
@@ -148,9 +173,11 @@ Customizing study PHI fields with ``CentralizedMapper``:
 Opting out for authorized identifiable data transfers:
 
 When protocol governance explicitly authorizes transferring unmasked clinical
-identifiers (for example, an approved EDC migration), pass ``mask_phi=False``
-on the sink configuration, mapper, or export helper. Opting out applies only to
-that operation and never mutates ``global_sensitivity_registry``:
+identifiers (for example, an approved ``21 CFR Part 11`` enclave archive or EDC
+migration), pass ``mask_phi=False`` on the sink configuration, mapper, Airflow
+``ImednetExportOperator``, or export helper—or pass ``--no-mask-phi`` on
+``imednet export`` CLI commands. Opting out applies only to that operation and
+never mutates ``global_sensitivity_registry``:
 
 .. testcode::
 
@@ -166,6 +193,11 @@ that operation and never mutates ``global_sensitivity_registry``:
        mask_phi=False,
    )
    export_to_mongodb(sdk, "MY_STUDY", config=authorized_cfg)
+
+.. code-block:: bash
+
+   imednet export json MY_STUDY /secure/enclave/study_archive.json --hierarchical --no-mask-phi
+   imednet export neo4j MY_STUDY bolt://localhost:7687 neo4j "$NEO4J_PASSWORD" --quality-gate --no-mask-phi
 
 Runnable examples
 -----------------

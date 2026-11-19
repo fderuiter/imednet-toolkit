@@ -1707,6 +1707,169 @@ class TestSinkPhiMaskingControls:
             "systolic_bp": 122,
         }
 
+    def test_export_to_neo4j_enforces_quality_gate_before_batch_writes(self, monkeypatch):
+        """Setting quality_gate_enabled=True on Neo4jSinkConfig drops low-readiness Record items via apply_quality_gate."""
+        import json
+
+        import imednet_sinks.graph as graph_mod
+        from imednet_sinks.graph import Neo4jSinkConfig, export_to_neo4j
+
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+
+        neo4j, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
+
+        sdk_mock = MagicMock()
+        sdk_mock.get_variables.return_value = [
+            Variable(variable_name="age", variable_type="int", form_id=10, form_key="DEMO"),
+            Variable(variable_name="weight", variable_type="int", form_id=10, form_key="DEMO"),
+        ]
+        valid_rec = Record(
+            record_id=1,
+            study_key="STUDY1",
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMO",
+            record_data={"age": 35, "weight": 70, "SSN": "123-45-6789"},
+        )
+        invalid_rec = Record(
+            record_id=2,
+            study_key="STUDY1",
+            subject_key="SUBJ-2",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMO",
+            record_data={"age": "not-an-int", "weight": "bad"},
+        )
+        sdk_mock.records.list.return_value = [valid_rec, invalid_rec]
+
+        cfg = Neo4jSinkConfig(
+            study_key="STUDY1",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "pass"),
+            quality_gate_enabled=True,
+            min_schema_readiness_score=90.0,
+        )
+        exported = export_to_neo4j(sdk_mock, "STUDY1", config=cfg)
+        assert exported == 1
+
+        session_mock = driver.session.return_value.__enter__.return_value
+        rows = session_mock.run.call_args.kwargs["rows"]
+        assert len(rows) == 1
+        assert rows[0]["record_id"] == 1
+        assert json.loads(rows[0]["record_data"])["ssn"] == "***MASKED***"
+
+    def test_all_sinks_mask_six_sensitive_keys_and_apply_committed_study_config(
+        self, monkeypatch, tmp_path
+    ):
+        """Snowflake, MongoDB, and Neo4j mask all 6 sensitive keys plus committed StudyConfiguration phiFields."""
+        import json
+
+        import imednet_sinks.document as doc_mod
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+
+        from imednet.integrations import enrichment as enrichment_mod
+        from imednet.models.records import Record
+        from imednet.models.study_config import StudyConfiguration
+
+        committed_cfg = StudyConfiguration(
+            study_key="STUDY-GOV",
+            phi_fields=["customMrn"],
+            terminology_lookups={"gender": {"2": "Female"}},
+        )
+        monkeypatch.setattr(
+            enrichment_mod,
+            "resolve_study_configuration",
+            lambda sk: committed_cfg if sk == "STUDY-GOV" else None,
+        )
+
+        rec = Record(
+            record_id=301,
+            study_key="STUDY-GOV",
+            subject_key="SUBJ-301",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMO",
+            record_data={
+                "SSN": "123-45-6789",
+                "DOB": "1990-02-14",
+                "patientName": "Clara Barton",
+                "email": "clara@example.org",
+                "phone": "555-0144",
+                "address": "42 Health Ave",
+                "customMrn": "MRN-301",
+                "gender": "2",
+            },
+        )
+        sdk_mock = MagicMock()
+        sdk_mock.records.list.side_effect = lambda **_kw: [rec.model_copy(deep=True)]
+
+        # 1. Neo4j
+        neo4j, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
+        assert (
+            graph_mod.export_to_neo4j(sdk_mock, "STUDY-GOV", "bolt://localhost:7687", ("n", "p"))
+            == 1
+        )
+        neo_payload = json.loads(
+            driver.session.return_value.__enter__.return_value.run.call_args.kwargs["rows"][0][
+                "record_data"
+            ]
+        )
+        for k in ("ssn", "dob", "patient_name", "email", "phone", "address", "custom_mrn"):
+            assert neo_payload[k] == "***MASKED***"
+        assert neo_payload["gender"] == "Female"
+
+        # 2. MongoDB
+        pymongo, _client, _col = _fake_pymongo_module()
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+        assert (
+            doc_mod.export_to_mongodb(sdk_mock, "STUDY-GOV", "mongodb://localhost", "db", "col")
+            == 1
+        )
+        mongo_payload = pymongo.UpdateOne.call_args.args[1]["$set"]["record_data"]
+        for k in ("ssn", "dob", "patient_name", "email", "phone", "address", "custom_mrn"):
+            assert mongo_payload[k] == "***MASKED***"
+        assert mongo_payload["gender"] == "Female"
+
+        # 3. Snowflake (and mask_phi=False explicit opt-out override)
+        sf, _conn, _cursor = _fake_snowflake_module()
+        pa, pq, _table = _fake_pyarrow_modules()
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, _ex: (
+                sf if pkg == "snowflake.connector" else (pa if pkg == "pyarrow" else pq)
+            ),
+        )
+        sf_cfg = wh_mod.SnowflakeSinkConfig(
+            study_key="STUDY-GOV",
+            account="a",
+            user="u",
+            password="p",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="TBL",
+            local_staging_dir=str(tmp_path),
+        )
+        assert wh_mod.export_to_snowflake(sdk_mock, "STUDY-GOV", config=sf_cfg) == 1
+        sf_payload = json.loads(pa.Table.from_pylist.call_args.args[0][0]["record_data"])
+        for k in ("ssn", "dob", "patient_name", "email", "phone", "address", "custom_mrn"):
+            assert sf_payload[k] == "***MASKED***"
+        assert sf_payload["gender"] == "Female"
+
+        pa.Table.from_pylist.reset_mock()
+        assert wh_mod.export_to_snowflake(sdk_mock, "STUDY-GOV", config=sf_cfg, mask_phi=False) == 1
+        sf_unmasked = json.loads(pa.Table.from_pylist.call_args.args[0][0]["record_data"])
+        assert sf_unmasked["ssn"] == "123-45-6789"
+        assert sf_unmasked["custom_mrn"] == "MRN-301"
+        assert sf_unmasked["gender"] == "Female"
+
     def test_all_sink_plugins_redact_custom_registry_and_study_config_phi_fields(
         self, monkeypatch, tmp_path
     ):
@@ -1765,7 +1928,7 @@ class TestSinkPhiMaskingControls:
             mongo_doc = update_doc["$set"]
             assert mongo_doc["subject_key"] == "SUBJ-9500"
             assert mongo_doc["record_data"]["custom_genetic_marker"] == "***MASKED***"
-            assert mongo_doc["record_data"]["site_chart_id"] == "[MASKED]"
+            assert mongo_doc["record_data"]["site_chart_id"] == "***MASKED***"
             assert mongo_doc["record_data"]["patient_name"] == "***MASKED***"
             assert mongo_doc["record_data"]["age"] == 51
 
@@ -1787,7 +1950,7 @@ class TestSinkPhiMaskingControls:
             assert neo4j_row["subject_key"] == "SUBJ-9500"
             neo4j_payload = json.loads(neo4j_row["record_data"])
             assert neo4j_payload["custom_genetic_marker"] == "***MASKED***"
-            assert neo4j_payload["site_chart_id"] == "[MASKED]"
+            assert neo4j_payload["site_chart_id"] == "***MASKED***"
             assert neo4j_payload["patient_name"] == "***MASKED***"
             assert neo4j_payload["age"] == 51
 
@@ -1822,7 +1985,7 @@ class TestSinkPhiMaskingControls:
             assert sf_row["subject_key"] == "SUBJ-9500"
             sf_payload = json.loads(sf_row["record_data"])
             assert sf_payload["custom_genetic_marker"] == "***MASKED***"
-            assert sf_payload["site_chart_id"] == "[MASKED]"
+            assert sf_payload["site_chart_id"] == "***MASKED***"
             assert sf_payload["patient_name"] == "***MASKED***"
             assert sf_payload["age"] == 51
         finally:

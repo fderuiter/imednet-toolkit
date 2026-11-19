@@ -1,18 +1,23 @@
-"""Thread- and task-local study context helpers."""
+"""Thread- and task-local study, base URL, and strict-mode context helpers."""
 
 from __future__ import annotations
 
 import contextvars
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 from imednet.errors.validation import ConfigurationError
+from imednet.utils.validators import parse_bool
 
 _active_study: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "active_study", default=None
 )
 _active_base_url: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "active_base_url", default=None
+)
+_active_strict_mode: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "active_strict_mode", default=None
 )
 
 
@@ -39,6 +44,34 @@ def reset_base_url_context(token: contextvars.Token[str | None]) -> None:
 def get_base_url_context() -> str | None:
     """Get the current base URL for the active thread/task context."""
     return _active_base_url.get()
+
+
+def set_strict_mode_context(strict_mode: bool) -> contextvars.Token[bool | None]:
+    """Set the active strict validation mode for the current thread/task context."""
+    return _active_strict_mode.set(strict_mode)
+
+
+def reset_strict_mode_context(token: contextvars.Token[bool | None]) -> None:
+    """Reset the active strict validation mode using a token from :func:`set_strict_mode_context`."""
+    _active_strict_mode.reset(token)
+
+
+def is_strict_mode() -> bool:
+    """Return whether strict validation mode is enabled in the active context or environment."""
+    active = _active_strict_mode.get()
+    if active is not None:
+        return active
+    return parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"))
+
+
+@contextmanager
+def strict_mode_context(strict_mode: bool) -> Iterator[None]:
+    """Temporarily set the active strict validation mode for the current thread/task context."""
+    token = set_strict_mode_context(strict_mode)
+    try:
+        yield
+    finally:
+        reset_strict_mode_context(token)
 
 
 def clear_study_context() -> None:

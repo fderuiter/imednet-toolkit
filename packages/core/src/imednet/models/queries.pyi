@@ -80,3 +80,16 @@ class Query(ImednetBaseModel):
     def update_status(self, target_status: QueryStatus | str) -> QueryStatus: ...
     def can_transition_to(self, target_status: QueryStatus | str) -> bool: ...
     def __setattr__(self, name: str, value: Any) -> None: ...
+
+__all__ = [
+    "ALLOWED_QUERY_TRANSITIONS",
+    "ALLOWED_TRANSITIONS",
+    "Query",
+    "QueryComment",
+    "QueryStatus",
+    "calculate_legacy_status",
+    "is_valid_query_transition",
+    "is_valid_transition",
+    "validate_query_transition",
+    "validate_transition",
+]

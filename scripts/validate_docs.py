@@ -2,10 +2,14 @@
 
 import argparse
 import ast
+import importlib
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
 from collections.abc import Sequence
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -343,6 +347,331 @@ def check_sphinx_html_baseurl() -> bool:
     return True
 
 
+class _ApiHtmlExtractor(HTMLParser):
+    """Lightweight stdlib HTML parser collecting IDs, dl blocks, dt text, and viewcode backlinks."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: set[str] = set()
+        self.dt_text: dict[str, str] = {}
+        self.dl_text_by_dt_id: dict[str, str] = {}
+        self.backlinks: list[str] = []
+        self._dl_stack: list[tuple[list[str], list[str]]] = []
+        self._cur_dt_id: str | None = None
+        self._cur_dt_chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+        elem_id = attr_map.get("id")
+        if elem_id:
+            self.ids.add(elem_id)
+
+        if tag == "dl":
+            self._dl_stack.append(([], []))
+        elif tag == "dt":
+            self._cur_dt_id = elem_id
+            self._cur_dt_chunks = []
+            if elem_id and self._dl_stack:
+                self._dl_stack[-1][0].append(elem_id)
+        elif tag == "a":
+            classes = (attr_map.get("class") or "").split()
+            href = attr_map.get("href")
+            if "viewcode-back" in classes and href:
+                self.backlinks.append(href)
+
+    def handle_data(self, data: str) -> None:
+        if self._cur_dt_id is not None:
+            self._cur_dt_chunks.append(data)
+        for _dt_ids, chunks in self._dl_stack:
+            chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "dt" and self._cur_dt_id is not None:
+            self.dt_text[self._cur_dt_id] = " ".join("".join(self._cur_dt_chunks).split())
+            self._cur_dt_id = None
+            self._cur_dt_chunks = []
+        elif tag == "dl" and self._dl_stack:
+            dt_ids, chunks = self._dl_stack.pop()
+            text = " ".join("".join(chunks).split())
+            for dt_id in dt_ids:
+                self.dl_text_by_dt_id.setdefault(dt_id, text)
+
+
+def _parse_html_file(path: Path) -> _ApiHtmlExtractor:
+    parser = _ApiHtmlExtractor()
+    parser.feed(path.read_text(encoding="utf-8"))
+    return parser
+
+
+def check_no_duplicate_suppression(conf_py_path: Path | None = None) -> bool:
+    """Verify _SuppressDuplicateDescriptions and duplicate warning filters are absent from docs/conf.py."""
+    print("Checking docs/conf.py for absence of duplicate warning suppression...")
+    if conf_py_path is None:
+        conf_py_path = Path(__file__).resolve().parents[1] / "docs" / "conf.py"
+    if not conf_py_path.exists():
+        print(f"Error: {conf_py_path} not found.")
+        return True
+
+    content = conf_py_path.read_text(encoding="utf-8")
+    has_errors = False
+    if "_SuppressDuplicateDescriptions" in content:
+        print("Error: _SuppressDuplicateDescriptions is still present in docs/conf.py.")
+        has_errors = True
+    if "duplicate object description" in content:
+        print("Error: 'duplicate object description' warning suppression found in docs/conf.py.")
+        has_errors = True
+    if not has_errors:
+        print("No duplicate warning suppression found in docs/conf.py.")
+    return has_errors
+
+
+def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
+    """Verify rendered HTML model fields, endpoint methods, _modules/index.html, and [docs] backlinks."""
+    print("Checking rendered Sphinx HTML API reference and viewcode backlinks...")
+    repo_root = Path(__file__).resolve().parents[1]
+    core_src = str(repo_root / "packages" / "core" / "src")
+    if core_src not in sys.path:
+        sys.path.insert(0, core_src)
+
+    if html_dir is None:
+        html_dir = repo_root / "docs" / "_build" / "html"
+        if not (html_dir / "reference" / "api" / "imednet.models.html").exists():
+            sphinx_bin = shutil.which("sphinx-build") or "sphinx-build"
+            print(f"Building Sphinx HTML into {html_dir} for verification...")
+            res = subprocess.run(
+                [sphinx_bin, "-b", "html", "-W", "--keep-going", "docs", str(html_dir)],
+                cwd=str(repo_root),
+                check=False,
+            )
+            if res.returncode != 0:
+                print("Error: Strict sphinx-build failed while preparing HTML for validation.")
+                return True
+
+    models_page = html_dir / "reference" / "api" / "imednet.models.html"
+    endpoints_page = html_dir / "reference" / "api" / "imednet.endpoints.html"
+    modules_index = html_dir / "_modules" / "index.html"
+
+    for required_page in (models_page, endpoints_page, modules_index):
+        if not required_page.exists():
+            print(f"Error: Expected rendered HTML page {required_page} does not exist.")
+            return True
+
+    has_errors = False
+
+    # 1. Verify 13 model submodules, 14 contract models (198+ fields), and 4 nested models
+    from imednet.models.engine import get_contract
+
+    contract = get_contract()
+    models_parsed = _parse_html_file(models_page)
+    model_submodules = (
+        "codings",
+        "forms",
+        "intervals",
+        "jobs",
+        "queries",
+        "record_revisions",
+        "records",
+        "sites",
+        "studies",
+        "subjects",
+        "users",
+        "variables",
+        "visits",
+    )
+    nested_models = {
+        "Keyword": "records",
+        "QueryComment": "queries",
+        "Role": "users",
+        "SubjectKeyword": "subjects",
+    }
+
+    expected_models: dict[str, tuple[str, type]] = {}
+    for sub in model_submodules:
+        mod_anchor = f"module-imednet.models.{sub}"
+        if mod_anchor not in models_parsed.ids:
+            print(f"Error: Submodule anchor '{mod_anchor}' missing from imednet.models.html.")
+            has_errors = True
+        mod = importlib.import_module(f"imednet.models.{sub}")
+        for sym in getattr(mod, "__all__", []):
+            obj = getattr(mod, sym, None)
+            if isinstance(obj, type) and sym in contract.models:
+                expected_models[sym] = (f"imednet.models.{sub}.{sym}", obj)
+
+    for nested_name, sub in nested_models.items():
+        mod = importlib.import_module(f"imednet.models.{sub}")
+        expected_models[nested_name] = (
+            f"imednet.models.{sub}.{nested_name}",
+            getattr(mod, nested_name),
+        )
+
+    if len(expected_models) < 18:
+        print(
+            f"Error: Expected 18 documented models (14 contract + 4 nested), found {len(expected_models)}."
+        )
+        has_errors = True
+
+    distinct_rendered_fields: set[tuple[str, str]] = set()
+    for model_name, (qname, model_cls) in sorted(expected_models.items()):
+        if qname not in models_parsed.ids:
+            print(f"Error: Model '{qname}' missing from imednet.models.html.")
+            has_errors = True
+            continue
+
+        dt_str = models_parsed.dt_text.get(qname, "")
+        dl_str = models_parsed.dl_text_by_dt_id.get(qname, "")
+        if "[source]" not in dt_str:
+            print(f"Error: Model '{qname}' is missing a [source] link.")
+            has_errors = True
+
+        doc_first_line = (model_cls.__doc__ or "").strip().splitlines()
+        if not doc_first_line or doc_first_line[0].strip() not in dl_str:
+            print(f"Error: Model '{qname}' docstring missing from imednet.models.html.")
+            has_errors = True
+
+        expected_base = "Job" if model_name == "JobStatus" else "ImednetBaseModel"
+        if f"Bases: {expected_base}" not in dl_str or f"Bases: {model_name}" in dl_str:
+            print(f"Error: Model '{qname}' has missing or circular Bases declaration.")
+            has_errors = True
+
+        for fname in getattr(model_cls, "model_fields", {}):
+            field_id = f"{qname}.{fname}"
+            if field_id not in models_parsed.ids:
+                print(f"Error: Model field '{field_id}' missing from imednet.models.html.")
+                has_errors = True
+            elif model_name in contract.models:
+                if (
+                    model_name == "JobStatus"
+                    and fname in contract.models["Job"].fields
+                    and fname not in contract.models["JobStatus"].fields
+                ):
+                    continue
+                distinct_rendered_fields.add((model_name, fname))
+
+    if len(distinct_rendered_fields) < 198:
+        print(
+            f"Error: Expected at least 198 rendered contract model fields, got {len(distinct_rendered_fields)}."
+        )
+        has_errors = True
+
+    # 2. Verify all 26 endpoints and sync/async method signatures
+    from imednet.endpoints.registry import ASYNC_ENDPOINT_REGISTRY, ENDPOINT_REGISTRY
+
+    endpoints_parsed = _parse_html_file(endpoints_page)
+    all_endpoints = [*ENDPOINT_REGISTRY.values(), *ASYNC_ENDPOINT_REGISTRY.values()]
+    list_count = 0
+    for ep_cls in all_endpoints:
+        qname = f"{ep_cls.__module__}.{ep_cls.__name__}"
+        is_async = ep_cls.__name__.startswith("Async")
+        if qname not in endpoints_parsed.ids:
+            print(f"Error: Endpoint '{qname}' missing from imednet.endpoints.html.")
+            has_errors = True
+            continue
+
+        if hasattr(ep_cls, "list"):
+            list_count += 1
+            for method_name in ("list", "to_dataframe"):
+                mid = f"{qname}.{method_name}"
+                if mid not in endpoints_parsed.ids:
+                    print(f"Error: Endpoint method '{mid}' missing from imednet.endpoints.html.")
+                    has_errors = True
+                elif is_async:
+                    if (
+                        method_name == "list"
+                        and "AsyncIterator" not in endpoints_parsed.dl_text_by_dt_id.get(mid, "")
+                    ):
+                        print(
+                            f"Error: Async list method '{mid}' missing AsyncIterator return type."
+                        )
+                        has_errors = True
+                    if method_name == "to_dataframe" and not endpoints_parsed.dt_text.get(
+                        mid, ""
+                    ).startswith("async "):
+                        print(f"Error: Async method '{mid}' missing 'async' coroutine prefix.")
+                        has_errors = True
+        elif f"{qname}.list" in endpoints_parsed.ids:
+            print(f"Error: Endpoint '{qname}' unexpectedly documents .list().")
+            has_errors = True
+
+        if hasattr(ep_cls, "get"):
+            mid = f"{qname}.get"
+            if mid not in endpoints_parsed.ids:
+                print(f"Error: Endpoint method '{mid}' missing from imednet.endpoints.html.")
+                has_errors = True
+            elif is_async and not endpoints_parsed.dt_text.get(mid, "").startswith("async "):
+                print(f"Error: Async method '{mid}' missing 'async' coroutine prefix.")
+                has_errors = True
+        elif f"{qname}.get" in endpoints_parsed.ids:
+            print(f"Error: List-only endpoint '{qname}' unexpectedly documents .get().")
+            has_errors = True
+
+    if list_count != 24:
+        print(f"Error: Expected 24 list endpoints, found {list_count}.")
+        has_errors = True
+
+    special_methods = (
+        (ENDPOINT_REGISTRY["records"], "create", False),
+        (ASYNC_ENDPOINT_REGISTRY["records"], "create", True),
+        (ENDPOINT_REGISTRY["subjects"], "list_by_site", False),
+        (ASYNC_ENDPOINT_REGISTRY["subjects"], "list_by_site", True),
+        (ENDPOINT_REGISTRY["jobs"], "poll", False),
+        (ASYNC_ENDPOINT_REGISTRY["jobs"], "poll", True),
+        (ENDPOINT_REGISTRY["jobs"], "poll_many", False),
+        (ASYNC_ENDPOINT_REGISTRY["jobs"], "poll_many", True),
+    )
+    for ep_cls, method_name, expect_async in special_methods:
+        mid = f"{ep_cls.__module__}.{ep_cls.__name__}.{method_name}"
+        if mid not in endpoints_parsed.ids:
+            print(f"Error: Endpoint method '{mid}' missing from imednet.endpoints.html.")
+            has_errors = True
+        elif expect_async and not endpoints_parsed.dt_text.get(mid, "").startswith("async "):
+            print(f"Error: Async method '{mid}' missing 'async' coroutine prefix.")
+            has_errors = True
+
+    # 3. Verify _modules/index.html omits builtins.html and all [docs] backlinks resolve
+    modules_index_text = modules_index.read_text(encoding="utf-8")
+    if "builtins.html" in modules_index_text or (html_dir / "_modules" / "builtins.html").exists():
+        print("Error: _modules/index.html or _modules/builtins.html contains 'builtins.html'.")
+        has_errors = True
+
+    target_ids_cache: dict[Path, set[str]] = {}
+    broken_backlinks = 0
+    total_backlinks = 0
+    for mod_html in sorted((html_dir / "_modules").rglob("*.html")):
+        if mod_html.name == "index.html":
+            continue
+        mod_parsed = _parse_html_file(mod_html)
+        for href in mod_parsed.backlinks:
+            total_backlinks += 1
+            rel_part, _, frag = href.partition("#")
+            target_file = (mod_html.parent / rel_part).resolve()
+            if not target_file.exists():
+                print(f"Error: Broken [docs] page link in {mod_html.relative_to(html_dir)}: {href}")
+                broken_backlinks += 1
+                has_errors = True
+                continue
+            if frag:
+                if target_file not in target_ids_cache:
+                    target_ids_cache[target_file] = _parse_html_file(target_file).ids
+                if frag not in target_ids_cache[target_file]:
+                    print(
+                        f"Error: Broken [docs] fragment in {mod_html.relative_to(html_dir)}: {href}"
+                    )
+                    broken_backlinks += 1
+                    has_errors = True
+
+    if total_backlinks == 0:
+        print("Error: Zero [docs] viewcode backlinks found in _modules/.")
+        has_errors = True
+
+    if not has_errors:
+        print(
+            f"Rendered API reference verified ({len(expected_models)} models, "
+            f"{len(distinct_rendered_fields)} fields, {len(all_endpoints)} endpoints, "
+            f"{total_backlinks} [docs] backlinks with {broken_backlinks} broken)."
+        )
+    return has_errors
+
+
 def check_sphinx_seo_configuration(repo_root: Path | None = None) -> bool:
     """Validate Sphinx templates_path, SEO hooks, index meta description, and orphan 404.rst."""
     print("Checking Sphinx SEO and 404 configuration...")
@@ -530,13 +859,16 @@ def check_built_html_seo(
     return has_errors
 
 
+DEFAULT_HTML_DIR = Path("docs/_build/html")
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for documentation validation."""
     parser = argparse.ArgumentParser(description="Validate documentation configuration and SEO.")
     parser.add_argument(
         "--html-dir",
         type=Path,
-        default=Path("docs/_build/html"),
+        default=DEFAULT_HTML_DIR,
         help="Path to rendered Sphinx HTML directory (default: docs/_build/html).",
     )
     parser.add_argument(
@@ -557,6 +889,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     githubpages_failed = check_sphinx_githubpages_extension()
     baseurl_failed = check_sphinx_html_baseurl()
     seo_config_failed = check_sphinx_seo_configuration()
+    suppression_failed = check_no_duplicate_suppression()
+    api_html_dir = args.html_dir if args.require_html or args.html_dir != DEFAULT_HTML_DIR else None
+    api_html_failed = check_rendered_api_reference(api_html_dir)
     html_seo_failed = check_built_html_seo(args.html_dir, require_exists=args.require_html)
 
     if (
@@ -567,6 +902,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         or githubpages_failed
         or baseurl_failed
         or seo_config_failed
+        or suppression_failed
+        or api_html_failed
         or html_seo_failed
     ):
         print("Validation failed.")
