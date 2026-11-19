@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Continuous Delta Sync and FileLock Reconciliation Loop
+    accDescr: Flowchart showing run_forever acquiring a FileLock, performing delta record sync and hard-delete reconciliation, releasing the lock, and waiting until stopped
     A[run_forever] --> B{stop_event set?}
     B -- No --> C[acquire FileLock]
     C --> D[load_records / delta sync]

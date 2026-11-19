@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Endpoint and Workflow Extension Architecture
+    accDescr: Diagram showing custom endpoints inheriting BaseEndpoint to register on the SDK and custom workflows exposed via the CLI
     BaseEndpoint --> NewEndpoint[Custom Endpoint]
     Workflows --> NewWorkflow[Custom Workflow]
     NewEndpoint --> |register| SDK

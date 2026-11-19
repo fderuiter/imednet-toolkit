@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Open Clinical Query Filtering Workflow
+    accDescr: Flowchart showing get_open_queries iterating over queries and inspecting the latest comment closed flag to return open queries
     A[get_open_queries] --> B[queries.list]
     B --> C{Iterate Queries}
     C --> D{Check latest comment}

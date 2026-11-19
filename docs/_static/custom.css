@@ -203,7 +203,24 @@ body[data-theme="dark"] .role-card:hover {
 }
 
 /* Interactive Pyodide Cells & Output Styles */
-.thebe-launch-button {
+.thebelab-button {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    padding: 0.3rem 0.75rem;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid var(--color-background-border, #d0d7de);
+    background-color: var(--color-background-primary, #ffffff);
+    color: var(--color-foreground-primary, #24292f);
+}
+
+.thebelab-button:focus-visible {
+    outline: 2px solid var(--color-brand-primary, #005fb8);
+    outline-offset: 2px;
+}
+
+.thebe-launch-button,
+.thebelab-button.thebe-launch-button {
     display: inline-flex;
     align-items: center;
     gap: 0.5rem;
@@ -215,25 +232,38 @@ body[data-theme="dark"] .role-card:hover {
     border: 1px solid transparent;
     border-radius: 6px;
     cursor: pointer;
-    transition: background-color 0.2s ease, opacity 0.2s ease;
     margin: 1rem 0;
 }
 
-.thebe-launch-button:hover {
-    opacity: 0.9;
+.thebe-launch-button span.launch_msg,
+.thebe-launch-button span.status {
+    color: inherit;
 }
 
-.thebe-launch-button:focus-visible {
+.thebe-launch-button:hover:not(:disabled),
+.thebelab-button.thebe-launch-button:hover:not(:disabled) {
+    background-color: var(--color-brand-primary-hover, #004c94);
+    color: var(--color-brand-btn-text, #ffffff);
+}
+
+.thebe-launch-button:focus-visible,
+.thebelab-button.thebe-launch-button:focus-visible {
     outline: 2px solid var(--color-brand-primary, #005fb8);
     outline-offset: 2px;
 }
 
-.thebe-launch-button.thebe-status-ready {
+.thebe-launch-button.thebe-status-ready,
+.thebelab-button.thebe-launch-button.thebe-status-ready,
+.thebe-launch-button.thebe-status-ready:hover:not(:disabled),
+.thebelab-button.thebe-launch-button.thebe-status-ready:hover:not(:disabled) {
     background-color: var(--color-status-success, #065f46);
     color: var(--color-brand-btn-text, #ffffff);
 }
 
-.thebe-launch-button.thebe-status-failed {
+.thebe-launch-button.thebe-status-failed,
+.thebelab-button.thebe-launch-button.thebe-status-failed,
+.thebe-launch-button.thebe-status-failed:hover:not(:disabled),
+.thebelab-button.thebe-launch-button.thebe-status-failed:hover:not(:disabled) {
     background-color: var(--color-status-danger, #b91c1c);
     color: var(--color-brand-btn-text, #ffffff);
 }
@@ -262,12 +292,16 @@ body[data-theme="dark"] .role-card:hover {
     border-radius: 6px;
     padding: 0.75rem;
     resize: vertical;
-    outline: none;
 }
 
 .thebe-editor:focus {
     border-color: var(--color-brand-primary, #005fb8);
     box-shadow: 0 0 0 2px rgba(0, 95, 184, 0.2);
+}
+
+.thebe-editor:focus-visible {
+    outline: 2px solid var(--color-brand-primary, #005fb8);
+    outline-offset: 2px;
 }
 
 .thebelab-controls {
@@ -278,35 +312,29 @@ body[data-theme="dark"] .role-card:hover {
     margin-bottom: 0.5rem;
 }
 
-.thebelab-button {
-    font-size: 0.8125rem;
-    font-weight: 600;
-    padding: 0.3rem 0.75rem;
-    border-radius: 4px;
-    cursor: pointer;
-    border: 1px solid var(--color-background-border, #d0d7de);
-    background-color: var(--color-background-primary, #ffffff);
-    color: var(--color-foreground-primary, #24292f);
-    transition: all 0.15s ease-in-out;
-}
-
-.thebelab-run-button {
+.thebelab-run-button,
+.thebelab-button.thebelab-run-button {
     background-color: var(--color-brand-primary, #005fb8);
     color: var(--color-brand-btn-text, #ffffff);
     border-color: transparent;
 }
 
-.thebelab-run-button:hover:not(:disabled) {
-    opacity: 0.9;
+.thebelab-run-button:hover:not(:disabled),
+.thebelab-button.thebelab-run-button:hover:not(:disabled) {
+    background-color: var(--color-brand-primary-hover, #004c94);
+    color: var(--color-brand-btn-text, #ffffff);
 }
 
-.thebelab-run-button:disabled {
+.thebelab-run-button:disabled,
+.thebelab-button.thebelab-run-button:disabled {
     opacity: 0.6;
     cursor: wait;
 }
 
-.thebelab-clear-button:hover {
+.thebelab-clear-button:hover,
+.thebelab-button.thebelab-clear-button:hover:not(:disabled) {
     background-color: var(--color-background-secondary, #f6f8fa);
+    color: var(--color-foreground-primary, #24292f);
 }
 
 .thebelab-cell-status {
@@ -1045,5 +1073,367 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
 
     .crf-fields-grid {
         grid-template-columns: 1fr;
+    }
+}
+
+/* =========================================================================
+   Mermaid Diagram Scroll Regions, Scaling Floors & Furo Token Overrides
+   ========================================================================= */
+
+.mermaid {
+    display: block;
+    overflow-x: auto;
+    overflow-y: hidden;
+    max-width: 100%;
+    -webkit-overflow-scrolling: touch;
+    padding: 0.75rem 0.5rem;
+    margin: 1.25rem 0;
+    border-radius: 6px;
+    background-color: var(--color-background-primary);
+}
+
+.mermaid:focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: 2px;
+}
+
+.mermaid svg {
+    display: block;
+    max-width: none !important;
+    height: auto;
+}
+
+/* Width floor fallback if an SVG ever renders with percentage width */
+.mermaid svg[width="100%"] {
+    min-width: 720px;
+}
+
+.mermaid svg .node rect,
+.mermaid svg .node circle,
+.mermaid svg .node ellipse,
+.mermaid svg .node polygon,
+.mermaid svg .node path {
+    fill: var(--color-diagram-node-bg, var(--color-background-secondary)) !important;
+    stroke: var(--color-diagram-node-border, var(--color-brand-primary)) !important;
+}
+
+.mermaid svg .cluster rect {
+    fill: var(--color-diagram-cluster-bg, var(--color-background-secondary)) !important;
+    stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+
+.mermaid svg .node .label,
+.mermaid svg .nodeLabel,
+.mermaid svg .cluster-label .nodeLabel,
+.mermaid svg .label text,
+.mermaid svg .label span,
+.mermaid svg .cluster-label span {
+    color: var(--color-foreground-primary) !important;
+    fill: var(--color-foreground-primary) !important;
+}
+
+.mermaid svg .edgePath .path,
+.mermaid svg .flowchart-link {
+    stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+
+.mermaid svg .marker,
+.mermaid svg marker path {
+    fill: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+    stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+
+.mermaid svg .edgeLabel,
+.mermaid svg .edgeLabel span,
+.mermaid svg .edgeLabel p {
+    background-color: var(--color-diagram-label-bg, var(--color-background-primary)) !important;
+    color: var(--color-foreground-primary) !important;
+}
+
+.mermaid svg .edgeLabel rect {
+    fill: var(--color-diagram-label-bg, var(--color-background-primary)) !important;
+    opacity: 1 !important;
+}
+
+.mermaid svg rect.actor,
+.mermaid svg .actor-man line,
+.mermaid svg .actor-man circle {
+    fill: var(--color-diagram-node-bg, var(--color-background-secondary)) !important;
+    stroke: var(--color-diagram-node-border, var(--color-brand-primary)) !important;
+}
+
+.mermaid svg text.actor,
+.mermaid svg text.actor > tspan {
+    fill: var(--color-foreground-primary) !important;
+}
+
+.mermaid svg line[id^="actor"],
+.mermaid svg .actor-line,
+.mermaid svg .messageLine0,
+.mermaid svg .messageLine1,
+.mermaid svg .loopLine {
+    stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+
+.mermaid svg .messageText,
+.mermaid svg .loopText,
+.mermaid svg .loopText > tspan,
+.mermaid svg .labelText,
+.mermaid svg .labelText > tspan {
+    fill: var(--color-foreground-primary) !important;
+}
+
+.mermaid svg .labelBox {
+    fill: var(--color-diagram-node-bg, var(--color-background-secondary)) !important;
+    stroke: var(--color-diagram-line, var(--color-foreground-secondary)) !important;
+}
+
+.mermaid svg rect.note {
+    fill: var(--color-diagram-note-bg, #fff8c5) !important;
+    stroke: var(--color-diagram-note-border, #92400e) !important;
+}
+
+.mermaid svg text.noteText,
+.mermaid svg text.noteText > tspan {
+    fill: var(--color-diagram-note-text, #1f2328) !important;
+}
+
+.mermaid svg .activation0,
+.mermaid svg .activation1,
+.mermaid svg .activation2 {
+    fill: var(--color-diagram-cluster-bg, var(--color-background-secondary)) !important;
+    stroke: var(--color-diagram-node-border, var(--color-brand-primary)) !important;
+}
+
+/* =========================================================================
+   High Contrast (@media (prefers-contrast: more)) — >= 7:1 Contrast
+   ========================================================================= */
+
+@media (prefers-contrast: more) {
+    body,
+    body[data-theme="light"] {
+        --color-background-primary: #ffffff;
+        --color-background-secondary: #f4f6f8;
+        --color-background-border: #4a5056;
+        --color-foreground-primary: #000000;
+        --color-foreground-secondary: #1f2328;
+        --color-foreground-muted: #24292f;
+        --color-code-background: #ffffff;
+        --color-code-foreground: #000000;
+        --color-brand-primary: #004385;
+        --color-brand-primary-hover: #003366;
+        --color-brand-content: #004385;
+        --color-brand-btn-text: #ffffff;
+        --color-brand-button-text: #ffffff;
+        --color-status-success: #065f46;
+        --color-status-warning: #78350f;
+        --color-status-danger: #991b1b;
+        --color-badge-success: #065f46;
+        --color-badge-warning: #78350f;
+        --color-badge-danger: #991b1b;
+        --color-badge-required: #991b1b;
+        --color-diagram-node-bg: #ffffff;
+        --color-diagram-node-border: #004385;
+        --color-diagram-cluster-bg: #f4f6f8;
+        --color-diagram-line: #1f2328;
+        --color-diagram-label-bg: #ffffff;
+        --color-diagram-note-bg: #fffbeb;
+        --color-diagram-note-text: #000000;
+        --color-diagram-note-border: #78350f;
+    }
+
+    body[data-theme="dark"] {
+        --color-background-primary: #0a0c10;
+        --color-background-secondary: #11141a;
+        --color-background-border: #9ca3af;
+        --color-foreground-primary: #ffffff;
+        --color-foreground-secondary: #e6edf3;
+        --color-foreground-muted: #c9d1d9;
+        --color-code-background: #0a0c10;
+        --color-code-foreground: #ffffff;
+        --color-brand-primary: #79c0ff;
+        --color-brand-primary-hover: #a5d6ff;
+        --color-brand-content: #79c0ff;
+        --color-brand-btn-text: #0a0c10;
+        --color-brand-button-text: #0a0c10;
+        --color-status-success: #6ee7b7;
+        --color-status-warning: #fde68a;
+        --color-status-danger: #fca5a5;
+        --color-badge-success: #6ee7b7;
+        --color-badge-warning: #fde68a;
+        --color-badge-danger: #fca5a5;
+        --color-badge-required: #fca5a5;
+        --color-diagram-node-bg: #11141a;
+        --color-diagram-node-border: #79c0ff;
+        --color-diagram-cluster-bg: #0a0c10;
+        --color-diagram-line: #e6edf3;
+        --color-diagram-label-bg: #0a0c10;
+        --color-diagram-note-bg: #1c1908;
+        --color-diagram-note-text: #ffffff;
+        --color-diagram-note-border: #fde68a;
+    }
+
+    .explorer-metric-badge,
+    .status-pill-success,
+    .status-pill-warning,
+    .status-pill-danger,
+    .crf-badge-required,
+    .thebe-stderr {
+        background-color: var(--color-background-primary);
+        border: 1px solid currentColor;
+    }
+
+    .thebe-launch-button,
+    .thebelab-button,
+    .explorer-run-btn,
+    .explorer-secondary-btn,
+    .role-card-launch-btn {
+        border: 2px solid currentColor;
+    }
+}
+
+@media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) {
+        --color-background-primary: #0a0c10;
+        --color-background-secondary: #11141a;
+        --color-background-border: #9ca3af;
+        --color-foreground-primary: #ffffff;
+        --color-foreground-secondary: #e6edf3;
+        --color-foreground-muted: #c9d1d9;
+        --color-code-background: #0a0c10;
+        --color-code-foreground: #ffffff;
+        --color-brand-primary: #79c0ff;
+        --color-brand-primary-hover: #a5d6ff;
+        --color-brand-content: #79c0ff;
+        --color-brand-btn-text: #0a0c10;
+        --color-brand-button-text: #0a0c10;
+        --color-status-success: #6ee7b7;
+        --color-status-warning: #fde68a;
+        --color-status-danger: #fca5a5;
+        --color-badge-success: #6ee7b7;
+        --color-badge-warning: #fde68a;
+        --color-badge-danger: #fca5a5;
+        --color-badge-required: #fca5a5;
+        --color-diagram-node-bg: #11141a;
+        --color-diagram-node-border: #79c0ff;
+        --color-diagram-cluster-bg: #0a0c10;
+        --color-diagram-line: #e6edf3;
+        --color-diagram-label-bg: #0a0c10;
+        --color-diagram-note-bg: #1c1908;
+        --color-diagram-note-text: #ffffff;
+        --color-diagram-note-border: #fde68a;
+    }
+}
+
+/* =========================================================================
+   Forced Colors (@media (forced-colors: active)) — System Color Tokens
+   ========================================================================= */
+
+@media (forced-colors: active) {
+    .thebe-launch-button,
+    .thebelab-button,
+    .thebelab-button.thebe-launch-button,
+    .thebelab-button.thebelab-run-button,
+    .explorer-run-btn,
+    .explorer-secondary-btn,
+    .role-card-launch-btn,
+    .persona-tab-btn,
+    .output-subtab-btn,
+    .mode-pill-btn {
+        forced-color-adjust: none;
+        background-color: ButtonFace !important;
+        color: ButtonText !important;
+        border: 1px solid ButtonText !important;
+    }
+
+    .thebe-launch-button:hover:not(:disabled),
+    .thebelab-button:hover:not(:disabled),
+    .thebelab-button.thebelab-run-button:hover:not(:disabled),
+    .explorer-run-btn:hover:not(:disabled),
+    .explorer-secondary-btn:hover:not(:disabled),
+    .role-card-launch-btn:hover,
+    .persona-tab-btn[aria-selected="true"],
+    .output-subtab-btn[aria-selected="true"],
+    .mode-pill-btn[aria-pressed="true"] {
+        background-color: Highlight !important;
+        color: HighlightText !important;
+        border-color: Highlight !important;
+    }
+
+    .thebelab-button:disabled,
+    .thebelab-button.thebelab-run-button:disabled {
+        background-color: ButtonFace !important;
+        color: GrayText !important;
+        border-color: GrayText !important;
+        opacity: 1;
+    }
+
+    .thebe-editor,
+    .thebelab-cell,
+    .role-card,
+    .explorer-select {
+        forced-color-adjust: none;
+        background-color: Canvas !important;
+        color: CanvasText !important;
+        border: 1px solid CanvasText !important;
+    }
+
+    .thebe-editor:focus-visible,
+    .thebe-launch-button:focus-visible,
+    .thebelab-button:focus-visible,
+    .explorer-run-btn:focus-visible,
+    .explorer-secondary-btn:focus-visible,
+    .role-card-launch-btn:focus-visible,
+    .persona-tab-btn:focus-visible,
+    .output-subtab-btn:focus-visible,
+    .mermaid:focus-visible,
+    pre:focus-visible {
+        outline: 2px solid Highlight !important;
+        outline-offset: 2px !important;
+    }
+
+    .mermaid {
+        forced-color-adjust: none;
+        background-color: Canvas !important;
+        border: 1px solid CanvasText !important;
+    }
+
+    .mermaid svg .node rect,
+    .mermaid svg .node circle,
+    .mermaid svg .node ellipse,
+    .mermaid svg .node polygon,
+    .mermaid svg .node path,
+    .mermaid svg .cluster rect,
+    .mermaid svg rect.actor,
+    .mermaid svg .labelBox,
+    .mermaid svg rect.note,
+    .mermaid svg .edgeLabel rect {
+        fill: Canvas !important;
+        stroke: CanvasText !important;
+    }
+
+    .mermaid svg .edgeLabel,
+    .mermaid svg .edgeLabel span,
+    .mermaid svg .edgeLabel p,
+    .mermaid svg .node .label,
+    .mermaid svg .nodeLabel,
+    .mermaid svg text,
+    .mermaid svg tspan {
+        background-color: Canvas !important;
+        color: CanvasText !important;
+        fill: CanvasText !important;
+    }
+
+    .mermaid svg .edgePath .path,
+    .mermaid svg .flowchart-link,
+    .mermaid svg line[id^="actor"],
+    .mermaid svg .actor-line,
+    .mermaid svg .messageLine0,
+    .mermaid svg .messageLine1,
+    .mermaid svg .loopLine,
+    .mermaid svg .marker,
+    .mermaid svg marker path {
+        stroke: CanvasText !important;
+        fill: CanvasText !important;
     }
 }

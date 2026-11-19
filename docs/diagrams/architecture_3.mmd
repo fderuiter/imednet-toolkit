@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Core SDK Layered Request Pipeline
+    accDescr: Directed graph showing CLI invoking Workflows, which coordinate Endpoints using the HTTPX-backed Client against the API
     CLI[CLI] --> |invokes| Workflows
     Workflows --> |coordinate| Endpoints
     Endpoints --> |use| Client["(HTTP Client)"]

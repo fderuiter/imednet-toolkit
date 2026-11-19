@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Record Schema Validation and Cache Resolution Flow
+    accDescr: Decision flowchart showing SchemaValidator resolving form keys via SchemaCache, refreshing study variables if needed, and validating payloads before submission
     A[Record payload] --> B[SchemaValidator.validate_record]
     B --> C{formKey or formId}
     C -->|Resolve formKey| D[SchemaCache]
