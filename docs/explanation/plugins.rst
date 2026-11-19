@@ -6,11 +6,20 @@ The iMednet SDK monorepo contains the following first-party packages:
 * :doc:`imednet </reference/api/core>` (Core SDK) — The foundational API client and SDK.
 * :doc:`imednet-workflows </reference/api/plugins-workflows>` — Opinionated data-extraction and query-management workflows.
 * :doc:`imednet-sinks </reference/api/plugins-sinks>` — Export sinks for data destinations.
+* :doc:`imednet-tui </reference/api/plugins-tui>` — Interactive terminal user interface (TUI) plugin.
 * :doc:`apache-airflow-providers-imednet </reference/api/providers-airflow>` — Apache Airflow integrations.
 
 The built-in ``imednet-workflows`` package is the reference implementation for
-third-party plugins.  Any third-party package can register its own plugin using
-the standard `Python entry-point`_ mechanism.
+third-party SDK plugins, while ``imednet-tui`` demonstrates CLI subcommand
+registration through the ``imednet.cli_plugins`` entry-point group:
+
+.. code-block:: toml
+
+    [project.entry-points."imednet.cli_plugins"]
+    tui = "imednet_tui.cli:setup_parser"
+
+Any third-party package can register its own SDK or CLI plugin using the
+standard `Python entry-point`_ mechanism.
 
 .. _Python entry-point: https://packaging.python.org/en/latest/specifications/entry-points/
 

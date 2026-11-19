@@ -82,8 +82,12 @@ def export_to_hive_parquet(
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
     forms = sdk.forms.list(study_key=study_key)
 
-    form_filter: dict[str, Any] = {"formIds": form_whitelist} if form_whitelist else {}
-    all_variables = sdk.variables.list(study_key=study_key, **form_filter)
+    form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
+    all_variables = (
+        []
+        if form_whitelist is not None and len(form_whitelist) == 0
+        else sdk.variables.list(study_key=study_key, **form_filter)
+    )
     variables_by_form: dict[int, list[Any]] = {}
     for variable in all_variables:
         if variable.form_id is not None:
@@ -114,10 +118,7 @@ def export_to_hive_parquet(
         if callable(iter_records) and callable(iter_parsed_rows):
             records = iter_records(
                 study_key,
-                extra_filters={
-                    "formIds": [form.form_id],
-                    **({"variableNames": variable_whitelist} if variable_whitelist else {}),
-                },
+                extra_filters={"formId": form.form_id},
             )
             for rows, _ in iter_parsed_rows(records, record_model):
                 df = mapper._build_dataframe(
@@ -139,10 +140,7 @@ def export_to_hive_parquet(
 
         records = mapper._fetch_records(
             study_key,
-            extra_filters={
-                "formId": form.form_id,
-                **({"variableNames": variable_whitelist} if variable_whitelist else {}),
-            },
+            extra_filters={"formId": form.form_id},
         )
         rows, _ = mapper._parse_records(records, record_model)
         df = mapper._build_dataframe(

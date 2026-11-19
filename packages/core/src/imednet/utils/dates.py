@@ -182,3 +182,36 @@ def normalize_iso_date(value: Any, *, date_order: Literal["MDY", "DMY"] | None =
             return value
 
     return value
+
+
+def normalize_utc_timestamp_bound(value: str, *, is_end: bool = False) -> str:
+    """Normalize a date or timestamp string to an ISO 8601 UTC timestamp bound.
+
+    Date-only inputs expand to ``T00:00:00Z`` when ``is_end`` is ``False`` and
+    ``T23:59:59Z`` when ``is_end`` is ``True``. Full timestamps are converted
+    to UTC ending with ``Z``.
+
+    Args:
+        value: Date or ISO 8601 datetime string.
+        is_end: Whether to use end-of-day time for date-only inputs.
+
+    Returns:
+        Canonical ISO 8601 UTC timestamp string ending with ``Z``.
+
+    Raises:
+        ValueError: If ``value`` is empty or cannot be parsed as a valid date or datetime.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Date filter bound must be a non-empty ISO 8601 date or timestamp string")
+
+    stripped = value.strip()
+    normalized = normalize_iso_date(stripped)
+    candidate = normalized if isinstance(normalized, str) else stripped
+
+    if _ISO_DATE_REGEX.fullmatch(candidate):
+        date.fromisoformat(candidate)
+        suffix = "T23:59:59Z" if is_end else "T00:00:00Z"
+        return f"{candidate}{suffix}"
+
+    dt = parse_iso_datetime(candidate)
+    return format_iso_datetime(dt)

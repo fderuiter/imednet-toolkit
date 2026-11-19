@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from imednet.cli import app as cli_app
-from imednet.spi.models import Record
+from imednet.spi.models import Record, Visit
 from imednet_workflows.cli import state_app
 from imednet_workflows.state_ledger import LedgerState, StreamState, StudyState
 from imednet_workflows.uat.models import UATWorkflowState
@@ -120,6 +120,33 @@ def test_validate_filter_syntax_valid() -> None:
 
     _, k, v, _ = validate_filter_syntax("count=42")
     assert k == "count" and v == 42
+
+    for expr, expected_key, expected_tuple in [
+        ("dictionaryName==MedDRA", "dictionaryName", ("==", "MedDRA")),
+        ("revision>=2", "revision", (">=", 2)),
+        ("subjectStatus!=Enrolled", "subjectStatus", ("!=", "Enrolled")),
+        ("revision>1", "revision", (">", 1)),
+    ]:
+        ok, parsed_key, parsed_val, parse_err = validate_filter_syntax(expr)
+        assert ok is True
+        assert parsed_key == expected_key
+        assert parsed_val == expected_tuple
+        assert parse_err is None
+
+    ok_visit, visit_k, visit_v, visit_err = validate_filter_syntax(
+        "interval_name=Screening", model=Visit
+    )
+    assert ok_visit is True
+    assert visit_k == "interval_name"
+    assert visit_v == "Screening"
+    assert visit_err is None
+
+    bad_visit, bad_k, bad_v, bad_err = validate_filter_syntax("visit_key=SCREENING", model=Visit)
+    assert bad_visit is False
+    assert bad_k is None
+    assert bad_v is None
+    assert bad_err is not None
+    assert "Unknown filter attribute 'visit_key' for Visit" in bad_err
 
 
 def test_validate_filter_syntax_invalid() -> None:

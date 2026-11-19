@@ -6,6 +6,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from imednet.endpoints.records import RecordsEndpoint
+from imednet.models.visits import Visit
+from imednet.spi.utils import (
+    ORDERED_FILTER_OPERATORS,
+    normalize_utc_timestamp_bound,
+    parse_filter_expression,
+    parse_filter_expressions,
+)
 from imednet.utils.dates import format_iso_datetime, parse_iso_datetime
 from imednet.utils.filters import (
     ALLOWED_OPERATORS,
@@ -315,3 +322,94 @@ def test_endpoint_resolve_params_special_param_record_data_filter() -> None:
             extra_params=None,
             filters={"record_data_filter": "a==1;b==2,c==3"},
         )
+
+
+@pytest.mark.parametrize("bad_key", ["revision>", "revision<", "status!", "key=1", "name~"])
+def test_validate_filter_key_rejects_operator_chars(bad_key: str) -> None:
+    """Test that validate_filter_key rejects operator characters in keys."""
+    with pytest.raises(ValueError, match="cannot contain operator characters"):
+        validate_filter_key(bad_key)
+
+
+def test_validate_filter_key_model_attributes() -> None:
+    """Test model-backed filter key validation for snake_case and camelCase attributes."""
+    validate_filter_key("interval_name", model=Visit)
+    validate_filter_key("intervalName", model=Visit)
+    validate_filter_key("visit_id", model=Visit)
+    validate_filter_key("visitId", model=Visit)
+    with pytest.raises(ValueError, match="Unknown filter attribute 'visit_key' for Visit"):
+        validate_filter_key("visit_key", model=Visit)
+
+
+def test_ordered_filter_operators_and_expression_parsing() -> None:
+    """Test operator-aware filter expression parsing across all documented operators."""
+    assert ORDERED_FILTER_OPERATORS == ("<=", ">=", "!=", "==", "=~", "<", ">")
+    assert parse_filter_expression("dictionaryName==MedDRA") == (
+        "dictionaryName",
+        ("==", "MedDRA"),
+    )
+    assert parse_filter_expression("revision>=2") == ("revision", (">=", 2))
+    assert parse_filter_expression("revision<=5") == ("revision", ("<=", 5))
+    assert parse_filter_expression("subjectStatus!=Enrolled") == (
+        "subjectStatus",
+        ("!=", "Enrolled"),
+    )
+    assert parse_filter_expression("subjectKey=~^SUBJ.*") == (
+        "subjectKey",
+        ("=~", "^SUBJ.*"),
+    )
+    assert parse_filter_expression("revision>1") == ("revision", (">", 1))
+    assert parse_filter_expression("revision<10") == ("revision", ("<", 10))
+    assert parse_filter_expression("interval_name=Screening", model=Visit) == (
+        "interval_name",
+        "Screening",
+    )
+
+    with pytest.raises(ValueError, match="Unknown filter attribute 'visit_key' for Visit"):
+        parse_filter_expression("visit_key=SCREENING", model=Visit)
+
+    for malformed in ["", "   ", "no_op", "=val", "key=", "a===b", "a<>b", "field~=val"]:
+        with pytest.raises(ValueError):
+            parse_filter_expression(malformed)
+
+
+def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None:
+    """Test that multiple operator tuples on one key join with semicolon AND connector."""
+    parsed = parse_filter_expressions(
+        [
+            "dateCreated>=2026-01-01T00:00:00Z",
+            "dateCreated<=2026-02-01T23:59:59Z",
+            "studyKey==STUDY",
+        ]
+    )
+    assert parsed == {
+        "dateCreated": [
+            (">=", "2026-01-01T00:00:00Z"),
+            ("<=", "2026-02-01T23:59:59Z"),
+        ],
+        "studyKey": ("==", "STUDY"),
+    }
+    assert (
+        build_filter_string(parsed)
+        == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z;studyKey==STUDY"
+    )
+
+    with pytest.raises(ValueError, match="cannot mix operator tuples and scalar values"):
+        build_filter_string({"age": [(">", 18), 30]})
+
+    with pytest.raises(ValueError, match="must have exactly 2 elements"):
+        build_filter_string({"age": [(">", 18, "bad")]})  # type: ignore[list-item]
+
+
+def test_normalize_utc_timestamp_bound() -> None:
+    """Test date-only and timestamp normalization for UTC audit bounds."""
+    assert normalize_utc_timestamp_bound("2026-01-01", is_end=False) == "2026-01-01T00:00:00Z"
+    assert normalize_utc_timestamp_bound("2026-02-01", is_end=True) == "2026-02-01T23:59:59Z"
+    assert (
+        normalize_utc_timestamp_bound("2026-01-15T14:30:00+02:00", is_end=False)
+        == "2026-01-15T12:30:00Z"
+    )
+    with pytest.raises(ValueError):
+        normalize_utc_timestamp_bound("")
+    with pytest.raises(ValueError):
+        normalize_utc_timestamp_bound("2026-99-99")

@@ -143,55 +143,35 @@ def prompt_iso8601_timestamp(
         print_progress(f"Validation Error: {err}")
 
 
-def validate_filter_syntax(filter_str: str) -> tuple[bool, str | None, Any | None, str | None]:
-    """Validate a single 'key=value' filter parameter string.
+def validate_filter_syntax(
+    filter_str: str,
+    *,
+    model: type[Any] | None = None,
+) -> tuple[bool, str | None, Any | None, str | None]:
+    """Validate a single filter parameter string via the shared SPI parser.
 
     Args:
         filter_str: Raw filter string.
+        model: Optional endpoint resource model class used to validate filter keys.
 
     Returns:
         A tuple of (is_valid, key, parsed_value, error_message).
     """
-    if (
-        not filter_str
-        or "=" not in filter_str
-        or filter_str.startswith("=")
-        or filter_str.endswith("=")
-    ):
-        return (
-            False,
-            None,
-            None,
-            f"Invalid filter format: '{filter_str}'. Format must be 'key=value' with non-empty key and value (e.g., 'form_key=DEMO' or 'subject_status=Screened').",
-        )
+    from imednet.spi.utils import parse_filter_expression
 
-    key, value = filter_str.split("=", 1)
-    k_strip = key.strip()
-    v_strip = value.strip()
-    if not k_strip or not v_strip:
-        return (
-            False,
-            None,
-            None,
-            f"Invalid filter format: '{filter_str}'. Key and value cannot be empty. Format must be 'key=value' (e.g., 'form_key=DEMO').",
-        )
-
-    if v_strip.lower() == "true":
-        parsed_val: Any = True
-    elif v_strip.lower() == "false":
-        parsed_val = False
-    elif v_strip.isdigit():
-        parsed_val = int(v_strip)
-    else:
-        parsed_val = v_strip
-
-    return True, k_strip, parsed_val, None
+    try:
+        key, parsed_val = parse_filter_expression(filter_str, model=model)
+    except ValueError as exc:
+        return False, None, None, str(exc)
+    return True, key, parsed_val, None
 
 
 def prompt_filters(
     category_name: str,
     example: str,
     existing_filters: list[str] | None = None,
+    *,
+    model: type[Any] | None = None,
 ) -> list[str]:
     """Interactively prompt and validate key-value filters for a category.
 
@@ -199,14 +179,15 @@ def prompt_filters(
         category_name: Name of the filter category (e.g., 'subject filter').
         example: An illustrative example string (e.g., 'subject_status=Screened').
         existing_filters: Filters already supplied on the command line.
+        model: Optional endpoint resource model class used to validate filter keys.
 
     Returns:
-        A list of validated 'key=value' filter strings.
+        A list of validated filter strings.
     """
     filters: list[str] = []
     if existing_filters:
         for f in existing_filters:
-            is_valid, _, _, err = validate_filter_syntax(f)
+            is_valid, _, _, err = validate_filter_syntax(f, model=model)
             if is_valid:
                 filters.append(f)
             else:
@@ -220,7 +201,7 @@ def prompt_filters(
                     )
                     sys.exit(1)
                 while True:
-                    c_valid, _, _, c_err = validate_filter_syntax(corrected)
+                    c_valid, _, _, c_err = validate_filter_syntax(corrected, model=model)
                     if c_valid:
                         filters.append(corrected)
                         break
@@ -245,7 +226,7 @@ def prompt_filters(
         entry = prompt_input(prompt_msg)
         if not entry:
             break
-        is_valid, _, _, err = validate_filter_syntax(entry)
+        is_valid, _, _, err = validate_filter_syntax(entry, model=model)
         if is_valid:
             filters.append(entry)
             prompt_msg = f"Enter additional {category_name} (or press Enter to finish)"

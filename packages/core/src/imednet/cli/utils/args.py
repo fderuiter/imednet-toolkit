@@ -11,31 +11,21 @@ from .output import print_error
 STUDY_KEY_ARG = "The key identifying the study."
 
 
-def parse_filter_args(filter_args: list[str] | None) -> dict[str, Any] | None:
-    """Parse a list of ``key=value`` strings into a dictionary."""
+def parse_filter_args(
+    filter_args: list[str] | None,
+    *,
+    model: type[Any] | None = None,
+) -> dict[str, Any] | None:
+    """Parse CLI filter strings into a dictionary via the shared SPI filter parser."""
     if not filter_args:
         return None
-    filter_dict: dict[str, str | bool | int] = {}
-    for arg in filter_args:
-        if "=" not in arg or arg.startswith("=") or arg.endswith("="):
-            print_error(
-                f"Error: Invalid filter format: '{arg}'. Use 'key=value' with non-empty key and value."
-            )
-            sys.exit(1)
-        key, value = arg.split("=", 1)
-        if not key.strip() or not value.strip():
-            print_error(f"Error: Invalid filter format: '{arg}'. Key and value cannot be empty.")
-            sys.exit(1)
+    from imednet.spi.utils import parse_filter_expressions
 
-        if value.lower() == "true":
-            filter_dict[key.strip()] = True
-        elif value.lower() == "false":
-            filter_dict[key.strip()] = False
-        elif value.isdigit():
-            filter_dict[key.strip()] = int(value)
-        else:
-            filter_dict[key.strip()] = value
-    return filter_dict
+    try:
+        return parse_filter_expressions(filter_args, model=model)
+    except ValueError as exc:
+        print_error(f"Error: {exc}")
+        sys.exit(1)
 
 
 def add_no_interactive(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
