@@ -263,6 +263,13 @@ class SimulationState:
                     "intervalId": 501,
                     "intervalName": "Baseline",
                     "studyKey": "STUDY",
+                    "forms": [
+                        {
+                            "formId": 302,
+                            "formKey": "F_VS",
+                            "formName": "Vital Signs",
+                        }
+                    ],
                 }
             ]
 
@@ -424,22 +431,76 @@ class SimulationState:
             return [r for r in records if r.get("studyKey") == study_key]
 
     def create_records(self, study_key: str, records_data: list[dict[str, Any]]) -> dict[str, Any]:
-        """Store new records in memory and return a background Job creation response."""
+        """Store new records in memory, sync enrolled subjects, and return a background Job."""
         with self._lock:
+            study_sites = [s for s in self.sites if s.get("studyKey") == study_key]
+            default_site = study_sites[0] if study_sites else {"siteId": 101, "siteName": "SITE"}
+            job_results: list[dict[str, Any]] = []
+
             for item in records_data:
                 self._next_record_id += 1
                 rec_id = self._next_record_id
                 rec_data = item.get("data") or item.get("recordData") or item
+                subj_key = item.get("subjectKey") or f"SUBJ-{rec_id}"
+
+                requested_site_name = item.get("siteName")
+                matched_site = (
+                    next(
+                        (s for s in study_sites if s.get("siteName") == requested_site_name),
+                        None,
+                    )
+                    if requested_site_name
+                    else None
+                )
+                site_id = item.get(
+                    "siteId",
+                    matched_site["siteId"] if matched_site else default_site["siteId"],
+                )
+                site_name = requested_site_name or (
+                    matched_site["siteName"] if matched_site else default_site["siteName"]
+                )
+
+                existing_subject = next(
+                    (
+                        s
+                        for s in self.subjects
+                        if s.get("studyKey") == study_key and s.get("subjectKey") == subj_key
+                    ),
+                    None,
+                )
+                if existing_subject is not None:
+                    subj_id = existing_subject.get("subjectId", 200 + (rec_id % 100))
+                    existing_subject["dateModified"] = "2026-11-15T00:00:00Z"
+                    existing_subject["lastUpdated"] = "2026-11-15T00:00:00Z"
+                else:
+                    subj_id = item.get("subjectId", 200 + len(self.subjects) + 1)
+                    self.subjects.append(
+                        {
+                            "subjectId": subj_id,
+                            "subjectKey": subj_key,
+                            "studyKey": study_key,
+                            "siteId": site_id,
+                            "siteName": site_name,
+                            "subjectStatus": "Enrolled",
+                            "deleted": False,
+                            "keywords": copy.deepcopy(item.get("keywords", [])),
+                            "dateCreated": "2026-11-15T00:00:00Z",
+                            "dateModified": "2026-11-15T00:00:00Z",
+                            "lastUpdated": "2026-11-15T00:00:00Z",
+                        }
+                    )
+
+                form_key = item.get("formKey", "F_DM")
                 record_entry = {
                     "recordId": rec_id,
                     "studyKey": study_key,
-                    "subjectKey": item.get("subjectKey") or f"SUBJ-{rec_id}",
-                    "subjectId": item.get("subjectId", 200 + (rec_id % 100)),
+                    "subjectKey": subj_key,
+                    "subjectId": subj_id,
                     "formId": item.get("formId", 301),
-                    "formKey": item.get("formKey", "F_DM"),
+                    "formKey": form_key,
                     "visitId": item.get("visitId", 401),
                     "intervalId": item.get("intervalId", 501),
-                    "siteId": item.get("siteId", 101),
+                    "siteId": site_id,
                     "recordType": item.get("recordType", "Standard"),
                     "recordStatus": "Complete",
                     "recordData": copy.deepcopy(rec_data),
@@ -449,6 +510,15 @@ class SimulationState:
                     "lastUpdated": "2026-11-15T00:00:00Z",
                 }
                 self.records.append(record_entry)
+                job_results.append(
+                    {
+                        "recordId": rec_id,
+                        "subjectId": subj_id,
+                        "subjectKey": subj_key,
+                        "formKey": form_key,
+                        "status": "SUCCESS",
+                    }
+                )
 
             batch_id = f"BATCH-{self._next_batch_num}"
             job_id = f"JOB-{self._next_batch_num}"
@@ -462,7 +532,8 @@ class SimulationState:
                 "totalRecords": len(records_data),
                 "successfulRecords": len(records_data),
                 "failedRecords": 0,
-                "results": {"status": "Completed", "recordsCreated": len(records_data)},
+                "resultUrl": f"/api/v1/edc/studies/{study_key}/jobs/{batch_id}/results",
+                "results": job_results,
                 "dateCreated": "2026-11-15T00:00:00Z",
                 "dateStarted": "2026-11-15T00:00:00Z",
                 "dateFinished": "2026-11-15T00:00:00Z",

@@ -6,11 +6,13 @@ They are architecturally linked to the core execution engine.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
     TypeVar,
+    cast,
 )
 
 from imednet.models.codings import Coding
@@ -26,7 +28,13 @@ from imednet.models.subjects import Subject
 from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
-from imednet.utils.job_poller import JobProgressHandler
+from imednet.utils.batch_coordinator import (
+    DEFAULT_BATCH_CHUNK_SIZE,
+    AsyncBatchCoordinator,
+    BatchCoordinator,
+    BatchSubmissionSummary,
+)
+from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
 from imednet.utils.typing import FilterValue, JsonDict
 
 try:
@@ -37,7 +45,10 @@ except Exception:
     tracer = None
 
 
-def _trace_method(func: Any) -> Any:
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _trace_method(func: _F) -> _F:
     """Decorator to trace synchronous method execution with OpenTelemetry."""
     from functools import wraps
 
@@ -49,10 +60,10 @@ def _trace_method(func: Any) -> Any:
                 return func(*args, **kwargs)
         return func(*args, **kwargs)
 
-    return wrapper
+    return cast(_F, wrapper)
 
 
-def _async_trace_method(func: Any) -> Any:
+def _async_trace_method(func: _F) -> _F:
     """Decorator to trace asynchronous method execution with OpenTelemetry."""
     from functools import wraps
 
@@ -64,7 +75,7 @@ def _async_trace_method(func: Any) -> Any:
                 return await func(*args, **kwargs)
         return await func(*args, **kwargs)
 
-    return wrapper
+    return cast(_F, wrapper)
 
 
 if TYPE_CHECKING:
@@ -93,7 +104,9 @@ class _ListOperation(Generic[T]):
         if self.is_async:
 
             @_async_trace_method
-            async def wrapper(study_key: str | None = None, **filters: FilterValue) -> list[T]:
+            async def async_wrapper(
+                study_key: str | None = None, **filters: FilterValue
+            ) -> list[T]:
                 """Execute the asynchronous list operation and return a list of items."""
                 _filters: dict[str, Any] = dict(filters)
                 if self.endpoint_name == "studies":
@@ -102,21 +115,21 @@ class _ListOperation(Generic[T]):
                     res = endpoint.list(study_key, **_filters)
                 return [item async for item in res] if hasattr(res, "__aiter__") else await res
 
-            wrapper.__doc__ = f"Asynchronously list {self.endpoint_name}."
-        else:
+            async_wrapper.__doc__ = f"Asynchronously list {self.endpoint_name}."
+            async_wrapper.__name__ = self.name
+            return async_wrapper
 
-            @_trace_method
-            def wrapper(study_key: str | None = None, **filters: FilterValue) -> list[T]:
-                """Execute the synchronous list operation and return a list of items."""
-                _filters: dict[str, Any] = dict(filters)
-                if self.endpoint_name == "studies":
-                    return list(endpoint.list(**_filters))
-                return list(endpoint.list(study_key, **_filters))
+        @_trace_method
+        def sync_wrapper(study_key: str | None = None, **filters: FilterValue) -> list[T]:
+            """Execute the synchronous list operation and return a list of items."""
+            _filters: dict[str, Any] = dict(filters)
+            if self.endpoint_name == "studies":
+                return list(endpoint.list(**_filters))
+            return list(endpoint.list(study_key, **_filters))
 
-            wrapper.__doc__ = f"List {self.endpoint_name}."
-
-        wrapper.__name__ = self.name
-        return wrapper
+        sync_wrapper.__doc__ = f"List {self.endpoint_name}."
+        sync_wrapper.__name__ = self.name
+        return sync_wrapper
 
 
 class SyncSDKConvenienceMixin:
@@ -155,10 +168,60 @@ class SyncSDKConvenienceMixin:
         email_notify: bool | str | None = None,
         *,
         schema: Any = None,
+        skip_validation: bool = False,
     ) -> Job:
         """Create records in the specified study."""
+        if skip_validation:
+            return self.records.create(
+                study_key,
+                records_data,
+                email_notify=email_notify,
+                schema=schema,
+                skip_validation=True,
+            )
         return self.records.create(
-            study_key, records_data, email_notify=email_notify, schema=schema
+            study_key,
+            records_data,
+            email_notify=email_notify,
+            schema=schema,
+        )
+
+    @_trace_method
+    def create_records_batch(
+        self,
+        study_key: str,
+        records_data: list[JsonDict],
+        email_notify: bool | str | None = None,
+        *,
+        schema: Any = None,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        skip_validation: bool = False,
+        wait_for_completion: bool = False,
+        timeout: float = 300.0,
+        interval: float = 5.0,
+    ) -> BatchSubmissionSummary:
+        """Validate once and submit records in bounded chunks (default 100 per POST)."""
+        coordinator = BatchCoordinator(chunk_size=chunk_size)
+        return coordinator.submit(
+            study_key,
+            records_data,
+            lambda chunk: self.records.create(
+                study_key,
+                chunk,
+                email_notify=email_notify,
+                schema=schema,
+                skip_validation=True,
+            ),
+            schema=schema,
+            skip_validation=skip_validation,
+            wait_for_completion=wait_for_completion,
+            poll_many=lambda batch_ids: self.poll_jobs(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+            ),
+            require_batch_id=wait_for_completion,
         )
 
     @_trace_method
@@ -166,14 +229,35 @@ class SyncSDKConvenienceMixin:
         self,
         study_key: str,
         batch_id: str,
+        timeout: float = 300,
+        interval: float = 5,
         *,
-        interval: int = 5,
-        timeout: int = 300,
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Poll a job until it reaches a terminal state."""
         return self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
+        )
+
+    @_trace_method
+    def poll_jobs(
+        self,
+        study_key: str,
+        batch_ids: list[str],
+        *,
+        interval: float = 5.0,
+        timeout: float = 300.0,
+        on_progress: JobProgressHandler | None = None,
+        fail_fast: bool = False,
+    ) -> JobPollSummary:
+        """Poll multiple jobs concurrently and fetch terminal resultUrl payloads."""
+        return self.jobs.poll_many(
+            study_key,
+            batch_ids,
+            interval=interval,
+            timeout=timeout,
+            on_progress=on_progress,
+            fail_fast=fail_fast,
         )
 
 
@@ -217,10 +301,60 @@ class AsyncSDKConvenienceMixin:
         email_notify: bool | str | None = None,
         *,
         schema: Any = None,
+        skip_validation: bool = False,
     ) -> Job:
         """Asynchronously create records in the specified study."""
+        if skip_validation:
+            return await self.records.create(
+                study_key,
+                records_data,
+                email_notify=email_notify,
+                schema=schema,
+                skip_validation=True,
+            )
         return await self.records.create(
-            study_key, records_data, email_notify=email_notify, schema=schema
+            study_key,
+            records_data,
+            email_notify=email_notify,
+            schema=schema,
+        )
+
+    @_async_trace_method
+    async def async_create_records_batch(
+        self,
+        study_key: str,
+        records_data: list[JsonDict],
+        email_notify: bool | str | None = None,
+        *,
+        schema: Any = None,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        skip_validation: bool = False,
+        wait_for_completion: bool = False,
+        timeout: float = 300.0,
+        interval: float = 5.0,
+    ) -> BatchSubmissionSummary:
+        """Asynchronously validate once and submit records in bounded chunks."""
+        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
+        return await coordinator.submit(
+            study_key,
+            records_data,
+            lambda chunk: self.records.create(
+                study_key,
+                chunk,
+                email_notify=email_notify,
+                schema=schema,
+                skip_validation=True,
+            ),
+            schema=schema,
+            skip_validation=skip_validation,
+            wait_for_completion=wait_for_completion,
+            poll_many=lambda batch_ids: self.async_poll_jobs(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+            ),
+            require_batch_id=wait_for_completion,
         )
 
     @_async_trace_method
@@ -228,14 +362,35 @@ class AsyncSDKConvenienceMixin:
         self,
         study_key: str,
         batch_id: str,
+        timeout: float = 300,
+        interval: float = 5,
         *,
-        interval: int = 5,
-        timeout: int = 300,
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Asynchronously poll a job until it reaches a terminal state."""
         return await self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
+        )
+
+    @_async_trace_method
+    async def async_poll_jobs(
+        self,
+        study_key: str,
+        batch_ids: list[str],
+        *,
+        interval: float = 5.0,
+        timeout: float = 300.0,
+        on_progress: JobProgressHandler | None = None,
+        fail_fast: bool = False,
+    ) -> JobPollSummary:
+        """Asynchronously poll multiple jobs concurrently and fetch resultUrl payloads."""
+        return await self.jobs.poll_many(
+            study_key,
+            batch_ids,
+            interval=interval,
+            timeout=timeout,
+            on_progress=on_progress,
+            fail_fast=fail_fast,
         )
 
 

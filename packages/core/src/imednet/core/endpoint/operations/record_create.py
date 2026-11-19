@@ -29,6 +29,8 @@ class RecordCreateOperation(Generic[T]):
         records_data: list[dict[str, Any]],
         email_notify: bool | str | None = None,
         schema: BaseSchemaCache[Any] | None = None,
+        *,
+        skip_validation: bool = False,
     ) -> None:
         """Initialize the record creation operation.
 
@@ -37,6 +39,8 @@ class RecordCreateOperation(Generic[T]):
             records_data: List of record data objects to create.
             email_notify: Email notification setting.
             schema: Optional schema cache for validation.
+            skip_validation: If True, skip per-record schema validation because
+                the caller has already validated the batch.
 
         Raises:
             ValidationError: If record data is invalid against the schema.
@@ -46,15 +50,21 @@ class RecordCreateOperation(Generic[T]):
         self.records_data = records_data
         self.email_notify = email_notify
         self.schema = schema
+        self.skip_validation = skip_validation
 
         self._validate()
         self.headers = self._build_headers()
 
     def _validate(self) -> None:
-        """Validate records against schema if provided."""
-        if self.schema is not None:
-            for rec in self.records_data:
-                validate_record_entry(self.schema, rec)
+        """Validate records against schema if provided and not already validated."""
+        if (
+            self.skip_validation
+            or self.schema is None
+            or getattr(self.schema, "is_prevalidated", False) is True
+        ):
+            return
+        for rec in self.records_data:
+            validate_record_entry(self.schema, rec)
 
     def _build_headers(self) -> dict[str, str]:
         """Build headers for record creation request.

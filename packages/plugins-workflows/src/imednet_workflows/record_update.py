@@ -3,12 +3,95 @@
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
 
 from imednet.spi.models import Job
+from imednet.spi.utils import (
+    DEFAULT_BATCH_CHUNK_SIZE,
+    AsyncBatchCoordinator,
+    BatchCoordinator,
+    BatchSubmissionSummary,
+    JobPollSummary,
+)
 from imednet.spi.validation import AsyncSchemaValidator, SchemaCache, SchemaValidator
 
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
+
+
+def _poll_many_sync(
+    sdk: "ImednetFacade",
+    study_key: str,
+    batch_ids: list[str],
+    *,
+    timeout: int,
+    poll_interval: int,
+) -> JobPollSummary:
+    """Poll multiple batch IDs via facade poll_jobs with fallback to poll_job."""
+    poll_jobs_fn = getattr(sdk, "poll_jobs", None)
+    if callable(poll_jobs_fn):
+        candidate = poll_jobs_fn(
+            study_key,
+            batch_ids,
+            timeout=float(timeout),
+            interval=float(poll_interval),
+        )
+        if isinstance(candidate, JobPollSummary):
+            return candidate
+
+    results = {}
+    failures = {}
+    for bid in batch_ids:
+        try:
+            results[bid] = sdk.poll_job(study_key, bid, timeout=timeout, interval=poll_interval)
+        except Exception as exc:
+            failures[bid] = exc
+            raise
+    return JobPollSummary(
+        study_key=study_key,
+        results=results,
+        failures=failures,
+        elapsed_total=0.0,
+    )
+
+
+async def _poll_many_async(
+    sdk: "AsyncImednetFacade",
+    study_key: str,
+    batch_ids: list[str],
+    *,
+    timeout: int,
+    poll_interval: int,
+) -> JobPollSummary:
+    """Asynchronously poll multiple batch IDs via async_poll_jobs with fallback."""
+    poll_jobs_fn = getattr(sdk, "async_poll_jobs", None)
+    if callable(poll_jobs_fn):
+        maybe_coro = poll_jobs_fn(
+            study_key,
+            batch_ids,
+            timeout=float(timeout),
+            interval=float(poll_interval),
+        )
+        if hasattr(maybe_coro, "__await__"):
+            candidate = await maybe_coro
+            if isinstance(candidate, JobPollSummary):
+                return candidate
+
+    results = {}
+    failures = {}
+    for bid in batch_ids:
+        try:
+            results[bid] = await sdk.async_poll_job(
+                study_key, bid, timeout=timeout, interval=poll_interval
+            )
+        except Exception as exc:
+            failures[bid] = exc
+            raise
+    return JobPollSummary(
+        study_key=study_key,
+        results=results,
+        failures=failures,
+        elapsed_total=0.0,
+    )
 
 
 class RecordUpdateWorkflow:
@@ -18,11 +101,13 @@ class RecordUpdateWorkflow:
 
     Args:
         sdk: An instance of the ImednetFacade.
+        batch_size: Maximum number of records per API POST chunk (default: 100).
     """
 
-    def __init__(self, sdk: "FacadeLike"):
+    def __init__(self, sdk: "FacadeLike", *, batch_size: int = DEFAULT_BATCH_CHUNK_SIZE):
         """Initialize the record update workflow with an SDK instance."""
         self._sdk = sdk
+        self._batch_size = batch_size
         self._is_async = hasattr(sdk, "async_create_record")
         self._validator: SchemaValidator | AsyncSchemaValidator
         if self._is_async:
@@ -32,17 +117,49 @@ class RecordUpdateWorkflow:
 
         self._schema: SchemaCache = cast(SchemaCache, self._validator.schema)
 
+    def _collect_distinct_form_refs(
+        self, records_data: list[dict[str, Any]]
+    ) -> tuple[list[str], list[int]]:
+        """Collect distinct form keys and form IDs across all records in order."""
+        seen_keys: set[str] = set()
+        form_keys: list[str] = []
+        seen_ids: set[int] = set()
+        unresolved_form_ids: list[int] = []
+
+        for rec in records_data:
+            fk = rec.get("formKey") or rec.get("form_key")
+            if fk:
+                if fk not in seen_keys:
+                    seen_keys.add(fk)
+                    form_keys.append(fk)
+                continue
+
+            fid = rec.get("formId") or rec.get("form_id") or 0
+            if fid:
+                resolved = self._schema.form_key_from_id(fid)
+                if resolved:
+                    if resolved not in seen_keys:
+                        seen_keys.add(resolved)
+                        form_keys.append(resolved)
+                elif fid not in seen_ids:
+                    seen_ids.add(fid)
+                    unresolved_form_ids.append(fid)
+
+        return form_keys, unresolved_form_ids
+
     def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
-        """Refresh schema if the form key is missing from cache."""
+        """Refresh schema once if any distinct form key in the batch is uncached."""
         if not records_data:
             return
-        first_ref = records_data[0].get("formKey") or self._schema.form_key_from_id(
-            records_data[0].get("formId", 0)
-        )
-        if first_ref and not self._schema.variables_for_form(first_ref):
+        form_keys, unresolved_ids = self._collect_distinct_form_refs(records_data)
+        missing_before_refresh = [fk for fk in form_keys if not self._schema.variables_for_form(fk)]
+        if missing_before_refresh or unresolved_ids:
             cast(SchemaValidator, self._validator).refresh(study_key)
-            if first_ref not in self._schema.forms:
-                raise ValueError(f"Form key '{first_ref}' not found")
+            form_keys, _ = self._collect_distinct_form_refs(records_data)
+
+        for ref in form_keys:
+            if ref not in self._schema.forms:
+                raise ValueError(f"Form key '{ref}' not found")
 
     async def _async_validate_form_key(
         self, study_key: str, records_data: list[dict[str, Any]]
@@ -50,13 +167,45 @@ class RecordUpdateWorkflow:
         """Asynchronous variant of :meth:`_validate_form_key`."""
         if not records_data:
             return
-        first_ref = records_data[0].get("formKey") or self._schema.form_key_from_id(
-            records_data[0].get("formId", 0)
-        )
-        if first_ref and not self._schema.variables_for_form(first_ref):
+        form_keys, unresolved_ids = self._collect_distinct_form_refs(records_data)
+        missing_before_refresh = [fk for fk in form_keys if not self._schema.variables_for_form(fk)]
+        if missing_before_refresh or unresolved_ids:
             await cast(AsyncSchemaValidator, self._validator).refresh(study_key)
-            if first_ref not in self._schema.forms:
-                raise ValueError(f"Form key '{first_ref}' not found")
+            form_keys, _ = self._collect_distinct_form_refs(records_data)
+
+        for ref in form_keys:
+            if ref not in self._schema.forms:
+                raise ValueError(f"Form key '{ref}' not found")
+
+    def create_or_update_records_batch(
+        self,
+        study_key: str,
+        records_data: list[dict[str, Any]],
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        chunk_size: int | None = None,
+    ) -> BatchSubmissionSummary:
+        """Validate once, submit records in bounded chunks, and return a batch summary."""
+        self._validate_form_key(study_key, records_data)
+        sdk = cast("ImednetFacade", self._sdk)
+        coordinator = BatchCoordinator(chunk_size=chunk_size or self._batch_size)
+        return coordinator.submit(
+            study_key,
+            records_data,
+            lambda chunk: sdk.create_record(study_key, chunk, schema=self._schema),
+            schema=self._schema,
+            validate_batch_fn=cast(SchemaValidator, self._validator).validate_batch,
+            wait_for_completion=wait_for_completion,
+            poll_single=lambda bid: sdk.poll_job(
+                study_key, bid, timeout=timeout, interval=poll_interval
+            ),
+            poll_many=lambda bids: _poll_many_sync(
+                sdk, study_key, bids, timeout=timeout, poll_interval=poll_interval
+            ),
+            require_batch_id=True,
+        )
 
     def create_or_update_records(
         self,
@@ -67,19 +216,45 @@ class RecordUpdateWorkflow:
         poll_interval: int = 5,
     ) -> Job:
         """Submit records for creation or update and optionally wait for completion."""
-        self._validate_form_key(study_key, records_data)
+        summary = self.create_or_update_records_batch(
+            study_key=study_key,
+            records_data=records_data,
+            wait_for_completion=wait_for_completion,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+        if summary.last_job is not None:
+            return summary.last_job
+        return Job(state="COMPLETED")
 
-        cast(SchemaValidator, self._validator).validate_batch(study_key, records_data)
-        sdk = cast("ImednetFacade", self._sdk)
-        job = sdk.create_record(study_key, records_data, schema=self._schema)
-
-        if not wait_for_completion:
-            return job
-        if not job.batch_id:
-            raise ValueError("Submission successful but no batch_id received.")
-
-        return cast(
-            'Job', sdk.poll_job(study_key, job.batch_id, timeout=timeout, interval=poll_interval)
+    async def async_create_or_update_records_batch(
+        self,
+        study_key: str,
+        records_data: list[dict[str, Any]],
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        chunk_size: int | None = None,
+    ) -> BatchSubmissionSummary:
+        """Asynchronously validate once, submit chunks, and return a batch summary."""
+        await self._async_validate_form_key(study_key, records_data)
+        sdk = cast("AsyncImednetFacade", self._sdk)
+        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size or self._batch_size)
+        return await coordinator.submit(
+            study_key,
+            records_data,
+            lambda chunk: sdk.async_create_record(study_key, chunk, schema=self._schema),
+            schema=self._schema,
+            validate_batch_fn=cast(AsyncSchemaValidator, self._validator).validate_batch,
+            wait_for_completion=wait_for_completion,
+            poll_single=lambda bid: sdk.async_poll_job(
+                study_key, bid, timeout=timeout, interval=poll_interval
+            ),
+            poll_many=lambda bids: _poll_many_async(
+                sdk, study_key, bids, timeout=timeout, poll_interval=poll_interval
+            ),
+            require_batch_id=True,
         )
 
     async def async_create_or_update_records(
@@ -91,23 +266,16 @@ class RecordUpdateWorkflow:
         poll_interval: int = 5,
     ) -> Job:
         """Asynchronous variant of :meth:`create_or_update_records`."""
-        await self._async_validate_form_key(study_key, records_data)
-
-        await cast(AsyncSchemaValidator, self._validator).validate_batch(study_key, records_data)
-        sdk = cast("AsyncImednetFacade", self._sdk)
-        job = await sdk.async_create_record(study_key, records_data, schema=self._schema)
-
-        if not wait_for_completion:
-            return job
-        if not job.batch_id:
-            raise ValueError("Submission successful but no batch_id received.")
-
-        return cast(
-            'Job',
-            await sdk.async_poll_job(
-                study_key, job.batch_id, timeout=timeout, interval=poll_interval
-            ),
+        summary = await self.async_create_or_update_records_batch(
+            study_key=study_key,
+            records_data=records_data,
+            wait_for_completion=wait_for_completion,
+            timeout=timeout,
+            poll_interval=poll_interval,
         )
+        if summary.last_job is not None:
+            return summary.last_job
+        return Job(state="COMPLETED")
 
     def _build_record_payload(
         self,

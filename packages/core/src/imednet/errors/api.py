@@ -112,6 +112,27 @@ class ApiError(ImednetError):
         self.message = effective_message
         self.description = description
         self.field = field
+        self.variable: str | None = None
+        if isinstance(field, dict):
+            self.variable = _non_empty_str(field.get("variable")) or _non_empty_str(
+                field.get("attribute")
+            )
+
+    @property
+    def field_attribute(self) -> str | None:
+        """Return the offending field or variable name from ``field``, if present."""
+        if not isinstance(self.field, dict):
+            return None
+        return _non_empty_str(self.field.get("attribute")) or _non_empty_str(
+            self.field.get("variable")
+        )
+
+    @property
+    def field_value(self) -> Any:
+        """Return the redacted offending field value from ``field``, if present."""
+        if not isinstance(self.field, dict):
+            return None
+        return self.field.get("value")
 
     def __str__(self) -> str:
         """Return a string representation of the error, including status and response.
@@ -125,6 +146,15 @@ class ApiError(ImednetError):
             details.append(f"Status Code: {self.status_code}")
         if self.response:
             details.append(f"Response: {self.response}")
+        if isinstance(self.field, dict) and self.field:
+            redacted_field = _redact_sensitive_value(self.field)
+            attr = _non_empty_str(redacted_field.get("attribute")) or _non_empty_str(
+                redacted_field.get("variable")
+            )
+            if attr is not None and "value" in redacted_field:
+                details.append(f"Field: {attr}={redacted_field['value']!r}")
+            elif attr is not None:
+                details.append(f"Field: {attr}")
         if details:
             return f"{base} ({', '.join(details)})"
         return base

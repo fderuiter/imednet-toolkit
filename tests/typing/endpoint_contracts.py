@@ -7,12 +7,18 @@ from imednet.endpoints.studies import AsyncStudiesEndpoint, StudiesEndpoint, Stu
 from imednet.models.jobs import JobStatus
 from imednet.models.records import Record
 from imednet.models.studies import Study
+from imednet.utils.batch_coordinator import BatchSubmissionSummary
+from imednet.utils.job_poller import JobPollSummary
 
 
 def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.records.list('S'), Iterator[Record])
+    assert_type(sdk.records.create_batch('S', [{'a': 1}]), BatchSubmissionSummary)
+    assert_type(sdk.create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(sdk.jobs.get('S', 'B'), JobStatus)
     assert_type(sdk.jobs.poll('S', 'B'), JobStatus)
+    assert_type(sdk.jobs.poll_many('S', ['B1', 'B2']), JobPollSummary)
+    assert_type(sdk.poll_jobs('S', ['B1', 'B2']), JobPollSummary)
     assert_type(sdk.studies.get('S'), Study)
     assert_type(sdk.studies.get('S').study_key, str | None)
     assert_type(sdk.studies.get(study_key='S'), Study)
@@ -26,8 +32,12 @@ def sync_contract(sdk: ImednetSDK) -> None:
 
 async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(sdk.records.list('S'), AsyncIterator[Record])
+    assert_type(await sdk.records.create_batch('S', [{'a': 1}]), BatchSubmissionSummary)
+    assert_type(await sdk.async_create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(await sdk.jobs.get('S', 'B'), JobStatus)
     assert_type(await sdk.jobs.poll('S', 'B'), JobStatus)
+    assert_type(await sdk.jobs.poll_many('S', ['B1', 'B2']), JobPollSummary)
+    assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2']), JobPollSummary)
     assert_type(await sdk.studies.get('S'), Study)
     assert_type((await sdk.studies.get('S')).study_key, str | None)
     assert_type(await sdk.studies.get(study_key='S'), Study)

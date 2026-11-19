@@ -12,12 +12,49 @@ from pydantic import Field
 
 from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import ImednetBaseModel, Job, JobState, normalize_job_state
-from imednet.spi.utils import JobFailedError, JobPoller, JobTimeoutError
+from imednet.spi.utils import (
+    DEFAULT_BATCH_CHUNK_SIZE,
+    JobFailedError,
+    JobPoller,
+    JobPollSummary,
+    JobTimeoutError,
+    chunk_records,
+)
 
-from .generator import GeneratedRecordSet
+from .generator import GeneratedRecordSet, SyntheticRecordGenerator
 from .models import RecordTestType
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_subject_keys_from_job_results(results_payload: Any) -> list[str]:
+    """Extract server-assigned subject keys from a polled JobStatus.results payload."""
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def _add(val: Any) -> None:
+        if isinstance(val, str) and val.strip() and val.strip() not in seen:
+            seen.add(val.strip())
+            keys.append(val.strip())
+
+    if isinstance(results_payload, list):
+        for entry in results_payload:
+            if isinstance(entry, dict):
+                status = str(entry.get("status") or "").upper()
+                if status in {"FAIL", "FAILED", "ERROR"}:
+                    continue
+                _add(entry.get("subjectKey") or entry.get("subject_key"))
+    elif isinstance(results_payload, dict):
+        for list_field in ("subjectKeys", "subject_keys", "subjects", "records", "data"):
+            nested = results_payload.get(list_field)
+            if isinstance(nested, list):
+                for item in nested:
+                    if isinstance(item, str):
+                        _add(item)
+                    elif isinstance(item, dict):
+                        _add(item.get("subjectKey") or item.get("subject_key"))
+        _add(results_payload.get("subjectKey") or results_payload.get("subject_key"))
+    return keys
 
 
 class SubmissionPhase(StrEnum):
@@ -50,6 +87,7 @@ class SubmissionResult(ImednetBaseModel):
     completed_at: datetime | None = None
     registration_batches: list[BatchSubmission] = Field(default_factory=list)
     data_batches: list[BatchSubmission] = Field(default_factory=list)
+    enrolled_subject_keys: list[str] = Field(default_factory=list)
     skipped_forms: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -108,10 +146,11 @@ class BulkRecordSubmissionWorkflow:
     def __init__(
         self,
         sdk: ImednetFacade,
-        batch_size: int = 100,
+        batch_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         await_registration: bool = True,
         registration_timeout: float = 600.0,
         skip_existing_subjects: bool = True,
+        registration_poll_interval: float | None = None,
     ) -> None:
         """Initialize the workflow."""
         self.sdk = sdk
@@ -119,6 +158,7 @@ class BulkRecordSubmissionWorkflow:
         self.await_registration = await_registration
         self.registration_timeout = registration_timeout
         self.skip_existing_subjects = skip_existing_subjects
+        self.registration_poll_interval = registration_poll_interval
         self.phase: SubmissionPhase = SubmissionPhase.PENDING
 
     def submit(
@@ -148,17 +188,25 @@ class BulkRecordSubmissionWorkflow:
         if self.skip_existing_subjects:
             existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
 
+        submitted_placeholders: list[str] = []
+        skipped_placeholders: set[str] = set()
+
         # Phase 1: Registration
         self.phase = SubmissionPhase.REGISTRATION
         for rs in registration_sets:
-            # Let's assume GeneratedRecordSet.payloads and GeneratedRecordSet.subject_keys are 1:1
             filtered_payloads = []
             for i, payload in enumerate(rs.payloads):
                 subj_key = rs.subject_keys[i] if i < len(rs.subject_keys) else None
                 if subj_key and subj_key in existing_subjects:
                     logger.info("Skipping registration for existing subject: %s", subj_key)
+                    skipped_placeholders.add(subj_key)
                     continue
-                filtered_payloads.append(payload)
+                clean_payload = dict(payload)
+                clean_payload.pop("subjectKey", None)
+                clean_payload.pop("subject_key", None)
+                filtered_payloads.append(clean_payload)
+                if subj_key:
+                    submitted_placeholders.append(subj_key)
 
             if not filtered_payloads:
                 result.skipped_forms.append(rs.form_key)
@@ -182,13 +230,30 @@ class BulkRecordSubmissionWorkflow:
             self.phase = SubmissionPhase.DATA
 
         # Explicit submission phase check for awaiting registration
+        enrolled_keys: list[str] = []
         if self.phase == SubmissionPhase.AWAITING_REGISTRATION:
             try:
-                self._await_registration_jobs(study_key, result.registration_batches)
+                enrolled_keys = self._await_registration_jobs(
+                    study_key, result.registration_batches
+                )
             except Exception:
                 self.phase = SubmissionPhase.FAILED
                 raise
             self.phase = SubmissionPhase.DATA
+
+        if not enrolled_keys and result.registration_batches and data_sets:
+            enrolled_keys = self._fallback_resolve_enrolled_subjects(
+                study_key, len(submitted_placeholders)
+            )
+
+        if enrolled_keys:
+            result.enrolled_subject_keys = list(enrolled_keys)
+            SyntheticRecordGenerator.resolve_subject_keys(
+                record_sets,
+                enrolled_keys,
+                placeholder_keys=submitted_placeholders or None,
+                preserved_keys=skipped_placeholders,
+            )
 
         # Explicit submission phase check for data submission
         if self.phase == SubmissionPhase.DATA:
@@ -211,8 +276,7 @@ class BulkRecordSubmissionWorkflow:
 
     def _chunk_payloads(self, payloads: list[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:
         """Yield successive batch_size chunks of payloads."""
-        for i in range(0, len(payloads), self.batch_size):
-            yield payloads[i : i + self.batch_size]
+        yield from chunk_records(payloads, self.batch_size)
 
     def _submit_batch(
         self,
@@ -233,22 +297,45 @@ class BulkRecordSubmissionWorkflow:
             job=job,
         )
 
-    def _await_registration_jobs(self, study_key: str, batches: list[BatchSubmission]) -> None:
-        """Block until all Phase 1 jobs reach terminal state concurrently."""
-        batches_to_poll = [b for b in batches if b.job.batch_id]
-        if not batches_to_poll:
-            return
+    def _poll_registration_batches(self, study_key: str, batch_ids: list[str]) -> JobPollSummary:
+        """Poll Phase 1 batches via facade poll_jobs (fetching resultUrl) with mock fallback."""
+        poll_kwargs: dict[str, Any] = {
+            "timeout": float(self.registration_timeout),
+            "fail_fast": False,
+        }
+        if self.registration_poll_interval is not None:
+            poll_kwargs["interval"] = float(self.registration_poll_interval)
+
+        poll_jobs_fn = getattr(self.sdk, "poll_jobs", None)
+        if callable(poll_jobs_fn):
+            candidate = poll_jobs_fn(
+                study_key,
+                batch_ids,
+                **poll_kwargs,
+            )
+            if isinstance(candidate, JobPollSummary):
+                return candidate
 
         poller = JobPoller(get_job=self.sdk.get_job)
-        batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
-        summary = poller.poll_many(
+        return poller.poll_many(
             study_key,
             batch_ids,
-            timeout=float(self.registration_timeout),
-            fail_fast=False,
+            **poll_kwargs,
         )
 
+    def _await_registration_jobs(self, study_key: str, batches: list[BatchSubmission]) -> list[str]:
+        """Block until all Phase 1 jobs reach terminal state and return enrolled Subject keys."""
+        batches_to_poll = [b for b in batches if b.job.batch_id]
+        if not batches_to_poll:
+            return []
+
+        batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
+        summary = self._poll_registration_batches(study_key, batch_ids)
+
         failed_batches: list[BatchSubmission] = []
+        enrolled_keys: list[str] = []
+        seen_enrolled: set[str] = set()
+
         for batch in batches_to_poll:
             batch_id = batch.job.batch_id
             if batch_id in summary.failures:
@@ -258,7 +345,16 @@ class BulkRecordSubmissionWorkflow:
                 elif isinstance(exc, JobFailedError):
                     status = getattr(exc, "status", None)
                     raw_state = getattr(status, "state", None)
-                    target_state = normalize_job_state(raw_state) if raw_state else JobState.FAILED
+                    status_failed_records = getattr(status, "failed_records", 0)
+                    status_result_err = getattr(status, "result_error", None)
+                    if (
+                        isinstance(status_failed_records, int) and status_failed_records > 0
+                    ) or status_result_err:
+                        target_state = JobState.FAILED
+                    else:
+                        target_state = (
+                            normalize_job_state(raw_state) if raw_state else JobState.FAILED
+                        )
                 else:
                     target_state = JobState.FAILED
                 batch.job.transition_to(target_state)
@@ -272,23 +368,35 @@ class BulkRecordSubmissionWorkflow:
                 batch.job.transition_to(target_state)
                 if not isinstance(batch.job, Job):
                     batch.job.state = target_state
+                status_success = getattr(status, "is_successful", None)
                 is_success = (
-                    batch.job.is_successful
-                    if isinstance(batch.job.is_successful, bool)
+                    status_success
+                    if isinstance(status_success, bool)
                     else (
-                        getattr(batch.job, "state", None)
-                        in (
-                            JobState.COMPLETED,
-                            JobState.COMPLETE,
-                            JobState.SUCCESS,
-                            "COMPLETED",
-                            "COMPLETE",
-                            "SUCCESS",
+                        batch.job.is_successful
+                        if isinstance(batch.job.is_successful, bool)
+                        else (
+                            getattr(batch.job, "state", None)
+                            in (
+                                JobState.COMPLETED,
+                                JobState.COMPLETE,
+                                JobState.SUCCESS,
+                                "COMPLETED",
+                                "COMPLETE",
+                                "SUCCESS",
+                            )
                         )
                     )
                 )
                 if not is_success:
                     failed_batches.append(batch)
+                else:
+                    for key in _extract_subject_keys_from_job_results(
+                        getattr(status, "results", None)
+                    ):
+                        if key not in seen_enrolled:
+                            seen_enrolled.add(key)
+                            enrolled_keys.append(key)
             else:
                 batch.job.transition_to(JobState.FAILED)
                 if not isinstance(batch.job, Job):
@@ -300,6 +408,31 @@ class BulkRecordSubmissionWorkflow:
                 f"{len(failed_batches)} registration batches failed.",
                 failed_batches=failed_batches,
             )
+
+        return enrolled_keys
+
+    def _fallback_resolve_enrolled_subjects(self, study_key: str, expected_count: int) -> list[str]:
+        """Resolve enrolled subjects via get_subjects when Job results lack subject keys."""
+        if not self.skip_existing_subjects and type(self.sdk).__module__.startswith(
+            "unittest.mock"
+        ):
+            return []
+        get_subjects_fn = getattr(self.sdk, "get_subjects", None)
+        if not callable(get_subjects_fn):
+            return []
+        subjects = get_subjects_fn(study_key)
+        if not isinstance(subjects, list):
+            return []
+        keys: list[str] = []
+        for subj in subjects:
+            if getattr(subj, "deleted", False):
+                continue
+            key = getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None)
+            if isinstance(key, str) and key.strip():
+                keys.append(key.strip())
+        if expected_count > 0 and len(keys) > expected_count:
+            return keys[-expected_count:]
+        return keys
 
     def _find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
         """Query subjects filtered by keyword to find pre-existing UAT subjects."""

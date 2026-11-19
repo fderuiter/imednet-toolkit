@@ -143,8 +143,13 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
 
             if resource == "jobs":
                 if sub_id is not None:
-                    # Single job status lookup
+                    sub_action = segments[4] if len(segments) >= 5 else None
                     job_status = self.state.get_job(study_key, sub_id)
+                    if sub_action == "results":
+                        return httpx.Response(
+                            200, json=job_status.get("results", []), request=request
+                        )
+                    # Single job status lookup
                     return httpx.Response(200, json=job_status, request=request)
                 # List jobs: JobsEndpoint uses JsonListPaginator which expects a raw JSON list
                 items = self.state.get_jobs(study_key)
@@ -166,6 +171,8 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         if len(segments) >= 1 and segments[0] == "jobs":
             batch_id = segments[1] if len(segments) >= 2 else "BATCH"
             job_status = self.state.get_job(None, batch_id)
+            if len(segments) >= 3 and segments[2] == "results":
+                return httpx.Response(200, json=job_status.get("results", []), request=request)
             return httpx.Response(200, json=job_status, request=request)
 
         # Fallback for unrecognized endpoints: return empty paginated response

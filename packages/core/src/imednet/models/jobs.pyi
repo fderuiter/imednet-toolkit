@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -49,7 +49,7 @@ def validate_job_transition(from_state: JobState | str, to_state: JobState | str
 class Job(ImednetBaseModel):
     """Represents an asynchronous background job."""
 
-    state: JobState | str | None
+    state: JobState | str | None = None
 
     def transition_to(self, target: JobState | str) -> Job: ...
     @property
@@ -59,17 +59,24 @@ class Job(ImednetBaseModel):
     @property
     def is_failed(self) -> bool: ...
 
-    job_id: str | None
-    batch_id: str | None
-    date_created: Any
-    date_finished: Any
-    date_started: Any
+    job_id: str | None = None
+    batch_id: str | None = None
+    date_created: Any = None
+    date_finished: Any = None
+    date_started: Any = None
 
 class JobStatus(Job):
     """Extended job information returned when polling."""
 
     results: Any = Field(default=None)
+    record_total_count: int | None = Field(default=None, alias="totalRecords")
+    record_success_count: int | None = Field(default=None, alias="successfulRecords")
+    record_failure_count: int | None = Field(default=None, alias="failedRecords")
+    result_error: str | None = Field(default=None, alias="resultError")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_record_count_keys(cls, data: Any) -> Any: ...
     @field_validator("progress", mode="before", check_fields=False)
     def _parse_progress(cls, v: Any) -> int: ...
     @property
@@ -78,12 +85,16 @@ class JobStatus(Job):
     def successful_records(self) -> int: ...
     @property
     def failed_records(self) -> int: ...
+    @property
+    def is_successful(self) -> bool: ...
+    @property
+    def is_failed(self) -> bool: ...
 
-    job_id: str | None
-    batch_id: str | None
-    state: JobState | str | None
-    date_created: str | None
-    date_started: str | None
-    date_finished: str | None
-    progress: int | None
-    result_url: str | None
+    job_id: str | None = None
+    batch_id: str | None = None
+    state: JobState | str | None = None
+    date_created: str | None = None
+    date_started: str | None = None
+    date_finished: str | None = None
+    progress: int | None = None
+    result_url: str | None = None

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -36,6 +37,21 @@ class BaseSchemaCache(Generic[_TClient]):
         self._is_async = is_async
         self._form_variables: dict[str, dict[str, Variable]] = {}
         self._form_id_to_key: dict[int, str] = {}
+        self._prevalidated_depth: int = 0
+
+    @property
+    def is_prevalidated(self) -> bool:
+        """Return True while inside a ``prevalidated()`` batch submission context."""
+        return self._prevalidated_depth > 0
+
+    @contextmanager
+    def prevalidated(self) -> Iterator[None]:
+        """Mark records using this schema cache as already validated for the active block."""
+        self._prevalidated_depth += 1
+        try:
+            yield
+        finally:
+            self._prevalidated_depth = max(0, self._prevalidated_depth - 1)
 
     def populate(self, variables: Iterable[Variable]) -> None:
         """Populate the cache with the given variables."""

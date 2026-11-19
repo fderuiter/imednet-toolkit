@@ -84,6 +84,8 @@ class SyntheticRecordGenerator:
         self,
         spec: UATSpecification,
         snapshot: StudySnapshot,
+        *,
+        subject_keys: list[str] | None = None,
     ) -> list[GeneratedRecordSet]:
         """Generate all record payloads for the enabled forms in the spec.
 
@@ -91,7 +93,7 @@ class SyntheticRecordGenerator:
         submission order: RegisterSubject records first, then scheduled/unscheduled.
         """
         results: list[GeneratedRecordSet] = []
-        subject_pool = self._get_subject_pool(spec)
+        subject_pool = list(subject_keys) if subject_keys else self._get_subject_pool(spec)
 
         # Phase 1: Enrollment/registration forms
         for form_spec in spec.forms_by_type(RecordTestType.REGISTER_SUBJECT):
@@ -106,6 +108,68 @@ class SyntheticRecordGenerator:
             results.append(self._generate_unscheduled_set(spec, form_spec, snapshot, subject_pool))
 
         return results
+
+    @staticmethod
+    def resolve_subject_keys(
+        record_sets: list[GeneratedRecordSet],
+        enrolled_subject_keys: list[str],
+        *,
+        placeholder_keys: list[str] | None = None,
+        preserved_keys: set[str] | None = None,
+    ) -> dict[str, str]:
+        """Bind server-assigned Phase 1 Subject keys into Phase 2 GeneratedRecordSet payloads."""
+        clean_enrolled = [k for k in enrolled_subject_keys if isinstance(k, str) and k]
+        if not clean_enrolled:
+            return {}
+
+        preserved = preserved_keys or set()
+        candidates: list[str] = []
+        seen: set[str] = set()
+        source_keys = placeholder_keys if placeholder_keys is not None else []
+        if not source_keys:
+            for rs in record_sets:
+                for sk in rs.subject_keys:
+                    if sk and sk not in preserved and sk not in seen:
+                        seen.add(sk)
+                        candidates.append(sk)
+        else:
+            for sk in source_keys:
+                if sk and sk not in preserved and sk not in seen:
+                    seen.add(sk)
+                    candidates.append(sk)
+
+        key_map: dict[str, str] = {pk: pk for pk in preserved}
+        for idx, placeholder in enumerate(candidates):
+            key_map[placeholder] = clean_enrolled[idx % len(clean_enrolled)]
+
+        for rs in record_sets:
+            if rs.test_type == RecordTestType.REGISTER_SUBJECT:
+                rs.subject_keys = [key_map.get(sk, sk) for sk in rs.subject_keys]
+                for payload in rs.payloads:
+                    payload.pop("subjectKey", None)
+                    payload.pop("subject_key", None)
+                continue
+
+            new_subject_keys: list[str] = []
+            for idx, payload in enumerate(rs.payloads):
+                orig_key = (
+                    rs.subject_keys[idx]
+                    if idx < len(rs.subject_keys)
+                    else payload.get("subjectKey")
+                )
+                mapped = key_map.get(orig_key) if isinstance(orig_key, str) else None
+                resolved_key: str = (
+                    mapped if mapped is not None else clean_enrolled[idx % len(clean_enrolled)]
+                )
+                payload["subjectKey"] = resolved_key
+                new_subject_keys.append(resolved_key)
+
+            if len(rs.subject_keys) > len(new_subject_keys):
+                for extra_key in rs.subject_keys[len(new_subject_keys) :]:
+                    new_subject_keys.append(key_map.get(extra_key, extra_key))
+            rs.subject_keys = new_subject_keys
+
+        return key_map
 
     def _get_subject_pool(self, spec: UATSpecification) -> list[str]:
         """Return a mocked value."""
