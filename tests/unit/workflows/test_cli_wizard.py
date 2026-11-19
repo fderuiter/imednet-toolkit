@@ -927,3 +927,43 @@ def test_prompts_reject_piped_stdin_and_non_interactive_mode(
     assert res_uat.exit_code == 1
     assert "Interactive prompts require an interactive TTY on stdin" in res_uat.stderr
     mock_get_sdk.assert_not_called()
+
+
+def test_wizard_filter_validation_preserves_zero_padded_and_superscripts_and_matches_cli() -> None:
+    """Workflow wizard prompts and CLI parse_filter_args enforce identical validation and coercion."""
+    from imednet.cli import parse_filter_args
+    from imednet.models.codings import Coding
+    from imednet.models.subjects import Subject
+
+    # Unicode superscript digits succeed as text with or without a model
+    ok_no_model, k1, v1, err1 = validate_filter_syntax("value=²")
+    assert ok_no_model is True and k1 == "value" and v1 == "²" and err1 is None
+    assert parse_filter_args(["value=²"]) == {"value": "²"}
+
+    ok_coding, k2, v2, err2 = validate_filter_syntax("value=²", model=Coding)
+    assert ok_coding is True and k2 == "value" and v2 == "²" and err2 is None
+    assert parse_filter_args(["value=²"], model=Coding) == {"value": "²"}
+
+    # Zero-padded identifiers and numeric text on string attributes stay str
+    ok_subj, k3, v3, err3 = validate_filter_syntax("subject_key=001", model=Subject)
+    assert ok_subj is True and k3 == "subject_key" and v3 == "001" and err3 is None
+    assert parse_filter_args(["subject_key=001"], model=Subject) == {"subject_key": "001"}
+
+    # Invalid integer or boolean values fail identically in wizard and CLI
+    bad_int, _, _, int_err = validate_filter_syntax("record_id=abc", model=Record)
+    assert bad_int is False and int_err is not None
+    assert "Invalid integer value 'abc' for attribute 'record_id'" in int_err
+
+    bad_bool, _, _, bool_err = validate_filter_syntax("deleted=maybe", model=Subject)
+    assert bad_bool is False and bool_err is not None
+    assert "Invalid boolean value 'maybe' for attribute 'deleted'" in bool_err
+
+    # Interactive prompt_filters accepts superscripts and retries on invalid model integer
+    user_inputs = "record_id=abc\nrecord_id=10\nsubject_key=001\n\n"
+    with patch("sys.stdin", _TTYStringIO(user_inputs)):
+        collected = prompt_filters("record filter", "form_key=DEMO", model=Record)
+    assert collected == ["record_id=10", "subject_key=001"]
+
+    with patch("sys.stdin", _TTYStringIO("value=²\n\n")):
+        sup_collected = prompt_filters("coding filter", "code=0042", model=Coding)
+    assert sup_collected == ["value=²"]
