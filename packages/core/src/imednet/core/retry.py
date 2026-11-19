@@ -99,6 +99,11 @@ class RetryConfig:
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR
     retry_policy: Any = field(default_factory=DefaultRetryPolicy)
 
+    def __post_init__(self) -> None:
+        """Normalize None retry policies to DefaultRetryPolicy."""
+        if self.retry_policy is None:
+            self.retry_policy = DefaultRetryPolicy()
+
     def create_retryer(
         self,
         wait_strategy: Callable[[Any], float] | None = None,
