@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from imednet.models.base import ImednetBaseModel
 
 class RecordRevision(ImednetBaseModel):
@@ -22,9 +20,9 @@ class RecordRevision(ImednetBaseModel):
     interval_id: int | None
     deleted: bool | None
     date_created: str | None
-    reason_for_change: Any
-    record_oid: Any
-    role: Any
-    subject_oid: Any
-    user: Any
+    reason_for_change: str | None
+    record_oid: str | None
+    role: str | None
+    subject_oid: str | None
+    user: str | None
     last_updated: str | None
