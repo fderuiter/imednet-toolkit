@@ -1380,3 +1380,87 @@ async def test_pilot_dotted_and_colliding_keys_preserve_raw_sdk_keys():
         await pilot.press("down", "enter")
         await pilot.pause()
         sdk.sites.list.assert_called_with("STUDY_01")
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_bounded_initial_fetch_and_load_all() -> None:
+    """Acceptance Criterion 4: AsyncImednetSDK TUI bounds initial fetch to 1 page and loads all on 'a'."""
+    import httpx
+    import respx
+
+    from imednet.sdk import AsyncImednetSDK
+
+    def _paged_subjects(req: httpx.Request) -> httpx.Response:
+        page_idx = int(req.url.params.get("page", 0))
+        req_size = int(req.url.params.get("size", 100))
+        batch_len = 100 if page_idx == 0 else 35
+        offset = page_idx * 100
+        rows = [
+            {
+                "subjectId": offset + n,
+                "subjectKey": f"ASUB-{offset + n}",
+                "siteId": 10,
+                "subjectStatus": "Screened",
+                "dateCreated": "2026-03-01T00:00:00Z",
+            }
+            for n in range(1, batch_len + 1)
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "data": rows,
+                "pagination": {"page": page_idx, "size": req_size, "totalPages": 2},
+            },
+        )
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get("https://api.async-tui.test/api/v1/edc/studies").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [{"studyKey": "ASYNC-01", "studyName": "Async Study"}],
+                    "pagination": {"page": 0, "size": 100, "totalPages": 1},
+                },
+            )
+        )
+        router.get("https://api.async-tui.test/api/v1/edc/studies/ASYNC-01/sites").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [{"siteId": 10, "siteName": "Async Site"}],
+                    "pagination": {"page": 0, "size": 100, "totalPages": 1},
+                },
+            )
+        )
+        subj_route = router.get(
+            "https://api.async-tui.test/api/v1/edc/studies/ASYNC-01/subjects"
+        ).mock(side_effect=_paged_subjects)
+
+        async with AsyncImednetSDK(
+            api_key="async-key",  # pragma: allowlist secret
+            security_key="async-secret",  # pragma: allowlist secret
+            base_url="https://api.async-tui.test",
+        ) as async_sdk:
+            app = ImednetTuiApp(async_sdk)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                study_view = app.screen.query_one(StudyList)
+                study_view.post_message(StudyList.StudySelected("ASYNC-01", "Async Study"))
+                await pilot.pause()
+
+                assert subj_route.call_count == 1
+                assert dict(subj_route.calls[0].request.url.params) == {
+                    "filter": "studyKey==ASYNC-01",
+                    "page": "0",
+                    "size": "100",
+                }
+                subj_table = app.screen.query_one(SubjectTable)
+                assert subj_table.row_count == 100
+                assert subj_table.truncated is True
+
+                await pilot.press("a")
+                await pilot.pause()
+                await pilot.pause()
+
+                assert subj_table.row_count == 135
+                assert subj_table.truncated is False

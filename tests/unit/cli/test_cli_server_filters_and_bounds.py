@@ -515,3 +515,178 @@ def test_codings_and_subjects_list_reject_unknown_model_filter_attributes(
     captured = capfd.readouterr()
     assert captured.out == ""
     assert f"Unknown filter attribute 'visit_key' for {expected_model}" in captured.err
+
+
+@respx.mock
+def test_interactive_all_flag_fetches_every_page_without_truncation_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance Criterion 3: interactive --all fetches all pages without truncation notice."""
+    sdk = _make_sdk()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+
+    def _responder(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        size = int(request.url.params["size"])
+        assert size == 100
+        count = 100 if page < 2 else 35
+        start = page * 100
+        items = [
+            {"recordId": start + idx + 1, "studyKey": "S1", "subjectKey": f"SUB-{start + idx + 1}"}
+            for idx in range(count)
+        ]
+        return httpx.Response(
+            200,
+            json=_paginated_payload(items, page=page, size=size, total_pages=3, total_items=235),
+        )
+
+    route = respx.get("https://api.test/api/v1/edc/studies/S1/records").mock(side_effect=_responder)
+    captured_grid: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "imednet.cli.utils.grid.run_interactive_grid",
+        lambda **kwargs: captured_grid.update(kwargs) or True,
+    )
+
+    cli.app(["records", "list", "S1", "--all"])
+
+    assert route.call_count == 3
+    assert len(captured_grid["items"]) == 235
+    assert captured_grid.get("status_notice") is None
+
+
+@respx.mock
+def test_interactive_exact_100_items_single_page_is_not_marked_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance Criterion 2: exact 100-item single-page study reports truncated=False."""
+    sdk = _make_sdk()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+
+    items = [
+        {"recordId": idx, "studyKey": "EXACT_100", "subjectKey": f"SUB-{idx}"}
+        for idx in range(1, 101)
+    ]
+    route = respx.get("https://api.test/api/v1/edc/studies/EXACT_100/records").mock(
+        return_value=httpx.Response(
+            200,
+            json=_paginated_payload(items, page=0, size=100, total_pages=1, total_items=100),
+        )
+    )
+    captured_grid: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "imednet.cli.utils.grid.run_interactive_grid",
+        lambda **kwargs: captured_grid.update(kwargs) or True,
+    )
+
+    cli.app(["records", "list", "EXACT_100"])
+
+    assert route.call_count == 1
+    assert len(captured_grid["items"]) == 100
+    assert captured_grid.get("status_notice") is None
+
+
+@pytest.mark.parametrize("export_fmt", ["json", "csv"])
+@respx.mock
+def test_records_list_output_file_preserves_full_fetch_even_in_interactive_tty(
+    export_fmt: str,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance Criterion 3: --output json|csv fetches all pages regardless of TTY interactivity."""
+    monkeypatch.chdir(tmp_path)
+    sdk = _make_sdk()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+
+    def _responder(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        count = 100 if page == 0 else 25
+        start = page * 100
+        data = [
+            {
+                "recordId": start + idx + 1,
+                "studyKey": "S1",
+                "subjectKey": f"SUB-{start + idx + 1}",
+                "recordData": {"AGE": 30},
+            }
+            for idx in range(count)
+        ]
+        return httpx.Response(
+            200,
+            json=_paginated_payload(data, page=page, size=100, total_pages=2, total_items=125),
+        )
+
+    route = respx.get("https://api.test/api/v1/edc/studies/S1/records").mock(side_effect=_responder)
+    cli.app(["records", "list", "S1", "--output", export_fmt])
+    capfd.readouterr()
+
+    assert route.call_count == 2
+    out_file = tmp_path / f"records.{export_fmt}"
+    assert out_file.exists()
+    content = out_file.read_text(encoding="utf-8")
+    assert "SUB-125" in content
+
+
+@respx.mock
+def test_console_script_entry_point_dispatches_sys_argv_offline(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance Criterion 4: installed 'imednet' console_scripts entry point dispatches offline."""
+    import importlib.metadata
+
+    eps = [
+        ep
+        for ep in importlib.metadata.entry_points(group="console_scripts")
+        if ep.name == "imednet"
+    ]
+    assert len(eps) == 1
+    entry_callable = eps[0].load()
+    assert entry_callable is cli.app
+
+    sdk = _make_sdk()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
+    route = respx.get("https://api.test/api/v1/edc/studies").mock(
+        return_value=httpx.Response(
+            200,
+            json=_paginated_payload(
+                [
+                    {"studyKey": f"ENTRY-{idx}", "studyName": f"Entry Trial {idx}"}
+                    for idx in range(1, 16)
+                ],
+                page=0,
+                size=15,
+                total_pages=2,
+                total_items=30,
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "imednet",
+            "studies",
+            "list",
+            "--sort",
+            "studyKey,asc",
+            "--limit",
+            "15",
+            "--format",
+            "json",
+        ],
+    )
+
+    entry_callable()
+
+    assert route.call_count == 1
+    assert dict(route.calls[0].request.url.params) == {
+        "sort": "studyKey,asc",
+        "size": "15",
+        "page": "0",
+    }
+    envelope = json.loads(capfd.readouterr().out)
+    assert envelope["count"] == 15
+    assert envelope["items"][0]["studyKey"] == "ENTRY-1"
