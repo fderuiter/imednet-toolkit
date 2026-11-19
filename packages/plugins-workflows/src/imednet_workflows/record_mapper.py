@@ -1046,19 +1046,24 @@ class RecordMapper:
             "dateCreated",
         ]
 
-        for key in variable_keys:
+        unique_variable_keys = list(
+            dict.fromkeys(key for key in variable_keys if key not in meta_cols)
+        )
+        for key in unique_variable_keys:
             if key not in df.columns:
                 df[key] = pd.NA
 
-        df = df[meta_cols + variable_keys]
+        df = df[meta_cols + unique_variable_keys]
         if should_mask:
             sensitive_vars = [
-                key for key in variable_keys if global_sensitivity_registry.is_sensitive(key)
+                key for key in unique_variable_keys if global_sensitivity_registry.is_sensitive(key)
             ]
             for key in sensitive_vars:
                 df[key] = "***MASKED***"
 
-            non_sensitive_vars = [key for key in variable_keys if key not in set(sensitive_vars)]
+            non_sensitive_vars = [
+                key for key in unique_variable_keys if key not in set(sensitive_vars)
+            ]
             if non_sensitive_vars:
                 var_frame = df[non_sensitive_vars]
                 try:
@@ -1069,7 +1074,7 @@ class RecordMapper:
                     df[col] = df[col].apply(mask_clinical_phi)
 
         if use_labels:
-            rename_map = {key: label_map.get(key, key) for key in variable_keys}
+            rename_map = {key: label_map.get(key, key) for key in unique_variable_keys}
             df = df.rename(columns=rename_map)
         return df
 
@@ -1190,12 +1195,17 @@ class RecordMapper:
                     continue
                 if form.form_id in form_models:
                     continue
-                var_keys = [
-                    v.variable_name
-                    for v in (form.variables or [])
-                    if not variable_whitelist or v.variable_name in variable_whitelist
-                ]
-                label_map = {v.variable_name: v.label for v in (form.variables or [])}
+                var_keys = list(
+                    dict.fromkeys(
+                        v.variable_name
+                        for v in (form.variables or [])
+                        if v.variable_name
+                        and (not variable_whitelist or v.variable_name in variable_whitelist)
+                    )
+                )
+                label_map = {
+                    v.variable_name: v.label for v in (form.variables or []) if v.variable_name
+                }
                 form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
                 form_label_maps[form.form_id] = label_map  # type: ignore
 
@@ -1211,6 +1221,15 @@ class RecordMapper:
             include_deleted=include_deleted,
         )
 
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        meta_keys = {
+            "recordId",
+            "subjectKey",
+            "visitId",
+            "formId",
+            "recordStatus",
+            "dateCreated",
+        }
         tree: dict[str, dict[str, Any]] = {}
 
         for rec in records:
@@ -1221,7 +1240,7 @@ class RecordMapper:
             label_map = form_label_maps[rec.form_id]  # type: ignore
 
             try:
-                parsed_data = self._parse_record(rec, model, mask_phi=mask_phi)
+                parsed_data = self._parse_record(rec, model, mask_phi=should_mask)
             except (ValidationError, TypeError) as exc:
                 logger.warning(
                     "Failed to parse record data for recordId %s: %s",
@@ -1233,11 +1252,19 @@ class RecordMapper:
                 logger.error("Unexpected error processing recordId %s: %s", rec.record_id, exc)
                 continue
 
+            if should_mask:
+                parsed_data = mask_clinical_phi(parsed_data)
+
             if use_labels_as_keys:
                 remapped: dict[str, Any] = {}
                 for k, v in parsed_data.items():
-                    lbl = label_map.get(k)
-                    remapped[lbl if lbl is not None else k] = v
+                    if k in meta_keys:
+                        remapped[k] = v
+                    else:
+                        lbl = label_map.get(k)
+                        target_key = lbl if lbl is not None else k
+                        if target_key not in meta_keys:
+                            remapped[target_key] = v
                 parsed_data = remapped
 
             # Automatically perform lookups for parent record identifiers using available metadata

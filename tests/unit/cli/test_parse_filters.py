@@ -2,7 +2,7 @@
 
 import pytest
 
-from imednet.cli import parse_filter_args
+from imednet.cli import parse_filter_args, parse_record_data_filter
 from imednet.models.visits import Visit
 
 
@@ -141,3 +141,125 @@ def test_parse_filter_args_rejects_invalid_expressions_on_stderr(
     captured = capfd.readouterr()
     assert captured.out == ""
     assert "Invalid filter" in captured.err
+
+
+def test_parse_filter_args_preserves_zero_padded_keys_and_superscripts() -> None:
+    """Zero-padded identifiers and Unicode superscripts stay strings without crashing."""
+    from imednet.models.codings import Coding
+    from imednet.models.subjects import Subject
+
+    assert parse_filter_args(["subject_key=001"], model=Subject) == {"subject_key": "001"}
+    assert parse_filter_args(["subject_key=123"], model=Subject) == {"subject_key": "123"}
+    assert parse_filter_args(["code=0042", "value=²"], model=Coding) == {
+        "code": "0042",
+        "value": "²",
+    }
+    assert parse_filter_args(["subject_key=001", "value=²", "count=0", "page=12"]) == {
+        "subject_key": "001",
+        "value": "²",
+        "count": 0,
+        "page": 12,
+    }
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_fragment"),
+    [
+        ("revision=abc", "Invalid integer value 'abc' for attribute 'revision'"),
+        ("revision=²", "Invalid integer value '²' for attribute 'revision'"),
+    ],
+)
+def test_parse_filter_args_rejects_invalid_model_integer_values(
+    expr: str, expected_fragment: str, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Invalid integer values for model attributes exit 1 with diagnostic on stderr."""
+    from imednet.models.codings import Coding
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_filter_args([expr], model=Coding)
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert expected_fragment in captured.err
+
+
+def test_parse_filter_args_rejects_invalid_model_boolean_values(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Invalid boolean values for model attributes exit 1 with diagnostic on stderr."""
+    from imednet.models.forms import Form
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_filter_args(["disabled=maybe"], model=Form)
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Invalid boolean value 'maybe' for attribute 'disabled'" in captured.err
+
+
+def test_parse_filter_args_disallow_study_key(capfd: pytest.CaptureFixture[str]) -> None:
+    """disallow_study_key=True rejects study_key and studyKey across single, AND, and OR filters."""
+    from imednet.models.records import Record
+    from imednet.models.studies import Study
+
+    assert parse_filter_args(["study_key=S1"], model=Study, disallow_study_key=False) == {
+        "study_key": "S1"
+    }
+    assert parse_filter_args(["studyKey==S1"], model=Study) == {"studyKey": ("==", "S1")}
+
+    for exprs in (
+        ["study_key=S1"],
+        ["studyKey=S1"],
+        ["form_key=DM;study_key=S1"],
+        ["form_key=DM", "studyKey==S1"],
+        ["study_key==S1,form_key==DM"],
+        ["studyKey==S1,formKey==DM"],
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            parse_filter_args(exprs, model=Record, disallow_study_key=True)
+        assert exc_info.value.code == 1
+        captured = capfd.readouterr()
+        assert captured.out == ""
+        assert "'study_key' and 'studyKey' cannot be used in --filter" in captured.err
+
+
+def test_parse_record_data_filter_valid_and_none() -> None:
+    """parse_record_data_filter accepts valid expressions, regex =~, and literal none bypass."""
+    assert parse_record_data_filter(None) is None
+    assert parse_record_data_filter("none") == "none"
+    assert parse_record_data_filter("NONE") == "NONE"
+    assert parse_record_data_filter("  none  ") == "none"
+    assert parse_record_data_filter("AESER==Serious;AGE>=18") == "AESER==Serious;AGE>=18"
+    assert parse_record_data_filter('AETERM=~"^Headache"') == 'AETERM=~"^Headache"'
+    assert (
+        parse_record_data_filter('AETERM=="Smith; John",AESER==Serious')
+        == 'AETERM=="Smith; John",AESER==Serious'
+    )
+
+
+@pytest.mark.parametrize(
+    ("bad_expr", "expected_fragment"),
+    [
+        ("", "cannot be empty"),
+        ("   ", "cannot be empty"),
+        ("badfilter", "missing comparison operator"),
+        ("AESER=Serious", "Invalid filter operator '='"),
+        ("AGE >= 18", "contains whitespace"),
+        ("AESER==Serious;AGE>=18,SEX==F", "cannot combine both ';' (AND) and ',' (OR)"),
+        ('AETERM=="Unclosed', "unclosed quotation marks"),
+        ("AGE>=18;AGE<=65", "Duplicate filter attribute 'AGE'"),
+    ],
+)
+def test_parse_record_data_filter_invalid(
+    bad_expr: str,
+    expected_fragment: str,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Invalid recordDataFilter strings exit with code 1 and write diagnostic to stderr."""
+    with pytest.raises(SystemExit) as exc_info:
+        parse_record_data_filter(bad_expr)
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Invalid record data filter" in captured.err
+    assert expected_fragment in captured.err

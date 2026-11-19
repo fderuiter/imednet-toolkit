@@ -234,16 +234,35 @@ def test_validate_staged_wheels_missing_required_module(tmp_path: Path) -> None:
 
 
 def test_validate_staged_wheels_workspace_integration(tmp_path: Path) -> None:
-    """Verify that staged wheels in repo pass validation and simulated Pyodide import."""
+    """Verify that staged browser wheels pass validation and simulated Pyodide import."""
     repo_root = Path(__file__).resolve().parents[2]
-    wheels_dir = repo_root / "docs" / "_static" / "wheels"
+    wheels_dir = tmp_path / "wheels"
 
-    # Stage wheels if not already staged
-    if not list(wheels_dir.glob("*.whl")):
-        stage_wheels(repo_root, wheels_dir)
+    staged = stage_wheels(repo_root, wheels_dir)
+    staged_names = [w.name for w in staged]
+    assert any(n.startswith("imednet-") for n in staged_names)
+    assert any(n.startswith("imednet_workflows-") for n in staged_names)
+    assert any(n.startswith("imednet_plugins_sinks-") for n in staged_names)
+    assert not any(n.startswith("apache_airflow_providers_imednet-") for n in staged_names)
+    assert not any(n.startswith("imednet_tui-") for n in staged_names)
 
-    errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
-    assert not errors, f"Expected staged wheels to pass validation, got: {errors}"
+    errors = validate_staged_wheels(wheels_dir)
+    assert not errors, f"Expected all three staged browser wheels to pass validation, got: {errors}"
+
+
+def test_validate_staged_wheels_detects_missing_plugin_wheels(tmp_path: Path) -> None:
+    """Verify default validate_staged_wheels requires imednet, imednet_workflows, and imednet_plugins_sinks."""
+    wheels_dir = tmp_path / "wheels"
+    wheels_dir.mkdir(parents=True)
+    core_only = wheels_dir / "imednet-1.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(core_only, "w") as zf:
+        zf.writestr("imednet/__init__.py", "class ImednetSDK:\n    pass\n")
+        zf.writestr("imednet/sdk.py", "")
+        zf.writestr("imednet/config.py", "")
+
+    errors = validate_staged_wheels(wheels_dir)
+    assert any("imednet_workflows" in e for e in errors)
+    assert any("imednet_plugins_sinks" in e for e in errors)
 
 
 def test_literalinclude_slice_missing_start_marker_detection(tmp_path: Path) -> None:
@@ -821,3 +840,114 @@ def test_validate_staged_wheels_child_process_environment_isolation(
 
     errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
     assert not errors, f"Subprocess validation failed due to leaked variables: {errors}"
+
+
+def test_missing_workspace_symbol_in_showcase_detected(tmp_path: Path) -> None:
+    """Verify showcase validation fails when an example imports a removed or nonexistent workspace symbol."""
+    examples_dir = tmp_path / "examples"
+    examples_dir.mkdir(parents=True)
+    bad_symbol_file = examples_dir / "stale_sink_import.py"
+    bad_symbol_file.write_text(
+        "from imednet.integrations import SnowflakeSinkConfig, export_to_snowflake\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_showcase_ast_and_imports(examples_dir)
+    assert len(errors) == 2
+    assert any(
+        "Missing symbol 'SnowflakeSinkConfig' in module 'imednet.integrations'" in e for e in errors
+    )
+    assert any(
+        "Missing symbol 'export_to_snowflake' in module 'imednet.integrations'" in e for e in errors
+    )
+
+
+def test_missing_workspace_symbol_in_literalinclude_slice_detected(tmp_path: Path) -> None:
+    """Verify documentation validation fails when a literalinclude slice imports a nonexistent workspace symbol."""
+    docs_dir = tmp_path / "docs"
+    examples_dir = tmp_path / "examples"
+    docs_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    snippet_py = examples_dir / "slice_target.py"
+    snippet_py.write_text(
+        "# [start]\nfrom imednet_sinks import NonExistentSinkSymbol\n# [end]\n",
+        encoding="utf-8",
+    )
+    doc_file = docs_dir / "guide.rst"
+    doc_file.write_text(
+        ".. literalinclude:: /../examples/slice_target.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start]\n"
+        "   :end-before: # [end]\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert len(errors) == 1
+    assert "Missing symbol 'NonExistentSinkSymbol' in module 'imednet_sinks'" in errors[0]
+
+
+def test_missing_workspace_symbol_in_inline_rst_snippet_detected(tmp_path: Path) -> None:
+    """Verify inline .. testcode:: and .. code-block:: python directives catch missing workspace symbols."""
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True)
+
+    doc_file = docs_dir / "howto.rst"
+    doc_file.write_text(
+        "Export Guide\n"
+        "============\n"
+        "\n"
+        ".. testcode::\n"
+        "\n"
+        "   from imednet.integrations import export_to_mongodb\n"
+        "\n"
+        ".. code-block:: python\n"
+        "\n"
+        "   from imednet_sinks import RemovedGraphHelper\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert len(errors) == 2
+    assert any(
+        "Missing symbol 'export_to_mongodb' in module 'imednet.integrations'" in e for e in errors
+    )
+    assert any("Missing symbol 'RemovedGraphHelper' in module 'imednet_sinks'" in e for e in errors)
+
+
+def test_symbol_validation_skips_uninstalled_optional_drivers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify symbol-level import validation skips uninstalled optional third-party drivers in minimal envs."""
+    import sys
+
+    blocked_roots = {"snowflake", "pymongo", "neo4j", "airflow", "duckdb", "pyarrow"}
+
+    class _BlockOptionalFinder:
+        def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> None:
+            if fullname.split(".", maxsplit=1)[0] in blocked_roots:
+                raise ModuleNotFoundError(
+                    f"Blocked optional {fullname}", name=fullname.split(".", maxsplit=1)[0]
+                )
+
+    for mod_name in list(sys.modules):
+        if mod_name.split(".", maxsplit=1)[0] in blocked_roots:
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_BlockOptionalFinder(), *sys.meta_path])
+
+    examples_dir = tmp_path / "examples"
+    examples_dir.mkdir(parents=True)
+    showcase = examples_dir / "minimal_env_demo.py"
+    showcase.write_text(
+        "from airflow import DAG\n"
+        "from airflow.sdk import task\n"
+        "from snowflake.connector import connect\n"
+        "from pymongo import MongoClient\n"
+        "from neo4j import GraphDatabase\n"
+        "from imednet_sinks import MongoDbSinkConfig, Neo4jSinkConfig, SnowflakeSinkConfig\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_showcase_ast_and_imports(examples_dir)
+    assert not errors, f"Expected optional drivers to be skipped cleanly, got: {errors}"

@@ -49,19 +49,22 @@ Usage
 -----
 .. code-block:: python
 
-    from imednet.integrations.document import MongoDbExportSink
+    import os
+    from imednet_sinks import MongoDbExportSink, MongoDbSinkConfig
     from imednet_workflows.data_extraction import DataExtractionWorkflow
 
     records = DataExtractionWorkflow(sdk).extract_records_by_criteria(
         study_key="MYSTUDY",
     )
 
-    with MongoDbExportSink(
-        uri="******localhost:27017",
+    config = MongoDbSinkConfig(
+        study_key="MYSTUDY",
+        uri=os.environ["MONGODB_URI"],
         database="imednet",
         collection="records",
-    ) as sink:
-        for i, batch in enumerate(batched(records, 500)):
+    )
+    with MongoDbExportSink(config=config) as sink:
+        for i, batch in enumerate(batched(records, config.batch_size)):
             sink.write_batch(batch, batch_id=f"MYSTUDY/all/{i}")
 """
 
@@ -155,7 +158,7 @@ class MongoDbExportSink(ExportSink):
     Parameters
     ----------
     config:
-        Mandatory :class:`~imednet.integrations.document.MongoDbSinkConfig`.
+        Mandatory :class:`~imednet_sinks.document.MongoDbSinkConfig`.
 
     Raises:
         ~imednet.errors.ExportConfigurationError: When the client cannot connect to the server.
@@ -204,12 +207,12 @@ class MongoDbExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
-        from imednet.spi.sinks import CentralizedMapper
+        from imednet.spi.sinks import build_sink_mapper
 
-        mapper = CentralizedMapper(
+        mapper = build_sink_mapper(
+            self.config,
             mode="document",
             post_processor=_post_process_document,
-            mask_phi=self.config.mask_phi,
         )
         docs = [_record_to_document(r, self._study_key, mapper=mapper) for r in records]
         if not docs:

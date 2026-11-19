@@ -37,19 +37,21 @@ Usage
 -----
 .. code-block:: python
 
-    from imednet.integrations.graph import Neo4jExportSink, Neo4jSinkConfig
+    import os
+    from imednet_sinks import Neo4jExportSink, Neo4jSinkConfig
     from imednet_workflows.data_extraction import DataExtractionWorkflow
 
     records = DataExtractionWorkflow(sdk).extract_records_by_criteria(
         study_key="MYSTUDY",
     )
 
-    config = Neo4jSinkConfig(batch_size=200)
-    with Neo4jExportSink(
-        uri="bolt://localhost:7687",
-        auth=("neo4j", "password"),
-        config=config,
-    ) as sink:
+    config = Neo4jSinkConfig(
+        study_key="MYSTUDY",
+        uri=os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
+        auth=("neo4j", os.environ["NEO4J_PASSWORD"]),
+        batch_size=200,
+    )
+    with Neo4jExportSink(config=config) as sink:
         for i, batch in enumerate(batched(records, config.batch_size)):
             sink.write_batch(batch, batch_id=f"MYSTUDY/all/{i}")
 """
@@ -222,12 +224,12 @@ class Neo4jExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
-        from imednet.spi.sinks import CentralizedMapper
+        from imednet.spi.sinks import build_sink_mapper
 
-        mapper = CentralizedMapper(
+        mapper = build_sink_mapper(
+            self.config,
             mode="document",
             post_processor=_post_process_graph,
-            mask_phi=self.config.mask_phi,
         )
         rows = [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
         if not rows:

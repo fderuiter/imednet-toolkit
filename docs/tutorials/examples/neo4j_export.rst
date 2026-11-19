@@ -1,7 +1,7 @@
 Neo4j Export Example
 ====================
 
-Export study records into a Neo4j property graph preserving the
+Export Study Records into a Neo4j property graph preserving the
 ``Study → Subject → Visit → Record`` hierarchy.
 
 Prerequisites

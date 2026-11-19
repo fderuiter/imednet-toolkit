@@ -46,9 +46,11 @@ Usage
 -----
 .. code-block:: python
 
-    from imednet.integrations.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+    import os
+    from imednet_sinks import SnowflakeExportSink, SnowflakeSinkConfig
 
     config = SnowflakeSinkConfig(
+        study_key="MYSTUDY",
         account="myorg-myaccount",
         user="loader",
         **{"password": os.environ["SF_PASS"]},  # keep credentials out of source code
@@ -389,19 +391,12 @@ class SnowflakeExportSink(ExportSink):
             )
 
         cfg = self._cfg
-        from imednet.spi.sinks import CentralizedMapper
+        from imednet.spi.sinks import build_sink_mapper
 
         post_proc = (
             _post_process_warehouse if self.config.mask_phi else _post_process_warehouse_unmasked
         )
-        mapper = CentralizedMapper(
-            mode="document",
-            post_processor=post_proc,
-            mask_phi=self.config.mask_phi,
-        )
-        custom_pipeline = cfg.extra.get("enrichment_pipeline")
-        if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
-            mapper.register_pipeline(cfg.study_key, custom_pipeline)
+        mapper = build_sink_mapper(cfg, mode="document", post_processor=post_proc)
 
         arrow_table = _records_to_arrow_table(
             records,

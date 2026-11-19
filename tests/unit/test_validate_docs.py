@@ -2,7 +2,38 @@
 
 from pathlib import Path
 
+from scripts.build_docs import SCOPED_INHERITED_MEMBERS, scope_apidoc_inherited_members
 from scripts.validate_docs import check_no_duplicate_suppression, check_rendered_api_reference
+
+
+def test_apidoc_options_sorted_for_sphinx_6_and_8_parity(tmp_path: Path) -> None:
+    """SPHINX_APIDOC_OPTIONS is alphabetically sorted so Sphinx 6 and 8 emit identical RST."""
+    build_docs_src = (Path(__file__).resolve().parents[2] / "scripts" / "build_docs.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'env["SPHINX_APIDOC_OPTIONS"] = "inherited-members,members,show-inheritance"' in (
+        build_docs_src
+    )
+
+    sample_rst = tmp_path / "imednet.sample.rst"
+    sample_rst.write_text(
+        "imednet.sample module\n"
+        "=====================\n\n"
+        ".. automodule:: imednet.sample\n"
+        "   :inherited-members:\n"
+        "   :members:\n"
+        "   :show-inheritance:\n",
+        encoding="utf-8",
+    )
+    scope_apidoc_inherited_members(tmp_path)
+    assert sample_rst.read_text(encoding="utf-8") == (
+        "imednet.sample module\n"
+        "=====================\n\n"
+        ".. automodule:: imednet.sample\n"
+        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
+        "   :members:\n"
+        "   :show-inheritance:\n"
+    )
 
 
 def test_check_no_duplicate_suppression_detects_forbidden_patterns(tmp_path: Path) -> None:

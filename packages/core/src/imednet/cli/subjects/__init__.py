@@ -49,6 +49,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             output_format=output_format,
             no_interactive=no_interactive,
             model=Subject,
+            disallow_study_key=True,
         )
 
         with fetching_status("subjects", study_key):

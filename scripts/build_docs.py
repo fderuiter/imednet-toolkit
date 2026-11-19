@@ -4,10 +4,13 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
-def run_command(cmd, env=None, check=True):
+def run_command(
+    cmd: Sequence[str], env: Mapping[str, str] | None = None, check: bool = True
+) -> None:
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, env=env, check=check)
 
@@ -85,10 +88,16 @@ def build_and_stage_wheels(
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             print(f"Warning: Failed to build wheels with uv: {exc}")
 
-    # Remove workspace root placeholder wheel if present
-    for placeholder in wheels_dir.glob("imednet_workspace-*.whl"):
-        with contextlib.suppress(OSError):
-            placeholder.unlink()
+    # Remove non-browser wheels (workspace root placeholder, Airflow server provider, CLI TUI)
+    excluded_patterns = (
+        "imednet_workspace-*.whl",
+        "apache_airflow_providers_imednet-*.whl",
+        "imednet_tui-*.whl",
+    )
+    for pattern in excluded_patterns:
+        for excluded_whl in wheels_dir.glob(pattern):
+            with contextlib.suppress(OSError):
+                excluded_whl.unlink()
 
     staged = sorted(wheels_dir.glob("*.whl"))
     print(f"Staged {len(staged)} wheel artifact(s) in {wheels_dir}: {[w.name for w in staged]}")
@@ -110,7 +119,7 @@ def scope_apidoc_inherited_members(api_dir: Path) -> None:
             rst_file.write_text(updated, encoding="utf-8")
 
 
-def main():
+def main() -> None:
     api_dir = Path("docs/reference/api")
 
     print("Cleaning old API docs...")
@@ -119,7 +128,7 @@ def main():
 
     print("Generating new API docs...")
     env = os.environ.copy()
-    env["SPHINX_APIDOC_OPTIONS"] = "members,inherited-members,show-inheritance"
+    env["SPHINX_APIDOC_OPTIONS"] = "inherited-members,members,show-inheritance"
 
     # Core package
     run_command(
@@ -202,6 +211,7 @@ def main():
     run_command(["sphinx-build", "-b", "html", "-W", "--keep-going", "docs", "docs/_build/html"])
 
     # Ensure staged wheels are present in docs/_build/html/_static/wheels/
+    # and clean up temporary staging directory so the git working tree stays clean.
     html_wheels_dir = Path("docs/_build/html/_static/wheels")
     static_wheels_dir = Path("docs/_static/wheels")
     if static_wheels_dir.exists():
@@ -210,9 +220,10 @@ def main():
             target_whl = html_wheels_dir / whl.name
             if not target_whl.exists():
                 shutil.copy2(whl, target_whl)
+        shutil.rmtree(static_wheels_dir, ignore_errors=True)
 
-    print("Validating documentation...")
-    run_command([sys.executable, "scripts/validate_docs.py"])
+    print("Validating documentation, rendered API reference, and SEO artifacts...")
+    run_command([sys.executable, "scripts/validate_docs.py", "--require-html"])
 
 
 if __name__ == "__main__":

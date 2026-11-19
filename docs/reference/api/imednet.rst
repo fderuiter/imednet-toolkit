@@ -2,8 +2,8 @@ imednet package
 ===============
 
 .. automodule:: imednet
-   :members:
    :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
    :show-inheritance:
 
 Subpackages
@@ -37,46 +37,46 @@ imednet.config module
 ---------------------
 
 .. automodule:: imednet.config
-   :members:
    :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
    :show-inheritance:
 
 imednet.constants module
 ------------------------
 
 .. automodule:: imednet.constants
-   :members:
    :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
    :show-inheritance:
 
 imednet.discovery module
 ------------------------
 
 .. automodule:: imednet.discovery
-   :members:
    :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
    :show-inheritance:
 
 imednet.plugins module
 ----------------------
 
 .. automodule:: imednet.plugins
-   :members:
    :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
    :show-inheritance:
 
 imednet.sdk module
 ------------------
 
 .. automodule:: imednet.sdk
-   :members:
    :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
    :show-inheritance:
 
 imednet.sdk\_convenience module
 -------------------------------
 
 .. automodule:: imednet.sdk_convenience
-   :members:
    :inherited-members: BaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
    :show-inheritance:

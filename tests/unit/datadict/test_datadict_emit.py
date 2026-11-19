@@ -503,14 +503,14 @@ def test_odm_round_trip_scoped_shared_variables_and_required_policy() -> None:
     }
 
     # Scoped ItemDef and CodeList identifiers per Form
-    assert root.find(".//odm:ItemDef[@OID='DM.STATUS']", ns) is not None
-    assert root.find(".//odm:ItemDef[@OID='DV.STATUS']", ns) is not None
+    assert root.find(".//odm:ItemDef[@OID='IT.DM.STATUS']", ns) is not None
+    assert root.find(".//odm:ItemDef[@OID='IT.DV.STATUS']", ns) is not None
     assert root.find(".//odm:ItemDef[@OID='STATUS']", ns) is None
-    assert root.find(".//odm:CodeList[@OID='CL_DM.STATUS']", ns) is not None
-    assert root.find(".//odm:CodeList[@OID='CL_DV.STATUS']", ns) is not None
+    assert root.find(".//odm:CodeList[@OID='CL.DM.STATUS']", ns) is not None
+    assert root.find(".//odm:CodeList[@OID='CL.DV.STATUS']", ns) is not None
 
     # Vendor RequiredPolicy attribute preserved alongside ODM Mandatory="No"
-    dm_ref = root.find(".//odm:ItemGroupDef[@OID='IG_DM']/odm:ItemRef[@ItemOID='DM.STATUS']", ns)
+    dm_ref = root.find(".//odm:ItemGroupDef[@OID='IG_DM']/odm:ItemRef[@ItemOID='IT.DM.STATUS']", ns)
     assert dm_ref is not None
     assert dm_ref.attrib.get("Mandatory") == "No"
     assert dm_ref.attrib.get("{http://www.imednet.com/ns/odm/metadata}RequiredPolicy") == (
@@ -609,9 +609,9 @@ def test_to_odm_xml_retains_unprefixed_oids_for_unique_and_identical_shared_vari
     assert root.find(".//odm:ItemDef[@OID='PERF']", ns) is not None
     assert root.find(".//odm:ItemDef[@OID='SUBJID']", ns) is not None
     assert root.find(".//odm:CodeList[@OID='CL_PERF']", ns) is not None
-    assert root.find(".//odm:ItemDef[@OID='VS_BASE.PERF']", ns) is None
-    assert root.find(".//odm:ItemDef[@OID='VS_WK4.PERF']", ns) is None
-    assert root.find(".//odm:CodeList[@OID='CL_VS_BASE.PERF']", ns) is None
+    assert root.find(".//odm:ItemDef[@OID='IT.VS_BASE.PERF']", ns) is None
+    assert root.find(".//odm:ItemDef[@OID='IT.VS_WK4.PERF']", ns) is None
+    assert root.find(".//odm:CodeList[@OID='CL.VS_BASE.PERF']", ns) is None
 
 
 def test_to_odm_xml_serializes_bounds_and_measurement_units() -> None:
@@ -922,3 +922,266 @@ def test_odm_round_trip_when_both_unprefixed_and_prefixed_raw_names_are_scoped()
         ("F1.AGE", "F2 Dotted Age Date", "Date"),
     ]
     assert forms_by_key["F2"].variables[0].extraAttributes["SDSVarName"] == "AGE_F2"
+
+
+def test_odm_round_trip_divergent_visdat_sex_comments_zero_diff() -> None:
+    """Multi-Form Study with divergent VISDAT, SEX, and COMMENTS round-trips with zero diffs."""
+    from imednet.datadict.diff import diff
+
+    dd = DataDictionary(
+        metadata=Metadata(
+            studyKey="STUDY_DIVERGENT_MULTI",
+            source="cdisc_odm",
+            extraAttributes={
+                "studyName": "STUDY_DIVERGENT_MULTI",
+                "protocolName": "STUDY_DIVERGENT_MULTI",
+            },
+        ),
+        forms=[
+            Form(
+                formKey="FOLLOWUP",
+                formName="Follow-up Visit",
+                formType="Subject",
+                variables=[
+                    Variable(
+                        variableName="COMMENTS",
+                        label="Extended Follow-up Clinical Notes",
+                        variableType="Text",
+                        sequence=3,
+                        required="Auto Query",
+                        format="500",
+                    ),
+                    Variable(
+                        variableName="VISDAT",
+                        label="Follow-up Visit Date",
+                        variableType="Date",
+                        sequence=1,
+                        required="Auto Query",
+                        format="DD-MMM-YYYY",
+                        precision="Day",
+                    ),
+                    Variable(
+                        variableName="SEX",
+                        label="Administrative Sex Category",
+                        variableType="Single Select",
+                        sequence=2,
+                        required="No",
+                        choices=[
+                            Choice(choiceValue="M", choiceText="Male", position=1),
+                            Choice(choiceValue="F", choiceText="Female", position=2),
+                            Choice(choiceValue="U", choiceText="Unknown", position=3),
+                        ],
+                    ),
+                ],
+            ),
+            Form(
+                formKey="SCREEN",
+                formName="Screening Visit",
+                formType="Subject",
+                variables=[
+                    Variable(
+                        variableName="VISDAT",
+                        label="Screening Visit Date",
+                        variableType="Date",
+                        sequence=1,
+                        required="Yes",
+                        format="YYYY-MM-DD",
+                    ),
+                    Variable(
+                        variableName="SEX",
+                        label="Biological Sex at Birth",
+                        variableType="Radio",
+                        sequence=2,
+                        required="Yes",
+                        choices=[
+                            Choice(choiceValue="M", choiceText="Male", position=1),
+                            Choice(choiceValue="F", choiceText="Female", position=2),
+                        ],
+                    ),
+                    Variable(
+                        variableName="COMMENTS",
+                        label="Screening Notes",
+                        variableType="Text",
+                        sequence=3,
+                        required="No",
+                        format="200",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    dd_before = copy.deepcopy(dd)
+    xml_str = to_odm_xml(dd, file_oid="DIV_001", creation_datetime="2026-11-19T12:00:00")
+    assert dd == dd_before
+
+    root = fromstring(xml_str)
+    ns = {
+        "odm": "http://www.cdisc.org/ns/odm/v1.3",
+        "imednet": "http://www.imednet.com/ns/odm/metadata",
+    }
+
+    for fk in ("SCREEN", "FOLLOWUP"):
+        for vn in ("VISDAT", "SEX", "COMMENTS"):
+            item_elem = root.find(f".//odm:ItemDef[@OID='IT.{fk}.{vn}']", ns)
+            assert item_elem is not None
+            assert item_elem.attrib["Name"] == vn
+        assert root.find(f".//odm:CodeList[@OID='CL.{fk}.SEX']", ns) is not None
+
+    assert root.find(".//odm:ItemDef[@OID='VISDAT']", ns) is None
+    assert root.find(".//odm:ItemDef[@OID='SEX']", ns) is None
+    assert root.find(".//odm:ItemDef[@OID='COMMENTS']", ns) is None
+    assert root.find(".//odm:CodeList[@OID='CL_SEX']", ns) is None
+
+    fu_visdat_ref = root.find(
+        ".//odm:ItemGroupDef[@OID='IG_FOLLOWUP']/odm:ItemRef[@ItemOID='IT.FOLLOWUP.VISDAT']", ns
+    )
+    assert fu_visdat_ref is not None
+    assert fu_visdat_ref.attrib["Mandatory"] == "No"
+    assert fu_visdat_ref.attrib["{http://www.imednet.com/ns/odm/metadata}RequiredPolicy"] == (
+        "Auto Query"
+    )
+    assert 'imednet:RequiredPolicy="Auto Query"' in xml_str
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    assert reloaded.metadata.validationWarnings == []
+
+    report = diff(dd, reloaded)
+    assert not report.has_changes, report.to_text()
+    assert report.items == []
+
+
+def test_to_odm_xml_shares_identical_sex_and_codelist_across_forms() -> None:
+    """Identical SEX Variables across Forms emit one <ItemDef OID='SEX'> and one <CodeList OID='CL_SEX'>."""
+    from imednet.datadict.diff import diff
+
+    sex_choices = [
+        Choice(choiceValue="M", choiceText="Male", position=1),
+        Choice(choiceValue="F", choiceText="Female", position=2),
+    ]
+    dd = DataDictionary(
+        metadata=Metadata(
+            studyKey="STUDY_SHARED_SEX",
+            source="cdisc_odm",
+            extraAttributes={
+                "studyName": "STUDY_SHARED_SEX",
+                "protocolName": "STUDY_SHARED_SEX",
+            },
+        ),
+        forms=[
+            Form(
+                formKey="DM",
+                formName="Demographics",
+                variables=[
+                    Variable(
+                        variableName="SEX",
+                        label="Sex",
+                        variableType="Radio",
+                        sequence=1,
+                        required="Yes",
+                        choices=copy.deepcopy(sex_choices),
+                    )
+                ],
+            ),
+            Form(
+                formKey="SCREEN",
+                formName="Screening",
+                variables=[
+                    Variable(
+                        variableName="SEX",
+                        label="Sex",
+                        variableType="Radio",
+                        sequence=1,
+                        required="Auto Query",
+                        choices=copy.deepcopy(sex_choices),
+                    )
+                ],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    item_defs = root.findall(".//odm:ItemDef", ns)
+    assert len(item_defs) == 1
+    assert item_defs[0].attrib["OID"] == "SEX"
+    assert item_defs[0].attrib["Name"] == "SEX"
+
+    codelists = root.findall(".//odm:CodeList", ns)
+    assert len(codelists) == 1
+    assert codelists[0].attrib["OID"] == "CL_SEX"
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    assert reloaded.metadata.validationWarnings == []
+    assert not diff(dd, reloaded).has_changes
+
+
+def test_to_odm_xml_shares_codelist_when_only_item_attributes_diverge() -> None:
+    """Divergent SEX ItemDefs with identical choices share a single <CodeList OID='CL_SEX'>."""
+    from imednet.datadict.diff import diff
+
+    sex_choices = [
+        Choice(choiceValue="M", choiceText="Male", position=1),
+        Choice(choiceValue="F", choiceText="Female", position=2),
+    ]
+    dd = DataDictionary(
+        metadata=Metadata(
+            studyKey="STUDY_SHARED_CODELIST",
+            source="cdisc_odm",
+            extraAttributes={
+                "studyName": "STUDY_SHARED_CODELIST",
+                "protocolName": "STUDY_SHARED_CODELIST",
+            },
+        ),
+        forms=[
+            Form(
+                formKey="DM",
+                formName="Demographics",
+                variables=[
+                    Variable(
+                        variableName="SEX",
+                        label="Biological Sex at Birth",
+                        variableType="Radio",
+                        sequence=1,
+                        required="Yes",
+                        choices=copy.deepcopy(sex_choices),
+                    )
+                ],
+            ),
+            Form(
+                formKey="SV",
+                formName="Subject Visit",
+                variables=[
+                    Variable(
+                        variableName="SEX",
+                        label="Participant Reported Sex",
+                        variableType="Single Select",
+                        sequence=1,
+                        required="Conditional",
+                        choices=copy.deepcopy(sex_choices),
+                    )
+                ],
+            ),
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {"odm": "http://www.cdisc.org/ns/odm/v1.3"}
+
+    dm_item = root.find(".//odm:ItemDef[@OID='IT.DM.SEX']", ns)
+    sv_item = root.find(".//odm:ItemDef[@OID='IT.SV.SEX']", ns)
+    assert dm_item is not None and dm_item.attrib["Name"] == "SEX"
+    assert sv_item is not None and sv_item.attrib["Name"] == "SEX"
+
+    codelists = root.findall(".//odm:CodeList", ns)
+    assert len(codelists) == 1
+    assert codelists[0].attrib["OID"] == "CL_SEX"
+    assert dm_item.find("odm:CodeListRef", ns).attrib["CodeListOID"] == "CL_SEX"  # type: ignore[union-attr]
+    assert sv_item.find("odm:CodeListRef", ns).attrib["CodeListOID"] == "CL_SEX"  # type: ignore[union-attr]
+
+    reloaded = load_from_cdisc_odm(xml_str, strict=True)
+    assert reloaded.metadata.validationWarnings == []
+    assert not diff(dd, reloaded).has_changes
