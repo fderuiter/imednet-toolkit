@@ -66,7 +66,7 @@ def my_task_logic():
 
 ## Incremental Checkpointing (Airflow 3)
 
-`ImednetExportOperator(incremental=True)` standardizes on the file-backed `ExtractionStateLedger` (`FileStateProvider`) resolved via `ledger_path` or `IMEDNET_WORKFLOW_LEDGER_PATH` rather than mutating Airflow XCom tables across runs.
+`ImednetExportOperator(incremental=True)` standardizes on the file-backed `ExtractionStateLedger` (`FileStateProvider`) resolved via `ledger_path`, `IMEDNET_WORKFLOW_LEDGER_PATH`, or `~/.imednet/pipeline_ledger.json` rather than mutating Airflow XCom tables across runs. Because ephemeral task containers (such as Kubernetes pods or isolated Celery workers) discard local container files when a task finishes, configure persistent or staged storage when using `incremental=True`.
 
 In Airflow 3, pass Study checkpoints across runs using:
 

@@ -154,8 +154,13 @@ Incremental Checkpointing in Airflow 3
 ``ImednetExportOperator(incremental=True)`` and ``imednet-workflows`` standardize
 on the file-backed :class:`~imednet_workflows.ExtractionStateLedger`
 (``FileStateProvider``) rather than querying or mutating Airflow's internal XCom
-metadata tables across DAG runs. In Airflow 3 deployments, choose one of three
-supported patterns to carry Study high-water marks between runs:
+metadata tables across DAG runs. Because ``FileStateProvider`` writes a JSON
+ledger file (resolved via ``ledger_path``, ``IMEDNET_WORKFLOW_LEDGER_PATH``, or
+``~/.imednet/pipeline_ledger.json``), ephemeral Airflow workers (such as
+Kubernetes pods or containerized Celery tasks) do not retain local container
+paths across DAG runs unless backed by shared or staged storage. In Airflow 3
+deployments, choose one of three supported patterns to carry Study high-water
+marks between runs:
 
 1. **Operator outputs and TaskFlow return values**: pass lightweight ISO-8601
    watermarks explicitly between tasks within a DAG run and supply them via

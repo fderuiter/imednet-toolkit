@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -11,7 +13,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 from imednet.models.records import Record
 from imednet.models.variables import Variable
 from imednet.spi import sink_base
@@ -22,6 +23,15 @@ from imednet_workflows.state_ledger import (
     FileStateProvider,
     StreamExecutionStatus,
 )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_airflow_provider_modules() -> Iterator[None]:
+    """Unload provider and Airflow modules on teardown so sibling test suites stay hermetic."""
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
+            sys.modules.pop(mod, None)
 
 
 class _RecordingSink(sink_base.ExportSink):
@@ -74,6 +84,9 @@ def test_airflow_export_operator_incremental_uses_file_state_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """ImednetExportOperator(incremental=True) persists checkpoints via FileStateProvider."""
+    pytest.importorskip("airflow")
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+
     ledger_path = tmp_path / "shared_ledger.json"
     monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_study")
     monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
@@ -123,6 +136,9 @@ def test_airflow_export_operator_tabular_incremental_uses_file_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Tabular incremental exports in ImednetExportOperator default to the file-backed ledger."""
+    pytest.importorskip("airflow")
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+
     ledger_path = tmp_path / "tabular_ledger.json"
     output_json = tmp_path / "records.json"
     monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_json_task")

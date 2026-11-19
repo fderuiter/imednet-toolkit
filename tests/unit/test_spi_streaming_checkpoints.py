@@ -470,72 +470,91 @@ def test_airflow_operator_file_ledger_incremental_checkpoint_and_failure_rollbac
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """ImednetExportOperator incremental export uses FileStateProvider and rolls back on error."""
-    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    import sys
 
-    ledger_path = tmp_path / "airflow_operator_ledger.json"
-    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "af_inc_1")
-    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
-    provider = ExtractionStateLedger(ledger_path)
-    seen_kwargs: list[dict[str, Any]] = []
+    pytest.importorskip("airflow")
+    prior_modules = set(sys.modules)
+    try:
+        from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 
-    def _run1(**kwargs: Any) -> list[Record]:
-        seen_kwargs.append(kwargs)
-        return [_make_record(1, date_modified="2026-03-01T14:00:00Z")]
+        ledger_path = tmp_path / "airflow_operator_ledger.json"
+        monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "af_inc_1")
+        monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+        provider = ExtractionStateLedger(ledger_path)
+        seen_kwargs: list[dict[str, Any]] = []
 
-    reads = [0]
-    mock_sinks = SimpleNamespace(
-        MongoDbExportSink=lambda config: _CountingSink(config, reads),
-        MongoDbSinkConfig=MongoDbSinkConfig,
-    )
-    sdk = MagicMock(sinks=mock_sinks)
-    sdk.records.list.side_effect = _run1
+        def _run1(**kwargs: Any) -> list[Record]:
+            seen_kwargs.append(kwargs)
+            return [_make_record(1, date_modified="2026-03-01T14:00:00Z")]
 
-    op1 = ImednetExportOperator(
-        task_id="af_inc_1",
-        study_key="STUDY-AF-INC",
-        destination="mongodb",
-        incremental=True,
-        stream_name="mongo_af",
-        ledger_path=str(ledger_path),
-        export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
-    )
-    monkeypatch.setattr(op1, "_get_sdk", lambda: sdk)
-    op1.execute({})
+        reads = [0]
+        mock_sinks = SimpleNamespace(
+            MongoDbExportSink=lambda config: _CountingSink(config, reads),
+            MongoDbSinkConfig=MongoDbSinkConfig,
+        )
+        sdk = MagicMock(sinks=mock_sinks)
+        sdk.records.list.side_effect = _run1
 
-    assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
-        2026, 3, 1, 14, 0, tzinfo=timezone.utc
-    )
+        op1 = ImednetExportOperator(
+            task_id="af_inc_1",
+            study_key="STUDY-AF-INC",
+            destination="mongodb",
+            incremental=True,
+            stream_name="mongo_af",
+            ledger_path=str(ledger_path),
+            export_kwargs={
+                "uri": "mongodb://localhost:27017",
+                "database": "db",
+                "collection": "col",
+            },
+        )
+        monkeypatch.setattr(op1, "_get_sdk", lambda: sdk)
+        op1.execute({})
 
-    # Second run fails mid-stream -> prior watermark preserved & status marked failed
-    def _run2(**kwargs: Any) -> list[Record]:
-        seen_kwargs.append(kwargs)
-        return [_make_record(2, date_modified="2026-03-02T10:00:00Z")]
+        assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
+            2026, 3, 1, 14, 0, tzinfo=timezone.utc
+        )
 
-    sdk.records.list.side_effect = _run2
-    sdk.sinks = SimpleNamespace(
-        MongoDbExportSink=lambda config: _CountingSink(config, reads, fail_on_batch=0),
-        MongoDbSinkConfig=MongoDbSinkConfig,
-    )
-    op2 = ImednetExportOperator(
-        task_id="af_inc_2",
-        study_key="STUDY-AF-INC",
-        destination="mongodb",
-        incremental=True,
-        stream_name="mongo_af",
-        ledger_path=str(ledger_path),
-        export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
-    )
-    monkeypatch.setattr(op2, "_get_sdk", lambda: sdk)
+        # Second run fails mid-stream -> prior watermark preserved & status marked failed
+        def _run2(**kwargs: Any) -> list[Record]:
+            seen_kwargs.append(kwargs)
+            return [_make_record(2, date_modified="2026-03-02T10:00:00Z")]
 
-    with pytest.raises(ExportBatchError):
-        op2.execute({})
+        sdk.records.list.side_effect = _run2
+        sdk.sinks = SimpleNamespace(
+            MongoDbExportSink=lambda config: _CountingSink(config, reads, fail_on_batch=0),
+            MongoDbSinkConfig=MongoDbSinkConfig,
+        )
+        op2 = ImednetExportOperator(
+            task_id="af_inc_2",
+            study_key="STUDY-AF-INC",
+            destination="mongodb",
+            incremental=True,
+            stream_name="mongo_af",
+            ledger_path=str(ledger_path),
+            export_kwargs={
+                "uri": "mongodb://localhost:27017",
+                "database": "db",
+                "collection": "col",
+            },
+        )
+        monkeypatch.setattr(op2, "_get_sdk", lambda: sdk)
 
-    assert seen_kwargs[1]["dateModified"] == (">=", "2026-03-01T14:00:00Z")
-    assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
-        2026, 3, 1, 14, 0, tzinfo=timezone.utc
-    )
-    stream = provider.read_state().studies["STUDY-AF-INC"].streams["mongo_af"]
-    assert stream.last_run_status == StreamExecutionStatus.FAILED
+        with pytest.raises(ExportBatchError):
+            op2.execute({})
+
+        assert seen_kwargs[1]["dateModified"] == (">=", "2026-03-01T14:00:00Z")
+        assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
+            2026, 3, 1, 14, 0, tzinfo=timezone.utc
+        )
+        stream = provider.read_state().studies["STUDY-AF-INC"].streams["mongo_af"]
+        assert stream.last_run_status == StreamExecutionStatus.FAILED
+    finally:
+        for mod in list(sys.modules):
+            if mod not in prior_modules and mod.startswith(
+                ("apache_airflow_providers_imednet", "airflow")
+            ):
+                sys.modules.pop(mod, None)
 
 
 # ---------------------------------------------------------------------------

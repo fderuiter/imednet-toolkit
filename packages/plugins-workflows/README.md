@@ -52,10 +52,11 @@ The following components are exposed via Python entry points:
 - **Custom Mappers (`imednet.mappers`)**: `RecordMapper`.
 - **Data Loaders (`imednet.loaders`)**: `CachedRecordsLoader`.
 - **Config Stores (`imednet.stores`)**: `ConfigVersionStore`.
+- **State Providers (`imednet.state_providers`)**: `default`, `file`.
 
 ## Features
 
-- **State Ledger Management**: High-water mark state tracking via File ledger (local JSON with atomic file updates and cooperative file-locking) or Airflow (XCom databases).
+- **State Ledger Management**: High-water mark state tracking via the file-backed ledger (`ExtractionStateLedger` / `FileStateProvider`: local JSON with atomic file updates and cooperative file-locking, configurable via `ledger_path` or `IMEDNET_WORKFLOW_LEDGER_PATH`).
 - **Continuous Sync Workers**: Background polling loops (`SyncWorker`) with configurable polling intervals, execution callbacks, and clean shutdown/one-run modes.
 - **Local SQLite Caching**: Thread-safe caching mirroring records with WAL (Write-Ahead Logging) mode, custom locks, and tenacity-backed network retry resilience.
 - **Bounded Chunk Processing**: Memory-efficient record streaming partitions (`ChunkedRecordPipeline`) to export sequence-numbered Parquet/tabular files.
