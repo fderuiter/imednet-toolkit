@@ -32,12 +32,13 @@ Canonical tasks
 ---------------
 
 ``pyproject.toml`` defines ``hatch run verify-static`` (format, lint and the
-three typing targets), ``hatch run verify-tests`` (offline workspace tests and
+typing targets), ``hatch run verify-tests`` (offline workspace tests and
 90% coverage), and ``hatch run docs`` (strict documentation checks).
-``hatch run verify`` runs these same tasks in order; the Pipeline quality job
-invokes it directly. The expanded commands above are useful for diagnostics.
+``hatch run verify`` runs ``verify-static`` and ``verify-tests`` in order; the
+Pipeline ``docs`` job runs ``uv run python scripts/build_docs.py`` once on the
+synced ``.venv`` workspace. The expanded commands above are useful for diagnostics.
 
-Install with ``uv sync --locked --extra dev --extra docs`` or the setup wizard;
+Install with ``uv sync --locked --all-packages --all-extras`` or the setup wizard;
 no real credentials or live EDC access are required. Run pre-commit first and
 ``uvx hatch run quality:all packages`` as well for the existing security, dead-code,
 spelling and similarity gates. The fast global Ruff check is an early subset;
