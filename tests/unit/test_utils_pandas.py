@@ -429,3 +429,84 @@ def test_models_to_dataframe_helper_raises_when_pandas_missing(monkeypatch) -> N
     monkeypatch.setattr("imednet.utils.pandas.pd", None)
     with pytest.raises(ImportError, match="pandas is required for custom_feature"):
         _models_to_dataframe([], "custom_feature")
+
+
+def _sample_phi_record() -> Record:
+    """Create a sample Record containing sensitive clinical fields and clinical vitals."""
+    return Record(
+        record_id=101,
+        study_key="STUDY1",
+        subject_key="SUBJ-001",
+        visit_id=1,
+        form_id=10,
+        record_status="Complete",
+        record_data={
+            "patientName": "Jane Doe",
+            "DOB": "1980-01-01",
+            "SSN": "123-45-6789",
+            "email": "jane@example.org",
+            "systolicBp": 120,
+        },
+    )
+
+
+def test_records_to_dataframe_masks_phi_by_default_and_honors_opt_out() -> None:
+    """Verify records_to_dataframe masks PHI in flat and nested modes and supports mask_phi=False."""
+    from imednet.utils.security import global_sensitivity_registry
+
+    rec = _sample_phi_record()
+    snapshot_keywords = set(global_sensitivity_registry._sensitive_keys)
+
+    flat_df = records_to_dataframe([rec], flatten=True)
+    assert flat_df.loc[0, "patientName"] == "***MASKED***"
+    assert flat_df.loc[0, "DOB"] == "***MASKED***"
+    assert flat_df.loc[0, "SSN"] == "***MASKED***"
+    assert flat_df.loc[0, "email"] == "***MASKED***"
+    assert flat_df.loc[0, "systolicBp"] == 120
+    assert flat_df.loc[0, "subject_key"] == "SUBJ-001"
+    assert flat_df.loc[0, "study_key"] == "STUDY1"
+    assert flat_df.loc[0, "record_id"] == 101
+
+    nested_df = records_to_dataframe([rec], flatten=False)
+    assert nested_df.loc[0, "record_data"] == {
+        "patientName": "***MASKED***",
+        "DOB": "***MASKED***",
+        "SSN": "***MASKED***",
+        "email": "***MASKED***",
+        "systolicBp": 120,
+    }
+    # Original Record model was not mutated in-place
+    assert rec.record_data["patientName"] == "Jane Doe"
+
+    unmasked_df = records_to_dataframe([rec], flatten=True, mask_phi=False)
+    assert unmasked_df.loc[0, "patientName"] == "Jane Doe"
+    assert unmasked_df.loc[0, "DOB"] == "1980-01-01"
+    assert unmasked_df.loc[0, "SSN"] == "123-45-6789"
+    assert unmasked_df.loc[0, "email"] == "jane@example.org"
+    assert unmasked_df.loc[0, "systolicBp"] == 120
+    assert global_sensitivity_registry._sensitive_keys == snapshot_keywords
+
+
+def test_export_records_csv_masks_phi_by_default_and_honors_opt_out(tmp_path) -> None:
+    """Verify export_records_csv masks PHI by default and supports mask_phi=False."""
+    sdk = MagicMock()
+    sdk.records.list.side_effect = lambda **_kw: [_sample_phi_record()]
+
+    masked_path = tmp_path / "masked_records.csv"
+    export_records_csv(sdk, "STUDY1", str(masked_path))
+    masked_df = pd.read_csv(masked_path)
+    assert masked_df.loc[0, "patientName"] == "***MASKED***"
+    assert masked_df.loc[0, "DOB"] == "***MASKED***"
+    assert masked_df.loc[0, "SSN"] == "***MASKED***"
+    assert masked_df.loc[0, "email"] == "***MASKED***"
+    assert masked_df.loc[0, "systolicBp"] == 120
+    assert masked_df.loc[0, "subject_key"] == "SUBJ-001"
+
+    unmasked_path = tmp_path / "unmasked_records.csv"
+    export_records_csv(sdk, "STUDY1", str(unmasked_path), mask_phi=False)
+    unmasked_df = pd.read_csv(unmasked_path)
+    assert unmasked_df.loc[0, "patientName"] == "Jane Doe"
+    assert unmasked_df.loc[0, "DOB"] == "1980-01-01"
+    assert unmasked_df.loc[0, "SSN"] == "123-45-6789"
+    assert unmasked_df.loc[0, "email"] == "jane@example.org"
+    assert unmasked_df.loc[0, "systolicBp"] == 120

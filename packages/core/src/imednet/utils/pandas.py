@@ -19,7 +19,11 @@ from ..models.subjects import Subject
 from ..models.users import User
 from ..models.variables import Variable
 from ..models.visits import Visit
-from .security import sanitize_csv_formula
+from .security import (
+    global_sensitivity_registry,
+    mask_clinical_phi,
+    sanitize_csv_formula,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
     from ..sdk import ImednetSDK
@@ -130,23 +134,44 @@ def users_to_dataframe(users: list[User]) -> pd.DataFrame:
     return pd.DataFrame(user_dicts)
 
 
-def records_to_dataframe(records: list[Record], *, flatten: bool = False) -> pd.DataFrame:
+def records_to_dataframe(
+    records: list[Record],
+    *,
+    flatten: bool = False,
+    mask_phi: bool = True,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.records.Record` to a DataFrame.
 
     Each record is converted using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False``. If ``flatten`` is ``True`` the ``record_data`` column is
     expanded using :func:`pandas.json_normalize` so that each variable becomes a
-    column in the resulting DataFrame.
+    column in the resulting DataFrame. When ``mask_phi`` is ``True`` (default),
+    sensitive PHI fields inside ``record_data`` are replaced with ``***MASKED***``.
     """
     df = _models_to_dataframe(records, "records_to_dataframe")
-    if flatten and not df.empty:
+    if df.empty:
+        return df
+
+    if mask_phi and "record_data" in df.columns:
+        df["record_data"] = df["record_data"].apply(mask_clinical_phi)
+
+    if flatten:
         record_df = pd.json_normalize(df["record_data"].tolist(), sep="_")
+        if mask_phi and not record_df.empty:
+            for col in record_df.columns:
+                if global_sensitivity_registry.is_sensitive(str(col)):
+                    record_df[col] = "***MASKED***"
         df = pd.concat([df.drop(columns=["record_data"]), record_df], axis=1)
     return df
 
 
 def export_records_csv(
-    sdk: ImednetSDK, study_key: str, file_path: str, *, flatten: bool = True
+    sdk: ImednetSDK,
+    study_key: str,
+    file_path: str,
+    *,
+    flatten: bool = True,
+    mask_phi: bool = True,
 ) -> None:
     """Fetch all records for ``study_key`` and write them to ``file_path``.
 
@@ -157,7 +182,7 @@ def export_records_csv(
     check_pandas("export_records_csv")
 
     records = list(sdk.records.list(study_key=study_key))
-    df = records_to_dataframe(records, flatten=flatten)
+    df = records_to_dataframe(records, flatten=flatten, mask_phi=mask_phi)
 
     # Sanitize data to prevent CSV injection
     df = df.map(sanitize_csv_formula)

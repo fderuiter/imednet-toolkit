@@ -99,14 +99,27 @@ class TestSinkConfig:
         assert cfg.max_retries == 3
         assert cfg.retry_backoff == 1.0
         assert cfg.idempotent is True
+        assert cfg.mask_phi is True
         assert cfg.extra == {}
 
     def test_custom_values(self):
         """Test that custom values."""
-        cfg = SinkConfig(study_key="MY_STUDY", batch_size=100, max_retries=0, idempotent=False)
+        cfg = SinkConfig(
+            study_key="MY_STUDY",
+            batch_size=100,
+            max_retries=0,
+            idempotent=False,
+            mask_phi=False,
+        )
         assert cfg.batch_size == 100
         assert cfg.max_retries == 0
         assert cfg.idempotent is False
+        assert cfg.mask_phi is False
+
+    def test_rejects_non_boolean_mask_phi(self):
+        """Test that non-boolean mask_phi raises ValueError."""
+        with pytest.raises(ValueError, match="mask_phi must be a boolean"):
+            SinkConfig(study_key="MY_STUDY", mask_phi="false")  # type: ignore[arg-type]
 
 
 class TestIterBatches:

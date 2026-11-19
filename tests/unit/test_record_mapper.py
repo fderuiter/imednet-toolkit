@@ -1128,3 +1128,58 @@ def test_sdtm_transformation_large_batch_benchmark() -> None:
 
     # Assert processing time is well under threshold (typically ~0.4-0.6s for 5,000 records)
     assert elapsed < 2.5
+
+
+def test_record_mapper_masks_phi_before_applying_question_labels() -> None:
+    """Verify RecordMapper masks canonical PHI variables before renaming columns to question labels."""
+    from imednet.utils.security import global_sensitivity_registry
+
+    registry_snapshot = set(global_sensitivity_registry._sensitive_keys)
+    sdk = MagicMock()
+    sdk.get_variables.return_value = [
+        Variable(variable_name="patientName", label="Full Legal Participant Name", form_id=10),
+        Variable(variable_name="DOB", label="Calendar Day", form_id=10),
+        Variable(variable_name="SSN", label="National Identifier", form_id=10),
+        Variable(variable_name="email", label="Electronic Contact", form_id=10),
+        Variable(variable_name="systolicBp", label="Systolic Blood Pressure (mmHg)", form_id=10),
+    ]
+    raw_record = Record(
+        record_id=101,
+        subject_key="SUBJ-101",
+        visit_id=1,
+        form_id=10,
+        record_status="Complete",
+        date_created=datetime(2025, 1, 1),
+        record_data={
+            "patientName": "Jane Doe",
+            "DOB": "1985-07-19",
+            "SSN": "123-45-6789",
+            "email": "jane@clinical.example",
+            "systolicBp": 119,
+        },
+    )
+    sdk.get_records.return_value = [raw_record]
+
+    mapper = RecordMapper(sdk)
+    df_labeled = mapper.dataframe("STUDY1", use_labels_as_columns=True)
+
+    assert df_labeled.iloc[0]["recordId"] == 101
+    assert df_labeled.iloc[0]["subjectKey"] == "SUBJ-101"
+    assert df_labeled.iloc[0]["Full Legal Participant Name"] == "***MASKED***"
+    assert df_labeled.iloc[0]["Calendar Day"] == "***MASKED***"
+    assert df_labeled.iloc[0]["National Identifier"] == "***MASKED***"
+    assert df_labeled.iloc[0]["Electronic Contact"] == "***MASKED***"
+    assert df_labeled.iloc[0]["Systolic Blood Pressure (mmHg)"] == 119
+    assert raw_record.record_data["patientName"] == "Jane Doe"
+
+    # Explicit opt-out via method parameter or constructor preserves raw values without mutating global registry
+    df_unmasked = mapper.dataframe("STUDY1", use_labels_as_columns=True, mask_phi=False)
+    assert df_unmasked.iloc[0]["Full Legal Participant Name"] == "Jane Doe"
+    assert df_unmasked.iloc[0]["Calendar Day"] == "1985-07-19"
+    assert df_unmasked.iloc[0]["National Identifier"] == "123-45-6789"
+    assert df_unmasked.iloc[0]["Electronic Contact"] == "jane@clinical.example"
+
+    opt_out_mapper = RecordMapper(sdk, mask_phi=False)
+    df_ctor_unmasked = opt_out_mapper.dataframe("STUDY1", use_labels_as_columns=True)
+    assert df_ctor_unmasked.iloc[0]["Full Legal Participant Name"] == "Jane Doe"
+    assert global_sensitivity_registry._sensitive_keys == registry_snapshot
