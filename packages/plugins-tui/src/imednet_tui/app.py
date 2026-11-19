@@ -432,10 +432,12 @@ def _clean_scalar_str(value: Any) -> str:
 
 
 def _extract_job_attr(job: Any, *names: str) -> Any:
-    """Return the first non-None job attribute or mapping entry."""
+    """Return the first non-None, non-blank job attribute or mapping entry."""
     for name in names:
         val = job.get(name) if isinstance(job, Mapping) else getattr(job, name, None)
         if val is not None and not callable(val):
+            if isinstance(val, str) and not val.strip():
+                continue
             return val
     return None
 

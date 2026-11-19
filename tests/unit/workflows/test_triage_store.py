@@ -293,3 +293,27 @@ def test_triage_store_create_item_rejects_duplicates_atomically(tmp_path: Path) 
     assert [ann.comment for ann in preserved.annotations] == ["Initial finding"]
     assert len(preserved.history) == 1
     assert preserved.history[0].to_status == TriageStatus.UNDER_REVIEW
+
+    # Invalid characters in item_id are rejected before polluting get_queue
+    bad_item = initial.model_copy(update={"item_id": "BAD ID WITH SPACES"})
+    with pytest.raises(ValueError, match="Invalid triage item identifier"):
+        store.create_item(bad_item)
+    assert [it.item_id for it in store.get_queue("STUDY-A")] == ["AE-CREATE-1"]
+
+    # Upserting an existing item without annotations/history preserves existing history and audits transition
+    minimal_update = TriageItem(
+        item_id="AE-CREATE-1",
+        study_key="STUDY-A",
+        status=TriageStatus.RESOLVED,
+        assignee="dm_lead",
+        severity="CRITICAL",
+    )
+    store.upsert_item(minimal_update)
+    after_upsert = store.get_triage_item("AE-CREATE-1")
+    assert after_upsert is not None
+    assert after_upsert.status == TriageStatus.RESOLVED
+    assert after_upsert.severity == "CRITICAL"
+    assert [ann.comment for ann in after_upsert.annotations] == ["Initial finding"]
+    assert len(after_upsert.history) == 2
+    assert after_upsert.history[-1].from_status == TriageStatus.UNDER_REVIEW
+    assert after_upsert.history[-1].to_status == TriageStatus.RESOLVED

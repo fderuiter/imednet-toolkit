@@ -148,13 +148,27 @@ class TriageStore:
             ) from last_error
 
     @staticmethod
+    def _validate_item_id(raw_item_id: str) -> str:
+        """Normalize and validate a triage item identifier."""
+        cleaned = raw_item_id.strip()
+        if not cleaned:
+            raise ValueError("Triage item_id must not be empty.")
+        if not _SAFE_SQL_IDENTIFIER.fullmatch(cleaned):
+            raise ValueError(
+                f"Invalid triage item identifier: {cleaned}. "
+                "Only alphanumeric characters and ._:- are allowed."
+            )
+        return cleaned
+
+    @staticmethod
     def _insert_item_details(
         conn: sqlite3.Connection,
         item: TriageItem,
         *,
         extra_annotation: tuple[str, str, str, str, str] | None = None,
+        extra_history: tuple[str, str, str, str, str, str | None, str] | None = None,
     ) -> None:
-        """Insert annotations and transition history rows for a triage item."""
+        """Insert or upsert annotations and transition history rows for a triage item."""
         annotation_rows = [
             (
                 annotation.annotation_id,
@@ -172,30 +186,43 @@ class TriageStore:
                 """
                 INSERT INTO triage_annotations (annotation_id, item_id, user_id, comment, timestamp)
                 VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(annotation_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    comment = excluded.comment,
+                    timestamp = excluded.timestamp
                 """,
                 annotation_rows,
             )
 
-        if item.history:
+        history_rows = [
+            (
+                entry.transition_id,
+                item.item_id,
+                entry.from_status.value,
+                entry.to_status.value,
+                entry.user_id,
+                entry.comment,
+                entry.timestamp.isoformat(),
+            )
+            for entry in item.history
+        ]
+        if extra_history is not None:
+            history_rows.append(extra_history)
+        if history_rows:
             conn.executemany(
                 """
                 INSERT INTO triage_history (
                     transition_id, item_id, from_status, to_status, user_id, comment, timestamp
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(transition_id) DO UPDATE SET
+                    from_status = excluded.from_status,
+                    to_status = excluded.to_status,
+                    user_id = excluded.user_id,
+                    comment = excluded.comment,
+                    timestamp = excluded.timestamp
                 """,
-                [
-                    (
-                        entry.transition_id,
-                        item.item_id,
-                        entry.from_status.value,
-                        entry.to_status.value,
-                        entry.user_id,
-                        entry.comment,
-                        entry.timestamp.isoformat(),
-                    )
-                    for entry in item.history
-                ],
+                history_rows,
             )
 
     def create_item(
@@ -207,10 +234,8 @@ class TriageStore:
     ) -> None:
         """Atomically insert a new triage item, rejecting duplicate item IDs."""
         now = datetime.now(UTC).isoformat()
-        cleaned_id = item.item_id.strip()
+        cleaned_id = self._validate_item_id(item.item_id)
         cleaned_study = item.study_key.strip()
-        if not cleaned_id:
-            raise ValueError("Triage item_id must not be empty.")
         if not cleaned_study:
             raise ValueError("Triage study_key must not be empty.")
         normalized_item = item.model_copy(
@@ -251,24 +276,41 @@ class TriageStore:
         self._execute_write(_write)
 
     def upsert_item(self, item: TriageItem) -> None:
-        """Insert or update a triage item and its associated annotations and history."""
+        """Insert or update a triage item while preserving existing annotations and audit history."""
         now = datetime.now(UTC).isoformat()
+        cleaned_id = self._validate_item_id(item.item_id)
+        cleaned_study = item.study_key.strip()
+        if not cleaned_study:
+            raise ValueError("Triage study_key must not be empty.")
+        normalized_item = item.model_copy(
+            update={"item_id": cleaned_id, "study_key": cleaned_study}
+        )
 
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to write triage item data."""
             existing = conn.execute(
                 "SELECT status FROM triage_items WHERE item_id = ?",
-                (item.item_id,),
+                (normalized_item.item_id,),
             ).fetchone()
+            audited_transition: tuple[str, str, str, str, str, str | None, str] | None = None
+            target_status = (
+                normalized_item.status
+                if isinstance(normalized_item.status, TriageStatus)
+                else TriageStatus(str(normalized_item.status))
+            )
             if existing is not None:
                 current_status = TriageStatus(str(existing["status"]))
-                target_status = (
-                    item.status
-                    if isinstance(item.status, TriageStatus)
-                    else TriageStatus(str(item.status))
-                )
                 if current_status != target_status:
                     validate_transition(current_status, target_status)
+                    audited_transition = (
+                        str(uuid.uuid4()),
+                        normalized_item.item_id,
+                        current_status.value,
+                        target_status.value,
+                        (normalized_item.assignee or "system").strip() or "system",
+                        "Updated via upsert_item",
+                        now,
+                    )
 
             conn.execute(
                 """
@@ -284,24 +326,29 @@ class TriageStore:
                     updated_at=excluded.updated_at
                 """,
                 (
-                    item.item_id,
-                    item.study_key,
-                    item.status.value,
-                    item.assignee,
-                    item.severity,
+                    normalized_item.item_id,
+                    normalized_item.study_key,
+                    target_status.value,
+                    normalized_item.assignee,
+                    normalized_item.severity,
                     now,
                     now,
                 ),
             )
 
-            conn.execute("DELETE FROM triage_annotations WHERE item_id = ?", (item.item_id,))
-            conn.execute("DELETE FROM triage_history WHERE item_id = ?", (item.item_id,))
-            self._insert_item_details(conn, item)
+            self._insert_item_details(
+                conn,
+                normalized_item,
+                extra_history=audited_transition,
+            )
 
         self._execute_write(_write)
 
     def get_triage_item(self, item_id: str) -> TriageItem | None:
         """Fetch a single triage item by ID."""
+        cleaned_id = item_id.strip()
+        if not cleaned_id:
+            return None
         with self._connection() as conn:
             row = conn.execute(
                 """
@@ -309,13 +356,13 @@ class TriageStore:
                 FROM triage_items
                 WHERE item_id = ?
                 """,
-                (item_id,),
+                (cleaned_id,),
             ).fetchone()
             if row is None:
                 return None
 
-            annotations = self._get_annotations(conn, item_id)
-            history = self._get_history(conn, item_id)
+            annotations = self._get_annotations(conn, cleaned_id)
+            history = self._get_history(conn, cleaned_id)
             return TriageItem(
                 item_id=str(row["item_id"]),
                 study_key=str(row["study_key"]),
@@ -434,6 +481,7 @@ class TriageStore:
 
     def assign_item(self, item_id: str, assignee: str) -> None:
         """Assign a triage item to a specific user."""
+        cleaned_id = item_id.strip()
 
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to update item assignee."""
@@ -443,10 +491,10 @@ class TriageStore:
                 SET assignee = ?, updated_at = ?
                 WHERE item_id = ?
                 """,
-                (assignee.strip(), datetime.now(UTC).isoformat(), item_id),
+                (assignee.strip(), datetime.now(UTC).isoformat(), cleaned_id),
             )
             if cursor.rowcount == 0:
-                raise ValueError(f"Unknown triage item: {item_id}")
+                raise ValueError(f"Unknown triage item: {cleaned_id}")
 
         self._execute_write(_write)
 
@@ -458,6 +506,7 @@ class TriageStore:
         comment: str | None,
     ) -> None:
         """Update the status of a triage item and record the transition in history."""
+        cleaned_id = item_id.strip()
         normalized_comment = comment.strip() if comment else None
         timestamp = datetime.now(UTC).isoformat()
 
@@ -465,10 +514,10 @@ class TriageStore:
             """Internal helper to update item status."""
             row = conn.execute(
                 "SELECT status FROM triage_items WHERE item_id = ?",
-                (item_id,),
+                (cleaned_id,),
             ).fetchone()
             if row is None:
-                raise ValueError(f"Unknown triage item: {item_id}")
+                raise ValueError(f"Unknown triage item: {cleaned_id}")
 
             from_status = TriageStatus(str(row["status"]))
             target_status = (
@@ -486,7 +535,7 @@ class TriageStore:
                 SET status = ?, updated_at = ?
                 WHERE item_id = ?
                 """,
-                (target_status.value, timestamp, item_id),
+                (target_status.value, timestamp, cleaned_id),
             )
             conn.execute(
                 """
@@ -497,7 +546,7 @@ class TriageStore:
                 """,
                 (
                     str(uuid.uuid4()),
-                    item_id,
+                    cleaned_id,
                     from_status.value,
                     target_status.value,
                     user_id,
@@ -510,6 +559,7 @@ class TriageStore:
 
     def add_annotation(self, item_id: str, user_id: str, comment: str) -> None:
         """Add a comment/annotation to a triage item."""
+        cleaned_id = item_id.strip()
         cleaned_comment = comment.strip()
         if not cleaned_comment:
             raise ValueError("Annotation comment must not be empty")
@@ -520,31 +570,32 @@ class TriageStore:
             """Internal helper to add item annotation."""
             row = conn.execute(
                 "SELECT item_id FROM triage_items WHERE item_id = ?",
-                (item_id,),
+                (cleaned_id,),
             ).fetchone()
             if row is None:
-                raise ValueError(f"Unknown triage item: {item_id}")
+                raise ValueError(f"Unknown triage item: {cleaned_id}")
 
             conn.execute(
                 """
                 INSERT INTO triage_annotations (annotation_id, item_id, user_id, comment, timestamp)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (str(uuid.uuid4()), item_id, user_id, cleaned_comment, timestamp),
+                (str(uuid.uuid4()), cleaned_id, user_id, cleaned_comment, timestamp),
             )
             conn.execute(
                 "UPDATE triage_items SET updated_at = ? WHERE item_id = ?",
-                (timestamp, item_id),
+                (timestamp, cleaned_id),
             )
 
         self._execute_write(_write)
 
     def get_item_last_updated(self, item_id: str) -> datetime | None:
         """Get the last updated timestamp for a triage item."""
+        cleaned_id = item_id.strip()
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT updated_at FROM triage_items WHERE item_id = ?",
-                (item_id,),
+                (cleaned_id,),
             ).fetchone()
         if row is None or row["updated_at"] is None:
             return None

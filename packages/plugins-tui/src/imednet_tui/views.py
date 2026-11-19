@@ -69,14 +69,27 @@ def _coerce_preview_value(value: Any) -> Any:
         return [_coerce_preview_value(v) for v in value]
     if isinstance(value, tuple):
         return [_coerce_preview_value(v) for v in value]
-    if not isinstance(value, type) and not _is_mock_object(value) and hasattr(value, "__dict__"):
-        obj_dict = {
-            str(k): _coerce_preview_value(v)
-            for k, v in vars(value).items()
-            if not str(k).startswith("_") and v is not None and not callable(v)
-        }
-        if obj_dict:
-            return obj_dict
+    if not isinstance(value, type) and not _is_mock_object(value):
+        if hasattr(value, "__dict__"):
+            obj_dict = {
+                str(k): _coerce_preview_value(v)
+                for k, v in vars(value).items()
+                if not str(k).startswith("_") and v is not None and not callable(v)
+            }
+            if obj_dict:
+                return obj_dict
+        slots = getattr(value, "__slots__", None)
+        if isinstance(slots, (list, tuple, set)):
+            slot_dict = {
+                str(slot): _coerce_preview_value(getattr(value, str(slot)))
+                for slot in slots
+                if not str(slot).startswith("_")
+                and hasattr(value, str(slot))
+                and getattr(value, str(slot)) is not None
+                and not callable(getattr(value, str(slot)))
+            }
+            if slot_dict:
+                return slot_dict
     return value
 
 
@@ -173,6 +186,27 @@ def _extract_preview_payload(selected: Any, spec: EntityViewSpec) -> tuple[dict[
     return {"item": str(selected)}, True
 
 
+def _mask_sensitive_tree(value: Any, sensitive_norms: frozenset[str]) -> Any:
+    """Recursively mask entity-specific sensitive keys across nested mappings and lists."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item_val in value.items():
+            norm_key = _norm_field_key(key)
+            if norm_key in sensitive_norms:
+                if item_val is None or item_val in ("", []):
+                    out[key] = item_val
+                elif isinstance(item_val, dict):
+                    out[key] = _mask_sensitive_tree(item_val, sensitive_norms)
+                else:
+                    out[key] = "***MASKED***"
+            else:
+                out[key] = _mask_sensitive_tree(item_val, sensitive_norms)
+        return out
+    if isinstance(value, list):
+        return [_mask_sensitive_tree(elem, sensitive_norms) for elem in value]
+    return value
+
+
 def _mask_entity_preview_payload(
     payload: dict[str, Any],
     spec: EntityViewSpec,
@@ -187,18 +221,8 @@ def _mask_entity_preview_payload(
         return {"item": "***MASKED***"}
     if not sensitive_norms:
         return masked
-
-    result: dict[str, Any] = {}
-    for key, val in masked.items():
-        norm_key = _norm_field_key(key)
-        if norm_key in sensitive_norms:
-            if val is None or val in ("", []) or isinstance(val, dict):
-                result[key] = val
-            else:
-                result[key] = "***MASKED***"
-        else:
-            result[key] = val
-    return result
+    tree = _mask_sensitive_tree(masked, sensitive_norms)
+    return tree if isinstance(tree, dict) else masked
 
 
 ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
@@ -234,7 +258,14 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         title="Queries",
         endpoint_attr="queries",
         supports_subject_filter=True,
-        sensitive_fields=("query_comments", "queryComments", "comments", "user", "author"),
+        sensitive_fields=(
+            "query_comments",
+            "queryComments",
+            "comments",
+            "comment",
+            "user",
+            "author",
+        ),
         columns=(
             EntityColumnSpec("Annotation ID", ("annotation_id", "annotationId")),
             EntityColumnSpec("Subject Key", ("subject_key", "subjectKey")),
@@ -301,6 +332,7 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
         title="Codings",
         endpoint_attr="codings",
         supports_subject_filter=True,
+        sensitive_fields=("coded_by", "codedBy", "reason", "value"),
         columns=(
             EntityColumnSpec("Coding ID", ("coding_id", "codingId")),
             EntityColumnSpec("Record ID", ("record_id", "recordId")),
@@ -319,7 +351,7 @@ ENTITY_VIEW_SPECS: dict[str, EntityViewSpec] = {
             EntityColumnSpec("Login", ("login",), sensitive=True),
             EntityColumnSpec("First Name", ("first_name", "firstName"), sensitive=True),
             EntityColumnSpec("Last Name", ("last_name", "lastName"), sensitive=True),
-            EntityColumnSpec("Active", ("active",)),
+            EntityColumnSpec("Active", ("active", "user_active_in_study", "userActiveInStudy")),
         ),
     ),
 }
@@ -455,6 +487,7 @@ class EntityTablePane(Container):
             f"{self.spec.title}: Select a study to load records.",
             id=f"{self.spec.key}_detail",
             classes="detail-banner",
+            markup=False,
         )
 
     def on_mount(self) -> None:
@@ -587,8 +620,8 @@ class EntityTablePane(Container):
                 is_opaque_fallback=is_opaque,
             )
         preview = json.dumps(payload, default=str, sort_keys=True)
-        if len(preview) > 220:
-            preview = f"{preview[:217]}..."
+        if len(preview) > 500:
+            preview = f"{preview[:497]}..."
         ro_prefix = "(READ-ONLY) " if self.is_read_only else ""
         detail = self.query_one(f"#{self.spec.key}_detail", Static)
         detail.update(f"{ro_prefix}{self.spec.title} Detail: {preview}")

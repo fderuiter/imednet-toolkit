@@ -6,6 +6,7 @@ import io
 import json
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -184,3 +185,22 @@ def test_spi_datadict_and_jobs_exports() -> None:
     errors = spi_datadict.validate(dd, spi_datadict.get_schema())
     assert isinstance(dd, spi_datadict.DataDictionary)
     assert errors == []
+
+
+def test_job_ledger_active_filter_survives_sql_limit_and_none_state_fallback() -> None:
+    """Verify active_only filters in SQL prior to LIMIT and record_from_model handles state=None."""
+    ledger = JobLedger()
+    fallback_job = SimpleNamespace(batch_id="B-OLDEST-ACTIVE", state=None, status="PROCESSING")
+    recorded = ledger.record_from_model("STUDY_LIM", fallback_job, source="sdk")
+    assert recorded is not None
+    assert recorded.state == "PROCESSING"
+    assert recorded.is_active is True
+
+    # Record 20 newer terminal jobs after the older active job
+    for idx in range(1, 21):
+        ledger.record_job("STUDY_LIM", f"B-DONE-{idx:02d}", state="COMPLETED", progress=100)
+
+    # Even with a small SQL limit (e.g. limit=5), active_only=True must find B-OLDEST-ACTIVE
+    limited_active = ledger.list_jobs("STUDY_LIM", active_only=True, limit=5)
+    assert [entry.batch_id for entry in limited_active] == ["B-OLDEST-ACTIVE"]
+    assert [entry.batch_id for entry in ledger.list_active_jobs("STUDY_LIM")] == ["B-OLDEST-ACTIVE"]

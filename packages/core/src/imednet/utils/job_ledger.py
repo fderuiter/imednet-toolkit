@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import sqlite3
@@ -365,12 +366,19 @@ class JobLedger:
                 getattr(job, "batch_id", None) or getattr(job, "batchId", None) or fallback_batch_id
             )
             job_id = getattr(job, "job_id", None) or getattr(job, "jobId", None)
-            state = getattr(job, "state", getattr(job, "status", getattr(job, "job_status", None)))
+            state = (
+                getattr(job, "state", None)
+                or getattr(job, "status", None)
+                or getattr(job, "job_status", None)
+                or getattr(job, "jobStatus", None)
+            )
             progress = getattr(job, "progress", None)
-            date_created = getattr(job, "date_created", None)
-            date_started = getattr(job, "date_started", None)
-            date_finished = getattr(job, "date_finished", None)
-            model_type = getattr(job, "job_type", None)
+            date_created = getattr(job, "date_created", None) or getattr(job, "dateCreated", None)
+            date_started = getattr(job, "date_started", None) or getattr(job, "dateStarted", None)
+            date_finished = getattr(job, "date_finished", None) or getattr(
+                job, "dateFinished", None
+            )
+            model_type = getattr(job, "job_type", None) or getattr(job, "jobType", None)
 
         if not batch_id or not str(batch_id).strip():
             return None
@@ -414,18 +422,33 @@ class JobLedger:
         """List persisted jobs for a study ordered by most recently updated."""
         if not study_key:
             return []
+        active_json = json.dumps(sorted(st.value for st in ACTIVE_JOB_STATES))
         with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT study_key, batch_id, job_id, job_type, state, progress,
-                       date_created, date_started, date_finished, source, recorded_at, updated_at
-                FROM job_ledger
-                WHERE study_key = ?
-                ORDER BY updated_at DESC, recorded_at DESC
-                LIMIT ?
-                """,
-                (study_key, max(1, limit)),
-            ).fetchall()
+            if active_only:
+                rows = conn.execute(
+                    """
+                    SELECT study_key, batch_id, job_id, job_type, state, progress,
+                           date_created, date_started, date_finished, source, recorded_at, updated_at
+                    FROM job_ledger
+                    WHERE study_key = ?
+                      AND UPPER(TRIM(state)) IN (SELECT value FROM json_each(?))
+                    ORDER BY updated_at DESC, recorded_at DESC
+                    LIMIT ?
+                    """,
+                    (study_key, active_json, max(1, limit)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT study_key, batch_id, job_id, job_type, state, progress,
+                           date_created, date_started, date_finished, source, recorded_at, updated_at
+                    FROM job_ledger
+                    WHERE study_key = ?
+                    ORDER BY updated_at DESC, recorded_at DESC
+                    LIMIT ?
+                    """,
+                    (study_key, max(1, limit)),
+                ).fetchall()
         entries = [self._row_to_entry(row) for row in rows]
         if active_only:
             return [entry for entry in entries if entry.is_active]

@@ -312,6 +312,8 @@ class TriagePane(Container):
                         clean_reviewer,
                         clean_comment,
                     )
+            if self.is_mounted:
+                self.query_one("#triage_comment_input", Input).value = ""
             self.selected_item_id = clean_id
             await self.refresh_queue()
         except Exception as exc:

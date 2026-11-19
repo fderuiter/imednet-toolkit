@@ -444,14 +444,14 @@ def test_triage_cli_full_lifecycle_and_transition_validation(tmp_path: Path) -> 
     assert res_resolved.exit_code == 0
     assert json.loads(res_resolved.stdout)["items"][0]["status"] == "RESOLVED"
 
-    # Re-adding an existing RESOLVED item must also fail and preserve full audit trail
+    # Re-adding an existing RESOLVED item (even with whitespace padding) must fail and preserve full audit trail
     res_dup_resolved = invoke_cli(
         [
             "workflows",
             "triage",
             "add",
             "STUDY_T",
-            "ITEM-001",
+            "  ITEM-001  ",
             "--comment",
             "Should not erase resolved item",
             *db_arg,

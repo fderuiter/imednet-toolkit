@@ -591,6 +591,18 @@ async def test_triage_pane_enforces_allowed_transitions_and_non_empty_comments(
         assert final_item.status == TriageStatus.RESOLVED
         assert len(final_item.history) == 2
 
+        # Repeating Add Item on a RESOLVED item also rejects duplicates and preserves history
+        triage_pane.query_one("#triage_item_id_input", Input).value = "  TRI-100  "
+        triage_pane.query_one("#triage_comment_input", Input).value = "Duplicate resolved add"
+        await triage_pane.create_triage_item(
+            "  TRI-100  ", initial_comment="Duplicate resolved add"
+        )
+        assert "already exists" in str(triage_pane.query_one("#triage_detail", Static).render())
+        still_resolved = store.get_triage_item("TRI-100")
+        assert still_resolved is not None
+        assert still_resolved.status == TriageStatus.RESOLVED
+        assert len(still_resolved.history) == 2
+
         # From RESOLVED, ALLOWED_TRANSITIONS only permits UNDER_REVIEW (RESOLVED -> NEW is forbidden)
         assert triage_pane.query_one("#triage_to_new_btn", Button).disabled is True
         assert triage_pane.query_one("#triage_to_resolved_btn", Button).disabled is True
@@ -1173,7 +1185,20 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
         modified_by: str
         reason_for_change: str
 
+    class _SlotsCoding:
+        __slots__ = ("coding_id", "record_id", "variable", "code", "coded_by", "reason", "value")
+
+        def __init__(self) -> None:
+            self.coding_id = "COD-SLOTS-1"
+            self.record_id = 1
+            self.variable = "AETERM"
+            self.code = "10019211"
+            self.coded_by = "slots_coder_login"
+            self.reason = "SlotsCodingReason"
+            self.value = "SlotsVerbatimTerm"
+
     sdk = _build_clinical_sdk()
+    sdk.codings.list.return_value = [_SlotsCoding()]
     sdk.users.list.return_value = [
         SimpleNamespace(
             user_id="U-NS-1",
@@ -1182,7 +1207,8 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
             last_name="NsLast",
             email="ns.investigator@example.test",
             username="ns_username",
-            active=True,
+            audit_meta={"login": "nested_login_handle"},
+            user_active_in_study=True,
         )
     ]
     sdk.record_revisions.list.return_value = [
@@ -1220,7 +1246,7 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
             poll_state["polls"] += 1
             return SimpleNamespace(
                 batch_id=active_16th,
-                state=None,
+                state="",
                 status=str(poll_state["status"]),
                 progress=30,
             )
@@ -1272,8 +1298,9 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
         users_pane = screen.query_one("#users_pane", EntityTablePane)
         revisions_pane = screen.query_one("#revisions_pane", EntityTablePane)
         records_pane = screen.query_one("#records_pane", EntityTablePane)
+        codings_pane = screen.query_one("#codings_pane", EntityTablePane)
 
-        for pane in (users_pane, revisions_pane, records_pane):
+        for pane in (users_pane, revisions_pane, records_pane, codings_pane):
             tbl = pane.query_one(f"#{pane.table_id}", DataTable)
             pane.on_data_table_row_selected(MagicMock(data_table=tbl, cursor_row=0))
 
@@ -1286,8 +1313,14 @@ async def test_synthetic_adapters_mask_detail_keep_polling_and_preserve_triage_h
             "NsLast",
             "ns.investigator@example.test",
             "ns_username",
+            "nested_login_handle",
         ):
             assert sensitive_val not in user_detail
+
+        coding_detail = str(codings_pane.query_one("#codings_detail", Static).render())
+        assert "COD-SLOTS-1" in coding_detail
+        for sensitive_val in ("slots_coder_login", "SlotsCodingReason", "SlotsVerbatimTerm"):
+            assert sensitive_val not in coding_detail
 
         rev_detail = str(revisions_pane.query_one("#record_revisions_detail", Static).render())
         for sensitive_val in ("ns_revision_author", "NsRevisionReasonText"):

@@ -586,10 +586,11 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
 
     def handle_show(args: argparse.Namespace) -> None:
         try:
+            clean_id = args.item_id.strip()
             store = _open_store(args.db_path)
-            item = store.get_triage_item(args.item_id)
+            item = store.get_triage_item(clean_id)
             if item is None:
-                print_error(f"Error: Unknown triage item '{args.item_id}'.")
+                print_error(f"Error: Unknown triage item '{clean_id}'.")
                 sys.exit(1)
             if args.output_format == "json":
                 emit_json([item], "triage_items")
@@ -682,19 +683,20 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
         if not args.comment or not args.comment.strip():
             trans_p.error("--comment must not be empty")
         try:
+            clean_id = args.item_id.strip()
             store = _open_store(args.db_path)
-            existing = store.get_triage_item(args.item_id)
+            existing = store.get_triage_item(clean_id)
             if existing is None:
-                print_error(f"Error: Unknown triage item '{args.item_id}'.")
+                print_error(f"Error: Unknown triage item '{clean_id}'.")
                 sys.exit(1)
             target = TriageStatus(args.to_status)
             validate_transition(existing.status, target)
-            store.update_status(args.item_id, target, args.user_id, args.comment.strip())
-            updated = store.get_triage_item(args.item_id)
+            store.update_status(clean_id, target, args.user_id, args.comment.strip())
+            updated = store.get_triage_item(clean_id)
             if args.output_format == "json":
                 emit_json([updated] if updated else [], "triage_items")
             else:
-                print(f"Transitioned '{args.item_id}' to {target.value}.")
+                print(f"Transitioned '{clean_id}' to {target.value}.")
         except (InvalidStateTransitionError, ValueError) as exc:
             print_error(f"Error: {exc}")
             sys.exit(1)
@@ -712,13 +714,14 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
 
     def handle_assign(args: argparse.Namespace) -> None:
         try:
+            clean_id = args.item_id.strip()
             store = _open_store(args.db_path)
-            store.assign_item(args.item_id, args.assignee)
-            updated = store.get_triage_item(args.item_id)
+            store.assign_item(clean_id, args.assignee)
+            updated = store.get_triage_item(clean_id)
             if args.output_format == "json":
                 emit_json([updated] if updated else [], "triage_items")
             else:
-                print(f"Assigned '{args.item_id}' to '{args.assignee}'.")
+                print(f"Assigned '{clean_id}' to '{args.assignee}'.")
         except Exception as exc:
             print_error(f"Error assigning triage item: {exc}")
             sys.exit(1)
@@ -736,13 +739,14 @@ def _register_triage_subcommands(sub: argparse._SubParsersAction[Any]) -> None:
         if not args.comment or not args.comment.strip():
             ann_p.error("--comment must not be empty")
         try:
+            clean_id = args.item_id.strip()
             store = _open_store(args.db_path)
-            store.add_annotation(args.item_id, args.user_id, args.comment.strip())
-            updated = store.get_triage_item(args.item_id)
+            store.add_annotation(clean_id, args.user_id, args.comment.strip())
+            updated = store.get_triage_item(clean_id)
             if args.output_format == "json":
                 emit_json([updated] if updated else [], "triage_items")
             else:
-                print(f"Added annotation to '{args.item_id}'.")
+                print(f"Added annotation to '{clean_id}'.")
         except Exception as exc:
             print_error(f"Error annotating triage item: {exc}")
             sys.exit(1)
