@@ -9,7 +9,7 @@ file locking dependencies.
 Development and documentation checkouts require Python **3.11.5+** to install
 patched selector dependencies. Published packages retain Python 3.11+ support.
 
-Full documentation: <https://fderuiter.github.io/imednet-toolkit/> | [Interactive Live Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
+Full documentation: <https://fderuiter.github.io/imednet-toolkit/> | [Simulation Scenario Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
 
 <div align="center">
 
@@ -31,8 +31,8 @@ reimplementing HTTP logic.
 
 Our documentation is organized according to the **Diátaxis framework**, which categorizes information based on user intent.
 
-### ⚡ [Interactive Live Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
-*Run live queries, test Python SDK and REST calls, inspect clinical form schemas, and verify audit trails directly in your browser without credentials or backend servers.*
+### ⚡ [Simulation Scenario Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
+*Browse verified Python SDK and REST snippets, inspect instant simulation previews for Study, Form, Record, and Query resources, validate form variable schemas, and review audit trails directly in your browser without credentials or backend servers.*
 - [Integration Engineer Live Console](https://fderuiter.github.io/imednet-toolkit/#panel-integration)
 - [Clinical Data Manager Form Validator](https://fderuiter.github.io/imednet-toolkit/#panel-datamanager)
 - [Regulatory Compliance Auditor Verification](https://fderuiter.github.io/imednet-toolkit/#panel-auditor)

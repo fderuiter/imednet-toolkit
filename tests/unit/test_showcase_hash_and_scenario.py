@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import json
 import re
 import shutil
 import subprocess
+import types
 import urllib.parse
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from scripts.validate_showcases import (
+    validate_canonical_showcase_terminology,
+    validate_landing_showcase,
+)
 
 from imednet.endpoints.records import RecordsEndpoint
 from imednet.models.forms import Form
-from imednet.models.queries import QueryStatus
+from imednet.models.queries import Query, QueryStatus
+from imednet.models.records import Record
 from imednet.models.studies import Study
+from imednet.simulation.state import get_default_simulation_state
 
 
 def get_repo_root() -> Path:
@@ -226,13 +236,20 @@ def test_showcase_sdk_snippets_syntax_and_api_contracts() -> None:
     # 1. Records extraction snippet
     records_insp = inspectors["records"]
     assert "to_df" not in snippets["records"], "records snippet must not call nonexistent to_df"
-    records_calls = [
-        (fn, kw) for fn, kw in records_insp.calls if fn == "client.records.to_dataframe"
-    ]
-    assert records_calls, "records snippet must call client.records.to_dataframe"
+    assert "ImednetClient" not in snippets["records"], "records snippet must use ImednetSDK"
+    sdk_init_calls = [(fn, kw) for fn, kw in records_insp.calls if fn == "ImednetSDK"]
+    assert sdk_init_calls and sdk_init_calls[0][1].get("simulation_mode") == "True", (
+        "records snippet must instantiate ImednetSDK(simulation_mode=True)"
+    )
+    records_list_calls = [(fn, kw) for fn, kw in records_insp.calls if fn == "sdk.records.list"]
+    assert records_list_calls and records_list_calls[0][1].get("study_key") == "'STUDY'", (
+        "records snippet must materialize sdk.records.list(study_key='STUDY')"
+    )
+    records_calls = [(fn, kw) for fn, kw in records_insp.calls if fn == "sdk.records.to_dataframe"]
+    assert records_calls, "records snippet must call sdk.records.to_dataframe"
     _, records_kw = records_calls[0]
-    assert records_kw.get("study_key") == "'STUDY-101'", (
-        f"Expected study_key='STUDY-101', got {records_kw.get('study_key')}"
+    assert records_kw.get("study_key") == "'STUDY'", (
+        f"Expected study_key='STUDY', got {records_kw.get('study_key')}"
     )
     assert records_kw.get("flatten") == "True", (
         f"Expected flatten=True, got {records_kw.get('flatten')}"
@@ -243,8 +260,10 @@ def test_showcase_sdk_snippets_syntax_and_api_contracts() -> None:
 
     # 2. Studies snippet
     studies_insp = inspectors["studies"]
-    studies_calls = [(fn, kw) for fn, kw in studies_insp.calls if fn == "client.studies.list"]
-    assert studies_calls, "studies snippet must call client.studies.list"
+    studies_calls = [(fn, kw) for fn, kw in studies_insp.calls if fn == "sdk.studies.list"]
+    assert studies_calls, "studies snippet must call sdk.studies.list"
+    _, studies_kw = studies_calls[0]
+    assert "status" not in studies_kw, "studies.list() must not pass unsupported status filter"
     studies_item_attrs = {attr for val, attr in studies_insp.attributes if val == "s"}
     assert "study_name" in studies_item_attrs, "studies snippet must access s.study_name"
     assert "study_type" in studies_item_attrs, "studies snippet must access s.study_type"
@@ -257,8 +276,12 @@ def test_showcase_sdk_snippets_syntax_and_api_contracts() -> None:
 
     # 3. Forms snippet
     forms_insp = inspectors["forms"]
-    forms_calls = [(fn, kw) for fn, kw in forms_insp.calls if fn == "client.forms.list"]
-    assert forms_calls, "forms snippet must call client.forms.list"
+    forms_calls = [(fn, kw) for fn, kw in forms_insp.calls if fn == "sdk.forms.list"]
+    assert forms_calls, "forms snippet must call sdk.forms.list"
+    _, forms_kw = forms_calls[0]
+    assert forms_kw.get("study_key") == "'STUDY'", (
+        f"Expected study_key='STUDY', got {forms_kw.get('study_key')}"
+    )
     forms_item_attrs = {attr for val, attr in forms_insp.attributes if val == "f"}
     assert "form_name" in forms_item_attrs, "forms snippet must access f.form_name"
     assert "form_key" in forms_item_attrs, "forms snippet must access f.form_key"
@@ -268,14 +291,48 @@ def test_showcase_sdk_snippets_syntax_and_api_contracts() -> None:
 
     # 4. Queries snippet
     queries_insp = inspectors["queries"]
-    queries_calls = [(fn, kw) for fn, kw in queries_insp.calls if fn == "client.queries.list"]
-    assert queries_calls, "queries snippet must call client.queries.list"
+    queries_calls = [(fn, kw) for fn, kw in queries_insp.calls if fn == "sdk.queries.list"]
+    assert queries_calls, "queries snippet must call sdk.queries.list"
     _, queries_kw = queries_calls[0]
-    assert queries_kw.get("status") == "'OPEN'", (
-        f"Expected queries status='OPEN', got {queries_kw.get('status')}"
+    assert queries_kw.get("study_key") == "'STUDY'", (
+        f"Expected study_key='STUDY', got {queries_kw.get('study_key')}"
+    )
+    assert "status" not in queries_kw, (
+        "sdk.queries.list() must not pass unsupported status filter keyword"
     )
     assert "severity" not in queries_kw, "queries snippet must not filter by severity"
+    assert ("QueryStatus", "OPEN") in queries_insp.attributes, (
+        "queries snippet must filter materialized queries using QueryStatus.OPEN"
+    )
     assert QueryStatus.OPEN.value == "OPEN", "OPEN must be a valid QueryStatus lifecycle state"
+
+    # 5. Execute all four snippets offline against seeded STUDY simulation fixtures
+    expected_models: dict[str, type[object]] = {
+        "records": Record,
+        "studies": Study,
+        "forms": Form,
+        "queries": Query,
+    }
+    for name, tree in trees.items():
+        get_default_simulation_state().reset()
+        namespace: dict[str, object] = {"__name__": "__test_showcase__"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(tree, filename=f"showcase.js:{name}", mode="exec"), namespace)  # noqa: S102
+
+        for var_name, var_val in namespace.items():
+            assert not isinstance(var_val, (types.GeneratorType, Iterator)), (
+                f"Snippet '{name}' left unmaterialized lazy iterator in '{var_name}'"
+            )
+
+        items = namespace.get(name)
+        expected_cls = expected_models[name]
+        assert isinstance(items, list) and len(items) > 0, (
+            f"Snippet '{name}' must materialize non-empty list of {expected_cls.__name__} fixtures"
+        )
+        assert all(isinstance(item, expected_cls) for item in items), (
+            f"Snippet '{name}' items must all be {expected_cls.__name__} instances"
+        )
+    get_default_simulation_state().reset()
 
 
 def parse_rest_request_line(
@@ -374,7 +431,7 @@ def test_showcase_rest_snippets_syntax_and_api_contracts() -> None:
     # 1. Records endpoint and query parameter assertions
     method, path, query_params = parsed_requests["records"]
     assert method == "GET"
-    assert path == "/api/v1/edc/studies/STUDY-101/records"
+    assert path == "/api/v1/edc/studies/STUDY/records"
     assert query_params == {"size": ["10"]}
     assert "limit" not in query_params, "records snippet must use size instead of limit"
     assert "form" not in query_params, "records snippet must not filter by invalid form param"
@@ -392,13 +449,13 @@ def test_showcase_rest_snippets_syntax_and_api_contracts() -> None:
     # 3. Forms endpoint assertions
     method, path, query_params = parsed_requests["forms"]
     assert method == "GET"
-    assert path == "/api/v1/edc/studies/STUDY-101/forms"
+    assert path == "/api/v1/edc/studies/STUDY/forms"
     assert not query_params, f"forms snippet expected no query parameters, got {query_params}"
 
     # 4. Queries endpoint assertions
     method, path, query_params = parsed_requests["queries"]
     assert method == "GET"
-    assert path == "/api/v1/edc/studies/STUDY-101/queries"
+    assert path == "/api/v1/edc/studies/STUDY/queries"
     assert "status" not in query_params, (
         "queries snippet must not include unsupported status parameter"
     )
@@ -673,3 +730,208 @@ def test_showcase_code_block_overflow_evaluation_lifecycle() -> None:
 
     # 5. Rapid sequential triggers debounce frame requests
     assert data["canceledRafCount"] >= 2, "Rapid triggers must cancel previous animation frames"
+
+
+def test_panel_integration_readonly_explorer_and_quick_start_callout() -> None:
+    """Verify #panel-integration renders read-only viewer, copy control, Quick Start callout, and no mock editor."""
+    repo_root = get_repo_root()
+    index_content = (repo_root / "docs" / "index.rst").read_text(encoding="utf-8")
+    readme_content = (repo_root / "README.md").read_text(encoding="utf-8")
+    showcase_js = (repo_root / "docs" / "_static" / "showcase.js").read_text(encoding="utf-8")
+
+    panel_start = index_content.index('id="panel-integration"')
+    panel_end = index_content.index('id="panel-datamanager"')
+    panel_integration = index_content[panel_start:panel_end]
+
+    assert "<textarea" not in index_content, "Landing page must not render editable <textarea>"
+    assert "ie-code-input" not in index_content, "Landing page must omit #ie-code-input"
+    assert "ie-run-btn" not in index_content, "Landing page must omit mock #ie-run-btn"
+    assert "#ie-code-input" not in showcase_js
+    assert "#ie-run-btn" not in showcase_js
+
+    assert 'id="ie-code-viewer"' in panel_integration
+    assert 'id="ie-code-display"' in panel_integration
+    assert 'id="ie-snippet-copy-btn"' in panel_integration
+    assert 'href="tutorials/quick_start.html"' in panel_integration
+
+    assert "Math.random" not in showcase_js, "showcase.js must not fabricate Math.random() latency"
+    assert "Simulation Preview (Deterministic Fixture)" in index_content
+    assert "Simulation Preview (Deterministic Fixture)" in showcase_js
+    assert "Simulation Scenario Explorer" in readme_content
+    assert "execute simulated SDK queries" not in readme_content
+
+
+def test_showcase_canonical_terminology_and_validation_gate() -> None:
+    """Verify docs/index.rst and docs/_static/showcase.js use canonical CONTEXT.md vocabulary."""
+    repo_root = get_repo_root()
+    docs_dir = repo_root / "docs"
+
+    assert not validate_canonical_showcase_terminology(docs_dir / "index.rst")
+    assert not validate_canonical_showcase_terminology(docs_dir / "_static" / "showcase.js")
+    assert not validate_landing_showcase(docs_dir, repo_root)
+
+
+def test_readonly_explorer_immediate_scenario_and_mode_updates_via_node() -> None:
+    """Verify scenario selection, SDK/REST toggle, and snippet copy work immediately without a Run button."""
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node runtime not available for DOM mock evaluation")
+
+    repo_root = get_repo_root()
+    script_path = repo_root / "docs" / "_static" / "showcase.js"
+
+    js_test = f"""
+    const fs = require('fs');
+    const code = fs.readFileSync('{script_path.as_posix()}', 'utf8');
+
+    let copiedClipboard = '';
+    Object.defineProperty(globalThis, 'navigator', {{
+        configurable: true,
+        value: {{
+            clipboard: {{
+                writeText: (txt) => {{
+                    copiedClipboard = txt;
+                    return Promise.resolve();
+                }}
+            }}
+        }}
+    }});
+
+    function makeElement(id, tagName = 'div') {{
+        const attrs = {{}};
+        const classes = new Set();
+        const handlers = {{}};
+        return {{
+            id,
+            tagName,
+            value: id === 'ie-dataset-select' ? 'records' : (id === 'cdm-form-select' ? 'VS' : 'part11'),
+            textContent: '',
+            innerHTML: '',
+            className: '',
+            clientWidth: 400,
+            scrollWidth: 400,
+            classList: {{
+                add: (...cls) => cls.forEach(c => classes.add(c)),
+                remove: (...cls) => cls.forEach(c => classes.delete(c)),
+                toggle: (cls, force) => {{
+                    if (force === undefined) force = !classes.has(cls);
+                    if (force) classes.add(cls); else classes.delete(cls);
+                    return force;
+                }},
+                contains: (cls) => classes.has(cls)
+            }},
+            setAttribute: (k, v) => {{ attrs[k] = String(v); }},
+            removeAttribute: (k) => {{ delete attrs[k]; }},
+            getAttribute: (k) => attrs[k] || null,
+            hasAttribute: (k) => k in attrs,
+            addEventListener: (ev, cb) => {{
+                handlers[ev] = handlers[ev] || [];
+                handlers[ev].push(cb);
+            }},
+            trigger: (ev) => {{
+                (handlers[ev] || []).forEach(cb => cb({{ preventDefault: () => {{}} }}));
+            }}
+        }};
+    }}
+
+    const elements = {{
+        '#ie-dataset-select': makeElement('ie-dataset-select', 'select'),
+        '#ie-mode-sdk': makeElement('ie-mode-sdk', 'button'),
+        '#ie-mode-rest': makeElement('ie-mode-rest', 'button'),
+        '#ie-code-display': makeElement('ie-code-display', 'code'),
+        '#ie-snippet-copy-btn': makeElement('ie-snippet-copy-btn', 'button'),
+        '#ie-metric-badge': makeElement('ie-metric-badge', 'div'),
+        '#ie-tab-table': makeElement('ie-tab-table', 'button'),
+        '#ie-tab-json': makeElement('ie-tab-json', 'button'),
+        '#ie-view-table': makeElement('ie-view-table', 'div'),
+        '#ie-view-json': makeElement('ie-view-json', 'div'),
+        '#ie-json-pre code': makeElement('ie-json-code', 'code'),
+        '#ie-copy-btn': makeElement('ie-copy-btn', 'button'),
+        '#cdm-form-select': makeElement('cdm-form-select', 'select'),
+        '#cdm-validate-btn': makeElement('cdm-validate-btn', 'button'),
+        '#cdm-metric-badge': makeElement('cdm-metric-badge', 'div'),
+        '#cdm-tab-crf': makeElement('cdm-tab-crf', 'button'),
+        '#cdm-tab-json': makeElement('cdm-tab-json', 'button'),
+        '#cdm-view-crf': makeElement('cdm-view-crf', 'div'),
+        '#cdm-view-json': makeElement('cdm-view-json', 'div'),
+        '#cdm-json-pre code': makeElement('cdm-json-code', 'code'),
+        '#cdm-copy-btn': makeElement('cdm-copy-btn', 'button'),
+        '#aud-scenario-select': makeElement('aud-scenario-select', 'select'),
+        '#aud-verify-btn': makeElement('aud-verify-btn', 'button'),
+        '#aud-metric-badge': makeElement('aud-metric-badge', 'div'),
+        '#aud-tab-table': makeElement('aud-tab-table', 'button'),
+        '#aud-tab-json': makeElement('aud-tab-json', 'button'),
+        '#aud-view-table': makeElement('aud-view-table', 'div'),
+        '#aud-view-json': makeElement('aud-view-json', 'div'),
+        '#aud-json-pre code': makeElement('aud-json-code', 'code'),
+        '#aud-copy-btn': makeElement('aud-copy-btn', 'button')
+    }};
+
+    const panels = [
+        makeElement('panel-integration', 'div'),
+        makeElement('panel-datamanager', 'div'),
+        makeElement('panel-auditor', 'div')
+    ];
+    const root = makeElement('interactive-showcase-root', 'div');
+    root.querySelector = (sel) => elements[sel] || null;
+    root.querySelectorAll = (sel) => sel === '.showcase-panel' ? panels : [];
+
+    global.window = {{
+        addEventListener: () => {{}},
+        history: {{ replaceState: () => {{}} }},
+        location: {{ hash: '' }}
+    }};
+    global.document = {{
+        readyState: 'complete',
+        getElementById: (id) => id === 'interactive-showcase-root' ? root : null,
+        querySelectorAll: () => [],
+        addEventListener: () => {{}},
+        body: makeElement('body')
+    }};
+
+    eval(code);
+
+    const out = {{}};
+    out.initialSnippet = elements['#ie-code-display'].textContent;
+    out.initialBadge = elements['#ie-metric-badge'].textContent;
+
+    // Switch scenario to queries -> updates snippet, table, JSON, and badge immediately
+    elements['#ie-dataset-select'].value = 'queries';
+    elements['#ie-dataset-select'].trigger('change');
+    out.queriesSnippet = elements['#ie-code-display'].textContent;
+    out.queriesBadge = elements['#ie-metric-badge'].textContent;
+    out.queriesJson = JSON.parse(elements['#ie-json-pre code'].textContent);
+
+    // Switch mode to REST -> updates snippet to STUDY REST endpoint
+    elements['#ie-mode-rest'].trigger('click');
+    out.queriesRestSnippet = elements['#ie-code-display'].textContent;
+    out.queriesRestLang = elements['#ie-code-display'].className;
+
+    // Copy button copies active snippet
+    elements['#ie-snippet-copy-btn'].trigger('click');
+    out.copiedText = copiedClipboard;
+
+    console.log(JSON.stringify(out));
+    """
+
+    res = subprocess.run(
+        [node_bin, "-e", js_test],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = json.loads(res.stdout)
+
+    assert 'ImednetSDK(simulation_mode=True)' in out["initialSnippet"]
+    assert 'study_key="STUDY"' in out["initialSnippet"]
+    assert "Simulation Preview (Deterministic Fixture)" in out["initialBadge"]
+    assert re.search(r"\b\d+(?:\.\d+)?\s*ms\b", out["initialBadge"]) is None
+
+    assert "QueryStatus.OPEN" in out["queriesSnippet"]
+    assert "Study Queries Ledger (STUDY)" in out["queriesBadge"]
+    assert all(item["studyKey"] == "STUDY" for item in out["queriesJson"])
+    assert all("variable" in item for item in out["queriesJson"])
+
+    assert out["queriesRestSnippet"].startswith("GET /api/v1/edc/studies/STUDY/queries HTTP/1.1")
+    assert out["queriesRestLang"] == "language-http"
+    assert out["copiedText"] == out["queriesRestSnippet"]
