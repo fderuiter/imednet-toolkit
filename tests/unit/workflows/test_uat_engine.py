@@ -209,3 +209,229 @@ def test_uat_engine_run_verification_failure_and_skip():
     assert report.total_rules == 3
     assert report.failed_rules == 1
     assert report.skipped_rules == 1
+
+
+def test_uat_engine_parses_and_verifies_xml_business_logic_rules():
+    """UATExecutionEngine parses single and multi-condition XML BusinessLogicRules and verifies them."""
+    from imednet.datadict import (
+        BusinessLogicRule,
+        Choice,
+        DataDictionary,
+        Form,
+        Variable,
+        parse_logic_xml,
+    )
+    from imednet.validation import validate_record_entry
+
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="F_DM",
+                formName="Demographics",
+                formId=101,
+                variables=[
+                    Variable(variableName="AGE", variableType="Integer", required="Yes"),
+                    Variable(
+                        variableName="SEX",
+                        variableType="Radio",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="Male", choiceValue="M"),
+                            Choice(choiceText="Female", choiceValue="F"),
+                        ],
+                    ),
+                    Variable(
+                        variableName="PREG",
+                        variableType="Single Select",
+                        choices=[
+                            Choice(choiceText="Yes", choiceValue="Yes"),
+                            Choice(choiceText="No", choiceValue="No"),
+                        ],
+                    ),
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="XML_1",
+                        name="Underage Check",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>AGE</variable><operator>&gt;=</operator><value>18</value><false/>"
+                            "</condition></conditions>"
+                            "<actions><action><type>error</type><message>Must be >= 18</message></action></actions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        id="XML_2",
+                        name="Male Pregnancy Check",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions>"
+                            "<condition><variable>SEX</variable><operator>==</operator><value>M</value><true/></condition>"
+                            "<condition><variable>PREG</variable><operator>==</operator><value>Yes</value><true/></condition>"
+                            "</conditions>"
+                            "<actions><action><type>error</type><message>Invalid pregnancy</message></action></actions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        id="XML_UI",
+                        name="Disable PREG",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition><variable>SEX</variable><operator>==</operator><value>M</value></condition></conditions>"
+                            "<actions><action><type>disable</type></action></actions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        id="XML_CROSS",
+                        name="Cross Form Check",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition><variable>OTHER.VAR</variable><operator>==</operator><value>1</value></condition></conditions></rule>"
+                        ),
+                    ),
+                ],
+            )
+        ]
+    )
+
+    sdk = Mock()
+
+    def _validate_and_reject(study_key, payloads):
+        for payload in payloads:
+            validate_record_entry(dd, payload)
+        return Mock()
+
+    sdk.create_record.side_effect = _validate_and_reject
+
+    engine = UATExecutionEngine(sdk, dd)
+    # UI-only and cross-form XML rules are skipped; both active single-Form rules are parsed
+    assert len(engine._rules) == 2
+    assert engine._rules[0]["rule_name"] == "Underage Check"
+    assert engine._rules[0]["form"] == "F_DM"
+    assert engine._rules[0]["variable"] == "AGE"
+
+    assert engine._rules[1]["rule_name"] == "Male Pregnancy Check"
+    assert engine._rules[1]["variable"] == "PREG"
+    assert engine._rules[1]["dependency_variable"] == "SEX"
+    assert engine._rules[1]["dependency_value"] == "M"
+
+    report = engine.run_verification("STUDY1")
+    assert report.total_rules == 2
+    assert report.passed_rules == 2
+    assert report.failed_rules == 0
+    assert all(r["status"] == EditCheckResultStatus.PASS for r in report.results)
+
+
+def test_xml_negative_synthesis_operators_and_required_defaults():
+    """UATExecutionEngine synthesizes negative payloads across XML operators and populates required fields."""
+    from imednet.datadict import (
+        BusinessLogicRule,
+        Choice,
+        DataDictionary,
+        Form,
+        Variable,
+        parse_logic_xml,
+    )
+
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="VS",
+                variables=[
+                    Variable(variableName="SYSBP", variableType="Integer", required="Yes"),
+                    Variable(variableName="DIABP", variableType="Integer", required="Yes"),
+                    Variable(variableName="TEMP", variableType="Float", required="Yes"),
+                    Variable(
+                        variableName="POS",
+                        variableType="Coded",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="Sitting", choiceValue="SIT"),
+                            Choice(choiceText="Standing", choiceValue="STAND"),
+                        ],
+                    ),
+                    Variable(variableName="NOTES", variableType="Text", required="No"),
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        name="Compare BP",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>DIABP</variable><operator>&gt;=</operator>"
+                            "<compareVariable>SYSBP</compareVariable>"
+                            "</condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        name="Empty Notes",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>NOTES</variable><empty/>"
+                            "</condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        name="Not Empty Notes",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>NOTES</variable><notEmpty/>"
+                            "</condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        name="Not Equal Pos",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>POS</variable><operator>!=</operator><value>SIT</value>"
+                            "</condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        name="In Set",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>POS</variable><operator>in</operator><value>SIT,STAND</value>"
+                            "</condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        name="Contains Text",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions operator='OR'>"
+                            "<condition><variable>TEMP</variable><operator>&gt;</operator><value>41.0</value></condition>"
+                            "<condition><variable>NOTES</variable><operator>contains</operator><value>ERR</value></condition>"
+                            "</conditions></rule>"
+                        ),
+                    ),
+                ],
+            )
+        ]
+    )
+
+    engine = UATExecutionEngine(Mock(), dd)
+    assert len(engine._rules) == 6
+    payloads = [engine.generate_negative_test_case(r) for r in engine._rules]
+    assert payloads[0]["DIABP"] > payloads[0]["SYSBP"]
+    assert payloads[1]["NOTES"] == ""
+    assert payloads[2]["NOTES"] != ""
+    assert payloads[3]["POS"] == "STAND"
+    assert payloads[4]["POS"] == "SIT"
+    assert payloads[5]["NOTES"] == "ERR"
+    assert isinstance(payloads[5]["TEMP"], float)

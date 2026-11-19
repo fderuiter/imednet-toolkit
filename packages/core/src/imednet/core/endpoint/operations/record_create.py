@@ -11,7 +11,7 @@ from typing import Any, Generic, TypeVar
 from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
-from imednet.validation.cache import BaseSchemaCache, validate_record_entry
+from imednet.validation.cache import ValidationSchemaProtocol, validate_record_entry
 
 T = TypeVar("T")
 
@@ -28,7 +28,7 @@ class RecordCreateOperation(Generic[T]):
         path: str,
         records_data: list[dict[str, Any]],
         email_notify: bool | str | None = None,
-        schema: BaseSchemaCache[Any] | None = None,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> None:
         """Initialize the record creation operation.
 
@@ -36,7 +36,7 @@ class RecordCreateOperation(Generic[T]):
             path: The full API path for the request.
             records_data: List of record data objects to create.
             email_notify: Email notification setting.
-            schema: Optional schema cache for validation.
+            schema: Optional validation schema (BaseSchemaCache or DataDictionary).
 
         Raises:
             ValidationError: If record data is invalid against the schema.

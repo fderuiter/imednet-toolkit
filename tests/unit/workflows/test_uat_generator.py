@@ -388,3 +388,134 @@ def test_no_subjects_pool_default(mock_snapshot):
     generator = SyntheticRecordGenerator()
     results = generator.generate(spec, mock_snapshot)
     assert results[0].subject_keys == ["UAT-TEST-001"]
+
+
+def test_canonical_variable_types_and_datadictionary_enrichment(mock_snapshot):
+    """SyntheticRecordGenerator emits valid values for Coded, Radio, Single Select, Checkbox, Multi Select, etc."""
+    from imednet.datadict import Choice, DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_CANON",
+                variables=[
+                    DDVariable(
+                        variableName="CODED_V",
+                        variableType="Coded",
+                        choices=[Choice(choiceText="One", choiceValue="C1")],
+                    ),
+                    DDVariable(
+                        variableName="RADIO_V",
+                        variableType="Radio",
+                        choices=[
+                            Choice(choiceText="Alpha", choiceValue="A"),
+                            Choice(choiceText="Beta", choiceValue="B"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="SINGLE_V",
+                        variableType="Single Select",
+                        choices=[Choice(choiceText="Option 1", choiceValue="OPT1")],
+                    ),
+                    DDVariable(
+                        variableName="CHECK_V",
+                        variableType="Checkbox",
+                        choices=[
+                            Choice(choiceText="K1", choiceValue="K1"),
+                            Choice(choiceText="K2", choiceValue="K2"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="MULTI_V",
+                        variableType="Multi Select",
+                        choices=[
+                            Choice(choiceText="M1", choiceValue="M1"),
+                            Choice(choiceText="M2", choiceValue="M2"),
+                        ],
+                    ),
+                ],
+            )
+        ]
+    )
+
+    spec = UATSpecification(
+        study_key="S1",
+        study_name="S1",
+        global_date_value=date(2026, 2, 15),
+        form_specs=[
+            UATFormSpec(
+                form_key="F_CANON",
+                form_name="Canonical",
+                form_type="Standard",
+                test_type=RecordTestType.CREATE_NEW_RECORD,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="CODED_V",
+                        variable_key="V1",
+                        variable_type="Coded",
+                        form_key="F_CANON",
+                    ),
+                    UATVariableSpec(
+                        variable_name="RADIO_V",
+                        variable_key="V2",
+                        variable_type="Radio",
+                        form_key="F_CANON",
+                    ),
+                    UATVariableSpec(
+                        variable_name="SINGLE_V",
+                        variable_key="V3",
+                        variable_type="Single Select",
+                        form_key="F_CANON",
+                    ),
+                    UATVariableSpec(
+                        variable_name="CHECK_V",
+                        variable_key="V4",
+                        variable_type="Checkbox",
+                        form_key="F_CANON",
+                    ),
+                    UATVariableSpec(
+                        variable_name="MULTI_V",
+                        variable_key="V5",
+                        variable_type="Multi Select",
+                        form_key="F_CANON",
+                    ),
+                    UATVariableSpec(
+                        variable_name="DTP_V",
+                        variable_key="V6",
+                        variable_type="Date/Time Precision",
+                        form_key="F_CANON",
+                    ),
+                    UATVariableSpec(
+                        variable_name="CALC_V",
+                        variable_key="V7",
+                        variable_type="Calculation",
+                        form_key="F_CANON",
+                        min_value=10,
+                        max_value=20,
+                    ),
+                    UATVariableSpec(
+                        variable_name="YESNO_V",
+                        variable_key="V8",
+                        variable_type="Yes/No",
+                        form_key="F_CANON",
+                    ),
+                ],
+            )
+        ],
+    )
+
+    generator = SyntheticRecordGenerator(seed=99, data_dictionary=dd)
+    results = generator.generate(spec, mock_snapshot)
+    data = results[0].payloads[0]["data"]
+
+    assert data["CODED_V"] == "C1"
+    assert data["RADIO_V"] in {"A", "B"}
+    assert data["SINGLE_V"] == "OPT1"
+    assert set(data["CHECK_V"].split("`")).issubset({"K1", "K2"})
+    assert set(data["MULTI_V"].split("`")).issubset({"M1", "M2"})
+    assert data["DTP_V"] == "2026-02-15"
+    assert 10 <= int(data["CALC_V"]) <= 20
+    assert data["YESNO_V"] in {"Yes", "No"}

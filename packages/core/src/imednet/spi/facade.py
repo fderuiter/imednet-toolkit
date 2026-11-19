@@ -4,7 +4,7 @@ These protocols define the expected interface for the iMednet SDK clients,
 allowing for easier mocking and decoupling in dependent packages.
 """
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from imednet.models.codings import Coding
 from imednet.models.forms import Form
@@ -20,6 +20,9 @@ from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 from imednet.utils.typing import FilterValue, JsonDict
+
+if TYPE_CHECKING:
+    from imednet.validation.cache import ValidationSchemaProtocol
 
 
 class ImednetFacade(Protocol):
@@ -186,7 +189,7 @@ class ImednetFacade(Protocol):
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: "ValidationSchemaProtocol | None" = None,
     ) -> Job:
         """Submit a request to create one or more data records.
 
@@ -389,7 +392,7 @@ class AsyncImednetFacade(Protocol):
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: "ValidationSchemaProtocol | None" = None,
     ) -> Job:
         """Asynchronously submit a request to create one or more data records.
 

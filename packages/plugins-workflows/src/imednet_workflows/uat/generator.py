@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import Field
 
 from imednet.spi.models import ImednetBaseModel
+from imednet.spi.validation import DataDictionary, extract_variable_constraints
 
 from .inspector import StudySnapshot
 from .models import (
@@ -49,16 +50,19 @@ class SyntheticRecordGenerator:
         self,
         seed: int | None = None,
         locale: str = "en_US",
+        data_dictionary: DataDictionary | None = None,
     ) -> None:
         """Initialize the generator.
 
         Args:
             seed: Optional seed for reproducibility.
             locale: Ignored.
+            data_dictionary: Optional DataDictionary used to enrich variable choices and bounds.
         """
         self._rng = random.Random(seed)  # noqa: S311
         self._seed = seed
         self._locale = locale
+        self._data_dictionary = data_dictionary
 
     def _lexify(self, text: str) -> str:
         """Return a mocked value."""
@@ -80,30 +84,75 @@ class SyntheticRecordGenerator:
             sentences.append(" ".join(sentence_words) + ".")
         return " ".join(sentences)
 
+    def _enrich_form_spec(
+        self, form_spec: UATFormSpec, data_dictionary: DataDictionary | None
+    ) -> UATFormSpec:
+        """Enrich variable specs with DataDictionary choices/bounds without mutating caller spec."""
+        if data_dictionary is None:
+            return form_spec
+        dd_vars = data_dictionary.variables_for_form(form_spec.form_key)
+        if not dd_vars:
+            return form_spec
+
+        enriched_vars: list[UATVariableSpec] = []
+        changed = False
+        for v in form_spec.variables:
+            dd_var = dd_vars.get(v.variable_name)
+            if dd_var is None:
+                enriched_vars.append(v)
+                continue
+            constraints = extract_variable_constraints(dd_var)
+            updates: dict[str, Any] = {}
+            if not v.coded_values and constraints.choices:
+                updates["coded_values"] = list(constraints.choices)
+            if v.min_value is None and constraints.min_value is not None:
+                updates["min_value"] = constraints.min_value
+            if v.max_value is None and constraints.max_value is not None:
+                updates["max_value"] = constraints.max_value
+            if v.max_length is None and constraints.max_length is not None:
+                updates["max_length"] = constraints.max_length
+            if not v.required and constraints.required_policy == "yes":
+                updates["required"] = True
+            if updates:
+                changed = True
+                enriched_vars.append(v.model_copy(update=updates))
+            else:
+                enriched_vars.append(v)
+
+        if not changed:
+            return form_spec
+        return form_spec.model_copy(update={"variables": enriched_vars})
+
     def generate(
         self,
         spec: UATSpecification,
         snapshot: StudySnapshot,
+        *,
+        data_dictionary: DataDictionary | None = None,
     ) -> list[GeneratedRecordSet]:
         """Generate all record payloads for the enabled forms in the spec.
 
         Returns one GeneratedRecordSet per enabled UATFormSpec, in the correct
         submission order: RegisterSubject records first, then scheduled/unscheduled.
         """
+        active_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
         results: list[GeneratedRecordSet] = []
         subject_pool = self._get_subject_pool(spec)
 
         # Phase 1: Enrollment/registration forms
         for form_spec in spec.forms_by_type(RecordTestType.REGISTER_SUBJECT):
-            results.append(self._generate_registration_set(spec, form_spec, snapshot, subject_pool))
+            enriched = self._enrich_form_spec(form_spec, active_dd)
+            results.append(self._generate_registration_set(spec, enriched, snapshot, subject_pool))
 
         # Phase 2: Scheduled forms
         for form_spec in spec.forms_by_type(RecordTestType.UPDATE_SCHEDULED_RECORD):
-            results.append(self._generate_scheduled_set(spec, form_spec, snapshot, subject_pool))
+            enriched = self._enrich_form_spec(form_spec, active_dd)
+            results.append(self._generate_scheduled_set(spec, enriched, snapshot, subject_pool))
 
         # Phase 3: Unscheduled forms
         for form_spec in spec.forms_by_type(RecordTestType.CREATE_NEW_RECORD):
-            results.append(self._generate_unscheduled_set(spec, form_spec, snapshot, subject_pool))
+            enriched = self._enrich_form_spec(form_spec, active_dd)
+            results.append(self._generate_unscheduled_set(spec, enriched, snapshot, subject_pool))
 
         return results
 
@@ -127,51 +176,74 @@ class SyntheticRecordGenerator:
         return self._synthesize_value(var_spec, spec)
 
     def _synthesize_value(self, var_spec: UATVariableSpec, spec: UATSpecification) -> str:
-        """Return a mocked value."""
+        """Return a mocked value appropriate for the canonical variable type."""
         v_type = var_spec.variable_type
+        v_norm = (v_type or "").strip().lower()
 
-        if v_type == "Text":
-            max_len = var_spec.max_length or spec.global_text_length or 10
-            return self._lexify("?" * max_len)
-
-        if v_type in ("Number", "Integer"):
-            min_v = var_spec.min_value if var_spec.min_value is not None else 1
-            max_v = var_spec.max_value if var_spec.max_value is not None else 100
-            return str(self._rng.randint(int(min_v), int(max_v)))
-
-        if v_type in ("Float", "Decimal"):
-            min_v = var_spec.min_value if var_spec.min_value is not None else 1.0
-            max_v = var_spec.max_value if var_spec.max_value is not None else 100.0
-            val = self._rng.uniform(min_v, max_v)
-            return f"{val:.2f}"
-
-        if v_type == "Date":
-            if spec.global_date_value:
-                return spec.global_date_value.isoformat()
-            return date.today().isoformat()
-
-        if v_type == "DateTime":
-            return datetime.now(UTC).isoformat()
-
-        if v_type == "Coded":
+        if v_norm in ("coded", "radio", "single select"):
             if var_spec.coded_values:
                 return self._rng.choice(var_spec.coded_values)
             return ""
 
-        if v_type in ("Boolean", "Yes/No"):
-            return self._rng.choice(["Yes", "No"])
-
-        if v_type == "Checkbox":
+        if v_norm in ("checkbox", "multi select"):
             if var_spec.coded_values:
                 count = self._rng.randint(1, min(3, len(var_spec.coded_values)))
                 choices = self._rng.sample(var_spec.coded_values, count)
                 return "`".join(choices)
             return ""
 
-        if v_type == "TextArea":
-            return self._paragraph(nb_sentences=3)
+        if v_norm in ("boolean", "bool", "yes/no", "yesno"):
+            if var_spec.coded_values:
+                return self._rng.choice(var_spec.coded_values)
+            return self._rng.choice(["Yes", "No"])
 
-        if v_type in ("Signature", "File"):
+        if v_norm in ("text", "string"):
+            if var_spec.coded_values:
+                return self._rng.choice(var_spec.coded_values)
+            max_len = var_spec.max_length or spec.global_text_length or 10
+            return self._lexify("?" * max_len)
+
+        if v_norm in ("number", "integer", "int"):
+            if var_spec.coded_values:
+                return self._rng.choice(var_spec.coded_values)
+            min_i = int(var_spec.min_value) if var_spec.min_value is not None else 1
+            max_i = int(var_spec.max_value) if var_spec.max_value is not None else max(100, min_i)
+            max_i = max(max_i, min_i)
+            return str(self._rng.randint(min_i, max_i))
+
+        if v_norm in ("float", "decimal", "slider"):
+            if var_spec.coded_values:
+                return self._rng.choice(var_spec.coded_values)
+            min_f = var_spec.min_value if var_spec.min_value is not None else 1.0
+            max_f = var_spec.max_value if var_spec.max_value is not None else max(100.0, min_f)
+            max_f = max(max_f, min_f)
+            val = self._rng.uniform(min_f, max_f)
+            return f"{val:.2f}"
+
+        if v_norm in ("date", "date/time precision"):
+            if spec.global_date_value:
+                return spec.global_date_value.isoformat()
+            return date.today().isoformat()
+
+        if v_norm == "datetime":
+            return datetime.now(UTC).isoformat()
+
+        if v_norm == "time":
+            return "12:00:00"
+
+        if v_norm == "textarea":
+            text = self._paragraph(nb_sentences=3)
+            if var_spec.max_length is not None:
+                return text[: var_spec.max_length]
+            return text
+
+        if v_norm == "calculation":
+            min_c = var_spec.min_value if var_spec.min_value is not None else 1.0
+            max_c = var_spec.max_value if var_spec.max_value is not None else max(100.0, min_c)
+            max_c = max(max_c, min_c)
+            return str(int(self._rng.uniform(min_c, max_c)))
+
+        if v_norm in ("signature", "file", "descriptive"):
             return ""
 
         logger.warning(
