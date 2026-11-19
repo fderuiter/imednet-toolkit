@@ -15,7 +15,16 @@ from .loaders import (
     load_from_csv_files,
     load_from_redcap,
 )
-from .logic import parse_logic_xml
+from .logic import (
+    ExtractedCondition,
+    ExtractedRuleMetadata,
+    LogicEvaluationReport,
+    LogicTreeEvaluator,
+    RuleEvaluationResult,
+    VariableConstraints,
+    extract_variable_constraints,
+    parse_logic_xml,
+)
 from .models import (
     BusinessLogicRule,
     Choice,
@@ -33,10 +42,17 @@ __all__ = [
     "DataDictionary",
     "DiffItem",
     "DiffReport",
+    "ExtractedCondition",
+    "ExtractedRuleMetadata",
     "Form",
+    "LogicEvaluationReport",
+    "LogicTreeEvaluator",
     "Metadata",
+    "RuleEvaluationResult",
     "Variable",
+    "VariableConstraints",
     "diff",
+    "extract_variable_constraints",
     "get_schema",
     "load_from_api",
     "load_from_cdisc_odm",
