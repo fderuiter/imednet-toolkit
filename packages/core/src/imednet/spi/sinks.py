@@ -3,7 +3,12 @@
 from collections.abc import Callable
 from typing import Any
 
-from imednet.integrations.enrichment import CentralizedMapper
+from imednet.integrations.enrichment import (
+    CentralizedMapper,
+    EnrichmentPipeline,
+    resolve_enrichment_pipeline,
+    resolve_study_configuration,
+)
 from imednet.integrations.sink_base import (
     STATE_PROVIDER_ENTRY_POINT_GROUP,
     ExportSink,
@@ -25,6 +30,7 @@ from imednet.integrations.sink_base import (
 __all__ = [
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
     "CentralizedMapper",
+    "EnrichmentPipeline",
     "ExportSink",
     "SinkConfig",
     "StateProviderProtocol",
@@ -39,6 +45,8 @@ __all__ = [
     "redact_batch_records",
     "redact_uri",
     "require_optional_dep",
+    "resolve_enrichment_pipeline",
+    "resolve_study_configuration",
     "run_streaming_export",
 ]
 

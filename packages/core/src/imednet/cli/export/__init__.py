@@ -62,6 +62,39 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional file path for file-backed checkpoint state ledger.",
     )
+    parser.add_argument(
+        "--mask-phi",
+        dest="mask_phi",
+        action="store_true",
+        default=True,
+        help="Mask sensitive Subject PHI fields with ***MASKED*** (enabled by default).",
+    )
+    parser.add_argument(
+        "--no-mask-phi",
+        dest="mask_phi",
+        action="store_false",
+        help="Disable default PHI masking for authorized raw exports.",
+    )
+    parser.add_argument(
+        "--quality-gate",
+        dest="quality_gate_enabled",
+        action="store_true",
+        default=None,
+        help="Enable pre-write record schema readiness quality gate filtering.",
+    )
+    parser.add_argument(
+        "--no-quality-gate",
+        dest="quality_gate_enabled",
+        action="store_false",
+        help="Disable pre-write record schema readiness quality gate filtering.",
+    )
+    parser.add_argument(
+        "--min-readiness-score",
+        dest="min_schema_readiness_score",
+        type=float,
+        default=None,
+        help="Minimum record schema readiness score (0-100) when quality gate is enabled.",
+    )
 
 
 def _parse_export_filters(filters: list[str] | None) -> dict[str, Any] | str | None:
@@ -129,6 +162,14 @@ def _extract_streaming_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     ledger_path = getattr(args, "ledger_path", None)
     if ledger_path is not None:
         opts["ledger_path"] = ledger_path
+    if getattr(args, "mask_phi", True) is False:
+        opts["mask_phi"] = False
+    quality_gate = getattr(args, "quality_gate_enabled", None)
+    if quality_gate is not None:
+        opts["quality_gate_enabled"] = quality_gate
+    min_readiness = getattr(args, "min_schema_readiness_score", None)
+    if min_readiness is not None:
+        opts["min_schema_readiness_score"] = min_readiness
     return opts
 
 

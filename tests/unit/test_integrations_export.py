@@ -1087,6 +1087,233 @@ def test_tabular_sink_config_receives_operational_options_without_pandas_leak(
     assert captured_configs[-1].idempotent is False
 
 
+def test_configured_study_exports_mask_six_default_and_custom_phi_before_labels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify CSV, Parquet, DuckDB, SQL, and hierarchical JSON honor StudyConfiguration PHI rules before applying labels."""
+    import json
+    import sqlite3
+    from types import SimpleNamespace
+
+    pytest.importorskip("pyarrow")
+    duckdb_mod = pytest.importorskip("duckdb")
+
+    from imednet.integrations import enrichment as enrichment_mod
+    from imednet.models.forms import Form
+    from imednet.models.intervals import FormSummary, Interval
+    from imednet.models.records import Record
+    from imednet.models.study_config import StudyConfiguration
+    from imednet.models.variables import Variable
+    from imednet.utils.security import global_sensitivity_registry
+
+    study_cfg = StudyConfiguration(
+        study_key="STUDY-CFG",
+        phi_fields=["customChartId"],
+        terminology_lookups={"gender": {"1": "Female"}},
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: study_cfg if sk == "STUDY-CFG" else None,
+    )
+
+    sdk = MagicMock()
+    demo_form = Form(
+        form_id=1,
+        form_key="DEMO",
+        form_name="Demo",
+        subject_record_report=True,
+        unscheduled_visit=False,
+        disabled=False,
+    )
+    screening_interval = Interval(
+        interval_id=10,
+        interval_name="Screening",
+        forms=[FormSummary(form_id=1, form_key="DEMO", form_name="Demo")],
+    )
+    sdk.forms.list.return_value = [demo_form]
+    sdk.get_forms.return_value = [demo_form]
+    sdk.get_intervals.return_value = [screening_interval]
+    sdk.visits.list.return_value = [
+        SimpleNamespace(visit_id=10, interval_name="Screening", subject_key="SUBJ-1")
+    ]
+    sdk.subjects.list.return_value = [SimpleNamespace(subject_key="SUBJ-1", site_name="Site A")]
+    vars_list = [
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="SSN",
+            label="National Registry Code",
+            variable_type="text",
+        ),
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="DOB",
+            label="Participant Birth Calendar",
+            variable_type="text",
+        ),
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="patientName",
+            label="Display Alias",
+            variable_type="text",
+        ),
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="email",
+            label="Electronic Reach",
+            variable_type="text",
+        ),
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="phone",
+            label="Voice Line",
+            variable_type="text",
+        ),
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="address",
+            label="Mailing Street",
+            variable_type="text",
+        ),
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="customChartId",
+            label="Internal Chart Ref",
+            variable_type="int",
+        ),
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="gender",
+            label="Coded Sex",
+            variable_type="int",
+        ),
+        Variable(
+            form_id=1,
+            form_key="DEMO",
+            variable_name="note",
+            label="Investigator Note",
+            variable_type="text",
+        ),
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.return_value = vars_list
+    sdk.variables.iter.side_effect = lambda **_kw: iter(vars_list)
+
+    rec = Record(
+        record_id=55,
+        study_key="STUDY-CFG",
+        subject_key="SUBJ-1",
+        visit_id=10,
+        form_id=1,
+        form_key="DEMO",
+        record_data={
+            "SSN": "123-45-6789",
+            "DOB": "1979-03-11",
+            "patientName": "Jane Doe",
+            "email": "jane@clinical.org",
+            "phone": "555-0111",
+            "address": "742 Evergreen",
+            "customChartId": 9988,
+            "gender": 1,
+            "note": "=SUM(1,2)",
+        },
+    )
+    sdk.records.list.side_effect = lambda **_kw: [rec.model_copy(deep=True)]
+    sdk.records.iter.side_effect = lambda **_kw: iter([rec.model_copy(deep=True)])
+    sdk.get_records.side_effect = lambda **_kw: [rec.model_copy(deep=True)]
+
+    expected_masked_labels = (
+        "National Registry Code",
+        "Participant Birth Calendar",
+        "Display Alias",
+        "Electronic Reach",
+        "Voice Line",
+        "Mailing Street",
+        "Internal Chart Ref",
+    )
+    registry_snapshot = set(global_sensitivity_registry._sensitive_keys)
+
+    # 1. CSV with labels + formula sanitization preserved
+    csv_out = tmp_path / "cfg.csv"
+    export_mod.export_to_csv(sdk, "STUDY-CFG", str(csv_out), use_labels_as_columns=True)
+    csv_row = pd.read_csv(csv_out).to_dict("records")[0]
+    for lbl in expected_masked_labels:
+        assert csv_row[lbl] == "***MASKED***"
+    assert csv_row["Coded Sex"] == "Female"
+    assert str(csv_row["Investigator Note"]).startswith("'=")
+
+    # 2. Parquet with labels (custom int PHI field safely widened to string)
+    pq_out = tmp_path / "cfg.parquet"
+    export_mod.export_to_parquet(sdk, "STUDY-CFG", str(pq_out), use_labels_as_columns=True)
+    pq_row = pd.read_parquet(pq_out).to_dict("records")[0]
+    for lbl in expected_masked_labels:
+        assert pq_row[lbl] == "***MASKED***"
+    assert pq_row["Coded Sex"] == "Female"
+
+    # 3. DuckDB with labels
+    ddb_out = tmp_path / "cfg.duckdb"
+    export_mod.export_to_duckdb(
+        sdk, "STUDY-CFG", str(ddb_out), "demo_tbl", use_labels_as_columns=True
+    )
+    with duckdb_mod.connect(str(ddb_out)) as dconn:
+        ddb_row = dconn.execute("SELECT * FROM demo_tbl").fetchdf().to_dict("records")[0]
+    for lbl in expected_masked_labels:
+        assert ddb_row[lbl] == "***MASKED***"
+    assert ddb_row["Coded Sex"] == "Female"
+
+    # 4. SQL with labels
+    sql_out = tmp_path / "cfg.sqlite"
+    export_mod.export_to_sql(
+        sdk, "STUDY-CFG", "demo_sql", f"sqlite:///{sql_out}", use_labels_as_columns=True
+    )
+    with sqlite3.connect(sql_out) as sconn:
+        sql_row = pd.read_sql_query("SELECT * FROM demo_sql", sconn).to_dict("records")[0]
+    for lbl in expected_masked_labels:
+        assert sql_row[lbl] == "***MASKED***"
+    assert sql_row["Coded Sex"] == "Female"
+
+    # 5. Hierarchical JSON with labels + opt-out
+    hier_out = tmp_path / "cfg_hier.json"
+    export_mod.export_to_json(
+        sdk,
+        "STUDY-CFG",
+        str(hier_out),
+        hierarchical=True,
+        use_labels_as_columns=True,
+    )
+    hier_rec = json.loads(hier_out.read_text(encoding="utf-8"))[0]["visits"][0]["forms"][0][
+        "records"
+    ][0]
+    for lbl in expected_masked_labels:
+        assert hier_rec[lbl] == "***MASKED***"
+    assert hier_rec["Coded Sex"] == "Female"
+
+    hier_unmasked = tmp_path / "cfg_hier_unmasked.json"
+    export_mod.export_to_json(
+        sdk,
+        "STUDY-CFG",
+        str(hier_unmasked),
+        hierarchical=True,
+        use_labels_as_columns=True,
+        mask_phi=False,
+    )
+    unmasked_rec = json.loads(hier_unmasked.read_text(encoding="utf-8"))[0]["visits"][0]["forms"][
+        0
+    ]["records"][0]
+    assert unmasked_rec["National Registry Code"] == "123-45-6789"
+    assert unmasked_rec["Internal Chart Ref"] == 9988
+    assert unmasked_rec["Coded Sex"] == "Female"
+    assert global_sensitivity_registry._sensitive_keys == registry_snapshot
+
+
 def test_export_to_json_hierarchical_masks_phi_under_both_label_modes(tmp_path, monkeypatch):
     """Hierarchical export_to_json masks DOB, SSN, and patientName under both use_labels_as_columns settings."""
     import json

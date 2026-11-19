@@ -927,3 +927,54 @@ def test_legacy_sqlite_schema_automatic_migration_and_rollback(
     assert [entry["commit_id"] for entry in history] == [legacy_id_v1, id_v2, id_v3]
     assert history[1]["parent_commit_id"] == legacy_id_v1
     assert history[2]["parent_commit_id"] == id_v2
+
+
+def test_resolve_committed_config_fast_path_and_mock_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sdk: MockSDK,
+) -> None:
+    """Verify resolve_committed_config avoids creating missing DBs, resolves committed HEAD, and honors mocks."""
+    from unittest.mock import patch
+
+    from imednet.core.context import study_context
+
+    missing_db = tmp_path / "nonexistent_dir" / "versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(missing_db))
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "unit-test-encryption-secret-32b!")
+
+    # Missing DB returns None without creating parent directories or SQLite files
+    assert ConfigVersionStore.resolve_committed_config("STUDY-01") is None
+    assert not missing_db.parent.exists()
+
+    # Initialized store with no commits for STUDY-99 returns None, while STUDY-01 returns committed config
+    active_db = tmp_path / "active" / "versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(active_db))
+    store = ConfigVersionStore(db_path=active_db)
+    cfg = StudyConfiguration(
+        study_key="STUDY-01",
+        version="1.2.0",
+        phi_fields=["custom_mrn"],
+    )
+    store.commit_config("STUDY-01", cfg, desc="add custom_mrn", sdk=mock_sdk)
+
+    assert ConfigVersionStore.resolve_committed_config("STUDY-99") is None
+    resolved = ConfigVersionStore.resolve_committed_config("STUDY-01")
+    assert resolved is not None
+    assert resolved.study_key == "STUDY-01"
+    assert resolved.phi_fields == ["custom_mrn"]
+
+    # Study context path resolution without creating directories
+    with study_context("STUDY-CTX"):
+        assert ConfigVersionStore.resolve_committed_config("STUDY-CTX") is None
+
+    # Mocked get_history / rollback_config fallback path
+    with (
+        patch.object(ConfigVersionStore, "get_history", return_value=[{"commit_id": "abc123"}]),
+        patch.object(ConfigVersionStore, "rollback_config", return_value=cfg),
+    ):
+        mock_resolved = ConfigVersionStore.resolve_committed_config("STUDY-01")
+        assert mock_resolved is cfg
+
+    with patch.object(ConfigVersionStore, "get_history", return_value=[]):
+        assert ConfigVersionStore.resolve_committed_config("STUDY-01") is None

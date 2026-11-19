@@ -11,11 +11,16 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, cast
 from unittest.mock import NonCallableMock
 
+from imednet.integrations.enrichment import (
+    EnrichmentPipeline,
+    mask_custom_phi_recursive,
+    resolve_enrichment_pipeline,
+    resolve_study_configuration,
+)
 from imednet.integrations.sink_base import (
     ExportSink,
     SinkConfig,
@@ -33,7 +38,7 @@ except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 from imednet.constants import MAX_SQLITE_COLUMNS
 from imednet.utils import sanitize_csv_formula
-from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.security import _normalize_key, global_sensitivity_registry, mask_clinical_phi
 
 from .. import ImednetClient
 from ..sdk import ImednetSDK
@@ -88,11 +93,21 @@ def _create_record_mapper(sdk: Any, *, mask_phi: bool = True) -> Any:
     return mapper
 
 
-def _mask_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Mask sensitive fields in the DataFrame based on the global registry."""
+def _is_custom_phi_key(key: str, phi_keys: set[str] | None) -> bool:
+    """Return True when *key* matches a custom StudyConfiguration PHI field."""
+    if not phi_keys or not key or global_sensitivity_registry.is_exempt(key):
+        return False
+    return _normalize_key(key) in phi_keys
+
+
+def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFrame:
+    """Mask sensitive fields in the DataFrame based on global and study rules."""
     sensitive_cols = list(
         dict.fromkeys(
-            col for col in df.columns if global_sensitivity_registry.is_sensitive(str(col))
+            col
+            for col in df.columns
+            if global_sensitivity_registry.is_sensitive(str(col))
+            or _is_custom_phi_key(str(col), phi_keys)
         )
     )
     for col in sensitive_cols:
@@ -108,12 +123,17 @@ def _mask_df(df: pd.DataFrame) -> pd.DataFrame:
     except TypeError:
         object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object]).columns))
 
+    custom_mask_fn = (lambda val: mask_custom_phi_recursive(val, phi_keys)) if phi_keys else None
     for col in object_cols:
         target = df[col]
         if isinstance(target, pd.DataFrame):
             df[col] = target.apply(lambda s: s.apply(mask_clinical_phi))
+            if custom_mask_fn is not None:
+                df[col] = df[col].apply(lambda s: s.apply(custom_mask_fn))
         else:
             df[col] = target.apply(mask_clinical_phi)
+            if custom_mask_fn is not None:
+                df[col] = df[col].apply(custom_mask_fn)
 
     return df
 
@@ -195,8 +215,10 @@ def _prepare_export_df(
         mask_phi=mask_phi,
         _mapper=_mapper,
     )
+    pipeline = resolve_enrichment_pipeline(study_key)
+    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     if mask_phi:
-        df = _mask_df(df)
+        df = _mask_df(df, phi_keys=phi_keys)
     if sanitize:
         df = _sanitize_df(df)
     return df
@@ -514,10 +536,17 @@ def _build_tabular_contract_types(
     *,
     use_labels_as_columns: bool,
     mask_phi: bool = True,
+    phi_keys: set[str] | None = None,
+    pipeline: EnrichmentPipeline | None = None,
 ) -> dict[str, str | None]:
     """Derive expected column names and logical types from the Record + Variable contract."""
     contract: dict[str, str | None] = dict(_RECORD_META_CONTRACT_TYPES)
     seen_lower: set[str] = {name.lower() for name, _ in _RECORD_META_CONTRACT_TYPES}
+    active_phi_keys = (
+        phi_keys
+        if phi_keys is not None
+        else (set(pipeline.phi_keys) if pipeline is not None else None)
+    )
 
     vars_by_name: dict[str, list[Any]] = {}
     for var in variables:
@@ -525,7 +554,21 @@ def _build_tabular_contract_types(
         if isinstance(vname, str) and vname:
             vars_by_name.setdefault(vname, []).append(var)
 
-    for key in variable_keys:
+    effective_keys: list[str] = list(variable_keys)
+    if pipeline is not None and pipeline.mappings:
+        replaced_sources: set[str] = set()
+        mapped_targets: list[str] = []
+        for src_var, rule in pipeline.mappings.items():
+            if rule.target_field and rule.target_field != src_var and src_var in variable_keys:
+                replaced_sources.add(src_var)
+                if (
+                    rule.target_field not in variable_keys
+                    and rule.target_field not in mapped_targets
+                ):
+                    mapped_targets.append(rule.target_field)
+        effective_keys = [k for k in variable_keys if k not in replaced_sources] + mapped_targets
+
+    for key in effective_keys:
         col_name = str(label_map.get(key, key) if use_labels_as_columns else key)
         col_lower = col_name.lower()
         if col_lower in seen_lower:
@@ -534,7 +577,12 @@ def _build_tabular_contract_types(
         if mask_phi and (
             global_sensitivity_registry.is_sensitive(key)
             or global_sensitivity_registry.is_sensitive(col_name)
+            or _is_custom_phi_key(key, active_phi_keys)
+            or _is_custom_phi_key(col_name, active_phi_keys)
         ):
+            contract[col_name] = "string"
+            continue
+        if pipeline is not None and key in pipeline.terminology:
             contract[col_name] = "string"
             continue
         logical: str | None = None
@@ -545,7 +593,9 @@ def _build_tabular_contract_types(
 
     if mask_phi:
         for col in list(contract):
-            if global_sensitivity_registry.is_sensitive(col):
+            if global_sensitivity_registry.is_sensitive(col) or _is_custom_phi_key(
+                col, active_phi_keys
+            ):
                 contract[col] = "string"
     return contract
 
@@ -1388,6 +1438,7 @@ class _TabularTransformSink(ExportSink):
         config: TabularSinkConfig,
         *,
         sanitize: bool,
+        pipeline: EnrichmentPipeline | None = None,
     ) -> None:
         super().__init__(config)
         self._inner = inner
@@ -1397,9 +1448,14 @@ class _TabularTransformSink(ExportSink):
         self._label_map = label_map
         self._cfg = config
         self._sanitize = sanitize
+        self._pipeline = pipeline
+        self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+        self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         rows, _ = self._mapper._parse_records(records, self._record_model)
+        if self._pipeline is not None and not self._has_native_enrichment:
+            rows = [self._pipeline.process(r, mask_phi=self._cfg.mask_phi) for r in rows]
         df = self._mapper._build_dataframe(
             rows,
             self._variable_keys,
@@ -1413,7 +1469,7 @@ class _TabularTransformSink(ExportSink):
         df = df.loc[:, ~dup_mask]
 
         if self._cfg.mask_phi:
-            df = _mask_df(df)
+            df = _mask_df(df, phi_keys=self._phi_keys)
         if self._sanitize:
             df = _sanitize_df(df)
 
@@ -1450,12 +1506,14 @@ def _tabular_export(
         return
 
     raw_variables = mapper._last_variables if hasattr(mapper, "_last_variables") else None
+    pipeline = resolve_enrichment_pipeline(study_key)
     contract_types = _build_tabular_contract_types(
         variable_keys,
         label_map,
         raw_variables if isinstance(raw_variables, list) else (),
         use_labels_as_columns=config.use_labels_as_columns,
         mask_phi=config.mask_phi,
+        pipeline=pipeline,
     )
     if isinstance(sink, (TabularParquetSink, TabularDuckDBSink)):
         sink.set_contract_types(contract_types)
@@ -1520,6 +1578,7 @@ def _tabular_export(
         label_map,
         config,
         sanitize=sanitize,
+        pipeline=pipeline,
     )
     run_streaming_export(
         sdk,
@@ -1900,29 +1959,15 @@ def _apply_json_enrichment(study_key: str, data: Any, *, mask_phi: bool = True) 
 
     logger = logging.getLogger(__name__)
     try:
-        from importlib.metadata import entry_points
-
-        config_version_stores = list(
-            entry_points(group="imednet.stores", name="ConfigVersionStore")
-        )
-        if not config_version_stores:
-            raise ImportError("ConfigVersionStore plugin not found.")
-
-        config_version_store_cls = config_version_stores[0].load()
-        enrichment_pipeline_cls = import_module(
-            "imednet.integrations.enrichment"
-        ).EnrichmentPipeline
-
-        store = config_version_store_cls()
-        history = store.get_history(study_key)
-        if history:
-            latest_commit = history[-1]["commit_id"]
-            study_cfg = store.rollback_config(study_key, latest_commit)
-
-            logger.info("Enrichment pipeline triggered")
-            pipeline = enrichment_pipeline_cls(study_cfg)
-            data = pipeline.process(data) if mask_phi else pipeline.process(data, mask_phi=False)
-            logger.info("Enrichment pipeline completed successfully")
+        study_cfg = resolve_study_configuration(study_key)
+        if study_cfg is not None:
+            pipeline = EnrichmentPipeline(study_cfg)
+            if pipeline._has_rules:
+                logger.info("Enrichment pipeline triggered")
+                data = (
+                    pipeline.process(data) if mask_phi else pipeline.process(data, mask_phi=False)
+                )
+                logger.info("Enrichment pipeline completed successfully")
     except Exception as e:
         logger.warning(f"Could not apply EnrichmentPipeline: {e}")
     return data
@@ -1988,6 +2033,9 @@ def export_to_json(
 
     if hierarchical:
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+        is_mock_hier_mapper = _is_mock_mapper(mapper) or not callable(
+            getattr(mapper, "_get_enrichment_pipeline", None)
+        )
         hier_kwargs: dict[str, Any] = {"use_labels_as_keys": use_labels_as_columns}
         if variable_whitelist is not None:
             hier_kwargs["variable_whitelist"] = variable_whitelist
@@ -2000,7 +2048,8 @@ def export_to_json(
         data = mapper.build_hierarchy(study_key, **hier_kwargs)
         if config.mask_phi:
             data = mask_clinical_phi(data)
-        data = _apply_json_enrichment(study_key, data, mask_phi=config.mask_phi)
+        if is_mock_hier_mapper:
+            data = _apply_json_enrichment(study_key, data, mask_phi=config.mask_phi)
         with _TabularCallableSink(
             config,
             "export_json",
@@ -2058,7 +2107,8 @@ def export_to_json(
             if not combined.empty
             else []
         )
-        records_out = _apply_json_enrichment(study_key, records_out, mask_phi=config.mask_phi)
+        if config.mask_phi:
+            records_out = mask_clinical_phi(records_out)
         _dump_json_payload(path, records_out, config)
 
     sink = _TabularCollectingSink(config, _write_json)
@@ -2309,6 +2359,11 @@ def export_to_duckdb_by_form(
     sink_kwargs = _pop_sink_kwargs(kwargs)
     effective_mask_phi = bool(sink_kwargs.get("mask_phi", mask_phi))
     mapper = _create_record_mapper(sdk, mask_phi=effective_mask_phi)
+    if hasattr(mapper, "_active_study_key"):
+        mapper._active_study_key = study_key
+    pipeline = resolve_enrichment_pipeline(study_key)
+    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+    has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     forms = sdk.forms.list(study_key=study_key)
 
     # Fetch all variables for the study once to avoid N+1 queries
@@ -2356,6 +2411,8 @@ def export_to_duckdb_by_form(
                     extra_filters={"formId": form.form_id},
                 )
                 rows, _ = mapper._parse_records(records, record_model)
+                if pipeline is not None and not has_native_enrichment:
+                    rows = [pipeline.process(r, mask_phi=effective_mask_phi) for r in rows]
                 df = mapper._build_dataframe(
                     rows,
                     variable_keys,
@@ -2367,7 +2424,7 @@ def export_to_duckdb_by_form(
                     dup_mask = df.columns.str.lower().duplicated()
                     df = df.loc[:, ~dup_mask]
                     if effective_mask_phi:
-                        df = _mask_df(df)
+                        df = _mask_df(df, phi_keys=phi_keys)
 
                 if (
                     isinstance(df, pd.DataFrame)
@@ -2393,6 +2450,7 @@ def export_to_duckdb_by_form(
                 variables,
                 use_labels_as_columns=use_labels_as_columns,
                 mask_phi=effective_mask_phi,
+                pipeline=pipeline,
             )
             is_incremental = bool(
                 sink_kwargs.get("incremental")
@@ -2415,6 +2473,8 @@ def export_to_duckdb_by_form(
             quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
             for chunk in iter_batches(stream, batch_size):
                 rows, _ = mapper._parse_records(chunk, record_model)
+                if pipeline is not None and not has_native_enrichment:
+                    rows = [pipeline.process(r, mask_phi=effective_mask_phi) for r in rows]
                 df = mapper._build_dataframe(
                     rows,
                     variable_keys,
@@ -2426,7 +2486,7 @@ def export_to_duckdb_by_form(
                     dup_mask = df.columns.str.lower().duplicated()
                     df = df.loc[:, ~dup_mask]
                     if effective_mask_phi:
-                        df = _mask_df(df)
+                        df = _mask_df(df, phi_keys=phi_keys)
                 if df.empty:
                     continue
                 if not wrote_any:
@@ -2489,6 +2549,11 @@ def export_to_sql_by_form(
     )
 
     mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+    if hasattr(mapper, "_active_study_key"):
+        mapper._active_study_key = study_key
+    pipeline = resolve_enrichment_pipeline(study_key)
+    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+    has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     engine = create_engine(conn_str)
     forms = sdk.forms.list(study_key=study_key)
 
@@ -2527,6 +2592,8 @@ def export_to_sql_by_form(
                 extra_filters={"formId": form.form_id},
             )
             rows, _ = mapper._parse_records(records, record_model)
+            if pipeline is not None and not has_native_enrichment:
+                rows = [pipeline.process(r, mask_phi=config.mask_phi) for r in rows]
             df = mapper._build_dataframe(
                 rows,
                 variable_keys,
@@ -2537,7 +2604,7 @@ def export_to_sql_by_form(
                 dup_mask = df.columns.str.lower().duplicated()
                 df = df.loc[:, ~dup_mask]
                 if config.mask_phi:
-                    df = _mask_df(df)
+                    df = _mask_df(df, phi_keys=phi_keys)
 
             form_table = form.form_key or ""
 
@@ -2615,6 +2682,7 @@ def export_to_sql_by_form(
             label_map,
             form_config,
             sanitize=False,
+            pipeline=pipeline,
         )
         run_streaming_export(
             sdk,
@@ -2664,19 +2732,28 @@ def export_to_long_sql(
         )
 
     include_deleted = bool(sink_kwargs.get("include_deleted", False))
+    pipeline = resolve_enrichment_pipeline(study_key)
+    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     rows: list[dict[str, Any]] = []
     first = True
     for rec in records:
         if not include_deleted and is_record_deleted(rec):
             continue
         timestamp = rec.date_modified
-        for name, value in (rec.record_data or {}).items():
+        rec_payload = dict(rec.record_data or {})
+        if pipeline is not None and rec_payload:
+            rec_payload = pipeline.process(rec_payload, mask_phi=effective_mask_phi)
+        for name, value in rec_payload.items():
             if not effective_mask_phi:
                 masked_value = value
-            elif global_sensitivity_registry.is_sensitive(name):
+            elif global_sensitivity_registry.is_sensitive(name) or _is_custom_phi_key(
+                name, phi_keys
+            ):
                 masked_value = "***MASKED***"
             else:
                 masked_value = mask_clinical_phi(value)
+                if phi_keys:
+                    masked_value = mask_custom_phi_recursive(masked_value, phi_keys)
 
             rows.append(
                 {
