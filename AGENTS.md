@@ -18,7 +18,7 @@ All canonical skills live under `.agents/skills/` (`.agents/skills/README.md`, r
 
 ## Project Overrides & Governance Precedence
 
-- **Environment Setup:** Use `uv sync --locked --extra dev --extra docs` (never `poetry`, unpinned `pip`, or unlisted deps). On Windows PowerShell, use `pwsh` with `scripts/env.ps1` / `.venv`, and prefer Git Bash (`C:\Program Files\Git\bin\bash.exe`) over WSL `bash.exe`.
+- **Environment Setup:** Use `uv sync --locked --all-packages --all-extras` (never `poetry`, unpinned `pip`, or unlisted deps). On Windows PowerShell, use `pwsh` with `scripts/env.ps1` / `.venv`, and prefer Git Bash (`C:\Program Files\Git\bin\bash.exe`) over WSL `bash.exe`.
 - **Workspace & Root Hygiene:** Use native harness worktrees or `.worktrees/`; save ephemeral artifacts, questionnaires, and handoffs under `.scratch/` or OS temp—never repo root (`scripts/check_root_files.py`).
 - **Specs & Domain Model:** Store single-PR specs/plans in `docs/superpowers/{specs,plans}/` (excluded in `docs/conf.py`). Maintain `CONTEXT.md` + `docs/adr/` via `domain-modeling` and regenerate `docs/adr/index.rst` via `hatch run docs` (`docs/agents/domain.md`).
 - **Triage Label Precedence:** `docs/agents/triage-labels.md` is authoritative for live GitHub labels and overrides legacy label spellings in frozen `docs/reference/{issue_management,triage_playbook}.rst` and `.github/ISSUE_TEMPLATE/*.yml`.
