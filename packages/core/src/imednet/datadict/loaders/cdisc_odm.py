@@ -23,6 +23,10 @@ from ..normalize import (
     to_camel_case,
 )
 
+ODM_NS = "http://www.cdisc.org/ns/odm/v1.3"
+IMEDNET_NS = "http://www.imednet.com/ns/odm/metadata"
+MDSOL_NS = "http://www.mdsol.com/ns/odm/metadata"
+
 # Standard ODM attributes by element type
 KNOWN_FORM_ATTRIBUTES = {
     "oid",
@@ -53,7 +57,12 @@ KNOWN_ITEM_ATTRIBUTES = {
     "sasfieldname",
     "sdsvarname",
     "controltype",
+}
+
+KNOWN_IMEDNET_ITEM_ATTRIBUTES = {
     "variablename",
+    "format",
+    "precision",
 }
 
 KNOWN_ITEM_REF_ATTRIBUTES = {
@@ -65,8 +74,10 @@ KNOWN_ITEM_REF_ATTRIBUTES = {
     "role",
     "collectionexceptionconditionoid",
     "controltype",
+}
+
+KNOWN_IMEDNET_ITEM_REF_ATTRIBUTES = {
     "requiredpolicy",
-    "requiredfield",
 }
 
 KNOWN_ITEM_GROUP_REF_ATTRIBUTES = {
@@ -166,13 +177,37 @@ def _local_tag(elem: ET.Element) -> str:
     return tag
 
 
+def _split_attr_ns(attr_key: str) -> tuple[str, str]:
+    """Split an ElementTree attribute key into (namespace_uri, local_name)."""
+    key_str = str(attr_key)
+    if key_str.startswith("{") and "}" in key_str:
+        ns_uri, local = key_str[1:].split("}", 1)
+        return ns_uri, local
+    return "", key_str
+
+
 def _get_attr(elem: ET.Element, *names: str) -> str | None:
-    """Case-insensitively retrieve an attribute from an Element ignoring namespaces."""
+    """Case-insensitively retrieve a standard ODM attribute from an Element."""
+    names_lower = {n.lower() for n in names}
+    fallback_val: str | None = None
+    for k, v in elem.attrib.items():
+        ns_uri, attr_local = _split_attr_ns(k)
+        local_lower = attr_local.lower()
+        if local_lower not in names_lower:
+            continue
+        if ns_uri in ("", ODM_NS):
+            return str(v)
+        if ns_uri == MDSOL_NS and local_lower == "controltype" and fallback_val is None:
+            fallback_val = str(v)
+    return fallback_val
+
+
+def _get_imednet_attr(elem: ET.Element, *names: str) -> str | None:
+    """Case-insensitively retrieve an explicit iMednet vendor extension attribute."""
     names_lower = {n.lower() for n in names}
     for k, v in elem.attrib.items():
-        k_str = str(k)
-        attr_local = k_str.split("}", 1)[1] if "}" in k_str else k_str
-        if attr_local.lower() in names_lower:
+        ns_uri, attr_local = _split_attr_ns(k)
+        if ns_uri == IMEDNET_NS and attr_local.lower() in names_lower:
             return str(v)
     return None
 
@@ -203,22 +238,37 @@ def _extract_unmapped_attributes(
     known: set[str],
     elem_type: str,
     record_warning: Any,
+    *,
+    known_imednet: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Extract attributes not in the known set and record warnings."""
+    """Extract attributes not in the known ODM or vendor sets and record warnings."""
     extra: dict[str, Any] = {}
+    imednet_allowed = known_imednet or set()
     for k, v in elem.attrib.items():
-        local_name = k.split("}", 1)[1] if "}" in k else k
-        # Ignore XML namespace declarations and xml:* builtins
-        if local_name.lower() in ("xmlns", "lang") or k.startswith(
-            ("{http://www.w3.org/", "xmlns")
+        ns_uri, local_name = _split_attr_ns(k)
+        local_lower = local_name.lower()
+        # Ignore XML namespace declarations and xml:* / W3C builtins
+        if (
+            local_lower == "xmlns"
+            or (ns_uri == "" and local_lower == "lang")
+            or k.startswith("xmlns")
+            or ns_uri.startswith("http://www.w3.org/")
         ):
             continue
-        if local_name.lower() not in known:
-            camel = to_camel_case(local_name)
-            extra[camel] = v
-            record_warning(
-                f"Unmapped attribute '{local_name}' on {elem_type} '{_get_attr(elem, 'OID') or 'unknown'}'"
-            )
+        if ns_uri in ("", ODM_NS) and local_lower in known:
+            continue
+        if ns_uri == IMEDNET_NS and local_lower in imednet_allowed:
+            continue
+        if ns_uri == MDSOL_NS and local_lower == "controltype" and "controltype" in known:
+            continue
+
+        camel = to_camel_case(local_name)
+        extra[camel] = v
+        elem_id = (
+            _get_attr(elem, "OID", "ItemOID", "ItemGroupOID", "FormOID", "StudyEventOID")
+            or "unknown"
+        )
+        record_warning(f"Unmapped attribute '{local_name}' on {elem_type} '{elem_id}'")
     return extra
 
 
@@ -372,7 +422,7 @@ def _resolve_variable_name(
     item_def_elems: dict[str, ET.Element] | None = None,
 ) -> str:
     """Resolve canonical variableName from ItemDef, unwrapping form-scoped OID prefixes."""
-    explicit_var_name = _get_attr(it_def, "VariableName")
+    explicit_var_name = _get_imednet_attr(it_def, "VariableName")
     if explicit_var_name and explicit_var_name.strip():
         return explicit_var_name.strip()
 
@@ -386,7 +436,7 @@ def _resolve_variable_name(
                 continue
             other_def = item_def_elems.get(other_oid) if item_def_elems is not None else None
             other_explicit = (
-                (_get_attr(other_def, "VariableName") or "").strip()
+                (_get_imednet_attr(other_def, "VariableName") or "").strip()
                 if other_def is not None
                 else ""
             )
@@ -954,6 +1004,7 @@ def load_from_cdisc_odm(
             KNOWN_ITEM_REF_ATTRIBUTES,
             "ItemRef",
             record_warning,
+            known_imednet=KNOWN_IMEDNET_ITEM_REF_ATTRIBUTES,
         )
 
         it_def = item_def_elems.get(it_oid)
@@ -968,6 +1019,7 @@ def load_from_cdisc_odm(
             KNOWN_ITEM_ATTRIBUTES,
             "ItemDef",
             record_warning,
+            known_imednet=KNOWN_IMEDNET_ITEM_ATTRIBUTES,
         )
         for k, v in ref_extra.items():
             it_extra.setdefault(k, v)
@@ -1034,7 +1086,7 @@ def load_from_cdisc_odm(
 
         seq = _parse_order(item_ref, fallback_seq)
 
-        req_policy = _get_attr(item_ref, "RequiredPolicy", "RequiredField")
+        req_policy = _get_imednet_attr(item_ref, "RequiredPolicy")
         mand_val = _get_attr(item_ref, "Mandatory")
         req: str | None = None
         if req_policy and req_policy.strip():
@@ -1070,8 +1122,9 @@ def load_from_cdisc_odm(
             variableType=var_type,
             sequence=seq,
             required=req,
-            format=_get_attr(it_def, "Length"),
-            precision=_get_attr(it_def, "SignificantDigits"),
+            format=_get_attr(it_def, "Length") or _get_imednet_attr(it_def, "Format"),
+            precision=_get_attr(it_def, "SignificantDigits")
+            or _get_imednet_attr(it_def, "Precision"),
             choices=var_choices,
             extraAttributes=it_extra,
         )

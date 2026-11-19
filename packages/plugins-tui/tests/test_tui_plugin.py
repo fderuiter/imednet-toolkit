@@ -1956,3 +1956,494 @@ async def test_async_sdk_bounded_initial_fetch_site_filter_and_load_all() -> Non
                     assert "siteId==10" in subj_route.calls[-1].request.url.params.get("filter", "")
 
                 assert spy_to_thread.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("viewport", [(80, 24), (100, 30), (120, 40)])
+async def test_jobs_tab_positive_content_height_across_viewports(viewport: tuple[int, int]) -> None:
+    """Acceptance Criterion 1 & Req 1/8: Jobs tab and table have positive visible height across viewports."""
+    from textual.widgets import Input, Static, TabbedContent, TabPane
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    study = MagicMock(study_key="VP-STUDY", study_name="Viewport Study")
+    sdk.async_get_studies = AsyncMock(return_value=[study])
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    app = ImednetTuiApp(sdk)
+    async with app.run_test(size=viewport) as pilot:
+        await pilot.pause()
+
+        bottom_pane = app.screen.query_one("#bottom-pane", TabbedContent)
+        jobs_tab = app.screen.query_one("#jobs-tab", TabPane)
+        job_monitor = app.screen.query_one(JobMonitor)
+        batch_input = app.screen.query_one("#batch_id_input", Input)
+        notice = app.screen.query_one("#job_monitor_notice", Static)
+        job_table = app.screen.query_one("#job_table", JobTable)
+
+        assert bottom_pane.size.height > 0
+        assert jobs_tab.content_size.height > 0
+        assert job_monitor.content_size.height > 0
+        assert batch_input.size.height > 0
+        assert job_table.content_size.height > 0
+
+        # Select study with zero tracked jobs and verify empty-view prompt & positive heights
+        study_list = app.screen.query_one(StudyList)
+        study_list.post_message(StudyList.StudySelected("VP-STUDY", "Viewport Study"))
+        await pilot.pause()
+
+        notice_rendered = str(notice.render())
+        assert "upstream APIs require batch IDs" in notice_rendered
+        assert "Enter one or more batch IDs above" in notice_rendered
+        assert job_monitor.content_size.height > 0
+        assert job_table.content_size.height > 0
+
+
+@pytest.mark.asyncio
+async def test_launch_tui_with_initial_study_and_batches_polls_and_renders_table() -> None:
+    """Acceptance Criterion 2 & Req 2/5: Launching with study and batch options selects study and polls."""
+    from textual.widgets import TabbedContent
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    s1 = MagicMock(study_key="STUDY-ALPHA", study_name="Alpha Study")
+    s2 = MagicMock(study_key="STUDY-BETA", study_name="Beta Study")
+    sdk.async_get_studies = AsyncMock(return_value=[s1, s2])
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    jobs_by_id = {
+        "BATCH-01": JobStatus(
+            batch_id="BATCH-01",
+            state=JobState.RUNNING,
+            progress=45,
+            total_records=120,
+            failed_records=2,
+            date_created="2026-05-01T10:00:00Z",
+        ),
+        "BATCH-02": JobStatus(
+            batch_id="BATCH-02",
+            state=JobState.COMPLETED,
+            progress=100,
+            total_records=80,
+            failed_records=0,
+            date_created="2026-05-01T09:30:00Z",
+        ),
+    }
+    sdk.async_get_job = AsyncMock(side_effect=lambda sk, bid: jobs_by_id[bid])
+
+    app = ImednetTuiApp(
+        sdk,
+        study_key="STUDY-BETA",
+        batch_ids=["BATCH-01", "BATCH-02"],
+    )
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+        assert isinstance(app.screen, DashboardScreen)
+        assert app.screen.selected_study_key == "STUDY-BETA"
+
+        study_list = app.screen.query_one(StudyList)
+        assert study_list.index == 1
+
+        bottom_pane = app.screen.query_one("#bottom-pane", TabbedContent)
+        assert bottom_pane.active == "jobs-tab"
+
+        job_table = app.screen.query_one("#job_table", JobTable)
+        assert job_table.row_count == 2
+        row0 = [str(c) for c in job_table.get_row_at(0)]
+        row1 = [str(c) for c in job_table.get_row_at(1)]
+        assert row0 == ["BATCH-01", "RUNNING", "45%", "120", "2", "2026-05-01T10:00:00Z"]
+        assert row1 == ["BATCH-02", "COMPLETED", "100%", "80", "0", "2026-05-01T09:30:00Z"]
+
+
+def test_run_tui_forwards_study_key_and_batch_ids(mock_sdk: MagicMock) -> None:
+    """Verify run_tui passes study_key, batch_ids, and high_contrast into ImednetTuiApp."""
+    with (
+        patch("imednet_tui.app.is_interactive_terminal", return_value=True),
+        patch.object(ImednetTuiApp, "run") as mock_run,
+    ):
+        captured: list[ImednetTuiApp] = []
+        orig_init = ImednetTuiApp.__init__
+
+        def spy_init(self: ImednetTuiApp, *args: Any, **kwargs: Any) -> None:
+            orig_init(self, *args, **kwargs)
+            captured.append(self)
+
+        with patch.object(ImednetTuiApp, "__init__", spy_init):
+            run_tui(
+                mock_sdk,
+                high_contrast=True,
+                study_key="STUDY-CLI",
+                batch_ids=["B-1", "B-2"],
+            )
+
+        mock_run.assert_called_once()
+        assert len(captured) == 1
+        assert captured[0].initial_study_key == "STUDY-CLI"
+        assert captured[0].initial_batch_ids == ["B-1", "B-2"]
+        assert captured[0].high_contrast_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_inline_batch_input_suppresses_shortcuts_and_polls_immediately() -> None:
+    """Acceptance Criteria 3 & 4: Focused batch input types q/d/h/r/a and polls immediately on Enter."""
+    from textual.widgets import Input
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(
+        return_value=[MagicMock(study_key="STUDY-INP", study_name="Input Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock(
+        side_effect=lambda sk, bid: JobStatus(
+            batch_id=bid,
+            state=JobState.COMPLETED,
+            progress=100,
+            total_records=25,
+            failed_records=3,
+            date_created="2026-06-01T12:00:00Z",
+        )
+    )
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-INP")
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+
+        batch_input = app.screen.query_one("#batch_id_input", Input)
+        job_table = app.screen.query_one("#job_table", JobTable)
+
+        # Submit while no text entered does nothing
+        batch_input.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert job_table.row_count == 0
+
+        initial_dark = app.theme
+        initial_hc = app.high_contrast_enabled
+
+        # Verify check_action suppresses single-key shortcuts while Input is focused
+        assert app.check_action("quit", ()) is False
+        assert app.check_action("toggle_dark", ()) is False
+        assert app.check_action("toggle_high_contrast", ()) is False
+        assert app.check_action("refresh_data", ()) is False
+        assert app.check_action("load_all", ()) is False
+
+        # Press q, d, h, r, a inside the focused batch input
+        for ch in "qdhra-batch-1, qdrh-batch-2":
+            await pilot.press(ch)
+        await pilot.pause()
+
+        assert app.is_running is True
+        assert app.theme == initial_dark
+        assert app.high_contrast_enabled == initial_hc
+        assert batch_input.value == "qdhra-batch-1, qdrh-batch-2"
+
+        # Submit batch IDs via Enter
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert batch_input.value == ""
+        assert job_table.row_count == 2
+        row0 = [str(c) for c in job_table.get_row_at(0)]
+        row1 = [str(c) for c in job_table.get_row_at(1)]
+        assert row0 == ["qdhra-batch-1", "COMPLETED", "100%", "25", "3", "2026-06-01T12:00:00Z"]
+        assert row1 == ["qdrh-batch-2", "COMPLETED", "100%", "25", "3", "2026-06-01T12:00:00Z"]
+
+        # Move focus to JobTable via Tab and verify single-key shortcuts work again
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is job_table
+        assert app.check_action("toggle_high_contrast", ()) is True
+        await pilot.press("h")
+        await pilot.pause()
+        assert app.high_contrast_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_study_switching_isolates_tracked_batches_and_retains_prior_list() -> None:
+    """Acceptance Criterion 5 & Req 6: Study switching isolates batch lists and never polls foreign IDs."""
+    from textual.widgets import Input
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    s1 = MagicMock(study_key="STUDY-ONE", study_name="Study One")
+    s2 = MagicMock(study_key="STUDY-TWO", study_name="Study Two")
+    sdk.async_get_studies = AsyncMock(return_value=[s1, s2])
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    polled_pairs: list[tuple[str, str]] = []
+
+    async def mock_get(study_key: str, batch_id: str) -> JobStatus:
+        polled_pairs.append((study_key, batch_id))
+        return JobStatus(
+            batch_id=batch_id,
+            state=JobState.RUNNING,
+            progress=30,
+            total_records=10,
+            failed_records=0,
+            date_created="2026-06-02T08:00:00Z",
+        )
+
+    sdk.async_get_job = mock_get
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-ONE")
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+
+        batch_input = app.screen.query_one("#batch_id_input", Input)
+        job_table = app.screen.query_one("#job_table", JobTable)
+        study_list = app.screen.query_one(StudyList)
+
+        # Register two jobs in STUDY-ONE
+        batch_input.focus()
+        await pilot.pause()
+        batch_input.value = "S1-BATCH-A, S1-BATCH-B"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert job_table.row_count == 2
+        assert [str(job_table.get_row_at(0)[0]), str(job_table.get_row_at(1)[0])] == [
+            "S1-BATCH-A",
+            "S1-BATCH-B",
+        ]
+
+        # Switch to STUDY-TWO: must show empty table and must NOT poll S1 batches under STUDY-TWO
+        study_list.post_message(StudyList.StudySelected("STUDY-TWO", "Study Two"))
+        await pilot.pause()
+        await pilot.pause()
+
+        assert job_table.row_count == 0
+        assert ("STUDY-TWO", "S1-BATCH-A") not in polled_pairs
+        assert ("STUDY-TWO", "S1-BATCH-B") not in polled_pairs
+
+        # Add a job in STUDY-TWO
+        batch_input.value = "S2-BATCH-ONLY"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert job_table.row_count == 1
+        assert str(job_table.get_row_at(0)[0]) == "S2-BATCH-ONLY"
+        assert ("STUDY-ONE", "S2-BATCH-ONLY") not in polled_pairs
+
+        # Return to STUDY-ONE: prior tracked jobs are preserved and displayed
+        study_list.post_message(StudyList.StudySelected("STUDY-ONE", "Study One"))
+        await pilot.pause()
+        await pilot.pause()
+
+        assert job_table.row_count == 2
+        assert [str(job_table.get_row_at(0)[0]), str(job_table.get_row_at(1)[0])] == [
+            "S1-BATCH-A",
+            "S1-BATCH-B",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_jobs_stop_polling_and_pause_timer() -> None:
+    """Acceptance Criterion 6 & Req 7: Terminal jobs stop polling and pause background refresh timer."""
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(
+        return_value=[MagicMock(study_key="STUDY-TERM", study_name="Terminal Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    call_counts = {"BATCH-ACTIVE": 0, "BATCH-FINISHED": 0}
+
+    async def mock_get(study_key: str, batch_id: str) -> JobStatus:
+        call_counts[batch_id] += 1
+        if batch_id == "BATCH-FINISHED":
+            return JobStatus(
+                batch_id=batch_id,
+                state=JobState.COMPLETED,
+                progress=100,
+                total_records=40,
+                failed_records=0,
+                date_created="2026-06-03T10:00:00Z",
+            )
+        # BATCH-ACTIVE is RUNNING on poll 1, then transitions to COMPLETED on poll 2
+        if call_counts[batch_id] == 1:
+            return JobStatus(
+                batch_id=batch_id,
+                state=JobState.RUNNING,
+                progress=50,
+                total_records=40,
+                failed_records=0,
+                date_created="2026-06-03T10:05:00Z",
+            )
+        return JobStatus(
+            batch_id=batch_id,
+            state=JobState.COMPLETED,
+            progress=100,
+            total_records=40,
+            failed_records=1,
+            date_created="2026-06-03T10:05:00Z",
+        )
+
+    sdk.async_get_job = mock_get
+
+    app = ImednetTuiApp(
+        sdk,
+        study_key="STUDY-TERM",
+        batch_ids=["BATCH-ACTIVE", "BATCH-FINISHED"],
+    )
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+        job_monitor = app.screen.query_one(JobMonitor)
+        job_table = app.screen.query_one("#job_table", JobTable)
+
+        # Poll 1: BATCH-ACTIVE is RUNNING, BATCH-FINISHED is COMPLETED -> timer remains active
+        assert call_counts == {"BATCH-ACTIVE": 1, "BATCH-FINISHED": 1}
+        assert job_monitor.timer is not None
+        assert job_monitor.is_polling_active is True
+
+        # Replace interval with a fast 0.05s timer to verify real background timer ticks!
+        job_monitor.timer.stop()
+        job_monitor.timer = job_monitor.set_interval(0.05, job_monitor.refresh_jobs, pause=False)
+
+        # Wait for fast timer tick: only BATCH-ACTIVE is polled (BATCH-FINISHED is already terminal!)
+        await asyncio.sleep(0.12)
+        await pilot.pause()
+        assert call_counts == {"BATCH-ACTIVE": 2, "BATCH-FINISHED": 1}
+
+        # Now every tracked job is terminal -> background timer automatically paused itself!
+        assert job_monitor.is_polling_active is False
+        assert [str(c) for c in job_table.get_row_at(0)] == [
+            "BATCH-ACTIVE",
+            "COMPLETED",
+            "100%",
+            "40",
+            "1",
+            "2026-06-03T10:05:00Z",
+        ]
+
+        # Wait through multiple 0.05s timer intervals: zero additional job requests are sent!
+        await asyncio.sleep(0.20)
+        await pilot.pause()
+        await job_monitor.refresh_jobs()
+        assert call_counts == {"BATCH-ACTIVE": 2, "BATCH-FINISHED": 1}
+
+
+@pytest.mark.asyncio
+async def test_more_than_15_jobs_rendered_and_keyboard_scrollable() -> None:
+    """Acceptance Criterion 7 & Req 4: >15 jobs render without truncation and scroll via keyboard."""
+    from textual.widgets import Input
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(
+        return_value=[MagicMock(study_key="STUDY-MANY", study_name="Many Jobs Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    batch_ids = [f"BATCH-{idx:02d}" for idx in range(1, 23)]  # 22 jobs (> 15)
+    sdk.async_get_job = AsyncMock(
+        side_effect=lambda sk, bid: JobStatus(
+            batch_id=bid,
+            state=JobState.COMPLETED,
+            progress=100,
+            total_records=10 + int(bid.split("-")[1]),
+            failed_records=int(bid.split("-")[1]) % 2,
+            date_created="2026-06-04T11:00:00Z",
+        )
+    )
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-MANY", batch_ids=batch_ids)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+        job_monitor = app.screen.query_one(JobMonitor)
+        batch_input = app.screen.query_one("#batch_id_input", Input)
+        job_table = app.screen.query_one("#job_table", JobTable)
+
+        assert job_table.row_count == 22
+        rendered_summary = str(job_monitor.render())
+        for bid in batch_ids:
+            assert bid in rendered_summary
+
+        # Focus batch_input, press Tab to move into JobTable, and scroll to the 22nd row via Down arrow
+        batch_input.focus()
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is job_table
+        assert job_table.cursor_row == 0
+
+        for _ in range(21):
+            await pilot.press("down")
+        await pilot.pause()
+
+        assert job_table.cursor_row == 21
+        last_row = [str(c) for c in job_table.get_row_at(21)]
+        assert last_row[0] == "BATCH-22"
+        assert last_row[3] == "32"
+        assert last_row[4] == "0"
+
+
+@pytest.mark.asyncio
+async def test_batch_submission_without_study_notifies_and_pending_cli_batches_attach() -> None:
+    """Verify submitting batch IDs before study selection warns, while initial CLI batches attach on first select."""
+    from textual.widgets import Input
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(
+        return_value=[MagicMock(study_key="STUDY-DEFER", study_name="Deferred Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock(
+        side_effect=lambda sk, bid: JobStatus(batch_id=bid, state=JobState.COMPLETED, progress=100)
+    )
+
+    app = ImednetTuiApp(sdk, batch_ids=["PENDING-BATCH-1"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+
+        # Before selecting a study, no poll happens and submitting in Input warns gracefully
+        sdk.async_get_job.assert_not_called()
+        batch_input = app.screen.query_one("#batch_id_input", Input)
+        batch_input.focus()
+        await pilot.pause()
+        batch_input.value = "EARLY-BATCH"
+        await pilot.press("enter")
+        await pilot.pause()
+        sdk.async_get_job.assert_not_called()
+
+        # Selecting a study attaches the deferred CLI batch ID
+        study_list = app.screen.query_one(StudyList)
+        study_list.post_message(StudyList.StudySelected("STUDY-DEFER", "Deferred Study"))
+        await pilot.pause()
+        await pilot.pause()
+
+        job_table = app.screen.query_one("#job_table", JobTable)
+        assert job_table.row_count == 1
+        assert str(job_table.get_row_at(0)[0]) == "PENDING-BATCH-1"
