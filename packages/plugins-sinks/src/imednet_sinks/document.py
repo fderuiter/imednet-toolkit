@@ -204,12 +204,12 @@ class MongoDbExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
-        from imednet.spi.sinks import CentralizedMapper
+        from imednet.spi.sinks import build_sink_mapper
 
-        mapper = CentralizedMapper(
+        mapper = build_sink_mapper(
+            self.config,
             mode="document",
             post_processor=_post_process_document,
-            mask_phi=self.config.mask_phi,
         )
         docs = [_record_to_document(r, self._study_key, mapper=mapper) for r in records]
         if not docs:

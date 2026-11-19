@@ -343,6 +343,8 @@ class ImednetExportOperator(BaseOperator):
         runtime_kwargs = self._get_runtime_export_kwargs()
         conn_settings = self._resolve_destination_connection(dest)
         stream_opts = self._collect_streaming_options(runtime_kwargs)
+        if not config.mask_phi:
+            stream_opts["mask_phi"] = False
 
         if dest == "snowflake":
             sink_cls = getattr(sinks, "SnowflakeExportSink", None)
@@ -479,6 +481,7 @@ class ImednetExportOperator(BaseOperator):
             max_retries=int(runtime_kwargs.get("max_retries", self.max_retries)),
             retry_backoff=float(runtime_kwargs.get("retry_backoff", 1.0)),
             idempotent=bool(runtime_kwargs.get("idempotent", self.idempotent)),
+            mask_phi=bool(runtime_kwargs.get("mask_phi", True)),
             extra=runtime_kwargs,
             quality_gate_enabled=bool(
                 runtime_kwargs.get("quality_gate_enabled", self.quality_gate_enabled)

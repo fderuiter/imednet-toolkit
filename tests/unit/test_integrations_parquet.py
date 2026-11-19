@@ -332,3 +332,72 @@ def test_export_to_hive_parquet_masks_phi_by_default_and_honors_opt_out(tmp_path
     assert unmasked_row["Contact Inbox"] == "jane@example.org"
     assert unmasked_row["Systolic BP"] == 120
     assert global_sensitivity_registry._sensitive_keys == snapshot_keywords
+
+
+def test_export_to_hive_parquet_deduplicates_case_insensitive_variables_and_masks_all_forms(
+    tmp_path: Path,
+) -> None:
+    """Verify export_to_hive_parquet deduplicates case-insensitive variable names and masks PHI across every Form."""
+    pytest.importorskip("pyarrow")
+    from imednet.models.records import Record
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [
+        SimpleNamespace(form_id=1, form_key="DEMOGRAPHICS"),
+        SimpleNamespace(form_id=2, form_key="ENROLLMENT"),
+    ]
+    sdk.variables.list.return_value = [
+        SimpleNamespace(form_id=1, variable_name="DOB", label="Birth Date"),
+        SimpleNamespace(form_id=1, variable_name="dob", label="birth date"),
+        SimpleNamespace(form_id=1, variable_name="Age", label="Age Years"),
+        SimpleNamespace(form_id=1, variable_name="AGE", label="age years"),
+        SimpleNamespace(form_id=2, variable_name="SSN", label="National ID"),
+        SimpleNamespace(form_id=2, variable_name="ssn", label="national id"),
+        SimpleNamespace(form_id=2, variable_name="patientName", label="Subject Full Name"),
+        SimpleNamespace(form_id=2, variable_name="visitScore", label="Visit Score"),
+    ]
+
+    all_records = [
+        Record(
+            record_id=201,
+            study_key="STUDY_DUP",
+            subject_key="SUBJ-201",
+            form_id=1,
+            form_key="DEMOGRAPHICS",
+            record_data={"DOB": "1984-02-29", "dob": "1984-02-29", "Age": 40, "AGE": 40},
+        ),
+        Record(
+            record_id=202,
+            study_key="STUDY_DUP",
+            subject_key="SUBJ-201",
+            form_id=2,
+            form_key="ENROLLMENT",
+            record_data={
+                "SSN": "123-45-6789",
+                "ssn": "123-45-6789",
+                "patientName": "Jane Doe",
+                "visitScore": 98,
+            },
+        ),
+    ]
+    sdk.records.iter.side_effect = lambda **_kw: iter(
+        [r.model_copy(deep=True) for r in all_records]
+    )
+    sdk.get_records.side_effect = lambda **_kw: [r.model_copy(deep=True) for r in all_records]
+
+    parquet_mod.export_to_hive_parquet(sdk, "STUDY_DUP", str(tmp_path))
+
+    demo_df = _read_partition_dataframe(tmp_path / "study_key=STUDY_DUP" / "form_key=DEMOGRAPHICS")
+    enroll_df = _read_partition_dataframe(tmp_path / "study_key=STUDY_DUP" / "form_key=ENROLLMENT")
+
+    assert [c.lower() for c in demo_df.columns].count("dob") == 1
+    assert [c.lower() for c in demo_df.columns].count("age") == 1
+    assert demo_df["DOB"].iloc[0] == "***MASKED***"
+    assert demo_df["Age"].iloc[0] == 40
+    assert demo_df["subjectKey"].iloc[0] == "SUBJ-201"
+
+    assert [c.lower() for c in enroll_df.columns].count("ssn") == 1
+    assert enroll_df["SSN"].iloc[0] == "***MASKED***"
+    assert enroll_df["patientName"].iloc[0] == "***MASKED***"
+    assert enroll_df["visitScore"].iloc[0] == 98
+    assert enroll_df["subjectKey"].iloc[0] == "SUBJ-201"

@@ -71,10 +71,13 @@ Public-API exposure rules
 from __future__ import annotations
 
 import contextlib
+import copy
+import functools
 import itertools
 import logging
 import math
 import re
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -84,6 +87,7 @@ from importlib import import_module
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, cast, runtime_checkable
+from unittest.mock import NonCallableMock
 
 from tenacity import wait_exponential
 
@@ -95,6 +99,7 @@ from imednet.utils.dates import (
     parse_iso_datetime,
 )
 from imednet.utils.filters import parse_filter_expressions, validate_connector_exclusivity
+from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +304,92 @@ class SinkConfig:
 # ---------------------------------------------------------------------------
 
 
+def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
+    """Return a PHI-redacted copy of a pandas DataFrame without mutating caller state."""
+    masked = df.copy()
+    sensitive_cols = list(
+        dict.fromkeys(
+            col for col in masked.columns if global_sensitivity_registry.is_sensitive(str(col))
+        )
+    )
+    for col in sensitive_cols:
+        if len(masked) > 0:
+            masked[col] = "***MASKED***"
+
+    if len(masked) == 0:
+        return masked
+
+    remaining = masked.drop(columns=sensitive_cols)
+    try:
+        object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object, "str"]).columns))
+    except TypeError:
+        object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object]).columns))
+
+    _ = pd_mod
+    for col in object_cols:
+        target = masked[col]
+        if hasattr(target, "columns"):
+            masked[col] = target.apply(lambda s: s.apply(mask_clinical_phi))
+        else:
+            masked[col] = target.apply(mask_clinical_phi)
+    return masked
+
+
+def _redact_single_record(item: Any) -> Any:
+    """Redact PHI on a single Mapping, Pydantic model, or record-like object."""
+    if isinstance(item, Mapping):
+        return mask_clinical_phi(dict(item))
+    if isinstance(item, NonCallableMock):
+        return item
+
+    model_copy = getattr(type(item), "model_copy", None)
+    model_fields = getattr(type(item), "model_fields", None)
+    if callable(model_copy) and isinstance(model_fields, Mapping):
+        updates: dict[str, Any] = {}
+        record_data = getattr(item, "record_data", None)
+        if isinstance(record_data, dict):
+            masked_rd = mask_clinical_phi(record_data)
+            if masked_rd != record_data:
+                updates["record_data"] = masked_rd
+        for field_name in model_fields:
+            if field_name == "record_data" or global_sensitivity_registry.is_exempt(field_name):
+                continue
+            if global_sensitivity_registry.is_sensitive(field_name):
+                val = getattr(item, field_name, None)
+                if val is not None and val != "***MASKED***":
+                    updates[field_name] = "***MASKED***"
+        return item.model_copy(update=updates) if updates else item
+
+    record_data = getattr(item, "record_data", None)
+    if isinstance(record_data, dict):
+        masked_rd = mask_clinical_phi(record_data)
+        if masked_rd != record_data:
+            copied = copy.copy(item)
+            copied.record_data = masked_rd
+            return copied
+    return item
+
+
+def redact_batch_records(records: Any, *, mask_phi: bool = True) -> Any:
+    """Apply default SensitivityRegistry PHI redaction across a batch of records or DataFrame."""
+    if not mask_phi or records is None:
+        return records
+
+    pd_mod = sys.modules.get("pandas")
+    if pd_mod is not None and isinstance(records, pd_mod.DataFrame):
+        return _redact_dataframe_batch(records, pd_mod)
+
+    if isinstance(records, Mapping):
+        return mask_clinical_phi(dict(records))
+    if isinstance(records, (str, bytes)):
+        return records
+    if isinstance(records, tuple):
+        return tuple(_redact_single_record(item) for item in records)
+    if isinstance(records, Iterable):
+        return [_redact_single_record(item) for item in records]
+    return records
+
+
 class ExportSink(ABC):
     """Abstract base class for all export sinks.
 
@@ -312,9 +403,40 @@ class ExportSink(ABC):
         all values at their defaults.
     """
 
+    _skip_auto_redact_batch: bool = False
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Automatically wrap concrete ``write_batch`` implementations with PHI redaction."""
+        super().__init_subclass__(**kwargs)
+        if cls.__dict__.get("_skip_auto_redact_batch", False):
+            return
+        raw_write_batch = cls.__dict__.get("write_batch")
+        if raw_write_batch is None or getattr(raw_write_batch, "__isabstractmethod__", False):
+            return
+        if getattr(raw_write_batch, "_phi_redaction_wrapped", False):
+            return
+
+        @functools.wraps(raw_write_batch)
+        def _wrapped_write_batch(
+            self: ExportSink,
+            records: Sequence[Any],
+            *,
+            batch_id: str,
+        ) -> int:
+            redacted = self.redact_batch(records)
+            return cast(int, raw_write_batch(self, redacted, batch_id=batch_id))
+
+        _wrapped_write_batch._phi_redaction_wrapped = True  # type: ignore[attr-defined]
+        cls.write_batch = _wrapped_write_batch  # type: ignore[method-assign]
+
     def __init__(self, config: SinkConfig) -> None:
         """Initialize the export sink with a configuration."""
         self.config: SinkConfig = config
+
+    def redact_batch(self, records: Sequence[Any]) -> Any:
+        """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
+        should_mask = getattr(self.config, "mask_phi", True) is not False
+        return redact_batch_records(records, mask_phi=should_mask)
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -1048,5 +1170,6 @@ __all__ = [
     "iter_batches",
     "iter_filtered_sdk_records",
     "normalize_watermark_datetime",
+    "redact_batch_records",
     "run_streaming_export",
 ]

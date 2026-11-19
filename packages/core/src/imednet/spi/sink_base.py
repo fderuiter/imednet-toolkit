@@ -21,6 +21,7 @@ from imednet.integrations.sink_base import (
     iter_batches,
     iter_filtered_sdk_records,
     normalize_watermark_datetime,
+    redact_batch_records,
     run_streaming_export,
 )
 
@@ -40,5 +41,6 @@ __all__ = [
     "iter_batches",
     "iter_filtered_sdk_records",
     "normalize_watermark_datetime",
+    "redact_batch_records",
     "run_streaming_export",
 ]
