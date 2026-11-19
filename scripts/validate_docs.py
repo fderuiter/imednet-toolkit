@@ -3,6 +3,7 @@
 import ast
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 
@@ -38,7 +39,7 @@ def check_todos_in_init() -> bool:
 
 
 def check_packages_registered() -> bool:
-    """Validate that all packages in /packages are registered in docs/conf.py and Makefile."""
+    """Validate that all packages in /packages are registered across workspace and docs configs."""
     print("Checking if all packages are registered in build configuration...")
 
     packages_dir = Path("packages")
@@ -48,6 +49,10 @@ def check_packages_registered() -> bool:
 
     conf_py_path = Path("docs/conf.py")
     index_rst_path = Path("docs/index.rst")
+    plugins_rst_path = Path("docs/explanation/plugins.rst")
+    cli_rst_path = Path("docs/how-to/cli.rst")
+    pyproject_path = Path("pyproject.toml")
+    readme_path = Path("README.md")
 
     if not conf_py_path.exists() or not index_rst_path.exists():
         print("Warning: docs/conf.py or docs/index.rst not found.")
@@ -55,10 +60,13 @@ def check_packages_registered() -> bool:
 
     conf_py_content = conf_py_path.read_text(encoding="utf-8")
     index_rst_content = index_rst_path.read_text(encoding="utf-8")
+    plugins_rst_content = (
+        plugins_rst_path.read_text(encoding="utf-8") if plugins_rst_path.exists() else ""
+    )
 
     has_errors = False
 
-    for pkg_dir in packages_dir.iterdir():
+    for pkg_dir in sorted(packages_dir.iterdir()):
         if not pkg_dir.is_dir() or pkg_dir.name.startswith("."):
             continue
 
@@ -82,6 +90,53 @@ def check_packages_registered() -> bool:
                 f"Error: Package {pkg_name} ({index_pkg_path}) is missing from docs/index.rst API Reference."
             )
             has_errors = True
+
+        # Check docs/explanation/plugins.rst
+        plugins_doc_ref = f"/reference/api/{pkg_name}"
+        if plugins_rst_path.exists() and plugins_doc_ref not in plugins_rst_content:
+            print(
+                f"Error: Package {pkg_name} ({plugins_doc_ref}) is missing from docs/explanation/plugins.rst."
+            )
+            has_errors = True
+
+    if plugins_rst_path.exists() and "imednet.cli_plugins" not in plugins_rst_content:
+        print(
+            "Error: imednet.cli_plugins entry-point group is missing from docs/explanation/plugins.rst."
+        )
+        has_errors = True
+
+    if pyproject_path.exists():
+        pyproject_data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        root_deps = set(pyproject_data.get("project", {}).get("dependencies", []))
+        if "imednet-tui" not in root_deps:
+            print(
+                "Error: 'imednet-tui' is missing from root pyproject.toml [project].dependencies."
+            )
+            has_errors = True
+
+    if readme_path.exists():
+        readme_content = readme_path.read_text(encoding="utf-8")
+        if "imednet[tui]" not in readme_content:
+            print("Error: 'imednet[tui]' is missing from README.md installation instructions.")
+            has_errors = True
+        if "uv sync --all-packages --extra dev --extra docs" not in readme_content:
+            print(
+                "Error: 'uv sync --all-packages --extra dev --extra docs' is missing from README.md."
+            )
+            has_errors = True
+
+    if cli_rst_path.exists():
+        cli_rst_content = cli_rst_path.read_text(encoding="utf-8")
+        for required_token in (
+            "imednet tui",
+            "--high-contrast",
+            "InteractiveDataGrid",
+            "IMEDNET_NON_INTERACTIVE=1",
+            "--interactive",
+        ):
+            if required_token not in cli_rst_content:
+                print(f"Error: '{required_token}' is missing from docs/how-to/cli.rst.")
+                has_errors = True
 
     if not has_errors:
         print("All packages are correctly registered.")

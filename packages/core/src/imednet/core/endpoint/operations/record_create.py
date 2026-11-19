@@ -6,9 +6,10 @@ Encapsulates validation, header construction, and execution logic for record cre
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Generic, TypeVar
+from typing import Any, TypeVar
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
+from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
 from imednet.validation.cache import BaseSchemaCache, validate_record_entry
@@ -16,7 +17,7 @@ from imednet.validation.cache import BaseSchemaCache, validate_record_entry
 T = TypeVar("T")
 
 
-class RecordCreateOperation(Generic[T]):
+class RecordCreateOperation(Operation[T]):
     """Operation for creating records.
 
     Handles validation against schema and security checks for headers
