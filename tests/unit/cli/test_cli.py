@@ -1773,3 +1773,299 @@ def test_jobs_json_mode_interactive_and_redirected(
     assert payload["items"][0]["results"] == job.results
     assert payload["items"][0]["resultUrl"] == job.result_url
     assert payload["items"][0]["dateStarted"] == job.date_started
+
+
+@pytest.mark.parametrize(
+    ("argv", "attr", "expected_args", "expected_kwargs"),
+    [
+        (
+            ["studies", "list", "-f", "study_key=S1", "--filter", "study_type=Clinical"],
+            "studies",
+            (),
+            {"study_key": "S1", "study_type": "Clinical"},
+        ),
+        (
+            ["sites", "list", "STUDY", "-f", "site_name=General", "--filter", "site_id=10"],
+            "sites",
+            ("STUDY",),
+            {"site_name": "General", "site_id": 10},
+        ),
+        (
+            ["forms", "list", "STUDY", "-f", "form_key=DM", "--filter", "disabled=false"],
+            "forms",
+            ("STUDY",),
+            {"form_key": "DM", "disabled": False},
+        ),
+        (
+            ["variables", "list", "STUDY", "-f", "variable_name=AGE", "--filter", "disabled=false"],
+            "variables",
+            ("STUDY",),
+            {"variable_name": "AGE", "disabled": False},
+        ),
+        (
+            [
+                "intervals",
+                "list",
+                "STUDY",
+                "-f",
+                "interval_name=Screening",
+                "--filter",
+                "disabled=false",
+            ],
+            "intervals",
+            ("STUDY",),
+            {"interval_name": "Screening", "disabled": False},
+        ),
+        (
+            [
+                "visits",
+                "list",
+                "STUDY",
+                "-f",
+                "interval_name=Screening",
+                "--filter",
+                "subject_key=001",
+            ],
+            "visits",
+            ("STUDY",),
+            {"interval_name": "Screening", "subject_key": "001"},
+        ),
+        (
+            ["queries", "list", "STUDY", "-f", "subject_key=001", "--filter", "variable=AGE"],
+            "queries",
+            ("STUDY",),
+            {"subject_key": "001", "variable": "AGE"},
+        ),
+        (
+            [
+                "record-revisions",
+                "list",
+                "STUDY",
+                "-f",
+                "subject_key=001",
+                "--filter",
+                "record_revision>=2",
+            ],
+            "record_revisions",
+            ("STUDY",),
+            {"subject_key": "001", "record_revision": (">=", 2)},
+        ),
+        (
+            ["records", "list", "STUDY", "-f", "form_key=AE", "--filter", "deleted=false"],
+            "records",
+            ("STUDY",),
+            {"form_key": "AE", "deleted": False},
+        ),
+    ],
+)
+def test_all_nine_list_commands_repeatable_filter_forwarding(
+    runner: CliRunner,
+    sdk: MagicMock,
+    argv: list[str],
+    attr: str,
+    expected_args: tuple[str, ...],
+    expected_kwargs: dict[str, object],
+) -> None:
+    """Repeatable -f and --filter options forward parsed kwargs across all nine list commands."""
+    getattr(sdk, attr).list.return_value = []
+    result = runner.invoke(cli.app, argv)
+    assert result.exit_code == 0
+    getattr(sdk, attr).list.assert_called_once_with(*expected_args, **expected_kwargs)
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "attr", "expected_args"),
+    [
+        ("studies", "studies", ()),
+        ("sites", "sites", ("STUDY",)),
+        ("forms", "forms", ("STUDY",)),
+        ("variables", "variables", ("STUDY",)),
+        ("intervals", "intervals", ("STUDY",)),
+        ("visits", "visits", ("STUDY",)),
+        ("queries", "queries", ("STUDY",)),
+        ("record-revisions", "record_revisions", ("STUDY",)),
+        ("records", "records", ("STUDY",)),
+        ("subjects", "subjects", ("STUDY",)),
+        ("codings", "codings", ("STUDY",)),
+    ],
+)
+def test_unfiltered_list_commands_pass_no_extra_kwargs(
+    runner: CliRunner,
+    sdk: MagicMock,
+    subcommand: str,
+    attr: str,
+    expected_args: tuple[str, ...],
+) -> None:
+    """Unfiltered invocations call sdk.<attr>.list without extra keyword arguments."""
+    getattr(sdk, attr).list.return_value = []
+    argv = [subcommand, "list", *expected_args]
+    result = runner.invoke(cli.app, argv)
+    assert result.exit_code == 0
+    getattr(sdk, attr).list.assert_called_once_with(*expected_args)
+
+
+def test_records_list_record_data_filter_and_none_bypass(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """records list forwards --record-data-filter, literal none bypass, and CSV export."""
+    sdk.records.list.return_value = []
+    res = runner.invoke(
+        cli.app,
+        [
+            "records",
+            "list",
+            "STUDY",
+            "-f",
+            "form_key=AE",
+            "--record-data-filter",
+            "AESER==Serious;AGE>=18",
+        ],
+    )
+    assert res.exit_code == 0
+    sdk.records.list.assert_called_once_with(
+        "STUDY",
+        form_key="AE",
+        record_data_filter="AESER==Serious;AGE>=18",
+    )
+
+    sdk.records.list.reset_mock()
+    res_none = runner.invoke(cli.app, ["records", "list", "STUDY", "--record-data-filter", "none"])
+    assert res_none.exit_code == 0
+    sdk.records.list.assert_called_once_with("STUDY", record_data_filter="none")
+
+    sdk.records.list.reset_mock()
+    rec = MagicMock()
+    rec.model_dump.return_value = {"recordId": 1}
+    sdk.records.list.return_value = [rec]
+    monkeypatch.chdir(tmp_path)
+    res_csv = runner.invoke(
+        cli.app,
+        [
+            "records",
+            "list",
+            "STUDY",
+            "--record-data-filter",
+            'AETERM=~"^Head"',
+            "--output",
+            "csv",
+        ],
+    )
+    assert res_csv.exit_code == 0
+    assert (tmp_path / "records.csv").exists()
+    sdk.records.list.assert_called_once_with("STUDY", record_data_filter='AETERM=~"^Head"')
+
+
+@pytest.mark.parametrize(
+    "bad_rdf",
+    [
+        "",
+        "   ",
+        "badfilter",
+        "AESER=Serious",
+        "AGE >= 18",
+        "AESER==Serious;AGE>=18,SEX==F",
+        'AETERM=="Unclosed',
+    ],
+)
+def test_records_list_invalid_record_data_filter_exits_before_sdk(
+    runner: CliRunner,
+    sdk: MagicMock,
+    bad_rdf: str,
+) -> None:
+    """Invalid --record-data-filter syntax exits with code 1 before calling sdk.records.list."""
+    result = runner.invoke(
+        cli.app,
+        ["records", "list", "STUDY", "--record-data-filter", bad_rdf],
+    )
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "Invalid record data filter" in result.stderr
+    sdk.records.list.assert_not_called()
+
+
+def test_records_list_output_conflicts_checked_before_filters(
+    runner: CliRunner,
+    sdk: MagicMock,
+) -> None:
+    """records list checks --output conflicts and invalid output format before filter validation."""
+    conflict = runner.invoke(
+        cli.app,
+        [
+            "records",
+            "list",
+            "STUDY",
+            "--output",
+            "json",
+            "--format",
+            "json",
+            "--filter",
+            "badfilter",
+            "--record-data-filter",
+            "badfilter",
+        ],
+    )
+    assert conflict.exit_code == 1
+    assert conflict.stdout == ""
+    assert "Choose --format json for stdout or --output for a file." in conflict.stderr
+    sdk.records.list.assert_not_called()
+
+    bad_fmt = runner.invoke(
+        cli.app,
+        [
+            "records",
+            "list",
+            "STUDY",
+            "--output",
+            "xml",
+            "--filter",
+            "badfilter",
+            "--record-data-filter",
+            "badfilter",
+        ],
+    )
+    assert bad_fmt.exit_code == 1
+    assert bad_fmt.stdout == ""
+    assert "Invalid output format. Use 'json' or 'csv'." in bad_fmt.stderr
+    sdk.records.list.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "attr"),
+    [
+        ("sites", "sites"),
+        ("forms", "forms"),
+        ("variables", "variables"),
+        ("intervals", "intervals"),
+        ("visits", "visits"),
+        ("queries", "queries"),
+        ("record-revisions", "record_revisions"),
+        ("records", "records"),
+        ("subjects", "subjects"),
+        ("codings", "codings"),
+    ],
+)
+@pytest.mark.parametrize(
+    "study_filter",
+    [
+        "study_key=STUDY",
+        "studyKey=STUDY",
+        "study_key==STUDY,study_key==OTHER",
+    ],
+)
+def test_study_scoped_list_commands_reject_study_key_in_filter(
+    runner: CliRunner,
+    sdk: MagicMock,
+    subcommand: str,
+    attr: str,
+    study_filter: str,
+) -> None:
+    """Study-scoped list commands reject study_key and studyKey in --filter without TypeError."""
+    result = runner.invoke(cli.app, [subcommand, "list", "STUDY", "-f", study_filter])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "'study_key' and 'studyKey' cannot be used in --filter" in result.stderr
+    assert "TypeError" not in result.stderr
+    getattr(sdk, attr).list.assert_not_called()

@@ -1,3 +1,6 @@
+.. meta::
+   :description: Unofficial Python SDK, CLI, workflow plugins, TUI, and Apache Airflow provider for the iMednet clinical trials EDC API.
+
 .. note::
    This SDK is unofficial and not affiliated with the vendor. Use at your own risk.
 

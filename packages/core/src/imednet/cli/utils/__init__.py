@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .args import STUDY_KEY_ARG, add_no_interactive, parse_filter_args
+from .args import STUDY_KEY_ARG, add_no_interactive, parse_filter_args, parse_record_data_filter
 from .commands import register_list_command
 from .context import fetching_status, get_sdk
 from .output import (
@@ -62,6 +62,7 @@ __all__ = [
     "is_non_interactive",
     "is_tty",
     "parse_filter_args",
+    "parse_record_data_filter",
     "print_error",
     "register_list_command",
     "run_interactive_grid",

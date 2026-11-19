@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 from collections.abc import Sequence
 from typing import Any
 
-from imednet.sdk import ImednetSDK
-from imednet.spi.cli import STUDY_KEY_ARG, print_error, with_sdk
-
-from .terminal import is_interactive_terminal
+from imednet.spi.cli import STUDY_KEY_ARG, is_interactive_terminal, print_error, with_sdk
+from imednet.spi.facade import ImednetFacade
 
 _BATCH_SPLIT_RE = re.compile(r"[\s,]+")
 
@@ -68,20 +65,24 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
 
     @with_sdk
-    def _launch(sdk: ImednetSDK, args: argparse.Namespace | None = None) -> None:
+    def _launch(sdk: ImednetFacade, args: argparse.Namespace | None = None) -> None:
         from .app import run_tui
 
         force = bool(args and getattr(args, "force", False))
         raw_study = None
         raw_batches = None
+        high_contrast = False
         if args is not None:
             raw_study = getattr(args, "study_key", None) or getattr(args, "study", None)
             raw_batches = getattr(args, "batch_ids", None) or getattr(args, "batch", None)
+            high_contrast = bool(getattr(args, "high_contrast", False))
 
         study_key = str(raw_study).strip() if raw_study and str(raw_study).strip() else None
         batch_ids = _parse_batch_args(raw_batches)
 
         run_kwargs: dict[str, Any] = {"force": force}
+        if high_contrast:
+            run_kwargs["high_contrast"] = True
         if study_key is not None:
             run_kwargs["study_key"] = study_key
         if batch_ids:
@@ -89,9 +90,6 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         run_tui(sdk, **run_kwargs)
 
     def run_tui_command(args: argparse.Namespace | None = None) -> None:
-        if args is not None and getattr(args, "high_contrast", False):
-            os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
-
         force = bool(args and getattr(args, "force", False))
         if not force and not is_interactive_terminal():
             print_error("Error: Interactive terminal required to run the TUI interface.")
