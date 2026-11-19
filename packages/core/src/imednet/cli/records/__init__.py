@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from ...models.records import Record
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status, print_error
@@ -63,6 +64,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             output_format=output_format,
             has_output_file=bool(output),
             no_interactive=no_interactive,
+            model=Record,
         )
 
         with fetching_status("records", study_key):
