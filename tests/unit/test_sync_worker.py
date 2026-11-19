@@ -65,3 +65,29 @@ def test_sync_worker_run_once_does_not_hold_lock_during_sync_records(tmp_path) -
     worker.run_once()
 
     assert lock_held_during_sync is False
+
+
+def test_sync_worker_scales_lock_poll_interval_for_short_timeouts(tmp_path) -> None:
+    """Test that short lock timeouts configure a proportional FileLock poll_interval."""
+    from imednet_workflows.cached_loader import CachedRecordsLoader, resolve_lock_poll_interval
+
+    assert resolve_lock_poll_interval(30) == 0.05
+    assert resolve_lock_poll_interval(0) == 0.05
+    assert resolve_lock_poll_interval(0.05) == 0.005
+    assert resolve_lock_poll_interval(0.005) == 0.001
+
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    assert loader.lock.poll_interval == 0.05
+
+    worker = SyncWorker(
+        loader,
+        config=SyncWorkerConfig(
+            study_key="PROT-01",
+            interval_seconds=0,
+            lock_timeout_seconds=0.05,
+        ),
+    )
+    assert worker._lock is loader.lock
+    assert loader.lock.timeout == 0.05
+    assert loader.lock.poll_interval == 0.005

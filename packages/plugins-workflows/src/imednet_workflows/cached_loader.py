@@ -13,7 +13,7 @@ from filelock import FileLock
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from imednet.spi.models import Record
-from imednet.spi.utils import build_filter_string
+from imednet.spi.utils import build_filter_string, get_sqlite_connection
 
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE
 
@@ -23,12 +23,7 @@ if TYPE_CHECKING:
 DEFAULT_CACHE_DIR = Path.home() / ".imednet" / "cache"
 
 # Per-DB-path locks that serialise _initialise_cache across threads within the
-# same process.  Switching an SQLite database to WAL journal mode requires a
-# brief exclusive lock; if multiple threads attempt the switch simultaneously
-# they all race for that lock and the losers immediately raise
-# ``sqlite3.OperationalError: database is locked``.  Serialising initialisation
-# eliminates the race entirely.  The dict grows at most one entry per distinct
-# database file, which is negligible.
+# same process so concurrent schema DDL executes cleanly without SQLITE_BUSY.
 _db_init_locks: dict[str, threading.Lock] = {}
 _db_init_locks_guard = threading.Lock()
 
@@ -40,19 +35,11 @@ def _get_db_init_lock(resolved_path: Path) -> threading.Lock:
         return _db_init_locks.setdefault(key, threading.Lock())
 
 
-def get_sqlite_connection(db_path: str | Path) -> sqlite3.Connection:
-    """Return a SQLite connection configured for concurrent cache access."""
-    resolved_path = Path(db_path).expanduser()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(resolved_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    # busy_timeout instructs SQLite to retry at the C level on SQLITE_BUSY
-    # (e.g. during the WAL transition); this complements Python's connect
-    # timeout and is also effective in cross-process scenarios.
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+def resolve_lock_poll_interval(timeout_seconds: float) -> float:
+    """Scale file-lock polling cadence proportionally for sub-second lock timeouts."""
+    if timeout_seconds <= 0:
+        return 0.05
+    return min(0.05, max(0.001, float(timeout_seconds) / 10.0))
 
 
 class CachedRecordsLoader:
@@ -65,7 +52,7 @@ class CachedRecordsLoader:
         cache_dir: str | Path | None = None,
         database_name: str = "records_cache.sqlite3",
         retry_attempts: int = 3,
-        lock_timeout_seconds: int = 30,
+        lock_timeout_seconds: float = 30,
         lock: FileLock | None = None,
     ) -> None:
         """Initialize the cached records loader.
@@ -83,8 +70,15 @@ class CachedRecordsLoader:
         self.db_path = base_dir / database_name
         self._retry_attempts = retry_attempts
         lock_path = Path(f"{self.db_path}.lock")
+        poll_interval = resolve_lock_poll_interval(lock_timeout_seconds)
         self._lock = (
-            lock if lock is not None else FileLock(str(lock_path), timeout=lock_timeout_seconds)
+            lock
+            if lock is not None
+            else FileLock(
+                str(lock_path),
+                timeout=lock_timeout_seconds,
+                poll_interval=poll_interval,
+            )
         )
         self._initialise_cache()
 

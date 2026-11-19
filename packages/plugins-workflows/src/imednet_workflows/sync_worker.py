@@ -10,7 +10,7 @@ from threading import Event
 
 from filelock import FileLock
 
-from .cached_loader import CachedRecordsLoader
+from .cached_loader import CachedRecordsLoader, resolve_lock_poll_interval
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ class SyncWorkerConfig:
     study_key: str
     interval_seconds: int = 900
     reconcile: bool = True
-    lock_timeout_seconds: int = 30
+    lock_timeout_seconds: float = 30
 
 
 class SyncWorker:
@@ -46,11 +46,17 @@ class SyncWorker:
         self._config = config
         self._stop_event = stop_event or Event()
         lock_path = Path(f"{loader.db_path}.lock")
+        poll_interval = resolve_lock_poll_interval(config.lock_timeout_seconds)
         if hasattr(loader, "lock") and isinstance(loader.lock, FileLock):
             loader.lock.timeout = config.lock_timeout_seconds
+            loader.lock.poll_interval = poll_interval
             self._lock = loader.lock
         else:
-            self._lock = FileLock(str(lock_path), timeout=config.lock_timeout_seconds)
+            self._lock = FileLock(
+                str(lock_path),
+                timeout=config.lock_timeout_seconds,
+                poll_interval=poll_interval,
+            )
 
     def run_once(self) -> int:
         """Run one idempotent cache sync cycle."""

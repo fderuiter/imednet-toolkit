@@ -222,7 +222,7 @@ class Status:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._start_time: float = 0.0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._interactive = False
         self._entered = False
         self._frames: Sequence[str] = _SPINNER_FRAMES
@@ -247,60 +247,58 @@ class Status:
         """Update the displayed status message."""
         with self._lock:
             self._msg = str(msg)
-        if self._interactive and self._entered:
-            self._render_frame()
+            if self._interactive and self._entered:
+                self._render_frame()
 
     def _render_frame(self, frame_idx: int = 0) -> None:
         stream = self.console.stream
         try:
             with self._lock:
                 current_msg = self._msg
-            if not supports_ansi_color(stream):
-                current_msg = _SGR_REGEX.sub("", current_msg)
-            elapsed = time.monotonic() - self._start_time
-            has_timer = bool(re.search(r"\(\d+\.?\d*s\)", current_msg))
-            timer_suffix = "" if has_timer else f" ({elapsed:.1f}s)"
+                if not supports_ansi_color(stream):
+                    current_msg = _SGR_REGEX.sub("", current_msg)
+                elapsed = time.monotonic() - self._start_time
+                has_timer = bool(re.search(r"\(\d+\.?\d*s\)", current_msg))
+                timer_suffix = "" if has_timer else f" ({elapsed:.1f}s)"
 
-            frame = self._frames[frame_idx % len(self._frames)]
-            content = f"{frame} {current_msg}{timer_suffix}"
-
-            cols = self.console.width
-            if cols > 0:
-                max_width = max(1, cols - 1)
-                content = _truncate_visible(content, max_width)
-
-            clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
-            line = f"{clear_seq}{content}"
-
-            vis_len = len(_ANSI_REGEX.sub("", content))
-            lines_by_width = max(1, (vis_len + cols - 1) // cols) if cols > 0 else 1
-            lines_by_newlines = content.count("\n") + 1
-            self._lines_rendered = max(lines_by_width, lines_by_newlines)
-
-            try:
-                stream.write(line)
-                stream.flush()
-            except UnicodeEncodeError:
-                self._frames = _ASCII_SPINNER_FRAMES
                 frame = self._frames[frame_idx % len(self._frames)]
                 content = f"{frame} {current_msg}{timer_suffix}"
+
+                cols = self.console.width
                 if cols > 0:
                     max_width = max(1, cols - 1)
                     content = _truncate_visible(content, max_width)
+
                 clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
                 line = f"{clear_seq}{content}"
-                stream.write(line)
-                stream.flush()
+
+                vis_len = len(_ANSI_REGEX.sub("", content))
+                lines_by_width = max(1, (vis_len + cols - 1) // cols) if cols > 0 else 1
+                lines_by_newlines = content.count("\n") + 1
+                self._lines_rendered = max(lines_by_width, lines_by_newlines)
+
+                try:
+                    stream.write(line)
+                    stream.flush()
+                except UnicodeEncodeError:
+                    self._frames = _ASCII_SPINNER_FRAMES
+                    frame = self._frames[frame_idx % len(self._frames)]
+                    content = f"{frame} {current_msg}{timer_suffix}"
+                    if cols > 0:
+                        max_width = max(1, cols - 1)
+                        content = _truncate_visible(content, max_width)
+                    clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
+                    line = f"{clear_seq}{content}"
+                    stream.write(line)
+                    stream.flush()
         except (BrokenPipeError, OSError, ValueError):
             pass
 
     def _run_spinner(self) -> None:
-        idx = 0
-        while not self._stop_event.is_set():
+        idx = 1
+        while not self._stop_event.wait(self._interval):
             self._render_frame(idx)
             idx += 1
-            if self._stop_event.wait(self._interval):
-                break
 
     def __enter__(self) -> Status:
         """Enter the status context and begin live rendering or static output."""
@@ -310,11 +308,13 @@ class Status:
         stream = self.console.stream
 
         if self._interactive:
-            try:
-                stream.write(_CURSOR_HIDE)
-                stream.flush()
-            except (BrokenPipeError, OSError, ValueError):
-                pass
+            with self._lock:
+                try:
+                    stream.write(_CURSOR_HIDE)
+                    stream.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+                self._render_frame(0)
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._run_spinner, daemon=True)
             self._thread.start()
@@ -343,12 +343,13 @@ class Status:
             if self._thread and self._thread.is_alive():
                 self._thread.join(timeout=1.0)
             stream = self.console.stream
-            try:
-                clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
-                stream.write(f"{clear_seq}{_CURSOR_SHOW}")
-                stream.flush()
-            except (BrokenPipeError, OSError, ValueError):
-                pass
+            with self._lock:
+                try:
+                    clear_seq = "\r\033[K" + ("\033[A\r\033[K" * max(0, self._lines_rendered - 1))
+                    stream.write(f"{clear_seq}{_CURSOR_SHOW}")
+                    stream.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
 
 
 class Console:

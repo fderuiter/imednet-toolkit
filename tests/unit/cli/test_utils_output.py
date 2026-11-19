@@ -257,6 +257,40 @@ def test_status_update_interactive() -> None:
     assert "Phase 2 - downloading" in all_output
 
 
+def test_status_enter_renders_initial_frame_synchronously(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status.__enter__ renders the initial frame synchronously even if thread startup lags."""
+    import threading as threading_mod
+
+    mock_stream = MagicMock()
+    mock_stream.isatty.return_value = True
+
+    class _IdleThread:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout: float | None = None) -> None:
+            pass
+
+    monkeypatch.setattr(threading_mod, "Thread", _IdleThread)
+
+    c = Console(stream=mock_stream)
+    with c.status("Immediate phase") as status:
+        status.update("Next phase")
+
+    calls = [call[0][0] for call in mock_stream.write.call_args_list if call[0]]
+    all_output = "".join(calls)
+    assert "Immediate phase" in all_output
+    assert "Next phase" in all_output
+
+
 def test_status_interactive_exception_cleans_up() -> None:
     """Status restores terminal cursor and clears line when exception occurs."""
     mock_stream = MagicMock()

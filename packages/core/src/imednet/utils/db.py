@@ -8,13 +8,25 @@ from pathlib import Path
 
 _db_init_locks: dict[str, threading.RLock] = {}
 _db_init_locks_guard = threading.RLock()
+_wal_initialized_files: set[tuple[str, int, int]] = set()
 
 
 def _get_db_init_lock(resolved_path: Path) -> threading.RLock:
     """Return a thread-safe lock for initializing a specific database file."""
-    key = str(resolved_path)
+    key = str(resolved_path.resolve())
     with _db_init_locks_guard:
         return _db_init_locks.setdefault(key, threading.RLock())
+
+
+def _file_identity(resolved_path: Path) -> tuple[str, int, int] | None:
+    """Return canonical path + (st_dev, st_ino) for non-empty existing SQLite files."""
+    try:
+        st = resolved_path.stat()
+    except OSError:
+        return None
+    if st.st_size <= 0:
+        return None
+    return (str(resolved_path.resolve()), st.st_dev, st.st_ino)
 
 
 def get_sqlite_connection(
@@ -29,6 +41,8 @@ def get_sqlite_connection(
 
     lock = _get_db_init_lock(resolved_path)
     with lock:
+        existing_id = _file_identity(resolved_path)
+        wal_ready = existing_id is not None and existing_id in _wal_initialized_files
         try:
             conn = sqlite3.connect(resolved_path, timeout=timeout)
         except sqlite3.Error as exc:
@@ -37,7 +51,12 @@ def get_sqlite_connection(
         conn.row_factory = sqlite3.Row
         if busy_timeout_ms:
             conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms};")
-        conn.execute("PRAGMA journal_mode=WAL;")
+        if not wal_ready:
+            row = conn.execute("PRAGMA journal_mode=WAL;").fetchone()
+            if row is not None and str(row[0]).lower() == "wal":
+                initialized_id = _file_identity(resolved_path)
+                if initialized_id is not None:
+                    _wal_initialized_files.add(initialized_id)
         conn.execute("PRAGMA synchronous=NORMAL;")
         if foreign_keys:
             conn.execute("PRAGMA foreign_keys=ON;")
