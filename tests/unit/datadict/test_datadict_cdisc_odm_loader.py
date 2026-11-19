@@ -754,3 +754,79 @@ def test_load_from_cdisc_odm_unwraps_nested_scoped_oids_without_vendor_extension
         ("AGE", "Integer"),
         ("F1.AGE", "Text"),
     ]
+
+
+def test_load_from_cdisc_odm_strict_rejects_unrecognized_third_party_attributes() -> None:
+    """Unrecognized third-party namespace attributes warn in default mode and fail in strict mode."""
+    xml_third_party = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3"
+     xmlns:acme="http://acme.example/ns/odm">
+  <Study OID="S_VENDOR">
+    <MetaDataVersion OID="MDV1">
+      <FormDef OID="DM" Name="Demographics">
+        <ItemGroupRef ItemGroupOID="IG_DM" OrderNumber="1"/>
+      </FormDef>
+      <ItemGroupDef OID="IG_DM" Name="Demographics Group">
+        <ItemRef ItemOID="VISDAT" OrderNumber="1" Mandatory="Yes" acme:RequiredPolicy="VendorOverride"/>
+      </ItemGroupDef>
+      <ItemDef OID="VISDAT" Name="Visit Date" DataType="date" acme:VariableName="HIJACKED_NAME"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    with pytest.raises(ValueError, match="Strict loading error: Unmapped attribute"):
+        load_from_cdisc_odm(xml_third_party, strict=True)
+
+    dd = load_from_cdisc_odm(xml_third_party, strict=False)
+    assert len(dd.metadata.validationWarnings) == 2
+    var = dd.forms[0].variables[0]
+    assert var.variableName == "VISDAT"
+    assert var.required == "Yes"
+    assert var.extraAttributes.get("requiredPolicy") == "VendorOverride"
+    assert var.extraAttributes.get("variableName") == "HIJACKED_NAME"
+
+    xml_unknown_imednet = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3"
+     xmlns:imednet="http://www.imednet.com/ns/odm/metadata">
+  <Study OID="S_IMEDNET_UNKNOWN">
+    <MetaDataVersion OID="MDV1">
+      <FormDef OID="DM" Name="Demographics">
+        <ItemGroupRef ItemGroupOID="IG_DM" OrderNumber="1"/>
+      </FormDef>
+      <ItemGroupDef OID="IG_DM" Name="Demographics Group">
+        <ItemRef ItemOID="VISDAT" OrderNumber="1" Mandatory="No" RequiredPolicy="Unqualified"/>
+      </ItemGroupDef>
+      <ItemDef OID="VISDAT" Name="VISDAT" DataType="date" imednet:UnsupportedExtension="1"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    with pytest.raises(ValueError, match="Strict loading error: Unmapped attribute"):
+        load_from_cdisc_odm(xml_unknown_imednet, strict=True)
+
+
+def test_load_from_cdisc_odm_preserves_external_unprefixed_oids_over_display_names() -> None:
+    """External CDISC ODM files preserve unprefixed ItemDef OIDs as variableName."""
+    external_odm = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">
+  <Study OID="STUDY_EXT">
+    <MetaDataVersion OID="MDV1">
+      <FormDef OID="DM" Name="Demographics">
+        <ItemGroupRef ItemGroupOID="IG_DM" OrderNumber="1"/>
+      </FormDef>
+      <ItemGroupDef OID="IG_DM" Name="Demographics Group">
+        <ItemRef ItemOID="VISDAT" OrderNumber="1" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.BRTHDAT" OrderNumber="2" Mandatory="No"/>
+      </ItemGroupDef>
+      <ItemDef OID="VISDAT" Name="Visit Date Prompt" DataType="date"/>
+      <ItemDef OID="IT.BRTHDAT" Name="Birth Date Prompt" DataType="date"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>
+"""
+    dd = load_from_cdisc_odm(external_odm, strict=True)
+    assert dd.metadata.validationWarnings == []
+    assert [(v.variableName, v.label) for v in dd.forms[0].variables] == [
+        ("VISDAT", "Visit Date Prompt"),
+        ("IT.BRTHDAT", "Birth Date Prompt"),
+    ]
