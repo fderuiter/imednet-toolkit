@@ -284,3 +284,111 @@ async def test_async_sdk_create_records_batch_and_async_poll_jobs() -> None:
         summary = await sdk.async_poll_jobs("STUDY", [j.batch_id for j in jobs], interval=0)
         assert summary.all_successful is True
         assert summary.results["ABATCH-1"].results == [{"batchId": "ABATCH-1", "status": "SUCCESS"}]
+
+
+@pytest.mark.asyncio
+async def test_async_batch_coordinator_concurrent_tasks_sharing_cache_validate_own_chunks() -> None:
+    """Overlapping submissions sharing an AsyncSchemaCache still validate their own chunks."""
+    import asyncio
+    from unittest.mock import patch
+
+    from imednet.errors import ValidationError
+    from imednet.models.variables import Variable
+    from imednet.validation.cache import AsyncSchemaCache, validate_record_data
+
+    shared_cache = AsyncSchemaCache()
+    shared_cache.populate(
+        [
+            Variable(
+                study_key="STUDY",
+                form_id=1,
+                form_key="F1",
+                form_name="Form 1",
+                variable_id=1,
+                variable_name="age",
+                variable_type="integer",
+            )
+        ]
+    )
+
+    task1_suspended = asyncio.Event()
+    release_task1 = asyncio.Event()
+    submitted_payloads: list[list[dict[str, Any]]] = []
+    child_task_error: BaseException | None = None
+
+    coordinator = AsyncBatchCoordinator(chunk_size=2)
+
+    async def slow_submit_task1(chunk: list[dict[str, Any]]) -> Job:
+        nonlocal child_task_error
+        submitted_payloads.append(chunk)
+        if not task1_suspended.is_set():
+            # Even a child task spawned inside Task 1's active context must validate new records
+            async def child_probe() -> Job:
+                return await coordinator.submit(
+                    "STUDY",
+                    [{"formKey": "F1", "data": {"age": "child-invalid"}}],
+                    fast_submit,
+                    schema=shared_cache,
+                )  # type: ignore[return-value]
+
+            try:
+                await asyncio.create_task(child_probe())
+            except ValidationError as exc:
+                child_task_error = exc
+            task1_suspended.set()
+            await release_task1.wait()
+        return Job(jobId="j1", batchId="b1", state="COMPLETED")
+
+    async def fast_submit(chunk: list[dict[str, Any]]) -> Job:
+        submitted_payloads.append(chunk)
+        return Job(jobId="j2", batchId="b2", state="COMPLETED")
+
+    valid_records_task1 = [
+        {"formKey": "F1", "data": {"age": 21}},
+        {"formKey": "F1", "data": {"age": 22}},
+        {"formKey": "F1", "data": {"age": 23}},
+    ]
+
+    with patch(
+        "imednet.validation.cache.validate_record_data",
+        wraps=validate_record_data,
+    ) as spy_validate:
+        task1 = asyncio.create_task(
+            coordinator.submit(
+                "STUDY",
+                valid_records_task1,
+                slow_submit_task1,
+                schema=shared_cache,
+            )
+        )
+        await task1_suspended.wait()
+        assert isinstance(child_task_error, ValidationError)
+
+        # Overlapping Task 2 with an invalid item MUST NOT bypass validation while Task 1 awaits
+        with pytest.raises(ValidationError, match="Value must be an integer"):
+            await coordinator.submit(
+                "STUDY",
+                [{"formKey": "F1", "data": {"age": "invalid-string"}}],
+                fast_submit,
+                schema=shared_cache,
+            )
+
+        # Overlapping Task 3 with a valid item validates its own chunk once and succeeds
+        task3_summary = await coordinator.submit(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 45}}],
+            fast_submit,
+            schema=shared_cache,
+        )
+        assert task3_summary.total_records == 1
+
+        release_task1.set()
+        task1_summary = await task1
+        assert task1_summary.total_records == 3
+        assert task1_summary.chunk_sizes == [2, 1]
+
+    # Invalid payloads were never passed to submit_chunk
+    flattened = [rec["data"]["age"] for chunk in submitted_payloads for rec in chunk]
+    assert flattened == [21, 22, 45, 23]
+    # 3 valid in Task 1 + 1 child invalid + 1 Task 2 invalid + 1 Task 3 valid = 6 validations total
+    assert spy_validate.call_count == 6

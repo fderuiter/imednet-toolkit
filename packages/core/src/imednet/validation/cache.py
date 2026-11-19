@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -23,6 +24,10 @@ if TYPE_CHECKING:
     from ..spi.facade import AsyncImednetFacade, ImednetFacade
 
 _TClient = TypeVar("_TClient")
+_PREVALIDATED_SCOPES: ContextVar[tuple[tuple[int, frozenset[int] | None], ...]] = ContextVar(
+    "imednet_prevalidated_scopes",
+    default=(),
+)
 
 
 class BaseSchemaCache(Generic[_TClient]):
@@ -37,21 +42,32 @@ class BaseSchemaCache(Generic[_TClient]):
         self._is_async = is_async
         self._form_variables: dict[str, dict[str, Variable]] = {}
         self._form_id_to_key: dict[int, str] = {}
-        self._prevalidated_depth: int = 0
 
     @property
     def is_prevalidated(self) -> bool:
-        """Return True while inside a ``prevalidated()`` batch submission context."""
-        return self._prevalidated_depth > 0
+        """Return True while inside a ``prevalidated()`` scope in the active task context."""
+        cache_id = id(self)
+        return any(cid == cache_id for cid, _ in _PREVALIDATED_SCOPES.get())
+
+    def is_record_prevalidated(self, record: dict[str, Any]) -> bool:
+        """Return True if ``record`` was already validated for this cache in the active task."""
+        cache_id = id(self)
+        rec_id = id(record)
+        for cid, rec_ids in _PREVALIDATED_SCOPES.get():
+            if cid == cache_id and (rec_ids is None or rec_id in rec_ids):
+                return True
+        return False
 
     @contextmanager
-    def prevalidated(self) -> Iterator[None]:
-        """Mark records using this schema cache as already validated for the active block."""
-        self._prevalidated_depth += 1
+    def prevalidated(self, records: Iterable[dict[str, Any]] | None = None) -> Iterator[None]:
+        """Mark ``records`` (or the active block) as validated in the current task context."""
+        rec_ids = frozenset(id(rec) for rec in records) if records is not None else None
+        current = _PREVALIDATED_SCOPES.get()
+        token = _PREVALIDATED_SCOPES.set((*current, (id(self), rec_ids)))
         try:
             yield
         finally:
-            self._prevalidated_depth = max(0, self._prevalidated_depth - 1)
+            _PREVALIDATED_SCOPES.reset(token)
 
     def populate(self, variables: Iterable[Variable]) -> None:
         """Populate the cache with the given variables."""

@@ -87,6 +87,23 @@ class BatchSubmissionSummary:
         return self.jobs[index]
 
 
+def _validate_records_with_schema(
+    schema: BaseSchemaCache[Any],
+    records_data: list[dict[str, Any]],
+) -> None:
+    """Validate records not already marked prevalidated in the active task scope."""
+    is_rec_prevalidated = getattr(schema, "is_record_prevalidated", None)
+    if callable(is_rec_prevalidated):
+        for rec in records_data:
+            if not is_rec_prevalidated(rec):
+                validate_record_entry(schema, rec)
+        return
+    if getattr(schema, "is_prevalidated", False) is True:
+        return
+    for rec in records_data:
+        validate_record_entry(schema, rec)
+
+
 def _raise_from_poll_summary(poll_summary: JobPollSummary) -> None:
     """Raise the first recorded polling failure or partial-failure JobFailedError."""
     if poll_summary.failures:
@@ -128,9 +145,8 @@ class BatchCoordinator:
         if not skip_validation:
             if validate_batch_fn is not None:
                 validate_batch_fn(study_key, records_data)
-            elif schema is not None and getattr(schema, "is_prevalidated", False) is not True:
-                for rec in records_data:
-                    validate_record_entry(schema, rec)
+            elif schema is not None:
+                _validate_records_with_schema(schema, records_data)
 
         chunks = chunk_records(records_data, self.chunk_size)
         if not chunks:
@@ -142,14 +158,16 @@ class BatchCoordinator:
                 skipped_count=skipped_count,
             )
 
-        ctx = schema.prevalidated() if isinstance(schema, BaseSchemaCache) else nullcontext()
         jobs: list[Job] = []
         chunk_sizes: list[int] = []
-        with ctx:
-            for chunk in chunks:
+        for chunk in chunks:
+            ctx = (
+                schema.prevalidated(chunk) if isinstance(schema, BaseSchemaCache) else nullcontext()
+            )
+            with ctx:
                 job = submit_chunk(chunk)
-                jobs.append(job)
-                chunk_sizes.append(len(chunk))
+            jobs.append(job)
+            chunk_sizes.append(len(chunk))
 
         poll_summary: JobPollSummary | None = None
         if wait_for_completion:
@@ -235,9 +253,8 @@ class AsyncBatchCoordinator:
         if not skip_validation:
             if validate_batch_fn is not None:
                 await validate_batch_fn(study_key, records_data)
-            elif schema is not None and getattr(schema, "is_prevalidated", False) is not True:
-                for rec in records_data:
-                    validate_record_entry(schema, rec)
+            elif schema is not None:
+                _validate_records_with_schema(schema, records_data)
 
         chunks = chunk_records(records_data, self.chunk_size)
         if not chunks:
@@ -249,14 +266,16 @@ class AsyncBatchCoordinator:
                 skipped_count=skipped_count,
             )
 
-        ctx = schema.prevalidated() if isinstance(schema, BaseSchemaCache) else nullcontext()
         jobs: list[Job] = []
         chunk_sizes: list[int] = []
-        with ctx:
-            for chunk in chunks:
+        for chunk in chunks:
+            ctx = (
+                schema.prevalidated(chunk) if isinstance(schema, BaseSchemaCache) else nullcontext()
+            )
+            with ctx:
                 job = await submit_chunk(chunk)
-                jobs.append(job)
-                chunk_sizes.append(len(chunk))
+            jobs.append(job)
+            chunk_sizes.append(len(chunk))
 
         poll_summary: JobPollSummary | None = None
         if wait_for_completion:

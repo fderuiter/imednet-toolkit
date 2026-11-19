@@ -611,3 +611,288 @@ def test_uat_workflow_fetches_result_url_and_flags_partial_failures() -> None:
         assert "B2" in res.poll_summary.failures
     finally:
         sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_concurrent_submissions_sharing_cache_validate_independently() -> (
+    None
+):
+    """Overlapping async RecordUpdateWorkflow submissions sharing a cache validate independently."""
+    import asyncio
+
+    from imednet.errors import ValidationError
+
+    first_post_in_flight = asyncio.Event()
+    allow_first_post = asyncio.Event()
+    posted_batches: list[list[dict[str, Any]]] = []
+    pause_on_post = False
+
+    class PauseFirstPostTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal pause_on_post
+            path = request.url.path
+            if request.method == "GET" and path.endswith("/variables"):
+                return httpx.Response(200, json={"data": _build_variables_payload(["F1"])})
+            if request.method == "POST" and path.endswith("/records"):
+                body = json.loads(request.content.decode("utf-8"))
+                posted_batches.append(body)
+                idx = len(posted_batches)
+                if pause_on_post:
+                    pause_on_post = False
+                    first_post_in_flight.set()
+                    await allow_first_post.wait()
+                return httpx.Response(
+                    200,
+                    json={"jobId": f"J-{idx}", "batchId": f"B-{idx}", "state": "COMPLETED"},
+                )
+            return httpx.Response(404)
+
+    async with AsyncImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=PauseFirstPostTransport(),
+    ) as sdk:
+        wf = RecordUpdateWorkflow(sdk, batch_size=2)
+        # Prime shared workflow schema cache
+        await wf.async_create_or_update_records("STUDY", [{"formKey": "F1", "data": {"age": 18}}])
+        posted_batches.clear()
+        pause_on_post = True
+
+        task1 = asyncio.create_task(
+            wf.async_create_or_update_records(
+                "STUDY",
+                [
+                    {"formKey": "F1", "data": {"age": 30}},
+                    {"formKey": "F1", "data": {"age": 31}},
+                    {"formKey": "F1", "data": {"age": 32}},
+                ],
+            )
+        )
+        await first_post_in_flight.wait()
+
+        # Direct SDK call sharing wf._schema while task1 is suspended inside prevalidated(chunk)
+        with pytest.raises(ValidationError, match="Value must be an integer"):
+            await sdk.async_create_record(
+                "STUDY",
+                [{"formKey": "F1", "data": {"age": "not-an-int"}}],
+                schema=wf._schema,
+            )
+
+        # Concurrent workflow call sharing wf._schema also rejects invalid record
+        with pytest.raises(ValidationError, match="Value must be an integer"):
+            await wf.async_create_or_update_records(
+                "STUDY",
+                [{"formKey": "F1", "data": {"age": "still-invalid"}}],
+            )
+
+        allow_first_post.set()
+        job = await task1
+        assert job.state == "COMPLETED"
+        assert [[r["data"]["age"] for r in b] for b in posted_batches] == [[30, 31], [32]]
+
+
+def test_uat_workflow_omitted_result_subject_keys_correlates_batch_and_protects_other_subjects() -> (
+    None
+):
+    """UATWorkflow correlates omitted subjectKey via batch records and fails closed if ambiguous."""
+    subjects_store: list[dict[str, Any]] = [
+        {
+            "studyKey": "S",
+            "subjectId": 1,
+            "subjectKey": "PRE-EXISTING-001",
+            "siteName": "Site1",
+            "deleted": False,
+        }
+    ]
+    records_store: list[dict[str, Any]] = [
+        {
+            "studyKey": "S",
+            "recordId": 100,
+            "subjectId": 1,
+            "subjectKey": "PRE-EXISTING-001",
+            "formKey": "REG",
+            "recordData": {"V1": "preexisting"},
+            "deleted": False,
+        }
+    ]
+    phase2_submitted_subjects: list[str] = []
+    inject_duplicate_concurrent = False
+    post_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/forms"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "studyKey": "S",
+                            "formId": 1,
+                            "formKey": "REG",
+                            "formName": "Reg",
+                            "formType": "Enrollment",
+                        },
+                        {
+                            "studyKey": "S",
+                            "formId": 2,
+                            "formKey": "VIS",
+                            "formName": "Visit",
+                            "formType": "DataEntry",
+                            "unscheduledVisit": True,
+                        },
+                    ]
+                },
+            )
+        if request.method == "GET" and path.endswith("/variables"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "studyKey": "S",
+                            "formId": 1,
+                            "formKey": "REG",
+                            "formName": "Reg",
+                            "variableId": 1,
+                            "variableName": "V1",
+                            "variableKey": "V1",
+                            "variableType": "Text",
+                        },
+                        {
+                            "studyKey": "S",
+                            "formId": 2,
+                            "formKey": "VIS",
+                            "formName": "Visit",
+                            "variableId": 2,
+                            "variableName": "V2",
+                            "variableKey": "V2",
+                            "variableType": "Text",
+                        },
+                    ]
+                },
+            )
+        if request.method == "GET" and path.endswith("/intervals"):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "GET" and path.endswith("/sites"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "studyKey": "S",
+                            "siteId": 1,
+                            "siteName": "Site1",
+                            "siteEnrollmentStatus": "Active",
+                        }
+                    ]
+                },
+            )
+        if request.method == "GET" and path.endswith("/subjects"):
+            return httpx.Response(200, json={"data": list(subjects_store)})
+        if request.method == "GET" and path.endswith("/records"):
+            return httpx.Response(200, json={"data": list(records_store)})
+        if request.method == "POST" and path.endswith("/records"):
+            post_count += 1
+            body = json.loads(request.content.decode("utf-8"))
+            if body and body[0].get("formKey") == "REG":
+                for idx, item in enumerate(body, start=1):
+                    assigned_key = f"BATCH-{post_count}-{idx}"
+                    subjects_store.append(
+                        {
+                            "studyKey": "S",
+                            "subjectId": 200 + len(subjects_store),
+                            "subjectKey": assigned_key,
+                            "siteName": item.get("siteName", "Site1"),
+                            "deleted": False,
+                        }
+                    )
+                    records_store.append(
+                        {
+                            "studyKey": "S",
+                            "recordId": 500 + len(records_store),
+                            "subjectKey": assigned_key,
+                            "formKey": "REG",
+                            "recordData": dict(item.get("data", {})),
+                            "deleted": False,
+                        }
+                    )
+                # Simulate a concurrent registration landing AFTER our batch in study subjects
+                concurrent_data = (
+                    dict(body[0].get("data", {}))
+                    if inject_duplicate_concurrent
+                    else {"V1": "CONCURRENT-OTHER-BATCH"}
+                )
+                subjects_store.append(
+                    {
+                        "studyKey": "S",
+                        "subjectId": 999 + post_count,
+                        "subjectKey": f"CONCURRENT-{post_count}",
+                        "siteName": "Site1",
+                        "deleted": False,
+                    }
+                )
+                records_store.append(
+                    {
+                        "studyKey": "S",
+                        "recordId": 900 + post_count,
+                        "subjectKey": f"CONCURRENT-{post_count}",
+                        "formKey": "REG",
+                        "recordData": concurrent_data,
+                        "deleted": False,
+                    }
+                )
+            else:
+                for item in body:
+                    if "subjectKey" in item:
+                        phase2_submitted_subjects.append(item["subjectKey"])
+            bid = f"JB-{post_count}"
+            return httpx.Response(
+                200, json={"jobId": f"J-{bid}", "batchId": bid, "state": "COMPLETED"}
+            )
+        if request.method == "GET" and "/jobs/JB-" in path and not path.endswith("/results"):
+            bid = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": f"J-{bid}",
+                    "batchId": bid,
+                    "state": "COMPLETED",
+                    "progress": 100,
+                    "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/S/jobs/{bid}/results",
+                },
+            )
+        if request.method == "GET" and path.endswith("/results"):
+            # Omit subjectKey and recordId from resultUrl!
+            return httpx.Response(200, json={"status": "Completed"})
+        return httpx.Response(404)
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        # 1. Distinct synthetic data correlates ONLY our batch's subjects (ignoring PRE-EXISTING-001
+        # and CONCURRENT-1 even though CONCURRENT-1 is last in get_subjects!)
+        wf = UATWorkflow(sdk, seed=7, poll_interval=0, poll_timeout=10)
+        res = wf.run("S", subject_count=2)
+        assert res.overall_success is True
+        assert phase2_submitted_subjects == ["BATCH-1-1", "BATCH-1-2"]
+        assert "PRE-EXISTING-001" not in phase2_submitted_subjects
+        assert "CONCURRENT-1" not in phase2_submitted_subjects
+
+        # 2. Indistinguishable concurrent registration fails closed with zero Phase 2 writes
+        phase2_submitted_subjects.clear()
+        inject_duplicate_concurrent = True
+        wf_ambig = UATWorkflow(sdk, seed=11, poll_interval=0, poll_timeout=10)
+        res_ambig = wf_ambig.run("S", subject_count=2)
+        assert res_ambig.overall_success is False
+        assert res_ambig.failure_phase is not None
+        assert "Ambiguous" in (res_ambig.error_message or "")
+        assert phase2_submitted_subjects == []
+    finally:
+        sdk.close()

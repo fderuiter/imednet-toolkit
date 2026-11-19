@@ -58,11 +58,15 @@ class RecordCreateOperation(Operation[T]):
 
     def _validate(self) -> None:
         """Validate records against schema if provided and not already validated."""
-        if (
-            self.skip_validation
-            or self.schema is None
-            or getattr(self.schema, "is_prevalidated", False) is True
-        ):
+        if self.skip_validation or self.schema is None:
+            return
+        is_rec_prevalidated = getattr(self.schema, "is_record_prevalidated", None)
+        if callable(is_rec_prevalidated):
+            for rec in self.records_data:
+                if is_rec_prevalidated(rec) is not True:
+                    validate_record_entry(self.schema, rec)
+            return
+        if getattr(self.schema, "is_prevalidated", False) is True:
             return
         for rec in self.records_data:
             validate_record_entry(self.schema, rec)

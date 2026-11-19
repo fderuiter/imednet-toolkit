@@ -114,7 +114,7 @@ class SyntheticRecordGenerator:
         record_sets: list[GeneratedRecordSet],
         enrolled_subject_keys: list[str],
         *,
-        placeholder_keys: list[str] | None = None,
+        placeholder_keys: list[str | None] | list[str] | None = None,
         preserved_keys: set[str] | None = None,
     ) -> dict[str, str]:
         """Bind server-assigned Phase 1 Subject keys into Phase 2 GeneratedRecordSet payloads."""
@@ -123,24 +123,27 @@ class SyntheticRecordGenerator:
             return {}
 
         preserved = preserved_keys or set()
-        candidates: list[str] = []
-        seen: set[str] = set()
-        source_keys = placeholder_keys if placeholder_keys is not None else []
-        if not source_keys:
-            for rs in record_sets:
-                for sk in rs.subject_keys:
+        key_map: dict[str, str] = {pk: pk for pk in preserved}
+        if placeholder_keys is not None and len(placeholder_keys) == len(clean_enrolled):
+            for placeholder, enrolled in zip(placeholder_keys, clean_enrolled, strict=False):
+                if placeholder and placeholder not in preserved:
+                    key_map.setdefault(placeholder, enrolled)
+        else:
+            candidates: list[str] = []
+            seen: set[str] = set()
+            if placeholder_keys:
+                for sk in placeholder_keys:
                     if sk and sk not in preserved and sk not in seen:
                         seen.add(sk)
                         candidates.append(sk)
-        else:
-            for sk in source_keys:
-                if sk and sk not in preserved and sk not in seen:
-                    seen.add(sk)
-                    candidates.append(sk)
-
-        key_map: dict[str, str] = {pk: pk for pk in preserved}
-        for idx, placeholder in enumerate(candidates):
-            key_map[placeholder] = clean_enrolled[idx % len(clean_enrolled)]
+            else:
+                for rs in record_sets:
+                    for sk in rs.subject_keys:
+                        if sk and sk not in preserved and sk not in seen:
+                            seen.add(sk)
+                            candidates.append(sk)
+            for idx, placeholder in enumerate(candidates):
+                key_map[placeholder] = clean_enrolled[idx % len(clean_enrolled)]
 
         for rs in record_sets:
             if rs.test_type == RecordTestType.REGISTER_SUBJECT:
