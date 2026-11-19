@@ -5,12 +5,12 @@ from __future__ import annotations
 import sys
 from builtins import __import__ as builtin_import
 from datetime import datetime
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from imednet.models.record_revisions import RecordRevision
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 
@@ -21,25 +21,25 @@ def test_ingest_revisions_append_mode() -> None:
 
     workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
     first = [
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=1,
             record_id=1,
-            form_id=10,
-            variable_name="AGE",
-            value="30",
-            revision_number=1,
-            date_modified=datetime(2024, 1, 1, 10, 0, 0),
-            modified_by="alice",
+            form_key="DEMO",
+            record_revision=1,
+            user="alice",
+            reason_for_change="Initial",
+            date_created="2024-01-01T10:00:00Z",
         )
     ]
     second = [
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=2,
             record_id=2,
-            form_id=10,
-            variable_name="AGE",
-            value="31",
-            revision_number=1,
-            date_modified=datetime(2024, 1, 2, 10, 0, 0),
-            modified_by="bob",
+            form_key="DEMO",
+            record_revision=1,
+            user="bob",
+            reason_for_change="Initial",
+            date_created="2024-01-02T10:00:00Z",
         )
     ]
 
@@ -57,25 +57,23 @@ def test_ingest_revisions_replace_mode() -> None:
 
     workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
     old_row = [
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=1,
             record_id=1,
-            form_id=10,
-            variable_name="AGE",
-            value="30",
-            revision_number=1,
-            date_modified=datetime(2024, 1, 1, 10, 0, 0),
-            modified_by="alice",
+            form_key="DEMO",
+            record_revision=1,
+            user="alice",
+            date_created="2024-01-01T10:00:00Z",
         )
     ]
     new_row = [
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=9,
             record_id=9,
-            form_id=99,
-            variable_name="WEIGHT",
-            value="80",
-            revision_number=1,
-            date_modified=datetime(2024, 1, 2, 10, 0, 0),
-            modified_by="bob",
+            form_key="VITALS",
+            record_revision=1,
+            user="bob",
+            date_created="2024-01-02T10:00:00Z",
         )
     ]
 
@@ -88,34 +86,34 @@ def test_ingest_revisions_replace_mode() -> None:
         workflow.ingest_revisions("STUDY", mode="replace")
 
     rows = workflow._connection.execute(
-        "SELECT record_id, variable_name FROM bronze_revisions ORDER BY record_id"
+        "SELECT record_id, form_key FROM bronze_revisions ORDER BY record_id"
     ).fetchall()
-    assert rows == [(9, "WEIGHT")]
+    assert rows == [(9, "VITALS")]
 
 
 def test_build_silver_view_deduplication() -> None:
-    """Test that build silver view deduplication."""
+    """Test that build_silver_view deduplicates by record_id keeping highest record_revision."""
     pytest.importorskip("duckdb")
 
     workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
     revisions = [
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=701,
             record_id=7,
-            form_id=3,
-            variable_name="HEIGHT",
-            value="175",
-            revision_number=1,
-            date_modified=datetime(2024, 1, 1, 10, 0, 0),
-            modified_by="alice",
+            form_key="VITALS",
+            record_revision=1,
+            user="alice",
+            reason_for_change="Initial",
+            date_created="2024-01-01T10:00:00Z",
         ),
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=702,
             record_id=7,
-            form_id=3,
-            variable_name="HEIGHT",
-            value="176",
-            revision_number=2,
-            date_modified=datetime(2024, 1, 2, 10, 0, 0),
-            modified_by="bob",
+            form_key="VITALS",
+            record_revision=2,
+            user="bob",
+            reason_for_change="Updated height",
+            date_created="2024-01-02T10:00:00Z",
         ),
     ]
 
@@ -124,10 +122,13 @@ def test_build_silver_view_deduplication() -> None:
 
     workflow.build_silver_view("STUDY")
     silver_rows = workflow._connection.execute(
-        "SELECT record_id, variable_name, value, revision_number FROM silver_current_state"
+        'SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created '
+        "FROM silver_current_state"
     ).fetchall()
 
-    assert silver_rows == [(7, "HEIGHT", "176", 2)]
+    assert silver_rows == [
+        (7, "VITALS", 2, "bob", "Updated height", datetime(2024, 1, 2, 10, 0, 0))
+    ]
 
 
 def test_ingest_revisions_returns_row_count() -> None:
@@ -136,32 +137,29 @@ def test_ingest_revisions_returns_row_count() -> None:
 
     workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
     revisions = [
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=1,
             record_id=1,
-            form_id=1,
-            variable_name="A",
-            value="x",
-            revision_number=1,
-            date_modified=datetime(2024, 1, 1, 10, 0, 0),
-            modified_by="alice",
+            form_key="F1",
+            record_revision=1,
+            user="alice",
+            date_created="2024-01-01T10:00:00Z",
         ),
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=2,
             record_id=2,
-            form_id=1,
-            variable_name="B",
-            value="y",
-            revision_number=1,
-            date_modified=datetime(2024, 1, 1, 11, 0, 0),
-            modified_by="bob",
+            form_key="F1",
+            record_revision=1,
+            user="bob",
+            date_created="2024-01-01T11:00:00Z",
         ),
-        SimpleNamespace(
+        RecordRevision(
+            record_revision_id=3,
             record_id=3,
-            form_id=1,
-            variable_name="C",
-            value="z",
-            revision_number=1,
-            date_modified=datetime(2024, 1, 1, 12, 0, 0),
-            modified_by="carol",
+            form_key="F1",
+            record_revision=1,
+            user="carol",
+            date_created="2024-01-01T12:00:00Z",
         ),
     ]
 
