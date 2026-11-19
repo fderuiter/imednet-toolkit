@@ -1,4 +1,6 @@
 graph TD
+    accTitle: RecordMapper DataFrame Construction Pipeline
+    accDescr: Flowchart showing dataframe fetching variable metadata, building dynamic Pydantic models, fetching and parsing records, and returning a DataFrame
     A["dataframe()"] --> B[_fetch_variable_metadata]
     B --> C[variables.list]
     C --> D[variable keys / labels]

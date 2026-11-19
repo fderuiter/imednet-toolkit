@@ -660,6 +660,14 @@ jobs:
           uv run --no-project --with playwright playwright install --with-deps chromium
           uv run --no-project --with playwright python scripts/verify_pyodide_tutorials.py --html-dir docs/_build/html
 
+      - name: Verify Documentation Accessibility and Diagrams in Chromium
+        env:
+          IMEDNET_REQUIRE_PLAYWRIGHT: "1"
+          IMEDNET_BUILT_HTML_DIR: docs/_build/html
+        run: |
+          uv run --with playwright pytest -o addopts="" tests/unit/test_docs_accessibility.py
+          rm -rf reports coverage.xml .coverage* .pytest_cache test-results playwright-report
+
       - name: Assert Clean Working Tree
         run: |
           if ! git diff --quiet docs/; then

@@ -90,13 +90,13 @@ Role-Based Pathways & Interactive Showcase
             </div>
          </div>
          <div class="showcase-persona-tabs" role="tablist" aria-label="Live Explorer Persona Selection">
-            <button type="button" class="showcase-persona-tab active" id="tab-integration" role="tab" aria-selected="true" aria-controls="panel-integration" data-target="panel-integration">
+            <button type="button" class="showcase-persona-tab active" id="tab-integration" role="tab" aria-selected="true" tabindex="0" aria-controls="panel-integration" data-target="panel-integration">
                Integration Engineer
             </button>
-            <button type="button" class="showcase-persona-tab" id="tab-datamanager" role="tab" aria-selected="false" aria-controls="panel-datamanager" data-target="panel-datamanager">
+            <button type="button" class="showcase-persona-tab" id="tab-datamanager" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-datamanager" data-target="panel-datamanager">
                Clinical Data Manager
             </button>
-            <button type="button" class="showcase-persona-tab" id="tab-auditor" role="tab" aria-selected="false" aria-controls="panel-auditor" data-target="panel-auditor">
+            <button type="button" class="showcase-persona-tab" id="tab-auditor" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-auditor" data-target="panel-auditor">
                Regulatory Compliance Auditor
             </button>
          </div>
@@ -112,7 +112,7 @@ Role-Based Pathways & Interactive Showcase
                </div>
                <div class="explorer-control-group">
                   <label for="ie-dataset-select" class="explorer-control-label">Sample Query:</label>
-                  <select id="ie-dataset-select" class="explorer-select" aria-label="Select sample dataset query">
+                  <select id="ie-dataset-select" class="explorer-select" aria-label="Sample Query: Select sample dataset query">
                      <option value="records">Clinical Records (Vital Signs - VS)</option>
                      <option value="studies">Active Clinical Trials Catalog</option>
                      <option value="forms">Case Report Form Schemas</option>
@@ -140,10 +140,10 @@ Role-Based Pathways & Interactive Showcase
                ⚡ Executed in 1.8 ms (Mock Client Engine) | Status: 200 OK
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Output View">
-               <button type="button" id="ie-tab-table" class="explorer-output-tab active" role="tab" aria-selected="true" aria-controls="ie-view-table">
+               <button type="button" id="ie-tab-table" class="explorer-output-tab active" role="tab" aria-selected="true" tabindex="0" aria-controls="ie-view-table">
                   Tabular View (DataFrame)
                </button>
-               <button type="button" id="ie-tab-json" class="explorer-output-tab" role="tab" aria-selected="false" aria-controls="ie-view-json">
+               <button type="button" id="ie-tab-json" class="explorer-output-tab" role="tab" aria-selected="false" tabindex="-1" aria-controls="ie-view-json">
                   Raw JSON Payload
                </button>
             </div>
@@ -177,7 +177,7 @@ Role-Based Pathways & Interactive Showcase
                </div>
             </div>
             <div class="explorer-controls-right">
-               <button type="button" id="cdm-validate-btn" class="explorer-run-btn" aria-label="Validate and render form schema">
+               <button type="button" id="cdm-validate-btn" class="explorer-run-btn" aria-label="Validate &amp; Render Form — Validate and render form schema">
                   <span>✓ Validate &amp; Render Form</span>
                </button>
             </div>
@@ -188,10 +188,10 @@ Role-Based Pathways & Interactive Showcase
                ✓ Schema Valid (CDISC ODM Compliant) — 0 Errors | Validated in 0.9 ms
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Form Schema View">
-               <button type="button" id="cdm-tab-crf" class="explorer-output-tab active" role="tab" aria-selected="true" aria-controls="cdm-view-crf">
+               <button type="button" id="cdm-tab-crf" class="explorer-output-tab active" role="tab" aria-selected="true" tabindex="0" aria-controls="cdm-view-crf">
                   CRF Structure
                </button>
-               <button type="button" id="cdm-tab-json" class="explorer-output-tab" role="tab" aria-selected="false" aria-controls="cdm-view-json">
+               <button type="button" id="cdm-tab-json" class="explorer-output-tab" role="tab" aria-selected="false" tabindex="-1" aria-controls="cdm-view-json">
                   Form Schema JSON
                </button>
             </div>
@@ -200,7 +200,7 @@ Role-Based Pathways & Interactive Showcase
          <div id="cdm-view-crf" class="explorer-output-view" role="tabpanel" tabindex="0" aria-labelledby="cdm-tab-crf"></div>
 
          <div id="cdm-view-json" class="explorer-output-view explorer-json-wrapper" role="tabpanel" tabindex="0" aria-labelledby="cdm-tab-json" hidden>
-            <button type="button" id="cdm-copy-btn" class="explorer-copy-btn" aria-label="Copy schema JSON">Copy JSON</button>
+            <button type="button" id="cdm-copy-btn" class="explorer-copy-btn" aria-label="Copy JSON — Copy schema JSON">Copy JSON</button>
             <pre id="cdm-json-pre" class="explorer-json-pre"><code class="language-json"></code></pre>
          </div>
 
@@ -223,7 +223,7 @@ Role-Based Pathways & Interactive Showcase
                </div>
             </div>
             <div class="explorer-controls-right">
-               <button type="button" id="aud-verify-btn" class="explorer-run-btn" aria-label="Verify audit trail and accessibility compliance">
+               <button type="button" id="aud-verify-btn" class="explorer-run-btn" aria-label="Verify Audit Integrity — Verify audit trail and accessibility compliance">
                   <span>🛡️ Verify Audit Integrity</span>
                </button>
             </div>
@@ -234,10 +234,10 @@ Role-Based Pathways & Interactive Showcase
                ✓ 21 CFR Part 11 Electronic Signature &amp; VPAT Check Verified | 1.1 ms
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Auditor View">
-               <button type="button" id="aud-tab-table" class="explorer-output-tab active" role="tab" aria-selected="true" aria-controls="aud-view-table">
+               <button type="button" id="aud-tab-table" class="explorer-output-tab active" role="tab" aria-selected="true" tabindex="0" aria-controls="aud-view-table">
                   Audit Trail Records
                </button>
-               <button type="button" id="aud-tab-json" class="explorer-output-tab" role="tab" aria-selected="false" aria-controls="aud-view-json">
+               <button type="button" id="aud-tab-json" class="explorer-output-tab" role="tab" aria-selected="false" tabindex="-1" aria-controls="aud-view-json">
                   Signed Event JSON
                </button>
             </div>
@@ -246,7 +246,7 @@ Role-Based Pathways & Interactive Showcase
          <div id="aud-view-table" class="explorer-output-view" role="tabpanel" tabindex="0" aria-labelledby="aud-tab-table"></div>
 
          <div id="aud-view-json" class="explorer-output-view explorer-json-wrapper" role="tabpanel" tabindex="0" aria-labelledby="aud-tab-json" hidden>
-            <button type="button" id="aud-copy-btn" class="explorer-copy-btn" aria-label="Copy audit JSON">Copy JSON</button>
+            <button type="button" id="aud-copy-btn" class="explorer-copy-btn" aria-label="Copy JSON — Copy audit JSON">Copy JSON</button>
             <pre id="aud-json-pre" class="explorer-json-pre"><code class="language-json"></code></pre>
          </div>
 

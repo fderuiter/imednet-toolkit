@@ -11,6 +11,8 @@ The following diagram illustrates the internal orchestration logic of the UAT wo
 .. mermaid::
 
     sequenceDiagram
+        accTitle: End-to-End UAT Workflow Orchestration Sequence
+        accDescr: Sequence across User, UATWorkflow, StudySchemaInspector, UATSpecificationBuilder, SyntheticRecordGenerator, BulkRecordSubmissionWorkflow, and PollingManager
         participant User
         participant Orchestrator as UATWorkflow
         participant Inspector as StudySchemaInspector

@@ -1025,3 +1025,234 @@ def test_narrow_24_char_viewport_clips_wide_single_attribute_before_panel_x() ->
     grid_24.draw()
     for _y, x, text, _ in win_24.strings:
         assert x + len(text) <= 24
+
+
+def test_grid_utf8_get_wch_search_and_function_key_filtering() -> None:
+    """InteractiveDataGrid.run decodes UTF-8 strings from get_wch(), ignores function keys, and falls back to getch()."""
+    from imednet.cli.utils.output import _display_width
+
+    win = MockWindow(height=20, width=80)
+    items = [
+        {"ID": 1, "Site": "東京病院", "Unit": "m/s"},
+        {"ID": 2, "Site": "大阪クリニック", "Unit": "kg/m²"},
+        {"ID": 3, "Site": "Cafe\u0301 Central", "Unit": "mg"},
+    ]
+    keystrokes: list[int | str] = [
+        "/",
+        "東",
+        "京",
+        curses.KEY_UP,  # Must be ignored during search (not converted via chr(259) -> 'ă')
+        curses.KEY_F1,  # Must be ignored during search
+        "\t",  # Control char ignored during search
+        "\n",  # Commit search
+    ]
+    observed_queries: list[str] = []
+    observed_counts: list[int] = []
+    idx = 0
+
+    def fake_get_wch() -> int | str:
+        nonlocal idx
+        if idx < len(keystrokes):
+            val = keystrokes[idx]
+            idx += 1
+            return val
+        observed_queries.append(grid.search_query)
+        observed_counts.append(len(grid.filtered_entries))
+        return "q"
+
+    win.get_wch = fake_get_wch  # type: ignore[attr-defined]
+    grid = InteractiveDataGrid(win, items=items, fields=["ID", "Site", "Unit"])
+    grid.run()
+
+    assert observed_queries == ["東京"]
+    assert observed_counts == [1]
+    assert grid.filtered_entries[0][0]["Site"] == "東京病院"
+
+    # Search superscript UTF-8 character '²' and verify cursor column uses display width
+    grid._handle_normal_input("\x1b")  # Clear filter with string Escape
+    assert grid.search_query == ""
+    assert len(grid.filtered_entries) == 3
+
+    grid._handle_normal_input("/")
+    for ch in ("東", "京"):
+        grid._handle_search_input(ch)
+    grid.draw()
+    expected_col = _display_width("Filter (type to search): 東京")
+    assert win.cursor_pos == (19, expected_col)
+
+    grid._handle_search_input("\x7f")  # String backspace removes '京'
+    assert grid.search_query == "東"
+    grid._handle_search_input("\b")  # String backspace removes '東'
+    assert grid.search_query == ""
+    grid._handle_search_input("²")
+    assert len(grid.filtered_entries) == 1
+    assert grid.filtered_entries[0][0]["ID"] == 2
+
+    # Fallback to getch() when get_wch is unavailable on window
+    win_legacy = MockWindow(height=20, width=80)
+    legacy_keys = iter([ord("/"), ord("m"), ord("g"), 10, ord("q")])
+    win_legacy.getch = lambda: next(legacy_keys)  # type: ignore[attr-defined]
+    grid_legacy = InteractiveDataGrid(win_legacy, items=items, fields=["ID", "Site", "Unit"])
+    grid_legacy.run()
+    assert grid_legacy.search_query == "mg"
+    assert len(grid_legacy.filtered_entries) == 1
+    assert grid_legacy.filtered_entries[0][0]["ID"] == 3
+
+
+def test_grid_boolean_yes_no_and_true_false_search_tokens() -> None:
+    """_collect_search_tokens indexes Yes/No alongside True/False so filter_entries matches panel labels."""
+    from imednet.models.users import Role, User
+
+    win = MockWindow(height=20, width=80)
+    u_active = User.model_construct(
+        user_id="U-1",
+        login="active_doc",
+        first_name="Jane",
+        last_name="Doe",
+        email="jane@example.com",
+        user_active_in_study=True,
+        roles=[Role.model_construct(role_id="R-1", name="PI", level=1, inactive=False)],
+    )
+    u_inactive = User.model_construct(
+        user_id="U-2",
+        login="former_monitor",
+        first_name="John",
+        last_name="Roe",
+        email="john@example.com",
+        user_active_in_study=False,
+        roles=[],
+    )
+    items = [
+        {"user_id": "U-1", "login": "active_doc"},
+        {"user_id": "U-2", "login": "former_monitor"},
+    ]
+    grid = InteractiveDataGrid(
+        win,
+        items=items,
+        fields=["user_id", "login"],
+        label="users",
+        details=[u_active, u_inactive],
+    )
+
+    grid.search_query = "yes"
+    grid.filter_entries()
+    assert [row["user_id"] for row, _ in grid.filtered_entries] == ["U-1"]
+
+    grid.search_query = "true"
+    grid.filter_entries()
+    assert [row["user_id"] for row, _ in grid.filtered_entries] == ["U-1"]
+
+    grid.search_query = "no"
+    grid.filter_entries()
+    # Both U-1 (inactive=False -> No) and U-2 (user_active_in_study=False -> No) match "no"
+    assert [row["user_id"] for row, _ in grid.filtered_entries] == ["U-1", "U-2"]
+
+    # Record variable boolean lookup for /no vs /yes
+    rec_grid = InteractiveDataGrid(
+        win,
+        items=[{"ID": 10}, {"ID": 20}],
+        fields=["ID"],
+        details=[
+            {"record_data": {"serious": True}},
+            {"record_data": {"serious": False}},
+        ],
+    )
+    rec_grid.search_query = "no"
+    rec_grid.filter_entries()
+    assert [row["ID"] for row, _ in rec_grid.filtered_entries] == [20]
+
+    rec_grid.search_query = "false"
+    rec_grid.filter_entries()
+    assert [row["ID"] for row, _ in rec_grid.filtered_entries] == [20]
+
+
+def test_grid_cjk_alignment_overflow_padding_and_panel_wrapping() -> None:
+    """Grid aligns CJK cells, pads 1 space when 2-cell glyphs overflow, and wraps multiline/CJK panel notes."""
+    from imednet.cli.utils.output import _display_width
+
+    win = MockWindow(height=22, width=80)
+    items = [
+        {
+            "site_name": "東京大学医学部附属病院臨床研究センター",
+            "note": "Line 1\r\nLine 2\tTabbed\x07",
+            "status": "Active",
+        },
+        {
+            "site_name": "Boston General",
+            "note": "Normal note",
+            "status": "Pending",
+        },
+    ]
+    details = [
+        {
+            "site_name": "東京大学医学部附属病院臨床研究センター",
+            "record_data": {
+                "clinical_note": "First line\r\nSecond line\twith tab\rThird\x1b\x07line",
+                "cjk_summary": "患者は安定した状態であり追加検査は不要と判定されたため経過観察を継続する",
+            },
+        },
+        {
+            "site_name": "Boston General",
+            "record_data": {"clinical_note": "Routine visit"},
+        },
+    ]
+    grid = InteractiveDataGrid(
+        win,
+        items=items,
+        fields=["site_name", "note", "status"],
+        label="records",
+        details=details,
+    )
+    # Open side panel on 80-col terminal (panel_x = 44, grid_limit = 43)
+    grid._handle_normal_input(" ")
+    assert grid.side_panel_open is True
+    grid.draw()
+
+    panel_x = int(80 * 0.55)
+    assert panel_x == 44
+
+    # Verify every write respects display-width bounds and no control chars escape
+    for y, x, text, _ in win.strings:
+        assert "\n" not in text
+        assert "\r" not in text
+        assert "\t" not in text
+        assert "\x07" not in text
+        assert "\x1b" not in text
+        assert x + _display_width(text) <= win.width, (
+            f"Write overflowed terminal width on row {y}: x={x}, width={_display_width(text)}, text={text!r}"
+        )
+        if y < win.height - 1 and x < panel_x:
+            assert x + _display_width(text) < panel_x, (
+                f"Grid write bled into panel_x={panel_x} on row {y}: x={x}, text={text!r}"
+            )
+
+    # Verify " | " separators on rows 3 and 4 start at identical x display column
+    sep_row_3 = [x for y, x, text, _ in win.strings if y == 3 and x < panel_x and "|" in text]
+    sep_row_4 = [x for y, x, text, _ in win.strings if y == 4 and x < panel_x and "|" in text]
+    assert sep_row_3 == sep_row_4
+
+    # Verify side panel split multiline notes and wrapped CJK text within content_w
+    content_x = panel_x + 2
+    content_w = max(10, (80 - panel_x) - 3)
+    panel_lines = [text for y, x, text, _ in win.strings if y >= 2 and x == content_x]
+    for p_line in panel_lines:
+        assert _display_width(p_line) == content_w
+    panel_joined = "\n".join(panel_lines)
+    assert "First line" in panel_joined
+    assert "Second line" in panel_joined
+    assert "with tab" in panel_joined
+    assert "Third  line" in panel_joined
+    assert "患者は安定した状態" in panel_joined
+
+
+def test_run_interactive_grid_guards_locale_error() -> None:
+    """run_interactive_grid suppresses locale.Error before launching curses.wrapper."""
+    import locale
+
+    items = [{"ID": 1}]
+    with (
+        patch("locale.setlocale", side_effect=locale.Error("unsupported locale setting")),
+        patch("curses.wrapper") as mock_wrapper,
+    ):
+        assert run_interactive_grid(items=items, fields=["ID"]) is True
+        mock_wrapper.assert_called_once()

@@ -1,4 +1,6 @@
 graph TD
+    accTitle: Tabular and Structured Data Export Sink Topology
+    accDescr: Flowchart comparing RecordMapper DataFrame exports to CSV, SQL, Parquet, and Snowflake against DataExtractionWorkflow exports to MongoDB and Neo4j
     SDK["ImednetSDK"] --> RM["RecordMapper (tabular)"]
     SDK --> DEW["DataExtractionWorkflow (structured)"]
     RM --> DF["pandas.DataFrame"]

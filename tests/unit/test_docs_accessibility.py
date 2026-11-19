@@ -180,14 +180,27 @@ def test_code_block_keyboard_accessibility() -> None:
 
 @pytest.mark.unit
 def test_vpat_document_conformance() -> None:
-    """Ensure VPAT document reflects verified WCAG 2.1 AA conformance and TUI accessibility."""
+    """Ensure VPAT document and showcase mock reflect community ownership and verified capabilities."""
     from imednet_tui.app import ImednetTuiApp
 
     vpat_content = (REPO_ROOT / "docs/reference/VPAT.rst").read_text(encoding="utf-8")
+    showcase_js = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
 
     assert "WCAG 2.1 Level AA" in vpat_content
     assert "4.5:1" in vpat_content
-    assert "verified-wcag-aa" in vpat_content
+    assert "7:1" in vpat_content
+    assert "Unofficial Open-Source" in vpat_content
+    assert "Mednet Solutions" in vpat_content
+    assert "https://github.com/fderuiter/imednet-toolkit/issues" in vpat_content
+    assert "accessibility@imednet.com" not in vpat_content
+    assert "verified-wcag-aa" not in vpat_content
+
+    assert "https://github.com/fderuiter/imednet-toolkit/issues" in showcase_js
+    assert "Unofficial open-source imednet-toolkit" in showcase_js
+    assert "accessibility@imednet.com" not in showcase_js
+    assert "verified-wcag-aa" not in showcase_js
+    assert "modal focus management" not in showcase_js
+
     assert "imednet tui" in vpat_content
     assert "--high-contrast" in vpat_content
     assert "IMEDNET_HIGH_CONTRAST=1" in vpat_content
@@ -855,3 +868,722 @@ def test_verify_built_tutorial_html_invariants(tmp_path: Path) -> None:
     assert LEGACY_BINDER_LABEL_PATTERN.search("Connecting to MyBinder") is not None
     assert LEGACY_BINDER_LABEL_PATTERN.search("Activate Interactive Runtime") is None
     assert LEGACY_BINDER_LABEL_PATTERN.search("Pyodide (WebAssembly): ready") is None
+
+
+@pytest.mark.unit
+def test_high_contrast_and_mermaid_conf_tokens() -> None:
+    """Verify prefers-contrast: more tokens reach >= 7:1 and Mermaid themeVariables avoid var()."""
+    from docs import conf as docs_conf
+
+    hc = docs_conf.high_contrast_css_variables
+    for mode in ("light", "dark"):
+        tokens = hc[mode]
+        bg_primary = tokens["color-background-primary"]
+        bg_secondary = tokens["color-background-secondary"]
+
+        for fg_key in (
+            "color-foreground-primary",
+            "color-foreground-secondary",
+            "color-foreground-muted",
+            "color-brand-primary",
+            "color-brand-content",
+            "color-status-success",
+            "color-status-warning",
+            "color-status-danger",
+            "color-diagram-line",
+            "color-diagram-node-border",
+        ):
+            for bg in (bg_primary, bg_secondary):
+                ratio = contrast_ratio(tokens[fg_key], bg)
+                assert ratio >= 7.0, (
+                    f"{mode} high-contrast {fg_key} ({tokens[fg_key]}) vs {bg} is {ratio:.2f}:1 < 7:1"
+                )
+
+        btn_text = tokens["color-brand-btn-text"]
+        for btn_bg_key in (
+            "color-brand-primary",
+            "color-brand-primary-hover",
+            "color-status-success",
+            "color-status-danger",
+        ):
+            btn_ratio = contrast_ratio(btn_text, tokens[btn_bg_key])
+            assert btn_ratio >= 7.0, (
+                f"{mode} high-contrast button text ({btn_text}) vs {btn_bg_key} "
+                f"({tokens[btn_bg_key]}) is {btn_ratio:.2f}:1 < 7:1"
+            )
+
+        note_ratio = contrast_ratio(
+            tokens["color-diagram-note-text"], tokens["color-diagram-note-bg"]
+        )
+        assert note_ratio >= 7.0, (
+            f"{mode} high-contrast diagram note contrast {note_ratio:.2f}:1 < 7:1"
+        )
+
+    init_js = docs_conf.mermaid_init_js
+    assert init_js.startswith("mermaid.initialize(") and init_js.endswith(");")
+    payload = json.loads(init_js[len("mermaid.initialize(") : -2])
+    assert payload["theme"] == "base"
+    assert payload["useMaxWidth"] is False
+    assert payload["flowchart"]["useMaxWidth"] is False
+    assert payload["sequence"]["useMaxWidth"] is False
+
+    for key, val in payload["themeVariables"].items():
+        assert isinstance(val, str) and val.startswith("#"), (
+            f"Mermaid themeVariables[{key!r}] must be a hex color for khroma compatibility, got {val!r}"
+        )
+        assert "var(" not in val
+    assert "var(--color-" in payload["themeCSS"]
+
+
+@pytest.mark.unit
+def test_thebe_cascade_focus_and_forced_colors_css() -> None:
+    """Verify CSS cascade ordering, hover overrides, focus-visible outline, and forced-colors rules."""
+    css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
+    thebe_js = (REPO_ROOT / "docs/_static/thebe_pyodide.js").read_text(encoding="utf-8")
+
+    pos_thebelab = css_content.index(".thebelab-button {")
+    pos_launch = css_content.index(".thebelab-button.thebe-launch-button")
+    assert pos_thebelab < pos_launch, (
+        ".thebelab-button must precede .thebe-launch-button in custom.css"
+    )
+
+    assert ".thebelab-button.thebelab-run-button:hover:not(:disabled)" in css_content
+    assert ".thebe-launch-button.thebe-status-ready" in css_content
+    assert 'statusSpan.style.color = "inherit"' in thebe_js
+
+    editor_block = re.search(r"\.thebe-editor\s*\{([^}]*)\}", css_content)
+    assert editor_block is not None
+    assert "outline: none" not in editor_block.group(1)
+    assert ".thebe-editor:focus-visible" in css_content
+
+    assert "@media (prefers-contrast: more)" in css_content
+    assert "@media (forced-colors: active)" in css_content
+    for sys_token in (
+        "ButtonFace",
+        "ButtonText",
+        "Highlight",
+        "HighlightText",
+        "Canvas",
+        "CanvasText",
+    ):
+        assert sys_token in css_content
+
+
+@pytest.mark.unit
+def test_diagram_validator_skips_acc_directives_and_verifies_all_15_diagrams() -> None:
+    """Verify validate_diagrams skips accTitle/accDescr symbols and confirms 15 titled diagrams."""
+    from scripts.validate_diagrams import (
+        collect_rst_mermaid_directives,
+        extract_acc_title,
+        extract_nodes_from_mermaid_lines,
+    )
+
+    sample = [
+        "graph TD\n",
+        "    accTitle: Sample Architecture [Unregistered(Symbol)]\n",
+        "    accDescr {\n",
+        "        Multi-line description mentioning FakeNode[FakeLabel]\n",
+        "    }\n",
+        "    CLI[CLI] --> Workflows\n",
+    ]
+    assert extract_acc_title(sample) == "Sample Architecture [Unregistered(Symbol)]"
+    nodes = extract_nodes_from_mermaid_lines(sample)
+    assert "accTitle" not in nodes
+    assert "accDescr" not in nodes
+    assert "FakeNode" not in nodes
+    assert nodes["CLI"] == "CLI"
+
+    diagrams_dir = REPO_ROOT / "docs" / "diagrams"
+    mmd_files = sorted(diagrams_dir.glob("*.mmd"))
+    assert len(mmd_files) >= 13
+    for mmd in mmd_files:
+        lines = mmd.read_text(encoding="utf-8").splitlines()
+        assert extract_acc_title(lines), f"{mmd.name} missing accTitle"
+        assert any(ln.strip().startswith("accDescr") for ln in lines), (
+            f"{mmd.name} missing accDescr"
+        )
+
+    external_refs, inline_blocks = collect_rst_mermaid_directives(str(REPO_ROOT / "docs"))
+    assert len(external_refs) == 13
+    assert len(inline_blocks) == 2
+    assert len(external_refs) + len(inline_blocks) == 15
+    for rel_path, lineno, block_lines in inline_blocks:
+        assert extract_acc_title(block_lines), (
+            f"{rel_path}:{lineno} inline diagram missing accTitle"
+        )
+
+
+def _launch_chromium_for_accessibility(playwright_instance: object) -> object:
+    """Launch headless Chromium with CI-safe flags and local binary fallbacks."""
+    launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    chromium = playwright_instance.chromium  # type: ignore[attr-defined]
+    try:
+        return chromium.launch(headless=True, args=launch_args)
+    except Exception:
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            *[
+                str(p)
+                for p in sorted(
+                    (Path.home() / ".cache" / "ms-playwright").glob(
+                        "chromium-*/chrome-linux*/chrome"
+                    ),
+                    reverse=True,
+                )
+            ],
+        ]
+        for candidate in candidates:
+            if shutil.which(candidate) or Path(candidate).is_file():
+                return chromium.launch(
+                    headless=True,
+                    executable_path=candidate,
+                    args=launch_args,
+                )
+        raise
+
+
+@pytest.mark.unit
+def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
+    """Verify computed contrast, Mermaid scaling/ARIA, SC 2.5.3 names, and roving tabindex in Chromium."""
+    import functools
+    import lzma
+    import os
+    import sys
+    import threading
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+    require_pw = os.environ.get("IMEDNET_REQUIRE_PLAYWRIGHT") == "1"
+    if require_pw:
+        from playwright.sync_api import sync_playwright
+    else:
+        sync_pw_mod = pytest.importorskip("playwright.sync_api")
+        sync_playwright = sync_pw_mod.sync_playwright
+
+    mermaid_xz = REPO_ROOT / "tests" / "fixtures" / "mermaid-10.2.0.min.js.xz"
+    assert mermaid_xz.is_file(), f"Offline Mermaid bundle missing: {mermaid_xz}"
+    mermaid_js_bytes = lzma.decompress(mermaid_xz.read_bytes())
+
+    env_html_dir = os.environ.get("IMEDNET_BUILT_HTML_DIR")
+    default_html_dir = REPO_ROOT / "docs" / "_build" / "html"
+    if env_html_dir and Path(env_html_dir).is_dir():
+        html_dir = Path(env_html_dir).resolve()
+    elif (default_html_dir / "index.html").is_file():
+        html_dir = default_html_dir.resolve()
+    else:
+        html_dir = (tmp_path / "html").resolve()
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sphinx",
+                "-b",
+                "html",
+                "-W",
+                "--keep-going",
+                str(REPO_ROOT / "docs"),
+                str(html_dir),
+            ],
+            check=True,
+            cwd=str(REPO_ROOT),
+        )
+
+    class _QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        functools.partial(_QuietHandler, directory=str(html_dir)),
+    )
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    contrast_helper_js = """
+    window.__wcagHelpers = {
+        parseRgb(str) {
+            if (!str) return null;
+            const m = str.match(/rgba?\\(\\s*([0-9.]+)[,\\s]+([0-9.]+)[,\\s]+([0-9.]+)(?:[,/\\s]+([0-9.]+))?\\s*\\)/i);
+            if (!m) return null;
+            return {
+                r: parseFloat(m[1]),
+                g: parseFloat(m[2]),
+                b: parseFloat(m[3]),
+                a: m[4] === undefined ? 1 : parseFloat(m[4])
+            };
+        },
+        blend(fg, bg) {
+            const a = fg.a + bg.a * (1 - fg.a);
+            if (a === 0) return { r: 255, g: 255, b: 255, a: 1 };
+            return {
+                r: (fg.r * fg.a + bg.r * bg.a * (1 - fg.a)) / a,
+                g: (fg.g * fg.a + bg.g * bg.a * (1 - fg.a)) / a,
+                b: (fg.b * fg.a + bg.b * bg.a * (1 - fg.a)) / a,
+                a
+            };
+        },
+        effectiveBg(el) {
+            const layers = [];
+            let cur = el;
+            while (cur && cur.nodeType === 1) {
+                const cs = getComputedStyle(cur);
+                const parsed = this.parseRgb(cs.backgroundColor);
+                if (parsed && parsed.a > 0) {
+                    layers.push(parsed);
+                    if (parsed.a >= 1) break;
+                }
+                cur = cur.parentElement;
+            }
+            let base = { r: 255, g: 255, b: 255, a: 1 };
+            for (let i = layers.length - 1; i >= 0; i--) {
+                base = this.blend(layers[i], base);
+            }
+            return base;
+        },
+        luminance(rgb) {
+            const lin = (v) => {
+                const s = v / 255;
+                return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+            };
+            return 0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b);
+        },
+        ratio(c1, c2) {
+            const l1 = this.luminance(c1);
+            const l2 = this.luminance(c2);
+            return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+        },
+        elementContrast(el) {
+            const bg = this.effectiveBg(el);
+            const fgRaw = this.parseRgb(getComputedStyle(el).color);
+            const fg = fgRaw && fgRaw.a < 1 ? this.blend(fgRaw, bg) : fgRaw;
+            return this.ratio(fg, bg);
+        }
+    };
+    """
+
+    try:
+        with sync_playwright() as pw:
+            browser = _launch_chromium_for_accessibility(pw)
+            try:
+                context = browser.new_context(viewport={"width": 1280, "height": 900})
+                context.set_default_timeout(10_000)
+
+                def _route_handler(route: object) -> None:
+                    req_url = route.request.url  # type: ignore[attr-defined]
+                    if "mermaid" in req_url and req_url.endswith(".js"):
+                        route.fulfill(  # type: ignore[attr-defined]
+                            status=200,
+                            content_type="application/javascript",
+                            body=mermaid_js_bytes,
+                        )
+                    elif req_url.startswith((f"http://127.0.0.1:{port}/", "data:", "blob:")):
+                        route.continue_()  # type: ignore[attr-defined]
+                    else:
+                        route.abort()  # type: ignore[attr-defined]
+
+                context.route("**/*", _route_handler)
+
+                # --------------------------------------------------------------
+                # 1. Pyodide controls: light, dark, prefers-contrast, forced-colors
+                # --------------------------------------------------------------
+                tut_page = context.new_page()
+                tut_page.goto(
+                    f"http://127.0.0.1:{port}/tutorials/quick_start.html",
+                    wait_until="load",
+                )
+                tut_page.add_script_tag(content=contrast_helper_js)
+
+                # Prepend synthetic sphinx-thebe.css hover rule before custom.css to verify override
+                tut_page.evaluate(
+                    """() => {
+                        window.pyodideRuntime.transformCodeCells();
+
+                        const legacy = document.createElement('style');
+                        legacy.id = 'legacy-sphinx-thebe-sim';
+                        legacy.textContent = '.thebelab-button:hover { background-color: #fcfcfc; color: #333333; }';
+                        document.head.insertBefore(legacy, document.head.firstChild);
+
+                        const launch = document.querySelector('.thebe-launch-button');
+                        launch.classList.add('thebelab-button');
+
+                        const readyClone = launch.cloneNode(true);
+                        readyClone.id = 'test-ready-launch-btn';
+                        launch.parentElement.appendChild(readyClone);
+                        window.pyodideRuntime.updateLaunchButtons('ready', 'Pyodide (WebAssembly): ready');
+
+                        // Keep original launch button in initial idle state while readyClone stays ready
+                        launch.classList.remove('thebe-status-ready');
+                        launch.textContent = 'Activate Interactive Runtime';
+
+                        document.querySelectorAll('.thebelab-run-button').forEach((b) => {
+                            b.disabled = false;
+                        });
+                        document.querySelectorAll('.thebelab-cell-status').forEach((s) => {
+                            s.textContent = 'Execution completed.';
+                        });
+                    }"""
+                )
+
+                for theme in ("light", "dark"):
+                    tut_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    run_btn = tut_page.locator(".thebelab-run-button").first
+                    run_btn.hover()
+                    ratios = tut_page.evaluate(
+                        """() => {
+                            const h = window.__wcagHelpers;
+                            const launch = document.querySelector('.thebe-launch-button:not(.thebe-status-ready)');
+                            const ready = document.getElementById('test-ready-launch-btn');
+                            const statusSpan = ready.querySelector('span.status');
+                            const runBtn = document.querySelector('.thebelab-run-button');
+                            return {
+                                launch: h.elementContrast(launch),
+                                ready: h.elementContrast(ready),
+                                statusSpan: h.elementContrast(statusSpan),
+                                runHover: h.elementContrast(runBtn)
+                            };
+                        }"""
+                    )
+                    for ctrl_name, val in ratios.items():
+                        assert val >= 4.5, f"{theme} mode {ctrl_name} contrast {val:.2f}:1 < 4.5:1"
+
+                # Verify .thebe-editor:focus-visible renders a 2px solid outline
+                editor_loc = tut_page.locator(".thebe-editor").first
+                editor_loc.focus()
+                tut_page.keyboard.press("Shift")
+                focus_outline = tut_page.evaluate(
+                    """() => {
+                        const ed = document.querySelector('.thebe-editor');
+                        const cs = getComputedStyle(ed);
+                        return { style: cs.outlineStyle, width: cs.outlineWidth, matches: ed.matches(':focus-visible') };
+                    }"""
+                )
+                assert focus_outline["matches"] is True
+                assert focus_outline["style"] == "solid"
+                assert focus_outline["width"] == "2px"
+
+                # Verify @media (prefers-contrast: more) reaches >= 7:1 in light and dark modes
+                tut_page.emulate_media(contrast="more")
+                for theme in ("light", "dark"):
+                    tut_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    tut_page.locator(".thebelab-run-button").first.hover()
+                    hc_ratios = tut_page.evaluate(
+                        """() => {
+                            const h = window.__wcagHelpers;
+                            return {
+                                launch: h.elementContrast(document.querySelector('.thebe-launch-button:not(.thebe-status-ready)')),
+                                ready: h.elementContrast(document.getElementById('test-ready-launch-btn')),
+                                statusSpan: h.elementContrast(document.querySelector('#test-ready-launch-btn span.status')),
+                                runHover: h.elementContrast(document.querySelector('.thebelab-run-button')),
+                                cellStatus: h.elementContrast(document.querySelector('.thebelab-cell-status'))
+                            };
+                        }"""
+                    )
+                    for ctrl_name, val in hc_ratios.items():
+                        assert val >= 7.0, (
+                            f"prefers-contrast: more ({theme}) {ctrl_name} contrast {val:.2f}:1 < 7.0:1"
+                        )
+                tut_page.emulate_media(contrast="no-preference")
+
+                # Verify @media (forced-colors: active) preserves button borders & focus rings
+                tut_page.emulate_media(forced_colors="active")
+                editor_loc.focus()
+                fc_styles = tut_page.evaluate(
+                    """() => {
+                        const btn = getComputedStyle(document.querySelector('.thebelab-run-button'));
+                        const ed = getComputedStyle(document.querySelector('.thebe-editor'));
+                        return {
+                            btnBorderStyle: btn.borderTopStyle,
+                            btnBorderWidth: parseFloat(btn.borderTopWidth),
+                            edOutlineStyle: ed.outlineStyle,
+                            edOutlineWidth: ed.outlineWidth
+                        };
+                    }"""
+                )
+                assert fc_styles["btnBorderStyle"] == "solid"
+                assert fc_styles["btnBorderWidth"] >= 1.0
+                assert fc_styles["edOutlineStyle"] == "solid"
+                assert fc_styles["edOutlineWidth"] == "2px"
+                tut_page.emulate_media(forced_colors="none")
+                tut_page.close()
+
+                # --------------------------------------------------------------
+                # 2. All 15 Mermaid diagrams: <title>, ARIA, dark contrast, 375px >= 12px
+                # --------------------------------------------------------------
+                diagram_pages = sorted(
+                    p.relative_to(html_dir).as_posix()
+                    for p in html_dir.rglob("*.html")
+                    if 'class="mermaid"' in p.read_text(encoding="utf-8", errors="ignore")
+                )
+                rendered_diagram_count = 0
+                overflowing_mobile_regions = 0
+
+                diag_page = context.new_page()
+                for rel_url in diagram_pages:
+                    diag_page.set_viewport_size({"width": 1280, "height": 900})
+                    diag_page.goto(
+                        f"http://127.0.0.1:{port}/{rel_url}",
+                        wait_until="load",
+                    )
+                    diag_page.wait_for_function(
+                        "() => Array.from(document.querySelectorAll('.mermaid')).every(m => m.querySelector('svg'))"
+                    )
+                    diag_page.add_script_tag(content=contrast_helper_js)
+
+                    # Switch to dark mode dynamically (zero JS re-render) and inspect contrast & titles
+                    diag_page.evaluate("document.body.setAttribute('data-theme', 'dark')")
+                    diag_page.wait_for_timeout(50)
+
+                    dark_audit = diag_page.evaluate(
+                        """() => {
+                            const h = window.__wcagHelpers;
+                            const results = [];
+                            document.querySelectorAll('.mermaid').forEach((container, idx) => {
+                                const svg = container.querySelector('svg');
+                                const titleEl = svg ? svg.querySelector('title') : null;
+                                const ariaLabel = svg ? svg.getAttribute('aria-label') : null;
+                                const hasError = !!(svg && svg.querySelector('.error-icon'));
+
+                                const containerBg = h.effectiveBg(container);
+                                const nodeBgSample = svg.querySelector('.node rect, .node polygon, .node circle, rect.actor');
+                                const nodeBg = nodeBgSample ? h.parseRgb(getComputedStyle(nodeBgSample).fill) : containerBg;
+
+                                let minTextContrast = Infinity;
+                                svg.querySelectorAll('.nodeLabel, text.actor > tspan, .messageText, .loopText > tspan, .labelText > tspan').forEach((t) => {
+                                    if (!(t.textContent || '').trim()) return;
+                                    const cs = getComputedStyle(t);
+                                    const fg = h.parseRgb(cs.color) || h.parseRgb(cs.fill);
+                                    if (!fg) return;
+                                    const isInsideBox = !!(t.closest('.node') || t.closest('text.actor') || t.classList.contains('labelText'));
+                                    const bg = isInsideBox && nodeBg ? nodeBg : containerBg;
+                                    minTextContrast = Math.min(minTextContrast, h.ratio(fg, bg));
+                                });
+
+                                svg.querySelectorAll('text.noteText, text.noteText > tspan').forEach((nt) => {
+                                    if (!(nt.textContent || '').trim()) return;
+                                    const noteRect = svg.querySelector('rect.note');
+                                    const bg = noteRect ? h.parseRgb(getComputedStyle(noteRect).fill) : containerBg;
+                                    const fg = h.parseRgb(getComputedStyle(nt).fill);
+                                    if (fg && bg) {
+                                        minTextContrast = Math.min(minTextContrast, h.ratio(fg, bg));
+                                    }
+                                });
+
+                                svg.querySelectorAll('.edgeLabel span, .edgeLabel').forEach((el) => {
+                                    if (!(el.textContent || '').trim()) return;
+                                    const bg = h.effectiveBg(el);
+                                    const fg = h.parseRgb(getComputedStyle(el).color);
+                                    if (fg && bg) {
+                                        minTextContrast = Math.min(minTextContrast, h.ratio(fg, bg));
+                                    }
+                                });
+
+                                let minStrokeContrast = Infinity;
+                                svg.querySelectorAll('.node rect, .node polygon, rect.actor, .edgePath .path, .flowchart-link, line[id^="actor"], .messageLine0, .messageLine1').forEach((s) => {
+                                    const stroke = h.parseRgb(getComputedStyle(s).stroke);
+                                    if (stroke && stroke.a > 0) {
+                                        minStrokeContrast = Math.min(minStrokeContrast, h.ratio(stroke, containerBg));
+                                    }
+                                });
+
+                                results.push({
+                                    idx,
+                                    hasError,
+                                    title: titleEl ? titleEl.textContent.trim() : '',
+                                    ariaLabel: ariaLabel || '',
+                                    minTextContrast,
+                                    minStrokeContrast
+                                });
+                            });
+                            return results;
+                        }"""
+                    )
+
+                    for item in dark_audit:
+                        rendered_diagram_count += 1
+                        assert item["hasError"] is False, (
+                            f"{rel_url} diagram {item['idx']} failed to parse"
+                        )
+                        assert item["title"], (
+                            f"{rel_url} diagram {item['idx']} missing <svg><title>"
+                        )
+                        assert item["ariaLabel"], (
+                            f"{rel_url} diagram {item['idx']} missing svg[aria-label]"
+                        )
+                        assert item["minTextContrast"] >= 4.5, (
+                            f"{rel_url} diagram {item['idx']} dark text contrast {item['minTextContrast']:.2f}:1 < 4.5:1"
+                        )
+                        assert item["minStrokeContrast"] >= 3.0, (
+                            f"{rel_url} diagram {item['idx']} dark stroke contrast {item['minStrokeContrast']:.2f}:1 < 3.0:1"
+                        )
+
+                    # Mobile 375px viewport check: >= 12px effective text & scrollable region semantics
+                    diag_page.set_viewport_size({"width": 375, "height": 812})
+                    diag_page.evaluate("window.dispatchEvent(new Event('resize'))")
+                    diag_page.wait_for_timeout(80)
+
+                    mobile_audit = diag_page.evaluate(
+                        """() => {
+                            return Array.from(document.querySelectorAll('.mermaid')).map((container, idx) => {
+                                const svg = container.querySelector('svg');
+                                const vb = svg.viewBox && svg.viewBox.baseVal;
+                                const svgRect = svg.getBoundingClientRect();
+                                const scale = (vb && vb.width > 0) ? (svgRect.width / vb.width) : 1;
+                                let minEffectivePx = Infinity;
+                                svg.querySelectorAll('.nodeLabel, text.actor, .messageText, text.noteText').forEach((el) => {
+                                    if (!(el.textContent || '').trim()) return;
+                                    const fs = parseFloat(getComputedStyle(el).fontSize) || 16;
+                                    minEffectivePx = Math.min(minEffectivePx, fs * scale);
+                                });
+                                const overflowing = container.clientWidth > 0 && container.scrollWidth > container.clientWidth;
+                                return {
+                                    idx,
+                                    overflowX: getComputedStyle(container).overflowX,
+                                    minEffectivePx,
+                                    overflowing,
+                                    tabindex: container.getAttribute('tabindex'),
+                                    role: container.getAttribute('role'),
+                                    regionLabel: container.getAttribute('aria-label') || ''
+                                };
+                            });
+                        }"""
+                    )
+                    for m_item in mobile_audit:
+                        assert m_item["overflowX"] == "auto"
+                        assert m_item["minEffectivePx"] >= 12.0, (
+                            f"{rel_url} diagram {m_item['idx']} mobile text shrunk to {m_item['minEffectivePx']:.1f}px < 12px"
+                        )
+                        if m_item["overflowing"]:
+                            overflowing_mobile_regions += 1
+                            assert m_item["tabindex"] == "0", (
+                                f"{rel_url} overflowing diagram missing tabindex='0'"
+                            )
+                            assert m_item["role"] == "region", (
+                                f"{rel_url} overflowing diagram missing role='region'"
+                            )
+                            assert m_item["regionLabel"], (
+                                f"{rel_url} overflowing diagram missing aria-label"
+                            )
+
+                assert rendered_diagram_count == 15, (
+                    f"Expected 15 rendered Mermaid diagrams across built HTML, found {rendered_diagram_count}"
+                )
+                assert overflowing_mobile_regions >= 2, (
+                    "Expected wide workflow sequence diagrams to scroll horizontally on 375px viewport"
+                )
+                diag_page.close()
+
+                # --------------------------------------------------------------
+                # 3. Showcase SC 2.5.3 Label in Name & 4 roving tabindex tablists
+                # --------------------------------------------------------------
+                idx_page = context.new_page()
+                idx_page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                )
+
+                sc_253_checks = idx_page.evaluate(
+                    """() => {
+                        const cleanVisible = (str) =>
+                            str.replace(/^[^A-Za-z0-9]+/, '').replace(/\\s+/g, ' ').trim();
+                        const ids = [
+                            'ie-dataset-select',
+                            'cdm-validate-btn',
+                            'cdm-copy-btn',
+                            'aud-verify-btn',
+                            'aud-copy-btn'
+                        ];
+                        return ids.map((id) => {
+                            const el = document.getElementById(id);
+                            let visible = '';
+                            if (el.tagName === 'SELECT') {
+                                const lbl = document.querySelector(`label[for="${id}"]`);
+                                visible = lbl ? lbl.textContent : '';
+                            } else {
+                                visible = el.textContent || '';
+                            }
+                            const normVisible = cleanVisible(visible);
+                            const aria = (el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                            return {
+                                id,
+                                normVisible,
+                                aria,
+                                startsWithVisible: aria.toLowerCase().startsWith(normVisible.toLowerCase())
+                            };
+                        });
+                    }"""
+                )
+                for chk in sc_253_checks:
+                    assert chk["normVisible"], f"Empty visible label for {chk['id']}"
+                    assert chk["startsWithVisible"], (
+                        f"SC 2.5.3 violation on #{chk['id']}: aria-label={chk['aria']!r} "
+                        f"does not start with visible text {chk['normVisible']!r}"
+                    )
+
+                # Test all 4 tablists for ArrowRight, ArrowLeft, End, Home + roving tabindex
+                tablists_meta = [
+                    (None, '[role="tablist"][aria-label="Live Explorer Persona Selection"]'),
+                    ("#tab-integration", '[role="tablist"][aria-label="Output View"]'),
+                    ("#tab-datamanager", '[role="tablist"][aria-label="Form Schema View"]'),
+                    ("#tab-auditor", '[role="tablist"][aria-label="Auditor View"]'),
+                ]
+                for parent_persona_btn, tablist_sel in tablists_meta:
+                    if parent_persona_btn:
+                        idx_page.locator(parent_persona_btn).click()
+
+                    tabs = idx_page.locator(f"{tablist_sel} [role='tab']")
+                    count = tabs.count()
+                    assert count >= 2
+
+                    # Initial state: first tab selected with tabindex="0", others "-1"
+                    tabs.nth(0).click()
+                    tabs.nth(0).focus()
+                    for i in range(count):
+                        expected_ti = "0" if i == 0 else "-1"
+                        assert tabs.nth(i).get_attribute("tabindex") == expected_ti
+
+                    # ArrowRight -> index 1
+                    idx_page.keyboard.press("ArrowRight")
+                    assert tabs.nth(1).get_attribute("aria-selected") == "true"
+                    assert tabs.nth(1).get_attribute("tabindex") == "0"
+                    assert tabs.nth(0).get_attribute("tabindex") == "-1"
+                    focused_id = idx_page.evaluate(
+                        "document.activeElement && document.activeElement.id"
+                    )
+                    assert focused_id == tabs.nth(1).get_attribute("id")
+
+                    # End -> last index
+                    idx_page.keyboard.press("End")
+                    assert tabs.nth(count - 1).get_attribute("aria-selected") == "true"
+                    assert tabs.nth(count - 1).get_attribute("tabindex") == "0"
+                    focused_id = idx_page.evaluate(
+                        "document.activeElement && document.activeElement.id"
+                    )
+                    assert focused_id == tabs.nth(count - 1).get_attribute("id")
+
+                    # Home -> index 0
+                    idx_page.keyboard.press("Home")
+                    assert tabs.nth(0).get_attribute("aria-selected") == "true"
+                    assert tabs.nth(0).get_attribute("tabindex") == "0"
+                    focused_id = idx_page.evaluate(
+                        "document.activeElement && document.activeElement.id"
+                    )
+                    assert focused_id == tabs.nth(0).get_attribute("id")
+
+                    # ArrowLeft from index 0 wraps to count - 1
+                    idx_page.keyboard.press("ArrowLeft")
+                    assert tabs.nth(count - 1).get_attribute("aria-selected") == "true"
+                    assert tabs.nth(count - 1).get_attribute("tabindex") == "0"
+                    focused_id = idx_page.evaluate(
+                        "document.activeElement && document.activeElement.id"
+                    )
+                    assert focused_id == tabs.nth(count - 1).get_attribute("id")
+
+                idx_page.close()
+                context.close()
+            finally:
+                browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()

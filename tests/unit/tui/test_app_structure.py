@@ -58,3 +58,9 @@ def test_dashboard_screen_structure(mock_sdk):
     screen = DashboardScreen(mock_sdk)
     assert screen.sdk == mock_sdk
     assert screen.log_viewer is not None
+    assert screen.log_viewer.border_title == "Logs"
+
+    screen._sync_compact_layout(80)
+    assert "compact" in screen.classes
+    screen._sync_compact_layout(100)
+    assert "compact" not in screen.classes

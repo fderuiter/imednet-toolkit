@@ -17,6 +17,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import BindingType
 from textual.containers import Container
+from textual.events import Resize
 from textual.message import Message
 from textual.screen import Screen
 from textual.timer import Timer
@@ -1163,6 +1164,8 @@ class LogViewer(Log):
     DEFAULT_CSS = """
     LogViewer {
         height: 1fr;
+        background: $surface;
+        border: solid $primary;
     }
     """
 
@@ -1188,7 +1191,11 @@ class DashboardScreen(Screen[None]):
         layout: grid;
         grid-size: 3 2;
         grid-columns: 1fr 1fr 2fr;
-        grid-rows: 1fr 1fr;
+        grid-rows: 2fr 1fr;
+        height: 1fr;
+    }
+
+    SubjectTable {
         height: 1fr;
     }
 
@@ -1206,7 +1213,7 @@ class DashboardScreen(Screen[None]):
 
     #bottom-pane {
         column-span: 3;
-        height: 1fr;
+        height: 100%;
         border-top: solid white;
     }
 
@@ -1217,6 +1224,25 @@ class DashboardScreen(Screen[None]):
     #bottom-pane TabPane {
         height: 1fr;
         padding: 0;
+    }
+
+    #bottom-pane JobMonitor,
+    #bottom-pane LogViewer {
+        height: 1fr;
+    }
+
+    DashboardScreen.compact #dashboard-grid {
+        grid-size: 2 3;
+        grid-columns: 1fr 1fr;
+        grid-rows: 2fr 2fr 3fr;
+    }
+
+    DashboardScreen.compact #subjects-box {
+        column-span: 2;
+    }
+
+    DashboardScreen.compact #bottom-pane {
+        column-span: 2;
     }
 
     #truncation-notice {
@@ -1294,6 +1320,12 @@ class DashboardScreen(Screen[None]):
     }
 
     DashboardScreen.high-contrast JobMonitor {
+        border: heavy white;
+        background: black;
+        color: white;
+    }
+
+    DashboardScreen.high-contrast LogViewer {
         border: heavy white;
         background: black;
         color: white;
@@ -1425,8 +1457,22 @@ class DashboardScreen(Screen[None]):
             self._pending_batch_ids.clear()
         job_monitor.set_study(study_key)
 
+    def _sync_compact_layout(self, width: int) -> None:
+        """Toggle compact 2-column grid layout when terminal width drops below 100."""
+        self.set_class(width < 100, "compact")
+
+    def on_resize(self, event: Resize) -> None:
+        """Reflow dashboard grid responsively when terminal dimensions change.
+
+        Args:
+            event: Textual resize event carrying updated viewport dimensions.
+        """
+        self._sync_compact_layout(event.size.width)
+
     def on_mount(self) -> None:
         """Sync high-contrast mode, attach SDK log handler, and apply initial CLI options."""
+        if self.app.size.width > 0:
+            self._sync_compact_layout(self.app.size.width)
         if getattr(self.app, "high_contrast_enabled", False) or "high-contrast" in self.app.classes:
             self.add_class("high-contrast")
 
