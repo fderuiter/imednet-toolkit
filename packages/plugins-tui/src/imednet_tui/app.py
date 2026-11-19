@@ -386,7 +386,7 @@ class SiteList(ListView):
             if self.is_attached:
                 if self.children:
                     await self.clear()
-                self.extend(items)
+                await self.extend(items)
                 if items:
                     self.index = min(prev_index, len(items) - 1) if prev_index is not None else 0
             self.truncated = truncated

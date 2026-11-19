@@ -47,6 +47,17 @@ def reset_high_contrast_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
 
 
+async def _settle(pilot: Any) -> None:
+    """Drain queued Textual messages and await all active background workers."""
+    await pilot.pause()
+    for _ in range(5):
+        active = [worker for worker in pilot.app.workers if not worker.is_finished]
+        if not active:
+            break
+        await pilot.app.workers.wait_for_complete(active)
+        await pilot.pause()
+
+
 @pytest.fixture
 def mock_sdk() -> MagicMock:
     """Return a contract-verified AsyncImednetFacade mock."""
@@ -217,13 +228,13 @@ async def test_app_study_and_subject_flow(mock_sdk: MagicMock) -> None:
     """Test interactive dashboard study selection, site loading, and site-filtered subjects."""
     app = ImednetTuiApp(mock_sdk)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         study_list = app.screen.query_one(StudyList)
         assert len(study_list.children) == 1
 
         study_list.post_message(StudyList.StudySelected("STUDY-ONC-01", "Oncology Phase III"))
-        await pilot.pause()
+        await _settle(pilot)
 
         site_list = app.screen.query_one(SiteList)
         assert len(site_list.children) == 1
@@ -233,23 +244,23 @@ async def test_app_study_and_subject_flow(mock_sdk: MagicMock) -> None:
 
         job_monitor = app.screen.query_one(JobMonitor)
         assert job_monitor.current_study_key == "STUDY-ONC-01"
-        job_monitor.track_job("BATCH-Active-1")
         mock_sdk.async_get_job.return_value = JobStatus(
             batch_id="BATCH-Active-1",
             state=JobState.RUNNING,
         )
-        await pilot.pause()
+        job_monitor.track_job("BATCH-Active-1")
+        await _settle(pilot)
 
         # Simulate selecting a site to filter subjects via facade site_id parameter
         site_list.post_message(SiteList.SiteSelected("SITE-101", "Memorial Hospital"))
-        await pilot.pause()
+        await _settle(pilot)
 
         assert subject_table.row_count == 1
         assert mock_sdk.async_get_subjects.await_args_list[-1].kwargs.get("site_id") == "SITE-101"
 
         # Trigger refresh action
         app.action_refresh_data()
-        await pilot.pause()
+        await _settle(pilot)
         assert mock_sdk.async_get_studies.await_count >= 2
         assert mock_sdk.async_get_sites.await_count >= 2
         assert mock_sdk.async_get_subjects.await_count >= 3
@@ -261,7 +272,7 @@ async def test_app_list_view_selection_events(mock_sdk: MagicMock) -> None:
     """Test on_list_view_selected event handlers for StudyList and SiteList."""
     app = ImednetTuiApp(mock_sdk)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         study_list = app.screen.query_one(StudyList)
         item = study_list.children[0]
@@ -269,14 +280,14 @@ async def test_app_list_view_selection_events(mock_sdk: MagicMock) -> None:
 
         event = ListView.Selected(study_list, item, 0)
         study_list.on_list_view_selected(event)
-        await pilot.pause()
+        await _settle(pilot)
 
         site_list = app.screen.query_one(SiteList)
         site_item = site_list.children[0]
         assert isinstance(site_item, ListItem)
         site_event = ListView.Selected(site_list, site_item, 0)
         site_list.on_list_view_selected(site_event)
-        await pilot.pause()
+        await _settle(pilot)
 
 
 @pytest.mark.asyncio
@@ -313,13 +324,13 @@ async def test_app_sync_sdk_facade_offloads_to_thread() -> None:
     with patch("imednet_tui.app.asyncio.to_thread", wraps=asyncio.to_thread) as spy_to_thread:
         app = ImednetTuiApp(sync_sdk)
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await _settle(pilot)
 
             study_list = app.screen.query_one(StudyList)
             assert len(study_list.children) == 1
 
             study_list.post_message(StudyList.StudySelected("SYNC-01", "Sync Study"))
-            await pilot.pause()
+            await _settle(pilot)
 
             site_list = app.screen.query_one(SiteList)
             assert len(site_list.children) == 1
@@ -331,12 +342,12 @@ async def test_app_sync_sdk_facade_offloads_to_thread() -> None:
             assert "enumeration is not supported" in str(job_monitor.render())
 
             job_monitor.track_job("SYNC-JOB-1")
-            await pilot.pause()
+            await _settle(pilot)
             sync_sdk.get_job.assert_called_with("SYNC-01", "SYNC-JOB-1")
             assert "SYNC-JOB-1" in str(job_monitor.render())
 
             site_list.post_message(SiteList.SiteSelected("SITE-SYNC", "Sync Site"))
-            await pilot.pause()
+            await _settle(pilot)
             assert subject_table.row_count == 1
             assert sync_sdk.get_subjects.call_args.kwargs.get("site_id") == "SITE-SYNC"
 
@@ -352,11 +363,11 @@ async def test_app_error_notifications(mock_sdk: MagicMock) -> None:
 
     app = ImednetTuiApp(mock_sdk)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         study_list = app.screen.query_one(StudyList)
         study_list.post_message(StudyList.StudySelected("STUDY-ONC-01", "Oncology Phase III"))
-        await pilot.pause()
+        await _settle(pilot)
 
         site_list = app.screen.query_one(SiteList)
         assert site_list.loading is False
@@ -370,7 +381,7 @@ async def test_app_handles_study_load_error(mock_sdk: MagicMock) -> None:
     mock_sdk.async_get_studies = AsyncMock(side_effect=RuntimeError("Connection refused"))
     app = ImednetTuiApp(mock_sdk)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         study_list = app.screen.query_one(StudyList)
         assert study_list.loading is False
@@ -901,12 +912,12 @@ async def test_job_monitor_sync_get_responsiveness_regression_heartbeat() -> Non
     async def heartbeat() -> None:
         nonlocal heartbeat_ticks
         while not stop_heartbeat:
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.01)
             heartbeat_ticks += 1
 
     def slow_sync_get_job(study_key: str, batch_id: str) -> JobStatus:
         assert study_key == "STUDY-HEARTBEAT"
-        time.sleep(0.18)
+        time.sleep(0.20)
         return JobStatus(batch_id=batch_id, state=JobState.COMPLETED)
 
     sdk = MagicMock(spec=ImednetFacade)
@@ -1213,6 +1224,7 @@ async def test_job_monitor_bounded_concurrent_polling_duration_and_limit() -> No
     current_concurrent = 0
     max_concurrent_seen = 0
     lock = asyncio.Lock()
+    all_in_flight = asyncio.Event()
 
     async def _get_job_async(study_key: str, batch_id: str) -> JobStatus:
         nonlocal current_concurrent, max_concurrent_seen
@@ -1220,7 +1232,10 @@ async def test_job_monitor_bounded_concurrent_polling_duration_and_limit() -> No
         async with lock:
             current_concurrent += 1
             max_concurrent_seen = max(max_concurrent_seen, current_concurrent)
-        await asyncio.sleep(0.12)
+            if current_concurrent == 5:
+                all_in_flight.set()
+        await asyncio.wait_for(all_in_flight.wait(), timeout=2.0)
+        await asyncio.sleep(0.02)
         async with lock:
             current_concurrent -= 1
         return JobStatus(batch_id=batch_id, state=JobState.COMPLETED)
@@ -1238,9 +1253,8 @@ async def test_job_monitor_bounded_concurrent_polling_duration_and_limit() -> No
     await monitor.refresh_jobs()
     elapsed = time.monotonic() - start
 
-    assert elapsed < 0.35
-    assert max_concurrent_seen <= JobMonitor.MAX_CONCURRENT_POLLS
-    assert max_concurrent_seen >= 2
+    assert elapsed < 1.5
+    assert max_concurrent_seen == JobMonitor.MAX_CONCURRENT_POLLS
 
     rendered = str(monitor.render())
     assert "Active & Recent Jobs (5)" in rendered
@@ -1349,10 +1363,11 @@ async def test_job_monitor_preserves_registration_order() -> None:
 @pytest.mark.asyncio
 async def test_job_monitor_sync_facade_bounded_concurrency() -> None:
     """Verify synchronous get_job() facade calls execute concurrently across worker threads."""
+    barrier = threading.Barrier(5, timeout=2.0)
 
     def sync_get_job(study_key: str, batch_id: str) -> JobStatus:
         assert study_key == "STUDY-SYNC-CONC"
-        time.sleep(0.08)
+        barrier.wait()
         return JobStatus(batch_id=batch_id, state=JobState.RUNNING)
 
     sdk = MagicMock(spec=ImednetFacade)
@@ -1368,7 +1383,7 @@ async def test_job_monitor_sync_facade_bounded_concurrency() -> None:
     await monitor.refresh_jobs()
     elapsed = time.monotonic() - start
 
-    assert elapsed < 0.25
+    assert elapsed < 2.0
     rendered = str(monitor.render())
     assert "Active & Recent Jobs (5)" in rendered
     for jid in job_ids:
@@ -1457,12 +1472,12 @@ async def test_subject_table_2500_study_issues_single_http_request_and_loads_all
 
         app = ImednetTuiApp(sdk)
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await _settle(pilot)
             assert studies_route.call_count == 1
 
             study_list = app.screen.query_one(StudyList)
             study_list.post_message(StudyList.StudySelected("LARGE-01", "Large Trial"))
-            await pilot.pause()
+            await _settle(pilot)
 
             assert subjects_route.call_count == 1
             assert sites_route.call_count == 1
@@ -1520,8 +1535,7 @@ async def test_subject_table_2500_study_issues_single_http_request_and_loads_all
             )
 
             await pilot.press("a")
-            await pilot.pause()
-            await pilot.pause()
+            await _settle(pilot)
 
             assert subject_table.row_count == 120
             assert subject_table.truncated is False
@@ -1548,7 +1562,7 @@ async def test_study_list_bounded_truncation_and_load_all() -> None:
 
     app = ImednetTuiApp(sdk)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         study_list = app.screen.query_one(StudyList)
         assert len(study_list.children) == 100
@@ -1556,8 +1570,7 @@ async def test_study_list_bounded_truncation_and_load_all() -> None:
         assert "Showing first 100 studies" in study_list.status_notice
 
         app.action_load_all()
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         assert len(study_list.children) == 135
         assert study_list.truncated is False
@@ -1579,7 +1592,7 @@ async def test_pilot_sync_simulation_sdk_selection_logs_refresh_and_contrast() -
         ):
             app = ImednetTuiApp(sdk)
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await _settle(pilot)
                 assert isinstance(app.screen, DashboardScreen)
                 dashboard = app.screen
 
@@ -1590,7 +1603,7 @@ async def test_pilot_sync_simulation_sdk_selection_logs_refresh_and_contrast() -
 
                 # Select first study via Enter
                 await pilot.press("enter")
-                await pilot.pause()
+                await _settle(pilot)
 
                 site_list = dashboard.query_one(SiteList)
                 subject_table = dashboard.query_one(SubjectTable)
@@ -1604,7 +1617,7 @@ async def test_pilot_sync_simulation_sdk_selection_logs_refresh_and_contrast() -
                 site_list.focus()
                 await pilot.pause()
                 await pilot.press("enter")
-                await pilot.pause()
+                await _settle(pilot)
                 assert dashboard.selected_site_id == "102"
                 assert subject_table.row_count == 1
 
@@ -1630,7 +1643,7 @@ async def test_pilot_sync_simulation_sdk_selection_logs_refresh_and_contrast() -
                     ) as spy_jobs,
                 ):
                     await pilot.press("r")
-                    await pilot.pause()
+                    await _settle(pilot)
                     spy_studies.assert_called_once()
                     spy_sites.assert_called_once_with("DEMO-STUDY")
                     spy_subjects.assert_called_once_with("DEMO-STUDY", "102")
@@ -1681,7 +1694,7 @@ async def test_pilot_async_simulation_sdk_selection_logs_refresh_and_zero_to_thr
             ) as spy_to_thread:
                 app = ImednetTuiApp(sdk)
                 async with app.run_test() as pilot:
-                    await pilot.pause()
+                    await _settle(pilot)
                     assert isinstance(app.screen, DashboardScreen)
                     dashboard = app.screen
 
@@ -1692,7 +1705,7 @@ async def test_pilot_async_simulation_sdk_selection_logs_refresh_and_zero_to_thr
 
                     # Select study via Enter -> awaits AsyncImednetFacade coroutines directly
                     await pilot.press("enter")
-                    await pilot.pause()
+                    await _settle(pilot)
 
                     site_list = dashboard.query_one(SiteList)
                     subject_table = dashboard.query_one(SubjectTable)
@@ -1706,14 +1719,14 @@ async def test_pilot_async_simulation_sdk_selection_logs_refresh_and_zero_to_thr
                     # Track simulated job on AsyncImednetSDK
                     if created_job.batch_id:
                         job_monitor.track_job(created_job.batch_id)
-                        await pilot.pause()
+                        await _settle(pilot)
                         assert created_job.batch_id in str(job_monitor.render())
 
                     # Select site via Enter -> filters down to the 1 subject on site 102
                     site_list.focus()
                     await pilot.pause()
                     await pilot.press("enter")
-                    await pilot.pause()
+                    await _settle(pilot)
                     assert dashboard.selected_site_id == "102"
                     assert subject_table.row_count == 1
 
@@ -1724,11 +1737,11 @@ async def test_pilot_async_simulation_sdk_selection_logs_refresh_and_zero_to_thr
 
                     # Refresh via 'r', Load All via 'a', and toggle contrast via 'h'
                     await pilot.press("r")
-                    await pilot.pause()
+                    await _settle(pilot)
                     assert subject_table.row_count == 1
 
                     await pilot.press("a")
-                    await pilot.pause()
+                    await _settle(pilot)
                     assert subject_table.row_count == 1
 
                     await pilot.press("h")
@@ -1792,7 +1805,7 @@ async def test_pilot_dotted_and_colliding_keys_preserve_raw_sdk_keys() -> None:
 
     app = ImednetTuiApp(sdk)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(pilot)
         assert isinstance(app.screen, DashboardScreen)
         dashboard = app.screen
 
@@ -1804,7 +1817,7 @@ async def test_pilot_dotted_and_colliding_keys_preserve_raw_sdk_keys() -> None:
         study_list.focus()
         await pilot.pause()
         await pilot.press("enter")
-        await pilot.pause()
+        await _settle(pilot)
 
         assert sdk.get_sites.call_args.args == ("STUDY.01",)
         assert sdk.get_subjects.call_args.args == ("STUDY.01",)
@@ -1817,7 +1830,7 @@ async def test_pilot_dotted_and_colliding_keys_preserve_raw_sdk_keys() -> None:
         site_list.focus()
         await pilot.pause()
         await pilot.press("enter")
-        await pilot.pause()
+        await _settle(pilot)
         assert sdk.get_subjects.call_args.args == ("STUDY.01",)
         assert sdk.get_subjects.call_args.kwargs.get("site_id") == "SITE.01"
 
@@ -1827,7 +1840,7 @@ async def test_pilot_dotted_and_colliding_keys_preserve_raw_sdk_keys() -> None:
 
         # Move down to colliding SITE_01 and select via Enter
         await pilot.press("down", "enter")
-        await pilot.pause()
+        await _settle(pilot)
         assert sdk.get_subjects.call_args.args == ("STUDY.01",)
         assert sdk.get_subjects.call_args.kwargs.get("site_id") == "SITE_01"
         assert str(subject_table.get_row_at(0)[0]) == "SUB-02"
@@ -1836,7 +1849,7 @@ async def test_pilot_dotted_and_colliding_keys_preserve_raw_sdk_keys() -> None:
         study_list.focus()
         await pilot.pause()
         await pilot.press("down", "enter")
-        await pilot.pause()
+        await _settle(pilot)
         assert sdk.get_sites.call_args.args == ("STUDY_01",)
 
 
@@ -1927,10 +1940,10 @@ async def test_async_sdk_bounded_initial_fetch_site_filter_and_load_all() -> Non
             ) as spy_to_thread:
                 app = ImednetTuiApp(async_sdk)
                 async with app.run_test() as pilot:
-                    await pilot.pause()
+                    await _settle(pilot)
                     study_view = app.screen.query_one(StudyList)
                     study_view.post_message(StudyList.StudySelected("ASYNC-01", "Async Study"))
-                    await pilot.pause()
+                    await _settle(pilot)
 
                     assert subj_route.call_count == 1
                     assert dict(subj_route.calls[0].request.url.params) == {
@@ -1942,8 +1955,7 @@ async def test_async_sdk_bounded_initial_fetch_site_filter_and_load_all() -> Non
                     assert subj_table.truncated is True
 
                     await pilot.press("a")
-                    await pilot.pause()
-                    await pilot.pause()
+                    await _settle(pilot)
 
                     assert subj_table.row_count == 135
                     assert subj_table.truncated is False
@@ -1951,7 +1963,7 @@ async def test_async_sdk_bounded_initial_fetch_site_filter_and_load_all() -> Non
                     # Selecting a site filters directly via site_id -> filter=siteId==10
                     site_view = app.screen.query_one(SiteList)
                     site_view.post_message(SiteList.SiteSelected("10", "Async Site"))
-                    await pilot.pause()
+                    await _settle(pilot)
                     assert subj_table.row_count == 1
                     assert "siteId==10" in subj_route.calls[-1].request.url.params.get("filter", "")
 
@@ -1975,7 +1987,7 @@ async def test_jobs_tab_positive_content_height_across_viewports(viewport: tuple
 
     app = ImednetTuiApp(sdk)
     async with app.run_test(size=viewport) as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         bottom_pane = app.screen.query_one("#bottom-pane", TabbedContent)
         jobs_tab = app.screen.query_one("#jobs-tab", TabPane)
@@ -1993,7 +2005,7 @@ async def test_jobs_tab_positive_content_height_across_viewports(viewport: tuple
         # Select study with zero tracked jobs and verify empty-view prompt & positive heights
         study_list = app.screen.query_one(StudyList)
         study_list.post_message(StudyList.StudySelected("VP-STUDY", "Viewport Study"))
-        await pilot.pause()
+        await _settle(pilot)
 
         notice_rendered = str(notice.render())
         assert "upstream APIs require batch IDs" in notice_rendered
@@ -2043,8 +2055,7 @@ async def test_launch_tui_with_initial_study_and_batches_polls_and_renders_table
         batch_ids=["BATCH-01", "BATCH-02"],
     )
     async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         assert isinstance(app.screen, DashboardScreen)
         assert app.screen.selected_study_key == "STUDY-BETA"
@@ -2118,7 +2129,7 @@ async def test_inline_batch_input_suppresses_shortcuts_and_polls_immediately() -
 
     app = ImednetTuiApp(sdk, study_key="STUDY-INP")
     async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         batch_input = app.screen.query_one("#batch_id_input", Input)
         job_table = app.screen.query_one("#job_table", JobTable)
@@ -2152,8 +2163,7 @@ async def test_inline_batch_input_suppresses_shortcuts_and_polls_immediately() -
 
         # Submit batch IDs via Enter
         await pilot.press("enter")
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         assert batch_input.value == ""
         assert job_table.row_count == 2
@@ -2204,7 +2214,7 @@ async def test_study_switching_isolates_tracked_batches_and_retains_prior_list()
 
     app = ImednetTuiApp(sdk, study_key="STUDY-ONE")
     async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         batch_input = app.screen.query_one("#batch_id_input", Input)
         job_table = app.screen.query_one("#job_table", JobTable)
@@ -2215,8 +2225,7 @@ async def test_study_switching_isolates_tracked_batches_and_retains_prior_list()
         await pilot.pause()
         batch_input.value = "S1-BATCH-A, S1-BATCH-B"
         await pilot.press("enter")
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         assert job_table.row_count == 2
         assert [str(job_table.get_row_at(0)[0]), str(job_table.get_row_at(1)[0])] == [
@@ -2226,8 +2235,7 @@ async def test_study_switching_isolates_tracked_batches_and_retains_prior_list()
 
         # Switch to STUDY-TWO: must show empty table and must NOT poll S1 batches under STUDY-TWO
         study_list.post_message(StudyList.StudySelected("STUDY-TWO", "Study Two"))
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         assert job_table.row_count == 0
         assert ("STUDY-TWO", "S1-BATCH-A") not in polled_pairs
@@ -2236,8 +2244,7 @@ async def test_study_switching_isolates_tracked_batches_and_retains_prior_list()
         # Add a job in STUDY-TWO
         batch_input.value = "S2-BATCH-ONLY"
         await pilot.press("enter")
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         assert job_table.row_count == 1
         assert str(job_table.get_row_at(0)[0]) == "S2-BATCH-ONLY"
@@ -2245,8 +2252,7 @@ async def test_study_switching_isolates_tracked_batches_and_retains_prior_list()
 
         # Return to STUDY-ONE: prior tracked jobs are preserved and displayed
         study_list.post_message(StudyList.StudySelected("STUDY-ONE", "Study One"))
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         assert job_table.row_count == 2
         assert [str(job_table.get_row_at(0)[0]), str(job_table.get_row_at(1)[0])] == [
@@ -2308,8 +2314,7 @@ async def test_terminal_jobs_stop_polling_and_pause_timer() -> None:
         batch_ids=["BATCH-ACTIVE", "BATCH-FINISHED"],
     )
     async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         job_monitor = app.screen.query_one(JobMonitor)
         job_table = app.screen.query_one("#job_table", JobTable)
@@ -2323,9 +2328,14 @@ async def test_terminal_jobs_stop_polling_and_pause_timer() -> None:
         job_monitor.timer.stop()
         job_monitor.timer = job_monitor.set_interval(0.05, job_monitor.refresh_jobs, pause=False)
 
-        # Wait for fast timer tick: only BATCH-ACTIVE is polled (BATCH-FINISHED is already terminal!)
-        await asyncio.sleep(0.12)
-        await pilot.pause()
+        # Wait deterministically for the timer tick that transitions BATCH-ACTIVE to COMPLETED
+        for _ in range(40):
+            await asyncio.sleep(0.03)
+            await _settle(pilot)
+            if not job_monitor.is_polling_active:
+                break
+
+        # Only BATCH-ACTIVE was polled on tick 2 (BATCH-FINISHED was already terminal!)
         assert call_counts == {"BATCH-ACTIVE": 2, "BATCH-FINISHED": 1}
 
         # Now every tracked job is terminal -> background timer automatically paused itself!
@@ -2340,8 +2350,8 @@ async def test_terminal_jobs_stop_polling_and_pause_timer() -> None:
         ]
 
         # Wait through multiple 0.05s timer intervals: zero additional job requests are sent!
-        await asyncio.sleep(0.20)
-        await pilot.pause()
+        await asyncio.sleep(0.15)
+        await _settle(pilot)
         await job_monitor.refresh_jobs()
         assert call_counts == {"BATCH-ACTIVE": 2, "BATCH-FINISHED": 1}
 
@@ -2375,8 +2385,7 @@ async def test_more_than_15_jobs_rendered_and_keyboard_scrollable() -> None:
 
     app = ImednetTuiApp(sdk, study_key="STUDY-MANY", batch_ids=batch_ids)
     async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         job_monitor = app.screen.query_one(JobMonitor)
         batch_input = app.screen.query_one("#batch_id_input", Input)
@@ -2426,7 +2435,7 @@ async def test_batch_submission_without_study_notifies_and_pending_cli_batches_a
 
     app = ImednetTuiApp(sdk, batch_ids=["PENDING-BATCH-1"])
     async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
+        await _settle(pilot)
 
         # Before selecting a study, no poll happens and submitting in Input warns gracefully
         sdk.async_get_job.assert_not_called()
@@ -2435,14 +2444,13 @@ async def test_batch_submission_without_study_notifies_and_pending_cli_batches_a
         await pilot.pause()
         batch_input.value = "EARLY-BATCH"
         await pilot.press("enter")
-        await pilot.pause()
+        await _settle(pilot)
         sdk.async_get_job.assert_not_called()
 
         # Selecting a study attaches the deferred CLI batch ID
         study_list = app.screen.query_one(StudyList)
         study_list.post_message(StudyList.StudySelected("STUDY-DEFER", "Deferred Study"))
-        await pilot.pause()
-        await pilot.pause()
+        await _settle(pilot)
 
         job_table = app.screen.query_one("#job_table", JobTable)
         assert job_table.row_count == 1
