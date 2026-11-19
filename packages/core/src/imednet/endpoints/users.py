@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
-from imednet.core.endpoint.strategies import PopStudyKeyStrategy
 from imednet.core.endpoint.structs import ParamState
 from imednet.core.protocols import ParamProcessor
 from imednet.models.users import User
@@ -37,10 +36,14 @@ class UsersParamProcessor(ParamProcessor):
         else:
             special_params["includeInactive"] = "false"
 
-        # Handle page, size, sort
+        # Handle page, size, sort, and raw filter
         for key in ("page", "size", "sort"):
             if key in filters:
-                special_params[key] = filters.pop(key)
+                val = filters.pop(key)
+                if val is not None:
+                    special_params[key] = val
+        if "filter" in filters:
+            special_params["filter"] = filters.pop("filter")
 
         return filters, special_params
 
@@ -50,8 +53,8 @@ class UsersOperationDef:
 
     PATH = "users"
     MODEL = User
-    STUDY_KEY_STRATEGY = PopStudyKeyStrategy()
     PARAM_PROCESSOR = UsersParamProcessor()
+    FILTER_ATTRIBUTES: frozenset[str] = frozenset()
 
     def _resolve_params(
         self,

@@ -97,9 +97,13 @@ def test_simulation_subjects_list_and_get():
         sdk = ImednetSDK(simulation_mode=True)
         subjects = list(sdk.subjects.list(study_key="STUDY"))
         assert len(subjects) >= 1
-        subject = sdk.subjects.get(study_key="STUDY", item_id="SUB1")
-        assert subject.subject_key == "SUB1"
+        assert subjects[0].subject_id is not None
+        subject = sdk.subjects.get(study_key="STUDY", item_id=subjects[0].subject_id)
+        assert subject.subject_id == subjects[0].subject_id
         assert subject.site_id == 101
+
+        or_filtered = list(sdk.subjects.list(study_key="STUDY", subjectKey=["SUB1", "SUB2"]))
+        assert len(or_filtered) >= 1
 
 
 def test_simulation_forms_and_visits_list():

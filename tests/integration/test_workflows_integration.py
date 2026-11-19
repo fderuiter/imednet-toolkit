@@ -24,7 +24,7 @@ def test_data_extraction_filters():
         json={"data": [{"subjectKey": "SUB1"}]}
     )
     respx.get("https://api.test/api/v1/edc/studies/ST/visits").respond(
-        json={"data": [{"visitId": 1, "subjectKey": "SUB1"}]}
+        json={"data": [{"visitId": 1, "intervalId": 5, "subjectKey": "SUB1"}]}
     )
     respx.get("https://api.test/api/v1/edc/studies/ST/records").respond(
         json={
@@ -39,8 +39,8 @@ def test_data_extraction_filters():
     recs = wf.extract_records_by_criteria(
         "ST",
         record_filter={"form_id": 10},
-        subject_filter={"status": "active"},
-        visit_filter={"visit_id": 1},
+        subject_filter={"subject_status": "Enrolled"},
+        visit_filter={"interval_id": 5},
     )
 
     assert [r.record_id for r in recs] == [1]
@@ -141,7 +141,7 @@ def test_data_extraction_no_matching_subjects() -> None:
     )
 
     wf = DataExtractionWorkflow(sdk)
-    recs = wf.extract_records_by_criteria("ST", subject_filter={"status": "active"})
+    recs = wf.extract_records_by_criteria("ST", subject_filter={"subject_status": "Enrolled"})
 
     assert recs == []
     assert subjects_route.called

@@ -4,6 +4,10 @@ from typing import Any
 
 import pytest
 
+from imednet.models.codings import Coding
+from imednet.models.queries import Query
+from imednet.models.users import User
+from imednet.models.visits import Visit
 from imednet.sdk import AsyncImednetSDK
 from tests.live.helpers import require_mutation
 
@@ -24,8 +28,9 @@ async def test_async_subjects(async_sdk: AsyncImednetSDK, study_key: str) -> Non
     subjects = [item async for item in async_sdk.subjects.list(study_key)]
     assert isinstance(subjects, list)
     if subjects:
-        subject = await async_sdk.subjects.get(study_key, subjects[0].subject_key)
-        assert subject.subject_key == subjects[0].subject_key
+        assert subjects[0].subject_id is not None
+        subject = await async_sdk.subjects.get(study_key, subjects[0].subject_id)
+        assert subject.subject_id == subjects[0].subject_id
 
 
 @pytest.mark.asyncio(scope="session")
@@ -51,11 +56,11 @@ async def test_async_intervals(async_sdk: AsyncImednetSDK, study_key: str) -> No
 @pytest.mark.asyncio(scope="session")
 async def test_async_visits(async_sdk: AsyncImednetSDK, study_key: str) -> None:
     """Test that async visits asynchronously."""
+    assert not hasattr(async_sdk.visits, "get")
     visits = [item async for item in async_sdk.visits.list(study_key)]
     assert isinstance(visits, list)
     if visits:
-        visit = await async_sdk.visits.get(study_key, visits[0].visit_id)
-        assert visit.visit_id == visits[0].visit_id
+        assert isinstance(visits[0], Visit)
 
 
 @pytest.mark.asyncio(scope="session")
@@ -81,11 +86,11 @@ async def test_async_forms(async_sdk: AsyncImednetSDK, study_key: str) -> None:
 @pytest.mark.asyncio(scope="session")
 async def test_async_queries(async_sdk: AsyncImednetSDK, study_key: str) -> None:
     """Test that async queries asynchronously."""
+    assert not hasattr(async_sdk.queries, "get")
     queries = [item async for item in async_sdk.queries.list(study_key)]
     assert isinstance(queries, list)
     if queries:
-        query = await async_sdk.queries.get(study_key, queries[0].annotation_id)
-        assert query.annotation_id == queries[0].annotation_id
+        assert isinstance(queries[0], Query)
 
 
 @pytest.mark.asyncio(scope="session")
@@ -111,11 +116,11 @@ async def test_async_users(async_sdk: AsyncImednetSDK, study_key: str) -> None:
 @pytest.mark.asyncio(scope="session")
 async def test_async_codings(async_sdk: AsyncImednetSDK, study_key: str) -> None:
     """Test that async codings asynchronously."""
+    assert not hasattr(async_sdk.codings, "get")
     codings = [item async for item in async_sdk.codings.list(study_key)]
     assert isinstance(codings, list)
     if codings:
-        coding = await async_sdk.codings.get(study_key, str(codings[0].coding_id))
-        assert coding.coding_id == codings[0].coding_id
+        assert isinstance(codings[0], Coding)
 
 
 @pytest.mark.asyncio(scope="session")

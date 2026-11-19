@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import (
@@ -38,12 +39,20 @@ _STR_ID_ALIASES: dict[str, str] = {
 class Keyword(ImednetBaseModel):
     """A keyword or tag associated with a record."""
 
+    keyword_name: str = Field("", alias="keywordName")
+    keyword_key: str = Field("", alias="keywordKey")
+    keyword_id: int = Field(0, alias="keywordId")
+    date_added: datetime = Field(default_factory=datetime.now, alias="dateAdded")
+
 
 Keyword = ModelEngine.get_model('Keyword', Keyword)
 
 
 class Record(ImednetBaseModel):
     """A data record for a subject, form, and visit."""
+
+    keywords: list[Keyword] = Field(default_factory=list, alias="keywords")
+    record_data: dict[str, Any] = Field(default_factory=dict, alias="recordData")
 
 
 Record = ModelEngine.get_model('Record', Record)

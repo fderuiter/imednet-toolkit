@@ -17,12 +17,12 @@ def test_list_uses_default_study_and_page_size(dummy_client, paginator_factory, 
     captured = paginator_factory(intervals, [{"intervalId": 1}])
     filter_capture = patch_build_filter(intervals)
 
-    result = ep.list(status="x")
+    result = ep.list(interval_name="Baseline")
 
     assert captured["path"] == "/api/v1/edc/studies/S1/intervals"
     assert captured["page_size"] == 500
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "x"}
+    assert filter_capture["filters"] == {"interval_name": "Baseline"}
     assert isinstance(result[0], Interval)
 
 
@@ -95,12 +95,12 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
 
     df = ep.to_dataframe(
         study_key="S1",
-        status="new",
+        interval_name="Baseline",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/intervals"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "new"}
+    assert filter_capture["filters"] == {"interval_name": "Baseline"}
     assert len(df) == 1
 
 
@@ -166,12 +166,12 @@ async def test_async_to_dataframe_parameter_forwarding(
 
     df = await ep.to_dataframe(
         study_key="S1",
-        status="new",
+        interval_name="Baseline",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/intervals"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"status": "new"}
+    assert filter_capture["filters"] == {"interval_name": "Baseline"}
     assert len(df) == 1
 
 

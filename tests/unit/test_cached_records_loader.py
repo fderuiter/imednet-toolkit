@@ -411,3 +411,52 @@ def test_lock_hold_duration_below_threshold(tmp_path: Path) -> None:
     assert len(hold_durations) == 1
     # 50 milliseconds = 0.05 seconds
     assert hold_durations[0] < 0.05, f"Lock held for {hold_durations[0]:.4f}s which exceeds 50ms"
+
+
+def test_cached_loader_http_contract_iso_timestamp_and_lowercase_bool(tmp_path: Path) -> None:
+    """Verify CachedRecordsLoader emits top-level unquoted UTC filter and deleted==false."""
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    with respx.mock:
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+        calls: list[dict[str, str]] = []
+
+        def responder(request: httpx.Request) -> httpx.Response:
+            calls.append(dict(request.url.params))
+            if len(calls) == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "studyKey": "STUDY",
+                                "recordId": 1,
+                                "formId": 10,
+                                "formKey": "DEMOG",
+                                "subjectKey": "SUB1",
+                                "dateModified": "2024-01-02T00:00:00Z",
+                                "recordData": {"AGE": 42},
+                            }
+                        ]
+                    },
+                )
+            if len(calls) == 2:
+                return httpx.Response(
+                    200,
+                    json={"data": [{"studyKey": "STUDY", "recordId": 1, "formKey": "DEMOG"}]},
+                )
+            return httpx.Response(200, json={"data": []})
+
+        respx.get("https://api.test/api/v1/edc/studies/STUDY/records").mock(side_effect=responder)
+
+        loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "http-cache")
+        loader.sync_records("STUDY", reconcile=True)
+        loader.sync_records("STUDY", reconcile=False)
+
+        assert "filter" not in calls[0]
+        assert calls[1]["filter"] == "deleted==false"
+        assert calls[1]["recordDataFilter"] == "none"
+        assert calls[2]["filter"] == "dateModified>=2024-01-02T00:00:00Z"

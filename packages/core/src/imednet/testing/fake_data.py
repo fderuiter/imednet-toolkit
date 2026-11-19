@@ -355,6 +355,12 @@ def fake_job() -> dict[str, Any]:
     }
 
 
+def _timestamp_array() -> list[int]:
+    """Return a 7-element numeric timestamp array [Y, M, D, h, m, s, ns]."""
+    dt = faker.date_time()
+    return [dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.microsecond * 1000]
+
+
 def fake_user() -> dict[str, Any]:
     """Return a fake user payload."""
     return {
@@ -366,8 +372,8 @@ def fake_user() -> dict[str, Any]:
         "userActiveInStudy": faker.boolean(),
         "roles": [
             {
-                "dateCreated": _timestamp(),
-                "dateModified": _timestamp(),
+                "dateCreated": _timestamp_array(),
+                "dateModified": _timestamp_array(),
                 "roleId": faker.lexify(text="????"),
                 "communityId": faker.random_int(min=1, max=10000),
                 "name": faker.word().title(),

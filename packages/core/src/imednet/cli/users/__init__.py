@@ -44,6 +44,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         study_key: str,
         include_inactive: bool = False,
         output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         with fetching_status("users", study_key):
             users_list = list(sdk.users.list(study_key, include_inactive=include_inactive))
@@ -104,6 +105,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "users",
             "No users found matching the criteria.",
             details=users_list,
+            interactive=False if no_interactive else None,
         )
 
     list_parser.set_defaults(
@@ -111,5 +113,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             study_key=args.study_key,
             include_inactive=args.include_inactive,
             output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )

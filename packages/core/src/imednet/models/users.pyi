@@ -1,12 +1,16 @@
+# pylint: disable=duplicate-code
 """Models for users and roles within iMedNet."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from pydantic import Field, computed_field
+from pydantic import Field, computed_field, field_validator
 
 from imednet.models.base import ImednetBaseModel
+
+def _normalize_role_timestamp(v: Any) -> Any: ...
 
 class Role(ImednetBaseModel):
     """A role assigned to a user within a study or community."""
@@ -18,19 +22,23 @@ class Role(ImednetBaseModel):
     type: str | None = Field(default=None, alias="type")
     inactive: bool | None = Field(default=None, alias="inactive")
     community_id: int | None = Field(default=None, alias="communityId")
-    date_created: str | None = Field(default=None, alias="dateCreated")
-    date_modified: str | None = Field(default=None, alias="dateModified")
+    date_created: datetime | None = Field(default=None, alias="dateCreated")
+    date_modified: datetime | None = Field(default=None, alias="dateModified")
+
+    @field_validator("date_created", "date_modified", mode="before")
+    @classmethod
+    def _parse_timestamp_array(cls, v: Any) -> Any: ...
 
 class User(ImednetBaseModel):
     """A user account in the system."""
 
+    roles: list[Role] = Field(default_factory=list, alias="roles")
     user_id: str | None
     login: str | None
     first_name: str | None
     last_name: str | None
     email: str | None
     user_active_in_study: bool | None
-    roles: Any
 
     @computed_field
     def name(self) -> str: ...

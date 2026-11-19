@@ -36,14 +36,14 @@ from imednet.models.visits import Visit
 
 @pytest.mark.asyncio
 async def test_async_list_records(dummy_client, async_paginator_factory, patch_build_filter):
-    """Test that async list records asynchronously."""
+    """Test that async list records omits studyKey from filter and maps recordDataFilter."""
     ep = records.AsyncRecordsEndpoint(dummy_client)
     captured = async_paginator_factory(records, [{"recordId": 1}])
     filter_capture = patch_build_filter(records)
-    result = await ep.list(study_key="S1", record_data_filter="x")
+    result = await ep.list(study_key="S1", record_data_filter="x", record_status="Open")
     assert captured["path"] == "/api/v1/edc/studies/S1/records"
     assert captured["params"] == {"filter": "FILTERED", "recordDataFilter": "x"}
-    assert filter_capture["filters"] == {"studyKey": "S1"}
+    assert filter_capture["filters"] == {"record_status": "Open"}
     assert isinstance(result[0], Record)
 
 
@@ -85,7 +85,7 @@ async def test_async_list_queries(dummy_client, async_paginator_factory):
     set_study_context("S1")
     ep = queries.AsyncQueriesEndpoint(dummy_client)
     captured = async_paginator_factory(queries, [{"annotationId": 1}])
-    result = await ep.list(status="new")
+    result = await ep.list(variable="AETERM")
     assert captured["path"] == "/api/v1/edc/studies/S1/queries"
     assert isinstance(result[0], Query)
 
@@ -96,7 +96,7 @@ async def test_async_list_record_revisions(dummy_client, async_paginator_factory
     set_study_context("S1")
     ep = record_revisions.AsyncRecordRevisionsEndpoint(dummy_client)
     captured = async_paginator_factory(record_revisions, [{"recordRevisionId": 1}])
-    result = await ep.list(status="x")
+    result = await ep.list(record_status="Open")
     assert captured["path"] == "/api/v1/edc/studies/S1/recordRevisions"
     assert isinstance(result[0], RecordRevision)
 
@@ -149,7 +149,7 @@ async def test_async_list_visits(dummy_client, async_paginator_factory):
     set_study_context("S1")
     ep = visits.AsyncVisitsEndpoint(dummy_client)
     captured = async_paginator_factory(visits, [{"visitId": 1}])
-    result = await ep.list(status="x")
+    result = await ep.list(interval_name="Baseline")
     assert captured["path"] == "/api/v1/edc/studies/S1/visits"
     assert isinstance(result[0], Visit)
 

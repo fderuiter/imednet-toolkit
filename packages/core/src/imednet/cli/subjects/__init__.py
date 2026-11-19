@@ -33,6 +33,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         study_key: str,
         subject_filter: list[str] | None = None,
         output_format: str = "table",
+        no_interactive: bool = False,
     ) -> None:
         parsed_filter = parse_filter_args(subject_filter, model=Subject)
 
@@ -60,6 +61,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "subjects",
             "No subjects found matching the criteria.",
             details=subjects_list,
+            interactive=False if no_interactive else None,
         )
 
     list_parser.set_defaults(
@@ -67,5 +69,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             study_key=args.study_key,
             subject_filter=args.subject_filter,
             output_format=args.output_format,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )
