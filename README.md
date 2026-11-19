@@ -73,6 +73,7 @@ pip install imednet
 For extended integrations, you can install optional dependencies:
 ```bash
 pip install "imednet[export]"
+pip install "imednet[tui]"
 pip install imednet-workflows
 pip install apache-airflow-providers-imednet
 ```
@@ -88,7 +89,7 @@ bash scripts/wizards/setup-imednet-env.sh
 The wizard guides you through:
 1. **Tooling Verification**: Ensuring Python (>= 3.11.5) and `uv` are available in your `PATH`.
 2. **UTF-8 Encoding**: Configuring `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` to prevent Windows console `charmap` encoding errors.
-3. **Workspace Synchronization**: Running `uv sync --extra dev --extra docs` to link workspace packages in editable mode.
+3. **Workspace Synchronization**: Running `uv sync --all-packages --extra dev --extra docs` to link workspace packages in editable mode.
 4. **EDC Credentials**: Safely entering EDC API credentials into `.env` (with optional GitHub Actions secrets sync via `gh`).
 5. **Self-Test**: Validating that the SDK and CLI (`imednet --help`) are fully operational.
 
@@ -99,7 +100,7 @@ To set up manually:
 # bash: export PYTHONUTF8=1
 
 # Synchronize monorepo packages with dev and docs tooling
-uv sync --extra dev --extra docs
+uv sync --all-packages --extra dev --extra docs
 ```
 
 ## Contributing

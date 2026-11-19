@@ -86,8 +86,8 @@ def test_partial_iteration_failure_has_no_success_stdout(sdk, capsys):
 
 def test_subject_filters_reach_sdk_in_json_mode(sdk, capsys):
     sdk.subjects.list.return_value = []
-    cli.app(["subjects", "list", "S", "--filter", "active=false", "--format", "json"])
-    sdk.subjects.list.assert_called_once_with("S", active=False)
+    cli.app(["subjects", "list", "S", "--filter", "deleted=false", "--format", "json"])
+    sdk.subjects.list.assert_called_once_with("S", deleted=False)
     assert json.loads(capsys.readouterr().out)["items"] == []
 
 

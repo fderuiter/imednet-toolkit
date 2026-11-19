@@ -268,22 +268,35 @@ class Pagination(ImednetBaseModel):
     sort: list[SortField] = Field(default_factory=list)
 
 
+class ErrorField(ImednetBaseModel):
+    """Offending request field details in an API error response."""
+
+    attribute: str = Field(
+        default="", description="Origination request attribute which caused the error"
+    )
+    value: str = Field(
+        default="", description="The value of request attribute passed in the request"
+    )
+
+
 class Error(ImednetBaseModel):
     """Error information in an API response."""
 
-    code: str = Field("", description="Error code")
-    message: str = Field("", description="Error message")
+    code: str = Field(default="", description="Error code")
+    description: str = Field(default="", description="Error description message")
+    message: str = Field(default="", description="Error message")
+    field: ErrorField | None = Field(default=None, description="Offending request field details")
     details: dict[str, Any] = Field(default_factory=dict)
 
 
 class Metadata(ImednetBaseModel):
     """Metadata information in an API response."""
 
-    status: str = Field("", description="Response status")
-    method: str = Field("", description="HTTP method")
-    path: str = Field("", description="Request path")
+    status: str = Field(default="", description="Response status")
+    method: str = Field(default="", description="HTTP method")
+    path: str = Field(default="", description="Request path")
     timestamp: datetime
-    error: Error = Field(default_factory=lambda: Error(code="", message=""))
+    error: Error = Field(default_factory=lambda: Error())
 
 
 T = TypeVar("T")
@@ -294,4 +307,4 @@ class ApiResponse(ImednetBaseModel, Generic[T]):
 
     metadata: Metadata
     pagination: Pagination | None = None
-    data: T
+    data: T | None = None

@@ -12,7 +12,6 @@ class Form(ImednetBaseModel):
     subject_record_report: bool | None = Field(default=None, alias="subjectRecordReport")
     unscheduled_visit: bool | None = Field(default=None, alias="unscheduledVisit")
     disabled: bool | None = Field(default=None, alias="disabled")
-
     study_key: str | None
     form_id: int | None
     form_key: str | None

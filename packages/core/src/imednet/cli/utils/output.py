@@ -424,6 +424,8 @@ def _truncate(text: str, length: int = 60) -> str:
 
 
 def _format_cell_value(value: Any, key: str | None = None) -> str:
+    if isinstance(value, Enum):
+        value = value.value
     if value is None or value == "":
         return "-"
     if isinstance(value, bool):
@@ -432,10 +434,10 @@ def _format_cell_value(value: Any, key: str | None = None) -> str:
         return value.strftime("%Y-%m-%d %H:%M")
 
     str_val = str(value)
-    if isinstance(value, list) and all(isinstance(x, (str, int, float, bool)) for x in value):
+    if isinstance(value, list) and all(isinstance(x, (str, int, float, bool, Enum)) for x in value):
         if not value:
             return "-"
-        s = ", ".join(str(x) for x in value)
+        s = ", ".join(str(x.value if isinstance(x, Enum) else x) for x in value)
         return _truncate(s)
     if isinstance(value, (list, dict)):
         return _truncate(str(value))
@@ -553,11 +555,12 @@ def display_list(
 
     should_run_interactive = interactive if interactive is not None else is_interactive_terminal()
     if should_run_interactive:
+        effective_details = details if details is not None else items
         grid_ran = run_interactive_grid(
             items=data_list,
             fields=field_keys,
             label=label,
-            details=details,
+            details=effective_details,
         )
         if grid_ran:
             return

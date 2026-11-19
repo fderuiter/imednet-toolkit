@@ -99,7 +99,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 }
             )
 
-        display_list(view_models, "users", "No users found matching the criteria.")
+        display_list(
+            view_models,
+            "users",
+            "No users found matching the criteria.",
+            details=users_list,
+        )
 
     list_parser.set_defaults(
         func=lambda args: list_users(

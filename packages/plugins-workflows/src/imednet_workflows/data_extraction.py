@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Record, RecordRevision
+from imednet.spi.utils import normalize_utc_timestamp_bound
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
@@ -124,32 +125,44 @@ class DataExtractionWorkflow:
 
         Args:
             study_key: The key identifying the study.
-            start_date: Optional start date filter (YYYY-MM-DD format expected by API).
-            end_date: Optional end date filter (YYYY-MM-DD format expected by API).
+            start_date: Optional inclusive lower UTC date/timestamp bound for ``dateCreated``.
+            end_date: Optional inclusive upper UTC date/timestamp bound for ``dateCreated``.
             user_filter: Optional dictionary of base filter conditions.
             **filters: Additional key-value pairs to be added as equality filters.
 
         Returns:
             A list of RecordRevision objects matching the criteria.
         """
-        # Start with the user_filter dict if provided, otherwise an empty dict
-        final_filter_dict = dict(user_filter) if user_filter else {}
-
-        # Add additional filters from kwargs
+        final_filter_dict: dict[str, Any] = dict(user_filter) if user_filter else {}
         final_filter_dict.update(filters)
 
-        # Prepare keyword arguments for date filters if they exist
-        date_kwargs = {}
-        if start_date:
-            date_kwargs["start_date"] = start_date
-        if end_date:
-            date_kwargs["end_date"] = end_date
+        if start_date is not None or end_date is not None:
+            date_bounds: list[tuple[str, Any]] = []
+            for key_variant in ("date_created", "dateCreated"):
+                if key_variant in final_filter_dict:
+                    existing = final_filter_dict.pop(key_variant)
+                    if isinstance(existing, list):
+                        for item in existing:
+                            date_bounds.append(item if isinstance(item, tuple) else ("==", item))
+                    elif isinstance(existing, tuple):
+                        date_bounds.append(existing)
+                    else:
+                        date_bounds.append(("==", existing))
 
-        # Fetch record revisions
+            if start_date is not None:
+                start_utc = normalize_utc_timestamp_bound(start_date, is_end=False)
+                date_bounds.append((">=", start_utc))
+            if end_date is not None:
+                end_utc = normalize_utc_timestamp_bound(end_date, is_end=True)
+                date_bounds.append(("<=", end_utc))
+
+            final_filter_dict["dateCreated"] = (
+                date_bounds[0] if len(date_bounds) == 1 else date_bounds
+            )
+
         revisions = self._sdk.get_record_revisions(
             study_key,
             **final_filter_dict,
-            **date_kwargs,
         )
         return list(revisions)
 

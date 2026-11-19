@@ -119,7 +119,7 @@ def test_extract_records_cli_parses_filters(monkeypatch: pytest.MonkeyPatch) -> 
             "--subject-filter",
             "subject_status=Screened",
             "--visit-filter",
-            "visit_key=BASE",
+            "interval_name=Screening",
         ],
     )
 
@@ -128,8 +128,37 @@ def test_extract_records_cli_parses_filters(monkeypatch: pytest.MonkeyPatch) -> 
         study_key="ST",
         record_filter={"form_key": "DEMOG"},
         subject_filter={"subject_status": "Screened"},
-        visit_filter={"visit_key": "BASE"},
+        visit_filter={"interval_name": "Screening"},
     )
+
+
+def test_extract_records_cli_rejects_unknown_visit_key_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that unknown Visit attribute visit_key=SCREENING fails before any HTTP call."""
+    runner = CliRunner()
+    monkeypatch.setenv("IMEDNET_API_KEY", "k")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "s")
+
+    sdk = MagicMock()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=sdk))
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "extract-records",
+            "ST",
+            "--visit-filter",
+            "visit_key=SCREENING",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Unknown filter attribute 'visit_key' for Visit" in result.stderr
+    sdk.get_visits.assert_not_called()
+    sdk.visits.list.assert_not_called()
+    sdk.get_records.assert_not_called()
 
 
 def test_invalid_filter_string(monkeypatch: pytest.MonkeyPatch) -> None:

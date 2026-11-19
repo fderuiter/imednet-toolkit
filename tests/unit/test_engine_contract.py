@@ -462,7 +462,19 @@ def test_model_engine_tracer_none_and_unknown_or_any_fields(monkeypatch):
                         type_name="any",
                         default_value=None,
                         alias="mysteryPayload",
-                    )
+                    ),
+                    "nested_map": FieldDefinition(
+                        name="nested_map",
+                        type_name="dict",
+                        default_value=None,
+                        alias="nestedMap",
+                    ),
+                    "nested_items": FieldDefinition(
+                        name="nested_items",
+                        type_name="list",
+                        default_value=None,
+                        alias="nestedItems",
+                    ),
                 },
             )
         }
@@ -471,95 +483,98 @@ def test_model_engine_tracer_none_and_unknown_or_any_fields(monkeypatch):
     monkeypatch.setattr(ModelEngine, "_model_cache", {})
     any_cls = ModelEngine.get_model("SyntheticAny")
     assert any_cls.model_fields["mystery_payload"].annotation is Any
-
-
-def test_generate_stubs_matches_committed_model_pyi_files(monkeypatch):
-    """Verify ModelEngine.generate_stubs reproduces committed .pyi stubs byte-for-byte."""
-    import builtins
-
-    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
-    written_stubs: dict[Path, str] = {}
-    real_open = builtins.open
-
-    class _MemoryWriter:
-        def __init__(self, target: Path) -> None:
-            self._target = target
-            self._chunks: list[str] = []
-
-        def write(self, data: str) -> int:
-            self._chunks.append(data)
-            return len(data)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:
-            written_stubs[self._target] = "".join(self._chunks)
-
-    def intercept_open(file, mode="r", *args, **kwargs):
-        if "w" in mode and str(file).endswith(".pyi"):
-            return _MemoryWriter(Path(file))
-        return real_open(file, mode, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", intercept_open)
-    ModelEngine.generate_stubs(str(models_dir))
-
-    assert len(written_stubs) >= 12
-    for pyi_path, generated_text in written_stubs.items():
-        assert pyi_path.exists(), f"Expected committed stub {pyi_path} to exist"
-        assert generated_text == pyi_path.read_text(encoding="utf-8"), (
-            f"Generated stub for {pyi_path.name} drifted from committed {pyi_path}"
-        )
-
-
-def test_generate_stubs_synthetic_module_constructs(tmp_path, monkeypatch):
-    """Verify ModelEngine.generate_stubs handles synthetic AST constructs and formatting branches."""
     assert (
-        ModelEngine._format_stub_annotation("typing.Union[int, str, NoneType]")
-        == "int | str | None"
+        engine._format_runtime_annotation(any_cls.model_fields["nested_map"].annotation)
+        == "dict[str, Any] | None"
+    )
+    assert (
+        engine._format_runtime_annotation(any_cls.model_fields["nested_items"].annotation)
+        == "list[Any] | None"
     )
 
-    # Ignored and non-matching files
+
+def test_generate_stubs_matches_committed_pyi_files(tmp_path):
+    """Verify ModelEngine.generate_stubs reproduces all 13 committed .pyi stubs byte-for-byte."""
+    import shutil
+
+    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
+    committed_stubs = sorted(models_dir.glob("*.pyi"))
+    assert len(committed_stubs) == 13
+
+    for py_file in sorted(models_dir.glob("*.py")):
+        shutil.copy2(py_file, tmp_path / py_file.name)
+
+    ModelEngine.generate_stubs(str(tmp_path))
+
+    generated_stubs = sorted(tmp_path.glob("*.pyi"))
+    assert [p.name for p in generated_stubs] == [p.name for p in committed_stubs]
+
+    for committed in committed_stubs:
+        generated = tmp_path / committed.name
+        assert generated.read_text(encoding="utf-8") == committed.read_text(encoding="utf-8"), (
+            f"Generated stub {committed.name} differs from committed {committed}"
+        )
+
+    assert engine._run_cli(["--check", str(models_dir)]) == 0
+
+
+def test_stub_cli_check_detects_drift_and_missing_stubs(tmp_path):
+    """Verify engine CLI --check returns non-zero when stubs drift or are missing."""
+    import shutil
+
+    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
+    for f in sorted(models_dir.glob("*.py*")):
+        shutil.copy2(f, tmp_path / f.name)
+
+    assert engine._run_cli(["--check", str(tmp_path)]) == 0
+
+    # Drift a stub
+    studies_pyi = tmp_path / "studies.pyi"
+    studies_pyi.write_text(
+        studies_pyi.read_text(encoding="utf-8") + "    drifted_field: str | None\n",
+        encoding="utf-8",
+    )
+    assert engine._run_cli(["--check", str(tmp_path)]) == 1
+
+    # Regenerate via CLI without --check, then verify --check passes again
+    assert engine._run_cli([str(tmp_path)]) == 0
+    assert engine._run_cli(["--check", str(tmp_path)]) == 0
+
+    # Add an unexpected stub and verify --check catches it
+    extra_pyi = tmp_path / "unexpected_extra.pyi"
+    extra_pyi.write_text("X: int\n", encoding="utf-8")
+    assert engine._run_cli(["--check", str(tmp_path)]) == 1
+    extra_pyi.unlink()
+
+    # Delete a stub and verify --check catches missing committed stub
+    studies_pyi.unlink()
+    assert engine._run_cli(["--check", str(tmp_path)]) == 1
+
+
+def test_ast_stub_generator_resolves_base_cls_strips_bodies_and_prunes_imports(
+    tmp_path, monkeypatch
+):
+    """Verify AST stub generator resolves base_cls, strips method bodies, preserves Enums, and prunes imports."""
     (tmp_path / "__init__.py").write_text('"""Init."""\n', encoding="utf-8")
     (tmp_path / "plain_helper.py").write_text("X = 1\n", encoding="utf-8")
 
-    synthetic_src = '''# pylint: disable=duplicate-code
-
-# synthetic header comment
-"""Synthetic model module."""
+    sample_py = tmp_path / "sample_model.py"
+    sample_py.write_text(
+        '''# pylint: disable=duplicate-code
+"""Sample dynamic model module."""
 
 from __future__ import annotations
 
 import dataclasses
-import os
-from typing import Dict as DictAlias
+from enum import Enum
+from typing import Any, Optional
 
-from pydantic import Field as PydanticField
+from pydantic import Field, computed_field
 
-from .base import ImednetBaseModel as BaseAlias
+from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
 
-MODULE_CONSTANT: str = "v1"
-
-
-def _private_helper() -> None:
-    return None
-
-
-def first_public_fn(value: os.PathLike[str]) -> str:
-    return str(value)
-
-
-def second_public_fn(flag: bool) -> bool:
-    return flag
-
-
-async def long_signature_function(
-    first_parameter_name: str,
-    second_parameter_name: DictAlias[str, str],
-    third_parameter_name: int | None = None,
-) -> bool:
-    return bool(first_parameter_name and second_parameter_name and third_parameter_name)
+MODULE_CONST: str = "v1"
 
 
 @dataclasses.dataclass
@@ -567,47 +582,118 @@ class EmptyMarker:
     pass
 
 
-class SyntheticRecord(BaseAlias):
-    CLASS_TAG = "RECORD"
-    custom_note: str | None = PydanticField(
-        default=None,
-        alias="customNote",
+class SampleState(str, Enum):
+    """Sample state enum."""
+
+    OPEN = "OPEN"
+    COMPLETED = "COMPLETED"
+
+    def is_done(self) -> bool:
+        """Check completion."""
+        return self is SampleState.COMPLETED
+
+
+class BaseSample(ImednetBaseModel):
+    """Custom base preserving narrow state annotation."""
+
+    study_key: Optional[str] = Field(default=None, alias="studyKey")
+
+    def helper(self, prefix: str = "x") -> str:
+        """Runtime body that must be stripped."""
+        value = f"{prefix}:{self.study_key}"
+        return value
+
+
+async def long_async_helper(
+    first_parameter_name: str,
+    second_parameter_name: str,
+    *,
+    third_keyword_only: int | None = None,
+    **kwargs: str,
+) -> bool:
+    return bool(first_parameter_name and second_parameter_name and third_keyword_only and kwargs)
+
+
+SampleStudy = ModelEngine.get_model("Study", base_cls=BaseSample)
+StudyAlias = SampleStudy
+''',
+        encoding="utf-8",
     )
-
-    async def fetch_extra(self) -> str:
-        return ""
-
-
-SyntheticRecord = ModelEngine.get_model("Record", SyntheticRecord)
-RecordAlias = SyntheticRecord
-'''
-    (tmp_path / "synthetic_records.py").write_text(synthetic_src, encoding="utf-8")
 
     monkeypatch.setattr(engine, "tracer", None)
     ModelEngine.generate_stubs(str(tmp_path))
-
     assert not (tmp_path / "__init__.pyi").exists()
     assert not (tmp_path / "plain_helper.pyi").exists()
 
-    stub_path = tmp_path / "synthetic_records.pyi"
-    assert stub_path.exists()
-    stub_text = stub_path.read_text(encoding="utf-8")
-    assert stub_text.startswith("# pylint: disable=duplicate-code\n# synthetic header comment\n")
-    assert "from __future__ import annotations" in stub_text
-    assert "import dataclasses" in stub_text
-    assert "import os" in stub_text
-    assert "from typing import Any, Dict as DictAlias" in stub_text
-    assert "from pydantic import Field as PydanticField" in stub_text
-    assert "from .base import ImednetBaseModel as BaseAlias" in stub_text
-    assert "ModelEngine" not in stub_text
-    assert "MODULE_CONSTANT: str" in stub_text
-    assert "_private_helper" not in stub_text
-    assert (
-        "def first_public_fn(value: os.PathLike[str]) -> str: ...\n"
-        "def second_public_fn(flag: bool) -> bool: ..."
-    ) in stub_text
-    assert "async def long_signature_function(\n" in stub_text
-    assert "@dataclasses.dataclass\nclass EmptyMarker: ..." in stub_text
-    assert "class SyntheticRecord(BaseAlias):" in stub_text
-    assert "    record_data: dict[str, Any] | None" in stub_text
-    assert "RecordAlias = SyntheticRecord" in stub_text
+    pyi_file = tmp_path / "sample_model.pyi"
+    assert pyi_file.exists()
+    content = pyi_file.read_text(encoding="utf-8")
+
+    # Leading pylint comment preserved
+    assert content.startswith("# pylint: disable=duplicate-code\n")
+
+    # Unused ModelEngine, Optional, computed_field, and Any must be pruned
+    assert "ModelEngine" not in content
+    assert "Optional" not in content
+    assert "Any" not in content
+    assert "computed_field" not in content
+    assert "import dataclasses" in content
+
+    # Enum literal assignments preserved and method bodies stripped
+    assert 'OPEN = "OPEN"' in content
+    assert 'COMPLETED = "COMPLETED"' in content
+    assert "def is_done(self) -> bool: ..." in content
+    assert 'def helper(self, prefix: str = "x") -> str: ...' in content
+    assert "@dataclasses.dataclass\nclass EmptyMarker: ..." in content
+    assert "async def long_async_helper(" in content
+    assert "MODULE_CONST: str" in content
+    assert "StudyAlias = SampleStudy" in content
+    assert "value =" not in content
+
+    # Optional normalized to PEP 604 union and base_cls resolved for synthesized SampleStudy
+    assert "study_key: str | None" in content
+    assert "class SampleStudy(BaseSample):" in content
+    assert "sponsor_key: str | None" in content
+
+
+def test_job_status_runtime_fields_match_jobs_pyi():
+    """Verify runtime Job and JobStatus model_fields types match committed jobs.pyi."""
+    import ast
+
+    from imednet.models.jobs import Job, JobStatus
+
+    jobs_pyi = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models" / "jobs.pyi"
+    tree = ast.parse(jobs_pyi.read_text(encoding="utf-8"))
+
+    stub_class_fields: dict[str, dict[str, str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name in {"Job", "JobStatus"}:
+            fields_map: dict[str, str] = {}
+            for stmt in node.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    fields_map[stmt.target.id] = ast.unparse(stmt.annotation)
+            stub_class_fields[node.name] = fields_map
+
+    expected_job_status_types = {
+        "state": "JobState | str | None",
+        "date_created": "str | None",
+        "date_started": "str | None",
+        "date_finished": "str | None",
+        "progress": "int | None",
+        "result_url": "str | None",
+    }
+
+    for field_name, expected_type in expected_job_status_types.items():
+        assert stub_class_fields["JobStatus"][field_name] == expected_type
+        runtime_ann = engine._format_runtime_annotation(
+            JobStatus.model_fields[field_name].annotation
+        )
+        assert runtime_ann == expected_type
+
+    for field_name in ("state", "date_created", "date_started", "date_finished"):
+        expected_type = expected_job_status_types[field_name]
+        assert stub_class_fields["Job"][field_name] == expected_type
+        assert (
+            engine._format_runtime_annotation(Job.model_fields[field_name].annotation)
+            == expected_type
+        )

@@ -23,7 +23,6 @@ class Record(ImednetBaseModel):
 
     keywords: list[Keyword] = Field(default_factory=list, alias="keywords")
     record_data: dict[str, Any] = Field(default_factory=dict, alias="recordData")
-
     study_key: str | None
     interval_id: int | None
     form_id: int | None

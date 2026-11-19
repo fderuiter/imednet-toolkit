@@ -661,11 +661,26 @@ class RecordMapper:
         form_whitelist: list[int] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Return variable names and label mapping for a study."""
+        if variable_whitelist is not None and len(variable_whitelist) == 0:
+            return [], {}
+        if form_whitelist is not None and len(form_whitelist) == 0:
+            return [], {}
+
         filters: dict[str, Any] = {}
-        if variable_whitelist is not None:
-            filters["variableNames"] = variable_whitelist
         if form_whitelist is not None:
-            filters["formIds"] = form_whitelist
+            filters["formId"] = (
+                form_whitelist[0] if len(form_whitelist) == 1 else list(form_whitelist)
+            )
+            if (
+                variable_whitelist is not None
+                and len(variable_whitelist) == 1
+                and len(form_whitelist) == 1
+            ):
+                filters["variableName"] = variable_whitelist[0]
+        elif variable_whitelist is not None:
+            filters["variableName"] = (
+                variable_whitelist[0] if len(variable_whitelist) == 1 else list(variable_whitelist)
+            )
 
         variables: list[VariableModel] = list(
             self.sdk.get_variables(
@@ -673,6 +688,13 @@ class RecordMapper:
                 **filters,
             )
         )
+        if form_whitelist is not None:
+            allowed_forms = set(form_whitelist)
+            variables = [v for v in variables if v.form_id is None or v.form_id in allowed_forms]
+        if variable_whitelist is not None:
+            allowed_vars = set(variable_whitelist)
+            variables = [v for v in variables if v.variable_name in allowed_vars]
+
         if not variables:
             logger.warning(
                 "No variables found for study '%s'. Returning empty DataFrame.",
@@ -696,6 +718,27 @@ class RecordMapper:
             )
         return create_model("RecordData", __base__=BaseModel, **fields)  # type: ignore
 
+    @staticmethod
+    def _extract_form_ids(
+        filters: dict[str, Any | tuple[str, Any] | list[Any]],
+    ) -> tuple[list[Any] | None, dict[str, Any | tuple[str, Any] | list[Any]]]:
+        """Extract scalar or multi-item formId filters and strip variable filters for /records."""
+        cleaned = dict(filters)
+        cleaned.pop("variableNames", None)
+        cleaned.pop("variableName", None)
+
+        if "formId" not in cleaned:
+            return None, cleaned
+
+        raw_form_id = cleaned.get("formId")
+        if isinstance(raw_form_id, (list, set)):
+            cleaned.pop("formId")
+            return list(dict.fromkeys(raw_form_id)), cleaned
+        if not isinstance(raw_form_id, tuple):
+            cleaned.pop("formId")
+            return [raw_form_id], cleaned
+        return None, cleaned
+
     def _fetch_records(
         self,
         study_key: str,
@@ -703,18 +746,36 @@ class RecordMapper:
         extra_filters: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
     ) -> list[RecordModel]:
         """Fetch records for a study applying optional filters."""
-        filters: dict[str, Any | tuple[str, Any] | list[Any]] = (
+        raw_filters: dict[str, Any | tuple[str, Any] | list[Any]] = (
             dict(extra_filters) if extra_filters else {}
         )
         if visit_key is not None:
             try:
-                filters["visitId"] = int(visit_key)
+                raw_filters["visitId"] = int(visit_key)
             except ValueError:
                 logger.warning(
                     "Invalid visit_key '%s'. Should be convertible to int. Fetching all records.",
                     visit_key,
                 )
+
+        form_id_list, filters = self._extract_form_ids(raw_filters)
+        if form_id_list is not None and len(form_id_list) == 0:
+            return []
+
         try:
+            if form_id_list is not None:
+                batched_records: list[RecordModel] = []
+                for fid in form_id_list:
+                    batched_records.extend(
+                        self.sdk.get_records(
+                            study_key=study_key,
+                            record_data_filter=None,
+                            **filters,
+                            formId=fid,
+                        )
+                    )
+                return batched_records
+
             return list(
                 self.sdk.get_records(
                     study_key=study_key,
@@ -722,6 +783,8 @@ class RecordMapper:
                     **filters,
                 )
             )
+        except ValueError:
+            raise
         except Exception as exc:  # pragma: no cover - unexpected
             logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
             return []
@@ -742,12 +805,9 @@ class RecordMapper:
         Returns:
             An iterable of Record models.
         """
-        form_ids: set[Any] | None = None
-        filters = dict(extra_filters) if extra_filters else {}
-        if "formIds" in filters and isinstance(filters["formIds"], list):
-            form_ids = set(filters["formIds"])
-        elif "formId" in filters:
-            form_ids = {filters["formId"]}
+        raw_filters = dict(extra_filters) if extra_filters else {}
+        form_id_list, _ = self._extract_form_ids(raw_filters)
+        form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
 
         loader = self._loader
         if loader is not None:
@@ -949,10 +1009,8 @@ class RecordMapper:
 
         record_model = self._build_record_model(variable_keys, label_map)
         extra_filters: dict[str, Any] = {}
-        if variable_whitelist is not None:
-            extra_filters["variableNames"] = variable_whitelist
         if form_whitelist is not None:
-            extra_filters["formIds"] = form_whitelist
+            extra_filters["formId"] = form_whitelist
 
         errors = 0
         yielded = False
@@ -1019,9 +1077,7 @@ class RecordMapper:
 
         extra_filters: dict[str, Any] = {}
         if form_whitelist is not None:
-            extra_filters["formIds"] = form_whitelist
-        if variable_whitelist is not None:
-            extra_filters["variableNames"] = variable_whitelist
+            extra_filters["formId"] = form_whitelist
 
         # 2. Fetch and iterate records
         records = self._iter_records(
@@ -1190,11 +1246,12 @@ class RecordMapper:
                 "pandas is required for RecordMapper.iter_sdtm_dataframes. Install "
                 "with 'pip install \"imednet[pandas]\"'."
             )
+        if variable_whitelist is not None and len(variable_whitelist) == 0:
+            return
+        allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
         extra_filters: dict[str, Any] = {}
-        if variable_whitelist is not None:
-            extra_filters["variableNames"] = variable_whitelist
         if form_whitelist is not None:
-            extra_filters["formIds"] = form_whitelist
+            extra_filters["formId"] = form_whitelist
 
         records = self._iter_records(
             study_key,
@@ -1202,7 +1259,25 @@ class RecordMapper:
             extra_filters=extra_filters or None,
         )
         for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
-            df = transform_records_to_sdtm(chunk, domain=domain, study_key=study_key)
+            records_batch: list[Any] = chunk
+            if allowed_vars is not None:
+                projected_chunk: list[Any] = []
+                for rec in chunk:
+                    rec_data = getattr(rec, "record_data", None)
+                    if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
+                        projected_chunk.append(
+                            rec.model_copy(
+                                update={
+                                    "record_data": {
+                                        k: v for k, v in rec_data.items() if k in allowed_vars
+                                    }
+                                }
+                            )
+                        )
+                    else:
+                        projected_chunk.append(rec)
+                records_batch = projected_chunk
+            df = transform_records_to_sdtm(records_batch, domain=domain, study_key=study_key)
             if not df.empty:
                 yield df
 

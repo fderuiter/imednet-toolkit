@@ -165,8 +165,8 @@ List records
                    {
                        "keywordName": "<string>",
                        "keywordKey": "<string>",
-                       "keywordId": "<integer>",
-                       "dateAdded": "<string>"
+                       "keywordId": 1,
+                       "dateAdded": "2020-07-20 14:05:00"
                    }
                ]
            },
@@ -332,7 +332,7 @@ Create records
    {
        "jobId": "<string>",
        "batchId": "<string>",
-       "state": "<string>",
+       "state": "OPEN",
        "dateCreated": "",
        "dateFinished": "",
        "dateStarted": ""

@@ -154,8 +154,8 @@ List subjects
                    {
                        "keywordName": "<string>",
                        "keywordKey": "<string>",
-                       "keywordId": "<integer>",
-                       "dateAdded": "<string>"
+                       "keywordId": 1,
+                       "dateAdded": "2020-07-20 14:05:00"
                    }
                ]
            },

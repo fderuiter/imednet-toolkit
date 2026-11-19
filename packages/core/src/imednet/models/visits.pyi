@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from pydantic import model_validator
+
 from imednet.models.base import ImednetBaseModel
 
 class Visit(ImednetBaseModel):
@@ -23,3 +27,7 @@ class Visit(ImednetBaseModel):
     visit_date_form: str | None
     visit_date_question: str | None
     last_updated: str | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clean_empty_dates(cls, data: Any) -> Any: ...

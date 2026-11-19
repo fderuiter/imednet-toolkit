@@ -32,13 +32,9 @@ class JobState(str, Enum):
     def allowed_transitions(self) -> set[JobState]: ...
 
 TERMINAL_JOB_STATES: set[JobState]
-
 ACTIVE_JOB_STATES: set[JobState]
-
 SUCCESSFUL_JOB_STATES: set[JobState]
-
 FAILED_JOB_STATES: set[JobState]
-
 ALLOWED_JOB_TRANSITIONS: dict[JobState, set[JobState]]
 
 class InvalidJobStateError(ValueError):
@@ -57,7 +53,15 @@ class Job(ImednetBaseModel):
     """Represents an asynchronous background job."""
 
     state: JobState | str | None = Field(default=None, alias="state")
+    job_id: str | None
+    batch_id: str | None
+    date_created: str | None
+    date_finished: str | None
+    date_started: str | None
 
+    @field_validator("state", mode="before")
+    @classmethod
+    def _validate_state(cls, v: Any) -> JobState | None: ...
     def transition_to(self, target: JobState | str) -> Job: ...
     @property
     def is_terminal(self) -> bool: ...
@@ -66,26 +70,10 @@ class Job(ImednetBaseModel):
     @property
     def is_failed(self) -> bool: ...
 
-    job_id: str | None
-    batch_id: str | None
-    date_created: str | None
-    date_finished: str | None
-    date_started: str | None
-
 class JobStatus(Job):
     """Extended job information returned when polling."""
 
     results: Any = Field(default=None)
-
-    @field_validator('progress', mode='before', check_fields=False)
-    def _parse_progress(cls, v: Any) -> int: ...
-    @property
-    def total_records(self) -> int: ...
-    @property
-    def successful_records(self) -> int: ...
-    @property
-    def failed_records(self) -> int: ...
-
     state: JobState | str | None
     job_id: str | None
     batch_id: str | None
@@ -94,3 +82,12 @@ class JobStatus(Job):
     date_started: str | None
     progress: int | None
     result_url: str | None
+
+    @field_validator("progress", mode="before", check_fields=False)
+    def _parse_progress(cls, v: Any) -> int: ...
+    @property
+    def total_records(self) -> int: ...
+    @property
+    def successful_records(self) -> int: ...
+    @property
+    def failed_records(self) -> int: ...

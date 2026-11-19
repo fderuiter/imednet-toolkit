@@ -11,7 +11,6 @@ class Variable(ImednetBaseModel):
 
     label: str | None = Field(default=None, alias="label")
     variable_oid: str | None = Field(default=None, alias="variableOid")
-
     study_key: str | None
     variable_id: int | None
     variable_type: str | None

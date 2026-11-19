@@ -17,7 +17,6 @@ class Interval(ImednetBaseModel):
     """Represents a visit interval or event within the study timeline."""
 
     forms: list[FormSummary] | None = Field(default=None, alias="forms")
-
     study_key: str | None
     interval_id: int | None
     interval_name: str | None

@@ -20,7 +20,6 @@ class Subject(ImednetBaseModel):
     """A subject (participant) in a study, with status and site info."""
 
     keywords: list[SubjectKeyword] = Field(default_factory=list, alias="keywords")
-
     study_key: str | None
     subject_id: int | None
     subject_key: str | None
