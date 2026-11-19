@@ -15,9 +15,10 @@ from typing import TYPE_CHECKING, Any, cast
 
 from .auth import AuthStrategy, CredentialSource
 from .config import Config, load_config
+from .constants import DEFAULT_BACKOFF_FACTOR, DEFAULT_RETRIES
 from .core.context import study_context
 from .core.factory import ClientFactory
-from .core.retry import RetryConfig, RetryPolicy
+from .core.retry import DefaultRetryPolicy, RetryConfig, RetryPolicy
 from .endpoints.registry import ASYNC_ENDPOINT_REGISTRY, ENDPOINT_REGISTRY
 from .errors import PluginLoadError
 from .plugins import (
@@ -126,6 +127,26 @@ class _BaseSDK:
     """
 
     config: Config
+
+    @staticmethod
+    def _resolve_retry_config(
+        retry_config: RetryConfig | None,
+        retries: int | None,
+        backoff_factor: float | None,
+        retry_policy: RetryPolicy | None,
+    ) -> RetryConfig | None:
+        """Resolve explicit retry_config or construct one from SDK retry arguments."""
+        if retry_config is not None:
+            return retry_config
+        if any(x is not None for x in (retries, backoff_factor, retry_policy)):
+            return RetryConfig(
+                retries=retries if retries is not None else DEFAULT_RETRIES,
+                backoff_factor=(
+                    backoff_factor if backoff_factor is not None else DEFAULT_BACKOFF_FACTOR
+                ),
+                retry_policy=retry_policy if retry_policy is not None else DefaultRetryPolicy(),
+            )
+        return None
 
     def _get_plugin_entry_point(self, name: str) -> EntryPoint | None:
         """Return the configured plugin entry point."""
@@ -275,16 +296,12 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
         if client is not None:
             self._client = client
         else:
-            if retry_config is None and any(
-                x is not None for x in [retries, backoff_factor, retry_policy]
-            ):
-                from .core.retry import RetryConfig
-
-                retry_config = RetryConfig(
-                    retries=retries if retries is not None else 3,
-                    backoff_factor=backoff_factor if backoff_factor is not None else 1.0,
-                    retry_policy=retry_policy,
-                )
+            retry_config = self._resolve_retry_config(
+                retry_config=retry_config,
+                retries=retries,
+                backoff_factor=backoff_factor,
+                retry_policy=retry_policy,
+            )
 
             self._client = ClientFactory.create_client(
                 config=config,
@@ -439,16 +456,12 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
         if async_client is not None:
             self._async_client = async_client
         else:
-            if retry_config is None and any(
-                x is not None for x in [retries, backoff_factor, retry_policy]
-            ):
-                from .core.retry import RetryConfig
-
-                retry_config = RetryConfig(
-                    retries=retries if retries is not None else 3,
-                    backoff_factor=backoff_factor if backoff_factor is not None else 1.0,
-                    retry_policy=retry_policy,
-                )
+            retry_config = self._resolve_retry_config(
+                retry_config=retry_config,
+                retries=retries,
+                backoff_factor=backoff_factor,
+                retry_policy=retry_policy,
+            )
 
             self._async_client = ClientFactory.create_async_client(
                 config=config,
