@@ -250,3 +250,96 @@ def test_cli_from_redcap_missing_file(capsys: pytest.CaptureFixture[str]) -> Non
     captured = capsys.readouterr()
     assert "Error loading from REDCap:" in captured.err
     assert "Target file 'nonexistent.csv' does not exist" in captured.err
+
+
+def test_cli_odm_round_trip_divergent_variables_and_auto_query(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI to-odm and from-odm --strict preserve divergent Variables and Auto Query with zero diffs."""
+    dd_data = {
+        "metadata": {
+            "schemaVersion": "1.0.0",
+            "studyKey": "CLI_DIVERGENT_ODM",
+            "source": "cdisc_odm",
+            "extraAttributes": {
+                "studyName": "CLI_DIVERGENT_ODM",
+                "protocolName": "CLI_DIVERGENT_ODM",
+            },
+        },
+        "forms": [
+            {
+                "formKey": "DM",
+                "formName": "Demographics",
+                "formType": "Subject",
+                "variables": [
+                    {
+                        "variableName": "VISDAT",
+                        "label": "Demographics Visit Date",
+                        "variableType": "Date",
+                        "sequence": 1,
+                        "required": "Auto Query",
+                        "format": "YYYY-MM-DD",
+                    },
+                    {
+                        "variableName": "SEX",
+                        "label": "Sex",
+                        "variableType": "Radio",
+                        "sequence": 2,
+                        "required": "Yes",
+                        "choices": [
+                            {"choiceValue": "M", "choiceText": "Male", "position": 1},
+                            {"choiceValue": "F", "choiceText": "Female", "position": 2},
+                        ],
+                    },
+                ],
+            },
+            {
+                "formKey": "SV",
+                "formName": "Subject Visit",
+                "formType": "Subject",
+                "variables": [
+                    {
+                        "variableName": "VISDAT",
+                        "label": "Follow-up Visit Date",
+                        "variableType": "Date",
+                        "sequence": 1,
+                        "required": "Yes",
+                        "format": "10",
+                    },
+                    {
+                        "variableName": "SEX",
+                        "label": "Sex",
+                        "variableType": "Radio",
+                        "sequence": 2,
+                        "required": "No",
+                        "choices": [
+                            {"choiceValue": "M", "choiceText": "Male", "position": 1},
+                            {"choiceValue": "F", "choiceText": "Female", "position": 2},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+    src_json = tmp_path / "src.json"
+    odm_xml = tmp_path / "exported.xml"
+    reloaded_json = tmp_path / "reloaded.json"
+    src_json.write_text(json.dumps(dd_data), encoding="utf-8")
+
+    app(["datadict", "to-odm", str(src_json), "-o", str(odm_xml)])
+    xml_text = odm_xml.read_text(encoding="utf-8")
+    assert 'OID="IT.DM.VISDAT"' in xml_text
+    assert 'OID="IT.SV.VISDAT"' in xml_text
+    assert 'OID="SEX"' in xml_text
+    assert 'OID="CL_SEX"' in xml_text
+    assert 'imednet:RequiredPolicy="Auto Query"' in xml_text
+    capsys.readouterr()
+
+    app(["datadict", "from-odm", str(odm_xml), "--strict", "-o", str(reloaded_json)])
+    capsys.readouterr()
+
+    app(["datadict", "diff", str(src_json), str(reloaded_json), "--format", "json"])
+    captured = capsys.readouterr()
+    diff_payload = json.loads(captured.out)
+    assert diff_payload["has_changes"] is False
+    assert diff_payload["total_changes"] == 0

@@ -183,21 +183,39 @@ def _freeze_value(value: Any) -> Any:
     return value
 
 
-def _item_def_signature(var: Variable) -> Any:
-    """Compute an equivalence signature for an ODM ItemDef + CodeList definition."""
+def _choices_signature(choices: list[Choice]) -> tuple[Any, ...]:
+    """Compute an immutable signature for a sorted Choice collection."""
     sorted_choices = sorted(
-        var.choices, key=lambda c: _sort_key_int_then_str(c.position, c.choiceValue)
+        choices, key=lambda c: _sort_key_int_then_str(c.position, c.choiceValue)
     )
-    choices_sig = tuple(
+    return tuple(
         (
             c.choiceValue,
             c.choiceText,
-            c.position,
+            c.position if c.position is not None else idx,
             _freeze_value(c.extraAttributes),
             _freeze_value(c.model_extra or {}),
         )
-        for c in sorted_choices
+        for idx, c in enumerate(sorted_choices, 1)
     )
+
+
+def _codelist_signature(var: Variable) -> tuple[str, tuple[Any, ...]] | None:
+    """Compute an equivalence signature for an ODM CodeList, or None when unchoiced."""
+    if not var.choices:
+        return None
+    datatype, _ = _map_to_odm_datatype(
+        var.variableType,
+        precision=var.precision,
+        has_choices=True,
+    )
+    cl_dtype = datatype if datatype in ("integer", "float", "text") else "text"
+    return (cl_dtype, _choices_signature(var.choices))
+
+
+def _item_def_signature(var: Variable) -> Any:
+    """Compute an equivalence signature for an ODM ItemDef + CodeList definition."""
+    choices_sig = _choices_signature(var.choices)
     excluded_keys = {"Domain", "SASDatasetName", "methodOid", "collectionExceptionConditionOid"}
     merged_extra = {k: v for k, v in (var.model_extra or {}).items() if k not in excluded_keys}
     for k, v in var.extraAttributes.items():
@@ -217,6 +235,8 @@ def _item_def_signature(var: Variable) -> Any:
         var.format,
         var.precision,
         sdtm_sig,
+        _freeze_value(normalize_measurement_units(var.extraAttributes)),
+        _freeze_value(normalize_variable_bounds(var.extraAttributes)),
         choices_sig,
         _freeze_value(merged_extra),
     )
@@ -260,19 +280,10 @@ def _allocate_scoped_oid(
 ) -> str:
     """Allocate a globally unique form-scoped OID without colliding with raw or prior OIDs."""
     base_var = var_name.strip() or "ITEM"
-    candidates: list[str] = []
-    if form_key:
-        candidates.append(f"{form_key}.{base_var}")
-        candidates.append(f"IT.{form_key}.{base_var}")
-        prefix = f"IT.{form_key}.{base_var}"
-    else:
-        candidates.append(f"IT.{base_var}")
-        prefix = f"IT.{base_var}"
-
-    for candidate in candidates:
-        if candidate not in used_oids and candidate not in reserved_raw_names:
-            used_oids.add(candidate)
-            return candidate
+    prefix = f"IT.{form_key}.{base_var}" if form_key else f"IT.{base_var}"
+    if prefix not in used_oids and prefix not in reserved_raw_names:
+        used_oids.add(prefix)
+        return prefix
 
     counter = 2
     while True:
@@ -281,6 +292,85 @@ def _allocate_scoped_oid(
             used_oids.add(fallback)
             return fallback
         counter += 1
+
+
+def _allocate_codelist_oid(prefix: str, used_oids: set[str]) -> str:
+    """Allocate a globally unique ODM CodeList OID from a candidate prefix."""
+    if prefix not in used_oids:
+        used_oids.add(prefix)
+        return prefix
+    counter = 2
+    while True:
+        fallback = f"{prefix}__{counter}"
+        if fallback not in used_oids:
+            used_oids.add(fallback)
+            return fallback
+        counter += 1
+
+
+def _allocate_codelist_oids(
+    sorted_forms: list[Form],
+    sorted_vars_by_form: list[list[Variable]],
+) -> tuple[dict[tuple[int, int], str], list[tuple[str, str, str, list[Choice]]]]:
+    """Allocate shared CL_{variableName} or form-qualified CL.{formKey}.{variableName} OIDs."""
+    cl_sigs_by_var_name: dict[str, set[Any]] = {}
+    cl_sig_by_occ: dict[tuple[int, int], tuple[str, tuple[Any, ...]] | None] = {}
+    for f_idx, sorted_vars in enumerate(sorted_vars_by_form):
+        for v_idx, var in enumerate(sorted_vars):
+            cl_sig = _codelist_signature(var)
+            cl_sig_by_occ[(f_idx, v_idx)] = cl_sig
+            cl_sigs_by_var_name.setdefault(var.variableName, set()).add(cl_sig)
+
+    divergent_cl_names = {v_name for v_name, sigs in cl_sigs_by_var_name.items() if len(sigs) > 1}
+    used_cl_oids: set[str] = set()
+    unscoped_cl_by_name: dict[str, str] = {}
+    scoped_cl_by_group: dict[tuple[str, str, Any], str] = {}
+
+    for f_idx, sorted_vars in enumerate(sorted_vars_by_form):
+        for v_idx, var in enumerate(sorted_vars):
+            if (
+                cl_sig_by_occ[(f_idx, v_idx)] is not None
+                and var.variableName not in divergent_cl_names
+                and var.variableName not in unscoped_cl_by_name
+            ):
+                base_var = var.variableName.strip() or "ITEM"
+                unscoped_cl_by_name[var.variableName] = _allocate_codelist_oid(
+                    f"CL_{base_var}",
+                    used_cl_oids,
+                )
+
+    cl_oid_by_occ: dict[tuple[int, int], str] = {}
+    emitted_codelists: set[str] = set()
+    codelist_elements: list[tuple[str, str, str, list[Choice]]] = []
+    for f_idx, form in enumerate(sorted_forms):
+        for v_idx, var in enumerate(sorted_vars_by_form[f_idx]):
+            cl_sig = cl_sig_by_occ[(f_idx, v_idx)]
+            if cl_sig is None:
+                continue
+            cl_dtype, _ = cl_sig
+            base_var = var.variableName.strip() or "ITEM"
+            if var.variableName in divergent_cl_names:
+                group_key = (form.formKey, var.variableName, cl_sig)
+                cl_oid = scoped_cl_by_group.get(group_key)
+                if cl_oid is None:
+                    prefix = f"CL.{form.formKey}.{base_var}" if form.formKey else f"CL.{base_var}"
+                    cl_oid = _allocate_codelist_oid(prefix, used_cl_oids)
+                    scoped_cl_by_group[group_key] = cl_oid
+                cl_name = (
+                    f"{form.formKey}.{base_var} CodeList"
+                    if form.formKey
+                    else f"{base_var} CodeList"
+                )
+            else:
+                cl_oid = unscoped_cl_by_name[var.variableName]
+                cl_name = f"{base_var} CodeList"
+
+            cl_oid_by_occ[(f_idx, v_idx)] = cl_oid
+            if cl_oid not in emitted_codelists:
+                emitted_codelists.add(cl_oid)
+                codelist_elements.append((cl_oid, cl_name, cl_dtype, var.choices))
+
+    return cl_oid_by_occ, codelist_elements
 
 
 def _allocate_item_oids(
@@ -606,8 +696,9 @@ def to_odm_xml(
 
     _emit_protocol_and_visits(mdv_elem, datadict.metadata.extraAttributes)
 
-    # Allocate globally unique ItemDef OIDs across unscoped and form-scoped variable names
+    # Allocate globally unique ItemDef and CodeList OIDs across unscoped and form-scoped variables
     sorted_vars_by_form, oid_by_occ, referencing_forms_by_oid = _allocate_item_oids(sorted_forms)
+    cl_oid_by_occ, codelist_elements = _allocate_codelist_oids(sorted_forms, sorted_vars_by_form)
 
     # 2. FormDef elements
     for form in sorted_forms:
@@ -680,7 +771,7 @@ def to_odm_xml(
 
     # 4. ItemDef elements (globally unique OIDs preserving source names and distinct definitions)
     emitted_item_defs: set[str] = set()
-    item_def_elements: list[tuple[Variable, str, str, str]] = []
+    item_def_elements: list[tuple[Variable, str, str, str, str | None]] = []
     for f_idx, form in enumerate(sorted_forms):
         sorted_vars = sorted_vars_by_form[f_idx]
         for v_idx, var in enumerate(sorted_vars):
@@ -692,9 +783,11 @@ def to_odm_xml(
                     precision=var.precision,
                     has_choices=bool(var.choices),
                 )
-                item_def_elements.append((var, form.formKey, item_oid, datatype))
+                item_def_elements.append(
+                    (var, form.formKey, item_oid, datatype, cl_oid_by_occ.get((f_idx, v_idx)))
+                )
 
-    for var, form_key, item_oid, datatype in item_def_elements:
+    for var, form_key, item_oid, datatype, item_cl_oid in item_def_elements:
         _, control_type = _map_to_odm_datatype(
             var.variableType,
             precision=var.precision,
@@ -713,10 +806,18 @@ def to_odm_xml(
             for fk in ref_forms
         ):
             item_attribs[f"{{{IMEDNET_NS}}}VariableName"] = var.variableName
-        if var.format and str(var.format).isdigit():
-            item_attribs["Length"] = str(var.format)
-        if var.precision and str(var.precision).isdigit():
-            item_attribs["SignificantDigits"] = str(var.precision)
+        if var.format is not None and str(var.format).strip():
+            fmt_str = str(var.format).strip()
+            if fmt_str.isascii() and fmt_str.isdigit() and int(fmt_str) > 0:
+                item_attribs["Length"] = fmt_str
+            else:
+                item_attribs[f"{{{IMEDNET_NS}}}Format"] = fmt_str
+        if var.precision is not None and str(var.precision).strip():
+            prec_str = str(var.precision).strip()
+            if prec_str.isascii() and prec_str.isdigit():
+                item_attribs["SignificantDigits"] = prec_str
+            else:
+                item_attribs[f"{{{IMEDNET_NS}}}Precision"] = prec_str
         if control_type:
             item_attribs["ControlType"] = control_type
         for sdtm_key in ("SDSVarName", "SASFieldName", "Origin", "Comment"):
@@ -767,21 +868,10 @@ def to_odm_xml(
                 tt_err = ET.SubElement(err_elem, f"{{{ODM_NS}}}TranslatedText", {"xml:lang": "en"})
                 tt_err.text = str(err_msg)
 
-        if var.choices:
-            cl_oid = f"CL_{item_oid}"
-            ET.SubElement(item_elem, f"{{{ODM_NS}}}CodeListRef", {"CodeListOID": cl_oid})
+        if item_cl_oid:
+            ET.SubElement(item_elem, f"{{{ODM_NS}}}CodeListRef", {"CodeListOID": item_cl_oid})
 
     # 5. CodeList elements
-    emitted_codelists: set[str] = set()
-    codelist_elements: list[tuple[str, str, str, list[Choice]]] = []
-    for var, _, item_oid, datatype in item_def_elements:
-        if var.choices:
-            cl_oid = f"CL_{item_oid}"
-            if cl_oid not in emitted_codelists:
-                emitted_codelists.add(cl_oid)
-                cl_dtype = datatype if datatype in ("integer", "float", "text") else "text"
-                codelist_elements.append((cl_oid, f"{item_oid} CodeList", cl_dtype, var.choices))
-
     for cl_oid, cl_name, cl_dtype, choices in codelist_elements:
         cl_elem = ET.SubElement(
             mdv_elem,
