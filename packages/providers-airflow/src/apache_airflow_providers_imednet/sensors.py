@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import closing
 from typing import Any
 
 try:  # pragma: no cover - optional Airflow dependency
@@ -70,8 +71,8 @@ class ImednetJobSensor(BaseSensorOperator):
             evaluate_job_state,
         )
 
-        sdk = self._get_sdk()
-        job: JobStatus = sdk.jobs.get(self.study_key, self.batch_id)
+        with closing(self._get_sdk()) as sdk:
+            job: JobStatus = sdk.jobs.get(self.study_key, self.batch_id)
 
         # In JobStatus instances, track state monotonically and guard against stale responses
         if isinstance(job, JobStatus):

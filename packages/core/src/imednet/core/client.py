@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from imednet.core.context import reset_strict_mode_context, set_strict_mode_context
 from imednet.core.http.executor import SyncRequestExecutor
 from imednet.core.retry import RetryConfig
 
@@ -49,6 +50,7 @@ class Client(HTTPClientBase[httpx.Client, SyncRequestExecutor]):
 
     def __enter__(self) -> Client:
         """Enter the synchronous context manager."""
+        self._strict_mode_tokens.append(set_strict_mode_context(self.strict_mode))
         return self
 
     def __exit__(
@@ -58,7 +60,11 @@ class Client(HTTPClientBase[httpx.Client, SyncRequestExecutor]):
         tb: TracebackType | None,
     ) -> None:
         """Exit the synchronous context manager and close the client."""
-        self.close()
+        try:
+            self.close()
+        finally:
+            if self._strict_mode_tokens:
+                reset_strict_mode_context(self._strict_mode_tokens.pop())
 
     def close(self) -> None:
         """Close the underlying HTTP client."""

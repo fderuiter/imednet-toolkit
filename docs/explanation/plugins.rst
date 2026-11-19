@@ -181,9 +181,12 @@ API reference
 .. autoclass:: imednet.plugins.PluginProtocol
    :members:
    :undoc-members:
+   :noindex:
 
 .. autoclass:: imednet.plugins.WorkflowsNamespaceProtocol
    :members:
    :undoc-members:
+   :noindex:
 
 .. autoexception:: imednet.errors.PluginLoadError
+   :noindex:

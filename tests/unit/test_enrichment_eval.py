@@ -257,23 +257,23 @@ def test_enrichment_pipeline_active_rules_preservation() -> None:
     assert result is not data
 
     # Root level checks
-    assert result["patient_name"] == "[MASKED]"
+    assert result["patient_name"] == "***MASKED***"
     assert result["gender"] == "Male"
     assert result["age_in_months"] == 60
 
     # Nested dict checks
-    assert result["nested_dict"]["patient_name"] == "[MASKED]"
+    assert result["nested_dict"]["patient_name"] == "***MASKED***"
     assert result["nested_dict"]["gender"] == "Female"
     assert result["nested_dict"]["age_in_months"] == 120
 
     # Nested list checks
-    assert result["nested_list"][0]["patient_name"] == "[MASKED]"
+    assert result["nested_list"][0]["patient_name"] == "***MASKED***"
     assert result["nested_list"][0]["gender"] == "Male"
     assert result["nested_list"][0]["age_in_months"] == 24
 
     # Nested tuple checks
     assert isinstance(result["nested_tuple"], tuple)
-    assert result["nested_tuple"][0]["patient_name"] == "[MASKED]"
+    assert result["nested_tuple"][0]["patient_name"] == "***MASKED***"
     assert result["nested_tuple"][0]["gender"] == "Female"
     assert result["nested_tuple"][0]["age_in_months"] == 36
 
@@ -354,7 +354,7 @@ def test_centralized_mapper_cached_fields_and_shared_pipeline() -> None:
     }
     mapped_custom = mapper.map_record(SimpleNamespace(**custom_record), study_key="STUDY-CUSTOM")
     assert mapper._pipeline_cache["STUDY-CUSTOM"] is custom_pipeline
-    assert mapped_custom["record_data"]["patient_name"] == "[MASKED]"
+    assert mapped_custom["record_data"]["patient_name"] == "***MASKED***"
     # Dynamic field snake_case conversion is preserved
     assert "vital_sign" in mapped_custom["record_data"]
 
@@ -523,16 +523,16 @@ def test_study_configuration_phi_fields_case_insensitive_in_document_and_tabular
         assert mapped["record_id"] == 777
 
         rd = mapped["record_data"]
-        assert rd["patient_name"] in {"***MASKED***", "[MASKED]"}
-        assert rd["dob"] in {"***MASKED***", "[MASKED]"}
-        assert rd["ssn"] in {"***MASKED***", "[MASKED]"}
-        assert rd["medical_record_number"] == "[MASKED]"
+        assert rd["patient_name"] == "***MASKED***"
+        assert rd["dob"] == "***MASKED***"
+        assert rd["ssn"] == "***MASKED***"
+        assert rd["medical_record_number"] == "***MASKED***"
         assert rd["gender"] == "Female"
         assert rd["heart_rate"] == 72
         if mode == "document":
-            assert rd["demographics"]["medicalRecordNumber"] == "[MASKED]"
+            assert rd["demographics"]["medicalRecordNumber"] == "***MASKED***"
         else:
-            assert rd["demographics.medical_record_number"] == "[MASKED]"
+            assert rd["demographics.medical_record_number"] == "***MASKED***"
 
     # Explicit opt-out skips PHI masking while keeping terminology enrichment active
     opt_out_mapper = CentralizedMapper(mode="document", mask_phi=False, study_config=study_cfg)
@@ -540,3 +540,156 @@ def test_study_configuration_phi_fields_case_insensitive_in_document_and_tabular
     assert unmasked["record_data"]["patient_name"] == "John Roe"
     assert unmasked["record_data"]["medical_record_number"] == "MRN-42"
     assert unmasked["record_data"]["gender"] == "Female"
+
+
+def test_enrichment_pipeline_masks_all_default_sensitivity_keys_and_honors_opt_out() -> None:
+    """Verify EnrichmentPipeline masks all default SensitivityRegistry keys even without custom Study rules."""
+    pipeline = EnrichmentPipeline(StudyConfiguration(study_key="STUDY-DEFAULT-PHI"))
+    assert pipeline._has_rules is False
+
+    payload = {
+        "study_key": "STUDY-DEFAULT-PHI",
+        "subject_key": "SUBJ-001",
+        "record_id": 12,
+        "SSN": "123-45-6789",
+        "DOB": "1982-11-05",
+        "patientName": "Alice Example",
+        "patientInitials": "AE",
+        "birthDate": "1982-11-05",
+        "dateOfBirth": "1982-11-05",
+        "email": "alice@example.org",
+        "phone": "555-0100",
+        "address": "100 Clinical Way",
+        "nested": [{"phone": "555-0199", "vital": 98}],
+        "pair": ({"address": "Suite 200", "ok": True},),
+    }
+
+    masked = pipeline.process(payload)
+    assert masked["study_key"] == "STUDY-DEFAULT-PHI"
+    assert masked["subject_key"] == "SUBJ-001"
+    assert masked["record_id"] == 12
+    for key in (
+        "SSN",
+        "DOB",
+        "patientName",
+        "patientInitials",
+        "birthDate",
+        "dateOfBirth",
+        "email",
+        "phone",
+        "address",
+    ):
+        assert masked[key] == "***MASKED***"
+    assert masked["nested"][0]["phone"] == "***MASKED***"
+    assert masked["nested"][0]["vital"] == 98
+    assert masked["pair"][0]["address"] == "***MASKED***"
+    assert masked["pair"][0]["ok"] is True
+
+    unmasked = pipeline.process(payload, mask_phi=False)
+    assert unmasked is payload
+    assert unmasked["SSN"] == "123-45-6789"
+
+
+def test_centralized_mapper_resolves_committed_study_config_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify CentralizedMapper auto-resolves ConfigVersionStore rules and fails closed on store errors."""
+    from imednet.integrations import enrichment as enrichment_mod
+    from imednet.integrations.enrichment import CentralizedMapper
+
+    committed_cfg = StudyConfiguration(
+        study_key="STUDY-GOVERNED",
+        phi_fields=["chartCode"],
+        terminology_lookups={"gender": {"1": "Male"}},
+    )
+
+    class _FakeStore:
+        def get_history(self, study_key: str) -> list[dict[str, str]]:
+            if study_key == "STUDY-GOVERNED":
+                return [{"commit_id": "abc123"}]
+            return []
+
+        def rollback_config(self, study_key: str, commit_id: str) -> StudyConfiguration:
+            assert study_key == "STUDY-GOVERNED"
+            assert commit_id == "abc123"
+            return committed_cfg
+
+    fake_ep = MagicMock()
+    fake_ep.load.return_value = _FakeStore
+    monkeypatch.setattr(enrichment_mod, "entry_points", lambda **_kw: [fake_ep])
+
+    mapper = CentralizedMapper(mode="document")
+    rec = SimpleNamespace(
+        record_id=88,
+        study_key="STUDY-GOVERNED",
+        subject_key="SUBJ-88",
+        record_data={"chartCode": "CRT-009", "SSN": "123-45-6789", "gender": "1"},
+    )
+    mapped = mapper.map_record(rec, study_key="STUDY-GOVERNED")
+    assert mapped["record_data"]["chart_code"] == "***MASKED***"
+    assert mapped["record_data"]["ssn"] == "***MASKED***"
+    assert mapped["record_data"]["gender"] == "Male"
+
+    # Fail closed when ConfigVersionStore raises (e.g., missing encryption key)
+    class _BrokenStore:
+        def __init__(self) -> None:
+            raise RuntimeError("Missing IMEDNET_CONFIG_ENCRYPTION_KEY")
+
+    broken_ep = MagicMock()
+    broken_ep.load.return_value = _BrokenStore
+    monkeypatch.setattr(enrichment_mod, "entry_points", lambda **_kw: [broken_ep])
+
+    fallback_mapper = CentralizedMapper(mode="document")
+    fallback_mapped = fallback_mapper.map_record(rec, study_key="STUDY-BROKEN")
+    assert fallback_mapped["record_data"]["ssn"] == "***MASKED***"
+    assert fallback_mapped["record_data"]["chart_code"] == "CRT-009"
+
+
+def test_real_config_version_store_end_to_end_and_missing_key_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Verify real ConfigVersionStore commits resolve via entry_points and fail closed on missing encryption key."""
+    from imednet.integrations.enrichment import CentralizedMapper, resolve_study_configuration
+    from imednet_workflows.config_version_control import ConfigVersionStore
+
+    db_file = tmp_path / "gov_store" / "config_versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv(
+        "IMEDNET_ENCRYPTION_KEY", "unit-test-encryption-secret"
+    )  # pragma: allowlist secret
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    mock_sdk = MagicMock()
+    mock_sdk.auth.get_user_roles.return_value = ["admin"]
+    mock_sdk.auth.get_user_id.return_value = "auditor-1"
+
+    cfg = StudyConfiguration(
+        study_key="STUDY-REAL-GOV",
+        phi_fields=["sponsorSubjectCode"],
+        terminology_lookups={"gender": {"1": "Male"}},
+    )
+    store = ConfigVersionStore(db_path=db_file)
+    store.commit_config("STUDY-REAL-GOV", cfg, "Initial PHI governance", sdk=mock_sdk)
+
+    resolved = resolve_study_configuration("STUDY-REAL-GOV")
+    assert resolved is not None
+    assert resolved.phi_fields == ["sponsorSubjectCode"]
+
+    rec = SimpleNamespace(
+        record_id=19,
+        study_key="STUDY-REAL-GOV",
+        subject_key="SUBJ-19",
+        record_data={"sponsorSubjectCode": "SP-19", "SSN": "123-45-6789", "gender": "1"},
+    )
+    mapped = CentralizedMapper(mode="document").map_record(rec, study_key="STUDY-REAL-GOV")
+    assert mapped["record_data"]["sponsor_subject_code"] == "***MASKED***"
+    assert mapped["record_data"]["ssn"] == "***MASKED***"
+    assert mapped["record_data"]["gender"] == "Male"
+
+    # Remove encryption keys: lookup fails closed to None, default SensitivityRegistry still masks SSN
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    assert resolve_study_configuration("STUDY-REAL-GOV") is None
+    closed_mapped = CentralizedMapper(mode="document").map_record(rec, study_key="STUDY-REAL-GOV")
+    assert closed_mapped["record_data"]["ssn"] == "***MASKED***"
+    assert closed_mapped["record_data"]["sponsor_subject_code"] == "SP-19"

@@ -42,3 +42,5 @@ class User(ImednetBaseModel):
 
     @computed_field
     def name(self) -> str: ...
+
+__all__ = ["Role", "User"]

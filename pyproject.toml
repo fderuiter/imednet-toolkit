@@ -74,7 +74,15 @@ warn_unused_ignores = false
 warn_redundant_casts = false
 ignore_missing_imports = true
 plugins = []
-exclude = '^(examples/.*|tests/.*|packages/.*/tests/.*|sandbox/.*)$'
+files = [
+    "packages/core/src/imednet",
+    "packages/plugins-workflows/src/imednet_workflows",
+    "packages/providers-airflow/src/apache_airflow_providers_imednet",
+    "packages/plugins-sinks/src/imednet_sinks",
+    "packages/plugins-tui/src/imednet_tui",
+    "tests/typing/endpoint_contracts.py",
+]
+exclude = '^(examples/.*|tests/(?!typing/endpoint_contracts\.py$).*|packages/.*/tests/.*|sandbox/.*)$'
 
 [[tool.mypy.overrides]]
 module = [

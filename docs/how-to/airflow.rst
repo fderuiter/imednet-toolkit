@@ -83,13 +83,19 @@ subpackages for clarity.
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
 records to any supported destination (CSV, Parquet, Snowflake, Neo4j, etc.)
 using the core SDK's universal sink interface. Common operational parameters
-(``batch_size``, ``max_retries``, ``idempotent``, ``quality_gate_enabled``, and
-``min_schema_readiness_score``) work consistently across plugin sinks and
-tabular exports without leaking sink-level options into Pandas or JSON writer
-kwargs. Destination-specific non-secret options—such as Snowflake staging
-settings (``stage_prefix``, ``local_staging_dir``, ``manifest_path``) and Neo4j
-``database`` names—can be supplied via ``export_kwargs`` or connection ``extra``
-metadata. ``ImednetJobSensor`` waits for an export job to complete.
+(``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
+``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
+across plugin sinks and tabular exports without leaking sink-level options into
+Pandas or JSON writer kwargs. PHI masking is enabled by default
+(``mask_phi=True``) across all tabular and sink destinations, replacing
+registered ``Subject`` identifiers and committed ``StudyConfiguration``
+``phiFields`` with ``***MASKED***``; authorized enclave workflows can explicitly
+opt out by passing ``mask_phi=False`` (or ``export_kwargs={"mask_phi": False}``)
+without mutating ``global_sensitivity_registry``. Destination-specific non-secret
+options—such as Snowflake staging settings (``stage_prefix``,
+``local_staging_dir``, ``manifest_path``) and Neo4j ``database`` names—can be
+supplied via ``export_kwargs`` or connection ``extra`` metadata.
+``ImednetJobSensor`` waits for an export job to complete.
 All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` instance
 from an Airflow connection. The production reference DAG above shows the recommended
 dynamic-mapping pattern: keep static settings (for example ``destination``,
