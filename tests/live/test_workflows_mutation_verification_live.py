@@ -59,8 +59,13 @@ def test_verify_subject_registration_outcome(
             subject_key = res.get("subjectKey")
 
     if subject_key:
-        subj = sdk.subjects.get(study_key, subject_key)
+        matched_subjects = list(sdk.get_subjects(study_key, subjectKey=subject_key))
+        assert matched_subjects, f"Subject {subject_key} not found"
+        subj = matched_subjects[0]
         assert subj.subject_key == subject_key
+        if subj.subject_id is not None:
+            fetched = sdk.subjects.get(study_key, subj.subject_id)
+            assert fetched.subject_id == subj.subject_id
         # Also check the record data
         records = list(sdk.get_records(study_key, subjectKey=subject_key, formKey=first_form_key))
         assert any(r.data.get(var_name) == unique_tag for r in records), "Record data mismatch"
@@ -147,14 +152,10 @@ def test_verify_update_scheduled_record_outcome(
     assert job.is_successful, f"Scheduled update job failed: {job.state}"
 
     # Step 3: Re-read and verify outcome
-    updated_records = list(
-        sdk.get_records(
-            study_key,
-            subjectKey=first_subject_key,
-            formKey=target.form_key,
-            intervalName=target.interval_name,
-        )
-    )
+    filter_kwargs = {"subjectKey": first_subject_key, "formKey": target.form_key}
+    if getattr(target, "interval_id", None) is not None:
+        filter_kwargs["intervalId"] = target.interval_id
+    updated_records = list(sdk.get_records(study_key, **filter_kwargs))
 
     assert any(r.data.get(var_name) == unique_tag for r in updated_records), (
         "Update not reflected in follow-up read"

@@ -52,6 +52,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sort: str | None = None,
         limit: int | None = None,
         fetch_all: bool = False,
+        no_interactive: bool = False,
     ) -> None:
         req_kwargs, effective_limit = prepare_list_query(
             filter_args=coding_filter,
@@ -59,6 +60,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             limit=limit,
             fetch_all=fetch_all,
             output_format=output_format,
+            no_interactive=no_interactive,
             model=Coding,
         )
 
@@ -95,6 +97,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "No codings found matching the criteria.",
             details=codings_list,
             truncated=truncated,
+            interactive=False if no_interactive else None,
         )
 
     list_parser.set_defaults(
@@ -105,5 +108,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )

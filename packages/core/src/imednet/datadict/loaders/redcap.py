@@ -376,6 +376,14 @@ def load_from_redcap(
         if ident_val:
             extra["identifier"] = ident_val
 
+        min_bound = known.get("textValidationMin")
+        if min_bound:
+            extra["textValidationMin"] = min_bound
+
+        max_bound = known.get("textValidationMax")
+        if max_bound:
+            extra["textValidationMax"] = max_bound
+
         choices = _parse_redcap_choices(raw_choices, field_type)
 
         req_raw = (known.get("requiredField") or "").lower()

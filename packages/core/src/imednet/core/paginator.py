@@ -12,6 +12,16 @@ MAX_PAGE_SIZE = LARGE_PAGE_SIZE
 ClientT = TypeVar("ClientT", RequesterProtocol, AsyncRequesterProtocol)
 
 
+def _parse_int_param(name: str, value: Any) -> int:
+    """Parse an integer pagination parameter, rejecting booleans, floats, and non-integers."""
+    if isinstance(value, (bool, float)):
+        raise ValueError(f"Pagination '{name}' must be an integer, got {type(value).__name__}.")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Pagination '{name}' must be an integer, got {value!r}.") from exc
+
+
 class BasePaginator(Generic[ClientT]):
     """Shared paginator implementation."""
 
@@ -32,7 +42,7 @@ class BasePaginator(Generic[ClientT]):
             client: Requester instance (sync or async).
             path: API path for the request.
             params: Query parameters.
-            page_size: Number of items per page (capped at 500 upstream).
+            page_size: Number of items per page (1 to 500).
             page_param: Query parameter name for the page index.
             size_param: Query parameter name for the page size.
             data_key: Key in the response JSON containing the items list.
@@ -48,16 +58,25 @@ class BasePaginator(Generic[ClientT]):
         self.metadata_key = metadata_key
 
         explicit_page = self.params.pop(self.page_param, None)
-        self._explicit_page = int(explicit_page) if explicit_page is not None else None
+        if explicit_page is not None:
+            parsed_page = _parse_int_param(self.page_param, explicit_page)
+            if parsed_page < 0:
+                raise ValueError(f"Pagination '{self.page_param}' must be >= 0, got {parsed_page}.")
+            self._explicit_page: int | None = parsed_page
+        else:
+            self._explicit_page = None
 
         explicit_size = self.params.pop(self.size_param, None)
         if explicit_size is None:
             explicit_size = self.params.pop("limit", None)
 
-        raw_size = int(explicit_size) if explicit_size is not None else int(page_size)
-        if raw_size <= 0:
-            raise ValueError(f"page_size must be a positive integer, got {raw_size}")
-        self.page_size = min(raw_size, MAX_PAGE_SIZE)
+        raw_size = explicit_size if explicit_size is not None else page_size
+        parsed_size = _parse_int_param(self.size_param, raw_size)
+        if parsed_size < 1 or parsed_size > MAX_PAGE_SIZE:
+            raise ValueError(
+                f"Pagination '{self.size_param}' must be between 1 and {MAX_PAGE_SIZE}, got {parsed_size}."
+            )
+        self.page_size = parsed_size
         self._cursor: int | None = None
         self._remaining_in_page: int = 0
         self._exhausted = False

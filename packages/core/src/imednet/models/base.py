@@ -19,6 +19,7 @@ from typing import (
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from imednet.utils.validators import (
+    _guard_str_container,
     is_missing_value,
     parse_bool,
     parse_datetime,
@@ -38,7 +39,12 @@ def _identity(v: Any) -> Any:
 
 def _optional_str(v: Any) -> Any:
     """Convert value to string, returning None if missing."""
-    return None if is_missing_value(v) else parse_str_or_default(v)
+    if is_missing_value(v):
+        return None
+    if isinstance(v, (list, dict)):
+        _guard_str_container(v)
+        return None
+    return parse_str_or_default(v)
 
 
 def _optional_int(v: Any) -> Any:
@@ -152,6 +158,7 @@ class ImednetBaseModel(BaseModel):
         extra="ignore",
         populate_by_name=True,
         str_strip_whitespace=True,
+        hide_input_in_errors=True,
     )
 
     @classmethod

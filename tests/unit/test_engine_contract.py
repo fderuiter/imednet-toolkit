@@ -193,6 +193,306 @@ def test_postman_bundled_asset_identical_to_root():
     )
 
 
+def test_parse_postman_type_infers_literals_and_checks_bool_before_int():
+    """Verify ContractBuilder.parse_postman_type infers scalar and container types with None defaults."""
+    from imednet.models.contract import ContractBuilder
+
+    builder = ContractBuilder()
+    assert builder.parse_postman_type(True) == ("boolean", None)
+    assert builder.parse_postman_type(False) == ("boolean", None)
+    assert builder.parse_postman_type("<boolean>") == ("boolean", None)
+    assert builder.parse_postman_type(0) == ("integer", None)
+    assert builder.parse_postman_type(42) == ("integer", None)
+    assert builder.parse_postman_type("<integer>") == ("integer", None)
+    assert builder.parse_postman_type("") == ("string", None)
+    assert builder.parse_postman_type("literal") == ("string", None)
+    assert builder.parse_postman_type("<string>") == ("string", None)
+    assert builder.parse_postman_type({}) == ("dict", None)
+    assert builder.parse_postman_type([]) == ("list", None)
+    assert builder.parse_postman_type(None) == ("any", None)
+
+
+def test_zero_any_fields_across_collection_models_and_job():
+    """Verify zero documented attributes resolve to typing.Any across all SDK contract models except JobStatus.results."""
+    from typing import Any
+
+    from imednet.models.codings import Coding
+    from imednet.models.forms import Form
+    from imednet.models.intervals import Interval
+    from imednet.models.jobs import Job, JobStatus
+    from imednet.models.queries import Query
+    from imednet.models.record_revisions import RecordRevision
+    from imednet.models.records import Record
+    from imednet.models.sites import Site
+    from imednet.models.studies import Study
+    from imednet.models.subjects import Subject
+    from imednet.models.users import User
+    from imednet.models.variables import Variable
+    from imednet.models.visits import Visit
+
+    models_without_any = [
+        Form,
+        Variable,
+        Interval,
+        Site,
+        Subject,
+        Record,
+        RecordRevision,
+        Coding,
+        Query,
+        Visit,
+        User,
+        Study,
+        Job,
+    ]
+    for model_cls in models_without_any:
+        any_fields = [
+            fname for fname, finfo in model_cls.model_fields.items() if finfo.annotation is Any
+        ]
+        assert any_fields == [], f"{model_cls.__name__} retains typing.Any fields: {any_fields}"
+
+    job_status_any = [
+        fname for fname, finfo in JobStatus.model_fields.items() if finfo.annotation is Any
+    ]
+    assert job_status_any == ["results"]
+
+
+def test_all_nullable_integer_and_boolean_contract_attributes_default_to_none():
+    """Verify all nullable integer and boolean contract attributes default to None when omitted."""
+    contract = get_contract()
+    int_bool_count = 0
+    for model_name, model_def in contract.models.items():
+        dyn_cls = ModelEngine.get_model(model_name)
+        instance = dyn_cls.from_json({})
+        for fname, fdef in model_def.fields.items():
+            if fdef.type_name in {"integer", "boolean"}:
+                int_bool_count += 1
+                assert fdef.default_value is None, f"{model_name}.{fname} default is not None"
+                assert getattr(instance, fname) is None, (
+                    f"{model_name}.{fname} resolved to {getattr(instance, fname)!r} instead of None"
+                )
+    assert int_bool_count >= 46
+
+
+def test_record_from_json_defaults_and_typed_keywords():
+    """Verify Record.from_json preserves None nullable IDs/booleans and parses Keyword objects."""
+    from datetime import UTC, datetime
+
+    from imednet.models.records import Keyword, Record
+
+    minimal = Record.from_json({"studyKey": "S1", "recordId": 1})
+    assert minimal.visit_id is None
+    assert minimal.parent_record_id is None
+    assert minimal.deleted is None
+    assert minimal.keywords == []
+    assert minimal.record_data == {}
+
+    with_keywords = Record.from_json(
+        {
+            "studyKey": "S1",
+            "recordId": 2,
+            "keywords": [
+                {
+                    "keywordName": "Safety Review",
+                    "keywordKey": "SAFE_REV",
+                    "keywordId": 77,
+                    "dateAdded": "2026-05-13T14:06:50Z",
+                }
+            ],
+            "recordData": {"AETERM": "Nausea"},
+        }
+    )
+    assert len(with_keywords.keywords) == 1
+    kw = with_keywords.keywords[0]
+    assert isinstance(kw, Keyword)
+    assert kw.keyword_id == 77
+    assert kw.keyword_key == "SAFE_REV"
+    assert kw.keyword_name == "Safety Review"
+    assert kw.date_added == datetime(2026, 5, 13, 14, 6, 50, tzinfo=UTC)
+    assert with_keywords.record_data == {"AETERM": "Nausea"}
+
+
+def test_coding_and_form_documented_types():
+    """Verify Coding numeric fields and Form.other_forms boolean field preserve documented types."""
+    from imednet.models.codings import Coding
+    from imednet.models.forms import Form
+
+    coding = Coding.from_json({"codingId": 1, "revision": 2, "reason": "Fix"})
+    assert coding.coding_id == 1 and type(coding.coding_id) is int
+    assert coding.revision == 2 and type(coding.revision) is int
+    assert coding.reason == "Fix" and type(coding.reason) is str
+
+    form = Form.from_json({"otherForms": True})
+    assert form.other_forms is True
+    assert Form.from_json({}).other_forms is None
+
+
+def test_user_from_json_roles_timestamp_arrays_and_strict_mode(monkeypatch):
+    """Verify User.from_json validates Role items, parses 7-element timestamps, and rejects extra nested keys in strict mode."""
+    from datetime import UTC, datetime
+
+    from pydantic import ValidationError
+
+    from imednet.models.users import Role, User
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "true")
+    user = User.from_json(
+        {
+            "userId": "u-1",
+            "login": "auditor",
+            "firstName": "Ada",
+            "lastName": "Lovelace",
+            "email": "ada@example.com",
+            "userActiveInStudy": True,
+            "roles": [
+                {
+                    "dateCreated": [2026, 5, 13, 14, 6, 50, 612000000],
+                    "dateModified": [2026, 5, 13, 14, 6, 50, 613000000],
+                    "roleId": "DATA_MGR",
+                    "communityId": 12,
+                    "name": "Data Manager",
+                    "description": "Clinical data review",
+                    "level": 2,
+                    "type": "Study",
+                    "inactive": False,
+                }
+            ],
+        }
+    )
+    assert len(user.roles) == 1
+    role = user.roles[0]
+    assert isinstance(role, Role)
+    assert role.role_id == "DATA_MGR"
+    assert role.community_id == 12
+    assert role.date_created == datetime(2026, 5, 13, 14, 6, 50, 612000, tzinfo=UTC)
+    assert role.date_modified == datetime(2026, 5, 13, 14, 6, 50, 613000, tzinfo=UTC)
+
+    with pytest.raises(ValidationError, match="undocumentedNestedKey"):
+        User.from_json(
+            {
+                "userId": "u-2",
+                "roles": [
+                    {
+                        "roleId": "R1",
+                        "undocumentedNestedKey": "unexpected",
+                    }
+                ],
+            }
+        )
+
+    with pytest.raises(ValidationError, match="7-element integer timestamp array"):
+        User.from_json(
+            {
+                "userId": "u-3",
+                "roles": [{"roleId": "R1", "dateCreated": [2026, 5, 13]}],
+            }
+        )
+
+    with pytest.raises(ValidationError, match="Nanosecond component out of range"):
+        User.from_json(
+            {
+                "userId": "u-4",
+                "roles": [
+                    {
+                        "roleId": "R1",
+                        "dateCreated": [2026, 5, 13, 14, 6, 50, 1_000_000_000],
+                    }
+                ],
+            }
+        )
+
+
+def test_bundled_and_local_fallback_contract_resolution(monkeypatch):
+    """Verify bundled resource loading and local workspace fallback when env vars are unset."""
+    monkeypatch.delenv("IMEDNET_OPENAPI_PATH", raising=False)
+    monkeypatch.delenv("IMEDNET_POSTMAN_PATH", raising=False)
+
+    contract = get_contract()
+    assert EXPECTED_14_MODELS.issubset(set(contract.models.keys()))
+    assert engine.to_snake("recordRevisionId") == "record_revision_id"
+    assert "study_key" in engine.ResourceRegistry.get_fields("Study")
+
+    # Exercise fallback from imednet.resources to imednet/resources
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+    orig_files = engine.importlib.resources.files
+
+    def fallback_files(pkg: str):
+        if pkg == "imednet.resources":
+            raise ModuleNotFoundError(pkg)
+        return orig_files(pkg)
+
+    monkeypatch.setattr(engine.importlib.resources, "files", fallback_files)
+    contract_fallback = get_contract()
+    assert "Record" in contract_fallback.models
+
+    # Exercise local dev checkout fallback when bundled resource reports is_file() == False
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+
+    class NonFileResource:
+        def is_file(self) -> bool:
+            return False
+
+    class FakePkgRoot:
+        def joinpath(self, *_args):
+            return NonFileResource()
+
+    monkeypatch.setattr(engine.importlib.resources, "files", lambda _pkg: FakePkgRoot())
+    contract_local = get_contract()
+    assert "Subject" in contract_local.models
+
+
+def test_model_engine_tracer_none_and_unknown_or_any_fields(monkeypatch):
+    """Verify ModelEngine handles tracer=None, unknown models, and fallback Any field definitions."""
+    from typing import Any
+
+    from imednet.models.contract import APIContract, FieldDefinition, ModelDefinition
+
+    monkeypatch.setattr(engine, "tracer", None)
+    unknown_cls = ModelEngine.get_model("UnregisteredSyntheticModel")
+    assert issubclass(unknown_cls, BaseModel)
+    assert unknown_cls.model_fields == {}
+
+    synthetic_contract = APIContract(
+        models={
+            "SyntheticAny": ModelDefinition(
+                name="SyntheticAny",
+                fields={
+                    "mystery_payload": FieldDefinition(
+                        name="mystery_payload",
+                        type_name="any",
+                        default_value=None,
+                        alias="mysteryPayload",
+                    ),
+                    "nested_map": FieldDefinition(
+                        name="nested_map",
+                        type_name="dict",
+                        default_value=None,
+                        alias="nestedMap",
+                    ),
+                    "nested_items": FieldDefinition(
+                        name="nested_items",
+                        type_name="list",
+                        default_value=None,
+                        alias="nestedItems",
+                    ),
+                },
+            )
+        }
+    )
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", synthetic_contract)
+    monkeypatch.setattr(ModelEngine, "_model_cache", {})
+    any_cls = ModelEngine.get_model("SyntheticAny")
+    assert any_cls.model_fields["mystery_payload"].annotation is Any
+    assert (
+        engine._format_runtime_annotation(any_cls.model_fields["nested_map"].annotation)
+        == "dict[str, Any] | None"
+    )
+    assert (
+        engine._format_runtime_annotation(any_cls.model_fields["nested_items"].annotation)
+        == "list[Any] | None"
+    )
+
+
 def test_generate_stubs_matches_committed_pyi_files(tmp_path):
     """Verify ModelEngine.generate_stubs reproduces all 13 committed .pyi stubs byte-for-byte."""
     import shutil
@@ -240,19 +540,32 @@ def test_stub_cli_check_detects_drift_and_missing_stubs(tmp_path):
     assert engine._run_cli([str(tmp_path)]) == 0
     assert engine._run_cli(["--check", str(tmp_path)]) == 0
 
+    # Add an unexpected stub and verify --check catches it
+    extra_pyi = tmp_path / "unexpected_extra.pyi"
+    extra_pyi.write_text("X: int\n", encoding="utf-8")
+    assert engine._run_cli(["--check", str(tmp_path)]) == 1
+    extra_pyi.unlink()
+
     # Delete a stub and verify --check catches missing committed stub
     studies_pyi.unlink()
     assert engine._run_cli(["--check", str(tmp_path)]) == 1
 
 
-def test_ast_stub_generator_resolves_base_cls_strips_bodies_and_prunes_imports(tmp_path):
+def test_ast_stub_generator_resolves_base_cls_strips_bodies_and_prunes_imports(
+    tmp_path, monkeypatch
+):
     """Verify AST stub generator resolves base_cls, strips method bodies, preserves Enums, and prunes imports."""
+    (tmp_path / "__init__.py").write_text('"""Init."""\n', encoding="utf-8")
+    (tmp_path / "plain_helper.py").write_text("X = 1\n", encoding="utf-8")
+
     sample_py = tmp_path / "sample_model.py"
     sample_py.write_text(
-        '''"""Sample dynamic model module."""
+        '''# pylint: disable=duplicate-code
+"""Sample dynamic model module."""
 
 from __future__ import annotations
 
+import dataclasses
 from enum import Enum
 from typing import Any, Optional
 
@@ -260,6 +573,13 @@ from pydantic import Field, computed_field
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
+
+MODULE_CONST: str = "v1"
+
+
+@dataclasses.dataclass
+class EmptyMarker:
+    pass
 
 
 class SampleState(str, Enum):
@@ -284,27 +604,50 @@ class BaseSample(ImednetBaseModel):
         return value
 
 
-SampleStudy = ModelEngine.get_model("Study", BaseSample)
+async def long_async_helper(
+    first_parameter_name: str,
+    second_parameter_name: str,
+    *,
+    third_keyword_only: int | None = None,
+    **kwargs: str,
+) -> bool:
+    return bool(first_parameter_name and second_parameter_name and third_keyword_only and kwargs)
+
+
+SampleStudy = ModelEngine.get_model("Study", base_cls=BaseSample)
+StudyAlias = SampleStudy
 ''',
         encoding="utf-8",
     )
 
+    monkeypatch.setattr(engine, "tracer", None)
     ModelEngine.generate_stubs(str(tmp_path))
+    assert not (tmp_path / "__init__.pyi").exists()
+    assert not (tmp_path / "plain_helper.pyi").exists()
+
     pyi_file = tmp_path / "sample_model.pyi"
     assert pyi_file.exists()
     content = pyi_file.read_text(encoding="utf-8")
+
+    # Leading pylint comment preserved
+    assert content.startswith("# pylint: disable=duplicate-code\n")
 
     # Unused ModelEngine, Optional, computed_field, and Any must be pruned
     assert "ModelEngine" not in content
     assert "Optional" not in content
     assert "Any" not in content
     assert "computed_field" not in content
+    assert "import dataclasses" in content
 
     # Enum literal assignments preserved and method bodies stripped
     assert 'OPEN = "OPEN"' in content
     assert 'COMPLETED = "COMPLETED"' in content
     assert "def is_done(self) -> bool: ..." in content
     assert 'def helper(self, prefix: str = "x") -> str: ...' in content
+    assert "@dataclasses.dataclass\nclass EmptyMarker: ..." in content
+    assert "async def long_async_helper(" in content
+    assert "MODULE_CONST: str" in content
+    assert "StudyAlias = SampleStudy" in content
     assert "value =" not in content
 
     # Optional normalized to PEP 604 union and base_cls resolved for synthesized SampleStudy

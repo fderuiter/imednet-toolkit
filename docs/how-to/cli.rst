@@ -91,15 +91,32 @@ retain their own contracts. This is not a global JSON wrapper for plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
 
+Terminal capabilities and non-interactive mode
+----------------------------------------------
+
+Multi-item ``list`` commands open an interactive keyboard grid when both ``stdin``
+and ``stdout`` are connected to a capable TTY, while single-job commands
+(``imednet jobs status`` and ``imednet jobs wait``) always print a static summary
+table to ``stdout`` and exit immediately.
+
+Pass ``--no-interactive`` (at the root command or on read/workflow subcommands) or
+set ``IMEDNET_NON_INTERACTIVE=1`` to disable full-screen ``curses`` grids, live
+``stderr`` spinners, and interactive ``stdin`` prompts. Set ``NO_COLOR=1`` (or any
+non-empty value) or ``TERM=dumb`` to suppress ANSI color escape sequences across
+tables and diagnostics while preserving ``--high-contrast`` palettes when color
+output is permitted. Interactive workflow wizards reject piped or non-TTY ``stdin``
+streams immediately with exit code ``1``.
+
 Server-side filters, sorting, and bounded fetches
 -------------------------------------------------
 
 Eleven filter-capable ``list`` commands (``studies``, ``sites``, ``forms``,
 ``intervals``, ``queries``, ``record-revisions``, ``variables``, ``visits``,
 ``records``, ``subjects``, and ``codings``) accept repeatable ``-f`` / ``--filter``
-arguments using ``=`` or the seven iMednet comparison operators (``<``, ``<=``,
-``>``, ``>=``, ``==``, ``!=``, ``=~``) with exclusive ``;`` (AND) or ``,`` (OR)
-connectors. ``records list`` additionally exposes ``--record-data-filter`` to filter
+arguments using ``=`` or the standard iMednet comparison operators (``<``, ``<=``,
+``>``, ``>=``, ``==``, ``!=``) with exclusive ``;`` (AND) or ``,`` (OR) connectors.
+``records list`` additionally exposes ``--record-data-filter`` (supporting ``=~``
+regular-expression matching in addition to the six standard operators) to filter
 Form Variable values on the server. All twelve ``list`` commands—including
 ``users list``—accept ``--sort``, ``--limit``, and ``--all``.
 
@@ -113,5 +130,7 @@ Form Variable values on the server. All twelve ``list`` commands—including
 Interactive TTY table sessions fetch one bounded page of 100 items by default and
 display a truncation notice when additional Study items exist; pass ``--limit N``
 (upstream ``size`` is automatically capped at 500 per page) or ``--all`` to retrieve
-larger batches. Headless ``--format json`` and file exports (``--output json|csv``)
-continue to fetch all matching pages unless ``--limit`` is explicitly specified.
+larger batches. Non-interactive runs (``--no-interactive``,
+``IMEDNET_NON_INTERACTIVE=1``, or piped ``stdout``), headless ``--format json``, and
+file exports (``--output json|csv``) continue to fetch all matching pages unless
+``--limit`` is explicitly specified.

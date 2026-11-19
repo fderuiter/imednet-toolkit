@@ -193,13 +193,18 @@ def test_all_eleven_filterable_list_commands_accept_filter_sort_limit_and_all(
         )
     )
 
+    filter_expr = (
+        "studyKey==S1,lastUpdated>=2025-01-01"
+        if not needs_study
+        else "lastUpdated>=2025-01-01,lastUpdated<=2025-12-31"
+    )
     argv = [subcommand, "list"]
     if needs_study:
         argv.append("S1")
     argv.extend(
         [
             "-f",
-            "studyKey==S1,lastUpdated>=2025-01-01",
+            filter_expr,
             "--sort",
             "lastUpdated,asc",
             "--limit",
@@ -213,7 +218,7 @@ def test_all_eleven_filterable_list_commands_accept_filter_sort_limit_and_all(
 
     assert route.call_count == 1
     params = dict(route.calls[0].request.url.params)
-    assert params["filter"] == "studyKey==S1,lastUpdated>=2025-01-01"
+    assert params["filter"] == filter_expr
     assert params["sort"] == "lastUpdated,asc"
     assert params["size"] == "25"
     assert params["page"] == "0"
@@ -450,11 +455,13 @@ def test_upstream_size_capped_at_500_when_limit_exceeds_500(
     envelope = json.loads(capfd.readouterr().out)
     assert envelope["count"] == 1200
 
-    # Direct Paginator instantiation also caps page_size at 500 and rejects <= 0
-    paginator = Paginator(MagicMock(), "/items", page_size=999)
+    # Direct Paginator instantiation enforces 1 <= page_size <= 500
+    paginator = Paginator(MagicMock(), "/items", page_size=500)
     assert paginator.page_size == 500
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises(ValueError, match="between 1 and 500"):
         Paginator(MagicMock(), "/items", page_size=0)
+    with pytest.raises(ValueError, match="between 1 and 500"):
+        Paginator(MagicMock(), "/items", page_size=999)
 
 
 @pytest.mark.parametrize(

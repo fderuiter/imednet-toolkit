@@ -41,20 +41,22 @@ async def test_iterates_pages():
 
 
 @pytest.mark.asyncio
-async def test_async_paginator_caps_page_size_and_tracks_has_more() -> None:
-    """AsyncPaginator caps page_size/size at 500, rejects <= 0, and tracks has_more."""
+async def test_async_paginator_bounds_and_tracks_has_more() -> None:
+    """AsyncPaginator enforces 1 <= size <= 500 and tracks has_more across page boundaries."""
     client = DummyAsyncClient(
         [
             {"data": [10, 20], "pagination": {"page": 0, "size": 500, "totalPages": 3}},
             {"data": [30], "pagination": {"page": 1, "size": 500, "totalPages": 2}},
         ]
     )
-    paginator = AsyncPaginator(client, "/items", params={"size": 1200}, page_size=999)
+    paginator = AsyncPaginator(client, "/items", params={"size": 500}, page_size=100)
     assert paginator.page_size == 500
     assert paginator.has_more is False
 
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises(ValueError, match="between 1 and 500"):
         AsyncPaginator(client, "/items", page_size=0)
+    with pytest.raises(ValueError, match="between 1 and 500"):
+        AsyncPaginator(client, "/items", params={"size": 1200})
 
     ait = paginator.__aiter__()
     first = await ait.__anext__()

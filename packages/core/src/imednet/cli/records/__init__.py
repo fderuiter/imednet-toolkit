@@ -45,6 +45,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sort: str | None = None,
         limit: int | None = None,
         fetch_all: bool = False,
+        no_interactive: bool = False,
     ) -> None:
         if output and output_format == "json":
             print_error("Choose --format json for stdout or --output for a file.")
@@ -61,6 +62,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             fetch_all=fetch_all,
             output_format=output_format,
             has_output_file=bool(output),
+            no_interactive=no_interactive,
         )
 
         with fetching_status("records", study_key):
@@ -91,6 +93,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 "No records found.",
                 details=records,
                 truncated=truncated,
+                interactive=False if no_interactive else None,
             )
 
     list_parser.set_defaults(
@@ -103,5 +106,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
+            no_interactive=getattr(args, "no_interactive", False),
         )
     )

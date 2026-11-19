@@ -48,6 +48,19 @@ Provide ``api_key`` and ``security_key`` via the login/password fields or in the
 environment. The hook merges these settings with values from
 ``imednet.config.load_config`` so environment variables still apply.
 
+For warehouse, graph, document, and transactional SQL exports, configure a
+separate Airflow connection and pass ``destination_conn_id`` on
+``ImednetExportOperator``. ``ImednetHook.resolve_destination_connection()``
+resolves destination credentials (Snowflake ``account``/``user``/``password``
+and coordinates, Neo4j ``uri``/``auth``/``database``, MongoDB ``uri`` and
+database settings, or SQLAlchemy connection URIs) at task execution time rather
+than embedding secrets in DAG definitions.
+
+To prevent credential leakage in Airflow rendered task metadata and XComs,
+templated fields (``export_kwargs`` and ``output_path``) reject raw secret keys
+(such as ``password``, ``auth``, ``api_key``, ``security_key``, ``token``, or
+``conn_str`` containing credentials) as well as URIs with embedded userinfo.
+
 For task-mapping discovery steps, ``ImednetHook`` provides explicit helper methods:
 
 - ``get_conn()`` returns the live :class:`~imednet.ImednetSDK` adhering to the
@@ -59,6 +72,8 @@ For task-mapping discovery steps, ``ImednetHook`` provides explicit helper metho
 - ``list_study_keys()`` returns primitive study keys only.
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
+- ``resolve_destination_connection()`` resolves runtime destination connection
+  settings for ``snowflake``, ``neo4j``, ``mongodb``, and ``sql`` targets.
 
 Operators and Sensors
 ---------------------
@@ -68,13 +83,18 @@ subpackages for clarity.
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
 records to any supported destination (CSV, Parquet, Snowflake, Neo4j, etc.)
 using the core SDK's universal sink interface. Common operational parameters
-(such as ``batch_size`` and ``max_retries``) work identically across all
-destinations. ``ImednetJobSensor`` waits for an export job to complete.
+(``batch_size``, ``max_retries``, ``idempotent``, ``quality_gate_enabled``, and
+``min_schema_readiness_score``) work consistently across plugin sinks and
+tabular exports without leaking sink-level options into Pandas or JSON writer
+kwargs. Destination-specific non-secret options—such as Snowflake staging
+settings (``stage_prefix``, ``local_staging_dir``, ``manifest_path``) and Neo4j
+``database`` names—can be supplied via ``export_kwargs`` or connection ``extra``
+metadata. ``ImednetJobSensor`` waits for an export job to complete.
 All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` instance
 from an Airflow connection. The production reference DAG above shows the recommended
-dynamic-mapping pattern: keep static settings (for example ``destination`` and
-``imednet_conn_id``) in ``.partial(...)`` and map only runtime fields
-(``study_key``, ``output_path``, ``export_kwargs``).
+dynamic-mapping pattern: keep static settings (for example ``destination``,
+``imednet_conn_id``, and ``destination_conn_id``) in ``.partial(...)`` and map
+only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs``).
 
 .. testcode::
 
@@ -99,8 +119,34 @@ dynamic-mapping pattern: keep static settings (for example ``destination`` and
        destination="csv",
        batch_size=1000,
        max_retries=5,
+       idempotent=True,
+       quality_gate_enabled=True,
+       min_schema_readiness_score=95.0,
        imednet_conn_id="imednet_default",
    ).expand_kwargs(export_targets())
+
+For warehouse or database sinks, bind ``destination_conn_id`` so credentials are
+resolved only inside ``execute()``:
+
+.. code-block:: python
+
+   ImednetExportOperator(
+       task_id="export_snowflake",
+       study_key="MY_STUDY",
+       destination="snowflake",
+       imednet_conn_id="imednet_default",
+       destination_conn_id="snowflake_warehouse",
+       batch_size=1000,
+       max_retries=5,
+       idempotent=True,
+       quality_gate_enabled=True,
+       min_schema_readiness_score=95.0,
+       export_kwargs={
+           "table": "CLINICAL_RECORDS",
+           "stage_prefix": "imednet/MY_STUDY",
+           "manifest_path": "/tmp/imednet_manifest.jsonl",
+       },
+   )
 
 Testing with Airflow
 --------------------

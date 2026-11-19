@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
-from imednet.core.endpoint.strategies import PopStudyKeyStrategy
 from imednet.core.endpoint.structs import ParamState
 from imednet.core.protocols import ParamProcessor
 from imednet.models.users import User
@@ -37,10 +36,14 @@ class UsersParamProcessor(ParamProcessor):
         else:
             special_params["includeInactive"] = "false"
 
-        # Handle page, size, sort
+        # Handle page, size, sort, and raw filter
         for key in ("page", "size", "sort"):
             if key in filters:
-                special_params[key] = filters.pop(key)
+                val = filters.pop(key)
+                if val is not None:
+                    special_params[key] = val
+        if "filter" in filters:
+            special_params["filter"] = filters.pop("filter")
 
         return filters, special_params
 
@@ -50,8 +53,8 @@ class UsersOperationDef:
 
     PATH = "users"
     MODEL = User
-    STUDY_KEY_STRATEGY = PopStudyKeyStrategy()
     PARAM_PROCESSOR = UsersParamProcessor()
+    FILTER_ATTRIBUTES: frozenset[str] = frozenset()
 
     def _resolve_params(
         self,
@@ -104,10 +107,13 @@ class UsersOperationDef:
             params.update(extra_params)
 
         if "size" in params and params["size"] is not None:
-            raw_size = int(params["size"])
+            from imednet.constants import LARGE_PAGE_SIZE
+            from imednet.core.paginator import _parse_int_param
+
+            raw_size = _parse_int_param("size", params["size"])
             if raw_size <= 0:
                 raise ValueError(f"size must be a positive integer, got {raw_size}")
-            params["size"] = min(raw_size, 500)
+            params["size"] = min(raw_size, LARGE_PAGE_SIZE)
 
         # Ensure 'filter' is never generated under any circumstances
         params.pop("filter", None)

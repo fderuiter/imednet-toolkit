@@ -81,6 +81,7 @@ def _async_trace_method(
 if TYPE_CHECKING:
     from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
     from imednet.endpoints.records import AsyncRecordsEndpoint, RecordsEndpoint
+    from imednet.validation.cache import ValidationSchemaProtocol
 
 
 T = TypeVar("T")
@@ -214,7 +215,7 @@ class SyncSDKConvenienceMixin:
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Create records in the specified study."""
         return self.records.create(
@@ -294,7 +295,7 @@ class AsyncSDKConvenienceMixin:
         records_data: list[JsonDict],
         email_notify: bool | str | None = None,
         *,
-        schema: Any = None,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously create records in the specified study."""
         return await self.records.create(

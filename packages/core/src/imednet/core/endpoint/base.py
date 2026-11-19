@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, TypeVar
 
 from imednet.constants import DEFAULT_PAGE_SIZE, LARGE_PAGE_SIZE
@@ -19,17 +19,21 @@ from imednet.core.endpoint.operations import FilterGetOperation, ListOperation
 from imednet.core.endpoint.operations.get import PathGetOperation
 from imednet.core.endpoint.strategies import (
     DefaultParamProcessor,
-    KeepStudyKeyStrategy,
     OptionalStudyKeyStrategy,
+    PopStudyKeyStrategy,
     StudyKeyStrategy,
 )
 from imednet.core.endpoint.structs import ListRequestState, ParamState
 from imednet.core.paginator import AsyncPaginator, Paginator
 from imednet.core.parsing import get_model_parser
 from imednet.core.protocols import AsyncRequesterProtocol, ParamProcessor, RequesterProtocol
+from imednet.errors.validation import ConfigurationError
 from imednet.models.base import ImednetBaseModel
 from imednet.utils.filters import (
+    _snake_to_camel,
     build_filter_string,
+    extract_filter_attributes,
+    validate_filter_key,
     validate_filter_syntax,
     validate_record_filter,
 )
@@ -142,6 +146,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
     PARAM_PROCESSOR: ParamProcessor | None = None
     PARAM_PROCESSOR_CLS: type[ParamProcessor] = DefaultParamProcessor
     STUDY_KEY_STRATEGY: StudyKeyStrategy | None = None
+    FILTER_ATTRIBUTES: frozenset[str] | None = None
 
     @property
     def study_key_strategy(self) -> StudyKeyStrategy:
@@ -149,7 +154,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
         if self.STUDY_KEY_STRATEGY:
             return self.STUDY_KEY_STRATEGY
         if self.requires_study_key:
-            return KeepStudyKeyStrategy()
+            return PopStudyKeyStrategy()
         return OptionalStudyKeyStrategy()
 
     @property
@@ -158,6 +163,34 @@ class _ListEndpointBase(GenericEndpoint[T]):
         if self.PARAM_PROCESSOR:
             return self.PARAM_PROCESSOR
         return self.PARAM_PROCESSOR_CLS()
+
+    def _validate_filter_attributes(
+        self,
+        raw_keys: Iterable[str],
+        *,
+        normalize_snake: bool,
+    ) -> None:
+        """Validate filter keys against the endpoint's documented allowlist."""
+        invalid: list[str] = []
+        for key in raw_keys:
+            if normalize_snake:
+                validate_filter_key(key)
+                attr = _snake_to_camel(key)
+            else:
+                attr = key
+            if self.FILTER_ATTRIBUTES is not None and attr not in self.FILTER_ATTRIBUTES:
+                label = f"{key} ({attr})" if normalize_snake and key != attr else attr
+                invalid.append(label)
+
+        if invalid:
+            invalid_str = ", ".join(dict.fromkeys(invalid))
+            allowed_str = (
+                ", ".join(sorted(self.FILTER_ATTRIBUTES)) if self.FILTER_ATTRIBUTES else "none"
+            )
+            raise ConfigurationError(
+                f"Unsupported filter attribute(s) for {self.__class__.__name__}: "
+                f"{invalid_str}. Allowed filter attributes: {allowed_str}."
+            )
 
     def _resolve_params(
         self,
@@ -175,8 +208,8 @@ class _ListEndpointBase(GenericEndpoint[T]):
         Returns:
             A ParamState containing the resolved study, parameters, and other filters.
         """
+        explicit_study_key_filter = study_key is not None and "studyKey" in filters
         filters = self._auto_filter(filters.copy())
-        raw_filter = filters.pop("filter", None)
 
         processed_filters, special_params = self.param_processor.process_filters(filters)
         if special_params:
@@ -192,28 +225,42 @@ class _ListEndpointBase(GenericEndpoint[T]):
         study, processed_filters = self.study_key_strategy.process(processed_filters)
         self._validate_study_key(study)
 
+        keys_to_validate = list(processed_filters.keys())
+        if explicit_study_key_filter and "studyKey" not in keys_to_validate:
+            keys_to_validate.append("studyKey")
+        self._validate_filter_attributes(keys_to_validate, normalize_snake=True)
+
         other_filters = {k: v for k, v in processed_filters.items() if k != "studyKey"}
 
-        params: dict[str, Any] = {}
+        raw_filter = extra_params.get("filter") if extra_params else None
         if raw_filter is not None:
             validate_filter_syntax(raw_filter)
-            stripped_raw = raw_filter.strip()
-            if stripped_raw and stripped_raw.lower() != "none":
-                if other_filters:
-                    combined = f"{raw_filter};{build_filter_string(other_filters)}"
-                    validate_filter_syntax(combined)
-                    params["filter"] = combined
-                else:
-                    params["filter"] = raw_filter
-            elif other_filters:
-                params["filter"] = build_filter_string(other_filters)
-        elif processed_filters:
-            params["filter"] = build_filter_string(processed_filters)
+            self._validate_filter_attributes(
+                extract_filter_attributes(raw_filter),
+                normalize_snake=False,
+            )
+
+        params: dict[str, Any] = {}
         if extra_params:
             params.update(extra_params)
 
+        if processed_filters:
+            built_filter = build_filter_string(processed_filters)
+            if (
+                isinstance(raw_filter, str)
+                and raw_filter.strip()
+                and raw_filter.strip().lower() != "none"
+            ):
+                combined_filter = f"{raw_filter};{built_filter}"
+                validate_filter_syntax(combined_filter)
+                params["filter"] = combined_filter
+            else:
+                params["filter"] = built_filter
+
         if "size" in params and params["size"] is not None:
-            raw_size = int(params["size"])
+            from imednet.core.paginator import _parse_int_param
+
+            raw_size = _parse_int_param("size", params["size"])
             if raw_size <= 0:
                 raise ValueError(f"size must be a positive integer, got {raw_size}")
             params["size"] = min(raw_size, LARGE_PAGE_SIZE)
@@ -311,6 +358,10 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
     Uses composable operations to provide standard list/get read operations.
     """
 
+    def _validate_item_id(self, item_id: ItemId) -> ItemId:
+        """Validate a single-item identifier before constructing the lookup filter."""
+        return item_id
+
     def _validate_get_result(self, items: list[T], study_key: str | None, item_id: ItemId) -> T:
         """Validate that a get operation returned exactly one item.
 
@@ -341,13 +392,14 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
             The requested resource.
         """
         self._require_item_id(item_id)
-        filters: dict[str, Any] = {self._id_param: item_id}
+        validated_id = self._validate_item_id(item_id)
+        filters: dict[str, Any] = {self._id_param: validated_id}
 
         from imednet.core.endpoint.operations.filter_get import FilterGetOperation
 
         return FilterGetOperation[T](
             study_key=study_key,
-            item_id=item_id,
+            item_id=validated_id,
             filters=filters,
             validate_func=self._validate_get_result,
             list_sync_func=self._list_sync,

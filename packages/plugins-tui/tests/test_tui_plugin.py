@@ -1450,7 +1450,6 @@ async def test_async_sdk_bounded_initial_fetch_and_load_all() -> None:
 
                 assert subj_route.call_count == 1
                 assert dict(subj_route.calls[0].request.url.params) == {
-                    "filter": "studyKey==ASYNC-01",
                     "page": "0",
                     "size": "100",
                 }

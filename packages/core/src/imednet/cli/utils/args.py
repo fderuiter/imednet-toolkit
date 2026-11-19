@@ -39,8 +39,21 @@ def parse_filter_args(
         sys.exit(1)
 
 
+def add_no_interactive(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
+    """Add ``--no-interactive`` option to disable interactive UI, spinners, and prompts."""
+    if "--no-interactive" in parser._option_string_actions:
+        return
+    kwargs: dict[str, Any] = {
+        "action": "store_true",
+        "help": "Disable interactive terminal UI, live spinners, and stdin prompts.",
+    }
+    if suppress_default:
+        kwargs["default"] = argparse.SUPPRESS
+    parser.add_argument("--no-interactive", **kwargs)
+
+
 def add_output_format(parser: argparse.ArgumentParser) -> None:
-    """Add the common opt-in machine response flag to a leaf read command."""
+    """Add common machine response and non-interactive flags to a leaf read command."""
     parser.add_argument(
         "--format",
         dest="output_format",
@@ -48,6 +61,7 @@ def add_output_format(parser: argparse.ArgumentParser) -> None:
         default="table",
         help="Response format: human table (default) or versioned JSON on stdout.",
     )
+    add_no_interactive(parser)
 
 
 def add_list_query_args(
@@ -113,6 +127,7 @@ def prepare_list_query(
     fetch_all: bool = False,
     output_format: str = "table",
     has_output_file: bool = False,
+    no_interactive: bool = False,
     model: type[Any] | None = None,
 ) -> tuple[dict[str, Any], int | None]:
     """Validate CLI query options and resolve SDK ``list()`` kwargs and item bound.
@@ -154,7 +169,7 @@ def prepare_list_query(
     effective_limit: int | None = None
     if limit is not None:
         effective_limit = limit
-    elif not fetch_all and output_format == "table" and not has_output_file:
+    elif not fetch_all and not no_interactive and output_format == "table" and not has_output_file:
         try:
             from .grid import is_interactive_terminal
 

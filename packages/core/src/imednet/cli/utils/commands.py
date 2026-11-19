@@ -10,6 +10,7 @@ from imednet.sdk import ImednetSDK
 from .args import (
     STUDY_KEY_ARG,
     add_list_query_args,
+    add_no_interactive,
     add_output_format,
     collect_list_items,
     prepare_list_query,
@@ -41,6 +42,7 @@ def register_list_command(
     list_parser = subparsers.add_parser("list", help=f"List all items of type {name}.")
 
     add_output_format(list_parser)
+    add_no_interactive(list_parser)
 
     if requires_study_key:
         list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
@@ -55,6 +57,7 @@ def register_list_command(
             sort: str | None = None,
             limit: int | None = None,
             fetch_all: bool = False,
+            no_interactive: bool = False,
         ) -> None:
             req_kwargs, effective_limit = prepare_list_query(
                 filter_args=filter_args,
@@ -62,6 +65,7 @@ def register_list_command(
                 limit=limit,
                 fetch_all=fetch_all,
                 output_format=output_format,
+                no_interactive=no_interactive,
             )
             with fetching_status(name, study_key):
                 items, truncated = collect_list_items(
@@ -76,6 +80,7 @@ def register_list_command(
                 output_format=output_format,
                 details=items,
                 truncated=truncated,
+                interactive=False if no_interactive else None,
             )
 
         list_parser.set_defaults(
@@ -86,6 +91,7 @@ def register_list_command(
                 sort=args.sort,
                 limit=args.limit,
                 fetch_all=args.fetch_all,
+                no_interactive=getattr(args, "no_interactive", False),
             )
         )
 
@@ -100,6 +106,7 @@ def register_list_command(
             sort: str | None = None,
             limit: int | None = None,
             fetch_all: bool = False,
+            no_interactive: bool = False,
         ) -> None:
             req_kwargs, effective_limit = prepare_list_query(
                 filter_args=filter_args,
@@ -107,6 +114,7 @@ def register_list_command(
                 limit=limit,
                 fetch_all=fetch_all,
                 output_format=output_format,
+                no_interactive=no_interactive,
             )
             with fetching_status(name):
                 items, truncated = collect_list_items(
@@ -121,6 +129,7 @@ def register_list_command(
                 output_format=output_format,
                 details=items,
                 truncated=truncated,
+                interactive=False if no_interactive else None,
             )
 
         list_parser.set_defaults(
@@ -130,5 +139,6 @@ def register_list_command(
                 sort=args.sort,
                 limit=args.limit,
                 fetch_all=args.fetch_all,
+                no_interactive=getattr(args, "no_interactive", False),
             )
         )
