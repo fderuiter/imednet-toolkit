@@ -10,20 +10,24 @@ loads it from the API using :class:`~imednet.endpoints.variables.VariablesEndpoi
 Any problems raise :class:`~imednet.errors.ValidationError` before the
 record is sent to the server.
 
-``SchemaValidator`` works with both synchronous and asynchronous SDK clients.
-It refreshes cached metadata using the appropriate API calls depending on the
-client type.
+``SchemaValidator`` and :class:`~imednet.validation.cache.AsyncSchemaValidator`
+work with synchronous and asynchronous SDK clients respectively, refreshing
+cached metadata via the appropriate API calls. :class:`~imednet.validation.cache.BaseSchemaCache`
+partitions cached variable definitions by ``(study_key, form_key)`` and form ID
+resolutions by ``(study_key, form_id)``, so multi-study validators and workflows
+can validate studies that share identical ``formKey`` or ``formId`` values
+without cross-study cache collisions.
 
 The diagram below outlines the main steps.
 
 .. mermaid:: /diagrams/schema_validation_7.mmd
 
 Record payloads can also be validated asynchronously. Use
-``SchemaValidator.validate_batch`` with ``AsyncImednetSDK`` before
+``AsyncSchemaValidator.validate_batch`` with ``AsyncImednetSDK`` before
 submitting records::
 
     async with AsyncImednetSDK() as sdk:
-        validator = SchemaValidator(sdk)
+        validator = AsyncSchemaValidator(sdk)
         await validator.validate_batch(study_key, records)
         await sdk.records.create(study_key, records, schema=validator.schema)
 

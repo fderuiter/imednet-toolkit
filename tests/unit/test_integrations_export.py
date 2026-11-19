@@ -686,6 +686,250 @@ def test_exports_with_multi_item_whitelists_and_quality_gate_end_to_end(tmp_path
             duck_conn.close()
 
 
+def _make_phi_export_sdk() -> MagicMock:
+    """Build a mock SDK returning PHI variables with non-PHI human-readable labels."""
+    from imednet.models.forms import Form
+    from imednet.models.intervals import FormSummary, Interval
+
+    sdk = MagicMock()
+    variables = [
+        Variable(
+            variable_name="patientName",
+            variable_type="text",
+            label="Participant Display Alias",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="DOB",
+            variable_type="text",
+            label="Enrollment Milestone Calendar",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="SSN",
+            variable_type="text",
+            label="Registry Reference Code",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="email",
+            variable_type="text",
+            label="Notification Channel",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="systolicBp",
+            variable_type="int",
+            label="Systolic BP",
+            form_id=10,
+            form_key="DEMO",
+        ),
+    ]
+    demo_form = Form(
+        form_id=10,
+        form_key="DEMO",
+        form_name="Demographics",
+        subject_record_report=True,
+        unscheduled_visit=False,
+        disabled=False,
+    )
+    baseline_interval = Interval(
+        interval_id=1,
+        interval_name="Baseline",
+        forms=[FormSummary(form_id=10, form_key="DEMO", form_name="Demographics")],
+    )
+    sdk.forms.list.return_value = [demo_form]
+    sdk.get_forms.return_value = [demo_form]
+    sdk.get_intervals.return_value = [baseline_interval]
+    sdk.variables.list.return_value = variables
+    sdk.get_variables.return_value = variables
+
+    base_record = Record(
+        record_id=101,
+        study_key="STUDY1",
+        subject_key="SUBJ-001",
+        site_id=5,
+        visit_id=1,
+        form_id=10,
+        form_key="DEMO",
+        record_status="Complete",
+        date_modified=datetime(2025, 1, 15, 12, 0, 0),
+        record_data={
+            "patientName": "Jane Doe",
+            "DOB": "1980-01-01",
+            "SSN": "123-45-6789",
+            "email": "jane@example.org",
+            "systolicBp": 118,
+        },
+    )
+    sdk.records.list.side_effect = lambda **_kw: [base_record.model_copy(deep=True)]
+    sdk.records.iter.side_effect = lambda **_kw: iter([base_record.model_copy(deep=True)])
+    sdk.get_records.side_effect = lambda **_kw: [base_record.model_copy(deep=True)]
+    return sdk
+
+
+def test_tabular_and_hierarchical_exports_mask_phi_with_labels_and_opt_out(
+    tmp_path: Path,
+) -> None:
+    """Verify CSV, Parquet, Excel, DuckDB, JSON (flat & hierarchical), and SQL mask PHI by default."""
+    import json
+    import sqlite3
+
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("openpyxl")
+    duckdb_mod = pytest.importorskip("duckdb")
+    from imednet.utils.security import global_sensitivity_registry
+
+    sdk = _make_phi_export_sdk()
+    snapshot_keywords = set(global_sensitivity_registry._sensitive_keys)
+    sensitive_labels = (
+        "Participant Display Alias",
+        "Enrollment Milestone Calendar",
+        "Registry Reference Code",
+        "Notification Channel",
+    )
+
+    # 1. CSV with use_labels_as_columns=True
+    csv_masked = tmp_path / "masked.csv"
+    export_mod.export_to_csv(sdk, "STUDY1", str(csv_masked), use_labels_as_columns=True)
+    csv_row = pd.read_csv(csv_masked).to_dict("records")[0]
+    for label in sensitive_labels:
+        assert csv_row[label] == "***MASKED***"
+    assert csv_row["Systolic BP"] == 118
+    assert csv_row["subjectKey"] == "SUBJ-001"
+    assert csv_row["recordId"] == 101
+
+    # 2. Parquet with use_labels_as_columns=True
+    pq_masked = tmp_path / "masked.parquet"
+    export_mod.export_to_parquet(sdk, "STUDY1", str(pq_masked), use_labels_as_columns=True)
+    pq_row = pd.read_parquet(pq_masked).to_dict("records")[0]
+    for label in sensitive_labels:
+        assert pq_row[label] == "***MASKED***"
+    assert pq_row["Systolic BP"] == 118
+
+    # 3. Excel with use_labels_as_columns=True
+    xlsx_masked = tmp_path / "masked.xlsx"
+    export_mod.export_to_excel(sdk, "STUDY1", str(xlsx_masked), use_labels_as_columns=True)
+    xlsx_row = pd.read_excel(xlsx_masked).to_dict("records")[0]
+    for label in sensitive_labels:
+        assert xlsx_row[label] == "***MASKED***"
+    assert xlsx_row["Systolic BP"] == 118
+
+    # 4. DuckDB with use_labels_as_columns=True
+    duck_masked = tmp_path / "masked.duckdb"
+    export_mod.export_to_duckdb(
+        sdk, "STUDY1", str(duck_masked), "records", use_labels_as_columns=True
+    )
+    conn = duckdb_mod.connect(str(duck_masked))
+    try:
+        duck_row = conn.execute("SELECT * FROM records").fetchdf().to_dict("records")[0]
+    finally:
+        conn.close()
+    for label in sensitive_labels:
+        assert duck_row[label] == "***MASKED***"
+    assert duck_row["Systolic BP"] == 118
+
+    # 5. Flat JSON with use_labels_as_columns=True
+    json_masked = tmp_path / "masked_flat.json"
+    export_mod.export_to_json(sdk, "STUDY1", str(json_masked), use_labels_as_columns=True)
+    json_row = json.loads(json_masked.read_text(encoding="utf-8"))[0]
+    for label in sensitive_labels:
+        assert json_row[label] == "***MASKED***"
+    assert json_row["Systolic BP"] == 118
+
+    # 6. Hierarchical JSON (default + use_labels_as_columns=True)
+    hier_json = tmp_path / "masked_hier.json"
+    export_mod.export_to_json(sdk, "STUDY1", str(hier_json), hierarchical=True)
+    hier_payload = json.loads(hier_json.read_text(encoding="utf-8"))
+    assert hier_payload[0]["subject_key"] == "SUBJ-001"
+    rec_node = hier_payload[0]["visits"][0]["forms"][0]["records"][0]
+    assert rec_node["patientName"] == "***MASKED***"
+    assert rec_node["DOB"] == "***MASKED***"
+    assert rec_node["SSN"] == "***MASKED***"
+    assert rec_node["email"] == "***MASKED***"
+    assert rec_node["systolicBp"] == 118
+    assert rec_node["recordId"] == 101
+    assert rec_node["subjectKey"] == "SUBJ-001"
+
+    hier_labeled = tmp_path / "masked_hier_labeled.json"
+    export_mod.export_to_json(
+        sdk,
+        "STUDY1",
+        str(hier_labeled),
+        hierarchical=True,
+        use_labels_as_columns=True,
+    )
+    labeled_node = json.loads(hier_labeled.read_text(encoding="utf-8"))[0]["visits"][0]["forms"][0][
+        "records"
+    ][0]
+    for label in sensitive_labels:
+        assert labeled_node[label] == "***MASKED***"
+    assert labeled_node["Systolic BP"] == 118
+
+    # 7. SQL, SQL-by-form, DuckDB-by-form, and long-SQL mask PHI by default
+    sql_db = tmp_path / "masked_sql.sqlite"
+    export_mod.export_to_sql(
+        sdk, "STUDY1", "wide_tbl", f"sqlite:///{sql_db}", use_labels_as_columns=True
+    )
+    export_mod.export_to_sql_by_form(
+        sdk, "STUDY1", f"sqlite:///{sql_db}", use_labels_as_columns=True
+    )
+    export_mod.export_to_long_sql(sdk, "STUDY1", "long_tbl", f"sqlite:///{sql_db}")
+    with sqlite3.connect(sql_db) as sconn:
+        wide_df = pd.read_sql_query("SELECT * FROM wide_tbl", sconn)
+        demo_df = pd.read_sql_query("SELECT * FROM DEMO", sconn)
+        long_df = pd.read_sql_query("SELECT * FROM long_tbl", sconn)
+    for label in sensitive_labels:
+        assert wide_df.loc[0, label] == "***MASKED***"
+        assert demo_df.loc[0, label] == "***MASKED***"
+    long_map = dict(zip(long_df["variable_name"], long_df["value"]))
+    assert long_map["patientName"] == "***MASKED***"
+    assert long_map["DOB"] == "***MASKED***"
+    assert long_map["SSN"] == "***MASKED***"
+    assert long_map["email"] == "***MASKED***"
+    assert str(long_map["systolicBp"]) == "118"
+
+    # 8. Explicit mask_phi=False opt-out returns unmasked values without mutating global registry
+    csv_unmasked = tmp_path / "unmasked.csv"
+    export_mod.export_to_csv(
+        sdk, "STUDY1", str(csv_unmasked), use_labels_as_columns=True, mask_phi=False
+    )
+    unmasked_csv_row = pd.read_csv(csv_unmasked).to_dict("records")[0]
+    assert unmasked_csv_row["Participant Display Alias"] == "Jane Doe"
+    assert unmasked_csv_row["Enrollment Milestone Calendar"] == "1980-01-01"
+    assert unmasked_csv_row["Registry Reference Code"] == "123-45-6789"
+    assert unmasked_csv_row["Notification Channel"] == "jane@example.org"
+
+    hier_unmasked = tmp_path / "unmasked_hier.json"
+    export_mod.export_to_json(
+        sdk,
+        "STUDY1",
+        str(hier_unmasked),
+        hierarchical=True,
+        mask_phi=False,
+    )
+    unmasked_node = json.loads(hier_unmasked.read_text(encoding="utf-8"))[0]["visits"][0]["forms"][
+        0
+    ]["records"][0]
+    assert unmasked_node["patientName"] == "Jane Doe"
+    assert unmasked_node["SSN"] == "123-45-6789"
+
+    sql_unmasked = tmp_path / "unmasked_sql.sqlite"
+    export_mod.export_to_long_sql(
+        sdk, "STUDY1", "long_tbl", f"sqlite:///{sql_unmasked}", mask_phi=False
+    )
+    with sqlite3.connect(sql_unmasked) as sconn:
+        long_unmasked = pd.read_sql_query("SELECT * FROM long_tbl", sconn)
+    unmasked_long_map = dict(zip(long_unmasked["variable_name"], long_unmasked["value"]))
+    assert unmasked_long_map["patientName"] == "Jane Doe"
+    assert unmasked_long_map["SSN"] == "123-45-6789"
+    assert global_sensitivity_registry._sensitive_keys == snapshot_keywords
+
+
 def test_tabular_sink_config_receives_operational_options_without_pandas_leak(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

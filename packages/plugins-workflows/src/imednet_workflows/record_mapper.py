@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
 from imednet.spi.sink_base import is_record_deleted
+from imednet.spi.utils import global_sensitivity_registry, mask_clinical_phi
 
 from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
@@ -646,6 +647,7 @@ class RecordMapper:
         *,
         loader: CachedRecordsLoader | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
+        mask_phi: bool = True,
         include_deleted: bool = False,
     ) -> None:
         """Initialize with an :class:`ImednetSDK` instance.
@@ -653,12 +655,15 @@ class RecordMapper:
         ``loader`` enables cache-backed streaming for large-study workflows.
         ``chunk_size`` controls the maximum number of records parsed into each
         yielded batch when using chunked mapping helpers.
+        ``mask_phi`` controls whether sensitive clinical fields are masked at
+        mapper ingress by default.
         ``include_deleted`` controls whether voided (``deleted=True``) records
         are retained (defaults to ``False``).
         """
         self.sdk = sdk
         self._loader = loader
         self._pipeline = ChunkedRecordPipeline(chunk_size=chunk_size)
+        self.mask_phi = mask_phi
         self._include_deleted = include_deleted
         self._last_variables: list[VariableModel] = []
 
@@ -796,7 +801,7 @@ class RecordMapper:
             return
 
         use_streaming_endpoint = self._can_stream_via_records_endpoint()
-        records_ep = getattr(self.sdk, "records", None)
+        records_ep = getattr(self.sdk, "records", None) if use_streaming_endpoint else None
         fetch_fn: Any = (
             records_ep.list
             if use_streaming_endpoint and records_ep is not None
@@ -935,16 +940,20 @@ class RecordMapper:
         self,
         rec: RecordModel,
         record_model: type[BaseModel],
+        *,
+        mask_phi: bool | None = None,
     ) -> dict[str, Any]:
         """Parse a single record using the dynamic Pydantic model.
 
         Args:
             rec: The Record model to parse.
             record_model: The dynamic Pydantic model for record data.
+            mask_phi: Optional per-call override for PHI masking.
 
         Returns:
             A dictionary containing both metadata and parsed record data.
         """
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
         meta = {
             "recordId": rec.record_id,
             "subjectKey": rec.subject_key,
@@ -959,17 +968,26 @@ class RecordMapper:
                 else None
             ),
         }
-        data = rec.record_data if isinstance(rec.record_data, dict) else {}
+        raw_data = rec.record_data if isinstance(rec.record_data, dict) else {}
+        data = mask_clinical_phi(raw_data) if (should_mask and raw_data) else raw_data
         parsed = record_model(**data).model_dump(by_alias=False)
         return {**meta, **parsed}
 
     def _parse_records(
-        self, records: Iterable[RecordModel], record_model: type[BaseModel]
+        self,
+        records: Iterable[RecordModel],
+        record_model: type[BaseModel],
+        *,
+        mask_phi: bool | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Parse raw records into row dictionaries and count failures."""
         rows: list[dict[str, Any]] = []
         errors = 0
-        for chunk_rows, chunk_errors in self._iter_parsed_rows(records, record_model):
+        for chunk_rows, chunk_errors in self._iter_parsed_rows(
+            records,
+            record_model,
+            mask_phi=mask_phi,
+        ):
             rows.extend(chunk_rows)
             errors += chunk_errors
         return rows, errors
@@ -978,6 +996,8 @@ class RecordMapper:
         self,
         records: Iterable[RecordModel],
         record_model: type[BaseModel],
+        *,
+        mask_phi: bool | None = None,
     ) -> Iterator[tuple[list[dict[str, Any]], int]]:
         """Iterate over records and parse them in chunks.
 
@@ -989,7 +1009,7 @@ class RecordMapper:
             errors = 0
             for rec in chunk:
                 try:
-                    rows.append(self._parse_record(rec, record_model))
+                    rows.append(self._parse_record(rec, record_model, mask_phi=mask_phi))
                 except (ValidationError, TypeError) as exc:
                     errors += 1
                     logger.warning(
@@ -1008,12 +1028,15 @@ class RecordMapper:
         variable_keys: list[str],
         label_map: dict[str, str],
         use_labels: bool,
+        *,
+        mask_phi: bool | None = None,
     ) -> pd.DataFrame:
         """Create the output DataFrame from parsed rows."""
         df = pd.DataFrame(rows)
         if df.empty:
             return df
 
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
         meta_cols = [
             "recordId",
             "subjectKey",
@@ -1028,6 +1051,23 @@ class RecordMapper:
                 df[key] = pd.NA
 
         df = df[meta_cols + variable_keys]
+        if should_mask:
+            sensitive_vars = [
+                key for key in variable_keys if global_sensitivity_registry.is_sensitive(key)
+            ]
+            for key in sensitive_vars:
+                df[key] = "***MASKED***"
+
+            non_sensitive_vars = [key for key in variable_keys if key not in set(sensitive_vars)]
+            if non_sensitive_vars:
+                var_frame = df[non_sensitive_vars]
+                try:
+                    obj_cols = var_frame.select_dtypes(include=[object, "str"]).columns
+                except TypeError:
+                    obj_cols = var_frame.select_dtypes(include=[object]).columns
+                for col in obj_cols:
+                    df[col] = df[col].apply(mask_clinical_phi)
+
         if use_labels:
             rename_map = {key: label_map.get(key, key) for key in variable_keys}
             df = df.rename(columns=rename_map)
@@ -1043,6 +1083,7 @@ class RecordMapper:
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield mapped record DataFrames in bounded chunks.
@@ -1094,9 +1135,16 @@ class RecordMapper:
                 include_deleted=include_deleted,
             ),
             record_model,
+            mask_phi=mask_phi,
         ):
             errors += chunk_errors
-            df = self._build_dataframe(rows, variable_keys, label_map, use_labels_as_columns)
+            df = self._build_dataframe(
+                rows,
+                variable_keys,
+                label_map,
+                use_labels_as_columns,
+                mask_phi=mask_phi,
+            )
             if df.empty:
                 continue
             yielded = True
@@ -1118,6 +1166,7 @@ class RecordMapper:
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Generate a nested JSON tree structure up to three levels deep.
@@ -1172,7 +1221,7 @@ class RecordMapper:
             label_map = form_label_maps[rec.form_id]  # type: ignore
 
             try:
-                parsed_data = self._parse_record(rec, model)
+                parsed_data = self._parse_record(rec, model, mask_phi=mask_phi)
             except (ValidationError, TypeError) as exc:
                 logger.warning(
                     "Failed to parse record data for recordId %s: %s",
@@ -1365,6 +1414,7 @@ class RecordMapper:
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` of records for a study."""
@@ -1391,6 +1441,7 @@ class RecordMapper:
                 use_labels_as_columns=use_labels_as_columns,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                mask_phi=mask_phi,
                 include_deleted=include_deleted,
             )
         )

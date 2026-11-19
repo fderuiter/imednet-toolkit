@@ -10,7 +10,7 @@ from typing import Any
 
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
-from .export import _record_mapper
+from .export import _mask_df, _record_mapper
 from .parquet_engine import PyArrowDatasetPartitionedStorageEngine
 
 
@@ -52,7 +52,12 @@ def _cached_records_loader() -> Any:
     return loaders[0].load()
 
 
-def _build_record_mapper(sdk: ImednetSDK, *, chunk_size: int) -> Any:
+def _build_record_mapper(
+    sdk: ImednetSDK,
+    *,
+    chunk_size: int,
+    mask_phi: bool = True,
+) -> Any:
     """Build a workflows ``RecordMapper`` without importing the plugin at module import time."""
     mapper_cls = _record_mapper()
     parameters = inspect.signature(mapper_cls).parameters
@@ -61,6 +66,8 @@ def _build_record_mapper(sdk: ImednetSDK, *, chunk_size: int) -> Any:
         kwargs["chunk_size"] = chunk_size
     if "loader" in parameters:
         kwargs["loader"] = _cached_records_loader()(sdk)
+    if "mask_phi" in parameters:
+        kwargs["mask_phi"] = mask_phi
     return mapper_cls(sdk, **kwargs)
 
 
@@ -73,12 +80,13 @@ def export_to_hive_parquet(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     chunk_size: int = 5_000,
+    mask_phi: bool = True,
 ) -> None:
     """Export study records to a Hive-partitioned Parquet directory layout."""
     pyarrow_module = _ensure_pyarrow()
     validate_partition_key(study_key)
 
-    mapper = _build_record_mapper(sdk, chunk_size=chunk_size)
+    mapper = _build_record_mapper(sdk, chunk_size=chunk_size, mask_phi=mask_phi)
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
     forms = sdk.forms.list(study_key=study_key)
 
@@ -129,6 +137,8 @@ def export_to_hive_parquet(
                 )
                 if df.empty:
                     continue
+                if mask_phi:
+                    df = _mask_df(df)
                 table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
                 storage_engine.write_form_table(
                     table,
@@ -149,6 +159,8 @@ def export_to_hive_parquet(
             label_map,
             use_labels_as_columns,
         )
+        if mask_phi and not df.empty:
+            df = _mask_df(df)
         table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
         storage_engine.write_form_table(
             table,

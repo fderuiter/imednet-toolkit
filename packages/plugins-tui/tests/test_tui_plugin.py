@@ -979,6 +979,181 @@ async def test_job_monitor_sync_endpoint_bounded_concurrency():
 
 
 @pytest.mark.asyncio
+async def test_subject_table_2500_study_issues_single_http_request_and_loads_all() -> None:
+    """Acceptance Criterion 4 & Req 7/8: SubjectTable issues 1 HTTP request on a 2,500-item Study."""
+    import httpx
+    import respx
+    from textual.containers import Container
+    from textual.widgets import Static
+
+    from imednet.sdk import ImednetSDK
+
+    with respx.mock(assert_all_called=False) as router:
+        studies_route = router.get("https://api.test/api/v1/edc/studies").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [{"studyKey": "LARGE-01", "studyName": "Large Trial"}],
+                    "pagination": {"page": 0, "size": 100, "totalPages": 1, "totalItems": 1},
+                },
+            )
+        )
+        sites_route = router.get("https://api.test/api/v1/edc/studies/LARGE-01/sites").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [{"siteId": i, "siteName": f"Site {i}"} for i in range(1, 101)],
+                    "pagination": {"page": 0, "size": 100, "totalPages": 2, "totalItems": 150},
+                },
+            )
+        )
+
+        def _subjects_handler(request: httpx.Request) -> httpx.Response:
+            page = int(request.url.params.get("page", 0))
+            size = int(request.url.params.get("size", 100))
+            total_pages = 25 if size == 100 else 5
+            count = size
+            start = page * size
+            data = [
+                {
+                    "subjectId": start + idx + 1,
+                    "subjectKey": f"SUB-{start + idx + 1:04d}",
+                    "siteId": 1,
+                    "subjectStatus": "Enrolled",
+                    "dateCreated": "2026-02-01T00:00:00Z",
+                }
+                for idx in range(count)
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "data": data,
+                    "pagination": {
+                        "page": page,
+                        "size": size,
+                        "totalPages": total_pages,
+                        "totalItems": 2500,
+                    },
+                },
+            )
+
+        subjects_route = router.get("https://api.test/api/v1/edc/studies/LARGE-01/subjects").mock(
+            side_effect=_subjects_handler
+        )
+
+        sdk = ImednetSDK(
+            api_key="test-key",  # pragma: allowlist secret
+            security_key="test-secret",  # pragma: allowlist secret
+            base_url="https://api.test",
+        )
+
+        app = ImednetTuiApp(sdk)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert studies_route.call_count == 1
+
+            study_list = app.screen.query_one(StudyList)
+            study_list.post_message(StudyList.StudySelected("LARGE-01", "Large Trial"))
+            await pilot.pause()
+
+            # Crucial Acceptance Criterion 4 check: exactly 1 HTTP request issued before render!
+            assert subjects_route.call_count == 1
+            assert sites_route.call_count == 1
+
+            subject_table = app.screen.query_one(SubjectTable)
+            assert subject_table.row_count == 100
+            assert subject_table.truncated is True
+
+            site_list = app.screen.query_one(SiteList)
+            assert len(site_list.children) == 100
+            assert site_list.truncated is True
+
+            # Verify status notice is displayed in banner and container border subtitle
+            banner = app.screen.query_one("#truncation-notice", Static)
+            assert "visible" in banner.classes
+            assert "Showing first 100 subjects" in str(banner.render())
+            subjects_box = app.screen.query_one("#subjects-box", Container)
+            assert "100" in str(subjects_box.border_subtitle)
+
+            # Now replace routes with smaller 2-page total so Load All ('a') finishes fast
+            sites_route.mock(
+                side_effect=lambda req: httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"siteId": int(req.url.params["page"]) * 100 + i, "siteName": f"S{i}"}
+                            for i in range(1, 51 if int(req.url.params["page"]) == 1 else 101)
+                        ],
+                        "pagination": {
+                            "page": int(req.url.params["page"]),
+                            "size": 100,
+                            "totalPages": 2,
+                        },
+                    },
+                )
+            )
+            subjects_route.mock(
+                side_effect=lambda req: httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "subjectId": int(req.url.params["page"]) * 100 + i,
+                                "siteId": 1,
+                                "subjectStatus": "Enrolled",
+                            }
+                            for i in range(1, 21 if int(req.url.params["page"]) == 1 else 101)
+                        ],
+                        "pagination": {
+                            "page": int(req.url.params["page"]),
+                            "size": 100,
+                            "totalPages": 2,
+                        },
+                    },
+                )
+            )
+
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert subject_table.row_count == 120
+            assert subject_table.truncated is False
+            assert len(site_list.children) == 150
+            assert site_list.truncated is False
+            assert "visible" not in banner.classes
+            assert subjects_box.border_subtitle == ""
+
+
+@pytest.mark.asyncio
+async def test_study_list_bounded_truncation_and_load_all() -> None:
+    """Verify StudyList bounds initial studies to 100 items and action_load_all loads remaining."""
+    sdk = MagicMock()
+    sdk.config.base_url = "https://edc.test.imednetapi.com"
+    many_studies = [
+        MagicMock(study_name=f"Study {i}", study_key=f"ST-{i:03d}") for i in range(1, 136)
+    ]
+    sdk.studies.async_list = AsyncMock(return_value=many_studies)
+
+    app = ImednetTuiApp(sdk)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        study_list = app.screen.query_one(StudyList)
+        assert len(study_list.children) == 100
+        assert study_list.truncated is True
+        assert "Showing first 100 studies" in study_list.status_notice
+
+        app.action_load_all()
+        await pilot.pause()
+        await pilot.pause()
+
+        assert len(study_list.children) == 135
+        assert study_list.truncated is False
+        assert study_list.status_notice == ""
+
+
+@pytest.mark.asyncio
 async def test_pilot_sync_simulation_sdk_selection_logs_refresh_and_contrast():
     """Verify Pilot keyboard controls (enter, r, h) and log routing with sync ImednetSDK."""
     imednet_logger = logging.getLogger("imednet")
@@ -1092,7 +1267,7 @@ async def test_pilot_async_simulation_sdk_selection_logs_refresh_and_contrast():
             assert subject_table.row_count == 1
             assert job_monitor.current_study_key == "DEMO-STUDY"
 
-            # Select site via Enter -> awaits AsyncSubjectsEndpoint.list_by_site coroutine
+            # Select site via Enter -> iterates/awaits AsyncSubjectsEndpoint for site
             site_list.focus()
             await pilot.pause()
             await pilot.press("enter")
@@ -1205,3 +1380,86 @@ async def test_pilot_dotted_and_colliding_keys_preserve_raw_sdk_keys():
         await pilot.press("down", "enter")
         await pilot.pause()
         sdk.sites.list.assert_called_with("STUDY_01")
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_bounded_initial_fetch_and_load_all() -> None:
+    """Acceptance Criterion 4: AsyncImednetSDK TUI bounds initial fetch to 1 page and loads all on 'a'."""
+    import httpx
+    import respx
+
+    from imednet.sdk import AsyncImednetSDK
+
+    def _paged_subjects(req: httpx.Request) -> httpx.Response:
+        page_idx = int(req.url.params.get("page", 0))
+        req_size = int(req.url.params.get("size", 100))
+        batch_len = 100 if page_idx == 0 else 35
+        offset = page_idx * 100
+        rows = [
+            {
+                "subjectId": offset + n,
+                "subjectKey": f"ASUB-{offset + n}",
+                "siteId": 10,
+                "subjectStatus": "Screened",
+                "dateCreated": "2026-03-01T00:00:00Z",
+            }
+            for n in range(1, batch_len + 1)
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "data": rows,
+                "pagination": {"page": page_idx, "size": req_size, "totalPages": 2},
+            },
+        )
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get("https://api.async-tui.test/api/v1/edc/studies").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [{"studyKey": "ASYNC-01", "studyName": "Async Study"}],
+                    "pagination": {"page": 0, "size": 100, "totalPages": 1},
+                },
+            )
+        )
+        router.get("https://api.async-tui.test/api/v1/edc/studies/ASYNC-01/sites").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [{"siteId": 10, "siteName": "Async Site"}],
+                    "pagination": {"page": 0, "size": 100, "totalPages": 1},
+                },
+            )
+        )
+        subj_route = router.get(
+            "https://api.async-tui.test/api/v1/edc/studies/ASYNC-01/subjects"
+        ).mock(side_effect=_paged_subjects)
+
+        async with AsyncImednetSDK(
+            api_key="async-key",  # pragma: allowlist secret
+            security_key="async-secret",  # pragma: allowlist secret
+            base_url="https://api.async-tui.test",
+        ) as async_sdk:
+            app = ImednetTuiApp(async_sdk)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                study_view = app.screen.query_one(StudyList)
+                study_view.post_message(StudyList.StudySelected("ASYNC-01", "Async Study"))
+                await pilot.pause()
+
+                assert subj_route.call_count == 1
+                assert dict(subj_route.calls[0].request.url.params) == {
+                    "page": "0",
+                    "size": "100",
+                }
+                subj_table = app.screen.query_one(SubjectTable)
+                assert subj_table.row_count == 100
+                assert subj_table.truncated is True
+
+                await pilot.press("a")
+                await pilot.pause()
+                await pilot.pause()
+
+                assert subj_table.row_count == 135
+                assert subj_table.truncated is False

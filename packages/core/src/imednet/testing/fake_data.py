@@ -136,15 +136,21 @@ def fake_record(schema: SchemaCache | None = None) -> dict[str, Any]:
     ``recordData`` values.
     """
     if schema and schema._form_variables:
-        form_key = faker.random_element(list(schema._form_variables))
-        variables = schema.variables_for_form(form_key)
+        raw_key = faker.random_element(list(schema._form_variables))
+        if isinstance(raw_key, tuple):
+            study_key_val, form_key = raw_key
+            variables = schema.variables_for_form(form_key, study_key=study_key_val)
+        else:
+            study_key_val = ""
+            form_key = raw_key
+            variables = schema.variables_for_form(form_key)
         first_var = next(iter(variables.values()))
         form_id = first_var.form_id
         record_data = {
             name: _fake_value(var.variable_type or "") for name, var in variables.items()
         }
         return {
-            "studyKey": faker.bothify(text="??????"),
+            "studyKey": study_key_val or faker.bothify(text="??????"),
             "intervalId": faker.random_int(min=1, max=10000),
             "formId": form_id,
             "formKey": form_key,
@@ -315,13 +321,15 @@ def fake_coding() -> dict[str, Any]:
 
 def fake_record_revision() -> dict[str, Any]:
     """Return a fake record revision payload."""
+    record_rev = faker.random_int(min=1, max=10)
+    data_rev = faker.random_int(min=1, max=record_rev)
     return {
         "studyKey": faker.bothify(text="??????"),
         "recordRevisionId": faker.random_int(min=1, max=10000),
         "recordId": faker.random_int(min=1, max=10000),
         "recordOid": faker.uuid4(),
-        "recordRevision": faker.random_int(min=1, max=10),
-        "dataRevision": faker.random_int(min=1, max=10),
+        "recordRevision": record_rev,
+        "dataRevision": data_rev,
         "recordStatus": faker.random_element(["Record Incomplete", "Record Complete"]),
         "subjectId": faker.random_int(min=1, max=10000),
         "subjectOid": faker.uuid4(),

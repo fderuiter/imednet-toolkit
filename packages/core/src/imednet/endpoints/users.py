@@ -106,6 +106,15 @@ class UsersOperationDef:
         if extra_params:
             params.update(extra_params)
 
+        if "size" in params and params["size"] is not None:
+            from imednet.constants import LARGE_PAGE_SIZE
+            from imednet.core.paginator import _parse_int_param
+
+            raw_size = _parse_int_param("size", params["size"])
+            if raw_size <= 0:
+                raise ValueError(f"size must be a positive integer, got {raw_size}")
+            params["size"] = min(raw_size, LARGE_PAGE_SIZE)
+
         # Ensure 'filter' is never generated under any circumstances
         params.pop("filter", None)
 

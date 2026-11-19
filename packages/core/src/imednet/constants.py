@@ -13,6 +13,7 @@ __all__ = [  # noqa: RUF022
     "DEFAULT_BACKOFF_FACTOR",
     "DEFAULT_PAGE_SIZE",
     "LARGE_PAGE_SIZE",
+    "MAX_PAGE_SIZE",
     "MAX_SQLITE_COLUMNS",
     "TERMINAL_JOB_STATES",
     # HTTP Headers
@@ -44,6 +45,9 @@ DEFAULT_PAGE_SIZE = 100
 
 LARGE_PAGE_SIZE = 500
 """Page size for endpoints with large metadata (forms, intervals, variables)."""
+
+MAX_PAGE_SIZE = 500
+"""Maximum number of items per page allowed by the upstream iMednet API."""
 
 # Database Limits
 MAX_SQLITE_COLUMNS = 2000

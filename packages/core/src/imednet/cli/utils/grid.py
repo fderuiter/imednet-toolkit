@@ -187,6 +187,7 @@ class InteractiveDataGrid:
         label: str = "records",
         details: Sequence[Any] | None = None,
         is_high_contrast: bool | None = None,
+        status_notice: str | None = None,
     ) -> None:
         """Initialize the interactive data grid.
 
@@ -197,6 +198,7 @@ class InteractiveDataGrid:
             label: Name of the resource being reviewed (e.g. 'records', 'subjects').
             details: Full domain objects corresponding to each row.
             is_high_contrast: Whether high-contrast clinical status mode is active.
+            status_notice: Optional notice displayed when results are truncated/bounded.
         """
         if curses is None:
             raise RuntimeError(
@@ -205,6 +207,7 @@ class InteractiveDataGrid:
         self.stdscr = stdscr
         self.fields = fields
         self.label = label
+        self.status_notice = status_notice
         self.is_high_contrast = (
             is_high_contrast
             if is_high_contrast is not None
@@ -416,7 +419,11 @@ class InteractiveDataGrid:
         hc_str = " [HIGH-CONTRAST]" if self.is_high_contrast else ""
         panel_str = " [SIDE PANEL]" if (self.side_panel_open and panel_width > 0) else ""
         filter_status = f' [Filter: "{self.search_query}"]' if self.search_query else ""
-        title = f"iMednet {self.label.title()} Review ({total_rows} items){filter_status}{panel_str}{mode_str}{hc_str}"
+        notice_str = f" [{self.status_notice}]" if self.status_notice else ""
+        title = (
+            f"iMednet {self.label.title()} Review ({total_rows} items)"
+            f"{notice_str}{filter_status}{panel_str}{mode_str}{hc_str}"
+        )
         safe_addstr(self.stdscr, 0, 0, title[:grid_limit], curses.A_BOLD)
 
         num_cols = len(self.fields)
@@ -759,8 +766,10 @@ class InteractiveDataGrid:
                 if num_cols > 0 and (max_col_offset > 0 or self.col_offset > 0)
                 else ""
             )
+            notice_suffix = f"  [{self.status_notice}]" if self.status_notice else ""
             help_text = (
-                f"[↑/↓/←/→] Navigate  [/] Search  [Space] Panel  [q] Quit  {pos_info}{col_info}"
+                f"[↑/↓/←/→] Navigate  [/] Search  [Space] Panel  [q] Quit  "
+                f"{pos_info}{col_info}{notice_suffix}"
             )
             safe_addstr(self.stdscr, y, 0, help_text[:max_x].ljust(max_x), curses.A_REVERSE)
 
@@ -886,6 +895,7 @@ def run_interactive_grid(
     label: str = "records",
     details: Sequence[Any] | None = None,
     is_high_contrast: bool | None = None,
+    status_notice: str | None = None,
 ) -> bool:
     """Launch the curses interactive data grid.
 
@@ -895,6 +905,7 @@ def run_interactive_grid(
         label: Entity label (e.g. 'records', 'subjects').
         details: Optional list of full domain models for variable inspection.
         is_high_contrast: Optional high-contrast mode override.
+        status_notice: Optional truncation/status notice to render in the grid bars.
 
     Returns:
         True if the interactive grid ran and exited normally, False if curses
@@ -913,6 +924,7 @@ def run_interactive_grid(
                 label=label,
                 details=details,
                 is_high_contrast=is_high_contrast,
+                status_notice=status_notice,
             )
             grid.run()
 
