@@ -30,26 +30,35 @@ The package provides a unified SDK namespace integration (`SinksNamespace`) dire
 You can initialize and execute sinks programmatically:
 
 ```python
-from imednet_sinks import export_to_mongodb, export_to_neo4j, export_to_snowflake
+from imednet_sinks import (
+    MongoDbSinkConfig,
+    Neo4jSinkConfig,
+    SnowflakeSinkConfig,
+    export_to_mongodb,
+    export_to_neo4j,
+    export_to_snowflake,
+)
 
-# Example module runner command to execute an export
-# export_to_mongodb(
-#     study_key='STUDY-123',
-#     connection_uri='mongodb://localhost:27017',
-#     database='imednet'
+# Example programmatic Record export to MongoDB:
+# config = MongoDbSinkConfig(
+#     study_key="STUDY-123",
+#     uri="mongodb://localhost:27017",
+#     database="imednet",
+#     collection="records",
 # )
+# export_to_mongodb(sdk, "STUDY-123", config=config)
 ```
 
 Alternatively, commands can be launched via standard CLI structures mapped to these functions if exposed by your main SDK runner.
 
 ## Features
 
-- **Multi-backend Support**: Tailored exporters mapping data to Document Store (MongoDB), Property Graph (Neo4j), or Data Warehouse (Snowflake) systems.
-- **Dynamic Lazy Imports**: Keeps package initialization light by lazy-loading heavy drivers (e.g. PyMongo, Neo4j, PyArrow) at execution time.
+- **Multi-backend Support**: Tailored exporters mapping Study Records to Document Store (MongoDB), Property Graph (Neo4j), or Data Warehouse (Snowflake) systems.
+- **Dynamic Lazy Imports**: Keeps package initialization light by lazy-loading heavy drivers (e.g. PyMongo, Neo4j, Snowflake Connector, PyArrow) at execution time.
 - **Idempotency & Resiliency**:
   - **MongoDB**: Uses bulk upserts mapping unique compound keys (`<study_key>/<record_id>`) using PyMongo `bulk_write` update/upsert actions.
   - **Neo4j**: Merges hierarchies (`Study -> Subject -> Visit -> Record`) idempotently using query templates.
-  - **Snowflake**: Two-phase loading converting records to Apache Arrow tables, writing Parquet stages, and running atomic transactional `COPY INTO` with `FORCE = FALSE`.
+  - **Snowflake**: Two-phase loading converting Study Records to Apache Arrow tables, writing staged Parquet batches, and running staged `COPY INTO` + `MERGE INTO` keyed on `(study_key, record_id)`.
 - **Unified SDK Namespace Integration**: Seamless integration through the `SinksNamespace` registered directly with the core SDK client.
 
 ## Component Description Table

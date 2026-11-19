@@ -168,3 +168,52 @@ def test_tui_plugin_force_flag_bypasses_guard(monkeypatch):
 
         args.func(args)
         mock_run_tui.assert_called_once_with(mock_sdk, force=True)
+
+
+def test_tui_plugin_study_and_repeatable_batch_options(monkeypatch):
+    """Verify --study and repeatable --batch options forward study_key and batch_ids to run_tui."""
+    from imednet_tui.cli import setup_parser
+
+    class DummyEntryPoint:
+        name = "tui"
+
+        def load(self):
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: (
+            [DummyEntryPoint()] if kwargs.get("group") == "imednet.cli_plugins" else []
+        ),
+    )
+
+    parser = get_parser()
+    args = parser.parse_args(
+        [
+            "tui",
+            "--study",
+            "STUDY-ONC-01",
+            "--batch",
+            "BATCH-101",
+            "--batch",
+            "BATCH-102,BATCH-103",
+            "-b",
+            "BATCH-101",
+        ]
+    )
+
+    with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+        patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
+    ):
+        mock_sdk = MagicMock()
+        mock_get_sdk.return_value = mock_sdk
+
+        args.func(args)
+        mock_run_tui.assert_called_once_with(
+            mock_sdk,
+            force=False,
+            study_key="STUDY-ONC-01",
+            batch_ids=["BATCH-101", "BATCH-102", "BATCH-103"],
+        )
