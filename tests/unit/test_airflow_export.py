@@ -73,11 +73,14 @@ def _setup_airflow(monkeypatch):
 EXPORT_FUNCTIONS = [
     "export_to_csv",
     "export_to_duckdb",
+    "export_to_duckdb_by_form",
     "export_to_parquet",
+    "export_to_hive_parquet",
     "export_to_excel",
     "export_to_json",
     "export_to_sql",
     "export_to_sql_by_form",
+    "export_to_long_sql",
 ]
 
 
@@ -107,19 +110,25 @@ def test_airflow_export_forwards_arguments(func_name: str) -> None:
 
 
 @pytest.mark.parametrize("func_name", EXPORT_FUNCTIONS)
-def test_spi_export_delegation_with_dispatcher_binding(func_name: str) -> None:
-    """Resolve real SPI bindings independently of package attribute import order."""
+def test_spi_export_unshadowed_module_delegation(func_name: str) -> None:
+    """Verify integrations.export and spi.export/export_helpers remain unshadowed modules across reloads."""
     script = '''
 import importlib
+from types import ModuleType
 from unittest.mock import patch
 import imednet.integrations as integrations
 
-# A cached submodule import must not decide whether `export` is callable or a module.
+assert not hasattr(integrations, "dispatcher")
+assert isinstance(integrations.export, ModuleType)
 importlib.reload(integrations)
-assert callable(integrations.export)
+assert isinstance(integrations.export, ModuleType)
 import imednet.spi as spi
+assert isinstance(spi.export, ModuleType)
+assert spi.export is integrations.export
+assert spi.export_helpers is integrations.export
 importlib.reload(spi)
 assert spi.export is integrations.export
+assert spi.export_helpers is integrations.export
 from apache_airflow_providers_imednet import export
 with patch("imednet.integrations.export." + FUNC, return_value=None) as destination:
     getattr(export, FUNC)("synthetic-study", path="synthetic-output")
@@ -876,3 +885,234 @@ def test_hook_resolve_destination_connection_variants(monkeypatch: pytest.Monkey
         "database": "neo_db",
     }
     assert ImednetHook.resolve_destination_connection("sqlite_conn", "csv") == {}
+
+
+def test_operator_accepts_all_ten_tabular_destinations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify hive_parquet, duckdb_by_form, long_sql, and sql_by_form succeed via destination without AirflowException."""
+    from types import SimpleNamespace
+
+    from apache_airflow_providers_imednet import export
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import (
+        _TABULAR_EXPORTS,
+        ImednetExportOperator,
+    )
+
+    assert set(_TABULAR_EXPORTS) == {
+        "csv",
+        "parquet",
+        "hive_parquet",
+        "excel",
+        "json",
+        "sql",
+        "sql_by_form",
+        "long_sql",
+        "duckdb",
+        "duckdb_by_form",
+    }
+
+    mock_sdk = MagicMock(sinks=None)
+    fake_pg = SimpleNamespace(
+        conn_type="postgres",
+        host="pg.internal",
+        port=5432,
+        schema="clinical",
+        login="loader",
+        password="pg_secret_password",  # pragma: allowlist secret
+        extra={},
+    )
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, conn_id: fake_pg if conn_id == "pg_dest" else None),
+    )
+
+    # 1. hive_parquet
+    mock_hive = MagicMock()
+    monkeypatch.setattr(export, "export_to_hive_parquet", mock_hive)
+    hive_op = ImednetExportOperator(
+        task_id="hive_pq",
+        study_key="STUDY-10",
+        destination="hive_parquet",
+        output_path="/tmp/hive_lake",
+        batch_size=250,
+        quality_gate_enabled=True,
+    )
+    monkeypatch.setattr(hive_op, "_get_sdk", lambda: mock_sdk)
+    assert hive_op.execute({}) == "/tmp/hive_lake"
+    mock_hive.assert_called_once_with(
+        mock_sdk,
+        "STUDY-10",
+        "/tmp/hive_lake",
+        batch_size=250,
+        quality_gate_enabled=True,
+    )
+
+    # 2. duckdb_by_form
+    mock_ddb_form = MagicMock()
+    monkeypatch.setattr(export, "export_to_duckdb_by_form", mock_ddb_form)
+    ddb_form_op = ImednetExportOperator(
+        task_id="ddb_by_form",
+        study_key="STUDY-10",
+        destination="duckdb_by_form",
+        output_path="/tmp/forms.duckdb",
+        batch_size=125,
+    )
+    monkeypatch.setattr(ddb_form_op, "_get_sdk", lambda: mock_sdk)
+    assert ddb_form_op.execute({}) == "/tmp/forms.duckdb"
+    mock_ddb_form.assert_called_once_with(
+        mock_sdk,
+        "STUDY-10",
+        "/tmp/forms.duckdb",
+        batch_size=125,
+    )
+
+    # 3. long_sql
+    mock_long_sql = MagicMock()
+    monkeypatch.setattr(export, "export_to_long_sql", mock_long_sql)
+    long_sql_op = ImednetExportOperator(
+        task_id="long_sql",
+        study_key="STUDY-10",
+        destination="long_sql",
+        destination_conn_id="pg_dest",
+        output_path="long_records",
+        quality_gate_enabled=True,
+        min_schema_readiness_score=90.0,
+    )
+    monkeypatch.setattr(long_sql_op, "_get_sdk", lambda: mock_sdk)
+    assert long_sql_op.execute({}) == "long_records"
+    mock_long_sql.assert_called_once_with(
+        mock_sdk,
+        "STUDY-10",
+        "long_records",
+        conn_str="postgresql://loader:pg_secret_password@pg.internal:5432/clinical",  # pragma: allowlist secret
+        quality_gate_enabled=True,
+        min_schema_readiness_score=90.0,
+    )
+
+    # 4. sql_by_form via destination=
+    mock_sql_by_form = MagicMock()
+    monkeypatch.setattr(export, "export_to_sql_by_form", mock_sql_by_form)
+    sql_by_form_op = ImednetExportOperator(
+        task_id="sql_by_form_dest",
+        study_key="STUDY-10",
+        destination="sql_by_form",
+        destination_conn_id="pg_dest",
+        retry_backoff=3.5,
+    )
+    monkeypatch.setattr(sql_by_form_op, "_get_sdk", lambda: mock_sdk)
+    res = sql_by_form_op.execute({})
+    assert "pg_secret_password" not in str(res)
+    mock_sql_by_form.assert_called_once_with(
+        mock_sdk,
+        "STUDY-10",
+        "postgresql://loader:pg_secret_password@pg.internal:5432/clinical",  # pragma: allowlist secret
+        retry_backoff=3.5,
+    )
+
+
+def test_operator_forwards_direct_sink_parameters_to_sink_configs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ImednetExportOperator forwards database, stage_prefix, local_staging_dir, manifest_path, retry_backoff, quality_gate_enabled, and min_schema_readiness_score when passed directly."""
+    from types import SimpleNamespace
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+
+    mock_sink_cls = MagicMock()
+    mock_config_cls = MagicMock()
+    mock_sdk = MagicMock(
+        sinks=MagicMock(SnowflakeExportSink=mock_sink_cls, SnowflakeSinkConfig=mock_config_cls)
+    )
+    mock_sdk.records.list.return_value = []
+
+    fake_conn = SimpleNamespace(
+        host="acct",
+        login="usr",
+        password="pwd",  # pragma: allowlist secret
+        schema="PUBLIC",
+        extra={"warehouse": "WH", "stage": "STG", "table": "TBL"},
+    )
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, _cid: fake_conn),
+    )
+
+    sentinel_tracer = object()
+    sentinel_provider = MagicMock()
+    sentinel_provider.transaction.return_value.__enter__.return_value = {}
+
+    op = ImednetExportOperator(
+        task_id="direct_sf_params",
+        study_key="STUDY-DIRECT",
+        destination="snowflake",
+        destination_conn_id="sf_conn",
+        database="DIRECT_DB",
+        stage_prefix="direct/prefix",
+        local_staging_dir="/tmp/direct_stage",
+        manifest_path="/tmp/direct_manifest.jsonl",
+        batch_size=128,
+        max_retries=5,
+        retry_backoff=4.25,
+        idempotent=False,
+        mask_phi=False,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=91.0,
+        tracer=sentinel_tracer,
+        modified_since="2026-01-01T00:00:00Z",
+        record_filter={"subjectKey": "SUBJ-1"},
+        record_data_filter="HR>60",
+        include_deleted=True,
+        incremental=True,
+        stream_name="custom_sf_stream",
+        ledger_path="/tmp/sf_ledger.json",
+        state_provider=sentinel_provider,
+        export_kwargs={"custom_flag": "yes"},
+    )
+    monkeypatch.setattr(op, "_get_sdk", lambda: mock_sdk)
+    op.execute({})
+
+    import dataclasses
+
+    from imednet.spi.sink_base import SinkConfig
+
+    call_kw = mock_config_cls.call_args.kwargs
+    expected_sink_config_fields = {f.name for f in dataclasses.fields(SinkConfig)}
+    assert expected_sink_config_fields.issubset(call_kw.keys())
+    assert call_kw["study_key"] == "STUDY-DIRECT"
+    assert call_kw["batch_size"] == 128
+    assert call_kw["max_retries"] == 5
+    assert call_kw["retry_backoff"] == 4.25
+    assert call_kw["idempotent"] is False
+    assert call_kw["mask_phi"] is False
+    assert call_kw["extra"] == {"custom_flag": "yes"}
+    assert call_kw["quality_gate_enabled"] is True
+    assert call_kw["min_schema_readiness_score"] == 91.0
+    assert call_kw["tracer"] is sentinel_tracer
+    assert call_kw["modified_since"] == "2026-01-01T00:00:00Z"
+    assert call_kw["record_filter"] == {"subjectKey": "SUBJ-1"}
+    assert call_kw["record_data_filter"] == "HR>60"
+    assert call_kw["include_deleted"] is True
+    assert call_kw["incremental"] is True
+    assert call_kw["stream_name"] == "custom_sf_stream"
+    assert call_kw["ledger_path"] == "/tmp/sf_ledger.json"
+    assert call_kw["state_provider"] is sentinel_provider
+    assert call_kw["database"] == "DIRECT_DB"
+    assert call_kw["stage_prefix"] == "direct/prefix"
+    assert call_kw["local_staging_dir"] == "/tmp/direct_stage"
+    assert call_kw["manifest_path"] == "/tmp/direct_manifest.jsonl"
+
+    from imednet.errors import ExportConfigurationError
+
+    bad_op = ImednetExportOperator(
+        task_id="bad_sf_batch_bool",
+        study_key="STUDY-DIRECT",
+        destination="snowflake",
+        destination_conn_id="sf_conn",
+        batch_size=True,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(bad_op, "_get_sdk", lambda: mock_sdk)
+    with pytest.raises(ExportConfigurationError, match="batch_size"):
+        bad_op.execute({})

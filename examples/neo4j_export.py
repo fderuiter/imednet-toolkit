@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import os
 
+from imednet_sinks import Neo4jSinkConfig, export_to_neo4j
+
 from imednet import ImednetSDK
-from imednet.integrations import Neo4jSinkConfig, export_to_neo4j
 
 sdk = ImednetSDK(
     api_key=os.environ["IMEDNET_API_KEY"],
@@ -32,8 +33,13 @@ NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 rows_loaded = export_to_neo4j(
     sdk,
     STUDY_KEY,
-    NEO4J_URI,
-    (NEO4J_USER, NEO4J_PASSWORD),
-    config=Neo4jSinkConfig(database=NEO4J_DATABASE, batch_size=500, idempotent=True),
+    config=Neo4jSinkConfig(
+        study_key=STUDY_KEY,
+        uri=NEO4J_URI,
+        auth=(NEO4J_USER, NEO4J_PASSWORD),
+        database=NEO4J_DATABASE,
+        batch_size=500,
+        idempotent=True,
+    ),
 )
 print(f"Loaded {rows_loaded} rows from study '{STUDY_KEY}' into Neo4j.")

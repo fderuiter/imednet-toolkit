@@ -10,8 +10,15 @@ from typing import Any
 
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
-from .export import _mask_df, _record_mapper
+from .export import (
+    _has_streaming_kwargs,
+    _mask_df,
+    _merge_form_whitelist_into_filter,
+    _pop_sink_kwargs,
+    _record_mapper,
+)
 from .parquet_engine import PyArrowDatasetPartitionedStorageEngine
+from .sink_base import SinkConfig, apply_quality_gate, is_record_deleted, iter_filtered_sdk_records
 
 
 def _ensure_pyarrow() -> ModuleType:
@@ -81,12 +88,33 @@ def export_to_hive_parquet(
     form_whitelist: list[int] | None = None,
     chunk_size: int = 5_000,
     mask_phi: bool = True,
+    quality_gate_enabled: bool = False,
+    **kwargs: Any,
 ) -> None:
     """Export study records to a Hive-partitioned Parquet directory layout."""
     pyarrow_module = _ensure_pyarrow()
     validate_partition_key(study_key)
 
-    mapper = _build_record_mapper(sdk, chunk_size=chunk_size, mask_phi=mask_phi)
+    kwargs.pop("manifest_path", None)
+    sink_kwargs = _pop_sink_kwargs(kwargs)
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(
+            f"export_to_hive_parquet() got an unexpected keyword argument {unexpected!r}"
+        )
+    has_streaming_opts = _has_streaming_kwargs(sink_kwargs)
+    effective_chunk_size = (
+        int(sink_kwargs["batch_size"])
+        if chunk_size == 5_000 and "batch_size" in sink_kwargs
+        else chunk_size
+    )
+    sink_kwargs.setdefault("batch_size", effective_chunk_size)
+    sink_kwargs.setdefault("mask_phi", mask_phi)
+    sink_kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
+    config = SinkConfig(study_key=study_key, **sink_kwargs)
+    effective_mask_phi = config.mask_phi
+
+    mapper = _build_record_mapper(sdk, chunk_size=effective_chunk_size, mask_phi=effective_mask_phi)
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
     forms = sdk.forms.list(study_key=study_key)
 
@@ -123,11 +151,48 @@ def export_to_hive_parquet(
         record_model = mapper._build_record_model(variable_keys, label_map)
         iter_records = getattr(mapper, "_iter_records", None)
         iter_parsed_rows = getattr(mapper, "_iter_parsed_rows", None)
-        if callable(iter_records) and callable(iter_parsed_rows):
+        if has_streaming_opts:
+            merged_filter = _merge_form_whitelist_into_filter(config.record_filter, [form.form_id])
+            raw_stream = iter_filtered_sdk_records(
+                sdk,
+                study_key,
+                watermark=config.modified_since,
+                record_filter=merged_filter,
+                record_data_filter=config.record_data_filter,
+                exclude_deleted_upstream=not config.include_deleted,
+            )
+            records: Any = (
+                rec for rec in raw_stream if config.include_deleted or not is_record_deleted(rec)
+            )
+            if config.quality_gate_enabled:
+                records = apply_quality_gate(sdk, study_key, records, config)
+            if callable(iter_parsed_rows):
+                for rows, _ in iter_parsed_rows(records, record_model):
+                    df = mapper._build_dataframe(
+                        rows,
+                        variable_keys,
+                        label_map,
+                        use_labels_as_columns,
+                    )
+                    if df.empty:
+                        continue
+                    if effective_mask_phi:
+                        df = _mask_df(df)
+                    table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
+                    storage_engine.write_form_table(
+                        table,
+                        base_dir=base_dir,
+                        study_key=study_key,
+                        form_key=form.form_key or "",
+                    )
+                continue
+        elif callable(iter_records) and callable(iter_parsed_rows):
             records = iter_records(
                 study_key,
                 extra_filters={"formId": form.form_id},
             )
+            if config.quality_gate_enabled:
+                records = apply_quality_gate(sdk, study_key, records, config)
             for rows, _ in iter_parsed_rows(records, record_model):
                 df = mapper._build_dataframe(
                     rows,
@@ -137,7 +202,7 @@ def export_to_hive_parquet(
                 )
                 if df.empty:
                     continue
-                if mask_phi:
+                if effective_mask_phi:
                     df = _mask_df(df)
                 table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
                 storage_engine.write_form_table(
@@ -147,11 +212,14 @@ def export_to_hive_parquet(
                     form_key=form.form_key or "",
                 )
             continue
+        else:
+            records = mapper._fetch_records(
+                study_key,
+                extra_filters={"formId": form.form_id},
+            )
+            if config.quality_gate_enabled:
+                records = list(apply_quality_gate(sdk, study_key, records, config))
 
-        records = mapper._fetch_records(
-            study_key,
-            extra_filters={"formId": form.form_id},
-        )
         rows, _ = mapper._parse_records(records, record_model)
         df = mapper._build_dataframe(
             rows,
@@ -159,7 +227,7 @@ def export_to_hive_parquet(
             label_map,
             use_labels_as_columns,
         )
-        if mask_phi and not df.empty:
+        if effective_mask_phi and not df.empty:
             df = _mask_df(df)
         table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
         storage_engine.write_form_table(

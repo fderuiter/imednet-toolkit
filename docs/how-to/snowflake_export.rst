@@ -128,6 +128,7 @@ purposes or replay:
        study_key="MY_STUDY",
        account="myorg",
        user="user",
+       password=os.environ["SNOWFLAKE_PASSWORD"],
        database="db",
        schema="public",
        warehouse="wh",
@@ -165,8 +166,8 @@ Error handling and retries
 Every ``write_batch`` call retries up to ``SinkConfig.max_retries`` times (default 3)
 with exponential back-off (``retry_backoff * 2 ** attempt``, default base 1 s).  After
 all retries are exhausted, :class:`~imednet.errors.ExportBatchError` is raised with the
-failing ``batch_id``.  Connection failures during ``__init__`` raise
-:class:`~imednet.errors.ExportConfigurationError`.
+failing ``batch_id``.  Missing required fields, invalid coordinates, or connection
+failures raise :class:`~imednet.errors.ExportConfigurationError`.
 
 Stage lifecycle and cleanup
 ---------------------------

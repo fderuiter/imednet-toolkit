@@ -679,17 +679,12 @@ class TestSnowflakeExportSink:
             SnowflakeExportSink(config=cfg)
 
     def test_raises_for_missing_required_config(self, monkeypatch, tmp_path):
-        """TODO: Add docstring."""
-        import imednet_sinks.warehouse as wh_mod
-        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+        """Constructing SnowflakeSinkConfig without required settings raises ExportConfigurationError immediately."""
+        from imednet_sinks.warehouse import SnowflakeSinkConfig
 
-        sf, conn, cursor = _fake_snowflake_module()
-        monkeypatch.setattr(wh_mod, "_require_optional_dep", lambda *_: sf)
-
-        # account is empty → should raise
-        cfg = SnowflakeSinkConfig(study_key="STUDY1", local_staging_dir=str(tmp_path))
+        # account/user/password/etc. empty → raises immediately on config initialization
         with pytest.raises(ExportConfigurationError, match="missing required fields"):
-            SnowflakeExportSink(config=cfg)
+            SnowflakeSinkConfig(study_key="STUDY1", local_staging_dir=str(tmp_path))
 
     def test_records_to_arrow_table_uses_snowflake_extra(self, monkeypatch):
         """TODO: Add docstring."""
@@ -1706,3 +1701,232 @@ class TestSinkPhiMaskingControls:
             "email": "jane.doe@clinical.example",
             "systolic_bp": 122,
         }
+
+
+class TestUnifiedSinkValidationAndQualityGateParity:
+    """Verify init-time ExportConfigurationError, entry-point pruning, and quality gate parity."""
+
+    def test_all_sink_configs_raise_export_configuration_error_immediately(self):
+        """SinkConfig, MongoDbSinkConfig, Neo4jSinkConfig, and SnowflakeSinkConfig fail fast with redacted messages."""
+        from imednet_sinks.document import MongoDbSinkConfig
+        from imednet_sinks.graph import Neo4jSinkConfig
+        from imednet_sinks.warehouse import SnowflakeSinkConfig
+
+        from imednet.spi.sink_base import SinkConfig
+
+        with pytest.raises(ExportConfigurationError, match="study_key"):
+            SinkConfig(study_key="")
+
+        with pytest.raises(ExportConfigurationError, match="uri"):
+            MongoDbSinkConfig(study_key="S1", uri="", database="db", collection="col")
+        with pytest.raises(ExportConfigurationError, match="database"):
+            MongoDbSinkConfig(
+                study_key="S1", uri="mongodb://localhost:27017", database="", collection="col"
+            )
+        with pytest.raises(ExportConfigurationError, match="collection"):
+            MongoDbSinkConfig(
+                study_key="S1", uri="mongodb://localhost:27017", database="db", collection=""
+            )
+
+        with pytest.raises(ExportConfigurationError, match="uri"):
+            Neo4jSinkConfig(
+                study_key="S1",
+                uri="",
+                auth=("neo4j", "secret_pw"),  # pragma: allowlist secret
+            )
+        with pytest.raises(ExportConfigurationError, match="auth") as neo_exc:
+            Neo4jSinkConfig(
+                study_key="S1",
+                uri="bolt://localhost:7687",
+                auth=("", "secret_pw"),  # pragma: allowlist secret
+            )
+        assert "secret_pw" not in str(neo_exc.value)
+        with pytest.raises(ExportConfigurationError, match="database"):
+            Neo4jSinkConfig(
+                study_key="S1",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "secret_pw"),  # pragma: allowlist secret
+                database=" ",
+            )
+
+        with pytest.raises(ExportConfigurationError, match="missing required fields") as sf_exc:
+            SnowflakeSinkConfig(
+                study_key="S1",
+                account="acct",
+                password="sf_secret_pw",  # pragma: allowlist secret
+            )
+        assert "sf_secret_pw" not in str(sf_exc.value)
+
+    def test_duplicate_sink_entry_point_groups_pruned(self):
+        """Verify imednet.sinks and imednet.sink_configs groups are pruned while imednet.plugins sinks remains active."""
+        from importlib.metadata import entry_points
+
+        assert list(entry_points(group="imednet.sinks")) == []
+        assert list(entry_points(group="imednet.sink_configs")) == []
+        plugin_eps = list(entry_points(group="imednet.plugins", name="sinks"))
+        assert len(plugin_eps) == 1
+
+    def test_quality_gate_drops_invalid_records_identically_across_all_sinks(
+        self, monkeypatch, tmp_path
+    ):
+        """With quality_gate_enabled=True, export_to_neo4j, export_to_mongodb, export_to_snowflake, and ImednetExportOperator drop invalid Study Records identically."""
+        import sys
+        from types import ModuleType
+
+        import imednet_sinks.document as doc_mod
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+        from imednet_sinks.warehouse import SnowflakeSinkConfig
+
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+
+        neo4j, neo_driver = _fake_neo4j_module()
+        pymongo, _mongo_client, _mongo_col = _fake_pymongo_module()
+        sf, _sf_conn, _sf_cursor = _fake_snowflake_module()
+        pa, pq, _arrow_table = _fake_pyarrow_modules()
+
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, _ex: (
+                sf if pkg == "snowflake.connector" else (pq if "parquet" in pkg else pa)
+            ),
+        )
+
+        valid_rec = Record(
+            record_id=1,
+            form_id=10,
+            form_key="VITALS",
+            subject_key="SUBJ-1",
+            record_data={"HR": 72},
+        )
+        # Unknown form_key=UNKNOWN_FORM scores 0.0 < min_schema_readiness_score (100.0) and is dropped
+        invalid_rec = Record(
+            record_id=2,
+            form_id=999,
+            form_key="UNKNOWN_FORM",
+            subject_key="SUBJ-1",
+            record_data={"HR": "not-an-int"},
+        )
+
+        def _build_sdk() -> MagicMock:
+            sdk = MagicMock()
+            variables = [
+                Variable(
+                    variable_name="HR",
+                    label="Heart Rate",
+                    variable_type="int",
+                    form_id=10,
+                    form_key="VITALS",
+                )
+            ]
+            sdk.variables.list.return_value = variables
+            sdk.get_variables.return_value = variables
+            sdk.forms.list.return_value = [SimpleNamespace(form_id=10, form_key="VITALS")]
+            sdk.records.list.side_effect = lambda **_kw: iter([valid_rec, invalid_rec])
+            return sdk
+
+        neo_written = graph_mod.export_to_neo4j(
+            _build_sdk(),
+            "STUDY-QG",
+            "bolt://localhost:7687",
+            ("neo4j", "pass"),  # pragma: allowlist secret
+            quality_gate_enabled=True,
+        )
+        mongo_written = doc_mod.export_to_mongodb(
+            _build_sdk(),
+            "STUDY-QG",
+            "mongodb://localhost:27017",
+            "clinical",
+            "records",
+            quality_gate_enabled=True,
+        )
+        sf_cfg = SnowflakeSinkConfig(
+            study_key="STUDY-QG",
+            account="acct",
+            user="usr",
+            password="pwd",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="RECORDS",
+            local_staging_dir=str(tmp_path / "sf"),
+            quality_gate_enabled=True,
+        )
+        sf_written = wh_mod.export_to_snowflake(_build_sdk(), "STUDY-QG", config=sf_cfg)
+
+        assert neo_written == 1
+        assert mongo_written == 1
+        assert sf_written == 1
+
+        neo_rows = neo_driver.session.return_value.__enter__.return_value.run.call_args.kwargs[
+            "rows"
+        ]
+        assert [r["record_id"] for r in neo_rows] == [1]
+        assert pymongo.UpdateOne.call_count == 1
+        assert pymongo.UpdateOne.call_args.args[0] == {"_id": "STUDY-QG/1"}
+        assert [r["record_id"] for r in pa.Table.from_pylist.call_args.args[0]] == [1]
+
+        # Verify ImednetExportOperator drops the exact same invalid record via shared runner
+        from imednet_sinks.plugin import create_sinks
+
+        airflow_sdk = _build_sdk()
+        airflow_sdk.sinks = create_sinks(airflow_sdk)
+        neo_driver.session.return_value.__enter__.return_value.run.reset_mock()
+
+        # Minimal offline Airflow stubs if airflow is not installed in environment
+        if "airflow" not in sys.modules:
+            for mod_name in (
+                "airflow",
+                "airflow.models",
+                "airflow.hooks",
+                "airflow.sdk",
+                "airflow.sdk.bases",
+                "airflow.sdk.bases.hook",
+                "airflow.sdk.definitions",
+                "airflow.sdk.definitions.context",
+                "airflow.sdk.definitions.dag",
+            ):
+                m = ModuleType(mod_name)
+                m.__path__ = []  # type: ignore[attr-defined]
+                sys.modules.setdefault(mod_name, m)
+            sys.modules["airflow.models"].BaseOperator = type(  # type: ignore[attr-defined]
+                "BaseOperator", (), {"template_fields": (), "__init__": lambda self, **_kw: None}
+            )
+            sys.modules["airflow.sdk.bases.hook"].BaseHook = type("BaseHook", (), {})  # type: ignore[attr-defined]
+
+        from apache_airflow_providers_imednet.hooks import ImednetHook
+        from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+
+        fake_neo_conn = SimpleNamespace(
+            conn_type="bolt",
+            host="localhost",
+            port=7687,
+            login="neo4j",
+            password="pass",  # pragma: allowlist secret
+            schema="neo4j",
+            extra={},
+        )
+        monkeypatch.setattr(
+            ImednetHook,
+            "_get_airflow_connection",
+            classmethod(lambda cls, _cid: fake_neo_conn),
+        )
+        op = ImednetExportOperator(
+            task_id="qg_neo4j",
+            study_key="STUDY-QG",
+            destination="neo4j",
+            destination_conn_id="neo_conn",
+            quality_gate_enabled=True,
+        )
+        monkeypatch.setattr(op, "_get_sdk", lambda: airflow_sdk)
+        op.execute({})
+
+        op_rows = neo_driver.session.return_value.__enter__.return_value.run.call_args.kwargs[
+            "rows"
+        ]
+        assert [r["record_id"] for r in op_rows] == [1]

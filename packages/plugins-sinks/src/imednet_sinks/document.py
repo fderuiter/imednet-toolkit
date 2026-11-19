@@ -106,15 +106,15 @@ class MongoDbSinkConfig(SinkConfig):
         """Validate MongoDB config properties after initialization."""
         super().__post_init__()  # type: ignore[no-untyped-call]
         if not self.uri or not isinstance(self.uri, str) or not self.uri.strip():
-            raise ValueError("uri must be a non-empty string")
+            raise ExportConfigurationError("uri must be a non-empty string")
         if not self.database or not isinstance(self.database, str) or not self.database.strip():
-            raise ValueError("database must be a non-empty string")
+            raise ExportConfigurationError("database must be a non-empty string")
         if (
             not self.collection
             or not isinstance(self.collection, str)
             or not self.collection.strip()
         ):
-            raise ValueError("collection must be a non-empty string")
+            raise ExportConfigurationError("collection must be a non-empty string")
 
 
 def _make_document_id(study_key: str, record_id: Any) -> str:

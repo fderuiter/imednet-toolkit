@@ -8,13 +8,6 @@ imednet.integrations package
 Submodules
 ----------
 
-imednet.integrations.dispatcher module
---------------------------------------
-
-.. automodule:: imednet.integrations.dispatcher
-   :members:
-   :show-inheritance:
-
 imednet.integrations.enrichment module
 --------------------------------------
 

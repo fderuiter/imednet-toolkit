@@ -83,7 +83,6 @@ display_text_year  # unused variable (packages/core/src/imednet/form_designer/mo
 record_key_date  # unused variable (packages/core/src/imednet/form_designer/models.py:199)
 record_comp_date  # unused variable (packages/core/src/imednet/form_designer/models.py:200)
 id  # unused variable (packages/core/src/imednet/form_designer/models.py:223)
-register_sink_target  # unused function (packages/core/src/imednet/integrations/dispatcher.py:106)
 _._detect_drift  # unused method (packages/core/src/imednet/models/base.py:164)
 _normalise  # unused function (packages/core/src/imednet/models/base.py:211)
 direction  # unused variable (packages/core/src/imednet/models/base.py:228)

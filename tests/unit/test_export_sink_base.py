@@ -121,6 +121,39 @@ class TestSinkConfig:
         with pytest.raises(ValueError, match="mask_phi must be a boolean"):
             SinkConfig(study_key="MY_STUDY", mask_phi="false")  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize(
+        "invalid_kwargs,match",
+        [
+            ({"study_key": ""}, "study_key must be a non-empty string"),
+            ({"study_key": "   "}, "study_key must be a non-empty string"),
+            ({"study_key": "MY_STUDY", "batch_size": 0}, "batch_size must be a positive integer"),
+            (
+                {"study_key": "MY_STUDY", "batch_size": True},
+                "batch_size must be a positive integer",
+            ),
+            (
+                {"study_key": "MY_STUDY", "max_retries": -1},
+                "max_retries must be a non-negative integer",
+            ),
+            (
+                {"study_key": "MY_STUDY", "retry_backoff": -0.1},
+                "retry_backoff must be a finite non-negative number",
+            ),
+            (
+                {"study_key": "MY_STUDY", "min_schema_readiness_score": 105.0},
+                "min_schema_readiness_score must be between 0.0 and 100.0",
+            ),
+            (
+                {"study_key": "MY_STUDY", "mask_phi": "no"},
+                "mask_phi must be a boolean",
+            ),
+        ],
+    )
+    def test_raises_export_configuration_error_immediately(self, invalid_kwargs, match):
+        """Constructing SinkConfig with missing or invalid settings raises ExportConfigurationError immediately."""
+        with pytest.raises(ExportConfigurationError, match=match):
+            SinkConfig(**invalid_kwargs)
+
 
 class TestIterBatches:
     """Test suite for IterBatches."""

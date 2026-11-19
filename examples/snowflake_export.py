@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import os
 
+from imednet_sinks import SnowflakeSinkConfig, export_to_snowflake
+
 from imednet import ImednetSDK
-from imednet.integrations import SnowflakeSinkConfig, export_to_snowflake
 
 # ---------------------------------------------------------------------------
 # SDK initialisation — credentials are read from environment variables only.
@@ -28,12 +29,15 @@ sdk = ImednetSDK(
     security_key=os.environ.get("IMEDNET_SECURITY_KEY", ""),
 )
 
+STUDY_KEY = os.environ.get("IMEDNET_STUDY_KEY", "MY_STUDY")
+
 # ---------------------------------------------------------------------------
 # Snowflake sink configuration.
 # Credentials are passed via environment variables so they never appear in
 # source code, logs, or exception messages.
 # ---------------------------------------------------------------------------
 config = SnowflakeSinkConfig(
+    study_key=STUDY_KEY,
     account=os.environ.get("SNOWFLAKE_ACCOUNT", "myorg-myaccount"),
     user=os.environ.get("SNOWFLAKE_USER", "loader"),
     password=os.environ["SNOWFLAKE_PASSWORD"],
@@ -53,8 +57,6 @@ config = SnowflakeSinkConfig(
     # re-running this script does not reload already-ingested files.
     idempotent=True,
 )
-
-STUDY_KEY = os.environ.get("IMEDNET_STUDY_KEY", "MY_STUDY")
 
 # ---------------------------------------------------------------------------
 # Export

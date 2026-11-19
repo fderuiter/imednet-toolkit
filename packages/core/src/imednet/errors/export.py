@@ -7,7 +7,7 @@ class ExportError(ImednetError):
     """Raised when an export sink cannot write a batch or finalize a destination."""
 
 
-class ExportConfigurationError(ExportError):
+class ExportConfigurationError(ExportError, ValueError):
     """Raised when a sink is misconfigured (missing credentials, invalid parameters)."""
 
 

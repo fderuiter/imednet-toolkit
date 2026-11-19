@@ -83,6 +83,7 @@ from imednet.sdk import ImednetSDK
 from imednet.spi.sink_base import (
     ExportSink,
     SinkConfig,
+    _redact_uri,
     _require_optional_dep,
     extract_record_id,
     run_streaming_export,
@@ -175,7 +176,28 @@ class SnowflakeSinkConfig(SinkConfig):
         super().__post_init__()
         if self.prefix is not None:
             self.stage_prefix = self.prefix
-        self.validate_identifiers(require_coordinates=False)
+        self.validate_required_fields()
+        self.validate_identifiers(require_coordinates=True)
+
+    def validate_required_fields(self) -> None:
+        """Ensure required Snowflake connection and target settings are non-empty."""
+        missing = [
+            name
+            for name, val in [
+                ("account", self.account),
+                ("user", self.user),
+                ("password", self.password),
+                ("database", self.database),
+                ("warehouse", self.warehouse),
+                ("stage", self.stage),
+                ("table", self.table),
+            ]
+            if not isinstance(val, str) or not val.strip()
+        ]
+        if missing:
+            raise ExportConfigurationError(
+                f"SnowflakeSinkConfig is missing required fields: {missing}"
+            )
 
     def validate_identifiers(self, *, require_coordinates: bool = False) -> None:
         """Validate Snowflake database coordinates and stage prefix against strict patterns."""
@@ -189,8 +211,9 @@ class SnowflakeSinkConfig(SinkConfig):
         for name, value in coordinates.items():
             if value:
                 if not _IDENTIFIER_PATTERN.match(value):
+                    safe_val = _redact_uri(value)
                     raise ExportConfigurationError(
-                        f"SnowflakeSinkConfig parameter '{name}' contains invalid characters: {value!r}"
+                        f"SnowflakeSinkConfig parameter '{name}' contains invalid characters: {safe_val!r}"
                     )
             elif require_coordinates:
                 raise ExportConfigurationError(
@@ -200,14 +223,16 @@ class SnowflakeSinkConfig(SinkConfig):
         prefix_val = self.stage_prefix
         if prefix_val:
             if not _PREFIX_PATTERN.match(prefix_val):
+                safe_prefix = _redact_uri(prefix_val)
                 raise ExportConfigurationError(
-                    f"SnowflakeSinkConfig parameter 'stage_prefix' contains invalid characters: {prefix_val!r}"
+                    f"SnowflakeSinkConfig parameter 'stage_prefix' contains invalid characters: {safe_prefix!r}"
                 )
         elif require_coordinates:
             raise ExportConfigurationError(
                 "SnowflakeSinkConfig parameter 'stage_prefix' must be non-empty."
             )
 
+    _validate_required_fields = validate_required_fields
     _validate_identifiers = validate_identifiers
 
 
@@ -327,24 +352,7 @@ class SnowflakeExportSink(ExportSink):
     def _connect(self) -> None:
         """Establish connection to Snowflake and initialize local staging."""
         cfg = self._cfg
-        missing = [
-            name
-            for name, val in [
-                ("account", cfg.account),
-                ("user", cfg.user),
-                ("password", cfg.password),
-                ("database", cfg.database),
-                ("warehouse", cfg.warehouse),
-                ("stage", cfg.stage),
-                ("table", cfg.table),
-            ]
-            if not val
-        ]
-        if missing:
-            raise ExportConfigurationError(
-                f"SnowflakeSinkConfig is missing required fields: {missing}"
-            )
-
+        cfg.validate_required_fields()
         cfg.validate_identifiers(require_coordinates=True)
 
         snowflake = _require_optional_dep("snowflake.connector", "snowflake")
@@ -359,8 +367,11 @@ class SnowflakeExportSink(ExportSink):
                 warehouse=cfg.warehouse,
             )
         except Exception as exc:
+            err_msg = _redact_uri(str(exc))
+            if cfg.password:
+                err_msg = err_msg.replace(cfg.password, "***")
             raise ExportConfigurationError(
-                f"Cannot connect to Snowflake account '{cfg.account}': {exc}"
+                f"Cannot connect to Snowflake account '{cfg.account}': {err_msg}"
             ) from exc
 
         # Set up local staging directory
@@ -563,9 +574,14 @@ def export_to_snowflake(
     sdk: ImednetSDK,
     study_key: str,
     *,
-    config: SnowflakeSinkConfig,
+    config: SnowflakeSinkConfig | None = None,
+    mask_phi: bool = True,
+    **kwargs: Any,
 ) -> int:
     """Export study records to Snowflake using :class:`SnowflakeExportSink`."""
+    if config is None:
+        kwargs.setdefault("mask_phi", mask_phi)
+        config = SnowflakeSinkConfig(study_key=study_key, **kwargs)
     return run_streaming_export(
         sdk,
         study_key,

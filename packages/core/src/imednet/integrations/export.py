@@ -2175,8 +2175,12 @@ def export_to_duckdb_by_form(
             "Install with `pip install 'imednet[duckdb]'`."
         ) from error
 
+    kwargs.pop("manifest_path", None)
     sink_kwargs = _pop_sink_kwargs(kwargs)
-    effective_mask_phi = bool(sink_kwargs.get("mask_phi", mask_phi))
+    has_streaming_opts = _has_streaming_kwargs(sink_kwargs)
+    sink_kwargs.setdefault("mask_phi", mask_phi)
+    config = SinkConfig(study_key=study_key, **sink_kwargs)
+    effective_mask_phi = config.mask_phi
     mapper = _create_record_mapper(sdk, mask_phi=effective_mask_phi)
     forms = sdk.forms.list(study_key=study_key)
 
@@ -2192,12 +2196,12 @@ def export_to_duckdb_by_form(
         if v.form_id is not None:
             variables_by_form.setdefault(v.form_id, []).append(v)
 
-    use_mock_fetch = _uses_mock_fetch_records(mapper) and not _has_streaming_kwargs(sink_kwargs)
-    batch_size = int(sink_kwargs.get("batch_size", 500))
-    include_deleted = bool(sink_kwargs.get("include_deleted", False))
-    modified_since = sink_kwargs.get("modified_since")
-    record_filter = sink_kwargs.get("record_filter")
-    record_data_filter = sink_kwargs.get("record_data_filter")
+    use_mock_fetch = _uses_mock_fetch_records(mapper) and not has_streaming_opts
+    batch_size = config.batch_size
+    include_deleted = config.include_deleted
+    modified_since = config.modified_since
+    record_filter = config.record_filter
+    record_data_filter = config.record_data_filter
 
     conn: Any = duckdb.connect(db_path, config={"threads": "1"})
     try:
@@ -2220,10 +2224,12 @@ def export_to_duckdb_by_form(
             }
             record_model = mapper._build_record_model(variable_keys, label_map)
             if use_mock_fetch:
-                records = mapper._fetch_records(
+                records: Iterable[Any] = mapper._fetch_records(
                     study_key,
                     extra_filters={"formId": form.form_id},
                 )
+                if config.quality_gate_enabled:
+                    records = list(apply_quality_gate(sdk, study_key, records, config))
                 rows, _ = mapper._parse_records(records, record_model)
                 df = mapper._build_dataframe(
                     rows,
@@ -2277,7 +2283,11 @@ def export_to_duckdb_by_form(
                 record_data_filter=record_data_filter,
                 exclude_deleted_upstream=not include_deleted,
             )
-            stream = (rec for rec in raw_stream if include_deleted or not is_record_deleted(rec))
+            stream: Iterable[Any] = (
+                rec for rec in raw_stream if include_deleted or not is_record_deleted(rec)
+            )
+            if config.quality_gate_enabled:
+                stream = apply_quality_gate(sdk, study_key, stream, config)
             wrote_any = False
             untyped_null_cols: set[str] = set()
             quoted_tbl = _quote_duckdb_identifier(form.form_key)
@@ -2516,28 +2526,39 @@ def export_to_long_sql(
         )
     from sqlalchemy import create_engine
 
+    kwargs.pop("manifest_path", None)
     sink_kwargs = _pop_sink_kwargs(kwargs)
-    effective_mask_phi = bool(sink_kwargs.get("mask_phi", mask_phi))
+    has_streaming_opts = _has_streaming_kwargs(sink_kwargs)
+    sink_kwargs.setdefault("mask_phi", mask_phi)
+    config = SinkConfig(study_key=study_key, **sink_kwargs)
+    effective_mask_phi = config.mask_phi
+    effective_chunk_size = (
+        config.batch_size if chunk_size == 1000 and "batch_size" in sink_kwargs else chunk_size
+    )
     engine = create_engine(conn_str)
     mapper = _create_record_mapper(sdk, mask_phi=effective_mask_phi)
-    if _uses_mock_fetch_records(mapper) and not _has_streaming_kwargs(sink_kwargs):
+    if _uses_mock_fetch_records(mapper) and not has_streaming_opts:
         records: Iterable[Any] = mapper._fetch_records(study_key)
     else:
         records = iter_filtered_sdk_records(
             sdk,
             study_key,
-            watermark=sink_kwargs.get("modified_since"),
-            record_filter=sink_kwargs.get("record_filter"),
-            record_data_filter=sink_kwargs.get("record_data_filter"),
-            exclude_deleted_upstream=not bool(sink_kwargs.get("include_deleted", False)),
+            watermark=config.modified_since,
+            record_filter=config.record_filter,
+            record_data_filter=config.record_data_filter,
+            exclude_deleted_upstream=not config.include_deleted,
         )
 
-    include_deleted = bool(sink_kwargs.get("include_deleted", False))
+    include_deleted = config.include_deleted
+    filtered_records: Iterable[Any] = (
+        rec for rec in records if include_deleted or not is_record_deleted(rec)
+    )
+    if config.quality_gate_enabled:
+        filtered_records = apply_quality_gate(sdk, study_key, filtered_records, config)
+
     rows: list[dict[str, Any]] = []
     first = True
-    for rec in records:
-        if not include_deleted and is_record_deleted(rec):
-            continue
+    for rec in filtered_records:
         timestamp = rec.date_modified
         for name, value in (rec.record_data or {}).items():
             if not effective_mask_phi:
@@ -2556,7 +2577,7 @@ def export_to_long_sql(
                     "timestamp": timestamp,
                 }
             )
-            if len(rows) >= chunk_size:
+            if len(rows) >= effective_chunk_size:
                 df = pd.DataFrame(rows)
                 df.to_sql(
                     table_name,
@@ -2574,3 +2595,16 @@ def export_to_long_sql(
             if_exists="replace" if first else "append",
             index=False,
         )
+
+
+def export_to_hive_parquet(
+    sdk: ImednetSDK,
+    study_key: str,
+    base_dir: str,
+    form_keys: list[str] | None = None,
+    **kwargs: Any,
+) -> None:
+    """Export records into Hive-partitioned Parquet datasets."""
+    from .parquet import export_to_hive_parquet as _export_to_hive_parquet
+
+    _export_to_hive_parquet(sdk, study_key, base_dir, form_keys=form_keys, **kwargs)

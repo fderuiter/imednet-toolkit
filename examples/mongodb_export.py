@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import os
 
+from imednet_sinks import MongoDbSinkConfig, export_to_mongodb
+
 from imednet import ImednetSDK
-from imednet.integrations import SinkConfig, export_to_mongodb
 
 sdk = ImednetSDK(
     api_key=os.environ["IMEDNET_API_KEY"],
@@ -28,9 +29,13 @@ MONGODB_COLLECTION = os.environ.get("MONGODB_COLLECTION", "records")
 rows_loaded = export_to_mongodb(
     sdk,
     STUDY_KEY,
-    MONGODB_URI,
-    MONGODB_DATABASE,
-    MONGODB_COLLECTION,
-    config=SinkConfig(batch_size=500, idempotent=True),
+    config=MongoDbSinkConfig(
+        study_key=STUDY_KEY,
+        uri=MONGODB_URI,
+        database=MONGODB_DATABASE,
+        collection=MONGODB_COLLECTION,
+        batch_size=500,
+        idempotent=True,
+    ),
 )
 print(f"Loaded {rows_loaded} rows from study '{STUDY_KEY}' into MongoDB.")

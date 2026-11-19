@@ -270,28 +270,46 @@ class SinkConfig:
     def __post_init__(self) -> None:
         """Validate config properties after initialization."""
         if not self.study_key or not isinstance(self.study_key, str) or not self.study_key.strip():
-            raise ValueError("study_key must be a non-empty string")
+            raise ExportConfigurationError("study_key must be a non-empty string")
+        if (
+            isinstance(self.batch_size, bool)
+            or not isinstance(self.batch_size, int)
+            or self.batch_size <= 0
+        ):
+            raise ExportConfigurationError("batch_size must be a positive integer")
         if (
             isinstance(self.max_retries, bool)
             or not isinstance(self.max_retries, int)
             or self.max_retries < 0
         ):
-            raise ValueError("max_retries must be a non-negative integer")
+            raise ExportConfigurationError("max_retries must be a non-negative integer")
         if (
             isinstance(self.retry_backoff, bool)
             or not isinstance(self.retry_backoff, (int, float))
             or not math.isfinite(self.retry_backoff)
             or self.retry_backoff < 0
         ):
-            raise ValueError("retry_backoff must be a finite non-negative number")
+            raise ExportConfigurationError("retry_backoff must be a finite non-negative number")
         if not isinstance(self.mask_phi, bool):
-            raise ValueError("mask_phi must be a boolean")
-        if self.modified_since is not None:
-            normalize_watermark_datetime(self.modified_since)
-        if isinstance(self.record_filter, str) and self.record_filter.strip():
-            validate_connector_exclusivity(self.record_filter)
-        if isinstance(self.record_data_filter, str) and self.record_data_filter.strip():
-            validate_connector_exclusivity(self.record_data_filter)
+            raise ExportConfigurationError("mask_phi must be a boolean")
+        if (
+            isinstance(self.min_schema_readiness_score, bool)
+            or not isinstance(self.min_schema_readiness_score, (int, float))
+            or not math.isfinite(self.min_schema_readiness_score)
+            or not (0.0 <= float(self.min_schema_readiness_score) <= 100.0)
+        ):
+            raise ExportConfigurationError(
+                "min_schema_readiness_score must be between 0.0 and 100.0"
+            )
+        try:
+            if self.modified_since is not None:
+                normalize_watermark_datetime(self.modified_since)
+            if isinstance(self.record_filter, str) and self.record_filter.strip():
+                validate_connector_exclusivity(self.record_filter)
+            if isinstance(self.record_data_filter, str) and self.record_data_filter.strip():
+                validate_connector_exclusivity(self.record_data_filter)
+        except ValueError as exc:
+            raise ExportConfigurationError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -545,11 +563,14 @@ def apply_quality_gate(
         elif hasattr(record, "__dict__"):
             rec_dict = {
                 "form_key": getattr(record, "form_key", None),
+                "formKey": getattr(record, "formKey", None),
                 "form_id": getattr(record, "form_id", None),
+                "formId": getattr(record, "formId", None),
                 "record_data": getattr(record, "record_data", None),
                 "recordData": getattr(record, "recordData", None),
                 "data": getattr(record, "data", {}),
-                "record_id": getattr(record, "record_id", None),
+                "record_id": getattr(record, "record_id", None)
+                or getattr(record, "recordId", None),
             }
         elif isinstance(record, dict):
             rec_dict = record

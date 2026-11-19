@@ -44,12 +44,13 @@ Usage
         study_key="MYSTUDY",
     )
 
-    config = Neo4jSinkConfig(batch_size=200)
-    with Neo4jExportSink(
+    config = Neo4jSinkConfig(
+        study_key="MYSTUDY",
         uri="bolt://localhost:7687",
         auth=("neo4j", "password"),
-        config=config,
-    ) as sink:
+        batch_size=200,
+    )
+    with Neo4jExportSink(config=config) as sink:
         for i, batch in enumerate(batched(records, config.batch_size)):
             sink.write_batch(batch, batch_id=f"MYSTUDY/all/{i}")
 """
@@ -100,9 +101,21 @@ class Neo4jSinkConfig(SinkConfig):
         """Validate Neo4j config properties after initialization."""
         super().__post_init__()  # type: ignore[no-untyped-call]
         if not self.uri or not isinstance(self.uri, str) or not self.uri.strip():
-            raise ValueError("uri must be a non-empty string")
-        if not self.auth or not isinstance(self.auth, tuple) or len(self.auth) != 2:
-            raise ValueError("auth must be a tuple of (username, password)")
+            raise ExportConfigurationError("uri must be a non-empty string")
+        if (
+            not self.auth
+            or not isinstance(self.auth, tuple)
+            or len(self.auth) != 2
+            or not isinstance(self.auth[0], str)
+            or not self.auth[0].strip()
+            or not isinstance(self.auth[1], str)
+            or not self.auth[1]
+        ):
+            raise ExportConfigurationError(
+                "auth must be a tuple of non-empty (username, password) strings"
+            )
+        if not self.database or not isinstance(self.database, str) or not self.database.strip():
+            raise ExportConfigurationError("database must be a non-empty string")
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +227,12 @@ class Neo4jExportSink(ExportSink):
             self._driver = neo4j_mod.GraphDatabase.driver(self._uri, auth=self._auth)
             self._driver.verify_connectivity()
         except Exception as exc:
-            raise ExportConfigurationError(f"Cannot connect to Neo4j at {redacted}: {exc}") from exc
+            err_msg = _redact_uri(str(exc))
+            if self._auth and len(self._auth) == 2 and self._auth[1]:
+                err_msg = err_msg.replace(self._auth[1], "***")
+            raise ExportConfigurationError(
+                f"Cannot connect to Neo4j at {redacted}: {err_msg}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # ExportSink interface
@@ -234,11 +252,11 @@ class Neo4jExportSink(ExportSink):
             return 0
 
         cypher = _MERGE_RECORD_CYPHER if self.config.idempotent else _CREATE_RECORD_CYPHER
-        cfg = self.config if isinstance(self.config, Neo4jSinkConfig) else Neo4jSinkConfig()
+        database = getattr(self.config, "database", "neo4j")
 
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
-            with self._driver.session(database=cfg.database) as session:
+            with self._driver.session(database=database) as session:
                 session.run(cypher, rows=rows)
             logger.debug("Wrote batch %s (%d records)", batch_id, len(rows))
             return len(rows)
@@ -256,14 +274,10 @@ class Neo4jExportSink(ExportSink):
         if not record_ids:
             return 0
 
-        cfg = (
-            self.config
-            if isinstance(self.config, Neo4jSinkConfig)
-            else Neo4jSinkConfig(study_key=self._study_key, uri=self._uri, auth=self._auth)
-        )
+        database = getattr(self.config, "database", "neo4j")
 
         def execute_reconcile() -> int:
-            with self._driver.session(database=cfg.database) as session:
+            with self._driver.session(database=database) as session:
                 session.run(
                     _DELETE_RECORD_CYPHER,
                     record_ids=record_ids,

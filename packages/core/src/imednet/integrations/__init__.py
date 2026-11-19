@@ -1,6 +1,6 @@
 """Integration helpers for exporting study data."""
 
-from .dispatcher import export, register_tabular_target
+from . import export
 from .export import (
     export_to_csv,
     export_to_duckdb,
@@ -16,20 +16,8 @@ from .parquet import export_to_hive_parquet, hive_parquet_query
 from .parquet_engine import PartitionedStorageEngine, PyArrowDatasetPartitionedStorageEngine
 from .sink_base import ExportSink, SinkConfig
 
-# Register standard tabular targets
-register_tabular_target("csv", export_to_csv)
-register_tabular_target("duckdb", export_to_duckdb)
-register_tabular_target("duckdb_by_form", export_to_duckdb_by_form)
-register_tabular_target("excel", export_to_excel)
-register_tabular_target("json", export_to_json)
-register_tabular_target("long_sql", export_to_long_sql)
-register_tabular_target("parquet", export_to_parquet)
-register_tabular_target("sql", export_to_sql)
-register_tabular_target("sql_by_form", export_to_sql_by_form)
-register_tabular_target("hive_parquet", export_to_hive_parquet)
-
 __all__ = [  # noqa: RUF022
-    # Unified entry point
+    # Procedural export module
     "export",
     # Tabular path
     "export_to_csv",

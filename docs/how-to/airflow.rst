@@ -81,15 +81,18 @@ The Airflow integration organizes hooks, operators, and sensors in dedicated
 subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, Snowflake, Neo4j, etc.)
-using the core SDK's universal sink interface. Common operational parameters
-(``batch_size``, ``max_retries``, ``idempotent``, ``quality_gate_enabled``, and
+records to any supported destination—including all ten tabular targets (``csv``,
+``parquet``, ``hive_parquet``, ``excel``, ``json``, ``sql``, ``sql_by_form``,
+``long_sql``, ``duckdb``, ``duckdb_by_form``) as well as external sinks
+(``snowflake``, ``neo4j``, ``mongodb``)—using the core SDK's universal sink
+interface. Common operational parameters (``batch_size``, ``max_retries``,
+``retry_backoff``, ``idempotent``, ``quality_gate_enabled``, and
 ``min_schema_readiness_score``) work consistently across plugin sinks and
 tabular exports without leaking sink-level options into Pandas or JSON writer
 kwargs. Destination-specific non-secret options—such as Snowflake staging
 settings (``stage_prefix``, ``local_staging_dir``, ``manifest_path``) and Neo4j
-``database`` names—can be supplied via ``export_kwargs`` or connection ``extra``
-metadata. ``ImednetJobSensor`` waits for an export job to complete.
+or MongoDB ``database`` names—can be supplied directly on the operator, via
+``export_kwargs``, or via connection ``extra`` metadata. ``ImednetJobSensor`` waits for an export job to complete.
 All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` instance
 from an Airflow connection. The production reference DAG above shows the recommended
 dynamic-mapping pattern: keep static settings (for example ``destination``,
@@ -156,8 +159,7 @@ is installed, ``tests/integration/test_airflow_dag.py`` runs a small DAG with
 ``ImednetExportOperator`` and ``ImednetJobSensor``. It is
 skipped automatically if Airflow is missing.
 
-Procedural export helpers use ``imednet.spi.export_helpers``, an explicit
-module namespace for CSV, JSON, Excel, Parquet and SQL helpers. The legacy
-``imednet.spi.export`` binding remains available for compatibility; provider
-delegation does not depend on whether that name resolves to a dispatcher or
-an imported module.
+Procedural export helpers are exposed through ``imednet.spi.export_helpers``
+and ``imednet.spi.export``, providing an unshadowed module namespace for all
+ten tabular export helpers (CSV, JSON, Excel, Parquet, Hive Parquet, SQL,
+per-form SQL, long-format SQL, DuckDB, and per-form DuckDB).

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 from urllib.parse import quote_plus
 
@@ -34,10 +34,14 @@ logger = logging.getLogger(__name__)
 _TABULAR_EXPORTS = {
     "csv": export.export_to_csv,
     "parquet": export.export_to_parquet,
+    "hive_parquet": export.export_to_hive_parquet,
     "excel": export.export_to_excel,
     "json": export.export_to_json,
     "sql": export.export_to_sql,
+    "sql_by_form": export.export_to_sql_by_form,
+    "long_sql": export.export_to_long_sql,
     "duckdb": export.export_to_duckdb,
+    "duckdb_by_form": export.export_to_duckdb_by_form,
 }
 
 _SECRET_EXPORT_KEYS = frozenset(
@@ -68,7 +72,9 @@ _SECRET_EXPORT_KEYS = frozenset(
 _TABULAR_OPTION_DEFAULTS: dict[str, Any] = {
     "batch_size": 500,
     "max_retries": 3,
+    "retry_backoff": 1.0,
     "idempotent": True,
+    "mask_phi": True,
     "quality_gate_enabled": False,
     "min_schema_readiness_score": 100.0,
 }
@@ -157,6 +163,32 @@ _STREAMING_EXPORT_KEYS = (
 )
 
 
+def _resolve_setting(
+    runtime_kwargs: Mapping[str, Any],
+    key: str,
+    operator_val: Any,
+    conn_settings: Mapping[str, Any],
+    default: Any = None,
+) -> Any:
+    """Resolve an optional setting across runtime kwargs, operator attributes, and connection metadata."""
+    if key in runtime_kwargs and runtime_kwargs[key] is not None:
+        return runtime_kwargs[key]
+    if operator_val is not None:
+        return operator_val
+    conn_val = conn_settings.get(key)
+    return conn_val if conn_val is not None else default
+
+
+def _coerce_int(value: Any) -> Any:
+    """Coerce numeric strings while preserving booleans so SinkConfig rejects bools."""
+    return value if isinstance(value, bool) else int(value)
+
+
+def _coerce_float(value: Any) -> Any:
+    """Coerce numeric strings while preserving booleans so SinkConfig rejects bools."""
+    return value if isinstance(value, bool) else float(value)
+
+
 class ImednetExportOperator(BaseOperator):
     """Unified Airflow operator for exporting study records to any destination."""
 
@@ -188,9 +220,16 @@ class ImednetExportOperator(BaseOperator):
         destination_conn_id: str | None = None,
         batch_size: int = 500,
         max_retries: int = 3,
+        retry_backoff: float = 1.0,
         idempotent: bool = True,
+        mask_phi: bool = True,
         quality_gate_enabled: bool = False,
         min_schema_readiness_score: float = 100.0,
+        tracer: Any = None,
+        database: str | None = None,
+        stage_prefix: str | None = None,
+        local_staging_dir: Any = None,
+        manifest_path: Any = None,
         modified_since: Any = None,
         record_filter: Any = None,
         record_data_filter: str | None = None,
@@ -212,9 +251,15 @@ class ImednetExportOperator(BaseOperator):
         :param destination_conn_id: Optional Airflow connection ID to resolve destination credentials at runtime.
         :param batch_size: Number of records to read and write per batch.
         :param max_retries: Maximum number of export attempts.
+        :param retry_backoff: Base delay in seconds between retry attempts.
         :param idempotent: Whether the export execution should be safely repeatable, automatically deduplicating or replacing existing outputs as appropriate.
+        :param mask_phi: Whether to mask sensitive clinical PHI fields prior to writing.
         :param quality_gate_enabled: Whether to filter records through the schema readiness quality gate prior to export.
         :param min_schema_readiness_score: Minimum schema readiness score (0-100) required when the quality gate is enabled.
+        :param database: Optional target database override for database/graph/warehouse sinks.
+        :param stage_prefix: Optional stage path prefix for warehouse sinks.
+        :param local_staging_dir: Optional local staging directory for warehouse sinks.
+        :param manifest_path: Optional JSON-lines manifest path for audit logging.
         :param kwargs: Additional Airflow BaseOperator arguments.
         """
         super().__init__(**kwargs)
@@ -226,12 +271,19 @@ class ImednetExportOperator(BaseOperator):
         self.imednet_conn_id = imednet_conn_id
         self.destination_conn_id = destination_conn_id
 
-        # Common operational parameters
+        # Common operational and destination parameters
         self.batch_size: int = batch_size
         self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         self.idempotent = idempotent
+        self.mask_phi = mask_phi
         self.quality_gate_enabled = quality_gate_enabled
         self.min_schema_readiness_score = min_schema_readiness_score
+        self.tracer = tracer
+        self.database = database
+        self.stage_prefix = stage_prefix
+        self.local_staging_dir = local_staging_dir
+        self.manifest_path = manifest_path
         self.modified_since = modified_since
         self.record_filter = record_filter
         self.record_data_filter = record_data_filter
@@ -286,6 +338,8 @@ class ImednetExportOperator(BaseOperator):
         """Collect non-default streaming, filtering, and checkpoint options."""
         opts: dict[str, Any] = {}
         defaults: dict[str, Any] = {
+            "mask_phi": True,
+            "tracer": None,
             "modified_since": None,
             "record_filter": None,
             "record_data_filter": None,
@@ -313,6 +367,8 @@ class ImednetExportOperator(BaseOperator):
                 merged[key] = current_val
         for key, val in self._collect_streaming_options(runtime_kwargs).items():
             merged.setdefault(key, val)
+        if self.manifest_path is not None and "manifest_path" not in merged:
+            merged["manifest_path"] = self.manifest_path
         if (
             merged.get("incremental")
             and "state_provider" not in merged
@@ -321,8 +377,10 @@ class ImednetExportOperator(BaseOperator):
             merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
         return merged
 
-    def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
-        """Dynamically load and configure the target sink from the SDK, handling dependencies lazily."""
+    def _build_sink_target(
+        self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None
+    ) -> tuple[Callable[[], Any], Any] | None:
+        """Build a validated sink configuration and lazy sink factory for external sinks."""
         dest = self.destination
         if not dest and self.export_func:
             dest = self.export_func.replace("export_to_", "")
@@ -343,77 +401,83 @@ class ImednetExportOperator(BaseOperator):
         runtime_kwargs = self._get_runtime_export_kwargs()
         conn_settings = self._resolve_destination_connection(dest)
         stream_opts = self._collect_streaming_options(runtime_kwargs)
+        common_sink_kwargs: dict[str, Any] = {
+            "study_key": config.study_key,
+            "batch_size": config.batch_size,
+            "max_retries": config.max_retries,
+            "retry_backoff": config.retry_backoff,
+            "idempotent": config.idempotent,
+            "extra": config.extra,
+            "quality_gate_enabled": config.quality_gate_enabled,
+            "min_schema_readiness_score": config.min_schema_readiness_score,
+            **stream_opts,
+        }
 
         if dest == "snowflake":
-            sink_cls = getattr(sinks, "SnowflakeExportSink", None)
-            config_cls = getattr(sinks, "SnowflakeSinkConfig", None)
-            if sink_cls is None or config_cls is None:
+            sf_sink_cls = getattr(sinks, "SnowflakeExportSink", None)
+            sf_config_cls = getattr(sinks, "SnowflakeSinkConfig", None)
+            if sf_sink_cls is None or sf_config_cls is None:
                 raise AirflowException(
                     "Snowflake sink is not available in the installed sinks plugin. "
                     "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[snowflake]'"
                 )
-            snowflake_config = config_cls(
-                study_key=config.study_key,
-                batch_size=config.batch_size,
-                max_retries=config.max_retries,
-                retry_backoff=config.retry_backoff,
-                idempotent=config.idempotent,
-                extra=config.extra,
-                quality_gate_enabled=config.quality_gate_enabled,
-                min_schema_readiness_score=config.min_schema_readiness_score,
-                account=runtime_kwargs.get("account") or conn_settings.get("account", ""),
-                user=runtime_kwargs.get("user") or conn_settings.get("user", ""),
+            if "stage_prefix" in runtime_kwargs and runtime_kwargs["stage_prefix"] is not None:
+                resolved_stage_prefix = runtime_kwargs["stage_prefix"]
+            elif "prefix" in runtime_kwargs and runtime_kwargs["prefix"] is not None:
+                resolved_stage_prefix = runtime_kwargs["prefix"]
+            elif self.stage_prefix is not None:
+                resolved_stage_prefix = self.stage_prefix
+            else:
+                resolved_stage_prefix = conn_settings.get("stage_prefix", "imednet")
+            snowflake_config = sf_config_cls(
+                **common_sink_kwargs,
+                account=_resolve_setting(runtime_kwargs, "account", None, conn_settings, ""),
+                user=_resolve_setting(runtime_kwargs, "user", None, conn_settings, ""),
                 password=conn_settings.get("password", ""),
-                database=runtime_kwargs.get("database") or conn_settings.get("database", ""),
-                schema=runtime_kwargs.get("schema") or conn_settings.get("schema", "PUBLIC"),
-                warehouse=runtime_kwargs.get("warehouse") or conn_settings.get("warehouse", ""),
-                stage=runtime_kwargs.get("stage") or conn_settings.get("stage", ""),
-                table=runtime_kwargs.get("table") or conn_settings.get("table", ""),
-                stage_prefix=(
-                    runtime_kwargs.get("stage_prefix")
-                    or runtime_kwargs.get("prefix")
-                    or conn_settings.get("stage_prefix", "imednet")
+                database=_resolve_setting(
+                    runtime_kwargs, "database", self.database, conn_settings, ""
                 ),
+                schema=_resolve_setting(runtime_kwargs, "schema", None, conn_settings, "PUBLIC"),
+                warehouse=_resolve_setting(runtime_kwargs, "warehouse", None, conn_settings, ""),
+                stage=_resolve_setting(runtime_kwargs, "stage", None, conn_settings, ""),
+                table=_resolve_setting(runtime_kwargs, "table", None, conn_settings, ""),
+                stage_prefix=resolved_stage_prefix,
                 prefix=runtime_kwargs.get("prefix"),
-                local_staging_dir=(
-                    runtime_kwargs.get("local_staging_dir")
-                    or conn_settings.get("local_staging_dir")
+                local_staging_dir=_resolve_setting(
+                    runtime_kwargs,
+                    "local_staging_dir",
+                    self.local_staging_dir,
+                    conn_settings,
+                    None,
                 ),
-                manifest_path=(
-                    runtime_kwargs.get("manifest_path") or conn_settings.get("manifest_path")
+                manifest_path=_resolve_setting(
+                    runtime_kwargs, "manifest_path", self.manifest_path, conn_settings, None
                 ),
-                **stream_opts,
             )
-            return sink_cls(config=snowflake_config)
+            return (lambda: sf_sink_cls(config=snowflake_config), snowflake_config)
 
         if dest == "neo4j":
-            sink_cls = getattr(sinks, "Neo4jExportSink", None)
-            config_cls = getattr(sinks, "Neo4jSinkConfig", None)
-            if sink_cls is None or config_cls is None:
+            neo_sink_cls = getattr(sinks, "Neo4jExportSink", None)
+            neo_config_cls = getattr(sinks, "Neo4jSinkConfig", None)
+            if neo_sink_cls is None or neo_config_cls is None:
                 raise AirflowException(
                     "Neo4j sink is not available in the installed sinks plugin. "
                     "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[neo4j]'"
                 )
-            neo4j_config = config_cls(
-                study_key=config.study_key,
-                batch_size=config.batch_size,
-                max_retries=config.max_retries,
-                retry_backoff=config.retry_backoff,
-                idempotent=config.idempotent,
-                extra=config.extra,
-                quality_gate_enabled=config.quality_gate_enabled,
-                min_schema_readiness_score=config.min_schema_readiness_score,
-                uri=runtime_kwargs.get("uri") or conn_settings.get("uri", ""),
+            neo4j_config = neo_config_cls(
+                **common_sink_kwargs,
+                uri=_resolve_setting(runtime_kwargs, "uri", None, conn_settings, ""),
                 auth=conn_settings.get("auth", ("", "")),
-                database=runtime_kwargs.get("database") or conn_settings.get("database", "neo4j"),
-                **stream_opts,
+                database=_resolve_setting(
+                    runtime_kwargs, "database", self.database, conn_settings, "neo4j"
+                ),
             )
-            return sink_cls(config=neo4j_config)
+            return (lambda: neo_sink_cls(config=neo4j_config), neo4j_config)
 
         if dest == "mongodb":
-            sink_cls = getattr(sinks, "MongoDbExportSink", None)
-            config_cls = getattr(sinks, "MongoDbSinkConfig", None)
-            if sink_cls is None or config_cls is None:
+            mongo_sink_cls = getattr(sinks, "MongoDbExportSink", None)
+            mongo_config_cls = getattr(sinks, "MongoDbSinkConfig", None)
+            if mongo_sink_cls is None or mongo_config_cls is None:
                 raise AirflowException(
                     "MongoDB sink is not available in the installed sinks plugin. "
                     "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[mongodb]'"
@@ -427,23 +491,25 @@ class ImednetExportOperator(BaseOperator):
                 )
             else:
                 mongo_uri = conn_settings.get("uri", "")
-            mongo_config = config_cls(
-                study_key=config.study_key,
-                batch_size=config.batch_size,
-                max_retries=config.max_retries,
-                retry_backoff=config.retry_backoff,
-                idempotent=config.idempotent,
-                extra=config.extra,
-                quality_gate_enabled=config.quality_gate_enabled,
-                min_schema_readiness_score=config.min_schema_readiness_score,
+            mongo_config = mongo_config_cls(
+                **common_sink_kwargs,
                 uri=mongo_uri,
-                database=runtime_kwargs.get("database") or conn_settings.get("database", ""),
-                collection=runtime_kwargs.get("collection") or conn_settings.get("collection", ""),
-                **stream_opts,
+                database=_resolve_setting(
+                    runtime_kwargs, "database", self.database, conn_settings, ""
+                ),
+                collection=_resolve_setting(runtime_kwargs, "collection", None, conn_settings, ""),
             )
-            return sink_cls(config=mongo_config)
+            return (lambda: mongo_sink_cls(config=mongo_config), mongo_config)
 
         return None
+
+    def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
+        """Dynamically load and configure the target sink from the SDK, handling dependencies lazily."""
+        target = self._build_sink_target(config, sdk=sdk)
+        if target is None:
+            return None
+        sink_factory, _ = target
+        return sink_factory()
 
     def execute(self, context: Context) -> str | None:
         """Execute the export task."""
@@ -475,15 +541,15 @@ class ImednetExportOperator(BaseOperator):
 
         config = sink_base.SinkConfig(
             study_key=self.study_key,
-            batch_size=int(runtime_kwargs.get("batch_size", self.batch_size)),
-            max_retries=int(runtime_kwargs.get("max_retries", self.max_retries)),
-            retry_backoff=float(runtime_kwargs.get("retry_backoff", 1.0)),
+            batch_size=_coerce_int(runtime_kwargs.get("batch_size", self.batch_size)),
+            max_retries=_coerce_int(runtime_kwargs.get("max_retries", self.max_retries)),
+            retry_backoff=_coerce_float(runtime_kwargs.get("retry_backoff", self.retry_backoff)),
             idempotent=bool(runtime_kwargs.get("idempotent", self.idempotent)),
             extra=runtime_kwargs,
             quality_gate_enabled=bool(
                 runtime_kwargs.get("quality_gate_enabled", self.quality_gate_enabled)
             ),
-            min_schema_readiness_score=float(
+            min_schema_readiness_score=_coerce_float(
                 runtime_kwargs.get(
                     "min_schema_readiness_score",
                     self.min_schema_readiness_score,
@@ -492,40 +558,48 @@ class ImednetExportOperator(BaseOperator):
             **stream_opts,
         )
 
-        sink = None
         if not export_callable:
-            sink = self._resolve_sink(config, sdk=sdk)
-            if not sink:
+            sink_target = self._build_sink_target(config, sdk=sdk)
+            if sink_target is None:
                 raise AirflowException(
                     f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
                 )
-
-        if sink:
+            sink_factory, resolved_cfg = sink_target
+            runner_cfg = resolved_cfg if isinstance(resolved_cfg, sink_base.SinkConfig) else config
             sink_base.run_streaming_export(
                 sdk,
                 self.study_key,
-                sink,
-                config,
+                sink_factory,
+                runner_cfg,
                 stream_name=f"airflow_{dest}",
                 batch_id_prefix=f"{self.study_key}/batch",
                 default_provider_name="airflow",
             )
-        else:
-            # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)
-            if not export_callable:
-                raise AirflowException(f"Unsupported destination or export_func '{dest}'")
+            return redact_uri(self.output_path) if self.output_path is not None else None
 
-            tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
-            if dest in ("sql", "sql_by_form", "long_sql"):
-                conn_settings = self._resolve_destination_connection(dest)
-                if dest == "sql_by_form":
-                    conn_str_arg = (
-                        self.output_path
-                        or tabular_kwargs.pop("conn_str", None)
-                        or conn_settings.get("conn_str")
-                    )
-                    export_callable(sdk, self.study_key, conn_str_arg, **tabular_kwargs)
-                    return redact_uri(str(conn_str_arg)) if conn_str_arg is not None else None
+        tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
+        if dest in ("sql", "sql_by_form", "long_sql"):
+            conn_settings = self._resolve_destination_connection(dest)
+            if dest == "sql_by_form":
+                conn_str_arg = (
+                    self.output_path
+                    or tabular_kwargs.pop("conn_str", None)
+                    or conn_settings.get("conn_str")
+                )
+                export_callable(sdk, self.study_key, conn_str_arg, **tabular_kwargs)
+                return redact_uri(str(conn_str_arg)) if conn_str_arg is not None else None
+            if (
+                self.output_path
+                and "://" in self.output_path
+                and ("table" in tabular_kwargs or "table_name" in tabular_kwargs)
+                and "conn_str" not in tabular_kwargs
+                and not conn_settings.get("conn_str")
+            ):
+                tabular_kwargs["conn_str"] = self.output_path
+                table_arg = tabular_kwargs.pop("table", None) or tabular_kwargs.pop(
+                    "table_name", None
+                )
+            else:
                 table_arg = (
                     self.output_path
                     or tabular_kwargs.pop("table", None)
@@ -534,11 +608,30 @@ class ImednetExportOperator(BaseOperator):
                 )
                 if "conn_str" not in tabular_kwargs and conn_settings.get("conn_str"):
                     tabular_kwargs["conn_str"] = conn_settings["conn_str"]
-                export_callable(sdk, self.study_key, table_arg, **tabular_kwargs)
-                if self.output_path is not None:
-                    return redact_uri(self.output_path)
-                return redact_uri(str(table_arg)) if table_arg is not None else None
-            export_callable(sdk, self.study_key, self.output_path, **tabular_kwargs)
+            export_callable(sdk, self.study_key, table_arg, **tabular_kwargs)
+            if self.output_path is not None:
+                return redact_uri(self.output_path)
+            return redact_uri(str(table_arg)) if table_arg is not None else None
+
+        if dest == "hive_parquet":
+            base_dir_arg = (
+                self.output_path
+                if self.output_path is not None
+                else tabular_kwargs.pop("base_dir", None)
+            )
+            export_callable(sdk, self.study_key, base_dir_arg, **tabular_kwargs)
+            return redact_uri(str(base_dir_arg)) if base_dir_arg is not None else None
+
+        if dest in ("duckdb", "duckdb_by_form"):
+            db_path_arg = (
+                self.output_path
+                if self.output_path is not None
+                else tabular_kwargs.pop("db_path", None)
+            )
+            export_callable(sdk, self.study_key, db_path_arg, **tabular_kwargs)
+            return redact_uri(str(db_path_arg)) if db_path_arg is not None else None
+
+        export_callable(sdk, self.study_key, self.output_path, **tabular_kwargs)
         return redact_uri(self.output_path) if self.output_path is not None else None
 
 

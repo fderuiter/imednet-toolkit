@@ -21,7 +21,6 @@ from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig, ex
 
 from imednet import cli
 from imednet.errors import ExportBatchError
-from imednet.integrations import dispatcher
 from imednet.integrations import export as export_mod
 from imednet.integrations.export import (
     TabularSinkConfig,
@@ -174,8 +173,8 @@ def test_iter_batches_streams_lazily_without_len() -> None:
         iter_batches(_gen(), -1)
 
 
-def test_dispatcher_export_reads_two_records_before_batch_zero() -> None:
-    """dispatcher.export reads 2 records before batch 0 when batch_size=2."""
+def test_run_streaming_export_reads_two_records_before_batch_zero() -> None:
+    """run_streaming_export reads 2 records before batch 0 when batch_size=2."""
     reads = [0]
 
     def _lazy_records(**_kwargs: Any) -> Iterator[Record]:
@@ -187,14 +186,14 @@ def test_dispatcher_export_reads_two_records_before_batch_zero() -> None:
     sdk.records.list.side_effect = _lazy_records
 
     created_sinks: list[_CountingSink] = []
+    cfg = SinkConfig(study_key="STUDY-LAZY", batch_size=2)
 
-    class _LazyTargetSink(_CountingSink):
-        def __init__(self, config: SinkConfig) -> None:
-            super().__init__(config, reads)
-            created_sinks.append(self)
+    def _make_sink() -> _CountingSink:
+        sink_inst = _CountingSink(cfg, reads)
+        created_sinks.append(sink_inst)
+        return sink_inst
 
-    dispatcher.register_sink_target("lazy_counting_sink", _LazyTargetSink)
-    total = dispatcher.export("lazy_counting_sink", sdk, "STUDY-LAZY", batch_size=2)
+    total = run_streaming_export(sdk, "STUDY-LAZY", _make_sink, cfg)
 
     assert total == 5
     sink = created_sinks[0]
