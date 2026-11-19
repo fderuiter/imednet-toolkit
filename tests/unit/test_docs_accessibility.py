@@ -779,7 +779,10 @@ def test_role_card_trigger_contracts_preserved() -> None:
 @pytest.mark.unit
 def test_verify_built_tutorial_html_invariants(tmp_path: Path) -> None:
     """Verify static HTML gate catches legacy Thebe/Binder artifacts and validates wheel staging."""
-    from scripts.verify_pyodide_tutorials import verify_built_tutorial_html
+    from scripts.verify_pyodide_tutorials import (
+        LEGACY_BINDER_LABEL_PATTERN,
+        verify_built_tutorial_html,
+    )
 
     wheels_dir = tmp_path / "_static" / "wheels"
     wheels_dir.mkdir(parents=True)
@@ -837,7 +840,18 @@ def test_verify_built_tutorial_html_invariants(tmp_path: Path) -> None:
     )
     (tutorials_dir / "quick_start.html").write_text(bad_html, encoding="utf-8")
     errs = verify_built_tutorial_html(tmp_path)
-    assert any("sphinx-thebe.js" in err for err in errs)
-    assert any("mybinder.org" in err for err in errs)
+    assert (
+        "tutorials/quick_start.html: Found forbidden legacy Thebe/Binder token 'sphinx-thebe.js'"
+        in errs
+    )
+    assert (
+        "tutorials/quick_start.html: Found forbidden legacy Thebe/Binder token 'mybinder.org'"
+        in errs
+    )
     assert any("data-content_root" in err for err in errs)
     assert any("imednet_tui" in err for err in errs)
+
+    assert LEGACY_BINDER_LABEL_PATTERN.search("Launching from mybinder.org...") is not None
+    assert LEGACY_BINDER_LABEL_PATTERN.search("Connecting to MyBinder") is not None
+    assert LEGACY_BINDER_LABEL_PATTERN.search("Activate Interactive Runtime") is None
+    assert LEGACY_BINDER_LABEL_PATTERN.search("Pyodide (WebAssembly): ready") is None

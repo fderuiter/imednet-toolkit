@@ -50,6 +50,7 @@ CONFIG_SCRIPT_PATTERN = re.compile(
     re.DOTALL,
 )
 CONTENT_ROOT_PATTERN = re.compile(r'<html[^>]*\bdata-content_root="([^"]*)"', re.IGNORECASE)
+LEGACY_BINDER_LABEL_PATTERN = re.compile(r"\bmybinder(?:\.org)?\b", re.IGNORECASE)
 
 
 class _QuietStaticHandler(SimpleHTTPRequestHandler):
@@ -246,7 +247,7 @@ def verify_tutorials_in_browser(
 
                 launch_btn = qs_page.locator(".thebe-launch-button").first
                 initial_label = (launch_btn.text_content() or "").strip()
-                if "mybinder.org" in initial_label.lower():
+                if LEGACY_BINDER_LABEL_PATTERN.search(initial_label):
                     errors.append(
                         f"quick_start.html: Launch button showed Binder label: '{initial_label}'"
                     )
@@ -257,7 +258,7 @@ def verify_tutorials_in_browser(
                     timeout=timeout_ms,
                 )
                 ready_label = (launch_btn.text_content() or "").strip()
-                if "mybinder.org" in ready_label.lower():
+                if LEGACY_BINDER_LABEL_PATTERN.search(ready_label):
                     errors.append(
                         f"quick_start.html: Ready button showed Binder label: '{ready_label}'"
                     )
@@ -391,7 +392,7 @@ def verify_tutorials_in_browser(
                 )
 
                 async_ready_label = (async_launch.text_content() or "").strip()
-                if "mybinder.org" in async_ready_label.lower():
+                if LEGACY_BINDER_LABEL_PATTERN.search(async_ready_label):
                     errors.append(
                         f"async_quick_start.html: Ready button showed Binder label: '{async_ready_label}'"
                     )
