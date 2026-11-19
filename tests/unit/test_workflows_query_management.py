@@ -141,3 +141,49 @@ def test_query_management_duck_typed_objects_fallback() -> None:
     counts = wf.get_query_state_counts("STUDY")
     assert counts["OPEN"] == 1
     assert counts["CLOSED"] == 1
+
+
+def test_get_queries_by_site_multi_subject_http_contract() -> None:
+    """Verify multi-Subject Site query lookup emits OR filter without studyKey predicate."""
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    with respx.mock:
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+        subjects_route = respx.get("https://api.test/api/v1/edc/studies/STUDY/subjects").respond(
+            json={
+                "data": [
+                    {"subjectId": 1, "subjectKey": "SUB1", "siteName": "General Hospital"},
+                    {"subjectId": 2, "subjectKey": "SUB2", "siteName": "General Hospital"},
+                ]
+            }
+        )
+        queries_route = respx.get("https://api.test/api/v1/edc/studies/STUDY/queries").respond(
+            json={
+                "data": [
+                    {
+                        "annotationId": 10,
+                        "subjectKey": "SUB1",
+                        "queryComments": [{"sequence": 1, "closed": False}],
+                    },
+                    {
+                        "annotationId": 11,
+                        "subjectKey": "SUB2",
+                        "queryComments": [{"sequence": 1, "closed": False}],
+                    },
+                ]
+            }
+        )
+
+        wf = QueryManagementWorkflow(sdk)
+        queries = wf.get_queries_by_site("STUDY", "General Hospital")
+
+        assert len(queries) == 2
+        assert (
+            subjects_route.calls.last.request.url.params["filter"] == 'siteName=="General Hospital"'
+        )
+        assert (
+            queries_route.calls.last.request.url.params["filter"]
+            == "subjectKey==SUB1,subjectKey==SUB2"
+        )

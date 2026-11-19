@@ -168,3 +168,51 @@ async def test_async_json_list_paginator_valid_list() -> None:
     paginator = AsyncJsonListPaginator(client, "/p")  # type: ignore
     items = [item async for item in paginator]
     assert items == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("params", "page_size"),
+    [
+        ({"page": 0, "size": 1}, 100),
+        ({"page": 5, "size": 500}, 100),
+        ({}, 1),
+        ({}, 500),
+    ],
+)
+def test_paginator_accepts_valid_bounds(params: dict[str, Any], page_size: int) -> None:
+    """Test Paginator and AsyncPaginator accept page >= 0 and 1 <= size <= 500."""
+    client = DummyClient([{"data": [1], "pagination": {"totalPages": 6}}])
+    paginator = Paginator(client, "/p", params=params, page_size=page_size)
+    if "page" in params:
+        assert list(paginator) == [1]
+    else:
+        single_client = DummyClient([{"data": [1], "pagination": {"totalPages": 1}}])
+        single_paginator = Paginator(single_client, "/p", params=params, page_size=page_size)
+        assert list(single_paginator) == [1]
+
+
+@pytest.mark.parametrize(
+    ("params", "page_size", "match"),
+    [
+        ({"page": -1}, 100, "page.*>= 0"),
+        ({"size": 0}, 100, "size.*between 1 and 500"),
+        ({"size": -10}, 100, "size.*between 1 and 500"),
+        ({"size": 501}, 100, "size.*between 1 and 500"),
+        ({}, 0, "size.*between 1 and 500"),
+        ({}, 501, "size.*between 1 and 500"),
+        ({"page": True}, 100, "must be an integer"),
+        ({"size": False}, 100, "must be an integer"),
+        ({"page": "abc"}, 100, "must be an integer"),
+    ],
+)
+def test_paginator_rejects_invalid_bounds(
+    params: dict[str, Any], page_size: int, match: str
+) -> None:
+    """Test Paginator and AsyncPaginator reject out-of-range page and size values."""
+    client = DummyClient([{"data": [1]}])
+    with pytest.raises(ValueError, match=match):
+        Paginator(client, "/p", params=params, page_size=page_size)
+
+    async_client = AsyncDummyClient([{"data": [1]}])
+    with pytest.raises(ValueError, match=match):
+        AsyncPaginator(async_client, "/p", params=params, page_size=page_size)  # type: ignore

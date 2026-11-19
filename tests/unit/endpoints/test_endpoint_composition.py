@@ -95,6 +95,23 @@ def test_users_endpoint_keeps_public_read_api(dummy_client, paginator_factory):
     assert capture["path"] == "/api/v1/edc/studies/S1/users"
 
 
+LIST_ONLY_SYNC = {CodingsEndpoint, QueriesEndpoint, UsersEndpoint, VisitsEndpoint}
+LIST_ONLY_ASYNC = {
+    AsyncCodingsEndpoint,
+    AsyncQueriesEndpoint,
+    AsyncUsersEndpoint,
+    AsyncVisitsEndpoint,
+}
+
+
+def test_list_only_endpoints_expose_no_get():
+    """List-only endpoints must not expose single-item get methods."""
+    for sync_cls in LIST_ONLY_SYNC:
+        assert not hasattr(sync_cls, "get")
+    for async_cls in LIST_ONLY_ASYNC:
+        assert not hasattr(async_cls, "get")
+
+
 def test_all_endpoints_inherit_from_single_edc_base():
     """Endpoints must have their respective EDC base as their sole direct parent."""
     for endpoint_cls in ALL_ENDPOINT_CLASSES:
@@ -102,7 +119,7 @@ def test_all_endpoints_inherit_from_single_edc_base():
         base_names = {b.__name__ for b in direct_bases if not b.__name__.endswith("OperationDef")}
         if endpoint_cls is JobsEndpoint:
             expected_base = "EdcSyncGetEndpoint"
-        elif endpoint_cls is UsersEndpoint:
+        elif endpoint_cls in LIST_ONLY_SYNC:
             expected_base = "EdcSyncListEndpoint"
         else:
             expected_base = "EdcSyncListGetEndpoint"
@@ -119,7 +136,7 @@ def test_all_async_endpoints_inherit_from_single_edc_base():
         }
         if endpoint_cls is AsyncJobsEndpoint:
             expected_base = "EdcAsyncGetEndpoint"
-        elif endpoint_cls is AsyncUsersEndpoint:
+        elif endpoint_cls in LIST_ONLY_ASYNC:
             expected_base = "EdcAsyncListEndpoint"
         else:
             expected_base = "EdcAsyncListGetEndpoint"

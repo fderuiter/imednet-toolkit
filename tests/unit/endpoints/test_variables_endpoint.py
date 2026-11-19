@@ -19,12 +19,12 @@ def test_list_requires_study_key_page_size(dummy_client, paginator_factory, patc
     with pytest.raises(ConfigurationError):
         ep.list()
 
-    result = ep.list(study_key="S1", name="x")
+    result = ep.list(study_key="S1", variable_name="x")
 
     assert capture["path"] == "/api/v1/edc/studies/S1/variables"
     assert capture["page_size"] == 500
     assert capture["params"] == {"filter": "FILTERED"}
-    assert patch["filters"] == {"name": "x"}
+    assert patch["filters"] == {"variable_name": "x"}
     assert isinstance(result[0], Variable)
 
 
@@ -85,12 +85,12 @@ def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patc
 
     df = ep.to_dataframe(
         study_key="S1",
-        name="x",
+        variable_name="x",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/variables"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"name": "x"}
+    assert filter_capture["filters"] == {"variable_name": "x"}
     assert len(df) == 1
 
 
@@ -144,12 +144,12 @@ async def test_async_to_dataframe_parameter_forwarding(
 
     df = await ep.to_dataframe(
         study_key="S1",
-        name="x",
+        variable_name="x",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/variables"
     assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"name": "x"}
+    assert filter_capture["filters"] == {"variable_name": "x"}
     assert len(df) == 1
 
 

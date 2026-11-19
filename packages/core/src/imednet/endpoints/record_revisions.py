@@ -10,6 +10,28 @@ class RecordRevisionsOperationDef:
     PATH = "recordRevisions"
     MODEL = RecordRevision
     _id_param = "recordRevisionId"
+    FILTER_ATTRIBUTES = frozenset(
+        {
+            "recordRevisionId",
+            "recordId",
+            "recordOid",
+            "recordRevision",
+            "dataRevision",
+            "recordStatus",
+            "subjectId",
+            "subjectOid",
+            "subjectKey",
+            "siteId",
+            "formKey",
+            "intervalId",
+            "role",
+            "user",
+            "reasonForChange",
+            "deleted",
+            "dateCreated",
+            "lastUpdated",
+        }
+    )
 
 
 class RecordRevisionsEndpoint(RecordRevisionsOperationDef, EdcSyncListGetEndpoint[RecordRevision]):  # type: ignore[misc]
