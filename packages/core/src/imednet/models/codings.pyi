@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from imednet.models.base import ImednetBaseModel
 
 class Coding(ImednetBaseModel):
@@ -26,6 +24,6 @@ class Coding(ImednetBaseModel):
     dictionary_name: str | None
     dictionary_version: str | None
     date_coded: str | None
+    reason: str | None
+    revision: int | None
     last_updated: str | None
-    reason: Any
-    revision: Any

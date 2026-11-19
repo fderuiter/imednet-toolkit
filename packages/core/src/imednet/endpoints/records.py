@@ -51,7 +51,7 @@ class RecordsOperationDef:
         }
     )
 
-    @execute_operation  # type: ignore
+    @execute_operation
     def create(
         self,
         study_key: str,
