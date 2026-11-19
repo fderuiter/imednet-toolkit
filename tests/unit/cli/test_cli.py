@@ -1610,6 +1610,54 @@ def test_get_sdk_handles_dotenv_parse_error_gracefully(
     )
 
 
+def test_get_sdk_forwards_resolved_config_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_sdk resolves load_config once and preserves oidc_token, timeout, strict_mode, and simulation_mode."""
+    from unittest.mock import patch
+
+    import imednet.config as config_mod
+    from imednet.auth.oidc import OIDCAuth
+    from imednet.cli.utils.context import get_sdk
+
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.setenv("IMEDNET_OIDC_TOKEN", "cli-oidc-token")
+    monkeypatch.setenv("IMEDNET_BASE_URL", "https://cli.imednet.example")
+    monkeypatch.setenv("IMEDNET_TIMEOUT", "52.5")
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "true")
+
+    call_count = 0
+    real_load = config_mod.load_config
+
+    def spy_load(*args: object, **kwargs: object) -> config_mod.Config:
+        nonlocal call_count
+        call_count += 1
+        return real_load(*args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        patch("imednet.cli.utils.context.load_config", side_effect=spy_load),
+        patch("imednet.sdk.load_config", side_effect=spy_load),
+        patch("imednet.core.base_client.load_config", side_effect=spy_load),
+    ):
+        sdk_instance = get_sdk()
+        try:
+            assert call_count == 1
+            assert isinstance(sdk_instance.auth, OIDCAuth)
+            assert sdk_instance.config.oidc_token == "cli-oidc-token"
+            assert sdk_instance.config.base_url == "https://cli.imednet.example"
+            assert sdk_instance.config.timeout == 52.5
+            assert sdk_instance.config.strict_mode is True
+        finally:
+            sdk_instance.close()
+
+    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
+    monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "true")
+    sim_sdk = get_sdk()
+    try:
+        assert sim_sdk.config.simulation_mode is True
+    finally:
+        sim_sdk.close()
+
+
 def test_jobs_wait_failed_terminal_state_exit(runner: CliRunner, sdk: MagicMock) -> None:
     """When a job ends in FAILED state, jobs wait exits with code 1, clean stdout, and diagnostic stderr."""
     from imednet.utils.job_poller import JobFailedError

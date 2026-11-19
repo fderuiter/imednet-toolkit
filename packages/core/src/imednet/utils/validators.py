@@ -161,11 +161,12 @@ def parse_int_or_default(v: Any, default: int = 0, strict: bool = False) -> int:
 def _guard_str_container(v: list[Any] | dict[Any, Any], *, strict: bool = False) -> None:
     """Emit a type-only drift warning for container values in string fields and raise in strict mode."""
     import logging
-    import os
+
+    from imednet.core.context import is_strict_mode
 
     msg = f"Drift detected (destructive): type-changed field. Expected str, got {type(v).__name__}"
     logging.getLogger("imednet.drift").warning(msg)
-    if strict or parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false")):
+    if strict or is_strict_mode():
         raise ValueError(msg)
 
 

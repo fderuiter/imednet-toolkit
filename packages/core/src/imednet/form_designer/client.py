@@ -1,15 +1,18 @@
 """HTTP client for interacting with the iMednet Form Designer backend."""
 
+from __future__ import annotations
+
 import json
+from typing import Any
 
 import httpx
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from imednet.errors import ApiError, ClientError
 
 from .models import Layout
 
-trace: "Any" = None
+trace: Any = None
 try:
     from opentelemetry import trace as _trace
 
@@ -17,7 +20,10 @@ try:
 except ImportError:
     pass
 
-from typing import Any
+
+def _is_rate_limited_status_error(exc: BaseException) -> bool:
+    """Return True only for HTTP 429 Too Many Requests responses."""
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429
 
 
 class FormDesignerClient:
@@ -44,6 +50,18 @@ class FormDesignerClient:
             self._tracer = trace.get_tracer(__name__)
         else:
             self._tracer = None
+
+    def close(self) -> None:
+        """Close the underlying HTTP session."""
+        self.session.close()
+
+    def __enter__(self) -> FormDesignerClient:
+        """Enter the synchronous context manager."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Exit the synchronous context manager and close the HTTP session."""
+        self.close()
 
     def save_form(
         self,
@@ -115,7 +133,7 @@ class FormDesignerClient:
 
         retryer = Retrying(
             stop=stop_after_attempt(4),
-            retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
+            retry=retry_if_exception(_is_rate_limited_status_error),
             wait=wait_exponential(multiplier=0.1),
             reraise=True,
         )

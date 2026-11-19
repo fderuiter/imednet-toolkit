@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, MutableMapping
+from contextlib import closing
 from datetime import date, datetime
 from typing import Any, TypeAlias, Union, cast
 from urllib.parse import quote_plus
 
 from imednet import Config, ImednetSDK, load_config
+from imednet.spi.utils import is_boolean_token, parse_bool
 
 from .._airflow_compat import BaseHook
 
@@ -22,6 +24,7 @@ _SENSITIVE_KEYS = {
     "auth_token",
     "authorization",
     "client_secret",
+    "oidc_token",
     "passphrase",
     "password",
     "private_key",
@@ -95,6 +98,29 @@ class ImednetHook(BaseHook):
         if isinstance(value, str) and value.strip().isdigit():
             parsed = int(value.strip())
             return parsed if parsed > 0 else None
+        return None
+
+    @staticmethod
+    def _float_or_none(value: object) -> float | None:
+        """Return a finite numeric value as float or ``None``."""
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return float(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _bool_or_none(value: object) -> bool | None:
+        """Return a parsed boolean value or ``None`` when unset/unrecognized."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return bool(value)
+        if isinstance(value, str) and is_boolean_token(value):
+            return parse_bool(value)
         return None
 
     @classmethod
@@ -294,14 +320,17 @@ class ImednetHook(BaseHook):
         conn = self._get_airflow_connection(self.imednet_conn_id)
         extras_dict = self._connection_extras(conn)
 
-        config = load_config(
+        return load_config(
             api_key=self._string_or_none(extras_dict.get("api_key"))
             or self._string_or_none(getattr(conn, "login", None)),
             security_key=self._string_or_none(extras_dict.get("security_key"))
             or self._string_or_none(getattr(conn, "password", None)),
             base_url=self._string_or_none(extras_dict.get("base_url")),
+            oidc_token=self._string_or_none(extras_dict.get("oidc_token")),
+            timeout=self._float_or_none(extras_dict.get("timeout")),
+            strict_mode=self._bool_or_none(extras_dict.get("strict_mode")),
+            simulation_mode=self._bool_or_none(extras_dict.get("simulation_mode")),
         )
-        return config  # noqa: RET504
 
     @classmethod
     def _to_primitive(cls, value: Any) -> PrimitiveContainer:
@@ -334,11 +363,7 @@ class ImednetHook(BaseHook):
     def get_conn(self) -> ImednetSDK:
         """Return an authenticated ImednetSDK instance adhering to the Airflow BaseHook contract."""
         config = self._resolved_config()
-        return ImednetSDK(
-            api_key=config.api_key,
-            security_key=config.security_key,
-            base_url=config.base_url,
-        )
+        return ImednetSDK(config=config)
 
     def get_sdk_client(self) -> ImednetSDK:
         """Return an SDK client for use within task execution context.
@@ -355,18 +380,20 @@ class ImednetHook(BaseHook):
             "base_url": self._to_primitive(config.base_url),
             "api_key": "***",
             "security_key": "***",
+            "oidc_token": "***",
             "api_key_configured": bool(config.api_key),
             "security_key_configured": bool(config.security_key),
+            "oidc_token_configured": bool(config.oidc_token),
         }
 
     def list_studies_metadata(self) -> list[dict[str, PrimitiveContainer]]:
         """Return primitive, serialization-safe study metadata for task mapping."""
-        studies = self.get_sdk_client().studies.list()
         metadata: list[dict[str, PrimitiveContainer]] = []
-        for study in studies:
-            primitive_study = self._to_primitive(study)
-            if isinstance(primitive_study, dict):
-                metadata.append(primitive_study)
+        with closing(self.get_sdk_client()) as sdk:
+            for study in sdk.studies.list():
+                primitive_study = self._to_primitive(study)
+                if isinstance(primitive_study, dict):
+                    metadata.append(primitive_study)
         return metadata
 
     def list_study_keys(self) -> list[str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from contextlib import closing
 from typing import Any, cast
 from urllib.parse import quote_plus
 
@@ -49,6 +50,7 @@ _SECRET_EXPORT_KEYS = frozenset(
         "authorization",
         "client_secret",
         "credentials",
+        "oidc_token",
         "passphrase",
         "passwd",
         "password",
@@ -331,7 +333,8 @@ class ImednetExportOperator(BaseOperator):
             return None
 
         if sdk is None:
-            sdk = self._get_sdk()
+            with closing(self._get_sdk()) as resolved_sdk:
+                return self._resolve_sink(config, sdk=resolved_sdk)
 
         sinks = getattr(sdk, "sinks", None)
         if sinks is None:
@@ -470,7 +473,6 @@ class ImednetExportOperator(BaseOperator):
                 f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
             )
 
-        sdk = self._get_sdk()
         stream_opts = self._collect_streaming_options(runtime_kwargs)
 
         config = sink_base.SinkConfig(
@@ -492,54 +494,55 @@ class ImednetExportOperator(BaseOperator):
             **stream_opts,
         )
 
-        sink = None
-        if not export_callable:
-            sink = self._resolve_sink(config, sdk=sdk)
-            if not sink:
-                raise AirflowException(
-                    f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
-                )
-
-        if sink:
-            sink_base.run_streaming_export(
-                sdk,
-                self.study_key,
-                sink,
-                config,
-                stream_name=f"airflow_{dest}",
-                batch_id_prefix=f"{self.study_key}/batch",
-                default_provider_name="airflow",
-            )
-        else:
-            # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)
+        with closing(self._get_sdk()) as sdk:
+            sink = None
             if not export_callable:
-                raise AirflowException(f"Unsupported destination or export_func '{dest}'")
-
-            tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
-            if dest in ("sql", "sql_by_form", "long_sql"):
-                conn_settings = self._resolve_destination_connection(dest)
-                if dest == "sql_by_form":
-                    conn_str_arg = (
-                        self.output_path
-                        or tabular_kwargs.pop("conn_str", None)
-                        or conn_settings.get("conn_str")
+                sink = self._resolve_sink(config, sdk=sdk)
+                if not sink:
+                    raise AirflowException(
+                        f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
                     )
-                    export_callable(sdk, self.study_key, conn_str_arg, **tabular_kwargs)
-                    return redact_uri(str(conn_str_arg)) if conn_str_arg is not None else None
-                table_arg = (
-                    self.output_path
-                    or tabular_kwargs.pop("table", None)
-                    or tabular_kwargs.pop("table_name", None)
-                    or conn_settings.get("table")
+
+            if sink:
+                sink_base.run_streaming_export(
+                    sdk,
+                    self.study_key,
+                    sink,
+                    config,
+                    stream_name=f"airflow_{dest}",
+                    batch_id_prefix=f"{self.study_key}/batch",
+                    default_provider_name="airflow",
                 )
-                if "conn_str" not in tabular_kwargs and conn_settings.get("conn_str"):
-                    tabular_kwargs["conn_str"] = conn_settings["conn_str"]
-                export_callable(sdk, self.study_key, table_arg, **tabular_kwargs)
-                if self.output_path is not None:
-                    return redact_uri(self.output_path)
-                return redact_uri(str(table_arg)) if table_arg is not None else None
-            export_callable(sdk, self.study_key, self.output_path, **tabular_kwargs)
-        return redact_uri(self.output_path) if self.output_path is not None else None
+            else:
+                # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)
+                if not export_callable:
+                    raise AirflowException(f"Unsupported destination or export_func '{dest}'")
+
+                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
+                if dest in ("sql", "sql_by_form", "long_sql"):
+                    conn_settings = self._resolve_destination_connection(dest)
+                    if dest == "sql_by_form":
+                        conn_str_arg = (
+                            self.output_path
+                            or tabular_kwargs.pop("conn_str", None)
+                            or conn_settings.get("conn_str")
+                        )
+                        export_callable(sdk, self.study_key, conn_str_arg, **tabular_kwargs)
+                        return redact_uri(str(conn_str_arg)) if conn_str_arg is not None else None
+                    table_arg = (
+                        self.output_path
+                        or tabular_kwargs.pop("table", None)
+                        or tabular_kwargs.pop("table_name", None)
+                        or conn_settings.get("table")
+                    )
+                    if "conn_str" not in tabular_kwargs and conn_settings.get("conn_str"):
+                        tabular_kwargs["conn_str"] = conn_settings["conn_str"]
+                    export_callable(sdk, self.study_key, table_arg, **tabular_kwargs)
+                    if self.output_path is not None:
+                        return redact_uri(self.output_path)
+                    return redact_uri(str(table_arg)) if table_arg is not None else None
+                export_callable(sdk, self.study_key, self.output_path, **tabular_kwargs)
+            return redact_uri(self.output_path) if self.output_path is not None else None
 
 
 __all__ = ["ImednetExportOperator"]

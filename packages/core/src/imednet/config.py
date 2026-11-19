@@ -6,7 +6,7 @@ This module provides the core configuration object for the iMednet SDK.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from imednet.auth.credentials import Credentials, CredentialSource
 from imednet.utils.validators import parse_bool
@@ -25,6 +25,7 @@ class Config:
         oidc_token: Optional OIDC token for authentication.
         timeout: The default timeout for network requests.
         strict_mode: Toggle strict mode for data validation.
+        simulation_mode: Toggle offline simulation mode.
     """
 
     api_key: str | None = None
@@ -44,6 +45,113 @@ class Config:
             A string representation of the configuration.
         """
         return f"Config(api_key='********', security_key='********', oidc_token='********', base_url={self.base_url!r}, timeout={self.timeout!r}, strict_mode={self.strict_mode!r}, simulation_mode={self.simulation_mode!r})"
+
+
+def _read_credential_source(credential_source: CredentialSource | None) -> Credentials:
+    """Read and validate a snapshot from an optional CredentialSource."""
+    credentials = Credentials()
+    if credential_source is not None:
+        try:
+            snapshot = credential_source.get_credentials()
+            if snapshot is not None:
+                credentials = snapshot
+        except Exception:
+            raise ValueError("Credential source lookup failed") from None
+        if not isinstance(credentials, Credentials):
+            raise ValueError("Credential source returned an invalid snapshot")
+    return credentials
+
+
+def _finalize_credentials(
+    api_key: str | None,
+    security_key: str | None,
+    base_url: str | None,
+    oidc_token: str | None,
+    *,
+    simulation_mode: bool,
+    require_credentials: bool,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Normalize string fields and validate authentication requirements."""
+    api_key = (api_key or "").strip() or None
+    security_key = (security_key or "").strip() or None
+    base_url = base_url.strip() if base_url else None
+    oidc_token = (oidc_token or "").strip() or None
+
+    if simulation_mode:
+        api_key = api_key or "simulated_api_key"
+        security_key = security_key or "simulated_security_key"
+    elif require_credentials and not oidc_token:
+        if not api_key and not security_key:
+            raise ValueError("Either OIDC token or both API key and security key are required")
+        if not api_key:
+            raise ValueError("API key is required when not using OIDC")
+        if not security_key:
+            raise ValueError("Security key is required when not using OIDC")
+    return api_key, security_key, base_url, oidc_token
+
+
+def merge_config_overrides(
+    config: Config,
+    *,
+    api_key: str | None = None,
+    security_key: str | None = None,
+    base_url: str | None = None,
+    oidc_token: str | None = None,
+    timeout: float | None = None,
+    strict_mode: bool | None = None,
+    simulation_mode: bool | None = None,
+    credential_source: CredentialSource | None = None,
+    require_credentials: bool = True,
+) -> Config:
+    """Apply explicit overrides onto a pre-resolved Config without reading environment variables."""
+    credentials = _read_credential_source(credential_source)
+    resolved_api_key = (
+        api_key
+        if api_key is not None
+        else (credentials.api_key if credentials.api_key is not None else config.api_key)
+    )
+    resolved_security_key = (
+        security_key
+        if security_key is not None
+        else (
+            credentials.security_key
+            if credentials.security_key is not None
+            else config.security_key
+        )
+    )
+    resolved_oidc_token = (
+        oidc_token
+        if oidc_token is not None
+        else (credentials.oidc_token if credentials.oidc_token is not None else config.oidc_token)
+    )
+    resolved_base_url = base_url if base_url is not None else config.base_url
+    resolved_timeout = timeout if timeout is not None else config.timeout
+    resolved_strict_mode = strict_mode if strict_mode is not None else config.strict_mode
+    resolved_simulation_mode = (
+        simulation_mode if simulation_mode is not None else config.simulation_mode
+    )
+
+    resolved_api_key, resolved_security_key, resolved_base_url, resolved_oidc_token = (
+        _finalize_credentials(
+            resolved_api_key,
+            resolved_security_key,
+            resolved_base_url,
+            resolved_oidc_token,
+            simulation_mode=resolved_simulation_mode,
+            require_credentials=require_credentials,
+        )
+    )
+    updated = replace(
+        config,
+        api_key=resolved_api_key,
+        security_key=resolved_security_key,
+        base_url=resolved_base_url,
+        oidc_token=resolved_oidc_token,
+        timeout=resolved_timeout,
+        strict_mode=resolved_strict_mode,
+        simulation_mode=resolved_simulation_mode,
+    )
+    return config if updated == config else updated
 
 
 def load_config(
@@ -78,16 +186,7 @@ def load_config(
     Raises:
         ValueError: If required authentication parameters are missing.
     """
-    credentials = Credentials()
-    if credential_source is not None:
-        try:
-            snapshot = credential_source.get_credentials()
-            if snapshot is not None:
-                credentials = snapshot
-        except Exception:
-            raise ValueError("Credential source lookup failed") from None
-        if not isinstance(credentials, Credentials):
-            raise ValueError("Credential source returned an invalid snapshot")
+    credentials = _read_credential_source(credential_source)
     api_key = api_key if api_key is not None else credentials.api_key
     security_key = security_key if security_key is not None else credentials.security_key
     oidc_token = oidc_token if oidc_token is not None else credentials.oidc_token
@@ -119,24 +218,14 @@ def load_config(
         else:
             simulation_mode = False
 
-    # Set the environment variable so models can read the resolved value during validation
-    os.environ["IMEDNET_STRICT_MODE"] = str(strict_mode).lower()
-
-    api_key = (api_key or "").strip() or None
-    security_key = (security_key or "").strip() or None
-    base_url = base_url.strip() if base_url else None
-    oidc_token = (oidc_token or "").strip() or None
-
-    if simulation_mode:
-        api_key = api_key or "simulated_api_key"
-        security_key = security_key or "simulated_security_key"
-    elif require_credentials and not oidc_token:
-        if not api_key and not security_key:
-            raise ValueError("Either OIDC token or both API key and security key are required")
-        if not api_key:
-            raise ValueError("API key is required when not using OIDC")
-        if not security_key:
-            raise ValueError("Security key is required when not using OIDC")
+    api_key, security_key, base_url, oidc_token = _finalize_credentials(
+        api_key,
+        security_key,
+        base_url,
+        oidc_token,
+        simulation_mode=simulation_mode,
+        require_credentials=require_credentials,
+    )
 
     return Config(
         api_key=api_key,

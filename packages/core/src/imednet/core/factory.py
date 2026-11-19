@@ -36,7 +36,7 @@ class ClientFactory:
     @staticmethod
     def create_client(
         config: Config,
-        timeout: float = 30.0,
+        timeout: float | None = None,
         retry_config: RetryConfig | None = None,
         transport: Any = None,
         auth: AuthStrategy | None = None,
@@ -55,15 +55,13 @@ class ClientFactory:
             )
         if auth is None:
             auth = _default_auth(config)
+        effective_timeout = config.timeout if timeout is None else timeout
         client = Client(
-            api_key=config.api_key or "",
-            security_key=config.security_key or "",
-            base_url=config.base_url,
-            timeout=timeout,
+            timeout=effective_timeout,
             retry_config=retry_config,
             auth=auth,
             transport=transport,
-            simulation_mode=config.simulation_mode,
+            config=config,
         )
         client.auth = auth
         return client
@@ -71,7 +69,7 @@ class ClientFactory:
     @staticmethod
     def create_async_client(
         config: Config,
-        timeout: float = 30.0,
+        timeout: float | None = None,
         retry_config: RetryConfig | None = None,
         transport: Any = None,
         auth: AuthStrategy | None = None,
@@ -90,15 +88,13 @@ class ClientFactory:
             )
         if auth is None:
             auth = _default_auth(config)
+        effective_timeout = config.timeout if timeout is None else timeout
         async_client = AsyncClient(
-            api_key=config.api_key or "",
-            security_key=config.security_key or "",
-            base_url=config.base_url,
-            timeout=timeout,
+            timeout=effective_timeout,
             retry_config=retry_config,
             auth=auth,
             transport=transport,
-            simulation_mode=config.simulation_mode,
+            config=config,
         )
         async_client.auth = auth
         return async_client

@@ -421,3 +421,193 @@ def test_oidc_edge_cases_malformed_tokens():
     bad_jwt3 = f"{h}.eyJzdWIiOiIxIn0.???invalid_b64???"
     auth3 = OIDCAuth(bad_jwt3, public_key=b"secret")
     assert auth3.get_user_roles() == []
+
+
+async def test_single_load_config_and_pre_resolved_config_and_oidc_precedence(monkeypatch):
+    """Constructors call load_config once, accept Config/oidc_token, and honor ADR 0005 precedence."""
+    import os
+    from unittest.mock import patch
+
+    import imednet.config as config_mod
+    from imednet.config import Config
+    from imednet.core.factory import ClientFactory
+
+    monkeypatch.delenv("IMEDNET_STRICT_MODE", raising=False)
+    calls: list[dict[str, object]] = []
+    real_load = config_mod.load_config
+
+    def counting_load(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return real_load(*args, **kwargs)
+
+    with (
+        patch("imednet.config.load_config", side_effect=counting_load),
+        patch("imednet.sdk.load_config", side_effect=counting_load),
+        patch("imednet.core.base_client.load_config", side_effect=counting_load),
+    ):
+        # 1. Sync SDK with explicit oidc_token + strict_mode + timeout -> 1 load_config call
+        with ImednetSDK(
+            oidc_token="explicit-sync-oidc",
+            base_url="https://sync.imednet.example",
+            timeout=44.0,
+            strict_mode=True,
+        ) as sdk:
+            assert len(calls) == 1
+            assert isinstance(sdk.auth, OIDCAuth)
+            assert sdk.config.oidc_token == "explicit-sync-oidc"
+            assert sdk.config.timeout == 44.0
+            assert sdk.config.strict_mode is True
+            assert sdk._client.timeout == httpx.Timeout(44.0)
+            assert "IMEDNET_STRICT_MODE" not in os.environ
+
+        # 2. Async SDK with explicit oidc_token -> 1 load_config call
+        calls.clear()
+        async with AsyncImednetSDK(
+            oidc_token="explicit-async-oidc",
+            timeout=48.0,
+            strict_mode=True,
+        ) as async_sdk:
+            assert len(calls) == 1
+            assert isinstance(async_sdk.auth, OIDCAuth)
+            assert async_sdk.config.oidc_token == "explicit-async-oidc"
+            assert async_sdk.config.timeout == 48.0
+            assert async_sdk.config.strict_mode is True
+            assert "IMEDNET_STRICT_MODE" not in os.environ
+
+        # 3. Direct Client and AsyncClient with oidc_token -> 1 load_config call each
+        calls.clear()
+        with Client(oidc_token="direct-client-oidc", timeout=35.0) as direct_client:
+            assert len(calls) == 1
+            assert isinstance(direct_client.auth, OIDCAuth)
+            assert direct_client.timeout == httpx.Timeout(35.0)
+
+        calls.clear()
+        async with AsyncClient(oidc_token="direct-async-oidc", timeout=36.0) as direct_async:
+            assert len(calls) == 1
+            assert isinstance(direct_async.auth, OIDCAuth)
+            assert direct_async.timeout == httpx.Timeout(36.0)
+
+        # 4. Pre-resolved Config passed into SDK, AsyncSDK, Client, ClientFactory -> 0 extra calls
+        calls.clear()
+        resolved = Config(
+            api_key="fallback-key",  # pragma: allowlist secret
+            security_key="fallback-sec",  # pragma: allowlist secret
+            base_url="https://pre-resolved.imednet.example",
+            oidc_token="preferred-oidc-token",
+            timeout=61.0,
+            strict_mode=True,
+            simulation_mode=False,
+        )
+        with ImednetSDK(config=resolved) as pre_sdk:
+            assert len(calls) == 0
+            assert pre_sdk.config is resolved
+            assert isinstance(pre_sdk.auth, OIDCAuth)
+            assert pre_sdk.auth.get_headers() == {"Authorization": "Bearer preferred-oidc-token"}
+            assert pre_sdk._client.timeout == httpx.Timeout(61.0)
+
+        async with AsyncImednetSDK(config=resolved) as pre_async_sdk:
+            assert len(calls) == 0
+            assert pre_async_sdk.config is resolved
+            assert isinstance(pre_async_sdk.auth, OIDCAuth)
+            assert pre_async_sdk._async_client.timeout == httpx.Timeout(61.0)
+
+        with ClientFactory.create_client(resolved) as factory_client:
+            assert len(calls) == 0
+            assert factory_client.config is resolved
+            assert factory_client.timeout == httpx.Timeout(61.0)
+
+        async with ClientFactory.create_async_client(resolved) as factory_async:
+            assert len(calls) == 0
+            assert factory_async.config is resolved
+            assert factory_async.timeout == httpx.Timeout(61.0)
+
+        # 5. ADR 0005 precedence: explicit oidc_token > credential_source > env
+        monkeypatch.setenv("IMEDNET_OIDC_TOKEN", "env-oidc")
+        store = MemoryCredentialStore(Credentials(oidc_token="source-oidc"))
+        calls.clear()
+        with ImednetSDK(oidc_token="explicit-wins", credential_source=store) as prec_sdk:
+            assert len(calls) == 1
+            assert prec_sdk.auth.get_headers() == {"Authorization": "Bearer explicit-wins"}
+
+
+async def test_strict_mode_isolated_per_sdk_without_env_mutation(monkeypatch):
+    """strict_mode=True enforces drift validation per SDK without mutating os.environ."""
+    import asyncio
+    import os
+
+    monkeypatch.delenv("IMEDNET_STRICT_MODE", raising=False)
+
+    drifted_payload = {
+        "data": [
+            {
+                "studyKey": "S-STRICT",
+                "studyName": "Strict Study",
+                "unexpectedAdditiveField": "surprise",
+            }
+        ],
+        "pagination": {"currentPage": 0, "size": 100, "totalPages": 1, "totalElements": 1},
+    }
+
+    def sync_respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=drifted_payload)
+
+    class AsyncMockTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0)
+            return httpx.Response(200, json=drifted_payload)
+
+    strict_sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        strict_mode=True,
+        transport=httpx.MockTransport(sync_respond),
+    )
+    lenient_sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        strict_mode=False,
+        transport=httpx.MockTransport(sync_respond),
+    )
+    try:
+        assert "IMEDNET_STRICT_MODE" not in os.environ
+
+        with pytest.raises(ValueError, match="unexpectedAdditiveField"):
+            list(strict_sdk.studies.list())
+
+        # Lenient SDK remains unaffected even inside strict_sdk's context block
+        with strict_sdk:
+            studies = list(lenient_sdk.studies.list())
+            assert len(studies) == 1
+            assert studies[0].study_key == "S-STRICT"
+
+        assert "IMEDNET_STRICT_MODE" not in os.environ
+    finally:
+        strict_sdk.close()
+        lenient_sdk.close()
+
+    async with (
+        AsyncImednetSDK(
+            api_key="k",
+            security_key="s",
+            strict_mode=True,
+            transport=AsyncMockTransport(),
+        ) as async_strict,
+        AsyncImednetSDK(
+            api_key="k",
+            security_key="s",
+            strict_mode=False,
+            transport=AsyncMockTransport(),
+        ) as async_lenient,
+    ):
+
+        async def _consume_strict() -> None:
+            with pytest.raises(ValueError, match="unexpectedAdditiveField"):
+                _ = [item async for item in async_strict.studies.list()]
+
+        async def _consume_lenient() -> list:
+            return [item async for item in async_lenient.studies.list()]
+
+        _, lenient_items = await asyncio.gather(_consume_strict(), _consume_lenient())
+        assert len(lenient_items) == 1
+        assert lenient_items[0].study_key == "S-STRICT"
+        assert "IMEDNET_STRICT_MODE" not in os.environ

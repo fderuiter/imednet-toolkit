@@ -14,9 +14,14 @@ from importlib.metadata import EntryPoint, entry_points
 from typing import TYPE_CHECKING, Any, cast
 
 from .auth import AuthStrategy, CredentialSource
-from .config import Config, load_config
+from .config import Config, load_config, merge_config_overrides
 from .constants import DEFAULT_BACKOFF_FACTOR, DEFAULT_RETRIES
-from .core.context import study_context
+from .core.context import (
+    reset_strict_mode_context,
+    set_strict_mode_context,
+    strict_mode_context,
+    study_context,
+)
 from .core.factory import ClientFactory
 from .core.retry import DefaultRetryPolicy, RetryConfig, RetryPolicy
 from .endpoints.registry import ASYNC_ENDPOINT_REGISTRY, ENDPOINT_REGISTRY
@@ -127,6 +132,74 @@ class _BaseSDK:
     """
 
     config: Config
+    _strict_mode_tokens: list[Any]
+
+    def _init_sdk_config(
+        self,
+        *,
+        config: Config | None,
+        api_key: str | None,
+        security_key: str | None,
+        base_url: str | None,
+        oidc_token: str | None,
+        timeout: float | None,
+        strict_mode: bool | None,
+        simulation_mode: bool | None,
+        auth: AuthStrategy | None,
+        credential_source: CredentialSource | None,
+        has_injected_client: bool,
+    ) -> Config:
+        """Resolve SDK configuration once and initialize common SDK state."""
+        if has_injected_client and auth is not None:
+            raise ValueError("An injected client already owns authentication")
+        effective_source = credential_source if auth is None else None
+        require_creds = auth is None and not has_injected_client
+        if config is not None:
+            resolved = merge_config_overrides(
+                config,
+                api_key=api_key,
+                security_key=security_key,
+                base_url=base_url,
+                oidc_token=oidc_token,
+                timeout=timeout,
+                strict_mode=strict_mode,
+                simulation_mode=simulation_mode,
+                credential_source=effective_source,
+                require_credentials=require_creds,
+            )
+        else:
+            resolved = load_config(
+                api_key=api_key,
+                security_key=security_key,
+                base_url=base_url,
+                oidc_token=oidc_token,
+                timeout=timeout,
+                strict_mode=strict_mode,
+                simulation_mode=simulation_mode,
+                credential_source=effective_source,
+                require_credentials=require_creds,
+            )
+        self.config = resolved
+        self._api_key = resolved.api_key
+        self._security_key = resolved.security_key
+        self._base_url = resolved.base_url
+        self._strict_mode_tokens = []
+        if isinstance(resolved.base_url, str) and resolved.base_url:
+            from .core.context import set_base_url_context
+
+            set_base_url_context(resolved.base_url)
+        return resolved
+
+    def _enter_strict_mode(self) -> None:
+        """Push this SDK's strict_mode onto the active task/thread context."""
+        strict_val = getattr(self.config, "strict_mode", None)
+        if isinstance(strict_val, bool):
+            self._strict_mode_tokens.append(set_strict_mode_context(strict_val))
+
+    def _exit_strict_mode(self) -> None:
+        """Pop the most recent strict_mode token set by this SDK."""
+        if getattr(self, "_strict_mode_tokens", None):
+            reset_strict_mode_context(self._strict_mode_tokens.pop())
 
     @staticmethod
     def _resolve_retry_config(
@@ -202,11 +275,16 @@ class _BaseSDK:
         from .core.context import reset_base_url_context, set_base_url_context
 
         token_base = None
-        if hasattr(self, "_base_url") and self._base_url:
+        if hasattr(self, "_base_url") and isinstance(self._base_url, str) and self._base_url:
             token_base = set_base_url_context(self._base_url)
+        strict_val = getattr(getattr(self, "config", None), "strict_mode", None)
         with study_context(study_key):
             try:
-                yield self
+                if isinstance(strict_val, bool):
+                    with strict_mode_context(strict_val):
+                        yield self
+                else:
+                    yield self
             finally:
                 if token_base is not None:
                     reset_base_url_context(token_base)
@@ -250,6 +328,8 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
         simulation_mode: bool | None = None,
         transport: Any = None,
         *,
+        config: Config | None = None,
+        oidc_token: str | None = None,
         auth: AuthStrategy | None = None,
         credential_source: CredentialSource | None = None,
     ) -> None:
@@ -268,30 +348,24 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
             retry_policy: Custom retry policy.
             simulation_mode: Toggle offline simulation mode.
             transport: Custom HTTP transport or SimulationTransport.
+            config: Pre-resolved configuration instance.
+            oidc_token: Explicit OIDC bearer token.
             auth: Explicit authentication strategy, used instead of default credentials.
             credential_source: Caller-owned credential source for client construction.
         """
-        if client is not None and auth is not None:
-            raise ValueError("An injected client already owns authentication")
-        config = load_config(
+        resolved_config = self._init_sdk_config(
+            config=config,
             api_key=api_key,
             security_key=security_key,
             base_url=base_url,
+            oidc_token=oidc_token,
             timeout=timeout,
             strict_mode=strict_mode,
             simulation_mode=simulation_mode,
-            credential_source=credential_source if auth is None else None,
-            require_credentials=auth is None and client is None,
+            auth=auth,
+            credential_source=credential_source,
+            has_injected_client=client is not None,
         )
-
-        self.config = config
-        self._api_key = config.api_key
-        self._security_key = config.security_key
-        self._base_url = config.base_url
-        if config.base_url:
-            from .core.context import set_base_url_context
-
-            set_base_url_context(config.base_url)
 
         if client is not None:
             self._client = client
@@ -304,8 +378,8 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
             )
 
             self._client = ClientFactory.create_client(
-                config=config,
-                timeout=config.timeout,
+                config=resolved_config,
+                timeout=resolved_config.timeout,
                 retry_config=retry_config,
                 transport=transport,
                 auth=auth,
@@ -332,16 +406,24 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
 
     def _init_endpoints(self) -> None:
         """Instantiate endpoint clients."""
+        strict_val = getattr(self.config, "strict_mode", None)
+        strict_mode = strict_val if isinstance(strict_val, bool) else None
         for attr, endpoint_cls in ENDPOINT_REGISTRY.items():
-            setattr(self, attr, endpoint_cls(self._client))
+            endpoint = endpoint_cls(self._client)
+            endpoint._strict_mode = strict_mode
+            setattr(self, attr, endpoint)
 
     def __enter__(self) -> ImednetSDK:
         """Support for context manager protocol."""
+        self._enter_strict_mode()
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Cleanup resources when exiting context."""
-        self.close()
+        try:
+            self.close()
+        finally:
+            self._exit_strict_mode()
 
     async def __aenter__(self) -> ImednetSDK:
         """Prevent accidental ``async with`` usage on the synchronous client."""
@@ -411,47 +493,25 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
         simulation_mode: bool | None = None,
         transport: Any = None,
         *,
+        config: Config | None = None,
+        oidc_token: str | None = None,
         auth: AuthStrategy | None = None,
         credential_source: CredentialSource | None = None,
     ) -> None:
-        """Initialize the asynchronous SDK.
-
-        Args:
-            api_key: iMednet API key.
-            security_key: iMednet security key.
-            base_url: Base URL for the iMednet API.
-            timeout: Default request timeout in seconds.
-            strict_mode: Toggle strict mode for data validation.
-            retry_config: Centralized configuration for retry behaviors.
-            async_client: Pre-configured async client instance.
-            retries: Number of retries for failed requests.
-            backoff_factor: Backoff factor for retry delays.
-            retry_policy: Custom retry policy.
-            simulation_mode: Toggle offline simulation mode.
-            transport: Custom HTTP transport or SimulationTransport.
-            auth: Explicit authentication strategy, used instead of default credentials.
-            credential_source: Caller-owned credential source for client construction.
-        """
-        if async_client is not None and auth is not None:
-            raise ValueError("An injected client already owns authentication")
-        config = load_config(
+        """Initialize the asynchronous SDK."""
+        resolved_config = self._init_sdk_config(
+            config=config,
             api_key=api_key,
             security_key=security_key,
             base_url=base_url,
+            oidc_token=oidc_token,
             timeout=timeout,
             strict_mode=strict_mode,
             simulation_mode=simulation_mode,
-            credential_source=credential_source if auth is None else None,
-            require_credentials=auth is None and async_client is None,
+            auth=auth,
+            credential_source=credential_source,
+            has_injected_client=async_client is not None,
         )
-        self.config = config
-        self._api_key = config.api_key
-        self._security_key = config.security_key
-        self._base_url = config.base_url
-        if config.base_url:
-            from .core.context import set_base_url_context
-
-            set_base_url_context(config.base_url)
 
         if async_client is not None:
             self._async_client = async_client
@@ -464,8 +524,8 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
             )
 
             self._async_client = ClientFactory.create_async_client(
-                config=config,
-                timeout=config.timeout,
+                config=resolved_config,
+                timeout=resolved_config.timeout,
                 retry_config=retry_config,
                 transport=transport,
                 auth=auth,
@@ -494,8 +554,12 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
 
     def _init_endpoints(self) -> None:
         """Initialize all asynchronous endpoint instances."""
+        strict_val = getattr(self.config, "strict_mode", None)
+        strict_mode = strict_val if isinstance(strict_val, bool) else None
         for attr, endpoint_cls in ASYNC_ENDPOINT_REGISTRY.items():
-            setattr(self, attr, endpoint_cls(self._async_client))
+            endpoint = endpoint_cls(self._async_client)
+            endpoint._strict_mode = strict_mode
+            setattr(self, attr, endpoint)
 
     def close(self) -> None:
         """Raise TypeError as sync close is not supported."""
@@ -520,11 +584,15 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
 
     async def __aenter__(self) -> AsyncImednetSDK:
         """Enter the asynchronous context manager."""
+        self._enter_strict_mode()
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Exit the asynchronous context manager and close the client."""
-        await self.aclose()
+        try:
+            await self.aclose()
+        finally:
+            self._exit_strict_mode()
 
     async def aclose(self) -> None:
         """Close the underlying asynchronous client and free resources."""

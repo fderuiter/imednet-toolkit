@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import types
 from collections.abc import Callable
 from datetime import datetime
@@ -18,6 +17,7 @@ from typing import (
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from imednet.core.context import is_strict_mode
 from imednet.utils.validators import (
     _guard_str_container,
     is_missing_value,
@@ -211,7 +211,7 @@ class ImednetBaseModel(BaseModel):
 
         unexpected_fields = incoming_keys - defined_fields
         if unexpected_fields:
-            is_strict = parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"))
+            is_strict = is_strict_mode()
             msg = f"Drift detected (additive): {cls.__name__} received unexpected fields: {', '.join(sorted(unexpected_fields))}"
             if is_strict:
                 raise ValueError(msg)

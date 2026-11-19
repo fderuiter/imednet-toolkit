@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 from typing import Any, TypeVar
 
 from imednet.constants import DEFAULT_PAGE_SIZE, LARGE_PAGE_SIZE
+from imednet.core.context import strict_mode_context
 from imednet.core.endpoint.abc import EndpointABC
 from imednet.core.endpoint.dispatch import (
     AsyncEndpointContext,
@@ -53,6 +54,7 @@ class GenericEndpoint(EndpointABC[T]):
     BASE_PATH = ""
     _client: RequesterProtocol | None
     _async_client: AsyncRequesterProtocol | None
+    _strict_mode: bool | None = None
 
     def __init__(
         self,
@@ -67,6 +69,7 @@ class GenericEndpoint(EndpointABC[T]):
         """
         self._client = client
         self._async_client = async_client
+        self._strict_mode = None
 
     def _auto_filter(self, filters: dict[str, Any]) -> dict[str, Any]:
         """Pass-through for filters in generic endpoints."""
@@ -95,9 +98,21 @@ class GenericEndpoint(EndpointABC[T]):
             raise RuntimeError("Async client not configured")
         return self._async_client
 
+    def _effective_strict_mode(self) -> bool | None:
+        """Return the strict validation mode configured on this endpoint or its client."""
+        if isinstance(self._strict_mode, bool):
+            return self._strict_mode
+        requester = self._client if self._client is not None else self._async_client
+        client_strict = getattr(requester, "strict_mode", None)
+        return client_strict if isinstance(client_strict, bool) else None
+
     def _parse_item(self, item: Any) -> T:
         """Parse a raw API item into a Pydantic model instance."""
         parse_func = get_model_parser(self.MODEL)
+        strict_mode = self._effective_strict_mode()
+        if strict_mode is not None:
+            with strict_mode_context(strict_mode):
+                return parse_func(item)
         return parse_func(item)
 
     def _resolve_parse_func(self) -> Callable[[Any], T]:
