@@ -6,7 +6,7 @@ They are architecturally linked to the core execution engine.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -24,7 +24,7 @@ from imednet.models.intervals import Interval
 from imednet.models.jobs import Job, JobStatus
 from imednet.models.queries import Query
 from imednet.models.record_revisions import RecordRevision
-from imednet.models.records import Record
+from imednet.models.records import BaseRecordRequest, Record
 from imednet.models.sites import Site
 from imednet.models.studies import Study
 from imednet.models.subjects import Subject
@@ -211,7 +211,7 @@ class SyncSDKConvenienceMixin:
     def create_record(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: Sequence[JsonDict | BaseRecordRequest],
         email_notify: str | None = None,
         *,
         schema: Any = None,
@@ -291,7 +291,7 @@ class AsyncSDKConvenienceMixin:
     async def async_create_record(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: Sequence[JsonDict | BaseRecordRequest],
         email_notify: str | None = None,
         *,
         schema: Any = None,

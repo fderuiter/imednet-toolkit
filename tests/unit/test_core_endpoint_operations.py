@@ -305,10 +305,14 @@ async def test_record_create_operation_async():
 
 def test_record_create_operation_all_identifier_pairs_and_strict_rejections():
     """Verify BaseRecordRequest subclasses, identifier serialization, PHI masking, and email checks."""
+    from pydantic import ValidationError as PydanticValidationError
+
     from imednet.errors import ValidationError
     from imednet.models.records import (
+        BaseRecordRequest,
         CreateNewRecordRequest,
         RecordData,
+        RecordRequest,
         RegisterSubjectRequest,
         UpdateScheduledRecordRequest,
     )
@@ -336,8 +340,8 @@ def test_record_create_operation_all_identifier_pairs_and_strict_rejections():
     op = RecordCreateOperation(
         path="/create",
         records_data=[
-            reg_by_id,  # type: ignore[list-item]
-            sched_by_oid,  # type: ignore[list-item]
+            reg_by_id,
+            sched_by_oid,
             unsched.model_dump(by_alias=True, exclude_none=True),
             {"form_key": "F2", "site_id": 9, "interval_id": 3, "data": {"x": "y"}},
         ],
@@ -359,6 +363,33 @@ def test_record_create_operation_all_identifier_pairs_and_strict_rejections():
         {"formId": 11, "subjectOid": "SUBJ-OID-2", "recordId": 55, "data": {"note": "ok"}},
         {"formKey": "F2", "siteId": 9, "intervalId": 3, "data": {"x": "y"}},
     ]
+
+    # Public request models strictly reject booleans, numeric strings, whole/fractional floats, and <=0 IDs before coercion
+    for bad_int in [True, False, "10", " 10 ", 10.0, 10.5, 0, -1]:
+        with pytest.raises(PydanticValidationError):
+            BaseRecordRequest(formId=bad_int)  # type: ignore[arg-type]
+        with pytest.raises(PydanticValidationError):
+            RegisterSubjectRequest(formKey="F1", siteId=bad_int)  # type: ignore[arg-type]
+        with pytest.raises(PydanticValidationError):
+            CreateNewRecordRequest(formKey="F1", subjectId=bad_int)  # type: ignore[arg-type]
+        with pytest.raises(PydanticValidationError):
+            CreateNewRecordRequest(formKey="F1", recordId=bad_int)  # type: ignore[arg-type]
+        with pytest.raises(PydanticValidationError):
+            UpdateScheduledRecordRequest(formKey="F1", intervalId=bad_int)  # type: ignore[arg-type]
+        with pytest.raises(PydanticValidationError):
+            RecordRequest(form_id=bad_int)  # type: ignore[arg-type]
+
+    # Assignment validation also blocks post-init string/float coercion
+    valid_req = RecordRequest(formKey="F1", siteId=5)
+    for bad_assign in ["5", 5.0, True, 0]:
+        with pytest.raises(PydanticValidationError):
+            valid_req.site_id = bad_assign  # type: ignore[assignment]
+
+    # String ID fields and data reject non-strings / non-dicts before coercion
+    with pytest.raises(PydanticValidationError):
+        RecordRequest(formKey=123)  # type: ignore[arg-type]
+    with pytest.raises(PydanticValidationError):
+        RecordRequest(formKey="F1", data=[("a", 1)])  # type: ignore[arg-type]
 
     # Reject subjectKey on RegisterSubjectRequest
     with pytest.raises(Exception):

@@ -5,12 +5,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field, RootModel, field_validator, model_validator
+from pydantic import Field, RootModel, StrictInt, StrictStr, field_validator, model_validator
 
 from imednet.models.base import ImednetBaseModel
 
 _INT_ID_ALIASES: dict[str, str]
-_STR_ID_FIELDS: set[str]
+_STR_ID_ALIASES: dict[str, str]
 
 class Keyword(ImednetBaseModel):
     """A keyword or tag associated with a record."""
@@ -52,8 +52,8 @@ class RecordData(RootModel[dict[str, Any]]):
 class BaseRecordRequest(ImednetBaseModel):
     """Base class for strict record creation/update requests."""
 
-    form_key: str | None = Field(default=None, alias="formKey")
-    form_id: int | None = Field(default=None, alias="formId")
+    form_key: StrictStr | None = Field(default=None, alias="formKey")
+    form_id: StrictInt | None = Field(default=None, alias="formId")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
 
     @model_validator(mode="before")
@@ -76,27 +76,27 @@ class RegisterSubjectRequest(BaseRecordRequest):
     it when the key is unknown.
     """
 
-    site_name: str | None = Field(
+    site_name: StrictStr | None = Field(
         default=None, alias="siteName", description="Name of the site where the subject is enrolled"
     )
-    site_id: int | None = Field(
+    site_id: StrictInt | None = Field(
         default=None, alias="siteId", description="ID of the site where the subject is enrolled"
     )
 
 class CreateNewRecordRequest(RegisterSubjectRequest):
     """Payload for creating a new unscheduled record or updating a record by identifier."""
 
-    subject_key: str | None = Field(default=None, alias="subjectKey")
-    subject_id: int | None = Field(default=None, alias="subjectId")
-    subject_oid: str | None = Field(default=None, alias="subjectOid")
-    record_id: int | None = Field(default=None, alias="recordId")
-    record_oid: str | None = Field(default=None, alias="recordOid")
+    subject_key: StrictStr | None = Field(default=None, alias="subjectKey")
+    subject_id: StrictInt | None = Field(default=None, alias="subjectId")
+    subject_oid: StrictStr | None = Field(default=None, alias="subjectOid")
+    record_id: StrictInt | None = Field(default=None, alias="recordId")
+    record_oid: StrictStr | None = Field(default=None, alias="recordOid")
 
 class UpdateScheduledRecordRequest(CreateNewRecordRequest):
     """Payload for updating an existing scheduled record."""
 
-    interval_name: str | None = Field(default=None, alias="intervalName")
-    interval_id: int | None = Field(default=None, alias="intervalId")
+    interval_name: StrictStr | None = Field(default=None, alias="intervalName")
+    interval_id: StrictInt | None = Field(default=None, alias="intervalId")
 
 class RecordRequest(UpdateScheduledRecordRequest):
     """Strict request envelope supporting all documented POST /records identifier pairs."""

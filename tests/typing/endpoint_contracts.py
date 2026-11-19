@@ -10,7 +10,7 @@ from imednet.models.intervals import Interval
 from imednet.models.jobs import Job, JobState, JobStatus
 from imednet.models.queries import Query, QueryStatus
 from imednet.models.record_revisions import RecordRevision
-from imednet.models.records import Record
+from imednet.models.records import Record, RecordRequest, RegisterSubjectRequest
 from imednet.models.sites import Site
 from imednet.models.studies import Study
 from imednet.models.subjects import Subject, SubjectKeyword
@@ -40,6 +40,7 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.records.list('S'), Iterator[Record])
     assert_type(sdk.records.get('S', 1), Record)
     assert_type(sdk.records.create('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(sdk.records.create('S', [RecordRequest(formKey='DEMOG')]), Job)
     assert_type(sdk.sites.list('S'), Iterator[Site])
     assert_type(sdk.sites.get('S', 1), Site)
     assert_type(sdk.studies.list(), Iterator[Study])
@@ -76,6 +77,10 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.get_visits('S'), list[Visit])
     assert_type(sdk.get_job('S', 'B'), JobStatus)
     assert_type(sdk.create_record('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(
+        sdk.create_record('S', [RegisterSubjectRequest(formKey='DEMOG', siteName='SITE-1')]),
+        Job,
+    )
     assert_type(sdk.poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
 
     # JobStatus and Enum literal typing
@@ -110,6 +115,7 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(sdk.records.list('S'), AsyncIterator[Record])
     assert_type(await sdk.records.get('S', 1), Record)
     assert_type(await sdk.records.create('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(await sdk.records.create('S', [RecordRequest(formKey='DEMOG')]), Job)
     assert_type(sdk.sites.list('S'), AsyncIterator[Site])
     assert_type(await sdk.sites.get('S', 1), Site)
     assert_type(sdk.studies.list(), AsyncIterator[Study])
@@ -146,6 +152,12 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.async_get_visits('S'), list[Visit])
     assert_type(await sdk.async_get_job('S', 'B'), JobStatus)
     assert_type(await sdk.async_create_record('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(
+        await sdk.async_create_record(
+            'S', [RegisterSubjectRequest(formKey='DEMOG', siteName='SITE-1')]
+        ),
+        Job,
+    )
     assert_type(await sdk.async_poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
 
 

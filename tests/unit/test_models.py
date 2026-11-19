@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Union, get_args, get_origin
+from typing import Annotated, Any, Union, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -13,6 +13,19 @@ from imednet import models
 def _build_value(annotation: Any) -> Any:
     """Helper function to  build value."""
     origin = get_origin(annotation)
+    if origin is Annotated:
+        args = get_args(annotation)
+        base, metadata = args[0], args[1:]
+        if any(getattr(m, "strict", False) for m in metadata):
+            if base is int:
+                return 1
+            if base is float:
+                return 1.0
+            if base is bool:
+                return True
+            if base is str:
+                return "value"
+        return _build_value(base)
     if origin is list:
         sub = get_args(annotation)[0]
         return [_build_value(sub)]

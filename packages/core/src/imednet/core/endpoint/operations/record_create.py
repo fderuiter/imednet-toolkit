@@ -5,11 +5,11 @@ Encapsulates validation, header construction, and execution logic for record cre
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Self, TypeVar
 
 from pydantic import ValidationError as PydanticValidationError
-from pydantic import field_validator, model_validator
+from pydantic import model_validator
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
@@ -17,22 +17,14 @@ from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.errors import ValidationError
 from imednet.models.records import BaseRecordRequest, RecordRequest
 from imednet.utils.security import validate_email_notify
+from imednet.utils.typing import JsonDict
 from imednet.validation.cache import BaseSchemaCache, validate_record_entry
 
 T = TypeVar("T")
 
 
 class _StrictRecordCreateEnvelope(RecordRequest):
-    """Strict wire-level request model enforcing formKey/formId presence and strict int IDs."""
-
-    @field_validator("form_id", "site_id", "subject_id", "interval_id", "record_id", mode="before")
-    @classmethod
-    def _require_strict_int(cls, v: Any) -> Any:
-        if v is None:
-            return None
-        if isinstance(v, bool) or not isinstance(v, int):
-            raise ValueError("Identifier must be an integer")
-        return v
+    """Strict wire-level request model enforcing formKey/formId presence."""
 
     @model_validator(mode="after")
     def _require_form_identifier(self) -> Self:  # noqa: N804
@@ -62,7 +54,7 @@ class RecordCreateOperation(Operation[T]):
     def __init__(
         self,
         path: str,
-        records_data: list[dict[str, Any]],
+        records_data: Sequence[JsonDict | BaseRecordRequest],
         email_notify: str | None = None,
         schema: BaseSchemaCache[Any] | None = None,
     ) -> None:
@@ -70,7 +62,7 @@ class RecordCreateOperation(Operation[T]):
 
         Args:
             path: The full API path for the request.
-            records_data: List of record data objects to create.
+            records_data: Sequence of record dictionaries or typed request models to create.
             email_notify: Optional email address to notify upon job completion.
             schema: Optional schema cache for validation.
 
@@ -87,13 +79,13 @@ class RecordCreateOperation(Operation[T]):
 
     def _validate_and_serialize(self, records_data: Any) -> list[dict[str, Any]]:
         """Validate every item through strict Pydantic models and optional schema."""
-        if not isinstance(records_data, list):
+        if not isinstance(records_data, (list, tuple)):
             raise ValidationError("records_data must be a list of record dictionaries")
 
         serialized: list[dict[str, Any]] = []
         for idx, rec in enumerate(records_data):
             if isinstance(rec, BaseRecordRequest):
-                raw_payload: Any = rec.model_dump(by_alias=True, exclude_none=True)
+                raw_payload: Any = rec.model_dump(by_alias=True, exclude_none=True, warnings=False)
             elif isinstance(rec, dict):
                 raw_payload = rec
             else:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from imednet.core.endpoint.dispatch import execute_operation
@@ -9,7 +10,7 @@ from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncList
 from imednet.core.endpoint.operations.record_create import RecordCreateOperation
 from imednet.core.endpoint.strategies import MappingParamProcessor
 from imednet.models.jobs import Job
-from imednet.models.records import Record
+from imednet.models.records import BaseRecordRequest, Record
 from imednet.utils.typing import JsonDict
 from imednet.validation.cache import SchemaCache
 
@@ -29,7 +30,7 @@ class RecordsOperationDef:
     def create(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: Sequence[JsonDict | BaseRecordRequest],
         email_notify: str | None = None,
         *,
         schema: SchemaCache | None = None,

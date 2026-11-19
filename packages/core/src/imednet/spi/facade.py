@@ -4,6 +4,7 @@ These protocols define the expected interface for the iMednet SDK clients,
 allowing for easier mocking and decoupling in dependent packages.
 """
 
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from imednet.models.codings import Coding
@@ -12,7 +13,7 @@ from imednet.models.intervals import Interval
 from imednet.models.jobs import Job, JobStatus
 from imednet.models.queries import Query
 from imednet.models.record_revisions import RecordRevision
-from imednet.models.records import Record
+from imednet.models.records import BaseRecordRequest, Record
 from imednet.models.sites import Site
 from imednet.models.studies import Study
 from imednet.models.subjects import Subject
@@ -184,7 +185,7 @@ class ImednetFacade(Protocol):
     def create_record(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: Sequence[JsonDict | BaseRecordRequest],
         email_notify: str | None = None,
         *,
         schema: Any = None,
@@ -394,7 +395,7 @@ class AsyncImednetFacade(Protocol):
     async def async_create_record(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: Sequence[JsonDict | BaseRecordRequest],
         email_notify: str | None = None,
         *,
         schema: Any = None,

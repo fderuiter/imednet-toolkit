@@ -178,6 +178,109 @@ def test_create_validates_data_with_snake_case_keys(dummy_client, response_facto
         ep.create("S1", [{"form_key": "F1", "data": {"bad": 1}}], schema=schema)
 
 
+def test_create_typed_and_raw_strict_ids_sync(dummy_client, response_factory, monkeypatch):
+    """Verify both typed request models and raw dicts enforce strict IDs through sync create and create_record."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    from imednet.models.jobs import JobState
+    from imednet.models.records import (
+        CreateNewRecordRequest,
+        RecordData,
+        RecordRequest,
+        RegisterSubjectRequest,
+        UpdateScheduledRecordRequest,
+    )
+    from imednet.sdk import ImednetSDK
+
+    ep = records.RecordsEndpoint(dummy_client)
+    dummy_client.post.return_value = response_factory(
+        {"jobId": "10", "batchId": "b10", "state": "created"}
+    )
+
+    typed_batch = [
+        RegisterSubjectRequest(formId=1, siteId=2, data=RecordData({"enroll": "yes"})),
+        CreateNewRecordRequest(
+            formKey="AE", subjectId=3, recordId=4, data=RecordData({"term": "headache"})
+        ),
+        UpdateScheduledRecordRequest(
+            formId=5, subjectKey="S-1", intervalId=6, data=RecordData({"sys": 120})
+        ),
+        RecordRequest(formKey="DEMOG", siteId=7, data=RecordData({"age": 41})),
+    ]
+    res = ep.create("S1", typed_batch)
+    assert res.state == JobState.CREATED
+    dummy_client.post.assert_called_once_with(
+        "/api/v1/edc/studies/S1/records",
+        json=[
+            {"formId": 1, "siteId": 2, "data": {"enroll": "yes"}},
+            {"formKey": "AE", "subjectId": 3, "recordId": 4, "data": {"term": "headache"}},
+            {"formId": 5, "subjectKey": "S-1", "intervalId": 6, "data": {"sys": 120}},
+            {"formKey": "DEMOG", "siteId": 7, "data": {"age": 41}},
+        ],
+        headers={},
+    )
+
+    dummy_client.post.reset_mock()
+    sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://example.com")
+    monkeypatch.setattr(sdk.records, "_client", dummy_client)
+
+    sdk_job = sdk.create_record(
+        "S1",
+        [
+            RecordRequest(formId=9, siteId=2, data=RecordData({"ok": 1})),
+            {"formId": 10, "siteId": 3, "data": {"ok": 2}},
+        ],
+    )
+    assert sdk_job.state == JobState.CREATED
+    dummy_client.post.assert_called_once_with(
+        "/api/v1/edc/studies/S1/records",
+        json=[
+            {"formId": 9, "siteId": 2, "data": {"ok": 1}},
+            {"formId": 10, "siteId": 3, "data": {"ok": 2}},
+        ],
+        headers={},
+    )
+
+    dummy_client.post.reset_mock()
+    for bad_id in ["10", 10.0, True, False, 0, -3]:
+        # Public request models reject non-strict IDs before Pydantic coercion
+        for builder in (
+            lambda v=bad_id: RecordRequest(formId=v),  # type: ignore[arg-type]
+            lambda v=bad_id: RegisterSubjectRequest(formKey="F1", siteId=v),  # type: ignore[arg-type]
+            lambda v=bad_id: CreateNewRecordRequest(formKey="F1", subjectId=v),  # type: ignore[arg-type]
+            lambda v=bad_id: CreateNewRecordRequest(formKey="F1", recordId=v),  # type: ignore[arg-type]
+            lambda v=bad_id: UpdateScheduledRecordRequest(formKey="F1", intervalId=v),  # type: ignore[arg-type]
+        ):
+            with pytest.raises(PydanticValidationError):
+                builder()
+
+        # Equivalent raw dicts and unvalidated model_construct instances fail identically in create / create_record
+        for bad_payload in (
+            [{"formId": bad_id, "data": {}}],
+            [{"formKey": "F1", "siteId": bad_id, "data": {}}],
+            [{"formKey": "F1", "subjectId": bad_id, "data": {}}],
+            [{"formKey": "F1", "intervalId": bad_id, "data": {}}],
+            [{"formKey": "F1", "recordId": bad_id, "data": {}}],
+            [RecordRequest.model_construct(form_id=bad_id, data=RecordData({}))],
+            [
+                RegisterSubjectRequest.model_construct(
+                    form_key="F1", site_id=bad_id, data=RecordData({})
+                )
+            ],
+        ):
+            with pytest.raises(ValidationError):
+                ep.create("S1", bad_payload)  # type: ignore[arg-type]
+            with pytest.raises(ValidationError):
+                sdk.create_record("S1", bad_payload)  # type: ignore[arg-type]
+
+    # Typed model missing both formKey and formId is also rejected
+    with pytest.raises(ValidationError):
+        ep.create("S1", [RegisterSubjectRequest(siteName="Site 1")])
+    with pytest.raises(ValidationError):
+        sdk.create_record("S1", [RegisterSubjectRequest(siteName="Site 1")])
+    dummy_client.post.assert_not_called()
+
+
 def test_create_raises_on_header_injection(dummy_client):
     """Test that create raises on header injection."""
     ep = records.RecordsEndpoint(dummy_client)
