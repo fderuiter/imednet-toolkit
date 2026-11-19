@@ -82,7 +82,8 @@ from imednet.spi.sink_base import (
     ExportSink,
     SinkConfig,
     _require_optional_dep,
-    iter_batches,
+    extract_record_id,
+    run_streaming_export,
 )
 
 logger = logging.getLogger(__name__)
@@ -298,19 +299,41 @@ class SnowflakeExportSink(ExportSink):
         pq.write_table(arrow_table, str(local_path))
 
         cfg = self._cfg
-        stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet"
+        is_incremental_sync = bool(cfg.incremental or cfg.modified_since is not None)
+        if is_incremental_sync and self.config.idempotent:
+            import hashlib
+
+            digest = hashlib.sha256(local_path.read_bytes()).hexdigest()[:12]
+            staged_filename = f"{safe_batch}_{digest}.parquet"
+        else:
+            staged_filename = f"{safe_batch}.parquet"
+
+        if staged_filename != local_path.name:
+            staged_local_path = Path(self._staging_dir) / staged_filename
+            local_path.replace(staged_local_path)
+            local_path = staged_local_path
+
+        stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{staged_filename}"
+        batch_record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
 
         def execute_export() -> int:
             """Execute PUT and COPY INTO commands to load data into Snowflake."""
             cur = self._conn.cursor()
             try:
-                cur.execute(f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/'")  # nosem
-                force_clause = "FORCE = FALSE" if self.config.idempotent else "FORCE = TRUE"
                 target_table = (
                     f"{_quote_identifier(cfg.database)}."
                     f"{_quote_identifier(cfg.schema)}."
                     f"{_quote_identifier(cfg.table)}"
                 )
+                if is_incremental_sync and self.config.idempotent and batch_record_ids:
+                    placeholders = ", ".join(["%s"] * len(batch_record_ids))
+                    cur.execute(
+                        f"DELETE FROM {target_table} "  # noqa: S608
+                        f"WHERE STUDY_KEY = %s AND RECORD_ID IN ({placeholders})",
+                        [cfg.study_key, *batch_record_ids],
+                    )  # nosem
+                cur.execute(f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/'")  # nosem
+                force_clause = "FORCE = FALSE" if self.config.idempotent else "FORCE = TRUE"
                 cur.execute(
                     f"COPY INTO {target_table} "
                     f"FROM '{stage_path}' "
@@ -334,6 +357,37 @@ class SnowflakeExportSink(ExportSink):
 
     def flush(self) -> None:
         """No-op: each batch is committed individually."""
+
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Delete newly voided rows from Snowflake when running idempotently."""
+        if not self.config.idempotent or not records:
+            return 0
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if not record_ids:
+            return 0
+
+        cfg = self._cfg
+        target_table = (
+            f"{_quote_identifier(cfg.database)}."
+            f"{_quote_identifier(cfg.schema)}."
+            f"{_quote_identifier(cfg.table)}"
+        )
+        placeholders = ", ".join(["%s"] * len(record_ids))
+
+        def execute_reconcile() -> int:
+            cur = self._conn.cursor()
+            try:
+                cur.execute(
+                    f"DELETE FROM {target_table} "  # noqa: S608
+                    f"WHERE STUDY_KEY = %s AND RECORD_ID IN ({placeholders})",
+                    [cfg.study_key, *record_ids],
+                )  # nosem
+                logger.debug("Reconciled %d voided records in batch %s", len(record_ids), batch_id)
+                return len(record_ids)
+            finally:
+                cur.close()
+
+        return self._execute_with_retry("reconcile_warehouse_deleted", batch_id, execute_reconcile)
 
     def close(self) -> None:
         """Close the Snowflake connection and clean up temporary staging files."""
@@ -374,16 +428,13 @@ def export_to_snowflake(
     config: SnowflakeSinkConfig,
 ) -> int:
     """Export study records to Snowflake using :class:`SnowflakeExportSink`."""
-    from imednet.spi.sink_base import apply_quality_gate
-
-    records = sdk.records.list(study_key=study_key, record_data_filter=None)
-    filtered_records = list(apply_quality_gate(sdk, study_key, records, config))
-
-    total_written = 0
-    with SnowflakeExportSink(config=config) as sink:
-        for index, batch in enumerate(iter_batches(filtered_records, config.batch_size)):
-            total_written += sink.write_batch(batch, batch_id=f"{study_key}/records/{index}")
-    return total_written
+    return run_streaming_export(
+        sdk,
+        study_key,
+        lambda: SnowflakeExportSink(config=config),
+        config,
+        stream_name=f"snowflake_{config.table}",
+    )
 
 
 __all__ = ["SnowflakeExportSink", "SnowflakeSinkConfig", "export_to_snowflake"]

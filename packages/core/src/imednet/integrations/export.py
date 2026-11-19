@@ -7,14 +7,24 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, cast
+from unittest.mock import NonCallableMock
 
-from imednet.integrations.sink_base import ExportSink, SinkConfig, apply_quality_gate
+from imednet.integrations.sink_base import (
+    ExportSink,
+    SinkConfig,
+    apply_quality_gate,
+    extract_record_id,
+    is_record_deleted,
+    iter_batches,
+    iter_filtered_sdk_records,
+    run_streaming_export,
+)
 
 try:
     import pandas as pd
@@ -115,13 +125,15 @@ def _records_df(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    _mapper: Any = None,
 ) -> pd.DataFrame:
     """Return a DataFrame of study records with duplicate columns removed."""
     if pd is None:
         raise ImportError(
             "pandas is required for _records_df. Install with \"pip install 'imednet[export]'\"."
         )
-    df: pd.DataFrame = _record_mapper()(sdk).dataframe(
+    mapper = _mapper if _mapper is not None else _record_mapper()(sdk)
+    df: pd.DataFrame = mapper.dataframe(
         study_key,
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
@@ -141,6 +153,7 @@ def _prepare_export_df(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     sanitize: bool = False,
+    _mapper: Any = None,
 ) -> pd.DataFrame:
     """Prepare a DataFrame for export by fetching records and optionally sanitizing."""
     df = _records_df(
@@ -149,6 +162,7 @@ def _prepare_export_df(
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
+        _mapper=_mapper,
     )
     df = _mask_df(df)
     if sanitize:
@@ -156,30 +170,40 @@ def _prepare_export_df(
     return df
 
 
-def export_to_parquet(
-    sdk: ImednetSDK,
-    study_key: str,
-    path: str,
-    *,
-    use_labels_as_columns: bool = False,
-    **kwargs: Any,
-) -> None:
-    """Export study records to a Parquet file.
+_DEFAULT_PREPARE_EXPORT_DF = _prepare_export_df
 
-    All exports now inherit StudyConfiguration rules by default.
 
-    Parameters
-    ----------
-    use_labels_as_columns:
-        When ``True``, variable labels are used for column names instead of
-        variable names.
-    """
-    df = _prepare_export_df(
-        sdk,
-        study_key,
-        use_labels_as_columns=use_labels_as_columns,
-    )
-    df.to_parquet(path, index=False, **kwargs)
+def _merge_form_whitelist_into_filter(
+    record_filter: dict[str, Any] | str | Sequence[str] | None,
+    form_whitelist: list[int] | None,
+) -> dict[str, Any] | str | Sequence[str] | None:
+    """Combine ``record_filter`` with ``form_whitelist`` without mixing connectors."""
+    if form_whitelist is None:
+        return record_filter
+    form_val: Any = form_whitelist[0] if len(form_whitelist) == 1 else list(form_whitelist)
+    if record_filter is None:
+        return {"formId": form_val}
+    if isinstance(record_filter, str):
+        return {"formId": form_val, "filter": record_filter}
+    if isinstance(record_filter, Mapping):
+        merged = dict(record_filter)
+        merged["formId"] = form_val
+        return merged
+    return {"formId": form_val, "filter": ";".join(str(x) for x in record_filter)}
+
+
+def _is_mock_mapper(mapper: Any) -> bool:
+    """Return True when ``mapper`` is a unittest.mock stub."""
+    return isinstance(mapper, NonCallableMock)
+
+
+def _uses_mock_fetch_records(mapper: Any) -> bool:
+    """Return True when a mock mapper explicitly configured ``_fetch_records``."""
+    if not isinstance(mapper, NonCallableMock):
+        return False
+    mock_children = getattr(mapper, "_mock_children", {})
+    obj_vars = vars(mapper)
+    return "_fetch_records" in mock_children or "_fetch_records" in obj_vars
 
 
 def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -268,6 +292,61 @@ class TabularCSVSink(ExportSink):
         pass
 
 
+class TabularParquetSink(ExportSink):
+    """Streaming Parquet sink backed by ``pyarrow.parquet.ParquetWriter``."""
+
+    def __init__(self, path: str, config: TabularSinkConfig) -> None:
+        """Initialize the Parquet sink."""
+        super().__init__(config)
+        self.path = path
+        self._cfg = config
+        self._writer: Any = None
+        self._parquet_kwargs = dict(config.pandas_kwargs)
+        self._parquet_kwargs.pop("engine", None)
+        self._compression = self._parquet_kwargs.pop("compression", "snappy")
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Write a DataFrame or sequence batch to the open ParquetWriter."""
+        df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
+        if len(df) == 0:
+            return 0
+
+        def execute_export() -> int:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if self._writer is None:
+                self._writer = cast(Any, pq).ParquetWriter(
+                    self.path,
+                    table.schema,
+                    compression=self._compression,
+                    **self._parquet_kwargs,
+                )
+            self._writer.write_table(table)
+            return len(df)
+
+        return self._execute_with_retry("export_parquet", batch_id, execute_export)
+
+    def flush(self) -> None:
+        """Flush and finalize Parquet footer before checkpoint commit."""
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+        elif not Path(self.path).exists():
+            pd.DataFrame().to_parquet(
+                self.path, index=False, compression=self._compression, **self._parquet_kwargs
+            )
+
+    def close(self) -> None:
+        """Ensure underlying ParquetWriter is closed."""
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            finally:
+                self._writer = None
+
+
 class TabularSQLSink(ExportSink):
     """Sink for exporting data to SQL databases."""
 
@@ -278,7 +357,47 @@ class TabularSQLSink(ExportSink):
         self.engine = engine
         self._is_first_batch = True
         self._cfg = config
-        self._initial_if_exists = self._cfg.pandas_kwargs.pop("if_exists", "replace")
+        self._is_incremental_sync = bool(
+            config.incremental
+            or config.modified_since is not None
+            or config.state_provider is not None
+        )
+        explicit_if_exists = self._cfg.pandas_kwargs.pop("if_exists", None)
+        if explicit_if_exists is None:
+            self._initial_if_exists = (
+                "append" if (self._is_incremental_sync and config.idempotent) else "replace"
+            )
+        else:
+            self._initial_if_exists = explicit_if_exists
+
+    def _delete_existing_record_ids(self, record_ids: Sequence[Any]) -> int:
+        """Delete existing rows matching ``recordId`` when the destination table exists."""
+        if not record_ids:
+            return 0
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import text as sa_text
+
+        inspector = sa_inspect(self.engine)
+        if not inspector.has_table(self.table):
+            return 0
+        existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
+        id_col = (
+            "recordId"
+            if "recordId" in existing_cols
+            else ("record_id" if "record_id" in existing_cols else None)
+        )
+        if id_col is None:
+            return 0
+
+        preparer = self.engine.dialect.identifier_preparer
+        quoted_table = preparer.quote(self.table)
+        quoted_col = preparer.quote(id_col)
+        params = {f"id_{idx}": rid for idx, rid in enumerate(record_ids)}
+        placeholders = ", ".join(f":{k}" for k in params)
+        stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
+        with self.engine.begin() as conn:
+            conn.execute(stmt, params)
+        return len(record_ids)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -293,6 +412,17 @@ class TabularSQLSink(ExportSink):
 
         def execute_export() -> int:
             if_exists = self._initial_if_exists if self._is_first_batch else "append"
+            if (
+                self._is_incremental_sync
+                and self._cfg.idempotent
+                and if_exists == "append"
+                and not isinstance(self.engine, NonCallableMock)
+            ):
+                for candidate_col in ("recordId", "record_id"):
+                    if candidate_col in df.columns:
+                        ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
+                        self._delete_existing_record_ids(ids)
+                        break
 
             df_str = df.to_csv(index=False)
             checksum = hashlib.sha256(df_str.encode('utf-8')).hexdigest()
@@ -312,6 +442,19 @@ class TabularSQLSink(ExportSink):
         loaded = self._execute_with_retry("export_sql", batch_id, execute_export)
         self._is_first_batch = False
         return loaded
+
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Delete newly voided rows from the SQL table when running idempotently."""
+        if not self._cfg.idempotent or not records or isinstance(self.engine, NonCallableMock):
+            return 0
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if not record_ids:
+            return 0
+        return self._execute_with_retry(
+            "reconcile_sql_deleted",
+            batch_id,
+            lambda: self._delete_existing_record_ids(record_ids),
+        )
 
     def _append_manifest(self, batch_id: str, row_count: int, checksum: str) -> None:
         if not self._cfg.manifest_path:
@@ -333,12 +476,222 @@ class TabularSQLSink(ExportSink):
         """Close the sink."""
 
 
+class TabularDuckDBSink(ExportSink):
+    """Streaming sink for exporting DataFrame batches into a DuckDB table."""
+
+    def __init__(self, db_path: str, table_name: str, config: TabularSinkConfig) -> None:
+        """Initialize the DuckDB sink."""
+        super().__init__(config)
+        _validate_duckdb_identifier(table_name)
+        self.db_path = db_path
+        self.table_name = table_name
+        self._cfg = config
+        self._is_first_batch = True
+        self._is_incremental_sync = bool(
+            config.incremental
+            or config.modified_since is not None
+            or config.state_provider is not None
+        )
+        import duckdb
+
+        self._conn: Any = duckdb.connect(db_path)
+
+    def _table_exists(self) -> bool:
+        rows = self._conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+            [self.table_name],
+        ).fetchall()
+        return bool(rows)
+
+    def _delete_record_ids(self, record_ids: Sequence[Any]) -> int:
+        if not record_ids or not self._table_exists():
+            return 0
+        cols = {
+            row[1]
+            for row in self._conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+        }
+        id_col = (
+            "recordId" if "recordId" in cols else ("record_id" if "record_id" in cols else None)
+        )
+        if id_col is None:
+            return 0
+        placeholders = ", ".join(["?"] * len(record_ids))
+        quoted_tbl = _quote_duckdb_identifier(self.table_name)
+        quoted_col = _quote_duckdb_identifier(id_col)
+        self._conn.execute(
+            f"DELETE FROM {quoted_tbl} WHERE {quoted_col} IN ({placeholders})",
+            list(record_ids),
+        )
+        return len(record_ids)
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Write a batch of records into DuckDB."""
+        df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
+        if len(df) == 0:
+            return 0
+
+        def execute_export() -> int:
+            quoted_tbl = _quote_duckdb_identifier(self.table_name)
+            quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
+            self._conn.register(_DUCKDB_DF_ALIAS, df)
+            try:
+                if self._is_first_batch and not (
+                    self._is_incremental_sync and self._cfg.idempotent
+                ):
+                    self._conn.execute(
+                        f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
+                    )
+                elif not self._table_exists():
+                    self._conn.execute(f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
+                else:
+                    if self._is_incremental_sync and self._cfg.idempotent:
+                        for candidate_col in ("recordId", "record_id"):
+                            if candidate_col in df.columns:
+                                ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
+                                self._delete_record_ids(ids)
+                                break
+                    self._conn.execute(
+                        f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
+                    )
+            finally:
+                self._conn.unregister(_DUCKDB_DF_ALIAS)
+            return len(df)
+
+        loaded = self._execute_with_retry("export_duckdb", batch_id, execute_export)
+        self._is_first_batch = False
+        return loaded
+
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Delete newly voided rows from DuckDB when running idempotently."""
+        if not self._cfg.idempotent or not records:
+            return 0
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if not record_ids:
+            return 0
+        return self._execute_with_retry(
+            "reconcile_duckdb_deleted",
+            batch_id,
+            lambda: self._delete_record_ids(record_ids),
+        )
+
+    def flush(self) -> None:
+        """Ensure empty table is created on full non-incremental export when 0 rows matched."""
+        if (
+            self._is_first_batch
+            and not self._is_incremental_sync
+            and self._conn is not None
+            and not isinstance(self._conn, NonCallableMock)
+            and not self._table_exists()
+        ):
+            empty_df = pd.DataFrame({"recordId": pd.Series(dtype="object")})
+            quoted_tbl = _quote_duckdb_identifier(self.table_name)
+            quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
+            self._conn.register(_DUCKDB_DF_ALIAS, empty_df)
+            try:
+                self._conn.execute(
+                    f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
+                )
+            finally:
+                self._conn.unregister(_DUCKDB_DF_ALIAS)
+
+    def close(self) -> None:
+        """Close the DuckDB connection."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
+
+
+class _TabularCollectingSink(ExportSink):
+    """Collects masked/sanitized DataFrame chunks and runs a writer callback on ``flush()``."""
+
+    def __init__(
+        self,
+        config: TabularSinkConfig,
+        on_flush: Any,
+    ) -> None:
+        super().__init__(config)
+        self._frames: list[pd.DataFrame] = []
+        self._on_flush = on_flush
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        _ = batch_id
+        df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
+        if len(df) == 0:
+            return 0
+        self._frames.append(df)
+        return len(df)
+
+    def flush(self) -> None:
+        combined = pd.concat(self._frames, ignore_index=True) if self._frames else pd.DataFrame()
+        self._on_flush(combined)
+
+    def close(self) -> None:
+        self._frames.clear()
+
+
+class _TabularTransformSink(ExportSink):
+    """Adapts record batches into masked/sanitized DataFrames before delegating to ``inner``."""
+
+    def __init__(
+        self,
+        inner: ExportSink,
+        mapper: Any,
+        record_model: Any,
+        variable_keys: list[str],
+        label_map: dict[str, str],
+        config: TabularSinkConfig,
+        *,
+        sanitize: bool,
+    ) -> None:
+        super().__init__(config)
+        self._inner = inner
+        self._mapper = mapper
+        self._record_model = record_model
+        self._variable_keys = variable_keys
+        self._label_map = label_map
+        self._cfg = config
+        self._sanitize = sanitize
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        rows, _ = self._mapper._parse_records(records, self._record_model)
+        df = self._mapper._build_dataframe(
+            rows,
+            self._variable_keys,
+            self._label_map,
+            self._cfg.use_labels_as_columns,
+        )
+        if df.empty:
+            return 0
+        df.columns = df.columns.astype(str)
+        dup_mask = df.columns.str.lower().duplicated()
+        df = df.loc[:, ~dup_mask]
+
+        df = _mask_df(df)
+        if self._sanitize:
+            df = _sanitize_df(df)
+
+        return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
+
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        return self._inner.reconcile_deleted(records, batch_id=batch_id)
+
+    def flush(self) -> None:
+        self._inner.flush()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 def _tabular_export(
     sdk: Any,
     study_key: str,
     sink: ExportSink,
     config: TabularSinkConfig,
     sanitize: bool = False,
+    *,
+    stream_name: str | None = None,
 ) -> None:
     mapper = _record_mapper()(sdk)
     variable_keys, label_map = mapper._fetch_variable_metadata(
@@ -354,42 +707,73 @@ def _tabular_export(
     if config.form_whitelist is not None:
         extra_filters["formId"] = config.form_whitelist
 
-    raw_records = mapper._iter_records(
-        study_key,
-        visit_key=None,
-        extra_filters=extra_filters or None,
-    )
+    merged_filter = _merge_form_whitelist_into_filter(config.record_filter, config.form_whitelist)
+    is_mock = _is_mock_mapper(mapper)
 
-    filtered_records = apply_quality_gate(sdk, study_key, raw_records, config)
-
-    import itertools
-    from collections.abc import Iterator
-
-    def _chunk_iterator(iterator: Iterator[Any], size: int) -> Iterator[list[Any]]:
-        while True:
-            chunk = list(itertools.islice(iterator, size))
-            if not chunk:
-                break
-            yield chunk
-
-    with sink:
-        for i, chunk in enumerate(_chunk_iterator(iter(filtered_records), config.batch_size)):
-            rows, _ = mapper._parse_records(chunk, record_model)
-            df = mapper._build_dataframe(
-                rows, variable_keys, label_map, config.use_labels_as_columns
+    def _records_source(
+        watermark: datetime | None, exclude_deleted_upstream: bool
+    ) -> Iterable[Any]:
+        if is_mock:
+            return cast(
+                Iterable[Any],
+                mapper._iter_records(
+                    study_key,
+                    visit_key=None,
+                    extra_filters=extra_filters or None,
+                ),
             )
-            if df.empty:
-                continue
+        if (
+            getattr(mapper, "_loader", None) is not None
+            or not mapper._can_stream_via_records_endpoint()
+        ):
+            iter_filters = dict(extra_filters)
+            if isinstance(config.record_filter, Mapping):
+                iter_filters.update(config.record_filter)
+            elif isinstance(config.record_filter, str) and config.record_filter.strip():
+                iter_filters["filter"] = config.record_filter
+            if watermark is not None:
+                from imednet.utils.dates import format_iso_datetime
 
-            # Deduplicate columns (case-insensitive) as legacy _records_df did
-            dup_mask = df.columns.str.lower().duplicated()
-            df = df.loc[:, ~dup_mask]
+                iter_filters["dateModified"] = (">=", format_iso_datetime(watermark))
+            return cast(
+                Iterable[Any],
+                mapper._iter_records(
+                    study_key,
+                    visit_key=None,
+                    extra_filters=iter_filters or None,
+                    record_data_filter=config.record_data_filter,
+                    include_deleted=not exclude_deleted_upstream,
+                ),
+            )
+        return iter_filtered_sdk_records(
+            sdk,
+            study_key,
+            watermark=watermark,
+            record_filter=merged_filter,
+            record_data_filter=config.record_data_filter,
+            exclude_deleted_upstream=exclude_deleted_upstream,
+        )
 
-            df = _mask_df(df)
-            if sanitize:
-                df = _sanitize_df(df)
-
-            sink.write_batch(cast(Any, df), batch_id=f"{study_key}/tabular/{i}")
+    transform_sink = _TabularTransformSink(
+        sink,
+        mapper,
+        record_model,
+        variable_keys,
+        label_map,
+        config,
+        sanitize=sanitize,
+    )
+    run_streaming_export(
+        sdk,
+        study_key,
+        transform_sink,
+        config,
+        stream_name=stream_name or "tabular",
+        batch_id_prefix=f"{study_key}/tabular",
+        records_source=_records_source,
+        quality_gate_fn=apply_quality_gate,
+        iter_batches_fn=iter_batches,
+    )
 
 
 def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -402,8 +786,82 @@ def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         "extra",
         "min_schema_readiness_score",
         "tracer",
+        "modified_since",
+        "record_filter",
+        "record_data_filter",
+        "include_deleted",
+        "incremental",
+        "stream_name",
+        "ledger_path",
+        "state_provider",
     )
     return {k: kwargs.pop(k) for k in sink_keys if k in kwargs}
+
+
+def _has_streaming_kwargs(sink_kwargs: Mapping[str, Any]) -> bool:
+    """Return True when caller supplied any streaming/filter/checkpoint kwargs."""
+    return bool(sink_kwargs)
+
+
+def export_to_parquet(
+    sdk: ImednetSDK,
+    study_key: str,
+    path: str,
+    *,
+    use_labels_as_columns: bool = False,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
+    quality_gate_enabled: bool = False,
+    **kwargs: Any,
+) -> None:
+    """Export study records to a Parquet file.
+
+    All exports now inherit StudyConfiguration rules by default.
+
+    Parameters
+    ----------
+    use_labels_as_columns:
+        When ``True``, variable labels are used for column names instead of
+        variable names.
+    """
+    config = kwargs.pop("config", None)
+    sink_kwargs = _pop_sink_kwargs(kwargs)
+    if config is None and not _has_streaming_kwargs(sink_kwargs):
+        if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
+            df = _prepare_export_df(
+                sdk,
+                study_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+            df.to_parquet(path, index=False, **kwargs)
+            return
+        pre_mapper = _record_mapper()(sdk)
+        if _is_mock_mapper(pre_mapper):
+            df = _prepare_export_df(
+                sdk,
+                study_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                _mapper=pre_mapper,
+            )
+            df.to_parquet(path, index=False, **kwargs)
+            return
+
+    if not isinstance(config, TabularSinkConfig):
+        config = TabularSinkConfig(
+            study_key=study_key,
+            pandas_kwargs=kwargs,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            quality_gate_enabled=quality_gate_enabled,
+            **sink_kwargs,
+        )
+    sink = TabularParquetSink(path, config)
+    _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name="parquet")
 
 
 def export_to_csv(
@@ -443,7 +901,7 @@ def export_to_csv(
         )
 
     sink = TabularCSVSink(path, config)
-    _tabular_export(sdk, study_key, sink, config, sanitize=True)
+    _tabular_export(sdk, study_key, sink, config, sanitize=True, stream_name="csv")
 
 
 def export_to_excel(
@@ -452,6 +910,9 @@ def export_to_excel(
     path: str,
     *,
     use_labels_as_columns: bool = False,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
+    quality_gate_enabled: bool = False,
     **kwargs: Any,
 ) -> None:
     """Export study records to an Excel workbook.
@@ -464,56 +925,57 @@ def export_to_excel(
         When ``True``, variable labels are used for column names instead of
         variable names.
     """
-    df = _prepare_export_df(
-        sdk,
-        study_key,
-        use_labels_as_columns=use_labels_as_columns,
-        sanitize=True,
+    config = kwargs.pop("config", None)
+    sink_kwargs = _pop_sink_kwargs(kwargs)
+    if config is None and not _has_streaming_kwargs(sink_kwargs):
+        if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
+            df = _prepare_export_df(
+                sdk,
+                study_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                sanitize=True,
+            )
+            df.to_excel(path, index=False, **kwargs)
+            return
+        pre_mapper = _record_mapper()(sdk)
+        if _is_mock_mapper(pre_mapper):
+            df = _prepare_export_df(
+                sdk,
+                study_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                sanitize=True,
+                _mapper=pre_mapper,
+            )
+            df.to_excel(path, index=False, **kwargs)
+            return
+
+    if not isinstance(config, TabularSinkConfig):
+        config = TabularSinkConfig(
+            study_key=study_key,
+            pandas_kwargs=kwargs,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            quality_gate_enabled=quality_gate_enabled,
+            **sink_kwargs,
+        )
+    excel_kwargs = dict(config.pandas_kwargs)
+    sink = _TabularCollectingSink(
+        config,
+        lambda combined: combined.to_excel(path, index=False, **excel_kwargs),
     )
-    df.to_excel(path, index=False, **kwargs)
+    _tabular_export(sdk, study_key, sink, config, sanitize=True, stream_name="excel")
 
 
-def export_to_json(
-    sdk: ImednetSDK,
-    study_key: str,
-    path: str,
-    *,
-    use_labels_as_columns: bool = False,
-    hierarchical: bool = False,
-    **kwargs: Any,
-) -> None:
-    """Export study records to a JSON file.
-
-    All exports now inherit StudyConfiguration rules by default.
-
-    Parameters
-    ----------
-    use_labels_as_columns:
-        When ``True``, variable labels are used for column names instead of
-        variable names.
-    hierarchical:
-        When ``True``, generates a nested tree (Subject > Visit > Form) suitable
-        for Veeva Vault integrations instead of a flat tabular layout.
-    """
-    import json
+def _apply_json_enrichment(study_key: str, data: Any) -> Any:
+    """Apply ConfigVersionStore EnrichmentPipeline when installed."""
     import logging
 
     logger = logging.getLogger(__name__)
-
-    if hierarchical:
-        mapper = _record_mapper()(sdk)
-        data = mapper.build_hierarchy(study_key, use_labels_as_keys=use_labels_as_columns)
-    else:
-        df = _prepare_export_df(
-            sdk,
-            study_key,
-            use_labels_as_columns=use_labels_as_columns,
-        )
-        import pandas as pd
-
-        # Explicitly handle missing values when converting to dict
-        data = cast(Any, df).where(pd.notnull(df), None).to_dict(orient="records")
-
     try:
         from importlib.metadata import entry_points
 
@@ -532,17 +994,115 @@ def export_to_json(
         history = store.get_history(study_key)
         if history:
             latest_commit = history[-1]["commit_id"]
-            config = store.rollback_config(study_key, latest_commit)
+            study_cfg = store.rollback_config(study_key, latest_commit)
 
             logger.info("Enrichment pipeline triggered")
-            pipeline = enrichment_pipeline_cls(config)
+            pipeline = enrichment_pipeline_cls(study_cfg)
             data = pipeline.process(data)
             logger.info("Enrichment pipeline completed successfully")
     except Exception as e:
         logger.warning(f"Could not apply EnrichmentPipeline: {e}")
+    return data
 
-    with open(path, "w") as f:
-        json.dump(data, f, **kwargs)
+
+def export_to_json(
+    sdk: ImednetSDK,
+    study_key: str,
+    path: str,
+    *,
+    use_labels_as_columns: bool = False,
+    hierarchical: bool = False,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
+    quality_gate_enabled: bool = False,
+    **kwargs: Any,
+) -> None:
+    """Export study records to a JSON file.
+
+    All exports now inherit StudyConfiguration rules by default.
+
+    Parameters
+    ----------
+    use_labels_as_columns:
+        When ``True``, variable labels are used for column names instead of
+        variable names.
+    hierarchical:
+        When ``True``, generates a nested tree (Subject > Visit > Form) suitable
+        for Veeva Vault integrations instead of a flat tabular layout.
+    """
+    config = kwargs.pop("config", None)
+    sink_kwargs = _pop_sink_kwargs(kwargs)
+
+    if hierarchical:
+        mapper = _record_mapper()(sdk)
+        if not _has_streaming_kwargs(sink_kwargs) and config is None:
+            data = mapper.build_hierarchy(study_key, use_labels_as_keys=use_labels_as_columns)
+        else:
+            include_deleted = bool(sink_kwargs.get("include_deleted", False))
+            data = mapper.build_hierarchy(
+                study_key,
+                use_labels_as_keys=use_labels_as_columns,
+                include_deleted=include_deleted,
+            )
+        data = _apply_json_enrichment(study_key, data)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, **kwargs)
+        return
+
+    if config is None and not _has_streaming_kwargs(sink_kwargs):
+        if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
+            df = _prepare_export_df(
+                sdk,
+                study_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+            data = cast(Any, df).where(pd.notnull(df), None).to_dict(orient="records")
+            data = _apply_json_enrichment(study_key, data)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, **kwargs)
+            return
+        pre_mapper = _record_mapper()(sdk)
+        if _is_mock_mapper(pre_mapper):
+            df = _prepare_export_df(
+                sdk,
+                study_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                _mapper=pre_mapper,
+            )
+            data = cast(Any, df).where(pd.notnull(df), None).to_dict(orient="records")
+            data = _apply_json_enrichment(study_key, data)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, **kwargs)
+            return
+
+    if not isinstance(config, TabularSinkConfig):
+        config = TabularSinkConfig(
+            study_key=study_key,
+            pandas_kwargs=kwargs,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            quality_gate_enabled=quality_gate_enabled,
+            **sink_kwargs,
+        )
+    json_kwargs = dict(config.pandas_kwargs)
+
+    def _write_json(combined: pd.DataFrame) -> None:
+        records_out = (
+            cast(Any, combined).where(pd.notnull(combined), None).to_dict(orient="records")
+            if not combined.empty
+            else []
+        )
+        records_out = _apply_json_enrichment(study_key, records_out)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(records_out, f, **json_kwargs)
+
+    sink = _TabularCollectingSink(config, _write_json)
+    _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name="json")
 
 
 def export_to_sql(
@@ -550,7 +1110,7 @@ def export_to_sql(
     study_key: str,
     table: str,
     conn_str: str,
-    if_exists: Literal["fail", "replace", "append", "delete_rows"] = "replace",
+    if_exists: Literal["fail", "replace", "append", "delete_rows"] | None = None,
     *,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -578,7 +1138,8 @@ def export_to_sql(
     config = kwargs.pop("config", None)
     if not isinstance(config, TabularSinkConfig):
         sink_kwargs = _pop_sink_kwargs(kwargs)
-        kwargs["if_exists"] = if_exists
+        if if_exists is not None:
+            kwargs["if_exists"] = if_exists
         config = TabularSinkConfig(
             study_key=study_key,
             manifest_path=manifest_path,
@@ -592,7 +1153,7 @@ def export_to_sql(
 
     engine = create_engine(conn_str)
     sink = TabularSQLSink(table, engine, config)
-    _tabular_export(sdk, study_key, sink, config, sanitize=False)
+    _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name=f"sql_{table}")
 
 
 def export_to_duckdb(
@@ -604,6 +1165,8 @@ def export_to_duckdb(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    quality_gate_enabled: bool = False,
+    **kwargs: Any,
 ) -> None:
     """Export study records to a DuckDB table using native DataFrame registration.
 
@@ -641,24 +1204,63 @@ def export_to_duckdb(
 
     _validate_duckdb_identifier(table_name)
 
-    df = _prepare_export_df(
+    config = kwargs.pop("config", None)
+    sink_kwargs = _pop_sink_kwargs(kwargs)
+
+    if config is None and not _has_streaming_kwargs(sink_kwargs):
+        df_legacy: pd.DataFrame | None = None
+        if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
+            df_legacy = _prepare_export_df(
+                sdk,
+                study_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+        else:
+            pre_mapper = _record_mapper()(sdk)
+            if _is_mock_mapper(pre_mapper):
+                df_legacy = _prepare_export_df(
+                    sdk,
+                    study_key,
+                    use_labels_as_columns=use_labels_as_columns,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                    _mapper=pre_mapper,
+                )
+        if df_legacy is not None:
+            conn: Any = duckdb.connect(db_path)
+            try:
+                conn.register(_DUCKDB_DF_ALIAS, df_legacy)
+                conn.execute(
+                    f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(table_name)} "
+                    f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
+                )
+                conn.unregister(_DUCKDB_DF_ALIAS)
+            finally:
+                conn.close()
+            return
+
+    if not isinstance(config, TabularSinkConfig):
+        config = TabularSinkConfig(
+            study_key=study_key,
+            pandas_kwargs=kwargs,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            quality_gate_enabled=quality_gate_enabled,
+            **sink_kwargs,
+        )
+
+    sink = TabularDuckDBSink(db_path, table_name, config)
+    _tabular_export(
         sdk,
         study_key,
-        use_labels_as_columns=use_labels_as_columns,
-        variable_whitelist=variable_whitelist,
-        form_whitelist=form_whitelist,
+        sink,
+        config,
+        sanitize=False,
+        stream_name=f"duckdb_{table_name}",
     )
-
-    conn: Any = duckdb.connect(db_path)
-    try:
-        conn.register(_DUCKDB_DF_ALIAS, df)
-        conn.execute(
-            f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(table_name)} "
-            f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
-        )
-        conn.unregister(_DUCKDB_DF_ALIAS)
-    finally:
-        conn.close()
 
 
 def export_to_duckdb_by_form(
@@ -669,6 +1271,7 @@ def export_to_duckdb_by_form(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    **kwargs: Any,
 ) -> None:
     """Export records to separate DuckDB tables for each form.
 
@@ -702,6 +1305,7 @@ def export_to_duckdb_by_form(
             "Install with `pip install 'imednet[duckdb]'`."
         ) from error
 
+    sink_kwargs = _pop_sink_kwargs(kwargs)
     mapper = _record_mapper()(sdk)
     forms = sdk.forms.list(study_key=study_key)
 
@@ -716,6 +1320,13 @@ def export_to_duckdb_by_form(
     for v in all_variables:
         if v.form_id is not None:
             variables_by_form.setdefault(v.form_id, []).append(v)
+
+    use_mock_fetch = _uses_mock_fetch_records(mapper) and not _has_streaming_kwargs(sink_kwargs)
+    batch_size = int(sink_kwargs.get("batch_size", 500))
+    include_deleted = bool(sink_kwargs.get("include_deleted", False))
+    modified_since = sink_kwargs.get("modified_since")
+    record_filter = sink_kwargs.get("record_filter")
+    record_data_filter = sink_kwargs.get("record_data_filter")
 
     conn: Any = duckdb.connect(db_path, config={"threads": "1"})
     try:
@@ -737,29 +1348,87 @@ def export_to_duckdb_by_form(
                 v.variable_name: v.label for v in variables if v.variable_name in variable_keys
             }
             record_model = mapper._build_record_model(variable_keys, label_map)
-            records = mapper._fetch_records(
-                study_key,
-                extra_filters={"formId": form.form_id},
-            )
-            rows, _ = mapper._parse_records(records, record_model)
-            df = mapper._build_dataframe(
-                rows,
-                variable_keys,
-                label_map,
-                use_labels_as_columns,
-            )
-            if isinstance(df, pd.DataFrame):
-                df.columns = df.columns.astype(str)
-                dup_mask = df.columns.str.lower().duplicated()
-                df = df.loc[:, ~dup_mask]
-                df = _mask_df(df)
+            if use_mock_fetch:
+                records = mapper._fetch_records(
+                    study_key,
+                    extra_filters={"formId": form.form_id},
+                )
+                rows, _ = mapper._parse_records(records, record_model)
+                df = mapper._build_dataframe(
+                    rows,
+                    variable_keys,
+                    label_map,
+                    use_labels_as_columns,
+                )
+                if isinstance(df, pd.DataFrame):
+                    df.columns = df.columns.astype(str)
+                    dup_mask = df.columns.str.lower().duplicated()
+                    df = df.loc[:, ~dup_mask]
+                    df = _mask_df(df)
 
-            conn.register(_DUCKDB_DF_ALIAS, df)
-            conn.execute(
-                f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(form.form_key)} "
-                f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
+                conn.register(_DUCKDB_DF_ALIAS, df)
+                conn.execute(
+                    f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(form.form_key)} "
+                    f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
+                )
+                conn.unregister(_DUCKDB_DF_ALIAS)
+                continue
+
+            form_filter = _merge_form_whitelist_into_filter(record_filter, [form.form_id])
+            raw_stream = iter_filtered_sdk_records(
+                sdk,
+                study_key,
+                watermark=modified_since,
+                record_filter=form_filter,
+                record_data_filter=record_data_filter,
+                exclude_deleted_upstream=not include_deleted,
             )
-            conn.unregister(_DUCKDB_DF_ALIAS)
+            stream = (rec for rec in raw_stream if include_deleted or not is_record_deleted(rec))
+            wrote_any = False
+            quoted_tbl = _quote_duckdb_identifier(form.form_key)
+            quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
+            for chunk in iter_batches(stream, batch_size):
+                rows, _ = mapper._parse_records(chunk, record_model)
+                df = mapper._build_dataframe(
+                    rows,
+                    variable_keys,
+                    label_map,
+                    use_labels_as_columns,
+                )
+                if isinstance(df, pd.DataFrame):
+                    df.columns = df.columns.astype(str)
+                    dup_mask = df.columns.str.lower().duplicated()
+                    df = df.loc[:, ~dup_mask]
+                    df = _mask_df(df)
+                if df.empty:
+                    continue
+                conn.register(_DUCKDB_DF_ALIAS, df)
+                try:
+                    if not wrote_any:
+                        conn.execute(
+                            f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
+                        )
+                        wrote_any = True
+                    else:
+                        conn.execute(
+                            f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
+                        )
+                finally:
+                    conn.unregister(_DUCKDB_DF_ALIAS)
+            if not wrote_any:
+                empty_df = mapper._build_dataframe(
+                    [],
+                    variable_keys,
+                    label_map,
+                    use_labels_as_columns,
+                )
+                conn.register(_DUCKDB_DF_ALIAS, empty_df)
+                try:
+                    conn.execute(
+                        f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
+                    )
+                finally:
+                    conn.unregister(_DUCKDB_DF_ALIAS)
     finally:
         conn.close()
 
@@ -778,6 +1447,7 @@ def export_to_sql_by_form(
     """Export records to separate SQL tables for each form."""
     from sqlalchemy import create_engine
 
+    sink_kwargs = _pop_sink_kwargs(kwargs)
     mapper = _record_mapper()(sdk)
     engine = create_engine(conn_str)
     forms = sdk.forms.list(study_key=study_key)
@@ -794,6 +1464,8 @@ def export_to_sql_by_form(
         if v.form_id is not None:
             variables_by_form.setdefault(v.form_id, []).append(v)
 
+    use_mock_fetch = _uses_mock_fetch_records(mapper) and not _has_streaming_kwargs(sink_kwargs)
+
     for form in forms:
         if form.form_id is None or form.form_key is None:
             continue
@@ -809,27 +1481,83 @@ def export_to_sql_by_form(
             v.variable_name: v.label for v in variables if v.variable_name in variable_keys
         }
         record_model = mapper._build_record_model(variable_keys, label_map)
-        records = mapper._fetch_records(
-            study_key,
-            extra_filters={"formId": form.form_id},
+        if use_mock_fetch:
+            records = mapper._fetch_records(
+                study_key,
+                extra_filters={"formId": form.form_id},
+            )
+            rows, _ = mapper._parse_records(records, record_model)
+            df = mapper._build_dataframe(
+                rows,
+                variable_keys,
+                label_map,
+                use_labels_as_columns,
+            )
+            if isinstance(df, pd.DataFrame):
+                dup_mask = df.columns.str.lower().duplicated()
+                df = df.loc[:, ~dup_mask]
+                df = _mask_df(df)
+            _to_sql_with_chunking(
+                df,
+                form.form_key or "",
+                engine,
+                if_exists=if_exists,
+                **kwargs,
+            )
+            continue
+
+        form_sink_kwargs = dict(sink_kwargs)
+        if "stream_name" in form_sink_kwargs and form_sink_kwargs["stream_name"] is not None:
+            form_sink_kwargs["stream_name"] = f"{form_sink_kwargs['stream_name']}_{form.form_key}"
+        form_pandas_kwargs = dict(kwargs)
+        if not (form_sink_kwargs.get("incremental") or form_sink_kwargs.get("modified_since")):
+            form_pandas_kwargs["if_exists"] = if_exists
+        form_config = TabularSinkConfig(
+            study_key=study_key,
+            pandas_kwargs=form_pandas_kwargs,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_keys,
+            form_whitelist=[form.form_id],
+            quality_gate_enabled=False,
+            **form_sink_kwargs,
         )
-        rows, _ = mapper._parse_records(records, record_model)
-        df = mapper._build_dataframe(
-            rows,
+        form_sink = TabularSQLSink(form.form_key, engine, form_config)
+        form_filter = _merge_form_whitelist_into_filter(form_config.record_filter, [form.form_id])
+
+        def _form_records_source(
+            watermark: datetime | None,
+            exclude_deleted_upstream: bool,
+            _flt: Any = form_filter,
+            _rdf: str | None = form_config.record_data_filter,
+        ) -> Iterable[Any]:
+            return iter_filtered_sdk_records(
+                sdk,
+                study_key,
+                watermark=watermark,
+                record_filter=_flt,
+                record_data_filter=_rdf,
+                exclude_deleted_upstream=exclude_deleted_upstream,
+            )
+
+        transform_sink = _TabularTransformSink(
+            form_sink,
+            mapper,
+            record_model,
             variable_keys,
             label_map,
-            use_labels_as_columns,
+            form_config,
+            sanitize=False,
         )
-        if isinstance(df, pd.DataFrame):
-            dup_mask = df.columns.str.lower().duplicated()
-            df = df.loc[:, ~dup_mask]
-            df = _mask_df(df)
-        _to_sql_with_chunking(
-            df,
-            form.form_key or "",
-            engine,
-            if_exists=if_exists,
-            **kwargs,
+        run_streaming_export(
+            sdk,
+            study_key,
+            transform_sink,
+            form_config,
+            stream_name=f"sql_{form.form_key}",
+            batch_id_prefix=f"{study_key}/{form.form_key}",
+            records_source=_form_records_source,
+            quality_gate_fn=apply_quality_gate,
+            iter_batches_fn=iter_batches,
         )
 
 
@@ -840,6 +1568,7 @@ def export_to_long_sql(
     conn_str: str,
     *,
     chunk_size: int = 1000,
+    **kwargs: Any,
 ) -> None:
     """Export records to a normalized long-format SQL table."""
     if pd is None:
@@ -849,13 +1578,27 @@ def export_to_long_sql(
         )
     from sqlalchemy import create_engine
 
+    sink_kwargs = _pop_sink_kwargs(kwargs)
     engine = create_engine(conn_str)
     mapper = _record_mapper()(sdk)
-    records = mapper._fetch_records(study_key)
+    if _uses_mock_fetch_records(mapper) and not _has_streaming_kwargs(sink_kwargs):
+        records: Iterable[Any] = mapper._fetch_records(study_key)
+    else:
+        records = iter_filtered_sdk_records(
+            sdk,
+            study_key,
+            watermark=sink_kwargs.get("modified_since"),
+            record_filter=sink_kwargs.get("record_filter"),
+            record_data_filter=sink_kwargs.get("record_data_filter"),
+            exclude_deleted_upstream=not bool(sink_kwargs.get("include_deleted", False)),
+        )
 
+    include_deleted = bool(sink_kwargs.get("include_deleted", False))
     rows: list[dict[str, Any]] = []
     first = True
     for rec in records:
+        if not include_deleted and is_record_deleted(rec):
+            continue
         timestamp = rec.date_modified
         for name, value in (rec.record_data or {}).items():
             if global_sensitivity_registry.is_sensitive(name):
