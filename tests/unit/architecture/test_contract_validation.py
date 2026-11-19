@@ -135,7 +135,9 @@ def test_workflows_contract_parity():
         sdk.close()
 
     async_sdk = AsyncImednetSDK(
-        api_key="key", security_key="secret", base_url="https://example.com"
+        api_key="key",  # pragma: allowlist secret
+        security_key="secret",  # pragma: allowlist secret
+        base_url="https://example.com",
     )
     try:
         for name, ep in eps.items():
