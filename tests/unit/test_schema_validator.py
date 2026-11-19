@@ -348,3 +348,80 @@ async def test_base_schema_cache_async_refresh() -> None:
     await cache.refresh(forms, variables, "STUDY")
     variables.list.assert_called_once_with(study_key="STUDY")
     assert "F1" in cache.forms
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_multi_study_schema_validator_isolates_colliding_form_keys_and_ids(
+    async_mode: bool,
+) -> None:
+    """SchemaValidator isolates STUDY_A and STUDY_B forms sharing formKey and formId."""
+    from imednet.validation.cache import SchemaCache
+
+    var_a = Variable(
+        studyKey="STUDY_A",
+        variable_name="age",
+        variable_type="integer",
+        form_id=101,
+        form_key="DM",
+    )
+    var_b = Variable(
+        studyKey="STUDY_B",
+        variable_name="country",
+        variable_type="text",
+        form_id=101,
+        form_key="DM",
+    )
+
+    sdk = MagicMock()
+    if async_mode:
+
+        async def _async_get_vars(study_key: str):
+            return [var_a] if study_key == "STUDY_A" else [var_b]
+
+        sdk.async_get_variables = AsyncMock(side_effect=_async_get_vars)
+        validator = AsyncSchemaValidator(sdk)  # type: ignore[assignment]
+
+        asyncio.run(validator.validate_record("STUDY_A", {"formKey": "DM", "data": {"age": 42}}))
+        asyncio.run(
+            validator.validate_record("STUDY_B", {"formKey": "DM", "data": {"country": "NL"}})
+        )
+        asyncio.run(validator.validate_record("STUDY_A", {"formId": 101, "data": {"age": 30}}))
+        asyncio.run(
+            validator.validate_record("STUDY_B", {"formId": 101, "data": {"country": "US"}})
+        )
+
+        with pytest.raises(ValidationError, match="Unknown variables for form DM: country"):
+            asyncio.run(
+                validator.validate_record("STUDY_A", {"formKey": "DM", "data": {"country": "NL"}})
+            )
+        with pytest.raises(ValidationError, match="Unknown variables for form DM: age"):
+            asyncio.run(
+                validator.validate_record("STUDY_B", {"formKey": "DM", "data": {"age": 42}})
+            )
+    else:
+        sdk.get_variables.side_effect = lambda study_key: (
+            [var_a] if study_key == "STUDY_A" else [var_b]
+        )
+        validator = SchemaValidator(sdk)  # type: ignore[assignment]
+
+        validator.validate_record("STUDY_A", {"formKey": "DM", "data": {"age": 42}})
+        validator.validate_record("STUDY_B", {"formKey": "DM", "data": {"country": "NL"}})
+        validator.validate_record("STUDY_A", {"formId": 101, "data": {"age": 30}})
+        validator.validate_record("STUDY_B", {"formId": 101, "data": {"country": "US"}})
+
+        with pytest.raises(ValidationError, match="Unknown variables for form DM: country"):
+            validator.validate_record("STUDY_A", {"formKey": "DM", "data": {"country": "NL"}})
+        with pytest.raises(ValidationError, match="Unknown variables for form DM: age"):
+            validator.validate_record("STUDY_B", {"formKey": "DM", "data": {"age": 42}})
+
+    cache: SchemaCache = validator.schema  # type: ignore[assignment]
+    assert set(cache.forms_for_study("STUDY_A")["DM"].keys()) == {"age"}
+    assert set(cache.forms_for_study("STUDY_B")["DM"].keys()) == {"country"}
+    assert ("STUDY_A", "DM") in cache.study_forms
+    assert ("STUDY_B", "DM") in cache.study_forms
+
+    # Ambiguous unkeyed lookup across multiple studies raises ValidationError
+    with pytest.raises(ValidationError, match="Ambiguous form"):
+        cache.variables_for_form("DM")
+    with pytest.raises(ValidationError, match="Ambiguous form ID"):
+        cache.form_key_from_id(101)

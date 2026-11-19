@@ -85,6 +85,7 @@ class RecordsOperationDef:
             records_data=records_data,
             email_notify=email_notify,
             schema=schema,
+            study_key=study_key,
             skip_validation=skip_validation,
         )
 

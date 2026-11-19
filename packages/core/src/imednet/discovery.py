@@ -3,15 +3,23 @@
 import logging
 from collections import Counter
 
+from imednet.models.sites import SiteEnrollmentStatus, is_site_enrollment_eligible
+from imednet.models.subjects import SubjectStatus, normalize_subject_status
 from imednet.sdk import ImednetSDK
 
 logger = logging.getLogger(__name__)
 
 # Site enrollment statuses treated as eligible for smoke/live use.
-# ``ENROLLMENT_OPEN`` is the primary write-path status in the observed DEV
-# environment.  ``active`` is kept for backward compatibility with environments
-# that use a simpler vocabulary.
-ELIGIBLE_SITE_STATUSES: frozenset[str] = frozenset({"active", "enrollment_open"})
+# ``Enrollment Open`` / ``ENROLLMENT_OPEN`` is the primary write-path status in the
+# observed DEV environment.  ``Active`` / ``active`` is kept for backward
+# compatibility with environments that use a simpler vocabulary.
+ELIGIBLE_SITE_STATUSES: frozenset[str] = frozenset(
+    {
+        "active",
+        "enrollment_open",
+        SiteEnrollmentStatus.ENROLLMENT_OPEN.value.lower(),
+    }
+)
 
 # Subject workflow statuses treated as eligible for smoke/live use.
 # ``Registered``, ``Baseline``, and ``Enrolled`` are the observed DEV values;
@@ -21,14 +29,27 @@ ELIGIBLE_SUBJECT_STATUSES: frozenset[str] = frozenset(
 )
 
 
-def is_site_eligible(site_enrollment_status: str) -> bool:
+def is_site_eligible(site_enrollment_status: str | SiteEnrollmentStatus | None) -> bool:
     """Return ``True`` when *site_enrollment_status* is usable for live tests."""
-    return (site_enrollment_status or "").lower() in ELIGIBLE_SITE_STATUSES
+    if not site_enrollment_status:
+        return False
+    if is_site_enrollment_eligible(site_enrollment_status):
+        return True
+    return str(site_enrollment_status).strip().lower() in ELIGIBLE_SITE_STATUSES
 
 
-def is_subject_eligible(subject_status: str) -> bool:
-    """Return ``True`` when *subject_status* is usable for live tests."""
-    return (subject_status or "").lower() in ELIGIBLE_SUBJECT_STATUSES
+def is_subject_eligible(
+    subject_status: str | SubjectStatus | None,
+    *,
+    deleted: bool | None = None,
+) -> bool:
+    """Return ``True`` when *subject_status* is usable for live tests and not soft-deleted."""
+    if deleted is True or not subject_status:
+        return False
+    normalized = normalize_subject_status(subject_status)
+    if normalized == SubjectStatus.DELETED:
+        return False
+    return str(normalized).strip().lower() in ELIGIBLE_SUBJECT_STATUSES
 
 
 class NoLiveDataError(RuntimeError):
@@ -90,10 +111,11 @@ def discover_subject_key(sdk: ImednetSDK, study_key: str) -> str:
     subjects = list(sdk.subjects.list(study_key=study_key))
     encountered: list[str] = []
     for subject in subjects:
+        is_deleted = getattr(subject, "deleted", None) is True
         status = getattr(subject, "subject_status", "")
-        if is_subject_eligible(status):
+        if not is_deleted and is_subject_eligible(status, deleted=False):
             return subject.subject_key or ""
-        encountered.append(status)
+        encountered.append("DELETED" if is_deleted else str(status or ""))
     counts = dict(Counter(encountered))
     logger.warning(
         "No eligible subjects found for study %s; encountered statuses: %s",

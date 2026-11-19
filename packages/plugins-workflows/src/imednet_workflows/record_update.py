@@ -184,31 +184,34 @@ class RecordUpdateWorkflow:
     def _check_form_refs_need_refresh(
         self,
         cache: BaseSchemaCache[Any],
+        study_key: str,
         explicit_form_keys: list[str],
         form_ids: list[Any],
     ) -> bool:
-        """Return True if any explicit form key or form ID is missing from ``cache``."""
-        if any(not cache.variables_for_form(fk) for fk in explicit_form_keys):
+        """Return True if any explicit form key or form ID for ``study_key`` is missing from ``cache``."""
+        if any(not cache.variables_for_form(fk, study_key=study_key) for fk in explicit_form_keys):
             return True
         for fid in form_ids:
-            resolved = cache.form_key_from_id(fid)
-            if not resolved or not cache.variables_for_form(resolved):
+            resolved = cache.form_key_from_id(fid, study_key=study_key)
+            if not resolved or not cache.variables_for_form(resolved, study_key=study_key):
                 return True
         return False
 
     def _verify_cached_form_refs(
         self,
         cache: BaseSchemaCache[Any],
+        study_key: str,
         explicit_form_keys: list[str],
         form_ids: list[Any],
     ) -> None:
-        """Verify all distinct form keys and form IDs exist in ``cache`` after refresh."""
+        """Verify all distinct form keys and form IDs exist in ``cache`` for ``study_key`` after refresh."""
+        study_forms = cache.forms_for_study(study_key)
         for fk in explicit_form_keys:
-            if fk not in cache.forms:
+            if fk not in study_forms:
                 raise ValueError(f"Form key '{fk}' not found")
         for fid in form_ids:
-            resolved = cache.form_key_from_id(fid)
-            if not resolved or resolved not in cache.forms:
+            resolved = cache.form_key_from_id(fid, study_key=study_key)
+            if not resolved or resolved not in study_forms:
                 raise ValidationError(f"Unknown form ID {fid}")
 
     def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
@@ -217,9 +220,9 @@ class RecordUpdateWorkflow:
             return
         cache = self._schema
         explicit_form_keys, form_ids = self._collect_distinct_form_refs(records_data, cache)
-        if self._check_form_refs_need_refresh(cache, explicit_form_keys, form_ids):
+        if self._check_form_refs_need_refresh(cache, study_key, explicit_form_keys, form_ids):
             cast(SchemaValidator, self._validator).refresh(study_key)
-        self._verify_cached_form_refs(cache, explicit_form_keys, form_ids)
+        self._verify_cached_form_refs(cache, study_key, explicit_form_keys, form_ids)
 
     async def _async_validate_form_key(
         self, study_key: str, records_data: list[dict[str, Any]]
@@ -229,9 +232,9 @@ class RecordUpdateWorkflow:
             return
         cache = self._schema
         explicit_form_keys, form_ids = self._collect_distinct_form_refs(records_data, cache)
-        if self._check_form_refs_need_refresh(cache, explicit_form_keys, form_ids):
+        if self._check_form_refs_need_refresh(cache, study_key, explicit_form_keys, form_ids):
             await cast(AsyncSchemaValidator, self._validator).refresh(study_key)
-        self._verify_cached_form_refs(cache, explicit_form_keys, form_ids)
+        self._verify_cached_form_refs(cache, study_key, explicit_form_keys, form_ids)
 
     def create_or_update_records_batch(
         self,

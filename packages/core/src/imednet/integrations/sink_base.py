@@ -525,6 +525,7 @@ def apply_quality_gate(
         yield from records
         return
 
+    from imednet.core.context import reset_study_context, set_study_context
     from imednet.validation.cache import SchemaValidator, calculate_readiness_score
 
     validator = SchemaValidator(sdk)
@@ -549,24 +550,28 @@ def apply_quality_gate(
         else:
             rec_dict = {"data": {}}
 
-        fk = rec_dict.get("formKey") or rec_dict.get("form_key")
-        if not fk:
-            fid = rec_dict.get("formId") or rec_dict.get("form_id") or 0
-            fk = validator.schema.form_key_from_id(fid)
+        ctx_token = set_study_context(study_key)
+        try:
+            fk = rec_dict.get("formKey") or rec_dict.get("form_key")
+            if not fk:
+                fid = rec_dict.get("formId") or rec_dict.get("form_id") or 0
+                fk = validator.schema.form_key_from_id(fid)
 
-        if not fk:
-            logger.info("Dropped record %s: Unknown form", rec_dict.get("record_id", "Unknown"))
-            dropped_count += 1
-            continue
+            if not fk:
+                logger.info("Dropped record %s: Unknown form", rec_dict.get("record_id", "Unknown"))
+                dropped_count += 1
+                continue
 
-        data = rec_dict.get("record_data")
-        if data is None:
-            data = rec_dict.get("recordData")
-        if data is None:
-            data = rec_dict.get("data", {})
-        if data is None:
-            data = {}
-        score, reasons = calculate_readiness_score(validator.schema, fk, data)
+            data = rec_dict.get("record_data")
+            if data is None:
+                data = rec_dict.get("recordData")
+            if data is None:
+                data = rec_dict.get("data", {})
+            if data is None:
+                data = {}
+            score, reasons = calculate_readiness_score(validator.schema, fk, data)
+        finally:
+            reset_study_context(ctx_token)
 
         if score < config.min_schema_readiness_score:
             logger.info(

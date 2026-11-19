@@ -818,3 +818,112 @@ def test_dynamic_db_path_missing_base_url_fallback(
     finally:
         reset_study_context(s_token)
         reset_base_url_context(b_token)
+
+
+def test_rollback_and_recommit_creates_parent_chained_commit(
+    store: ConfigVersionStore, mock_sdk: MockSDK
+) -> None:
+    """Committing v1 -> v2 -> restored v1 creates a new commit linked to v2 via parent_commit_id."""
+    assert store.get_head("STUDY-01") is None
+
+    v1 = _make_config(study_key="STUDY-01", version="1.0.0")
+    v2 = _make_config(study_key="STUDY-01", version="2.0.0", extra_mapping=True)
+
+    id_v1 = store.commit_config("STUDY-01", v1, desc="Release v1", sdk=mock_sdk)
+    assert store.get_head("STUDY-01") == id_v1
+
+    id_v2 = store.commit_config("STUDY-01", v2, desc="Release v2", sdk=mock_sdk)
+    assert store.get_head("STUDY-01") == id_v2
+
+    restored_v1 = store.rollback_config("STUDY-01", id_v1)
+    id_v3 = store.commit_config("STUDY-01", restored_v1, desc="Rollback to v1", sdk=mock_sdk)
+
+    assert id_v3 != id_v1
+    assert id_v3 != id_v2
+    assert store.get_head("STUDY-01") == id_v3
+
+    history = store.get_history("STUDY-01")
+    assert len(history) == 3
+    assert history[0]["commit_id"] == id_v1
+    assert history[0]["parent_commit_id"] is None
+    assert history[1]["commit_id"] == id_v2
+    assert history[1]["parent_commit_id"] == id_v1
+    assert history[2]["commit_id"] == id_v3
+    assert history[2]["parent_commit_id"] == id_v2
+    assert history[2]["content_hash"] == history[0]["content_hash"]
+
+    # Duplicate commit identical to current head (v3) is still rejected
+    with pytest.raises(ValueError, match="already exists"):
+        store.commit_config("STUDY-01", restored_v1, desc="Duplicate rollback", sdk=mock_sdk)
+
+    # Diff between v2 and rolled-back v3 shows reverted version
+    diff = store.diff_configs(id_v2, id_v3)
+    assert diff["changed"]["version"] == {"before": "2.0.0", "after": "1.0.0"}
+
+
+def test_legacy_sqlite_schema_automatic_migration_and_rollback(
+    tmp_path: Path, mock_sdk: MockSDK, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-existing 7-column SQLite DB migrates cleanly and supports parent-chained rollback."""
+    monkeypatch.setenv(
+        "IMEDNET_SECURITY_KEY", "legacy_migration_test_key"
+    )  # pragma: allowlist secret
+    from imednet_workflows.config_version_control import _encrypt_payload
+
+    # First resolve the dynamic path that ConfigVersionStore will use
+    probe = ConfigVersionStore(db_path=tmp_path / "legacy.sqlite3")
+    actual_db_path = probe.db_path
+    actual_db_path.unlink(missing_ok=True)
+
+    v1 = _make_config(study_key="STUDY-01", version="1.0.0")
+    v1_json = json.dumps(v1.model_dump(mode="json", by_alias=True), sort_keys=True)
+    legacy_id_v1 = _sha256_of(v1_json)
+    encrypted_v1 = _encrypt_payload(v1_json)
+
+    # Create pre-existing 7-column schema without parent_commit_id, content_hash, or config_heads
+    with sqlite3.connect(actual_db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE config_commits (
+                commit_id   TEXT PRIMARY KEY,
+                study_key   TEXT NOT NULL,
+                version_tag TEXT NOT NULL,
+                config_data TEXT NOT NULL,
+                modified_by TEXT NOT NULL,
+                description TEXT NOT NULL,
+                timestamp   TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO config_commits
+                (commit_id, study_key, version_tag, config_data, modified_by, description, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                legacy_id_v1,
+                "STUDY-01",
+                "1.0.0",
+                encrypted_v1,
+                "alice",
+                "legacy v1",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    migrated_store = ConfigVersionStore(db_path=tmp_path / "legacy.sqlite3")
+    assert migrated_store.get_head("STUDY-01") == legacy_id_v1
+
+    v2 = _make_config(study_key="STUDY-01", version="2.0.0")
+    id_v2 = migrated_store.commit_config("STUDY-01", v2, desc="v2 after migration", sdk=mock_sdk)
+    restored = migrated_store.rollback_config("STUDY-01", legacy_id_v1)
+    id_v3 = migrated_store.commit_config(
+        "STUDY-01", restored, desc="rollback to legacy v1", sdk=mock_sdk
+    )
+
+    history = migrated_store.get_history("STUDY-01")
+    assert [entry["commit_id"] for entry in history] == [legacy_id_v1, id_v2, id_v3]
+    assert history[1]["parent_commit_id"] == legacy_id_v1
+    assert history[2]["parent_commit_id"] == id_v2
