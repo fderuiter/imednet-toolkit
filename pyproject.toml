@@ -21,7 +21,6 @@ dev = [
     "pandas>=2.2.3,<3.0.0",
     "duckdb>=1.1.0",
     "pyarrow>=14.0.1",
-    "snowflake-connector-python>=3.0.0",
     "pytest>=9.0.3",
     "pytest-cov>=6.1.1,<8.0.0",
     "respx>=0.22.0,<0.24.0",
