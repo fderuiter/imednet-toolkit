@@ -2455,3 +2455,177 @@ async def test_batch_submission_without_study_notifies_and_pending_cli_batches_a
         job_table = app.screen.query_one("#job_table", JobTable)
         assert job_table.row_count == 1
         assert str(job_table.get_row_at(0)[0]) == "PENDING-BATCH-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("viewport", [(80, 24), (80, 30), (120, 40)])
+async def test_pilot_viewport_geometry_tab_stability_and_unclipped_subject_table(
+    viewport: tuple[int, int],
+) -> None:
+    """Verify JobMonitor height, #bottom-pane tab stability, LogViewer border, and SubjectTable width."""
+    from textual.widgets import TabbedContent
+
+    from imednet_tui.app import JobTable, LogViewer
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    study = MagicMock(study_key="STUDY-GEO-01", study_name="Geometry Study")
+    site = MagicMock(site_id="SITE-101", site_name="Central Clinic")
+    subject = MagicMock(
+        subject_id="SUBJ-001",
+        site_id="SITE-101",
+        subject_status="Enrolled",
+        date_created="2026-01-10T08:00:00Z",
+    )
+    sdk.async_get_studies = AsyncMock(return_value=[study])
+    sdk.async_get_sites = AsyncMock(return_value=[site])
+    sdk.async_get_subjects = AsyncMock(return_value=[subject])
+    sdk.async_get_job = AsyncMock(
+        return_value=JobStatus(
+            batch_id="BATCH-GEO-1",
+            state=JobState.RUNNING,
+            progress=60,
+            total_records=50,
+            failed_records=0,
+            date_created="2026-01-12T10:00:00Z",
+        )
+    )
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-GEO-01", batch_ids=["BATCH-GEO-1"])
+    async with app.run_test(size=viewport) as pilot:
+        await _settle(pilot)
+
+        assert isinstance(app.screen, DashboardScreen)
+        dashboard = app.screen
+        expect_compact = viewport[0] < 100
+        assert ("compact" in dashboard.classes) is expect_compact
+
+        bottom_pane = dashboard.query_one("#bottom-pane", TabbedContent)
+        job_monitor = dashboard.query_one(JobMonitor)
+        job_table = dashboard.query_one("#job_table", JobTable)
+        subject_table = dashboard.query_one(SubjectTable)
+        log_viewer = dashboard.query_one(LogViewer)
+
+        assert job_monitor.content_region.height > 0
+        assert job_table.content_region.height > 0
+        assert subject_table.content_region.height > 0
+        assert subject_table.content_region.width >= 53
+        assert subject_table.content_region.width >= subject_table.virtual_size.width
+
+        jobs_pane_region = bottom_pane.region
+        jobs_pane_height = bottom_pane.size.height
+        jobs_monitor_content_size = job_monitor.content_region.size
+        assert job_monitor.styles.border.top[0] == "solid"
+
+        # Switch to Logs tab and verify #bottom-pane height and inner content region do not shift
+        bottom_pane.active = "logs-tab"
+        await _settle(pilot)
+
+        assert bottom_pane.region == jobs_pane_region
+        assert bottom_pane.size.height == jobs_pane_height
+        assert log_viewer.border_title == "Logs"
+        assert log_viewer.styles.border.top[0] == "solid"
+        assert log_viewer.content_region.size == jobs_monitor_content_size
+
+        # Verify high-contrast mode applies matching heavy borders on both LogViewer and JobMonitor
+        await pilot.press("h")
+        await _settle(pilot)
+        assert log_viewer.styles.border.top[0] == "heavy"
+        assert bottom_pane.size.height == jobs_pane_height
+
+        bottom_pane.active = "jobs-tab"
+        await _settle(pilot)
+        assert job_monitor.styles.border.top[0] == "heavy"
+        assert bottom_pane.size.height == jobs_pane_height
+
+
+@pytest.mark.asyncio
+async def test_dynamic_resize_across_compact_threshold_preserves_state_and_scrolls_jobs() -> None:
+    """Resizing across width 100 reflows #dashboard-grid while preserving Study/Site state and scrolling >15 jobs."""
+    from textual.widgets import Input, TabbedContent
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    study = MagicMock(study_key="STUDY-RESIZE", study_name="Resize Trial")
+    site = MagicMock(site_id="SITE-202", site_name="West Campus")
+    subject = MagicMock(
+        subject_id="SUBJ-202",
+        site_id="SITE-202",
+        subject_status="Enrolled",
+        date_created="2026-07-01T14:30:00Z",
+    )
+    sdk.async_get_studies = AsyncMock(return_value=[study])
+    sdk.async_get_sites = AsyncMock(return_value=[site])
+    sdk.async_get_subjects = AsyncMock(return_value=[subject])
+
+    batch_ids = [f"BATCH-R-{idx:02d}" for idx in range(1, 19)]
+    sdk.async_get_job = AsyncMock(
+        side_effect=lambda sk, bid: JobStatus(
+            batch_id=bid,
+            state=JobState.COMPLETED,
+            progress=100,
+            total_records=20,
+            failed_records=0,
+            date_created="2026-07-01T15:00:00Z",
+        )
+    )
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-RESIZE", batch_ids=batch_ids)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _settle(pilot)
+
+        assert isinstance(app.screen, DashboardScreen)
+        dashboard = app.screen
+        site_list = dashboard.query_one(SiteList)
+        subject_table = dashboard.query_one(SubjectTable)
+        subjects_box = dashboard.query_one("#subjects-box", Container)
+        bottom_pane = dashboard.query_one("#bottom-pane", TabbedContent)
+        batch_input = dashboard.query_one("#batch_id_input", Input)
+        job_table = dashboard.query_one("#job_table", JobTable)
+
+        site_list.post_message(SiteList.SiteSelected("SITE-202", "West Campus"))
+        await _settle(pilot)
+
+        assert "compact" not in dashboard.classes
+        assert dashboard.selected_study_key == "STUDY-RESIZE"
+        assert dashboard.selected_site_id == "SITE-202"
+        assert subject_table.row_count == 1
+        assert job_table.row_count == 18
+
+        # Narrow to 80x24 -> compact 2x3 grid activates, preserving study/site selection and scrolling >15 jobs
+        await pilot.resize_terminal(80, 24)
+        await _settle(pilot)
+
+        assert "compact" in dashboard.classes
+        assert dashboard.selected_study_key == "STUDY-RESIZE"
+        assert dashboard.selected_site_id == "SITE-202"
+        assert subject_table.row_count == 1
+        assert subjects_box.region.width == 80
+        assert bottom_pane.region.width == 80
+        assert subject_table.content_region.width >= subject_table.virtual_size.width
+
+        batch_input.focus()
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        for _ in range(17):
+            await pilot.press("down")
+        await pilot.pause()
+        assert job_table.cursor_row == 17
+        assert str(job_table.get_row_at(17)[0]) == "BATCH-R-18"
+
+        # Expand to boundary width 100 -> exits compact layout cleanly
+        await pilot.resize_terminal(100, 30)
+        await _settle(pilot)
+        assert "compact" not in dashboard.classes
+        assert dashboard.selected_study_key == "STUDY-RESIZE"
+        assert dashboard.selected_site_id == "SITE-202"
+
+        # Shrink to width 99 -> re-enters compact layout without state loss
+        await pilot.resize_terminal(99, 30)
+        await _settle(pilot)
+        assert "compact" in dashboard.classes
+        assert dashboard.selected_study_key == "STUDY-RESIZE"
+        assert dashboard.selected_site_id == "SITE-202"
