@@ -10,6 +10,12 @@ from imednet.core.endpoint.operations.record_create import RecordCreateOperation
 from imednet.core.endpoint.strategies import MappingParamProcessor
 from imednet.models.jobs import Job
 from imednet.models.records import Record
+from imednet.utils.batch_coordinator import (
+    DEFAULT_BATCH_CHUNK_SIZE,
+    AsyncBatchCoordinator,
+    BatchCoordinator,
+    BatchSubmissionSummary,
+)
 from imednet.utils.typing import JsonDict
 from imednet.validation.cache import ValidationSchemaProtocol
 
@@ -59,6 +65,7 @@ class RecordsOperationDef:
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        skip_validation: bool = False,
     ) -> RecordCreateOperation[Job]:
         """Create one or more records in a study.
 
@@ -67,6 +74,7 @@ class RecordsOperationDef:
             records_data: The data for the records to create.
             email_notify: Whether to send email notifications.
             schema: Optional validation schema (SchemaCache or DataDictionary).
+            skip_validation: Whether to skip schema validation if already validated.
 
         Returns:
             The background job for the creation operation.
@@ -77,11 +85,38 @@ class RecordsOperationDef:
             records_data=records_data,
             email_notify=email_notify,
             schema=schema,
+            skip_validation=skip_validation,
         )
 
 
 class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # type: ignore[misc]
     """API endpoint for interacting with records (form instances)."""
+
+    def create_batch(
+        self,
+        study_key: str,
+        records_data: list[JsonDict],
+        email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        skip_validation: bool = False,
+    ) -> BatchSubmissionSummary:
+        """Validate once and submit records in bounded chunks (default 100 per POST)."""
+        coordinator = BatchCoordinator(chunk_size=chunk_size)
+        return coordinator.submit(
+            study_key,
+            records_data,
+            lambda chunk: self.create(
+                study_key,
+                chunk,
+                email_notify=email_notify,
+                schema=schema,
+                skip_validation=True,
+            ),
+            schema=schema,
+            skip_validation=skip_validation,
+        )
 
     def to_dataframe(
         self,
@@ -112,6 +147,32 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
 
 class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record]):  # type: ignore[misc]
     """Async API endpoint for interacting with records (form instances)."""
+
+    async def create_batch(
+        self,
+        study_key: str,
+        records_data: list[JsonDict],
+        email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        skip_validation: bool = False,
+    ) -> BatchSubmissionSummary:
+        """Validate once and asynchronously submit records in bounded chunks."""
+        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
+        return await coordinator.submit(
+            study_key,
+            records_data,
+            lambda chunk: self.create(
+                study_key,
+                chunk,
+                email_notify=email_notify,
+                schema=schema,
+                skip_validation=True,
+            ),
+            schema=schema,
+            skip_validation=skip_validation,
+        )
 
     async def to_dataframe(
         self,

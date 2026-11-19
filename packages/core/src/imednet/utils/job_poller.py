@@ -20,6 +20,7 @@ from imednet.models.jobs import (
     normalize_job_state,
     validate_job_transition,
 )
+from imednet.utils.secrets import redact_sensitive_payload
 
 logger = logging.getLogger(__name__)
 
@@ -89,26 +90,127 @@ class JobPollSummary:
 
     @property
     def all_successful(self) -> bool:
-        """Return True if all jobs were successful."""
-        return not self.failures and all(cast(Any, s).is_successful for s in self.results.values())
+        """Return True if all jobs were successful with zero failed records."""
+        return not self.failures and all(
+            cast(Any, s).is_successful
+            and getattr(s, "failed_records", 0) == 0
+            and not getattr(s, "result_error", None)
+            for s in self.results.values()
+        )
 
     @property
     def any_failed(self) -> bool:
-        """Return True if any job failed or timed out."""
-        return bool(self.failures) or any(cast(Any, s).is_failed for s in self.results.values())
+        """Return True if any job failed, timed out, or reported failed records."""
+        return bool(self.failures) or any(
+            cast(Any, s).is_failed
+            or getattr(s, "failed_records", 0) > 0
+            or bool(getattr(s, "result_error", None))
+            for s in self.results.values()
+        )
 
 
 class JobTimeoutError(TimeoutError):
     """Raised when a job does not finish before the timeout."""
 
 
-class JobFailedError(Exception):
-    """Raised when a job completes with a FAILED or CANCELLED state."""
+def _extract_record_errors(status: JobStatus | Any) -> list[dict[str, Any]]:
+    """Extract sanitized per-record error entries from a JobStatus results payload."""
+    results = getattr(status, "results", None)
+    extracted: list[dict[str, Any]] = []
+    if isinstance(results, list):
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            item_status = str(item.get("status") or "").upper()
+            has_err_key = bool(item.get("error") or item.get("errors"))
+            if item_status in {"FAIL", "FAILED", "ERROR"} or (not item_status and has_err_key):
+                extracted.append(cast(dict[str, Any], redact_sensitive_payload(item)))
+    elif isinstance(results, dict):
+        nested_errors = results.get("errors")
+        if isinstance(nested_errors, list):
+            for err_item in nested_errors:
+                if isinstance(err_item, dict):
+                    extracted.append(cast(dict[str, Any], redact_sensitive_payload(err_item)))
+                elif err_item is not None:
+                    extracted.append({"error": str(redact_sensitive_payload(err_item))})
+        elif results.get("error"):
+            extracted.append(cast(dict[str, Any], redact_sensitive_payload(results)))
+    return extracted
 
-    def __init__(self, message: str, status: JobStatus) -> None:
-        """Initialize the JobFailedError."""
-        super().__init__(message)
+
+def _is_fetchable_result_url(url: Any) -> bool:
+    """Return True when ``resultUrl`` is a non-empty, non-placeholder string."""
+    if not isinstance(url, str):
+        return False
+    stripped = url.strip()
+    if not stripped:
+        return False
+    return not (stripped.startswith("<") and stripped.endswith(">"))
+
+
+def _format_job_failure_details(
+    base_message: str,
+    status: JobStatus | Any,
+    record_errors: list[dict[str, Any]],
+    result_error: str | None,
+) -> str:
+    """Append record failure and resultUrl error diagnostics to a base message."""
+    extras: list[str] = []
+    failed_count = getattr(status, "failed_records", 0)
+    if isinstance(failed_count, int) and failed_count > 0:
+        extras.append(f"failed_records={failed_count}")
+    if result_error and result_error not in base_message:
+        extras.append(f"result_error={result_error}")
+    if record_errors:
+        summaries: list[str] = []
+        for entry in record_errors[:5]:
+            detail = (
+                entry.get("error")
+                or entry.get("message")
+                or entry.get("description")
+                or entry.get("errors")
+                or entry
+            )
+            summaries.append(str(detail))
+        extras.append(f"record_errors={summaries}")
+    if extras:
+        return f"{base_message} ({'; '.join(extras)})"
+    return base_message
+
+
+class JobFailedError(Exception):
+    """Raised when a job fails, is cancelled, has failed records, or fails fetching resultUrl."""
+
+    def __init__(
+        self,
+        message: str,
+        status: JobStatus,
+        *,
+        record_errors: list[dict[str, Any]] | None = None,
+        result_error: str | None = None,
+    ) -> None:
+        """Initialize the JobFailedError with attached record diagnostics."""
+        resolved_errors = (
+            record_errors if record_errors is not None else _extract_record_errors(status)
+        )
+        raw_res_err = (
+            result_error if result_error is not None else getattr(status, "result_error", None)
+        )
+        resolved_result_error = (
+            str(redact_sensitive_payload(raw_res_err))
+            if isinstance(raw_res_err, str) and raw_res_err
+            else None
+        )
+        formatted_message = _format_job_failure_details(
+            message,
+            status,
+            resolved_errors,
+            resolved_result_error,
+        )
+        super().__init__(formatted_message)
         self.status = status
+        self.record_errors = resolved_errors
+        self.result_error = resolved_result_error
 
 
 def evaluate_job_state(
@@ -146,7 +248,15 @@ def evaluate_job_state(
     if prev is not None and isinstance(current_state_val, (str, JobState)):
         validate_job_transition(prev, current_state_val)
 
-    if getattr(job, "is_failed", False):
+    failed_count = getattr(job, "failed_records", 0)
+    has_failed_records = (
+        getattr(job, "is_terminal", False) and isinstance(failed_count, int) and failed_count > 0
+    )
+    res_err = getattr(job, "result_error", None)
+    has_result_error = (
+        getattr(job, "is_terminal", False) and isinstance(res_err, str) and bool(res_err)
+    )
+    if getattr(job, "is_failed", False) or has_failed_records or has_result_error:
         batch_id = getattr(job, "batch_id", getattr(job, "batchId", "unknown"))
         raise JobFailedError(f"Job {batch_id} ended in state {job.state}", job)
     return getattr(job, "is_terminal", False)
@@ -325,6 +435,26 @@ class JobPoller(BaseJobPoller):
             self._trigger_callback(on_progress, event)
 
             if is_terminal:
+                if self._fetch_result and _is_fetchable_result_url(
+                    getattr(status, "result_url", None)
+                ):
+                    try:
+                        res = self._fetch_result(status.result_url)  # type: ignore
+                        self._process_fetch_result(status, res)
+                    except Exception as exc:
+                        redacted_err = str(redact_sensitive_payload(str(exc)))
+                        status.result_error = redacted_err
+                        logger.error(
+                            "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",
+                            batch_id,
+                            redacted_err,
+                        )
+                        raise JobFailedError(
+                            f"Job {batch_id} failed to fetch resultUrl: {redacted_err}",
+                            status,
+                            result_error=redacted_err,
+                        ) from exc
+
                 if cast(Any, status).is_successful:
                     logger.info(
                         "[JobPoller] batch_id=%s COMPLETED after %s polls (%ss)",
@@ -334,17 +464,12 @@ class JobPoller(BaseJobPoller):
                     )
                 else:
                     logger.error(
-                        "[JobPoller] batch_id=%s FAILED: state=%s",
+                        "[JobPoller] batch_id=%s FAILED: state=%s failed_records=%s",
                         batch_id,
                         status.state,
+                        getattr(status, "failed_records", 0),
                     )
 
-                if self._fetch_result and getattr(status, "result_url", None):
-                    try:
-                        res = self._fetch_result(status.result_url)  # type: ignore
-                        self._process_fetch_result(status, res)
-                    except Exception:  # noqa: S110
-                        pass
                 evaluate_job_state(status)
                 return status
 
@@ -490,6 +615,26 @@ class AsyncJobPoller(BaseJobPoller):
             self._trigger_callback(on_progress, event)
 
             if is_terminal:
+                if self._fetch_result and _is_fetchable_result_url(
+                    getattr(status, "result_url", None)
+                ):
+                    try:
+                        res = await self._fetch_result(status.result_url)  # type: ignore
+                        self._process_fetch_result(status, res)
+                    except Exception as exc:
+                        redacted_err = str(redact_sensitive_payload(str(exc)))
+                        status.result_error = redacted_err
+                        logger.error(
+                            "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",
+                            batch_id,
+                            redacted_err,
+                        )
+                        raise JobFailedError(
+                            f"Job {batch_id} failed to fetch resultUrl: {redacted_err}",
+                            status,
+                            result_error=redacted_err,
+                        ) from exc
+
                 if cast(Any, status).is_successful:
                     logger.info(
                         "[JobPoller] batch_id=%s COMPLETED after %s polls (%ss)",
@@ -499,17 +644,12 @@ class AsyncJobPoller(BaseJobPoller):
                     )
                 else:
                     logger.error(
-                        "[JobPoller] batch_id=%s FAILED: state=%s",
+                        "[JobPoller] batch_id=%s FAILED: state=%s failed_records=%s",
                         batch_id,
                         status.state,
+                        getattr(status, "failed_records", 0),
                     )
 
-                if self._fetch_result and getattr(status, "result_url", None):
-                    try:
-                        res = await self._fetch_result(status.result_url)  # type: ignore
-                        self._process_fetch_result(status, res)
-                    except Exception:  # noqa: S110
-                        pass
                 evaluate_job_state(status)
                 return status
 

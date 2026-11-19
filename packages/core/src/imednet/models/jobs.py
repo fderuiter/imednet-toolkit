@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
@@ -284,6 +284,25 @@ class JobStatus(Job):
     """Extended job information returned when polling."""
 
     results: Any = Field(default=None)
+    record_total_count: int | None = Field(default=None, alias="totalRecords")
+    record_success_count: int | None = Field(default=None, alias="successfulRecords")
+    record_failure_count: int | None = Field(default=None, alias="failedRecords")
+    result_error: str | None = Field(default=None, alias="resultError")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_record_count_keys(cls, data: Any) -> Any:
+        """Accept snake_case record count kwargs without colliding with properties."""
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if "total_records" in normalized and "totalRecords" not in normalized:
+            normalized["totalRecords"] = normalized.pop("total_records")
+        if "successful_records" in normalized and "successfulRecords" not in normalized:
+            normalized["successfulRecords"] = normalized.pop("successful_records")
+        if "failed_records" in normalized and "failedRecords" not in normalized:
+            normalized["failedRecords"] = normalized.pop("failed_records")
+        return normalized
 
     @field_validator("progress", mode="before", check_fields=False)
     def _parse_progress(cls, v: Any) -> int:
@@ -306,7 +325,13 @@ class JobStatus(Job):
         if isinstance(self.results, list):
             return len(self.results)
         if isinstance(self.results, dict):
-            return int(self.results.get("total", 0))
+            if "total" in self.results:
+                return int(self.results.get("total", 0))
+            if self.record_total_count is not None:
+                return int(self.record_total_count)
+            return 0
+        if self.record_total_count is not None:
+            return int(self.record_total_count)
         if self.results:
             return 1
         return 0
@@ -322,8 +347,14 @@ class JobStatus(Job):
                 and (r.get("status") or "").upper() in {"PASS", "SUCCESS", "COMPLETED"}
             )
         if isinstance(self.results, dict):
-            return int(self.results.get("success", 0))
-        if self.is_successful and self.results:
+            if "success" in self.results:
+                return int(self.results.get("success", 0))
+            if self.record_success_count is not None:
+                return int(self.record_success_count)
+            return 0
+        if self.record_success_count is not None:
+            return int(self.record_success_count)
+        if super().is_successful and self.results:
             return 1
         return 0
 
@@ -335,14 +366,34 @@ class JobStatus(Job):
                 1
                 for r in self.results
                 if isinstance(r, dict)
-                and (r.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"}
+                and (
+                    (r.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"}
+                    or (not r.get("status") and bool(r.get("error") or r.get("errors")))
+                )
             )
         if isinstance(self.results, dict):
-            return int(self.results.get("failed", 0))
-        if self.is_failed and self.results:
+            if "failed" in self.results:
+                return int(self.results.get("failed", 0))
+            if self.record_failure_count is not None:
+                return int(self.record_failure_count)
+            return 0
+        if self.record_failure_count is not None:
+            return int(self.record_failure_count)
+        if super().is_failed and self.results:
             return 1
-        # If it's plain text and state is failed, we count it as 1 failure.
         return 0
+
+    @property
+    def is_successful(self) -> bool:
+        """Checks if the job completed in a success state with zero failed records."""
+        return super().is_successful and self.failed_records == 0 and not self.result_error
+
+    @property
+    def is_failed(self) -> bool:
+        """Checks if the job failed, was cancelled, or finished with record/result errors."""
+        return super().is_failed or (
+            self.is_terminal and (self.failed_records > 0 or bool(self.result_error))
+        )
 
 
 JobStatus = ModelEngine.get_model('JobStatus', JobStatus)

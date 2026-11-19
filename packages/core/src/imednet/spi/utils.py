@@ -8,6 +8,13 @@ from imednet.core.context import (
     set_base_url_context,
 )
 from imednet.errors import PathTraversalValidationError
+from imednet.utils.batch_coordinator import (
+    DEFAULT_BATCH_CHUNK_SIZE,
+    AsyncBatchCoordinator,
+    BatchCoordinator,
+    BatchSubmissionSummary,
+    chunk_records,
+)
 from imednet.utils.dates import (
     format_iso_datetime,
     normalize_iso_date,
@@ -54,8 +61,12 @@ from imednet.utils.validators import is_boolean_token, is_missing_value, parse_b
 
 __all__ = [
     "ALLOWED_OPERATORS",
+    "DEFAULT_BATCH_CHUNK_SIZE",
     "ORDERED_FILTER_OPERATORS",
+    "AsyncBatchCoordinator",
     "AsyncJobPoller",
+    "BatchCoordinator",
+    "BatchSubmissionSummary",
     "InvalidJobStateError",
     "InvalidJobTransitionError",
     "InvalidStateTransitionError",
@@ -69,6 +80,7 @@ __all__ = [
     "PathTraversalValidationError",
     "RestrictedAstEvaluator",
     "build_filter_string",
+    "chunk_records",
     "evaluate_expression",
     "evaluate_job_state",
     "flatten",

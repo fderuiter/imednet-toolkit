@@ -231,3 +231,70 @@ def test_nested_error_secret_redaction_and_cli_readable_message(
     assert exc_info.value.code == 1
     captured = capsys.readouterr()
     assert "API Error: Field raised validation errors" in captured.err
+
+
+def test_api_error_nested_variable_details_and_sensitive_field_value_redaction():
+    """Test Variable detail attributes and redaction before formatting metadata.error.field.value."""
+    payload = {
+        "metadata": {
+            "status": "BAD_REQUEST",
+            "error": {
+                "code": "1000",
+                "description": "Invalid variable value",
+                "field": {
+                    "variable": "DEM_AGE",
+                    "value": "not-an-integer",
+                },
+            },
+        }
+    }
+    err_cls = get_error_class(400, payload)
+    assert err_cls is ValidationError
+
+    err = err_cls(payload, status_code=400)
+    assert err.code == 1000
+    assert err.status == "BAD_REQUEST"
+    assert err.message == "Invalid variable value"
+    assert err.variable == "DEM_AGE"
+    assert err.field_attribute == "DEM_AGE"
+    assert err.field_value == "not-an-integer"
+    assert "Field: DEM_AGE='not-an-integer'" in str(err)
+
+    # Sensitive variable/attribute names and Bearer values are redacted before formatting str(err)
+    raw_cred_val = "sensitive-subject-cred-val-999"
+    cred_payload = {
+        "metadata": {
+            "status": "BAD_REQUEST",
+            "error": {
+                "code": "1000",
+                "description": "Invalid credential variable",
+                "field": {
+                    "variable": "SUBJECT_API_TOKEN",
+                    "value": raw_cred_val,
+                },
+            },
+        }
+    }
+    redacted_err = ApiError(cred_payload, status_code=400)
+    assert raw_cred_val not in str(redacted_err)
+    assert redacted_err.variable == "SUBJECT_API_TOKEN"
+    assert redacted_err.field_value == "***"
+    assert "Field: SUBJECT_API_TOKEN='***'" in str(redacted_err)
+
+    bearer_payload = {
+        "metadata": {
+            "status": "BAD_REQUEST",
+            "error": {
+                "code": "1000",
+                "description": "Header validation failed",
+                "field": {
+                    "attribute": "customHeader",
+                    "value": f"Bearer {raw_cred_val}",
+                },
+            },
+        }
+    }
+    bearer_err = ApiError(bearer_payload, status_code=400)
+    assert raw_cred_val not in str(bearer_err)
+    assert bearer_err.field_value == "Bearer ***"
+    assert "Field: customHeader='Bearer ***'" in str(bearer_err)

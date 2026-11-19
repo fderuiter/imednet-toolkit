@@ -327,8 +327,12 @@ def test_job_poller_fetch_result(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     poller_fail = JobPoller(get_job_fail, fetch_result=fetch_res)
-    st2 = poller_fail.run("ST", "1", interval=0)
-    assert st2.results is None
+    with pytest.raises(JobFailedError, match="failed to fetch resultUrl") as exc_info:
+        poller_fail.run("ST", "1", interval=0)
+    assert exc_info.value.status is not None
+    assert exc_info.value.status.results is None
+    assert exc_info.value.status.result_error == "fetch fail"
+    assert exc_info.value.result_error == "fetch fail"
 
     # Text fallback
     class MockTextResponse:
@@ -379,8 +383,12 @@ async def test_async_job_poller_fetch_result() -> None:
         )
 
     poller_fail = AsyncJobPoller(get_job_fail, fetch_result=fetch_res)
-    st2 = await poller_fail.run("ST", "1", interval=0)
-    assert st2.results is None
+    with pytest.raises(JobFailedError, match="failed to fetch resultUrl") as exc_info:
+        await poller_fail.run("ST", "1", interval=0)
+    assert exc_info.value.status is not None
+    assert exc_info.value.status.results is None
+    assert exc_info.value.status.result_error == "fetch fail"
+    assert exc_info.value.result_error == "fetch fail"
 
 
 @pytest.mark.asyncio
@@ -420,3 +428,127 @@ async def test_async_poll_many_fail_fast(monkeypatch: pytest.MonkeyPatch) -> Non
 
     with pytest.raises(ValueError, match="Immediate failure"):
         await poller.async_poll_many("ST", ["OK", "FAIL"], interval=0, fail_fast=True)
+
+
+def test_job_status_and_summary_partial_record_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Completed JobStatus with nonzero failed_records marks is_successful and all_successful False."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    partial_list_status = JobStatus(
+        batchId="B1",
+        state="COMPLETED",
+        progress=100,
+        results=[
+            {"recordId": 1, "status": "SUCCESS"},
+            {"recordId": 2, "status": "FAILED", "error": "DEM_AGE out of range"},
+        ],
+    )
+    assert partial_list_status.total_records == 2
+    assert partial_list_status.successful_records == 1
+    assert partial_list_status.failed_records == 1
+    assert partial_list_status.is_successful is False
+    assert partial_list_status.is_failed is True
+
+    partial_dict_status = JobStatus(
+        batchId="B2",
+        state="COMPLETED",
+        progress=100,
+        results={"total": 4, "success": 3, "failed": 1, "errors": [{"message": "Bad site"}]},
+    )
+    assert partial_dict_status.total_records == 4
+    assert partial_dict_status.successful_records == 3
+    assert partial_dict_status.failed_records == 1
+    assert partial_dict_status.is_successful is False
+    assert partial_dict_status.is_failed is True
+
+    partial_field_status = JobStatus.model_validate(
+        {
+            "batchId": "B3",
+            "state": "COMPLETED",
+            "progress": 100,
+            "totalRecords": 10,
+            "successfulRecords": 8,
+            "failedRecords": 2,
+        }
+    )
+    assert partial_field_status.total_records == 10
+    assert partial_field_status.successful_records == 8
+    assert partial_field_status.failed_records == 2
+    assert partial_field_status.is_successful is False
+    assert partial_field_status.is_failed is True
+
+    # Direct summary construction with a partial-failure status in results still reports False
+    from imednet.utils.job_poller import JobPollSummary
+
+    direct_summary = JobPollSummary(
+        study_key="ST",
+        results={"B1": partial_list_status},
+        failures={},
+        elapsed_total=0.0,
+    )
+    assert direct_summary.all_successful is False
+    assert direct_summary.any_failed is True
+
+    # Polling surfaces JobFailedError with Record failure diagnostics attached
+    poller = JobPoller(lambda _s, _b: partial_list_status)
+    with pytest.raises(JobFailedError, match="failed_records=1") as exc_info:
+        poller.run("ST", "B1", interval=0)
+    assert exc_info.value.record_errors == [
+        {"recordId": 2, "status": "FAILED", "error": "DEM_AGE out of range"}
+    ]
+    assert "DEM_AGE out of range" in str(exc_info.value)
+
+    summary = poller.poll_many("ST", ["B1"], interval=0)
+    assert summary.all_successful is False
+    assert summary.any_failed is True
+    assert "B1" in summary.failures
+    assert summary.failures["B1"].record_errors
+
+
+@pytest.mark.asyncio
+async def test_poll_many_records_result_url_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Polling multiple jobs records and surfaces resultUrl fetch errors in sync and async modes."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    def get_sync_job(study_key: str, batch_id: str) -> JobStatus:
+        return JobStatus(
+            batchId=batch_id,
+            state="COMPLETED",
+            progress=100,
+            resultUrl="https://example.test/results/secret",
+        )
+
+    def failing_sync_fetch(url: str) -> object:
+        raise RuntimeError("502 Bad Gateway for Authorization: Bearer top-secret-token")
+
+    sync_poller = JobPoller(get_sync_job, fetch_result=failing_sync_fetch)
+    sync_summary = sync_poller.poll_many("ST", ["B_ERR"], interval=0)
+    assert sync_summary.all_successful is False
+    assert sync_summary.any_failed is True
+    err = sync_summary.failures["B_ERR"]
+    assert isinstance(err, JobFailedError)
+    assert "top-secret-token" not in str(err)
+    assert err.status is not None
+    assert err.status.is_successful is False
+    assert err.status.result_error is not None
+    assert "502 Bad Gateway" in err.status.result_error
+
+    async def get_async_job(study_key: str, batch_id: str) -> JobStatus:
+        return JobStatus(
+            batchId=batch_id,
+            state="COMPLETED",
+            progress=100,
+            resultUrl="https://example.test/results/async",
+        )
+
+    async def failing_async_fetch(url: str) -> object:
+        raise RuntimeError("Connection reset fetching resultUrl")
+
+    async_poller = AsyncJobPoller(get_async_job, fetch_result=failing_async_fetch)
+    async_summary = await async_poller.async_poll_many("ST", ["B_ASYNC_ERR"], interval=0)
+    assert async_summary.all_successful is False
+    assert async_summary.any_failed is True
+    async_err = async_summary.failures["B_ASYNC_ERR"]
+    assert isinstance(async_err, JobFailedError)
+    assert async_err.result_error == "Connection reset fetching resultUrl"

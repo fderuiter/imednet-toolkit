@@ -12,7 +12,11 @@ from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
-from imednet.validation.cache import ValidationSchemaProtocol, validate_record_entry
+from imednet.validation.cache import (
+    ValidationSchemaProtocol,
+    is_schema_record_prevalidated,
+    validate_record_entry,
+)
 
 T = TypeVar("T")
 
@@ -30,6 +34,8 @@ class RecordCreateOperation(Operation[T]):
         records_data: list[dict[str, Any]],
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        *,
+        skip_validation: bool = False,
     ) -> None:
         """Initialize the record creation operation.
 
@@ -38,6 +44,8 @@ class RecordCreateOperation(Operation[T]):
             records_data: List of record data objects to create.
             email_notify: Email notification setting.
             schema: Optional validation schema (BaseSchemaCache or DataDictionary).
+            skip_validation: If True, skip per-record schema validation because
+                the caller has already validated the batch.
 
         Raises:
             ValidationError: If record data is invalid against the schema.
@@ -47,14 +55,25 @@ class RecordCreateOperation(Operation[T]):
         self.records_data = records_data
         self.email_notify = email_notify
         self.schema = schema
+        self.skip_validation = skip_validation
 
         self._validate()
         self.headers = self._build_headers()
 
     def _validate(self) -> None:
-        """Validate records against schema if provided."""
-        if self.schema is not None:
+        """Validate records against schema if provided and not already validated."""
+        if self.skip_validation or self.schema is None:
+            return
+        is_rec_prevalidated = getattr(self.schema, "is_record_prevalidated", None)
+        if callable(is_rec_prevalidated):
             for rec in self.records_data:
+                if is_rec_prevalidated(rec) is not True:
+                    validate_record_entry(self.schema, rec)
+            return
+        if getattr(self.schema, "is_prevalidated", False) is True:
+            return
+        for rec in self.records_data:
+            if not is_schema_record_prevalidated(self.schema, rec):
                 validate_record_entry(self.schema, rec)
 
     def _build_headers(self) -> dict[str, str]:
