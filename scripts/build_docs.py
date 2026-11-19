@@ -4,10 +4,13 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
-def run_command(cmd, env=None, check=True):
+def run_command(
+    cmd: Sequence[str], env: Mapping[str, str] | None = None, check: bool = True
+) -> None:
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, env=env, check=check)
 
@@ -161,7 +164,7 @@ def mark_reexport_stubs_noindex(api_dir: Path) -> None:
             rst_file.write_text(updated, encoding="utf-8")
 
 
-def main():
+def main() -> None:
     api_dir = Path("docs/reference/api")
 
     print("Cleaning old API docs...")
@@ -265,6 +268,9 @@ def main():
         for whl in staged_wheels_dir.glob("*.whl"):
             shutil.copy2(whl, html_wheels_dir / whl.name)
     shutil.rmtree(Path("docs/_static/wheels"), ignore_errors=True)
+
+    print("Validating rendered HTML SEO and Pages artifacts...")
+    run_command([sys.executable, "scripts/validate_docs.py", "--require-html"])
 
 
 if __name__ == "__main__":
