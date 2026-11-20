@@ -305,15 +305,17 @@ class JobStatus(Job):
         return normalized
 
     @field_validator("progress", mode="before", check_fields=False)
-    def _parse_progress(cls, v: Any) -> int:
-        """Parse progress value as an integer.
+    def _parse_progress(cls, v: Any) -> int | None:
+        """Parse progress value as an integer, preserving None when absent.
 
         Args:
             v: The progress value from the API.
 
         Returns:
-            The parsed integer progress.
+            The parsed integer progress, or None if missing.
         """
+        if v is None:
+            return None
         try:
             return int(v)
         except (TypeError, ValueError):

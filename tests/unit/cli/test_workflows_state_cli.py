@@ -299,6 +299,223 @@ class TestResetState:
         assert "Failed to reset ledger state" in result.output
 
 
+class _InteractiveStringIO:
+    """In-memory TTY-like stdin stream for interactive wizard tests."""
+
+    def __init__(self, text: str) -> None:
+        import io
+
+        self._buf = io.StringIO(text)
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self) -> str:
+        return self._buf.readline()
+
+
+@pytest.mark.parametrize("via_root_cli", [False, True])
+class TestStateStreamContractsAndParity:
+    """Verify cli.app and state_app share parser parity, TTY guards, and stderr-only errors."""
+
+    @staticmethod
+    def _invoke(runner: CliRunner, via_root_cli: bool, state_args: list[str]) -> Result:
+        from imednet import cli
+
+        if via_root_cli:
+            return runner.invoke(cli.app, ["workflows", "state", *state_args])
+        return runner.invoke(state_app, state_args)
+
+    def test_error_1_show_read_failure_writes_only_to_stderr(
+        self, runner: CliRunner, tmp_path, via_root_cli: bool
+    ) -> None:
+        ledger_path = str(tmp_path / "ledger.json")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.side_effect = OSError("cannot read")
+            result = self._invoke(runner, via_root_cli, ["show", "--ledger-path", ledger_path])
+
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Failed to read ledger" in result.stderr
+
+    def test_error_2_show_interactive_piped_stdin_exits_one_on_stderr(
+        self, runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch, via_root_cli: bool
+    ) -> None:
+        import io
+        import sys
+
+        ledger_path = str(tmp_path / "ledger.json")
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        result = self._invoke(
+            runner, via_root_cli, ["show", "--interactive", "--ledger-path", ledger_path]
+        )
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Interactive prompts require an interactive TTY on stdin" in result.stderr
+
+    def test_error_2b_show_interactive_with_no_interactive_exits_one_on_stderr(
+        self, runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch, via_root_cli: bool
+    ) -> None:
+        import sys
+
+        ledger_path = str(tmp_path / "ledger.json")
+        monkeypatch.setattr(sys, "stdin", _InteractiveStringIO("STUDY-01\n"))
+        result = self._invoke(
+            runner,
+            via_root_cli,
+            ["show", "--interactive", "--no-interactive", "--ledger-path", ledger_path],
+        )
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Interactive prompts require an interactive TTY on stdin" in result.stderr
+
+    def test_show_interactive_tty_prompts_and_filters_study(
+        self, runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch, via_root_cli: bool
+    ) -> None:
+        import sys
+
+        ledger_path = str(tmp_path / "ledger.json")
+        state = _make_ledger_state("STUDY-01", "records")
+        state.studies["STUDY-02"] = _make_ledger_state("STUDY-02", "visits").studies["STUDY-02"]
+        monkeypatch.setattr(sys, "stdin", _InteractiveStringIO("STUDY-01\n"))
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.return_value = state
+            result = self._invoke(
+                runner, via_root_cli, ["show", "--interactive", "--ledger-path", ledger_path]
+            )
+        assert result.exit_code == 0
+        assert "STUDY-01 | records" in result.stdout
+        assert "STUDY-02" not in result.stdout
+
+    def test_error_3_set_invalid_timestamp_writes_only_to_stderr(
+        self, runner: CliRunner, tmp_path, via_root_cli: bool
+    ) -> None:
+        ledger_path = str(tmp_path / "ledger.json")
+        result = self._invoke(
+            runner,
+            via_root_cli,
+            [
+                "set",
+                "-s",
+                "STUDY-01",
+                "-m",
+                "records",
+                "-t",
+                "bad-timestamp",
+                "-l",
+                ledger_path,
+            ],
+        )
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Invalid ISO timestamp format" in result.stderr
+
+    def test_error_4_set_headless_write_failure_writes_only_to_stderr(
+        self, runner: CliRunner, tmp_path, via_root_cli: bool
+    ) -> None:
+        ledger_path = str(tmp_path / "ledger.json")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.set_last_timestamp.side_effect = OSError("disk full")
+            result = self._invoke(
+                runner,
+                via_root_cli,
+                [
+                    "set",
+                    "-s",
+                    "STUDY-01",
+                    "-m",
+                    "records",
+                    "-t",
+                    "2026-05-22T12:00:00Z",
+                    "-l",
+                    ledger_path,
+                ],
+            )
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Failed to write ledger" in result.stderr
+
+    def test_error_5_set_interactive_write_failure_writes_only_to_stderr(
+        self, runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch, via_root_cli: bool
+    ) -> None:
+        import sys
+
+        ledger_path = str(tmp_path / "ledger.json")
+        monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+        monkeypatch.setattr(sys, "stdin", _InteractiveStringIO("5\ny\n"))
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.return_value = LedgerState()
+            mock_ledger.return_value.set_last_timestamp.side_effect = OSError("readonly fs")
+            result = self._invoke(
+                runner,
+                via_root_cli,
+                [
+                    "set",
+                    "--interactive",
+                    "-s",
+                    "STUDY-01",
+                    "-m",
+                    "records",
+                    "-t",
+                    "2026-05-22T12:00:00Z",
+                    "-l",
+                    ledger_path,
+                ],
+            )
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Failed to write ledger" in result.stderr
+
+    def test_error_6_reset_exception_writes_only_to_stderr(
+        self, runner: CliRunner, tmp_path, via_root_cli: bool
+    ) -> None:
+        ledger_path = str(tmp_path / "ledger.json")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.delete_entry.side_effect = OSError("locked")
+            result = self._invoke(
+                runner,
+                via_root_cli,
+                ["reset", "--study-key", "STUDY-01", "--ledger-path", ledger_path],
+            )
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Failed to reset ledger state" in result.stderr
+
+
+def test_direct_state_helpers_missing_args_write_only_to_stderr(tmp_path, capsys) -> None:
+    """Verify _execute_set_state and _execute_reset_state fallback error paths write to stderr."""
+    from imednet_workflows.cli import _execute_reset_state, _execute_set_state
+
+    ledger_path = str(tmp_path / "ledger.json")
+    with pytest.raises(SystemExit) as set_exc:
+        _execute_set_state(
+            study_key=None,
+            stream=None,
+            timestamp=None,
+            records_processed=0,
+            ledger_path=ledger_path,
+            interactive=False,
+            parser=None,
+        )
+    set_cap = capsys.readouterr()
+    assert set_exc.value.code == 2
+    assert set_cap.out == ""
+    assert "the following arguments are required" in set_cap.err
+
+    with pytest.raises(SystemExit) as reset_exc:
+        _execute_reset_state(
+            study_key=None,
+            stream=None,
+            ledger_path=ledger_path,
+            interactive=False,
+            parser=None,
+        )
+    reset_cap = capsys.readouterr()
+    assert reset_exc.value.code == 2
+    assert reset_cap.out == ""
+    assert "the following arguments are required" in reset_cap.err
+
+
 def test_show_state_handles_none_timestamp(runner: CliRunner, tmp_path) -> None:
     """state show renders None without AttributeError when last_timestamp is uncommitted."""
     import argparse

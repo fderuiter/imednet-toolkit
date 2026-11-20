@@ -10,6 +10,7 @@ class VariablesOperationDef:
     PATH = "variables"
     MODEL = Variable
     _id_param = "variableId"
+    _lookup_key_hint = "variableName"
     PAGE_SIZE = 500
     FILTER_ATTRIBUTES = frozenset(
         {

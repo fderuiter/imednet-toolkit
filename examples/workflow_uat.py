@@ -90,15 +90,13 @@ def _open_sdk() -> tuple[ImednetSDK, str]:
             "STUDY",
         )
 
-    study_key = os.environ.get("IMEDNET_STUDY_KEY") or "STUDY"
-
     if cfg.simulation_mode:
         return (
             ImednetSDK(
                 simulation_mode=True,
                 transport=SimulationTransport(SimulationState()),
             ),
-            study_key,
+            os.environ.get("IMEDNET_STUDY_KEY", "STUDY"),
         )
 
     return (
@@ -107,7 +105,7 @@ def _open_sdk() -> tuple[ImednetSDK, str]:
             security_key=cfg.security_key,
             base_url=cfg.base_url,
         ),
-        study_key,
+        os.environ.get("IMEDNET_STUDY_KEY", "STUDY"),
     )
 
 

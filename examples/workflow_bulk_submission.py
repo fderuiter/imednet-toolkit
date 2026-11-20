@@ -13,7 +13,7 @@ def main() -> None:
     except ValueError:
         cfg = load_config(simulation_mode=True)
 
-    study_key = os.environ.get("IMEDNET_STUDY_KEY") or "STUDY"
+    study_key = os.environ.get("IMEDNET_STUDY_KEY", "STUDY")
 
     with ImednetSDK(
         api_key=cfg.api_key,

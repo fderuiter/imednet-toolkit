@@ -1120,7 +1120,7 @@ def test_validate_canonical_showcase_terminology_allows_js_window_globals(tmp_pa
 
 
 def test_validate_showcase_mock_data_schemas_rejects_non_contract_keys(tmp_path: Path) -> None:
-    """Verify validate_showcase_mock_data_schemas detects non-Postman keys in studies, forms, and queries."""
+    """Verify validate_showcase_mock_data_schemas detects non-contract keys across REST and DataDictionary sections."""
     repo_root = Path(__file__).resolve().parents[2]
     postman_path = repo_root / "imednet.postman_collection.json"
     valid_js = (repo_root / "docs" / "_static" / "showcase.js").read_text(encoding="utf-8")
@@ -1132,13 +1132,23 @@ def test_validate_showcase_mock_data_schemas_rejects_non_contract_keys(tmp_path:
             1,
         )
         .replace(
-            'formKey: "F_VS",',
-            'formKey: "F_VS",\n                domain: "VS",',
+            'formKey: "F_VS",\n                formName: "Vital Signs",\n                formType: "CRF",',
+            'formKey: "F_VS",\n                variableCount: 7,\n                formName: "Vital Signs",\n                formType: "CRF",',
             1,
         )
         .replace(
-            'annotationId: 701,',
+            'formKey: "F_VS",\n                formName: "Vital Signs",\n                formType: "Subject",',
+            'formKey: "F_VS",\n                domain: "VS",\n                formName: "Vital Signs",\n                formType: "Subject",',
+            1,
+        )
+        .replace(
+            "annotationId: 701,",
             'annotationId: 701,\n                status: "OPEN",',
+            1,
+        )
+        .replace(
+            "recordRevisionId: 9001,",
+            'recordRevisionId: 9001,\n                auditId: "AUD-8801",',
             1,
         )
     )
@@ -1147,8 +1157,13 @@ def test_validate_showcase_mock_data_schemas_rejects_non_contract_keys(tmp_path:
 
     errors = validate_showcase_mock_data_schemas(bad_showcase, postman_path)
     assert any("MOCK_DATA.studies[0] contains non-contract keys ['protocol']" in e for e in errors)
+    assert any(
+        "MOCK_DATA.formsCatalog[0] contains non-contract keys ['variableCount']" in e
+        for e in errors
+    )
     assert any("MOCK_DATA.forms.VS contains non-contract keys ['domain']" in e for e in errors)
     assert any("MOCK_DATA.queries[0] contains non-contract keys ['status']" in e for e in errors)
+    assert any("MOCK_DATA.audits[0] contains non-contract keys ['auditId']" in e for e in errors)
 
 
 def test_execute_showcases_in_simulation_rejects_empty_output(tmp_path: Path) -> None:

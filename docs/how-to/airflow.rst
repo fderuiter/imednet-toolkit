@@ -117,8 +117,7 @@ only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs`
 
    from datetime import datetime
    from typing import Any
-   from airflow import DAG
-   from airflow.sdk import task
+   from airflow.sdk import DAG, task
    from apache_airflow_providers_imednet import ImednetExportOperator, ImednetHook
 
    with DAG(

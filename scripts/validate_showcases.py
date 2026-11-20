@@ -1678,8 +1678,14 @@ def load_postman_contract_schemas(postman_path: Path) -> tuple[dict[str, set[str
         "List studies": "studies",
         "List forms": "forms",
         "List queries": "queries",
+        "List record revisions": "audits",
     }
-    schemas: dict[str, set[str]] = {"studies": set(), "forms": set(), "queries": set()}
+    schemas: dict[str, set[str]] = {
+        "studies": set(),
+        "forms": set(),
+        "queries": set(),
+        "audits": set(),
+    }
 
     def _walk_items(items: object) -> None:
         if not isinstance(items, list):
@@ -1718,11 +1724,16 @@ def load_postman_contract_schemas(postman_path: Path) -> tuple[dict[str, set[str
     return schemas, []
 
 
+_CANONICAL_DATADICT_FORM_KEYS: frozenset[str] = frozenset(
+    {"formKey", "formName", "formId", "formType", "variables", "businessLogic", "extraAttributes"}
+)
+
+
 def validate_showcase_mock_data_schemas(
     showcase_js_path: Path,
     postman_path: Path,
 ) -> list[str]:
-    """Validate that MOCK_DATA.studies, MOCK_DATA.forms, and MOCK_DATA.queries match Postman schemas."""
+    """Validate MOCK_DATA REST (studies, formsCatalog, queries, audits) and DataDictionary (forms) schemas."""
     if not showcase_js_path.exists():
         return [f"Showcase script not found: {showcase_js_path}"]
 
@@ -1741,26 +1752,28 @@ def validate_showcase_mock_data_schemas(
 
     errors: list[str] = []
 
-    for section_name in ("studies", "forms", "queries"):
+    section_specs: list[tuple[str, set[str], bool]] = [
+        ("studies", schemas["studies"], True),
+        ("formsCatalog", schemas["forms"], True),
+        ("queries", schemas["queries"], True),
+        ("audits", schemas["audits"], False),
+    ]
+
+    for section_name, allowed_keys, required in section_specs:
         raw_section = mock_data.get(section_name)
-        if isinstance(raw_section, list):
-            items: list[tuple[str, object]] = [
-                (f"{section_name}[{idx}]", item) for idx, item in enumerate(raw_section)
-            ]
-        elif isinstance(raw_section, dict) and section_name == "forms":
-            items = [(f"forms.{key}", val) for key, val in raw_section.items()]
-        else:
+        if raw_section is None and not required:
+            continue
+        if not isinstance(raw_section, list):
             errors.append(
                 f"{showcase_js_path}: MOCK_DATA.{section_name} is missing or has invalid container type"
             )
             continue
-
-        if not items:
+        if not raw_section:
             errors.append(f"{showcase_js_path}: MOCK_DATA.{section_name} must not be empty")
             continue
 
-        allowed_keys = schemas[section_name]
-        for item_label, item_val in items:
+        for idx, item_val in enumerate(raw_section):
+            item_label = f"{section_name}[{idx}]"
             if not isinstance(item_val, dict) or not item_val:
                 errors.append(
                     f"{showcase_js_path}: MOCK_DATA.{item_label} must be a non-empty object"
@@ -1795,6 +1808,26 @@ def validate_showcase_mock_data_schemas(
                                 f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments[{c_idx}] "
                                 f"contains non-contract keys {extra_comment_keys}"
                             )
+
+    raw_forms = mock_data.get("forms")
+    if isinstance(raw_forms, dict) and raw_forms:
+        for form_domain, form_val in raw_forms.items():
+            if not isinstance(form_val, dict) or not form_val:
+                errors.append(
+                    f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} must be a non-empty object"
+                )
+                continue
+            unexpected_dd = sorted(set(form_val.keys()) - _CANONICAL_DATADICT_FORM_KEYS)
+            if unexpected_dd:
+                errors.append(
+                    f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} contains non-contract keys "
+                    f"{unexpected_dd}; allowed DataDictionary Form keys: "
+                    f"{sorted(_CANONICAL_DATADICT_FORM_KEYS)}"
+                )
+    else:
+        errors.append(
+            f"{showcase_js_path}: MOCK_DATA.forms is missing or has invalid container type"
+        )
 
     return errors
 

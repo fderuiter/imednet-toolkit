@@ -17,32 +17,15 @@ asynchronous callers:
 .. testcode::
 
    from imednet import AsyncImednetSDK, ImednetSDK
-   from imednet.simulation import reset_default_simulation_state
 
    # Synchronous single-Job polling
-   sdk = ImednetSDK(simulation_mode=True)
-   job = sdk.records.create(
-       "STUDY",
-       [
-           {
-               "formKey": "F_VS",
-               "siteName": "SITE",
-               "subjectKey": "SUBJ-001",
-               "intervalName": "Baseline",
-               "data": {"V_WEIGHT": 70.5},
-           }
-       ],
-   )
-   assert job.batch_id
-   status = sdk.poll_job("STUDY", job.batch_id, interval=0.05, timeout=10)
+   sdk = ImednetSDK()
+   status = sdk.poll_job("STUDY", "BATCH", interval=0.05, timeout=10)
 
    # Asynchronous single-Job polling
    async def wait_async() -> None:
-       async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
-           assert job.batch_id
-           await async_sdk.async_poll_job("STUDY", job.batch_id, interval=0.05, timeout=10)
-
-   reset_default_simulation_state()
+       async with AsyncImednetSDK() as async_sdk:
+           await async_sdk.async_poll_job("STUDY", "BATCH", interval=0.05, timeout=10)
 
 Chunked Batch Submission and Multi-Job Polling
 ----------------------------------------------

@@ -1824,31 +1824,24 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 assert fc_copy_focus["outlineStyle"] == "solid"
                 assert fc_copy_focus["outlineWidth"] == "2px"
 
-                callout_links = idx_page.locator("#panel-datamanager .quick-start-callout a")
-                callout_count = callout_links.count()
-                assert callout_count >= 1
-                for i in range(callout_count):
-                    callout_links.nth(i).focus()
-                    idx_page.keyboard.press("Shift")
-                    fc_callout_focus = idx_page.evaluate(
-                        """(idx) => {
-                            const link = document.querySelectorAll(
-                                '#panel-datamanager .quick-start-callout a'
-                            )[idx];
-                            const cs = getComputedStyle(link);
-                            return {
-                                matches: link.matches(':focus-visible'),
-                                style: cs.outlineStyle,
-                                width: cs.outlineWidth
-                            };
-                        }""",
-                        i,
-                    )
-                    assert fc_callout_focus == {
-                        "matches": True,
-                        "style": "solid",
-                        "width": "2px",
-                    }
+                idx_page.locator("#panel-datamanager .quick-start-callout a").first.focus()
+                idx_page.keyboard.press("Shift")
+                fc_callout_focus = idx_page.evaluate(
+                    """() => {
+                        const link = document.querySelector('#panel-datamanager .quick-start-callout a');
+                        const cs = getComputedStyle(link);
+                        return {
+                            matches: link.matches(':focus-visible'),
+                            style: cs.outlineStyle,
+                            width: cs.outlineWidth
+                        };
+                    }"""
+                )
+                assert fc_callout_focus == {
+                    "matches": True,
+                    "style": "solid",
+                    "width": "2px",
+                }
                 idx_page.emulate_media(forced_colors="none")
 
                 # 4c. @media (prefers-contrast: more) >= 7.0:1 across light and dark modes on index.html

@@ -15,6 +15,7 @@ from ...sdk import ImednetSDK
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import (
     STUDY_KEY_ARG,
+    add_no_interactive,
     fetching_status,
     parse_filter_args,
     parse_record_data_filter,
@@ -107,6 +108,7 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Minimum record schema readiness score (0-100) when quality gate is enabled.",
     )
+    add_no_interactive(parser)
 
 
 def _parse_export_filters(filters: list[str] | None) -> dict[str, Any] | str | None:
