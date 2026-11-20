@@ -84,6 +84,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,7 @@ from imednet.spi.sinks import (
     apply_quality_gate,
     build_sink_mapper,
     extract_record_id,
+    normalize_sink_value,
     run_streaming_export,
 )
 from imednet.spi.utils import flatten, global_sensitivity_registry, mask_clinical_phi
@@ -256,23 +258,8 @@ class SnowflakeSinkConfig(SinkConfig):
 
 
 def _normalize_warehouse_value(value: Any) -> Any:
-    """Recursively normalize Pydantic models and tuples into JSON-serializable primitives."""
-    if value is None or value.__class__ in (str, int, float, bool):
-        return value
-    if value.__class__ is dict:
-        return {str(k): _normalize_warehouse_value(v) for k, v in value.items()}
-    if value.__class__ in (list, tuple):
-        return [_normalize_warehouse_value(item) for item in value]
-    model_dump = getattr(type(value), "model_dump", None)
-    if callable(model_dump):
-        dumped = value.model_dump(mode="json")
-        if dumped is not value and isinstance(dumped, (dict, list, tuple, str, int, float, bool)):
-            return _normalize_warehouse_value(dumped)
-    if isinstance(value, dict):
-        return {str(k): _normalize_warehouse_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_normalize_warehouse_value(item) for item in value]
-    return value
+    """Recursively normalize Pydantic models, enums, and tuples into plain containers."""
+    return normalize_sink_value(value)
 
 
 @functools.lru_cache(maxsize=2048)
@@ -449,6 +436,8 @@ def _scalar_family(value: Any) -> str:
     """Classify scalar values into Arrow-compatible type families."""
     if isinstance(value, bool):
         return "bool"
+    if isinstance(value, Decimal):
+        return "decimal"
     if isinstance(value, (int, float)):
         return "num"
     if isinstance(value, str):
@@ -546,7 +535,13 @@ def _resolve_column_types(arrow_table: Any, columns: Sequence[str]) -> dict[str,
                 sf_type = "BOOLEAN"
             elif type_name.startswith(("int", "uint")):
                 sf_type = "BIGINT"
-            elif type_name.startswith(("float", "double", "halffloat", "decimal")):
+            elif type_name.startswith("decimal"):
+                scale = getattr(raw_type, "scale", None)
+                if isinstance(scale, int) and 0 <= scale <= 37:
+                    sf_type = f"NUMBER(38, {scale})"
+                else:
+                    sf_type = "NUMBER(38, 9)"
+            elif type_name.startswith(("float", "double", "halffloat")):
                 sf_type = "FLOAT"
             elif type_name.startswith("timestamp"):
                 sf_type = "TIMESTAMP_TZ"

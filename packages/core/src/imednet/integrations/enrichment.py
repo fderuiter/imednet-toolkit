@@ -24,7 +24,7 @@ from imednet.utils.serialization import flatten
 
 logger = logging.getLogger(__name__)
 
-_FIRST_CAP_RE = re.compile(r'(.)([A-Z][a-z]+)')
+_FIRST_CAP_RE = re.compile(r'([A-Za-z0-9])([A-Z][a-z]+)')
 _ALL_CAP_RE = re.compile(r'([a-z0-9])([A-Z])')
 _MASKED_VALUE = "***MASKED***"
 
@@ -308,11 +308,33 @@ class CentralizedMapper:
                 val = dict(val or {})
                 if self.mask_phi and val:
                     val = mask_clinical_phi(val)
-                    if self.mode == "tabular" and pipeline_phi_keys:
-                        val = _mask_custom_phi_recursive(val, pipeline_phi_keys)
+                if active_pipeline is not None and not (
+                    active_pipeline.__class__ is EnrichmentPipeline
+                    and not active_pipeline._has_rules
+                ):
+                    if self.mask_phi:
+                        try:
+                            val = active_pipeline.process(val, _skip_default_phi=False)
+                        except TypeError:
+                            val = active_pipeline.process(val)
+                    else:
+                        try:
+                            val = active_pipeline.process(val, mask_phi=False)
+                        except TypeError:
+                            val = active_pipeline.process(val)
                 if self.mode == "tabular":
                     val = flatten(val)
                 val = {_to_snake_case(k): v for k, v in val.items()}
+            elif (
+                self.mask_phi
+                and val is not None
+                and not global_sensitivity_registry.is_exempt(snake_key)
+                and (
+                    (pipeline_phi_keys and _normalize_key(snake_key) in pipeline_phi_keys)
+                    or global_sensitivity_registry.is_sensitive(snake_key)
+                )
+            ):
+                val = _MASKED_VALUE
 
             if val is not None or snake_key not in mapped:
                 mapped[snake_key] = val
@@ -337,18 +359,6 @@ class CentralizedMapper:
             mapped['study_key'] = study_key
         elif 'study_key' not in mapped or not mapped['study_key']:
             mapped['study_key'] = resolved_study_key
-
-        if not (active_pipeline.__class__ is EnrichmentPipeline and not active_pipeline._has_rules):
-            if self.mask_phi:
-                try:
-                    mapped = active_pipeline.process(mapped, _skip_default_phi=True)
-                except TypeError:
-                    mapped = active_pipeline.process(mapped)
-            else:
-                try:
-                    mapped = active_pipeline.process(mapped, mask_phi=False)
-                except TypeError:
-                    mapped = active_pipeline.process(mapped)
 
         if self.post_processor:
             mapped = self.post_processor(mapped)
@@ -384,11 +394,20 @@ class EnrichmentPipeline:
                 self.phi_keys.add(snake_norm)
 
         self.terminology = config.terminology_lookups or {}
+        self._snake_terminology: dict[str, dict[str, str]] = {}
+        for term_key, lookup in self.terminology.items():
+            snake_term_key = _to_snake_case(str(term_key))
+            if snake_term_key and snake_term_key not in self._snake_terminology:
+                self._snake_terminology[snake_term_key] = lookup
 
         self.mappings = {}
+        self._snake_mappings: dict[str, Any] = {}
         for mapping in config.mappings:
             if mapping.source_variable_name:
                 self.mappings[mapping.source_variable_name] = mapping
+                snake_src = _to_snake_case(mapping.source_variable_name)
+                if snake_src and snake_src not in self._snake_mappings:
+                    self._snake_mappings[snake_src] = mapping
 
         self._has_rules = bool(self.phi_keys or self.terminology or self.mappings)
         self._last_clean_repr: str | None = None
@@ -495,15 +514,20 @@ class EnrichmentPipeline:
 
                 # If value is not a complex structure, apply rules
                 if not isinstance(v, (dict, list, tuple)):
-                    # Terminology mapping
-                    # The terminology lookups are usually keyed by variable name or domain.variable
-                    if k in self.terminology and str(new_val) in self.terminology[k]:
-                        new_val = self.terminology[k][str(new_val)]
+                    snake_k = _to_snake_case(k) if isinstance(k, str) else None
+                    # Terminology mapping: exact sourceVariableName first, then snake_case fallback
+                    term_lookup = self.terminology.get(k)
+                    if term_lookup is None and snake_k is not None:
+                        term_lookup = self._snake_terminology.get(snake_k)
+                    if not is_phi_key and term_lookup is not None and str(new_val) in term_lookup:
+                        new_val = term_lookup[str(new_val)]
 
                     # Mapping rules (business logic and key renaming)
-                    if k in self.mappings:
-                        rule = self.mappings[k]
-                        if rule.business_logic:
+                    rule = self.mappings.get(k)
+                    if rule is None and snake_k is not None:
+                        rule = self._snake_mappings.get(snake_k)
+                    if rule is not None:
+                        if not is_phi_key and rule.business_logic:
                             new_val = self._evaluate_business_logic(rule.business_logic, new_val)
                         if rule.target_field and rule.target_field != k:
                             new_key = rule.target_field
