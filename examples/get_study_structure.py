@@ -48,7 +48,7 @@ with ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url) a
                                 form.form_id,
                                 form.form_name,
                                 var.variable_name,
-                                getattr(var, "variable_label", ""),
+                                var.label or "",
                             ]
                         )
                 else:

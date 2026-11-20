@@ -128,6 +128,16 @@ def _mask_default_phi_cow(value: Any, key_cache: dict[str, bool]) -> Any:
     return value
 
 
+def _matches_custom_phi_key(key: str, phi_keys: set[str]) -> bool:
+    """Return True if *key* matches *phi_keys* in normalized or collapsed form."""
+    if not phi_keys or global_sensitivity_registry.is_exempt(key):
+        return False
+    norm = _normalize_key(key)
+    if not norm:
+        return False
+    return norm in phi_keys or norm.replace("_", "") in phi_keys
+
+
 def _mask_custom_phi_recursive(value: Any, phi_keys: set[str]) -> Any:
     """Recursively mask custom normalized study PHI keys prior to flattening."""
     if not phi_keys:
@@ -136,11 +146,7 @@ def _mask_custom_phi_recursive(value: Any, phi_keys: set[str]) -> Any:
         return {
             k: (
                 _MASKED_VALUE
-                if (
-                    isinstance(k, str)
-                    and not global_sensitivity_registry.is_exempt(k)
-                    and _normalize_key(k) in phi_keys
-                )
+                if isinstance(k, str) and _matches_custom_phi_key(k, phi_keys)
                 else _mask_custom_phi_recursive(v, phi_keys)
             )
             for k, v in value.items()
@@ -286,10 +292,9 @@ class CentralizedMapper:
             for f, snake_key in fields:
                 if f == "record_data":
                     continue
-                if pipeline_phi_keys and _normalize_key(snake_key) in pipeline_phi_keys:
-                    if not global_sensitivity_registry.is_exempt(snake_key):
-                        masked.add(snake_key)
-                elif global_sensitivity_registry.is_sensitive(snake_key):
+                if (
+                    pipeline_phi_keys and _matches_custom_phi_key(snake_key, pipeline_phi_keys)
+                ) or global_sensitivity_registry.is_sensitive(snake_key):
                     masked.add(snake_key)
             cached = frozenset(masked)
             self._masked_meta_cache[cache_key] = cached
@@ -418,9 +423,11 @@ class EnrichmentPipeline:
             norm_key = _normalize_key(raw_key)
             if norm_key:
                 self.phi_keys.add(norm_key)
+                self.phi_keys.add(norm_key.replace("_", ""))
             snake_norm = _normalize_key(_to_snake_case(str(raw_key)))
             if snake_norm:
                 self.phi_keys.add(snake_norm)
+                self.phi_keys.add(snake_norm.replace("_", ""))
 
         self.terminology = config.terminology_lookups or {}
         self._snake_terminology: dict[str, dict[str, str]] = {}
@@ -523,7 +530,7 @@ class EnrichmentPipeline:
                 new_key = k
                 is_phi_key = False
                 if mask_phi and isinstance(k, str) and not global_sensitivity_registry.is_exempt(k):
-                    is_phi_key = bool(self.phi_keys and _normalize_key(k) in self.phi_keys) or (
+                    is_phi_key = _matches_custom_phi_key(k, self.phi_keys) or (
                         not _skip_default_phi and global_sensitivity_registry.is_sensitive(k)
                     )
                 if is_phi_key and isinstance(v, (dict, list, tuple)):
@@ -568,9 +575,7 @@ class EnrichmentPipeline:
                         and isinstance(new_key, str)
                         and not global_sensitivity_registry.is_exempt(new_key)
                     ):
-                        target_is_phi = bool(
-                            self.phi_keys and _normalize_key(new_key) in self.phi_keys
-                        ) or (
+                        target_is_phi = _matches_custom_phi_key(new_key, self.phi_keys) or (
                             not _skip_default_phi
                             and global_sensitivity_registry.is_sensitive(new_key)
                         )
