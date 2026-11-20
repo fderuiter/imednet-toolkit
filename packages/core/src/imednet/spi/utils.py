@@ -88,7 +88,7 @@ from imednet.utils.tabular import (
     normalize_tabular_row,
 )
 from imednet.utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
-from imednet.utils.url import redact_sensitive_text
+from imednet.utils.url import redact_sensitive_text, validate_path_segment
 from imednet.utils.validators import is_boolean_token, is_missing_value, parse_bool
 
 __all__ = [
@@ -165,5 +165,6 @@ __all__ = [
     "sqlite_connection",
     "validate_filter_key",
     "validate_partition_key",
+    "validate_path_segment",
     "validate_subject_registration_sites",
 ]

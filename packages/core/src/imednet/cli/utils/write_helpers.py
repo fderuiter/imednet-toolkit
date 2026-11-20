@@ -26,7 +26,7 @@ from imednet.utils.tabular import (
 from imednet.validation.cache import SchemaCache, ValidationSchemaProtocol
 
 from ..decorators import _redact_secrets
-from .args import add_output_format
+from .args import add_output_format, resolve_output_format
 from .context import fetching_status
 from .output import display_list, emit_json, format_job_progress, print_error
 from .terminal import is_json_output_mode, is_non_interactive, supports_live_status
@@ -216,11 +216,12 @@ def write_progress_context(
     study_key: str,
     *,
     no_interactive: bool = False,
-    output_format: str = "table",
+    output_format: str | None = None,
 ) -> Iterator[JobProgressHandler | None]:
     """Manage spinner and polling progress callbacks while honoring non-interactive/JSON modes."""
+    resolved_format = resolve_output_format(output_format)
     quiet = (
-        no_interactive or output_format == "json" or is_non_interactive() or is_json_output_mode()
+        no_interactive or resolved_format == "json" or is_non_interactive() or is_json_output_mode()
     )
     if quiet:
         yield None
@@ -292,17 +293,18 @@ def render_write_summary(
     summary: BatchSubmissionSummary,
     *,
     resource: str,
-    output_format: str = "table",
+    output_format: str | None = None,
 ) -> None:
     """Render a :class:`BatchSubmissionSummary` in human table or JSON mode and exit 1 if invalid."""
+    resolved_format = resolve_output_format(output_format)
     if summary.validation_report is not None and not summary.validation_report.is_valid:
-        if output_format == "json":
+        if resolved_format == "json":
             emit_json([_summary_to_json_item(summary)], resource)
         else:
             print_error(_redact_secrets(summary.validation_report.format_summary()))
         sys.exit(1)
 
-    if output_format == "json":
+    if resolved_format == "json":
         emit_json([_summary_to_json_item(summary)], resource)
         return
 

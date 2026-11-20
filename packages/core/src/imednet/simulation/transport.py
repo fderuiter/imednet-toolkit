@@ -275,7 +275,7 @@ def _parse_single_clause(raw_clause: str, *, attribute: str, full_expr: str) -> 
     compiled_re: re.Pattern[str] | None = None
     if normalized_op == "=~":
         try:
-            compiled_re = re.compile(unquoted_val)
+            compiled_re = re.compile(unquoted_val, re.IGNORECASE)
         except re.error as exc:
             raise _FilterParseError(
                 f"Invalid regular expression '{unquoted_val}': {exc}",

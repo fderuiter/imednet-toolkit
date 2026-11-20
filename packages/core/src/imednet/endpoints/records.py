@@ -32,6 +32,7 @@ class RecordsOperationDef:
     PATH = "records"
     MODEL = Record
     _id_param = "recordId"
+    _lookup_key_hint = "recordOid"
     PARAM_PROCESSOR = MappingParamProcessor(
         {
             "record_data_filter": "recordDataFilter",
@@ -82,6 +83,7 @@ class RecordsOperationDef:
         Returns:
             The background job for the creation operation.
         """
+        self._validate_study_key(study_key)  # type: ignore
         normalized = normalize_records_input(records_data, schema=schema)
         path = self._get_endpoint_path(study_key)  # type: ignore
         return RecordCreateOperation[Job](
@@ -114,6 +116,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and optionally poll jobs."""
+        self._validate_study_key(study_key)
         normalized = normalize_records_input(records_data, schema=schema)
         coordinator = BatchCoordinator(chunk_size=chunk_size)
 
@@ -215,6 +218,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
+        self._validate_study_key(study_key)
         normalized = normalize_records_input(records_data, schema=schema)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
 

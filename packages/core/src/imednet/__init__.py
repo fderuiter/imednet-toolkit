@@ -5,7 +5,7 @@ from importlib import metadata as _metadata
 from .config import Config, load_config
 from .core.base_client import BaseClient
 from .core.retry import DefaultRetryPolicy, RetryPolicy, RetryState
-from .errors import PluginLoadError
+from .errors import ApiError, ImednetError, NotFoundError, PluginLoadError
 from .errors.orchestration import FilterConflictError, OrchestratorError
 from .orchestration import (
     MultiStudyOrchestrator,
@@ -25,6 +25,7 @@ from .utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsIn
 ImednetClient = ImednetSDK
 
 __all__ = [
+    "ApiError",
     "AsyncImednetSDK",
     "BaseClient",
     "Config",
@@ -33,10 +34,12 @@ __all__ = [
     "FilterScalar",
     "FilterValue",
     "ImednetClient",
+    "ImednetError",
     "ImednetSDK",
     "ItemId",
     "JsonDict",
     "MultiStudyOrchestrator",
+    "NotFoundError",
     "OrchestratorError",
     "OrchestratorResult",
     "PluginLoadError",

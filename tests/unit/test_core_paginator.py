@@ -203,6 +203,10 @@ def test_paginator_accepts_valid_bounds(params: dict[str, Any], page_size: int) 
         ({"page": True}, 100, "must be an integer"),
         ({"size": False}, 100, "must be an integer"),
         ({"page": "abc"}, 100, "must be an integer"),
+        ({"limit": 0}, 100, "limit.*>= 1"),
+        ({"limit": -5}, 100, "limit.*>= 1"),
+        ({"limit": True}, 100, "must be an integer"),
+        ({"limit": 1.5}, 100, "must be an integer"),
     ],
 )
 def test_paginator_rejects_invalid_bounds(
@@ -259,8 +263,50 @@ async def test_async_paginator_explicit_limit_bounds_to_single_page() -> None:
     assert async_client.calls[0]["params"] == {"page": 0, "size": 2}
 
 
-def test_paginator_rejects_conflicting_size_and_limit() -> None:
-    """Test Paginator rejects conflicting explicit size and limit values."""
-    client = DummyClient([{"data": [1]}])
-    with pytest.raises(ValueError, match="Conflicting pagination bounds"):
-        Paginator(client, "/p", params={"size": 10, "limit": 25})
+def test_paginator_decouples_size_and_limit_across_pages() -> None:
+    """Test Paginator decouples per-page size from total limit and advances across pages."""
+    client = DummyClient(
+        [
+            {"data": list(range(1, 11)), "pagination": {"totalPages": 4}},
+            {"data": list(range(11, 21)), "pagination": {"totalPages": 4}},
+            {"data": list(range(21, 31)), "pagination": {"totalPages": 4}},
+            {"data": list(range(31, 41)), "pagination": {"totalPages": 4}},
+        ]
+    )
+    paginator = Paginator(client, "/p", params={"size": 10, "limit": 25})
+    assert paginator.page_size == 10
+    assert list(paginator) == list(range(1, 26))
+    assert len(client.calls) == 3
+    assert [c["params"] for c in client.calls] == [
+        {"page": 0, "size": 10},
+        {"page": 1, "size": 10},
+        {"page": 2, "size": 10},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_paginator_and_async_paginator_limit_1000_spans_multiple_500_item_pages() -> None:
+    """Test Paginator and AsyncPaginator yield 1000 items across two 500-item pages."""
+    pages = [
+        {"data": list(range(500)), "pagination": {"totalPages": 3}},
+        {"data": list(range(500, 1000)), "pagination": {"totalPages": 3}},
+        {"data": list(range(1000, 1500)), "pagination": {"totalPages": 3}},
+    ]
+
+    sync_client = DummyClient(list(pages))
+    sync_paginator = Paginator(sync_client, "/p", params={"limit": 1000}, page_size=100)
+    assert sync_paginator.page_size == 500
+    assert list(sync_paginator) == list(range(1000))
+    assert len(sync_client.calls) == 2
+    assert sync_client.calls[0]["params"] == {"page": 0, "size": 500}
+    assert sync_client.calls[1]["params"] == {"page": 1, "size": 500}
+
+    async_client = AsyncDummyClient(list(pages))
+    async_paginator = AsyncPaginator(  # type: ignore[arg-type]
+        async_client, "/p", params={"limit": 1000}, page_size=100
+    )
+    assert async_paginator.page_size == 500
+    assert [item async for item in async_paginator] == list(range(1000))
+    assert len(async_client.calls) == 2
+    assert async_client.calls[0]["params"] == {"page": 0, "size": 500}
+    assert async_client.calls[1]["params"] == {"page": 1, "size": 500}
