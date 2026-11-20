@@ -141,9 +141,7 @@ class _SimulatedSDK:
         if isinstance(dm_cond, tuple) and len(dm_cond) == 2 and dm_cond[0] == ">":
             raw_val = dm_cond[1]
             parsed = (
-                raw_val
-                if isinstance(raw_val, datetime)
-                else datetime.fromisoformat(str(raw_val))
+                raw_val if isinstance(raw_val, datetime) else datetime.fromisoformat(str(raw_val))
             )
             cutoff = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
         elif record_data_filter and "dateModified>" in record_data_filter:
@@ -856,3 +854,66 @@ def test_initial_sync_failure_and_stale_running_lease_recovery_end_to_end(
     rows = _read_exporter_records("csv", dest)
     assert set(rows) == {1}
     assert str(rows[1]["AGE"]) == "61"
+
+
+def test_by_form_streaming_quality_gate_caps_watermark_below_rejected_record(
+    tmp_path: Path,
+) -> None:
+    """Single-pass per-form streaming caps per-form watermarks strictly below rejected records."""
+    ledger = ExtractionStateLedger(str(tmp_path / "by_form_ledger.json"))
+    ddb_path = tmp_path / "by_form_gate.duckdb"
+    variables = [_make_variable("AGE"), _make_variable("WT")]
+
+    # Run 1: rec 1 (10:00) valid, rec 2 (11:00) rejected (only unmapped drift keys), rec 3 (12:00) valid
+    run1_records = [
+        _make_record(1, date_modified="2026-06-01T10:00:00Z", data={"AGE": "40", "WT": "70"}),
+        _make_record(
+            2,
+            date_modified="2026-06-01T11:00:00Z",
+            data={"D1": "x", "D2": "x", "D3": "x", "D4": "x"},
+        ),
+        _make_record(3, date_modified="2026-06-01T12:00:00Z", data={"AGE": "55", "WT": "82"}),
+    ]
+    sdk1 = _SimulatedSDK(run1_records, variables)
+    export_to_duckdb_by_form(
+        sdk1,
+        "STUDY_BY_FORM_GATE",
+        ddb_path,
+        incremental=True,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=75.0,
+        state_provider=ledger,
+        mask_phi=False,
+    )
+
+    # Watermark for duckdb_DEMOG must be held at 10:00 (strictly < 11:00 rejected rec 2), not 12:00
+    assert ledger.get_last_timestamp("STUDY_BY_FORM_GATE", "duckdb_DEMOG") == datetime(
+        2026, 6, 1, 10, 0, tzinfo=timezone.utc
+    )
+    rows1 = _read_exporter_records("duckdb_by_form", ddb_path)
+    assert set(rows1) == {1, 3}
+
+    # Run 2: rec 2 is fixed at 11:05 -> re-fetched because watermark was capped at 10:00!
+    run2_records = [
+        _make_record(1, date_modified="2026-06-01T10:00:00Z", data={"AGE": "40", "WT": "70"}),
+        _make_record(2, date_modified="2026-06-01T11:05:00Z", data={"AGE": "48", "WT": "76"}),
+        _make_record(3, date_modified="2026-06-01T12:00:00Z", data={"AGE": "55", "WT": "82"}),
+    ]
+    sdk2 = _SimulatedSDK(run2_records, variables)
+    export_to_duckdb_by_form(
+        sdk2,
+        "STUDY_BY_FORM_GATE",
+        ddb_path,
+        incremental=True,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=75.0,
+        state_provider=ledger,
+        mask_phi=False,
+    )
+
+    assert ledger.get_last_timestamp("STUDY_BY_FORM_GATE", "duckdb_DEMOG") == datetime(
+        2026, 6, 1, 12, 0, tzinfo=timezone.utc
+    )
+    rows2 = _read_exporter_records("duckdb_by_form", ddb_path)
+    assert set(rows2) == {1, 2, 3}
+    assert str(rows2[2]["AGE"]) == "48"

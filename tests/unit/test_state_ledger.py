@@ -631,82 +631,161 @@ def test_cli_default_ledger_path_behavior() -> None:
     assert reset_args.ledger_path == DEFAULT_LEDGER_PATH
 
 
-def test_airflow_state_provider_in_context_sdk_scoping_and_fallbacks(monkeypatch) -> None:
-    """Verify AirflowStateProvider uses airflow.sdk.get_current_context and scopes xcom_pull by task_id."""
-    import json as _json
-    from types import ModuleType, SimpleNamespace
-    from unittest.mock import MagicMock
+def test_file_state_provider_transaction_rolls_back_on_base_exception(tmp_path: Path) -> None:
+    """FileStateProvider.transaction catches BaseException (e.g. task timeout) and allows retry."""
+
+    class SimulatedTaskTimeout(BaseException):
+        """Synthetic BaseException matching AirflowTaskTimeout hierarchy."""
+
+    ledger = FileStateProvider(str(tmp_path / "ledger.json"))
+    initial_ts = datetime(2026, 4, 1, 8, 0, 0, tzinfo=timezone.utc)
+    ledger.set_last_timestamp("STUDY-TIMEOUT", "records", initial_ts)
+
+    with pytest.raises(SimulatedTaskTimeout, match="execution_timeout exceeded"):
+        with ledger.transaction("STUDY-TIMEOUT", "records") as tx:
+            tx["new_timestamp"] = datetime(2026, 4, 2, 8, 0, 0, tzinfo=timezone.utc)
+            tx["records_processed"] = 42
+            raise SimulatedTaskTimeout("execution_timeout exceeded")
+
+    assert ledger.get_last_status("STUDY-TIMEOUT", "records") == StreamExecutionStatus.FAILED
+    assert ledger.get_last_timestamp("STUDY-TIMEOUT", "records") == initial_ts
+    failed_stream = ledger.read_state().studies["STUDY-TIMEOUT"].streams["records"]
+    assert failed_stream.error_message == "execution_timeout exceeded"
+
+    retry_ts = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
+    with ledger.transaction("STUDY-TIMEOUT", "records") as retry_tx:
+        assert retry_tx["last_timestamp"] == initial_ts
+        retry_tx["new_timestamp"] = retry_ts
+        retry_tx["records_processed"] = 100
+
+    assert ledger.get_last_status("STUDY-TIMEOUT", "records") == StreamExecutionStatus.SUCCESS
+    assert ledger.get_last_timestamp("STUDY-TIMEOUT", "records") == retry_ts
+
+
+def test_airflow_state_provider_sdk_variable_lifecycle_and_edge_cases(monkeypatch) -> None:
+    """AirflowStateProvider reads, writes, lists, deletes, and rolls back via airflow.sdk.Variable."""
+    import json
+    import types
 
     from imednet_workflows.state_ledger import AirflowStateProvider
 
+    store: dict[str, str] = {}
+
+    class FakeSdkVariable:
+        @staticmethod
+        def get(key: str, default=None, deserialize_json: bool = False):
+            if key not in store:
+                return default
+            raw = store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(key: str, value, serialize_json: bool = False) -> None:
+            store[key] = json.dumps(value) if serialize_json else str(value)
+
+        @staticmethod
+        def delete(key: str) -> None:
+            store.pop(key, None)
+
+        @staticmethod
+        def keys(prefix: str = "") -> list[str]:
+            return [k for k in sorted(store) if k.startswith(prefix)]
+
+    fake_airflow = types.ModuleType("airflow")
+    fake_sdk = types.ModuleType("airflow.sdk")
+    fake_sdk.Variable = FakeSdkVariable  # type: ignore[attr-defined]
+    fake_exec = types.ModuleType("airflow.sdk.execution_time")
+    fake_runner = types.ModuleType("airflow.sdk.execution_time.task_runner")
+    fake_runner.SUPERVISOR_COMMS = object()  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "airflow", fake_airflow)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", fake_sdk)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time", fake_exec)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time.task_runner", fake_runner)
+
     provider = AirflowStateProvider()
-    pushed: list[tuple[str, dict[str, object]]] = []
 
-    class _MappedTI:
-        task_id = "export_records"
-        map_index = 2
-
-        def xcom_pull(self, *, task_ids=None, key=None, include_prior_dates=False):
-            assert task_ids == "export_records"
-            assert include_prior_dates is True
-            assert key == "state_STUDY_X_csv"
-            if not pushed:
-                return None
-            return [
-                {"last_timestamp": "2026-01-01T00:00:00", "status": "running"},
-                pushed[-1][1],
-            ]
-
-        def xcom_push(self, *, key: str, value: dict[str, object]) -> None:
-            pushed.append((key, value))
-
-    sdk_mod = ModuleType("airflow.sdk")
-    sdk_mod.get_current_context = lambda: {"ti": _MappedTI()}  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
-
-    session_mod = ModuleType("airflow.utils.session")
-    create_session_spy = MagicMock()
-    session_mod.create_session = create_session_spy  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_mod)
-
-    # Initial run in active context returns None without querying XComModel DB
-    assert provider.get_last_timestamp("STUDY_X", "csv") is None
-    assert provider.get_last_status("STUDY_X", "csv") is None
-    create_session_spy.assert_not_called()
-
-    # Transaction commits via xcom_push and subsequent pull reads latest entry
-    with provider.transaction(
-        "STUDY_X", "csv", fallback_timestamp=datetime(2026, 2, 1, 8, 0)
-    ) as tx:
-        tx["new_timestamp"] = datetime(2026, 2, 2, 9, 30, tzinfo=timezone.utc)
-        tx["records_processed"] = 12
-
-    assert provider.get_last_timestamp("STUDY_X", "csv") == datetime(
-        2026, 2, 2, 9, 30, tzinfo=timezone.utc
+    # Special characters (colon, tilde, slash) round-trip without key collisions
+    ts_naive = datetime(2026, 6, 1, 10, 0, 0)
+    provider.set_last_timestamp(
+        "STUDY:01~A",
+        "records/dm",
+        ts_naive,
+        status=StreamExecutionStatus.RUNNING,
     )
-    assert provider.get_last_status("STUDY_X", "csv") == StreamExecutionStatus.SUCCESS
-
-    # Deserialization & parsing helpers
-    assert provider._deserialize_xcom_row(object, SimpleNamespace(value={"ok": 1})) == {"ok": 1}
-    assert provider._deserialize_xcom_row(
-        object, SimpleNamespace(value=_json.dumps({"ok": 2}).encode("utf-8"))
-    ) == {"ok": 2}
-    assert provider._deserialize_xcom_row(object, SimpleNamespace(value="{bad")) is None
-    assert provider._parse_status(StreamExecutionStatus.RUNNING) == StreamExecutionStatus.RUNNING
-    assert provider._parse_status("invalid_state") == StreamExecutionStatus.FAILED
-    assert provider._parse_status(99) == StreamExecutionStatus.FAILED
-    assert provider._parse_iso_utc(datetime(2026, 2, 1, 8, 0)) == datetime(
-        2026, 2, 1, 8, 0, tzinfo=timezone.utc
+    assert provider.get_last_timestamp("STUDY:01~A", "records/dm") == datetime(
+        2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc
     )
-    assert provider._parse_iso_utc("not-a-timestamp") is None
-    assert provider._parse_iso_utc(99) is None
-    assert provider._pull_ti_xcom_dict(
-        SimpleNamespace(xcom_pull=lambda **_kw: {"ok": 3}), "state_STUDY_X_csv"
-    ) == {"ok": 3}
+    assert provider.get_last_status("STUDY:01~A", "records/dm") == StreamExecutionStatus.RUNNING
+
+    # RUNNING -> RUNNING without force=True is rejected
+    with pytest.raises(InvalidStateTransitionError):
+        provider.set_last_timestamp(
+            "STUDY:01~A",
+            "records/dm",
+            ts_naive,
+            status=StreamExecutionStatus.RUNNING,
+            force=False,
+        )
+
+    # Complete RUNNING -> SUCCESS and add second stream + unrelated/malformed keys
+    ts_done = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    provider.set_last_timestamp(
+        "STUDY:01~A",
+        "records/dm",
+        ts_done,
+        status=StreamExecutionStatus.SUCCESS,
+        force=False,
+    )
+    provider.set_last_timestamp("STUDY-02", "queries", ts_done)
+    store["unrelated_prefix:foo:bar"] = "{}"
+    store["imednet_state:missing_stream_separator"] = "{}"
+    store["imednet_state:STUDY-BAD:broken_json"] = "{not-json"
+
+    state = provider.read_state()
+    assert set(state.studies) == {"STUDY:01~A", "STUDY-02"}
+    assert state.studies["STUDY:01~A"].streams["records/dm"].last_timestamp == ts_done
+
+    # Parsing resilience for non-string timestamp and unknown/enum status
+    assert AirflowStateProvider._parse_timestamp({"last_timestamp": 123}) is None
+    assert (
+        AirflowStateProvider._parse_status({"status": StreamExecutionStatus.PENDING})
+        == StreamExecutionStatus.PENDING
+    )
+    assert AirflowStateProvider._parse_status({"status": "corrupt"}) == StreamExecutionStatus.FAILED
+    assert AirflowStateProvider._parse_status({"status": 999}) == StreamExecutionStatus.FAILED
+    assert provider._parse_variable_key("other:study:stream") is None
+    assert provider._parse_variable_key("imednet_state:only_one_part") is None
+
+    # BaseException rollback during transaction preserves prior high-water mark
+    class SyntheticTimeout(BaseException):
+        pass
+
+    with pytest.raises(SyntheticTimeout):
+        with provider.transaction("STUDY-02", "queries") as tx:
+            tx["new_timestamp"] = datetime(2026, 6, 2, 0, 0, 0, tzinfo=timezone.utc)
+            raise SyntheticTimeout("timed out")
+
+    assert provider.get_last_status("STUDY-02", "queries") == StreamExecutionStatus.FAILED
+    assert provider.get_last_timestamp("STUDY-02", "queries") == ts_done
+
+    # Retry succeeds and advances checkpoint
+    retry_ts = datetime(2026, 6, 2, 1, 0, 0, tzinfo=timezone.utc)
+    with provider.transaction("STUDY-02", "queries") as tx:
+        tx["new_timestamp"] = retry_ts
+        tx["records_processed"] = 7
+    assert provider.get_last_status("STUDY-02", "queries") == StreamExecutionStatus.SUCCESS
+    assert provider.get_last_timestamp("STUDY-02", "queries") == retry_ts
+
+    # Delete specific stream, missing stream, and entire Study
+    assert provider.delete_entry("STUDY:01~A", "missing") is False
+    assert provider.delete_entry("STUDY:01~A", "records/dm") is True
+    assert provider.delete_entry("STUDY-02") is True
+    assert provider.delete_entry("STUDY-02") is False
 
 
-def test_airflow_state_provider_out_of_context_xcom_model_crud(tmp_path, monkeypatch) -> None:
-    """Verify out-of-context set, get, read_state, and delete_entry against Airflow 3 XComModel."""
+def test_airflow_state_provider_out_of_context_model_variable_crud(tmp_path, monkeypatch) -> None:
+    """Verify out-of-context set, get, read_state, and delete_entry against Airflow 3 Variable ORM."""
     import logging
 
     airflow_mod = sys.modules.get("airflow")
@@ -723,9 +802,7 @@ def test_airflow_state_provider_out_of_context_xcom_model_crud(tmp_path, monkeyp
     _ = airflow
     from airflow import settings
     from airflow.configuration import conf
-    from airflow.models.xcom import XComModel
     from airflow.utils.db import initdb
-    from airflow.utils.session import create_session
 
     from imednet_workflows.state_ledger import AirflowStateProvider
 
@@ -771,33 +848,13 @@ def test_airflow_state_provider_out_of_context_xcom_model_crud(tmp_path, monkeyp
             status="success",
         )
 
-        # Also insert a legacy-shaped XCom row without study_key/stream_name keys in payload
-        with create_session() as session:
-            provider._ensure_manual_task_instance(
-                session,
-                dag_id="manual_state_sync",
-                task_id="manual_state_sync",
-                run_id="manual__legacy",
-                logical_date=t1,
-            )
-            XComModel.set(
-                key="state_LEGACY_visits",
-                value={"last_timestamp": t1.isoformat(), "records_processed": 3},
-                dag_id="manual_state_sync",
-                task_id="manual_state_sync",
-                run_id="manual__legacy",
-                map_index=-1,
-                session=session,
-            )
-
         assert provider.get_last_timestamp("STUDY_DB", "records") == t1
         assert provider.get_last_status("STUDY_DB", "records") == StreamExecutionStatus.SUCCESS
 
         ledger = provider.read_state()
         assert "STUDY_DB" in ledger.studies
         assert ledger.studies["STUDY_DB"].streams["records"].records_processed == 25
-        assert "LEGACY" in ledger.studies
-        assert ledger.studies["LEGACY"].streams["visits"].records_processed == 3
+        assert ledger.studies["STUDY_DB"].streams["queries"].records_processed == 5
 
         # Delete single stream, then whole study, then non-existent study
         assert provider.delete_entry("STUDY_DB", "queries") is True
