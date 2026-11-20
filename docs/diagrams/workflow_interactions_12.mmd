@@ -1,11 +1,18 @@
 graph TD
-    accTitle: Continuous Delta Sync and FileLock Reconciliation Loop
-    accDescr: Flowchart showing run_forever acquiring a FileLock, performing delta record sync and hard-delete reconciliation, releasing the lock, and waiting until stopped
+    accTitle: Epoch-Fenced Delta Sync and SyncWorker Health Lifecycle
+    accDescr: Flowchart showing SyncWorker running lock-free remote delta and active-ID fetches, short FileLock epoch-stamped SQLite upserts and epoch-fenced orphan reconciliation, and transitioning across RUNNING, DEGRADED, FAILED, and STOPPED states
     A[run_forever] --> B{stop_event set?}
-    B -- No --> C[acquire FileLock]
-    C --> D[load_records / delta sync]
-    D --> E[reconcile hard-deletes]
-    E --> F[release FileLock]
-    F --> G[wait interval_seconds]
-    G --> B
-    B -- Yes --> H[log stopped]
+    B -- No --> C[_fetch_delta_records]
+    C --> D["FileLock: epoch _upsert_records"]
+    D --> E[_fetch_active_record_ids]
+    E --> F[_fetch_missing_records]
+    F --> G["FileLock: epoch reconcile_cache + watermark"]
+    G --> H{cycle succeeded?}
+    H -- Yes --> I[state = RUNNING]
+    I --> M[wait interval_seconds]
+    H -- No --> J{failure limit reached?}
+    J -- No --> K[state = DEGRADED]
+    K --> M
+    M --> B
+    J -- Yes --> L[state = FAILED]
+    B -- Yes --> N[state = STOPPED]

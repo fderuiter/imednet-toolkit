@@ -233,3 +233,93 @@ def test_airflow_set_last_timestamp_invalid_status(sdk_variable_store: dict[str,
             datetime.now(timezone.utc),
             status="unsupported_status",
         )
+
+
+def test_airflow_initial_failure_and_empty_run_keep_none_watermark(
+    sdk_variable_store: dict[str, Any],
+) -> None:
+    """Airflow provider keeps last_timestamp as None on failed or zero-record initial syncs."""
+    provider = AirflowStateProvider()
+    var_key = provider._get_variable_key("ST-INIT", "recs")
+
+    with pytest.raises(RuntimeError, match="initial airflow failure"):
+        with provider.transaction("ST-INIT", "recs") as tx:
+            assert tx["last_timestamp"] is None
+            running_payload = json.loads(sdk_variable_store[var_key])
+            assert running_payload["status"] == "running"
+            assert running_payload["last_timestamp"] is None
+            raise RuntimeError("initial airflow failure")
+
+    failed_payload = json.loads(sdk_variable_store[var_key])
+    assert failed_payload["status"] == "failed"
+    assert failed_payload["last_timestamp"] is None
+    assert provider.get_last_timestamp("ST-INIT", "recs") is None
+
+    # Subsequent retry that reads zero records commits status=success while keeping None watermark
+    with provider.transaction("ST-INIT", "recs") as retry_tx:
+        assert retry_tx["last_timestamp"] is None
+        retry_tx["records_processed"] = 0
+
+    success_payload = json.loads(sdk_variable_store[var_key])
+    assert success_payload["status"] == "success"
+    assert success_payload["last_timestamp"] is None
+    assert provider.get_last_timestamp("ST-INIT", "recs") is None
+    assert provider.read_state().studies["ST-INIT"].streams["recs"].last_timestamp is None
+
+
+def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
+    sdk_variable_store: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Airflow provider recovers expired/dead-PID RUNNING leases via FAILED -> RUNNING."""
+    import os
+    import socket
+    from datetime import timedelta
+
+    provider = AirflowStateProvider()
+    var_key = provider._get_variable_key("ST1", "recs")
+    pushed_statuses: list[str] = []
+    orig_write = provider._write_variable
+
+    def _tracking_write(key: str, payload: dict[str, Any]) -> None:
+        pushed_statuses.append(payload["status"])
+        orig_write(key, payload)
+
+    monkeypatch.setattr(provider, "_write_variable", _tracking_write)
+
+    # Active lease on current PID blocks concurrent transaction
+    sdk_variable_store[var_key] = json.dumps(
+        {
+            "study_key": "ST1",
+            "stream_name": "recs",
+            "last_timestamp": None,
+            "status": "running",
+            "owner_pid": os.getpid(),
+            "owner_host": socket.gethostname(),
+            "lease_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        }
+    )
+    with pytest.raises(InvalidStateTransitionError):
+        with provider.transaction("ST1", "recs"):
+            pass
+
+    # Expired remote lease transitions RUNNING -> FAILED -> RUNNING -> SUCCESS
+    sdk_variable_store[var_key] = json.dumps(
+        {
+            "study_key": "ST1",
+            "stream_name": "recs",
+            "last_timestamp": None,
+            "status": "running",
+            "owner_pid": 1,
+            "owner_host": "airflow-worker-dead-pod",
+            "lease_expires_at": (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+        }
+    )
+    committed = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+    with provider.transaction("ST1", "recs") as tx:
+        assert tx["last_timestamp"] is None
+        tx["new_timestamp"] = committed
+        tx["records_processed"] = 4
+
+    assert pushed_statuses == ["failed", "running", "success"]
+    assert provider.get_last_timestamp("ST1", "recs") == committed

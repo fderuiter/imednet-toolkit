@@ -576,6 +576,153 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
     assert state_payload["status"] == "failed"
 
 
+def test_initial_streaming_failure_and_empty_run_do_not_skip_historical_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failed or empty initial incremental syncs keep None watermarks across File and Airflow."""
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+
+    ledger_path = tmp_path / "initial_recovery.json"
+    ledger = ExtractionStateLedger(ledger_path=ledger_path)
+    historical_ts = "2020-01-15T08:00:00Z"
+
+    seen_file_calls: list[dict[str, Any]] = []
+
+    def _empty_records(**kwargs: Any) -> Iterator[Record]:
+        seen_file_calls.append(kwargs)
+        return iter(())
+
+    def _historical_records(**kwargs: Any) -> Iterator[Record]:
+        seen_file_calls.append(kwargs)
+        yield _make_record(1, date_modified=historical_ts)
+
+    sdk = MagicMock()
+    reads = [0]
+    cfg = SinkConfig(
+        study_key="STUDY-HIST",
+        batch_size=2,
+        incremental=True,
+        stream_name="records",
+        state_provider=ledger,
+    )
+
+    # 1. Empty initial sync keeps last_timestamp as None
+    sdk.records.list.side_effect = _empty_records
+    assert run_streaming_export(sdk, "STUDY-HIST", _CountingSink(cfg, reads), cfg) == 0
+    assert ledger.get_last_timestamp("STUDY-HIST", "records") is None
+    assert "dateModified" not in seen_file_calls[0]
+
+    # 2. Failed initial sync (before any watermark committed) keeps last_timestamp as None
+    sdk.records.list.side_effect = _historical_records
+    with pytest.raises(ExportBatchError, match="simulated batch failure"):
+        run_streaming_export(sdk, "STUDY-HIST", _CountingSink(cfg, reads, fail_on_batch=0), cfg)
+    assert ledger.get_last_timestamp("STUDY-HIST", "records") is None
+    assert "dateModified" not in seen_file_calls[1]
+
+    # 3. Retry succeeds and fetches historical 2020 record without dateModified filter
+    written = run_streaming_export(sdk, "STUDY-HIST", _CountingSink(cfg, reads), cfg)
+    assert written == 1
+    assert "dateModified" not in seen_file_calls[2]
+    assert ledger.get_last_timestamp("STUDY-HIST", "records") == datetime(
+        2020, 1, 15, 8, 0, tzinfo=timezone.utc
+    )
+
+    # 4. AirflowStateProvider initial failure also preserves None in Airflow Variables for retry
+    var_store: dict[str, str] = {}
+
+    class _FakeSdkVariable:
+        @staticmethod
+        def get(key: str, default: Any = None, deserialize_json: bool = False) -> Any:
+            if key not in var_store:
+                return default
+            raw = var_store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(
+            key: str,
+            value: Any,
+            description: str | None = None,
+            serialize_json: bool = False,
+        ) -> None:
+            _ = description
+            var_store[key] = json.dumps(value) if serialize_json else str(value)
+
+        @staticmethod
+        def delete(key: str) -> None:
+            var_store.pop(key, None)
+
+        @staticmethod
+        def keys(prefix: str | None = None) -> list[str]:
+            if prefix is None:
+                return sorted(var_store.keys())
+            return sorted(k for k in var_store if k.startswith(prefix))
+
+    airflow_mod = ModuleType("airflow")
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.Variable = _FakeSdkVariable  # type: ignore[attr-defined]
+    airflow_mod.sdk = sdk_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(__import__("sys").modules, "airflow", airflow_mod)
+    monkeypatch.setitem(__import__("sys").modules, "airflow.sdk", sdk_mod)
+    monkeypatch.delitem(__import__("sys").modules, "airflow.sdk.execution_time", raising=False)
+    monkeypatch.delitem(
+        __import__("sys").modules, "airflow.sdk.execution_time.task_runner", raising=False
+    )
+
+    af_provider = AirflowStateProvider()
+    seen_af_calls: list[dict[str, Any]] = []
+
+    def _af_records(**kwargs: Any) -> list[Record]:
+        seen_af_calls.append(kwargs)
+        return [_make_record(7, date_modified=historical_ts)]
+
+    sdk.records.list.side_effect = _af_records
+    sdk.sinks = SimpleNamespace(
+        MongoDbExportSink=lambda config: _CountingSink(config, reads, fail_on_batch=0),
+        MongoDbSinkConfig=MongoDbSinkConfig,
+    )
+    op_fail = ImednetExportOperator(
+        task_id="af_hist_fail",
+        study_key="STUDY-AF-HIST",
+        destination="mongodb",
+        incremental=True,
+        stream_name="mongo_hist",
+        state_provider=af_provider,
+        export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
+    )
+    monkeypatch.setattr(op_fail, "_get_sdk", lambda: sdk)
+    with pytest.raises(ExportBatchError):
+        op_fail.execute({})
+
+    af_hist_key = af_provider._get_variable_key("STUDY-AF-HIST", "mongo_hist")
+    failed_payload = json.loads(var_store[af_hist_key])
+    assert failed_payload["status"] == "failed"
+    assert failed_payload["last_timestamp"] is None
+    assert af_provider.get_last_timestamp("STUDY-AF-HIST", "mongo_hist") is None
+
+    sdk.sinks = SimpleNamespace(
+        MongoDbExportSink=lambda config: _CountingSink(config, reads),
+        MongoDbSinkConfig=MongoDbSinkConfig,
+    )
+    op_retry = ImednetExportOperator(
+        task_id="af_hist_retry",
+        study_key="STUDY-AF-HIST",
+        destination="mongodb",
+        incremental=True,
+        stream_name="mongo_hist",
+        state_provider=af_provider,
+        export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
+    )
+    monkeypatch.setattr(op_retry, "_get_sdk", lambda: sdk)
+    op_retry.execute({})
+
+    assert "dateModified" not in seen_af_calls[0]
+    assert "dateModified" not in seen_af_calls[1]
+    assert af_provider.get_last_timestamp("STUDY-AF-HIST", "mongo_hist") == datetime(
+        2020, 1, 15, 8, 0, tzinfo=timezone.utc
+    )
+
+
 # ---------------------------------------------------------------------------
 # 3. Voided (deleted=True) exclusion & include_deleted=True across workflows
 # ---------------------------------------------------------------------------
