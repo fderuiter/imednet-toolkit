@@ -330,14 +330,38 @@ def test_record_mapper_iter_dataframes_streams_lazily() -> None:
     assert [len(df) for df in remaining] == [2, 1]
     assert reads[0] == 5
 
-    # SDTM chunked streaming
+    # SDTM chunked streaming: single-subject group sorts & sequences continuously across chunks
     reads[0] = 0
     sdtm_frames = mapper.iter_sdtm_dataframes("STUDY-MAP", domain="AE")
     first_sdtm = next(sdtm_frames)
     assert len(first_sdtm) == 2
-    assert reads[0] == 2
+    assert list(first_sdtm["AESEQ"]) == [1, 2]
     rest_sdtm = list(sdtm_frames)
     assert sum(len(df) for df in rest_sdtm) == 3
+    assert [seq for df in rest_sdtm for seq in df["AESEQ"]] == [3, 4, 5]
+
+    # SDTM chunked streaming across ordered Subjects yields lazily with 1-record boundary lookahead
+    def _lazy_ordered_subjects(**kwargs: Any) -> Iterator[Record]:
+        assert kwargs.get("sort") == "subjectKey,asc;recordId,asc"
+        for idx in range(1, 6):
+            reads[0] += 1
+            yield _make_record(
+                idx,
+                subject_key=f"SUBJ-{idx:02d}",
+                form_key="AE",
+                record_data={"aeTerm": f"Headache {idx}", "aeSerious": "Yes"},
+            )
+
+    sdk.records.list.side_effect = _lazy_ordered_subjects
+    reads[0] = 0
+    ordered_sdtm_frames = mapper.iter_sdtm_dataframes("STUDY-MAP", domain="AE")
+    assert reads[0] == 0
+    first_ordered = next(ordered_sdtm_frames)
+    assert len(first_ordered) == 2
+    assert reads[0] == 3
+    rest_ordered = list(ordered_sdtm_frames)
+    assert [len(df) for df in rest_ordered] == [2, 1]
+    assert reads[0] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +495,17 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
     tmp_path: Path,
 ) -> None:
     """AirflowStateProvider passes dateModified filter, updates checkpoint, and rolls back on error."""
+    import logging
+    import sys
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith("airflow."):
+                sys.modules.pop(mod, None)
+
     pytest.importorskip("airflow")
     import airflow.settings
     from airflow.configuration import conf
@@ -479,10 +514,16 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
 
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
     db_url = f"sqlite:///{tmp_path / 'airflow_checkpoint.db'}"
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_settings_conn = airflow.settings.SQL_ALCHEMY_CONN
     conf.set("database", "sql_alchemy_conn", db_url)
     airflow.settings.SQL_ALCHEMY_CONN = db_url
+    airflow.settings.dispose_orm()
     airflow.settings.configure_orm()
     initdb()
 
@@ -558,9 +599,12 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
         assert state_payload["status"] == "failed"
     finally:
         airflow.settings.dispose_orm()
+        airflow.settings.SQL_ALCHEMY_CONN = prev_settings_conn
         if prev_conn:
             conf.set("database", "sql_alchemy_conn", prev_conn)
-            airflow.settings.SQL_ALCHEMY_CONN = prev_conn
+        airflow.settings.configure_orm()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
 
 
 def test_initial_streaming_failure_and_empty_run_do_not_skip_historical_records(
@@ -615,16 +659,33 @@ def test_initial_streaming_failure_and_empty_run_do_not_skip_historical_records(
     )
 
     # 4. AirflowStateProvider initial failure also preserves None in Airflow 3 Variable for retry
+    import logging
+    import sys
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith("airflow."):
+                sys.modules.pop(mod, None)
+
     pytest.importorskip("airflow")
     import airflow.settings
     from airflow.configuration import conf
     from airflow.models import Variable as OrmVariable
     from airflow.utils.db import initdb
 
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
     db_url = f"sqlite:///{tmp_path / 'airflow_hist_checkpoint.db'}"
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_settings_conn = airflow.settings.SQL_ALCHEMY_CONN
     conf.set("database", "sql_alchemy_conn", db_url)
     airflow.settings.SQL_ALCHEMY_CONN = db_url
+    airflow.settings.dispose_orm()
     airflow.settings.configure_orm()
     initdb()
 
@@ -693,9 +754,12 @@ def test_initial_streaming_failure_and_empty_run_do_not_skip_historical_records(
         )
     finally:
         airflow.settings.dispose_orm()
+        airflow.settings.SQL_ALCHEMY_CONN = prev_settings_conn
         if prev_conn:
             conf.set("database", "sql_alchemy_conn", prev_conn)
-            airflow.settings.SQL_ALCHEMY_CONN = prev_conn
+        airflow.settings.configure_orm()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
 
 
 # ---------------------------------------------------------------------------

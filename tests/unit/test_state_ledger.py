@@ -634,10 +634,12 @@ def test_cli_default_ledger_path_behavior() -> None:
 def test_airflow_state_provider_real_variable_ledger_parity(tmp_path: Path) -> None:
     """AirflowStateProvider persists, reads, and deletes Variable state on real Airflow 3."""
     import logging
+    from typing import Any as _Any
 
+    _ = _Any
     if (
         "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
     ):
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith("airflow."):
@@ -730,6 +732,7 @@ def test_airflow_state_provider_real_variable_ledger_parity(tmp_path: Path) -> N
 def test_airflow_state_provider_task_sdk_runtime_branch(monkeypatch: pytest.MonkeyPatch) -> None:
     """AirflowStateProvider routes through airflow.sdk.Variable when SUPERVISOR_COMMS is active."""
     from types import ModuleType, SimpleNamespace
+    from typing import Any
 
     from imednet_workflows.state_ledger import AirflowStateProvider
 

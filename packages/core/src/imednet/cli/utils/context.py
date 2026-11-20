@@ -42,7 +42,9 @@ def get_sdk() -> ImednetSDK:
     try:
         return ImednetSDK(config=config)
     except Exception as exc:  # pragma: no cover - defensive
-        print_error(f"Error initializing SDK: {exc}")
+        from ..decorators import redact_cli_secrets
+
+        print_error(f"Error initializing SDK: {redact_cli_secrets(str(exc))}")
         sys.exit(1)
 
 

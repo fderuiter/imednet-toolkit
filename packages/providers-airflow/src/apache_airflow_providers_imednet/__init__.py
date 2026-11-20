@@ -84,7 +84,7 @@ def get_provider_info() -> dict[str, Any]:
             {
                 "integration-name": "iMednet",
                 "external-doc-url": "https://fderuiter.github.io/imednet-toolkit/",
-                "tags": ["service"],
+                "tags": ["clinical", "edc", "imednet"],
             }
         ],
         "hooks": [

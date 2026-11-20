@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,10 +22,22 @@ from imednet_workflows.state_ledger import (
 @pytest.fixture(scope="module")
 def airflow_ledger_db(tmp_path_factory: pytest.TempPathFactory):
     """Configure an isolated SQLite Airflow 3 database when Airflow is installed."""
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+    ):
+        for _mod in list(sys.modules):
+            if _mod == "airflow" or _mod.startswith("airflow."):
+                sys.modules.pop(_mod, None)
+
     pytest.importorskip("airflow")
     import airflow.settings
     from airflow.configuration import conf
     from airflow.utils.db import initdb
+
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
 
     db_dir = tmp_path_factory.mktemp("state_ledger_providers_af")
     db_url = f"sqlite:///{db_dir / 'airflow.db'}"
@@ -32,6 +45,7 @@ def airflow_ledger_db(tmp_path_factory: pytest.TempPathFactory):
 
     conf.set("database", "sql_alchemy_conn", db_url)
     airflow.settings.SQL_ALCHEMY_CONN = db_url
+    airflow.settings.dispose_orm()
     airflow.settings.configure_orm()
     initdb()
 
@@ -41,6 +55,9 @@ def airflow_ledger_db(tmp_path_factory: pytest.TempPathFactory):
     if prev_conn:
         conf.set("database", "sql_alchemy_conn", prev_conn)
         airflow.settings.SQL_ALCHEMY_CONN = prev_conn
+    airflow.settings.configure_orm()
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
 
 
 @pytest.fixture

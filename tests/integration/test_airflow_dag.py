@@ -944,7 +944,7 @@ def test_export_operator_incremental_variable_checkpoints_across_runs(
         _build_record(1, date_modified="2026-04-01T10:00:00Z"),
         _build_record(2, date_modified="2026-04-02T15:30:00Z"),
     ]
-    sdk, seen_calls = _build_mock_sdk(run1_records)
+    sdk, _seen_calls = _build_mock_sdk(run1_records)
     monkeypatch.setattr(ImednetExportOperator, "_get_sdk", lambda self: sdk)
 
     op_run1 = ImednetExportOperator(

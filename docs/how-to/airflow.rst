@@ -48,13 +48,14 @@ Connections
 
 Create an Airflow connection ``imednet_default`` (connection type ``imednet``,
 registered via ``apache_airflow_providers_imednet:get_provider_info``) or override
-``imednet_conn_id``. ``ProvidersManager`` discovers
-``apache-airflow-providers-imednet`` and exposes the ``imednet`` connection type
-via ``ImednetHook`` with masked secret fields. Provide ``api_key`` and
-``security_key`` via the login/password fields or in ``extra`` JSON, and set
-``host`` (or ``base_url`` in ``extra``) for a non-standard environment. The hook
-merges these settings with values from ``imednet.config.load_config`` so
-environment variables still apply.
+``imednet_conn_id``.
+Provide ``api_key`` and ``security_key`` via the login/password fields or in the
+``extra`` JSON (both unprefixed keys and Airflow UI custom-field ``extra__imednet__*``
+keys are supported, with password-masked custom fields registered for ``api_key``,
+``security_key``, and ``oidc_token``). ``base_url`` may be set via the connection
+``host`` field or in ``extra`` for a non-standard environment. The hook merges
+these settings with values from ``imednet.config.load_config`` so environment
+variables still apply.
 
 For warehouse, graph, document, DuckDB, and transactional SQL exports, configure a
 separate Airflow connection and pass ``destination_conn_id`` on
@@ -62,15 +63,15 @@ separate Airflow connection and pass ``destination_conn_id`` on
 resolves destination credentials (Snowflake ``account``/``user``/``password``
 and coordinates, Neo4j ``uri``/``auth``/``database``, MongoDB ``uri`` and
 database settings, DuckDB ``db_path`` and ``table_name``, or SQLAlchemy
-connection URIs) at task execution time rather
-than embedding secrets in DAG definitions.
+connection URIs for ``sql``, ``sql_by_form``, and ``long_sql``) at task execution
+time rather than embedding secrets in DAG definitions.
 
 To prevent credential leakage in Airflow rendered task metadata and XComs,
-templated fields (``export_kwargs``, ``output_path``, ``modified_since``,
-``record_filter``, ``record_data_filter``, and ``stream_name``) reject raw
-secret keys (such as ``password``, ``auth``, ``api_key``, ``security_key``,
-``token``, or ``conn_str`` containing credentials) as well as URIs with embedded
-userinfo.
+templated fields (``study_key``, ``output_path``, ``export_kwargs``,
+``modified_since``, ``record_filter``, ``record_data_filter``, and ``stream_name``)
+reject raw secret keys (such as ``password``, ``auth``, ``api_key``,
+``security_key``, ``token``, or ``conn_str`` containing credentials) as well as
+URIs with embedded userinfo.
 
 For task-mapping discovery steps, ``ImednetHook`` provides explicit helper methods:
 
@@ -94,11 +95,9 @@ subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
 records to any supported destination (CSV, Parquet, Excel, JSON, DuckDB, SQL,
-``sql_by_form``, ``long_sql``, Snowflake, Neo4j, and MongoDB) using the core
-SDK's universal sink interface. When ``incremental=True`` is enabled,
-``ImednetExportOperator`` commits and reads high-water mark checkpoints via
-``AirflowStateProvider`` backed by Airflow 3 ``Variable`` JSON state. Common
-operational parameters (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
+``sql_by_form``, ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
+using the core SDK's universal sink interface. Common operational parameters
+(``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
 across plugin sinks and tabular exports without leaking sink-level options into
 Pandas or JSON writer kwargs. PHI masking is enabled by default
@@ -122,11 +121,17 @@ only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs`
 
 .. testcode::
 
+   from datetime import datetime
    from typing import Any
    from airflow.sdk import DAG, task
    from apache_airflow_providers_imednet import ImednetExportOperator, ImednetHook
 
-   with DAG(dag_id="imednet_dynamic_export"):
+   with DAG(
+       dag_id="imednet_dynamic_export",
+       start_date=datetime(2024, 1, 1),
+       schedule=None,
+       catchup=False,
+   ):
 
        @task
        def export_targets() -> list[dict[str, Any]]:
@@ -135,7 +140,7 @@ only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs`
                {
                    "study_key": study_key,
                    "output_path": f"/tmp/{study_key}.csv",
-                   "export_kwargs": {"index": False},
+                   "export_kwargs": {},
                }
                for study_key in hook.list_study_keys()
            ]

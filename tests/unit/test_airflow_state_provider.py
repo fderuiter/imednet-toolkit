@@ -9,13 +9,6 @@ from pathlib import Path
 
 import pytest
 
-if "airflow" not in sys.modules or getattr(sys.modules.get("airflow"), "__path__", None) is None:
-    for _mod in list(sys.modules):
-        if _mod == "airflow" or _mod.startswith("airflow."):
-            sys.modules.pop(_mod, None)
-
-pytest.importorskip("airflow")
-
 from imednet_workflows.state_ledger import (
     AirflowStateProvider,
     InvalidStateTransitionError,
@@ -28,6 +21,15 @@ from imednet_workflows.state_ledger import (
 @pytest.fixture(scope="module")
 def airflow_state_db(tmp_path_factory: pytest.TempPathFactory):
     """Initialize an isolated SQLite Airflow 3 metadata database for Variable checkpoints."""
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+    ):
+        for _mod in list(sys.modules):
+            if _mod == "airflow" or _mod.startswith("airflow."):
+                sys.modules.pop(_mod, None)
+
+    pytest.importorskip("airflow")
     import airflow.settings
     from airflow.configuration import conf
     from airflow.utils.db import initdb

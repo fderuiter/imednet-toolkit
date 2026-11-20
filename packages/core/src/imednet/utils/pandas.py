@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -20,15 +21,20 @@ from ..models.subjects import Subject
 from ..models.users import User
 from ..models.variables import Variable
 from ..models.visits import Visit
+from .batch_coordinator import DEFAULT_BATCH_CHUNK_SIZE, BatchSubmissionSummary
+from .job_poller import JobProgressHandler
 from .security import (
     _normalize_key,
     global_sensitivity_registry,
     mask_clinical_phi,
     sanitize_csv_formula,
 )
+from .tabular import MASKED_SENTINEL, csv_to_records, dataframe_rows_to_records
+from .typing import JsonDict
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
     from ..sdk import ImednetSDK
+    from ..validation.cache import ValidationSchemaProtocol
 
 
 def check_pandas(feature_name: str | None = None) -> None:
@@ -199,9 +205,65 @@ def records_to_dataframe(
                 if global_sensitivity_registry.is_sensitive(col_str) or _is_custom_phi_column(
                     col_str, phi_keys
                 ):
-                    record_df[col] = "***MASKED***"
+                    record_df[col] = MASKED_SENTINEL
         df = pd.concat([df.drop(columns=["record_data"]), record_df], axis=1)
     return df
+
+
+def dataframe_to_records(
+    df: pd.DataFrame,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+) -> list[JsonDict]:
+    """Convert a ``pandas.DataFrame`` into REST create-records payload dicts.
+
+    Strips read-only :class:`~imednet.models.records.Record` metadata columns,
+    maps snake_case and camelCase identifiers (``formKey``/``formId``,
+    ``subjectKey``/``subjectOid``/``subjectId``, ``siteName``/``siteId``,
+    ``intervalName``/``intervalId``), drops ``NaN`` and blank cells, coerces
+    integer-valued floats (``45.0 -> 45``), and raises
+    :class:`~imednet.errors.ValidationError` if any cell contains ``***MASKED***``.
+    """
+    check_pandas("dataframe_to_records")
+    return dataframe_rows_to_records(df, schema=schema)
+
+
+def import_records_csv(
+    sdk: ImednetSDK,
+    study_key: str,
+    file_path: str | os.PathLike[str],
+    *,
+    email_notify: bool | str | None = None,
+    schema: ValidationSchemaProtocol | None = None,
+    chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+    skip_validation: bool = False,
+    wait_for_completion: bool = False,
+    timeout: float = 300.0,
+    interval: float = 5.0,
+    on_progress: JobProgressHandler | None = None,
+    dry_run: bool = False,
+    collect_errors: bool = False,
+) -> BatchSubmissionSummary:
+    """Import records from a CSV file into ``study_key`` using stdlib CSV parsing.
+
+    Works in ``packages/core`` even when ``pandas`` is not installed. Rejects
+    ``***MASKED***`` sentinels before any HTTP request is sent.
+    """
+    records = csv_to_records(file_path, schema=schema)
+    return sdk.records.create_batch(
+        study_key,
+        records,
+        email_notify=email_notify,
+        schema=schema,
+        chunk_size=chunk_size,
+        skip_validation=skip_validation,
+        wait_for_completion=wait_for_completion,
+        timeout=timeout,
+        interval=interval,
+        on_progress=on_progress,
+        dry_run=dry_run,
+        collect_errors=collect_errors,
+    )
 
 
 def export_records_csv(
@@ -245,3 +307,22 @@ def export_records_csv(
     df = df.map(sanitize_csv_formula)
 
     df.to_csv(file_path, index=False)
+
+
+__all__ = [
+    "MASKED_SENTINEL",
+    "check_pandas",
+    "csv_to_records",
+    "dataframe_to_records",
+    "export_records_csv",
+    "forms_to_dataframe",
+    "import_records_csv",
+    "intervals_to_dataframe",
+    "queries_to_dataframe",
+    "records_to_dataframe",
+    "sites_to_dataframe",
+    "subjects_to_dataframe",
+    "users_to_dataframe",
+    "variables_to_dataframe",
+    "visits_to_dataframe",
+]

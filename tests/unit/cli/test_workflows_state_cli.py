@@ -297,6 +297,148 @@ class TestResetState:
 
         assert result.exit_code == 1
         assert "Failed to reset ledger state" in result.output
+        assert result.stdout == ""
+        assert "Failed to reset ledger state" in result.stderr
+
+
+class TestHeadlessStateRecoveryAndContracts:
+    """Verify headless state recovery, stderr diagnostics, and interrupt exit codes."""
+
+    @pytest.mark.parametrize("initial_status", ["failed", "pending"])
+    def test_headless_state_set_recovers_failed_and_pending_streams(
+        self, runner: CliRunner, tmp_path, initial_status: str
+    ) -> None:
+        """Headless workflows state set --force recovers failed and pending streams to success."""
+        from imednet.cli import app as main_app
+        from imednet_workflows.state_ledger import FileStateProvider, InvalidStateTransitionError
+
+        ledger_path = tmp_path / "ledger.json"
+        provider = FileStateProvider(ledger_path)
+        ts_old = datetime(2026, 5, 20, 8, 0, 0, tzinfo=timezone.utc)
+        ts_new = "2026-05-22T12:00:00Z"
+
+        provider.set_last_timestamp(
+            study_key="STUDY-REC",
+            stream_name="records",
+            timestamp=ts_old,
+            records_processed=5,
+            status=initial_status,  # type: ignore[arg-type]
+            error_message="boom" if initial_status == "failed" else None,
+            force=True,
+        )
+
+        # Programmatic non-forced update must still enforce strict transition matrix
+        with pytest.raises(InvalidStateTransitionError):
+            provider.set_last_timestamp(
+                study_key="STUDY-REC",
+                stream_name="records",
+                timestamp=datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc),
+                status="success",
+                force=False,
+            )
+
+        # Non-forced CLI set routes diagnostic to stderr and exits 1
+        rejected = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY-REC",
+                "--stream",
+                "records",
+                "--timestamp",
+                ts_new,
+                "--records-processed",
+                "12",
+                "--ledger-path",
+                str(ledger_path),
+            ],
+        )
+        assert rejected.exit_code == 1
+        assert rejected.stdout == ""
+        assert "Failed to write ledger" in rejected.stderr
+
+        # Headless CLI recovery via top-level workflows state set --force succeeds with exit code 0
+        result = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY-REC",
+                "--stream",
+                "records",
+                "--timestamp",
+                ts_new,
+                "--records-processed",
+                "12",
+                "--ledger-path",
+                str(ledger_path),
+                "--force",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Successfully set high-water mark" in result.stdout
+        assert result.stderr == ""
+
+        updated = provider.read_state().studies["STUDY-REC"].streams["records"]
+        assert updated.last_run_status == "success"
+        assert updated.records_processed == 12
+        assert updated.error_message is None
+
+    def test_state_diagnostics_route_exclusively_to_stderr(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        """State command errors write only to stderr in both main app and state_app."""
+        from imednet.cli import app as main_app
+
+        ledger_path = str(tmp_path / "ledger.json")
+
+        res_bad_ts = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "-s",
+                "S1",
+                "-m",
+                "records",
+                "-t",
+                "invalid-ts",
+                "-l",
+                ledger_path,
+            ],
+        )
+        assert res_bad_ts.exit_code == 1
+        assert res_bad_ts.stdout == ""
+        assert "Invalid ISO timestamp format" in res_bad_ts.stderr
+
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.side_effect = OSError("corrupt ledger")
+            res_show = runner.invoke(main_app, ["workflows", "state", "show", "-l", ledger_path])
+        assert res_show.exit_code == 1
+        assert res_show.stdout == ""
+        assert "Failed to read ledger" in res_show.stderr
+
+    def test_state_commands_keyboard_interrupt_exits_130(self, runner: CliRunner, tmp_path) -> None:
+        """Ctrl+C in state_app and workflows state exits 130 with Aborted by user. on stderr."""
+        from imednet.cli import app as main_app
+
+        ledger_path = str(tmp_path / "ledger.json")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.side_effect = KeyboardInterrupt()
+            res_standalone = runner.invoke(state_app, ["show", "-l", ledger_path])
+            res_main = runner.invoke(main_app, ["workflows", "state", "show", "-l", ledger_path])
+
+        for res in (res_standalone, res_main):
+            assert res.exit_code == 130
+            assert res.stdout == ""
+            assert "Aborted by user." in res.stderr
+            assert "Traceback" not in res.stderr
 
 
 class _InteractiveStringIO:
@@ -601,3 +743,113 @@ def test_set_state_force_flag_overrides_stuck_stream(runner: CliRunner, tmp_path
         2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc
     )
     assert ledger.get_last_status("STUDY-STUCK", "records") == StreamExecutionStatus.SUCCESS
+
+
+@pytest.mark.parametrize("initial_status", ["failed", "pending"])
+def test_headless_state_set_recovers_airflow_variable_streams(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_status: str,
+) -> None:
+    """Headless workflows state set --force recovers failed/pending Airflow 3 Variable checkpoints."""
+    import logging
+    import sys
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith("airflow."):
+                sys.modules.pop(mod, None)
+
+    pytest.importorskip("airflow")
+    import airflow.settings
+    from airflow.configuration import conf
+    from airflow.utils.db import initdb
+
+    from imednet.cli import app as main_app
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
+    db_url = f"sqlite:///{tmp_path / f'airflow_cli_{initial_status}.db'}"
+    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_settings_conn = airflow.settings.SQL_ALCHEMY_CONN
+    conf.set("database", "sql_alchemy_conn", db_url)
+    airflow.settings.SQL_ALCHEMY_CONN = db_url
+    airflow.settings.dispose_orm()
+    airflow.settings.configure_orm()
+    initdb()
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+    monkeypatch.delenv("AIRFLOW_CTX_TASK_ID", raising=False)
+
+    try:
+        provider = AirflowStateProvider()
+        provider.set_last_timestamp(
+            study_key="STUDY-AF-CLI",
+            stream_name="records",
+            timestamp=datetime(2026, 5, 20, 8, 0, 0, tzinfo=timezone.utc),
+            records_processed=5,
+            status=initial_status,  # type: ignore[arg-type]
+            error_message="worker crash" if initial_status == "failed" else None,
+            force=True,
+        )
+
+        # Non-forced CLI set rejects invalid transition on stderr with exit code 1
+        rejected = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY-AF-CLI",
+                "--stream",
+                "records",
+                "--timestamp",
+                "2026-05-22T12:00:00Z",
+                "--records-processed",
+                "12",
+            ],
+        )
+        assert rejected.exit_code == 1
+        assert rejected.stdout == ""
+        assert "Failed to write ledger" in rejected.stderr
+
+        # Forced CLI set recovers Airflow Variable state to success and clears error_message
+        recovered = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY-AF-CLI",
+                "--stream",
+                "records",
+                "--timestamp",
+                "2026-05-22T12:00:00Z",
+                "--records-processed",
+                "12",
+                "--force",
+            ],
+        )
+        assert recovered.exit_code == 0
+        assert "Successfully set high-water mark" in recovered.stdout
+        assert recovered.stderr == ""
+        assert provider.get_last_status("STUDY-AF-CLI", "records") == StreamExecutionStatus.SUCCESS
+        updated = provider.read_state().studies["STUDY-AF-CLI"].streams["records"]
+        assert updated.records_processed == 12
+        assert updated.error_message is None
+    finally:
+        airflow.settings.dispose_orm()
+        airflow.settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if prev_conn is not None:
+            conf.set("database", "sql_alchemy_conn", prev_conn)
+        airflow.settings.configure_orm()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)

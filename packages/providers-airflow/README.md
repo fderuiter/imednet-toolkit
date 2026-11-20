@@ -25,7 +25,7 @@ pip install ./packages/providers-airflow
 ```
 
 **Required Dependencies:**
-This package requires `imednet`, `imednet-workflows` (for incremental `Variable` checkpointing), and `apache-airflow>=3.2.0,<4.0.0`.
+This package requires `imednet`, `imednet-workflows` (for incremental Airflow `Variable` checkpointing), and `apache-airflow>=3.2.0,<4.0.0`.
 
 **Build Targets (Hatchling):**
 This package uses Hatchling as its build backend, targeting the `src/apache_airflow_providers_imednet` package directory and registering the `apache_airflow_provider` discovery entry point in `pyproject.toml`.
@@ -92,12 +92,11 @@ def my_task_logic() -> None:
 
 ## Features
 
-- **Provider & Connection Discovery**: Registers `apache-airflow-providers-imednet` via `get_provider_info()` and exposes the `imednet` connection type through `ImednetHook`, resolving authorization keys/secrets and auto-masking sensitive values (`api_key`, `security_key`, `oidc_token`, `token`) as `***`.
-- **Dynamic Task Mapping & Templating**: Supports Airflow dynamic task mapping (`study_key`, `output_path`, `export_kwargs`) and Jinja-templated watermark/filter attributes (`modified_since`, `record_filter`, `record_data_filter`, `stream_name`).
-- **Incremental Variable Checkpoints**: Persists and reads incremental high-water mark state through Airflow 3 `Variable` JSON checkpoints when `incremental=True`.
+- **Connection Hook Management**: Secures connection variables via `ImednetHook`, resolving authorization keys/secrets and auto-masking sensitive values (`api_key`, `security_key`, `token`) as `***` during serialization.
+- **Dynamic Task Mapping & Templating**: Supports Airflow standard task mapping via `mapped_runtime_fields` (`study_key`, `output_path`, `export_kwargs`) and Jinja-templated filter/checkpoint fields (`modified_since`, `record_filter`, `record_data_filter`, `stream_name`).
 - **Lazy Database Ingestion**: Uses dynamic resolution to lazily import database drivers (such as `imednet_sinks`) during execution.
 - **State Polling Sensor**: `ImednetJobSensor` monitors asynchronous platform processes with robust exception handling and state polling.
-- **Flexible Tabular & SQL Exporters**: Exposes tabular serialization adapters for CSV, Parquet, Excel, JSON, DuckDB, `sql`, `sql_by_form`, and `long_sql` formats.
+- **Flexible Tabular Exporters**: Exposes tabular serialization adapters for CSV, Parquet, Excel, JSON, DuckDB, and SQL (`sql`, `sql_by_form`, `long_sql`) formats.
 
 ## Component Description Table
 

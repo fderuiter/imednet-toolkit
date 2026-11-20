@@ -364,6 +364,34 @@ class ImednetHook(BaseHook):
             return extras_dict[key]
         return extras_dict.get(f"extra__{self.conn_type}__{key}")
 
+    @classmethod
+    def _host_base_url(cls, conn: object) -> str | None:
+        """Normalize ``conn.host`` (plus optional scheme/port/path) into an HTTP(S) base URL."""
+        host = cls._string_or_none(getattr(conn, "host", None))
+        if host is None:
+            return None
+        if host.lower().startswith(("http://", "https://")):
+            return host.rstrip("/")
+
+        raw_schema = cls._string_or_none(getattr(conn, "schema", None))
+        raw_conn_type = cls._string_or_none(getattr(conn, "conn_type", None))
+        if raw_schema and raw_schema.lower() in {"http", "https"}:
+            scheme = raw_schema.lower()
+            path_part = ""
+        else:
+            scheme = "http" if (raw_conn_type and raw_conn_type.lower() == "http") else "https"
+            path_part = f"/{raw_schema.strip('/')}" if raw_schema and raw_schema.strip("/") else ""
+
+        port = cls._port_or_none(getattr(conn, "port", None))
+        host_part = host.rstrip("/")
+        if port is not None and ":" not in host_part.split("/", 1)[0]:
+            if "/" in host_part:
+                netloc, subpath = host_part.split("/", 1)
+                host_part = f"{netloc}:{port}/{subpath}"
+            else:
+                host_part = f"{host_part}:{port}"
+        return f"{scheme}://{host_part}{path_part}"
+
     def _resolved_config(self) -> Config:
         """Resolve hook configuration from Airflow connection fields and env fallback."""
         conn = self._get_airflow_connection(self.imednet_conn_id)
@@ -375,7 +403,7 @@ class ImednetHook(BaseHook):
             security_key=self._string_or_none(self._extra_value(extras_dict, "security_key"))
             or self._string_or_none(getattr(conn, "password", None)),
             base_url=self._string_or_none(self._extra_value(extras_dict, "base_url"))
-            or self._string_or_none(getattr(conn, "host", None)),
+            or self._host_base_url(conn),
             oidc_token=self._string_or_none(self._extra_value(extras_dict, "oidc_token")),
             timeout=self._float_or_none(self._extra_value(extras_dict, "timeout")),
             strict_mode=self._bool_or_none(self._extra_value(extras_dict, "strict_mode")),

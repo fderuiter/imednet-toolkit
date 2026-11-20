@@ -152,36 +152,8 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
         "output_path",
         "export_kwargs",
     )
-    assert ImednetExportOperator.template_fields == (
-        *ImednetExportOperator.mapped_runtime_fields,
-        "modified_since",
-        "record_filter",
-        "record_data_filter",
-        "stream_name",
-    )
+    assert ImednetExportOperator.template_fields[:3] == ImednetExportOperator.mapped_runtime_fields
     assert ImednetExportOperator.template_fields_renderers == {"export_kwargs": "json"}
-
-
-def test_export_operator_rejects_secrets_in_templated_filter_fields(monkeypatch):
-    """Templated filter and watermark fields reject secret keys and embedded URI credentials."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
-
-    _setup_airflow(monkeypatch)
-
-    from apache_airflow_providers_imednet import ImednetExportOperator
-    from apache_airflow_providers_imednet._airflow_compat import AirflowException
-
-    with pytest.raises(AirflowException, match="record_filter"):
-        ImednetExportOperator(
-            task_id="t_secret_filter",
-            study_key="S",
-            record_filter={"password": "leaked"},  # pragma: allowlist secret
-        )
-
-    op = ImednetExportOperator(task_id="t_secret_stream", study_key="S")
-    with pytest.raises(AirflowException, match="stream_name"):
-        op.stream_name = "postgresql://user:pass@db.example/prod"  # pragma: allowlist secret
 
 
 def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monkeypatch):
@@ -1017,3 +989,33 @@ def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monk
     with pytest.raises(Exception, match="Network request failed"):
         hook.list_studies_metadata()
     assert sdk_list_err._client._client.is_closed
+
+
+def test_export_operator_rejects_secrets_in_templated_filter_fields(monkeypatch):
+    """Templated filter and watermark fields reject secret keys and embedded URI credentials."""
+    if "apache_airflow_providers_imednet" in sys.modules:
+        del sys.modules["apache_airflow_providers_imednet"]
+
+    _setup_airflow(monkeypatch)
+
+    from apache_airflow_providers_imednet import ImednetExportOperator
+    from apache_airflow_providers_imednet._airflow_compat import AirflowException
+
+    assert ImednetExportOperator.template_fields == (
+        *ImednetExportOperator.mapped_runtime_fields,
+        "modified_since",
+        "record_filter",
+        "record_data_filter",
+        "stream_name",
+    )
+
+    with pytest.raises(AirflowException, match="record_filter"):
+        ImednetExportOperator(
+            task_id="t_secret_filter",
+            study_key="S",
+            record_filter={"password": "leaked"},  # pragma: allowlist secret
+        )
+
+    op = ImednetExportOperator(task_id="t_secret_stream", study_key="S")
+    with pytest.raises(AirflowException, match="stream_name"):
+        op.stream_name = "postgresql://user:pass@db.example/prod"  # pragma: allowlist secret

@@ -42,6 +42,7 @@ def _cleanup_airflow_provider_modules():
         for mod in list(sys.modules):
             if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
                 sys.modules.pop(mod, None)
+
     yield
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
@@ -296,7 +297,10 @@ def test_real_airflow_providers_manager_registers_imednet_connection_and_masks_s
 ):
     """Verify Airflow 3 ProvidersManager discovers apache-airflow-providers-imednet and masks secrets."""
     import warnings
+    from pathlib import Path
 
+    import airflow
+    import jsonschema
     from airflow.providers_manager import ProvidersManager
     from airflow.sdk.bases.operator import BaseOperator as SdkBaseOperator
     from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
@@ -308,6 +312,10 @@ def test_real_airflow_providers_manager_registers_imednet_connection_and_masks_s
     base_hook_cls = real_airflow["BaseHook"]
 
     info = provider_pkg.get_provider_info()
+    schema_path = Path(airflow.__file__).resolve().parent / "provider_info.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    jsonschema.validate(instance=info, schema=schema)
+
     assert info["package-name"] == "apache-airflow-providers-imednet"
     assert hook_cls.conn_name_attr == "imednet_conn_id"
     assert hook_cls.default_conn_name == "imednet_default"
@@ -364,6 +372,28 @@ def test_real_airflow_providers_manager_registers_imednet_connection_and_masks_s
     assert sdk_client.config.api_key == "ui-api-key"  # pragma: allowlist secret
     assert sdk_client.config.security_key == "ui-sec-key"  # pragma: allowlist secret
     assert str(sdk_client.config.base_url).rstrip("/") == "https://ui.synthetic.example/api"
+
+    from airflow.models.connection import Connection as OrmConnection
+
+    http_uri_conn = OrmConnection(
+        conn_id="imednet_http_uri",
+        uri="http://mock:mock@localhost:8080/api",  # pragma: allowlist secret
+    )
+    monkeypatch.setattr(
+        base_hook_cls, "get_connection", classmethod(lambda cls, cid: http_uri_conn)
+    )
+    http_sdk = managed_sdk(hook_cls("imednet_http_uri").get_conn())
+    assert str(http_sdk.config.base_url).rstrip("/") == "http://localhost:8080/api"
+
+    imednet_uri_conn = OrmConnection(
+        conn_id="imednet_scheme_uri",
+        uri="imednet://mock:mock@edc.prod.imednetapi.com",  # pragma: allowlist secret
+    )
+    monkeypatch.setattr(
+        base_hook_cls, "get_connection", classmethod(lambda cls, cid: imednet_uri_conn)
+    )
+    imednet_sdk = managed_sdk(hook_cls("imednet_scheme_uri").get_conn())
+    assert str(imednet_sdk.config.base_url).rstrip("/") == "https://edc.prod.imednetapi.com"
 
     # Verify ImednetExportOperator inherits from Airflow 3 Task SDK BaseOperator
     assert issubclass(operator_cls, SdkBaseOperator)

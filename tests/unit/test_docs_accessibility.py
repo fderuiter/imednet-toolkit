@@ -211,6 +211,20 @@ def test_vpat_document_conformance() -> None:
         key = binding[0] if isinstance(binding, tuple) else binding.key
         assert f"``{key}``" in vpat_content, f"TUI binding '{key}' missing from VPAT.rst"
 
+    for token in (
+        "Left",
+        "Right",
+        "``h``",
+        "``l``",
+        "``[``",
+        "``]``",
+        "``{``",
+        "``}``",
+        "--no-interactive",
+        "imednet tui --no-interactive",
+    ):
+        assert token in vpat_content, f"Expected '{token}' in docs/reference/VPAT.rst"
+
 
 @pytest.mark.unit
 def test_cli_and_plugins_docs_tui_accessibility_coverage() -> None:
@@ -218,10 +232,20 @@ def test_cli_and_plugins_docs_tui_accessibility_coverage() -> None:
     cli_rst = (REPO_ROOT / "docs/how-to/cli.rst").read_text(encoding="utf-8")
     for token in (
         "imednet tui",
+        "imednet tui --no-interactive",
+        "--no-interactive",
         "--high-contrast",
         "InteractiveDataGrid",
         "IMEDNET_NON_INTERACTIVE=1",
         "--interactive",
+        "Left",
+        "Right",
+        "``h``",
+        "``l``",
+        "``[``",
+        "``]``",
+        "``{``",
+        "``}``",
     ):
         assert token in cli_rst, f"Expected '{token}' in docs/how-to/cli.rst"
 
@@ -229,6 +253,166 @@ def test_cli_and_plugins_docs_tui_accessibility_coverage() -> None:
     assert "/reference/api/plugins-tui" in plugins_rst
     assert "imednet.cli_plugins" in plugins_rst
     assert 'tui = "imednet_tui.cli:setup_parser"' in plugins_rst
+
+
+_TERMINAL_PALETTES: dict[str, dict[str, dict[str, str]]] = {
+    "XTerm": {
+        "dark": {
+            "fg": "#E5E5E5",
+            "bg": "#000000",
+            "0": "#000000",
+            "7": "#E5E5E5",
+            "8": "#7F7F7F",
+            "15": "#FFFFFF",
+        },
+        "light": {
+            "fg": "#000000",
+            "bg": "#FFFFFF",
+            "0": "#000000",
+            "7": "#E5E5E5",
+            "8": "#7F7F7F",
+            "15": "#FFFFFF",
+        },
+    },
+    "VGA": {
+        "dark": {
+            "fg": "#AAAAAA",
+            "bg": "#000000",
+            "0": "#000000",
+            "7": "#AAAAAA",
+            "8": "#555555",
+            "15": "#FFFFFF",
+        },
+        "light": {
+            "fg": "#000000",
+            "bg": "#FFFFFF",
+            "0": "#000000",
+            "7": "#AAAAAA",
+            "8": "#555555",
+            "15": "#FFFFFF",
+        },
+    },
+    "Windows_Campbell": {
+        "dark": {
+            "fg": "#CCCCCC",
+            "bg": "#0C0C0C",
+            "0": "#0C0C0C",
+            "7": "#CCCCCC",
+            "8": "#767676",
+            "15": "#F2F2F2",
+        },
+        "light": {
+            "fg": "#0C0C0C",
+            "bg": "#FFFFFF",
+            "0": "#0C0C0C",
+            "7": "#CCCCCC",
+            "8": "#767676",
+            "15": "#F2F2F2",
+        },
+    },
+    "GNOME_Tango": {
+        "dark": {
+            "fg": "#D3D7CF",
+            "bg": "#2E3436",
+            "0": "#2E3436",
+            "7": "#D3D7CF",
+            "8": "#555753",
+            "15": "#EEEEEC",
+        },
+        "light": {
+            "fg": "#2E3436",
+            "bg": "#FFFFFF",
+            "0": "#2E3436",
+            "7": "#D3D7CF",
+            "8": "#555753",
+            "15": "#EEEEEC",
+        },
+    },
+    "VSCode_Integrated": {
+        "dark": {
+            "fg": "#CCCCCC",
+            "bg": "#1E1E1E",
+            "0": "#000000",
+            "7": "#E5E5E5",
+            "8": "#666666",
+            "15": "#E5E5E5",
+        },
+        "light": {
+            "fg": "#333333",
+            "bg": "#FFFFFF",
+            "0": "#000000",
+            "7": "#555555",
+            "8": "#666666",
+            "15": "#A5A5A5",
+        },
+    },
+}
+
+
+def _resolve_sgr_colors(rendered: str, palette: dict[str, str]) -> tuple[str, str]:
+    """Resolve effective foreground and background hex colors from an ANSI SGR-wrapped string."""
+    match = re.match(r"^\x1b\[([0-9;]*)m", rendered)
+    assert match is not None, f"Expected leading ANSI SGR sequence in {rendered!r}"
+    params = [int(p) for p in match.group(1).split(";") if p]
+    fg_hex = palette["fg"]
+    bg_hex = palette["bg"]
+    idx = 0
+    while idx < len(params):
+        code = params[idx]
+        if code == 38 and idx + 4 < len(params) and params[idx + 1] == 2:
+            r, g, b = params[idx + 2], params[idx + 3], params[idx + 4]
+            fg_hex = f"#{r:02X}{g:02X}{b:02X}"
+            idx += 5
+            continue
+        if code == 48 and idx + 4 < len(params) and params[idx + 1] == 2:
+            r, g, b = params[idx + 2], params[idx + 3], params[idx + 4]
+            bg_hex = f"#{r:02X}{g:02X}{b:02X}"
+            idx += 5
+            continue
+        if 30 <= code <= 37:
+            fg_hex = palette[str(code - 30)]
+        elif 90 <= code <= 97:
+            fg_hex = palette[str(code - 90 + 8)]
+        elif 40 <= code <= 47:
+            bg_hex = palette[str(code - 40)]
+        elif 100 <= code <= 107:
+            bg_hex = palette[str(code - 100 + 8)]
+        idx += 1
+    return fg_hex, bg_hex
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "palette_name",
+    ["XTerm", "VGA", "Windows_Campbell", "GNOME_Tango", "VSCode_Integrated"],
+)
+@pytest.mark.parametrize("theme_mode", ["light", "dark"])
+@pytest.mark.parametrize("term_value", ["xterm-256color", "xterm-16color"])
+def test_cli_high_contrast_status_badges_meet_wcag_aaa_across_terminal_palettes(
+    monkeypatch: pytest.MonkeyPatch,
+    palette_name: str,
+    theme_mode: str,
+    term_value: str,
+) -> None:
+    """Verify >= 7:1 contrast for all high-contrast status tokens across light and dark terminal palettes."""
+    from imednet.cli.utils.output import _HC_STATUS_COLOR_MAP, _colorize
+
+    palette = _TERMINAL_PALETTES[palette_name][theme_mode]
+    monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
+    monkeypatch.setenv("TERM", term_value)
+    monkeypatch.delenv("COLORTERM", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr("imednet.cli.utils.output.supports_ansi_color", lambda _stream=None: True)
+
+    assert _HC_STATUS_COLOR_MAP, "Expected non-empty _HC_STATUS_COLOR_MAP"
+    for status_token, color_key in _HC_STATUS_COLOR_MAP.items():
+        rendered = _colorize(status_token.upper(), color_key)
+        fg_hex, bg_hex = _resolve_sgr_colors(rendered, palette)
+        ratio = contrast_ratio(fg_hex, bg_hex)
+        assert ratio >= 7.0, (
+            f"High-contrast token {status_token!r} ({color_key}) on {palette_name} ({theme_mode}, "
+            f"TERM={term_value}) rendered {fg_hex} on {bg_hex} with {ratio:.2f}:1 (< 7.0:1)"
+        )
 
 
 @pytest.mark.unit
