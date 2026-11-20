@@ -15,14 +15,18 @@ dependencies = [
 repository = "https://github.com/fderuiter/imednet-toolkit"
 documentation = "https://fderuiter.github.io/imednet-toolkit/"
 
+[project.entry-points."apache_airflow_provider"]
+provider_info = "apache_airflow_providers_imednet.get_provider_info:get_provider_info"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/apache_airflow_providers_imednet"]
+packages = ["src/apache_airflow_providers_imednet", "src/airflow"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/src/apache_airflow_providers_imednet"
+    "/src/apache_airflow_providers_imednet",
+    "/src/airflow"
 ]

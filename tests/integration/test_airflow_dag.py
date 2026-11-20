@@ -1,10 +1,20 @@
 """Unit tests for airflow dag."""
 
+import sys
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_modules_for_real_airflow():
+    """Clear cached provider modules if an earlier unit test reloaded them against dummy stubs."""
+    for mod in list(sys.modules):
+        if mod.startswith("apache_airflow_providers_imednet"):
+            sys.modules.pop(mod, None)
+    yield
 
 
 def test_dag_runs(monkeypatch, tmp_path):
@@ -53,3 +63,40 @@ def test_dag_runs(monkeypatch, tmp_path):
         body = f.read()
     assert "id" in body
     assert "id" in body
+
+
+def test_job_sensor_fails_in_dag_when_result_url_has_failed_records(monkeypatch):
+    """ImednetJobSensor raises AirflowException when terminal Job resultUrl reports failed Records."""
+    pytest.importorskip("airflow")
+    import httpx
+    from airflow.exceptions import AirflowException
+
+    from apache_airflow_providers_imednet import ImednetJobSensor
+    from imednet import ImednetSDK
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/jobs/BATCH_BAD"):
+            return httpx.Response(
+                200,
+                json={
+                    "batchId": "BATCH_BAD",
+                    "state": "COMPLETED",
+                    "resultUrl": "https://edc.trn.imednetapi.com/results/BATCH_BAD.json",
+                },
+            )
+        return httpx.Response(
+            200,
+            json=[{"recordKey": "SUBJ-001-1", "status": "FAILED", "error": "Form locked"}],
+        )
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://edc.trn.imednetapi.com",
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr(ImednetJobSensor, "_get_sdk", lambda self: sdk)
+
+    sensor = ImednetJobSensor(task_id="wait_bad_batch", study_key="STUDY_A", batch_id="BATCH_BAD")
+    with pytest.raises(AirflowException, match="Form locked"):
+        sensor.poke(context={})

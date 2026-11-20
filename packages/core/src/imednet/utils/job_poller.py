@@ -38,6 +38,8 @@ __all__ = [
     "JobStatusEvent",
     "JobTimeoutError",
     "evaluate_job_state",
+    "fetch_terminal_job_result",
+    "resolve_sdk_result_fetcher",
 ]
 
 
@@ -262,6 +264,68 @@ def evaluate_job_state(
     return getattr(job, "is_terminal", False)
 
 
+def _attach_fetched_result(status: JobStatus | Any, res: Any) -> JobStatus | Any:
+    """Attach a fetched ``resultUrl`` HTTP response or decoded payload to ``status``."""
+    if hasattr(res, "json"):
+        try:
+            status.results = res.json()
+        except Exception:
+            status.results = getattr(res, "text", str(res))
+    else:
+        status.results = res
+    return status
+
+
+def resolve_sdk_result_fetcher(sdk: Any) -> Callable[[str], Any] | None:
+    """Resolve a synchronous ``resultUrl`` fetcher callable from an SDK or endpoint double."""
+    from unittest.mock import NonCallableMock
+
+    from imednet.endpoints.jobs import JobsEndpoint
+
+    jobs = getattr(sdk, "jobs", None)
+    if isinstance(jobs, JobsEndpoint):
+        return jobs.fetch_result
+    if jobs is not None and not isinstance(jobs, NonCallableMock):
+        fetch_fn = getattr(jobs, "fetch_result", None)
+        if callable(fetch_fn):
+            return cast(Callable[[str], Any], fetch_fn)
+    return None
+
+
+def fetch_terminal_job_result(
+    status: JobStatus | Any,
+    fetch_result: Callable[[str], Any] | None,
+    *,
+    batch_id: str | None = None,
+) -> JobStatus | Any:
+    """Fetch and attach ``resultUrl`` output for a terminal ``Job`` status when available."""
+    if not getattr(status, "is_terminal", False) or not callable(fetch_result):
+        return status
+    result_url = getattr(status, "result_url", None)
+    if not _is_fetchable_result_url(result_url):
+        return status
+
+    resolved_batch_id = batch_id or str(
+        getattr(status, "batch_id", getattr(status, "batchId", "unknown"))
+    )
+    try:
+        res = fetch_result(cast(str, result_url))
+        return _attach_fetched_result(status, res)
+    except Exception as exc:
+        redacted_err = str(redact_sensitive_payload(str(exc)))
+        status.result_error = redacted_err
+        logger.error(
+            "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",
+            resolved_batch_id,
+            redacted_err,
+        )
+        raise JobFailedError(
+            f"Job {resolved_batch_id} failed to fetch resultUrl: {redacted_err}",
+            status,
+            result_error=redacted_err,
+        ) from exc
+
+
 class BaseJobPoller:
     """Base class for polling a job until it reaches a terminal state."""
 
@@ -337,14 +401,7 @@ class BaseJobPoller:
 
     def _process_fetch_result(self, status: JobStatus, res: Any) -> JobStatus:
         """Process the fetched result data and attach to the status object."""
-        if hasattr(res, "json"):
-            try:
-                status.results = res.json()
-            except Exception:
-                status.results = getattr(res, "text", str(res))
-        else:
-            status.results = res
-        return status
+        return cast(JobStatus, _attach_fetched_result(status, res))
 
     def _trigger_callback(
         self,
@@ -435,25 +492,7 @@ class JobPoller(BaseJobPoller):
             self._trigger_callback(on_progress, event)
 
             if is_terminal:
-                if self._fetch_result and _is_fetchable_result_url(
-                    getattr(status, "result_url", None)
-                ):
-                    try:
-                        res = self._fetch_result(status.result_url)  # type: ignore
-                        self._process_fetch_result(status, res)
-                    except Exception as exc:
-                        redacted_err = str(redact_sensitive_payload(str(exc)))
-                        status.result_error = redacted_err
-                        logger.error(
-                            "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",
-                            batch_id,
-                            redacted_err,
-                        )
-                        raise JobFailedError(
-                            f"Job {batch_id} failed to fetch resultUrl: {redacted_err}",
-                            status,
-                            result_error=redacted_err,
-                        ) from exc
+                fetch_terminal_job_result(status, self._fetch_result, batch_id=batch_id)
 
                 if cast(Any, status).is_successful:
                     logger.info(

@@ -270,3 +270,171 @@ def test_real_airflow_hook_describe_connection_redaction(real_airflow, synthetic
     assert desc["security_key"] == "***"
     assert desc["api_key_configured"] is True
     assert desc["security_key_configured"] is True
+
+
+def test_real_airflow_hook_resolves_connection_host_scheme_port_and_precedence(
+    monkeypatch,
+    real_airflow,
+    managed_sdk,
+):
+    """ImednetHook honors explicit base_url extras first, then Connection.host/scheme/port."""
+    connection_cls = real_airflow["Connection"]
+    base_hook_cls = real_airflow["BaseHook"]
+    hook_cls = real_airflow["ImednetHook"]
+
+    # 1. Connection(host="edc.trn.imednetapi.com") routes to training endpoint
+    trn_conn = connection_cls(
+        conn_id="imednet_trn",
+        conn_type="imednet",
+        host="edc.trn.imednetapi.com",
+        login="trn-key",  # pragma: allowlist secret
+        password="trn-secret",  # pragma: allowlist secret
+    )
+    monkeypatch.setattr(base_hook_cls, "get_connection", classmethod(lambda cls, cid: trn_conn))
+    trn_sdk = managed_sdk(hook_cls("imednet_trn").get_conn())
+    assert str(trn_sdk.config.base_url).rstrip("/") == "https://edc.trn.imednetapi.com"
+    assert trn_sdk._client.base_url == "https://edc.trn.imednetapi.com"
+
+    # 2. Connection host with /api/v1/edc suffix and custom scheme/port
+    custom_conn = connection_cls(
+        conn_id="imednet_custom_host",
+        conn_type="http",
+        host="edc.trn.imednetapi.com/api/v1/edc/",
+        port=8443,
+        login="trn-key",  # pragma: allowlist secret
+        password="trn-secret",  # pragma: allowlist secret
+    )
+    monkeypatch.setattr(base_hook_cls, "get_connection", classmethod(lambda cls, cid: custom_conn))
+    custom_sdk = managed_sdk(hook_cls("imednet_custom_host").get_conn())
+    assert str(custom_sdk.config.base_url).rstrip("/") == "http://edc.trn.imednetapi.com:8443"
+    assert custom_sdk._client.base_url == "http://edc.trn.imednetapi.com:8443"
+
+    # 3. Explicit extra["base_url"] takes precedence over Connection.host and strips /api/v1/edc
+    override_conn = connection_cls(
+        conn_id="imednet_override",
+        conn_type="imednet",
+        host="edc.prod.imednetapi.com",
+        login="trn-key",  # pragma: allowlist secret
+        password="trn-secret",  # pragma: allowlist secret
+        extra=json.dumps({"base_url": "https://edc.trn.imednetapi.com/api/v1/edc"}),
+    )
+    monkeypatch.setattr(
+        base_hook_cls, "get_connection", classmethod(lambda cls, cid: override_conn)
+    )
+    override_sdk = managed_sdk(hook_cls("imednet_override").get_conn())
+    assert str(override_sdk.config.base_url).rstrip("/") == "https://edc.trn.imednetapi.com"
+    assert override_sdk._client.base_url == "https://edc.trn.imednetapi.com"
+
+
+def test_real_airflow_sqlite_destination_uris_work_with_sqlalchemy(
+    monkeypatch,
+    real_airflow,
+    tmp_path,
+):
+    """resolve_destination_connection emits valid SQLAlchemy SQLite URLs for absolute & relative paths."""
+    import sqlalchemy as sa
+
+    connection_cls = real_airflow["Connection"]
+    base_hook_cls = real_airflow["BaseHook"]
+    hook_cls = real_airflow["ImednetHook"]
+
+    abs_db = tmp_path / "warehouse_abs.db"
+    uri_abs_db = tmp_path / "warehouse_uri_abs.db"
+    rel_name = "warehouse_rel.db"
+
+    cases = [
+        (
+            "sqlite_host_abs",
+            connection_cls(conn_id="sqlite_host_abs", conn_type="sqlite", host=str(abs_db)),
+            f"sqlite:///{abs_db}",
+            abs_db,
+        ),
+        (
+            "sqlite_uri_abs",
+            connection_cls(conn_id="sqlite_uri_abs", uri=f"sqlite:///{uri_abs_db}"),
+            f"sqlite:///{uri_abs_db}",
+            uri_abs_db,
+        ),
+        (
+            "sqlite_host_rel",
+            connection_cls(conn_id="sqlite_host_rel", conn_type="sqlite", host=rel_name),
+            f"sqlite:///{rel_name}",
+            tmp_path / rel_name,
+        ),
+    ]
+
+    monkeypatch.chdir(tmp_path)
+    for conn_id, conn_obj, expected_uri, expected_file in cases:
+        monkeypatch.setattr(base_hook_cls, "get_connection", classmethod(lambda cls, cid: conn_obj))
+        resolved = hook_cls.resolve_destination_connection(conn_id, "sql")
+        assert resolved["conn_str"] == expected_uri
+
+        engine = sa.create_engine(str(resolved["conn_str"]))
+        try:
+            with engine.begin() as db_conn:
+                db_conn.execute(sa.text("CREATE TABLE records (id INTEGER PRIMARY KEY)"))
+                db_conn.execute(sa.text("INSERT INTO records (id) VALUES (1)"))
+        finally:
+            engine.dispose()
+        assert expected_file.exists()
+
+
+def test_real_airflow_hook_test_connection_and_provider_discovery(monkeypatch, real_airflow):
+    """ProvidersManager discovers imednet hook and test_connection() redacts sensitive errors."""
+    import httpx
+    from airflow.providers_manager import ProvidersManager
+    from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
+
+    connection_cls = real_airflow["Connection"]
+    base_hook_cls = real_airflow["BaseHook"]
+    hook_cls = real_airflow["ImednetHook"]
+    sdk_cls = real_airflow["ImednetSDK"]
+
+    pm = ProvidersManager()
+    pm_runtime = ProvidersManagerTaskRuntime()
+    assert "apache-airflow-providers-imednet" in pm.providers
+    hook_meta = pm_runtime.hooks.get("imednet")
+    assert hook_meta is not None
+    assert hook_meta.connection_type == "imednet"
+    assert hook_meta.connection_testable is True
+
+    conn = connection_cls(
+        conn_id="imednet_test_conn",
+        conn_type="imednet",
+        host="edc.trn.imednetapi.com",
+        login="SUPER_SECRET_API_KEY",  # pragma: allowlist secret
+        password="SUPER_SECRET_SEC_KEY",  # pragma: allowlist secret
+    )
+    discovered_hook = conn.get_hook()
+    assert isinstance(discovered_hook, hook_cls)
+
+    monkeypatch.setattr(base_hook_cls, "get_connection", classmethod(lambda cls, cid: conn))
+
+    # 1. Successful connection test
+    ok_sdk = sdk_cls(
+        api_key="k",
+        security_key="s",
+        base_url="https://edc.trn.imednetapi.com",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"data": [], "pagination": {"totalPages": 1}})
+        ),
+    )
+    hook_ok = hook_cls("imednet_test_conn")
+    monkeypatch.setattr(hook_ok, "get_sdk_client", lambda: ok_sdk)
+    ok, msg = hook_ok.test_connection()
+    assert ok is True
+    assert "successfully" in msg.lower()
+
+    # 2. Failed connection test redacts credentials
+    def _failing_sdk():
+        raise RuntimeError(
+            "Auth failed for https://user:SUPER_SECRET_SEC_KEY@edc.trn.imednetapi.com"  # pragma: allowlist secret
+            "?api_key=SUPER_SECRET_API_KEY"
+        )
+
+    hook_fail = hook_cls("imednet_test_conn")
+    monkeypatch.setattr(hook_fail, "get_sdk_client", _failing_sdk)
+    ok_fail, err_msg = hook_fail.test_connection()
+    assert ok_fail is False
+    assert "SUPER_SECRET_API_KEY" not in err_msg
+    assert "SUPER_SECRET_SEC_KEY" not in err_msg

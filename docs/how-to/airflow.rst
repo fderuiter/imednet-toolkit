@@ -42,11 +42,21 @@ focused operator/sensor usage patterns.
 Connections
 -----------
 
-Create an Airflow connection ``imednet_default`` or override ``imednet_conn_id``.
-Provide ``api_key`` and ``security_key`` via the login/password fields or in the
-``extra`` JSON. ``base_url`` may be added in ``extra`` for a non-standard
-environment. The hook merges these settings with values from
-``imednet.config.load_config`` so environment variables still apply.
+Create an Airflow connection ``imednet_default`` (connection type ``imednet``) or
+override ``imednet_conn_id``. Provide ``api_key`` and ``security_key`` via the
+login/password fields or in the ``extra`` JSON. Base URL resolution honors an
+explicit ``base_url`` in ``extra`` first, then resolves ``Connection.host``
+(with optional ``scheme`` and ``port``) while stripping ``/api/v1/edc``,
+``/api/v1``, and ``/api`` suffixes before falling back to
+``imednet.config.load_config`` environment defaults. ``ImednetHook.test_connection()``
+validates credentials against the ``Study`` endpoint and redacts sensitive tokens
+on error.
+
+Incremental exports (``idempotent=True`` / ``incremental=True``) persist per-``Study``,
+per-stream JSON checkpoints via ``airflow.sdk.Variable`` rather than task-bound
+``XCom`` entries, preserving watermarks across dynamic task mapping order changes
+and rolling ``RUNNING`` checkpoints back to ``FAILED`` on ``BaseException``
+interrupts such as ``AirflowTaskTimeout``.
 
 For warehouse, graph, document, and transactional SQL exports, configure a
 separate Airflow connection and pass ``destination_conn_id`` on

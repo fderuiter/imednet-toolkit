@@ -29,6 +29,10 @@ class JobsOperationDef:
 class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ignore[misc]
     """Synchronous endpoint for managing Jobs."""
 
+    def fetch_result(self, result_url: str) -> object:
+        """Fetch a terminal Job ``resultUrl`` payload using the authenticated sync client."""
+        return self._require_sync_client().get(result_url)
+
     def poll(
         self,
         study_key: str,
@@ -41,7 +45,7 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
         """Wait for a terminal Job using the shared polling implementation."""
         from imednet.utils.job_poller import JobPoller
 
-        poller = JobPoller(self.get, fetch_result=self._require_sync_client().get)
+        poller = JobPoller(self.get, fetch_result=self.fetch_result)
         if on_progress is None:
             return poller.run(study_key, batch_id, interval, timeout)
         return poller.run(study_key, batch_id, interval, timeout, on_progress=on_progress)
@@ -59,7 +63,7 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
         """Collect terminal statuses and per-job failures through the shared poller."""
         from imednet.utils.job_poller import JobPoller
 
-        return JobPoller(self.get, fetch_result=self._require_sync_client().get).poll_many(
+        return JobPoller(self.get, fetch_result=self.fetch_result).poll_many(
             study_key, batch_ids, interval, timeout, on_progress=on_progress, fail_fast=fail_fast
         )
 

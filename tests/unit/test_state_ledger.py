@@ -629,3 +629,217 @@ def test_cli_default_ledger_path_behavior() -> None:
 
     reset_args = root_parser.parse_args(["workflows", "state", "reset", "-s", "TEST-01"])
     assert reset_args.ledger_path == DEFAULT_LEDGER_PATH
+
+
+def test_file_state_provider_transaction_rolls_back_on_base_exception(tmp_path: Path) -> None:
+    """FileStateProvider.transaction catches BaseException (e.g. task timeout) and allows retry."""
+
+    class SimulatedTaskTimeout(BaseException):
+        """Synthetic BaseException matching AirflowTaskTimeout hierarchy."""
+
+    ledger = FileStateProvider(str(tmp_path / "ledger.json"))
+    initial_ts = datetime(2026, 4, 1, 8, 0, 0, tzinfo=timezone.utc)
+    ledger.set_last_timestamp("STUDY-TIMEOUT", "records", initial_ts)
+
+    with pytest.raises(SimulatedTaskTimeout, match="execution_timeout exceeded"):
+        with ledger.transaction("STUDY-TIMEOUT", "records") as tx:
+            tx["new_timestamp"] = datetime(2026, 4, 2, 8, 0, 0, tzinfo=timezone.utc)
+            tx["records_processed"] = 42
+            raise SimulatedTaskTimeout("execution_timeout exceeded")
+
+    assert ledger.get_last_status("STUDY-TIMEOUT", "records") == StreamExecutionStatus.FAILED
+    assert ledger.get_last_timestamp("STUDY-TIMEOUT", "records") == initial_ts
+    failed_stream = ledger.read_state().studies["STUDY-TIMEOUT"].streams["records"]
+    assert failed_stream.error_message == "execution_timeout exceeded"
+
+    retry_ts = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
+    with ledger.transaction("STUDY-TIMEOUT", "records") as retry_tx:
+        assert retry_tx["last_timestamp"] == initial_ts
+        retry_tx["new_timestamp"] = retry_ts
+        retry_tx["records_processed"] = 100
+
+    assert ledger.get_last_status("STUDY-TIMEOUT", "records") == StreamExecutionStatus.SUCCESS
+    assert ledger.get_last_timestamp("STUDY-TIMEOUT", "records") == retry_ts
+
+
+def test_airflow_state_provider_sdk_variable_lifecycle_and_edge_cases(monkeypatch) -> None:
+    """AirflowStateProvider reads, writes, lists, deletes, and rolls back via airflow.sdk.Variable."""
+    import json
+    import types
+
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    store: dict[str, str] = {}
+
+    class FakeSdkVariable:
+        @staticmethod
+        def get(key: str, default=None, deserialize_json: bool = False):
+            if key not in store:
+                return default
+            raw = store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(key: str, value, serialize_json: bool = False) -> None:
+            store[key] = json.dumps(value) if serialize_json else str(value)
+
+        @staticmethod
+        def delete(key: str) -> None:
+            store.pop(key, None)
+
+        @staticmethod
+        def keys(prefix: str = "") -> list[str]:
+            return [k for k in sorted(store) if k.startswith(prefix)]
+
+    fake_airflow = types.ModuleType("airflow")
+    fake_sdk = types.ModuleType("airflow.sdk")
+    fake_sdk.Variable = FakeSdkVariable  # type: ignore[attr-defined]
+    fake_exec = types.ModuleType("airflow.sdk.execution_time")
+    fake_runner = types.ModuleType("airflow.sdk.execution_time.task_runner")
+    fake_runner.SUPERVISOR_COMMS = object()  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "airflow", fake_airflow)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", fake_sdk)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time", fake_exec)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time.task_runner", fake_runner)
+
+    provider = AirflowStateProvider()
+
+    # Special characters (colon, tilde, slash) round-trip without key collisions
+    ts_naive = datetime(2026, 6, 1, 10, 0, 0)
+    provider.set_last_timestamp(
+        "STUDY:01~A",
+        "records/dm",
+        ts_naive,
+        status=StreamExecutionStatus.RUNNING,
+    )
+    assert provider.get_last_timestamp("STUDY:01~A", "records/dm") == datetime(
+        2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc
+    )
+    assert provider.get_last_status("STUDY:01~A", "records/dm") == StreamExecutionStatus.RUNNING
+
+    # RUNNING -> RUNNING without force=True is rejected
+    with pytest.raises(InvalidStateTransitionError):
+        provider.set_last_timestamp(
+            "STUDY:01~A",
+            "records/dm",
+            ts_naive,
+            status=StreamExecutionStatus.RUNNING,
+            force=False,
+        )
+
+    # Complete RUNNING -> SUCCESS and add second stream + unrelated/malformed keys
+    ts_done = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    provider.set_last_timestamp(
+        "STUDY:01~A",
+        "records/dm",
+        ts_done,
+        status=StreamExecutionStatus.SUCCESS,
+        force=False,
+    )
+    provider.set_last_timestamp("STUDY-02", "queries", ts_done)
+    store["unrelated_prefix:foo:bar"] = "{}"
+    store["imednet_state:missing_stream_separator"] = "{}"
+    store["imednet_state:STUDY-BAD:broken_json"] = "{not-json"
+
+    state = provider.read_state()
+    assert set(state.studies) == {"STUDY:01~A", "STUDY-02"}
+    assert state.studies["STUDY:01~A"].streams["records/dm"].last_timestamp == ts_done
+
+    # Parsing resilience for non-string timestamp and unknown/enum status
+    assert AirflowStateProvider._parse_timestamp({"last_timestamp": 123}) is None
+    assert (
+        AirflowStateProvider._parse_status({"status": StreamExecutionStatus.PENDING})
+        == StreamExecutionStatus.PENDING
+    )
+    assert AirflowStateProvider._parse_status({"status": "corrupt"}) == StreamExecutionStatus.FAILED
+    assert AirflowStateProvider._parse_status({"status": 999}) == StreamExecutionStatus.FAILED
+    assert provider._parse_variable_key("other:study:stream") is None
+    assert provider._parse_variable_key("imednet_state:only_one_part") is None
+
+    # BaseException rollback during transaction preserves prior high-water mark
+    class SyntheticTimeout(BaseException):
+        pass
+
+    with pytest.raises(SyntheticTimeout):
+        with provider.transaction("STUDY-02", "queries") as tx:
+            tx["new_timestamp"] = datetime(2026, 6, 2, 0, 0, 0, tzinfo=timezone.utc)
+            raise SyntheticTimeout("timed out")
+
+    assert provider.get_last_status("STUDY-02", "queries") == StreamExecutionStatus.FAILED
+    assert provider.get_last_timestamp("STUDY-02", "queries") == ts_done
+
+    # Retry succeeds and advances checkpoint
+    retry_ts = datetime(2026, 6, 2, 1, 0, 0, tzinfo=timezone.utc)
+    with provider.transaction("STUDY-02", "queries") as tx:
+        tx["new_timestamp"] = retry_ts
+        tx["records_processed"] = 7
+    assert provider.get_last_status("STUDY-02", "queries") == StreamExecutionStatus.SUCCESS
+    assert provider.get_last_timestamp("STUDY-02", "queries") == retry_ts
+
+    # Delete specific stream, missing stream, and entire Study
+    assert provider.delete_entry("STUDY:01~A", "missing") is False
+    assert provider.delete_entry("STUDY:01~A", "records/dm") is True
+    assert provider.delete_entry("STUDY-02") is True
+    assert provider.delete_entry("STUDY-02") is False
+
+    # Out-of-task fallback (SUPERVISOR_COMMS = None) uses ModelVariable + session
+    fake_runner.SUPERVISOR_COMMS = None  # type: ignore[attr-defined]
+    fake_settings = types.ModuleType("airflow.settings")
+    configured = {"count": 0}
+    fake_settings.Session = None  # type: ignore[attr-defined]
+    fake_settings.configure_orm = lambda: configured.__setitem__("count", configured["count"] + 1)  # type: ignore[attr-defined]
+    fake_airflow.settings = fake_settings  # type: ignore[attr-defined]
+
+    class FakeModelVariable:
+        key = type("Col", (), {"startswith": staticmethod(lambda p: p)})()
+
+        @staticmethod
+        def get(key: str, default_var=None, deserialize_json: bool = False):
+            if key not in store:
+                return default_var
+            raw = store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(key: str, value, serialize_json: bool = False) -> None:
+            store[key] = json.dumps(value) if serialize_json else str(value)
+
+        @staticmethod
+        def delete(key: str) -> int:
+            return 1 if store.pop(key, None) is not None else 0
+
+    class FakeSessionCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def scalars(self, prefix_expr):
+            prefix = str(prefix_expr)
+            return type(
+                "Res", (), {"all": staticmethod(lambda: [k for k in store if k.startswith(prefix)])}
+            )()
+
+    fake_models = types.ModuleType("airflow.models")
+    fake_models_var = types.ModuleType("airflow.models.variable")
+    fake_models_var.Variable = FakeModelVariable  # type: ignore[attr-defined]
+    fake_utils = types.ModuleType("airflow.utils")
+    fake_utils_session = types.ModuleType("airflow.utils.session")
+    fake_utils_session.create_session = FakeSessionCtx  # type: ignore[attr-defined]
+    fake_sa = types.ModuleType("sqlalchemy")
+    fake_sa.select = lambda col: type("Sel", (), {"where": staticmethod(lambda expr: expr)})()  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "airflow.settings", fake_settings)
+    monkeypatch.setitem(sys.modules, "airflow.models", fake_models)
+    monkeypatch.setitem(sys.modules, "airflow.models.variable", fake_models_var)
+    monkeypatch.setitem(sys.modules, "airflow.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", fake_utils_session)
+    monkeypatch.setitem(sys.modules, "sqlalchemy", fake_sa)
+
+    provider.set_last_timestamp("STUDY-CLI", "records", ts_done)
+    assert configured["count"] >= 1
+    assert provider.get_last_timestamp("STUDY-CLI", "records") == ts_done
+    assert "STUDY-CLI" in provider.read_state().studies
+    assert provider.delete_entry("STUDY-CLI", "records") is True

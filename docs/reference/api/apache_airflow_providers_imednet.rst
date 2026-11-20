@@ -26,6 +26,14 @@ apache\_airflow\_providers\_imednet.export module
    :members:
    :show-inheritance:
 
+apache\_airflow\_providers\_imednet.get\_provider\_info module
+--------------------------------------------------------------
+
+.. automodule:: apache_airflow_providers_imednet.get_provider_info
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 apache\_airflow\_providers\_imednet.sensors module
 --------------------------------------------------
 

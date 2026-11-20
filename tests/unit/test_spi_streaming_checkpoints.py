@@ -472,22 +472,46 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
     """AirflowStateProvider passes dateModified filter, updates checkpoint, and rolls back on error."""
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 
-    xcom_store: dict[str, dict[str, Any]] = {}
+    var_store: dict[str, str] = {}
 
-    class _FakeTI:
+    class _FakeSdkVariable:
         @staticmethod
-        def xcom_pull(*, key: str, include_prior_dates: bool = False) -> Any:
-            _ = include_prior_dates
-            return xcom_store.get(key)
+        def get(key: str, default: Any = None, deserialize_json: bool = False) -> Any:
+            if key not in var_store:
+                return default
+            raw = var_store[key]
+            return json.loads(raw) if deserialize_json else raw
 
         @staticmethod
-        def xcom_push(*, key: str, value: Any) -> None:
-            xcom_store[key] = value
+        def set(
+            key: str,
+            value: Any,
+            description: str | None = None,
+            serialize_json: bool = False,
+        ) -> None:
+            _ = description
+            var_store[key] = json.dumps(value) if serialize_json else str(value)
 
-    python_op_mod = ModuleType("airflow.operators.python")
-    python_op_mod.get_current_context = lambda: {"ti": _FakeTI()}  # type: ignore[attr-defined]
-    monkeypatch.setitem(__import__("sys").modules, "airflow.operators.python", python_op_mod)
-    monkeypatch.setitem(__import__("sys").modules, "airflow.models.xcom", None)
+        @staticmethod
+        def delete(key: str) -> None:
+            var_store.pop(key, None)
+
+        @staticmethod
+        def keys(prefix: str | None = None) -> list[str]:
+            if prefix is None:
+                return sorted(var_store.keys())
+            return sorted(k for k in var_store if k.startswith(prefix))
+
+    airflow_mod = ModuleType("airflow")
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.Variable = _FakeSdkVariable  # type: ignore[attr-defined]
+    airflow_mod.sdk = sdk_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(__import__("sys").modules, "airflow", airflow_mod)
+    monkeypatch.setitem(__import__("sys").modules, "airflow.sdk", sdk_mod)
+    monkeypatch.delitem(__import__("sys").modules, "airflow.sdk.execution_time", raising=False)
+    monkeypatch.delitem(
+        __import__("sys").modules, "airflow.sdk.execution_time.task_runner", raising=False
+    )
 
     provider = AirflowStateProvider()
     seen_kwargs: list[dict[str, Any]] = []
@@ -548,7 +572,7 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
     assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
         2026, 3, 1, 14, 0, tzinfo=timezone.utc
     )
-    state_payload = xcom_store["state_STUDY-AF-INC_mongo_af"]
+    state_payload = json.loads(var_store[provider._get_variable_key("STUDY-AF-INC", "mongo_af")])
     assert state_payload["status"] == "failed"
 
 

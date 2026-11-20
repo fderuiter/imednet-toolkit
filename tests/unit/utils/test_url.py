@@ -10,6 +10,12 @@ from imednet.utils.url import build_safe_path, redact_url_query, sanitize_base_u
     [
         ("https://x/api", "https://x"),
         ("https://x/api/", "https://x"),
+        ("https://x/api/v1", "https://x"),
+        ("https://x/api/v1/", "https://x"),
+        ("https://x/api/v1/edc", "https://x"),
+        ("https://x/api/v1/edc/", "https://x"),
+        ("https://edc.trn.imednetapi.com/api/v1/edc", "https://edc.trn.imednetapi.com"),
+        ("https://x/v1", "https://x/v1"),
         ("https://x//", "https://x"),
         ("https://x", "https://x"),
     ],

@@ -54,6 +54,8 @@ from imednet.utils.job_poller import (
     JobStatusEvent,
     JobTimeoutError,
     evaluate_job_state,
+    fetch_terminal_job_result,
+    resolve_sdk_result_fetcher,
 )
 from imednet.utils.secrets import redact_sensitive_payload
 from imednet.utils.security import (
@@ -93,6 +95,7 @@ __all__ = [
     "chunk_records",
     "evaluate_expression",
     "evaluate_job_state",
+    "fetch_terminal_job_result",
     "flatten",
     "format_iso_datetime",
     "get_base_url_context",
@@ -114,6 +117,7 @@ __all__ = [
     "redact_sensitive_text",
     "reset_base_url_context",
     "resolve_enrichment_pipeline",
+    "resolve_sdk_result_fetcher",
     "resolve_study_configuration",
     "sanitize_csv_formula",
     "set_base_url_context",
