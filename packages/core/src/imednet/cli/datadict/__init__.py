@@ -22,6 +22,7 @@ from ...datadict import (
     validate,
 )
 from ...datadict.models import DataDictionary
+from ..decorators import validate_cli_path_segment
 from ..utils import get_sdk
 
 
@@ -106,6 +107,7 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
 
 def _handle_from_api(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-api` command."""
+    validate_cli_path_segment(args.study_key, name="study_key")
     try:
         with closing(get_sdk()) as sdk:
             dd = load_from_api(sdk, args.study_key, no_raw_xml=args.no_raw_xml)
