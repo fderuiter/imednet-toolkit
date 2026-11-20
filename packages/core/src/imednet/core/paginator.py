@@ -25,6 +25,9 @@ def _parse_int_param(name: str, value: Any) -> int:
 class BasePaginator(Generic[ClientT]):
     """Shared paginator implementation."""
 
+    #: Active number of items requested per page.
+    page_size: int
+
     def __init__(
         self,
         client: ClientT,

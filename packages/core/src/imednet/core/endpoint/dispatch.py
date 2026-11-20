@@ -60,24 +60,29 @@ def _resolve_hints_and_return(
     except Exception:
         hints = dict(getattr(func, "__annotations__", {}))
 
-    model_cls = getattr(owner, "MODEL", Any) if owner is not None else Any
+    raw_model = getattr(owner, "MODEL", None) if owner is not None else None
+    model_cls = raw_model if isinstance(raw_model, type) else None
     raw_ret = hints.get("return", Any)
     type_args = get_args(raw_ret)
 
     if type_args:
         candidate = type_args[0]
-        inner = model_cls if isinstance(candidate, TypeVar) else candidate
+        inner = (
+            model_cls if (isinstance(candidate, TypeVar) and model_cls is not None) else candidate
+        )
     elif isinstance(raw_ret, type) and hasattr(raw_ret, "execute_sync"):
         try:
             op_hints = get_type_hints(raw_ret.execute_sync)
             candidate = op_hints.get("return", Any)
         except Exception:
             candidate = Any
-        inner = model_cls if isinstance(candidate, TypeVar) else candidate
+        inner = (
+            model_cls if (isinstance(candidate, TypeVar) and model_cls is not None) else candidate
+        )
     elif isinstance(raw_ret, TypeVar):
-        inner = model_cls
+        inner = model_cls if model_cls is not None else raw_ret
     else:
-        inner = model_cls if raw_ret is Any else raw_ret
+        inner = (model_cls if model_cls is not None else Any) if raw_ret is Any else raw_ret
 
     if is_list:
         iterator_cls = cast(Any, AsyncIterator if is_async else Iterator)
@@ -107,7 +112,8 @@ def _configure_wrapper(
         is_list=is_list,
         is_async=is_async,
     )
-    model_cls = getattr(owner, "MODEL", Any) if owner is not None else Any
+    raw_model = getattr(owner, "MODEL", None) if owner is not None else None
+    model_cls = raw_model if isinstance(raw_model, type) else None
 
     sig = inspect.signature(func)
     params = list(sig.parameters.values())
@@ -116,7 +122,9 @@ def _configure_wrapper(
     for key, val in hints.items():
         if key == "return":
             continue
-        resolved_annotations[key] = model_cls if isinstance(val, TypeVar) else val
+        resolved_annotations[key] = (
+            model_cls if (isinstance(val, TypeVar) and model_cls is not None) else val
+        )
     resolved_annotations["return"] = resolved_ret
 
     updated_params = [
@@ -223,6 +231,12 @@ class execute_operation(Generic[P, T]):  # noqa: N801
             return self
         return _build_operation_callable(self.func, instance, owner, pass_paginator=False)
 
+    if not TYPE_CHECKING:
+
+        def __call__(self, endpoint: Any, *args: Any, **kwargs: Any) -> Any:
+            """Execute the wrapped operation against the given endpoint instance."""
+            return self.__get__(endpoint, type(endpoint))(*args, **kwargs)
+
 
 class execute_list(Generic[P, T]):  # noqa: N801
     """Descriptor that dispatches a list operation."""
@@ -306,6 +320,12 @@ class execute_list(Generic[P, T]):  # noqa: N801
             sync_wrapper, func, target_cls, is_list=True, is_async=False, bound=True
         )
 
+    if not TYPE_CHECKING:
+
+        def __call__(self, endpoint: Any, *args: Any, **kwargs: Any) -> Any:
+            """Execute the wrapped list operation against the given endpoint instance."""
+            return self.__get__(endpoint, type(endpoint))(*args, **kwargs)
+
 
 class execute_get(Generic[P, T]):  # noqa: N801
     """Descriptor that dispatches a get operation."""
@@ -341,3 +361,9 @@ class execute_get(Generic[P, T]):  # noqa: N801
         if instance is None and owner is None:
             return self
         return _build_operation_callable(self.func, instance, owner, pass_paginator=True)
+
+    if not TYPE_CHECKING:
+
+        def __call__(self, endpoint: Any, *args: Any, **kwargs: Any) -> Any:
+            """Execute the wrapped get operation against the given endpoint instance."""
+            return self.__get__(endpoint, type(endpoint))(*args, **kwargs)

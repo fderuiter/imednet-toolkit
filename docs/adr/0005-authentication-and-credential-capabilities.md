@@ -2,7 +2,7 @@
 
 ## Decision
 
-Keep BaseClient and HTTPClientBase and their public imports. An explicit AuthStrategy
+Keep {py:class}`~imednet.core.BaseClient` and {py:class}`~imednet.core.HTTPClientBase` and their public imports. An explicit AuthStrategy
 owns authentication and must initialize both transports and SDKs without placeholder
 keys. Resolve noncredential configuration normally, then bypass only default credential
 validation. The strategy wins even if it has false boolean value. Reject auth together

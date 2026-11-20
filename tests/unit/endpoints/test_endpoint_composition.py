@@ -169,6 +169,13 @@ def test_class_level_dispatch_descriptors_expose_unbound_callables_and_metadata(
     assert isinstance(raw_get, execute_get)
     assert raw_get.__get__(None, None) is raw_get
 
+    assert callable(raw_create)
+    assert callable(raw_list)
+    assert callable(raw_get)
+    assert "records_data" in inspect.signature(raw_create).parameters
+    assert "study_key" in inspect.signature(raw_list).parameters
+    assert "item_id" in inspect.signature(raw_get).parameters
+
     assert callable(RecordsEndpoint.list)
     assert not inspect.iscoroutinefunction(RecordsEndpoint.list)
     assert inspect.signature(RecordsEndpoint.list).return_annotation == Iterator[Record]
@@ -208,6 +215,99 @@ def test_class_level_dispatch_descriptors_expose_unbound_callables_and_metadata(
     assert callable(AsyncJobsEndpoint.get)
     assert inspect.iscoroutinefunction(AsyncJobsEndpoint.get)
     assert inspect.signature(AsyncJobsEndpoint.get).return_annotation is JobStatus
+
+
+def test_generic_edc_endpoint_bases_preserve_typevar_annotations():
+    """Generic Edc*Endpoint bases preserve TypeVar T rather than collapsing to Any."""
+    import inspect
+    from collections.abc import AsyncIterator, Iterator
+    from typing import TypeVar, get_args, get_origin
+
+    from imednet.core import (
+        EdcAsyncGetEndpoint,
+        EdcAsyncListEndpoint,
+        EdcAsyncListGetEndpoint,
+        EdcSyncGetEndpoint,
+        EdcSyncListEndpoint,
+        EdcSyncListGetEndpoint,
+    )
+
+    sync_list_ret = inspect.signature(EdcSyncListEndpoint.list).return_annotation
+    assert get_origin(sync_list_ret) is Iterator
+    assert isinstance(get_args(sync_list_ret)[0], TypeVar)
+
+    sync_list_get_ret = inspect.signature(EdcSyncListGetEndpoint.list).return_annotation
+    assert get_origin(sync_list_get_ret) is Iterator
+    assert isinstance(get_args(sync_list_get_ret)[0], TypeVar)
+    assert isinstance(inspect.signature(EdcSyncGetEndpoint.get).return_annotation, TypeVar)
+    assert isinstance(inspect.signature(EdcSyncListGetEndpoint.get).return_annotation, TypeVar)
+
+    async_list_ret = inspect.signature(EdcAsyncListEndpoint.list).return_annotation
+    assert get_origin(async_list_ret) is AsyncIterator
+    assert isinstance(get_args(async_list_ret)[0], TypeVar)
+
+    async_list_get_ret = inspect.signature(EdcAsyncListGetEndpoint.list).return_annotation
+    assert get_origin(async_list_get_ret) is AsyncIterator
+    assert isinstance(get_args(async_list_get_ret)[0], TypeVar)
+    assert inspect.iscoroutinefunction(EdcAsyncGetEndpoint.get)
+    assert inspect.iscoroutinefunction(EdcAsyncListGetEndpoint.get)
+    assert isinstance(inspect.signature(EdcAsyncGetEndpoint.get).return_annotation, TypeVar)
+    assert isinstance(inspect.signature(EdcAsyncListGetEndpoint.get).return_annotation, TypeVar)
+
+
+async def test_sdk_list_operation_descriptor_metadata_and_callable_inspection():
+    """_ListOperation copies wrapper metadata and supports callable/signature inspection and unbound calls."""
+    import inspect
+    from unittest.mock import AsyncMock, MagicMock
+
+    from imednet.models.records import Record
+    from imednet.models.studies import Study
+    from imednet.sdk import AsyncImednetSDK, ImednetSDK
+    from imednet.sdk_convenience import AsyncSDKConvenienceMixin, SyncSDKConvenienceMixin
+
+    raw_sync = SyncSDKConvenienceMixin.__dict__["get_records"]
+    assert raw_sync.__get__(None, None) is raw_sync
+    assert callable(raw_sync)
+    assert raw_sync.__name__ == "get_records"
+    assert raw_sync.__doc__ == "List records."
+    assert inspect.signature(raw_sync).return_annotation == list[Record]
+
+    unbound_sync = ImednetSDK.get_records
+    assert callable(unbound_sync)
+    assert not inspect.iscoroutinefunction(unbound_sync)
+    sync_sig = inspect.signature(unbound_sync)
+    assert list(sync_sig.parameters) == ["self", "study_key", "filters"]
+    assert sync_sig.parameters["self"].annotation is inspect.Parameter.empty
+    assert sync_sig.return_annotation == list[Record]
+    assert "<locals>" not in unbound_sync.__qualname__
+
+    raw_async = AsyncSDKConvenienceMixin.__dict__["async_get_studies"]
+    assert raw_async.__get__(None, None) is raw_async
+    assert callable(raw_async)
+    assert raw_async.__name__ == "async_get_studies"
+    assert raw_async.__doc__ == "Asynchronously list studies."
+
+    unbound_async = AsyncImednetSDK.async_get_studies
+    assert callable(unbound_async)
+    assert inspect.iscoroutinefunction(unbound_async)
+    async_sig = inspect.signature(unbound_async)
+    assert list(async_sig.parameters) == ["self", "study_key", "filters"]
+    assert async_sig.parameters["self"].annotation is inspect.Parameter.empty
+    assert async_sig.return_annotation == list[Study]
+    assert "<locals>" not in unbound_async.__qualname__
+
+    fake_sync_sdk = MagicMock()
+    fake_sync_sdk.records.list.return_value = ["r1", "r2"]
+    assert raw_sync(fake_sync_sdk, "STUDY_1", page_size=10) == ["r1", "r2"]
+    assert ImednetSDK.get_records(fake_sync_sdk, "STUDY_1") == ["r1", "r2"]
+
+    async def _aiter_studies():
+        yield "s1"
+
+    fake_async_sdk = AsyncMock()
+    fake_async_sdk.studies = MagicMock()
+    fake_async_sdk.studies.list.return_value = _aiter_studies()
+    assert await AsyncImednetSDK.async_get_studies(fake_async_sdk, "STUDY_1") == ["s1"]
 
 
 async def test_unbound_sync_and_async_descriptors_execute_correctly(
