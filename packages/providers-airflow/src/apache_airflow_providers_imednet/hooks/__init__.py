@@ -177,6 +177,7 @@ class ImednetHook(BaseHook):
                 ),
                 "local_staging_dir": cls._string_or_none(extras.get("local_staging_dir")),
                 "manifest_path": cls._string_or_none(extras.get("manifest_path")),
+                "hard_delete": cls._bool_or_none(extras.get("hard_delete")),
             }
             return {k: v for k, v in candidates.items() if v is not None}
 

@@ -32,11 +32,15 @@ def register_list_command(
     model: type[Any] | None = None,
 ) -> None:
     """Attach a standard ``list`` command to parser."""
+    endpoint_cls = ENDPOINT_REGISTRY.get(attr)
     resolved_model = model
-    if resolved_model is None:
-        endpoint_cls = ENDPOINT_REGISTRY.get(attr)
-        if endpoint_cls is not None:
-            resolved_model = getattr(endpoint_cls, "MODEL", None)
+    if resolved_model is None and endpoint_cls is not None:
+        resolved_model = getattr(endpoint_cls, "MODEL", None)
+    allowed_attributes: frozenset[str] | None = None
+    if endpoint_cls is not None:
+        raw_attrs = getattr(endpoint_cls, "FILTER_ATTRIBUTES", None)
+        if isinstance(raw_attrs, frozenset):
+            allowed_attributes = raw_attrs
 
     subparsers = getattr(parser, '_subparsers', None)
     if subparsers is None:
@@ -67,16 +71,22 @@ def register_list_command(
             limit: int | None = None,
             fetch_all: bool = False,
             no_interactive: bool = False,
+            _prepared_query: tuple[dict[str, Any], int | None] | None = None,
         ) -> None:
-            req_kwargs, effective_limit = prepare_list_query(
-                filter_args=filter_args,
-                sort=sort,
-                limit=limit,
-                fetch_all=fetch_all,
-                output_format=output_format,
-                no_interactive=no_interactive,
-                model=resolved_model,
-                disallow_study_key=True,
+            req_kwargs, effective_limit = (
+                _prepared_query
+                if _prepared_query is not None
+                else prepare_list_query(
+                    filter_args=filter_args,
+                    sort=sort,
+                    limit=limit,
+                    fetch_all=fetch_all,
+                    output_format=output_format,
+                    no_interactive=no_interactive,
+                    model=resolved_model,
+                    allowed_attributes=allowed_attributes,
+                    disallow_study_key=True,
+                )
             )
             with fetching_status(name, study_key):
                 items, truncated = collect_list_items(
@@ -94,17 +104,31 @@ def register_list_command(
                 interactive=False if no_interactive else None,
             )
 
-        list_parser.set_defaults(
-            func=lambda args: list_cmd(
+        def _dispatch_study_list(args: argparse.Namespace) -> None:
+            no_interactive = getattr(args, "no_interactive", False)
+            prepared = prepare_list_query(
+                filter_args=args.filter_args,
+                sort=args.sort,
+                limit=args.limit,
+                fetch_all=args.fetch_all,
+                output_format=args.output_format,
+                no_interactive=no_interactive,
+                model=resolved_model,
+                allowed_attributes=allowed_attributes,
+                disallow_study_key=True,
+            )
+            list_cmd(
                 study_key=args.study_key,
                 output_format=args.output_format,
                 filter_args=args.filter_args,
                 sort=args.sort,
                 limit=args.limit,
                 fetch_all=args.fetch_all,
-                no_interactive=getattr(args, "no_interactive", False),
+                no_interactive=no_interactive,
+                _prepared_query=prepared,
             )
-        )
+
+        list_parser.set_defaults(func=_dispatch_study_list)
 
     else:
         add_list_query_args(list_parser)
@@ -118,15 +142,21 @@ def register_list_command(
             limit: int | None = None,
             fetch_all: bool = False,
             no_interactive: bool = False,
+            _prepared_query: tuple[dict[str, Any], int | None] | None = None,
         ) -> None:
-            req_kwargs, effective_limit = prepare_list_query(
-                filter_args=filter_args,
-                sort=sort,
-                limit=limit,
-                fetch_all=fetch_all,
-                output_format=output_format,
-                no_interactive=no_interactive,
-                model=resolved_model,
+            req_kwargs, effective_limit = (
+                _prepared_query
+                if _prepared_query is not None
+                else prepare_list_query(
+                    filter_args=filter_args,
+                    sort=sort,
+                    limit=limit,
+                    fetch_all=fetch_all,
+                    output_format=output_format,
+                    no_interactive=no_interactive,
+                    model=resolved_model,
+                    allowed_attributes=allowed_attributes,
+                )
             )
             with fetching_status(name):
                 items, truncated = collect_list_items(
@@ -144,13 +174,26 @@ def register_list_command(
                 interactive=False if no_interactive else None,
             )
 
-        list_parser.set_defaults(
-            func=lambda args: list_cmd_no_study(
+        def _dispatch_no_study_list(args: argparse.Namespace) -> None:
+            no_interactive = getattr(args, "no_interactive", False)
+            prepared = prepare_list_query(
+                filter_args=args.filter_args,
+                sort=args.sort,
+                limit=args.limit,
+                fetch_all=args.fetch_all,
+                output_format=args.output_format,
+                no_interactive=no_interactive,
+                model=resolved_model,
+                allowed_attributes=allowed_attributes,
+            )
+            list_cmd_no_study(
                 output_format=args.output_format,
                 filter_args=args.filter_args,
                 sort=args.sort,
                 limit=args.limit,
                 fetch_all=args.fetch_all,
-                no_interactive=getattr(args, "no_interactive", False),
+                no_interactive=no_interactive,
+                _prepared_query=prepared,
             )
-        )
+
+        list_parser.set_defaults(func=_dispatch_no_study_list)

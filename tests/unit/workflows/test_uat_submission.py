@@ -1132,3 +1132,154 @@ def test_default_uat_submission_with_tagged_synthetic_subject_and_real_sdk():
     assert "F_DM" in run_result.submission_result.skipped_forms
     assert len(run_result.submission_result.registration_batches) == 0
     assert len(run_result.submission_result.data_batches) == 1
+
+
+def test_submission_phase_transition_table_and_validation(mock_sdk):
+    """Validate ALLOWED_SUBMISSION_TRANSITIONS and InvalidSubmissionPhaseTransitionError."""
+    from imednet_workflows.uat.submission import (
+        ALLOWED_SUBMISSION_TRANSITIONS,
+        InvalidSubmissionPhaseTransitionError,
+        SubmissionPhase,
+        is_valid_submission_transition,
+        normalize_submission_phase,
+        validate_submission_transition,
+    )
+
+    assert ALLOWED_SUBMISSION_TRANSITIONS == {
+        SubmissionPhase.PENDING: {SubmissionPhase.REGISTRATION, SubmissionPhase.FAILED},
+        SubmissionPhase.REGISTRATION: {
+            SubmissionPhase.AWAITING_REGISTRATION,
+            SubmissionPhase.DATA,
+            SubmissionPhase.FAILED,
+        },
+        SubmissionPhase.AWAITING_REGISTRATION: {
+            SubmissionPhase.DATA,
+            SubmissionPhase.FAILED,
+        },
+        SubmissionPhase.DATA: {SubmissionPhase.COMPLETED, SubmissionPhase.FAILED},
+        SubmissionPhase.COMPLETED: set(),
+        SubmissionPhase.FAILED: set(),
+    }
+
+    assert normalize_submission_phase("registration") == SubmissionPhase.REGISTRATION
+    assert normalize_submission_phase("DATA") == SubmissionPhase.DATA
+    with pytest.raises(InvalidSubmissionPhaseTransitionError):
+        normalize_submission_phase("INVALID_PHASE")
+    with pytest.raises(InvalidSubmissionPhaseTransitionError):
+        normalize_submission_phase(123)  # type: ignore[arg-type]
+
+    assert is_valid_submission_transition("pending", "registration") is True
+    assert is_valid_submission_transition("completed", "registration") is False
+    assert is_valid_submission_transition("invalid", "registration") is False
+
+    assert SubmissionPhase.PENDING.can_transition_to(SubmissionPhase.REGISTRATION) is True
+    assert SubmissionPhase.PENDING.is_terminal is False
+    assert SubmissionPhase.COMPLETED.is_terminal is True
+    assert SubmissionPhase.FAILED.is_terminal is True
+    assert SubmissionPhase.REGISTRATION.validate_transition_to(SubmissionPhase.DATA) is True
+    assert validate_submission_transition(SubmissionPhase.DATA, SubmissionPhase.COMPLETED) is True
+
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+    workflow.transition_to(SubmissionPhase.REGISTRATION)
+    workflow.transition_to(SubmissionPhase.DATA)
+    workflow.transition_to(SubmissionPhase.COMPLETED)
+    assert workflow.phase == SubmissionPhase.COMPLETED
+
+    with pytest.raises(InvalidSubmissionPhaseTransitionError) as exc_info:
+        workflow.transition_to(SubmissionPhase.REGISTRATION)
+    assert "Cannot transition submission workflow from completed to registration" in str(
+        exc_info.value
+    )
+    assert workflow.phase == SubmissionPhase.COMPLETED
+
+    # Calling submit() while already COMPLETED raises InvalidSubmissionPhaseTransitionError
+    with pytest.raises(InvalidSubmissionPhaseTransitionError):
+        workflow.submit("study1", [])
+
+    # reset() restores PENDING and allows submit() to succeed
+    workflow.reset()
+    assert workflow.phase == SubmissionPhase.PENDING
+    res = workflow.submit("study1", [])
+    assert res.total_records_submitted == 0
+    assert workflow.phase == SubmissionPhase.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "subject_lookup",
+        "registration_submit",
+        "awaiting_registration_poll",
+        "awaiting_registration_correlate",
+        "data_submit",
+    ],
+)
+def test_submission_workflow_api_error_transitions_to_failed_before_propagating(
+    mock_sdk, failure_stage: str
+):
+    """ApiError across subject lookup, registration, awaiting_registration, and data sets FAILED."""
+    from imednet.spi.errors import ApiError
+    from imednet_workflows.uat.submission import (
+        InvalidSubmissionPhaseTransitionError,
+        SubmissionPhase,
+    )
+
+    rs_reg = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"formKey": "REG", "siteName": "Site1", "data": {"AGE": 30}}],
+        subject_keys=["S1"],
+    )
+    rs_data = GeneratedRecordSet(
+        form_key="DATA",
+        form_name="Data Form",
+        test_type=RecordTestType.CREATE_NEW_RECORD,
+        payloads=[{"formKey": "DATA", "subjectKey": "S1", "data": {"BP": 120}}],
+        subject_keys=["S1"],
+    )
+
+    if failure_stage == "subject_lookup":
+        workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=True)
+        mock_sdk.get_subjects.side_effect = ApiError("Subject lookup HTTP 502", status_code=502)
+    elif failure_stage == "registration_submit":
+        workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+        mock_sdk.create_record.side_effect = ApiError(
+            "Registration submit HTTP 500", status_code=500
+        )
+    elif failure_stage == "awaiting_registration_poll":
+        workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+        mock_sdk.create_record.return_value = Job(batch_id="reg_1", state="PENDING")
+        mock_sdk.get_subjects.return_value = []
+        mock_sdk.get_job.side_effect = ApiError("Job poll HTTP 503", status_code=503)
+    elif failure_stage == "awaiting_registration_correlate":
+        workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+        mock_sdk.create_record.return_value = Job(batch_id="reg_1", state="PENDING")
+        mock_sdk.get_subjects.side_effect = [
+            [],
+            ApiError("Post-registration subject lookup HTTP 503", status_code=503),
+        ]
+        mock_sdk.get_job.return_value = JobStatus(
+            batch_id="reg_1",
+            state="COMPLETED",
+            results=[{"subjectId": 42, "status": "SUCCESS"}],
+        )
+    else:
+        workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+        mock_sdk.create_record.side_effect = [
+            Job(batch_id="reg_1", state="PENDING"),
+            ApiError("Data submit HTTP 500", status_code=500),
+        ]
+        mock_sdk.get_subjects.return_value = []
+        mock_sdk.get_job.return_value = JobStatus(
+            batch_id="reg_1",
+            state="COMPLETED",
+            results=[{"subjectKey": "S1"}],
+        )
+
+    with pytest.raises(ApiError):
+        workflow.submit("study1", [rs_reg, rs_data])
+
+    assert workflow.phase == SubmissionPhase.FAILED
+    with pytest.raises(InvalidSubmissionPhaseTransitionError):
+        workflow.transition_to(SubmissionPhase.DATA)

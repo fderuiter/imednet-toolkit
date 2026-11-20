@@ -8,12 +8,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ...endpoints.records import RecordsEndpoint
 from ...integrations.sink_base import normalize_watermark_datetime
 from ...models.records import Record
 from ...sdk import ImednetSDK
-from ...utils.filters import parse_filter_expressions, validate_connector_exclusivity
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, fetching_status, parse_filter_args, print_error
+from ..utils import (
+    STUDY_KEY_ARG,
+    fetching_status,
+    parse_filter_args,
+    parse_record_data_filter,
+    print_error,
+)
 
 
 def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
@@ -29,13 +35,19 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         dest="filters",
         action="append",
         default=None,
-        help="Filter expression (e.g. 'subjectKey==SUBJ-01'). Repeatable.",
+        help=(
+            "Server filter expression using =, ==, !=, <, <=, >, >= and ';' (AND) "
+            "or ',' (OR) connectors (e.g. 'subjectKey==SUBJ-01'). Repeatable."
+        ),
     )
     parser.add_argument(
         "--record-data-filter",
         dest="record_data_filter",
         default=None,
-        help="Clinical variable payload filter expression.",
+        help=(
+            "Clinical variable recordDataFilter expression using ==, !=, <, <=, >, >=, =~ "
+            "(e.g. 'AESER==Serious;AGE>=18' or 'AETERM=~^Head')."
+        ),
     )
     parser.add_argument(
         "--incremental",
@@ -98,33 +110,23 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _parse_export_filters(filters: list[str] | None) -> dict[str, Any] | str | None:
-    """Validate and parse CLI ``--filter`` arguments against ``Record``."""
+    """Validate and parse CLI ``--filter`` arguments against ``RecordsEndpoint`` allowlists."""
     if not filters:
         return None
-    try:
-        for expr in filters:
-            validate_connector_exclusivity(expr)
-        if len(filters) == 1 and "," in filters[0]:
-            # Validate each OR clause against Record fields when outside quotes
-            from ...integrations.sink_base import _split_top_level
-
-            or_clauses = _split_top_level(filters[0], ",")
-            if len(or_clauses) > 1:
-                for clause in or_clauses:
-                    parse_filter_expressions([clause], model=Record)
-                return filters[0]
-        if len(filters) > 1:
-            from ...integrations.sink_base import _split_top_level
-
-            for expr in filters:
-                if len(_split_top_level(expr, ",")) > 1:
-                    raise ValueError(
-                        "Filter expression cannot combine both ';' (AND) and ',' (OR) connectors"
-                    )
-    except ValueError as exc:
-        print_error(f"Error: {exc}")
-        sys.exit(1)
-    return parse_filter_args(filters, model=Record)
+    parsed = parse_filter_args(
+        filters,
+        model=Record,
+        allowed_attributes=RecordsEndpoint.FILTER_ATTRIBUTES,
+        disallow_study_key=True,
+    )
+    if (
+        parsed is not None
+        and len(parsed) == 1
+        and "filter" in parsed
+        and isinstance(parsed["filter"], str)
+    ):
+        return parsed["filter"]
+    return parsed
 
 
 def _extract_streaming_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -145,12 +147,9 @@ def _extract_streaming_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
     record_data_filter = getattr(args, "record_data_filter", None)
     if record_data_filter is not None:
-        try:
-            validate_connector_exclusivity(record_data_filter)
-        except ValueError as exc:
-            print_error(f"Error: {exc}")
-            sys.exit(1)
-        opts["record_data_filter"] = record_data_filter
+        validated_rdf = parse_record_data_filter(record_data_filter)
+        if validated_rdf is not None:
+            opts["record_data_filter"] = validated_rdf
 
     if getattr(args, "incremental", False):
         opts["incremental"] = True

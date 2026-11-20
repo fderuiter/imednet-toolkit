@@ -209,6 +209,110 @@ class SubmissionPhase(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
 
+    def can_transition_to(self, target: SubmissionPhase | str) -> bool:
+        """Return True if transitioning from this phase to ``target`` is permitted."""
+        return is_valid_submission_transition(self, target)
+
+    def validate_transition_to(self, target: SubmissionPhase | str) -> bool:
+        """Validate that transitioning from this phase to ``target`` is permitted."""
+        return validate_submission_transition(self, target)
+
+    @property
+    def allowed_transitions(self) -> set[SubmissionPhase]:
+        """Return the set of allowed target phases from this phase."""
+        return ALLOWED_SUBMISSION_TRANSITIONS.get(self, set())
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return True if this submission phase is terminal."""
+        return self in TERMINAL_SUBMISSION_PHASES
+
+
+TERMINAL_SUBMISSION_PHASES: set[SubmissionPhase] = {
+    SubmissionPhase.COMPLETED,
+    SubmissionPhase.FAILED,
+}
+
+ACTIVE_SUBMISSION_PHASES: set[SubmissionPhase] = {
+    SubmissionPhase.PENDING,
+    SubmissionPhase.REGISTRATION,
+    SubmissionPhase.AWAITING_REGISTRATION,
+    SubmissionPhase.DATA,
+}
+
+ALLOWED_SUBMISSION_TRANSITIONS: dict[SubmissionPhase, set[SubmissionPhase]] = {
+    SubmissionPhase.PENDING: {
+        SubmissionPhase.REGISTRATION,
+        SubmissionPhase.FAILED,
+    },
+    SubmissionPhase.REGISTRATION: {
+        SubmissionPhase.AWAITING_REGISTRATION,
+        SubmissionPhase.DATA,
+        SubmissionPhase.FAILED,
+    },
+    SubmissionPhase.AWAITING_REGISTRATION: {
+        SubmissionPhase.DATA,
+        SubmissionPhase.FAILED,
+    },
+    SubmissionPhase.DATA: {
+        SubmissionPhase.COMPLETED,
+        SubmissionPhase.FAILED,
+    },
+    SubmissionPhase.COMPLETED: set(),
+    SubmissionPhase.FAILED: set(),
+}
+
+
+class InvalidSubmissionPhaseTransitionError(ValueError):
+    """Raised when an invalid bulk submission phase transition is attempted."""
+
+
+def normalize_submission_phase(phase: SubmissionPhase | str) -> SubmissionPhase:
+    """Normalize a phase value into a ``SubmissionPhase`` enum member."""
+    if isinstance(phase, SubmissionPhase):
+        return phase
+    if isinstance(phase, str):
+        try:
+            return SubmissionPhase(phase.strip().lower())
+        except ValueError as err:
+            valid = sorted(p.value for p in SubmissionPhase)
+            raise InvalidSubmissionPhaseTransitionError(
+                f"Invalid submission phase: '{phase}'. Must be one of: {valid}"
+            ) from err
+    raise InvalidSubmissionPhaseTransitionError(
+        f"Invalid submission phase type: {type(phase).__name__}"
+    )
+
+
+def is_valid_submission_transition(
+    from_phase: SubmissionPhase | str,
+    to_phase: SubmissionPhase | str,
+) -> bool:
+    """Return True if transitioning ``from_phase`` to ``to_phase`` is allowed."""
+    try:
+        src = normalize_submission_phase(from_phase)
+        dst = normalize_submission_phase(to_phase)
+    except InvalidSubmissionPhaseTransitionError:
+        return False
+    return dst in ALLOWED_SUBMISSION_TRANSITIONS.get(src, set())
+
+
+def validate_submission_transition(
+    from_phase: SubmissionPhase | str,
+    to_phase: SubmissionPhase | str,
+) -> bool:
+    """Validate that ``from_phase`` may transition to ``to_phase``."""
+    src = normalize_submission_phase(from_phase)
+    dst = normalize_submission_phase(to_phase)
+    permitted = ALLOWED_SUBMISSION_TRANSITIONS.get(src, set())
+    if dst not in permitted:
+        allowed_values = sorted(p.value for p in permitted)
+        raise InvalidSubmissionPhaseTransitionError(
+            f"Cannot transition submission workflow from {src.value} to {dst.value}. "
+            f"Allowed transitions from {src.value}: {allowed_values}"
+        )
+    return True
+
 
 class BatchSubmission(ImednetBaseModel):
     """Tracks a single API call to records.create()."""
@@ -301,8 +405,25 @@ class BulkRecordSubmissionWorkflow:
         self.registration_timeout = registration_timeout
         self.skip_existing_subjects = skip_existing_subjects
         self.registration_poll_interval = registration_poll_interval
-        self.phase: SubmissionPhase = SubmissionPhase.PENDING
+        self._phase: SubmissionPhase = SubmissionPhase.PENDING
         self._initial_subjects_snapshot: _PreExistingSubjectsSnapshot | None = None
+
+    @property
+    def phase(self) -> SubmissionPhase:
+        """Return the current lifecycle phase of the submission workflow."""
+        return self._phase
+
+    def transition_to(self, target: SubmissionPhase | str) -> SubmissionPhase:
+        """Transition the submission workflow to an approved target phase."""
+        target_phase = normalize_submission_phase(target)
+        validate_submission_transition(self._phase, target_phase)
+        self._phase = target_phase
+        return self._phase
+
+    def reset(self) -> None:
+        """Reset the submission workflow phase back to ``PENDING``."""
+        self._phase = SubmissionPhase.PENDING
+        self._initial_subjects_snapshot = None
 
     def submit(
         self,
@@ -317,6 +438,8 @@ class BulkRecordSubmissionWorkflow:
         Returns a SubmissionResult with all jobs and metadata.
         Raises BulkSubmissionError if Phase 1 jobs fail and Phase 2 depends on them.
         """
+        validate_submission_transition(self._phase, SubmissionPhase.REGISTRATION)
+
         result = SubmissionResult(
             study_key=study_key,
             started_at=datetime.now(UTC),
@@ -329,140 +452,130 @@ class BulkRecordSubmissionWorkflow:
 
         self._initial_subjects_snapshot = None
         existing_subjects: set[str] = set()
-        if self.skip_existing_subjects:
-            existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
 
-        pre_existing = _PreExistingSubjectsSnapshot(
-            subject_keys=set(existing_subjects),
-            subject_ids=set(),
-            subject_oids=set(),
-        )
-        if registration_sets and data_sets:
-            snap = (
-                self._initial_subjects_snapshot
-                if self._initial_subjects_snapshot is not None
-                else self._snapshot_existing_subjects(study_key)
+        try:
+            if self.skip_existing_subjects:
+                existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
+
+            pre_existing = _PreExistingSubjectsSnapshot(
+                subject_keys=set(existing_subjects),
+                subject_ids=set(),
+                subject_oids=set(),
             )
-            pre_existing.subject_keys.update(snap.subject_keys)
-            pre_existing.subject_ids.update(snap.subject_ids)
-            pre_existing.subject_oids.update(snap.subject_oids)
+            if registration_sets and data_sets:
+                snap = (
+                    self._initial_subjects_snapshot
+                    if self._initial_subjects_snapshot is not None
+                    else self._snapshot_existing_subjects(study_key)
+                )
+                pre_existing.subject_keys.update(snap.subject_keys)
+                pre_existing.subject_ids.update(snap.subject_ids)
+                pre_existing.subject_oids.update(snap.subject_oids)
 
-        submitted_placeholders: list[str | None] = []
-        skipped_placeholders: set[str] = set()
-        batch_item_groups: list[tuple[BatchSubmission, list[_SubmittedRegistrationItem]]] = []
+            submitted_placeholders: list[str | None] = []
+            skipped_placeholders: set[str] = set()
+            batch_item_groups: list[tuple[BatchSubmission, list[_SubmittedRegistrationItem]]] = []
 
-        # Phase 1: Registration
-        self.phase = SubmissionPhase.REGISTRATION
-        for rs in registration_sets:
-            filtered_payloads: list[dict[str, Any]] = []
-            filtered_items: list[_SubmittedRegistrationItem] = []
-            for i, payload in enumerate(rs.payloads):
-                subj_key = rs.subject_keys[i] if i < len(rs.subject_keys) else None
-                if subj_key and subj_key in existing_subjects:
-                    logger.info("Skipping registration for existing subject: %s", subj_key)
-                    skipped_placeholders.add(subj_key)
+            # Phase 1: Registration
+            self.transition_to(SubmissionPhase.REGISTRATION)
+            for rs in registration_sets:
+                filtered_payloads: list[dict[str, Any]] = []
+                filtered_items: list[_SubmittedRegistrationItem] = []
+                for i, payload in enumerate(rs.payloads):
+                    subj_key = rs.subject_keys[i] if i < len(rs.subject_keys) else None
+                    if subj_key and subj_key in existing_subjects:
+                        logger.info("Skipping registration for existing subject: %s", subj_key)
+                        skipped_placeholders.add(subj_key)
+                        continue
+                    clean_payload = dict(payload)
+                    clean_payload.pop("subjectKey", None)
+                    clean_payload.pop("subject_key", None)
+                    raw_data = (
+                        clean_payload.get("data")
+                        if "data" in clean_payload
+                        else clean_payload.get("recordData")
+                    )
+                    item = _SubmittedRegistrationItem(
+                        placeholder_key=subj_key,
+                        form_key=str(
+                            clean_payload.get("formKey")
+                            or clean_payload.get("form_key")
+                            or rs.form_key
+                            or ""
+                        ),
+                        site_name=_clean_str(
+                            _get_attr_or_key(clean_payload, "siteName", "site_name")
+                        ),
+                        site_id=_clean_int(_get_attr_or_key(clean_payload, "siteId", "site_id")),
+                        subject_oid=_clean_str(
+                            _get_attr_or_key(clean_payload, "subjectOid", "subject_oid")
+                        ),
+                        data=dict(raw_data) if isinstance(raw_data, dict) else {},
+                    )
+                    filtered_payloads.append(clean_payload)
+                    filtered_items.append(item)
+                    submitted_placeholders.append(subj_key)
+
+                if not filtered_payloads:
+                    result.skipped_forms.append(rs.form_key)
                     continue
-                clean_payload = dict(payload)
-                clean_payload.pop("subjectKey", None)
-                clean_payload.pop("subject_key", None)
-                raw_data = (
-                    clean_payload.get("data")
-                    if "data" in clean_payload
-                    else clean_payload.get("recordData")
-                )
-                item = _SubmittedRegistrationItem(
-                    placeholder_key=subj_key,
-                    form_key=str(
-                        clean_payload.get("formKey")
-                        or clean_payload.get("form_key")
-                        or rs.form_key
-                        or ""
-                    ),
-                    site_name=_clean_str(_get_attr_or_key(clean_payload, "siteName", "site_name")),
-                    site_id=_clean_int(_get_attr_or_key(clean_payload, "siteId", "site_id")),
-                    subject_oid=_clean_str(
-                        _get_attr_or_key(clean_payload, "subjectOid", "subject_oid")
-                    ),
-                    data=dict(raw_data) if isinstance(raw_data, dict) else {},
-                )
-                filtered_payloads.append(clean_payload)
-                filtered_items.append(item)
-                submitted_placeholders.append(subj_key)
 
-            if not filtered_payloads:
-                result.skipped_forms.append(rs.form_key)
-                continue
+                offset = 0
+                for chunk in self._chunk_payloads(filtered_payloads):
+                    chunk_items = filtered_items[offset : offset + len(chunk)]
+                    offset += len(chunk)
+                    batch = self._submit_batch(
+                        study_key,
+                        chunk,
+                        phase="registration",
+                        form_key=rs.form_key,
+                        form_name=rs.form_name,
+                        email_notify=email_notify,
+                    )
+                    for item in chunk_items:
+                        item.batch_id = batch.job.batch_id
+                    result.registration_batches.append(batch)
+                    batch_item_groups.append((batch, chunk_items))
 
-            offset = 0
-            for chunk in self._chunk_payloads(filtered_payloads):
-                chunk_items = filtered_items[offset : offset + len(chunk)]
-                offset += len(chunk)
-                batch = self._submit_batch(
-                    study_key,
-                    chunk,
-                    phase="registration",
-                    form_key=rs.form_key,
-                    form_name=rs.form_name,
-                    email_notify=email_notify,
-                )
-                for item in chunk_items:
-                    item.batch_id = batch.job.batch_id
-                result.registration_batches.append(batch)
-                batch_item_groups.append((batch, chunk_items))
-
-        # Determine transition from registration phase
-        if self.await_registration and result.registration_batches:
-            self.phase = SubmissionPhase.AWAITING_REGISTRATION
-        else:
-            self.phase = SubmissionPhase.DATA
-
-        # Explicit submission phase check for awaiting registration
-        poll_summary: JobPollSummary | None = None
-        if self.phase == SubmissionPhase.AWAITING_REGISTRATION:
-            try:
+            # Determine transition from registration phase
+            poll_summary: JobPollSummary | None = None
+            if self.await_registration and result.registration_batches:
+                self.transition_to(SubmissionPhase.AWAITING_REGISTRATION)
                 poll_summary = self._poll_and_validate_registration_batches(
                     study_key, result.registration_batches
                 )
-            except Exception:
-                self.phase = SubmissionPhase.FAILED
-                raise
-            self.phase = SubmissionPhase.DATA
-
-        if batch_item_groups:
-            must_correlate = self._requires_phase2_correlation(data_sets, poll_summary)
-            if not self.await_registration:
-                if must_correlate:
-                    self.phase = SubmissionPhase.FAILED
+                if batch_item_groups:
+                    must_correlate = self._requires_phase2_correlation(data_sets, poll_summary)
+                    enrolled_keys, correlation_error = self._correlate_enrolled_subjects(
+                        study_key=study_key,
+                        batch_item_groups=batch_item_groups,
+                        summary=poll_summary,
+                        pre_existing=pre_existing,
+                        allow_record_lookup=bool(data_sets),
+                    )
+                    if enrolled_keys is not None:
+                        result.enrolled_subject_keys = list(enrolled_keys)
+                        SyntheticRecordGenerator.resolve_subject_keys(
+                            record_sets,
+                            enrolled_keys,
+                            placeholder_keys=submitted_placeholders,
+                            preserved_keys=skipped_placeholders,
+                        )
+                    elif must_correlate:
+                        raise BulkSubmissionError(
+                            correlation_error
+                            or "Unable to correlate enrolled subjects to this registration batch.",
+                            failed_batches=list(result.registration_batches),
+                        )
+                self.transition_to(SubmissionPhase.DATA)
+            else:
+                self.transition_to(SubmissionPhase.DATA)
+                if batch_item_groups and self._requires_phase2_correlation(data_sets, poll_summary):
                     raise BulkSubmissionError(
                         "Cannot correlate enrolled subjects for Phase 2 records when await_registration is False.",
                         failed_batches=list(result.registration_batches),
                     )
-            else:
-                enrolled_keys, correlation_error = self._correlate_enrolled_subjects(
-                    study_key=study_key,
-                    batch_item_groups=batch_item_groups,
-                    summary=poll_summary,
-                    pre_existing=pre_existing,
-                    allow_record_lookup=bool(data_sets),
-                )
-                if enrolled_keys is not None:
-                    result.enrolled_subject_keys = list(enrolled_keys)
-                    SyntheticRecordGenerator.resolve_subject_keys(
-                        record_sets,
-                        enrolled_keys,
-                        placeholder_keys=submitted_placeholders,
-                        preserved_keys=skipped_placeholders,
-                    )
-                elif must_correlate:
-                    self.phase = SubmissionPhase.FAILED
-                    raise BulkSubmissionError(
-                        correlation_error
-                        or "Unable to correlate enrolled subjects to this registration batch.",
-                        failed_batches=list(result.registration_batches),
-                    )
 
-        # Explicit submission phase check for data submission
-        if self.phase == SubmissionPhase.DATA:
             # Phase 2: Data Submission
             for rs in data_sets:
                 for chunk in self._chunk_payloads(rs.payloads):
@@ -475,7 +588,13 @@ class BulkRecordSubmissionWorkflow:
                         email_notify=email_notify,
                     )
                     result.data_batches.append(batch)
-            self.phase = SubmissionPhase.COMPLETED
+            self.transition_to(SubmissionPhase.COMPLETED)
+        except InvalidSubmissionPhaseTransitionError:
+            raise
+        except Exception:
+            if not self._phase.is_terminal:
+                self.transition_to(SubmissionPhase.FAILED)
+            raise
 
         result.completed_at = datetime.now(UTC)
         return result
@@ -562,7 +681,10 @@ class BulkRecordSubmissionWorkflow:
                             normalize_job_state(raw_state) if raw_state else JobState.FAILED
                         )
                 else:
-                    target_state = JobState.FAILED
+                    batch.job.transition_to(JobState.FAILED)
+                    if not isinstance(batch.job, Job):
+                        batch.job.state = JobState.FAILED
+                    raise exc
                 batch.job.transition_to(target_state)
                 if not isinstance(batch.job, Job):
                     batch.job.state = target_state
@@ -1073,9 +1195,16 @@ class BulkRecordSubmissionWorkflow:
 
 
 __all__ = [
+    "ACTIVE_SUBMISSION_PHASES",
+    "ALLOWED_SUBMISSION_TRANSITIONS",
+    "TERMINAL_SUBMISSION_PHASES",
     "BatchSubmission",
     "BulkRecordSubmissionWorkflow",
     "BulkSubmissionError",
+    "InvalidSubmissionPhaseTransitionError",
     "SubmissionPhase",
     "SubmissionResult",
+    "is_valid_submission_transition",
+    "normalize_submission_phase",
+    "validate_submission_transition",
 ]

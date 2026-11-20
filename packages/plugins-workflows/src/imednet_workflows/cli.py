@@ -325,6 +325,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             from .wizard import ensure_interactive_stdin
 
             ensure_interactive_stdin(force_non_interactive=no_interactive)
+        else:
+            if not args.study_key:
+                extract_parser.error("the following arguments are required: study_key")
+            from imednet.spi.models import Record, Subject, Visit
+
+            parse_filter_args(args.record_filter, model=Record)
+            parse_filter_args(args.subject_filter, model=Subject)
+            parse_filter_args(args.visit_filter, model=Visit)
         extract_records(
             study_key=args.study_key,
             record_filter=args.record_filter,
@@ -578,18 +586,18 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         elif not study_key:
             uat_run_parser.error("the following arguments are required: study_key")
 
-        phase_descriptions = {
+        active_phase_descriptions = {
             UATWorkflowState.INSPECTING: "[Phase 1/5] Inspecting study schema and metadata...",
             UATWorkflowState.BUILDING_SPEC: "[Phase 2/5] Building test specification...",
             UATWorkflowState.GENERATING: "[Phase 3/5] Generating synthetic test records...",
             UATWorkflowState.SUBMITTING: "[Phase 4/5] Submitting records to iMednet API...",
             UATWorkflowState.MONITORING: "[Phase 5/5] Monitoring asynchronous job completion...",
-            UATWorkflowState.COMPLETED: "[Complete] UAT pipeline execution finished successfully.",
-            UATWorkflowState.FAILED: "[Failed] UAT pipeline execution encountered an error.",
         }
 
         def on_phase(phase: UATWorkflowState) -> None:
-            msg = phase_descriptions.get(phase, f"UAT Phase transition: {phase.value}")
+            if phase in (UATWorkflowState.COMPLETED, UATWorkflowState.FAILED):
+                return
+            msg = active_phase_descriptions.get(phase, f"UAT Phase transition: {phase.value}")
             print_progress(msg)
 
         def on_progress(batch_id: str, status: Any, elapsed: float) -> None:
@@ -610,8 +618,15 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             email_notify=email_notify,
         )
 
+        result_state = getattr(result, "state", None)
+        is_success = bool(result.overall_success) and result_state != UATWorkflowState.FAILED
+        if is_success:
+            print_progress("[Complete] UAT pipeline execution finished successfully.")
+        else:
+            print_progress("[Failed] UAT pipeline execution encountered an error.")
+
         print(result.summary())
-        if not result.overall_success:
+        if not is_success:
             sys.exit(1)
 
     def _handle_uat_run(args: argparse.Namespace) -> None:

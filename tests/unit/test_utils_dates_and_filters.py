@@ -412,7 +412,11 @@ def test_ordered_filter_operators_and_expression_parsing() -> None:
         "subjectStatus",
         ("!=", "Enrolled"),
     )
-    assert parse_filter_expression("subjectKey=~^SUBJ.*") == (
+    with pytest.raises(
+        ValueError, match=r"Allowed operators: \['!=', '<', '<=', '==', '>', '>='\]"
+    ):
+        parse_filter_expression("subjectKey=~^SUBJ.*")
+    assert parse_filter_expression("subjectKey=~^SUBJ.*", allow_regex=True) == (
         "subjectKey",
         ("=~", "^SUBJ.*"),
     )
@@ -432,15 +436,17 @@ def test_ordered_filter_operators_and_expression_parsing() -> None:
 
 
 def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None:
-    """Test that multiple operator tuples on one key join with semicolon AND connector."""
-    parsed = parse_filter_expressions(
-        [
-            "dateCreated>=2026-01-01T00:00:00Z",
-            "dateCreated<=2026-02-01T23:59:59Z",
-            "studyKey==STUDY",
-        ]
-    )
-    assert parsed == {
+    """Test programmatic operator tuple lists on one key and CLI duplicate AND rejection."""
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'dateCreated'"):
+        parse_filter_expressions(
+            [
+                "dateCreated>=2026-01-01T00:00:00Z",
+                "dateCreated<=2026-02-01T23:59:59Z",
+                "studyKey==STUDY",
+            ]
+        )
+
+    programmatic_bounds = {
         "dateCreated": [
             (">=", "2026-01-01T00:00:00Z"),
             ("<=", "2026-02-01T23:59:59Z"),
@@ -448,7 +454,7 @@ def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None
         "studyKey": ("==", "STUDY"),
     }
     assert (
-        build_filter_string(parsed)
+        build_filter_string(programmatic_bounds)
         == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z;studyKey==STUDY"
     )
 
@@ -552,3 +558,103 @@ def test_schema_guided_scalar_coercion_across_model_types() -> None:
     assert parse_filter_expression("color=001", model=CustomFilterModel) == ("color", "001")
     assert parse_filter_expression("mixed=42", model=CustomFilterModel) == ("mixed", 42)
     assert parse_filter_expression("mixed=0042", model=CustomFilterModel) == ("mixed", "0042")
+
+
+def test_validate_filter_key_allowed_attributes_and_sorted_listing() -> None:
+    """validate_filter_key enforces endpoint FILTER_ATTRIBUTES and lists valid attributes."""
+    from imednet.endpoints.queries import QueriesEndpoint
+    from imednet.endpoints.visits import VisitsEndpoint
+    from imednet.models.queries import Query
+
+    validate_filter_key(
+        "interval_name",
+        model=Visit,
+        allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
+    )
+    validate_filter_key(
+        "intervalName",
+        model=Visit,
+        allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
+    )
+
+    with pytest.raises(ValueError) as visit_exc:
+        validate_filter_key(
+            "visit_id",
+            model=Visit,
+            allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
+        )
+    assert "Unknown filter attribute 'visit_id' for Visit." in str(visit_exc.value)
+    assert "Valid attributes:" in str(visit_exc.value)
+    assert "intervalId" in str(visit_exc.value)
+
+    with pytest.raises(ValueError) as query_exc:
+        validate_filter_key(
+            "status",
+            model=Query,
+            allowed_attributes=QueriesEndpoint.FILTER_ATTRIBUTES,
+        )
+    assert "Unknown filter attribute 'status' for Query." in str(query_exc.value)
+    assert "Valid attributes:" in str(query_exc.value)
+
+    with pytest.raises(
+        ValueError,
+        match="'study_key' and 'studyKey' cannot be used in --filter",
+    ):
+        validate_filter_key(
+            "study_key",
+            model=Visit,
+            allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
+        )
+
+
+def test_filter_quote_preservation_on_empty_and_quoted_strings() -> None:
+    """Table 10 empty and explicitly quoted strings preserve double quotes on serialization."""
+    from imednet.models.codings import Coding
+
+    parsed = parse_filter_expressions(
+        ['reason==""', 'code="0042"', 'dictionary_name="MedDRA"'],
+        model=Coding,
+    )
+    reason_op, reason_val = parsed["reason"]
+    assert reason_op == "=="
+    assert isinstance(reason_val, str)
+    assert reason_val == ""
+    assert parsed["code"] == "0042"
+    assert isinstance(parsed["code"], str)
+
+    serialized = build_filter_string(parsed)
+    assert serialized == 'reason=="";code=="0042";dictionaryName=="MedDRA"'
+
+    # Programmatic empty strings in dicts also serialize as ""
+    assert build_filter_string({"reason": ("==", "")}) == 'reason==""'
+    assert build_filter_string({"reason": ""}) == 'reason==""'
+
+    # OR filter strings also preserve quotes on empty and quoted strings
+    or_parsed = parse_filter_expressions(['reason=="",reason=="Not Applicable"'], model=Coding)
+    assert or_parsed == {"filter": 'reason=="",reason=="Not Applicable"'}
+
+
+def test_duplicate_and_attribute_normalization_across_casing_and_syntax() -> None:
+    """Normalized camelCase duplicate AND attributes fail while OR and case-sensitive eCRF pass."""
+    from imednet.utils.filters import validate_filter_syntax, validate_record_filter
+
+    for bad_exprs in (
+        ["record_id>=1", "recordId<=10"],
+        ["recordId>=1;recordId<=10"],
+        ["record_id>=1;recordId<=10"],
+    ):
+        with pytest.raises(ValueError, match="Duplicate filter attribute 'recordId'"):
+            parse_filter_expressions(bad_exprs)
+
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'recordId'"):
+        validate_filter_syntax("record_id>=1;recordId<=10")
+
+    # OR expressions allow the same attribute across comma branches
+    assert parse_filter_expressions(["record_id==1,recordId==2"]) == {
+        "filter": "recordId==1,recordId==2"
+    }
+
+    # Case-sensitive eCRF variable names remain distinct unless identical
+    validate_record_filter("age>=18;AGE<=65")
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'AGE'"):
+        validate_record_filter("AGE>=18;AGE<=65")

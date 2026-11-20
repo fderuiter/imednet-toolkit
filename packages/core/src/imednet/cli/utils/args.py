@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import itertools
 import sys
-from collections.abc import Iterable, Sequence
+import weakref
+from collections.abc import Collection, Iterable, Sequence
 from typing import Any
 
 from imednet.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
@@ -26,6 +27,30 @@ DEFAULT_INTERACTIVE_LIMIT = DEFAULT_PAGE_SIZE
 _STUDY_KEY_FILTER_ATTRS: frozenset[str] = frozenset({"study_key", "studyKey"})
 
 
+_ENDPOINT_FILTER_ATTRS_CACHE: weakref.WeakKeyDictionary[type[Any], frozenset[str] | None] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def resolve_endpoint_filter_attributes(model: type[Any] | None) -> frozenset[str] | None:
+    """Resolve documented endpoint ``FILTER_ATTRIBUTES`` for a registered SDK model."""
+    if model is None:
+        return None
+    if model in _ENDPOINT_FILTER_ATTRS_CACHE:
+        return _ENDPOINT_FILTER_ATTRS_CACHE[model]
+    from imednet.endpoints.registry import ENDPOINT_REGISTRY
+
+    resolved: frozenset[str] | None = None
+    for endpoint_cls in ENDPOINT_REGISTRY.values():
+        if getattr(endpoint_cls, "MODEL", None) is model:
+            attrs = getattr(endpoint_cls, "FILTER_ATTRIBUTES", None)
+            if isinstance(attrs, frozenset):
+                resolved = attrs
+                break
+    _ENDPOINT_FILTER_ATTRS_CACHE[model] = resolved
+    return resolved
+
+
 def _contains_study_key_filter(parsed: dict[str, Any]) -> bool:
     """Return True if parsed filters include ``study_key`` or ``studyKey``."""
     if _STUDY_KEY_FILTER_ATTRS.intersection(parsed):
@@ -40,20 +65,37 @@ def parse_filter_args(
     filter_args: list[str] | None,
     *,
     model: type[Any] | None = None,
+    allowed_attributes: Collection[str] | None = None,
     disallow_study_key: bool = False,
 ) -> dict[str, Any] | None:
     """Parse repeatable CLI ``--filter`` strings via the shared SPI filter parser.
 
-    Supports legacy ``key=value`` equality, all seven iMednet comparison
-    operators (``<``, ``<=``, ``>``, ``>=``, ``==``, ``!=``, ``=~``), compound
-    expressions joined exclusively by ``;`` (AND) or ``,`` (OR), and optional
-    Pydantic ``model`` attribute validation. Exits with status code ``1`` on
-    ``stderr`` if validation fails.
+    Supports legacy ``key=value`` equality, Table 2 iMednet comparison
+    operators (``<``, ``<=``, ``>``, ``>=``, ``==``, ``!=``), compound
+    expressions joined exclusively by ``;`` (AND) or ``,`` (OR), endpoint
+    ``allowed_attributes`` allowlists, and Pydantic ``model`` scalar coercion.
+    Exits with status code ``1`` on ``stderr`` if validation fails.
     """
     if not filter_args:
         return None
+
+    effective_allowed: Collection[str] | None = (
+        allowed_attributes
+        if allowed_attributes is not None
+        else resolve_endpoint_filter_attributes(model)
+    )
+    if disallow_study_key and effective_allowed is not None:
+        effective_allowed = frozenset(
+            attr for attr in effective_allowed if attr not in _STUDY_KEY_FILTER_ATTRS
+        )
+
     try:
-        parsed = parse_filter_expressions(filter_args, model=model)
+        parsed = parse_filter_expressions(
+            filter_args,
+            model=model,
+            allowed_attributes=effective_allowed,
+            allow_regex=False,
+        )
     except ValueError as exc:
         print_error(f"Error: {exc}")
         sys.exit(1)
@@ -138,7 +180,7 @@ def add_list_query_args(
             default=None,
             help=filter_help
             or (
-                "Server filter expression using =, ==, !=, <, <=, >, >=, =~ and "
+                "Server filter expression using =, ==, !=, <, <=, >, >= and "
                 "';' (AND) or ',' (OR) connectors. Repeat for multiple AND filters."
             ),
         )
@@ -148,8 +190,8 @@ def add_list_query_args(
             dest="record_data_filter",
             default=None,
             help=(
-                "Server recordDataFilter expression for Form Variable values "
-                "(e.g., 'AESER==Serious;AGE>=18')."
+                "Server recordDataFilter expression for Form Variable values using "
+                "==, !=, <, <=, >, >=, =~ (e.g., 'AESER==Serious;AGE>=18' or 'AETERM=~^Head')."
             ),
         )
     parser.add_argument(
@@ -185,6 +227,7 @@ def prepare_list_query(
     has_output_file: bool = False,
     no_interactive: bool = False,
     model: type[Any] | None = None,
+    allowed_attributes: Collection[str] | None = None,
     disallow_study_key: bool = False,
 ) -> tuple[dict[str, Any], int | None]:
     """Validate CLI query options and resolve SDK ``list()`` kwargs and item bound.
@@ -208,6 +251,7 @@ def prepare_list_query(
     parsed_filters = parse_filter_args(
         filter_args,
         model=model,
+        allowed_attributes=allowed_attributes,
         disallow_study_key=disallow_study_key,
     )
     if parsed_filters:

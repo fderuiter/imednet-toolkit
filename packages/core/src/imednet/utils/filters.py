@@ -8,7 +8,7 @@ import functools
 import re
 import types
 import weakref
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import date, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal, TypeVar, Union, get_args, get_origin
@@ -29,6 +29,12 @@ _OPERATOR_CHARS = frozenset("<>=!~")
 T = TypeVar("T")
 
 
+class _QuotedFilterStr(str):
+    """String subclass marking a scalar token that was explicitly double-quoted."""
+
+    __slots__ = ()
+
+
 @functools.lru_cache(maxsize=128)
 def _snake_to_camel(text: str) -> str:
     """Convert a snake_case string to camelCase."""
@@ -37,6 +43,15 @@ def _snake_to_camel(text: str) -> str:
     parts = text.split("_")
     first, rest = parts[0], parts[1:]
     return first + "".join(word.capitalize() for word in rest)
+
+
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+@functools.lru_cache(maxsize=128)
+def _camel_to_snake(text: str) -> str:
+    """Convert a camelCase string to snake_case."""
+    return _CAMEL_BOUNDARY_RE.sub("_", text).lower()
 
 
 def _scan_filter_string(filter_str: str) -> tuple[bool, bool, bool, bool]:
@@ -271,16 +286,35 @@ def _get_model_filter_keys(model: type[Any]) -> frozenset[str]:
     return result
 
 
-def validate_filter_key(key: str, *, model: type[Any] | None = None) -> None:
-    """Validate that a filter key is non-empty, operator-free, and optionally on ``model``.
+def _expand_allowed_attributes(
+    allowed_attributes: Collection[str],
+) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Return ``(accepted_keys, sorted_canonical_camel_keys)`` for an allowlist."""
+    canonical = sorted({_snake_to_camel(attr) for attr in allowed_attributes})
+    accepted = frozenset(
+        set(allowed_attributes) | set(canonical) | {_camel_to_snake(attr) for attr in canonical}
+    )
+    return accepted, tuple(canonical)
+
+
+def validate_filter_key(
+    key: str,
+    *,
+    model: type[Any] | None = None,
+    allowed_attributes: Collection[str] | None = None,
+) -> None:
+    """Validate that a filter key is non-empty, operator-free, and allowed.
 
     Args:
         key: The key string to validate.
         model: Optional Pydantic resource model class to validate attribute names against.
+        allowed_attributes: Optional endpoint filter attribute allowlist. When provided,
+            takes precedence over ``model`` attribute membership while preserving
+            ``snake_case`` and ``camelCase`` forms.
 
     Raises:
         ValueError: If key is empty, contains whitespace or operator characters, or is
-            unknown on ``model``.
+            not permitted by ``allowed_attributes`` / ``model``.
     """
     if not isinstance(key, str) or not key or not key.strip():
         raise ValueError("Filter key must be a non-empty string")
@@ -288,6 +322,21 @@ def validate_filter_key(key: str, *, model: type[Any] | None = None) -> None:
         raise ValueError(f"Filter key '{key}' cannot contain whitespace")
     if any(c in _OPERATOR_CHARS for c in key):
         raise ValueError(f"Filter key '{key}' cannot contain operator characters")
+    if allowed_attributes is not None:
+        accepted, canonical = _expand_allowed_attributes(allowed_attributes)
+        if key not in accepted:
+            valid_display = ", ".join(canonical) if canonical else "none"
+            if key in ("study_key", "studyKey") and "studyKey" not in canonical:
+                raise ValueError(
+                    "'study_key' and 'studyKey' cannot be used in --filter when "
+                    f"study_key is scoped to the command. Valid attributes: {valid_display}"
+                )
+            target_name = model.__name__ if model is not None else "endpoint"
+            raise ValueError(
+                f"Unknown filter attribute '{key}' for {target_name}. "
+                f"Valid attributes: {valid_display}"
+            )
+        return
     if model is not None:
         valid_keys = _get_model_filter_keys(model)
         if valid_keys and key not in valid_keys:
@@ -476,6 +525,8 @@ def _parse_single_clause(
     raw_arg: str,
     *,
     model: type[Any] | None = None,
+    allowed_attributes: Collection[str] | None = None,
+    allow_regex: bool = False,
 ) -> tuple[str, str, str | bool | int | float, bool]:
     """Parse ``key<op>value`` into ``(key, op, parsed_value, was_quoted)``."""
     if not isinstance(clause, str) or not clause or not clause.strip():
@@ -505,14 +556,15 @@ def _parse_single_clause(
     except ValueError as exc:
         raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
 
+    allowed_ops = sorted(RECORD_DATA_OPERATORS if allow_regex else ALLOWED_OPERATORS)
     if raw_value.startswith(("=", "<", ">", "~", "!")):
         raise ValueError(
             f"Invalid filter format: '{raw_arg}'. "
-            f"Unsupported comparison operator; allowed operators: {list(ORDERED_FILTER_OPERATORS)}."
+            f"Unsupported comparison operator; allowed operators: {allowed_ops}."
         )
 
     try:
-        validate_filter_key(raw_key, model=model)
+        validate_filter_key(raw_key, model=model, allowed_attributes=allowed_attributes)
     except ValueError as exc:
         raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
 
@@ -523,7 +575,7 @@ def _parse_single_clause(
 
     if matched_op != "=":
         try:
-            validate_filter_operator(matched_op, allow_regex=True)
+            validate_filter_operator(matched_op, allow_regex=allow_regex)
         except ValueError as exc:
             raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
 
@@ -537,6 +589,8 @@ def _parse_single_clause(
         field_kind=field_kind,
         field_name=raw_key,
     )
+    if was_quoted and isinstance(parsed_scalar, str):
+        parsed_scalar = _QuotedFilterStr(parsed_scalar)
     return raw_key, matched_op, parsed_scalar, was_quoted
 
 
@@ -559,20 +613,25 @@ def parse_filter_expression(
     filter_str: str,
     *,
     model: type[Any] | None = None,
+    allowed_attributes: Collection[str] | None = None,
+    allow_regex: bool = False,
 ) -> tuple[str, Any]:
     """Parse a single filter expression string into ``(key, value_or_operator_tuple)``.
 
     Matches two-character comparison operators (``<=``, ``>=``, ``!=``, ``==``,
-    ``=~``) and single-character inequalities (``<``, ``>``) before single ``=``
-    equality shorthand per the iMedNet Common API specification.
+    and ``=~`` when ``allow_regex=True``) and single-character inequalities
+    (``<``, ``>``) before single ``=`` equality shorthand per the iMednet Common
+    API specification.
 
     Args:
         filter_str: Raw filter expression string.
-        model: Optional Pydantic model class used to validate the parsed key.
+        model: Optional Pydantic model class used for scalar coercion and fallback key checks.
+        allowed_attributes: Optional endpoint filter attribute allowlist.
+        allow_regex: Whether to permit ``=~`` (Table 7 ``recordDataFilter`` only).
 
     Returns:
         Tuple of ``(key, parsed_value)`` where ``parsed_value`` is ``(operator, scalar)``
-        for explicit operators in :data:`ALLOWED_OPERATORS` or ``scalar`` for ``=`` shorthand.
+        for explicit operators or ``scalar`` for ``=`` shorthand.
 
     Raises:
         ValueError: If syntax, operator, or key validation fails.
@@ -585,7 +644,11 @@ def parse_filter_expression(
             "Expected a single 'key=value' filter expression."
         )
     raw_key, matched_op, parsed_scalar, _ = _parse_single_clause(
-        filter_str, filter_str, model=model
+        filter_str,
+        filter_str,
+        model=model,
+        allowed_attributes=allowed_attributes,
+        allow_regex=allow_regex,
     )
     if matched_op == "=":
         return raw_key, parsed_scalar
@@ -596,14 +659,16 @@ def parse_filter_expressions(
     expressions: Sequence[str],
     *,
     model: type[Any] | None = None,
+    allowed_attributes: Collection[str] | None = None,
+    allow_regex: bool = False,
 ) -> dict[str, Any]:
     """Parse multiple filter expressions into a filter dictionary.
 
     Supports compound ``;`` (AND) and ``,`` (OR) expressions, quote-aware
-    values, and optional resource ``model`` attribute validation. Repeated AND
-    conditions on the same key are preserved as a list of ``(operator, value)``
-    tuples so :func:`build_filter_string` joins them with ``;``. Comma-separated
-    OR expressions return ``{"filter": formatted_or_string}``.
+    values, endpoint ``allowed_attributes`` allowlists, and resource ``model``
+    scalar coercion. Duplicate attributes in ``;`` (AND) clauses are rejected
+    after normalizing ``snake_case`` to ``camelCase``. Comma-separated OR
+    expressions return ``{"filter": formatted_or_string}``.
     """
     for arg in expressions:
         if not isinstance(arg, str) or not arg or not arg.strip():
@@ -625,33 +690,42 @@ def parse_filter_expressions(
     if any(_has_unquoted_char(arg, ",") for arg in expressions):
         raw_arg = expressions[0]
         or_clauses = _split_outside_quotes(raw_arg, ",")
-        parsed_or = [_parse_single_clause(clause, raw_arg, model=model) for clause in or_clauses]
+        parsed_or = [
+            _parse_single_clause(
+                clause,
+                raw_arg,
+                model=model,
+                allowed_attributes=allowed_attributes,
+                allow_regex=allow_regex,
+            )
+            for clause in or_clauses
+        ]
         formatted = ",".join(_format_clause(*pc) for pc in parsed_or)
         try:
-            _validate_filter_expression(formatted, allow_regex=True)
+            _validate_filter_expression(formatted, allow_regex=allow_regex)
         except ValueError as exc:
             raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
         return {"filter": formatted}
 
     filter_dict: dict[str, Any] = {}
+    seen_and_keys: set[str] = set()
     for expr in expressions:
         for clause in _split_outside_quotes(expr, ";"):
-            key, op, val, _ = _parse_single_clause(clause, expr, model=model)
-            parsed_val: Any = val if op == "=" else (op, val)
-            if key not in filter_dict:
-                filter_dict[key] = parsed_val
-                continue
-
-            prev = filter_dict[key]
-            if isinstance(prev, list):
-                combined = list(prev)
-            elif isinstance(prev, tuple):
-                combined = [prev]
-            else:
-                combined = [("==", prev)]
-
-            combined.append(parsed_val if isinstance(parsed_val, tuple) else ("==", parsed_val))
-            filter_dict[key] = combined
+            key, op, val, _ = _parse_single_clause(
+                clause,
+                expr,
+                model=model,
+                allowed_attributes=allowed_attributes,
+                allow_regex=allow_regex,
+            )
+            canonical_key = _snake_to_camel(key)
+            if canonical_key in seen_and_keys:
+                raise ValueError(
+                    f"Invalid filter format: '{expr}'. "
+                    f"Duplicate filter attribute '{canonical_key}' in AND clause."
+                )
+            seen_and_keys.add(canonical_key)
+            filter_dict[key] = val if op == "=" else (op, val)
     return filter_dict
 
 
@@ -717,9 +791,10 @@ def _validate_filter_expression(filter_str: str, *, allow_regex: bool) -> None:
                 f"Invalid filter operator '{op}'. Allowed operators: {sorted(allowed)}"
             )
         if connector == ";":
-            if attr in seen_and_attrs:
-                raise ValueError(f"Duplicate filter attribute '{attr}' in AND clause")
-            seen_and_attrs.add(attr)
+            dedup_attr = attr if allow_regex else _snake_to_camel(attr)
+            if dedup_attr in seen_and_attrs:
+                raise ValueError(f"Duplicate filter attribute '{dedup_attr}' in AND clause")
+            seen_and_attrs.add(dedup_attr)
 
 
 def validate_filter_syntax(filter_str: str) -> None:
@@ -766,6 +841,9 @@ def _format_filter_value(val: Any) -> str:
     if isinstance(val, date):
         return val.isoformat()
     if isinstance(val, str):
+        if val == "" or isinstance(val, _QuotedFilterStr):
+            escaped = val.replace("\\", "\\\\").replace('"', r"\"")
+            return f'"{escaped}"'
         if _ISO_8601_TIMESTAMP_REGEX.match(val):
             return val
         if _UNSAFE_CHARS_REGEX.search(val):
