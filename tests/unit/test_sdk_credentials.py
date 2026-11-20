@@ -44,3 +44,26 @@ def test_initialization_succeeds(monkeypatch) -> None:
     )
     sdk = ImednetSDK()
     assert isinstance(sdk, ImednetSDK)
+
+
+@pytest.mark.asyncio
+async def test_injected_transport_bypasses_credential_enforcement(monkeypatch) -> None:
+    """Passing transport to ImednetSDK or AsyncImednetSDK bypasses credential checks."""
+    import httpx
+
+    from imednet.sdk import AsyncImednetSDK
+
+    for env_var in ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_OIDC_TOKEN"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    mock_transport = httpx.MockTransport(
+        lambda _req: httpx.Response(200, json={"data": [], "pagination": {"totalPages": 0}})
+    )
+    with ImednetSDK(transport=mock_transport) as sdk:
+        assert list(sdk.studies.list()) == []
+
+    async with AsyncImednetSDK(transport=mock_transport) as async_sdk:
+        assert [s async for s in async_sdk.studies.list()] == []
+
+    with ImednetSDK(config=Config(), transport=mock_transport) as sdk_with_cfg:
+        assert list(sdk_with_cfg.studies.list()) == []

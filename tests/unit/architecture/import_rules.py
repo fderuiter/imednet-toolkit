@@ -13,9 +13,12 @@ PUBLIC_CORE = (
     "imednet.errors",
 )
 PUBLIC_SYMBOLS = {
+    "ApiError",
     "ImednetSDK",
     "AsyncImednetSDK",
     "Config",
+    "ImednetError",
+    "NotFoundError",
     "PluginLoadError",
     "FilterConflictError",
     "OrchestratorError",
@@ -25,6 +28,8 @@ PUBLIC_SYMBOLS = {
     "PluginProtocol",
     "AsyncSinksNamespaceProtocol",
     "AsyncWorkflowsNamespaceProtocol",
+    "SimulationState",
+    "SimulationTransport",
     "SinksNamespaceProtocol",
     "SyncWorkflowsNamespaceProtocol",
     "WorkflowsNamespaceProtocol",
@@ -37,6 +42,7 @@ PUBLIC_SYMBOLS = {
     "JsonDict",
     "RetryPolicy",
     "RetryState",
+    "create_simulation_transport",
     "load_config",
 }
 

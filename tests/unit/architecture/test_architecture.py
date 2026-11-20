@@ -139,6 +139,9 @@ def test_extensions_use_spi():
                     "imednet.ImednetSDK",
                     "imednet.AsyncImednetSDK",
                     "imednet.Config",
+                    "imednet.ApiError",
+                    "imednet.ImednetError",
+                    "imednet.NotFoundError",
                     "imednet.PluginLoadError",
                     "imednet.FilterConflictError",
                     "imednet.OrchestratorError",
@@ -148,6 +151,8 @@ def test_extensions_use_spi():
                     "imednet.PluginProtocol",
                     "imednet.AsyncSinksNamespaceProtocol",
                     "imednet.AsyncWorkflowsNamespaceProtocol",
+                    "imednet.SimulationState",
+                    "imednet.SimulationTransport",
                     "imednet.SinksNamespaceProtocol",
                     "imednet.SyncWorkflowsNamespaceProtocol",
                     "imednet.WorkflowsNamespaceProtocol",
@@ -160,6 +165,7 @@ def test_extensions_use_spi():
                     "imednet.JsonDict",
                     "imednet.RetryPolicy",
                     "imednet.RetryState",
+                    "imednet.create_simulation_transport",
                     "imednet.load_config",
                 )
                 if imp.startswith("imednet.") and not imp.startswith(allowed_prefixes):

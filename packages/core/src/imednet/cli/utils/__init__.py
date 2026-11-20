@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING, Any
 from .args import (
     STUDY_KEY_ARG,
     add_no_interactive,
+    add_output_format,
     parse_filter_args,
     parse_record_data_filter,
     resolve_endpoint_filter_attributes,
+    resolve_output_format,
 )
 from .commands import register_list_command
 from .context import fetching_status, get_sdk
@@ -23,6 +25,7 @@ from .output import (
     clear_line,
     console,
     display_list,
+    emit_json,
     format_job_progress,
     print_error,
 )
@@ -56,9 +59,11 @@ __all__ = [
     "_format_cell_value",
     "_truncate",
     "add_no_interactive",
+    "add_output_format",
     "clear_line",
     "console",
     "display_list",
+    "emit_json",
     "fetching_status",
     "format_job_progress",
     "get_sdk",
@@ -72,6 +77,7 @@ __all__ = [
     "print_error",
     "register_list_command",
     "resolve_endpoint_filter_attributes",
+    "resolve_output_format",
     "run_interactive_grid",
     "supports_ansi_color",
     "supports_fullscreen_ui",

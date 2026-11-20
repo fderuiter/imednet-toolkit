@@ -10,6 +10,7 @@ class IntervalsOperationDef:
     PATH = "intervals"
     MODEL = Interval
     _id_param = "intervalId"
+    _lookup_key_hint = "intervalName"
     PAGE_SIZE = 500
     FILTER_ATTRIBUTES = frozenset(
         {
