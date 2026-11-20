@@ -31,26 +31,27 @@ logger = logging.getLogger(__name__)
 
 def extract_study_data(
     study_key: str,
-    sdk: ImednetSDK,
-    study_logger: Any,
+    sdk_client: Any,
+    logger: Any,
+    *args: Any,
     **kwargs: Any,
-) -> dict:
+) -> dict[str, int]:
     """Pipeline function: extract subject and record counts for a study.
 
     This function conforms to the StudyWorkerCallable protocol. It is called
     concurrently for each study resolved by the orchestrator.
     """
-    study_logger.info("Starting data extraction")
+    logger.info("Starting data extraction")
 
-    with sdk.study_context(study_key):
-        subjects = sdk.subjects.list(study_key=study_key)
-        records = sdk.records.list(study_key=study_key)
+    with sdk_client.study_context(study_key):
+        subjects = sdk_client.subjects.list(study_key=study_key)
+        records = sdk_client.records.list(study_key=study_key)
 
     result = {
         "subject_count": len(list(subjects)),
         "record_count": len(list(records)),
     }
-    study_logger.info("Extraction complete: %s", result)
+    logger.info("Extraction complete: %s", result)
     return result
 
 

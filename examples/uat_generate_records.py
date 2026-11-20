@@ -15,7 +15,7 @@ from imednet_workflows.uat import (
 )
 
 
-def main():
+def main() -> None:
     """Execute the UAT record generation example."""
     # 1. Create a mocked StudySnapshot (normally from StudySchemaInspector)
     snapshot = MagicMock(spec=StudySnapshot)
