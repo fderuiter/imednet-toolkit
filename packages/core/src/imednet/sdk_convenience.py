@@ -38,7 +38,8 @@ from imednet.utils.batch_coordinator import (
     BatchSubmissionSummary,
 )
 from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
-from imednet.utils.typing import FilterValue, JsonDict
+from imednet.utils.tabular import normalize_records_input
+from imednet.utils.typing import FilterValue, RecordsInput
 
 try:
     from opentelemetry import trace as _trace
@@ -347,24 +348,25 @@ class SyncSDKConvenienceMixin:
     def create_record(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
         skip_validation: bool = False,
     ) -> Job:
         """Create records in the specified study."""
+        normalized = normalize_records_input(records_data, schema=schema)
         if skip_validation:
             return self.records.create(
                 study_key,
-                records_data,
+                normalized,
                 email_notify=email_notify,
                 schema=schema,
                 skip_validation=True,
             )
         return self.records.create(
             study_key,
-            records_data,
+            normalized,
             email_notify=email_notify,
             schema=schema,
         )
@@ -373,7 +375,7 @@ class SyncSDKConvenienceMixin:
     def create_records_batch(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
@@ -382,12 +384,16 @@ class SyncSDKConvenienceMixin:
         wait_for_completion: bool = False,
         timeout: float = 300.0,
         interval: float = 5.0,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
+        normalized = normalize_records_input(records_data, schema=schema)
         coordinator = BatchCoordinator(chunk_size=chunk_size)
         return coordinator.submit(
             study_key,
-            records_data,
+            normalized,
             lambda chunk: self.records.create(
                 study_key,
                 chunk,
@@ -398,13 +404,17 @@ class SyncSDKConvenienceMixin:
             schema=schema,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
-            poll_many=lambda batch_ids: self.poll_jobs(
+            poll_many=lambda batch_ids, *, on_progress=None: self.poll_jobs(
                 study_key,
                 batch_ids,
                 interval=interval,
                 timeout=timeout,
+                on_progress=on_progress,
             ),
+            on_progress=on_progress,
             require_batch_id=wait_for_completion,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
         )
 
     @_trace_method
@@ -498,24 +508,25 @@ class AsyncSDKConvenienceMixin:
     async def async_create_record(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
         skip_validation: bool = False,
     ) -> Job:
         """Asynchronously create records in the specified study."""
+        normalized = normalize_records_input(records_data, schema=schema)
         if skip_validation:
             return await self.records.create(
                 study_key,
-                records_data,
+                normalized,
                 email_notify=email_notify,
                 schema=schema,
                 skip_validation=True,
             )
         return await self.records.create(
             study_key,
-            records_data,
+            normalized,
             email_notify=email_notify,
             schema=schema,
         )
@@ -524,7 +535,7 @@ class AsyncSDKConvenienceMixin:
     async def async_create_records_batch(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
@@ -533,12 +544,16 @@ class AsyncSDKConvenienceMixin:
         wait_for_completion: bool = False,
         timeout: float = 300.0,
         interval: float = 5.0,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once and submit records in bounded chunks."""
+        normalized = normalize_records_input(records_data, schema=schema)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
         return await coordinator.submit(
             study_key,
-            records_data,
+            normalized,
             lambda chunk: self.records.create(
                 study_key,
                 chunk,
@@ -549,13 +564,17 @@ class AsyncSDKConvenienceMixin:
             schema=schema,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
-            poll_many=lambda batch_ids: self.async_poll_jobs(
+            poll_many=lambda batch_ids, *, on_progress=None: self.async_poll_jobs(
                 study_key,
                 batch_ids,
                 interval=interval,
                 timeout=timeout,
+                on_progress=on_progress,
             ),
+            on_progress=on_progress,
             require_batch_id=wait_for_completion,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
         )
 
     @_async_trace_method

@@ -157,6 +157,7 @@ def test_extensions_use_spi():
                     "imednet.ImednetClient",
                     "imednet.ItemId",
                     "imednet.JsonDict",
+                    "imednet.RecordsInput",
                     "imednet.RetryPolicy",
                     "imednet.RetryState",
                     "imednet.load_config",

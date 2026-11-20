@@ -32,6 +32,7 @@ PUBLIC_SYMBOLS = {
     "ImednetClient",
     "ItemId",
     "JsonDict",
+    "RecordsInput",
     "RetryPolicy",
     "RetryState",
     "load_config",

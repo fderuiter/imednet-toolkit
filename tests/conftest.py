@@ -116,6 +116,7 @@ def _ensure_cli_parser_cached() -> None:
         prog_key = sys.argv[0] if sys.argv else ""
         key = (
             id(cli_mod),
+            id(current_get_parser),
             id(wf_mod),
             id(wf_cli),
             id(getattr(wf_cli, "setup_parser", None)),
