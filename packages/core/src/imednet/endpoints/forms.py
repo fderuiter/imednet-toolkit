@@ -10,6 +10,7 @@ class FormsOperationDef:
     PATH = "forms"
     MODEL = Form
     _id_param = "formId"
+    _lookup_key_hint = "formKey"
     PAGE_SIZE = 500
     FILTER_ATTRIBUTES = frozenset(
         {

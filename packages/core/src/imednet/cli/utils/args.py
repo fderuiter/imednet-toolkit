@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
 import sys
 import weakref
 from collections.abc import Callable, Collection, Iterable, Sequence
@@ -19,6 +20,7 @@ from imednet.utils.filters import (
 )
 
 from .output import print_error
+from .terminal import OUTPUT_FORMAT_ENV
 
 STUDY_KEY_ARG = "The key identifying the study."
 DEFAULT_INTERACTIVE_LIMIT = DEFAULT_PAGE_SIZE
@@ -320,10 +322,23 @@ def add_output_format(parser: argparse.ArgumentParser) -> None:
         "--format",
         dest="output_format",
         choices=("table", "json"),
-        default="table",
+        default=None,
         help="Response format: human table (default) or versioned JSON on stdout.",
     )
     add_no_interactive(parser)
+
+
+def resolve_output_format(
+    output_format: str | None = None,
+    *,
+    default: str = "table",
+) -> str:
+    """Resolve CLI ``--format`` option against ``IMEDNET_CLI_OUTPUT_FORMAT``."""
+    if output_format is not None:
+        return output_format
+    if os.environ.get(OUTPUT_FORMAT_ENV, "").strip().lower() == "json":
+        return "json"
+    return default
 
 
 def add_list_query_args(
@@ -387,7 +402,7 @@ def prepare_list_query(
     sort: str | None = None,
     limit: int | None = None,
     fetch_all: bool = False,
-    output_format: str = "table",
+    output_format: str | None = None,
     has_output_file: bool = False,
     no_interactive: bool = False,
     model: type[Any] | None = None,
@@ -428,10 +443,13 @@ def prepare_list_query(
     if sort is not None:
         request_kwargs["sort"] = sort.strip()
 
+    resolved_format = resolve_output_format(output_format)
     effective_limit: int | None = None
     if limit is not None:
         effective_limit = limit
-    elif not fetch_all and not no_interactive and output_format == "table" and not has_output_file:
+    elif (
+        not fetch_all and not no_interactive and resolved_format == "table" and not has_output_file
+    ):
         try:
             from .grid import is_interactive_terminal
 

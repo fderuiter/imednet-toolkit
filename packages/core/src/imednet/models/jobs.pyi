@@ -53,11 +53,11 @@ class Job(ImednetBaseModel):
     """Represents an asynchronous background job."""
 
     state: JobState | str | None = Field(default=None, alias="state")
-    job_id: str | None
-    batch_id: str | None
-    date_created: str | None
-    date_finished: str | None
-    date_started: str | None
+    job_id: str | None = None
+    batch_id: str | None = None
+    date_created: str | None = None
+    date_finished: str | None = None
+    date_started: str | None = None
 
     @field_validator("state", mode="before")
     @classmethod
@@ -78,20 +78,20 @@ class JobStatus(Job):
     record_success_count: int | None = Field(default=None, alias="successfulRecords")
     record_failure_count: int | None = Field(default=None, alias="failedRecords")
     result_error: str | None = Field(default=None, alias="resultError")
-    state: JobState | str | None
-    job_id: str | None
-    batch_id: str | None
-    date_created: str | None
-    date_finished: str | None
-    date_started: str | None
-    progress: int | None
-    result_url: str | None
+    state: JobState | str | None = None
+    job_id: str | None = None
+    batch_id: str | None = None
+    date_created: str | None = None
+    date_finished: str | None = None
+    date_started: str | None = None
+    progress: int | None = None
+    result_url: str | None = None
 
     @model_validator(mode="before")
     @classmethod
     def _normalize_record_count_keys(cls, data: Any) -> Any: ...
     @field_validator("progress", mode="before", check_fields=False)
-    def _parse_progress(cls, v: Any) -> int: ...
+    def _parse_progress(cls, v: Any) -> int | None: ...
     @property
     def total_records(self) -> int: ...
     @property

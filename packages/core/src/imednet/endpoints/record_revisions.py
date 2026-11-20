@@ -10,6 +10,7 @@ class RecordRevisionsOperationDef:
     PATH = "recordRevisions"
     MODEL = RecordRevision
     _id_param = "recordRevisionId"
+    _lookup_key_hint = "recordOid"
     FILTER_ATTRIBUTES = frozenset(
         {
             "recordRevisionId",

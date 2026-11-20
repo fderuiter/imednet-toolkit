@@ -14,6 +14,7 @@ from ...models.records import Record
 from ...sdk import ImednetSDK
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import (
+    add_no_interactive,
     add_simulation_arg,
     add_study_key_args,
     fetching_status,
@@ -122,6 +123,7 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Minimum record schema readiness score (0-100) when quality gate is enabled.",
     )
+    add_no_interactive(parser)
 
 
 def _parse_export_filters(filters: list[str] | None) -> dict[str, Any] | str | None:
@@ -146,7 +148,7 @@ def _parse_export_filters(filters: list[str] | None) -> dict[str, Any] | str | N
 
 def _extract_streaming_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Extract non-default streaming/checkpoint options from parsed CLI args."""
-    if hasattr(args, "study_key"):
+    if getattr(args, "study_key", None) is not None:
         validate_cli_path_segment(args.study_key, name="study_key")
     opts: dict[str, Any] = {}
     since = getattr(args, "since", None)

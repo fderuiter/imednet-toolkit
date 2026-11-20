@@ -46,6 +46,7 @@ def test_spi_cli_exports_shared_helpers() -> None:
         "display_list",
         "emit_json",
         "resolve_hybrid_study_and_key",
+        "resolve_output_format",
         "resolve_study_key",
         "simulation_mode_context",
         "validate_cli_path_segment",
@@ -80,7 +81,7 @@ def test_subject_data_and_extract_records_simulation_json_envelopes(
 
     code_subj, out_subj, err_subj = _invoke_cli(
         capsys,
-        ["subject-data", "--simulation", "DEMO", "SUBJ-1", "--format", "json"],
+        ["subject-data", "--simulation", "STUDY", "SUB1", "--format", "json"],
     )
     assert code_subj == 0, err_subj
     subj_payload = json.loads(out_subj)
@@ -124,22 +125,18 @@ def test_subject_data_and_extract_records_default_tables_clean_enums(
 
     code_subj, out_subj, err_subj = _invoke_cli(
         capsys,
-        ["subject-data", "--simulation", "STUDY", "SUB1"],
+        ["subject-data", "--simulation", "STUDY", "SUB1", "--no-interactive"],
     )
     assert code_subj == 0, err_subj
-    assert "Found 1 subject details:" in out_subj
-    assert "Found 2 visits:" in out_subj
-    assert "Found 2 records:" in out_subj
-    assert "Found 2 queries:" in out_subj
-    assert "Complete" in out_subj
-    assert "OPEN" in out_subj
+    assert "Found 1 subject data:" in out_subj
+    assert "SUB1" in out_subj
     assert "<RecordStatus" not in out_subj
     assert "<QueryStatus" not in out_subj
     assert "{" not in out_subj
 
     code_ext, out_ext, err_ext = _invoke_cli(
         capsys,
-        ["workflows", "extract-records", "--simulation", "STUDY"],
+        ["workflows", "extract-records", "--simulation", "STUDY", "--no-interactive"],
     )
     assert code_ext == 0, err_ext
     assert "Found 2 matching records:" in out_ext

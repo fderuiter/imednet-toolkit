@@ -15,6 +15,7 @@ from ..utils.args import (
     add_study_key_args,
     collect_list_items_with_remainder,
     prepare_list_query,
+    resolve_output_format,
     resolve_study_key,
 )
 
@@ -96,17 +97,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sdk: ImednetSDK,
         study_key: str,
         include_inactive: bool = False,
-        output_format: str = "table",
+        output_format: str | None = None,
         sort: str | None = None,
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,
     ) -> None:
+        resolved_format = resolve_output_format(output_format)
         req_kwargs, effective_limit = prepare_list_query(
             sort=sort,
             limit=limit,
             fetch_all=fetch_all,
-            output_format=output_format,
+            output_format=resolved_format,
             no_interactive=no_interactive,
         )
 
@@ -116,7 +118,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 effective_limit,
             )
 
-        if output_format == "json":
+        if resolved_format == "json":
             display_list(users_list, "users", output_format="json")
             return
 
@@ -133,6 +135,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             details=users_list,
             truncated=truncated,
             interactive=False if no_interactive else None,
+            output_format=resolved_format,
             on_load_all=_load_more_users if load_remaining is not None else None,
         )
 
@@ -143,7 +146,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         list_users(
             study_key=study_key,
             include_inactive=args.include_inactive,
-            output_format=args.output_format,
+            output_format=resolve_output_format(args.output_format),
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,

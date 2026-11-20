@@ -13,8 +13,8 @@ declaration did not justify that cost. Revisit only for a measured user-facing r
 Add opt-in `--format json` to core list reads, job status/wait, and read-oriented
 workflow commands (`subject-data`, `workflows extract-records`, and `workflows state show`)
 using one versioned response envelope exposed via shared `imednet.spi.cli` helpers
-(`add_output_format`, `display_list`, `emit_json`, Study key argument resolvers,
-`validate_cli_path_segment`, and offline `--simulation` helpers). Human defaults render through curses `InteractiveDataGrid`
+(`add_output_format`, `resolve_output_format`, `display_list`, `emit_json`, Study key
+argument resolvers, `validate_cli_path_segment`, and offline `--simulation` helpers). Human defaults render through curses `InteractiveDataGrid`
 paging, live search and side-panel inspection on interactive TTYs (or clean static human
 tables on multi-section/workflow reads), and fall back to plain tabular stdout when streams
 are non-interactive, `TERM=dumb`, or `IMEDNET_NON_INTERACTIVE=1` is set; existing file

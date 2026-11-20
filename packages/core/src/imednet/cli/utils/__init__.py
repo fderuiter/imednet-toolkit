@@ -15,6 +15,7 @@ from .args import (
     parse_record_data_filter,
     resolve_endpoint_filter_attributes,
     resolve_hybrid_study_and_key,
+    resolve_output_format,
     resolve_study_key,
 )
 from .commands import register_list_command
@@ -89,6 +90,7 @@ __all__ = [
     "register_list_command",
     "resolve_endpoint_filter_attributes",
     "resolve_hybrid_study_and_key",
+    "resolve_output_format",
     "resolve_study_key",
     "run_interactive_grid",
     "simulation_mode_context",

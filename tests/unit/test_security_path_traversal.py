@@ -122,8 +122,8 @@ def test_endpoint_abc_separates_static_prefixes_from_dynamic_segments() -> None:
 def test_acceptance_criteria_vectors_send_zero_http_requests() -> None:
     """Verify exact acceptance criteria traversal/truncation vectors fail preflight."""
     sdk = ImednetSDK(
-        api_key="test-key",
-        security_key="test-secret",
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
         base_url="https://edc.example.test",
     )
 
@@ -151,8 +151,8 @@ def test_acceptance_criteria_vectors_send_zero_http_requests() -> None:
 def test_all_sync_list_endpoints_reject_unsafe_study_key(ep_attr: str) -> None:
     """All 12 sync list endpoints reject unsafe study_key values before HTTP dispatch."""
     sdk = ImednetSDK(
-        api_key="test-key",
-        security_key="test-secret",
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
         base_url="https://edc.example.test",
     )
     try:
@@ -171,8 +171,8 @@ def test_all_sync_list_endpoints_reject_unsafe_study_key(ep_attr: str) -> None:
 async def test_all_async_list_endpoints_reject_unsafe_study_key(ep_attr: str) -> None:
     """All 12 async list endpoints reject unsafe study_key values before HTTP dispatch."""
     async with AsyncImednetSDK(
-        api_key="test-key",
-        security_key="test-secret",
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
         base_url="https://edc.example.test",
     ) as sdk:
         endpoint = getattr(sdk, ep_attr)
@@ -187,8 +187,8 @@ async def test_all_async_list_endpoints_reject_unsafe_study_key(ep_attr: str) ->
 def test_all_sync_get_endpoints_reject_unsafe_identifiers(ep_attr: str) -> None:
     """All sync get endpoints (including jobs and studies) reject unsafe study_key and item_id."""
     sdk = ImednetSDK(
-        api_key="test-key",
-        security_key="test-secret",
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
         base_url="https://edc.example.test",
     )
     try:
@@ -216,8 +216,8 @@ def test_all_sync_get_endpoints_reject_unsafe_identifiers(ep_attr: str) -> None:
 async def test_all_async_get_endpoints_reject_unsafe_identifiers(ep_attr: str) -> None:
     """All async get endpoints (including jobs and studies) reject unsafe inputs."""
     async with AsyncImednetSDK(
-        api_key="test-key",
-        security_key="test-secret",
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
         base_url="https://edc.example.test",
     ) as sdk:
         endpoint = getattr(sdk, ep_attr)
@@ -241,13 +241,13 @@ async def test_all_async_get_endpoints_reject_unsafe_identifiers(ep_attr: str) -
 async def test_records_create_and_jobs_poll_reject_unsafe_segments() -> None:
     """Sync and async record creation and job polling reject unsafe study_key and batch_id."""
     sdk = ImednetSDK(
-        api_key="test-key",
-        security_key="test-secret",
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
         base_url="https://edc.example.test",
     )
     async with AsyncImednetSDK(
-        api_key="test-key",
-        security_key="test-secret",
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
         base_url="https://edc.example.test",
     ) as async_sdk:
         try:
@@ -332,6 +332,8 @@ def test_airflow_sensor_and_export_operator_reject_unsafe_segments_before_sdk(
         ["jobs", "wait", "ALLOWED_STUDY", "%2e%2e/CANARY_STUDY/records", "--format", "json"],
         ["sites", "list", "CANARY_STUDY/records#", "--format", "json"],
         ["records", "list", "CANARY_STUDY/users?", "--format", "json"],
+        ["subjects", "list", "CANARY_STUDY/subjects?", "--format", "json"],
+        ["codings", "list", "CANARY_STUDY/codings#", "--format", "json"],
         ["export", "csv", "../CANARY_STUDY", "/tmp/unused.csv"],
         ["datadict", "from-api", "--study-key", "../../CANARY_STUDY"],
         ["workflows", "extract-records", "../CANARY_STUDY"],

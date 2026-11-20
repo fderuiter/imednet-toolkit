@@ -233,10 +233,16 @@ def app(args: list[str] | None = None) -> None:
         if getattr(parsed, "simulation", False):
             os.environ[SIMULATION_MODE_ENV] = "1"
 
-        if getattr(parsed, "output_format", None) == "json":
+        explicit_format = getattr(parsed, "output_format", None)
+        if explicit_format is None:
+            explicit_format = getattr(parsed, "format", None)
+
+        if explicit_format == "json":
             os.environ[OUTPUT_FORMAT_ENV] = "json"
-        else:
+        elif explicit_format in {"table", "text", "md"}:
             os.environ.pop(OUTPUT_FORMAT_ENV, None)
+        elif old_output_format is not None and old_output_format.strip().lower() == "json":
+            os.environ[OUTPUT_FORMAT_ENV] = "json"
 
         if hasattr(parsed, "func"):
             parsed.func(parsed)

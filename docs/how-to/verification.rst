@@ -2,7 +2,14 @@
 Verification Loop
 =================
 
-Before proposing any solution, execute and pass all CI quality gates locally.
+.. note::
+   **Contributor Scope:** This guide is for SDK contributors and maintainers
+   running pre-PR lint, static type-checking, and test gates locally. For
+   clinical ``Study`` schema validation, pre-live UAT checks, or 21 CFR Part 11
+   audit verification, see :doc:`data_dictionary`,
+   :doc:`workflows/uat_workflow`, and :doc:`audit_compliance`.
+
+Before proposing any code change, execute and pass all CI quality gates locally.
 
 1. Read ``.github/workflows/main.yml`` (the ``quality`` and ``pre-commit`` jobs) to identify the authoritative lint, format, and type-check commands.
 2. Run the full gate in order (contributors must execute ``uvx pre-commit run --all-files`` before opening pull requests):

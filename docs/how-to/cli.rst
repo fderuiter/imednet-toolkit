@@ -102,17 +102,19 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
    imednet records list STUDY --format json
    imednet jobs status STUDY BATCH --format json
    imednet jobs wait STUDY BATCH --timeout 60 --format json
-   imednet subject-data STUDY SUBJ-1 --format json
    imednet workflows extract-records STUDY --format json
+   imednet subject-data STUDY SUBJ-001 --format json
    imednet workflows state show --study-key STUDY --format json
+   IMEDNET_CLI_OUTPUT_FORMAT=json imednet studies list
 
 Supported JSON envelope reads include core list resources (studies, queries, variables,
-record-revisions, sites, records, subjects, intervals, visits, codings, and users),
+record-revisions, sites, forms, records, subjects, intervals, visits, codings, and users),
 ``jobs status`` / ``jobs wait``, and read-oriented workflow commands (``subject-data``,
 ``workflows extract-records``, and ``workflows state show``) via shared ``imednet.spi.cli``
-helpers. JSON reads emit exactly one envelope
+helpers. JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
-``items``. Empty results use an empty items array. Item fields use the SDK models'
+``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
+and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it). Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
 JSON aliases; the JSON view includes model fields beyond the human summary table.
 Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
@@ -121,9 +123,10 @@ Usage failures exit 2, SDK-command interruption exits 130, and success/help exit
 ``records list -o`` / ``--output {json,csv}`` is deprecated and prints a ``stderr``
 deprecation warning recommending ``--format json`` (for ``stdout``) or ``imednet export``
 (for file exports), while continuing to write ``./records.json`` or ``./records.csv``;
-combining ``--output`` with ``--format json`` remains an error. Existing ``export``
-commands and ``datadict`` JSON/schema/diff outputs (see :doc:`/how-to/data_dictionary`)
-retain their own contracts. This is not a global JSON wrapper for arbitrary plugins.
+combining ``--output`` with ``--format json`` (or ``IMEDNET_CLI_OUTPUT_FORMAT=json``) remains
+an error. Existing ``export`` commands (which also accept ``--no-interactive`` to suppress
+live spinners) and ``datadict`` JSON/schema/diff outputs (see :doc:`/how-to/data_dictionary`)
+retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
 

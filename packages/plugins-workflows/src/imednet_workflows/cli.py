@@ -28,9 +28,12 @@ from imednet.spi.cli import (
     console,
     display_list,
     emit_json,
+    fetching_status,
+    is_json_output_mode,
     parse_filter_args,
     print_error,
     resolve_hybrid_study_and_key,
+    resolve_output_format,
     resolve_study_key,
     validate_cli_path_segment,
     with_sdk,
@@ -39,18 +42,10 @@ from imednet.spi.utils import validate_path_segment
 
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
-from .subject_data import SubjectComprehensiveData, SubjectDataWorkflow
+from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncWorker, SyncWorkerConfig, SyncWorkerState
 
 _UniqueStoreAction = UniqueStoreAction
-_RECORD_SUMMARY_FIELDS: list[str] = [
-    "record_id",
-    "subject_key",
-    "form_key",
-    "visit_id",
-    "record_status",
-    "date_created",
-]
 
 
 def _execute_set_state(
@@ -79,7 +74,7 @@ def _execute_set_state(
             msg = f"the following arguments are required: {', '.join(missing)}"
             if parser is not None:
                 parser.error(msg)
-            print(f"Error: {msg}", file=sys.stderr)
+            print_error(f"Error: {msg}")
             sys.exit(2)
 
         try:
@@ -219,7 +214,7 @@ def _execute_reset_state(
         msg = "the following arguments are required: -s/--study-key"
         if parser is not None:
             parser.error(msg)
-        print(f"Error: {msg}", file=sys.stderr)
+        print_error(f"Error: {msg}")
         sys.exit(2)
 
     ledger = get_state_provider(ledger_path)
@@ -248,11 +243,12 @@ def _execute_show_state(
     study_key: str | None = None,
     *,
     interactive: bool = False,
-    output_format: str = "table",
+    output_format: str | None = None,
     no_interactive: bool = False,
 ) -> None:
     """Display or serialize high-water mark ledger records."""
-    if interactive and output_format == "json":
+    resolved_format = resolve_output_format(output_format)
+    if interactive and resolved_format == "json":
         print_error("Error: Cannot combine --interactive and --format json.")
         sys.exit(1)
 
@@ -260,11 +256,11 @@ def _execute_show_state(
         from .wizard import ensure_interactive_stdin, prompt_input
 
         ensure_interactive_stdin(force_non_interactive=no_interactive)
-        prompted_study = prompt_input(
+        study_input = prompt_input(
             "Enter study key to filter (leave blank for all studies)",
             default=study_key or "",
         )
-        study_key = prompted_study if prompted_study else None
+        study_key = study_input if study_input else None
 
     ledger = get_state_provider(ledger_path)
     try:
@@ -300,7 +296,7 @@ def _execute_show_state(
                 }
             )
 
-    if output_format == "json":
+    if resolved_format == "json":
         emit_json(entries, "ledger_state")
         return
 
@@ -318,8 +314,10 @@ def _execute_show_state(
         print("No ledger entries found matching filters.")
 
 
-def _register_state_subcommands(state_sub: argparse._SubParsersAction[Any]) -> None:
-    """Register ``show``, ``set``, and ``reset`` subcommands under a ``state`` parser."""
+def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
+    """Attach show, set, and reset subparsers to a state ArgumentParser."""
+    state_sub = state_parser.add_subparsers(dest="state_command")
+
     show_parser = state_sub.add_parser(
         "show", help="Show the current high-water mark records and stream metadata."
     )
@@ -341,7 +339,7 @@ def _register_state_subcommands(state_sub: argparse._SubParsersAction[Any]) -> N
             ledger_path=args.ledger_path,
             study_key=study_key,
             interactive=args.interactive,
-            output_format=getattr(args, "output_format", "table"),
+            output_format=resolve_output_format(getattr(args, "output_format", None)),
             no_interactive=getattr(args, "no_interactive", False),
         )
 
@@ -423,79 +421,6 @@ def _register_state_subcommands(state_sub: argparse._SubParsersAction[Any]) -> N
     reset_parser.set_defaults(func=_handle_reset_state)
 
 
-def _render_extracted_records(records: list[Any], *, output_format: str = "table") -> None:
-    """Render extracted records as a v1 JSON envelope or clean human table."""
-    if output_format == "json":
-        emit_json(records, "records")
-        return
-
-    if not records:
-        print("No records found matching the criteria.")
-        return
-
-    first = records[0]
-    if isinstance(first, dict) or hasattr(first, "record_id"):
-        display_list(
-            records,
-            "matching records",
-            "No records found matching the criteria.",
-            fields=_RECORD_SUMMARY_FIELDS,
-            details=records,
-            interactive=False,
-        )
-    else:
-        display_list(
-            records,
-            "matching records",
-            "No records found matching the criteria.",
-            interactive=False,
-        )
-
-
-def _render_subject_data(data: Any, *, output_format: str = "table") -> None:
-    """Render comprehensive subject data as a v1 JSON envelope or clean human tables."""
-    if output_format == "json":
-        emit_json([data], "subject_data")
-        return
-
-    if not isinstance(data, SubjectComprehensiveData) and not isinstance(
-        getattr(data, "records", None), list
-    ):
-        display_list([data], "subject data", interactive=False)
-        return
-
-    subject_details = getattr(data, "subject_details", None)
-    subjects = [subject_details] if subject_details is not None else []
-    display_list(
-        subjects,
-        "subject details",
-        "No subject details found.",
-        fields=["subject_key", "subject_status", "site_name", "enrollment_start_date"],
-        interactive=False,
-    )
-    display_list(
-        list(getattr(data, "visits", None) or []),
-        "visits",
-        "No visits found.",
-        fields=["visit_id", "interval_name", "subject_key", "visit_date"],
-        interactive=False,
-    )
-    display_list(
-        list(getattr(data, "records", None) or []),
-        "records",
-        "No records found.",
-        fields=_RECORD_SUMMARY_FIELDS,
-        interactive=False,
-    )
-    display_list(
-        list(getattr(data, "queries", None) or []),
-        "queries",
-        "No queries found.",
-        fields=["annotation_id", "subject_key", "record_id", "variable", "status", "description"],
-        interactive=False,
-    )
-
-
 def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     """Set up the workflows argparse subparsers."""
     wf_parser = subparsers.add_parser("workflows", help="Execute common data workflows.")
@@ -538,11 +463,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         visit_filter: list[str] | None = None,
         interactive: bool = False,
         no_interactive: bool = False,
-        output_format: str = "table",
+        output_format: str | None = None,
     ) -> None:
         from imednet.spi.models import Record, Subject, Visit
 
         from .wizard import print_progress
+
+        resolved_format = resolve_output_format(output_format)
+        json_mode = resolved_format == "json" or is_json_output_mode()
 
         if interactive:
             from .wizard import ensure_interactive_stdin, prompt_filters, prompt_study_key
@@ -577,9 +505,9 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         parsed_subject_filter = parse_filter_args(subject_filter, model=Subject)
         parsed_visit_filter = parse_filter_args(visit_filter, model=Visit)
 
-        if output_format != "json":
+        if not json_mode:
             print_progress(f"Extracting records for study '{study_key}'...")
-        if interactive:
+        if interactive and not json_mode:
             records = workflow.extract_records_by_criteria(
                 study_key=study_key,
                 record_filter=parsed_record_filter,
@@ -595,11 +523,32 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 visit_filter=parsed_visit_filter,
             )
 
-        _render_extracted_records(records, output_format=output_format)
+        if resolved_format == "json":
+            display_list(records, "records", output_format="json")
+            return
+
+        view_models = [
+            {
+                "ID": getattr(r, "record_id", None),
+                "Subject": getattr(r, "subject_key", None),
+                "Form": getattr(r, "form_key", None),
+                "Status": getattr(r, "record_status", None),
+                "Created": getattr(r, "date_created", None),
+            }
+            for r in records
+        ]
+        display_list(
+            view_models,
+            "matching records",
+            "No records found matching the criteria.",
+            details=records,
+            interactive=False if no_interactive else None,
+            output_format=resolved_format,
+        )
 
     def _handle_extract_records(args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
-        output_format = getattr(args, "output_format", "table")
+        output_format = resolve_output_format(getattr(args, "output_format", None))
         if args.interactive and output_format == "json":
             print_error("Error: Cannot combine --interactive and --format json.")
             sys.exit(1)
@@ -701,8 +650,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     sync_parser.set_defaults(func=_handle_sync_worker)
 
     state_parser = sub.add_parser("state", help="Manage high-water mark execution ledger state.")
-    state_sub = state_parser.add_subparsers(dest="state_command")
-    _register_state_subcommands(state_sub)
+    _configure_state_subparsers(state_parser)
 
     # UAT command integration
     uat_parser = sub.add_parser("uat", help="Manage and execute UAT acceptance test pipelines.")
@@ -875,19 +823,53 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         sdk: ImednetSDK,
         study_key: str,
         subject_key: str,
-        output_format: str = "table",
+        output_format: str | None = None,
+        no_interactive: bool = False,
     ) -> None:
+        resolved_format = resolve_output_format(output_format)
         workflow = SubjectDataWorkflow(sdk)  # type: ignore[arg-type]
-        data = workflow.get_all_subject_data(study_key, subject_key)
-        _render_subject_data(data, output_format=output_format)
+        if resolved_format == "json" or is_json_output_mode():
+            data = workflow.get_all_subject_data(study_key, subject_key)
+        else:
+            with fetching_status("subject data", study_key):
+                data = workflow.get_all_subject_data(study_key, subject_key)
+
+        if data.subject_details is None:
+            print_error(f"Error: Subject '{subject_key}' not found in study '{study_key}'.")
+            sys.exit(1)
+
+        if resolved_format == "json":
+            emit_json([data], "subject_data")
+            return
+
+        subj = data.subject_details
+        raw_keywords = getattr(subj, "keywords", None) or []
+        keywords_str = ", ".join(str(getattr(k, "keyword_name", k)) for k in raw_keywords)
+        view_row = {
+            "subject_key": getattr(subj, "subject_key", None) or subject_key,
+            "status": getattr(subj, "subject_status", None),
+            "site": getattr(subj, "site_name", None),
+            "enrollment_date": getattr(subj, "enrollment_start_date", None),
+            "visits": len(data.visits),
+            "records": len(data.records),
+            "queries": len(data.queries),
+            "keywords": keywords_str or None,
+        }
+        display_list(
+            [view_row],
+            "subject data",
+            details=[data],
+            interactive=False if no_interactive else None,
+            output_format=resolved_format,
+        )
 
     def handle_subject_data(args: argparse.Namespace) -> None:
         study_key, subject_key = resolve_hybrid_study_and_key(subj_parser, args)
-        output_format = getattr(args, "output_format", "table")
         subject_data(
             study_key=study_key,
             subject_key=subject_key,
-            output_format=output_format,
+            output_format=resolve_output_format(getattr(args, "output_format", None)),
+            no_interactive=getattr(args, "no_interactive", False),
         )
 
     subj_parser.set_defaults(func=handle_subject_data)
@@ -899,8 +881,7 @@ def state_app(args: list[str] | None = None) -> None:
         args = sys.argv[1:]
     parser = argparse.ArgumentParser(description="Manage high-water mark execution ledger state.")
     add_no_interactive(parser, suppress_default=False)
-    state_sub = parser.add_subparsers(dest="state_command")
-    _register_state_subcommands(state_sub)
+    _configure_state_subparsers(parser)
 
     parsed = parser.parse_args(args)
     old_non_interactive = os.environ.get(NON_INTERACTIVE_ENV)
@@ -908,10 +889,13 @@ def state_app(args: list[str] | None = None) -> None:
     try:
         if getattr(parsed, "no_interactive", False):
             os.environ[NON_INTERACTIVE_ENV] = "1"
-        if getattr(parsed, "output_format", None) == "json":
+        explicit_format = getattr(parsed, "output_format", None)
+        if explicit_format == "json":
             os.environ[OUTPUT_FORMAT_ENV] = "json"
-        else:
+        elif explicit_format == "table":
             os.environ.pop(OUTPUT_FORMAT_ENV, None)
+        elif old_output_format is not None and old_output_format.strip().lower() == "json":
+            os.environ[OUTPUT_FORMAT_ENV] = "json"
         if hasattr(parsed, "func"):
             parsed.func(parsed)
         else:
