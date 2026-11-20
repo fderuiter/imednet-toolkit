@@ -76,3 +76,4 @@ class StudyStructure(ImednetBaseModel):
 
     study_key: str = Field(..., alias="studyKey")
     intervals: list[IntervalStructure] = Field(default_factory=list)
+    forms: list[FormStructure] = Field(default_factory=list)

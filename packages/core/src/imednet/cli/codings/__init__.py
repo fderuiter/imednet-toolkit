@@ -13,7 +13,7 @@ from ..utils import STUDY_KEY_ARG, display_list, fetching_status
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
-    collect_list_items,
+    collect_list_items_with_remainder,
     prepare_list_query,
 )
 
@@ -28,6 +28,17 @@ def _get_val(obj: Any, *keys: str, default: Any = None) -> Any:
             if val is not None:
                 return val
     return default
+
+
+def _coding_view_model(c: Any) -> dict[str, Any]:
+    return {
+        "coding_id": _get_val(c, "coding_id", "codingId", "id"),
+        "dictionary_name": _get_val(c, "dictionary_name", "dictionaryName", "dictionary"),
+        "dictionary_version": _get_val(c, "dictionary_version", "dictionaryVersion", "version"),
+        "variable": _get_val(c, "variable"),
+        "value": _get_val(c, "value"),
+        "code": _get_val(c, "code"),
+    }
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -73,7 +84,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
         with fetching_status("codings", study_key):
-            codings_list, truncated = collect_list_items(
+            codings_list, truncated, load_remaining = collect_list_items_with_remainder(
                 sdk.codings.list(study_key, **req_kwargs),
                 effective_limit,
             )
@@ -82,22 +93,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             display_list(codings_list, "codings", output_format="json")
             return
 
-        view_models = []
-        for c in codings_list:
-            view_models.append(
-                {
-                    "coding_id": _get_val(c, "coding_id", "codingId", "id"),
-                    "dictionary_name": _get_val(
-                        c, "dictionary_name", "dictionaryName", "dictionary"
-                    ),
-                    "dictionary_version": _get_val(
-                        c, "dictionary_version", "dictionaryVersion", "version"
-                    ),
-                    "variable": _get_val(c, "variable"),
-                    "value": _get_val(c, "value"),
-                    "code": _get_val(c, "code"),
-                }
-            )
+        view_models = [_coding_view_model(c) for c in codings_list]
+
+        def _load_more_codings() -> tuple[list[dict[str, Any]], list[Any]]:
+            more = load_remaining() if load_remaining is not None else []
+            return [_coding_view_model(c) for c in more], more
 
         display_list(
             view_models,
@@ -106,6 +106,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             details=codings_list,
             truncated=truncated,
             interactive=False if no_interactive else None,
+            on_load_all=_load_more_codings if load_remaining is not None else None,
         )
 
     def _dispatch_list_codings(args: argparse.Namespace) -> None:

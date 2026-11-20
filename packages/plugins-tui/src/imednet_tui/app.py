@@ -10,6 +10,7 @@ import os
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, ClassVar, cast
 
@@ -37,7 +38,7 @@ from textual.widgets import (
 
 from imednet.spi.constants import MAX_PAGE_SIZE
 from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
-from imednet.spi.models import Job, JobState, JobStatus
+from imednet.spi.models import Job, JobState, JobStatus, Subject
 from imednet.spi.utils import (
     InvalidJobStateError,
     InvalidJobTransitionError,
@@ -113,9 +114,58 @@ def _sanitize_dom_id(prefix: str, raw_value: object, used_ids: set[str]) -> str:
     return candidate
 
 
-def _escape_markup(text: str) -> str:
-    """Escape square brackets so dynamic text is rendered literally by Rich markup."""
-    return text.replace("[", r"\[")
+def _clean_scalar(value: object) -> str | None:
+    """Convert scalar SDK/mock values to non-empty strings while preserving ``0``."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if isinstance(value, Enum):
+        text = str(value.value)
+        return text if text.strip() else None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return str(value)
+    return None
+
+
+def _extract_subject_status(sub: object) -> str:
+    """Resolve effective subject status across SDK ``Subject`` instances and test mocks."""
+    if isinstance(sub, Subject):
+        raw_effective = sub.effective_status
+        if isinstance(raw_effective, Enum):
+            text = str(raw_effective.value)
+            return text if text.strip() else "-"
+        if isinstance(raw_effective, str) and raw_effective.strip():
+            return raw_effective
+        return "-"
+    if getattr(sub, "deleted", None) is True:
+        return "DELETED"
+    for attr in ("effective_status", "subject_status", "status"):
+        candidate = getattr(sub, attr, None)
+        if isinstance(candidate, Enum):
+            text = str(candidate.value)
+            if text.strip():
+                return text
+        elif isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return "-"
+
+
+def _format_subject_row(sub: object) -> tuple[Text, Text, Text, Text]:
+    """Format a subject record into literal Rich ``Text`` cells for ``SubjectTable``."""
+    sub_id = (
+        _clean_scalar(getattr(sub, "subject_id", None))
+        or _clean_scalar(getattr(sub, "subject_key", None))
+        or "-"
+    )
+    raw_site_id = getattr(sub, "site_id", None)
+    cleaned_site_id = _clean_scalar(raw_site_id) if raw_site_id is not None else None
+    site_id_str = cleaned_site_id if cleaned_site_id is not None else "-"
+    status_str = _extract_subject_status(sub)
+    created_str = _clean_scalar(getattr(sub, "date_created", None)) or "-"
+    return (Text(sub_id), Text(site_id_str), Text(status_str), Text(created_str))
 
 
 async def _fetch_bounded_facade_items(
@@ -230,6 +280,19 @@ class StudyList(ListView):
         self.truncated = False
         self.status_notice = ""
         self._study_items: dict[str, tuple[str, str]] = {}
+        self._request_id = 0
+
+    def sync_selected_study(self, study_key: str | None) -> None:
+        """Synchronize highlighted study index with ``study_key`` when loaded."""
+        if not self.loaded or not self.is_attached or not study_key:
+            return
+        target_index: int | None = None
+        for idx, (_, (key, _)) in enumerate(self._study_items.items()):
+            if key == study_key:
+                target_index = idx
+                break
+        self._initial_index = target_index
+        self.index = target_index
 
     async def on_mount(self) -> None:
         """Load studies automatically upon mounting the widget."""
@@ -241,11 +304,10 @@ class StudyList(ListView):
         Args:
             load_all: When True, fetch all pages instead of the initial bounded batch.
         """
+        self._request_id += 1
+        request_id = self._request_id
         was_loaded = self.loaded
         prev_index = self.index if was_loaded else None
-        if self.children:
-            await self.clear()
-        self._study_items.clear()
         self.loading = True
         limit = None if load_all else DEFAULT_FETCH_LIMIT
         try:
@@ -255,41 +317,51 @@ class StudyList(ListView):
                 "get_studies",
                 limit=limit,
             )
+            if request_id != self._request_id:
+                return
 
             used_ids: set[str] = set()
             items: list[ListItem] = []
             study_map: dict[str, tuple[str, str]] = {}
             for study in studies:
-                name = str(
-                    getattr(study, "study_name", None)
-                    or getattr(study, "name", None)
+                name = (
+                    _clean_scalar(getattr(study, "study_name", None))
+                    or _clean_scalar(getattr(study, "name", None))
                     or "Unknown Study"
                 )
-                key = str(getattr(study, "study_key", "no-key"))
+                key = _clean_scalar(getattr(study, "study_key", None)) or "no-key"
                 item_id = _sanitize_dom_id("study", key, used_ids)
                 study_map[item_id] = (key, name)
-                items.append(ListItem(Label(f"{name} ({key})"), id=item_id))
+                items.append(ListItem(Label(f"{name} ({key})", markup=False), id=item_id))
 
             self._study_items = study_map
             if self.is_attached:
                 if self.children:
                     await self.clear()
-                await self.extend(items)
+                if request_id != self._request_id:
+                    return
+                target_index: int | None = None
                 if items:
-                    preferred_index: int | None = None
-                    if not was_loaded and self.preferred_study_key:
+                    active_study_key: str | None = None
+                    with contextlib.suppress(Exception):
+                        screen_obj: Any = self.screen
+                        if isinstance(screen_obj, DashboardScreen):
+                            active_study_key = screen_obj.selected_study_key
+                    match_key = active_study_key or self.preferred_study_key
+                    if match_key:
                         for idx, (_, (key, _)) in enumerate(study_map.items()):
-                            if key == self.preferred_study_key:
-                                preferred_index = idx
+                            if key == match_key:
+                                target_index = idx
                                 break
-                    if preferred_index is not None:
-                        target_index = preferred_index
                     elif prev_index is not None:
                         target_index = min(prev_index, len(items) - 1)
                     else:
                         target_index = 0
-                    self._initial_index = target_index
-                    self.index = target_index
+                self._initial_index = target_index
+                await self.extend(items)
+                if request_id != self._request_id:
+                    return
+                self.index = target_index
             self.loaded = True
             self.truncated = truncated
             self.status_notice = (
@@ -299,10 +371,11 @@ class StudyList(ListView):
             )
             _sync_widget_truncation(self, len(items), truncated)
         except Exception as e:
-            if hasattr(self.app, "notify"):
-                self.app.notify(f"Error loading studies: {e}", severity="error")
+            if request_id == self._request_id and hasattr(self.app, "notify"):
+                self.app.notify(f"Error loading studies: {e}", severity="error", markup=False)
         finally:
-            self.loading = False
+            if request_id == self._request_id:
+                self.loading = False
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Handle selection event in the list view.
@@ -350,6 +423,7 @@ class SiteList(ListView):
         self.truncated = False
         self.status_notice = ""
         self._site_items: dict[str, tuple[str, str]] = {}
+        self._request_id = 0
 
     async def load_sites(self, study_key: str, *, load_all: bool = False) -> None:
         """Fetch and populate site items for a given study key.
@@ -358,14 +432,21 @@ class SiteList(ListView):
             study_key: Study key to load sites for.
             load_all: When True, fetch all pages instead of the initial bounded batch.
         """
-        prev_index = self.index if self.current_study_key == study_key else None
+        self._request_id += 1
+        request_id = self._request_id
+        same_study = self.current_study_key == study_key
+        prev_index = self.index if same_study else None
         self.current_study_key = study_key
-        if self.children:
-            await self.clear()
-        self._site_items.clear()
         self.loading = True
         limit = None if load_all else DEFAULT_FETCH_LIMIT
         try:
+            if not same_study:
+                if self.children:
+                    await self.clear()
+                if request_id != self._request_id or self.current_study_key != study_key:
+                    return
+                self._site_items.clear()
+
             sites, truncated = await _fetch_bounded_facade_items(
                 self.sdk,
                 "async_get_sites",
@@ -373,24 +454,38 @@ class SiteList(ListView):
                 study_key,
                 limit=limit,
             )
+            if request_id != self._request_id or self.current_study_key != study_key:
+                return
 
             used_ids: set[str] = set()
             items: list[ListItem] = []
             site_map: dict[str, tuple[str, str]] = {}
             for site in sites:
-                site_id = str(getattr(site, "site_id", "no-id"))
-                name = str(getattr(site, "site_name", None) or "Unknown Site")
+                raw_site_id = getattr(site, "site_id", None)
+                cleaned_site_id = _clean_scalar(raw_site_id) if raw_site_id is not None else None
+                site_id = cleaned_site_id if cleaned_site_id is not None else "no-id"
+                name = _clean_scalar(getattr(site, "site_name", None)) or "Unknown Site"
                 item_id = _sanitize_dom_id("site", site_id, used_ids)
                 site_map[item_id] = (site_id, name)
-                items.append(ListItem(Label(f"{name} ({site_id})"), id=item_id))
+                items.append(ListItem(Label(f"{name} ({site_id})", markup=False), id=item_id))
 
             self._site_items = site_map
             if self.is_attached:
                 if self.children:
                     await self.clear()
+                if request_id != self._request_id or self.current_study_key != study_key:
+                    return
+                target_index = (
+                    min(prev_index, len(items) - 1)
+                    if items and prev_index is not None
+                    else (0 if items else None)
+                )
+                self._initial_index = target_index
                 await self.extend(items)
+                if request_id != self._request_id or self.current_study_key != study_key:
+                    return
                 if items:
-                    self.index = min(prev_index, len(items) - 1) if prev_index is not None else 0
+                    self.index = target_index
             self.truncated = truncated
             self.status_notice = (
                 f"Showing first {len(items)} sites (truncated — press 'a' to load all)"
@@ -399,10 +494,15 @@ class SiteList(ListView):
             )
             _sync_widget_truncation(self, len(items), truncated)
         except Exception as e:
-            if hasattr(self.app, "notify"):
-                self.app.notify(f"Error loading sites: {e}", severity="error")
+            if (
+                request_id == self._request_id
+                and self.current_study_key == study_key
+                and hasattr(self.app, "notify")
+            ):
+                self.app.notify(f"Error loading sites: {e}", severity="error", markup=False)
         finally:
-            self.loading = False
+            if request_id == self._request_id:
+                self.loading = False
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Handle selection event in the site list view.
@@ -420,7 +520,7 @@ class SiteList(ListView):
             self.post_message(self.SiteSelected(site_id, site_name))
 
 
-class SubjectTable(DataTable[str]):
+class SubjectTable(DataTable[Text]):
     """Interactive table displaying subjects."""
 
     def __init__(self, sdk: ImednetFacade | AsyncImednetFacade, **kwargs: Any) -> None:
@@ -437,6 +537,7 @@ class SubjectTable(DataTable[str]):
         self.current_site_id: str | None = None
         self.truncated = False
         self.status_notice = ""
+        self._request_id = 0
 
     def on_mount(self) -> None:
         """Initialize table columns when widget is mounted."""
@@ -457,9 +558,12 @@ class SubjectTable(DataTable[str]):
             site_id: Optional site identifier to filter results directly via the SDK facade.
             load_all: When True, fetch all pages instead of the initial bounded batch.
         """
+        self._request_id += 1
+        request_id = self._request_id
+        same_scope = self.current_study_key == study_key and self.current_site_id == site_id
         self.current_study_key = study_key
         self.current_site_id = site_id
-        if self.is_mounted:
+        if not same_scope and self.is_mounted:
             self.clear()
         self.loading = True
         limit = None if load_all else DEFAULT_FETCH_LIMIT
@@ -475,19 +579,14 @@ class SubjectTable(DataTable[str]):
                 limit=limit,
                 **filters,
             )
+            if (
+                request_id != self._request_id
+                or self.current_study_key != study_key
+                or self.current_site_id != site_id
+            ):
+                return
 
-            rows = []
-            for sub in subjects:
-                s_site_id = str(getattr(sub, "site_id", "") or "")
-                raw_sub_id = getattr(sub, "subject_id", None)
-                sub_id = (
-                    raw_sub_id
-                    if raw_sub_id is not None
-                    else (getattr(sub, "subject_key", None) or "-")
-                )
-                status = getattr(sub, "subject_status", None) or getattr(sub, "status", None) or "-"
-                created = str(getattr(sub, "date_created", None) or "-")
-                rows.append((str(sub_id), s_site_id, str(status), created))
+            rows = [_format_subject_row(sub) for sub in subjects]
             if self.is_mounted:
                 self.clear()
             self.add_rows(rows)
@@ -499,10 +598,16 @@ class SubjectTable(DataTable[str]):
             )
             _sync_widget_truncation(self, len(rows), truncated)
         except Exception as e:
-            if hasattr(self.app, "notify"):
-                self.app.notify(f"Error loading subjects: {e}", severity="error")
+            if (
+                request_id == self._request_id
+                and self.current_study_key == study_key
+                and self.current_site_id == site_id
+                and hasattr(self.app, "notify")
+            ):
+                self.app.notify(f"Error loading subjects: {e}", severity="error", markup=False)
         finally:
-            self.loading = False
+            if request_id == self._request_id:
+                self.loading = False
 
 
 class _TrackedJobPlaceholder:
@@ -607,7 +712,7 @@ def _extract_entry_row(entry: _TrackedJobEntry) -> tuple[str, str, str, str, str
     return (batch_id, state_str, progress_str, total_str, failed_str, created_str)
 
 
-class JobTable(DataTable[str]):
+class JobTable(DataTable[Text]):
     """Keyboard-scrollable table displaying tracked background study jobs."""
 
     JOB_COLUMNS: ClassVar[tuple[str, ...]] = (
@@ -644,7 +749,7 @@ class JobTable(DataTable[str]):
         prev_row = self.cursor_row if preserve_cursor else 0
         self.clear()
         if rows:
-            self.add_rows(rows)
+            self.add_rows([tuple(Text(cell) for cell in row) for row in rows])
             if preserve_cursor and prev_row > 0:
                 self.move_cursor(row=min(prev_row, len(rows) - 1))
 
@@ -714,7 +819,8 @@ class JobMonitor(Container):
         self._study_jobs: dict[str, dict[str, _TrackedJobEntry]] = {}
         self._unassigned_job_ids: list[str] = []
         self._rendered_study_key: str | None = None
-        self._summary_text = "Job Monitor: Select a study to view background jobs."
+        self._summary_renderable = Text("Job Monitor: Select a study to view background jobs.")
+        self._summary_text = self._summary_renderable.markup
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -793,32 +899,39 @@ class JobMonitor(Container):
             placeholder="Enter batch ID(s) to track (e.g. BATCH-001) and press Enter...",
             id="batch_id_input",
         )
-        yield Static(self._summary_text, id="job_monitor_notice")
+        yield Static(self._summary_renderable.plain, id="job_monitor_notice", markup=False)
         yield JobTable(id="job_table")
 
-    def update(self, content: str = "") -> None:
-        """Store summary markup text for non-composited inspection and testing."""
-        self._summary_text = content
+    def update(self, content: str | Text = "") -> None:
+        """Store summary text or renderable for non-composited inspection and testing."""
+        if isinstance(content, Text):
+            self._summary_renderable = content.copy()
+            self._summary_text = content.markup
+        else:
+            self._summary_text = content
+            self._summary_renderable = Text(content)
 
     def render(self) -> Text:
         """Return summary text representation for non-composited inspection."""
-        return Text.from_markup(self._summary_text)
+        return self._summary_renderable.copy()
 
     def _update_ui(
         self,
         *,
-        summary_text: str,
+        summary: Text | str,
         notice_text: str | None = None,
         rows: Sequence[tuple[str, str, str, str, str, str]] = (),
         preserve_cursor: bool = True,
     ) -> None:
-        """Synchronize summary text, notice banner, and table rows when mounted."""
-        self.update(summary_text)
+        """Synchronize summary renderable, notice banner, and table rows when mounted."""
+        summary_renderable = summary.copy() if isinstance(summary, Text) else Text(summary)
+        self.update(summary_renderable.markup if isinstance(summary, Text) else summary)
+        self._summary_renderable = summary_renderable
         if not self.is_mounted:
             return
         with contextlib.suppress(Exception):
             notice = self.query_one("#job_monitor_notice", Static)
-            notice.update(notice_text if notice_text is not None else summary_text)
+            notice.update(notice_text if notice_text is not None else summary_renderable.plain)
         with contextlib.suppress(Exception):
             table = self.query_one("#job_table", JobTable)
             table.set_job_rows(rows, preserve_cursor=preserve_cursor)
@@ -832,7 +945,7 @@ class JobMonitor(Container):
             self.run_worker(self.refresh_jobs())
         else:
             self._update_ui(
-                summary_text="Job Monitor: Select a study to view background jobs.",
+                summary=Text("Job Monitor: Select a study to view background jobs."),
                 notice_text=(
                     "Select a study to monitor jobs. Upstream iMednet APIs require batch IDs; "
                     "enter batch ID(s) above once a study is active."
@@ -902,7 +1015,11 @@ class JobMonitor(Container):
             return
         if not self.current_study_key:
             if hasattr(self.app, "notify"):
-                self.app.notify("Select a study before adding batch IDs.", severity="warning")
+                self.app.notify(
+                    "Select a study before adding batch IDs.",
+                    severity="warning",
+                    markup=False,
+                )
             return
         self.track_jobs(batch_ids, study_key=self.current_study_key, refresh=True)
 
@@ -920,9 +1037,9 @@ class JobMonitor(Container):
         ):
             self._render_study_entries(study_key, entries)
         else:
-            loading_msg = f"Job Monitor: Loading jobs for study '{_escape_markup(study_key)}'..."
+            loading_msg = f"Job Monitor: Loading jobs for study '{study_key}'..."
             self._update_ui(
-                summary_text=loading_msg,
+                summary=Text(loading_msg),
                 notice_text=loading_msg,
                 rows=(),
                 preserve_cursor=False,
@@ -1022,15 +1139,16 @@ class JobMonitor(Container):
             self._apply_job_evaluation(entry, job)
 
     @staticmethod
-    def _format_entry_line(entry: _TrackedJobEntry) -> str:
-        """Format a single tracked job entry into Rich-safe markup."""
+    def _format_entry_line(entry: _TrackedJobEntry) -> Text:
+        """Format a single tracked job entry into a styled Rich ``Text`` line."""
         job = entry.last_job
         if job is None:
-            safe_jid = _escape_markup(entry.job_id)
             if entry.warning:
-                safe_warn = _escape_markup(entry.warning)
-                return f"[yellow]WARNING[/yellow] - Job ({safe_jid}) (Warning: {safe_warn})"
-            return f"[yellow]ACTIVE[/yellow] - Job ({safe_jid})"
+                return Text.assemble(
+                    ("WARNING", "yellow"),
+                    f" - Job ({entry.job_id}) (Warning: {entry.warning})",
+                )
+            return Text.assemble(("ACTIVE", "yellow"), f" - Job ({entry.job_id})")
 
         batch_id, state_str, progress_str, total_str, failed_str, created_str = _extract_entry_row(
             entry
@@ -1047,39 +1165,37 @@ class JobMonitor(Container):
         else:
             color = "red"
 
-        safe_status = _escape_markup(state_str)
-        safe_label = _escape_markup(f"{type_label} ({batch_id})" if batch_id != "-" else type_label)
+        label = f"{type_label} ({batch_id})" if batch_id != "-" else type_label
         metrics_suffix = (
             ""
             if isinstance(job, _TrackedJobPlaceholder)
-            else (
-                f" [{_escape_markup(progress_str)}, "
-                f"total={_escape_markup(total_str)}, failed={_escape_markup(failed_str)}]"
-            )
+            else f" [{progress_str}, total={total_str}, failed={failed_str}]"
         )
-        created_suffix = f" ({_escape_markup(created_str)})" if created_str != "-" else ""
-        warning_suffix = (
-            f" [yellow](Warning: {_escape_markup(entry.warning)})[/yellow]" if entry.warning else ""
-        )
-        return (
-            f"[{color}]{safe_status}[/{color}] - "
-            f"{safe_label}{metrics_suffix}{created_suffix}{warning_suffix}"
-        )
+        created_suffix = f" ({created_str})" if created_str != "-" else ""
+        parts: list[str | tuple[str, str]] = [
+            (state_str, color),
+            f" - {label}{metrics_suffix}{created_suffix}",
+        ]
+        if entry.warning:
+            parts.extend([" ", (f"(Warning: {entry.warning})", "yellow")])
+        return Text.assemble(*parts)
 
     def _render_study_entries(
         self,
         study_key: str,
         entries: dict[str, _TrackedJobEntry],
     ) -> None:
-        """Render summary markup, notice banner, and table rows for ``entries``."""
+        """Render styled summary, notice banner, and table rows for ``entries``."""
         entry_list = list(entries.values())
         rows: list[tuple[str, str, str, str, str, str]] = []
-        lines = [f"[bold]Active & Recent Jobs ({len(entry_list)})[/bold]"]
+        summary_parts: list[str | Text | tuple[str, str]] = [
+            (f"Active & Recent Jobs ({len(entry_list)})", "bold")
+        ]
         active_count = 0
         warnings: list[str] = []
         for entry in entry_list:
             rows.append(_extract_entry_row(entry))
-            lines.append(self._format_entry_line(entry))
+            summary_parts.extend(["\n", self._format_entry_line(entry)])
             if not entry.is_terminal:
                 active_count += 1
             if entry.warning:
@@ -1090,9 +1206,9 @@ class JobMonitor(Container):
         polling_note = f"{active_count} active" if active_count else "polling paused (all terminal)"
         notice_text = f"Active & Recent Jobs ({len(rows)}) — {polling_note}"
         if warnings:
-            notice_text = f"{notice_text} | Warning: {_escape_markup('; '.join(warnings))}"
+            notice_text = f"{notice_text} | Warning: {'; '.join(warnings)}"
         self._update_ui(
-            summary_text="\n".join(lines),
+            summary=Text.assemble(*summary_parts),
             notice_text=notice_text,
             rows=rows,
             preserve_cursor=same_study,
@@ -1105,7 +1221,7 @@ class JobMonitor(Container):
             self._pause_timer()
             self._rendered_study_key = None
             self._update_ui(
-                summary_text="Job Monitor: Select a study to view background jobs.",
+                summary=Text("Job Monitor: Select a study to view background jobs."),
                 notice_text=(
                     "Select a study to monitor jobs. Upstream iMednet APIs require batch IDs; "
                     "enter batch ID(s) above once a study is active."
@@ -1118,17 +1234,17 @@ class JobMonitor(Container):
         try:
             entries = self._entries_for_study(study_key)
             if not entries:
-                if self.current_study_key != study_key and self.is_mounted:
+                if self.current_study_key != study_key:
                     return
                 self._pause_timer()
                 self._rendered_study_key = study_key
                 empty_msg = (
                     f"Job Monitor: Background job enumeration is not supported by the iMednet Jobs API "
-                    f"for study '{_escape_markup(study_key)}' (upstream APIs require batch IDs). "
+                    f"for study '{study_key}' (upstream APIs require batch IDs). "
                     "Enter one or more batch IDs above and press Enter to track jobs."
                 )
                 self._update_ui(
-                    summary_text=empty_msg,
+                    summary=Text(empty_msg),
                     notice_text=empty_msg,
                     rows=(),
                     preserve_cursor=False,
@@ -1141,7 +1257,7 @@ class JobMonitor(Container):
                     *(self._poll_tracked_entry(study_key, entry) for entry in active_entries)
                 )
 
-            if self.current_study_key != study_key and self.is_mounted:
+            if self.current_study_key != study_key:
                 return
 
             current_entries = self._entries_for_study(study_key)
@@ -1153,11 +1269,10 @@ class JobMonitor(Container):
             self._render_study_entries(study_key, current_entries)
         except Exception as e:
             if self.current_study_key == study_key or not self.is_mounted:
-                escaped_err = _escape_markup(str(e))
-                err_msg = f"[red]Error fetching jobs: {escaped_err}[/red]"
+                err_msg = f"Error fetching jobs: {e}"
                 self._update_ui(
-                    summary_text=err_msg,
-                    notice_text=f"Error fetching jobs: {escaped_err}",
+                    summary=Text.assemble((err_msg, "red")),
+                    notice_text=err_msg,
                     rows=(),
                     preserve_cursor=False,
                 )
@@ -1423,7 +1538,7 @@ class DashboardScreen(Screen[None]):
             Header, status banner, containers, grid panels, tab panes, and footer.
         """
         yield Header()
-        yield Static("", id="truncation-notice")
+        yield Static("", id="truncation-notice", markup=False)
         studies_box = Container(
             StudyList(self.sdk, preferred_study_key=self.initial_study_key, id="study_list"),
             id="studies-box",
@@ -1448,9 +1563,13 @@ class DashboardScreen(Screen[None]):
 
     def _activate_study(self, study_key: str, study_name: str) -> None:
         """Activate ``study_key`` across sites, subjects, and job monitor panes."""
+        with contextlib.suppress(Exception):
+            self.workers.cancel_group(self, "load-all")
         self.selected_study_key = study_key
         self.selected_site_id = None
         self.log_viewer.write_line(f"Selected Study: {study_name} ({study_key})")
+        with contextlib.suppress(Exception):
+            self.query_one(StudyList).sync_selected_study(study_key)
         site_list = self.query_one(SiteList)
         self.run_worker(site_list.load_sites(study_key), exclusive=True, group="load-sites")
 
@@ -1556,6 +1675,7 @@ class DashboardScreen(Screen[None]):
         study_list = self.query_one(StudyList)
         site_list = self.query_one(SiteList)
         subject_table = self.query_one(SubjectTable)
+        target_study_key = self.selected_study_key
 
         tasks = []
         if study_list.truncated or not study_list.loaded:
@@ -1572,7 +1692,28 @@ class DashboardScreen(Screen[None]):
             )
         if tasks:
             await asyncio.gather(*tasks)
-        self.refresh_truncation_notice()
+        if self.selected_study_key == target_study_key:
+            self.refresh_truncation_notice()
+
+    def clear_site_filter(self) -> bool:
+        """Clear any active site filter and reload unfiltered study subjects."""
+        if self.selected_site_id is None:
+            return False
+        cleared_site = self.selected_site_id
+        self.selected_site_id = None
+        self.log_viewer.write_line(f"Cleared Site Filter (ID: {cleared_site})")
+        with contextlib.suppress(Exception):
+            self.workers.cancel_group(self, "load-all")
+        site_list = self.query_one(SiteList)
+        study_key = self.selected_study_key or site_list.current_study_key
+        if study_key:
+            subject_table = self.query_one(SubjectTable)
+            self.run_worker(
+                subject_table.load_subjects(study_key, None),
+                exclusive=True,
+                group="load-subjects",
+            )
+        return True
 
     def on_study_list_study_selected(self, message: StudyList.StudySelected) -> None:
         """Handle study selection by populating sites, subjects, and jobs.
@@ -1583,11 +1724,16 @@ class DashboardScreen(Screen[None]):
         self._activate_study(message.study_key, message.study_name)
 
     def on_site_list_site_selected(self, message: SiteList.SiteSelected) -> None:
-        """Handle site selection by filtering displayed subjects.
+        """Handle site selection by filtering displayed subjects or toggling off active filter.
 
         Args:
             message: Site selection event containing site details.
         """
+        if self.selected_site_id == message.site_id:
+            self.clear_site_filter()
+            return
+        with contextlib.suppress(Exception):
+            self.workers.cancel_group(self, "load-all")
         self.selected_site_id = message.site_id
         self.log_viewer.write_line(f"Selected Site: {message.site_name} (ID: {message.site_id})")
         site_list = self.query_one(SiteList)
@@ -1637,6 +1783,7 @@ class ImednetTuiApp(App[None]):
         ("h", "toggle_high_contrast", "High Contrast"),
         ("r", "refresh_data", "Refresh"),
         ("a", "load_all", "Load All"),
+        ("escape", "handle_escape", "Clear Filter"),
     ]
 
     _SINGLE_KEY_ACTIONS: ClassVar[frozenset[str]] = frozenset(
@@ -1716,11 +1863,25 @@ class ImednetTuiApp(App[None]):
         self.high_contrast_enabled = not self.high_contrast_enabled
         self._sync_high_contrast_classes()
 
+    def action_handle_escape(self) -> None:
+        """Move focus from the batch input to the jobs table, or clear an active site filter."""
+        screen = self._get_dashboard()
+        if screen is None:
+            return
+        if isinstance(self.focused, Input) and self.focused.id == "batch_id_input":
+            with contextlib.suppress(Exception):
+                screen.query_one("#job_table", JobTable).focus()
+            return
+        screen.clear_site_filter()
+
     def action_refresh_data(self) -> None:
         """Refresh studies and any active study/site panes on the dashboard screen."""
         screen = self._get_dashboard()
         if screen is None:
             return
+
+        with contextlib.suppress(Exception):
+            screen.workers.cancel_group(screen, "load-all")
 
         study_list = screen.query_one(StudyList)
         screen.run_worker(study_list.load_studies(), exclusive=True, group="load-studies")

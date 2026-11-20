@@ -251,6 +251,10 @@ def test_grid_side_panel_toggle_and_inspection() -> None:
     grid.draw()
     text_open = " ".join(s[2] for s in win.strings)
     assert "RECORD INSPECTION" in text_open
+    assert "RECORD METADATA" in text_open
+    assert "SUBMISSION METADATA" not in text_open
+    assert "[[/]] Scroll" in text_open
+    assert "[Esc] Close" in text_open
     assert "PULSE" in text_open
     assert "72" in text_open
     assert "TEMP" in text_open
@@ -310,6 +314,210 @@ def test_grid_instant_search_filtering() -> None:
     grid._handle_normal_input(27)  # clear filter
     assert grid.search_query == ""
     assert len(grid.filtered_entries) == 3
+
+
+def test_grid_80x24_adaptive_notices_fit_43_and_79_columns() -> None:
+    """80x24 header (43 cols split, 80 cols full) and status bar (79 cols) keep truncated/[a]/--all visible."""
+    for label, fields in (
+        ("records", ["ID", "Subject", "Form", "Status", "Created"]),
+        (
+            "record revisions",
+            [f"col_{i}" for i in range(19)],
+        ),
+    ):
+        win = MockWindow(height=24, width=80)
+        rows = [{f: f"val-{idx}-{f}" for f in fields} for idx in range(100)]
+        grid = InteractiveDataGrid(
+            win,
+            items=rows,
+            fields=fields,
+            label=label,
+            status_notice=f"Showing first 100 {label} (truncated; pass --all or --limit for more)",
+            on_load_all=list,
+        )
+        grid.draw()
+
+        top_bar = "".join(text for y, _, text, _ in win.strings if y == 0)
+        bottom_bar = "".join(text for y, _, text, _ in win.strings if y == 23)
+        for bar in (top_bar, bottom_bar):
+            assert "truncated" in bar.lower()
+            assert "[a]" in bar
+            assert "--all" in bar
+
+        # Open side panel on 80x24 -> grid_limit = 43, bar_width = 79
+        grid._handle_normal_input(" ")
+        assert grid.side_panel_open is True
+        grid.draw()
+
+        panel_x = int(80 * 0.55)
+        assert panel_x == 44
+        split_top = "".join(text for y, x, text, _ in win.strings if y == 0 and x < panel_x)
+        split_bottom = "".join(text for y, _, text, _ in win.strings if y == 23)
+        assert len(split_top) <= 43
+        assert len(split_bottom) <= 79
+        for bar in (split_top, split_bottom):
+            assert "truncated" in bar.lower()
+            assert "[a]" in bar
+            assert "--all" in bar
+        assert "[[/]] Scroll" in split_bottom
+        assert "[Esc] Close" in split_bottom
+
+
+def test_grid_load_all_key_search_miss_warning_and_sdk_error_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[a] renders loading status before fetch, warns on truncated search misses, and catches SDK errors."""
+    from imednet.errors import ApiError
+
+    win = MockWindow(height=24, width=80)
+    initial_rows = [{"ID": i, "Subject": f"SUBJ-{i:04d}"} for i in range(1, 101)]
+    remaining_rows = [{"ID": i, "Subject": f"SUBJ-{i:04d}"} for i in range(101, 251)]
+    observed_pre_fetch_banners: list[str] = []
+
+    def _load_more() -> list[dict[str, object]]:
+        observed_pre_fetch_banners.append(" ".join(text for _, _, text, _ in win.strings))
+        return remaining_rows
+
+    grid = InteractiveDataGrid(
+        win,
+        items=initial_rows,
+        fields=["ID", "Subject"],
+        label="records",
+        truncated=True,
+        on_load_all=_load_more,
+    )
+
+    # During '/' search, 'a' stays literal and does not trigger on_load_all
+    grid._handle_normal_input("/")
+    for ch in "a-0150":
+        grid._handle_search_input(ch)
+    assert grid.search_query == "a-0150"
+    assert observed_pre_fetch_banners == []
+
+    # Search for unloaded item SUBJ-0150 shows partial-dataset warning on both full and split 80x24 views
+    grid.search_query = "SUBJ-0150"
+    grid.filter_entries()
+    grid._handle_search_input("\n")
+    assert len(grid.filtered_entries) == 0
+
+    grid.draw()
+    miss_full = " ".join(text for y, _, text, _ in win.strings if 3 <= y < 23)
+    assert "partial" in miss_full.lower() or "truncated" in miss_full.lower()
+    assert "[a]" in miss_full
+    assert "--all" in miss_full
+
+    grid._handle_normal_input(" ")  # Split view (grid_limit=43) wraps warning without clipping cues
+    grid.draw()
+    miss_split = " ".join(text for y, x, text, _ in win.strings if 3 <= y < 23 and x < 44)
+    assert "truncated" in miss_split.lower()
+    assert "[a]" in miss_split
+    assert "--all" in miss_split
+    grid._handle_normal_input("\x1b")  # Close panel while keeping search_query="SUBJ-0150"
+    assert grid.side_panel_open is False
+    assert grid.search_query == "SUBJ-0150"
+
+    # Pressing 'a' renders loading notice before fetching, appends 150 rows, and matches SUBJ-0150
+    grid._handle_normal_input("a")
+    assert len(observed_pre_fetch_banners) == 1
+    assert "Loading all records..." in observed_pre_fetch_banners[0]
+    assert len(grid.all_entries) == 250
+    assert grid.truncated is False
+    assert len(grid.filtered_entries) == 1
+    assert grid.filtered_entries[0][0]["Subject"] == "SUBJ-0150"
+
+    # Verify SDK exceptions during [a] are caught cleanly in curses with secret redaction
+    monkeypatch.setenv("IMEDNET_API_KEY", "super-secret-api-key")  # pragma: allowlist secret
+
+    def _failing_loader() -> list[dict[str, object]]:
+        raise ApiError("Upstream 503 for token super-secret-api-key")
+
+    err_grid = InteractiveDataGrid(
+        win,
+        items=initial_rows,
+        fields=["ID", "Subject"],
+        label="records",
+        truncated=True,
+        on_load_all=_failing_loader,
+    )
+    err_grid._handle_normal_input("a")
+    err_grid.draw()
+    rendered_err = " ".join(text for _, _, text, _ in win.strings)
+    assert "Load all failed:" in rendered_err
+    assert "super-secret-api-key" not in rendered_err
+    assert "********" in rendered_err
+    assert err_grid.truncated is True
+    assert len(err_grid.all_entries) == 100
+
+
+def test_grid_side_panel_overflow_cues_and_esc_precedence() -> None:
+    """Overflowing side panel renders Lines X-Y of Z with ▲/▼ on max_y-2 and Esc closes panel before filter."""
+    from imednet.cli.utils.output import _display_width
+
+    win = MockWindow(height=24, width=80)
+    many_vars = {f"VAR_{i:02d}": f"Value {i}" for i in range(1, 26)}
+    rec = Record.model_construct(
+        record_id=501,
+        subject_key="SUBJ-501",
+        form_key="LABS",
+        record_status="Completed",
+        record_data=many_vars,
+    )
+    grid = InteractiveDataGrid(
+        win,
+        items=[{"ID": 501, "Subject": "SUBJ-501", "Form": "LABS", "Status": "Completed"}],
+        fields=["ID", "Subject", "Form", "Status"],
+        details=[rec],
+    )
+
+    # Apply active filter, exit search mode, and open panel
+    grid._handle_normal_input("/")
+    for ch in "SUBJ-501":
+        grid._handle_search_input(ch)
+    grid._handle_search_input(10)
+    grid._handle_normal_input(" ")
+    assert grid.side_panel_open is True
+    assert grid.search_query == "SUBJ-501"
+
+    panel_x = int(80 * 0.55)
+    content_x = panel_x + 2
+    content_w = max(10, (80 - panel_x) - 3)
+
+    # At top of overflowing panel: row max_y - 2 (22) shows Lines 1-19 of Z with ▼ only
+    grid.draw()
+    cue_top = [text for y, x, text, _ in win.strings if y == 22 and x == content_x]
+    assert len(cue_top) == 1
+    assert _display_width(cue_top[0]) == content_w
+    assert "Lines 1-19 of " in cue_top[0]
+    assert "▼" in cue_top[0]
+    assert "▲" not in cue_top[0]
+
+    # Scroll down one line with ']': both ▲ and ▼ appear
+    grid._handle_normal_input("]")
+    grid.draw()
+    cue_mid = [text for y, x, text, _ in win.strings if y == 22 and x == content_x][0]
+    assert "Lines 2-20 of " in cue_mid
+    assert "▲" in cue_mid
+    assert "▼" in cue_mid
+
+    # Scroll past bottom: clamps at max_scroll and shows ▲ without ▼
+    for _ in range(50):
+        grid._handle_normal_input("]")
+    grid.draw()
+    cue_bottom = [text for y, x, text, _ in win.strings if y == 22 and x == content_x][0]
+    assert "▲" in cue_bottom
+    assert "▼" not in cue_bottom
+    # Single '[' immediately scrolls up by 1 because downward scroll clamped at max_scroll
+    bottom_scroll = grid.side_panel_scroll
+    grid._handle_normal_input("[")
+    assert grid.side_panel_scroll == bottom_scroll - 1
+
+    # First Esc closes side panel while preserving search_query; second Esc clears search_query
+    grid._handle_normal_input(27)
+    assert grid.side_panel_open is False
+    assert grid.search_query == "SUBJ-501"
+
+    grid._handle_normal_input(27)
+    assert grid.search_query == ""
 
 
 def test_grid_status_colors_high_contrast(monkeypatch: pytest.MonkeyPatch) -> None:

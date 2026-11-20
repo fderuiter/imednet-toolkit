@@ -13,13 +13,14 @@ _CURSES_ERROR: tuple[type[BaseException], ...] = (curses.error,) if curses is no
 import locale
 import os
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel
 
+from ..decorators import _redact_secrets
 from .output import (
     _HC_STATUS_COLOR_MAP,
     _STATUS_COLOR_MAP,
@@ -210,6 +211,8 @@ class InteractiveDataGrid:
         details: Sequence[Any] | None = None,
         is_high_contrast: bool | None = None,
         status_notice: str | None = None,
+        truncated: bool | None = None,
+        on_load_all: Callable[[], Any] | None = None,
     ) -> None:
         """Initialize the interactive data grid.
 
@@ -221,6 +224,8 @@ class InteractiveDataGrid:
             details: Full domain objects corresponding to each row.
             is_high_contrast: Whether high-contrast clinical status mode is active.
             status_notice: Optional notice displayed when results are truncated/bounded.
+            truncated: Whether initial rows represent a truncated subset of server items.
+            on_load_all: Optional callback draining remaining pages on ``[a]``.
         """
         if curses is None:
             raise RuntimeError(
@@ -230,6 +235,14 @@ class InteractiveDataGrid:
         self.fields = fields
         self.label = label
         self.status_notice = status_notice
+        self.on_load_all = on_load_all
+        self.truncated: bool = (
+            truncated
+            if truncated is not None
+            else (on_load_all is not None or ("truncated" in (status_notice or "").lower()))
+        )
+        self._transient_notice: str | None = None
+        self._side_panel_max_scroll: int | None = None
         self.is_high_contrast = (
             is_high_contrast
             if is_high_contrast is not None
@@ -361,7 +374,56 @@ class InteractiveDataGrid:
             self.selected_idx = max(0, min(self.selected_idx, total - 1))
             self.top_idx = max(0, min(self.top_idx, total - 1))
         self.side_panel_scroll = 0
+        self._side_panel_max_scroll = None
         self.col_offset = max(0, min(self.col_offset, self._max_col_offset()))
+
+    def action_load_all(self) -> None:
+        """Load all remaining pages via ``on_load_all`` and re-run ``filter_entries``."""
+        if not self.truncated or self.on_load_all is None:
+            return
+
+        self._transient_notice = f"Loading all {self.label}..."
+        self.draw()
+
+        try:
+            loaded = self.on_load_all()
+        except Exception as exc:
+            redacted = _sanitize_cell_text(_redact_secrets(str(exc))).strip()
+            reason = redacted or type(exc).__name__
+            self._transient_notice = f"Load all failed: {reason}"
+            return
+
+        new_entries: list[tuple[dict[str, Any], Any]] = []
+        if (
+            isinstance(loaded, tuple)
+            and len(loaded) == 2
+            and not isinstance(loaded[0], (str, bytes, dict))
+        ):
+            more_rows, more_details = list(loaded[0]), list(loaded[1])
+            for idx, raw_row in enumerate(more_rows):
+                detail_obj = more_details[idx] if idx < len(more_details) else raw_row
+                row_dict = (
+                    dict(raw_row)
+                    if isinstance(raw_row, dict)
+                    else {f: getattr(raw_row, f, None) for f in self.fields}
+                )
+                new_entries.append((row_dict, detail_obj))
+        elif loaded is not None:
+            for entry in loaded:
+                if isinstance(entry, dict):
+                    new_entries.append((dict(entry), entry))
+                elif hasattr(entry, "model_dump") and not self.fields:
+                    dumped = entry.model_dump()
+                    new_entries.append((dumped if isinstance(dumped, dict) else {}, entry))
+                else:
+                    new_entries.append(({f: getattr(entry, f, None) for f in self.fields}, entry))
+
+        self.all_entries.extend(new_entries)
+        self.truncated = False
+        self.on_load_all = None
+        self.status_notice = None
+        self._transient_notice = None
+        self.filter_entries()
 
     def _format_cell(self, value: Any, key: str | None = None) -> str:
         """Format a single cell value for table display."""
@@ -474,15 +536,7 @@ class InteractiveDataGrid:
         _, grid_limit, panel_x, panel_width = self._layout_bounds(max_x)
 
         # Title / header bar at line 0
-        mode_str = " [SEARCH MODE]" if self.is_searching else ""
-        hc_str = " [HIGH-CONTRAST]" if self.is_high_contrast else ""
-        panel_str = " [SIDE PANEL]" if (self.side_panel_open and panel_width > 0) else ""
-        filter_status = f' [Filter: "{self.search_query}"]' if self.search_query else ""
-        notice_str = f" [{self.status_notice}]" if self.status_notice else ""
-        title = _sanitize_cell_text(
-            f"iMednet {self.label.title()} Review ({total_rows} items)"
-            f"{notice_str}{filter_status}{panel_str}{mode_str}{hc_str}"
-        )
+        title = self._format_header_bar(grid_limit, total_rows, panel_width)
         safe_addstr(self.stdscr, 0, 0, _slice_display_width(title, grid_limit), curses.A_BOLD)
 
         num_cols = len(self.fields)
@@ -524,20 +578,44 @@ class InteractiveDataGrid:
                 y = 3 + v_idx
                 if row_idx >= total_rows:
                     if total_rows == 0 and v_idx == 0:
-                        empty_note = (
-                            "No matching records found."
-                            if self.search_query
-                            else f"No {self.label} found."
-                        )
                         note_avail = max(0, grid_limit - 2)
                         if note_avail > 0:
-                            safe_addstr(
-                                self.stdscr,
-                                y,
-                                2,
-                                _slice_display_width(empty_note, note_avail),
-                                curses.A_DIM,
-                            )
+                            if self.search_query and self.truncated:
+                                loaded_count = len(self.all_entries)
+                                full_warn = _sanitize_cell_text(
+                                    f"No matches in first {loaded_count} {self.label} "
+                                    f"(partial/truncated). Press [a] or pass --all."
+                                )
+                                compact_warn = _sanitize_cell_text(
+                                    f"0 matches in {loaded_count} (truncated: [a]/--all)"
+                                )
+                                if viewport_height == 1 and _display_width(full_warn) > note_avail:
+                                    warn_lines = [compact_warn]
+                                else:
+                                    warn_lines = self._wrap_single_panel_line(
+                                        full_warn, note_avail, ""
+                                    )
+                                for w_idx, w_line in enumerate(warn_lines[:viewport_height]):
+                                    safe_addstr(
+                                        self.stdscr,
+                                        y + w_idx,
+                                        2,
+                                        _slice_display_width(w_line, note_avail),
+                                        curses.A_DIM,
+                                    )
+                            else:
+                                empty_note = (
+                                    "No matching records found."
+                                    if self.search_query
+                                    else f"No {self.label} found."
+                                )
+                                safe_addstr(
+                                    self.stdscr,
+                                    y,
+                                    2,
+                                    _slice_display_width(empty_note, note_avail),
+                                    curses.A_DIM,
+                                )
                     break
 
                 row_dict, _ = self.filtered_entries[row_idx]
@@ -804,7 +882,7 @@ class InteractiveDataGrid:
         meta, variables = extract_item_details(detail_obj)
 
         lines: list[tuple[str, int]] = []
-        primary_header = "SUBMISSION METADATA" if is_records else f"{self.label.upper()} METADATA"
+        primary_header = "RECORD METADATA" if is_records else f"{self.label.upper()} METADATA"
         lines.append((primary_header, curses.A_BOLD))
 
         record_primary_keys = [
@@ -883,16 +961,92 @@ class InteractiveDataGrid:
 
         # Render lines with scroll offset
         visible_slots = max(1, viewport_lines - 2)
-        max_scroll = max(0, len(lines) - visible_slots)
+        total_lines = len(lines)
+        max_scroll = max(0, total_lines - visible_slots)
+        self._side_panel_max_scroll = max_scroll
         self.side_panel_scroll = max(0, min(self.side_panel_scroll, max_scroll))
 
         for idx in range(visible_slots):
             line_idx = self.side_panel_scroll + idx
             y = 2 + idx
-            if line_idx >= len(lines):
+            if line_idx >= total_lines:
                 break
             text, attr = lines[line_idx]
             safe_addstr(self.stdscr, y, content_x, _fit_display_width(text, content_w), attr)
+
+        if max_scroll > 0 and max_y - 2 > 1:
+            start_line = self.side_panel_scroll + 1
+            end_line = min(total_lines, self.side_panel_scroll + visible_slots)
+            up_cue = "▲ " if self.side_panel_scroll > 0 else ""
+            down_cue = " ▼" if self.side_panel_scroll < max_scroll else ""
+            range_cue = f"{up_cue}Lines {start_line}-{end_line} of {total_lines}{down_cue}"
+            hint_cue = f"{range_cue} [[/]]"
+            cue_text = hint_cue if _display_width(hint_cue) <= content_w else range_cue
+            safe_addstr(
+                self.stdscr,
+                max_y - 2,
+                content_x,
+                _fit_display_width(cue_text, content_w),
+                curses.A_DIM,
+            )
+
+    def _full_truncation_notice(self) -> str:
+        """Return a descriptive single-line truncation notice including [a] and --all."""
+        raw = _sanitize_cell_text(self.status_notice) if self.status_notice else ""
+        if raw and all(tok in raw for tok in ("truncated", "[a]", "--all")):
+            return raw
+        return (
+            f"Showing first {len(self.all_entries)} {self.label} "
+            f"(truncated; press [a] or pass --all)"
+        )
+
+    def _format_header_bar(self, grid_limit: int, total_rows: int, panel_width: int) -> str:
+        """Format line 0 title bar so truncation recovery cues fit narrow 43-col panes."""
+        label_title = _sanitize_cell_text(self.label.title())
+        mode_str = " [SEARCH MODE]" if self.is_searching else ""
+        hc_str = " [HIGH-CONTRAST]" if self.is_high_contrast else ""
+        panel_str = " [SIDE PANEL]" if (self.side_panel_open and panel_width > 0) else ""
+        filter_status = (
+            _sanitize_cell_text(f' [Filter: "{self.search_query}"]') if self.search_query else ""
+        )
+
+        if self._transient_notice:
+            clean_transient = _sanitize_cell_text(self._transient_notice)
+            transient_candidates = [
+                f"iMednet {label_title} Review ({total_rows} items) [{clean_transient}]"
+                f"{filter_status}{panel_str}{mode_str}{hc_str}",
+                f"{label_title} ({total_rows}) [{clean_transient}]",
+                f"[{clean_transient}]",
+            ]
+            for candidate in transient_candidates:
+                if _display_width(candidate) <= grid_limit:
+                    return candidate
+            return transient_candidates[-1]
+
+        if self.truncated:
+            full_notice = self._full_truncation_notice()
+            candidates = [
+                f"iMednet {label_title} Review ({total_rows} items) [{full_notice}]"
+                f"{filter_status}{panel_str}{mode_str}{hc_str}",
+                f"iMednet {label_title} Review ({total_rows} items) "
+                f"[truncated: press [a] or --all]{filter_status}{panel_str}{mode_str}{hc_str}",
+                f"iMednet {label_title} ({total_rows}) "
+                f"[truncated: [a] load all | --all]{filter_status}{mode_str}{hc_str}",
+                f"{label_title} ({total_rows}) [truncated: [a] | --all]{filter_status}",
+                f"{label_title} ({total_rows}) [truncated: [a]/--all]",
+                f"{label_title}:{total_rows} [truncated [a]/--all]",
+                f"{total_rows} [truncated [a]/--all]",
+            ]
+            for candidate in candidates:
+                if _display_width(candidate) <= grid_limit:
+                    return candidate
+            return candidates[-1]
+
+        notice_str = f" [{_sanitize_cell_text(self.status_notice)}]" if self.status_notice else ""
+        return _sanitize_cell_text(
+            f"iMednet {label_title} Review ({total_rows} items)"
+            f"{notice_str}{filter_status}{panel_str}{mode_str}{hc_str}"
+        )
 
     def _draw_status_bar(
         self, y: int, max_x: int, total_rows: int, max_col_offset: int = 0
@@ -913,18 +1067,67 @@ class InteractiveDataGrid:
                 curses.curs_set(0)
             pos_info = f"Row {self.selected_idx + 1}/{total_rows}" if total_rows > 0 else "0/0"
             num_cols = len(self.fields)
-            col_info = (
-                f"  Col {self.col_offset + 1}/{num_cols}"
-                if num_cols > 0 and (max_col_offset > 0 or self.col_offset > 0)
-                else ""
-            )
-            notice_suffix = (
-                f"  [{_sanitize_cell_text(self.status_notice)}]" if self.status_notice else ""
-            )
-            help_text = (
-                f"[↑/↓/←/→] Navigate  [/] Search  [Space] Panel  [q] Quit  "
-                f"{pos_info}{col_info}{notice_suffix}"
-            )
+            has_cols = num_cols > 0 and (max_col_offset > 0 or self.col_offset > 0)
+            col_info = f"  Col {self.col_offset + 1}/{num_cols}" if has_cols else ""
+            col_compact = f" Col {self.col_offset + 1}/{num_cols}" if has_cols else ""
+
+            if self._transient_notice:
+                clean_transient = _sanitize_cell_text(self._transient_notice)
+                candidates = [
+                    f"[↑/↓/←/→] Navigate  [/] Search  [Space] Panel  [q] Quit  "
+                    f"{pos_info}{col_info}  [{clean_transient}]",
+                    f"[/] [q] {pos_info}{col_compact} [{clean_transient}]",
+                    f"[{clean_transient}] {pos_info}",
+                ]
+            elif self.side_panel_open and self.truncated:
+                full_notice = self._full_truncation_notice()
+                candidates = [
+                    f"[↑/↓/←/→] Navigate  [/] Search  [[/]] Scroll  [Esc] Close Panel  "
+                    f"[a] Load All  [q] Quit  {pos_info}{col_info}  [{full_notice}]",
+                    f"[↑↓] [/] [[/]] Scroll [Esc] Close [q] {pos_info}{col_compact} "
+                    f"[truncated: [a]/--all]",
+                    f"[/] [[/]] Scroll [Esc] Close [q] {pos_info}{col_compact} "
+                    f"[truncated [a]/--all]",
+                    f"[[/]] Scroll [Esc] Close {pos_info} [truncated [a]/--all]",
+                ]
+            elif self.side_panel_open:
+                extra = (
+                    f"  [{_sanitize_cell_text(self.status_notice)}]" if self.status_notice else ""
+                )
+                candidates = [
+                    f"[↑/↓/←/→] Navigate  [/] Search  [[/]] Scroll  [Esc] Close Panel  "
+                    f"[q] Quit  {pos_info}{col_info}{extra}",
+                    f"[↑/↓] Nav  [/] Search  [[/]] Scroll  [Esc] Close  "
+                    f"[q] Quit  {pos_info}{col_compact}{extra}",
+                    f"[↑↓←→] [/] [[/]] Scroll [Esc] Close [q]  {pos_info}{col_compact}{extra}",
+                    f"[[/]] Scroll [Esc] Close [q] {pos_info}{extra}",
+                ]
+            elif self.truncated:
+                full_notice = self._full_truncation_notice()
+                candidates = [
+                    f"[↑/↓/←/→] Navigate  [/] Search  [Space] Panel  [a] Load All  [q] Quit  "
+                    f"{pos_info}{col_info}  [{full_notice}]",
+                    f"[↑↓] Nav [/] Find [Space] Panel [q] Quit  {pos_info}{col_compact} "
+                    f"[truncated: [a]/--all]",
+                    f"[↑↓←→] [/] [Space] [q] {pos_info}{col_compact} [truncated: [a]/--all]",
+                    f"[/] [Space] [q] {pos_info} [truncated [a]/--all]",
+                ]
+            else:
+                notice_suffix = (
+                    f"  [{_sanitize_cell_text(self.status_notice)}]" if self.status_notice else ""
+                )
+                candidates = [
+                    f"[↑/↓/←/→] Navigate  [/] Search  [Space] Panel  [q] Quit  "
+                    f"{pos_info}{col_info}{notice_suffix}",
+                    f"[↑↓←→] [/] Search [Space] Panel [q] Quit  "
+                    f"{pos_info}{col_compact}{notice_suffix}",
+                ]
+
+            help_text = candidates[-1]
+            for candidate in candidates:
+                if _display_width(candidate) <= bar_width:
+                    help_text = candidate
+                    break
             safe_addstr(
                 self.stdscr, y, 0, _fit_display_width(help_text, bar_width), curses.A_REVERSE
             )
@@ -954,6 +1157,7 @@ class InteractiveDataGrid:
                 continue
 
             if ch == curses.KEY_RESIZE:
+                self._side_panel_max_scroll = None
                 self.col_offset = max(0, min(self.col_offset, self._max_col_offset()))
                 continue
 
@@ -1000,14 +1204,27 @@ class InteractiveDataGrid:
         if ch in (ord(" "), " "):
             self.side_panel_open = not self.side_panel_open
             self.side_panel_scroll = 0
+            self._side_panel_max_scroll = None
             self.col_offset = max(0, min(self.col_offset, self._max_col_offset()))
             return False
 
         if ch in (ord("/"), "/"):
+            self._transient_notice = None
             self.is_searching = True
             return False
 
-        if ch in (27, "\x1b"):  # Escape in normal mode clears active filter
+        if ch in (ord("a"), ord("A"), "a", "A"):
+            self.action_load_all()
+            return False
+
+        if ch in (27, "\x1b"):  # Escape closes open panel first, then clears active filter
+            self._transient_notice = None
+            if self.side_panel_open:
+                self.side_panel_open = False
+                self.side_panel_scroll = 0
+                self._side_panel_max_scroll = None
+                self.col_offset = max(0, min(self.col_offset, self._max_col_offset()))
+                return False
             if self.search_query:
                 self.search_query = ""
                 self.filter_entries()
@@ -1017,11 +1234,13 @@ class InteractiveDataGrid:
             if total > 0 and self.selected_idx > 0:
                 self.selected_idx -= 1
                 self.side_panel_scroll = 0
+                self._side_panel_max_scroll = None
 
         elif ch in (curses.KEY_DOWN, ord("j"), "j"):
             if total > 0 and self.selected_idx < total - 1:
                 self.selected_idx += 1
                 self.side_panel_scroll = 0
+                self._side_panel_max_scroll = None
 
         elif ch in (curses.KEY_LEFT, ord("h"), "h"):
             if self.col_offset > 0:
@@ -1038,27 +1257,38 @@ class InteractiveDataGrid:
             if total > 0:
                 self.selected_idx = max(0, self.selected_idx - viewport_height)
                 self.side_panel_scroll = 0
+                self._side_panel_max_scroll = None
 
         elif ch == curses.KEY_NPAGE:  # Page Down
             if total > 0:
                 self.selected_idx = min(total - 1, self.selected_idx + viewport_height)
                 self.side_panel_scroll = 0
+                self._side_panel_max_scroll = None
 
         elif ch in (curses.KEY_HOME, 362):  # Home
             if total > 0:
                 self.selected_idx = 0
                 self.side_panel_scroll = 0
+                self._side_panel_max_scroll = None
 
         elif ch in (curses.KEY_END, 385):  # End
             if total > 0:
                 self.selected_idx = total - 1
                 self.side_panel_scroll = 0
+                self._side_panel_max_scroll = None
 
         elif ch in (ord("["), ord("{"), "[", "{"):  # Scroll side panel up
             if self.side_panel_open and self.side_panel_scroll > 0:
                 self.side_panel_scroll -= 1
 
-        elif ch in (ord("]"), ord("}"), "]", "}") and self.side_panel_open:  # Scroll panel down
+        elif (
+            ch in (ord("]"), ord("}"), "]", "}")
+            and self.side_panel_open
+            and (
+                self._side_panel_max_scroll is None
+                or self.side_panel_scroll < self._side_panel_max_scroll
+            )
+        ):  # Scroll panel down
             self.side_panel_scroll += 1
 
         return False
@@ -1071,6 +1301,8 @@ def run_interactive_grid(
     details: Sequence[Any] | None = None,
     is_high_contrast: bool | None = None,
     status_notice: str | None = None,
+    truncated: bool | None = None,
+    on_load_all: Callable[[], Any] | None = None,
 ) -> bool:
     """Launch the curses interactive data grid.
 
@@ -1081,6 +1313,8 @@ def run_interactive_grid(
         details: Optional list of full domain models for variable inspection.
         is_high_contrast: Optional high-contrast mode override.
         status_notice: Optional truncation/status notice to render in the grid bars.
+        truncated: Whether initial rows represent a truncated subset of server items.
+        on_load_all: Optional callback draining remaining pages on ``[a]``.
 
     Returns:
         True if the interactive grid ran and exited normally, False if curses
@@ -1103,6 +1337,8 @@ def run_interactive_grid(
                 details=details,
                 is_high_contrast=is_high_contrast,
                 status_notice=status_notice,
+                truncated=truncated,
+                on_load_all=on_load_all,
             )
             grid.run()
 
