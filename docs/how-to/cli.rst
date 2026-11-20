@@ -25,21 +25,23 @@ dashboard for browsing studies, sites, subjects, and background jobs:
    IMEDNET_HIGH_CONTRAST=1 imednet --high-contrast tui
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
-``Enter`` to select a study or site (or to register batch IDs in the Jobs tab input),
-``q`` to quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to
-refresh active study data, and ``a`` to load all pages when a panel is truncated. Single-key
-shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input. Pass
-``--study`` and repeatable ``--batch`` flags at launch to open a study and monitor specific
-batch jobs immediately, and pass ``--force`` only when intentionally bypassing TTY stream
-checks.
+``Enter`` to select a study or site (re-selecting the active site clears the site filter)
+or to register batch IDs in the Jobs tab input, ``Esc`` to move focus from the Jobs batch
+input to the Jobs table or clear an active site filter, ``q`` to quit, ``d`` to toggle
+dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh active study data, and
+``a`` to load all pages when a panel is truncated. Single-key shortcuts are suppressed
+automatically while typing batch IDs in the Jobs tab input. Pass ``--study`` and
+repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
+immediately, and pass ``--force`` only when intentionally bypassing TTY stream checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
 table with live filtering and a side inspection panel:
 
-* ``Up`` / ``Down`` (or ``k`` / ``j``), ``Page Up`` / ``Page Down``, ``Home`` / ``End``: navigate rows.
-* ``/``: enter live search mode across table columns, submission metadata, and form variables (``Enter`` or ``Esc`` exits search input; ``Esc`` in normal mode clears the active filter).
-* ``Space``: toggle the side inspection panel (``[`` / ``]`` or ``{`` / ``}`` scrolls panel lines).
+* ``Up`` / ``Down`` (or ``k`` / ``j``), ``Page Up`` / ``Page Down``, ``Home`` / ``End``: navigate rows; ``Left`` / ``Right`` (or ``h`` / ``l``): scroll wide columns.
+* ``/``: enter live search mode across table columns, record metadata, and form variables (``Enter`` or ``Esc`` exits search input; in normal mode, ``Esc`` closes an open side panel first and then clears the active filter).
+* ``a``: load all remaining pages into ``InteractiveDataGrid`` when the initial 100-item TTY view is truncated, re-evaluating any active ``/`` filter.
+* ``Space``: toggle the side inspection panel (``[`` / ``]`` or ``{`` / ``}`` scrolls overflowing panel lines with ``Lines X-Y of Z`` ``▲`` / ``▼`` cues; ``Esc`` or ``Space`` closes the panel).
 * ``q``: exit ``InteractiveDataGrid``.
 
 Set ``IMEDNET_NON_INTERACTIVE=1`` (or pipe stdout in scripts and CI) to bypass
@@ -90,10 +92,30 @@ Usage failures exit 2, SDK-command interruption exits 130, and success/help exit
 
 ``records list --output json`` still writes ``records.json``; it is distinct from
 ``--format json`` stdout and combining them is an error. Existing ``export``
-commands, datadict JSON/schema/diff outputs and optional workflow command formats
-retain their own contracts. This is not a global JSON wrapper for plugins.
+commands, ``datadict`` JSON/schema/diff outputs (see :doc:`/how-to/data_dictionary`)
+and optional workflow command formats retain their own contracts. This is not a
+global JSON wrapper for plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
+
+Data Dictionary commands
+------------------------
+
+The ``imednet datadict`` subcommands convert Study metadata across 4-file CSV exports,
+CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate canonical JSON
+files, export the JSON Schema, and compute structural revision diffs (see
+:doc:`/how-to/data_dictionary` for Python equivalents and Record validation):
+
+.. code-block:: bash
+
+   imednet datadict from-csv ./datadict_export.zip -o study_dd.json --strict --no-raw-xml
+   imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
+   imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
+   imednet datadict from-redcap ./redcap_dictionary.csv --study-key STUDY -o study_dd.json
+   imednet datadict from-api --study-key STUDY -o api_dd.json --no-raw-xml
+   imednet datadict schema -o data-dictionary.schema.json
+   imednet datadict validate study_dd.json --schema data-dictionary.schema.json
+   imednet datadict diff baseline_dd.json study_dd.json --format md
 
 Terminal capabilities and non-interactive mode
 ----------------------------------------------
@@ -137,13 +159,13 @@ literal ``none`` bypass) to filter Form Variable values on the server. All twelv
 
    imednet records list STUDY --filter "formKey==AE;recordId>=100" \
        --record-data-filter "AESER==Serious;AGE>=18" --sort dateCreated,desc --limit 50
-   imednet queries list STUDY --filter "type==Open,type==Answered" --sort annotationId,desc
+   imednet queries list STUDY --filter "type==record,type==question" --sort annotationId,desc
    imednet users list STUDY --include-inactive --sort login,asc --limit 25
 
 Interactive TTY table sessions fetch one bounded page of 100 items by default and
-display a truncation notice when additional Study items exist; pass ``--limit N``
-(upstream ``size`` is automatically capped at 500 per page) or ``--all`` to retrieve
-larger batches. Non-interactive runs (``--no-interactive``,
+display a truncation notice when additional Study items exist; press ``a`` inside
+``InteractiveDataGrid`` or pass ``--limit N`` (upstream ``size`` is automatically
+capped at 500 per page) or ``--all`` to retrieve larger batches. Non-interactive runs (``--no-interactive``,
 ``IMEDNET_NON_INTERACTIVE=1``, or piped ``stdout``), headless ``--format json``, and
 file exports (``--output json|csv``) continue to fetch all matching pages unless
 ``--limit`` is explicitly specified.

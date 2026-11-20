@@ -19,7 +19,8 @@ Relationships
 ~~~~~~~~~~~~~
 * ``(:Study)-[:HAS_SUBJECT]->(:Subject)``
 * ``(:Subject)-[:HAS_VISIT]->(:Visit)``
-* ``(:Visit)-[:HAS_RECORD]->(:Record)``
+* ``(:Visit)-[:HAS_RECORD]->(:Record)`` (scheduled records with ``visit_id > 0``)
+* ``(:Subject)-[:HAS_RECORD]->(:Record)`` (unscheduled records with ``visit_id`` omitted or ``<= 0``)
 
 Optional dependency
 -------------------
@@ -61,25 +62,31 @@ Usage
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from imednet.spi.sinks import CentralizedMapper
+from typing import Any
+from unittest.mock import NonCallableMock
 
 from imednet.errors import ExportConfigurationError
 from imednet.sdk import ImednetSDK
 from imednet.spi.sink_base import (
-    ExportSink,
-    SinkConfig,
     _redact_uri,
     _require_optional_dep,
+)
+from imednet.spi.sinks import (
+    CentralizedMapper,
+    ExportSink,
+    SinkConfig,
     apply_quality_gate,
+    build_sink_mapper,
     extract_record_id,
+    normalize_sink_value,
     run_streaming_export,
 )
 
@@ -123,20 +130,30 @@ MERGE (r:Record   {record_id:  row.record_id,   study_key: row.study_key})
 SET r += row
 MERGE (s)-[:HAS_SUBJECT]->(su)
 FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
-    MERGE (v:Visit {visit_id: row.visit_id, study_key: row.study_key})
+    MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
     MERGE (su)-[:HAS_VISIT]->(v)
     MERGE (v)-[:HAS_RECORD]->(r)
+)
+FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
+    MERGE (su)-[:HAS_RECORD]->(r)
 )
 """
 
 _CREATE_RECORD_CYPHER = """\
 UNWIND $rows AS row
+MERGE (s:Study   {study_key:   row.study_key})
+MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
 CREATE (r:Record)
 SET r = row
-WITH r, row
-WHERE row.visit_id IS NOT NULL
-MATCH (v:Visit {visit_id: row.visit_id, study_key: row.study_key})
-MERGE (v)-[:HAS_RECORD]->(r)
+MERGE (s)-[:HAS_SUBJECT]->(su)
+FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
+    MERGE (su)-[:HAS_VISIT]->(v)
+    MERGE (v)-[:HAS_RECORD]->(r)
+)
+FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
+    MERGE (su)-[:HAS_RECORD]->(r)
+)
 """
 
 _DELETE_RECORD_CYPHER = """\
@@ -144,6 +161,34 @@ UNWIND $record_ids AS rid
 MATCH (r:Record {record_id: rid, study_key: $study_key})
 DETACH DELETE r
 """
+
+
+def _graph_json_default(value: Any) -> Any:
+    """Encode ``date``/``datetime`` as ISO-8601 strings and ``Decimal`` as exact strings."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _normalize_visit_id(visit_id: Any) -> Any:
+    """Normalize non-positive ``visit_id`` markers (``<= 0``) to ``None`` for unscheduled records."""
+    if visit_id is None or isinstance(visit_id, NonCallableMock):
+        return visit_id
+    if isinstance(visit_id, bool):
+        return None
+    if isinstance(visit_id, (int, float, Decimal)) and visit_id <= 0:
+        return None
+    if isinstance(visit_id, str):
+        stripped = visit_id.strip()
+        if not stripped:
+            return None
+        if stripped.lstrip("-").isdigit() and int(stripped) <= 0:
+            return None
+    return visit_id
 
 
 def _build_convention_cypher(
@@ -161,19 +206,29 @@ def _build_convention_cypher(
         "SET r += row\n"
         "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
         f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
-        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {study_prop}: row.{study_prop}}})\n"
+        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
         "    MERGE (su)-[:HAS_VISIT]->(v)\n"
         "    MERGE (v)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
+        "    MERGE (su)-[:HAS_RECORD]->(r)\n"
         ")\n"
     )
     create_cypher = (
         "UNWIND $rows AS row\n"
+        f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
+        f"MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
         "CREATE (r:Record)\n"
         "SET r = row\n"
-        "WITH r, row\n"
-        f"WHERE row.{visit_prop} IS NOT NULL\n"
-        f"MATCH (v:Visit {{{visit_prop}: row.{visit_prop}, {study_prop}: row.{study_prop}}})\n"
-        "MERGE (v)-[:HAS_RECORD]->(r)\n"
+        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        "    MERGE (su)-[:HAS_VISIT]->(v)\n"
+        "    MERGE (v)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
+        "    MERGE (su)-[:HAS_RECORD]->(r)\n"
+        ")\n"
     )
     return merge_cypher, create_cypher
 
@@ -188,7 +243,7 @@ def _build_sdtm_cypher(seq_prop: str | None, has_visit: bool) -> tuple[str, str]
     if has_visit:
         visit_block = (
             "FOREACH (_ IN CASE WHEN row.VISITNUM IS NOT NULL THEN [1] ELSE [] END |\n"
-            "    MERGE (v:Visit {VISITNUM: row.VISITNUM, STUDYID: row.STUDYID})\n"
+            "    MERGE (v:Visit {VISITNUM: row.VISITNUM, USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
             "    MERGE (su)-[:HAS_VISIT]->(v)\n"
             "    MERGE (v)-[:HAS_RECORD]->(r)\n"
             ")\n"
@@ -215,40 +270,63 @@ def _build_sdtm_cypher(seq_prop: str | None, has_visit: bool) -> tuple[str, str]
         "CREATE (r:Record)\n"
         "SET r = row\n"
         "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
-        "MERGE (su)-[:HAS_RECORD]->(r)\n"
+        f"{visit_block}"
     )
     return merge_cypher, create_cypher
 
 
 def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
-    import json
+    for visit_key in ("visit_id", "visitId", "VISIT_ID"):
+        if visit_key in row:
+            row[visit_key] = _normalize_visit_id(row.get(visit_key))
+            break
+    else:
+        row["visit_id"] = _normalize_visit_id(row.get("visit_id"))
+
+    for key, val in list(row.items()):
+        if (
+            key in ("record_data", "recordData", "RECORD_DATA", "keywords", "KEYWORDS")
+            or val is None
+            or isinstance(val, NonCallableMock)
+        ):
+            continue
+        if isinstance(val, Enum):
+            row[key] = val.value
+        elif isinstance(val, (datetime, date)):
+            row[key] = val.isoformat()
+        elif isinstance(val, Decimal):
+            row[key] = str(val)
 
     for rd_key in ("record_data", "recordData", "RECORD_DATA"):
         if rd_key in row:
-            row[rd_key] = json.dumps(row.get(rd_key, {}))
+            normalized_record_data = normalize_sink_value(row.get(rd_key, {}))
+            row[rd_key] = json.dumps(normalized_record_data, default=_graph_json_default)
             break
     else:
-        row["record_data"] = json.dumps({})
+        row["record_data"] = json.dumps({}, default=_graph_json_default)
 
     for kw_key in ("keywords", "KEYWORDS"):
         keywords = row.get(kw_key)
-        if isinstance(keywords, list):
-            row[kw_key] = json.dumps(
-                [
-                    k.model_dump(mode="json", by_alias=True) if hasattr(k, "model_dump") else k
-                    for k in keywords
-                ]
-            )
+        if keywords is not None and not isinstance(keywords, (str, NonCallableMock)):
+            normalized_keywords = normalize_sink_value(keywords, by_alias=True)
+            row[kw_key] = json.dumps(normalized_keywords, default=_graph_json_default)
     return row
 
 
 def _post_process_graph_sdtm(row: dict[str, Any]) -> dict[str, Any]:
     """Serialize any non-primitive SDTM row values for Neo4j property compatibility."""
-    import json
-
     for key, val in list(row.items()):
-        if isinstance(val, (dict, list, tuple)):
-            row[key] = json.dumps(val, default=str)
+        if val is None or isinstance(val, NonCallableMock):
+            continue
+        if isinstance(val, Enum):
+            row[key] = val.value
+        elif isinstance(val, (datetime, date)):
+            row[key] = val.isoformat()
+        elif isinstance(val, Decimal):
+            row[key] = str(val)
+        elif isinstance(val, (dict, list, tuple)):
+            normalized_val = normalize_sink_value(val)
+            row[key] = json.dumps(normalized_val, default=_graph_json_default)
     return row
 
 
@@ -261,8 +339,6 @@ def _record_to_row(
 ) -> dict[str, Any]:
     """Convert a typed ``Record`` model to a flat Cypher parameter dict."""
     if mapper is None:
-        from imednet.spi.sinks import CentralizedMapper
-
         mapper = CentralizedMapper(
             mode="document",
             post_processor=_post_process_graph,
@@ -320,7 +396,8 @@ class Neo4jExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
-        from imednet.spi.sinks import build_sink_mapper
+        if not records:
+            return 0
 
         post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
         mapper = build_sink_mapper(
@@ -329,45 +406,52 @@ class Neo4jExportSink(ExportSink):
             post_processor=post_proc,
             seq_counters=self._seq_counters,
         )
-        custom_pipeline = self.config.extra.get("enrichment_pipeline")
-        if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
-            mapper.register_pipeline(self._study_key, custom_pipeline)
-        rows = [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
-        if not rows:
-            return 0
-
-        if self.config.as_sdtm:
-            sample_row = rows[0]
-            seq_prop = next(
-                (
-                    k
-                    for k in sample_row
-                    if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
-                ),
-                None,
-            )
-            has_visit = any("VISITNUM" in r for r in rows)
-            merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
-        elif self.config.naming_convention == "camelCase":
-            merge_cypher, create_cypher = _build_convention_cypher(
-                "studyKey", "subjectKey", "recordId", "visitId"
-            )
-        elif self.config.naming_convention == "sdtm":
-            merge_cypher, create_cypher = _build_convention_cypher(
-                "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
-            )
-        else:
-            merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
-
-        cypher = merge_cypher if self.config.idempotent else create_cypher
-        cfg = self.config if isinstance(self.config, Neo4jSinkConfig) else Neo4jSinkConfig()
+        database = getattr(self.config, "database", "neo4j")
+        mapped_rows: list[dict[str, Any]] | None = None
+        cypher: str | None = None
 
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
-            with self._driver.session(database=cfg.database) as session:
-                session.run(cypher, rows=rows)
-            logger.debug("Wrote batch %s (%d records)", batch_id, len(rows))
-            return len(rows)
+            nonlocal mapped_rows, cypher
+            if mapped_rows is None:
+                try:
+                    mapped_rows = [
+                        _record_to_row(r, self._study_key, mapper=mapper) for r in records
+                    ]
+                except ExportConfigurationError:
+                    raise
+                except Exception:
+                    raise TypeError("Malformed Neo4j record batch payload.") from None
+            if not mapped_rows:
+                return 0
+            if cypher is None:
+                if self.config.as_sdtm:
+                    sample_row = mapped_rows[0]
+                    seq_prop = next(
+                        (
+                            k
+                            for k in sample_row
+                            if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
+                        ),
+                        None,
+                    )
+                    has_visit = any("VISITNUM" in r for r in mapped_rows)
+                    merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+                elif self.config.naming_convention == "camelCase":
+                    merge_cypher, create_cypher = _build_convention_cypher(
+                        "studyKey", "subjectKey", "recordId", "visitId"
+                    )
+                elif self.config.naming_convention == "sdtm":
+                    merge_cypher, create_cypher = _build_convention_cypher(
+                        "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
+                    )
+                else:
+                    merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
+                cypher = merge_cypher if self.config.idempotent else create_cypher
+            with self._driver.session(database=database) as session:
+                session.run(cypher, rows=mapped_rows)
+            logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))
+            return len(mapped_rows)
 
         return self._execute_with_retry("export_graph", batch_id, execute_export)
 

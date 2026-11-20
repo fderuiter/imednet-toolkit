@@ -6,8 +6,10 @@ import re
 from collections.abc import Collection
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from imednet.core.context import is_strict_mode
+from imednet.models.base import ImednetBaseModel
 from imednet.models.sdtm import (
     SDTM_DOMAIN_SPECS,
     VALID_NAMING_CONVENTIONS,
@@ -878,7 +880,19 @@ class CategoricalNormalizer:
         return raw_value, None
 
 
-class StandardsReadinessReport(BaseModel):
+def _coerce_float_or_default(v: Any) -> float:
+    """Coerce numeric inputs to float, defaulting to 0.0 on drift unless strict mode is active."""
+    if is_missing_value(v):
+        return 0.0
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        if is_strict_mode():
+            raise
+        return 0.0
+
+
+class StandardsReadinessReport(ImednetBaseModel):
     """Comprehensive report on the readiness of data records against clinical standards."""
 
     score: float
@@ -889,6 +903,18 @@ class StandardsReadinessReport(BaseModel):
     profile: str = "general"
     checked_records: int = 0
     domain_scores: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _normalize_score(cls, v: Any) -> float:
+        return _coerce_float_or_default(v)
+
+    @field_validator("domain_scores", mode="before")
+    @classmethod
+    def _normalize_domain_scores(cls, v: Any) -> dict[str, float]:
+        if not isinstance(v, dict):
+            return {}
+        return {str(k): _coerce_float_or_default(val) for k, val in v.items()}
 
     @property
     def is_ready(self) -> bool:

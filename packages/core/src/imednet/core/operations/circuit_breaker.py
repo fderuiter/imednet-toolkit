@@ -26,7 +26,7 @@ class CircuitBreakerError(Exception):
 
 
 class CircuitBreaker:
-    """Global circuit breaker to track request failure rates across threads.
+    """Thread-safe circuit breaker to track consecutive failure rates.
 
     Transitions from CLOSED to OPEN after consecutive failures.
     Transitions from OPEN to HALF_OPEN after recovery_timeout.
@@ -71,8 +71,15 @@ class CircuitBreaker:
                     logger.warning("Circuit breaker transitioned to HALF_OPEN state.")
             return self._state
 
-    def check_request_allowed(self) -> None:
-        """Check if a new outgoing request is allowed. Raises CircuitBreakerError if not."""
+    def check_request_allowed(self) -> bool:
+        """Check if a new outgoing request is allowed.
+
+        Returns:
+            bool: True if a HALF_OPEN probe slot was acquired, False otherwise.
+
+        Raises:
+            CircuitBreakerError: If the circuit is open or HALF_OPEN probe limit is reached.
+        """
         with self._lock:
             state = self.state
             if state == CircuitState.OPEN:
@@ -81,6 +88,14 @@ class CircuitBreaker:
                 if self._half_open_probes >= self.half_open_max_probes:
                     raise CircuitBreakerError("fail-fast is active: probe limit reached")
                 self._half_open_probes += 1
+                return True
+            return False
+
+    def release_probe(self) -> None:
+        """Release an unsettled HALF_OPEN probe slot when a probe is cancelled or aborted."""
+        with self._lock:
+            if self._state == CircuitState.HALF_OPEN and self._half_open_probes > 0:
+                self._half_open_probes -= 1
 
     def record_success(self) -> None:
         """Record a successful request."""
@@ -99,6 +114,7 @@ class CircuitBreaker:
             self._last_failure_time = time.monotonic()
             if self._state == CircuitState.HALF_OPEN:
                 self._state = CircuitState.OPEN
+                self._half_open_probes = 0
                 logger.warning("Circuit breaker transitioned to OPEN state (probe failed).")
             elif self._state == CircuitState.CLOSED:
                 self._consecutive_failures += 1

@@ -97,6 +97,14 @@ imednet.models.reporting module
    :members:
    :show-inheritance:
 
+imednet.models.sdtm module
+--------------------------
+
+.. automodule:: imednet.models.sdtm
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.models.sites module
 ---------------------------
 

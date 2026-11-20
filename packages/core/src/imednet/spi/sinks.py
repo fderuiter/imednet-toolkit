@@ -24,6 +24,7 @@ from imednet.integrations.sink_base import (
     is_record_deleted,
     iter_batches,
     iter_filtered_sdk_records,
+    normalize_sink_value,
     redact_batch_records,
     run_streaming_export,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "iter_batches",
     "iter_filtered_sdk_records",
     "normalize_naming_convention",
+    "normalize_sink_value",
     "redact_batch_records",
     "redact_uri",
     "require_optional_dep",
