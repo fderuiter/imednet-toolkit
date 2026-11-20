@@ -324,3 +324,157 @@ def test_concurrent_readers_during_slow_remote_sync(tmp_path: Path) -> None:
 
     assert reader.errors == []
     assert reads_mid_sync > 0, "Reader was blocked while remote sync was retrieving data"
+
+
+def test_interleaved_slow_reconcile_and_concurrent_workflows_retain_all_active_records(
+    tmp_path: Path,
+) -> None:
+    """Overlapping SyncWorker, RecordMapper, and SchemaProfiler cycles drop zero active records."""
+    import time
+    from unittest.mock import patch
+
+    from imednet_workflows.record_mapper import RecordMapper
+    from imednet_workflows.schema_profiler import SchemaProfiler
+
+    upstream_lock = threading.Lock()
+    upstream_records: dict[int, Record] = {
+        1: _make_record(1),
+        2: _make_record(2),
+        3: _make_record(3),
+    }
+
+    reconcile_entered = threading.Event()
+    concurrent_insert_committed = threading.Event()
+    first_reconcile_slotted = False
+    slot_lock = threading.Lock()
+
+    def _get_records(
+        *, study_key: str, record_data_filter: str | None = None, **kwargs: Any
+    ) -> list[Record]:
+        nonlocal first_reconcile_slotted
+        if record_data_filter == "none":
+            with slot_lock:
+                is_slow_reconcile = not first_reconcile_slotted
+                if is_slow_reconcile:
+                    first_reconcile_slotted = True
+            with upstream_lock:
+                snapshot = [
+                    Record(
+                        study_key=study_key,
+                        record_id=rec_id,
+                        form_key=rec.form_key,
+                        date_modified=rec.date_modified,
+                        record_data=None,
+                    )
+                    for rec_id, rec in sorted(upstream_records.items())
+                ]
+            if is_slow_reconcile:
+                reconcile_entered.set()
+                # Wait until concurrent workflow inserts new records into upstream & SQLite
+                concurrent_insert_committed.wait(timeout=5)
+                time.sleep(0.02)
+            return snapshot
+
+        record_ids_filter = kwargs.get("record_id")
+        with upstream_lock:
+            if isinstance(record_ids_filter, list):
+                wanted = set(record_ids_filter)
+                return [rec for rec_id, rec in sorted(upstream_records.items()) if rec_id in wanted]
+            return [rec for _, rec in sorted(upstream_records.items())]
+
+    def _list_delta(
+        *, study_key: str, filter: str, record_data_filter: str | None = None
+    ) -> list[Record]:
+        with upstream_lock:
+            return [rec for _, rec in sorted(upstream_records.items())]
+
+    sdk = MagicMock()
+    sdk.get_records.side_effect = _get_records
+    sdk.records.list.side_effect = _list_delta
+    sdk.get_forms.return_value = []
+    sdk.get_variables.return_value = []
+    sdk.forms.list.return_value = []
+    sdk.variables.list.return_value = []
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    # Seed initial state; delete record 2 upstream so slow reconcile also has a real orphan to prune
+    loader.sync_records("PROT-01", reconcile=False)
+    with upstream_lock:
+        del upstream_records[2]
+
+    hold_durations: list[float] = []
+    hold_lock = threading.Lock()
+    thread_starts: dict[int, float] = {}
+    orig_acquire = loader.lock.acquire
+    orig_release = loader.lock.release
+
+    def _track_acquire(*args: Any, **kwargs: Any) -> Any:
+        res = orig_acquire(*args, **kwargs)
+        with hold_lock:
+            thread_starts[threading.get_ident()] = time.perf_counter()
+        return res
+
+    def _track_release(*args: Any, **kwargs: Any) -> Any:
+        now = time.perf_counter()
+        with hold_lock:
+            started = thread_starts.pop(threading.get_ident(), now)
+            hold_durations.append(now - started)
+        return orig_release(*args, **kwargs)
+
+    errors: list[Exception] = []
+
+    def _slow_sync_worker() -> None:
+        worker = SyncWorker(
+            loader,
+            config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=1, reconcile=True),
+        )
+        try:
+            worker.run_once()
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def _concurrent_mapper_and_profiler() -> None:
+        try:
+            reconcile_entered.wait(timeout=5)
+            # Upstream adds active record 4 (timestamped) and record 5 (date_modified=None)
+            with upstream_lock:
+                upstream_records[4] = _make_record(4)
+                upstream_records[5] = Record(
+                    study_key="PROT-01",
+                    form_id=1,
+                    form_key="FORM",
+                    record_id=5,
+                    subject_key="S0005",
+                    date_modified=None,
+                    record_data={"value": 5},
+                )
+            mapper = RecordMapper(sdk, loader=loader)
+            list(mapper._iter_records("PROT-01"))
+            concurrent_insert_committed.set()
+
+            profiler = SchemaProfiler(sdk, loader=loader)
+            profiler.profile_records("PROT-01")
+        except Exception as exc:  # pragma: no cover
+            concurrent_insert_committed.set()
+            errors.append(exc)
+
+    with (
+        patch.object(loader.lock, "acquire", side_effect=_track_acquire),
+        patch.object(loader.lock, "release", side_effect=_track_release),
+    ):
+        t_worker = threading.Thread(target=_slow_sync_worker, daemon=True)
+        t_consumers = threading.Thread(target=_concurrent_mapper_and_profiler, daemon=True)
+        t_worker.start()
+        t_consumers.start()
+        t_worker.join(timeout=10)
+        t_consumers.join(timeout=10)
+
+    assert errors == [], f"Concurrent workflow race raised exceptions: {errors}"
+    cached_ids = {r.record_id for r in loader.get_cached_records("PROT-01")}
+    assert cached_ids == {1, 3, 4, 5}, (
+        f"Expected all active records {{1, 3, 4, 5}}, got {cached_ids}"
+    )
+    assert hold_durations, "Expected FileLock acquisitions during concurrent writes"
+    assert max(hold_durations) < 0.05, (
+        f"Max FileLock hold duration {max(hold_durations):.4f}s exceeded 50ms"
+    )

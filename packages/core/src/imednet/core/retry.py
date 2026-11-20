@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -9,7 +10,7 @@ from typing import Any, Protocol, runtime_checkable
 import httpx
 from tenacity import AsyncRetrying, Retrying, stop_after_attempt, wait_random_exponential
 
-from imednet.constants import DEFAULT_BACKOFF_FACTOR, DEFAULT_RETRIES
+from imednet.constants import DEFAULT_BACKOFF_FACTOR, DEFAULT_MAX_RETRY_AFTER, DEFAULT_RETRIES
 
 #: HTTP methods that are safe to retry automatically. Mutating methods such as
 #: POST and PATCH are intentionally excluded because a server may have already
@@ -98,11 +99,20 @@ class RetryConfig:
     retries: int = DEFAULT_RETRIES
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR
     retry_policy: Any = field(default_factory=DefaultRetryPolicy)
+    max_retry_after: float = DEFAULT_MAX_RETRY_AFTER
 
     def __post_init__(self) -> None:
-        """Normalize None retry policies to DefaultRetryPolicy."""
+        """Normalize None retry policies and validate Retry-After bounds."""
         if self.retry_policy is None:
             self.retry_policy = DefaultRetryPolicy()
+        if (
+            isinstance(self.max_retry_after, bool)
+            or not isinstance(self.max_retry_after, (int, float))
+            or not math.isfinite(self.max_retry_after)
+            or self.max_retry_after < 0
+        ):
+            raise ValueError("max_retry_after must be a finite non-negative number")
+        self.max_retry_after = float(self.max_retry_after)
 
     def create_retryer(
         self,

@@ -8,10 +8,10 @@ from scripts.typecheck_docs import main, typecheck_documentation
 
 
 def test_repo_documentation_snippets_pass_typecheck() -> None:
-    """Verify all RST, Markdown, and docstring Python snippets in the repository pass mypy."""
+    """Verify all RST, literalinclude, showcase.js, Markdown, and docstring snippets pass mypy."""
     repo_root = Path(__file__).resolve().parents[2]
     count, errors = typecheck_documentation(repo_root)
-    assert count >= 20
+    assert count >= 50
     assert not errors, f"Expected repository documentation snippets to type-check, got: {errors}"
     assert not (repo_root / "docs" / "_build" / "snippets").exists()
 
@@ -86,3 +86,47 @@ def test_typecheck_docs_follows_imports_silently_for_package_internals(tmp_path:
     count, errors = typecheck_documentation(tmp_path)
     assert count == 1
     assert not errors, f"Expected zero errors with --follow-imports=silent, got: {errors}"
+
+
+def test_typecheck_docs_catches_literalinclude_showcase_js_and_untyped_defs(
+    tmp_path: Path,
+) -> None:
+    """Verify literalinclude slices, showcase.js SNIPPETS.sdk templates, and untyped function bodies are checked."""
+    docs_dir = tmp_path / "docs"
+    static_dir = docs_dir / "_static"
+    examples_dir = tmp_path / "examples"
+    static_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    (examples_dir / "sliced_tutorial.py").write_text(
+        "# [start]\n"
+        "from imednet import ImednetSDK\n\n"
+        "def untyped_helper():\n"
+        "    sdk = ImednetSDK()\n"
+        "    sdk.studies.nonexistent_method()\n"
+        "# [end]\n",
+        encoding="utf-8",
+    )
+    (docs_dir / "tutorial.rst").write_text(
+        "Tutorial\n"
+        "========\n\n"
+        ".. literalinclude:: /../examples/sliced_tutorial.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start]\n"
+        "   :end-before: # [end]\n",
+        encoding="utf-8",
+    )
+    (static_dir / "showcase.js").write_text(
+        "const SNIPPETS = {\n"
+        "    sdk: {\n"
+        '        studies: `from imednet import ImednetSDK\\nsdk = ImednetSDK()\\nlen(sdk.studies.list())`\n'
+        "    },\n"
+        "    rest: {}\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    count, errors = typecheck_documentation(tmp_path)
+    assert count == 2
+    assert any("sliced_tutorial.py:" in err and "nonexistent_method" in err for err in errors)
+    assert any("showcase.js:" in err and "Sized" in err for err in errors)

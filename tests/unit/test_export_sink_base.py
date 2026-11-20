@@ -711,6 +711,64 @@ class TestSpiSinks:
 
         assert imednet.http.__all__ == []
 
+    def test_spi_normalize_sink_value(self):
+        """Assert normalize_sink_value dumps Keyword models, Enum values, and tuples while preserving Date/Decimal."""
+        from datetime import UTC, date, datetime
+        from decimal import Decimal
+        from enum import Enum
+
+        import imednet.spi.sinks as spi_sinks
+        from imednet.models.records import Keyword, RecordStatus
+
+        class CustomCode(Enum):
+            ALPHA = 10
+
+        class LegacyStubModel:
+            def model_dump(self):
+                return {"stub": ("x", RecordStatus.LOCKED)}
+
+        assert "normalize_sink_value" in spi_sinks.__all__
+
+        kw = Keyword(
+            keyword_name="Safety",
+            keyword_key="SAFETY",
+            keyword_id=7,
+            date_added=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        )
+        raw = {
+            "status": RecordStatus.COMPLETE,
+            "code": CustomCode.ALPHA,
+            RecordStatus.SIGNED: ("tuple_item", kw, LegacyStubModel()),
+            "lab_decimal": Decimal("0.0042"),
+            "visit_date": date(2026, 5, 1),
+        }
+
+        normalized = spi_sinks.normalize_sink_value(raw)
+        assert normalized["status"] == "Complete"
+        assert normalized["code"] == 10
+        assert normalized["Signed"][0] == "tuple_item"
+        assert isinstance(normalized["Signed"], list)
+        assert normalized["Signed"][1] == {
+            "keyword_name": "Safety",
+            "keyword_key": "SAFETY",
+            "keyword_id": 7,
+            "date_added": "2026-05-01T12:00:00Z",
+        }
+        assert normalized["Signed"][2] == {"stub": ["x", "Locked"]}
+        assert normalized["lab_decimal"] == Decimal("0.0042")
+        assert isinstance(normalized["lab_decimal"], Decimal)
+        assert normalized["visit_date"] == date(2026, 5, 1)
+
+        aliased = spi_sinks.normalize_sink_value([kw], by_alias=True)
+        assert aliased == [
+            {
+                "keywordName": "Safety",
+                "keywordKey": "SAFETY",
+                "keywordId": 7,
+                "dateAdded": "2026-05-01T12:00:00Z",
+            }
+        ]
+
 
 class TestDirectTabularSinkPhiRedaction:
     """Verify direct TabularCSVSink.write_batch and TabularSQLSink.write_batch PHI redaction."""

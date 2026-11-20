@@ -1354,18 +1354,20 @@ html_css_files: list[str] = ["custom.css"]
 html_js_files: list[str] = ["showcase.js", "thebe_pyodide.js"]
 
 doctest_global_setup = """
-import os
-import respx
-import warnings
-import sys
-warnings.filterwarnings("ignore")
+import builtins
 import logging
+import os
+import sys
+import warnings
+from unittest.mock import MagicMock, patch
+
+for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")]:
+    del sys.modules[_mod]
+
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
 logging.captureWarnings(True)
-import warnings
-warnings.simplefilter("ignore")
-import httpx
-from unittest.mock import MagicMock, patch
 
 os.environ["IMEDNET_SIMULATION_MODE"] = "true"
 os.environ["IMEDNET_API_KEY"] = "dummy_api_key"  # pragma: allowlist secret
@@ -1375,90 +1377,38 @@ os.environ["IMEDNET_STUDY_KEY"] = "MY_STUDY"
 
 __file__ = "/a/b/c/d/e/dummy.py"
 
-import duckdb
-_duckdb_connect_patcher = patch('duckdb.connect', return_value=MagicMock())
+_duckdb_connect_patcher = patch("duckdb.connect", return_value=MagicMock())
 _duckdb_connect_patcher.start()
 
-from imednet_workflows.config_version_control import ConfigVersionStore
-_cvs_patcher1 = patch.object(ConfigVersionStore, 'diff_configs', return_value={"added": [], "removed": [], "changed": []})
-_cvs_patcher1.start()
-_cvs_patcher2 = patch.object(ConfigVersionStore, 'commit_config', return_value="mock_commit_id")
-_cvs_patcher2.start()
-_cvs_patcher3 = patch.object(ConfigVersionStore, 'rollback_config', return_value={})
-_cvs_patcher3.start()
-_cvs_patcher4 = patch.object(ConfigVersionStore, 'get_history', return_value=[{"version_tag": "v1", "commit_id": "mock_commit_id", "timestamp": "2026-01-01"}])
-_cvs_patcher4.start()
+_mongo_client_patcher = patch("pymongo.MongoClient", return_value=MagicMock())
+_mongo_client_patcher.start()
 
-import imednet.integrations.export
-_export_patcher = patch.object(imednet.integrations.export, '_prepare_export_df', return_value=sys.modules['pandas'].DataFrame())
-_export_patcher.start()
+_neo4j_driver_patcher = patch("neo4j.GraphDatabase.driver", return_value=MagicMock())
+_neo4j_driver_patcher.start()
 
-from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
-_reg_patcher = patch.object(RegisterSubjectsWorkflow, 'register_subjects', return_value={'batch_id': 'MOCK_BATCH'})
-_reg_patcher.start()
-
-from unittest.mock import MagicMock, patch
-import builtins
+_snowflake_connect_patcher = patch("snowflake.connector.connect", return_value=MagicMock())
+_snowflake_connect_patcher.start()
 
 _original_print = builtins.print
+
+
 def _mock_print(*args, **kwargs):
+    if kwargs.get("file") is not None:
+        _original_print(*args, **kwargs)
+        return
     if args and str(args[0]) in ("True", "2020", "5", "'1.23'", "['x']", "{}"):
         _original_print(*args, **kwargs)
 
-_print_patcher = patch.object(builtins, 'print', side_effect=_mock_print)
+
+_print_patcher = patch.object(builtins, "print", side_effect=_mock_print)
 _print_patcher.start()
-
-sys.modules["snowflake"] = MagicMock()
-sys.modules["snowflake.connector"] = MagicMock()
-sys.modules["pymongo"] = MagicMock()
-sys.modules["pymongo.errors"] = MagicMock()
-sys.modules["neo4j"] = MagicMock()
-
-import imednet.integrations.sink_base
-_snowflake_patcher = patch.object(imednet.integrations.sink_base, '_require_optional_dep', return_value=MagicMock())
-_snowflake_patcher.start()
-
-import imednet_sinks.warehouse
-_wh_patcher = patch.object(imednet_sinks.warehouse, '_require_optional_dep', return_value=MagicMock())
-_wh_patcher.start()
-
-import imednet_sinks.document
-_doc_patcher = patch.object(imednet_sinks.document, '_require_optional_dep', return_value=MagicMock())
-_doc_patcher.start()
-
-import imednet_sinks.graph
-_graph_patcher = patch.object(imednet_sinks.graph, '_require_optional_dep', return_value=MagicMock())
-_graph_patcher.start()
-
-# Mock airflow and provider
-import sys
-from unittest.mock import MagicMock
-sys.modules['airflow'] = MagicMock()
-sys.modules['airflow.decorators'] = MagicMock()
-sys.modules['airflow.sdk'] = MagicMock()
-sys.modules['apache_airflow_providers_imednet'] = MagicMock()
-
-
-commit_a = "mock_commit_a"
-commit_b = "mock_commit_b"
-commit_id = "mock_commit_id"
-subject_data = {}
-api_response = {}
-
 """
 
 doctest_global_cleanup = """
 _duckdb_connect_patcher.stop()
-_cvs_patcher1.stop()
-_cvs_patcher2.stop()
-_cvs_patcher3.stop()
-_cvs_patcher4.stop()
-_export_patcher.stop()
-_reg_patcher.stop()
-_snowflake_patcher.stop()
-_wh_patcher.stop()
-_doc_patcher.stop()
-_graph_patcher.stop()
+_mongo_client_patcher.stop()
+_neo4j_driver_patcher.stop()
+_snowflake_connect_patcher.stop()
 _print_patcher.stop()
 """
 

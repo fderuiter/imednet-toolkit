@@ -6,7 +6,7 @@ import argparse
 import itertools
 import sys
 import weakref
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from typing import Any
 
 from imednet.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
@@ -296,6 +296,63 @@ def prepare_list_query(
     return request_kwargs, effective_limit
 
 
+def collect_list_items_with_remainder(
+    source: Iterable[Any],
+    effective_limit: int | None,
+) -> tuple[list[Any], bool, Callable[[], list[Any]] | None]:
+    """Materialize items up to ``effective_limit`` and return a remainder loader when truncated.
+
+    Preserves the live ``_PaginatedIterator`` cursor so subsequent ``[a]`` loads drain
+    remaining pages starting at page 1 without re-fetching page 0.
+
+    Returns:
+        Tuple of ``(items, truncated, load_remaining)``.
+    """
+    if effective_limit is None:
+        return list(source), False, None
+
+    if isinstance(source, Sequence):
+        truncated = len(source) > effective_limit
+        initial = list(source[:effective_limit])
+        if not truncated:
+            return initial, False, None
+        remaining = list(source[effective_limit:])
+
+        def _drain_sequence() -> list[Any]:
+            rest = list(remaining)
+            remaining.clear()
+            return rest
+
+        return initial, True, _drain_sequence
+
+    if hasattr(source, "has_more"):
+        iterator = iter(source)
+        items = list(itertools.islice(iterator, effective_limit))
+        truncated = bool(getattr(source, "has_more", False))
+        if not truncated:
+            return items, False, None
+
+        def _drain_paginated() -> list[Any]:
+            return list(iterator)
+
+        return items, True, _drain_paginated
+
+    iterator = iter(source)
+    batch = list(itertools.islice(iterator, effective_limit + 1))
+    truncated = len(batch) > effective_limit
+    initial = batch[:effective_limit]
+    if not truncated:
+        return initial, False, None
+    overflow = batch[effective_limit:]
+
+    def _drain_iterable() -> list[Any]:
+        rest = [*overflow, *iterator]
+        overflow.clear()
+        return rest
+
+    return initial, True, _drain_iterable
+
+
 def collect_list_items(
     source: Iterable[Any],
     effective_limit: int | None,
@@ -308,18 +365,5 @@ def collect_list_items(
     Returns:
         Tuple of ``(items, truncated)``.
     """
-    if effective_limit is None:
-        return list(source), False
-
-    if isinstance(source, Sequence):
-        truncated = len(source) > effective_limit
-        return list(source[:effective_limit]), truncated
-
-    if hasattr(source, "has_more"):
-        items = list(itertools.islice(source, effective_limit))
-        return items, bool(getattr(source, "has_more", False))
-
-    iterator = iter(source)
-    batch = list(itertools.islice(iterator, effective_limit + 1))
-    truncated = len(batch) > effective_limit
-    return batch[:effective_limit], truncated
+    items, truncated, _ = collect_list_items_with_remainder(source, effective_limit)
+    return items, truncated

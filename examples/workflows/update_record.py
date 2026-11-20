@@ -31,5 +31,5 @@ with ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url) a
     if not job.batch_id:
         raise RuntimeError("Submission succeeded but no batch ID returned")
 
-    status = JobPoller(sdk.jobs.get, False).run(study_key, job.batch_id)
+    status = JobPoller(sdk.jobs.get, None).run(study_key, job.batch_id)
     print(f"Job {status.batch_id} finished with state: {status.state}")

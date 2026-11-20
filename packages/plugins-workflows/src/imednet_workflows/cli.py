@@ -24,13 +24,14 @@ from imednet.spi.cli import (
     parse_filter_args,
     positive_int,
     print_error,
+    redact_cli_secrets,
     with_sdk,
 )
 
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectDataWorkflow
-from .sync_worker import SyncWorker, SyncWorkerConfig
+from .sync_worker import SyncWorker, SyncWorkerConfig, SyncWorkerState
 
 
 def _execute_show_state(ledger_path: str, study_key: str | None = None) -> None:
@@ -424,6 +425,15 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     worker.run_forever(on_cycle=on_cycle, on_sleep_tick=on_sleep_tick)
                 except TypeError:
                     worker.run_forever()
+            if worker.state == SyncWorkerState.FAILED:
+                err_detail = f": {worker.last_error}" if worker.last_error is not None else ""
+                print_error(
+                    redact_cli_secrets(
+                        f"Sync worker failed after {worker.consecutive_failures}/"
+                        f"{worker.max_consecutive_failures} consecutive failures{err_detail}"
+                    )
+                )
+                sys.exit(1)
         except KeyboardInterrupt:
             clear_line()
             worker.stop()

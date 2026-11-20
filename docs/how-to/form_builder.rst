@@ -4,7 +4,9 @@ Form Builder
 The Form Builder module allows you to programmatically define form layouts and submit them to the legacy iMedNet Form Designer. This bypasses manual drag-and-drop operations, enabling automated form creation and updates.
 
 .. warning::
-    This module interacts with the legacy Form Designer endpoint (``formdez_save.php``). It requires session credentials (``PHPSESSID`` and ``CSRFKey``) scraped from an active browser session.
+    **Legacy Scope Only:** ``imednet.form_designer`` targets only visual page layout submission to the legacy internal Form Designer endpoint (``formdez_save.php``) and requires scraped browser session cookies (``PHPSESSID`` and ``CSRFKey``). It is **not** part of the official iMednet REST API and does **not** load Study Data Dictionaries, convert CDISC ODM XML, or validate Record edit check rules.
+
+    For canonical Study metadata conversion, CDISC ODM / REDCap / CSV loading, ``BusinessLogicRule`` evaluation, and UAT verification, see :doc:`/how-to/data_dictionary` and :doc:`/how-to/workflows/uat_workflow`.
 
 Core Concepts
 -------------
@@ -45,7 +47,7 @@ For CI/CD or automated workflows, use the example script:
 
 .. code-block:: console
 
-    hatch run python examples/build_form_payload.py --preset "Demo Form" \
+    uv run --with "imednet[cli]" python examples/build_form_payload.py --preset "Demo Form" \
         --base-url "https://your.imednet.com" \
         --phpsessid "YOUR_SESSION_ID" \
         --csrf "YOUR_CSRF_KEY" \
