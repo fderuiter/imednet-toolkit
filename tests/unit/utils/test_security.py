@@ -471,3 +471,25 @@ def test_mask_clinical_phi_preserves_masked_sentinel_and_cdisc_exemptions() -> N
     assert masked["brthDat"] == "***MASKED***"
     assert masked["brth_yr"] == "***MASKED***"
     assert masked["SubjInit"] == "***MASKED***"
+
+
+def test_sensitivity_registry_resyncs_collapsed_sets_after_direct_set_restore() -> None:
+    """Verify snapshot/clear/update patterns on _sensitive_keys and _exempt_keys resync collapsed sets."""
+    registry = SensitivityRegistry()
+    sens_snapshot = set(registry._sensitive_keys)
+    exempt_snapshot = set(registry._exempt_keys)
+
+    registry.add_sensitive_key("subject_oid")
+    registry.add_exempt_key("custom_safe_id")
+    assert registry.is_sensitive("subjectOid")
+    assert registry.is_exempt("CUSTOMSAFEID")
+
+    registry._sensitive_keys.clear()
+    registry._sensitive_keys.update(sens_snapshot)
+    registry._exempt_keys.clear()
+    registry._exempt_keys.update(exempt_snapshot)
+
+    assert not registry.is_sensitive("subject_oid")
+    assert not registry.is_sensitive("subjectOid")
+    assert not registry.is_exempt("custom_safe_id")
+    assert not registry.is_exempt("CUSTOMSAFEID")

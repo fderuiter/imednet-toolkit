@@ -78,11 +78,23 @@ class SensitivityRegistry:
             "subjid",
             "studyid",
         }
+        self._sens_snapshot = frozenset(self._sensitive_keys)
+        self._exempt_snapshot = frozenset(self._exempt_keys)
         self._collapsed_sensitive = {k.replace("_", "") for k in self._sensitive_keys}
         self._collapsed_exempt = {k.replace("_", "") for k in self._exempt_keys}
 
+    def _sync_collapsed_sets(self) -> None:
+        """Resynchronize collapsed key sets if underlying sets were mutated directly."""
+        if self._sensitive_keys != self._sens_snapshot:
+            self._sens_snapshot = frozenset(self._sensitive_keys)
+            self._collapsed_sensitive = {k.replace("_", "") for k in self._sensitive_keys}
+        if self._exempt_keys != self._exempt_snapshot:
+            self._exempt_snapshot = frozenset(self._exempt_keys)
+            self._collapsed_exempt = {k.replace("_", "") for k in self._exempt_keys}
+
     def add_sensitive_key(self, key: Any) -> None:
         """Add a key to the sensitive list if it is not exempted."""
+        self._sync_collapsed_sets()
         norm_key = _normalize_key(key)
         if not norm_key:
             return
@@ -90,9 +102,11 @@ class SensitivityRegistry:
         if norm_key not in self._exempt_keys and collapsed not in self._collapsed_exempt:
             self._sensitive_keys.add(norm_key)
             self._collapsed_sensitive.add(collapsed)
+            self._sens_snapshot = frozenset(self._sensitive_keys)
 
     def remove_sensitive_key(self, key: Any) -> None:
         """Remove a key from the sensitive list."""
+        self._sync_collapsed_sets()
         norm_key = _normalize_key(key)
         if not norm_key:
             return
@@ -101,16 +115,20 @@ class SensitivityRegistry:
             if existing == norm_key or existing.replace("_", "") == collapsed:
                 self._sensitive_keys.discard(existing)
         self._collapsed_sensitive.discard(collapsed)
+        self._sens_snapshot = frozenset(self._sensitive_keys)
 
     def add_exempt_key(self, key: Any) -> None:
         """Add a key to the exemption list."""
+        self._sync_collapsed_sets()
         norm_key = _normalize_key(key)
         if norm_key:
             self._exempt_keys.add(norm_key)
             self._collapsed_exempt.add(norm_key.replace("_", ""))
+            self._exempt_snapshot = frozenset(self._exempt_keys)
 
     def remove_exempt_key(self, key: Any) -> None:
         """Remove a key from the exemption list."""
+        self._sync_collapsed_sets()
         norm_key = _normalize_key(key)
         if not norm_key:
             return
@@ -119,9 +137,11 @@ class SensitivityRegistry:
             if existing == norm_key or existing.replace("_", "") == collapsed:
                 self._exempt_keys.discard(existing)
         self._collapsed_exempt.discard(collapsed)
+        self._exempt_snapshot = frozenset(self._exempt_keys)
 
     def is_exempt(self, key: Any) -> bool:
         """Check if a key is explicitly exempted from PHI masking."""
+        self._sync_collapsed_sets()
         norm_key = _normalize_key(key)
         if not norm_key:
             return False
@@ -129,6 +149,7 @@ class SensitivityRegistry:
 
     def is_sensitive(self, key: Any) -> bool:
         """Check if a key is considered sensitive and not exempted."""
+        self._sync_collapsed_sets()
         norm_key = _normalize_key(key)
         if not norm_key:
             return False
