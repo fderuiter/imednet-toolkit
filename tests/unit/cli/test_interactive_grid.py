@@ -520,19 +520,90 @@ def test_grid_side_panel_overflow_cues_and_esc_precedence() -> None:
     assert grid.search_query == ""
 
 
-def test_grid_status_colors_high_contrast() -> None:
-    """Grid uses high-contrast color mappings when requested."""
+def test_grid_status_colors_high_contrast(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Grid binds >= 7:1 foreground-and-background high-contrast pairs across 256-color and 16-color terminals."""
     win = MockWindow()
     items = [{"ID": 1, "Status": "Completed"}]
     grid_normal = InteractiveDataGrid(
         win, items=items, fields=["ID", "Status"], is_high_contrast=False
     )
-    grid_normal.color_attrs = {"green": 10, "blue": 20}
+    grid_normal.color_attrs = {"green": 10, "hc_success": 20}
     assert grid_normal._get_status_attr("Completed") == 10
 
     grid_hc = InteractiveDataGrid(win, items=items, fields=["ID", "Status"], is_high_contrast=True)
-    grid_hc.color_attrs = {"green": 10, "blue": 20}
+    grid_hc.color_attrs = {
+        "green": 10,
+        "hc_success": 20,
+        "hc_warning": 21,
+        "hc_danger": 22,
+    }
     assert grid_hc._get_status_attr("Completed") == 20
+    assert grid_hc._get_status_attr("Pending") == 21
+    assert grid_hc._get_status_attr("Failed") == 22
+
+    # Verify _setup_curses initializes custom RGB pairs when COLORS >= 256 and can_change_color() is True
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("COLORTERM", raising=False)
+    init_pairs_rgb: list[tuple[int, int, int]] = []
+    init_colors_rgb: list[tuple[int, int, int, int]] = []
+    with (
+        patch("curses.has_colors", return_value=True),
+        patch("curses.start_color"),
+        patch("curses.use_default_colors"),
+        patch("curses.COLORS", 256, create=True),
+        patch("curses.can_change_color", return_value=True, create=True),
+        patch(
+            "curses.init_color", side_effect=lambda i, r, g, b: init_colors_rgb.append((i, r, g, b))
+        ),
+        patch("curses.init_pair", side_effect=lambda p, fg, bg: init_pairs_rgb.append((p, fg, bg))),
+        patch("curses.color_pair", side_effect=lambda p: p * 100),
+    ):
+        g_rgb = InteractiveDataGrid(
+            win, items=items, fields=["ID", "Status"], is_high_contrast=True
+        )
+        assert (250, 0, 0, 0) in init_colors_rgb
+        assert (251, 0, 1000, 400) in init_colors_rgb
+        assert (252, 1000, 1000, 0) in init_colors_rgb
+        assert (253, 1000, 600, 1000) in init_colors_rgb
+        assert (7, 251, 250) in init_pairs_rgb
+        assert (8, 252, 250) in init_pairs_rgb
+        assert (9, 253, 250) in init_pairs_rgb
+        assert g_rgb._get_status_attr("Active") == (700 | curses.A_BOLD)
+        assert g_rgb._get_status_attr("Running") == (800 | curses.A_BOLD)
+        assert g_rgb._get_status_attr("Error") == (900 | curses.A_BOLD | curses.A_UNDERLINE)
+
+    # Verify _setup_curses falls back to xterm-256 cube indices when can_change_color() is False
+    init_pairs_256: list[tuple[int, int, int]] = []
+    with (
+        patch("curses.has_colors", return_value=True),
+        patch("curses.start_color"),
+        patch("curses.use_default_colors"),
+        patch("curses.COLORS", 256, create=True),
+        patch("curses.can_change_color", return_value=False, create=True),
+        patch("curses.init_pair", side_effect=lambda p, fg, bg: init_pairs_256.append((p, fg, bg))),
+        patch("curses.color_pair", side_effect=lambda p: p * 100),
+    ):
+        InteractiveDataGrid(win, items=items, fields=["ID", "Status"], is_high_contrast=True)
+        assert (7, 47, 16) in init_pairs_256
+        assert (8, 226, 16) in init_pairs_256
+        assert (9, 213, 16) in init_pairs_256
+
+    # Verify _setup_curses binds explicit black-and-white pairs on 16-color terminals (never -1 background)
+    monkeypatch.setenv("TERM", "xterm-16color")
+    init_pairs_16: list[tuple[int, int, int]] = []
+    with (
+        patch("curses.has_colors", return_value=True),
+        patch("curses.start_color"),
+        patch("curses.use_default_colors"),
+        patch("curses.COLORS", 16, create=True),
+        patch("curses.init_pair", side_effect=lambda p, fg, bg: init_pairs_16.append((p, fg, bg))),
+        patch("curses.color_pair", side_effect=lambda p: p * 100),
+    ):
+        g_16 = InteractiveDataGrid(win, items=items, fields=["ID", "Status"], is_high_contrast=True)
+        assert (7, 15, curses.COLOR_BLACK) in init_pairs_16
+        assert (8, curses.COLOR_BLACK, 15) in init_pairs_16
+        assert (9, 15, curses.COLOR_BLACK) in init_pairs_16
+        assert g_16._get_status_attr("Pending") == 800
 
 
 def test_grid_exit_on_q() -> None:

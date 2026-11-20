@@ -14,31 +14,119 @@
     const MOCK_DATA = {
         studies: [
             {
+                sponsorKey: "ACME-SPONSOR",
                 studyKey: "STUDY",
+                studyId: 1003,
                 studyName: "Benchmark Validation Study",
                 studyDescription: "Benchmark simulated study",
                 studyType: "Observational",
-                sponsorKey: "ACME-SPONSOR",
-                studyId: 1003,
-                dateCreated: "2026-01-01T00:00:00Z"
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                lastUpdated: "2026-01-15T12:00:00Z"
             },
             {
+                sponsorKey: "ACME-SPONSOR",
                 studyKey: "DEMO-STUDY",
+                studyId: 1001,
                 studyName: "Demo Oncology Study",
                 studyDescription: "Simulated oncology biomarker study",
                 studyType: "Interventional",
-                sponsorKey: "ACME-SPONSOR",
-                studyId: 1001,
-                dateCreated: "2026-01-01T00:00:00Z"
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                lastUpdated: "2026-01-15T12:00:00Z"
             },
             {
+                sponsorKey: "ACME-SPONSOR",
                 studyKey: "MY_STUDY",
+                studyId: 1002,
                 studyName: "Primary Clinical Study",
                 studyDescription: "Primary simulated clinical investigation",
                 studyType: "Interventional",
-                sponsorKey: "ACME-SPONSOR",
-                studyId: 1002,
-                dateCreated: "2026-01-01T00:00:00Z"
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                lastUpdated: "2026-01-15T12:00:00Z"
+            }
+        ],
+        formsCatalog: [
+            {
+                studyKey: "STUDY",
+                formId: 302,
+                formKey: "F_VS",
+                formName: "Vital Signs",
+                formType: "CRF",
+                revision: 1,
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                disabled: false,
+                eproForm: false,
+                allowCopy: false,
+                embeddedLog: false,
+                enforceOwnership: false,
+                otherForms: false,
+                userAgreement: false,
+                lastUpdated: "2026-01-15T12:00:00Z",
+                subjectRecordReport: false,
+                unscheduledVisit: false
+            },
+            {
+                studyKey: "STUDY",
+                formId: 301,
+                formKey: "F_DM",
+                formName: "Demographics",
+                formType: "CRF",
+                revision: 1,
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                disabled: false,
+                eproForm: false,
+                allowCopy: false,
+                embeddedLog: false,
+                enforceOwnership: false,
+                otherForms: false,
+                userAgreement: false,
+                lastUpdated: "2026-01-15T12:00:00Z",
+                subjectRecordReport: true,
+                unscheduledVisit: false
+            },
+            {
+                studyKey: "STUDY",
+                formId: 303,
+                formKey: "F_AE",
+                formName: "Safety Observations",
+                formType: "CRF",
+                revision: 1,
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                disabled: false,
+                eproForm: false,
+                allowCopy: true,
+                embeddedLog: false,
+                enforceOwnership: false,
+                otherForms: false,
+                userAgreement: false,
+                lastUpdated: "2026-01-15T12:00:00Z",
+                subjectRecordReport: false,
+                unscheduledVisit: true
+            },
+            {
+                studyKey: "STUDY",
+                formId: 304,
+                formKey: "F_LB",
+                formName: "Laboratory Findings",
+                formType: "CRF",
+                revision: 1,
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                disabled: false,
+                eproForm: false,
+                allowCopy: false,
+                embeddedLog: false,
+                enforceOwnership: false,
+                otherForms: false,
+                userAgreement: false,
+                lastUpdated: "2026-01-15T12:00:00Z",
+                subjectRecordReport: false,
+                unscheduledVisit: false
             }
         ],
         forms: {
@@ -276,44 +364,104 @@
         },
         queries: [
             {
-                annotationId: 701,
                 studyKey: "STUDY",
-                subjectKey: "SUB1",
+                subjectId: 201,
+                annotationId: 701,
+                description: "Please verify demographic details.",
                 recordId: 601,
                 variable: "V_AGE",
-                status: "OPEN",
-                description: "Please verify demographic details.",
-                dateCreated: "2026-01-12T10:00:00Z"
+                subjectKey: "SUB1",
+                dateCreated: "2026-01-12T10:00:00Z",
+                dateModified: "2026-01-12T10:00:00Z",
+                annotationType: "subject",
+                subjectOid: "SE_SUB1",
+                type: "Query",
+                lastUpdated: "2026-01-12T10:00:00Z",
+                queryComments: [
+                    {
+                        sequence: 1,
+                        annotationStatus: "Monitor Open",
+                        user: "sim_monitor",
+                        comment: "Please verify demographic details.",
+                        closed: false,
+                        date: "2026-01-12T10:00:00Z"
+                    }
+                ]
             },
             {
-                annotationId: 702,
                 studyKey: "STUDY",
-                subjectKey: "SUB1",
+                subjectId: 201,
+                annotationId: 702,
+                description: "Check vital sign measurement.",
                 recordId: 601,
                 variable: "V_WEIGHT",
-                status: "OPEN",
-                description: "Check vital sign measurement.",
-                dateCreated: "2026-01-12T10:00:00Z"
+                subjectKey: "SUB1",
+                dateCreated: "2026-01-12T10:00:00Z",
+                dateModified: "2026-01-12T10:00:00Z",
+                annotationType: "record",
+                subjectOid: "SE_SUB1",
+                type: "Query",
+                lastUpdated: "2026-01-12T10:00:00Z",
+                queryComments: [
+                    {
+                        sequence: 1,
+                        annotationStatus: "Monitor Open",
+                        user: "sim_monitor",
+                        comment: "Check vital sign measurement.",
+                        closed: false,
+                        date: "2026-01-12T10:00:00Z"
+                    }
+                ]
             },
             {
-                annotationId: 703,
                 studyKey: "STUDY",
-                subjectKey: "SUB2",
+                subjectId: 202,
+                annotationId: 703,
+                description: "Repeat systolic reading confirmed after 10-minute rest.",
                 recordId: 602,
                 variable: "V_SYSBP",
-                status: "ANSWERED",
-                description: "Repeat systolic reading confirmed after 10-minute rest.",
-                dateCreated: "2026-01-14T11:00:00Z"
+                subjectKey: "SUB2",
+                dateCreated: "2026-01-14T11:00:00Z",
+                dateModified: "2026-01-14T11:30:00Z",
+                annotationType: "record",
+                subjectOid: "SE_SUB2",
+                type: "Query",
+                lastUpdated: "2026-01-14T11:30:00Z",
+                queryComments: [
+                    {
+                        sequence: 1,
+                        annotationStatus: "Subject Answered",
+                        user: "sim_coordinator",
+                        comment: "Repeat systolic reading confirmed after 10-minute rest.",
+                        closed: false,
+                        date: "2026-01-14T11:30:00Z"
+                    }
+                ]
             },
             {
-                annotationId: 704,
                 studyKey: "STUDY",
-                subjectKey: "SUB3",
+                subjectId: 203,
+                annotationId: 704,
+                description: "Confirmed unit notation matches study data dictionary.",
                 recordId: 603,
                 variable: "V_PULSE",
-                status: "CLOSED",
-                description: "Confirmed unit notation matches study data dictionary.",
-                dateCreated: "2026-01-15T16:20:00Z"
+                subjectKey: "SUB3",
+                dateCreated: "2026-01-15T16:20:00Z",
+                dateModified: "2026-01-15T16:45:00Z",
+                annotationType: "record",
+                subjectOid: "SE_SUB3",
+                type: "Query",
+                lastUpdated: "2026-01-15T16:45:00Z",
+                queryComments: [
+                    {
+                        sequence: 1,
+                        annotationStatus: "Monitor Closed",
+                        user: "sim_monitor",
+                        comment: "Confirmed unit notation matches study data dictionary.",
+                        closed: true,
+                        date: "2026-01-15T16:45:00Z"
+                    }
+                ]
             }
         ],
         audits: [
@@ -529,7 +677,17 @@
             keys.forEach(function (k) {
                 const val = record[k];
                 let cellHtml = escapeHtml(val);
-                if (k === "STATUS" || k === "status" || k === "recordStatus" || k === "wcagCompliance") {
+                if (k === "queryComments" && Array.isArray(val)) {
+                    const latest = val.length ? val[val.length - 1] : null;
+                    const statusLabel = latest && latest.annotationStatus ? String(latest.annotationStatus) : "Open";
+                    const lowerStatus = statusLabel.toLowerCase();
+                    const commentBadge = lowerStatus.includes("closed")
+                        ? "badge-success"
+                        : lowerStatus.includes("open") || lowerStatus.includes("answered")
+                        ? "badge-warning"
+                        : "badge-neutral";
+                    cellHtml = `<span class="status-badge ${commentBadge}">${escapeHtml(statusLabel)}</span> <code>(${val.length})</code>`;
+                } else if (k === "STATUS" || k === "status" || k === "recordStatus" || k === "wcagCompliance") {
                     const lowerVal = String(val).toLowerCase();
                     const badgeClass = lowerVal.includes("verified") || lowerVal.includes("pass") || lowerVal.includes("complete") || lowerVal.includes("locked")
                         ? "badge-success"
@@ -539,6 +697,8 @@
                     cellHtml = `<span class="status-badge ${badgeClass}">${cellHtml}</span>`;
                 } else if (typeof val === "boolean") {
                     cellHtml = val ? `<span class="status-badge badge-success">true</span>` : `<span class="status-badge badge-neutral">false</span>`;
+                } else if (val !== null && typeof val === "object") {
+                    cellHtml = `<code>${escapeHtml(JSON.stringify(val))}</code>`;
                 }
                 html += `<td>${cellHtml}</td>`;
             });
@@ -882,18 +1042,7 @@
                 data = MOCK_DATA.studies;
                 caption = "Clinical Studies Catalog";
             } else if (datasetKey === "forms") {
-                data = Object.keys(MOCK_DATA.forms).map(function (k) {
-                    const f = MOCK_DATA.forms[k];
-                    const rules = Array.isArray(f.businessLogic) ? f.businessLogic : [];
-                    return {
-                        formId: f.formId,
-                        formKey: f.formKey,
-                        formName: f.formName,
-                        formType: f.formType,
-                        variableCount: f.variables.length,
-                        ruleCount: rules.length
-                    };
-                });
+                data = MOCK_DATA.formsCatalog;
                 caption = "Study Forms Catalog (STUDY)";
             } else if (datasetKey === "queries") {
                 data = MOCK_DATA.queries;

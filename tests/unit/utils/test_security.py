@@ -386,3 +386,110 @@ def test_sensitivity_registry_is_exempt_and_custom_registry_masking():
     assert masked_custom["nested_tuple"][0]["chartCode"] == "***MASKED***"
     assert masked_custom["nested_tuple"][0]["vital"] == 98.6
     assert not global_sensitivity_registry.is_sensitive("chartCode")
+
+
+@pytest.mark.parametrize(
+    "sensitive_key",
+    [
+        "BRTHDTC",
+        "brthdtc",
+        "brthDtc",
+        "BrthDtc",
+        "brth_dtc",
+        "BRTHDAT",
+        "brthdat",
+        "brthDat",
+        "BrthDat",
+        "brth_dat",
+        "BRTHYR",
+        "brthyr",
+        "brthYr",
+        "BrthYr",
+        "brth_yr",
+        "SUBJINIT",
+        "subjinit",
+        "subjInit",
+        "SubjInit",
+        "subj_init",
+    ],
+)
+def test_sensitivity_registry_marks_cdisc_phi_keys_sensitive_across_casings(
+    sensitive_key: str,
+) -> None:
+    """Verify SensitivityRegistry recognizes CDISC birth and initials variables across casings."""
+    registry = SensitivityRegistry()
+    assert registry.is_sensitive(sensitive_key)
+    assert not registry.is_exempt(sensitive_key)
+
+
+@pytest.mark.parametrize(
+    "exempt_key",
+    [
+        "USUBJID",
+        "usubjid",
+        "uSubjId",
+        "USubjId",
+        "u_subj_id",
+        "usubj_id",
+        "SUBJID",
+        "subjid",
+        "subjId",
+        "SubjId",
+        "subj_id",
+        "STUDYID",
+        "studyid",
+        "studyId",
+        "StudyId",
+        "study_id",
+    ],
+)
+def test_sensitivity_registry_exempts_cdisc_identifiers_across_casings(exempt_key: str) -> None:
+    """Verify SensitivityRegistry exempts USUBJID, SUBJID, and STUDYID across all casing styles."""
+    registry = SensitivityRegistry()
+    assert registry.is_exempt(exempt_key)
+    assert not registry.is_sensitive(exempt_key)
+    registry.add_sensitive_key(exempt_key)
+    assert not registry.is_sensitive(exempt_key)
+
+
+def test_mask_clinical_phi_preserves_masked_sentinel_and_cdisc_exemptions() -> None:
+    """Verify generic mask_clinical_phi emits ***MASKED*** for CDISC PHI while keeping IDs intact."""
+    payload = {
+        "STUDYID": "STUDY-01",
+        "USUBJID": "STUDY-01-001",
+        "subjId": "001",
+        "BRTHDTC": "1985-07-19",
+        "brthDat": "1985-07-19",
+        "brth_yr": 1985,
+        "SubjInit": "JD",
+    }
+    masked = mask_clinical_phi(payload)
+    assert masked["STUDYID"] == "STUDY-01"
+    assert masked["USUBJID"] == "STUDY-01-001"
+    assert masked["subjId"] == "001"
+    assert masked["BRTHDTC"] == "***MASKED***"
+    assert masked["brthDat"] == "***MASKED***"
+    assert masked["brth_yr"] == "***MASKED***"
+    assert masked["SubjInit"] == "***MASKED***"
+
+
+def test_sensitivity_registry_resyncs_collapsed_sets_after_direct_set_restore() -> None:
+    """Verify snapshot/clear/update patterns on _sensitive_keys and _exempt_keys resync collapsed sets."""
+    registry = SensitivityRegistry()
+    sens_snapshot = set(registry._sensitive_keys)
+    exempt_snapshot = set(registry._exempt_keys)
+
+    registry.add_sensitive_key("subject_oid")
+    registry.add_exempt_key("custom_safe_id")
+    assert registry.is_sensitive("subjectOid")
+    assert registry.is_exempt("CUSTOMSAFEID")
+
+    registry._sensitive_keys.clear()
+    registry._sensitive_keys.update(sens_snapshot)
+    registry._exempt_keys.clear()
+    registry._exempt_keys.update(exempt_snapshot)
+
+    assert not registry.is_sensitive("subject_oid")
+    assert not registry.is_sensitive("subjectOid")
+    assert not registry.is_exempt("custom_safe_id")
+    assert not registry.is_exempt("CUSTOMSAFEID")
