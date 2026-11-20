@@ -241,23 +241,98 @@ Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
 
 .. list-table::
    :header-rows: 1
-   :widths: 30 15 55
+   :widths: 28 16 56
 
    * - Field
      - Default
      - Description
+   * - ``study_key``
+     - *(required)*
+     - Non-empty ``Study`` key targeted by the export operation.
    * - ``batch_size``
-     - 500
-     - Records per :meth:`write_batch` call.
+     - ``500``
+     - ``Record`` items per :meth:`write_batch` call.
    * - ``max_retries``
-     - 3
-     - Retry attempts on transient errors.
+     - ``3``
+     - Retry attempts on transient destination errors.
    * - ``retry_backoff``
-     - 1.0
-     - Base delay (seconds); grows as ``backoff * 2^attempt``.
+     - ``1.0``
+     - Base delay (seconds); grows exponentially as ``retry_backoff * 2^attempt``.
    * - ``idempotent``
      - ``True``
-     - Use upsert / MERGE semantics.
+     - Use upsert / ``MERGE`` semantics keyed on deterministic ``Record`` identifiers.
+   * - ``mask_phi``
+     - ``True``
+     - Redact registered sensitive ``Subject`` and ``StudyConfiguration`` ``phiFields`` values to ``***MASKED***`` before serialization.
+   * - ``extra``
+     - ``{}``
+     - Destination-specific extension dictionary forwarded to custom sink plugins.
+   * - ``quality_gate_enabled``
+     - ``False``
+     - Run :func:`~imednet.spi.sink_base.apply_quality_gate` before batch writes to filter ``Record`` items below the readiness threshold.
+   * - ``min_schema_readiness_score``
+     - ``100.0``
+     - Minimum readiness score (``0.0``–``100.0``) required when ``quality_gate_enabled=True``.
+   * - ``tracer``
+     - ``None``
+     - Optional OpenTelemetry-compatible tracer used to emit sink batch spans.
+   * - ``modified_since``
+     - ``None``
+     - Lower-bound UTC modification watermark (``datetime`` or ISO-8601 string) applied when no committed checkpoint exists.
+   * - ``record_filter``
+     - ``None``
+     - Optional ``Record`` metadata filter dictionary or filter expression string pushed down to ``RecordsEndpoint``.
+   * - ``record_data_filter``
+     - ``None``
+     - Optional ``Variable`` payload filter expression (``recordDataFilter``).
+   * - ``include_deleted``
+     - ``False``
+     - Include voided (``deleted=True``) ``Record`` items directly in ``write_batch`` payloads instead of routing them to ``reconcile_deleted``.
+   * - ``incremental``
+     - ``False``
+     - Enable transactional high-water mark reads and commits via a ``StateProviderProtocol`` ledger.
+   * - ``stream_name``
+     - ``None``
+     - Logical stream key inside the state ledger (defaults to ``"records"`` or a destination-specific stream identifier).
+   * - ``ledger_path``
+     - ``None``
+     - Filesystem path passed to file-backed checkpoint providers when ``state_provider`` is not supplied explicitly.
+   * - ``state_provider``
+     - ``None``
+     - Pre-configured :class:`~imednet.spi.sink_base.StateProviderProtocol` instance overriding entry-point discovery.
+
+Streaming checkpoints and state provider SPI
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Incremental exports decouple destination sinks from checkpoint persistence through
+:class:`~imednet.spi.sink_base.StateProviderProtocol` and
+:func:`~imednet.spi.sink_base.get_state_provider`:
+
+* ``StateProviderProtocol`` defines the runtime-checkable contract for reading and
+  committing per-``Study`` stream watermarks: ``get_last_timestamp(study_key, stream_name)``,
+  ``set_last_timestamp(...)``, ``transaction(study_key, stream_name, fallback_timestamp=None)``,
+  ``read_state()``, and ``delete_entry(study_key, stream_name=None)``.
+* ``get_state_provider(ledger_path=None, *, provider_name=None)`` resolves plugins registered
+  under the ``imednet.state_providers`` entry-point group (shipped by ``imednet-workflows``):
+
+  - ``default`` → :func:`imednet_workflows.state_ledger.get_state_provider` (auto-detects Airflow task context vs file ledger).
+  - ``file`` → :class:`imednet_workflows.state_ledger.FileStateProvider` (also exported as the backward-compatible alias :class:`imednet_workflows.ExtractionStateLedger`).
+  - ``airflow`` → :class:`imednet_workflows.state_ledger.AirflowStateProvider` (persists stream watermarks in Airflow XCom metadata).
+
+* :func:`~imednet.spi.sink_base.run_streaming_export` orchestrates end-to-end streaming
+  writes across every ``ExportSink``:
+
+  1. Opens ``provider.transaction(...)`` when ``incremental=True`` or ``state_provider`` is set,
+     resolving the active watermark from the stored ``last_timestamp`` or ``modified_since`` fallback.
+  2. Streams paginated ``Record`` items via :func:`~imednet.spi.sink_base.iter_filtered_sdk_records`,
+     combining ``watermark``, ``record_filter``, and ``record_data_filter`` into AND-safe query branches.
+  3. Tracks the maximum observed ``Record`` modification timestamp while routing voided
+     (``deleted=True``) items to ``sink.reconcile_deleted(...)`` on incremental idempotent runs
+     when ``include_deleted=False``.
+  4. Applies :func:`~imednet.spi.sink_base.apply_quality_gate` and streams fixed-size chunks
+     into ``sink.write_batch(...)``.
+  5. Flushes and closes the sink before exiting ``provider.transaction(...)``, ensuring the
+     high-water mark advances **only** after every batch and ``sink.flush()`` succeed.
 
 Error propagation
 ~~~~~~~~~~~~~~~~~

@@ -107,7 +107,7 @@ _WORD_TOKEN_RE = re.compile(r"[a-z0-9']+")
 _NEGATION_RE = re.compile(r"^(?:not|no|non|un|never|without|neither|nor|cannot|.*n't)$")
 _ANSWER_TOKEN_RE = re.compile(r"^(?:re)?answer(?:s|ed|ing)?$")
 _CANCEL_TOKEN_RE = re.compile(r"^(?:re)?cancel(?:s|ed|led|ing|ling|lation)?$")
-_CLOSE_TOKEN_RE = re.compile(r"^(?:re)?clos(?:e|es|ed|ing|ure)$")
+_CLOSE_TOKEN_RE = re.compile(r"^(?:re)?(?:close|closes|closed|closing|closure)$")
 
 
 def _has_non_negated_token(text: str, pattern: re.Pattern[str]) -> bool:

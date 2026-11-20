@@ -34,7 +34,7 @@ dict keyed by study key.
 For the recommended Airflow production pattern (TaskFlow discovery feeding
 mapped provider operators with retries/timeouts/concurrency guardrails), see
 :doc:`/how-to/airflow` and
-``examples/airflow/multi_study_pipeline.py``.
+``examples/airflow/airflow_multi_study_pipeline.py``.
 
 .. literalinclude:: /../examples/workflows/multi_study_pipeline.py
    :language: python
