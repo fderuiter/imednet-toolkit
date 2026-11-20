@@ -47,7 +47,7 @@ _WORD_TOKEN_RE = re.compile("[a-z0-9']+")
 _NEGATION_RE = re.compile("^(?:not|no|non|un|never|without|neither|nor|cannot|.*n't)$")
 _ANSWER_TOKEN_RE = re.compile("^(?:re)?answer(?:s|ed|ing)?$")
 _CANCEL_TOKEN_RE = re.compile("^(?:re)?cancel(?:s|ed|led|ing|ling|lation)?$")
-_CLOSE_TOKEN_RE = re.compile("^(?:re)?clos(?:e|es|ed|ing|ure)$")
+_CLOSE_TOKEN_RE = re.compile("^(?:re)?(?:close|closes|closed|closing|closure)$")
 
 def _has_non_negated_token(text: str, pattern: re.Pattern[str]) -> bool: ...
 def calculate_legacy_status(query_comments: list[Any] | None) -> QueryStatus: ...
