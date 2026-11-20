@@ -30,6 +30,38 @@ from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncWorker, SyncWorkerConfig, SyncWorkerState
 
 
+def _execute_show_state(ledger_path: str, study_key: str | None = None) -> None:
+    """Display high-water mark records and stream metadata from the ledger."""
+    ledger = get_state_provider(ledger_path)
+    try:
+        state = ledger.read_state()
+    except Exception as err:
+        print(f"Failed to read ledger from {ledger_path}: {err}")
+        sys.exit(1)
+
+    has_data = False
+    print(f"iMednet Extraction Ledger ({ledger_path})")
+    print(
+        "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
+    )
+    for s_key, study_state in state.studies.items():
+        if study_key and s_key != study_key:
+            continue
+        for stream_name, stream_state in study_state.streams.items():
+            has_data = True
+            ts_str = (
+                stream_state.last_timestamp.isoformat()
+                if stream_state.last_timestamp is not None
+                else "None"
+            )
+            print(
+                f"{s_key} | {stream_name} | {ts_str} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
+            )
+
+    if not has_data:
+        print("No ledger entries found matching filters.")
+
+
 def _execute_set_state(
     study_key: str | None,
     stream: str | None,
@@ -39,6 +71,7 @@ def _execute_set_state(
     interactive: bool = False,
     parser: argparse.ArgumentParser | None = None,
     no_interactive: bool = False,
+    force: bool = False,
 ) -> None:
     """Execute high-water mark timestamp update for a study/stream in the ledger."""
     if not interactive:
@@ -74,6 +107,7 @@ def _execute_set_state(
                 timestamp=dt,
                 records_processed=records_processed,
                 status="success",
+                force=force,
             )
             print(
                 f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
@@ -431,33 +465,10 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
     add_no_interactive(show_parser)
 
-    def show_state(ledger_path: str, study_key: str | None = None) -> None:  # pragma: no cover
-        ledger = get_state_provider(ledger_path)
-        try:
-            state = ledger.read_state()
-        except Exception as err:
-            print(f"Failed to read ledger from {ledger_path}: {err}")
-            sys.exit(1)
-
-        has_data = False
-        print(f"iMednet Extraction Ledger ({ledger_path})")
-        print(
-            "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
-        )
-        for s_key, study_state in state.studies.items():
-            if study_key and s_key != study_key:
-                continue
-            for stream_name, stream_state in study_state.streams.items():
-                has_data = True
-                print(
-                    f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
-                )
-
-        if not has_data:
-            print("No ledger entries found matching filters.")
-
     show_parser.set_defaults(
-        func=lambda args: show_state(ledger_path=args.ledger_path, study_key=args.study_key)
+        func=lambda args: _execute_show_state(
+            ledger_path=args.ledger_path, study_key=args.study_key
+        )
     )
 
     set_parser = state_sub.add_parser(
@@ -476,6 +487,12 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         help="Path to the pipeline ledger JSON file.",
     )
     set_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force state transition override even when the current status disallows it.",
+    )
+    set_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
     add_no_interactive(set_parser)
@@ -490,6 +507,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             interactive=args.interactive,
             parser=set_parser,
             no_interactive=getattr(args, "no_interactive", False),
+            force=getattr(args, "force", False),
         )
     )
 
@@ -806,31 +824,10 @@ def state_app(args: list[str] | None = None) -> None:
     )
     add_no_interactive(show_parser)
 
-    def show_state(ledger_path: str, study_key: str | None = None) -> None:
-        ledger = get_state_provider(ledger_path)
-        try:
-            state = ledger.read_state()
-        except Exception as err:
-            print(f"Failed to read ledger from {ledger_path}: {err}")
-            sys.exit(1)
-        has_data = False
-        print(f"iMednet Extraction Ledger ({ledger_path})")
-        print(
-            "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
-        )
-        for s_key, study_state in state.studies.items():
-            if study_key and s_key != study_key:
-                continue
-            for stream_name, stream_state in study_state.streams.items():
-                has_data = True
-                print(
-                    f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
-                )
-        if not has_data:
-            print("No ledger entries found matching filters.")
-
     show_parser.set_defaults(
-        func=lambda args: show_state(ledger_path=args.ledger_path, study_key=args.study_key)
+        func=lambda args: _execute_show_state(
+            ledger_path=args.ledger_path, study_key=args.study_key
+        )
     )
 
     set_parser = state_sub.add_parser("set")
@@ -839,6 +836,12 @@ def state_app(args: list[str] | None = None) -> None:
     set_parser.add_argument("-t", "--timestamp")
     set_parser.add_argument("-r", "--records-processed", type=int, default=0)
     set_parser.add_argument("-l", "--ledger-path", default=DEFAULT_LEDGER_PATH)
+    set_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force state transition override even when the current status disallows it.",
+    )
     set_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
@@ -854,6 +857,7 @@ def state_app(args: list[str] | None = None) -> None:
             interactive=args.interactive,
             parser=set_parser,
             no_interactive=getattr(args, "no_interactive", False),
+            force=getattr(args, "force", False),
         )
     )
 
