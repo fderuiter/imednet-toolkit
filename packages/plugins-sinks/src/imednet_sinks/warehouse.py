@@ -1361,12 +1361,19 @@ class SnowflakeExportSink(ExportSink):
         )
         placeholders = ", ".join(["%s"] * len(record_ids))
 
+        if cfg.naming_convention == "camelCase":
+            where_clause = f'"STUDYKEY" = %s AND "RECORDID" IN ({placeholders})'
+        elif cfg.naming_convention == "sdtm":
+            where_clause = f'"STUDYID" = %s AND "RECORD_ID" IN ({placeholders})'
+        else:
+            where_clause = f"STUDY_KEY = %s AND RECORD_ID IN ({placeholders})"
+
         def execute_reconcile() -> int:
             cur = self._conn.cursor()
             try:
                 cur.execute(
                     f"DELETE FROM {target_table} "  # noqa: S608
-                    f"WHERE STUDY_KEY = %s AND RECORD_ID IN ({placeholders})",
+                    f"WHERE {where_clause}",
                     [cfg.study_key, *record_ids],
                 )  # nosem
                 logger.debug("Reconciled %d voided records in batch %s", len(record_ids), batch_id)

@@ -29,6 +29,7 @@ class RecordsOperationDef:
     PATH = "records"
     MODEL = Record
     _id_param = "recordId"
+    _lookup_key_hint = "recordOid"
     PARAM_PROCESSOR = MappingParamProcessor(
         {
             "record_data_filter": "recordDataFilter",

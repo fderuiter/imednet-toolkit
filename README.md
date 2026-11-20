@@ -45,9 +45,12 @@ Our documentation is organized according to the **Diátaxis framework**, which c
 
 ### 🛠️ [How-To Guides](docs/how-to/)
 *Problem-oriented guides for completing specific tasks.*
+- [Data Dictionary & Schema Validation](docs/how-to/data_dictionary.rst) — Compile, convert, validate, and diff Study schemas with `imednet datadict` (`from-csv`, `from-odm`, `to-odm`, `from-redcap`, `from-api`, `validate`, `diff`, and `schema`)
 - [CLI Usage](docs/how-to/cli.rst)
 - [UAT Workflow](docs/how-to/workflows/uat_workflow.rst)
+- [Registering Subjects](docs/how-to/register_subjects.rst)
 - [Bulk Record Creation](docs/how-to/workflows/bulk_submission.rst)
+- [Audit & 21 CFR Part 11 Compliance](docs/how-to/audit_compliance.rst)
 - [Export Destinations](docs/how-to/export_destinations.rst)
 
 ### 💡 [Explanation](docs/explanation/)

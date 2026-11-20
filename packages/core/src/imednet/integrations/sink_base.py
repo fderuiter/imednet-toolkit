@@ -284,8 +284,8 @@ class SinkConfig:
     sdtm_domain:
         Optional target 2-character CDISC SDTM domain code (e.g. ``"AE"``, ``"VS"``).
     standards_profile:
-        Optional standards validation profile name (e.g. ``"drug"``,
-        ``"medical_device"``) or :class:`~imednet.models.standards.StandardsProfile`.
+        Optional standards validation profile name (e.g. ``"drug"``, ``"device"``,
+        or ``"general"``) or :class:`~imednet.models.standards.StandardsProfile`.
     min_standards_score:
         Optional minimum CDISC standards readiness score ``[0.0, 100.0]`` required
         for exports to proceed.

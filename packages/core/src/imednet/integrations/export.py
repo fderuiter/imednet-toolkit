@@ -1378,10 +1378,9 @@ def _filter_arrow_table_excluding_ids(pa: Any, tbl: Any, exclude_ids: set[str]) 
     """Filter out rows from ``tbl`` whose canonical record ID is in ``exclude_ids``."""
     if tbl.num_rows == 0 or not exclude_ids:
         return tbl
-    id_col = (
-        "recordId"
-        if "recordId" in tbl.column_names
-        else ("record_id" if "record_id" in tbl.column_names else None)
+    id_col = next(
+        (c for c in ("recordId", "record_id", "RECORD_ID") if c in tbl.column_names),
+        None,
     )
     if id_col is None:
         return tbl
@@ -1604,10 +1603,9 @@ class TabularParquetSink(ExportSink):
         remaining = dict(self._delta_id_counts)
         for record_batch in delta_pf.iter_batches(batch_size=max(1, self._cfg.batch_size)):
             tbl = pa.Table.from_batches([record_batch])
-            id_col = (
-                "recordId"
-                if "recordId" in tbl.column_names
-                else ("record_id" if "record_id" in tbl.column_names else None)
+            id_col = next(
+                (c for c in ("recordId", "record_id", "RECORD_ID") if c in tbl.column_names),
+                None,
             )
             if id_col is not None and tbl.num_rows > 0:
                 mask: list[bool] = []
@@ -1781,10 +1779,9 @@ class TabularSQLSink(ExportSink):
         if not inspector.has_table(self.table):
             return 0
         existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
-        id_col = (
-            "recordId"
-            if "recordId" in existing_cols
-            else ("record_id" if "record_id" in existing_cols else None)
+        id_col = next(
+            (c for c in ("recordId", "record_id", "RECORD_ID") if c in existing_cols),
+            None,
         )
         if id_col is None:
             return 0
@@ -1817,7 +1814,7 @@ class TabularSQLSink(ExportSink):
                 and if_exists == "append"
                 and not isinstance(self.engine, NonCallableMock)
             ):
-                for candidate_col in ("recordId", "record_id"):
+                for candidate_col in ("recordId", "record_id", "RECORD_ID"):
                     if candidate_col in df.columns:
                         ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
                         self._delete_existing_record_ids(ids)
@@ -1918,8 +1915,9 @@ class TabularDuckDBSink(ExportSink):
             row[1]
             for row in self._conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
         }
-        id_col = (
-            "recordId" if "recordId" in cols else ("record_id" if "record_id" in cols else None)
+        id_col = next(
+            (c for c in ("recordId", "record_id", "RECORD_ID") if c in cols),
+            None,
         )
         if id_col is None:
             return 0
@@ -1972,7 +1970,7 @@ class TabularDuckDBSink(ExportSink):
                     self._conn.execute(f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
                 else:
                     if self._is_incremental_sync and self._cfg.idempotent:
-                        for candidate_col in ("recordId", "record_id"):
+                        for candidate_col in ("recordId", "record_id", "RECORD_ID"):
                             if candidate_col in df.columns:
                                 ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
                                 self._delete_record_ids(ids)

@@ -1751,3 +1751,120 @@ def test_export_to_parquet_naming_conventions(
     )
     result_df = pd.read_parquet(pq_file)
     assert expected_cols.issubset(set(result_df.columns))
+
+
+def test_incremental_reconciliation_with_sdtm_naming_convention(tmp_path: Path) -> None:
+    """Incremental Parquet, DuckDB, and SQL exports deduplicate updates and reconcile deletes under naming_convention='sdtm'."""
+    import duckdb
+    from sqlalchemy import create_engine
+
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [Form(form_id=1, form_key="VITALS", form_name="Vitals")]
+    sdk.variables.list.return_value = [
+        Variable(variable_id=1, form_id=1, form_key="VITALS", variable_name="sys_bp"),
+    ]
+
+    initial_recs = [
+        Record(
+            record_id=1,
+            study_key="INC_SDTM",
+            form_id=1,
+            form_key="VITALS",
+            subject_key="S1",
+            date_modified="2026-01-01T00:00:00Z",
+            record_data={"sys_bp": 110},
+        ),
+        Record(
+            record_id=2,
+            study_key="INC_SDTM",
+            form_id=1,
+            form_key="VITALS",
+            subject_key="S2",
+            date_modified="2026-01-01T00:00:00Z",
+            record_data={"sys_bp": 120},
+        ),
+    ]
+    delta_recs = [
+        Record(
+            record_id=1,
+            study_key="INC_SDTM",
+            form_id=1,
+            form_key="VITALS",
+            subject_key="S1",
+            date_modified="2026-01-02T00:00:00Z",
+            record_data={"sys_bp": 135},
+        ),
+        Record(
+            record_id=2,
+            study_key="INC_SDTM",
+            form_id=1,
+            form_key="VITALS",
+            subject_key="S2",
+            deleted=True,
+            date_modified="2026-01-02T00:00:00Z",
+            record_data={"sys_bp": 120},
+        ),
+    ]
+
+    pq_file = tmp_path / "inc_sdtm.parquet"
+    duck_file = tmp_path / "inc_sdtm.duckdb"
+    sqlite_url = f"sqlite:///{tmp_path / 'inc_sdtm.db'}"
+
+    sdk.records.list.side_effect = lambda **_kw: iter(initial_recs)
+    export_mod.export_to_parquet(sdk, "INC_SDTM", str(pq_file), naming_convention="sdtm")
+    export_mod.export_to_duckdb(sdk, "INC_SDTM", str(duck_file), "vitals", naming_convention="sdtm")
+    export_mod.export_to_sql(
+        sdk,
+        "INC_SDTM",
+        "vitals",
+        sqlite_url,
+        quality_gate_enabled=False,
+        naming_convention="sdtm",
+    )
+
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_recs)
+    export_mod.export_to_parquet(
+        sdk,
+        "INC_SDTM",
+        str(pq_file),
+        naming_convention="sdtm",
+        modified_since="2026-01-02T00:00:00Z",
+    )
+    export_mod.export_to_duckdb(
+        sdk,
+        "INC_SDTM",
+        str(duck_file),
+        "vitals",
+        naming_convention="sdtm",
+        modified_since="2026-01-02T00:00:00Z",
+    )
+    export_mod.export_to_sql(
+        sdk,
+        "INC_SDTM",
+        "vitals",
+        sqlite_url,
+        quality_gate_enabled=False,
+        naming_convention="sdtm",
+        modified_since="2026-01-02T00:00:00Z",
+    )
+
+    pq_df = pd.read_parquet(pq_file)
+    assert pq_df["RECORD_ID"].tolist() == [1]
+    assert pq_df["SYSBP"].tolist() == [135]
+
+    with duckdb.connect(str(duck_file)) as conn:
+        duck_df = conn.execute('SELECT "RECORD_ID", "SYSBP" FROM vitals').df()
+    assert duck_df["RECORD_ID"].tolist() == [1]
+    assert duck_df["SYSBP"].tolist() == [135]
+
+    engine = create_engine(sqlite_url)
+    try:
+        sql_df = pd.read_sql_table("vitals", engine)
+    finally:
+        engine.dispose()
+    assert sql_df["RECORD_ID"].tolist() == [1]
+    assert sql_df["SYSBP"].tolist() == [135]

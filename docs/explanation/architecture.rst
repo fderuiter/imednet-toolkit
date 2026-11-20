@@ -307,6 +307,21 @@ Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
    * - ``state_provider``
      - ``None``
      - Pre-configured :class:`~imednet.spi.sink_base.StateProviderProtocol` instance overriding entry-point discovery.
+   * - ``as_sdtm``
+     - ``False``
+     - Transform exported ``Record`` payloads into standardized CDISC SDTM domain rows via :func:`~imednet.spi.models.transform_records_to_sdtm_rows` (automatically enabled when ``sdtm_domain`` is supplied).
+   * - ``sdtm_domain``
+     - ``None``
+     - Optional 2-character CDISC SDTM domain code (for example ``"AE"``, ``"DM"``, or ``"VS"``) selecting the target domain for ``as_sdtm`` transformation.
+   * - ``standards_profile``
+     - ``None``
+     - Optional CDISC standards validation profile name (for example ``"drug"``, ``"device"``, or ``"general"``) or :class:`~imednet.models.standards.StandardsProfile` evaluated before sink writes.
+   * - ``min_standards_score``
+     - ``None``
+     - Optional minimum CDISC standards readiness score (``0.0``–``100.0``) enforced via :func:`~imednet.spi.sink_base.evaluate_standards_readiness` prior to export.
+   * - ``naming_convention``
+     - ``None``
+     - Optional raw variable and metadata key naming convention (``"snake_case"``, ``"camelCase"``, or ``"sdtm"``) applied across tabular, document, graph, and warehouse mappers.
 
 Streaming checkpoints and state provider SPI
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

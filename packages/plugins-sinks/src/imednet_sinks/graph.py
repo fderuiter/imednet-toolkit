@@ -472,10 +472,24 @@ class Neo4jExportSink(ExportSink):
             else Neo4jSinkConfig(study_key=self._study_key, uri=self._uri, auth=self._auth)
         )
 
+        delete_cypher = _DELETE_RECORD_CYPHER
+        if cfg.naming_convention == "camelCase":
+            delete_cypher = (
+                "UNWIND $record_ids AS rid\n"
+                "MATCH (r:Record {recordId: rid, studyKey: $study_key})\n"
+                "DETACH DELETE r\n"
+            )
+        elif cfg.naming_convention == "sdtm":
+            delete_cypher = (
+                "UNWIND $record_ids AS rid\n"
+                "MATCH (r:Record {RECORD_ID: rid, STUDYID: $study_key})\n"
+                "DETACH DELETE r\n"
+            )
+
         def execute_reconcile() -> int:
             with self._driver.session(database=cfg.database) as session:
                 session.run(
-                    _DELETE_RECORD_CYPHER,
+                    delete_cypher,
                     record_ids=record_ids,
                     study_key=self._study_key,
                 )

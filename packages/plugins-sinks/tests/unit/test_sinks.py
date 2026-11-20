@@ -3595,3 +3595,80 @@ class TestPluginSinksSdtmAndNamingConventionParity:
             neo_sink.write_batch([rec], batch_id="b0")
         neo_row = driver.session.return_value.__enter__.return_value.run.call_args.kwargs["rows"][0]
         assert (expected_vars - expected_var_only).issubset(set(neo_row.keys()))
+
+    @pytest.mark.parametrize(
+        ("convention", "expected_neo_fragment", "expected_sf_where"),
+        [
+            (
+                "snake_case",
+                "MATCH (r:Record {record_id: rid, study_key: $study_key})",
+                "WHERE STUDY_KEY = %s AND RECORD_ID IN (%s)",
+            ),
+            (
+                "camelCase",
+                "MATCH (r:Record {recordId: rid, studyKey: $study_key})",
+                'WHERE "STUDYKEY" = %s AND "RECORDID" IN (%s)',
+            ),
+            (
+                "sdtm",
+                "MATCH (r:Record {RECORD_ID: rid, STUDYID: $study_key})",
+                'WHERE "STUDYID" = %s AND "RECORD_ID" IN (%s)',
+            ),
+        ],
+    )
+    def test_reconcile_deleted_respects_naming_convention_in_neo4j_and_snowflake(
+        self,
+        monkeypatch,
+        tmp_path,
+        convention: str,
+        expected_neo_fragment: str,
+        expected_sf_where: str,
+    ):
+        """Neo4j and Snowflake reconcile_deleted match identifiers formatted by naming_convention."""
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+        from imednet_sinks import (
+            Neo4jExportSink,
+            Neo4jSinkConfig,
+            SnowflakeExportSink,
+            SnowflakeSinkConfig,
+        )
+
+        from imednet.models.records import Record
+
+        voided = Record(record_id=88, study_key="DEL_STUDY", deleted=True, record_data={})
+
+        neo4j_mod, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="DEL_STUDY",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "pass"),
+                naming_convention=convention,
+            )
+        ) as neo_sink:
+            assert neo_sink.reconcile_deleted([voided], batch_id="del/0") == 1
+        neo_cypher = driver.session.return_value.__enter__.return_value.run.call_args.args[0]
+        assert expected_neo_fragment in neo_cypher
+
+        sf, _conn, cursor = _fake_snowflake_module()
+        monkeypatch.setattr(wh_mod, "_require_optional_dep", lambda *_: sf)
+        with SnowflakeExportSink(
+            SnowflakeSinkConfig(
+                study_key="DEL_STUDY",
+                account="acct",
+                user="usr",
+                password="pwd",  # pragma: allowlist secret
+                database="DB",
+                schema="PUBLIC",
+                warehouse="WH",
+                stage="STG",
+                table="RECORDS",
+                local_staging_dir=str(tmp_path / f"sf_del_{convention}"),
+                naming_convention=convention,
+            )
+        ) as sf_sink:
+            assert sf_sink.reconcile_deleted([voided], batch_id="del/0") == 1
+        sf_sql = cursor.execute.call_args.args[0]
+        assert expected_sf_where in sf_sql
