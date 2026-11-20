@@ -80,6 +80,10 @@ def main() -> int:
         failure_count,
         len(results),
     )
+    print(
+        f"Pipeline complete: {success_count} succeeded, {failure_count} failed "
+        f"across {len(results)} studies."
+    )
 
     for study_key, result in sorted(results.items()):
         status = result["status"]

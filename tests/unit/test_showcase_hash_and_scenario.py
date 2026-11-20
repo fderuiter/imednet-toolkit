@@ -16,8 +16,10 @@ from pathlib import Path
 
 import pytest
 from scripts.validate_showcases import (
+    load_postman_contract_schemas,
     validate_canonical_showcase_terminology,
     validate_landing_showcase,
+    validate_showcase_mock_data_schemas,
 )
 
 from imednet.endpoints.records import RecordsEndpoint
@@ -931,7 +933,88 @@ def test_readonly_explorer_immediate_scenario_and_mode_updates_via_node() -> Non
     assert "Study Queries Ledger (STUDY)" in out["queriesBadge"]
     assert all(item["studyKey"] == "STUDY" for item in out["queriesJson"])
     assert all("variable" in item for item in out["queriesJson"])
+    assert all("queryComments" in item and "status" not in item for item in out["queriesJson"])
 
     assert out["queriesRestSnippet"].startswith("GET /api/v1/edc/studies/STUDY/queries HTTP/1.1")
     assert out["queriesRestLang"] == "language-http"
     assert out["copiedText"] == out["queriesRestSnippet"]
+
+
+def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
+    """Verify MOCK_DATA.studies, MOCK_DATA.forms, and MOCK_DATA.queries match Postman schemas and render cleanly."""
+    repo_root = get_repo_root()
+    showcase_js = repo_root / "docs" / "_static" / "showcase.js"
+    postman_json = repo_root / "imednet.postman_collection.json"
+
+    schemas, schema_errs = load_postman_contract_schemas(postman_json)
+    assert not schema_errs, f"Unexpected Postman schema load errors: {schema_errs}"
+    assert "sponsorKey" in schemas["studies"] and "lastUpdated" in schemas["studies"]
+    assert "formType" in schemas["forms"] and "unscheduledVisit" in schemas["forms"]
+    assert "queryComments" in schemas["queries"] and "status" not in schemas["queries"]
+
+    validation_errs = validate_showcase_mock_data_schemas(showcase_js, postman_json)
+    assert not validation_errs, f"Showcase MOCK_DATA schema violations: {validation_errs}"
+
+    node_bin = shutil.which("node")
+    if not node_bin:
+        return
+
+    js_probe = f"""
+    const fs = require('fs');
+    const code = fs.readFileSync('{showcase_js.as_posix()}', 'utf8');
+    function makeEl(id, val = '') {{
+        const attrs = {{}};
+        const handlers = {{}};
+        return {{
+            id, value: val, textContent: '', innerHTML: '', className: '',
+            clientWidth: 400, scrollWidth: 400,
+            classList: {{ add: () => {{}}, remove: () => {{}}, toggle: () => {{}}, contains: () => false }},
+            setAttribute: (k, v) => {{ attrs[k] = String(v); }},
+            removeAttribute: (k) => {{ delete attrs[k]; }},
+            getAttribute: (k) => attrs[k] || null,
+            hasAttribute: (k) => k in attrs,
+            addEventListener: (ev, cb) => {{ (handlers[ev] = handlers[ev] || []).push(cb); }},
+            trigger: (ev) => {{ (handlers[ev] || []).forEach(cb => cb({{ preventDefault: () => {{}} }})); }}
+        }};
+    }}
+    const els = {{
+        '#ie-dataset-select': makeEl('ie-dataset-select', 'forms'),
+        '#ie-code-display': makeEl('ie-code-display'),
+        '#ie-metric-badge': makeEl('ie-metric-badge'),
+        '#ie-view-table': makeEl('ie-view-table'),
+        '#ie-json-pre code': makeEl('ie-json-code'),
+        '#cdm-form-select': makeEl('cdm-form-select', 'VS'),
+        '#cdm-metric-badge': makeEl('cdm-metric-badge'),
+        '#cdm-view-crf': makeEl('cdm-view-crf'),
+        '#cdm-json-pre code': makeEl('cdm-json-code')
+    }};
+    const root = makeEl('interactive-showcase-root');
+    root.querySelector = (sel) => els[sel] || null;
+    root.querySelectorAll = () => [];
+    global.window = {{ addEventListener: () => {{}}, history: {{ replaceState: () => {{}} }}, location: {{ hash: '' }} }};
+    global.document = {{
+        readyState: 'complete',
+        getElementById: (id) => id === 'interactive-showcase-root' ? root : null,
+        querySelectorAll: () => [],
+        addEventListener: () => {{}},
+        body: makeEl('body')
+    }};
+    eval(code);
+    const formsJson = JSON.parse(els['#ie-json-pre code'].textContent);
+    els['#ie-dataset-select'].value = 'queries';
+    els['#ie-dataset-select'].trigger('change');
+    const queriesTableHtml = els['#ie-view-table'].innerHTML;
+    const cdmJson = JSON.parse(els['#cdm-json-pre code'].textContent);
+    const cdmHtml = els['#cdm-view-crf'].innerHTML;
+    console.log(JSON.stringify({{ formsJson, queriesTableHtml, cdmJson, cdmHtml }}));
+    """
+    res = subprocess.run([node_bin, "-e", js_probe], capture_output=True, text=True, check=True)
+    probe = json.loads(res.stdout)
+    for form_item in probe["formsJson"]:
+        assert set(form_item.keys()) <= schemas["forms"]
+        assert "variableCount" not in form_item
+        assert "domain" not in form_item
+    assert "[object Object]" not in probe["queriesTableHtml"]
+    assert "Monitor Open" in probe["queriesTableHtml"]
+    assert set(probe["cdmJson"].keys()) <= schemas["forms"]
+    assert "V_WEIGHT" in probe["cdmHtml"]

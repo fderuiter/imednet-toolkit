@@ -14,96 +14,119 @@
     const MOCK_DATA = {
         studies: [
             {
+                sponsorKey: "ACME-SPONSOR",
                 studyKey: "STUDY",
+                studyId: 1003,
                 studyName: "Benchmark Validation Study",
                 studyDescription: "Benchmark simulated study",
                 studyType: "Observational",
-                sponsorKey: "ACME-SPONSOR",
-                studyId: 1003,
-                dateCreated: "2026-01-01T00:00:00Z"
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                lastUpdated: "2026-01-15T12:00:00Z"
             },
             {
+                sponsorKey: "ACME-SPONSOR",
                 studyKey: "DEMO-STUDY",
+                studyId: 1001,
                 studyName: "Demo Oncology Study",
                 studyDescription: "Simulated oncology biomarker study",
                 studyType: "Interventional",
-                sponsorKey: "ACME-SPONSOR",
-                studyId: 1001,
-                dateCreated: "2026-01-01T00:00:00Z"
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                lastUpdated: "2026-01-15T12:00:00Z"
             },
             {
+                sponsorKey: "ACME-SPONSOR",
                 studyKey: "MY_STUDY",
+                studyId: 1002,
                 studyName: "Primary Clinical Study",
                 studyDescription: "Primary simulated clinical investigation",
                 studyType: "Interventional",
-                sponsorKey: "ACME-SPONSOR",
-                studyId: 1002,
-                dateCreated: "2026-01-01T00:00:00Z"
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                lastUpdated: "2026-01-15T12:00:00Z"
             }
         ],
         forms: {
             VS: {
+                studyKey: "STUDY",
                 formId: 302,
                 formKey: "F_VS",
                 formName: "Vital Signs",
-                domain: "VS",
-                studyKey: "STUDY",
-                description: "Standard vital signs observations (blood pressure, pulse, weight, temperature).",
-                variables: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
-                    { id: "VISIT", label: "Visit Name", type: "string", required: true, rule: "Values: Baseline, Follow-Up" },
-                    { id: "V_SYSBP", label: "Systolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "70 <= val <= 240" },
-                    { id: "V_DIABP", label: "Diastolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "40 <= val <= 140" },
-                    { id: "V_PULSE", label: "Pulse Rate (beats/min)", type: "integer", required: true, rule: "40 <= val <= 180" },
-                    { id: "V_WEIGHT", label: "Weight (kg)", type: "float", required: true, rule: "val > 0.0" },
-                    { id: "V_TEMP", label: "Oral Temperature (°C)", type: "float", required: false, rule: "35.0 <= val <= 41.0" }
-                ]
+                formType: "CRF",
+                revision: 1,
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                disabled: false,
+                eproForm: false,
+                allowCopy: false,
+                embeddedLog: false,
+                enforceOwnership: false,
+                otherForms: false,
+                userAgreement: false,
+                lastUpdated: "2026-01-15T12:00:00Z",
+                subjectRecordReport: false,
+                unscheduledVisit: false
             },
             DM: {
+                studyKey: "STUDY",
                 formId: 301,
                 formKey: "F_DM",
                 formName: "Demographics",
-                domain: "DM",
-                studyKey: "STUDY",
-                description: "Demographic background, biological sex, race category, and randomized arm.",
-                variables: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
-                    { id: "V_AGE", label: "Age at Screening", type: "integer", required: true, rule: "val >= 18" },
-                    { id: "V_GENDER", label: "Biological Sex", type: "string", required: true, rule: "Values: Female, Male, Other" },
-                    { id: "V_RACE", label: "Race Category", type: "string", required: true, rule: "CDISC controlled terminology" },
-                    { id: "V_ARM", label: "Planned Arm", type: "string", required: true, rule: "Values: ARM-A, ARM-B, PLACEBO" }
-                ]
+                formType: "CRF",
+                revision: 1,
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                disabled: false,
+                eproForm: false,
+                allowCopy: false,
+                embeddedLog: false,
+                enforceOwnership: false,
+                otherForms: false,
+                userAgreement: false,
+                lastUpdated: "2026-01-15T12:00:00Z",
+                subjectRecordReport: true,
+                unscheduledVisit: false
             },
             AE: {
+                studyKey: "STUDY",
                 formId: 303,
                 formKey: "F_AE",
                 formName: "Safety Observations",
-                domain: "AE",
-                studyKey: "STUDY",
-                description: "Clinical safety observation terms, severity grading, and relationship to study agent.",
-                variables: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
-                    { id: "V_AETERM", label: "Reported Observation Term", type: "string", required: true, rule: "MedDRA LLT terminology" },
-                    { id: "V_AESTDTC", label: "Start Date", type: "date", required: true, rule: "ISO 8601 YYYY-MM-DD" },
-                    { id: "V_AESEV", label: "Severity Grade", type: "string", required: true, rule: "Values: MILD, MODERATE, SEVERE" },
-                    { id: "V_AESER", label: "Serious Safety Indicator", type: "boolean", required: true, rule: "true | false" },
-                    { id: "V_AEREL", label: "Causality Relationship", type: "string", required: true, rule: "Values: RELATED, POSSIBLE, UNRELATED" }
-                ]
+                formType: "CRF",
+                revision: 1,
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                disabled: false,
+                eproForm: false,
+                allowCopy: true,
+                embeddedLog: false,
+                enforceOwnership: false,
+                otherForms: false,
+                userAgreement: false,
+                lastUpdated: "2026-01-15T12:00:00Z",
+                subjectRecordReport: false,
+                unscheduledVisit: true
             },
             LB: {
+                studyKey: "STUDY",
                 formId: 304,
                 formKey: "F_LB",
                 formName: "Laboratory Findings",
-                domain: "LB",
-                studyKey: "STUDY",
-                description: "Laboratory analytes, standard units, and reference range indicators.",
-                variables: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
-                    { id: "V_LBTEST", label: "Analyte Test Name", type: "string", required: true, rule: "e.g. HEMOGLOBIN, POTASSIUM, ALT" },
-                    { id: "V_LBORRES", label: "Numeric Result", type: "float", required: true, rule: "val > 0.0" },
-                    { id: "V_LBORRESU", label: "Standard Unit", type: "string", required: true, rule: "SI units (g/dL, mmol/L, U/L)" },
-                    { id: "V_LBNRIND", label: "Normal Range Indicator", type: "string", required: true, rule: "Values: NORMAL, LOW, HIGH" }
-                ]
+                formType: "CRF",
+                revision: 1,
+                dateCreated: "2026-01-01T00:00:00Z",
+                dateModified: "2026-01-15T12:00:00Z",
+                disabled: false,
+                eproForm: false,
+                allowCopy: false,
+                embeddedLog: false,
+                enforceOwnership: false,
+                otherForms: false,
+                userAgreement: false,
+                lastUpdated: "2026-01-15T12:00:00Z",
+                subjectRecordReport: false,
+                unscheduledVisit: false
             }
         },
         records: {
@@ -133,44 +156,104 @@
         },
         queries: [
             {
-                annotationId: 701,
                 studyKey: "STUDY",
-                subjectKey: "SUB1",
+                subjectId: 201,
+                annotationId: 701,
+                description: "Please verify demographic details.",
                 recordId: 601,
                 variable: "V_AGE",
-                status: "OPEN",
-                description: "Please verify demographic details.",
-                dateCreated: "2026-01-12T10:00:00Z"
+                subjectKey: "SUB1",
+                dateCreated: "2026-01-12T10:00:00Z",
+                dateModified: "2026-01-12T10:00:00Z",
+                annotationType: "subject",
+                subjectOid: "SE_SUB1",
+                type: "Query",
+                lastUpdated: "2026-01-12T10:00:00Z",
+                queryComments: [
+                    {
+                        sequence: 1,
+                        annotationStatus: "Monitor Open",
+                        user: "sim_monitor",
+                        comment: "Please verify demographic details.",
+                        closed: false,
+                        date: "2026-01-12T10:00:00Z"
+                    }
+                ]
             },
             {
-                annotationId: 702,
                 studyKey: "STUDY",
-                subjectKey: "SUB1",
+                subjectId: 201,
+                annotationId: 702,
+                description: "Check vital sign measurement.",
                 recordId: 601,
                 variable: "V_WEIGHT",
-                status: "OPEN",
-                description: "Check vital sign measurement.",
-                dateCreated: "2026-01-12T10:00:00Z"
+                subjectKey: "SUB1",
+                dateCreated: "2026-01-12T10:00:00Z",
+                dateModified: "2026-01-12T10:00:00Z",
+                annotationType: "record",
+                subjectOid: "SE_SUB1",
+                type: "Query",
+                lastUpdated: "2026-01-12T10:00:00Z",
+                queryComments: [
+                    {
+                        sequence: 1,
+                        annotationStatus: "Monitor Open",
+                        user: "sim_monitor",
+                        comment: "Check vital sign measurement.",
+                        closed: false,
+                        date: "2026-01-12T10:00:00Z"
+                    }
+                ]
             },
             {
-                annotationId: 703,
                 studyKey: "STUDY",
-                subjectKey: "SUB2",
+                subjectId: 202,
+                annotationId: 703,
+                description: "Repeat systolic reading confirmed after 10-minute rest.",
                 recordId: 602,
                 variable: "V_SYSBP",
-                status: "ANSWERED",
-                description: "Repeat systolic reading confirmed after 10-minute rest.",
-                dateCreated: "2026-01-14T11:00:00Z"
+                subjectKey: "SUB2",
+                dateCreated: "2026-01-14T11:00:00Z",
+                dateModified: "2026-01-14T11:30:00Z",
+                annotationType: "record",
+                subjectOid: "SE_SUB2",
+                type: "Query",
+                lastUpdated: "2026-01-14T11:30:00Z",
+                queryComments: [
+                    {
+                        sequence: 1,
+                        annotationStatus: "Subject Answered",
+                        user: "sim_coordinator",
+                        comment: "Repeat systolic reading confirmed after 10-minute rest.",
+                        closed: false,
+                        date: "2026-01-14T11:30:00Z"
+                    }
+                ]
             },
             {
-                annotationId: 704,
                 studyKey: "STUDY",
-                subjectKey: "SUB3",
+                subjectId: 203,
+                annotationId: 704,
+                description: "Confirmed unit notation matches study data dictionary.",
                 recordId: 603,
                 variable: "V_PULSE",
-                status: "CLOSED",
-                description: "Confirmed unit notation matches study data dictionary.",
-                dateCreated: "2026-01-15T16:20:00Z"
+                subjectKey: "SUB3",
+                dateCreated: "2026-01-15T16:20:00Z",
+                dateModified: "2026-01-15T16:45:00Z",
+                annotationType: "record",
+                subjectOid: "SE_SUB3",
+                type: "Query",
+                lastUpdated: "2026-01-15T16:45:00Z",
+                queryComments: [
+                    {
+                        sequence: 1,
+                        annotationStatus: "Monitor Closed",
+                        user: "sim_monitor",
+                        comment: "Confirmed unit notation matches study data dictionary.",
+                        closed: true,
+                        date: "2026-01-15T16:45:00Z"
+                    }
+                ]
             }
         ],
         audits: [
@@ -238,6 +321,59 @@
                 notes: "Community-maintained open-source SDK (not affiliated with Mednet Solutions); verified in CI via Chromium Playwright — report issues at https://github.com/fderuiter/imednet-toolkit/issues"
             }
         ]
+    };
+
+    // -------------------------------------------------------------------------
+    // Clinical Data Manager Variable Validation Metadata (keyed by Form domain)
+    // -------------------------------------------------------------------------
+    const CDM_FORM_SCHEMAS = {
+        VS: {
+            domain: "VS",
+            summary: "Standard vital signs observations (blood pressure, pulse, weight, temperature).",
+            variables: [
+                { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
+                { id: "VISIT", label: "Visit Name", type: "string", required: true, rule: "Values: Baseline, Follow-Up" },
+                { id: "V_SYSBP", label: "Systolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "70 <= val <= 240" },
+                { id: "V_DIABP", label: "Diastolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "40 <= val <= 140" },
+                { id: "V_PULSE", label: "Pulse Rate (beats/min)", type: "integer", required: true, rule: "40 <= val <= 180" },
+                { id: "V_WEIGHT", label: "Weight (kg)", type: "float", required: true, rule: "val > 0.0" },
+                { id: "V_TEMP", label: "Oral Temperature (°C)", type: "float", required: false, rule: "35.0 <= val <= 41.0" }
+            ]
+        },
+        DM: {
+            domain: "DM",
+            summary: "Demographic background, biological sex, race category, and randomized arm.",
+            variables: [
+                { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
+                { id: "V_AGE", label: "Age at Screening", type: "integer", required: true, rule: "val >= 18" },
+                { id: "V_GENDER", label: "Biological Sex", type: "string", required: true, rule: "Values: Female, Male, Other" },
+                { id: "V_RACE", label: "Race Category", type: "string", required: true, rule: "CDISC controlled terminology" },
+                { id: "V_ARM", label: "Planned Arm", type: "string", required: true, rule: "Values: ARM-A, ARM-B, PLACEBO" }
+            ]
+        },
+        AE: {
+            domain: "AE",
+            summary: "Clinical safety observation terms, severity grading, and relationship to study agent.",
+            variables: [
+                { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
+                { id: "V_AETERM", label: "Reported Observation Term", type: "string", required: true, rule: "MedDRA LLT terminology" },
+                { id: "V_AESTDTC", label: "Start Date", type: "date", required: true, rule: "ISO 8601 YYYY-MM-DD" },
+                { id: "V_AESEV", label: "Severity Grade", type: "string", required: true, rule: "Values: MILD, MODERATE, SEVERE" },
+                { id: "V_AESER", label: "Serious Safety Indicator", type: "boolean", required: true, rule: "true | false" },
+                { id: "V_AEREL", label: "Causality Relationship", type: "string", required: true, rule: "Values: RELATED, POSSIBLE, UNRELATED" }
+            ]
+        },
+        LB: {
+            domain: "LB",
+            summary: "Laboratory analytes, standard units, and reference range indicators.",
+            variables: [
+                { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
+                { id: "V_LBTEST", label: "Analyte Test Name", type: "string", required: true, rule: "e.g. HEMOGLOBIN, POTASSIUM, ALT" },
+                { id: "V_LBORRES", label: "Numeric Result", type: "float", required: true, rule: "val > 0.0" },
+                { id: "V_LBORRESU", label: "Standard Unit", type: "string", required: true, rule: "SI units (g/dL, mmol/L, U/L)" },
+                { id: "V_LBNRIND", label: "Normal Range Indicator", type: "string", required: true, rule: "Values: NORMAL, LOW, HIGH" }
+            ]
+        }
     };
 
     // -------------------------------------------------------------------------
@@ -322,7 +458,17 @@
             keys.forEach(function (k) {
                 const val = record[k];
                 let cellHtml = escapeHtml(val);
-                if (k === "STATUS" || k === "status" || k === "recordStatus" || k === "wcagCompliance") {
+                if (k === "queryComments" && Array.isArray(val)) {
+                    const latest = val.length ? val[val.length - 1] : null;
+                    const statusLabel = latest && latest.annotationStatus ? String(latest.annotationStatus) : "Open";
+                    const lowerStatus = statusLabel.toLowerCase();
+                    const commentBadge = lowerStatus.includes("closed")
+                        ? "badge-success"
+                        : lowerStatus.includes("open") || lowerStatus.includes("answered")
+                        ? "badge-warning"
+                        : "badge-neutral";
+                    cellHtml = `<span class="status-badge ${commentBadge}">${escapeHtml(statusLabel)}</span> <code>(${val.length})</code>`;
+                } else if (k === "STATUS" || k === "status" || k === "recordStatus" || k === "wcagCompliance") {
                     const lowerVal = String(val).toLowerCase();
                     const badgeClass = lowerVal.includes("verified") || lowerVal.includes("pass") || lowerVal.includes("complete") || lowerVal.includes("locked")
                         ? "badge-success"
@@ -332,6 +478,8 @@
                     cellHtml = `<span class="status-badge ${badgeClass}">${cellHtml}</span>`;
                 } else if (typeof val === "boolean") {
                     cellHtml = val ? `<span class="status-badge badge-success">true</span>` : `<span class="status-badge badge-neutral">false</span>`;
+                } else if (val !== null && typeof val === "object") {
+                    cellHtml = `<code>${escapeHtml(JSON.stringify(val))}</code>`;
                 }
                 html += `<td>${cellHtml}</td>`;
             });
@@ -345,16 +493,16 @@
     // -------------------------------------------------------------------------
     // Helper: Render Form Variable Structure
     // -------------------------------------------------------------------------
-    function renderCrfStructure(formDef) {
-        if (!formDef) return "";
+    function renderCrfStructure(formDef, formSchema) {
+        if (!formDef || !formSchema) return "";
         let html = `<div class="crf-view-container">`;
         html += `<div class="crf-header">`;
-        html += `<h4><span class="crf-tag">${escapeHtml(formDef.domain)}</span> ${escapeHtml(formDef.formName)} <span class="crf-oid">(${escapeHtml(formDef.formKey || formDef.formId)})</span></h4>`;
-        html += `<p class="crf-desc">${escapeHtml(formDef.description)}</p>`;
+        html += `<h4><span class="crf-tag">${escapeHtml(formSchema.domain)}</span> ${escapeHtml(formDef.formName)} <span class="crf-oid">(${escapeHtml(formDef.formKey || formDef.formId)})</span></h4>`;
+        html += `<p class="crf-desc">${escapeHtml(formSchema.summary)}</p>`;
         html += `</div>`;
 
         html += `<div class="form-variables-grid">`;
-        formDef.variables.forEach(function (variable) {
+        formSchema.variables.forEach(function (variable) {
             html += `<div class="form-variable-card">`;
             html += `<div class="form-variable-header">`;
             html += `<span class="form-variable-id">${escapeHtml(variable.id)}</span>`;
@@ -640,15 +788,7 @@
                 caption = "Clinical Studies Catalog";
             } else if (datasetKey === "forms") {
                 data = Object.keys(MOCK_DATA.forms).map(function (k) {
-                    const f = MOCK_DATA.forms[k];
-                    return {
-                        formId: f.formId,
-                        formKey: f.formKey,
-                        formName: f.formName,
-                        studyKey: f.studyKey,
-                        variableCount: f.variables.length,
-                        description: f.description
-                    };
+                    return MOCK_DATA.forms[k];
                 });
                 caption = "Study Forms Catalog (STUDY)";
             } else if (datasetKey === "queries") {
@@ -753,14 +893,15 @@
         function executeCdmValidation() {
             const formKey = cdmSelectForm ? cdmSelectForm.value : "VS";
             const formDef = MOCK_DATA.forms[formKey] || MOCK_DATA.forms.VS;
+            const formSchema = CDM_FORM_SCHEMAS[formKey] || CDM_FORM_SCHEMAS.VS;
 
             if (cdmMetricBadge) {
-                cdmMetricBadge.textContent = `Simulation Preview (Deterministic Fixture) — ${formDef.formName} (${formDef.variables.length} Variables) | CDISC ODM Compliant`;
+                cdmMetricBadge.textContent = `Simulation Preview (Deterministic Fixture) — ${formDef.formName} (${formSchema.variables.length} Variables) | CDISC ODM Compliant`;
                 cdmMetricBadge.classList.add("active");
             }
 
             if (cdmViewCrf) {
-                cdmViewCrf.innerHTML = renderCrfStructure(formDef);
+                cdmViewCrf.innerHTML = renderCrfStructure(formDef, formSchema);
             }
 
             if (cdmJsonPre) {

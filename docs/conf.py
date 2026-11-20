@@ -330,7 +330,7 @@ pyodide_config = {
         "IMEDNET_API_KEY": "dummy_api_key",  # pragma: allowlist secret
         "IMEDNET_SECURITY_KEY": "dummy_security_key",  # pragma: allowlist secret
         "SNOWFLAKE_PASSWORD": "dummy_password",  # pragma: allowlist secret
-        "IMEDNET_STUDY_KEY": "MY_STUDY",
+        "IMEDNET_STUDY_KEY": "STUDY",
     },
 }
 
@@ -342,10 +342,7 @@ autosummary_generate = False
 # ModuleNotFoundError during the docs build.
 autodoc_mock_imports = [
     "matplotlib",
-    "airflow",
     "opentelemetry",
-    "pyarrow",
-    "duckdb",
 ]
 
 suppress_warnings = [
@@ -1365,19 +1362,24 @@ logging.captureWarnings(True)
 import warnings
 warnings.simplefilter("ignore")
 import httpx
+import tempfile
 from unittest.mock import MagicMock, patch
 
 os.environ["IMEDNET_SIMULATION_MODE"] = "true"
 os.environ["IMEDNET_API_KEY"] = "dummy_api_key"  # pragma: allowlist secret
 os.environ["IMEDNET_SECURITY_KEY"] = "dummy_security_key"  # pragma: allowlist secret
 os.environ["SNOWFLAKE_PASSWORD"] = "dummy_password"  # pragma: allowlist secret
-os.environ["IMEDNET_STUDY_KEY"] = "MY_STUDY"
+os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
+os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
+
+_doctest_orig_cwd = os.getcwd()
+_doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
+os.chdir(_doctest_tmpdir.name)
+
+from imednet.simulation.state import get_default_simulation_state
+get_default_simulation_state().reset()
 
 __file__ = "/a/b/c/d/e/dummy.py"
-
-import duckdb
-_duckdb_connect_patcher = patch('duckdb.connect', return_value=MagicMock())
-_duckdb_connect_patcher.start()
 
 from imednet_workflows.config_version_control import ConfigVersionStore
 _cvs_patcher1 = patch.object(ConfigVersionStore, 'diff_configs', return_value={"added": [], "removed": [], "changed": []})
@@ -1389,15 +1391,10 @@ _cvs_patcher3.start()
 _cvs_patcher4 = patch.object(ConfigVersionStore, 'get_history', return_value=[{"version_tag": "v1", "commit_id": "mock_commit_id", "timestamp": "2026-01-01"}])
 _cvs_patcher4.start()
 
-import imednet.integrations.export
-_export_patcher = patch.object(imednet.integrations.export, '_prepare_export_df', return_value=sys.modules['pandas'].DataFrame())
-_export_patcher.start()
-
 from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
 _reg_patcher = patch.object(RegisterSubjectsWorkflow, 'register_subjects', return_value={'batch_id': 'MOCK_BATCH'})
 _reg_patcher.start()
 
-from unittest.mock import MagicMock, patch
 import builtins
 
 _original_print = builtins.print
@@ -1430,14 +1427,6 @@ import imednet_sinks.graph
 _graph_patcher = patch.object(imednet_sinks.graph, '_require_optional_dep', return_value=MagicMock())
 _graph_patcher.start()
 
-# Mock airflow and provider
-import sys
-from unittest.mock import MagicMock
-sys.modules['airflow'] = MagicMock()
-sys.modules['airflow.decorators'] = MagicMock()
-sys.modules['airflow.sdk'] = MagicMock()
-sys.modules['apache_airflow_providers_imednet'] = MagicMock()
-
 
 commit_a = "mock_commit_a"
 commit_b = "mock_commit_b"
@@ -1448,18 +1437,19 @@ api_response = {}
 """
 
 doctest_global_cleanup = """
-_duckdb_connect_patcher.stop()
 _cvs_patcher1.stop()
 _cvs_patcher2.stop()
 _cvs_patcher3.stop()
 _cvs_patcher4.stop()
-_export_patcher.stop()
 _reg_patcher.stop()
 _snowflake_patcher.stop()
 _wh_patcher.stop()
 _doc_patcher.stop()
 _graph_patcher.stop()
 _print_patcher.stop()
+get_default_simulation_state().reset()
+os.chdir(_doctest_orig_cwd)
+_doctest_tmpdir.cleanup()
 """
 
 html_theme = "furo"

@@ -14,11 +14,12 @@ Use typed exceptions to respond to different failure modes:
 .. testcode::
 
    from imednet import ImednetSDK
-   from imednet.errors import RateLimitError, ServerError, NotFoundError
+   from imednet.errors import NotFoundError, RateLimitError, ServerError
 
    sdk = ImednetSDK()
    try:
-       sdk.studies.list()
+       for study in sdk.studies.list():
+           print(study.study_key)
    except RateLimitError:
        print("Too many requests, try again later")
    except NotFoundError as exc:
@@ -29,26 +30,66 @@ Use typed exceptions to respond to different failure modes:
 Custom strategies
 -----------------
 
-Retry policies decide if a request should be retried. To retry on
-``RateLimitError`` and ``ServerError``:
+Retry policies decide if a request should be retried before the executor converts
+non-2xx responses into SDK exceptions. Inspect ``state.result`` for HTTP 429 and
+5xx responses (alongside network-level ``state.exception`` failures):
 
 .. testcode::
 
+   from collections.abc import Iterator
+   import httpx
    from imednet import ImednetSDK
-   from imednet.core.retry import RetryPolicy, RetryState
+   from imednet.core.retry import RetryConfig, RetryPolicy, RetryState
    from imednet.errors import RateLimitError, ServerError
 
    class RateLimitServerRetry(RetryPolicy):
        def should_retry(self, state: RetryState) -> bool:
-           return isinstance(state.exception, (RateLimitError, ServerError))
+           if isinstance(state.exception, (RateLimitError, ServerError, httpx.RequestError)):
+               return True
+           if isinstance(state.result, httpx.Response):
+               status = state.result.status_code
+               return status == 429 or 500 <= status < 600
+           return False
 
-   sdk = ImednetSDK(
+   attempts: list[int] = []
+   canned_responses: Iterator[httpx.Response] = iter(
+       [
+           httpx.Response(429, json={"metadata": {"status": "TOO_MANY_REQUESTS"}}),
+           httpx.Response(500, json={"metadata": {"status": "SERVER_ERROR"}}),
+           httpx.Response(
+               200,
+               json={
+                   "metadata": {"status": "OK"},
+                   "pagination": {
+                       "currentPage": 0,
+                       "size": 25,
+                       "totalPages": 1,
+                       "totalElements": 1,
+                   },
+                   "data": [{"studyKey": "STUDY", "studyName": "Retry Demo Study"}],
+               },
+           ),
+       ]
+   )
+
+   def responder(_request: httpx.Request) -> httpx.Response:
+       response = next(canned_responses)
+       attempts.append(response.status_code)
+       return response
+
+   retry_sdk = ImednetSDK(
        api_key="A",
        security_key="B",
-       retries=5,
-       backoff_factor=0.5,
-       retry_policy=RateLimitServerRetry(),
+       retry_config=RetryConfig(
+           retries=5,
+           backoff_factor=0.01,
+           retry_policy=RateLimitServerRetry(),
+       ),
+       transport=httpx.MockTransport(responder),
    )
+   recovered_studies = list(retry_sdk.studies.list())
+   assert attempts == [429, 500, 200]
+   assert [s.study_key for s in recovered_studies] == ["STUDY"]
 
 Logging and exponential backoff
 -------------------------------

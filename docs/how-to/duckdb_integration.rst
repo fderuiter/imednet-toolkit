@@ -34,10 +34,13 @@ table and query it immediately:
    from imednet.integrations import export_to_duckdb
 
    sdk = ImednetSDK(api_key="mock", security_key="mock")
-   export_to_duckdb(sdk, "MY_STUDY", "./clinical.duckdb", "study_records")
+   export_to_duckdb(sdk, "STUDY", "./clinical.duckdb", "study_records")
 
    conn = duckdb.connect("./clinical.duckdb", read_only=True)
-   print(conn.execute("SELECT COUNT(*) FROM study_records").fetchone())
+   count_row = conn.execute("SELECT COUNT(*) FROM study_records").fetchone()
+   assert count_row is not None and count_row[0] > 0
+   print(count_row)
+   conn.close()
 
 `export_to_duckdb_by_form`
 --------------------------
@@ -52,10 +55,13 @@ form key:
    from imednet.integrations import export_to_duckdb_by_form
 
    sdk = ImednetSDK(api_key="mock", security_key="mock")
-   export_to_duckdb_by_form(sdk, "MY_STUDY", "./clinical_by_form.duckdb")
+   export_to_duckdb_by_form(sdk, "STUDY", "./clinical_by_form.duckdb")
 
    conn = duckdb.connect("./clinical_by_form.duckdb", read_only=True)
-   print(conn.execute("SHOW TABLES").fetchall())
+   tables = conn.execute("SHOW TABLES").fetchall()
+   assert len(tables) > 0
+   print(tables)
+   conn.close()
 
 Hive-partitioned Parquet for multi-study workloads
 ---------------------------------------------------
@@ -84,9 +90,14 @@ DuckDB query with Hive partition discovery and schema union:
 .. testcode::
 
    import duckdb
+   from imednet import ImednetSDK
+   from imednet.integrations import export_to_hive_parquet
+
+   sdk = ImednetSDK(api_key="mock", security_key="mock")
+   export_to_hive_parquet(sdk, "STUDY", "./lake")
 
    conn = duckdb.connect()
-   rows = conn.execute(
+   hive_rows = conn.execute(
        """
        SELECT study_key, form_key, COUNT(*)
        FROM read_parquet('./lake/**/*.parquet', hive_partitioning = true, union_by_name = true)
@@ -94,7 +105,9 @@ DuckDB query with Hive partition discovery and schema union:
        ORDER BY 1, 2
        """
    ).fetchall()
-   print(rows)
+   assert len(hive_rows) > 0
+   print(hive_rows)
+   conn.close()
 
 You can also generate the query string via
 :func:`imednet.integrations.hive_parquet_query`:
@@ -105,7 +118,10 @@ You can also generate the query string via
    from imednet.integrations import hive_parquet_query
 
    conn = duckdb.connect()
-   print(conn.execute(hive_parquet_query("./lake")).fetchdf())
+   hive_df = conn.execute(hive_parquet_query("./lake")).fetchdf()
+   assert not hive_df.empty
+   print(hive_df)
+   conn.close()
 
 `DuckDBIngestionWorkflow`
 -------------------------
@@ -113,7 +129,7 @@ You can also generate the query string via
 For incremental bronze/silver ingestion, use
 :class:`imednet_workflows.DuckDBIngestionWorkflow`.
 
-.. code-block:: python
+.. testcode::
 
    import duckdb
    from imednet import ImednetSDK
@@ -124,23 +140,25 @@ For incremental bronze/silver ingestion, use
 
    # Incremental bronze load
    inserted = workflow.ingest_revisions(
-       "MY_STUDY",
+       "STUDY",
        start_date="2026-01-01",
        end_date="2026-01-31",
        mode="append",
    )
+   assert inserted > 0
    print(f"Inserted {inserted} revision rows")
 
    # Build silver current-state projection
-   workflow.build_silver_view("MY_STUDY")
+   workflow.build_silver_view("STUDY")
 
-   conn = duckdb.connect("./centralized.duckdb", read_only=True)
-   print(
-       conn.execute(
-           'SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created '
-           "FROM silver_current_state ORDER BY record_id LIMIT 10"
-       ).fetchall()
-   )
+   conn = duckdb.connect("./centralized.duckdb")
+   silver_rows = conn.execute(
+       'SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created '
+       "FROM silver_current_state ORDER BY record_id LIMIT 10"
+   ).fetchall()
+   assert len(silver_rows) > 0
+   print(silver_rows)
+   conn.close()
 
 The two key methods are
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.ingest_revisions`

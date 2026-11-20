@@ -68,7 +68,7 @@ with DAG(
                 "output_path": (
                     f"{IMEDNET_EXPORT_ROOT}/{_safe_study_path_fragment(study_key)}.csv"
                 ),
-                "export_kwargs": {"index": False},
+                "export_kwargs": {},
             }
             for study_key in study_keys
         ]

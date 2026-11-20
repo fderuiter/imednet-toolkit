@@ -1,5 +1,7 @@
 """Demonstrate instantiating UATWorkflow with environment-loaded SDK configuration."""
 
+import os
+
 from imednet import ImednetSDK, load_config
 from imednet_workflows.uat import UATWorkflow
 
@@ -12,19 +14,18 @@ def main() -> None:
         print(f"Skipping execution: {e}")
         return
 
-    # In a real environment, you'd execute against an active study.
-    # Here we show how to instantiate and run the workflow.
+    study_key = os.getenv("IMEDNET_STUDY_KEY") or "STUDY"
+
     try:
         with ImednetSDK(
             api_key=cfg.api_key,
             security_key=cfg.security_key,
             base_url=cfg.base_url,
         ) as sdk:
-            UATWorkflow(sdk)
-            # Inspects study, builds spec, generates synthetic data, submits, and monitors.
-            # Replace "MY_STUDY" with a real study key.
-            # result = workflow.run("MY_STUDY")
-            # print(result.summary())
+            workflow = UATWorkflow(sdk)
+            # Inspects Study, builds spec, generates synthetic Records, submits, and monitors Jobs.
+            result = workflow.run(study_key)
+            print(result.summary())
     except Exception as e:
         print(f"Failed: {e}")
 

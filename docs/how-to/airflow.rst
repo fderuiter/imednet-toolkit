@@ -104,32 +104,41 @@ only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs`
 
 .. testcode::
 
+   from datetime import datetime
    from typing import Any
+   from airflow import DAG
    from airflow.sdk import task
    from apache_airflow_providers_imednet import ImednetExportOperator, ImednetHook
 
-   @task
-   def export_targets() -> list[dict[str, Any]]:
-       hook = ImednetHook("imednet_default")
-       return [
-           {
-               "study_key": study_key,
-               "output_path": f"/tmp/{study_key}.csv",
-               "export_kwargs": {"index": False},
-           }
-           for study_key in hook.list_study_keys()
-       ]
+   with DAG(
+       dag_id="imednet_dynamic_export",
+       start_date=datetime(2024, 1, 1),
+       schedule=None,
+       catchup=False,
+   ):
 
-   ImednetExportOperator.partial(
-       task_id="export_records",
-       destination="csv",
-       batch_size=1000,
-       max_retries=5,
-       idempotent=True,
-       quality_gate_enabled=True,
-       min_schema_readiness_score=95.0,
-       imednet_conn_id="imednet_default",
-   ).expand_kwargs(export_targets())
+       @task
+       def export_targets() -> list[dict[str, Any]]:
+           hook = ImednetHook("imednet_default")
+           return [
+               {
+                   "study_key": study_key,
+                   "output_path": f"/tmp/{study_key}.csv",
+                   "export_kwargs": {},
+               }
+               for study_key in hook.list_study_keys()
+           ]
+
+       ImednetExportOperator.partial(
+           task_id="export_records",
+           destination="csv",
+           batch_size=1000,
+           max_retries=5,
+           idempotent=True,
+           quality_gate_enabled=True,
+           min_schema_readiness_score=95.0,
+           imednet_conn_id="imednet_default",
+       ).expand_kwargs(export_targets())
 
 For warehouse or database sinks, bind ``destination_conn_id`` so credentials are
 resolved only inside ``execute()``:

@@ -1,5 +1,7 @@
 """Demonstrate configuring BulkRecordSubmissionWorkflow and GeneratedRecordSet payloads."""
 
+import os
+
 from imednet import ImednetSDK, load_config
 from imednet_workflows.uat import BulkRecordSubmissionWorkflow, GeneratedRecordSet, RecordTestType
 
@@ -12,37 +14,40 @@ def main() -> None:
         print(f"Skipping execution: {e}")
         return
 
-    # In a real environment, you'd execute against an active study.
+    study_key = os.getenv("IMEDNET_STUDY_KEY") or "STUDY"
+
     try:
         with ImednetSDK(
             api_key=cfg.api_key,
             security_key=cfg.security_key,
             base_url=cfg.base_url,
         ) as sdk:
-            BulkRecordSubmissionWorkflow(
+            workflow = BulkRecordSubmissionWorkflow(
                 sdk, batch_size=500, skip_existing_subjects=True, await_registration=True
             )
 
             # Example record sets (normally produced by a generator or mapped from source data)
-            GeneratedRecordSet(
-                form_key="REG",
-                form_name="Registration Form",
+            registration_set = GeneratedRecordSet(
+                form_key="F_DM",
+                form_name="Demographics",
                 test_type=RecordTestType.REGISTER_SUBJECT,
-                payloads=[{"subject_id": "SUBJ_1", "age": 45}],
+                payloads=[{"subjectKey": "SUBJ_1", "V_AGE": 45}],
                 subject_keys=["SUBJ_1"],
             )
 
-            GeneratedRecordSet(
-                form_key="VITALS",
-                form_name="Vitals Form",
+            data_set = GeneratedRecordSet(
+                form_key="F_VS",
+                form_name="Vital Signs",
                 test_type=RecordTestType.CREATE_NEW_RECORD,
-                payloads=[{"subject_id": "SUBJ_1", "hr": 72, "bp": "120/80"}],
+                payloads=[{"subjectKey": "SUBJ_1", "V_PULSE": 72, "V_SYSBP": 120}],
                 subject_keys=["SUBJ_1"],
             )
 
-            # Submit in two phases: Registration first, then Data
-            # result = workflow.submit("MY_STUDY", [registration_set, data_set])
-            # print(f"Submitted {result.total_records_submitted} records across {len(result.all_batches)} batches.")
+            result = workflow.submit(study_key, [registration_set, data_set])
+            print(
+                f"Submitted {result.total_records_submitted} records across "
+                f"{len(result.all_batches)} batches."
+            )
     except Exception as e:
         print(f"Failed: {e}")
 
