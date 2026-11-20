@@ -7,12 +7,15 @@ from typing import Any
 
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status
+from ..utils import display_list, fetching_status
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
+    add_simulation_arg,
+    add_study_key_args,
     collect_list_items,
     prepare_list_query,
+    resolve_study_key,
 )
 
 
@@ -33,7 +36,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     parser = subparsers.add_parser("users", help="Manage users within a study.")
     sub = parser.add_subparsers(dest="command")
     list_parser = sub.add_parser("list", help="List users for a specific study.")
-    list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(list_parser)
     list_parser.add_argument(
         "--include-inactive",
         action="store_true",
@@ -43,6 +46,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     add_list_query_args(list_parser, include_filter=False)
 
     add_output_format(list_parser)
+    add_simulation_arg(list_parser)
 
     @with_sdk
     def list_users(
@@ -129,9 +133,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             interactive=False if no_interactive else None,
         )
 
-    list_parser.set_defaults(
-        func=lambda args: list_users(
-            study_key=args.study_key,
+    def _dispatch_list_users(args: argparse.Namespace) -> None:
+        study_key = resolve_study_key(list_parser, args, required=True)
+        assert study_key is not None
+        list_users(
+            study_key=study_key,
             include_inactive=args.include_inactive,
             output_format=args.output_format,
             sort=args.sort,
@@ -139,4 +145,5 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             fetch_all=args.fetch_all,
             no_interactive=getattr(args, "no_interactive", False),
         )
-    )
+
+    list_parser.set_defaults(func=_dispatch_list_users)

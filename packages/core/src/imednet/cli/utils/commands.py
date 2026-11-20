@@ -10,12 +10,14 @@ from imednet.endpoints.registry import ENDPOINT_REGISTRY
 from imednet.sdk import ImednetSDK
 
 from .args import (
-    STUDY_KEY_ARG,
     add_list_query_args,
     add_no_interactive,
     add_output_format,
+    add_simulation_arg,
+    add_study_key_args,
     collect_list_items,
     prepare_list_query,
+    resolve_study_key,
 )
 from .context import fetching_status
 from .output import display_list
@@ -56,9 +58,10 @@ def register_list_command(
 
     add_output_format(list_parser)
     add_no_interactive(list_parser)
+    add_simulation_arg(list_parser)
 
     if requires_study_key:
-        list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+        add_study_key_args(list_parser)
         add_list_query_args(list_parser)
 
         @with_sdk
@@ -105,6 +108,8 @@ def register_list_command(
             )
 
         def _dispatch_study_list(args: argparse.Namespace) -> None:
+            study_key = resolve_study_key(list_parser, args, required=True)
+            assert study_key is not None
             no_interactive = getattr(args, "no_interactive", False)
             prepared = prepare_list_query(
                 filter_args=args.filter_args,
@@ -118,7 +123,7 @@ def register_list_command(
                 disallow_study_key=True,
             )
             list_cmd(
-                study_key=args.study_key,
+                study_key=study_key,
                 output_format=args.output_format,
                 filter_args=args.filter_args,
                 sort=args.sort,

@@ -10,12 +10,15 @@ from ...endpoints.records import RecordsEndpoint
 from ...models.records import Record
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status, print_error
+from ..utils import display_list, fetching_status, print_error
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
+    add_simulation_arg,
+    add_study_key_args,
     collect_list_items,
     prepare_list_query,
+    resolve_study_key,
 )
 from ..utils.export import export_list_to_file
 
@@ -25,9 +28,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     parser = subparsers.add_parser("records", help="Manage records within a study.")
     sub = parser.add_subparsers(dest="command")
     list_parser = sub.add_parser("list", help="List records for a study.")
-    list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(list_parser)
     list_parser.add_argument(
-        "-o", "--output", help="Save records to the given format (json or csv)"
+        "-o", "--output", help="Save records to the given format (json or csv; deprecated)"
     )
     add_list_query_args(
         list_parser,
@@ -36,6 +39,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
 
     add_output_format(list_parser)
+    add_simulation_arg(list_parser)
 
     def _validate_records_output(output: str | None, output_format: str) -> None:
         if output and output_format == "json":
@@ -86,6 +90,10 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if output_format == "json":
             display_list(records, "records", output_format="json")
         elif output:
+            print_error(
+                "Warning: '-o/--output' on 'records list' is deprecated; "
+                "use '--format json' for stdout or 'imednet export' for file exports."
+            )
             export_list_to_file(records, "records", output.lower())
         else:
             view_models = []
@@ -109,6 +117,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             )
 
     def _dispatch_list_records(args: argparse.Namespace) -> None:
+        study_key = resolve_study_key(list_parser, args, required=True)
+        assert study_key is not None
         no_interactive = getattr(args, "no_interactive", False)
         _validate_records_output(args.output, args.output_format)
         prepared = prepare_list_query(
@@ -125,7 +135,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             disallow_study_key=True,
         )
         list_records(
-            study_key=args.study_key,
+            study_key=study_key,
             output=args.output,
             output_format=args.output_format,
             record_filter=args.record_filter,

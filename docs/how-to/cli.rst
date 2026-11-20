@@ -21,6 +21,7 @@ dashboard for browsing studies, sites, subjects, and background jobs:
    pip install "imednet[tui]"
    imednet tui
    imednet tui --study DEMO-STUDY --batch BATCH-001 --batch BATCH-002
+   imednet tui DEMO-STUDY --simulation
    imednet tui --high-contrast
    IMEDNET_HIGH_CONTRAST=1 imednet --high-contrast tui
 
@@ -64,7 +65,27 @@ step-by-step wizard prompts for study keys, filters, and state ledger updates:
    imednet workflows state reset --interactive
    imednet workflows uat run --interactive
 
-Machine-readable core reads
+Offline simulation and Study key syntax
+---------------------------------------
+
+Pass ``--simulation`` (either on ``imednet`` or on any SDK-backed leaf command, including
+``imednet tui``) or set ``IMEDNET_SIMULATION_MODE=true`` to run against deterministic
+in-memory ``SimulationTransport`` fixtures without live API credentials. The CLI
+restores ``IMEDNET_SIMULATION_MODE`` to its prior environment state when the command exits.
+
+Core Study commands, ``datadict from-api``, ``workflows``, and ``tui`` accept either a
+positional ``STUDY`` argument or ``-s`` / ``--study-key STUDY``; passing conflicting
+positional and flag Study keys fails fast with usage exit code ``2``:
+
+.. code-block:: bash
+
+   imednet --simulation studies list
+   imednet forms list --simulation --study-key DEMO-STUDY
+   imednet datadict from-api DEMO-STUDY --simulation -o demo_dd.json
+   imednet subject-data --simulation DEMO-STUDY SUBJ-001 --format json
+   imednet workflows extract-records --simulation --study-key STUDY --format json
+
+Machine-readable JSON reads
 ---------------------------
 
 The CLI uses standard-library argparse; install ``imednet[cli]`` only for optional
@@ -74,14 +95,21 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
 
    imednet studies list --format json
    imednet subjects list STUDY --filter subject_status=Screened --format json
+   imednet subjects list --study-key STUDY --format json
    imednet users list STUDY --include-inactive --format json
    imednet codings list STUDY -f dictionaryName=MedDRA --format json
    imednet records list STUDY --format json
    imednet jobs status STUDY BATCH --format json
    imednet jobs wait STUDY BATCH --timeout 60 --format json
+   imednet subject-data STUDY SUBJ-1 --format json
+   imednet workflows extract-records STUDY --format json
+   imednet workflows state show --study-key STUDY --format json
 
-Supported core list resources are studies, queries, variables, record-revisions,
-sites, records, subjects, intervals, visits, codings, and users. Core JSON reads emit exactly one envelope
+Supported JSON envelope reads include core list resources (studies, queries, variables,
+record-revisions, sites, records, subjects, intervals, visits, codings, and users),
+``jobs status`` / ``jobs wait``, and read-oriented workflow commands (``subject-data``,
+``workflows extract-records``, and ``workflows state show``) via shared ``imednet.spi.cli``
+helpers. JSON reads emit exactly one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items``. Empty results use an empty items array. Item fields use the SDK models'
 JSON aliases; the JSON view includes model fields beyond the human summary table.
@@ -89,11 +117,12 @@ Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
 Usage failures exit 2, SDK-command interruption exits 130, and success/help exits 0.
 
-``records list --output json`` still writes ``records.json``; it is distinct from
-``--format json`` stdout and combining them is an error. Existing ``export``
-commands, ``datadict`` JSON/schema/diff outputs (see :doc:`/how-to/data_dictionary`)
-and optional workflow command formats retain their own contracts. This is not a
-global JSON wrapper for plugins.
+``records list -o`` / ``--output {json,csv}`` is deprecated and prints a ``stderr``
+deprecation warning recommending ``--format json`` (for ``stdout``) or ``imednet export``
+(for file exports), while continuing to write ``./records.json`` or ``./records.csv``;
+combining ``--output`` with ``--format json`` remains an error. Existing ``export``
+commands and ``datadict`` JSON/schema/diff outputs (see :doc:`/how-to/data_dictionary`)
+retain their own contracts. This is not a global JSON wrapper for arbitrary plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
 
@@ -111,6 +140,7 @@ files, export the JSON Schema, and compute structural revision diffs (see
    imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
    imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
    imednet datadict from-redcap ./redcap_dictionary.csv --study-key STUDY -o study_dd.json
+   imednet datadict from-api STUDY -o api_dd.json --no-raw-xml
    imednet datadict from-api --study-key STUDY -o api_dd.json --no-raw-xml
    imednet datadict schema -o data-dictionary.schema.json
    imednet datadict validate study_dd.json --schema data-dictionary.schema.json

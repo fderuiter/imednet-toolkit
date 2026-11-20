@@ -22,7 +22,9 @@ from .decorators import _redact_secrets, with_sdk
 from .utils import (
     NON_INTERACTIVE_ENV,
     OUTPUT_FORMAT_ENV,
+    SIMULATION_MODE_ENV,
     add_no_interactive,
+    add_simulation_arg,
     get_sdk,
     parse_filter_args,
     parse_record_data_filter,
@@ -57,6 +59,7 @@ def get_parser() -> argparse.ArgumentParser:
         "--high-contrast", action="store_true", help="Enable high-contrast mode for accessibility."
     )
     add_no_interactive(parser, suppress_default=False)
+    add_simulation_arg(parser, suppress_default=False)
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -222,9 +225,13 @@ def app(args: list[str] | None = None) -> None:
 
     old_output_format = os.environ.get(OUTPUT_FORMAT_ENV)
     old_non_interactive = os.environ.get(NON_INTERACTIVE_ENV)
+    old_simulation_mode = os.environ.get(SIMULATION_MODE_ENV)
     try:
         if getattr(parsed, "no_interactive", False):
             os.environ[NON_INTERACTIVE_ENV] = "1"
+
+        if getattr(parsed, "simulation", False):
+            os.environ[SIMULATION_MODE_ENV] = "1"
 
         if getattr(parsed, "output_format", None) == "json":
             os.environ[OUTPUT_FORMAT_ENV] = "json"
@@ -245,6 +252,10 @@ def app(args: list[str] | None = None) -> None:
             os.environ[NON_INTERACTIVE_ENV] = old_non_interactive
         else:
             os.environ.pop(NON_INTERACTIVE_ENV, None)
+        if old_simulation_mode is not None:
+            os.environ[SIMULATION_MODE_ENV] = old_simulation_mode
+        else:
+            os.environ.pop(SIMULATION_MODE_ENV, None)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,15 @@ from ...datadict import (
     validate,
 )
 from ...datadict.models import DataDictionary
-from ..utils import get_sdk
+from ..utils import (
+    UniqueStoreAction,
+    add_simulation_arg,
+    add_study_key_args,
+    get_sdk,
+    redact_secrets,
+    resolve_study_key,
+    simulation_mode_context,
+)
 
 
 def _handle_to_odm(args: argparse.Namespace) -> None:
@@ -106,11 +114,25 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
 
 def _handle_from_api(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-api` command."""
+    parser: argparse.ArgumentParser | None = getattr(args, "_api_parser", None)
+    if parser is not None:
+        study_key = resolve_study_key(parser, args, required=True)
+    else:
+        study_key = getattr(args, "study_key_flag", None) or getattr(args, "study_key", None)
+    if not study_key or not str(study_key).strip():
+        print("Error: the following arguments are required: study_key", file=sys.stderr)
+        sys.exit(2)
+
     try:
-        with closing(get_sdk()) as sdk:
-            dd = load_from_api(sdk, args.study_key, no_raw_xml=args.no_raw_xml)
+        with (
+            simulation_mode_context(bool(getattr(args, "simulation", False))),
+            closing(get_sdk()) as sdk,
+        ):
+            dd = load_from_api(sdk, study_key, no_raw_xml=args.no_raw_xml)
+    except SystemExit:
+        raise
     except Exception as exc:
-        print(f"Error loading from API: {exc}", file=sys.stderr)
+        print(f"Error loading from API: {redact_secrets(str(exc))}", file=sys.stderr)
         sys.exit(1)
 
     if args.output:
@@ -233,6 +255,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
     odm_parser.add_argument(
         "--study-key",
+        action=UniqueStoreAction,
         help="Optional study key identifier override.",
     )
     odm_parser.add_argument(
@@ -283,6 +306,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
     redcap_parser.add_argument(
         "--study-key",
+        action=UniqueStoreAction,
         help="Optional study key identifier override.",
     )
     redcap_parser.add_argument(
@@ -302,11 +326,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "from-api",
         help="Extract study forms and variables from live iMednet REST API.",
     )
-    api_parser.add_argument(
-        "--study-key",
-        required=True,
-        help="Study key identifier to query.",
-    )
+    add_study_key_args(api_parser, flag_help="Study key identifier to query.")
     api_parser.add_argument(
         "-o",
         "--output",
@@ -317,7 +337,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         action="store_true",
         help="Omit verbatim XML strings.",
     )
-    api_parser.set_defaults(func=_handle_from_api)
+    add_simulation_arg(api_parser)
+    api_parser.set_defaults(func=_handle_from_api, _api_parser=api_parser)
 
     # 3. validate
     val_parser = cmd_subparsers.add_parser(

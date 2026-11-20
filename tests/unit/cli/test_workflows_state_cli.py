@@ -296,4 +296,144 @@ class TestResetState:
             )
 
         assert result.exit_code == 1
-        assert "Failed to reset ledger state" in result.output
+        assert result.stdout == ""
+        assert "Failed to reset ledger state" in result.stderr
+
+
+class TestStateContractsAndInteractiveShow:
+    """Tests for stderr error contracts, JSON envelopes, interactive show, and hybrid Study flags."""
+
+    def test_state_errors_write_only_to_stderr_with_empty_stdout(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        """Verify state set, reset, and show write error diagnostics to stderr with empty stdout."""
+        ledger_path = str(tmp_path / "ledger.json")
+
+        bad_ts = runner.invoke(
+            state_app,
+            [
+                "set",
+                "--study-key",
+                "STUDY-01",
+                "--stream",
+                "records",
+                "--timestamp",
+                "invalid-ts",
+                "--ledger-path",
+                ledger_path,
+            ],
+        )
+        assert bad_ts.exit_code == 1
+        assert bad_ts.stdout == ""
+        assert "Invalid ISO timestamp" in bad_ts.stderr
+
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.set_last_timestamp.side_effect = OSError("disk full")
+            write_err = runner.invoke(
+                state_app,
+                [
+                    "set",
+                    "STUDY-01",
+                    "--stream",
+                    "records",
+                    "--timestamp",
+                    "2026-05-22T12:00:00Z",
+                    "--ledger-path",
+                    ledger_path,
+                ],
+            )
+        assert write_err.exit_code == 1
+        assert write_err.stdout == ""
+        assert "Failed to write ledger" in write_err.stderr
+
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.side_effect = OSError("corrupt ledger")
+            show_err = runner.invoke(
+                state_app,
+                ["show", "--ledger-path", ledger_path, "--format", "json"],
+            )
+        assert show_err.exit_code == 1
+        assert show_err.stdout == ""
+        assert "Failed to read ledger" in show_err.stderr
+
+    def test_state_show_format_json_emits_v1_envelope(self, runner: CliRunner, tmp_path) -> None:
+        """Verify state show --format json emits a v1 JSON envelope on stdout."""
+        import json
+
+        ledger_path = str(tmp_path / "ledger.json")
+        state = _make_ledger_state("STUDY-01", "records")
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.return_value = state
+            result = runner.invoke(
+                state_app,
+                ["show", "STUDY-01", "--ledger-path", ledger_path, "--format", "json"],
+            )
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        payload = json.loads(result.stdout)
+        assert payload["schemaVersion"] == "1.0"
+        assert payload["resource"] == "ledger_state"
+        assert payload["status"] == "complete"
+        assert payload["count"] == 1
+        assert payload["items"][0]["studyKey"] == "STUDY-01"
+        assert payload["items"][0]["streamName"] == "records"
+        assert payload["items"][0]["recordsProcessed"] == 42
+
+    def test_state_show_interactive_prompts_on_tty_and_rejects_piped_or_no_interactive(
+        self, runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verify state show --interactive prompts on TTY and exits 1 on piped stdin or --no-interactive."""
+        import io
+
+        ledger_path = str(tmp_path / "ledger.json")
+        state = _make_ledger_state("STUDY-01", "records")
+        state.studies["STUDY-02"] = _make_ledger_state("STUDY-02", "visits").studies["STUDY-02"]
+
+        class FakeTtyStdin(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+        monkeypatch.setattr("sys.stdin", FakeTtyStdin("STUDY-01\n"))
+        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+            mock_ledger.return_value.read_state.return_value = state
+            tty_res = runner.invoke(
+                state_app,
+                ["show", "--ledger-path", ledger_path, "--interactive"],
+            )
+        assert tty_res.exit_code == 0
+        assert "Enter study key to filter" in tty_res.stderr
+        assert "STUDY-01" in tty_res.stdout
+        assert "STUDY-02" not in tty_res.stdout
+
+        # Piped (non-TTY) stdin exits 1 with stderr diagnostic and empty stdout
+        monkeypatch.setattr("sys.stdin", io.StringIO("STUDY-01\n"))
+        piped_res = runner.invoke(
+            state_app,
+            ["show", "--ledger-path", ledger_path, "--interactive"],
+        )
+        assert piped_res.exit_code == 1
+        assert piped_res.stdout == ""
+        assert "Interactive prompts require an interactive TTY" in piped_res.stderr
+
+        # --no-interactive exits 1 even when stdin is a TTY
+        monkeypatch.setattr("sys.stdin", FakeTtyStdin("STUDY-01\n"))
+        no_int_res = runner.invoke(
+            state_app,
+            ["show", "--ledger-path", ledger_path, "--interactive", "--no-interactive"],
+        )
+        assert no_int_res.exit_code == 1
+        assert no_int_res.stdout == ""
+        assert "Interactive prompts require an interactive TTY" in no_int_res.stderr
+
+    def test_state_hybrid_study_key_conflict_exits_2(self, runner: CliRunner, tmp_path) -> None:
+        """Verify conflicting positional and --study-key on state commands exits 2."""
+        ledger_path = str(tmp_path / "ledger.json")
+        res = runner.invoke(
+            state_app,
+            ["show", "STUDY-01", "--study-key", "STUDY-02", "--ledger-path", ledger_path],
+        )
+        assert res.exit_code == 2
+        assert res.stdout == ""
+        assert "conflicting" in res.stderr

@@ -7,7 +7,15 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
-from imednet.spi.cli import STUDY_KEY_ARG, is_interactive_terminal, print_error, with_sdk
+from imednet.spi.cli import (
+    add_simulation_arg,
+    add_study_key_args,
+    is_interactive_terminal,
+    print_error,
+    resolve_study_key,
+    simulation_mode_context,
+    with_sdk,
+)
 from imednet.spi.facade import ImednetFacade
 
 _BATCH_SPLIT_RE = re.compile(r"[\s,]+")
@@ -36,14 +44,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         help="Launch interactive terminal interface.",
         description="Interactive terminal interface for browsing clinical studies, sites, subjects, and jobs.",
     )
-    tui_parser.add_argument(
-        "-s",
-        "--study",
-        "--study-key",
-        dest="study_key",
-        default=None,
-        help=STUDY_KEY_ARG,
-    )
+    add_study_key_args(tui_parser, flag_names=("-s", "--study", "--study-key"))
     tui_parser.add_argument(
         "-b",
         "--batch",
@@ -63,6 +64,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         action="store_true",
         help="Force launch even if terminal streams appear non-interactive.",
     )
+    add_simulation_arg(tui_parser)
 
     @with_sdk
     def _launch(sdk: ImednetFacade, args: argparse.Namespace | None = None) -> None:
@@ -90,11 +92,17 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         run_tui(sdk, **run_kwargs)
 
     def run_tui_command(args: argparse.Namespace | None = None) -> None:
+        if args is not None:
+            resolved_study = resolve_study_key(tui_parser, args, required=False)
+            if resolved_study is not None:
+                args.study_key = resolved_study
+
         force = bool(args and getattr(args, "force", False))
         if not force and not is_interactive_terminal():
             print_error("Error: Interactive terminal required to run the TUI interface.")
             raise SystemExit(1)
 
-        _launch(args)
+        with simulation_mode_context(bool(args and getattr(args, "simulation", False))):
+            _launch(args)
 
     tui_parser.set_defaults(func=run_tui_command)

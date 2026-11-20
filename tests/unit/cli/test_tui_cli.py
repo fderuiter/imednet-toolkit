@@ -217,3 +217,37 @@ def test_tui_plugin_study_and_repeatable_batch_options(monkeypatch):
             study_key="STUDY-ONC-01",
             batch_ids=["BATCH-101", "BATCH-102", "BATCH-103"],
         )
+
+
+def test_tui_plugin_positional_study_and_conflict(monkeypatch):
+    """Verify tui accepts positional STUDY, --study-key STUDY, and exits 2 on conflicts."""
+    from imednet_tui.cli import setup_parser
+
+    class DummyEntryPoint:
+        name = "tui"
+
+        def load(self):
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: (
+            [DummyEntryPoint()] if kwargs.get("group") == "imednet.cli_plugins" else []
+        ),
+    )
+
+    parser = get_parser()
+    pos_args = parser.parse_args(["tui", "DEMO-POS", "--force"])
+    with (
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+        patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
+    ):
+        mock_sdk = MagicMock()
+        mock_get_sdk.return_value = mock_sdk
+        pos_args.func(pos_args)
+        mock_run_tui.assert_called_once_with(mock_sdk, force=True, study_key="DEMO-POS")
+
+    conflict_args = parser.parse_args(["tui", "DEMO-POS", "--study-key", "DEMO-FLAG", "--force"])
+    with pytest.raises(SystemExit) as exc_info:
+        conflict_args.func(conflict_args)
+    assert exc_info.value.code == 2

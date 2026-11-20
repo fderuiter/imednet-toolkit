@@ -21,6 +21,12 @@ Environment Variables
    * - IMEDNET_SECURITY_KEY
      - Security key used for authentication.
      - None
+   * - IMEDNET_OIDC_TOKEN
+     - Bearer token used for OIDC authentication instead of API/security keys.
+     - None
+   * - IMEDNET_SIMULATION_MODE
+     - Set to ``true`` or ``1`` to route SDK and CLI traffic through offline ``SimulationTransport`` fixtures without live credentials.
+     - ``false``
    * - IMEDNET_BASE_URL
      - Optional base URL for private deployments.
      - None
@@ -107,7 +113,7 @@ Troubleshooting
 
 **Missing required environment variable(s)**
 
-If you see an error like ``Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set.`` (CLI) or ``API key and security key are required`` (SDK), or an "Unauthorized" API error, ensure you have set these variables in your shell or in a ``.env`` file in the directory where you run the script. See `Using a .env File`_ for details.
+If you see an error like ``Error: IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set.`` or ``Error: IMEDNET_SECURITY_KEY environment variable must be set`` (CLI), ``Either OIDC token or both API key and security key are required`` (SDK), or an "Unauthorized" API error, ensure you have set ``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY`` (or ``IMEDNET_OIDC_TOKEN``) in your shell or in a ``.env`` file in the directory where you run the script. See `Using a .env File`_ for details. For offline exploration and testing without live credentials, pass ``--simulation`` on the CLI or set ``IMEDNET_SIMULATION_MODE=true``.
 
 Mapping-name validation
 ------------------------

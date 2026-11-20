@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 import sys
 from collections.abc import Callable
 from functools import wraps
@@ -27,11 +26,9 @@ R = TypeVar("R")
 
 def _redact_secrets(msg: str) -> str:
     """Redact secrets from error messages."""
-    for env_var in ["IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_OIDC_TOKEN"]:
-        val = os.environ.get(env_var)
-        if val and val in msg:
-            msg = msg.replace(val, "********")
-    return msg
+    from .utils.terminal import redact_secrets
+
+    return redact_secrets(msg)
 
 
 def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:

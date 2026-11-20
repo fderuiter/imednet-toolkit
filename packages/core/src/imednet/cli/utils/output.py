@@ -515,6 +515,18 @@ def _truncate(text: str, length: int = 60) -> str:
     return f"{text[:length]}..." if len(text) > length else text
 
 
+def _normalize_enums(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {_normalize_enums(k): _normalize_enums(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_enums(x) for x in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_enums(x) for x in value)
+    return value
+
+
 def _format_cell_value(value: Any, key: str | None = None) -> str:
     if isinstance(value, Enum):
         value = value.value
@@ -533,7 +545,7 @@ def _format_cell_value(value: Any, key: str | None = None) -> str:
         )
         return _truncate(s)
     if isinstance(value, (list, dict)):
-        return _truncate(_sanitize_cell_text(str(value)))
+        return _truncate(_sanitize_cell_text(str(_normalize_enums(value))))
     return _sanitize_cell_text(str(value))
 
 

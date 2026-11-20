@@ -9,12 +9,15 @@ from ...endpoints.codings import CodingsEndpoint
 from ...models.codings import Coding
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status
+from ..utils import display_list, fetching_status
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
+    add_simulation_arg,
+    add_study_key_args,
     collect_list_items,
     prepare_list_query,
+    resolve_study_key,
 )
 
 
@@ -35,7 +38,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     parser = subparsers.add_parser("codings", help="Manage medical codings within a study.")
     sub = parser.add_subparsers(dest="command")
     list_parser = sub.add_parser("list", help="List codings for a specific study.")
-    list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(list_parser)
     add_list_query_args(
         list_parser,
         filter_dest="coding_filter",
@@ -43,6 +46,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
 
     add_output_format(list_parser)
+    add_simulation_arg(list_parser)
 
     @with_sdk
     def list_codings(
@@ -109,6 +113,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
     def _dispatch_list_codings(args: argparse.Namespace) -> None:
+        study_key = resolve_study_key(list_parser, args, required=True)
+        assert study_key is not None
         no_interactive = getattr(args, "no_interactive", False)
         prepared = prepare_list_query(
             filter_args=args.coding_filter,
@@ -122,7 +128,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             disallow_study_key=True,
         )
         list_codings(
-            study_key=args.study_key,
+            study_key=study_key,
             coding_filter=args.coding_filter,
             output_format=args.output_format,
             sort=args.sort,

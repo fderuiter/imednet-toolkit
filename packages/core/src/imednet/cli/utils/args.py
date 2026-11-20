@@ -137,6 +137,170 @@ def parse_record_data_filter(record_data_filter: str | None) -> str | None:
     return stripped
 
 
+class UniqueStoreAction(argparse.Action):
+    """Store action that rejects conflicting duplicate flag values."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        """Store flag value on namespace or abort with exit code 2 on conflicting values."""
+        del option_string
+        existing = getattr(namespace, self.dest, None)
+        if existing is not None and existing != values:
+            key_name = self.dest.removesuffix("_flag")
+            parser.error(f"conflicting values provided for {key_name}: '{existing}' and '{values}'")
+        setattr(namespace, self.dest, values)
+
+
+def _is_blank_arg(val: str | None) -> bool:
+    return val is None or not str(val).strip()
+
+
+def add_study_key_args(
+    parser: argparse.ArgumentParser,
+    *,
+    flag_names: Sequence[str] = ("-s", "--study-key"),
+    include_positional: bool = True,
+    positional_help: str = STUDY_KEY_ARG,
+    flag_help: str = STUDY_KEY_ARG,
+) -> None:
+    """Register hybrid ``--study-key`` flag and optional positional ``study_key``."""
+    available_flags = [f for f in flag_names if f not in parser._option_string_actions]
+    if available_flags:
+        parser.add_argument(
+            *available_flags,
+            dest="study_key_flag",
+            default=None,
+            action=UniqueStoreAction,
+            help=flag_help,
+        )
+    if include_positional:
+        has_pos = any(
+            not action.option_strings and action.dest == "study_key" for action in parser._actions
+        )
+        if not has_pos:
+            parser.add_argument("study_key", nargs="?", default=None, help=positional_help)
+
+
+def resolve_study_key(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    required: bool = True,
+    missing_error: str = "the following arguments are required: study_key",
+) -> str | None:
+    """Resolve hybrid positional ``study_key`` and ``--study-key`` flag, exiting 2 on conflict."""
+    flag_val: str | None = getattr(args, "study_key_flag", None)
+    pos_val: str | None = getattr(args, "study_key", None)
+
+    flag_present = not _is_blank_arg(flag_val)
+    pos_present = not _is_blank_arg(pos_val)
+
+    if flag_present and pos_present:
+        if flag_val != pos_val:
+            parser.error(
+                f"conflicting values provided for study_key: '{flag_val}' (flag) and '{pos_val}' (positional)"
+            )
+        resolved: str | None = flag_val
+    elif flag_present:
+        resolved = flag_val
+    elif pos_present:
+        resolved = pos_val
+    else:
+        resolved = None
+
+    if resolved is None and required:
+        parser.error(missing_error)
+
+    if resolved is not None or hasattr(args, "study_key"):
+        args.study_key = resolved
+    return resolved
+
+
+def resolve_hybrid_study_and_key(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    secondary_dest: str = "subject_key",
+    secondary_flag_dest: str = "subject_key_flag",
+) -> tuple[str, str]:
+    """Resolve hybrid positional and flag pairs for ``study_key`` and a secondary key."""
+    flag_study: str | None = getattr(args, "study_key_flag", None)
+    flag_secondary: str | None = getattr(args, secondary_flag_dest, None)
+    pos_study: str | None = getattr(args, "study_key", None)
+    pos_secondary: str | None = getattr(args, secondary_dest, None)
+
+    if flag_study is not None and flag_secondary is not None:
+        study_key: str | None = flag_study
+        secondary_key: str | None = flag_secondary
+    elif flag_study is not None and flag_secondary is None:
+        study_key = flag_study
+        if pos_secondary is not None and pos_study is not None:
+            if (
+                not _is_blank_arg(pos_study)
+                and not _is_blank_arg(flag_study)
+                and pos_study != flag_study
+            ):
+                parser.error(
+                    f"conflicting values provided for study_key: '{flag_study}' (flag) and '{pos_study}' (positional)"
+                )
+            secondary_key = pos_secondary
+        elif pos_study is not None:
+            secondary_key = pos_study
+        else:
+            secondary_key = None
+    elif flag_study is None and flag_secondary is not None:
+        secondary_key = flag_secondary
+        if pos_study is not None and pos_secondary is not None:
+            if (
+                not _is_blank_arg(pos_secondary)
+                and not _is_blank_arg(flag_secondary)
+                and pos_secondary != flag_secondary
+            ):
+                parser.error(
+                    f"conflicting values provided for {secondary_dest}: '{flag_secondary}' (flag) and '{pos_secondary}' (positional)"
+                )
+            study_key = pos_study
+        elif pos_study is not None:
+            study_key = pos_study
+        else:
+            study_key = None
+    else:
+        study_key = pos_study
+        secondary_key = pos_secondary
+
+    missing_study = _is_blank_arg(study_key)
+    missing_secondary = _is_blank_arg(secondary_key)
+    if missing_study and missing_secondary:
+        parser.error(f"the following arguments are required: study_key, {secondary_dest}")
+    elif missing_study:
+        parser.error("the following arguments are required: study_key")
+    elif missing_secondary:
+        parser.error(f"the following arguments are required: {secondary_dest}")
+
+    assert study_key is not None
+    assert secondary_key is not None
+    return study_key, secondary_key
+
+
+def add_simulation_arg(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
+    """Add ``--simulation`` option to run against offline ``SimulationTransport`` fixtures."""
+    if "--simulation" in parser._option_string_actions:
+        return
+    kwargs: dict[str, Any] = {
+        "dest": "simulation",
+        "action": "store_true",
+        "help": "Run offline against deterministic synthetic simulation data without live API credentials.",
+    }
+    if suppress_default:
+        kwargs["default"] = argparse.SUPPRESS
+    parser.add_argument("--simulation", **kwargs)
+
+
 def add_no_interactive(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
     """Add ``--no-interactive`` option to disable interactive UI, spinners, and prompts."""
     if "--no-interactive" in parser._option_string_actions:

@@ -8,9 +8,20 @@ from typing import Any
 
 NON_INTERACTIVE_ENV = "IMEDNET_NON_INTERACTIVE"
 OUTPUT_FORMAT_ENV = "IMEDNET_CLI_OUTPUT_FORMAT"
+SIMULATION_MODE_ENV = "IMEDNET_SIMULATION_MODE"
 NO_COLOR_ENV = "NO_COLOR"
 
 _TRUTHY_NON_INTERACTIVE = frozenset({"1", "true", "yes"})
+_SECRET_ENV_VARS = ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_OIDC_TOKEN")
+
+
+def redact_secrets(msg: str) -> str:
+    """Redact configured credential values from diagnostic error messages."""
+    for env_var in _SECRET_ENV_VARS:
+        val = os.environ.get(env_var)
+        if val and val in msg:
+            msg = msg.replace(val, "********")
+    return msg
 
 
 def is_tty(stream: Any) -> bool:
