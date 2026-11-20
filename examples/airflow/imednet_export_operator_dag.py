@@ -6,7 +6,7 @@ an Airflow connection ``imednet_default`` (or override ``imednet_conn_id``).
 
 from datetime import datetime
 
-from airflow import DAG
+from airflow.sdk import DAG
 
 from apache_airflow_providers_imednet import ImednetExportOperator
 

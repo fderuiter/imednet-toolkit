@@ -20,7 +20,10 @@ from .._airflow_compat import AirflowException, Context
 from ..hooks import ImednetHook
 
 try:  # pragma: no cover - optional Airflow dependency
-    from airflow.models import BaseOperator
+    try:
+        from airflow.sdk.bases.operator import BaseOperator
+    except (ImportError, ModuleNotFoundError):
+        from airflow.models import BaseOperator  # type: ignore[no-redef]
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - placeholder fallback
 
     class BaseOperator:  # type: ignore
@@ -561,6 +564,30 @@ class ImednetExportOperator(BaseOperator):
                     raise AirflowException(f"Unsupported destination or export_func '{dest}'")
 
                 tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
+                if dest == "duckdb":
+                    conn_settings = self._resolve_destination_connection(dest)
+                    db_path_arg = (
+                        self.output_path
+                        or tabular_kwargs.pop("db_path", None)
+                        or tabular_kwargs.pop("path", None)
+                        or conn_settings.get("db_path")
+                    )
+                    if db_path_arg is not None:
+                        _validate_no_secrets_in_value(db_path_arg, field_name="output_path")
+                    table_name_arg = (
+                        tabular_kwargs.pop("table_name", None)
+                        or tabular_kwargs.pop("table", None)
+                        or conn_settings.get("table_name")
+                        or "records"
+                    )
+                    export_callable(
+                        sdk,
+                        self.study_key,
+                        db_path_arg,
+                        table_name_arg,
+                        **tabular_kwargs,
+                    )
+                    return redact_uri(str(db_path_arg)) if db_path_arg is not None else None
                 if dest in ("sql", "sql_by_form", "long_sql"):
                     conn_settings = self._resolve_destination_connection(dest)
                     if dest == "sql_by_form":

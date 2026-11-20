@@ -282,9 +282,19 @@ This documentation is organized according to the Diátaxis framework into four m
    how-to/caching
    how-to/retry_policy
    how-to/job_polling
+   how-to/domain_lifecycles
+   how-to/simulation_testing
    how-to/airflow
    how-to/workflows/uat_workflow
+   how-to/workflows/uat_inspector
    how-to/workflows/bulk_submission
+   how-to/workflows/data_extraction
+   how-to/workflows/record_update
+   how-to/workflows/subject_data
+   how-to/workflows/query_management
+   how-to/workflows/triage_store
+   how-to/workflows/schema_profiler
+   how-to/workflows/chunked_pipeline
    how-to/export_destinations
    how-to/duckdb_integration
    how-to/snowflake_export
