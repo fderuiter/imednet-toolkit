@@ -66,6 +66,8 @@ from imednet.utils.job_poller import (
     JobStatusEvent,
     JobTimeoutError,
     evaluate_job_state,
+    fetch_terminal_job_result,
+    resolve_sdk_result_fetcher,
 )
 from imednet.utils.pandas import (
     csv_to_records,
@@ -88,7 +90,7 @@ from imednet.utils.tabular import (
     normalize_tabular_row,
 )
 from imednet.utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
-from imednet.utils.url import redact_sensitive_text, validate_path_segment
+from imednet.utils.url import redact_sensitive_text, sanitize_base_url, validate_path_segment
 from imednet.utils.validators import is_boolean_token, is_missing_value, parse_bool
 
 __all__ = [
@@ -128,6 +130,7 @@ __all__ = [
     "evaluate_expression",
     "evaluate_job_state",
     "extract_candidate_subject_key",
+    "fetch_terminal_job_result",
     "filter_existing_subject_registrations",
     "flatten",
     "format_iso_datetime",
@@ -159,7 +162,9 @@ __all__ = [
     "redact_sensitive_text",
     "reset_base_url_context",
     "resolve_enrichment_pipeline",
+    "resolve_sdk_result_fetcher",
     "resolve_study_configuration",
+    "sanitize_base_url",
     "sanitize_csv_formula",
     "set_base_url_context",
     "sqlite_connection",

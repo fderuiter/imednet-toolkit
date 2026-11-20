@@ -44,6 +44,10 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
             return fetch_external(url)
         return client.get(url)
 
+    def fetch_result(self, result_url: str) -> Any:
+        """Fetch a terminal Job ``resultUrl`` payload via the hardened endpoint helper."""
+        return self._fetch_result_url(result_url)
+
     def poll(
         self,
         study_key: str,
@@ -58,7 +62,7 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
 
         self._validate_study_key(study_key)
         validate_path_segment(batch_id, name="batch_id")
-        poller = JobPoller(self.get, fetch_result=self._fetch_result_url)
+        poller = JobPoller(self.get, fetch_result=self.fetch_result)
         if on_progress is None:
             return poller.run(study_key, batch_id, interval, timeout)
         return poller.run(study_key, batch_id, interval, timeout, on_progress=on_progress)
@@ -79,7 +83,7 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
         self._validate_study_key(study_key)
         for batch_id in batch_ids:
             validate_path_segment(batch_id, name="batch_id")
-        return JobPoller(self.get, fetch_result=self._fetch_result_url).poll_many(
+        return JobPoller(self.get, fetch_result=self.fetch_result).poll_many(
             study_key, batch_ids, interval, timeout, on_progress=on_progress, fail_fast=fail_fast
         )
 
@@ -97,6 +101,10 @@ class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # ty
             return await fetch_external(url)  # type: ignore[misc]
         return await client.get(url)
 
+    async def fetch_result(self, result_url: str) -> Any:
+        """Asynchronously fetch a terminal Job ``resultUrl`` payload via the hardened helper."""
+        return await self._fetch_result_url(result_url)
+
     async def poll(
         self,
         study_key: str,
@@ -111,7 +119,7 @@ class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # ty
 
         self._validate_study_key(study_key)
         validate_path_segment(batch_id, name="batch_id")
-        poller = AsyncJobPoller(self.get, fetch_result=self._fetch_result_url)
+        poller = AsyncJobPoller(self.get, fetch_result=self.fetch_result)
         if on_progress is None:
             return await poller.run(study_key, batch_id, interval, timeout)
         return await poller.run(study_key, batch_id, interval, timeout, on_progress=on_progress)
@@ -132,6 +140,6 @@ class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # ty
         self._validate_study_key(study_key)
         for batch_id in batch_ids:
             validate_path_segment(batch_id, name="batch_id")
-        return await AsyncJobPoller(self.get, fetch_result=self._fetch_result_url).async_poll_many(
+        return await AsyncJobPoller(self.get, fetch_result=self.fetch_result).async_poll_many(
             study_key, batch_ids, interval, timeout, on_progress=on_progress, fail_fast=fail_fast
         )
