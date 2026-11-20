@@ -7,6 +7,7 @@ from typing import Any
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.models.subjects import Subject
+from imednet.utils.url import validate_path_segment
 
 
 class ListBySiteOperation:
@@ -62,6 +63,8 @@ class SubjectsOperationDef:
     @execute_operation  # type: ignore[arg-type]
     def list_by_site(self, study_key: str, site_id: str | int) -> ListBySiteOperation:
         """List subjects by site ID."""
+        self._validate_study_key(study_key)  # type: ignore[attr-defined]
+        validate_path_segment(site_id, name="site_id")
         return ListBySiteOperation(self, study_key, site_id)
 
 

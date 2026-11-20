@@ -83,7 +83,7 @@ class UsersOperationDef:
             extra_params = {} if extra_params is None else extra_params.copy()
             extra_params.update(special_params)
 
-        if study_key:
+        if study_key is not None:
             processed_filters["studyKey"] = study_key
 
         study, processed_filters = self.study_key_strategy.process(processed_filters)  # type: ignore[attr-defined]

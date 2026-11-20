@@ -589,12 +589,14 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
             if resource == "jobs":
                 if sub_id is not None:
                     sub_action = segments[4] if len(segments) >= 5 else None
-                    job_status = self.state.get_job(study_key, sub_id)
                     if sub_action == "results":
-                        return httpx.Response(
-                            200, json=job_status.get("results", []), request=request
-                        )
-                    # Single job status lookup
+                        job_results = self.state.get_job_results(study_key, sub_id)
+                        if job_results is None:
+                            return self._not_found_response(request, f"Job {sub_id} not found")
+                        return httpx.Response(200, json=job_results, request=request)
+                    job_status = self.state.get_job(study_key, sub_id)
+                    if job_status is None:
+                        return self._not_found_response(request, f"Job {sub_id} not found")
                     return httpx.Response(200, json=job_status, request=request)
                 # List jobs: JobsEndpoint uses JsonListPaginator which expects a raw JSON list
                 items = self.state.get_jobs(study_key)
@@ -617,42 +619,70 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
 
         # 3. Direct /jobs/{batch_id} path
         if len(segments) >= 1 and segments[0] == "jobs":
-            batch_id = segments[1] if len(segments) >= 2 else "BATCH"
-            job_status = self.state.get_job(None, batch_id)
+            if len(segments) == 1:
+                return httpx.Response(200, json=self.state.get_jobs(None), request=request)
+            batch_id = segments[1]
             if len(segments) >= 3 and segments[2] == "results":
-                return httpx.Response(200, json=job_status.get("results", []), request=request)
+                job_results = self.state.get_job_results(None, batch_id)
+                if job_results is None:
+                    return self._not_found_response(request, f"Job {batch_id} not found")
+                return httpx.Response(200, json=job_results, request=request)
+            job_status = self.state.get_job(None, batch_id)
+            if job_status is None:
+                return self._not_found_response(request, f"Job {batch_id} not found")
             return httpx.Response(200, json=job_status, request=request)
 
         # Fallback for unrecognized endpoints: return empty paginated response
         return self._filter_and_paginate(request, [], params)
 
+    def _error_response(
+        self,
+        request: httpx.Request,
+        status_code: int,
+        status_text: str,
+        message: str,
+        *,
+        field: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """Build a contract-compliant HTTP error envelope."""
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        error_body: dict[str, Any] = {
+            "code": str(status_code),
+            "description": message,
+            "message": message,
+        }
+        if field is not None:
+            error_body["field"] = field
+        payload = {
+            "metadata": {
+                "status": status_text,
+                "method": request.method.upper(),
+                "path": request.url.path,
+                "timestamp": now_iso,
+                "error": error_body,
+            }
+        }
+        return httpx.Response(
+            status_code,
+            json=payload,
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    def _not_found_response(self, request: httpx.Request, message: str) -> httpx.Response:
+        """Build a contract-compliant HTTP 404 Not Found error envelope."""
+        return self._error_response(request, 404, "NOT_FOUND", message)
+
     def _bad_request_response(
         self, request: httpx.Request, exc: _FilterParseError
     ) -> httpx.Response:
         """Build a contract-compliant HTTP 400 error envelope."""
-        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        payload = {
-            "metadata": {
-                "status": "BAD_REQUEST",
-                "method": request.method.upper(),
-                "path": request.url.path,
-                "timestamp": now_iso,
-                "error": {
-                    "code": "400",
-                    "description": str(exc),
-                    "message": str(exc),
-                    "field": {
-                        "attribute": exc.attribute,
-                        "value": exc.value,
-                    },
-                },
-            }
-        }
-        return httpx.Response(
+        return self._error_response(
+            request,
             400,
-            json=payload,
-            headers={"content-type": "application/json"},
-            request=request,
+            "BAD_REQUEST",
+            str(exc),
+            field={"attribute": exc.attribute, "value": exc.value},
         )
 
     def _filter_and_paginate(

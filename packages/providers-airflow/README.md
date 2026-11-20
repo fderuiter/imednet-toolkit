@@ -10,6 +10,14 @@ Install the package via standard pip using the public package distribution name:
 pip install apache-airflow-providers-imednet
 ```
 
+Install optional destination extras for tabular/DuckDB exports or database sinks:
+
+```bash
+pip install "apache-airflow-providers-imednet[export]"
+pip install "apache-airflow-providers-imednet[duckdb]"
+pip install "apache-airflow-providers-imednet[snowflake,mongodb,neo4j]"
+```
+
 Or using the workspace-relative path install command:
 
 ```bash
@@ -17,32 +25,45 @@ pip install ./packages/providers-airflow
 ```
 
 **Required Dependencies:**
-This package requires `imednet` and a standard `apache-airflow` core environment as parent dependencies.
+This package requires `imednet`, `imednet-workflows` (for incremental XCom checkpointing), and `apache-airflow>=3.2.0,<4.0.0`.
 
 **Build Targets (Hatchling):**
-This package uses Hatchling as its build backend, targeting the `src/apache_airflow_providers_imednet` package directory as defined in `pyproject.toml`.
+This package uses Hatchling as its build backend, targeting the `src/apache_airflow_providers_imednet` package directory and registering the `apache_airflow_provider` discovery entry point in `pyproject.toml`.
 
 ## Usage Guide
 
-You can integrate iMedNet operators and sensors directly within your declarative Airflow DAGs:
+You can integrate iMednet hooks, operators, and sensors directly within your Airflow 3 DAGs (see `examples/airflow/airflow_multi_study_pipeline.py` for a full dynamic-mapping reference):
 
 ```python
-from apache_airflow_providers_imednet.hooks import ImednetHook
-from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-from apache_airflow_providers_imednet.sensors import ImednetJobSensor
+from datetime import datetime
 
-hook = ImednetHook(imednet_conn_id="my_imednet_conn")
-export_task = ImednetExportOperator(
-    task_id="export",
-    study_key="{{ params.study_key }}",
-    output_path="/tmp/records.csv",
-    export_func="export_to_csv",
+from airflow.sdk import DAG
+from apache_airflow_providers_imednet import (
+    ImednetExportOperator,
+    ImednetHook,
+    ImednetJobSensor,
 )
-sensor_task = ImednetJobSensor(
-    task_id="wait_for_job",
-    study_key="{{ params.study_key }}",
-    batch_id="{{ ti.xcom_pull(task_ids='export') }}",
-)
+
+with DAG(
+    dag_id="imednet_pipeline",
+    schedule=None,
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+):
+    hook = ImednetHook(imednet_conn_id="imednet_default")
+    export_task = ImednetExportOperator(
+        task_id="export_records",
+        study_key="{{ params.study_key }}",
+        destination="duckdb",
+        output_path="/tmp/study.duckdb",
+        export_kwargs={"table_name": "clinical_records"},
+        incremental=True,
+    )
+    sensor_task = ImednetJobSensor(
+        task_id="wait_for_job",
+        study_key="{{ params.study_key }}",
+        batch_id="{{ params.batch_id }}",
+    )
 ```
 
 ## Using the ImednetHook

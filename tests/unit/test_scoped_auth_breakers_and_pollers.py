@@ -474,7 +474,7 @@ async def test_cancelled_half_open_probes_release_slots_in_http_and_universal_ex
     )
     http_breaker.record_failure()
     await asyncio.sleep(0.02)
-    assert http_breaker.state == CircuitState.HALF_OPEN
+    assert http_breaker.state == CircuitState.OPEN
 
     in_flight = asyncio.Event()
     allow_finish = asyncio.Event()
@@ -492,6 +492,7 @@ async def test_cancelled_half_open_probes_release_slots_in_http_and_universal_ex
 
     probe_task = asyncio.create_task(http_exec("GET", "/probe"))
     await in_flight.wait()
+    assert http_breaker.state == CircuitState.HALF_OPEN
     assert http_breaker._half_open_probes == 1
 
     # While probe is active, second request is blocked
@@ -514,7 +515,7 @@ async def test_cancelled_half_open_probes_release_slots_in_http_and_universal_ex
     op_breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0.01, half_open_max_probes=1)
     op_breaker.record_failure()
     await asyncio.sleep(0.02)
-    assert op_breaker.state == CircuitState.HALF_OPEN
+    assert op_breaker.state == CircuitState.OPEN
 
     op_started = asyncio.Event()
     op_gate = asyncio.Event()
@@ -530,6 +531,7 @@ async def test_cancelled_half_open_probes_release_slots_in_http_and_universal_ex
     )
     op_task = asyncio.create_task(u_exec.execute_async(slow_op))
     await op_started.wait()
+    assert op_breaker.state == CircuitState.HALF_OPEN
     assert op_breaker._half_open_probes == 1
 
     op_task.cancel()
