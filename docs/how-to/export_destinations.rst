@@ -120,6 +120,68 @@ Snowflake (warehouse-native export):
    rows = export_to_snowflake(sdk, "MY_STUDY", config=snowflake_cfg)
    print(rows)
 
+Incremental streaming checkpoints
+---------------------------------
+
+Warehouse, document, graph, and tabular exports share eight streaming checkpoint
+and filter options on :class:`~imednet.spi.sink_base.SinkConfig`,
+:func:`~imednet.spi.sink_base.run_streaming_export`, tabular helpers
+(:func:`~imednet.integrations.export_to_parquet`,
+:func:`~imednet.integrations.export_to_csv`,
+:func:`~imednet.integrations.export_to_duckdb`,
+:func:`~imednet.integrations.export_to_duckdb_by_form`,
+:func:`~imednet.integrations.export_to_hive_parquet`), and
+``ImednetExportOperator``:
+
+* ``incremental`` (``bool``) – Enable transactional high-water mark reads and commits.
+* ``stream_name`` (``str | None``) – Logical stream key in the ledger (for example ``"mongodb_records"`` or ``"vitals_parquet"``).
+* ``ledger_path`` (``str | Path | None``) – Path for file-backed checkpoint state via :class:`~imednet_workflows.ExtractionStateLedger` (:class:`~imednet_workflows.state_ledger.FileStateProvider`).
+* ``state_provider`` (``StateProviderProtocol | None``) – Explicit provider instance such as ``ExtractionStateLedger(...)``, :class:`~imednet_workflows.state_ledger.AirflowStateProvider`, or :func:`~imednet.spi.sink_base.get_state_provider`.
+* ``modified_since`` (``datetime | str | None``) – Initial UTC lower-bound watermark used when the stream has no prior checkpoint.
+* ``record_filter`` (``dict[str, Any] | str | None``) – ``Record`` metadata filter pushed down to ``RecordsEndpoint``.
+* ``record_data_filter`` (``str | None``) – ``Variable`` payload filter expression (``recordDataFilter``).
+* ``include_deleted`` (``bool``) – Include voided (``deleted=True``) ``Record`` items directly in batches instead of reconciling deletes separately.
+
+State providers registered under ``imednet.state_providers`` (``default``, ``file``, and
+``airflow``) commit the updated watermark only after every batch and ``sink.flush()``
+complete cleanly. Below is a resumable ``run_streaming_export`` example using
+``ExtractionStateLedger`` with ``mask_phi=True`` preserved by default:
+
+.. testcode::
+
+   import tempfile
+   from pathlib import Path
+   from imednet import ImednetSDK
+   from imednet.spi.sink_base import run_streaming_export
+   from imednet_sinks import MongoDbExportSink, MongoDbSinkConfig
+   from imednet_workflows import ExtractionStateLedger
+
+   with tempfile.TemporaryDirectory() as tmp_dir:
+       ledger_file = Path(tmp_dir) / "export_state.json"
+       ledger = ExtractionStateLedger(str(ledger_file))
+       incremental_cfg = MongoDbSinkConfig(
+           study_key="MY_STUDY",
+           uri="mongodb://localhost:27017",
+           database="imednet",
+           collection="records",
+           mask_phi=True,
+           incremental=True,
+           stream_name="mongodb_records",
+           ledger_path=ledger_file,
+           state_provider=ledger,
+           modified_since="2026-01-01T00:00:00Z",
+           record_filter={"form_key": "F_VS"},
+           record_data_filter="V_WEIGHT>0",
+           include_deleted=False,
+       )
+       written_count = run_streaming_export(
+           ImednetSDK(simulation_mode=True),
+           "STUDY",
+           lambda: MongoDbExportSink(incremental_cfg),
+           incremental_cfg,
+       )
+       assert written_count >= 0
+
 PHI protection and masking controls
 -----------------------------------
 

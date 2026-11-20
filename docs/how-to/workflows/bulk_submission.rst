@@ -48,4 +48,39 @@ The following script sets up a bulk submission instance and illustrates the two-
 Error Handling
 --------------
 
-If the registration phase fails (i.e. one or more jobs return a FAILED state), the orchestrator will raise a ``BulkSubmissionError`` immediately, avoiding cascading failures on the dependent data phase.
+If the registration phase fails (i.e. one or more ``Job`` items return a ``FAILED`` state or record-level errors), the orchestrator raises a ``BulkSubmissionError`` immediately, avoiding cascading failures on the dependent ``Record`` data phase.
+
+Direct Chunked Writes with ``create_or_update_records_batch``
+-------------------------------------------------------------
+
+When ``Subject`` enrollment is already complete and you want schema-validated, chunked ``Record`` writes without ``GeneratedRecordSet`` wrappers, use :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_or_update_records_batch` (or ``async_create_or_update_records_batch`` for ``AsyncImednetSDK``) via ``sdk.workflows.record_update``:
+
+.. testcode::
+
+   from typing import Any, cast
+   from imednet import ImednetSDK
+   from imednet.simulation import reset_default_simulation_state
+   from imednet_workflows.record_update import RecordUpdateWorkflow
+
+   sdk = ImednetSDK(simulation_mode=True)
+   updater = RecordUpdateWorkflow(cast(Any, sdk), batch_size=100)
+
+   summary = updater.create_or_update_records_batch(
+       study_key="STUDY",
+       records_data=[
+           {
+               "formKey": "F_VS",
+               "siteName": "SITE",
+               "subjectKey": "SUBJ-001",
+               "intervalName": "Baseline",
+               "data": {"V_WEIGHT": 71.0},
+           }
+       ],
+       wait_for_completion=True,
+       poll_interval=1,
+       chunk_size=50,
+   )
+   print(summary.batch_ids, summary.all_successful)
+   reset_default_simulation_state()
+
+See :doc:`record_update` and :doc:`/how-to/job_polling` for ``BatchSubmissionSummary`` and partial ``JobStatus`` failure triage details.
