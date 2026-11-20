@@ -55,3 +55,66 @@ def test_decorator_handles_unexpected_error(monkeypatch: pytest.MonkeyPatch) -> 
     assert result.exit_code == 1
     assert "Unexpected error" in result.stderr
     assert "Unexpected error" not in result.stdout
+
+
+def test_cli_execution_guard_clears_line_and_exits_130(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cli_execution_guard clears active status line, prints Aborted by user., and exits 130."""
+    from unittest.mock import patch
+
+    from imednet.spi.cli import cli_execution_guard
+
+    with (
+        patch("imednet.cli.utils.output.clear_line") as mock_clear,
+        pytest.raises(SystemExit) as exc_info,
+        cli_execution_guard(),
+    ):
+        raise KeyboardInterrupt()
+
+    assert exc_info.value.code == 130
+    mock_clear.assert_called_once()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Aborted by user." in captured.err
+
+
+def test_positive_int_validator() -> None:
+    """positive_int accepts strictly positive integers and rejects <= 0 or non-integers."""
+    import argparse
+
+    from imednet.spi.cli import positive_int
+
+    assert positive_int("1") == 1
+    assert positive_int("900") == 900
+
+    for invalid in ("0", "-1", "abc", "1.5", True, False):
+        with pytest.raises(argparse.ArgumentTypeError):
+            positive_int(invalid)  # type: ignore[arg-type]
+
+
+def test_get_sdk_redacts_secrets_on_init_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """get_sdk redacts environment secrets if SDK initialization fails unexpectedly."""
+    from unittest.mock import patch
+
+    from imednet.cli.utils.context import get_sdk
+
+    oidc_val = "oidc_secret_init_token_777"  # pragma: allowlist secret
+    monkeypatch.setenv("IMEDNET_OIDC_TOKEN", oidc_val)
+    with (
+        patch("imednet.cli.utils.context.load_config", return_value=MagicMock()),
+        patch(
+            "imednet.cli.utils.context.ImednetSDK",
+            side_effect=RuntimeError(f"bad token {oidc_val}"),
+        ),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        get_sdk()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert oidc_val not in err
+    assert "********" in err

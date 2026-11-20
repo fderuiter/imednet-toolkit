@@ -84,7 +84,7 @@ def test_concurrent_sync_and_readers_no_deadlock(tmp_path: Path) -> None:
     # Run several sequential sync cycles while readers are active.
     worker = SyncWorker(
         loader,
-        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=0, reconcile=True),
+        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=1, reconcile=True),
     )
     sync_errors: list[Exception] = []
     for _ in range(5):
@@ -118,7 +118,7 @@ def test_parallel_sync_workers_no_deadlock(tmp_path: Path) -> None:
             loader,
             config=SyncWorkerConfig(
                 study_key="PROT-01",
-                interval_seconds=0,
+                interval_seconds=1,
                 lock_timeout_seconds=30,
             ),
         )
@@ -192,7 +192,7 @@ def test_sync_worker_respects_reconcile_false(tmp_path: Path) -> None:
 
     worker = SyncWorker(
         loader,
-        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=0, reconcile=False),
+        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=1, reconcile=False),
     )
     worker.run_once()
 
@@ -223,7 +223,7 @@ def test_high_concurrency_no_exceptions(tmp_path: Path, n_readers: int, n_cycles
 
     worker = SyncWorker(
         loader,
-        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=0),
+        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=1),
     )
     sync_errors: list[Exception] = []
     for _ in range(n_cycles):
@@ -265,7 +265,7 @@ def test_parallel_sync_workers_no_timeout_under_network_delay(tmp_path: Path) ->
             loader,
             config=SyncWorkerConfig(
                 study_key="PROT-01",
-                interval_seconds=0,
+                interval_seconds=1,
                 lock_timeout_seconds=0.05,
             ),
         )
@@ -305,9 +305,8 @@ def test_concurrent_readers_during_slow_remote_sync(tmp_path: Path) -> None:
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
     worker = SyncWorker(
         loader,
-        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=0),
+        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=1),
     )
-
     stop_event = threading.Event()
     reader = _ReaderLoop(loader, stop_event)
     reader.start()
@@ -427,7 +426,7 @@ def test_interleaved_slow_reconcile_and_concurrent_workflows_retain_all_active_r
     def _slow_sync_worker() -> None:
         worker = SyncWorker(
             loader,
-            config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=0, reconcile=True),
+            config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=1, reconcile=True),
         )
         try:
             worker.run_once()

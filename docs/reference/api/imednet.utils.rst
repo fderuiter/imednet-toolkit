@@ -49,6 +49,14 @@ imednet.utils.db module
    :members:
    :show-inheritance:
 
+imednet.utils.enrollment module
+-------------------------------
+
+.. automodule:: imednet.utils.enrollment
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.utils.evaluator module
 ------------------------------
 
@@ -109,6 +117,14 @@ imednet.utils.serialization module
 ----------------------------------
 
 .. automodule:: imednet.utils.serialization
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
+imednet.utils.tabular module
+----------------------------
+
+.. automodule:: imednet.utils.tabular
    :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
