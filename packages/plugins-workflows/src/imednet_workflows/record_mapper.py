@@ -1911,6 +1911,7 @@ class RecordMapper:
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        records: Iterable[RecordModel] | None = None,
     ) -> list[dict[str, Any]]:
         """Generate a nested JSON tree structure up to three levels deep.
 
@@ -1927,40 +1928,50 @@ class RecordMapper:
         pipeline_phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
         study_struct = get_study_structure(self.sdk, study_key)
 
-        # 1. Build form-scoped models
+        # 1. Build form-scoped models across both standalone study forms and interval forms
         form_models: dict[int, type[BaseModel]] = {}
         form_label_maps: dict[int, dict[str, str]] = {}
 
+        candidate_forms: list[Any] = []
+        raw_study_forms = getattr(study_struct, "forms", None)
+        if isinstance(raw_study_forms, Iterable):
+            candidate_forms.extend(raw_study_forms)
         for interval in study_struct.intervals:
-            for form in interval.forms:
-                if form_whitelist and form.form_id not in form_whitelist:
-                    continue
-                if form.form_id in form_models:
-                    continue
-                var_keys = list(
-                    dict.fromkeys(
-                        v.variable_name
-                        for v in (form.variables or [])
-                        if v.variable_name
-                        and (not variable_whitelist or v.variable_name in variable_whitelist)
-                    )
+            candidate_forms.extend(interval.forms)
+
+        for form in candidate_forms:
+            if form_whitelist and form.form_id not in form_whitelist:
+                continue
+            if form.form_id in form_models:
+                continue
+            var_keys = list(
+                dict.fromkeys(
+                    v.variable_name
+                    for v in (form.variables or [])
+                    if v.variable_name
+                    and (not variable_whitelist or v.variable_name in variable_whitelist)
                 )
-                label_map = {
-                    v.variable_name: v.label for v in (form.variables or []) if v.variable_name
-                }
-                form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
-                form_label_maps[form.form_id] = label_map  # type: ignore
+            )
+            label_map = {
+                v.variable_name: v.label for v in (form.variables or []) if v.variable_name
+            }
+            form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
+            form_label_maps[form.form_id] = label_map  # type: ignore
 
         extra_filters: dict[str, Any] = {}
         if form_whitelist is not None:
             extra_filters["formId"] = form_whitelist
 
-        # 2. Fetch and iterate records
-        records = self._iter_records(
-            study_key,
-            visit_key,
-            extra_filters=extra_filters or None,
-            include_deleted=include_deleted,
+        # 2. Fetch and iterate records unless pre-streamed records were supplied
+        record_iter: Iterable[RecordModel] = (
+            records
+            if records is not None
+            else self._iter_records(
+                study_key,
+                visit_key,
+                extra_filters=extra_filters or None,
+                include_deleted=include_deleted,
+            )
         )
 
         meta_keys = {
@@ -1973,7 +1984,7 @@ class RecordMapper:
         }
         tree: dict[str, dict[str, Any]] = {}
 
-        for rec in records:
+        for rec in record_iter:
             if rec.form_id not in form_models:
                 continue
 

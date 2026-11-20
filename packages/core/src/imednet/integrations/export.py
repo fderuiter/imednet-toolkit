@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import inspect
+import io
 import json
+import math
+import numbers
 import os
 import re
-from collections.abc import Iterable, Mapping, Sequence
+import uuid
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -388,6 +393,204 @@ class TabularSinkConfig(SinkConfig):
     pandas_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
+def _is_incremental_config(config: SinkConfig) -> bool:
+    """Return True when ``config`` activates incremental, watermark, or stateful sync."""
+    return bool(
+        config.incremental or config.modified_since is not None or config.state_provider is not None
+    )
+
+
+def _canonical_record_id(value: Any) -> str | None:
+    """Normalize a ``recordId`` / ``record_id`` value to a canonical string key."""
+    if value is None or value is pd.NA or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return str(int(value)) if value.is_integer() else str(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else None
+    if isinstance(value, numbers.Integral):
+        return str(int(value))
+    if isinstance(value, numbers.Real):
+        as_float = float(value)
+        if math.isnan(as_float) or math.isinf(as_float):
+            return None
+        return str(int(as_float)) if as_float.is_integer() else str(as_float)
+    if _is_missing_scalar(value):
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _extract_row_canonical_id(row: Mapping[str, Any]) -> str | None:
+    """Extract canonical record ID from a row mapping under ``recordId`` or ``record_id``."""
+    for key in ("recordId", "record_id"):
+        if key in row:
+            cid = _canonical_record_id(row[key])
+            if cid is not None:
+                return cid
+    return None
+
+
+def _find_df_record_id_col(df: pd.DataFrame) -> str | None:
+    """Return the record ID column name in ``df``, if present."""
+    for candidate in ("recordId", "record_id"):
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def _dedupe_df_by_record_id(
+    df: pd.DataFrame,
+    *,
+    exclude_ids: set[str] | None = None,
+) -> tuple[pd.DataFrame, set[str]]:
+    """Keep the latest row per canonical record ID and optionally drop ``exclude_ids``."""
+    if df.empty:
+        return df, set()
+    id_col = _find_df_record_id_col(df)
+    if id_col is None:
+        return df.reset_index(drop=True), set()
+
+    excluded = exclude_ids or set()
+    raw_ids = df[id_col].tolist()
+    seen: set[str] = set()
+    kept_rev: list[int] = []
+    for idx in range(len(raw_ids) - 1, -1, -1):
+        cid = _canonical_record_id(raw_ids[idx])
+        if cid is None:
+            kept_rev.append(idx)
+            continue
+        if cid in excluded or cid in seen:
+            continue
+        seen.add(cid)
+        kept_rev.append(idx)
+
+    kept_rev.reverse()
+    return df.iloc[kept_rev].reset_index(drop=True), seen
+
+
+def _filter_df_excluding_record_ids(df: pd.DataFrame, exclude_ids: set[str]) -> pd.DataFrame:
+    """Drop rows from ``df`` whose canonical record ID appears in ``exclude_ids``."""
+    if df.empty or not exclude_ids:
+        return df
+    id_col = _find_df_record_id_col(df)
+    if id_col is None:
+        return df
+    mask = [_canonical_record_id(val) not in exclude_ids for val in df[id_col].tolist()]
+    return df.loc[mask].reset_index(drop=True)
+
+
+def _atomic_replace_file(
+    dest_path: str,
+    write_fn: Callable[[str], Any],
+    *,
+    suffix: str = ".tmp",
+) -> None:
+    """Write via a sibling temporary file and atomically replace ``dest_path``."""
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = str(dest.parent / f".{dest.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}{suffix}")
+    try:
+        write_fn(tmp_path)
+        if Path(tmp_path).exists():
+            os.replace(tmp_path, dest_path)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _concat_tabular_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate tabular DataFrames while avoiding pandas all-NA column dtype warnings."""
+    non_empty = [f for f in frames if not f.empty]
+    if not non_empty:
+        return frames[0].copy() if frames else pd.DataFrame()
+    if len(non_empty) == 1:
+        return non_empty[0].reset_index(drop=True)
+
+    unified_cols: list[Any] = []
+    seen_cols: set[Any] = set()
+    for frame in non_empty:
+        for col in frame.columns:
+            if col not in seen_cols:
+                seen_cols.add(col)
+                unified_cols.append(col)
+
+    non_na_somewhere = {
+        col for frame in non_empty for col in frame.columns if bool(frame[col].notna().any())
+    }
+    prepared: list[pd.DataFrame] = []
+    for frame in non_empty:
+        keep_cols = [
+            col
+            for col in frame.columns
+            if bool(frame[col].notna().any()) or col not in non_na_somewhere
+        ]
+        if keep_cols:
+            prepared.append(frame[keep_cols])
+        else:
+            anchor = next(iter(non_na_somewhere))
+            anchor_dtype = next(
+                other[anchor].dtype
+                for other in non_empty
+                if anchor in other.columns and bool(other[anchor].notna().any())
+            )
+            stub = pd.DataFrame(
+                {anchor: pd.Series([pd.NA] * len(frame), index=frame.index, dtype=anchor_dtype)}
+            )
+            prepared.append(stub)
+
+    merged = pd.concat(prepared, ignore_index=True)
+    return merged.reindex(columns=unified_cols)
+
+
+def _sanitize_json_value(value: Any) -> Any:
+    """Recursively convert missing sentinels and nonfinite floats to ``None`` for RFC 8259 JSON."""
+    if value is None or value is pd.NA:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        return {k: _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        as_float = float(value)
+        return None if (math.isnan(as_float) or math.isinf(as_float)) else as_float
+    if _is_missing_scalar(value):
+        return None
+    item_fn = getattr(value, "item", None)
+    if callable(item_fn):
+        try:
+            return _sanitize_json_value(item_fn())
+        except Exception:
+            return value
+    return value
+
+
+def _dataframe_to_json_records(df: Any) -> list[dict[str, Any]]:
+    """Convert a DataFrame (or test mock) to strict JSON-safe record dictionaries."""
+    if not isinstance(df, pd.DataFrame):
+        raw_mock = cast(Any, df).where(pd.notnull(df), None).to_dict(orient="records")
+        return cast(list[dict[str, Any]], _sanitize_json_value(raw_mock))
+    if df.empty:
+        return []
+    obj_df = df.astype(object)
+    raw_records = obj_df.where(pd.notnull(obj_df), None).to_dict(orient="records")
+    return cast(list[dict[str, Any]], _sanitize_json_value(raw_records))
+
+
 class TabularCSVSink(ExportSink):
     """Sink for exporting data to CSV format."""
 
@@ -397,6 +600,9 @@ class TabularCSVSink(ExportSink):
         self.path = path
         self._is_first_batch = True
         self._cfg = config
+        self._is_incremental_sync = _is_incremental_config(config)
+        self._staged_frames: list[pd.DataFrame] = []
+        self._voided_ids: set[str] = set()
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -407,6 +613,30 @@ class TabularCSVSink(ExportSink):
         )
         if len(df) == 0:
             return 0
+
+        if self._is_incremental_sync and self._cfg.idempotent:
+
+            def stage_export() -> int:
+                csv_str = df.to_csv(
+                    index=False,
+                    header=self._is_first_batch,
+                    **self._cfg.pandas_kwargs,
+                )
+                checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
+                rows_loaded = len(df)
+                self._append_manifest(batch_id, rows_loaded, checksum)
+                id_col = _find_df_record_id_col(df)
+                if id_col is not None:
+                    for raw_id in df[id_col].tolist():
+                        cid = _canonical_record_id(raw_id)
+                        if cid is not None:
+                            self._voided_ids.discard(cid)
+                self._staged_frames.append(df)
+                return rows_loaded
+
+            loaded = self._execute_with_retry("export_csv", batch_id, stage_export)
+            self._is_first_batch = False
+            return loaded
 
         def execute_export() -> int:
             if self._is_first_batch:
@@ -434,6 +664,84 @@ class TabularCSVSink(ExportSink):
         self._is_first_batch = False
         return loaded
 
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Stage newly voided record IDs for atomic CSV reconciliation on flush."""
+        _ = batch_id
+        if not self._cfg.idempotent or not records:
+            return 0
+        cids = [
+            cid for r in records if (cid := _canonical_record_id(extract_record_id(r))) is not None
+        ]
+        if not cids:
+            return 0
+        self._voided_ids.update(cids)
+        return len(cids)
+
+    def _reconcile_csv_to_disk(self) -> int:
+        combined_delta = (
+            _concat_tabular_frames(self._staged_frames) if self._staged_frames else pd.DataFrame()
+        )
+        dedup_delta, delta_ids = _dedupe_df_by_record_id(
+            combined_delta,
+            exclude_ids=self._voided_ids,
+        )
+        dest_exists = Path(self.path).exists() and Path(self.path).stat().st_size > 0
+        sep = str(self._cfg.pandas_kwargs.get("sep", ","))
+
+        if not dest_exists:
+            if dedup_delta.empty:
+                return 0
+            csv_out = dedup_delta.to_csv(index=False, header=True, **self._cfg.pandas_kwargs)
+            _atomic_replace_file(
+                self.path,
+                lambda tmp: Path(tmp).write_text(csv_out, encoding="utf-8"),
+                suffix=".csv.tmp",
+            )
+            return len(dedup_delta)
+
+        delta_fields = [str(c) for c in dedup_delta.columns]
+        delta_rows: list[dict[str, str]] = []
+        if not dedup_delta.empty:
+            rendered_delta = dedup_delta.to_csv(
+                index=False,
+                header=True,
+                **self._cfg.pandas_kwargs,
+            )
+            delta_rows = list(csv.DictReader(io.StringIO(rendered_delta), delimiter=sep))
+
+        exclude_ids = delta_ids | self._voided_ids
+
+        def _stream_merge(tmp_path: str) -> None:
+            with (
+                open(self.path, encoding="utf-8", newline="") as src_f,
+                open(tmp_path, mode="w", encoding="utf-8", newline="") as dst_f,
+            ):
+                reader = csv.DictReader(src_f, delimiter=sep)
+                existing_fields = [f for f in (reader.fieldnames or []) if f is not None]
+                unified_fields = existing_fields + [
+                    c for c in delta_fields if c not in existing_fields
+                ]
+                if not unified_fields:
+                    return
+                writer = csv.DictWriter(
+                    dst_f,
+                    fieldnames=unified_fields,
+                    delimiter=sep,
+                    lineterminator="\n",
+                    restval="",
+                )
+                writer.writeheader()
+                for row in reader:
+                    row_cid = _extract_row_canonical_id(row)
+                    if row_cid is not None and row_cid in exclude_ids:
+                        continue
+                    writer.writerow({k: (row.get(k) or "") for k in unified_fields})
+                for d_row in delta_rows:
+                    writer.writerow({k: (d_row.get(k) or "") for k in unified_fields})
+
+        _atomic_replace_file(self.path, _stream_merge, suffix=".csv.tmp")
+        return len(delta_rows)
+
     def _append_manifest(self, batch_id: str, row_count: int, checksum: str) -> None:
         if not self._cfg.manifest_path:
             return
@@ -448,10 +756,32 @@ class TabularCSVSink(ExportSink):
             f.write(json.dumps(entry) + os.linesep)
 
     def flush(self) -> None:
-        pass
+        """Finalize staged incremental CSV updates and voided deletions atomically."""
+        should_reconcile = False
+        if self._is_incremental_sync and self._cfg.idempotent:
+            should_reconcile = bool(self._staged_frames or self._voided_ids)
+        elif (
+            self._cfg.idempotent
+            and self._voided_ids
+            and Path(self.path).exists()
+            and Path(self.path).stat().st_size > 0
+        ):
+            should_reconcile = True
+
+        if not should_reconcile:
+            return
+
+        batch_id = f"{self._cfg.study_key or 'study'}/csv/flush"
+        try:
+            self._execute_with_retry("reconcile_csv", batch_id, self._reconcile_csv_to_disk)
+        finally:
+            self._staged_frames.clear()
+            self._voided_ids.clear()
 
     def close(self) -> None:
-        pass
+        """Clear any staged state."""
+        self._staged_frames.clear()
+        self._voided_ids.clear()
 
 
 _RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
@@ -919,6 +1249,58 @@ def _align_arrow_column(
     return _safe_cast_arrow_array(pa, inferred_col, widened), widened
 
 
+def _cast_arrow_table_to_schema(pa: Any, tbl: Any, target_schema: Any) -> Any:
+    """Cast or null-pad an Arrow ``Table`` to match ``target_schema``."""
+    cast_cols: list[Any] = []
+    for target_field in target_schema:
+        if target_field.name in tbl.column_names:
+            col = tbl[target_field.name]
+            if pa.types.is_null(col.type):
+                cast_cols.append(pa.nulls(tbl.num_rows, type=target_field.type))
+            elif col.type != target_field.type:
+                cast_cols.append(_safe_cast_arrow_array(pa, col, target_field.type))
+            else:
+                cast_cols.append(col)
+        else:
+            cast_cols.append(pa.nulls(tbl.num_rows, type=target_field.type))
+    return pa.Table.from_arrays(cast_cols, schema=target_schema)
+
+
+def _unify_arrow_schemas(pa: Any, base_schema: Any, incoming_schema: Any) -> Any:
+    """Return a unified ``pyarrow.Schema`` widening overlapping fields and appending new fields."""
+    incoming_by_name = {f.name: f.type for f in incoming_schema}
+    unified_fields: list[Any] = []
+    seen_names: set[str] = set()
+    for b_field in base_schema:
+        seen_names.add(b_field.name)
+        if b_field.name in incoming_by_name:
+            utype = _unify_arrow_types(pa, b_field.type, incoming_by_name[b_field.name])
+        else:
+            utype = b_field.type
+        unified_fields.append(pa.field(b_field.name, utype))
+    for inc_field in incoming_schema:
+        if inc_field.name not in seen_names:
+            unified_fields.append(pa.field(inc_field.name, inc_field.type))
+    return pa.schema(unified_fields)
+
+
+def _filter_arrow_table_excluding_ids(pa: Any, tbl: Any, exclude_ids: set[str]) -> Any:
+    """Filter out rows from ``tbl`` whose canonical record ID is in ``exclude_ids``."""
+    if tbl.num_rows == 0 or not exclude_ids:
+        return tbl
+    id_col = (
+        "recordId"
+        if "recordId" in tbl.column_names
+        else ("record_id" if "record_id" in tbl.column_names else None)
+    )
+    if id_col is None:
+        return tbl
+    mask = [_canonical_record_id(val) not in exclude_ids for val in tbl[id_col].to_pylist()]
+    if all(mask):
+        return tbl
+    return tbl.filter(pa.array(mask, type=pa.bool_()))
+
+
 class TabularParquetSink(ExportSink):
     """Streaming Parquet sink backed by ``pyarrow.parquet.ParquetWriter``."""
 
@@ -936,18 +1318,31 @@ class TabularParquetSink(ExportSink):
         self._writer: Any = None
         self._schema: Any = None
         self._contract_types: dict[str, str | None] = dict(contract_types) if contract_types else {}
-        self._is_incremental_sync = bool(
-            config.incremental
-            or config.modified_since is not None
-            or config.state_provider is not None
-        )
+        self._is_incremental_sync = _is_incremental_config(config)
         self._parquet_kwargs = dict(config.pandas_kwargs)
         self._parquet_kwargs.pop("engine", None)
         self._compression = self._parquet_kwargs.pop("compression", "snappy")
+        self._voided_ids: set[str] = set()
+        self._delta_id_counts: dict[str, int] = {}
+        self._delta_path: str | None = None
 
     def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
         """Configure contract-derived column types prior to streaming batches."""
         self._contract_types = dict(contract_types)
+
+    def _use_staged_delta(self) -> bool:
+        return bool(self._is_incremental_sync and self._cfg.idempotent)
+
+    def _active_writer_path(self) -> str:
+        if self._use_staged_delta():
+            if self._delta_path is None:
+                dest = Path(self.path)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                self._delta_path = str(
+                    dest.parent / f".{dest.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.delta.parquet"
+                )
+            return self._delta_path
+        return self.path
 
     def _align_batch_table(self, pa: Any, df: pd.DataFrame) -> tuple[Any, bool]:
         """Convert ``df`` into an Arrow table aligned with contract or active writer schema."""
@@ -1010,13 +1405,14 @@ class TabularParquetSink(ExportSink):
 
     def _evolve_writer_schema(self, pa: Any, pq: Any, new_schema: Any) -> None:
         """Stream existing row groups into a reopened ParquetWriter when schema widens."""
+        target_path = self._active_writer_path()
         self._writer.close()
         self._writer = None
-        tmp_prev = f"{self.path}.schema_evolve.tmp"
-        os.replace(self.path, tmp_prev)
+        tmp_prev = f"{target_path}.schema_evolve.tmp"
+        os.replace(target_path, tmp_prev)
         try:
             self._writer = cast(Any, pq).ParquetWriter(
-                self.path,
+                target_path,
                 new_schema,
                 compression=self._compression,
                 **self._parquet_kwargs,
@@ -1024,21 +1420,7 @@ class TabularParquetSink(ExportSink):
             with pq.ParquetFile(tmp_prev) as prev_pf:
                 for record_batch in prev_pf.iter_batches(batch_size=max(1, self._cfg.batch_size)):
                     prev_tbl = pa.Table.from_batches([record_batch])
-                    cast_cols: list[Any] = []
-                    for target_field in new_schema:
-                        if target_field.name in prev_tbl.column_names:
-                            col = prev_tbl[target_field.name]
-                            if pa.types.is_null(col.type):
-                                cast_cols.append(
-                                    pa.nulls(prev_tbl.num_rows, type=target_field.type)
-                                )
-                            elif col.type != target_field.type:
-                                cast_cols.append(_safe_cast_arrow_array(pa, col, target_field.type))
-                            else:
-                                cast_cols.append(col)
-                        else:
-                            cast_cols.append(pa.nulls(prev_tbl.num_rows, type=target_field.type))
-                    self._writer.write_table(pa.Table.from_arrays(cast_cols, schema=new_schema))
+                    self._writer.write_table(_cast_arrow_table_to_schema(pa, prev_tbl, new_schema))
             self._schema = new_schema
         finally:
             Path(tmp_prev).unlink(missing_ok=True)
@@ -1058,10 +1440,11 @@ class TabularParquetSink(ExportSink):
             import pyarrow.parquet as pq
 
             table, schema_evolved = self._align_batch_table(pa, df)
+            target_path = self._active_writer_path()
             if self._writer is None:
                 self._schema = table.schema
                 self._writer = cast(Any, pq).ParquetWriter(
-                    self.path,
+                    target_path,
                     self._schema,
                     compression=self._compression,
                     **self._parquet_kwargs,
@@ -1069,53 +1452,208 @@ class TabularParquetSink(ExportSink):
             elif schema_evolved:
                 self._evolve_writer_schema(pa, pq, table.schema)
             self._writer.write_table(table)
+            if self._use_staged_delta():
+                id_col = _find_df_record_id_col(df)
+                if id_col is not None:
+                    for raw_id in df[id_col].tolist():
+                        cid = _canonical_record_id(raw_id)
+                        if cid is not None:
+                            self._delta_id_counts[cid] = self._delta_id_counts.get(cid, 0) + 1
+                            self._voided_ids.discard(cid)
             return len(df)
 
         return self._execute_with_retry("export_parquet", batch_id, execute_export)
 
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Stage newly voided record IDs for atomic Parquet reconciliation on flush."""
+        _ = batch_id
+        if not self._cfg.idempotent or not records:
+            return 0
+        cids = [
+            cid for r in records if (cid := _canonical_record_id(extract_record_id(r))) is not None
+        ]
+        if not cids:
+            return 0
+        self._voided_ids.update(cids)
+        return len(cids)
+
+    def _write_empty_parquet(self) -> None:
+        if self._contract_types:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            empty_schema = pa.schema(
+                [
+                    (col, _logical_to_arrow_type(pa, ltype) or pa.string())
+                    for col, ltype in self._contract_types.items()
+                ]
+            )
+            empty_arrays = [pa.nulls(0, type=f.type) for f in empty_schema]
+            empty_table = pa.Table.from_arrays(empty_arrays, schema=empty_schema)
+            cast(Any, pq).write_table(
+                empty_table,
+                self.path,
+                compression=self._compression,
+                **self._parquet_kwargs,
+            )
+        else:
+            pd.DataFrame().to_parquet(
+                self.path,
+                index=False,
+                compression=self._compression,
+                **self._parquet_kwargs,
+            )
+
+    def _stream_delta_batches_filtered(
+        self,
+        pa: Any,
+        delta_pf: Any,
+        out_writer: Any,
+        target_schema: Any,
+    ) -> None:
+        remaining = dict(self._delta_id_counts)
+        for record_batch in delta_pf.iter_batches(batch_size=max(1, self._cfg.batch_size)):
+            tbl = pa.Table.from_batches([record_batch])
+            id_col = (
+                "recordId"
+                if "recordId" in tbl.column_names
+                else ("record_id" if "record_id" in tbl.column_names else None)
+            )
+            if id_col is not None and tbl.num_rows > 0:
+                mask: list[bool] = []
+                for val in tbl[id_col].to_pylist():
+                    cid = _canonical_record_id(val)
+                    if cid is None:
+                        mask.append(True)
+                    else:
+                        remaining[cid] = remaining.get(cid, 1) - 1
+                        mask.append(cid not in self._voided_ids and remaining[cid] == 0)
+                if not all(mask):
+                    tbl = tbl.filter(pa.array(mask, type=pa.bool_()))
+            if tbl.num_rows > 0:
+                out_writer.write_table(_cast_arrow_table_to_schema(pa, tbl, target_schema))
+
+    def _reconcile_parquet_to_disk(self) -> int:
+        dest_exists = Path(self.path).exists() and Path(self.path).stat().st_size > 0
+        has_delta = bool(
+            self._delta_path
+            and Path(self._delta_path).exists()
+            and Path(self._delta_path).stat().st_size > 0
+        )
+
+        if not has_delta and not self._voided_ids:
+            if not dest_exists:
+                self._write_empty_parquet()
+            return 0
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        pq_any: Any = pq
+
+        needs_delta_filter = any(cnt > 1 for cnt in self._delta_id_counts.values()) or bool(
+            self._voided_ids & set(self._delta_id_counts)
+        )
+
+        if not dest_exists:
+            if not has_delta:
+                return 0
+            delta_file = cast(str, self._delta_path)
+            if not needs_delta_filter:
+                Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+                os.replace(delta_file, self.path)
+                return len(self._delta_id_counts)
+
+            delta_schema = pq_any.read_schema(delta_file)
+
+            def _write_dedup_delta(tmp_path: str) -> None:
+                with (
+                    pq_any.ParquetFile(delta_file) as delta_pf,
+                    pq_any.ParquetWriter(
+                        tmp_path,
+                        delta_schema,
+                        compression=self._compression,
+                        **self._parquet_kwargs,
+                    ) as out_writer,
+                ):
+                    self._stream_delta_batches_filtered(pa, delta_pf, out_writer, delta_schema)
+
+            _atomic_replace_file(self.path, _write_dedup_delta, suffix=".parquet.tmp")
+            return len(self._delta_id_counts)
+
+        prev_schema = pq_any.read_schema(self.path)
+        if has_delta:
+            delta_schema = pq_any.read_schema(cast(str, self._delta_path))
+            unified_schema = _unify_arrow_schemas(pa, prev_schema, delta_schema)
+        else:
+            unified_schema = prev_schema
+
+        exclude_prev_ids = set(self._delta_id_counts) | self._voided_ids
+
+        def _stream_merge(tmp_path: str) -> None:
+            with pq_any.ParquetWriter(
+                tmp_path,
+                unified_schema,
+                compression=self._compression,
+                **self._parquet_kwargs,
+            ) as out_writer:
+                with pq_any.ParquetFile(self.path) as prev_pf:
+                    for record_batch in prev_pf.iter_batches(
+                        batch_size=max(1, self._cfg.batch_size)
+                    ):
+                        prev_tbl = pa.Table.from_batches([record_batch])
+                        kept_tbl = _filter_arrow_table_excluding_ids(pa, prev_tbl, exclude_prev_ids)
+                        if kept_tbl.num_rows > 0:
+                            out_writer.write_table(
+                                _cast_arrow_table_to_schema(pa, kept_tbl, unified_schema)
+                            )
+                if has_delta:
+                    with pq_any.ParquetFile(cast(str, self._delta_path)) as delta_pf:
+                        self._stream_delta_batches_filtered(
+                            pa, delta_pf, out_writer, unified_schema
+                        )
+
+        _atomic_replace_file(self.path, _stream_merge, suffix=".parquet.tmp")
+        return len(self._delta_id_counts)
+
     def flush(self) -> None:
-        """Flush and finalize Parquet footer before checkpoint commit."""
+        """Flush and finalize Parquet footer or reconcile incremental deltas before checkpoint commit."""
+        wrote_batches = self._writer is not None
         if self._writer is not None:
             self._writer.close()
             self._writer = None
-        elif not (
-            self._is_incremental_sync
-            and Path(self.path).exists()
-            and Path(self.path).stat().st_size > 0
-        ):
-            if self._contract_types:
-                import pyarrow as pa
-                import pyarrow.parquet as pq
 
-                empty_schema = pa.schema(
-                    [
-                        (col, _logical_to_arrow_type(pa, ltype) or pa.string())
-                        for col, ltype in self._contract_types.items()
-                    ]
+        if self._use_staged_delta() or (self._cfg.idempotent and self._voided_ids):
+            batch_id = f"{self._cfg.study_key or 'study'}/parquet/flush"
+            try:
+                self._execute_with_retry(
+                    "reconcile_parquet",
+                    batch_id,
+                    self._reconcile_parquet_to_disk,
                 )
-                empty_arrays = [pa.nulls(0, type=f.type) for f in empty_schema]
-                empty_table = pa.Table.from_arrays(empty_arrays, schema=empty_schema)
-                cast(Any, pq).write_table(
-                    empty_table,
-                    self.path,
-                    compression=self._compression,
-                    **self._parquet_kwargs,
-                )
-            else:
-                pd.DataFrame().to_parquet(
-                    self.path,
-                    index=False,
-                    compression=self._compression,
-                    **self._parquet_kwargs,
-                )
+            finally:
+                if self._delta_path is not None:
+                    Path(self._delta_path).unlink(missing_ok=True)
+                    self._delta_path = None
+                self._delta_id_counts.clear()
+                self._voided_ids.clear()
+            return
+
+        if not wrote_batches:
+            self._write_empty_parquet()
 
     def close(self) -> None:
-        """Ensure underlying ParquetWriter is closed."""
+        """Ensure underlying ParquetWriter is closed and any staging file is removed."""
         if self._writer is not None:
             try:
                 self._writer.close()
             finally:
                 self._writer = None
+        if self._delta_path is not None:
+            Path(self._delta_path).unlink(missing_ok=True)
+            self._delta_path = None
+        self._delta_id_counts.clear()
+        self._voided_ids.clear()
         self._schema = None
 
 
@@ -1274,7 +1812,7 @@ class TabularDuckDBSink(ExportSink):
         )
         import duckdb
 
-        self._conn: Any = duckdb.connect(db_path)
+        self._conn: Any = duckdb.connect(db_path, config={"threads": "1"})
 
     def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
         """Configure contract-derived column types prior to streaming batches."""
@@ -1402,25 +1940,51 @@ class _TabularCollectingSink(ExportSink):
         self,
         config: TabularSinkConfig,
         on_flush: Any,
+        *,
+        pass_voided_ids: bool = False,
     ) -> None:
         super().__init__(config)
         self._frames: list[pd.DataFrame] = []
+        self._voided_ids: set[str] = set()
         self._on_flush = on_flush
+        self._pass_voided_ids = pass_voided_ids
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         _ = batch_id
         df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
         if len(df) == 0:
             return 0
+        id_col = _find_df_record_id_col(df)
+        if id_col is not None:
+            for raw_id in df[id_col].tolist():
+                cid = _canonical_record_id(raw_id)
+                if cid is not None:
+                    self._voided_ids.discard(cid)
         self._frames.append(df)
         return len(df)
 
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        _ = batch_id
+        if not self.config.idempotent or not records:
+            return 0
+        cids = [
+            cid for r in records if (cid := _canonical_record_id(extract_record_id(r))) is not None
+        ]
+        if not cids:
+            return 0
+        self._voided_ids.update(cids)
+        return len(cids)
+
     def flush(self) -> None:
-        combined = pd.concat(self._frames, ignore_index=True) if self._frames else pd.DataFrame()
-        self._on_flush(combined)
+        combined = _concat_tabular_frames(self._frames) if self._frames else pd.DataFrame()
+        if self._pass_voided_ids:
+            self._on_flush(combined, set(self._voided_ids))
+        else:
+            self._on_flush(combined)
 
     def close(self) -> None:
         self._frames.clear()
+        self._voided_ids.clear()
 
 
 class _TabularTransformSink(ExportSink):
@@ -1485,44 +2049,16 @@ class _TabularTransformSink(ExportSink):
         self._inner.close()
 
 
-def _tabular_export(
+def _make_mapper_records_source(
     sdk: Any,
     study_key: str,
-    sink: ExportSink,
+    mapper: Any,
     config: TabularSinkConfig,
-    sanitize: bool = False,
-    *,
-    stream_name: str | None = None,
-) -> None:
-    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-    variable_keys, label_map = mapper._fetch_variable_metadata(
-        study_key,
-        variable_whitelist=config.variable_whitelist,
-        form_whitelist=config.form_whitelist,
-    )
-    if not variable_keys:
-        with sink:
-            pass
-        return
-
-    raw_variables = mapper._last_variables if hasattr(mapper, "_last_variables") else None
-    pipeline = resolve_enrichment_pipeline(study_key)
-    contract_types = _build_tabular_contract_types(
-        variable_keys,
-        label_map,
-        raw_variables if isinstance(raw_variables, list) else (),
-        use_labels_as_columns=config.use_labels_as_columns,
-        mask_phi=config.mask_phi,
-        pipeline=pipeline,
-    )
-    if isinstance(sink, (TabularParquetSink, TabularDuckDBSink)):
-        sink.set_contract_types(contract_types)
-
-    record_model = mapper._build_record_model(variable_keys, label_map)
+) -> Callable[[datetime | None, bool], Iterable[Any]]:
+    """Build a streaming records source callback compatible with real and mock mappers."""
     extra_filters: dict[str, Any] = {}
     if config.form_whitelist is not None:
         extra_filters["formId"] = config.form_whitelist
-
     merged_filter = _merge_form_whitelist_into_filter(config.record_filter, config.form_whitelist)
     is_mock = _is_mock_mapper(mapper)
 
@@ -1570,6 +2106,45 @@ def _tabular_export(
             exclude_deleted_upstream=exclude_deleted_upstream,
         )
 
+    return _records_source
+
+
+def _tabular_export(
+    sdk: Any,
+    study_key: str,
+    sink: ExportSink,
+    config: TabularSinkConfig,
+    sanitize: bool = False,
+    *,
+    stream_name: str | None = None,
+) -> None:
+    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+    variable_keys, label_map = mapper._fetch_variable_metadata(
+        study_key,
+        variable_whitelist=config.variable_whitelist,
+        form_whitelist=config.form_whitelist,
+    )
+    if not variable_keys:
+        with sink:
+            pass
+        return
+
+    raw_variables = mapper._last_variables if hasattr(mapper, "_last_variables") else None
+    pipeline = resolve_enrichment_pipeline(study_key)
+    contract_types = _build_tabular_contract_types(
+        variable_keys,
+        label_map,
+        raw_variables if isinstance(raw_variables, list) else (),
+        use_labels_as_columns=config.use_labels_as_columns,
+        mask_phi=config.mask_phi,
+        pipeline=pipeline,
+    )
+    if isinstance(sink, (TabularParquetSink, TabularDuckDBSink)):
+        sink.set_contract_types(contract_types)
+
+    record_model = mapper._build_record_model(variable_keys, label_map)
+    records_source = _make_mapper_records_source(sdk, study_key, mapper, config)
+
     transform_sink = _TabularTransformSink(
         sink,
         mapper,
@@ -1587,7 +2162,7 @@ def _tabular_export(
         config,
         stream_name=stream_name or "tabular",
         batch_id_prefix=f"{study_key}/tabular",
-        records_source=_records_source,
+        records_source=records_source,
         quality_gate_fn=apply_quality_gate,
         iter_batches_fn=iter_batches,
     )
@@ -1651,7 +2226,7 @@ def _collect_tabular_df(
     _tabular_export(sdk, study_key, collector, config, sanitize=sanitize)
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    return _concat_tabular_frames(frames)
 
 
 def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1676,23 +2251,6 @@ def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         "state_provider",
     )
     return {k: kwargs.pop(k) for k in sink_keys if k in kwargs}
-
-
-_STREAMING_ONLY_KEYS = (
-    "modified_since",
-    "record_filter",
-    "record_data_filter",
-    "include_deleted",
-    "incremental",
-    "stream_name",
-    "ledger_path",
-    "state_provider",
-)
-
-
-def _has_streaming_kwargs(sink_kwargs: Mapping[str, Any]) -> bool:
-    """Return True when caller supplied any streaming/filter/checkpoint kwargs."""
-    return any(k in sink_kwargs for k in _STREAMING_ONLY_KEYS)
 
 
 def _config_has_streaming_options(config: TabularSinkConfig) -> bool:
@@ -1946,10 +2504,51 @@ def export_to_excel(
             return
 
     excel_kwargs = dict(config.pandas_kwargs)
-    sink = _TabularCollectingSink(
-        config,
-        lambda combined: combined.to_excel(path, index=False, **excel_kwargs),
-    )
+    is_incremental_excel = _is_incremental_config(config)
+
+    def _write_or_reconcile_excel(combined: pd.DataFrame, voided_ids: set[str]) -> None:
+        if not (is_incremental_excel and config.idempotent):
+            combined.to_excel(path, index=False, **excel_kwargs)
+            return
+
+        dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
+        if combined.empty and not voided_ids:
+            if dest_exists:
+                return
+            _atomic_replace_file(
+                path,
+                lambda tmp: combined.to_excel(tmp, index=False, **excel_kwargs),
+                suffix=".xlsx",
+            )
+            return
+
+        dedup_delta, delta_ids = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
+        if dest_exists:
+            prev_df = pd.read_excel(path)
+            prev_kept = _filter_df_excluding_record_ids(prev_df, delta_ids | voided_ids)
+            if not prev_kept.empty:
+                if config.mask_phi:
+                    pipeline = resolve_enrichment_pipeline(study_key)
+                    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+                    prev_kept = _mask_df(prev_kept, phi_keys=phi_keys)
+                if config.sanitize:
+                    prev_kept = _sanitize_df(prev_kept)
+            if prev_kept.empty:
+                merged_df = dedup_delta
+            elif dedup_delta.empty:
+                merged_df = prev_kept.reset_index(drop=True)
+            else:
+                merged_df = _concat_tabular_frames([prev_kept, dedup_delta])
+        else:
+            merged_df = dedup_delta
+
+        _atomic_replace_file(
+            path,
+            lambda tmp: merged_df.to_excel(tmp, index=False, **excel_kwargs),
+            suffix=".xlsx",
+        )
+
+    sink = _TabularCollectingSink(config, _write_or_reconcile_excel, pass_voided_ids=True)
     _tabular_export(sdk, study_key, sink, config, sanitize=True, stream_name="excel")
 
 
@@ -1974,19 +2573,287 @@ def _apply_json_enrichment(study_key: str, data: Any, *, mask_phi: bool = True) 
 
 
 def _dump_json_payload(path: str, data: Any, config: TabularSinkConfig) -> int:
-    """Persist JSON export payload, appending list items when ``idempotent=False``."""
-    payload = data
-    if not config.idempotent and isinstance(data, list) and Path(path).exists():
+    """Persist strict RFC 8259 JSON export payload atomically, appending when ``idempotent=False``."""
+    sanitized_data = _sanitize_json_value(data)
+    payload = sanitized_data
+    if not config.idempotent and isinstance(sanitized_data, list) and Path(path).exists():
         try:
             with open(path, encoding="utf-8") as existing_file:
                 existing_data = json.load(existing_file)
             if isinstance(existing_data, list):
-                payload = existing_data + data
+                payload = _sanitize_json_value(existing_data) + sanitized_data
         except Exception:
-            payload = data
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, **config.pandas_kwargs)
-    return len(data) if isinstance(data, list) else 1
+            payload = sanitized_data
+
+    dump_kwargs = dict(config.pandas_kwargs)
+    dump_kwargs["allow_nan"] = False
+
+    def _write_tmp_json(tmp_path: str) -> None:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, **dump_kwargs)
+
+    _atomic_replace_file(path, _write_tmp_json, suffix=".json.tmp")
+    return len(sanitized_data) if isinstance(sanitized_data, list) else 1
+
+
+def _merge_flat_json_records(
+    existing_records: list[Any],
+    delta_records: list[dict[str, Any]],
+    voided_ids: set[str],
+) -> list[Any]:
+    """Upsert ``delta_records`` by canonical record ID and drop ``voided_ids``."""
+    delta_by_cid: dict[str, dict[str, Any]] = {}
+    unkeyed_delta: list[dict[str, Any]] = []
+    for drec in delta_records:
+        cid = _extract_row_canonical_id(drec)
+        if cid is not None:
+            delta_by_cid[cid] = drec
+        else:
+            unkeyed_delta.append(drec)
+
+    merged: list[Any] = []
+    placed_cids: set[str] = set()
+    for erec in existing_records:
+        if isinstance(erec, Mapping):
+            cid = _extract_row_canonical_id(erec)
+            if cid is not None and cid in voided_ids:
+                continue
+            if cid is not None and cid in delta_by_cid:
+                if cid not in placed_cids:
+                    merged.append(delta_by_cid[cid])
+                    placed_cids.add(cid)
+                continue
+        merged.append(erec)
+
+    for cid, drec in delta_by_cid.items():
+        if cid not in placed_cids and cid not in voided_ids:
+            merged.append(drec)
+    merged.extend(unkeyed_delta)
+    return merged
+
+
+def _merge_hierarchical_archives(
+    existing_tree: list[Any],
+    delta_tree: list[dict[str, Any]],
+    exclude_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Merge hierarchical Subject->Visit->Form trees by ``recordId`` and prune voided records."""
+    subjects: dict[Any, dict[str, Any]] = {}
+
+    for subj in existing_tree:
+        if not isinstance(subj, Mapping):
+            continue
+        sk = subj.get("subject_key")
+        visits_map: dict[Any, dict[Any, list[dict[str, Any]]]] = {}
+        for visit in subj.get("visits") or []:
+            if not isinstance(visit, Mapping):
+                continue
+            vid = visit.get("visit_id")
+            for fnode in visit.get("forms") or []:
+                if not isinstance(fnode, Mapping):
+                    continue
+                fid = fnode.get("form_id")
+                kept = [
+                    dict(rec)
+                    for rec in (fnode.get("records") or [])
+                    if isinstance(rec, Mapping)
+                    and _extract_row_canonical_id(rec) not in exclude_ids
+                ]
+                if kept:
+                    visits_map.setdefault(vid, {}).setdefault(fid, []).extend(kept)
+
+        unsched_map: dict[Any, list[dict[str, Any]]] = {}
+        for fnode in subj.get("forms") or []:
+            if not isinstance(fnode, Mapping):
+                continue
+            fid = fnode.get("form_id")
+            kept = [
+                dict(rec)
+                for rec in (fnode.get("records") or [])
+                if isinstance(rec, Mapping) and _extract_row_canonical_id(rec) not in exclude_ids
+            ]
+            if kept:
+                unsched_map.setdefault(fid, []).extend(kept)
+
+        entry = subjects.setdefault(sk, {"visits": {}, "forms": {}})
+        for vid, forms_dict in visits_map.items():
+            for fid, recs in forms_dict.items():
+                entry["visits"].setdefault(vid, {}).setdefault(fid, []).extend(recs)
+        for fid, recs in unsched_map.items():
+            entry["forms"].setdefault(fid, []).extend(recs)
+
+    for subj in delta_tree:
+        if not isinstance(subj, Mapping):
+            continue
+        sk = subj.get("subject_key")
+        entry = subjects.setdefault(sk, {"visits": {}, "forms": {}})
+        for visit in subj.get("visits") or []:
+            if not isinstance(visit, Mapping):
+                continue
+            vid = visit.get("visit_id")
+            for fnode in visit.get("forms") or []:
+                if not isinstance(fnode, Mapping):
+                    continue
+                fid = fnode.get("form_id")
+                recs = [
+                    dict(rec) for rec in (fnode.get("records") or []) if isinstance(rec, Mapping)
+                ]
+                if recs:
+                    entry["visits"].setdefault(vid, {}).setdefault(fid, []).extend(recs)
+        for fnode in subj.get("forms") or []:
+            if not isinstance(fnode, Mapping):
+                continue
+            fid = fnode.get("form_id")
+            recs = [dict(rec) for rec in (fnode.get("records") or []) if isinstance(rec, Mapping)]
+            if recs:
+                entry["forms"].setdefault(fid, []).extend(recs)
+
+    merged_tree: list[dict[str, Any]] = []
+    for sk, entry in subjects.items():
+        subj_visits: list[dict[str, Any]] = []
+        for vid, forms_dict in entry["visits"].items():
+            visit_forms = [
+                {"form_id": fid, "records": recs} for fid, recs in forms_dict.items() if recs
+            ]
+            if visit_forms:
+                subj_visits.append({"visit_id": vid, "forms": visit_forms})
+        unsched_forms = [
+            {"form_id": fid, "records": recs} for fid, recs in entry["forms"].items() if recs
+        ]
+        if not subj_visits and not unsched_forms:
+            continue
+        out_subj: dict[str, Any] = {"subject_key": sk, "visits": subj_visits}
+        if unsched_forms:
+            out_subj["forms"] = unsched_forms
+        merged_tree.append(out_subj)
+
+    return merged_tree
+
+
+class _HierarchicalJSONSink(ExportSink):
+    """Streaming sink that builds and reconciles hierarchical JSON archives atomically on flush."""
+
+    _skip_auto_redact_batch = True
+
+    def __init__(
+        self,
+        path: str,
+        study_key: str,
+        mapper: Any,
+        hier_kwargs: dict[str, Any],
+        config: TabularSinkConfig,
+        *,
+        is_mock_hier_mapper: bool,
+    ) -> None:
+        super().__init__(config)
+        self.path = path
+        self._study_key = study_key
+        self._mapper = mapper
+        self._hier_kwargs = dict(hier_kwargs)
+        self._cfg = config
+        self._is_mock_hier_mapper = is_mock_hier_mapper
+        self._is_incremental_sync = _is_incremental_config(config)
+        self._records_by_cid: dict[str, Any] = {}
+        self._unkeyed_records: list[Any] = []
+        self._voided_ids: set[str] = set()
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        _ = batch_id
+        if not records:
+            return 0
+        for rec in records:
+            cid = _canonical_record_id(extract_record_id(rec))
+            if cid is not None:
+                if cid in self._records_by_cid:
+                    del self._records_by_cid[cid]
+                self._records_by_cid[cid] = rec
+                self._voided_ids.discard(cid)
+            else:
+                self._unkeyed_records.append(rec)
+        return len(records)
+
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        _ = batch_id
+        if not self._cfg.idempotent or not records:
+            return 0
+        cids = [
+            cid for r in records if (cid := _canonical_record_id(extract_record_id(r))) is not None
+        ]
+        for cid in cids:
+            self._voided_ids.add(cid)
+            self._records_by_cid.pop(cid, None)
+        return len(cids)
+
+    def _build_and_write_archive(self) -> int:
+        dest_exists = Path(self.path).exists() and Path(self.path).stat().st_size > 0
+        active_records = list(self._records_by_cid.values()) + self._unkeyed_records
+
+        if (
+            self._is_incremental_sync
+            and self._cfg.idempotent
+            and not active_records
+            and not self._voided_ids
+            and dest_exists
+        ):
+            return 0
+
+        if active_records:
+            call_kwargs = dict(self._hier_kwargs)
+            if not self._is_mock_hier_mapper:
+                call_kwargs["records"] = active_records
+            delta_data = self._mapper.build_hierarchy(self._study_key, **call_kwargs)
+        else:
+            delta_data = []
+
+        if self._cfg.mask_phi:
+            delta_data = mask_clinical_phi(delta_data)
+        if self._is_mock_hier_mapper:
+            delta_data = _apply_json_enrichment(
+                self._study_key,
+                delta_data,
+                mask_phi=self._cfg.mask_phi,
+            )
+
+        if self._is_incremental_sync and self._cfg.idempotent and dest_exists:
+            existing_tree: list[Any] = []
+            try:
+                with open(self.path, encoding="utf-8") as existing_f:
+                    loaded = json.load(existing_f)
+                if isinstance(loaded, list):
+                    existing_tree = loaded
+            except Exception:
+                existing_tree = []
+
+            exclude_ids = set(self._records_by_cid) | self._voided_ids
+            final_data: Any = _merge_hierarchical_archives(
+                existing_tree,
+                delta_data if isinstance(delta_data, list) else [],
+                exclude_ids,
+            )
+            if self._cfg.mask_phi:
+                pipeline = resolve_enrichment_pipeline(self._study_key)
+                phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+                final_data = mask_clinical_phi(final_data)
+                if phi_keys:
+                    final_data = mask_custom_phi_recursive(final_data, phi_keys)
+        else:
+            final_data = delta_data
+
+        return _dump_json_payload(self.path, final_data, self._cfg)
+
+    def flush(self) -> None:
+        batch_id = f"{self._study_key}/json_hierarchical/flush"
+        try:
+            self._execute_with_retry("export_json", batch_id, self._build_and_write_archive)
+        finally:
+            self._records_by_cid.clear()
+            self._unkeyed_records.clear()
+            self._voided_ids.clear()
+
+    def close(self) -> None:
+        self._records_by_cid.clear()
+        self._unkeyed_records.clear()
+        self._voided_ids.clear()
 
 
 def export_to_json(
@@ -2045,17 +2912,40 @@ def export_to_json(
             hier_kwargs["include_deleted"] = config.include_deleted
         if not config.mask_phi and not _is_mock_mapper(mapper):
             hier_kwargs["mask_phi"] = False
-        data = mapper.build_hierarchy(study_key, **hier_kwargs)
-        if config.mask_phi:
-            data = mask_clinical_phi(data)
-        if is_mock_hier_mapper:
+
+        if is_mock_hier_mapper and not _config_has_streaming_options(config):
+            data = mapper.build_hierarchy(study_key, **hier_kwargs)
+            if config.mask_phi:
+                data = mask_clinical_phi(data)
             data = _apply_json_enrichment(study_key, data, mask_phi=config.mask_phi)
-        with _TabularCallableSink(
+            with _TabularCallableSink(
+                config,
+                "export_json",
+                lambda: _dump_json_payload(path, data, config),
+            ) as legacy_hier_sink:
+                legacy_hier_sink.write_batch([1], batch_id=f"{study_key}/json/0")
+            return
+
+        hier_sink = _HierarchicalJSONSink(
+            path,
+            study_key,
+            mapper,
+            hier_kwargs,
             config,
-            "export_json",
-            lambda: _dump_json_payload(path, data, config),
-        ) as hier_sink:
-            hier_sink.write_batch([1], batch_id=f"{study_key}/json/0")
+            is_mock_hier_mapper=is_mock_hier_mapper,
+        )
+        records_source = _make_mapper_records_source(sdk, study_key, mapper, config)
+        run_streaming_export(
+            sdk,
+            study_key,
+            hier_sink,
+            config,
+            stream_name="json_hierarchical",
+            batch_id_prefix=f"{study_key}/json_hierarchical",
+            records_source=records_source,
+            quality_gate_fn=apply_quality_gate,
+            iter_batches_fn=iter_batches,
+        )
         return
 
     if not _config_has_streaming_options(config):
@@ -2089,9 +2979,7 @@ def export_to_json(
                     )
                 )
         if df_mock is not None:
-            mock_data = (
-                cast(Any, df_mock).where(pd.notnull(df_mock), None).to_dict(orient="records")
-            )
+            mock_data = _dataframe_to_json_records(df_mock)
             mock_data = _apply_json_enrichment(study_key, mock_data, mask_phi=config.mask_phi)
             with _TabularCallableSink(
                 config,
@@ -2101,17 +2989,49 @@ def export_to_json(
                 legacy_sink.write_batch([1], batch_id=f"{study_key}/json/0")
             return
 
-    def _write_json(combined: pd.DataFrame) -> None:
-        records_out = (
-            cast(Any, combined).where(pd.notnull(combined), None).to_dict(orient="records")
-            if not combined.empty
-            else []
+    is_incremental_json = _is_incremental_config(config)
+
+    def _write_or_reconcile_json(combined: pd.DataFrame, voided_ids: set[str]) -> None:
+        if not (is_incremental_json and config.idempotent):
+            records_out = _dataframe_to_json_records(combined)
+            if config.mask_phi:
+                records_out = mask_clinical_phi(records_out)
+            _dump_json_payload(path, records_out, config)
+            return
+
+        dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
+        if combined.empty and not voided_ids:
+            if dest_exists:
+                return
+            _dump_json_payload(path, [], config)
+            return
+
+        dedup_delta, _ = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
+        delta_records = _dataframe_to_json_records(dedup_delta)
+        existing_records: list[Any] = []
+        if dest_exists:
+            try:
+                with open(path, encoding="utf-8") as existing_f:
+                    loaded = json.load(existing_f)
+                if isinstance(loaded, list):
+                    existing_records = loaded
+            except Exception:
+                existing_records = []
+
+        merged_records: Any = _merge_flat_json_records(
+            existing_records,
+            delta_records,
+            voided_ids,
         )
         if config.mask_phi:
-            records_out = mask_clinical_phi(records_out)
-        _dump_json_payload(path, records_out, config)
+            pipeline = resolve_enrichment_pipeline(study_key)
+            phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+            merged_records = mask_clinical_phi(merged_records)
+            if phi_keys:
+                merged_records = mask_custom_phi_recursive(merged_records, phi_keys)
+        _dump_json_payload(path, merged_records, config)
 
-    sink = _TabularCollectingSink(config, _write_json)
+    sink = _TabularCollectingSink(config, _write_or_reconcile_json, pass_voided_ids=True)
     _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name="json")
 
 
@@ -2356,9 +3276,17 @@ def export_to_duckdb_by_form(
             "Install with `pip install 'imednet[duckdb]'`."
         ) from error
 
-    sink_kwargs = _pop_sink_kwargs(kwargs)
-    effective_mask_phi = bool(sink_kwargs.get("mask_phi", mask_phi))
-    mapper = _create_record_mapper(sdk, mask_phi=effective_mask_phi)
+    manifest_path = kwargs.pop("manifest_path", None)
+    config = _build_tabular_sink_config(
+        study_key,
+        kwargs,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        manifest_path=manifest_path,
+        mask_phi=mask_phi,
+    )
+    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
     if hasattr(mapper, "_active_study_key"):
         mapper._active_study_key = study_key
     pipeline = resolve_enrichment_pipeline(study_key)
@@ -2378,41 +3306,35 @@ def export_to_duckdb_by_form(
         if v.form_id is not None:
             variables_by_form.setdefault(v.form_id, []).append(v)
 
-    use_mock_fetch = _uses_mock_fetch_records(mapper) and not _has_streaming_kwargs(sink_kwargs)
-    batch_size = int(sink_kwargs.get("batch_size", 500))
-    include_deleted = bool(sink_kwargs.get("include_deleted", False))
-    modified_since = sink_kwargs.get("modified_since")
-    record_filter = sink_kwargs.get("record_filter")
-    record_data_filter = sink_kwargs.get("record_data_filter")
+    use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
+    if use_mock_fetch:
+        conn: Any = duckdb.connect(db_path, config={"threads": "1"})
+        try:
+            for form in forms:
+                if form.form_id is None or form.form_key is None:
+                    continue
+                if form_whitelist is not None and form.form_id not in form_whitelist:
+                    continue
 
-    conn: Any = duckdb.connect(db_path, config={"threads": "1"})
-    try:
-        for form in forms:
-            if form.form_id is None or form.form_key is None:
-                continue
-            if form_whitelist is not None and form.form_id not in form_whitelist:
-                continue
+                _validate_duckdb_identifier(form.form_key)
 
-            _validate_duckdb_identifier(form.form_key)
-
-            variables = variables_by_form.get(form.form_id, [])
-            variable_keys = [
-                v.variable_name
-                for v in variables
-                if variable_whitelist is None or v.variable_name in variable_whitelist
-            ]
-            label_map = {
-                v.variable_name: v.label for v in variables if v.variable_name in variable_keys
-            }
-            record_model = mapper._build_record_model(variable_keys, label_map)
-            if use_mock_fetch:
+                variables = variables_by_form.get(form.form_id, [])
+                variable_keys = [
+                    v.variable_name
+                    for v in variables
+                    if variable_whitelist is None or v.variable_name in variable_whitelist
+                ]
+                label_map = {
+                    v.variable_name: v.label for v in variables if v.variable_name in variable_keys
+                }
+                record_model = mapper._build_record_model(variable_keys, label_map)
                 records = mapper._fetch_records(
                     study_key,
                     extra_filters={"formId": form.form_id},
                 )
                 rows, _ = mapper._parse_records(records, record_model)
                 if pipeline is not None and not has_native_enrichment:
-                    rows = [pipeline.process(r, mask_phi=effective_mask_phi) for r in rows]
+                    rows = [pipeline.process(r, mask_phi=config.mask_phi) for r in rows]
                 df = mapper._build_dataframe(
                     rows,
                     variable_keys,
@@ -2423,7 +3345,7 @@ def export_to_duckdb_by_form(
                     df.columns = df.columns.astype(str)
                     dup_mask = df.columns.str.lower().duplicated()
                     df = df.loc[:, ~dup_mask]
-                    if effective_mask_phi:
+                    if config.mask_phi:
                         df = _mask_df(df, phi_keys=phi_keys)
 
                 if (
@@ -2442,81 +3364,108 @@ def export_to_duckdb_by_form(
                     )
                 finally:
                     conn.unregister(_DUCKDB_DF_ALIAS)
-                continue
+        finally:
+            conn.close()
+        return
 
-            form_contract_types = _build_tabular_contract_types(
-                variable_keys,
-                label_map,
-                variables,
-                use_labels_as_columns=use_labels_as_columns,
-                mask_phi=effective_mask_phi,
-                pipeline=pipeline,
-            )
-            is_incremental = bool(
-                sink_kwargs.get("incremental")
-                or sink_kwargs.get("modified_since") is not None
-                or sink_kwargs.get("state_provider") is not None
-            )
-            form_filter = _merge_form_whitelist_into_filter(record_filter, [form.form_id])
-            raw_stream = iter_filtered_sdk_records(
+    for form in forms:
+        if form.form_id is None or form.form_key is None:
+            continue
+        if form_whitelist is not None and form.form_id not in form_whitelist:
+            continue
+
+        _validate_duckdb_identifier(form.form_key)
+
+        variables = variables_by_form.get(form.form_id, [])
+        variable_keys = [
+            v.variable_name
+            for v in variables
+            if variable_whitelist is None or v.variable_name in variable_whitelist
+        ]
+        label_map = {
+            v.variable_name: v.label for v in variables if v.variable_name in variable_keys
+        }
+        record_model = mapper._build_record_model(variable_keys, label_map)
+        form_contract_types = _build_tabular_contract_types(
+            variable_keys,
+            label_map,
+            variables,
+            use_labels_as_columns=use_labels_as_columns,
+            mask_phi=config.mask_phi,
+            pipeline=pipeline,
+        )
+        form_stream_name = (
+            f"{config.stream_name}_{form.form_key}" if config.stream_name is not None else None
+        )
+        form_config = TabularSinkConfig(
+            study_key=study_key,
+            manifest_path=config.manifest_path,
+            pandas_kwargs=dict(config.pandas_kwargs),
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_keys,
+            form_whitelist=[form.form_id],
+            batch_size=config.batch_size,
+            max_retries=config.max_retries,
+            retry_backoff=config.retry_backoff,
+            idempotent=config.idempotent,
+            mask_phi=config.mask_phi,
+            extra=dict(config.extra),
+            quality_gate_enabled=config.quality_gate_enabled,
+            min_schema_readiness_score=config.min_schema_readiness_score,
+            tracer=config.tracer,
+            modified_since=config.modified_since,
+            record_filter=config.record_filter,
+            record_data_filter=config.record_data_filter,
+            include_deleted=config.include_deleted,
+            incremental=config.incremental,
+            stream_name=form_stream_name,
+            ledger_path=config.ledger_path,
+            state_provider=config.state_provider,
+        )
+        form_sink = TabularDuckDBSink(
+            db_path,
+            form.form_key,
+            form_config,
+            contract_types=form_contract_types,
+        )
+        form_filter = _merge_form_whitelist_into_filter(form_config.record_filter, [form.form_id])
+
+        def _duckdb_form_records_source(
+            watermark: datetime | None,
+            exclude_deleted_upstream: bool,
+            _flt: Any = form_filter,
+            _rdf: str | None = form_config.record_data_filter,
+        ) -> Iterable[Any]:
+            return iter_filtered_sdk_records(
                 sdk,
                 study_key,
-                watermark=modified_since,
-                record_filter=form_filter,
-                record_data_filter=record_data_filter,
-                exclude_deleted_upstream=not include_deleted,
+                watermark=watermark,
+                record_filter=_flt,
+                record_data_filter=_rdf,
+                exclude_deleted_upstream=exclude_deleted_upstream,
             )
-            stream = (rec for rec in raw_stream if include_deleted or not is_record_deleted(rec))
-            wrote_any = False
-            untyped_null_cols: set[str] = set()
-            quoted_tbl = _quote_duckdb_identifier(form.form_key)
-            quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
-            for chunk in iter_batches(stream, batch_size):
-                rows, _ = mapper._parse_records(chunk, record_model)
-                if pipeline is not None and not has_native_enrichment:
-                    rows = [pipeline.process(r, mask_phi=effective_mask_phi) for r in rows]
-                df = mapper._build_dataframe(
-                    rows,
-                    variable_keys,
-                    label_map,
-                    use_labels_as_columns,
-                )
-                if isinstance(df, pd.DataFrame):
-                    df.columns = df.columns.astype(str)
-                    dup_mask = df.columns.str.lower().duplicated()
-                    df = df.loc[:, ~dup_mask]
-                    if effective_mask_phi:
-                        df = _mask_df(df, phi_keys=phi_keys)
-                if df.empty:
-                    continue
-                if not wrote_any:
-                    df_for_ddb = _apply_contract_to_all_null_df_columns(df, form_contract_types)
-                    untyped_null_cols = _collect_untyped_all_null_columns(df, form_contract_types)
-                else:
-                    df_for_ddb = _evolve_duckdb_table_for_df(
-                        conn,
-                        form.form_key,
-                        df,
-                        form_contract_types,
-                        untyped_null_cols,
-                    )
-                conn.register(_DUCKDB_DF_ALIAS, df_for_ddb)
-                try:
-                    if not wrote_any:
-                        conn.execute(
-                            f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
-                        )
-                        wrote_any = True
-                    else:
-                        conn.execute(
-                            f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
-                        )
-                finally:
-                    conn.unregister(_DUCKDB_DF_ALIAS)
-            if not wrote_any and not is_incremental:
-                _replace_duckdb_with_empty_table(conn, form.form_key, form_contract_types)
-    finally:
-        conn.close()
+
+        transform_sink = _TabularTransformSink(
+            form_sink,
+            mapper,
+            record_model,
+            variable_keys,
+            label_map,
+            form_config,
+            sanitize=False,
+            pipeline=pipeline,
+        )
+        run_streaming_export(
+            sdk,
+            study_key,
+            transform_sink,
+            form_config,
+            stream_name=f"duckdb_{form.form_key}",
+            batch_id_prefix=f"{study_key}/{form.form_key}",
+            records_source=_duckdb_form_records_source,
+            quality_gate_fn=apply_quality_gate,
+            iter_batches_fn=iter_batches,
+        )
 
 
 def export_to_sql_by_form(
@@ -2697,6 +3646,171 @@ def export_to_sql_by_form(
         )
 
 
+def _unpack_long_sql_rows(
+    records: Iterable[Any],
+    *,
+    mask_phi: bool,
+    pipeline: EnrichmentPipeline | None,
+    phi_keys: set[str] | None,
+) -> list[dict[str, Any]]:
+    """Unpack ``Record`` envelopes into normalized long-format variable rows with PHI masking."""
+    long_rows: list[dict[str, Any]] = []
+    for rec in records:
+        rec_id = extract_record_id(rec)
+        form_id = rec.get("form_id") if isinstance(rec, Mapping) else getattr(rec, "form_id", None)
+        timestamp = (
+            rec.get("date_modified")
+            if isinstance(rec, Mapping)
+            else getattr(rec, "date_modified", None)
+        )
+        raw_payload = (
+            rec.get("record_data") or rec.get("recordData")
+            if isinstance(rec, Mapping)
+            else getattr(rec, "record_data", None)
+        )
+        rec_payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+        if pipeline is not None and rec_payload:
+            rec_payload = pipeline.process(rec_payload, mask_phi=mask_phi)
+        for name, value in rec_payload.items():
+            if not mask_phi:
+                masked_value = value
+            elif global_sensitivity_registry.is_sensitive(name) or _is_custom_phi_key(
+                name, phi_keys
+            ):
+                masked_value = "***MASKED***"
+            else:
+                masked_value = mask_clinical_phi(value)
+                if phi_keys:
+                    masked_value = mask_custom_phi_recursive(masked_value, phi_keys)
+            long_rows.append(
+                {
+                    "record_id": rec_id,
+                    "form_id": form_id,
+                    "variable_name": name,
+                    "value": masked_value,
+                    "timestamp": timestamp,
+                }
+            )
+    return long_rows
+
+
+class _LongSQLSink(ExportSink):
+    """Streaming sink for normalized long-format SQL tables supporting incremental upserts."""
+
+    _skip_auto_redact_batch = True
+
+    def __init__(
+        self,
+        table: str,
+        engine: Any,
+        config: TabularSinkConfig,
+        *,
+        chunk_size: int,
+        pipeline: EnrichmentPipeline | None,
+    ) -> None:
+        super().__init__(config)
+        self.table = table
+        self.engine = engine
+        self._cfg = config
+        self._chunk_size = max(1, chunk_size)
+        self._pipeline = pipeline
+        self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+        self._is_incremental_sync = _is_incremental_config(config)
+        self._is_first_write = True
+        self._initial_if_exists: Literal["replace", "append"] = (
+            "append" if (self._is_incremental_sync or not config.idempotent) else "replace"
+        )
+
+    def _delete_record_ids(self, record_ids: Sequence[Any]) -> int:
+        if not record_ids or isinstance(self.engine, NonCallableMock):
+            return 0
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import text as sa_text
+
+        inspector = sa_inspect(self.engine)
+        if not inspector.has_table(self.table):
+            return 0
+        existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
+        if "record_id" not in existing_cols:
+            return 0
+        preparer = self.engine.dialect.identifier_preparer
+        quoted_table = preparer.quote(self.table)
+        quoted_col = preparer.quote("record_id")
+        params = {f"id_{idx}": rid for idx, rid in enumerate(record_ids)}
+        placeholders = ", ".join(f":{k}" for k in params)
+        stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
+        with self.engine.begin() as conn:
+            conn.execute(stmt, params)
+        return len(record_ids)
+
+    def _write_long_chunks(self, long_rows: list[dict[str, Any]]) -> None:
+        for start in range(0, len(long_rows), self._chunk_size):
+            chunk = long_rows[start : start + self._chunk_size]
+            if_exists: Literal["replace", "append"] = (
+                self._initial_if_exists if self._is_first_write else "append"
+            )
+            pd.DataFrame(chunk).to_sql(
+                self.table,
+                self.engine,
+                if_exists=if_exists,
+                index=False,
+            )
+            self._is_first_write = False
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        if not records:
+            return 0
+        incoming_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        long_rows = _unpack_long_sql_rows(
+            records,
+            mask_phi=self._cfg.mask_phi,
+            pipeline=self._pipeline,
+            phi_keys=self._phi_keys,
+        )
+
+        def execute_export() -> int:
+            if (
+                self._is_incremental_sync
+                and self._cfg.idempotent
+                and self._initial_if_exists == "append"
+                and incoming_ids
+            ):
+                self._delete_record_ids(incoming_ids)
+            if long_rows:
+                self._write_long_chunks(long_rows)
+            return len(records)
+
+        return self._execute_with_retry("export_long_sql", batch_id, execute_export)
+
+    def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        if not self._cfg.idempotent or not records or isinstance(self.engine, NonCallableMock):
+            return 0
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if not record_ids:
+            return 0
+        return self._execute_with_retry(
+            "reconcile_long_sql_deleted",
+            batch_id,
+            lambda: self._delete_record_ids(record_ids),
+        )
+
+    def flush(self) -> None:
+        if (
+            self._is_first_write
+            and self._cfg.idempotent
+            and not self._is_incremental_sync
+            and not isinstance(self.engine, NonCallableMock)
+        ):
+            empty_df = pd.DataFrame(
+                columns=["record_id", "form_id", "variable_name", "value", "timestamp"]
+            )
+            empty_df.to_sql(self.table, self.engine, if_exists="replace", index=False)
+            self._is_first_write = False
+
+    def close(self) -> None:
+        """Close the sink."""
+
+
 def export_to_long_sql(
     sdk: ImednetClient,
     study_key: str,
@@ -2715,70 +3829,58 @@ def export_to_long_sql(
         )
     from sqlalchemy import create_engine
 
-    sink_kwargs = _pop_sink_kwargs(kwargs)
-    effective_mask_phi = bool(sink_kwargs.get("mask_phi", mask_phi))
+    manifest_path = kwargs.pop("manifest_path", None)
+    config = _build_tabular_sink_config(
+        study_key,
+        kwargs,
+        manifest_path=manifest_path,
+        mask_phi=mask_phi,
+    )
     engine = create_engine(conn_str)
-    mapper = _create_record_mapper(sdk, mask_phi=effective_mask_phi)
-    if _uses_mock_fetch_records(mapper) and not _has_streaming_kwargs(sink_kwargs):
-        records: Iterable[Any] = mapper._fetch_records(study_key)
-    else:
-        records = iter_filtered_sdk_records(
-            sdk,
-            study_key,
-            watermark=sink_kwargs.get("modified_since"),
-            record_filter=sink_kwargs.get("record_filter"),
-            record_data_filter=sink_kwargs.get("record_data_filter"),
-            exclude_deleted_upstream=not bool(sink_kwargs.get("include_deleted", False)),
-        )
-
-    include_deleted = bool(sink_kwargs.get("include_deleted", False))
+    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
     pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-    rows: list[dict[str, Any]] = []
-    first = True
-    for rec in records:
-        if not include_deleted and is_record_deleted(rec):
-            continue
-        timestamp = rec.date_modified
-        rec_payload = dict(rec.record_data or {})
-        if pipeline is not None and rec_payload:
-            rec_payload = pipeline.process(rec_payload, mask_phi=effective_mask_phi)
-        for name, value in rec_payload.items():
-            if not effective_mask_phi:
-                masked_value = value
-            elif global_sensitivity_registry.is_sensitive(name) or _is_custom_phi_key(
-                name, phi_keys
-            ):
-                masked_value = "***MASKED***"
-            else:
-                masked_value = mask_clinical_phi(value)
-                if phi_keys:
-                    masked_value = mask_custom_phi_recursive(masked_value, phi_keys)
 
-            rows.append(
-                {
-                    "record_id": rec.record_id,
-                    "form_id": rec.form_id,
-                    "variable_name": name,
-                    "value": masked_value,
-                    "timestamp": timestamp,
-                }
-            )
-            if len(rows) >= chunk_size:
-                df = pd.DataFrame(rows)
-                df.to_sql(
-                    table_name,
-                    engine,
-                    if_exists="replace" if first else "append",
-                    index=False,
-                )
-                rows = []
-                first = False
-    if rows:
-        df = pd.DataFrame(rows)
-        df.to_sql(
-            table_name,
-            engine,
-            if_exists="replace" if first else "append",
-            index=False,
+    if _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config):
+        legacy_records = (
+            rec
+            for rec in mapper._fetch_records(study_key)
+            if config.include_deleted or not is_record_deleted(rec)
         )
+        long_rows = _unpack_long_sql_rows(
+            legacy_records,
+            mask_phi=config.mask_phi,
+            pipeline=pipeline,
+            phi_keys=phi_keys,
+        )
+        first = True
+        for start in range(0, len(long_rows), max(1, chunk_size)):
+            df = pd.DataFrame(long_rows[start : start + max(1, chunk_size)])
+            df.to_sql(
+                table_name,
+                engine,
+                if_exists="replace" if first else "append",
+                index=False,
+            )
+            first = False
+        return
+
+    long_sink = _LongSQLSink(
+        table_name,
+        engine,
+        config,
+        chunk_size=chunk_size,
+        pipeline=pipeline,
+    )
+    records_source = _make_mapper_records_source(sdk, study_key, mapper, config)
+    run_streaming_export(
+        sdk,
+        study_key,
+        long_sink,
+        config,
+        stream_name=f"long_sql_{table_name}",
+        batch_id_prefix=f"{study_key}/long_sql/{table_name}",
+        records_source=records_source,
+        quality_gate_fn=apply_quality_gate,
+        iter_batches_fn=iter_batches,
+    )

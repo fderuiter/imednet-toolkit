@@ -1801,7 +1801,10 @@ def test_sdtm_variable_whitelist_projection_and_custom_domain_phi(
                 "LBDTC": "2026-05-02 08:15:00",
                 "BRTHDTC": "1980-04-12",
                 "droppedExtra": "ignore-me",
-                "auditMeta": {"patientName": "Alice Smith", "secretTag": "TAG-9"},
+                "auditMeta": {
+                    "patientName": "Alice Smith",
+                    "secretTag": "TAG-9",  # pragma: allowlist secret
+                },
             },
         ),
         {
@@ -1812,7 +1815,10 @@ def test_sdtm_variable_whitelist_projection_and_custom_domain_phi(
                 "LBDTC": "2026-05-01 07:00:00",
                 "BRTHDTC": "1975-11-30",
                 "droppedExtra": "ignore-dict",
-                "auditMeta": {"patientName": "Bob Jones", "secretTag": "TAG-1"},
+                "auditMeta": {
+                    "patientName": "Bob Jones",
+                    "secretTag": "TAG-1",  # pragma: allowlist secret
+                },
             },
         },
     ]

@@ -100,3 +100,43 @@ async def test_universal_executor_async():
     with pytest.raises(ValueError, match="Async Error"):
         await executor.execute_async(task_factory)
     assert attempts == 2
+
+
+class SelectiveOperationRetryPolicy(DefaultOperationRetryPolicy):
+    """Retry RuntimeError but reject ValueError as deterministic caller input error."""
+
+    def should_retry(self, exception: Exception) -> bool:
+        return not isinstance(exception, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_universal_executor_skips_failure_accounting_for_non_retriable_errors():
+    """Verify non-retriable input errors do not increment circuit breaker failures."""
+    from imednet.core.operations.circuit_breaker import CircuitBreaker, CircuitState
+
+    breaker = CircuitBreaker(failure_threshold=2, recovery_timeout=10.0)
+    executor = UniversalExecutor(
+        retry_config=RetryConfig(
+            retries=2,
+            backoff_factor=0.0,
+            retry_policy=SelectiveOperationRetryPolicy(),
+        ),
+        circuit_breaker=breaker,
+    )
+
+    for _ in range(5):
+        with pytest.raises(ValueError, match="bad payload"):
+            executor.execute(lambda: (_ for _ in ()).throw(ValueError("bad payload")))
+
+    assert breaker.state == CircuitState.CLOSED
+    assert breaker.consecutive_failures == 0
+
+    async def bad_async() -> str:
+        raise ValueError("bad async payload")
+
+    for _ in range(5):
+        with pytest.raises(ValueError, match="bad async payload"):
+            await executor.execute_async(bad_async)
+
+    assert breaker.state == CircuitState.CLOSED
+    assert breaker.consecutive_failures == 0
