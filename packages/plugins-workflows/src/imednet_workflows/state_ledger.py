@@ -6,8 +6,10 @@ import abc
 import contextlib
 import json
 import os
+import sys
 import tempfile
-from collections.abc import Generator
+import uuid
+from collections.abc import Generator, Mapping
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -460,99 +462,247 @@ class FileStateProvider(BaseStateProvider):
 ExtractionStateLedger = FileStateProvider
 
 
-class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
+class AirflowStateProvider(BaseStateProvider):
     """Manages transactional state using Airflow XCom metadata."""
 
     def _get_xcom_key(self, study_key: str, stream_name: str) -> str:
         return f"state_{study_key}_{stream_name}"
 
+    @staticmethod
+    def _parse_iso_utc(raw_value: Any) -> datetime | None:
+        if isinstance(raw_value, datetime):
+            return raw_value.replace(tzinfo=UTC) if raw_value.tzinfo is None else raw_value
+        if isinstance(raw_value, str):
+            try:
+                ts = datetime.fromisoformat(raw_value)
+            except ValueError:
+                return None
+            return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
+        return None
+
+    @staticmethod
+    def _parse_status(raw_status: Any) -> StreamExecutionStatus:
+        if isinstance(raw_status, StreamExecutionStatus):
+            return raw_status
+        if isinstance(raw_status, str):
+            try:
+                return StreamExecutionStatus(raw_status.lower())
+            except ValueError:
+                return StreamExecutionStatus.FAILED
+        return StreamExecutionStatus.FAILED
+
+    @staticmethod
+    def _get_active_ti() -> tuple[bool, Any | None]:
+        """Resolve the active Airflow TaskInstance when executing inside a task context."""
+        sdk_missing = False
+        try:
+            from airflow.sdk import get_current_context as sdk_get_current_context
+
+            try:
+                context = sdk_get_current_context()
+                if isinstance(context, Mapping) and context.get("ti") is not None:
+                    return True, context["ti"]
+            except Exception:  # noqa: S110
+                pass
+        except ImportError:
+            sdk_missing = True
+
+        legacy_mod = sys.modules.get("airflow.operators.python")
+        if legacy_mod is not None or sdk_missing:
+            try:
+                legacy_get_ctx: Any = None
+                if legacy_mod is not None:
+                    legacy_get_ctx = getattr(legacy_mod, "get_current_context", None)
+                else:
+                    from airflow.operators.python import (
+                        get_current_context as _legacy_get_ctx,
+                    )
+
+                    legacy_get_ctx = _legacy_get_ctx
+                if callable(legacy_get_ctx):
+                    context = legacy_get_ctx()
+                    if isinstance(context, Mapping) and context.get("ti") is not None:
+                        return True, context["ti"]
+            except Exception:  # noqa: S110
+                pass
+
+        return False, None
+
+    @classmethod
+    def _pull_xcom_dict(cls, ti: Any, key: str) -> dict[str, Any] | None:
+        """Pull the most recent task-scoped XCom payload for ``ti``."""
+        task_id = getattr(ti, "task_id", None)
+        map_index = getattr(ti, "map_index", None)
+        if task_id is None:
+            val = ti.xcom_pull(key=key, include_prior_dates=True)
+        elif type(map_index) is int:
+            try:
+                val = ti.xcom_pull(
+                    task_ids=task_id,
+                    key=key,
+                    include_prior_dates=True,
+                    map_indexes=map_index,
+                )
+            except TypeError:
+                try:
+                    val = ti.xcom_pull(
+                        task_ids=task_id,
+                        key=key,
+                        include_prior_dates=True,
+                    )
+                except TypeError:
+                    val = ti.xcom_pull(key=key, include_prior_dates=True)
+        else:
+            try:
+                val = ti.xcom_pull(
+                    task_ids=task_id,
+                    key=key,
+                    include_prior_dates=True,
+                )
+            except TypeError:
+                val = ti.xcom_pull(key=key, include_prior_dates=True)
+
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, (list, tuple)):
+            dicts = [item for item in val if isinstance(item, dict)]
+            if not dicts:
+                return None
+            return max(
+                dicts,
+                key=lambda item: (
+                    cls._parse_iso_utc(item.get("last_timestamp"))
+                    or datetime.min.replace(tzinfo=UTC)
+                ),
+            )
+        return None
+
+    @staticmethod
+    def _deserialize_xcom_row(xcom_model_cls: Any, row: Any) -> dict[str, Any] | None:
+        """Decode an ``XComModel`` ORM row payload into a state dictionary."""
+        raw_val = getattr(row, "value", None)
+        if isinstance(raw_val, dict):
+            return raw_val
+        deserialize = getattr(xcom_model_cls, "deserialize_value", None)
+        if callable(deserialize):
+            try:
+                decoded = deserialize(row)
+                if isinstance(decoded, dict):
+                    return decoded
+            except Exception:  # noqa: S110
+                pass
+        if isinstance(raw_val, (bytes, bytearray)):
+            raw_val = raw_val.decode("utf-8", errors="ignore")
+        if isinstance(raw_val, str):
+            try:
+                parsed = json.loads(raw_val)
+                if isinstance(parsed, dict):
+                    return parsed
+            except ValueError:
+                pass
+        return None
+
+    def _query_latest_xcom_dict(self, study_key: str, stream_name: str) -> dict[str, Any] | None:
+        """Query the latest state payload from ``XComModel`` outside task execution."""
+        try:
+            from airflow.models.xcom import XComModel
+            from airflow.utils.session import create_session
+            from sqlalchemy import select
+        except ImportError:
+            return None
+
+        key = self._get_xcom_key(study_key, stream_name)
+        with create_session() as session:
+            row = session.scalars(
+                select(XComModel)
+                .where(XComModel.key == key)
+                .order_by(XComModel.timestamp.desc())
+                .limit(1)
+            ).first()
+            if row is None:
+                return None
+            return self._deserialize_xcom_row(XComModel, row)
+
+    @staticmethod
+    def _ensure_manual_task_instance(
+        session: Any,
+        *,
+        dag_id: str,
+        task_id: str,
+        run_id: str,
+        logical_date: datetime,
+    ) -> None:
+        """Ensure prerequisite ``DagRun`` and ``TaskInstance`` rows exist for manual XCom writes."""
+        from airflow.models.dagrun import DagRun
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.utils.state import DagRunState, TaskInstanceState
+        from airflow.utils.types import DagRunType
+        from sqlalchemy import insert, select
+
+        existing_dr_id = session.scalar(
+            select(DagRun.id).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id)
+        )
+        if existing_dr_id is None:
+            session.add(
+                DagRun(
+                    dag_id=dag_id,
+                    run_id=run_id,
+                    run_type=DagRunType.MANUAL,
+                    logical_date=logical_date,
+                    run_after=logical_date,
+                    state=DagRunState.SUCCESS,
+                )
+            )
+            session.flush()
+
+        existing_ti = session.scalar(
+            select(TaskInstance.task_id).where(
+                TaskInstance.dag_id == dag_id,
+                TaskInstance.task_id == task_id,
+                TaskInstance.run_id == run_id,
+                TaskInstance.map_index == -1,
+            )
+        )
+        if existing_ti is None:
+            session.execute(
+                insert(TaskInstance).values(
+                    task_id=task_id,
+                    dag_id=dag_id,
+                    run_id=run_id,
+                    map_index=-1,
+                    pool="default_pool",
+                    pool_slots=1,
+                    state=TaskInstanceState.SUCCESS,
+                )
+            )
+            session.flush()
+
     def get_last_timestamp(self, study_key: str, stream_name: str) -> datetime | None:
         """Returns the high-water mark timestamp from Airflow XCom."""
-        try:
-            from airflow.operators.python import get_current_context
+        in_context, ti = self._get_active_ti()
+        if in_context:
+            val = self._pull_xcom_dict(ti, self._get_xcom_key(study_key, stream_name))
+            if val is not None and "last_timestamp" in val:
+                return self._parse_iso_utc(val["last_timestamp"])
+            return None
 
-            context = get_current_context()
-            ti = context["ti"]
-            # Pull from prior dates to get the last successful high-water mark across runs
-            val = ti.xcom_pull(
-                key=self._get_xcom_key(study_key, stream_name), include_prior_dates=True
-            )
-            if val and isinstance(val, dict) and "last_timestamp" in val:
-                return datetime.fromisoformat(val["last_timestamp"])
-        except Exception:  # noqa: S110
-            pass
-
-        # Fallback to DB query if not running within a context
-        try:
-            from airflow.models.xcom import XCom
-            from airflow.utils.session import provide_session
-
-            @provide_session  # type: ignore[misc]
-            def _get_xcom(session: Any = None) -> Any:
-                # Query the latest XCom for this key
-                return (
-                    session.query(XCom)
-                    .filter(XCom.key == self._get_xcom_key(study_key, stream_name))
-                    .order_by(XCom.timestamp.desc())
-                    .first()
-                )
-
-            xcom_obj = _get_xcom()
-            if xcom_obj and isinstance(xcom_obj.value, dict) and "last_timestamp" in xcom_obj.value:
-                return datetime.fromisoformat(xcom_obj.value["last_timestamp"])
-        except ImportError:
-            pass
+        payload = self._query_latest_xcom_dict(study_key, stream_name)
+        if payload is not None and "last_timestamp" in payload:
+            return self._parse_iso_utc(payload["last_timestamp"])
         return None
 
     def get_last_status(self, study_key: str, stream_name: str) -> StreamExecutionStatus | None:
         """Returns the execution status from Airflow XCom."""
-        try:
-            from airflow.operators.python import get_current_context
+        in_context, ti = self._get_active_ti()
+        if in_context:
+            val = self._pull_xcom_dict(ti, self._get_xcom_key(study_key, stream_name))
+            if val is not None and "status" in val:
+                return self._parse_status(val["status"])
+            return None
 
-            context = get_current_context()
-            ti = context["ti"]
-            val = ti.xcom_pull(
-                key=self._get_xcom_key(study_key, stream_name), include_prior_dates=True
-            )
-            if val and isinstance(val, dict) and "status" in val:
-                raw_status = val["status"]
-                if isinstance(raw_status, StreamExecutionStatus):
-                    return raw_status
-                if isinstance(raw_status, str):
-                    try:
-                        return StreamExecutionStatus(raw_status.lower())
-                    except ValueError:
-                        return StreamExecutionStatus.FAILED
-                return StreamExecutionStatus.FAILED
-        except Exception:  # noqa: S110
-            pass
-
-        try:
-            from airflow.models.xcom import XCom
-            from airflow.utils.session import provide_session
-
-            @provide_session  # type: ignore[misc]
-            def _get_xcom(session: Any = None) -> Any:
-                return (
-                    session.query(XCom)
-                    .filter(XCom.key == self._get_xcom_key(study_key, stream_name))
-                    .order_by(XCom.timestamp.desc())
-                    .first()
-                )
-
-            xcom_obj = _get_xcom()
-            if xcom_obj and isinstance(xcom_obj.value, dict) and "status" in xcom_obj.value:
-                raw_status = xcom_obj.value["status"]
-                if isinstance(raw_status, StreamExecutionStatus):
-                    return raw_status
-                if isinstance(raw_status, str):
-                    try:
-                        return StreamExecutionStatus(raw_status.lower())
-                    except ValueError:
-                        return StreamExecutionStatus.FAILED
-                return StreamExecutionStatus.FAILED
-        except ImportError:
-            pass
+        payload = self._query_latest_xcom_dict(study_key, stream_name)
+        if payload is not None and "status" in payload:
+            return self._parse_status(payload["status"])
         return None
 
     def set_last_timestamp(
@@ -567,12 +717,15 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
         force: bool = False,
     ) -> None:
         """Sets the high-water mark timestamp atomically using Airflow XCom."""
+        _ = force
         validated_status = _coerce_and_validate_status(status)
 
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=UTC)
 
         val = {
+            "study_key": study_key,
+            "stream_name": stream_name,
             "last_timestamp": timestamp.isoformat(),
             "records_processed": records_processed,
             "status": validated_status.value,
@@ -580,38 +733,43 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
             "metadata": metadata or {},
         }
 
-        try:
-            from airflow.operators.python import get_current_context
-
-            context = get_current_context()
-            ti = context["ti"]
+        in_context, ti = self._get_active_ti()
+        if in_context and ti is not None:
             ti.xcom_push(key=self._get_xcom_key(study_key, stream_name), value=val)
             return
-        except Exception:  # noqa: S110
-            pass
 
-        # Fallback to DB if out of context but within Airflow environment
+        # Out-of-context persistence via Airflow 3 XComModel
         try:
-            from airflow.models.xcom import XCom
+            from airflow.models.xcom import XComModel
+            from airflow.utils.session import create_session
+        except ImportError:
+            return
 
-            dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID", "manual_state_sync")
-            task_id = os.environ.get("AIRFLOW_CTX_TASK_ID", "manual_state_sync")
-            exec_date_str = os.environ.get("AIRFLOW_CTX_EXECUTION_DATE")
+        now = datetime.now(UTC)
+        dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID", "manual_state_sync")
+        task_id = os.environ.get("AIRFLOW_CTX_TASK_ID", "manual_state_sync")
+        run_id = (
+            os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
+            or f"manual__{now.isoformat()}_{uuid.uuid4().hex[:8]}"
+        )
 
-            if exec_date_str:
-                exec_date = datetime.fromisoformat(exec_date_str)
-            else:
-                exec_date = datetime.now(UTC)
-
-            XCom.set(
+        with create_session() as session:
+            self._ensure_manual_task_instance(
+                session,
+                dag_id=dag_id,
+                task_id=task_id,
+                run_id=run_id,
+                logical_date=now,
+            )
+            XComModel.set(
                 key=self._get_xcom_key(study_key, stream_name),
                 value=val,
-                task_id=task_id,
                 dag_id=dag_id,
-                execution_date=exec_date,
+                task_id=task_id,
+                run_id=run_id,
+                map_index=-1,
+                session=session,
             )
-        except ImportError:
-            pass
 
     @contextlib.contextmanager
     def transaction(
@@ -675,73 +833,92 @@ class AirflowStateProvider(BaseStateProvider):  # pragma: no cover
             raise
 
     def delete_entry(self, study_key: str, stream_name: str | None = None) -> bool:
-        """Deletes a study or specific stream entry from XCom."""
+        """Deletes a study or specific stream entry from XComModel."""
         try:
-            from airflow.models.xcom import XCom
-            from airflow.utils.session import provide_session
-
-            @provide_session  # type: ignore[misc]
-            def _delete_xcom(session: Any = None) -> bool:
-                query = session.query(XCom)
-                if stream_name:
-                    query = query.filter(XCom.key == self._get_xcom_key(study_key, stream_name))
-                else:
-                    query = query.filter(XCom.key.like(f"state_{study_key}_%"))
-
-                deleted = query.delete(synchronize_session=False)
-                return deleted > 0  # type: ignore[no-any-return]
-
-            return bool(_delete_xcom())
+            from airflow.models.xcom import XComModel
+            from airflow.utils.session import create_session
+            from sqlalchemy import delete, select
         except ImportError:
             return False
 
+        with create_session() as session:
+            if stream_name:
+                result = session.execute(
+                    delete(XComModel).where(
+                        XComModel.key == self._get_xcom_key(study_key, stream_name)
+                    )
+                )
+                return int(getattr(result, "rowcount", 0) or 0) > 0
+
+            rows = session.scalars(select(XComModel).where(XComModel.key.like("state_%"))).all()
+            prefix = f"state_{study_key}_"
+            matching_keys = set()
+            for row in rows:
+                payload = self._deserialize_xcom_row(XComModel, row)
+                if isinstance(payload, dict) and "study_key" in payload:
+                    if payload["study_key"] == study_key:
+                        matching_keys.add(row.key)
+                elif isinstance(row.key, str) and row.key.startswith(prefix):
+                    matching_keys.add(row.key)
+
+            if not matching_keys:
+                return False
+
+            result = session.execute(delete(XComModel).where(XComModel.key.in_(matching_keys)))
+            return int(getattr(result, "rowcount", 0) or 0) > 0
+
     def read_state(self) -> LedgerState:
-        """Reads and validates the current full state from XComs for CLI display."""
+        """Reads and validates the current full state from XComModel for CLI display."""
         state = LedgerState()
         try:
-            from airflow.models.xcom import XCom
-            from airflow.utils.session import provide_session
+            from airflow.models.xcom import XComModel
+            from airflow.utils.session import create_session
+            from sqlalchemy import select
+        except ImportError:
+            return state
 
-            @provide_session  # type: ignore[misc]
-            def _get_all_xcoms(session: Any = None) -> Any:
-                return (
-                    session.query(XCom)
-                    .filter(XCom.key.like("state_%"))
-                    .order_by(XCom.timestamp.desc())
-                    .all()
+        with create_session() as session:
+            xcoms = session.scalars(
+                select(XComModel)
+                .where(XComModel.key.like("state_%"))
+                .order_by(XComModel.timestamp.desc())
+            ).all()
+
+            processed_keys: set[str] = set()
+            for row in xcoms:
+                row_key = getattr(row, "key", None)
+                if not isinstance(row_key, str) or row_key in processed_keys:
+                    continue
+                processed_keys.add(row_key)
+
+                val = self._deserialize_xcom_row(XComModel, row)
+                if not isinstance(val, dict) or "last_timestamp" not in val:
+                    continue
+
+                s_key: str | None = str(val["study_key"]) if "study_key" in val else None
+                s_name: str | None = str(val["stream_name"]) if "stream_name" in val else None
+                if not s_key or not s_name:
+                    parts = row_key.split("_", 2)
+                    if len(parts) == 3 and parts[0] == "state":
+                        s_key = parts[1]
+                        s_name = parts[2]
+
+                if not s_key or not s_name:
+                    continue
+
+                ts = self._parse_iso_utc(val["last_timestamp"])
+                if ts is None:
+                    continue
+
+                study = state.studies.setdefault(s_key, StudyState())
+                study.streams[s_name] = StreamState(
+                    last_timestamp=ts,
+                    records_processed=int(val.get("records_processed", 0)),
+                    last_run_status=self._parse_status(val.get("status", "success")),
+                    error_message=val.get("error_message"),
+                    metadata=val.get("metadata") or {},
                 )
 
-            xcoms = _get_all_xcoms()
-
-            # To avoid duplicates if there are multiple XComs for the same key over time,
-            # keep track of keys processed. Since it's ordered by desc, first one is latest.
-            processed_keys = set()
-            for x in xcoms:
-                if x.key in processed_keys:
-                    continue
-                processed_keys.add(x.key)
-
-                parts = x.key.split("_", 2)
-                if len(parts) == 3 and parts[0] == "state":
-                    s_key = parts[1]
-                    s_name = parts[2]
-
-                    val = x.value
-                    if isinstance(val, dict) and "last_timestamp" in val:
-                        ts = datetime.fromisoformat(val["last_timestamp"])
-                        if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=UTC)
-
-                        study = state.studies.setdefault(s_key, StudyState())
-                        study.streams[s_name] = StreamState(
-                            last_timestamp=ts,
-                            records_processed=val.get("records_processed", 0),
-                            last_run_status=val.get("status", "success"),
-                            error_message=val.get("error_message"),
-                            metadata=val.get("metadata", {}),
-                        )
-        except ImportError:
-            pass
         return state
 
 

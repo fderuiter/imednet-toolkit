@@ -552,6 +552,7 @@ def _setup_airflow_for_dag(monkeypatch):
     decorators_mod.task = _DummyTaskDecorator()
     airflow_mod.DAG = _DummyDAG
     airflow_mod.decorators = decorators_mod
+    airflow_mod.sdk.DAG = _DummyDAG
     airflow_mod.sdk.task = _DummyTaskDecorator()
     monkeypatch.setitem(sys.modules, "airflow.decorators", decorators_mod)
 
