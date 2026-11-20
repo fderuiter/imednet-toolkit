@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator, Iterator
 from contextlib import AbstractContextManager
-from typing import Literal, assert_type
+from typing import Any, Literal, assert_type
 
 from imednet_sinks.plugin import create_sinks
 
@@ -27,6 +27,7 @@ from imednet.models.records import Record
 from imednet.models.sites import Site
 from imednet.models.studies import Study
 from imednet.models.subjects import Subject, SubjectKeyword
+from imednet.models.triage import TriageItem
 from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
@@ -52,7 +53,13 @@ from imednet.plugins import (
 from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.utils.batch_coordinator import BatchSubmissionSummary
 from imednet.utils.job_poller import JobPollSummary
-from imednet_workflows import DataExtractionWorkflow, StudySchemaInspector, UATWorkflow, Workflows
+from imednet_workflows import (
+    DataExtractionWorkflow,
+    StudySchemaInspector,
+    TriageStore,
+    UATWorkflow,
+    Workflows,
+)
 
 
 def sync_contract(sdk: ImednetSDK) -> None:
@@ -168,6 +175,21 @@ def sync_contract(sdk: ImednetSDK) -> None:
     )
     assert_type(sdk.workflows.uat.run('S'), UATRunResultProtocol)
     assert_type(sdk.workflows.uat_inspector.inspect('S'), StudySnapshotProtocol)
+    assert_type(
+        sdk.workflows.query_management.get_open_queries('S', include_answered=True),
+        list[Query],
+    )
+    assert_type(sdk.workflows.query_management.get_unresolved_queries('S'), list[Query])
+    assert_type(
+        sdk.workflows.query_management.sync_queries_to_triage(
+            'S', store=TriageStore(), unresolved_only=True
+        ),
+        list[TriageItem],
+    )
+    assert_type(
+        sdk.workflows.record_mapper.build_hierarchy('S', records=[]),
+        list[dict[str, Any]],
+    )
 
     # Concrete synchronous sinks contracts
     assert_type(sdk.sinks, SinksNamespaceProtocol | None)

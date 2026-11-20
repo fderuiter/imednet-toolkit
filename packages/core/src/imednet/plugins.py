@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from .models.records import Record, RegisterSubjectRequest
     from .models.sites import Site
     from .models.subjects import Subject
+    from .models.triage import TriageItem, TriageStatus
     from .models.variables import Variable
     from .models.visits import Visit
     from .spi.facade import AsyncImednetFacade, ImednetFacade
@@ -136,6 +137,22 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
         ...
 
 
+class TriageStoreProtocol(Protocol):
+    """Structural contract for triage stores used by ``sdk.workflows.query_management``."""
+
+    def upsert_item(self, item: TriageItem) -> None:
+        """Insert or update a triage item while preserving annotations and history."""
+        ...
+
+    def get_triage_item(self, item_id: str) -> TriageItem | None:
+        """Fetch a single triage item by ID."""
+        ...
+
+    def get_queue(self, study_key: str, status: TriageStatus | None = None) -> list[TriageItem]:
+        """Fetch the triage queue for a study, optionally filtered by status."""
+        ...
+
+
 class QueryManagementWorkflowProtocol(Protocol):
     """Structural contract for ``sdk.workflows.query_management``."""
 
@@ -143,9 +160,19 @@ class QueryManagementWorkflowProtocol(Protocol):
         self,
         study_key: str,
         additional_filter: dict[str, Any] | None = None,
+        include_answered: bool = False,
         **kwargs: Any,
     ) -> list[Query]:
-        """Retrieve open queries for a study."""
+        """Retrieve open queries for a study, optionally including answered queries."""
+        ...
+
+    def get_unresolved_queries(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Retrieve all unresolved (OPEN and ANSWERED) queries for a study."""
         ...
 
     def get_queries_for_subject(
@@ -170,6 +197,19 @@ class QueryManagementWorkflowProtocol(Protocol):
 
     def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
         """Count queries grouped by query status."""
+        ...
+
+    def sync_queries_to_triage(
+        self,
+        study_key: str,
+        store: TriageStoreProtocol | str | Path | None = None,
+        *,
+        additional_filter: dict[str, Any] | None = None,
+        unresolved_only: bool = False,
+        default_severity: str = "medium",
+        **kwargs: Any,
+    ) -> list[TriageItem]:
+        """Synchronize clinical queries for a study into a local triage queue."""
         ...
 
 
@@ -218,6 +258,7 @@ class RecordMapperProtocol(Protocol):
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        records: Iterable[Record] | None = None,
     ) -> list[dict[str, Any]]:
         """Generate a nested JSON hierarchy for study records."""
         ...
@@ -1320,6 +1361,7 @@ __all__ = [
     "SyncSinksNamespaceProtocol",
     "SyncStudySchemaInspectorProtocol",
     "SyncWorkflowsNamespaceProtocol",
+    "TriageStoreProtocol",
     "UATRunResultProtocol",
     "UATWorkflowProtocol",
     "WorkflowsNamespaceProtocol",

@@ -16,9 +16,13 @@ from pathlib import Path
 
 EXCLUDED_DOC_DIRS = {"_build", "agents", "superpowers"}
 RST_DIRECTIVE_RE = re.compile(r"^(\s*)\.\.\s+(testcode|code-block|sourcecode)::(?:\s*(\S+))?\s*$")
+RST_LITERALINCLUDE_RE = re.compile(r"^(\s*)\.\.\s+literalinclude::\s+(\S+)\s*$")
 RST_OPTION_RE = re.compile(r"^:[a-zA-Z0-9_-]+:")
+RST_KV_OPTION_RE = re.compile(r"^\s+:([a-zA-Z0-9_-]+):(?:\s+(.*))?$")
 MD_FENCE_OPEN_RE = re.compile(r"^(\s*)```(?:python|py)\s*$")
 MD_FENCE_CLOSE_RE = re.compile(r"^\s*```\s*$")
+SHOWCASE_SDK_BLOCK_RE = re.compile(r"sdk:\s*\{(.*?)\n\s*\},?\s*rest:", re.DOTALL)
+SHOWCASE_SDK_ITEM_RE = re.compile(r"(\w+):\s*`([^`]+)`")
 MYPY_DIAG_RE = re.compile(r"^.*?([^/\\:]+\.py):(\d+):(.*)$")
 
 
@@ -202,8 +206,237 @@ def extract_docstring_snippets(py_path: Path, counter_start: int) -> list[Extrac
     return snippets
 
 
+def _slice_literalinclude_numbered(
+    target_text: str,
+    options: dict[str, str],
+) -> list[tuple[int, str]] | None:
+    """Slice target_text according to Sphinx literalinclude options, preserving 1-based line numbers."""
+    if "start-after" in options and "start-at" in options:
+        return None
+    if "end-before" in options and "end-at" in options:
+        return None
+
+    numbered = [(idx + 1, line) for idx, line in enumerate(target_text.splitlines(keepends=True))]
+
+    if "start-after" in options:
+        pattern = options["start-after"]
+        for idx, (_, line) in enumerate(numbered):
+            if pattern in line:
+                numbered = numbered[idx + 1 :]
+                break
+        else:
+            return None
+    elif "start-at" in options:
+        pattern = options["start-at"]
+        for idx, (_, line) in enumerate(numbered):
+            if pattern in line:
+                numbered = numbered[idx:]
+                break
+        else:
+            return None
+
+    if "end-before" in options:
+        pattern = options["end-before"]
+        for idx, (_, line) in enumerate(numbered):
+            if idx > 0 and pattern in line:
+                numbered = numbered[:idx]
+                break
+        else:
+            return None
+    elif "end-at" in options:
+        pattern = options["end-at"]
+        for idx, (_, line) in enumerate(numbered):
+            if pattern in line:
+                numbered = numbered[: idx + 1]
+                break
+        else:
+            return None
+
+    if "lines" in options:
+        linespec = options["lines"]
+        selected_indices: list[int] = []
+        try:
+            for raw_item in linespec.split(","):
+                item = raw_item.strip()
+                if not item:
+                    continue
+                if "-" in item:
+                    if item.count("-") > 1:
+                        return None
+                    start_str, end_str = item.split("-", 1)
+                    if not start_str.strip() and not end_str.strip():
+                        return None
+                    s = int(start_str) if start_str.strip() else 1
+                    e = int(end_str) if end_str.strip() else len(numbered)
+                    if s > e:
+                        return None
+                    for i in range(s - 1, min(e, len(numbered))):
+                        if i >= 0 and i not in selected_indices:
+                            selected_indices.append(i)
+                else:
+                    i = int(item) - 1
+                    if 0 <= i < len(numbered) and i not in selected_indices:
+                        selected_indices.append(i)
+        except ValueError:
+            return None
+        if not selected_indices and numbered:
+            return None
+        numbered = [numbered[i] for i in selected_indices]
+
+    if "dedent" in options:
+        dedent_val = options["dedent"]
+        if dedent_val:
+            try:
+                d = int(dedent_val)
+            except ValueError:
+                return None
+            if d < 0:
+                return None
+            numbered = [
+                (ln, line[d:] if len(line.rstrip("\r\n")) >= d else "\n") for ln, line in numbered
+            ]
+        else:
+            dedented_lines = textwrap.dedent("".join(line for _, line in numbered)).splitlines(
+                keepends=True
+            )
+            numbered = [
+                (orig_ln, ded_line)
+                for (orig_ln, _), ded_line in zip(numbered, dedented_lines, strict=False)
+            ]
+
+    cleaned = [(ln, line.rstrip("\r\n")) for ln, line in numbered]
+    while cleaned and cleaned[-1][1] == "":
+        cleaned.pop()
+    if not any(line.strip() for _, line in cleaned):
+        return None
+    return cleaned
+
+
+def extract_rst_literalinclude_snippets(
+    text: str,
+    rst_file: Path,
+    docs_dir: Path,
+    counter_start: int,
+) -> list[ExtractedSnippet]:
+    """Extract Python .. literalinclude:: slices from an RST file."""
+    lines = text.splitlines()
+    snippets: list[ExtractedSnippet] = []
+    idx = counter_start
+    n = len(lines)
+    i = 0
+
+    while i < n:
+        match = RST_LITERALINCLUDE_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+
+        target = match.group(2).strip("'\"")
+        i += 1
+        options: dict[str, str] = {}
+        while i < n:
+            curr = lines[i]
+            opt_match = RST_KV_OPTION_RE.match(curr)
+            if opt_match:
+                options[opt_match.group(1)] = (opt_match.group(2) or "").strip()
+                i += 1
+            elif not curr.strip():
+                has_next_opt = False
+                for next_i in range(i + 1, n):
+                    if not lines[next_i].strip():
+                        continue
+                    if RST_KV_OPTION_RE.match(lines[next_i]):
+                        has_next_opt = True
+                    break
+                if has_next_opt:
+                    i += 1
+                else:
+                    break
+            else:
+                break
+
+        resolved = (
+            (docs_dir / target.lstrip("/")).resolve()
+            if target.startswith("/")
+            else (rst_file.parent / target).resolve()
+        )
+        is_python = resolved.suffix == ".py" or options.get("language", "").lower() in (
+            "python",
+            "py",
+        )
+        if not is_python or not resolved.is_file():
+            continue
+
+        try:
+            target_text = resolved.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        sliced = _slice_literalinclude_numbered(target_text, options)
+        if not sliced:
+            continue
+
+        idx += 1
+        code = "\n".join(line for _, line in sliced)
+        line_map = {offset + 1: (resolved, orig_ln) for offset, (orig_ln, _) in enumerate(sliced)}
+        snippets.append(
+            ExtractedSnippet(
+                filename=f"rst_li_{idx}_{rst_file.stem}.py",
+                code=code,
+                line_map=line_map,
+            )
+        )
+
+    return snippets
+
+
+def extract_showcase_js_snippets(
+    showcase_js_path: Path,
+    counter_start: int,
+) -> list[ExtractedSnippet]:
+    """Extract SNIPPETS.sdk Python templates from docs/_static/showcase.js."""
+    if not showcase_js_path.is_file():
+        return []
+    try:
+        content = showcase_js_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    sdk_match = SHOWCASE_SDK_BLOCK_RE.search(content)
+    if not sdk_match:
+        return []
+
+    snippets: list[ExtractedSnippet] = []
+    idx = counter_start
+    sdk_body = sdk_match.group(1)
+    sdk_body_start = sdk_match.start(1)
+
+    for item_match in SHOWCASE_SDK_ITEM_RE.finditer(sdk_body):
+        scenario_name = item_match.group(1)
+        raw_template = item_match.group(2)
+        template_lineno = content[: sdk_body_start + item_match.start(2)].count("\n") + 1
+        code = textwrap.dedent(raw_template.replace(r"\n", "\n")).rstrip()
+        if not code.strip():
+            continue
+
+        idx += 1
+        code_lines = code.splitlines()
+        line_map = {
+            offset + 1: (showcase_js_path, template_lineno) for offset in range(len(code_lines))
+        }
+        snippets.append(
+            ExtractedSnippet(
+                filename=f"showcase_sdk_{idx}_{scenario_name}.py",
+                code=code,
+                line_map=line_map,
+            )
+        )
+
+    return snippets
+
+
 def collect_snippets(repo_root: Path) -> list[ExtractedSnippet]:
-    """Collect all Python code snippets from RST docs, Markdown files, and package docstrings."""
+    """Collect all Python code snippets from RST docs, literalinclude slices, Markdown files, showcase.js, and docstrings."""
     snippets: list[ExtractedSnippet] = []
     idx = 0
 
@@ -247,6 +480,14 @@ def collect_snippets(repo_root: Path) -> list[ExtractedSnippet]:
                         line_map=line_map,
                     )
                 )
+
+            li_snippets = extract_rst_literalinclude_snippets(text, rst_file, docs_dir, idx)
+            idx += len(li_snippets)
+            snippets.extend(li_snippets)
+
+        showcase_snippets = extract_showcase_js_snippets(docs_dir / "_static" / "showcase.js", idx)
+        idx += len(showcase_snippets)
+        snippets.extend(showcase_snippets)
 
     markdown_candidates: list[Path] = []
     root_readme = repo_root / "README.md"

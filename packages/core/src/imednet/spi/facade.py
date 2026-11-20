@@ -518,6 +518,7 @@ from imednet.plugins import (
     SyncSinksNamespaceProtocol,
     SyncStudySchemaInspectorProtocol,
     SyncWorkflowsNamespaceProtocol,
+    TriageStoreProtocol,
     WorkflowsNamespaceProtocol,
 )
 
@@ -533,5 +534,6 @@ __all__ = [
     "SyncSinksNamespaceProtocol",
     "SyncStudySchemaInspectorProtocol",
     "SyncWorkflowsNamespaceProtocol",
+    "TriageStoreProtocol",
     "WorkflowsNamespaceProtocol",
 ]
