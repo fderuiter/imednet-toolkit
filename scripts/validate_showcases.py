@@ -13,6 +13,7 @@ import contextlib
 import importlib
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -156,6 +157,23 @@ def _ast_exports_symbol(spec: ModuleSpec | None, symbol: str) -> bool | None:
     return False
 
 
+def _reset_orphaned_airflow_modules() -> None:
+    """Purge partial airflow.* entries left in sys.modules by mocked unit tests."""
+    airflow_mod = sys.modules.get("airflow")
+    utils_mod = sys.modules.get("airflow.utils")
+    if (
+        airflow_mod is None
+        or getattr(airflow_mod, "__file__", None) is None
+        or utils_mod is None
+        or getattr(utils_mod, "__file__", None) is None
+    ) and any(name == "airflow" or name.startswith("airflow.") for name in sys.modules):
+        for name in list(sys.modules):
+            if name == "airflow" or name.startswith(
+                ("airflow.", "apache_airflow_providers_imednet")
+            ):
+                sys.modules.pop(name, None)
+
+
 def is_symbol_available(mod: str, symbol: str) -> tuple[bool, str]:
     """Check whether an imported symbol exists on a resolved module or as a submodule.
 
@@ -180,6 +198,9 @@ def is_symbol_available(mod: str, symbol: str) -> tuple[bool, str]:
     with contextlib.suppress(ModuleNotFoundError, ValueError, AttributeError, ImportError):
         if importlib.util.find_spec(f"{mod}.{symbol}") is not None:
             return True, "resolved_submodule"
+
+    if top_level in ("airflow", "apache_airflow_providers_imednet"):
+        _reset_orphaned_airflow_modules()
 
     try:
         module_obj = importlib.import_module(mod)
@@ -508,6 +529,314 @@ def execute_showcases_in_simulation(
                         errors.append(
                             f"{py_file}: Workflow showcase produced empty output (silent no-op) in simulation mode"
                         )
+                elif "airflow" not in py_file.relative_to(examples_dir).parts:
+                    has_file_output = any(
+                        p.is_file() and p.stat().st_size > 0 for p in Path(run_cwd).rglob("*")
+                    )
+                    if not (proc.stdout.strip() or proc.stderr.strip() or has_file_output):
+                        errors.append(f"{py_file}: Produced empty output in simulation mode")
+
+    return errors
+
+
+_AIRFLOW_DAG_VALIDATION_RUNNER = """\
+import ast
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+import airflow
+from airflow.sdk import DAG as SdkDAG
+from apache_airflow_providers_imednet import ImednetExportOperator
+
+dag_classes = tuple({airflow.DAG, SdkDAG})
+
+airflow_dir = Path(sys.argv[1])
+export_root = Path(sys.argv[2])
+export_root.mkdir(parents=True, exist_ok=True)
+os.environ["IMEDNET_EXPORT_ROOT"] = str(export_root)
+
+errors: list[str] = []
+
+for dag_file in sorted(airflow_dir.glob("*.py")):
+    source = dag_file.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(dag_file))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == "schedule_interval":
+                    errors.append(
+                        f"{dag_file}:{node.lineno}: Deprecated Airflow 2 'schedule_interval' "
+                        "argument found; use 'schedule=None' for Airflow 3.x"
+                    )
+
+    spec = importlib.util.spec_from_file_location(f"_sim_dag_{dag_file.stem}", dag_file)
+    if spec is None or spec.loader is None:
+        errors.append(f"{dag_file}: Could not create module spec")
+        continue
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        errors.append(f"{dag_file}: Failed to import DAG under Airflow {airflow.__version__}: {exc}")
+        continue
+
+    dags = [val for val in vars(module).values() if isinstance(val, dag_classes)]
+    if not dags:
+        errors.append(f"{dag_file}: Did not define any airflow.DAG object")
+        continue
+
+    for dag in dags:
+        if getattr(dag, "schedule", "UNSET") is not None:
+            errors.append(f"{dag_file}: Expected dag.schedule to be None, got {dag.schedule!r}")
+
+        for task_obj in dag.tasks:
+            if isinstance(task_obj, ImednetExportOperator):
+                out_csv = export_root / f"{dag.dag_id}_{task_obj.task_id}.csv"
+                study_key = "STUDY" if task_obj.study_key in ("STUDY_KEY", "{{ params.study_key }}") else task_obj.study_key
+                run_op = ImednetExportOperator(
+                    task_id=f"sim_{task_obj.task_id}",
+                    study_key=study_key,
+                    destination=task_obj.destination,
+                    output_path=str(out_csv),
+                    export_func=task_obj.export_func,
+                    export_kwargs=dict(task_obj.export_kwargs),
+                    imednet_conn_id=task_obj.imednet_conn_id,
+                )
+                try:
+                    run_op.execute(context={})
+                except Exception as exc:
+                    errors.append(
+                        f"{dag_file}:{task_obj.task_id}: CSV export failed: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if not out_csv.is_file() or out_csv.stat().st_size == 0:
+                    errors.append(f"{dag_file}:{task_obj.task_id}: Expected non-empty CSV at {out_csv}")
+            elif type(task_obj).__name__ == "MappedOperator" and getattr(task_obj, "operator_class", None) is ImednetExportOperator:
+                discover_fn = getattr(module, "discover_export_targets", None)
+                raw_fn = getattr(discover_fn, "function", None)
+                if callable(raw_fn):
+                    try:
+                        targets = raw_fn()
+                    except Exception as exc:
+                        errors.append(f"{dag_file}: Discovery task failed: {type(exc).__name__}: {exc}")
+                        continue
+                    if not targets:
+                        errors.append(f"{dag_file}: Discovery task returned zero targets")
+                        continue
+                    partial_kw = dict(getattr(task_obj, "partial_kwargs", {}))
+                    wrote_non_empty = False
+                    for idx, target in enumerate(targets):
+                        study_key = target["study_key"]
+                        out_csv = Path(target["output_path"])
+                        out_csv.parent.mkdir(parents=True, exist_ok=True)
+                        run_op = ImednetExportOperator(
+                            task_id=f"sim_mapped_{idx}",
+                            study_key=study_key,
+                            destination=partial_kw.get("destination"),
+                            output_path=str(out_csv),
+                            export_func=partial_kw.get("export_func"),
+                            export_kwargs=dict(target.get("export_kwargs") or {}),
+                            imednet_conn_id=partial_kw.get("imednet_conn_id", "imednet_default"),
+                        )
+                        try:
+                            run_op.execute(context={})
+                        except Exception as exc:
+                            errors.append(
+                                f"{dag_file}: Mapped CSV export for '{study_key}' failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            break
+                        if study_key == "STUDY" and out_csv.is_file() and out_csv.stat().st_size > 0:
+                            wrote_non_empty = True
+                    if not errors and not wrote_non_empty:
+                        errors.append(
+                            f"{dag_file}: Mapped CSV export for 'STUDY' did not produce a non-empty file"
+                        )
+
+if errors:
+    for err in errors:
+        print(err, file=sys.stderr)
+    sys.exit(1)
+"""
+
+
+def _build_simulation_subprocess_env(repo_root: Path | None = None) -> dict[str, str]:
+    """Construct clean offline simulation environment for subprocess validation."""
+    default_root = Path(__file__).resolve().parent.parent
+    roots = [r for r in (repo_root, default_root) if r is not None]
+    src_paths: list[str] = []
+    for root in roots:
+        for pkg_sub in (
+            "packages/core/src",
+            "packages/plugins-workflows/src",
+            "packages/plugins-sinks/src",
+            "packages/plugins-tui/src",
+            "packages/providers-airflow/src",
+        ):
+            candidate = (root / pkg_sub).resolve()
+            if candidate.is_dir() and str(candidate) not in src_paths:
+                src_paths.append(str(candidate))
+
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.upper().startswith(("COV_", "COVERAGE_")) and "cov_core" not in k.lower()
+    }
+    py_path_entries = list(src_paths)
+    if env.get("PYTHONPATH"):
+        py_path_entries.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(py_path_entries)
+    env["IMEDNET_SIMULATION_MODE"] = "true"
+    env["IMEDNET_NON_INTERACTIVE"] = "1"
+    env["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
+    env["AIRFLOW_CONN_MY_IMEDNET_CONN"] = "http://mock:mock@localhost"  # pragma: allowlist secret
+    return env
+
+
+def validate_airflow_dags_in_simulation(
+    airflow_examples_dir: Path,
+    repo_root: Path | None = None,
+    timeout_seconds: float = 60.0,
+) -> list[str]:
+    """Import Airflow 3.x DAGs and execute CSV export operators against SimulationTransport."""
+    if not airflow_examples_dir.exists():
+        return []
+    if not list(airflow_examples_dir.glob("*.py")):
+        return []
+    try:
+        if importlib.util.find_spec("airflow") is None:
+            return []
+    except (ModuleNotFoundError, ValueError, ImportError):
+        return []
+
+    env = _build_simulation_subprocess_env(repo_root)
+    with tempfile.TemporaryDirectory(prefix="imednet_airflow_sim_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        airflow_home = tmp_dir / "airflow_home"
+        airflow_home.mkdir(parents=True, exist_ok=True)
+        export_root = tmp_dir / "exports"
+        env["AIRFLOW_HOME"] = str(airflow_home)
+
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _AIRFLOW_DAG_VALIDATION_RUNNER,
+                    str(airflow_examples_dir.resolve()),
+                    str(export_root.resolve()),
+                ],
+                cwd=str(tmp_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            return [
+                f"{airflow_examples_dir}: Airflow DAG validation timed out after {timeout_seconds:.1f}s"
+            ]
+
+        if proc.returncode != 0:
+            lines = [line.strip() for line in proc.stderr.splitlines() if line.strip()]
+            if lines:
+                return lines
+            return [
+                f"{airflow_examples_dir}: Airflow DAG validation failed with exit code {proc.returncode}"
+            ]
+
+    return []
+
+
+_MD_PYTHON_BLOCK_RE = re.compile(r"^```(?:python|py)\s*\n(.*?)^```\s*$", re.MULTILINE | re.DOTALL)
+
+
+def validate_provider_readme_blocks(
+    readme_path: Path,
+    repo_root: Path | None = None,
+    timeout_seconds: float = 60.0,
+) -> list[str]:
+    """Validate and execute Python blocks in packages/providers-airflow/README.md without MagicMock."""
+    if not readme_path.exists():
+        return [f"Provider README not found: {readme_path}"]
+
+    try:
+        content = readme_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"{readme_path}: Failed to read file: {exc}"]
+
+    if "[amazon]" in content:
+        return [f"{readme_path}: Contains nonexistent '[amazon]' installation extra"]
+
+    blocks = [m.group(1) for m in _MD_PYTHON_BLOCK_RE.finditer(content)]
+    if not blocks:
+        return [f"{readme_path}: No Python code blocks found"]
+
+    errors: list[str] = []
+    parsed_blocks: list[tuple[int, str, ast.Module]] = []
+    for idx, raw_block in enumerate(blocks, start=1):
+        code = textwrap.dedent(raw_block).strip()
+        if "MagicMock" in code:
+            errors.append(f"{readme_path} (block {idx}): Disallowed MagicMock usage")
+            continue
+        try:
+            tree = ast.parse(code, filename=f"{readme_path}:block_{idx}")
+        except SyntaxError as exc:
+            errors.append(f"{readme_path} (block {idx}): Syntax error: {exc.msg}")
+            continue
+        for lineno, reason in validate_ast_imports(tree):
+            errors.append(f"{readme_path} (block {idx}, line {lineno}): {reason}")
+        parsed_blocks.append((idx, code, tree))
+
+    if errors:
+        return errors
+
+    try:
+        if importlib.util.find_spec("airflow") is None:
+            return []
+    except (ModuleNotFoundError, ValueError, ImportError):
+        return []
+
+    env = _build_simulation_subprocess_env(repo_root)
+    with tempfile.TemporaryDirectory(prefix="imednet_readme_sim_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        airflow_home = tmp_dir / "airflow_home"
+        airflow_home.mkdir(parents=True, exist_ok=True)
+        env["AIRFLOW_HOME"] = str(airflow_home)
+
+        for idx, code, tree in parsed_blocks:
+            zero_arg_funcs = [
+                node.name
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and not node.args.posonlyargs
+                and not node.args.args
+                and not node.args.kwonlyargs
+            ]
+            runner = code + "\n" + "\n".join(f"{fn_name}()" for fn_name in zero_arg_funcs) + "\n"
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-c", runner],
+                    cwd=str(tmp_dir),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(
+                    f"{readme_path} (block {idx}): Timed out after {timeout_seconds:.1f}s"
+                )
+                continue
+            if proc.returncode != 0:
+                tail = (
+                    proc.stderr.strip().splitlines()[-1]
+                    if proc.stderr.strip()
+                    else "execution failed"
+                )
+                errors.append(f"{readme_path} (block {idx}): Execution failed: {tail}")
 
     return errors
 
@@ -1233,6 +1562,275 @@ _JS_BROWSER_GLOBALS_PATTERN = re.compile(
     r"\bwindow\.(?:location|history|addEventListener|dispatchEvent)\b"
 )
 
+_CANONICAL_QUERY_COMMENT_KEYS: frozenset[str] = frozenset(
+    {"sequence", "annotationStatus", "user", "comment", "closed", "date"}
+)
+
+
+def _extract_js_object_literal(js_content: str, const_name: str) -> str | None:
+    """Extract balanced `{ ... }` literal assigned to `const <const_name> = {`."""
+    marker = re.search(rf"\bconst\s+{re.escape(const_name)}\s*=\s*\{{", js_content)
+    if not marker:
+        return None
+    start = marker.end() - 1
+    depth = 0
+    in_str: str | None = None
+    escaped = False
+    i = start
+    n = len(js_content)
+    while i < n:
+        ch = js_content[i]
+        if in_str is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_str:
+                in_str = None
+        elif ch in ('"', "'", "`"):
+            in_str = ch
+        elif ch == "/" and i + 1 < n and js_content[i + 1] == "/":
+            newline_pos = js_content.find("\n", i + 2)
+            i = n if newline_pos == -1 else newline_pos
+            continue
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return js_content[start : i + 1]
+        i += 1
+    return None
+
+
+def _parse_js_mock_data(js_content: str) -> tuple[dict[str, object] | None, str | None]:
+    """Parse MOCK_DATA object literal from showcase.js into Python dicts/lists."""
+    literal = _extract_js_object_literal(js_content, "MOCK_DATA")
+    if literal is None:
+        return None, "MOCK_DATA object literal not found"
+
+    # Strip single-line comments outside string literals
+    cleaned_chars: list[str] = []
+    in_str: str | None = None
+    escaped = False
+    i = 0
+    n = len(literal)
+    while i < n:
+        ch = literal[i]
+        if in_str is not None:
+            cleaned_chars.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_str:
+                in_str = None
+        elif ch in ('"', "'"):
+            in_str = ch
+            cleaned_chars.append(ch)
+        elif ch == "/" and i + 1 < n and literal[i + 1] == "/":
+            newline_pos = literal.find("\n", i + 2)
+            if newline_pos == -1:
+                break
+            i = newline_pos
+            continue
+        else:
+            cleaned_chars.append(ch)
+        i += 1
+
+    normalized = "".join(cleaned_chars)
+    # Quote bare JS object property keys while leaving string contents untouched
+    out_parts: list[str] = []
+    token_re = re.compile(r'"(?:\\.|[^"\\])*"|([\{,\s])([A-Za-z_$][A-Za-z0-9_$]*)(\s*:)')
+    pos = 0
+    for m in token_re.finditer(normalized):
+        out_parts.append(normalized[pos : m.start()])
+        if m.group(2) is not None:
+            out_parts.append(f'{m.group(1)}"{m.group(2)}"{m.group(3)}')
+        else:
+            out_parts.append(m.group(0))
+        pos = m.end()
+    out_parts.append(normalized[pos:])
+    json_ready = re.sub(r",\s*([\}\]])", r"\1", "".join(out_parts))
+
+    try:
+        parsed = json.loads(json_ready)
+    except json.JSONDecodeError as exc:
+        return None, f"Failed to parse MOCK_DATA JSON structure: {exc}"
+
+    if not isinstance(parsed, dict):
+        return None, "Expected MOCK_DATA to parse as an object"
+    return parsed, None
+
+
+def load_postman_contract_schemas(postman_path: Path) -> tuple[dict[str, set[str]], list[str]]:
+    """Extract canonical Study, Form, and Query response attribute sets from Postman collection."""
+    if not postman_path.exists():
+        return {}, [f"Postman collection not found: {postman_path}"]
+
+    try:
+        collection = json.loads(postman_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, [f"{postman_path}: Failed to parse JSON: {exc}"]
+
+    target_requests = {
+        "Retrieve a study": "studies",
+        "List studies": "studies",
+        "List forms": "forms",
+        "List queries": "queries",
+        "List record revisions": "audits",
+    }
+    schemas: dict[str, set[str]] = {
+        "studies": set(),
+        "forms": set(),
+        "queries": set(),
+        "audits": set(),
+    }
+
+    def _walk_items(items: object) -> None:
+        if not isinstance(items, list):
+            return
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if isinstance(name, str) and name in target_requests:
+                bucket = target_requests[name]
+                for resp in entry.get("response", []) or []:
+                    if not isinstance(resp, dict) or resp.get("code") != 200:
+                        continue
+                    body = resp.get("body")
+                    if not isinstance(body, str) or not body.strip():
+                        continue
+                    with contextlib.suppress(json.JSONDecodeError):
+                        payload = json.loads(body)
+                        if isinstance(payload, dict):
+                            data_section = payload.get("data")
+                            if isinstance(data_section, list):
+                                for sample in data_section:
+                                    if isinstance(sample, dict):
+                                        schemas[bucket].update(sample.keys())
+                            elif "studyKey" in payload:
+                                schemas[bucket].update(payload.keys())
+            if "item" in entry:
+                _walk_items(entry["item"])
+
+    _walk_items(collection.get("item", []))
+    missing = [name for name, keys in schemas.items() if not keys]
+    if missing:
+        return schemas, [
+            f"{postman_path}: Missing canonical schema definitions for {sorted(missing)}"
+        ]
+    return schemas, []
+
+
+_CANONICAL_DATADICT_FORM_KEYS: frozenset[str] = frozenset(
+    {"formKey", "formName", "formId", "formType", "variables", "businessLogic", "extraAttributes"}
+)
+
+
+def validate_showcase_mock_data_schemas(
+    showcase_js_path: Path,
+    postman_path: Path,
+) -> list[str]:
+    """Validate MOCK_DATA REST (studies, formsCatalog, queries, audits) and DataDictionary (forms) schemas."""
+    if not showcase_js_path.exists():
+        return [f"Showcase script not found: {showcase_js_path}"]
+
+    schemas, schema_errors = load_postman_contract_schemas(postman_path)
+    if schema_errors:
+        return schema_errors
+
+    try:
+        js_content = showcase_js_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"{showcase_js_path}: Failed to read file: {exc}"]
+
+    mock_data, parse_err = _parse_js_mock_data(js_content)
+    if parse_err is not None or mock_data is None:
+        return [f"{showcase_js_path}: {parse_err}"]
+
+    errors: list[str] = []
+
+    section_specs: list[tuple[str, set[str], bool]] = [
+        ("studies", schemas["studies"], True),
+        ("formsCatalog", schemas["forms"], True),
+        ("queries", schemas["queries"], True),
+        ("audits", schemas["audits"], False),
+    ]
+
+    for section_name, allowed_keys, required in section_specs:
+        raw_section = mock_data.get(section_name)
+        if raw_section is None and not required:
+            continue
+        if not isinstance(raw_section, list):
+            errors.append(
+                f"{showcase_js_path}: MOCK_DATA.{section_name} is missing or has invalid container type"
+            )
+            continue
+        if not raw_section:
+            errors.append(f"{showcase_js_path}: MOCK_DATA.{section_name} must not be empty")
+            continue
+
+        for idx, item_val in enumerate(raw_section):
+            item_label = f"{section_name}[{idx}]"
+            if not isinstance(item_val, dict) or not item_val:
+                errors.append(
+                    f"{showcase_js_path}: MOCK_DATA.{item_label} must be a non-empty object"
+                )
+                continue
+            item_keys = set(item_val.keys())
+            unexpected = sorted(item_keys - allowed_keys)
+            if unexpected:
+                errors.append(
+                    f"{showcase_js_path}: MOCK_DATA.{item_label} contains non-contract keys "
+                    f"{unexpected}; allowed Postman {section_name} keys: {sorted(allowed_keys)}"
+                )
+            if section_name == "queries" and "queryComments" in item_val:
+                comments = item_val["queryComments"]
+                if not isinstance(comments, list):
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments must be a list"
+                    )
+                else:
+                    for c_idx, comment in enumerate(comments):
+                        if not isinstance(comment, dict):
+                            errors.append(
+                                f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments[{c_idx}] "
+                                "must be an object"
+                            )
+                            continue
+                        extra_comment_keys = sorted(
+                            set(comment.keys()) - _CANONICAL_QUERY_COMMENT_KEYS
+                        )
+                        if extra_comment_keys:
+                            errors.append(
+                                f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments[{c_idx}] "
+                                f"contains non-contract keys {extra_comment_keys}"
+                            )
+
+    raw_forms = mock_data.get("forms")
+    if isinstance(raw_forms, dict) and raw_forms:
+        for form_domain, form_val in raw_forms.items():
+            if not isinstance(form_val, dict) or not form_val:
+                errors.append(
+                    f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} must be a non-empty object"
+                )
+                continue
+            unexpected_dd = sorted(set(form_val.keys()) - _CANONICAL_DATADICT_FORM_KEYS)
+            if unexpected_dd:
+                errors.append(
+                    f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} contains non-contract keys "
+                    f"{unexpected_dd}; allowed DataDictionary Form keys: "
+                    f"{sorted(_CANONICAL_DATADICT_FORM_KEYS)}"
+                )
+    else:
+        errors.append(
+            f"{showcase_js_path}: MOCK_DATA.forms is missing or has invalid container type"
+        )
+
+    return errors
+
 
 def extract_showcase_sdk_snippets(showcase_js_path: Path) -> tuple[dict[str, str], list[str]]:
     """Extract SNIPPETS.sdk Python snippets from docs/_static/showcase.js."""
@@ -1323,6 +1921,13 @@ def validate_landing_showcase(docs_dir: Path, repo_root: Path | None = None) -> 
             )
 
     errors.extend(validate_canonical_showcase_terminology(showcase_js))
+
+    default_root = Path(__file__).resolve().parent.parent
+    for candidate_root in [r for r in (repo_root, default_root) if r is not None]:
+        postman_candidate = candidate_root / "imednet.postman_collection.json"
+        if postman_candidate.is_file():
+            errors.extend(validate_showcase_mock_data_schemas(showcase_js, postman_candidate))
+            break
 
     index_rst = docs_dir / "index.rst"
     if index_rst.exists():
@@ -1499,6 +2104,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.skip_execution and not showcase_errors:
         print(f"Executing showcase scripts in simulation mode from {examples_dir}...")
         execution_errors = execute_showcases_in_simulation(examples_dir, repo_root)
+        if (examples_dir / "airflow").exists():
+            print(f"Validating Airflow 3.x DAGs and CSV exports in {examples_dir / 'airflow'}...")
+            execution_errors.extend(
+                validate_airflow_dags_in_simulation(examples_dir / "airflow", repo_root)
+            )
+
+    provider_readme = repo_root / "packages" / "providers-airflow" / "README.md"
+    readme_errors: list[str] = []
+    if provider_readme.exists():
+        print(f"Validating provider README Python blocks in {provider_readme}...")
+        readme_errors = validate_provider_readme_blocks(provider_readme, repo_root)
 
     print(f"Validating documentation literal includes in {docs_dir}...")
     doc_errors = validate_documentation_literal_includes(docs_dir, repo_root)
@@ -1529,7 +2145,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if created_temp_wheels and args.wheels_dir is None:
                 shutil.rmtree(wheels_dir, ignore_errors=True)
 
-    all_errors = showcase_errors + execution_errors + doc_errors + landing_errors + wheel_errors
+    all_errors = (
+        showcase_errors
+        + execution_errors
+        + readme_errors
+        + doc_errors
+        + landing_errors
+        + wheel_errors
+    )
 
     if all_errors:
         print(f"\nShowcase verification failed with {len(all_errors)} error(s):", file=sys.stderr)

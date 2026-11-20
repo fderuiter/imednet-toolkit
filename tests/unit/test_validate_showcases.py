@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import zipfile
 from pathlib import Path
@@ -13,13 +14,16 @@ from scripts.validate_showcases import (
     extract_literalinclude_slice,
     main,
     stage_wheels,
+    validate_airflow_dags_in_simulation,
     validate_canonical_showcase_terminology,
     validate_documentation_literal_includes,
     validate_landing_showcase,
+    validate_provider_readme_blocks,
     validate_python_slice,
     validate_python_syntax,
     validate_quick_start_ast_structure,
     validate_showcase_ast_and_imports,
+    validate_showcase_mock_data_schemas,
     validate_staged_wheels,
 )
 from sphinx.config import Config
@@ -1113,6 +1117,159 @@ def test_validate_canonical_showcase_terminology_allows_js_window_globals(tmp_pa
     assert any("Disallowed CONTEXT.md synonym 'Clinic'" in e for e in errs)
     assert any("Disallowed CONTEXT.md synonym 'window'" in e for e in errs)
     assert any("Disallowed CONTEXT.md synonym 'field'" in e for e in errs)
+
+
+def test_validate_showcase_mock_data_schemas_rejects_non_contract_keys(tmp_path: Path) -> None:
+    """Verify validate_showcase_mock_data_schemas detects non-contract keys across REST and DataDictionary sections."""
+    repo_root = Path(__file__).resolve().parents[2]
+    postman_path = repo_root / "imednet.postman_collection.json"
+    valid_js = (repo_root / "docs" / "_static" / "showcase.js").read_text(encoding="utf-8")
+
+    drifted_js = (
+        valid_js.replace(
+            'studyKey: "STUDY",\n                studyId: 1003,',
+            'studyKey: "STUDY",\n                protocol: "ONC-01",\n                studyId: 1003,',
+            1,
+        )
+        .replace(
+            'formKey: "F_VS",\n                formName: "Vital Signs",\n                formType: "CRF",',
+            'formKey: "F_VS",\n                variableCount: 7,\n                formName: "Vital Signs",\n                formType: "CRF",',
+            1,
+        )
+        .replace(
+            'formKey: "F_VS",\n                formName: "Vital Signs",\n                formType: "Subject",',
+            'formKey: "F_VS",\n                domain: "VS",\n                formName: "Vital Signs",\n                formType: "Subject",',
+            1,
+        )
+        .replace(
+            "annotationId: 701,",
+            'annotationId: 701,\n                status: "OPEN",',
+            1,
+        )
+        .replace(
+            "recordRevisionId: 9001,",
+            'recordRevisionId: 9001,\n                auditId: "AUD-8801",',
+            1,
+        )
+    )
+    bad_showcase = tmp_path / "showcase.js"
+    bad_showcase.write_text(drifted_js, encoding="utf-8")
+
+    errors = validate_showcase_mock_data_schemas(bad_showcase, postman_path)
+    assert any("MOCK_DATA.studies[0] contains non-contract keys ['protocol']" in e for e in errors)
+    assert any(
+        "MOCK_DATA.formsCatalog[0] contains non-contract keys ['variableCount']" in e
+        for e in errors
+    )
+    assert any("MOCK_DATA.forms.VS contains non-contract keys ['domain']" in e for e in errors)
+    assert any("MOCK_DATA.queries[0] contains non-contract keys ['status']" in e for e in errors)
+    assert any("MOCK_DATA.audits[0] contains non-contract keys ['auditId']" in e for e in errors)
+
+
+def test_execute_showcases_in_simulation_rejects_empty_output(tmp_path: Path) -> None:
+    """Verify non-Airflow showcase scripts that produce zero output fail simulation execution."""
+    examples_dir = tmp_path / "examples"
+    examples_dir.mkdir(parents=True)
+    (examples_dir / "silent_noop.py").write_text("x = 1 + 1\n", encoding="utf-8")
+
+    errors = execute_showcases_in_simulation(examples_dir)
+    assert len(errors) == 1
+    assert "Produced empty output in simulation mode" in errors[0]
+
+
+def test_get_study_structure_populates_variable_label_in_csv(tmp_path: Path) -> None:
+    """Verify examples/get_study_structure.py reads Variable.label into study_structure.csv."""
+    import csv
+    import os
+    import sys
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "examples" / "get_study_structure.py"
+    env = os.environ.copy()
+    env["IMEDNET_SIMULATION_MODE"] = "true"
+    env["IMEDNET_OUTPUT_DIR"] = str(tmp_path)
+
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "Saved study structure to:" in proc.stdout
+    csv_path = tmp_path / "study_structure.csv"
+    assert csv_path.is_file()
+    with csv_path.open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    weight_rows = [r for r in rows if r["variableName"] == "V_WEIGHT"]
+    assert weight_rows and weight_rows[0]["variableLabel"] == "Weight"
+
+
+def test_validate_airflow_dags_in_simulation_passes_and_catches_regressions(
+    tmp_path: Path,
+) -> None:
+    """Verify Airflow 3.x DAG import and CSV export checks pass and detect colliding index kwargs."""
+    if importlib.util.find_spec("airflow") is None:
+        pytest.skip("airflow is not installed")
+    repo_root = Path(__file__).resolve().parents[2]
+
+    errors = validate_airflow_dags_in_simulation(repo_root / "examples" / "airflow", repo_root)
+    assert not errors, f"Expected repository Airflow DAG to pass validation, got: {errors}"
+
+    bad_airflow_dir = tmp_path / "airflow"
+    bad_airflow_dir.mkdir(parents=True)
+    ref_dag = (repo_root / "examples" / "airflow" / "airflow_multi_study_pipeline.py").read_text(
+        encoding="utf-8"
+    )
+    bad_dag = ref_dag.replace('"export_kwargs": {}', '"export_kwargs": {"index": False}')
+    (bad_airflow_dir / "bad_multi_study.py").write_text(bad_dag, encoding="utf-8")
+
+    bad_errors = validate_airflow_dags_in_simulation(bad_airflow_dir, repo_root)
+    assert any("ExportBatchError" in e or "Mapped CSV export" in e for e in bad_errors), (
+        f"Expected ExportBatchError on colliding index=False, got: {bad_errors}"
+    )
+
+
+def test_validate_provider_readme_blocks_passes_and_catches_regressions(tmp_path: Path) -> None:
+    """Verify provider README Python blocks run without MagicMock and catch contract drift."""
+    if importlib.util.find_spec("airflow") is None:
+        pytest.skip("airflow is not installed")
+    repo_root = Path(__file__).resolve().parents[2]
+    readme_path = repo_root / "packages" / "providers-airflow" / "README.md"
+
+    errors = validate_provider_readme_blocks(readme_path, repo_root)
+    assert not errors, f"Expected provider README blocks to pass, got: {errors}"
+
+    bad_readme = tmp_path / "README.md"
+    bad_readme.write_text(
+        "Install `apache-airflow-providers-imednet[amazon]`\n```python\nprint('hi')\n```\n",
+        encoding="utf-8",
+    )
+    assert any("[amazon]" in e for e in validate_provider_readme_blocks(bad_readme, repo_root))
+
+    bad_sensor_readme = tmp_path / "README_sensor.md"
+    bad_sensor_readme.write_text(
+        "```python\n"
+        "from apache_airflow_providers_imednet.sensors import ImednetJobSensor\n"
+        "ImednetJobSensor(task_id='w', job_id='123')\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    sensor_errs = validate_provider_readme_blocks(bad_sensor_readme, repo_root)
+    assert any("Execution failed" in e for e in sensor_errs)
+
+
+def test_docs_conf_does_not_mock_duckdb_export_or_airflow() -> None:
+    """Verify Sphinx doctest configuration runs real duckdb.connect, _prepare_export_df, and airflow."""
+    repo_root = Path(__file__).resolve().parents[2]
+    conf_text = (repo_root / "docs" / "conf.py").read_text(encoding="utf-8")
+
+    assert "_duckdb_connect_patcher" not in conf_text
+    assert "_export_patcher" not in conf_text
+    assert "sys.modules['airflow']" not in conf_text
+    assert 'sys.modules["airflow"]' not in conf_text
+    assert "sys.modules['apache_airflow_providers_imednet']" not in conf_text
 
 
 def test_workflow_showcase_rejects_unassigned_constructor_calls(tmp_path: Path) -> None:

@@ -115,11 +115,17 @@ only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs`
 
 .. testcode::
 
+   from datetime import datetime
    from typing import Any
    from airflow.sdk import DAG, task
    from apache_airflow_providers_imednet import ImednetExportOperator, ImednetHook
 
-   with DAG(dag_id="imednet_dynamic_export"):
+   with DAG(
+       dag_id="imednet_dynamic_export",
+       start_date=datetime(2024, 1, 1),
+       schedule=None,
+       catchup=False,
+   ):
 
        @task
        def export_targets() -> list[dict[str, Any]]:
@@ -128,7 +134,7 @@ only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs`
                {
                    "study_key": study_key,
                    "output_path": f"/tmp/{study_key}.csv",
-                   "export_kwargs": {"index": False},
+                   "export_kwargs": {},
                }
                for study_key in hook.list_study_keys()
            ]
