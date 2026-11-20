@@ -1024,6 +1024,21 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     background-color: var(--color-background-primary);
 }
 
+.crf-rules-section {
+    margin-top: 1.15rem;
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--color-background-border);
+}
+
+.crf-rules-heading {
+    margin: 0 0 0.65rem 0;
+    font-size: 0.85rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--color-foreground-secondary);
+}
+
 /* Quick Start tutorial callout link */
 .quick-start-callout {
     background-color: var(--color-background-primary);
@@ -1036,6 +1051,13 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 0.75rem;
+}
+
+.quick-start-callout-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.65rem 1.15rem;
 }
 
 .quick-start-callout p {

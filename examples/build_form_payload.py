@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """Hybrid Entry Point for iMedNet Form Builder.
 
-Usage:
-  cp .env.example .env
-  # Or export directly:
-  # export IMEDNET_API_KEY="your_api_key"
-  # export IMEDNET_SECURITY_KEY="your_security_key"
-  # export IMEDNET_BASE_URL="https://edc.prod.imednetapi.com"
+Submits layouts to the legacy Form Designer endpoint (`formdez_save.php`)
+using active browser session credentials (`--phpsessid` and `--csrf`),
+not REST API keys.
 
-  # Headless Mode (CLI)
-  uv run --with "imednet[cli]" python examples/build_form_payload.py \
-      --preset "Demo Form" --form-id 123 --revision 5
+Usage:
+  # Optional base URL fallback:
+  # export IMEDNET_BASE_URL="https://your.imednet.com"
+
+  # Headless Mode (all 7 session and form options are required)
+  uv run --with "imednet[cli]" python examples/build_form_payload.py \\
+      --preset "Demo Form" \\
+      --base-url "https://your.imednet.com" \\
+      --phpsessid "YOUR_SESSION_ID" \\
+      --csrf "YOUR_CSRF_KEY" \\
+      --form-id 12345 \\
+      --comm-id 999 \\
+      --revision 5
 """
 
 import argparse
