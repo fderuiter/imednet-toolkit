@@ -25,13 +25,14 @@ dashboard for browsing studies, sites, subjects, and background jobs:
    IMEDNET_HIGH_CONTRAST=1 imednet --high-contrast tui
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
-``Enter`` to select a study or site (or to register batch IDs in the Jobs tab input),
-``q`` to quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to
-refresh active study data, and ``a`` to load all pages when a panel is truncated. Single-key
-shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input. Pass
-``--study`` and repeatable ``--batch`` flags at launch to open a study and monitor specific
-batch jobs immediately, and pass ``--force`` only when intentionally bypassing TTY stream
-checks.
+``Enter`` to select a study or site (re-selecting the active site clears the site filter)
+or to register batch IDs in the Jobs tab input, ``Esc`` to move focus from the Jobs batch
+input to the Jobs table or clear an active site filter, ``q`` to quit, ``d`` to toggle
+dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh active study data, and
+``a`` to load all pages when a panel is truncated. Single-key shortcuts are suppressed
+automatically while typing batch IDs in the Jobs tab input. Pass ``--study`` and
+repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
+immediately, and pass ``--force`` only when intentionally bypassing TTY stream checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
@@ -90,10 +91,30 @@ Usage failures exit 2, SDK-command interruption exits 130, and success/help exit
 
 ``records list --output json`` still writes ``records.json``; it is distinct from
 ``--format json`` stdout and combining them is an error. Existing ``export``
-commands, datadict JSON/schema/diff outputs and optional workflow command formats
-retain their own contracts. This is not a global JSON wrapper for plugins.
+commands, ``datadict`` JSON/schema/diff outputs (see :doc:`/how-to/data_dictionary`)
+and optional workflow command formats retain their own contracts. This is not a
+global JSON wrapper for plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
+
+Data Dictionary commands
+------------------------
+
+The ``imednet datadict`` subcommands convert Study metadata across 4-file CSV exports,
+CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate canonical JSON
+files, export the JSON Schema, and compute structural revision diffs (see
+:doc:`/how-to/data_dictionary` for Python equivalents and Record validation):
+
+.. code-block:: bash
+
+   imednet datadict from-csv ./datadict_export.zip -o study_dd.json --strict --no-raw-xml
+   imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
+   imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
+   imednet datadict from-redcap ./redcap_dictionary.csv --study-key STUDY -o study_dd.json
+   imednet datadict from-api --study-key STUDY -o api_dd.json --no-raw-xml
+   imednet datadict schema -o data-dictionary.schema.json
+   imednet datadict validate study_dd.json --schema data-dictionary.schema.json
+   imednet datadict diff baseline_dd.json study_dd.json --format md
 
 Terminal capabilities and non-interactive mode
 ----------------------------------------------

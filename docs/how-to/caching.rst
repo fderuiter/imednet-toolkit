@@ -21,16 +21,37 @@ primitives (e.g. Django's cache framework or FastAPI dependency injection).
 Schema Cache
 ------------
 
-:class:`~imednet.validation.cache.SchemaCache` stores variable metadata by form
-key to validate record payloads locally. It can be populated explicitly via
-``SchemaCache.refresh()`` using the :class:`~imednet.endpoints.forms.FormsEndpoint`
-and :class:`~imednet.endpoints.variables.VariablesEndpoint` or lazily through
-:class:`~imednet.validation.cache.SchemaValidator` when validation is performed.
+:class:`~imednet.validation.cache.SchemaCache` (and
+:class:`~imednet.validation.cache.AsyncSchemaCache`) stores Variable metadata
+partitioned by ``(study_key, form_key)`` and ``(study_key, form_id)`` to validate
+Record payloads locally. It can be populated explicitly via ``SchemaCache.refresh()``
+using :class:`~imednet.endpoints.forms.FormsEndpoint` and
+:class:`~imednet.endpoints.variables.VariablesEndpoint`, or lazily through
+:class:`~imednet.validation.cache.SchemaValidator` when validation runs.
 
-The cache maps each form key to a dictionary of variables and also tracks form
-IDs. ``SchemaValidator`` looks up the form key for a record and fetches metadata
-on demand if it has not been cached yet.
+What ``SchemaCache`` Validates vs. Skips
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For offline tests, ``imednet.testing.fake_data`` includes helpers to generate
-forms, variables and records. These objects can be used with
-``SchemaCache.refresh`` to validate payloads without hitting the API.
+Because ``SchemaCache`` is hydrated from REST ``/forms`` and ``/variables``
+endpoints, it performs **structural and scalar type checks only**:
+
+- **Enforced by** ``SchemaCache``: Form existence, ``formId`` to ``formKey``
+  resolution, unknown Variable rejection, and scalar Variable type checks
+  (``Number``, ``Integer``, ``Float``, ``Date``, ``Text``).
+- **Skipped by** ``SchemaCache``: Required Variable policies (``Yes`` and
+  ``Auto Query``), Choice codelist membership, numeric (``minValue`` /
+  ``maxValue``) and text length (``minLength`` / ``maxLength``) bounds, and
+  conditional XML business logic rules.
+
+When you need offline constraint and edit check enforcement without polling
+``/forms`` or ``/variables``, load a
+:class:`~imednet.datadict.models.DataDictionary` and pass ``schema=data_dictionary``
+to ``sdk.records.create``, ``sdk.records.create_batch``,
+:class:`~imednet_workflows.record_update.RecordUpdateWorkflow`, or
+:class:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow`. See
+:doc:`/how-to/data_dictionary` and :doc:`/explanation/schema_validation` for
+side-by-side details.
+
+For lightweight type-check unit tests without a full Data Dictionary,
+``imednet.testing.fake_data`` includes helpers to generate Forms, Variables, and
+Records that work with ``SchemaCache.refresh`` offline.
