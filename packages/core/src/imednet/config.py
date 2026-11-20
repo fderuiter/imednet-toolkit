@@ -70,6 +70,7 @@ def _finalize_credentials(
     *,
     simulation_mode: bool,
     require_credentials: bool,
+    has_transport: bool = False,
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """Normalize string fields and validate authentication requirements."""
     api_key = (api_key or "").strip() or None
@@ -80,7 +81,7 @@ def _finalize_credentials(
     if simulation_mode:
         api_key = api_key or "simulated_api_key"
         security_key = security_key or "simulated_security_key"
-    elif require_credentials and not oidc_token:
+    elif require_credentials and not has_transport and not oidc_token:
         if not api_key and not security_key:
             raise ValueError("Either OIDC token or both API key and security key are required")
         if not api_key:
@@ -102,6 +103,7 @@ def merge_config_overrides(
     simulation_mode: bool | None = None,
     credential_source: CredentialSource | None = None,
     require_credentials: bool = True,
+    has_transport: bool = False,
 ) -> Config:
     """Apply explicit overrides onto a pre-resolved Config without reading environment variables."""
     credentials = _read_credential_source(credential_source)
@@ -139,6 +141,7 @@ def merge_config_overrides(
             resolved_oidc_token,
             simulation_mode=resolved_simulation_mode,
             require_credentials=require_credentials,
+            has_transport=has_transport,
         )
     )
     updated = replace(
@@ -165,6 +168,7 @@ def load_config(
     *,
     credential_source: CredentialSource | None = None,
     require_credentials: bool = True,
+    has_transport: bool = False,
 ) -> Config:
     """Return configuration using arguments or environment variables.
 
@@ -179,6 +183,8 @@ def load_config(
         credential_source: Optional caller-owned source, consulted before the environment.
         require_credentials: Validate default credential requirements. Custom authentication
             or an injected client owns authentication when this is False.
+        has_transport: Bypass default credential requirements when an offline HTTP transport
+            is supplied.
 
     Returns:
         The loaded SDK configuration.
@@ -225,6 +231,7 @@ def load_config(
         oidc_token,
         simulation_mode=simulation_mode,
         require_credentials=require_credentials,
+        has_transport=has_transport,
     )
 
     return Config(

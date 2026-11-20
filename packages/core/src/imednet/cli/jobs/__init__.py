@@ -14,7 +14,7 @@ from ..utils import (
     format_job_progress,
     supports_live_status,
 )
-from ..utils.args import add_output_format
+from ..utils.args import add_output_format, resolve_output_format
 from ..utils.output import display_list
 
 JOB_SUMMARY_FIELDS: list[str] = [
@@ -40,22 +40,25 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def job_status(
-        sdk: ImednetSDK, study_key: str, batch_id: str, output_format: str = "table"
+        sdk: ImednetSDK, study_key: str, batch_id: str, output_format: str | None = None
     ) -> None:
+        resolved_format = resolve_output_format(output_format)
         with fetching_status("job status", study_key):
             job = sdk.get_job(study_key, batch_id)
         display_list(
             [job],
             "jobs",
             fields=JOB_SUMMARY_FIELDS,
-            output_format=output_format,
+            output_format=resolved_format,
             details=[job],
             interactive=False,
         )
 
     status_parser.set_defaults(
         func=lambda args: job_status(
-            study_key=args.study_key, batch_id=args.batch_id, output_format=args.output_format
+            study_key=args.study_key,
+            batch_id=args.batch_id,
+            output_format=resolve_output_format(args.output_format),
         )
     )
 
@@ -74,8 +77,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         batch_id: str,
         interval: int,
         timeout: int,
-        output_format: str = "table",
+        output_format: str | None = None,
     ) -> None:
+        resolved_format = resolve_output_format(output_format)
         with fetching_status("job result", study_key) as status_ctrl:
 
             def on_progress(event: Any) -> None:
@@ -100,7 +104,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             [job],
             "jobs",
             fields=JOB_SUMMARY_FIELDS,
-            output_format=output_format,
+            output_format=resolved_format,
             details=[job],
             interactive=False,
         )
@@ -111,6 +115,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             batch_id=args.batch_id,
             interval=args.interval,
             timeout=args.timeout,
-            output_format=args.output_format,
+            output_format=resolve_output_format(args.output_format),
         )
     )

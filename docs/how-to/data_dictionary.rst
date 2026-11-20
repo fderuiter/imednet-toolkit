@@ -5,10 +5,16 @@ A **Data Dictionary** is the canonical Study metadata specification in ``imednet
 
 The :mod:`imednet.datadict` package and ``imednet datadict`` CLI subcommands let Clinical Data Managers and Integration Engineers load Study metadata from four sources, emit deterministic JSON or CDISC ODM 1.3 XML, structurally diff Study revisions, evaluate XML business logic offline, and enforce Form rules before submitting Record payloads to the EDC API.
 
+.. seealso::
+   * :doc:`workflows/uat_workflow` — Execute pre-live User Acceptance Testing checks against a ``Study`` sandbox.
+   * :doc:`register_subjects` — Register ``Subject`` enrollments after ``Site`` and ``Form`` configuration.
+   * :doc:`workflows/bulk_submission` — Validate and submit batch ``Record`` payloads with ``Job`` polling.
+   * :doc:`form_builder` — Automate visual layout state dumps to the legacy ``formdez_save.php`` web endpoint using browser session cookies.
+
 Canonical Model Overview
 ------------------------
 
-Every loader compiles Study metadata into a typed Pydantic v2 hierarchy:
+Every loader compiles Study metadata into a typed Pydantic v2 hierarchy with deterministic camelCase JSON serialization:
 
 * :class:`~imednet.datadict.DataDictionary`: Root container holding ``metadata``, ``forms``, and ``unassignedBusinessLogic``, while implementing :class:`~imednet.validation.cache.ValidationSchemaProtocol`.
 * :class:`~imednet.datadict.Form`: Represents a Study Form (``formKey``, ``formName``, ``formId``, ``formType``) with ordered ``variables`` and Form-scoped ``businessLogic`` rules.
@@ -16,6 +22,8 @@ Every loader compiles Study metadata into a typed Pydantic v2 hierarchy:
 * :class:`~imednet.datadict.Choice`: Defines a coded categorical option (``choiceValue``, ``choiceText``, ``position``).
 * :class:`~imednet.datadict.BusinessLogicRule`: Captures an edit check or workflow rule with both a parsed AST dictionary (``logic``) and optional verbatim XML (``logicRawXml``). ``Form``-scoped rules attach to ``form.businessLogic``, while ``Workflow``, ``Query``, ``Approval``, and ``Required`` rules route to top-level ``unassignedBusinessLogic``.
 * :class:`~imednet.datadict.Metadata`: Tracks ``schemaVersion``, ``studyKey``, ``generatedAt``, ``source``, and ``validationWarnings``.
+
+Source CSV or XML attributes without explicit typed properties are preserved losslessly under ``extraAttributes`` using deterministic lexical camelCase keys (via ``to_camel_case``).
 
 Loading a Data Dictionary
 -------------------------
