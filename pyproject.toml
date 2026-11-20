@@ -82,7 +82,7 @@ files = [
     "packages/plugins-tui/src/imednet_tui",
     "tests/typing/endpoint_contracts.py",
 ]
-exclude = '^(examples/.*|tests/(?!typing/endpoint_contracts\.py$).*|packages/.*/tests/.*|sandbox/.*)$'
+exclude = '^(examples/.*|tests/(?!typing/endpoint_contracts\.py$).*|packages/.*/tests/.*|packages/providers-airflow/src/airflow/.*|sandbox/.*)$'
 
 [[tool.mypy.overrides]]
 module = [

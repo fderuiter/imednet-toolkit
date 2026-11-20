@@ -199,7 +199,9 @@ def generate_api_reference(api_dir: Path | None = None) -> None:
         if pkg.is_dir() and pkg.name != "core":
             src_dir = pkg / "src"
             if src_dir.exists():
-                subdirs = sorted(d for d in src_dir.iterdir() if d.is_dir())
+                subdirs = sorted(
+                    d for d in src_dir.iterdir() if d.is_dir() and (d / "__init__.py").exists()
+                )
                 if subdirs:
                     target_dir = subdirs[0]
                     run_command(

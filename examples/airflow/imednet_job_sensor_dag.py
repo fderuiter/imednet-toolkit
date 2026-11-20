@@ -31,4 +31,5 @@ with DAG(
         study_key="STUDY_KEY",
         batch_id="BATCH_ID",
         poke_interval=60,
+        deferrable=True,
     )

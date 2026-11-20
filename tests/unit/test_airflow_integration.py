@@ -152,7 +152,15 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
         "output_path",
         "export_kwargs",
     )
-    assert ImednetExportOperator.template_fields == ImednetExportOperator.mapped_runtime_fields
+    assert ImednetExportOperator.template_fields == (
+        "study_key",
+        "output_path",
+        "export_kwargs",
+        "modified_since",
+        "record_filter",
+        "record_data_filter",
+        "stream_name",
+    )
     assert ImednetExportOperator.template_fields_renderers == {"export_kwargs": "json"}
 
 

@@ -17,6 +17,16 @@ pip installation. Package versions remain managed by release-please.
 
    pip install "apache-airflow>=3.2.0,<4.0.0" apache-airflow-providers-imednet
 
+Optional extras are available for OpenLineage dataset lineage, warehouse/graph/document
+sinks, incremental checkpoint ledgers, S3/AWS object-store targets, or all integrations:
+
+.. code-block:: bash
+
+   pip install "apache-airflow-providers-imednet[openlineage]"
+   pip install "apache-airflow-providers-imednet[sinks,workflows]"
+   pip install "apache-airflow-providers-imednet[amazon]"
+   pip install "apache-airflow-providers-imednet[all]"
+
 Production Reference DAG
 ------------------------
 
@@ -42,11 +52,15 @@ focused operator/sensor usage patterns.
 Connections
 -----------
 
-Create an Airflow connection ``imednet_default`` or override ``imednet_conn_id``.
-Provide ``api_key`` and ``security_key`` via the login/password fields or in the
-``extra`` JSON. ``base_url`` may be added in ``extra`` for a non-standard
-environment. The hook merges these settings with values from
-``imednet.config.load_config`` so environment variables still apply.
+Installing ``apache-airflow-providers-imednet`` registers the ``imednet``
+connection type in Airflow's ``ProvidersManager`` with labeled UI form fields
+(``API Key`` for ``login``, ``Security Key`` for ``password``, plus ``Base URL``,
+masked ``OIDC Token``, ``Request Timeout``, ``Strict Mode``, and
+``Simulation Mode``). Create an Airflow connection ``imednet_default`` or
+override ``imednet_conn_id``. ``ImednetHook.test_connection()`` validates
+connectivity against the lightweight study metadata endpoint while redacting
+secrets from error diagnostics. The hook merges connection settings with values
+from ``imednet.config.load_config`` so environment variables still apply.
 
 For warehouse, graph, document, and transactional SQL exports, configure a
 separate Airflow connection and pass ``destination_conn_id`` on
@@ -57,14 +71,21 @@ database settings, or SQLAlchemy connection URIs) at task execution time rather
 than embedding secrets in DAG definitions.
 
 To prevent credential leakage in Airflow rendered task metadata and XComs,
-templated fields (``export_kwargs`` and ``output_path``) reject raw secret keys
-(such as ``password``, ``auth``, ``api_key``, ``security_key``, ``token``, or
-``conn_str`` containing credentials) as well as URIs with embedded userinfo.
+templated fields (``study_key``, ``output_path``, ``export_kwargs``,
+``modified_since``, ``record_filter``, ``record_data_filter``, and
+``stream_name``) reject raw secret keys (such as ``password``, ``auth``,
+``api_key``, ``security_key``, ``token``, or ``conn_str`` containing
+credentials) as well as URIs or inline tokens with embedded secrets.
 
-For task-mapping discovery steps, ``ImednetHook`` provides explicit helper methods:
+For task-mapping discovery and async execution, ``ImednetHook`` provides explicit
+helper methods:
 
 - ``get_conn()`` returns the live :class:`~imednet.ImednetSDK` adhering to the
   standard Airflow BaseHook contract.
+- ``get_async_conn()`` returns an authenticated :class:`~imednet.AsyncImednetSDK`
+  for async triggers and coroutines.
+- ``test_connection()`` probes API credentials and returns ``(ok, message)`` with
+  sensitive values redacted.
 - ``get_sdk_client()`` is a direct alias for ``get_conn()`` for use inside task
   execution context.
 - ``list_studies_metadata()`` returns JSON-serializable primitive dictionaries
@@ -75,10 +96,10 @@ For task-mapping discovery steps, ``ImednetHook`` provides explicit helper metho
 - ``resolve_destination_connection()`` resolves runtime destination connection
   settings for ``snowflake``, ``neo4j``, ``mongodb``, and ``sql`` targets.
 
-Operators and Sensors
----------------------
-The Airflow integration organizes hooks, operators, and sensors in dedicated
-subpackages for clarity.
+Operators, Deferrable Sensors, and OpenLineage
+----------------------------------------------
+The Airflow integration organizes hooks, operators, sensors, and triggers in
+dedicated modules for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
 records to any supported destination (CSV, Parquet, Snowflake, Neo4j, etc.)
@@ -86,16 +107,30 @@ using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
 across plugin sinks and tabular exports without leaking sink-level options into
-Pandas or JSON writer kwargs. PHI masking is enabled by default
-(``mask_phi=True``) across all tabular and sink destinations, replacing
-registered ``Subject`` identifiers and committed ``StudyConfiguration``
-``phiFields`` with ``***MASKED***``; authorized enclave workflows can explicitly
-opt out by passing ``mask_phi=False`` (or ``export_kwargs={"mask_phi": False}``)
-without mutating ``global_sensitivity_registry``. Destination-specific non-secret
-options—such as Snowflake staging settings (``stage_prefix``,
-``local_staging_dir``, ``manifest_path``) and Neo4j ``database`` names—can be
-supplied via ``export_kwargs`` or connection ``extra`` metadata.
-``ImednetJobSensor`` waits for an export job to complete.
+Pandas or JSON writer kwargs. Incremental schedules can pass Jinja expressions
+directly to ``modified_since``, ``record_filter``, ``record_data_filter``, and
+``stream_name``; when ``incremental=True`` is enabled, checkpoints are persisted
+in Airflow 3.x XComs via ``AirflowStateProvider``. When
+``apache-airflow-providers-openlineage`` is installed,
+``get_openlineage_facets_on_start()`` and ``get_openlineage_facets_on_complete()``
+emit source and destination ``Dataset`` facets with all URIs redacted via
+``imednet.spi.sinks.redact_uri``.
+
+PHI masking is enabled by default (``mask_phi=True``) across all tabular and
+sink destinations, replacing registered ``Subject`` identifiers and committed
+``StudyConfiguration`` ``phiFields`` with ``***MASKED***``; authorized enclave
+workflows can explicitly opt out by passing ``mask_phi=False`` (or
+``export_kwargs={"mask_phi": False}``) without mutating
+``global_sensitivity_registry``. Destination-specific non-secret options—such as
+Snowflake staging settings (``stage_prefix``, ``local_staging_dir``,
+``manifest_path``) and Neo4j ``database`` names—can be supplied via
+``export_kwargs`` or connection ``extra`` metadata.
+
+``ImednetJobSensor`` waits for an asynchronous job to reach a terminal state.
+Passing ``deferrable=True`` (or enabling ``[operators] default_deferrable``)
+suspends the Airflow worker slot and delegates polling to ``ImednetJobTrigger``
+in the Airflow triggerer using ``AsyncImednetSDK`` and ``AsyncJobPoller``—storing
+only ``imednet_conn_id`` and job coordinates in serialized trigger state.
 All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` instance
 from an Airflow connection. The production reference DAG above shows the recommended
 dynamic-mapping pattern: keep static settings (for example ``destination``,

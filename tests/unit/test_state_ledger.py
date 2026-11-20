@@ -629,3 +629,103 @@ def test_cli_default_ledger_path_behavior() -> None:
 
     reset_args = root_parser.parse_args(["workflows", "state", "reset", "-s", "TEST-01"])
     assert reset_args.ledger_path == DEFAULT_LEDGER_PATH
+
+
+def test_airflow_state_provider_xcom_model_helpers_and_in_process_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify AirflowStateProvider XComModel helpers, run_id resolution, and state roundtrips."""
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    provider = AirflowStateProvider()
+
+    # 1. _resolve_out_of_task_run_id branches
+    monkeypatch.delenv("AIRFLOW_CTX_DAG_RUN_ID", raising=False)
+    monkeypatch.delenv("AIRFLOW_CTX_LOGICAL_DATE", raising=False)
+    monkeypatch.delenv("AIRFLOW_CTX_EXECUTION_DATE", raising=False)
+    assert provider._resolve_out_of_task_run_id() == "manual__state_sync"
+
+    monkeypatch.setenv("AIRFLOW_CTX_LOGICAL_DATE", "2026-06-01T09:00:00")
+    assert provider._resolve_out_of_task_run_id() == "manual__2026-06-01T09:00:00+00:00"
+
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled__2026-06-02")
+    assert provider._resolve_out_of_task_run_id() == "scheduled__2026-06-02"
+
+    # 2. _deserialize_xcom_value branches
+    assert provider._deserialize_xcom_value(object, None) is None
+    assert provider._deserialize_xcom_value(object, SimpleNamespace(value={"a": 1})) == {"a": 1}
+
+    cls_with_deser = SimpleNamespace(deserialize_value=lambda obj: {"decoded": obj.value})
+    assert provider._deserialize_xcom_value(cls_with_deser, SimpleNamespace(value="raw")) == {
+        "decoded": "raw"
+    }
+
+    cls_broken_deser = SimpleNamespace(
+        deserialize_value=lambda _obj: (_ for _ in ()).throw(RuntimeError("bad"))
+    )
+    assert provider._deserialize_xcom_value(
+        cls_broken_deser, SimpleNamespace(value='{"from_json": 2}')
+    ) == {"from_json": 2}
+    assert (
+        provider._deserialize_xcom_value(cls_broken_deser, SimpleNamespace(value="not-json"))
+        == "not-json"
+    )
+
+    # 3. Real SQLite Airflow 3 DB roundtrip IN-PROCESS for full coverage of _ensure_standalone_xcom_parents
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
+            sys.modules.pop(mod, None)
+    airflow_db_mod = pytest.importorskip("airflow.utils.db")
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setenv("AIRFLOW_HOME", tmpdir)
+        monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", f"sqlite:///{tmpdir}/af_cov.db")
+        from airflow import settings
+
+        settings.configure_orm()
+        airflow_db_mod.initdb()
+
+        ts = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
+        with provider.transaction("STUDY_UNDER_01", "records", fallback_timestamp=ts) as tx:
+            tx["new_timestamp"] = datetime(2026, 6, 2, 13, 0, tzinfo=timezone.utc)
+            tx["records_processed"] = 9
+
+        assert provider.get_last_timestamp("STUDY_UNDER_01", "records") == datetime(
+            2026, 6, 2, 13, 0, tzinfo=timezone.utc
+        )
+        assert (
+            provider.get_last_status("STUDY_UNDER_01", "records") == StreamExecutionStatus.SUCCESS
+        )
+        ledger_state = provider.read_state()
+        assert "STUDY_UNDER_01" in ledger_state.studies
+        assert ledger_state.studies["STUDY_UNDER_01"].streams["records"].records_processed == 9
+        assert provider.delete_entry("STUDY_UNDER_01", "records") is True
+        assert provider.delete_entry("STUDY_UNDER_01") is False
+
+    # 4. Task-context TaskInstance branch via airflow.sdk.get_current_context
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = {
+        "last_timestamp": "2026-06-01T10:00:00+00:00",
+        "status": "success",
+    }
+    monkeypatch.setitem(
+        sys.modules, "airflow.sdk", SimpleNamespace(get_current_context=lambda: {"ti": mock_ti})
+    )
+    assert provider.get_last_timestamp("STUDY_CTX", "records") == datetime(
+        2026, 6, 1, 10, 0, tzinfo=timezone.utc
+    )
+    assert provider.get_last_status("STUDY_CTX", "records") == StreamExecutionStatus.SUCCESS
+    provider.set_last_timestamp(
+        "STUDY_CTX", "records", datetime(2026, 6, 1, 11, 0, tzinfo=timezone.utc)
+    )
+    mock_ti.xcom_push.assert_called_once()
+
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
+            sys.modules.pop(mod, None)
