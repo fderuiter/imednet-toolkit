@@ -34,7 +34,7 @@ def is_non_interactive() -> bool:
 
 def is_json_output_mode() -> bool:
     """Return True when structured JSON output mode is active on stdout."""
-    if os.environ.get(OUTPUT_FORMAT_ENV) == "json":
+    if os.environ.get(OUTPUT_FORMAT_ENV, "").strip().lower() == "json":
         return True
     try:
         argv = sys.argv

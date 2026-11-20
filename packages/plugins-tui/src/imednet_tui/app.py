@@ -37,7 +37,6 @@ from textual.widgets import (
     TabPane,
 )
 
-from imednet.spi.cli import is_interactive_terminal
 from imednet.spi.constants import DEFAULT_BASE_URL, MAX_PAGE_SIZE
 from imednet.spi.errors import NotFoundError
 from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
@@ -50,6 +49,8 @@ from imednet.spi.utils import (
     redact_sensitive_payload,
     redact_sensitive_text,
 )
+
+from .terminal import is_interactive_terminal
 
 __all__ = [
     "DEFAULT_FETCH_LIMIT",
@@ -917,7 +918,7 @@ class JobMonitor(Container):
         layout: vertical;
         height: 1fr;
         background: $surface;
-        border: solid $primary;
+        border: none;
     }
 
     JobMonitor #batch_id_input {
@@ -934,7 +935,11 @@ class JobMonitor(Container):
     }
 
     JobMonitor #job_monitor_notice {
-        height: auto;
+        height: 1;
+        max-height: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-wrap: nowrap;
         padding: 0 1;
         color: $text;
     }
@@ -1690,7 +1695,7 @@ class DashboardScreen(Screen[None]):
         layout: grid;
         grid-size: 3 2;
         grid-columns: 1fr 1fr 2fr;
-        grid-rows: 2fr 1fr;
+        grid-rows: 1fr 1fr;
         height: 1fr;
     }
 
@@ -1733,7 +1738,7 @@ class DashboardScreen(Screen[None]):
     DashboardScreen.compact #dashboard-grid {
         grid-size: 2 3;
         grid-columns: 1fr 1fr;
-        grid-rows: 2fr 2fr 3fr;
+        grid-rows: 1fr 1fr 2fr;
     }
 
     DashboardScreen.compact #subjects-box {
@@ -1746,7 +1751,11 @@ class DashboardScreen(Screen[None]):
 
     #truncation-notice {
         display: none;
-        height: auto;
+        height: 1;
+        max-height: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-wrap: nowrap;
         padding: 0 1;
         background: $warning 20%;
         color: $text;
@@ -1758,14 +1767,16 @@ class DashboardScreen(Screen[None]):
 
     /* High contrast mode styles */
     DashboardScreen.high-contrast {
-        background: black;
-        color: white;
+        background: #000000;
+        color: #FFFFFF;
     }
 
     DashboardScreen.high-contrast #truncation-notice {
-        background: black;
-        color: white;
-        border-bottom: heavy white;
+        height: 1;
+        max-height: 1;
+        background: #FFFFFF;
+        color: #000000;
+        border: none;
     }
 
     DashboardScreen.high-contrast #studies-box {
@@ -1819,15 +1830,18 @@ class DashboardScreen(Screen[None]):
     }
 
     DashboardScreen.high-contrast JobMonitor {
-        border: heavy white;
-        background: black;
-        color: white;
+        border: none;
+        background: #000000;
+        color: #FFFFFF;
     }
 
-    DashboardScreen.high-contrast LogViewer {
+    DashboardScreen.high-contrast LogViewer,
+    DashboardScreen.high-contrast LogViewer:focus {
         border: heavy white;
-        background: black;
-        color: white;
+        background: #000000;
+        color: #FFFFFF;
+        text-opacity: 100%;
+        background-tint: #000000 0%;
     }
 
     DashboardScreen.high-contrast JobMonitor #batch_id_input {
@@ -2133,8 +2147,24 @@ class ImednetTuiApp(App[None]):
     }
 
     .high-contrast {
-        background: black;
-        color: white;
+        background: #000000;
+        color: #FFFFFF;
+    }
+
+    .high-contrast #truncation-notice {
+        height: 1;
+        max-height: 1;
+        background: #FFFFFF;
+        color: #000000;
+        border: none;
+    }
+
+    .high-contrast LogViewer,
+    .high-contrast LogViewer:focus {
+        background: #000000;
+        color: #FFFFFF;
+        text-opacity: 100%;
+        background-tint: #000000 0%;
     }
     """
 
