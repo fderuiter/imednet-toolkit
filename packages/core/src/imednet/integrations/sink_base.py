@@ -85,6 +85,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from types import TracebackType
@@ -628,6 +629,49 @@ def _redact_uri(uri: str) -> str:
         'neo4j+s://bolt.example.com'
     """
     return _URI_USERINFO_RE.sub(r"\1***@", uri)
+
+
+def normalize_sink_value(value: Any, *, by_alias: bool = False) -> Any:
+    """Dump Pydantic models, ``Enum`` values, and tuples into plain containers.
+
+    Leaves scalar ``Decimal``, ``datetime``, and ``date`` instances intact so
+    each destination sink can encode them without lossy float conversion.
+    """
+    if value is None or value.__class__ in (str, int, float, bool):
+        return value
+    if isinstance(value, NonCallableMock):
+        return value
+    if isinstance(value, Enum):
+        return normalize_sink_value(value.value, by_alias=by_alias)
+    if value.__class__ is dict:
+        return {
+            str(normalize_sink_value(k.value, by_alias=by_alias))
+            if isinstance(k, Enum)
+            else (k if k.__class__ is str else str(k)): normalize_sink_value(v, by_alias=by_alias)
+            for k, v in value.items()
+        }
+    if value.__class__ in (list, tuple):
+        return [normalize_sink_value(item, by_alias=by_alias) for item in value]
+    model_dump = getattr(type(value), "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = value.model_dump(mode="json", by_alias=by_alias)
+        except TypeError:
+            dumped = value.model_dump()
+        if dumped is not value and isinstance(
+            dumped, (Mapping, list, tuple, str, int, float, bool)
+        ):
+            return normalize_sink_value(dumped, by_alias=by_alias)
+    if isinstance(value, Mapping):
+        return {
+            str(normalize_sink_value(k.value, by_alias=by_alias))
+            if isinstance(k, Enum)
+            else str(k): normalize_sink_value(v, by_alias=by_alias)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [normalize_sink_value(item, by_alias=by_alias) for item in value]
+    return value
 
 
 def _require_optional_dep(package: str, extras_key: str) -> Any:
@@ -1421,6 +1465,7 @@ __all__ = [
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
+    "normalize_sink_value",
     "normalize_watermark_datetime",
     "redact_batch_records",
     "run_streaming_export",
