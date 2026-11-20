@@ -120,6 +120,7 @@ def main() -> None:
             print(f"Error: Missing arguments for headless mode: {', '.join(missing)}")
             sys.exit(1)
 
+        assert base_url is not None
         run_headless(
             args.preset,
             base_url,
