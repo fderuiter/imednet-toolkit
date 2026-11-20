@@ -8,6 +8,18 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mocked_airflow_provider_modules():
+    """Evict provider modules reloaded against dummy Airflow stubs on module teardown."""
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None:
+        providers_pkg.__dict__.pop("imednet", None)
+
+
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
     airflow = ModuleType("airflow")

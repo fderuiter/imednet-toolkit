@@ -10,9 +10,11 @@ import pytest
 def _purge_partial_airflow_modules() -> None:
     import sys
 
+    airflow_mod = sys.modules.get("airflow")
     if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        airflow_mod is None
+        or getattr(airflow_mod, "__path__", None) is None
+        or getattr(airflow_mod, "__file__", None) is None
     ):
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
