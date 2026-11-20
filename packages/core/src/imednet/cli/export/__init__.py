@@ -12,7 +12,7 @@ from ...endpoints.records import RecordsEndpoint
 from ...integrations.sink_base import normalize_watermark_datetime
 from ...models.records import Record
 from ...sdk import ImednetSDK
-from ..decorators import with_sdk
+from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import (
     STUDY_KEY_ARG,
     fetching_status,
@@ -166,6 +166,8 @@ def _parse_export_filters(filters: list[str] | None) -> dict[str, Any] | str | N
 
 def _extract_streaming_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Extract non-default streaming/checkpoint options from parsed CLI args."""
+    if hasattr(args, "study_key"):
+        validate_cli_path_segment(args.study_key, name="study_key")
     opts: dict[str, Any] = {}
     since = getattr(args, "since", None)
     if since is not None:

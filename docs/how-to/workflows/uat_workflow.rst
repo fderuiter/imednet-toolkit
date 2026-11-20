@@ -1,7 +1,7 @@
 UAT Workflow Guide
 ==================
 
-The UAT (User Acceptance Testing) workflow automates the end-to-end process of inspecting a study, generating a test specification, producing synthetic test records, submitting them to the API, and monitoring the asynchronous jobs until completion.
+The UAT (User Acceptance Testing) workflow (:class:`~imednet_workflows.uat.UATWorkflow`, also registered under ``imednet.workflows`` as ``uat`` via ``sdk.workflows.uat``) automates the end-to-end process of inspecting a ``Study``, generating a test specification, producing synthetic test ``Record`` payloads, submitting them to the API, and monitoring asynchronous ``Job`` batches until completion.
 
 Visual Workflow
 ---------------

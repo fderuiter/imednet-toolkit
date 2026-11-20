@@ -18,8 +18,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from airflow import DAG
-from airflow.sdk import task
+from airflow.sdk import DAG, task
 
 from apache_airflow_providers_imednet import ImednetExportOperator, ImednetHook
 
