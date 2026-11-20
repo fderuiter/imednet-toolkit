@@ -14,6 +14,7 @@ from urllib.parse import quote_plus
 from imednet import ImednetSDK
 from imednet.spi import sink_base
 from imednet.spi.sinks import redact_uri
+from imednet.spi.utils import validate_path_segment
 
 from .. import export
 from .._airflow_compat import AirflowException, Context
@@ -563,10 +564,25 @@ class ImednetExportOperator(BaseOperator):
 
         return None
 
+    def _default_incremental_stream_name(self, dest: str, context: Context) -> str:
+        """Build a task-scoped default checkpoint stream name when stream_name is omitted."""
+        task_id = getattr(self, "task_id", None)
+        base_name = (
+            f"airflow_{dest}_{task_id}"
+            if isinstance(task_id, str) and task_id
+            else f"airflow_{dest}"
+        )
+        if isinstance(context, Mapping):
+            ti = context.get("ti")
+            map_index = getattr(ti, "map_index", None)
+            if type(map_index) is int and map_index >= 0:
+                return f"{base_name}__map_{map_index}"
+        return base_name
+
     def execute(self, context: Context) -> str | None:
         """Execute the export task."""
-        _ = context
         # Validate templated fields at runtime prior to any export work.
+        validate_path_segment(self.study_key, name="study_key")
         for templated_field in (
             "output_path",
             "modified_since",
@@ -619,6 +635,8 @@ class ImednetExportOperator(BaseOperator):
             **sink_stream_opts,
         )
 
+        default_stream_name = self._default_incremental_stream_name(dest, context)
+
         with closing(self._get_sdk()) as sdk:
             sink = None
             if not export_callable:
@@ -650,7 +668,7 @@ class ImednetExportOperator(BaseOperator):
                     self.study_key,
                     sink,
                     stream_config,
-                    stream_name=f"airflow_{dest}",
+                    stream_name=default_stream_name,
                     batch_id_prefix=f"{self.study_key}/batch/{run_token}",
                     default_provider_name="airflow",
                 )
@@ -660,6 +678,32 @@ class ImednetExportOperator(BaseOperator):
                     raise AirflowException(f"Unsupported destination or export_func '{dest}'")
 
                 tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
+                if tabular_kwargs.get("incremental"):
+                    tabular_kwargs.setdefault("stream_name", default_stream_name)
+                if dest == "duckdb":
+                    conn_settings = self._resolve_destination_connection(dest)
+                    db_path_arg = (
+                        self.output_path
+                        or tabular_kwargs.pop("db_path", None)
+                        or tabular_kwargs.pop("path", None)
+                        or conn_settings.get("db_path")
+                    )
+                    if db_path_arg is not None:
+                        _validate_no_secrets_in_value(db_path_arg, field_name="output_path")
+                    table_name_arg = (
+                        tabular_kwargs.pop("table_name", None)
+                        or tabular_kwargs.pop("table", None)
+                        or conn_settings.get("table_name")
+                        or "records"
+                    )
+                    export_callable(
+                        sdk,
+                        self.study_key,
+                        db_path_arg,
+                        table_name_arg,
+                        **tabular_kwargs,
+                    )
+                    return redact_uri(str(db_path_arg)) if db_path_arg is not None else None
                 if dest in ("sql", "sql_by_form", "long_sql"):
                     conn_settings = self._resolve_destination_connection(dest)
                     if dest == "sql_by_form":

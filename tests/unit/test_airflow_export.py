@@ -186,7 +186,7 @@ def test_export_operator_dispatches_duckdb(monkeypatch: pytest.MonkeyPatch) -> N
         mock_sdk,
         "STUDY-123",
         "/tmp/test_study.duckdb",
-        table_name="clinical_records",
+        "clinical_records",
     )
     assert result == "/tmp/test_study.duckdb"
 
@@ -1305,6 +1305,131 @@ def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.Monkey
     assert ret_long == "long_records"
 
 
+def test_export_operator_duckdb_default_table_custom_table_and_conn_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify DuckDB operator/hook resolution across default table, custom table, and destination_conn_id."""
+    import duckdb
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    conn_obj = SimpleNamespace(
+        host=str(tmp_path / "from_conn.duckdb"),
+        schema=None,
+        extra_dejson={"table": "conn_records"},
+    )
+    monkeypatch.setattr(
+        ImednetHook, "_get_airflow_connection", classmethod(lambda cls, cid: conn_obj)
+    )
+    resolved = ImednetHook.resolve_destination_connection("duckdb_target", "duckdb")
+    assert resolved == {
+        "db_path": str(tmp_path / "from_conn.duckdb"),
+        "table_name": "conn_records",
+    }
+
+    records = [
+        Record.model_validate(
+            {
+                "studyKey": "STUDY_DUCK",
+                "recordId": 101,
+                "subjectId": 1,
+                "subjectKey": "SUBJ-01",
+                "formKey": "DEMO",
+                "dateModified": "2026-01-10T00:00:00Z",
+                "recordData": {"AGE": 44, "PATIENT_NAME": "Alice Doe"},
+            }
+        ),
+        Record.model_validate(
+            {
+                "studyKey": "STUDY_DUCK",
+                "recordId": 102,
+                "subjectId": 2,
+                "subjectKey": "SUBJ-02",
+                "formKey": "DEMO",
+                "dateModified": "2026-01-11T00:00:00Z",
+                "recordData": {"AGE": 51, "PATIENT_NAME": "Bob Roe"},
+            }
+        ),
+    ]
+    variables = [
+        Variable.model_validate(
+            {
+                "studyKey": "STUDY_DUCK",
+                "variableId": 1,
+                "variableName": "AGE",
+                "formId": 10,
+                "formKey": "DEMO",
+                "formName": "Demographics",
+                "label": "Age",
+            }
+        ),
+        Variable.model_validate(
+            {
+                "studyKey": "STUDY_DUCK",
+                "variableId": 2,
+                "variableName": "PATIENT_NAME",
+                "formId": 10,
+                "formKey": "DEMO",
+                "formName": "Demographics",
+                "label": "Patient Name",
+            }
+        ),
+    ]
+
+    sdk = MagicMock()
+    sdk.records.list.side_effect = lambda **_kw: iter(records)
+    sdk.get_variables.return_value = variables
+    sdk.variables.list.return_value = variables
+    sdk.studies.get_configuration = MagicMock(side_effect=AttributeError)
+
+    default_db = tmp_path / "default_tbl.duckdb"
+    op_default = ImednetExportOperator(
+        task_id="duckdb_default",
+        study_key="STUDY_DUCK",
+        destination="duckdb",
+        output_path=str(default_db),
+    )
+    monkeypatch.setattr(op_default, "_get_sdk", lambda: sdk)
+    assert op_default.execute({}) == str(default_db)
+
+    custom_db = tmp_path / "custom_tbl.duckdb"
+    op_custom = ImednetExportOperator(
+        task_id="duckdb_custom_table",
+        study_key="STUDY_DUCK",
+        destination="duckdb",
+        output_path=str(custom_db),
+        export_kwargs={"table": "study_records_v1"},
+    )
+    monkeypatch.setattr(op_custom, "_get_sdk", lambda: sdk)
+    assert op_custom.execute({}) == str(custom_db)
+
+    op_conn = ImednetExportOperator(
+        task_id="duckdb_conn",
+        study_key="STUDY_DUCK",
+        destination="duckdb",
+        destination_conn_id="duckdb_target",
+    )
+    monkeypatch.setattr(op_conn, "_get_sdk", lambda: sdk)
+    assert op_conn.execute({}) == str(tmp_path / "from_conn.duckdb")
+
+    for db_file, tbl_name in [
+        (default_db, "records"),
+        (custom_db, "study_records_v1"),
+        (tmp_path / "from_conn.duckdb", "conn_records"),
+    ]:
+        with duckdb.connect(str(db_file), read_only=True, config={"threads": "1"}) as con:
+            rows = con.execute(
+                f'SELECT "recordId", "subjectKey", "PATIENT_NAME", "AGE" FROM {tbl_name} ORDER BY "recordId"'
+            ).fetchall()
+        assert rows == [
+            (101, "SUBJ-01", "***MASKED***", 44),
+            (102, "SUBJ-02", "***MASKED***", 51),
+        ]
+
+
 def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and_reconcile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1477,7 +1602,7 @@ def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and
         for rec in f["records"]
     )
     assert hier_ids == list(range(1, 11))
-    with duckdb.connect(str(ddb_out)) as dconn:
+    with duckdb.connect(str(ddb_out), config={"threads": "1"}) as dconn:
         assert [
             r[0]
             for r in dconn.execute(

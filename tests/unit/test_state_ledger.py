@@ -633,6 +633,16 @@ def test_cli_default_ledger_path_behavior() -> None:
 
 def test_airflow_state_provider_real_variable_ledger_parity(tmp_path: Path) -> None:
     """AirflowStateProvider persists, reads, and deletes Variable state on real Airflow 3."""
+    import logging
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith("airflow."):
+                sys.modules.pop(mod, None)
+
     pytest.importorskip("airflow")
     import airflow.settings
     from airflow.configuration import conf
@@ -641,10 +651,16 @@ def test_airflow_state_provider_real_variable_ledger_parity(tmp_path: Path) -> N
 
     from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
 
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
     db_url = f"sqlite:///{tmp_path / 'state_ledger_af.db'}"
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_settings_conn = airflow.settings.SQL_ALCHEMY_CONN
     conf.set("database", "sql_alchemy_conn", db_url)
     airflow.settings.SQL_ALCHEMY_CONN = db_url
+    airflow.settings.dispose_orm()
     airflow.settings.configure_orm()
     initdb()
 
@@ -703,9 +719,12 @@ def test_airflow_state_provider_real_variable_ledger_parity(tmp_path: Path) -> N
         assert "STUDY_AF_OTHER" in provider.read_state().studies
     finally:
         airflow.settings.dispose_orm()
-        if prev_conn:
+        airflow.settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if prev_conn is not None:
             conf.set("database", "sql_alchemy_conn", prev_conn)
-            airflow.settings.SQL_ALCHEMY_CONN = prev_conn
+        airflow.settings.configure_orm()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
 
 
 def test_airflow_state_provider_task_sdk_runtime_branch(monkeypatch: pytest.MonkeyPatch) -> None:

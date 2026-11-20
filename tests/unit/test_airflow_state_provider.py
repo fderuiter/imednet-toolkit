@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+
+if "airflow" not in sys.modules or getattr(sys.modules.get("airflow"), "__path__", None) is None:
+    for _mod in list(sys.modules):
+        if _mod == "airflow" or _mod.startswith("airflow."):
+            sys.modules.pop(_mod, None)
 
 pytest.importorskip("airflow")
 
@@ -15,6 +21,7 @@ from imednet_workflows.state_ledger import (
     InvalidStateTransitionError,
     LedgerState,
     StreamExecutionStatus,
+    get_state_provider,
 )
 
 
@@ -25,12 +32,17 @@ def airflow_state_db(tmp_path_factory: pytest.TempPathFactory):
     from airflow.configuration import conf
     from airflow.utils.db import initdb
 
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
     db_dir = tmp_path_factory.mktemp("airflow_state_provider")
     db_url = f"sqlite:///{db_dir / 'airflow.db'}"
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
 
     conf.set("database", "sql_alchemy_conn", db_url)
     airflow.settings.SQL_ALCHEMY_CONN = db_url
+    airflow.settings.dispose_orm()
     airflow.settings.configure_orm()
     initdb()
 
@@ -40,6 +52,9 @@ def airflow_state_db(tmp_path_factory: pytest.TempPathFactory):
     if prev_conn:
         conf.set("database", "sql_alchemy_conn", prev_conn)
         airflow.settings.SQL_ALCHEMY_CONN = prev_conn
+    airflow.settings.configure_orm()
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
 
 
 @pytest.fixture(autouse=True)
@@ -316,3 +331,6 @@ def test_airflow_state_provider_offline_fallback(monkeypatch: pytest.MonkeyPatch
     provider.set_last_timestamp("OFFLINE", "s1", datetime(2026, 1, 1, tzinfo=UTC))
     assert provider.delete_entry("OFFLINE") is False
     assert provider.read_state() == LedgerState()
+
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+    assert isinstance(get_state_provider(), AirflowStateProvider)

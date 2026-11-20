@@ -177,3 +177,38 @@ def test_job_sensor(monkeypatch):
     job.is_terminal = False
     job.is_successful = False
     assert sensor.poke({}) is False
+
+
+def test_provider_info_and_hook_metadata_contract():
+    """Verify get_provider_info, entry point metadata, and ImednetHook attributes."""
+    from importlib.metadata import distribution, entry_points
+
+    import apache_airflow_providers_imednet as provider_pkg
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+
+    assert ImednetHook.conn_name_attr == "imednet_conn_id"
+    assert ImednetHook.default_conn_name == "imednet_default"
+    assert ImednetHook.conn_type == "imednet"
+    assert ImednetHook.hook_name == "iMednet"
+
+    info = provider_pkg.get_provider_info()
+    assert info["package-name"] == "apache-airflow-providers-imednet"
+    assert info["name"] == "iMednet"
+    conn_types = info["connection-types"]
+    assert len(conn_types) == 1
+    assert conn_types[0]["connection-type"] == "imednet"
+    assert conn_types[0]["hook-class-name"] == "airflow.providers.imednet.hooks.ImednetHook"
+    assert conn_types[0]["hook-name"] == "iMednet"
+    assert "conn-fields" in conn_types[0]
+    assert "ui-field-behaviour" in conn_types[0]
+
+    eps = entry_points(group="apache_airflow_provider")
+    matched = [ep for ep in eps if ep.value == "apache_airflow_providers_imednet:get_provider_info"]
+    assert len(matched) == 1
+    assert matched[0].load() is provider_pkg.get_provider_info
+
+    dist = distribution("apache-airflow-providers-imednet")
+    requires = dist.requires or []
+    assert any(req.startswith("imednet-workflows") for req in requires)
+    extras = set(dist.metadata.get_all("Provides-Extra") or [])
+    assert {"duckdb", "export", "mongodb", "neo4j", "snowflake"}.issubset(extras)
