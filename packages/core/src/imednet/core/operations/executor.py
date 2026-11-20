@@ -16,7 +16,11 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from imednet.core.operations.circuit_breaker import CircuitBreaker, get_global_circuit_breaker
+from imednet.core.operations.circuit_breaker import (
+    CircuitBreaker,
+    ProbeLease,
+    get_global_circuit_breaker,
+)
 from imednet.core.operations.monitor import OperationMonitor
 from imednet.core.retry import RetryConfig
 
@@ -50,8 +54,7 @@ class DefaultOperationRetryPolicy(OperationRetryPolicy):
         Returns:
             bool: True, as the default policy retries everything.
         """
-        # Default fallback: retry on any exception?
-        # Usually we only retry on specific ones, but for universal wrapper, we can allow everything or leave it configurable
+        _ = exception
         return True
 
 
@@ -76,7 +79,7 @@ class UniversalExecutor:
             operation_name: Name of the operation (used in logs and spans).
             wait_strategy: Optional custom wait strategy function.
             retry_predicate: Optional custom retry predicate function.
-            circuit_breaker: Optional instance-scoped circuit breaker.
+            circuit_breaker: Optional scoped circuit breaker instance.
             **attributes: Additional attributes to attach to logs and spans.
         """
         self.tracer = tracer
@@ -109,83 +112,97 @@ class UniversalExecutor:
                     return self.retry_config.retry_policy.should_retry(exc)  # type: ignore[no-any-return]
         return False
 
-    def _handle_retry_error(self, e: RetryError, monitor: OperationMonitor) -> NoReturn:
-        """Record retry exhaustion on the circuit breaker and escalate the underlying cause."""
-        self.circuit_breaker.record_failure()
-        cause = e.last_attempt.exception() if e.last_attempt else e
+    def _should_record_failure(self, exc: Exception) -> bool:
+        """Return True if ``exc`` represents a retriable/upstream failure for breaker accounting."""
+        policy = self.retry_config.retry_policy
+        if isinstance(policy, OperationRetryPolicy):
+            return policy.should_retry(exc)
+        if hasattr(policy, "should_retry"):
+            try:
+                return bool(policy.should_retry(exc))
+            except TypeError:
+                return True
+        return True
+
+    def _handle_retry_exhausted(
+        self,
+        error: RetryError,
+        lease: ProbeLease,
+        monitor: OperationMonitor,
+    ) -> NoReturn:
+        """Record breaker failure and escalate the underlying cause after retry exhaustion."""
+        lease.record_failure()
+        cause = error.last_attempt.exception() if error.last_attempt else error
         if isinstance(cause, Exception):
             try:
                 monitor.on_retry_error(cause, self.retry_config.retries)
-            except Exception as _exc:
-                if _exc is not cause:
+            except Exception as raised_exc:
+                if raised_exc is not cause:
                     raise
-        if cause is not None and cause is not e:
+        if cause is not None and cause is not error:
             raise cause
-        raise e
+        raise error
+
+    def _handle_unretried_exception(
+        self,
+        error: Exception,
+        lease: ProbeLease,
+        monitor: OperationMonitor,
+    ) -> None:
+        """Record breaker failure only when retriable, and notify operation telemetry."""
+        if self._should_record_failure(error):
+            lease.record_failure()
+        monitor.on_failure(error)
 
     def execute(self, func: Callable[[], T]) -> T:
         """Synchronous execution."""
-        probe_acquired = self.circuit_breaker.check_request_allowed()
-        settled = False
-
         retryer = self.retry_config.create_retryer(
             wait_strategy=self.wait_strategy,
             retry_predicate=self.retry_predicate,
         )
 
-        try:
-            with OperationMonitor(self.tracer, self.operation_name, **self.attributes) as monitor:
-                try:
-                    result: Any = retryer(func)
-                    self.circuit_breaker.record_success()
-                    settled = True
-                    monitor.on_success()
-                    return result  # type: ignore[no-any-return]
-                except RetryError as e:
-                    settled = True
-                    self._handle_retry_error(e, monitor)
-                except Exception as e:
-                    monitor.on_failure(e)
-                    raise
-        finally:
-            if probe_acquired and not settled:
-                self.circuit_breaker.release_probe()
+        with (
+            self.circuit_breaker.acquire() as lease,
+            OperationMonitor(self.tracer, self.operation_name, **self.attributes) as monitor,
+        ):
+            try:
+                result: Any = retryer(func)
+                lease.record_success()
+                monitor.on_success()
+                return result  # type: ignore[no-any-return]
+            except RetryError as err:
+                self._handle_retry_exhausted(err, lease, monitor)
+            except Exception as err:
+                self._handle_unretried_exception(err, lease, monitor)
+                raise
 
     async def execute_async(self, func: Callable[[], Awaitable[T]]) -> T:
         """Asynchronous execution."""
-        probe_acquired = self.circuit_breaker.check_request_allowed()
-        settled = False
-
         retryer = self.retry_config.create_async_retryer(
             wait_strategy=self.wait_strategy,
             retry_predicate=self.retry_predicate,
         )
 
-        try:
-            async with OperationMonitor(
-                self.tracer, self.operation_name, **self.attributes
-            ) as monitor:
-                try:
+        async with (
+            self.circuit_breaker.acquire() as lease,
+            OperationMonitor(self.tracer, self.operation_name, **self.attributes) as monitor,
+        ):
+            try:
 
-                    async def _async_wrapper() -> T:
-                        """Wrapper to await the function.
+                async def _async_wrapper() -> T:
+                    """Wrapper to await the function.
 
-                        Returns:
-                            T: Result of the operation.
-                        """
-                        return await func()
+                    Returns:
+                        T: Result of the operation.
+                    """
+                    return await func()
 
-                    result: Any = await retryer(_async_wrapper)
-                    self.circuit_breaker.record_success()
-                    settled = True
-                    monitor.on_success()
-                    return result  # type: ignore[no-any-return]
-                except RetryError as e:
-                    settled = True
-                    self._handle_retry_error(e, monitor)
-                except Exception as e:
-                    monitor.on_failure(e)
-                    raise
-        finally:
-            if probe_acquired and not settled:
-                self.circuit_breaker.release_probe()
+                result: Any = await retryer(_async_wrapper)
+                lease.record_success()
+                monitor.on_success()
+                return result  # type: ignore[no-any-return]
+            except RetryError as err:
+                self._handle_retry_exhausted(err, lease, monitor)
+            except Exception as err:
+                self._handle_unretried_exception(err, lease, monitor)
+                raise

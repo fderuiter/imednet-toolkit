@@ -284,6 +284,41 @@ def validate_ast_docstrings(tree: ast.AST) -> list[tuple[int, str]]:
     return diagnostics
 
 
+def _is_workflow_showcase(py_file: Path, examples_dir: Path) -> bool:
+    """Return True if py_file is a top-level workflow_*.py showcase or inside examples/workflows/."""
+    if py_file.name.startswith("workflow_"):
+        return True
+    with contextlib.suppress(ValueError):
+        rel_parts = py_file.resolve().relative_to(examples_dir.resolve()).parts
+        return "workflows" in rel_parts
+    return False
+
+
+def validate_ast_workflow_bindings(tree: ast.AST) -> list[tuple[int, str]]:
+    """Reject discarded workflow or record-set constructor calls in workflow showcases."""
+    diagnostics: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        callee_name: str | None = None
+        if isinstance(func, ast.Name):
+            callee_name = func.id
+        elif isinstance(func, ast.Attribute):
+            callee_name = func.attr
+        if callee_name and (
+            callee_name.endswith(("Workflow", "RecordSet")) or callee_name == "ImednetSDK"
+        ):
+            diagnostics.append(
+                (
+                    getattr(node, "lineno", 1),
+                    f"Unassigned '{callee_name}(...)' call discards its instance without executing workflow actions",
+                )
+            )
+    diagnostics.sort(key=lambda item: item[0])
+    return diagnostics
+
+
 def validate_showcase_ast_and_imports(
     examples_dir: Path, repo_root: Path | None = None
 ) -> list[str]:
@@ -318,6 +353,10 @@ def validate_showcase_ast_and_imports(
 
         for lineno, reason in validate_ast_imports(tree):
             errors.append(f"{py_file}:{lineno}: {reason}")
+
+        if _is_workflow_showcase(py_file, examples_dir):
+            for lineno, reason in validate_ast_workflow_bindings(tree):
+                errors.append(f"{py_file}:{lineno}: {reason}")
 
     return errors
 
@@ -476,8 +515,21 @@ def execute_showcases_in_simulation(
                     errors.append(f"{py_file}: {err_reason}")
                     continue
 
-                is_airflow_dag = "airflow" in py_file.relative_to(examples_dir).parts
-                if not is_airflow_dag:
+                if _is_workflow_showcase(py_file, examples_dir):
+                    combined_output = f"{proc.stdout}\n{proc.stderr}"
+                    if "Skipping execution" in combined_output:
+                        errors.append(
+                            f"{py_file}: Workflow showcase skipped execution instead of running in simulation mode"
+                        )
+                    elif py_file.name.startswith("workflow_") and not proc.stdout.strip():
+                        errors.append(
+                            f"{py_file}: Workflow showcase produced empty stdout (silent no-op) in simulation mode"
+                        )
+                    elif not (proc.stdout.strip() or proc.stderr.strip()):
+                        errors.append(
+                            f"{py_file}: Workflow showcase produced empty output (silent no-op) in simulation mode"
+                        )
+                elif "airflow" not in py_file.relative_to(examples_dir).parts:
                     has_file_output = any(
                         p.is_file() and p.stat().st_size > 0 for p in Path(run_cwd).rglob("*")
                     )
@@ -495,7 +547,10 @@ import sys
 from pathlib import Path
 
 import airflow
+from airflow.sdk import DAG as SdkDAG
 from apache_airflow_providers_imednet import ImednetExportOperator
+
+dag_classes = tuple({airflow.DAG, SdkDAG})
 
 airflow_dir = Path(sys.argv[1])
 export_root = Path(sys.argv[2])
@@ -527,7 +582,7 @@ for dag_file in sorted(airflow_dir.glob("*.py")):
         errors.append(f"{dag_file}: Failed to import DAG under Airflow {airflow.__version__}: {exc}")
         continue
 
-    dags = [val for val in vars(module).values() if isinstance(val, airflow.DAG)]
+    dags = [val for val in vars(module).values() if isinstance(val, dag_classes)]
     if not dags:
         errors.append(f"{dag_file}: Did not define any airflow.DAG object")
         continue

@@ -126,8 +126,10 @@ You can also generate the query string via
 `DuckDBIngestionWorkflow`
 -------------------------
 
-For incremental bronze/silver ingestion, use
-:class:`imednet_workflows.DuckDBIngestionWorkflow`.
+For incremental bronze/silver ``Record`` revision ingestion, use
+:class:`imednet_workflows.DuckDBIngestionWorkflow` (also registered under the
+``imednet.workflows`` plugin entry point ``duckdb_centralizer`` via
+``sdk.workflows.duckdb_centralizer``).
 
 .. testcode::
 
@@ -165,6 +167,50 @@ The two key methods are
 for incremental loads and
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.build_silver_view`
 for current-state materialization.
+
+Incremental checkpoints for DuckDB and Hive Parquet helpers
+-----------------------------------------------------------
+
+:func:`imednet.integrations.export_to_duckdb`,
+:func:`imednet.integrations.export_to_duckdb_by_form`, and
+:func:`imednet.integrations.export_to_hive_parquet` accept all eight streaming
+checkpoint options—``incremental``, ``stream_name``, ``ledger_path``,
+``state_provider``, ``modified_since``, ``record_filter``, ``record_data_filter``,
+and ``include_deleted``—while keeping ``mask_phi=True`` as the default PHI guard.
+
+Use :class:`~imednet_workflows.ExtractionStateLedger`
+(:class:`~imednet_workflows.state_ledger.FileStateProvider`) for local analytical
+pipelines or :class:`~imednet_workflows.state_ledger.AirflowStateProvider` when
+orchestrating DuckDB refreshes from Apache Airflow:
+
+.. testcode::
+
+   import tempfile
+   from pathlib import Path
+   from imednet import ImednetSDK
+   from imednet.integrations import export_to_duckdb
+   from imednet_workflows import ExtractionStateLedger
+
+   with tempfile.TemporaryDirectory() as duck_tmp_dir:
+       duck_db_path = Path(duck_tmp_dir) / "incremental.duckdb"
+       duck_ledger_path = Path(duck_tmp_dir) / "duckdb_state.json"
+       duck_ledger = ExtractionStateLedger(str(duck_ledger_path))
+
+       export_to_duckdb(
+           ImednetSDK(simulation_mode=True),
+           "STUDY",
+           str(duck_db_path),
+           "vital_signs_records",
+           mask_phi=True,
+           incremental=True,
+           stream_name="duckdb_vital_signs",
+           ledger_path=duck_ledger_path,
+           state_provider=duck_ledger,
+           modified_since="2026-01-01T00:00:00Z",
+           record_filter={"form_key": "F_VS"},
+           record_data_filter="V_WEIGHT>0",
+           include_deleted=False,
+       )
 
 CLI `duckdb` subcommand reference
 ---------------------------------

@@ -23,6 +23,7 @@ from imednet.spi.cli import (
     parse_filter_args,
     with_sdk,
 )
+from imednet.spi.utils import validate_path_segment
 
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
@@ -325,6 +326,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             extract_parser.error("the following arguments are required: study_key")
 
         assert study_key is not None
+        validate_path_segment(study_key, name="study_key")
         workflow = DataExtractionWorkflow(sdk)  # type: ignore[arg-type]
         parsed_record_filter = parse_filter_args(record_filter, model=Record)
         parsed_subject_filter = parse_filter_args(subject_filter, model=Subject)
@@ -362,6 +364,11 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         else:
             if not args.study_key:
                 extract_parser.error("the following arguments are required: study_key")
+            try:
+                validate_path_segment(args.study_key, name="study_key")
+            except Exception as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
             from imednet.spi.models import Record, Subject, Visit
 
             parse_filter_args(args.record_filter, model=Record)
@@ -611,6 +618,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 enabled_form_keys = None
         elif not study_key:
             uat_run_parser.error("the following arguments are required: study_key")
+
+        validate_path_segment(study_key, name="study_key")
 
         active_phase_descriptions = {
             UATWorkflowState.INSPECTING: "[Phase 1/5] Inspecting study schema and metadata...",

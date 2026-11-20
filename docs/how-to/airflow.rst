@@ -16,6 +16,10 @@ pip installation. Package versions remain managed by release-please.
 .. code-block:: bash
 
    pip install "apache-airflow>=3.2.0,<4.0.0" apache-airflow-providers-imednet
+   # Optional destination extras:
+   pip install "apache-airflow-providers-imednet[export]"
+   pip install "apache-airflow-providers-imednet[duckdb]"
+   pip install "apache-airflow-providers-imednet[snowflake,mongodb,neo4j]"
 
 Production Reference DAG
 ------------------------
@@ -42,18 +46,21 @@ focused operator/sensor usage patterns.
 Connections
 -----------
 
-Create an Airflow connection ``imednet_default`` or override ``imednet_conn_id``.
+Create an Airflow connection ``imednet_default`` (connection type ``imednet``,
+registered via ``apache_airflow_providers_imednet:get_provider_info``) or override
+``imednet_conn_id``.
 Provide ``api_key`` and ``security_key`` via the login/password fields or in the
 ``extra`` JSON. ``base_url`` may be added in ``extra`` for a non-standard
 environment. The hook merges these settings with values from
 ``imednet.config.load_config`` so environment variables still apply.
 
-For warehouse, graph, document, and transactional SQL exports, configure a
+For warehouse, graph, document, DuckDB, and transactional SQL exports, configure a
 separate Airflow connection and pass ``destination_conn_id`` on
 ``ImednetExportOperator``. ``ImednetHook.resolve_destination_connection()``
 resolves destination credentials (Snowflake ``account``/``user``/``password``
 and coordinates, Neo4j ``uri``/``auth``/``database``, MongoDB ``uri`` and
-database settings, or SQLAlchemy connection URIs) at task execution time rather
+database settings, DuckDB ``db_path`` and ``table_name``, or SQLAlchemy
+connection URIs) at task execution time rather
 than embedding secrets in DAG definitions.
 
 To prevent credential leakage in Airflow rendered task metadata and XComs,
@@ -73,7 +80,7 @@ For task-mapping discovery steps, ``ImednetHook`` provides explicit helper metho
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
 - ``resolve_destination_connection()`` resolves runtime destination connection
-  settings for ``snowflake``, ``neo4j``, ``mongodb``, and ``sql`` targets.
+  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb``, and ``sql`` targets.
 
 Operators and Sensors
 ---------------------
@@ -81,7 +88,8 @@ The Airflow integration organizes hooks, operators, and sensors in dedicated
 subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, Snowflake, Neo4j, etc.)
+records to any supported destination (CSV, Parquet, DuckDB, SQL, Snowflake,
+Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
@@ -92,10 +100,13 @@ registered ``Subject`` identifiers and committed ``StudyConfiguration``
 ``phiFields`` with ``***MASKED***``; authorized enclave workflows can explicitly
 opt out by passing ``mask_phi=False`` (or ``export_kwargs={"mask_phi": False}``)
 without mutating ``global_sensitivity_registry``. Destination-specific non-secret
-options—such as Snowflake staging settings (``stage_prefix``,
-``local_staging_dir``, ``manifest_path``) and Neo4j ``database`` names—can be
+options—such as DuckDB ``table_name`` (or ``table``, defaulting to ``"records"``),
+Snowflake staging settings (``stage_prefix``,
+``local_staging_dir``, ``manifest_path``), and Neo4j ``database`` names—can be
 supplied via ``export_kwargs`` or connection ``extra`` metadata.
-``ImednetJobSensor`` waits for an export job to complete.
+``ImednetJobSensor(study_key=..., batch_id=...)`` polls an asynchronous iMednet
+job identified by ``study_key`` and ``batch_id`` until it reaches a terminal
+state (see :ref:`rest_resource_jobs`).
 All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` instance
 from an Airflow connection. The production reference DAG above shows the recommended
 dynamic-mapping pattern: keep static settings (for example ``destination``,
@@ -163,6 +174,56 @@ resolved only inside ``execute()``:
            "stage_prefix": "imednet/MY_STUDY",
            "manifest_path": "/tmp/imednet_manifest.jsonl",
        },
+   )
+
+Incremental Checkpoints with ``AirflowStateProvider`` and ``ExtractionStateLedger``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ImednetExportOperator`` forwards all eight streaming checkpoint and ``Record``
+filter parameters directly to :func:`~imednet.spi.sink_base.run_streaming_export`
+and tabular export helpers while maintaining ``mask_phi=True`` by default:
+
+- ``incremental``: Enable transactional high-water mark reads and commits.
+- ``stream_name``: Stream key used to isolate checkpoints per destination or ``Form``.
+- ``state_provider``: Explicit checkpoint provider such as
+  :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (persisting
+  watermarks in Airflow XCom metadata under ``state_<study_key>_<stream_name>``)
+  or :class:`~imednet_workflows.ExtractionStateLedger`
+  (:class:`~imednet_workflows.state_ledger.FileStateProvider`). When omitted on an
+  ``incremental=True`` run, ``ImednetExportOperator`` defaults to the ``airflow``
+  provider entry point automatically unless ``ledger_path`` is specified.
+- ``ledger_path``: Shared filesystem path used when persisting checkpoints with
+  ``ExtractionStateLedger`` instead of XCom metadata.
+- ``modified_since``: Initial UTC lower-bound watermark when no prior checkpoint exists.
+- ``record_filter``: ``Record`` metadata filter dictionary or expression string.
+- ``record_data_filter``: ``Variable`` payload filter expression (``recordDataFilter``).
+- ``include_deleted``: Include voided (``deleted=True``) ``Record`` items directly
+  in destination batches instead of reconciling deletes separately.
+
+.. testcode::
+
+   from apache_airflow_providers_imednet import ImednetExportOperator
+   from imednet_workflows.state_ledger import AirflowStateProvider, ExtractionStateLedger
+
+   airflow_state = AirflowStateProvider()
+   shared_file_ledger = ExtractionStateLedger("/tmp/airflow_shared_ledger.json")
+
+   incremental_export_task = ImednetExportOperator(
+       task_id="incremental_export_snowflake",
+       study_key="MY_STUDY",
+       destination="snowflake",
+       imednet_conn_id="imednet_default",
+       destination_conn_id="snowflake_warehouse",
+       mask_phi=True,
+       incremental=True,
+       stream_name="snowflake_vital_signs",
+       ledger_path=None,
+       state_provider=airflow_state,
+       modified_since="2026-01-01T00:00:00Z",
+       record_filter={"form_key": "F_VS"},
+       record_data_filter="V_WEIGHT>0",
+       include_deleted=False,
+       export_kwargs={"table": "VITAL_SIGNS_RECORDS"},
    )
 
 Testing with Airflow

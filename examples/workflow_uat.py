@@ -125,6 +125,8 @@ def main() -> None:
         )
         run_result = workflow.run(study_key, subject_count=2)
         print(run_result.summary())
+        if not run_result.overall_success:
+            raise RuntimeError(f"UAT workflow did not succeed for Study {study_key}")
 
         engine = UATExecutionEngine(sdk, data_dictionary, poll_interval=0.0)
         report = engine.run_verification(study_key, form_scope="F_VS")
