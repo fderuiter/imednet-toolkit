@@ -7,8 +7,21 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def _purge_partial_airflow_modules() -> None:
+    import sys
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+                sys.modules.pop(mod, None)
+
+
 def test_dag_runs(monkeypatch, tmp_path):
     """Test that dag runs."""
+    _purge_partial_airflow_modules()
     pytest.importorskip("airflow")
     out_csv = tmp_path / "out.csv"
     from airflow.models import DAG  # noqa: I001
@@ -58,6 +71,7 @@ def test_dag_runs(monkeypatch, tmp_path):
 @pytest.fixture
 def airflow3_sqlite_env(monkeypatch, tmp_path):
     """Initialize an isolated Airflow 3 SQLite metadata database and restore logging/ORM state."""
+    _purge_partial_airflow_modules()
     pytest.importorskip("airflow")
     import json
     import logging

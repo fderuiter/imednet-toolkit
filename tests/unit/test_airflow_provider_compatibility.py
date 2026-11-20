@@ -25,10 +25,26 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_airflow_provider_modules():
     """Unload provider modules upon module teardown to ensure other test suites stay hermetic."""
+    import logging
+
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+                sys.modules.pop(mod, None)
+
     yield
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
             sys.modules.pop(mod, None)
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
 
 
 @pytest.fixture
