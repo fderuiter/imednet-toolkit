@@ -7,6 +7,7 @@ from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncList
 from imednet.core.endpoint.operations.get import PathGetOperation
 from imednet.models.studies import Study
 from imednet.utils.typing import ItemId
+from imednet.utils.url import validate_path_segment
 
 
 class StudiesOperationDef:
@@ -57,9 +58,10 @@ class StudiesOperationDef:
             raise TypeError(f"get() takes at most 2 positional arguments ({2 + len(args)} given)")
 
         resolved_key = item_id if item_id is not None else study_key
-        if not resolved_key:
+        if resolved_key is None:
             raise TypeError("Missing required argument: study_key")
 
+        validate_path_segment(resolved_key, name="study_key")
         path = self._get_endpoint_path(None, resolved_key)  # type: ignore[attr-defined]
         return PathGetOperation[Study](
             path=path,

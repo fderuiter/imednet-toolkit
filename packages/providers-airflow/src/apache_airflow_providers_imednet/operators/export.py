@@ -13,6 +13,7 @@ from urllib.parse import quote_plus
 from imednet import ImednetSDK
 from imednet.spi import sink_base
 from imednet.spi.sinks import redact_uri
+from imednet.spi.utils import validate_path_segment
 
 from .. import export
 from .._airflow_compat import AirflowException, Context
@@ -477,6 +478,7 @@ class ImednetExportOperator(BaseOperator):
         """Execute the export task."""
         _ = context
         # Validate templated fields at runtime prior to any export work.
+        validate_path_segment(self.study_key, name="study_key")
         if self.output_path is not None:
             _validate_no_secrets_in_value(self.output_path, field_name="output_path")
         runtime_kwargs = self._get_runtime_export_kwargs()
