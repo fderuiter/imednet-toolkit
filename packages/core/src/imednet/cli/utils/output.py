@@ -31,8 +31,54 @@ _ANSI_COLORS = {
     "magenta": "\033[35m",
     "dim": "\033[2m",
     "bold_magenta": "\033[1;35m",
+    "hc_success": "\033[1;38;2;0;255;102;48;2;0;0;0m",
+    "hc_warning": "\033[1;38;2;255;255;0;48;2;0;0;0m",
+    "hc_danger": "\033[1;38;2;255;153;255;48;2;0;0;0m",
+    "hc_16_success": "\033[1;97;40m",
+    "hc_16_warning": "\033[30;107m",
+    "hc_16_danger": "\033[1;4;97;40m",
     "reset": "\033[0m",
 }
+
+_16_COLOR_TERMS: frozenset[str] = frozenset(
+    {
+        "16color",
+        "ansi",
+        "conhost",
+        "cons25",
+        "cygwin",
+        "linux",
+        "rxvt",
+        "screen",
+        "vt100",
+        "vt220",
+        "xterm",
+        "xterm-16color",
+        "xterm-color",
+    }
+)
+
+_HC_16_FALLBACK_MAP: dict[str, str] = {
+    "hc_success": "hc_16_success",
+    "hc_warning": "hc_16_warning",
+    "hc_danger": "hc_16_danger",
+}
+
+
+def _is_16_color_terminal() -> bool:
+    """Return True when the active terminal environment only supports 16 ANSI colors."""
+    colorterm = os.environ.get("COLORTERM", "").strip().lower()
+    if colorterm in {"truecolor", "24bit"}:
+        return False
+    if colorterm in {"16", "16color", "ansi"}:
+        return True
+    term = os.environ.get("TERM", "").strip().lower()
+    if not term:
+        return False
+    if any(token in term for token in ("256color", "truecolor", "24bit", "-direct")):
+        return False
+    return term in _16_COLOR_TERMS or term.endswith(("-16color", "-color"))
+
 
 _STATUS_COLOR_MAP = {
     "active": "green",
@@ -64,32 +110,32 @@ _STATUS_COLOR_MAP = {
 }
 
 _HC_STATUS_COLOR_MAP = {
-    "active": "blue",
-    "success": "blue",
-    "ok": "blue",
-    "completed": "blue",
-    "complete": "blue",
-    "open": "blue",
-    "approved": "blue",
-    "verified": "blue",
-    "pending": "yellow",
-    "processing": "yellow",
-    "running": "yellow",
-    "queued": "yellow",
-    "suspended": "yellow",
-    "hold": "yellow",
-    "incomplete": "yellow",
-    "initiated": "yellow",
-    "inactive": "magenta",
-    "closed": "magenta",
-    "error": "magenta",
-    "fail": "magenta",
-    "failed": "magenta",
-    "cancelled": "magenta",
-    "timeout": "magenta",
-    "rejected": "magenta",
-    "terminated": "magenta",
-    "withdrawn": "magenta",
+    "active": "hc_success",
+    "success": "hc_success",
+    "ok": "hc_success",
+    "completed": "hc_success",
+    "complete": "hc_success",
+    "open": "hc_success",
+    "approved": "hc_success",
+    "verified": "hc_success",
+    "pending": "hc_warning",
+    "processing": "hc_warning",
+    "running": "hc_warning",
+    "queued": "hc_warning",
+    "suspended": "hc_warning",
+    "hold": "hc_warning",
+    "incomplete": "hc_warning",
+    "initiated": "hc_warning",
+    "inactive": "hc_danger",
+    "closed": "hc_danger",
+    "error": "hc_danger",
+    "fail": "hc_danger",
+    "failed": "hc_danger",
+    "cancelled": "hc_danger",
+    "timeout": "hc_danger",
+    "rejected": "hc_danger",
+    "terminated": "hc_danger",
+    "withdrawn": "hc_danger",
 }
 
 _ANSI_REGEX = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
@@ -304,6 +350,8 @@ class Status:
         console: Console,
         spinner: str | None = None,
         refresh_per_second: float = 12.5,
+        *,
+        announce_non_interactive: bool = True,
     ) -> None:
         """Initialize a status controller.
 
@@ -312,6 +360,8 @@ class Status:
             console: Console instance managing stream output.
             spinner: Optional spinner style identifier.
             refresh_per_second: Target frame refresh rate.
+            announce_non_interactive: Whether to emit the initial message on
+                stderr when entering non-interactive mode.
         """
         self._msg = str(msg)
         self.console = console
@@ -325,6 +375,7 @@ class Status:
         self._entered = False
         self._frames: Sequence[str] = _SPINNER_FRAMES
         self._lines_rendered: int = 1
+        self._announce_non_interactive = announce_non_interactive
 
     @property
     def lines_rendered(self) -> int:
@@ -347,6 +398,27 @@ class Status:
             self._msg = str(msg)
         if self._interactive and self._entered:
             self._render_frame()
+
+    def step(self, msg: str) -> None:
+        """Emit a mode-aware step update for long-running loops.
+
+        Updates the live spinner on interactive TTYs and writes a structured
+        plain-text line to ``stderr`` when non-interactive (unless JSON output
+        mode is active).
+        """
+        with self._lock:
+            self._msg = str(msg)
+        if self._interactive and self._entered:
+            self._render_frame()
+            return
+        if is_json_output_mode():
+            return
+        stream = self.console.stream
+        try:
+            clean_msg = _ANSI_REGEX.sub("", str(msg))
+            print(clean_msg, file=stream, flush=True)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
 
     def _render_frame(self, frame_idx: int = 0) -> None:
         stream = self.console.stream
@@ -424,7 +496,7 @@ class Status:
             )
             is_test_captured = stream is sys.stderr and is_string_io
 
-            if not is_json_mode and not is_test_captured:
+            if self._announce_non_interactive and not is_json_mode and not is_test_captured:
                 try:
                     clean_msg = _ANSI_REGEX.sub("", self._msg)
                     print(clean_msg, file=stream, flush=True)
@@ -501,9 +573,17 @@ class Console:
         msg: str,
         spinner: str | None = None,
         refresh_per_second: float = 12.5,
+        *,
+        announce_non_interactive: bool = True,
     ) -> Status:
         """Create a live status context manager."""
-        return Status(msg, console=self, spinner=spinner, refresh_per_second=refresh_per_second)
+        return Status(
+            msg,
+            console=self,
+            spinner=spinner,
+            refresh_per_second=refresh_per_second,
+            announce_non_interactive=announce_non_interactive,
+        )
 
 
 _DummyConsole = Console
@@ -540,7 +620,8 @@ def _format_cell_value(value: Any, key: str | None = None) -> str:
 def _colorize(text: str, color: str) -> str:
     if not supports_ansi_color(sys.stdout):
         return text
-    return f"{_ANSI_COLORS.get(color, '')}{text}{_ANSI_COLORS['reset']}"
+    resolved_color = _HC_16_FALLBACK_MAP.get(color, color) if _is_16_color_terminal() else color
+    return f"{_ANSI_COLORS.get(resolved_color, '')}{text}{_ANSI_COLORS['reset']}"
 
 
 def _print_table(items: Sequence[Any], fields: list[str]) -> None:

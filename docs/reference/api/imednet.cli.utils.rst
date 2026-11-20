@@ -64,3 +64,11 @@ imednet.cli.utils.terminal module
    :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:
+
+imednet.cli.utils.write\_helpers module
+---------------------------------------
+
+.. automodule:: imednet.cli.utils.write_helpers
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:

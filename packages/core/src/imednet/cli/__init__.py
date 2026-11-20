@@ -18,7 +18,7 @@ from ..integrations.export import (
     export_to_sql,
     export_to_sql_by_form,
 )
-from .decorators import _redact_secrets, with_sdk
+from .decorators import _redact_secrets, cli_execution_guard, with_sdk
 from .utils import (
     NON_INTERACTIVE_ENV,
     OUTPUT_FORMAT_ENV,
@@ -217,12 +217,13 @@ def app(args: list[str] | None = None) -> None:
 
     parsed = parser.parse_args(args)
 
-    if parsed.high_contrast and getattr(parsed, "command", None) != "tui":
-        os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
-
+    old_high_contrast = os.environ.get("IMEDNET_HIGH_CONTRAST")
     old_output_format = os.environ.get(OUTPUT_FORMAT_ENV)
     old_non_interactive = os.environ.get(NON_INTERACTIVE_ENV)
     try:
+        if parsed.high_contrast and getattr(parsed, "command", None) != "tui":
+            os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
+
         if getattr(parsed, "no_interactive", False):
             os.environ[NON_INTERACTIVE_ENV] = "1"
 
@@ -237,12 +238,17 @@ def app(args: list[str] | None = None) -> None:
         elif old_output_format is not None and old_output_format.strip().lower() == "json":
             os.environ[OUTPUT_FORMAT_ENV] = "json"
 
-        if hasattr(parsed, "func"):
-            parsed.func(parsed)
-        else:
-            active_parser = _find_active_subparser(parser, args)
-            active_parser.print_help()
+        with cli_execution_guard():
+            if hasattr(parsed, "func"):
+                parsed.func(parsed)
+            else:
+                active_parser = _find_active_subparser(parser, args)
+                active_parser.print_help()
     finally:
+        if old_high_contrast is not None:
+            os.environ["IMEDNET_HIGH_CONTRAST"] = old_high_contrast
+        else:
+            os.environ.pop("IMEDNET_HIGH_CONTRAST", None)
         if old_output_format is not None:
             os.environ[OUTPUT_FORMAT_ENV] = old_output_format
         else:

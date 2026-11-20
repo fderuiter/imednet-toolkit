@@ -280,6 +280,7 @@ class CachedRecordsLoader:
         *,
         conn: sqlite3.Connection | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
+        order_by_subject: bool = False,
     ) -> Iterator[Record]:
         """Yield cached records for ``study_key`` in bounded chunks."""
         if chunk_size <= 0:
@@ -289,16 +290,31 @@ class CachedRecordsLoader:
         if conn is None:
             conn = get_sqlite_connection(self.db_path)
             close_conn = True
+        query = (
+            """
+            SELECT payload
+            FROM record_cache
+            WHERE study_key = ?
+            ORDER BY
+                COALESCE(
+                    NULLIF(TRIM(CAST(json_extract(payload, '$.recordData.USUBJID') AS TEXT)), ''),
+                    NULLIF(TRIM(CAST(json_extract(payload, '$.recordData.usubjid') AS TEXT)), ''),
+                    NULLIF(TRIM(CAST(json_extract(payload, '$.subjectKey') AS TEXT)), ''),
+                    NULLIF(TRIM(CAST(json_extract(payload, '$.subject_key') AS TEXT)), ''),
+                    ''
+                ) ASC,
+                record_id ASC
+            """
+            if order_by_subject
+            else """
+            SELECT payload
+            FROM record_cache
+            WHERE study_key = ?
+            ORDER BY record_id
+            """
+        )
         try:
-            cursor = conn.execute(
-                """
-                SELECT payload
-                FROM record_cache
-                WHERE study_key = ?
-                ORDER BY record_id
-                """,
-                (study_key,),
-            )
+            cursor = conn.execute(query, (study_key,))
             while True:
                 rows = cursor.fetchmany(chunk_size)
                 if not rows:
