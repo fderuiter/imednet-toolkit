@@ -59,12 +59,12 @@ class ImednetHook(BaseHook):
             "relabeling": {
                 "host": "Base URL",
                 "login": "API Key",
-                "password": "Security Key",
+                "password": "Security Key",  # pragma: allowlist secret
             },
             "placeholders": {
                 "host": "https://edc.prod.imednetapi.com",
                 "login": "Your iMednet API key",
-                "password": "Your iMednet security key",
+                "password": "Your iMednet security key",  # pragma: allowlist secret
                 "extra": '{"timeout": 30.0, "strict_mode": false}',
             },
         }

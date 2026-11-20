@@ -300,7 +300,7 @@ def test_real_airflow_providers_manager_registers_imednet_connection_and_masks_s
     ui_behaviour = hook_cls.get_ui_field_behaviour()
     assert "schema" in ui_behaviour["hidden_fields"]
     assert ui_behaviour["relabeling"]["login"] == "API Key"
-    assert ui_behaviour["relabeling"]["password"] == "Security Key"
+    assert ui_behaviour["relabeling"]["password"] == "Security Key"  # pragma: allowlist secret
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

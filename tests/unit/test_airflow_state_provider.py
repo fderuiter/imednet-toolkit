@@ -130,7 +130,11 @@ def test_airflow_state_provider_transaction_commit_and_rollback() -> None:
     ):
         tx2["new_timestamp"] = datetime(2026, 1, 3, 12, 0, 0, tzinfo=UTC)
         tx2["records_processed"] = 3
-        raise RuntimeError("sink write failure for postgresql://loader:secret@db.internal/edc")
+        err_msg = (
+            "sink write failure for "
+            "postgresql://loader:secret@db.internal/edc"  # pragma: allowlist secret
+        )
+        raise RuntimeError(err_msg)
 
     assert provider.get_last_timestamp("STUDY_TX", "airflow_csv") == committed_ts
     assert provider.get_last_status("STUDY_TX", "airflow_csv") == StreamExecutionStatus.FAILED

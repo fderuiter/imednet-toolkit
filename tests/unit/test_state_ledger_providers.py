@@ -170,3 +170,105 @@ def test_airflow_set_last_timestamp_invalid_status() -> None:
     provider = AirflowStateProvider()
     with pytest.raises(ValueError, match="Invalid stream execution status"):
         provider.set_last_timestamp("ST1", "recs", datetime.now(UTC), status="unsupported_status")
+
+
+def test_airflow_initial_failure_and_empty_run_keep_none_watermark(
+    clean_airflow_vars: None,
+) -> None:
+    """Airflow provider keeps last_timestamp as None on failed or zero-record initial syncs."""
+    from airflow.models import Variable
+
+    _ = clean_airflow_vars
+    provider = AirflowStateProvider()
+    var_key = "imednet_state__ST-INIT__recs"
+
+    with pytest.raises(RuntimeError, match="initial airflow failure"):
+        with provider.transaction("ST-INIT", "recs") as tx:
+            assert tx["last_timestamp"] is None
+            running_payload = Variable.get(var_key, deserialize_json=True)
+            assert running_payload["status"] == "running"
+            assert running_payload["last_timestamp"] is None
+            raise RuntimeError("initial airflow failure")
+
+    failed_payload = Variable.get(var_key, deserialize_json=True)
+    assert failed_payload["status"] == "failed"
+    assert failed_payload["last_timestamp"] is None
+    assert provider.get_last_timestamp("ST-INIT", "recs") is None
+
+    # Subsequent retry that reads zero records commits status=success while keeping None watermark
+    with provider.transaction("ST-INIT", "recs") as retry_tx:
+        assert retry_tx["last_timestamp"] is None
+        retry_tx["records_processed"] = 0
+
+    success_payload = Variable.get(var_key, deserialize_json=True)
+    assert success_payload["status"] == "success"
+    assert success_payload["last_timestamp"] is None
+    assert provider.get_last_timestamp("ST-INIT", "recs") is None
+
+
+def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
+    clean_airflow_vars: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Airflow provider recovers expired/dead-PID RUNNING leases via FAILED -> RUNNING."""
+    import os
+    import socket
+    from datetime import timedelta
+
+    from airflow.models import Variable
+
+    _ = clean_airflow_vars
+    provider = AirflowStateProvider()
+    var_key = "imednet_state__ST1__recs"
+    pushed_statuses: list[str] = []
+
+    orig_set = provider._set_variable_payload
+
+    def _spy_set(key: str, payload: dict[str, object]) -> None:
+        pushed_statuses.append(str(payload["status"]))
+        orig_set(key, payload)
+
+    monkeypatch.setattr(provider, "_set_variable_payload", _spy_set)
+
+    # Active lease on current PID blocks concurrent transaction
+    Variable.set(
+        var_key,
+        {
+            "study_key": "ST1",
+            "stream_name": "recs",
+            "last_timestamp": None,
+            "status": "running",
+            "last_run_status": "running",
+            "owner_pid": os.getpid(),
+            "owner_host": socket.gethostname(),
+            "lease_expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
+        },
+        serialize_json=True,
+    )
+    with pytest.raises(InvalidStateTransitionError):
+        with provider.transaction("ST1", "recs"):
+            pass
+
+    # Expired remote lease transitions RUNNING -> FAILED -> RUNNING -> SUCCESS
+    Variable.set(
+        var_key,
+        {
+            "study_key": "ST1",
+            "stream_name": "recs",
+            "last_timestamp": None,
+            "status": "running",
+            "last_run_status": "running",
+            "owner_pid": 1,
+            "owner_host": "airflow-worker-dead-pod",
+            "lease_expires_at": (datetime.now(UTC) - timedelta(seconds=5)).isoformat(),
+        },
+        serialize_json=True,
+    )
+    committed = datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
+    with provider.transaction("ST1", "recs") as tx:
+        assert tx["last_timestamp"] is None
+        tx["new_timestamp"] = committed
+        tx["records_processed"] = 4
+
+    assert pushed_statuses == ["failed", "running", "success"]
+    assert provider.get_last_timestamp("ST1", "recs") == committed

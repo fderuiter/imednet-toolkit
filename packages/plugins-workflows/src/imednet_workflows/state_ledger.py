@@ -6,10 +6,11 @@ import abc
 import contextlib
 import json
 import os
+import socket
 import sys
 import tempfile
 from collections.abc import Generator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -145,11 +146,14 @@ def validate_transition(
 class StreamState(BaseModel):
     """Schema for individual stream execution checkpoints."""
 
-    last_timestamp: datetime
+    last_timestamp: datetime | None = None
     records_processed: int = 0
     last_run_status: StreamExecutionStatus = StreamExecutionStatus.SUCCESS
     error_message: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    owner_pid: int | None = None
+    owner_host: str | None = None
+    lease_expires_at: datetime | None = None
 
     @field_validator("last_run_status", mode="before")
     @classmethod
@@ -192,7 +196,7 @@ class BaseStateProvider(abc.ABC):
         self,
         study_key: str,
         stream_name: str,
-        timestamp: datetime,
+        timestamp: datetime | None,
         records_processed: int = 0,
         status: StreamExecutionStatus | str = StreamExecutionStatus.SUCCESS,
         error_message: str | None = None,
@@ -208,6 +212,8 @@ class BaseStateProvider(abc.ABC):
         study_key: str,
         stream_name: str,
         fallback_timestamp: datetime | None = None,
+        *,
+        lease_ttl_seconds: float | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         """Context manager for transactional state tracking."""
 
@@ -227,21 +233,102 @@ DEFAULT_LEDGER_PATH: str = os.environ.get(
     "IMEDNET_WORKFLOW_LEDGER_PATH",
     str(Path.home() / ".imednet" / "pipeline_ledger.json"),
 )
+DEFAULT_LEASE_TTL_SECONDS: float = 3600.0
+
+
+def _normalize_optional_utc(ts: datetime | None) -> datetime | None:
+    """Normalize an optional datetime into timezone-aware UTC."""
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
+
+
+def _parse_optional_timestamp(raw: Any) -> datetime | None:
+    """Parse an optional ISO-8601 timestamp string or datetime into UTC."""
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return _normalize_optional_utc(raw)
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return None
+        return _normalize_optional_utc(datetime.fromisoformat(stripped))
+    return None
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if a local OS process with the given PID exists and is not a zombie."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+    stat_path = Path(f"/proc/{pid}/stat")
+    if stat_path.exists():
+        with contextlib.suppress(OSError):
+            content = stat_path.read_text(encoding="utf-8")
+            rparen = content.rfind(")")
+            if rparen != -1:
+                fields = content[rparen + 2 :].split()
+                if fields and fields[0] == "Z":
+                    return False
+    return True
+
+
+def _check_stale_running(
+    owner_pid: int | None,
+    owner_host: str | None,
+    lease_expires_at: datetime | None,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Return a recovery reason if a RUNNING stream lease is stale, or None if still active."""
+    current_time = now if now is not None else datetime.now(UTC)
+    normalized_expiry = _normalize_optional_utc(lease_expires_at)
+    if normalized_expiry is not None and current_time >= normalized_expiry:
+        return f"lease expired at {normalized_expiry.isoformat()}"
+
+    current_host = socket.gethostname()
+    if (
+        (owner_host is None or owner_host == current_host)
+        and owner_pid is not None
+        and not _is_pid_alive(owner_pid)
+    ):
+        host_label = owner_host or current_host
+        return f"owner process {owner_pid} on {host_label} is no longer running"
+
+    return None
 
 
 class FileStateProvider(BaseStateProvider):
     """Manages transactional state bookmarks per study using a local JSON file."""
 
-    def __init__(self, ledger_path: str = DEFAULT_LEDGER_PATH) -> None:
+    def __init__(
+        self,
+        ledger_path: str | Path = DEFAULT_LEDGER_PATH,
+        *,
+        lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS,
+    ) -> None:
         """Initialize the extraction state ledger.
 
         Args:
             ledger_path: Path to the JSON file where state is persisted.
+            lease_ttl_seconds: Lease duration in seconds for active RUNNING transactions.
         """
         if ledger_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
             ledger_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
         self.ledger_path = Path(ledger_path)
         self._lock_path = self.ledger_path.with_suffix(".lock")
+        self.lease_ttl_seconds = lease_ttl_seconds
 
     def _ensure_ledger_exists(self) -> None:
         """Ensure the ledger file and its parent directory exist."""
@@ -307,11 +394,7 @@ class FileStateProvider(BaseStateProvider):
             stream = study.streams.get(stream_name)
             if not stream:
                 return None
-            # Ensure return datetime is timezone-aware
-            ts = stream.last_timestamp
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=UTC)
-            return ts
+            return _normalize_optional_utc(stream.last_timestamp)
 
     def get_last_status(self, study_key: str, stream_name: str) -> StreamExecutionStatus | None:
         """Returns the last execution status for a given study and stream."""
@@ -329,7 +412,7 @@ class FileStateProvider(BaseStateProvider):
         self,
         study_key: str,
         stream_name: str,
-        timestamp: datetime,
+        timestamp: datetime | None,
         records_processed: int = 0,
         status: StreamExecutionStatus | str = StreamExecutionStatus.SUCCESS,
         error_message: str | None = None,
@@ -348,12 +431,10 @@ class FileStateProvider(BaseStateProvider):
                 current_status = current_stream.last_run_status if current_stream else None
                 validate_transition(current_status, validated_status)
 
-            # Ensure timezone-aware datetime
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=UTC)
+            normalized_ts = _normalize_optional_utc(timestamp)
 
             study.streams[stream_name] = StreamState(
-                last_timestamp=timestamp,
+                last_timestamp=normalized_ts,
                 records_processed=records_processed,
                 last_run_status=validated_status,
                 error_message=error_message,
@@ -367,12 +448,13 @@ class FileStateProvider(BaseStateProvider):
         study_key: str,
         stream_name: str,
         fallback_timestamp: datetime | None = None,
+        *,
+        lease_ttl_seconds: float | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         """Context manager for transactional state tracking.
 
         Yields a dict where user can record 'records_processed', 'new_timestamp', and 'metadata'.
         Saves automatically upon exiting the context with no exceptions.
-        The ledger file lock is held for the entire duration of the context.
         """
         with self._lock():
             state = self.read_state()
@@ -380,44 +462,80 @@ class FileStateProvider(BaseStateProvider):
             current_stream = study.streams.get(stream_name)
             current_status = current_stream.last_run_status if current_stream else None
 
-            last_ts: datetime | None = None
-            if current_stream:
-                last_ts = current_stream.last_timestamp
-                if last_ts.tzinfo is None:
-                    last_ts = last_ts.replace(tzinfo=UTC)
-            if last_ts is None:
-                last_ts = fallback_timestamp
-            if last_ts is not None and last_ts.tzinfo is None:
-                last_ts = last_ts.replace(tzinfo=UTC)
+            prior_ts = (
+                _normalize_optional_utc(current_stream.last_timestamp) if current_stream else None
+            )
+            effective_ts = (
+                prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
+            )
+
+            now = datetime.now(UTC)
+            if current_stream is not None and current_status == StreamExecutionStatus.RUNNING:
+                stale_reason = _check_stale_running(
+                    current_stream.owner_pid,
+                    current_stream.owner_host,
+                    current_stream.lease_expires_at,
+                    now=now,
+                )
+                if stale_reason is not None:
+                    validate_transition(current_status, StreamExecutionStatus.FAILED)
+                    study.streams[stream_name] = StreamState(
+                        last_timestamp=prior_ts,
+                        records_processed=current_stream.records_processed,
+                        last_run_status=StreamExecutionStatus.FAILED,
+                        error_message=f"Recovered stale running stream: {stale_reason}",
+                        metadata=dict(current_stream.metadata),
+                    )
+                    self.write_state(state)
+                    current_status = StreamExecutionStatus.FAILED
 
             # Atomic transaction guard: ensure transition to RUNNING is valid
             validate_transition(current_status, StreamExecutionStatus.RUNNING)
 
-            running_ts = last_ts or datetime.now(UTC)
+            ttl = self.lease_ttl_seconds if lease_ttl_seconds is None else lease_ttl_seconds
             study.streams[stream_name] = StreamState(
-                last_timestamp=running_ts,
+                last_timestamp=prior_ts,
                 records_processed=0,
                 last_run_status=StreamExecutionStatus.RUNNING,
+                owner_pid=os.getpid(),
+                owner_host=socket.gethostname(),
+                lease_expires_at=now + timedelta(seconds=ttl),
             )
             self.write_state(state)
 
-            tx_data: dict[str, Any] = {
-                "last_timestamp": last_ts,
-                "new_timestamp": None,
-                "records_processed": 0,
-                "metadata": {},
-            }
-            try:
-                yield tx_data
-                # Validate transition to SUCCESS
+        tx_data: dict[str, Any] = {
+            "last_timestamp": effective_ts,
+            "new_timestamp": None,
+            "records_processed": 0,
+            "metadata": {},
+        }
+        try:
+            yield tx_data
+        except BaseException as err:
+            if isinstance(err, GeneratorExit):
+                raise
+            # Mark stream as failed and preserve previous committed high-water mark
+            with self._lock():
+                state = self.read_state()
+                validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
+                study_entry = state.studies.setdefault(study_key, StudyState())
+                study_entry.streams[stream_name] = StreamState(
+                    last_timestamp=prior_ts,
+                    records_processed=tx_data.get("records_processed", 0),
+                    last_run_status=StreamExecutionStatus.FAILED,
+                    error_message=str(err),
+                    metadata=tx_data.get("metadata") or {},
+                )
+                self.write_state(state)
+            raise
+        else:
+            with self._lock():
+                state = self.read_state()
                 validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
-
-                # Commit changes only if successful
-                new_ts = tx_data.get("new_timestamp")
-                commit_ts = new_ts or last_ts or running_ts
-                if commit_ts.tzinfo is None:
-                    commit_ts = commit_ts.replace(tzinfo=UTC)
-
+                raw_new_ts = tx_data.get("new_timestamp")
+                commit_ts = (
+                    _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
+                )
                 study_entry = state.studies.setdefault(study_key, StudyState())
                 study_entry.streams[stream_name] = StreamState(
                     last_timestamp=commit_ts,
@@ -426,20 +544,6 @@ class FileStateProvider(BaseStateProvider):
                     metadata=tx_data.get("metadata") or {},
                 )
                 self.write_state(state)
-            except Exception as err:
-                # Mark stream as failed and preserve previous high-water mark
-                validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
-                err_ts = last_ts or running_ts
-                study_entry = state.studies.setdefault(study_key, StudyState())
-                study_entry.streams[stream_name] = StreamState(
-                    last_timestamp=err_ts,
-                    records_processed=tx_data.get("records_processed", 0),
-                    last_run_status=StreamExecutionStatus.FAILED,
-                    error_message=str(err),
-                    metadata=tx_data.get("metadata") or {},
-                )
-                self.write_state(state)
-                raise
 
     def delete_entry(self, study_key: str, stream_name: str | None = None) -> bool:
         """Deletes a study or specific stream entry from the ledger under the file lock.
@@ -468,6 +572,10 @@ class AirflowStateProvider(BaseStateProvider):
     """Manages transactional state bookmarks using Airflow 3 ``Variable`` JSON state."""
 
     VARIABLE_PREFIX: str = "imednet_state__"
+
+    def __init__(self, *, lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS) -> None:
+        """Initialize the Airflow 3 Variable state provider."""
+        self.lease_ttl_seconds = lease_ttl_seconds
 
     def _get_variable_key(self, study_key: str, stream_name: str) -> str:
         """Build the Airflow Variable key for ``(study_key, stream_name)``."""
@@ -606,19 +714,20 @@ class AirflowStateProvider(BaseStateProvider):
             return parts[0], parts[1]
         return None
 
+    @staticmethod
+    def _safe_parse_timestamp(raw: Any) -> datetime | None:
+        """Parse an optional timestamp safely, returning ``None`` on invalid strings."""
+        try:
+            return _parse_optional_timestamp(raw)
+        except ValueError:
+            return None
+
     def get_last_timestamp(self, study_key: str, stream_name: str) -> datetime | None:
         """Return the high-water mark timestamp from Airflow ``Variable`` state."""
         payload = self._get_variable_payload(self._get_variable_key(study_key, stream_name))
         if not payload:
             return None
-        raw_ts = payload.get("last_timestamp")
-        if not isinstance(raw_ts, str):
-            return None
-        try:
-            parsed = datetime.fromisoformat(raw_ts)
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        return self._safe_parse_timestamp(payload.get("last_timestamp"))
 
     def get_last_status(self, study_key: str, stream_name: str) -> StreamExecutionStatus | None:
         """Return the last execution status from Airflow ``Variable`` state."""
@@ -641,12 +750,16 @@ class AirflowStateProvider(BaseStateProvider):
         self,
         study_key: str,
         stream_name: str,
-        timestamp: datetime,
+        timestamp: datetime | None,
         records_processed: int = 0,
         status: StreamExecutionStatus | str = StreamExecutionStatus.SUCCESS,
         error_message: str | None = None,
         metadata: dict[str, Any] | None = None,
         force: bool = False,
+        *,
+        owner_pid: int | None = None,
+        owner_host: str | None = None,
+        lease_expires_at: datetime | None = None,
     ) -> None:
         """Persist the high-water mark checkpoint using Airflow ``Variable`` JSON state."""
         validated_status = _coerce_and_validate_status(status)
@@ -654,7 +767,8 @@ class AirflowStateProvider(BaseStateProvider):
             previous_status = self.get_last_status(study_key, stream_name)
             validate_transition(previous_status, validated_status)
 
-        normalized_ts = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=UTC)
+        normalized_ts = _normalize_optional_utc(timestamp)
+        normalized_lease = _normalize_optional_utc(lease_expires_at)
         redacted_error = (
             redact_sensitive_text(redact_uri(error_message)) if error_message is not None else None
         )
@@ -664,12 +778,17 @@ class AirflowStateProvider(BaseStateProvider):
         payload: dict[str, Any] = {
             "study_key": study_key,
             "stream_name": stream_name,
-            "last_timestamp": normalized_ts.isoformat(),
+            "last_timestamp": normalized_ts.isoformat() if normalized_ts is not None else None,
             "records_processed": int(records_processed),
             "status": validated_status.value,
             "last_run_status": validated_status.value,
             "error_message": redacted_error,
             "metadata": redacted_meta,
+            "owner_pid": owner_pid,
+            "owner_host": owner_host,
+            "lease_expires_at": (
+                normalized_lease.isoformat() if normalized_lease is not None else None
+            ),
         }
         self._set_variable_payload(self._get_variable_key(study_key, stream_name), payload)
 
@@ -679,60 +798,103 @@ class AirflowStateProvider(BaseStateProvider):
         study_key: str,
         stream_name: str,
         fallback_timestamp: datetime | None = None,
+        *,
+        lease_ttl_seconds: float | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         """Context manager for transactional state tracking backed by Airflow ``Variable``."""
-        prior_ts = self.get_last_timestamp(study_key, stream_name)
-        if prior_ts is None and fallback_timestamp is not None:
-            prior_ts = (
-                fallback_timestamp
-                if fallback_timestamp.tzinfo is not None
-                else fallback_timestamp.replace(tzinfo=UTC)
-            )
-
-        validate_transition(
-            self.get_last_status(study_key, stream_name), StreamExecutionStatus.RUNNING
+        prior_ts = _normalize_optional_utc(self.get_last_timestamp(study_key, stream_name))
+        effective_ts = (
+            prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
         )
 
-        active_ts = prior_ts or datetime.now(UTC)
+        current_status = self.get_last_status(study_key, stream_name)
+        now = datetime.now(UTC)
+        if current_status == StreamExecutionStatus.RUNNING:
+            raw_entry = (
+                self._get_variable_payload(self._get_variable_key(study_key, stream_name)) or {}
+            )
+            raw_pid = raw_entry.get("owner_pid")
+            owner_pid_val = (
+                raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
+            )
+            raw_host = raw_entry.get("owner_host")
+            owner_host_val = raw_host if isinstance(raw_host, str) else None
+            lease_exp_val = self._safe_parse_timestamp(raw_entry.get("lease_expires_at"))
+            stale_reason = _check_stale_running(
+                owner_pid_val,
+                owner_host_val,
+                lease_exp_val,
+                now=now,
+            )
+            if stale_reason is not None:
+                validate_transition(current_status, StreamExecutionStatus.FAILED)
+                raw_processed = raw_entry.get("records_processed", 0)
+                raw_meta = raw_entry.get("metadata")
+                self.set_last_timestamp(
+                    study_key=study_key,
+                    stream_name=stream_name,
+                    timestamp=prior_ts,
+                    records_processed=(
+                        raw_processed
+                        if isinstance(raw_processed, int) and not isinstance(raw_processed, bool)
+                        else 0
+                    ),
+                    status=StreamExecutionStatus.FAILED,
+                    error_message=f"Recovered stale running stream: {stale_reason}",
+                    metadata=raw_meta if isinstance(raw_meta, dict) else None,
+                )
+                current_status = StreamExecutionStatus.FAILED
+
+        # Atomic transaction guard: ensure transition to RUNNING is valid
+        validate_transition(current_status, StreamExecutionStatus.RUNNING)
+
+        ttl = self.lease_ttl_seconds if lease_ttl_seconds is None else lease_ttl_seconds
         self.set_last_timestamp(
             study_key=study_key,
             stream_name=stream_name,
-            timestamp=active_ts,
+            timestamp=prior_ts,
             records_processed=0,
             status=StreamExecutionStatus.RUNNING,
+            owner_pid=os.getpid(),
+            owner_host=socket.gethostname(),
+            lease_expires_at=now + timedelta(seconds=ttl),
         )
 
-        bookmark_ctx: dict[str, Any] = {
-            "last_timestamp": prior_ts,
+        tx_data: dict[str, Any] = {
+            "last_timestamp": effective_ts,
             "new_timestamp": None,
             "records_processed": 0,
             "metadata": {},
         }
 
         try:
-            yield bookmark_ctx
-            validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
-            updated_ts = bookmark_ctx.get("new_timestamp") or prior_ts or active_ts
-            self.set_last_timestamp(
-                study_key=study_key,
-                stream_name=stream_name,
-                timestamp=updated_ts,
-                records_processed=int(bookmark_ctx.get("records_processed", 0)),
-                status=StreamExecutionStatus.SUCCESS,
-                metadata=bookmark_ctx.get("metadata"),
-            )
-        except Exception as err:
+            yield tx_data
+        except BaseException as err:
+            if isinstance(err, GeneratorExit):
+                raise
             validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
             self.set_last_timestamp(
                 study_key=study_key,
                 stream_name=stream_name,
-                timestamp=prior_ts or active_ts,
-                records_processed=int(bookmark_ctx.get("records_processed", 0)),
+                timestamp=prior_ts,
+                records_processed=int(tx_data.get("records_processed", 0)),
                 status=StreamExecutionStatus.FAILED,
                 error_message=str(err),
-                metadata=bookmark_ctx.get("metadata"),
+                metadata=tx_data.get("metadata"),
             )
             raise
+        else:
+            validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
+            raw_new_ts = tx_data.get("new_timestamp")
+            commit_ts = _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
+            self.set_last_timestamp(
+                study_key=study_key,
+                stream_name=stream_name,
+                timestamp=commit_ts,
+                records_processed=int(tx_data.get("records_processed", 0)),
+                status=StreamExecutionStatus.SUCCESS,
+                metadata=tx_data.get("metadata"),
+            )
 
     def delete_entry(self, study_key: str, stream_name: str | None = None) -> bool:
         """Delete a study or specific stream entry from Airflow ``Variable`` state."""
@@ -758,24 +920,50 @@ class AirflowStateProvider(BaseStateProvider):
             if not payload:
                 continue
             identity = self._resolve_entry_identity(key, payload)
+            if identity is None:
+                continue
+            has_state_fields = (
+                "last_timestamp" in payload or "last_run_status" in payload or "status" in payload
+            )
+            if not has_state_fields:
+                continue
             raw_ts = payload.get("last_timestamp")
-            if identity is None or not isinstance(raw_ts, str):
+            if raw_ts is None:
+                parsed_ts = None
+            elif isinstance(raw_ts, str):
+                parsed_ts = self._safe_parse_timestamp(raw_ts)
+                if parsed_ts is None:
+                    continue
+            elif isinstance(raw_ts, datetime):
+                parsed_ts = _normalize_optional_utc(raw_ts)
+            else:
                 continue
-            try:
-                parsed_ts = datetime.fromisoformat(raw_ts)
-            except ValueError:
-                continue
-            if parsed_ts.tzinfo is None:
-                parsed_ts = parsed_ts.replace(tzinfo=UTC)
+
+            raw_pid = payload.get("owner_pid")
+            owner_pid_val = (
+                raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
+            )
+            raw_host = payload.get("owner_host")
+            owner_host_val = raw_host if isinstance(raw_host, str) else None
+            lease_exp_val = self._safe_parse_timestamp(payload.get("lease_expires_at"))
+
             s_key, s_name = identity
             study = state.studies.setdefault(s_key, StudyState())
             raw_meta = payload.get("metadata")
+            raw_processed = payload.get("records_processed", 0)
             study.streams[s_name] = StreamState(
                 last_timestamp=parsed_ts,
-                records_processed=int(payload.get("records_processed", 0)),
+                records_processed=(
+                    int(raw_processed)
+                    if isinstance(raw_processed, int) and not isinstance(raw_processed, bool)
+                    else 0
+                ),
                 last_run_status=payload.get("last_run_status", payload.get("status", "success")),
                 error_message=payload.get("error_message"),
                 metadata=dict(raw_meta) if isinstance(raw_meta, dict) else {},
+                owner_pid=owner_pid_val,
+                owner_host=owner_host_val,
+                lease_expires_at=lease_exp_val,
             )
         return state
 
