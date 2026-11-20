@@ -8,6 +8,7 @@ from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.models.subjects import Subject
 from imednet.utils.typing import ItemId
+from imednet.utils.url import validate_path_segment
 
 
 class ListBySiteOperation:
@@ -61,6 +62,8 @@ class SubjectsOperationDef:
 
     def _validate_item_id(self, item_id: ItemId) -> ItemId:
         """Validate that single-subject retrieval uses a non-negative integer subjectId."""
+        if isinstance(item_id, str):
+            validate_path_segment(item_id, name="item_id")
         if isinstance(item_id, bool) or not isinstance(item_id, int) or item_id < 0:
             raise ValueError(
                 f"Subjects endpoint get() requires a non-negative integer subjectId, got {item_id!r}. "
@@ -71,6 +74,8 @@ class SubjectsOperationDef:
     @execute_operation  # type: ignore[arg-type]
     def list_by_site(self, study_key: str, site_id: str | int) -> ListBySiteOperation:
         """List subjects by site ID."""
+        self._validate_study_key(study_key)  # type: ignore[attr-defined]
+        validate_path_segment(site_id, name="site_id")
         return ListBySiteOperation(self, study_key, site_id)
 
 

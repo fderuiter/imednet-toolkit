@@ -263,6 +263,41 @@ def validate_ast_docstrings(tree: ast.AST) -> list[tuple[int, str]]:
     return diagnostics
 
 
+def _is_workflow_showcase(py_file: Path, examples_dir: Path) -> bool:
+    """Return True if py_file is a top-level workflow_*.py showcase or inside examples/workflows/."""
+    if py_file.name.startswith("workflow_"):
+        return True
+    with contextlib.suppress(ValueError):
+        rel_parts = py_file.resolve().relative_to(examples_dir.resolve()).parts
+        return "workflows" in rel_parts
+    return False
+
+
+def validate_ast_workflow_bindings(tree: ast.AST) -> list[tuple[int, str]]:
+    """Reject discarded workflow or record-set constructor calls in workflow showcases."""
+    diagnostics: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        callee_name: str | None = None
+        if isinstance(func, ast.Name):
+            callee_name = func.id
+        elif isinstance(func, ast.Attribute):
+            callee_name = func.attr
+        if callee_name and (
+            callee_name.endswith(("Workflow", "RecordSet")) or callee_name == "ImednetSDK"
+        ):
+            diagnostics.append(
+                (
+                    getattr(node, "lineno", 1),
+                    f"Unassigned '{callee_name}(...)' call discards its instance without executing workflow actions",
+                )
+            )
+    diagnostics.sort(key=lambda item: item[0])
+    return diagnostics
+
+
 def validate_showcase_ast_and_imports(
     examples_dir: Path, repo_root: Path | None = None
 ) -> list[str]:
@@ -297,6 +332,10 @@ def validate_showcase_ast_and_imports(
 
         for lineno, reason in validate_ast_imports(tree):
             errors.append(f"{py_file}:{lineno}: {reason}")
+
+        if _is_workflow_showcase(py_file, examples_dir):
+            for lineno, reason in validate_ast_workflow_bindings(tree):
+                errors.append(f"{py_file}:{lineno}: {reason}")
 
     return errors
 
@@ -453,6 +492,22 @@ def execute_showcases_in_simulation(
                 err_reason = _find_output_error(proc.stdout, proc.stderr)
                 if err_reason is not None:
                     errors.append(f"{py_file}: {err_reason}")
+                    continue
+
+                if _is_workflow_showcase(py_file, examples_dir):
+                    combined_output = f"{proc.stdout}\n{proc.stderr}"
+                    if "Skipping execution" in combined_output:
+                        errors.append(
+                            f"{py_file}: Workflow showcase skipped execution instead of running in simulation mode"
+                        )
+                    elif py_file.name.startswith("workflow_") and not proc.stdout.strip():
+                        errors.append(
+                            f"{py_file}: Workflow showcase produced empty stdout (silent no-op) in simulation mode"
+                        )
+                    elif not (proc.stdout.strip() or proc.stderr.strip()):
+                        errors.append(
+                            f"{py_file}: Workflow showcase produced empty output (silent no-op) in simulation mode"
+                        )
 
     return errors
 
