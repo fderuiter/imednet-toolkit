@@ -342,10 +342,7 @@ autosummary_generate = False
 # ModuleNotFoundError during the docs build.
 autodoc_mock_imports = [
     "matplotlib",
-    "airflow",
     "opentelemetry",
-    "pyarrow",
-    "duckdb",
 ]
 
 suppress_warnings = [
@@ -1358,6 +1355,7 @@ import builtins
 import logging
 import os
 import sys
+import tempfile
 import warnings
 from unittest.mock import MagicMock, patch
 
@@ -1373,12 +1371,17 @@ os.environ["IMEDNET_SIMULATION_MODE"] = "true"
 os.environ["IMEDNET_API_KEY"] = "dummy_api_key"  # pragma: allowlist secret
 os.environ["IMEDNET_SECURITY_KEY"] = "dummy_security_key"  # pragma: allowlist secret
 os.environ["SNOWFLAKE_PASSWORD"] = "dummy_password"  # pragma: allowlist secret
-os.environ["IMEDNET_STUDY_KEY"] = "MY_STUDY"
+os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
+os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
+
+_doctest_orig_cwd = os.getcwd()
+_doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
+os.chdir(_doctest_tmpdir.name)
+
+from imednet.simulation.state import get_default_simulation_state
+get_default_simulation_state().reset()
 
 __file__ = "/a/b/c/d/e/dummy.py"
-
-_duckdb_connect_patcher = patch("duckdb.connect", return_value=MagicMock())
-_duckdb_connect_patcher.start()
 
 _mongo_client_patcher = patch("pymongo.MongoClient", return_value=MagicMock())
 _mongo_client_patcher.start()
@@ -1405,11 +1408,13 @@ _print_patcher.start()
 """
 
 doctest_global_cleanup = """
-_duckdb_connect_patcher.stop()
 _mongo_client_patcher.stop()
 _neo4j_driver_patcher.stop()
 _snowflake_connect_patcher.stop()
 _print_patcher.stop()
+get_default_simulation_state().reset()
+os.chdir(_doctest_orig_cwd)
+_doctest_tmpdir.cleanup()
 """
 
 html_theme = "furo"

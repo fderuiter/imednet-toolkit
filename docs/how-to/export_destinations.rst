@@ -195,16 +195,20 @@ All destination sinks, partitioned Parquet exports, flat and hierarchical JSON
 exports, and DataFrame converters mask Protected Health Information (PHI) at
 mapper ingress **by default** (``mask_phi=True``):
 
-* **Default sensitive keys**: Registered clinical identifiers—including
-  ``patientName`` / ``patient_name``, ``patientInitials``, ``DOB`` /
-  ``date_of_birth`` / ``birth_date``, ``SSN``, ``phone``, ``email``, and
-  ``address``—are replaced with ``***MASKED***`` before column label mapping
-  (``use_labels_as_columns=True``), hierarchy construction, or sink batch
-  serialization.
-* **Relational identifiers preserved**: Join and graph keys (``study_key``,
-  ``subject_key``, and ``record_id``) are explicitly exempted from masking so
-  relational joins, MongoDB ``_id`` documents, Hive partitions, and Neo4j
-  ``MERGE`` graph edges remain intact.
+* **Default sensitive keys**: Registered clinical and CDISC identifiers—including
+  ``patientName`` / ``patient_name``, ``patientInitials``, ``SUBJINIT``,
+  ``DOB`` / ``date_of_birth`` / ``birth_date``, ``BRTHDTC``, ``BRTHDAT``,
+  ``BRTHYR``, ``SSN``, ``phone``, ``email``, and ``address``—are replaced with
+  ``***MASKED***`` before column label mapping (``use_labels_as_columns=True``),
+  hierarchy construction, or sink batch serialization. On CDISC SDTM exports
+  (``sdtm_dataframe``, ``iter_sdtm_dataframes``, and ``as_sdtm=True``), masked
+  ``BRTHDTC`` values are redacted to four-digit ISO 8601 years (``YYYY``) or
+  ``None`` rather than ``***MASKED***`` text.
+* **Relational identifiers preserved**: Join, graph, and CDISC subject/study
+  keys (``study_key``, ``subject_key``, ``record_id``, ``STUDYID``,
+  ``USUBJID``, and ``SUBJID``) are explicitly exempted from masking so
+  relational joins, MongoDB ``_id`` documents, Hive partitions, CDISC domain
+  merges, and Neo4j ``MERGE`` graph edges remain intact.
 * **Automatic Study governance resolution**: Exports automatically inspect
   committed ``StudyConfiguration`` rules from ``ConfigVersionStore`` (when
   ``imednet-workflows`` is installed) to enforce custom ``phiFields``,
