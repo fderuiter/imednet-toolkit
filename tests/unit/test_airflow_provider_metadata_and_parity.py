@@ -377,6 +377,38 @@ def test_trigger_run_transitions_failure_redaction_and_cancellation() -> None:
         assert "B_FAIL" in fail_events[0].payload["message"]
         fail_sdk.__aexit__.assert_awaited_once()
 
+        # Terminal COMPLETED job with failed Record item in resultUrl emits redacted error event
+        from imednet.spi.models import JobStatus
+
+        result_url_job = JobStatus.model_validate(
+            {
+                "batchId": "B_RES",
+                "state": "COMPLETED",
+                "progress": 100,
+                "resultUrl": "https://edc.trn.imednetapi.com/results/B_RES.json?api_key=RAW_TRIG_SECRET",  # pragma: allowlist secret
+            }
+        )
+        res_sdk = _mock_async_sdk(lambda sk, bid: result_url_job)
+        res_sdk.jobs.fetch_result = AsyncMock(
+            return_value=[
+                {
+                    "recordKey": "REC-99",
+                    "status": "FAILED",
+                    "error": "Invalid Variable token=RAW_TRIG_SECRET",  # pragma: allowlist secret
+                }
+            ]
+        )
+        res_trigger = ImednetJobTrigger(study_key="S_OK", batch_id="B_RES", poke_interval=0.01)
+        with patch.object(ImednetHook, "get_async_conn", new=AsyncMock(return_value=res_sdk)):
+            res_events = [event async for event in res_trigger.run()]
+
+        assert len(res_events) == 1
+        assert res_events[0].payload["status"] == "error"
+        assert "Invalid Variable" in res_events[0].payload["message"]
+        assert "RAW_TRIG_SECRET" not in res_events[0].payload["message"]
+        res_sdk.jobs.fetch_result.assert_awaited_once()
+        res_sdk.__aexit__.assert_awaited_once()
+
         # Secret-bearing connection exception is scrubbed before yielding TriggerEvent
         conn_leak = SimpleNamespace(
             login="top-secret-key",  # pragma: allowlist secret
@@ -614,7 +646,7 @@ def test_export_operator_jinja_templating_and_secret_rejection() -> None:
 
     _, call_kwargs = export_csv_mock.call_args
     assert "modified_since" not in call_kwargs
-    assert "stream_name" not in call_kwargs
+    assert call_kwargs["stream_name"] == "csv_blank_watermark_export"
 
     # Inline secrets in newly templated fields are rejected eagerly at construction and execute()
     with pytest.raises(AirflowException, match="Secret key"):

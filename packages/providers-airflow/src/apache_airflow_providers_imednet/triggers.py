@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -122,7 +123,12 @@ class ImednetJobTrigger(BaseTrigger):
         try:
             sdk = await hook.get_async_conn()
             async with sdk:
-                poller = AsyncJobPoller(sdk.jobs.get)
+                jobs_ep = getattr(sdk, "jobs", None)
+                raw_fetch_result = getattr(jobs_ep, "fetch_result", None)
+                fetch_result = (
+                    raw_fetch_result if inspect.iscoroutinefunction(raw_fetch_result) else None
+                )
+                poller = AsyncJobPoller(sdk.jobs.get, fetch_result=fetch_result)
                 effective_timeout = float(self.timeout) if self.timeout is not None else math.inf
                 status = await poller.run(
                     self.study_key,

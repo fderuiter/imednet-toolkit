@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, MutableMapping
 from contextlib import closing
 from datetime import date, datetime
 from typing import Any, TypeAlias, Union, cast
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 from imednet import AsyncImednetSDK, Config, ImednetSDK, load_config
 from imednet.spi.utils import (
@@ -15,6 +16,7 @@ from imednet.spi.utils import (
     parse_bool,
     redact_sensitive_payload,
     redact_sensitive_text,
+    sanitize_base_url,
 )
 
 from .._airflow_compat import BaseHook
@@ -341,6 +343,19 @@ class ImednetHook(BaseHook):
                 or cls._string_or_none(extras.get("sqlalchemy_uri"))
                 or cls._string_or_none(extras.get("uri"))
             )
+            raw_conn_type = cls._string_or_none(getattr(conn, "conn_type", None))
+            if not conn_str and (raw_conn_type or "").lower() == "sqlite":
+                host = cls._string_or_none(getattr(conn, "host", None))
+                schema = cls._string_or_none(getattr(conn, "schema", None))
+                if host and schema:
+                    sqlite_target = f"{host.rstrip('/')}/{schema.lstrip('/')}"
+                else:
+                    sqlite_target = host or schema or ":memory:"
+                conn_str = (
+                    sqlite_target
+                    if sqlite_target.startswith("sqlite:")
+                    else f"sqlite:///{sqlite_target}"
+                )
             if not conn_str:
                 get_uri = getattr(conn, "get_uri", None)
                 if callable(get_uri):
@@ -351,7 +366,7 @@ class ImednetHook(BaseHook):
                     if isinstance(raw_uri, str) and raw_uri.strip():
                         conn_str = raw_uri.strip()
             if not conn_str:
-                conn_type = cls._string_or_none(getattr(conn, "conn_type", None)) or "postgresql"
+                conn_type = raw_conn_type or "postgresql"
                 if conn_type == "postgres":
                     conn_type = "postgresql"
                 host = cls._string_or_none(getattr(conn, "host", None))
@@ -359,10 +374,7 @@ class ImednetHook(BaseHook):
                 sql_user = cls._string_or_none(getattr(conn, "login", None))
                 sql_password = cls._string_or_none(getattr(conn, "password", None))
                 port = cls._port_or_none(getattr(conn, "port", None))
-                if conn_type == "sqlite":
-                    sqlite_target = host or schema or ":memory:"
-                    conn_str = f"sqlite:///{sqlite_target}"
-                elif host or schema:
+                if host or schema:
                     userinfo = ""
                     if sql_user:
                         userinfo = (
@@ -409,6 +421,48 @@ class ImednetHook(BaseHook):
             return direct
         return extras_dict.get(f"extra__imednet__{field_name}")
 
+    @classmethod
+    def _resolve_connection_base_url(
+        cls,
+        conn: object,
+        extras: Mapping[str, object],
+    ) -> str | None:
+        """Resolve an iMednet base URL from explicit extras first, then Connection host/scheme/port."""
+        explicit_base_url = cls._string_or_none(cls._extra_field(extras, "base_url"))
+        if explicit_base_url is not None:
+            cleaned_explicit = explicit_base_url.rstrip("/")
+            return re.sub(r"/api/v1(?:/edc)?$", "", cleaned_explicit).rstrip("/")
+
+        raw_host = cls._string_or_none(getattr(conn, "host", None))
+        if raw_host is None:
+            return None
+
+        port = cls._port_or_none(getattr(conn, "port", None))
+        if raw_host.startswith(("http://", "https://")):
+            parsed = urlsplit(raw_host)
+            scheme = parsed.scheme
+            netloc = parsed.netloc
+            if port is not None and parsed.port is None:
+                netloc = f"{netloc}:{port}"
+            path = parsed.path
+        else:
+            extra_scheme = (cls._string_or_none(cls._extra_field(extras, "scheme")) or "").lower()
+            conn_scheme = (cls._string_or_none(getattr(conn, "conn_type", None)) or "").lower()
+            if extra_scheme in {"http", "https"}:
+                scheme = extra_scheme
+            elif conn_scheme in {"http", "https"}:
+                scheme = conn_scheme
+            else:
+                scheme = "https"
+
+            host_only, _, tail = raw_host.partition("/")
+            path = f"/{tail}" if tail else ""
+            netloc = (
+                f"{host_only}:{port}" if port is not None and ":" not in host_only else host_only
+            )
+
+        return sanitize_base_url(f"{scheme}://{netloc}{path}")
+
     def _config_from_connection(self, conn: object) -> Config:
         """Build SDK ``Config`` from a resolved Airflow connection and env fallbacks."""
         extras_dict = self._connection_extras(conn)
@@ -417,7 +471,7 @@ class ImednetHook(BaseHook):
             or self._string_or_none(getattr(conn, "login", None)),
             security_key=self._string_or_none(self._extra_field(extras_dict, "security_key"))
             or self._string_or_none(getattr(conn, "password", None)),
-            base_url=self._string_or_none(self._extra_field(extras_dict, "base_url")),
+            base_url=self._resolve_connection_base_url(conn, extras_dict),
             oidc_token=self._string_or_none(self._extra_field(extras_dict, "oidc_token")),
             timeout=self._float_or_none(self._extra_field(extras_dict, "timeout")),
             strict_mode=self._bool_or_none(self._extra_field(extras_dict, "strict_mode")),
@@ -439,17 +493,12 @@ class ImednetHook(BaseHook):
         try:
             conn = self._get_airflow_connection(self.imednet_conn_id)
             extras_dict = self._connection_extras(conn)
-            raw_url = self._string_or_none(self._extra_field(extras_dict, "base_url"))
-            if not raw_url:
-                host = self._string_or_none(getattr(conn, "host", None))
-                if host:
-                    raw_url = host if "://" in host else f"https://{host}"
+            raw_url = self._resolve_connection_base_url(conn, extras_dict)
         except Exception:
             raw_url = None
 
-        resolved = (
-            raw_url or self._string_or_none(os.environ.get("IMEDNET_BASE_URL")) or default_url
-        )
+        env_url = self._string_or_none(os.environ.get("IMEDNET_BASE_URL"))
+        resolved = raw_url or (sanitize_base_url(env_url) if env_url else None) or default_url
         return redact_uri(redact_sensitive_text(resolved)).rstrip("/")
 
     @classmethod
@@ -506,15 +555,22 @@ class ImednetHook(BaseHook):
                     message = message.replace(secret, "***")
         return message
 
+    def get_sdk_client(self) -> ImednetSDK:
+        """Return an SDK client for use within task execution context.
+
+        Direct alias for :meth:`get_conn`.
+        """
+        return self.get_conn()
+
     def test_connection(self) -> tuple[bool, str]:
-        """Validate iMednet API connectivity and credentials via study metadata."""
+        """Validate connectivity and credentials against the configured iMednet Study endpoint."""
         config: Config | None = None
         try:
             try:
                 config = self._resolved_config()
             except Exception:
                 config = None
-            with closing(self.get_conn()) as sdk:
+            with closing(self.get_sdk_client()) as sdk:
                 next(iter(sdk.studies.list()), None)
             return True, "Connection successfully tested"
         except Exception as exc:
@@ -526,13 +582,6 @@ class ImednetHook(BaseHook):
                     if isinstance(secret, str) and secret:
                         message = message.replace(secret, "***")
             return False, message or exc.__class__.__name__
-
-    def get_sdk_client(self) -> ImednetSDK:
-        """Return an SDK client for use within task execution context.
-
-        Direct alias for :meth:`get_conn`.
-        """
-        return self.get_conn()
 
     def describe_connection(self) -> dict[str, PrimitiveContainer]:
         """Return redacted primitive metadata about resolved hook configuration."""
