@@ -441,8 +441,13 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 continue
             for stream_name, stream_state in study_state.streams.items():
                 has_data = True
+                ts_str = (
+                    stream_state.last_timestamp.isoformat()
+                    if stream_state.last_timestamp is not None
+                    else "None"
+                )
                 print(
-                    f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
+                    f"{s_key} | {stream_name} | {ts_str} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
                 )
 
         if not has_data:
@@ -815,8 +820,13 @@ def state_app(args: list[str] | None = None) -> None:
                 continue
             for stream_name, stream_state in study_state.streams.items():
                 has_data = True
+                ts_str = (
+                    stream_state.last_timestamp.isoformat()
+                    if stream_state.last_timestamp is not None
+                    else "None"
+                )
                 print(
-                    f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
+                    f"{s_key} | {stream_name} | {ts_str} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
                 )
         if not has_data:
             print("No ledger entries found matching filters.")

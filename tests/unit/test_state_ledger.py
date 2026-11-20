@@ -368,6 +368,8 @@ def test_valid_state_transitions() -> None:
         (StreamExecutionStatus.PENDING, StreamExecutionStatus.RUNNING),
         (StreamExecutionStatus.PENDING, StreamExecutionStatus.FAILED),
         (StreamExecutionStatus.PENDING, StreamExecutionStatus.PENDING),
+        (StreamExecutionStatus.RUNNING, StreamExecutionStatus.RUNNING),
+        (StreamExecutionStatus.RUNNING, StreamExecutionStatus.PENDING),
         (StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS),
         (StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED),
         (StreamExecutionStatus.SUCCESS, StreamExecutionStatus.PENDING),
@@ -391,8 +393,6 @@ def test_invalid_state_transitions_rejected() -> None:
     """Verify invalid lifecycle transitions are rejected with InvalidStateTransitionError."""
     invalid_cases = [
         (StreamExecutionStatus.PENDING, StreamExecutionStatus.SUCCESS),
-        (StreamExecutionStatus.RUNNING, StreamExecutionStatus.RUNNING),
-        (StreamExecutionStatus.RUNNING, StreamExecutionStatus.PENDING),
         (StreamExecutionStatus.SUCCESS, StreamExecutionStatus.FAILED),
         (StreamExecutionStatus.FAILED, StreamExecutionStatus.SUCCESS),
     ]
@@ -478,29 +478,41 @@ def test_legacy_ledger_backward_compatibility(tmp_path) -> None:
     assert stream.metadata == {"legacy": True}
 
 
-def test_transaction_atomic_guard_prevents_concurrent_runs(tmp_path) -> None:
-    """Stream in RUNNING status rejects starting a second transaction."""
+def test_transaction_recovers_cleanly_from_crashed_running_state(tmp_path) -> None:
+    """Stream left in RUNNING status after a crash transitions cleanly to RUNNING and SUCCESS."""
     ledger_file = tmp_path / "ledger.json"
     ledger = ExtractionStateLedger(str(ledger_file))
     fallback_ts = datetime(2026, 5, 22, 10, 0, 0, tzinfo=timezone.utc)
+    committed_ts = datetime(2026, 5, 22, 11, 0, 0, tzinfo=timezone.utc)
 
-    # Simulate an active or crashed worker that left stream in RUNNING state
-    ledger.set_last_timestamp(
-        "STUDY-01", "records", fallback_ts, status=StreamExecutionStatus.RUNNING
-    )
+    # Simulate a crashed worker that left stream in RUNNING state (including None watermark)
+    ledger.set_last_timestamp("STUDY-01", "records", None, status=StreamExecutionStatus.RUNNING)
     state = ledger.read_state()
+    assert state.studies["STUDY-01"].streams["records"].last_timestamp is None
     assert (
         state.studies["STUDY-01"].streams["records"].last_run_status
         == StreamExecutionStatus.RUNNING
     )
 
-    # Attempting transaction for the stream while RUNNING must be rejected by atomic guard
-    with pytest.raises(
-        InvalidStateTransitionError,
-        match="Cannot transition stream state from 'running' to 'running'",
-    ):
-        with ledger.transaction("STUDY-01", "records", fallback_timestamp=fallback_ts):
-            pass
+    # Retry transaction transitions RUNNING -> RUNNING -> SUCCESS cleanly
+    with ledger.transaction("STUDY-01", "records", fallback_timestamp=fallback_ts) as tx:
+        assert tx["last_timestamp"] == fallback_ts
+        tx["new_timestamp"] = committed_ts
+        tx["records_processed"] = 12
+
+    recovered = ledger.read_state().studies["STUDY-01"].streams["records"]
+    assert recovered.last_run_status == StreamExecutionStatus.SUCCESS
+    assert recovered.last_timestamp == committed_ts
+    assert recovered.records_processed == 12
+
+    # RUNNING -> PENDING reset transition is also permitted
+    ledger.set_last_timestamp(
+        "STUDY-01", "records", committed_ts, status=StreamExecutionStatus.RUNNING
+    )
+    ledger.set_last_timestamp(
+        "STUDY-01", "records", committed_ts, status=StreamExecutionStatus.PENDING
+    )
+    assert ledger.get_last_status("STUDY-01", "records") == StreamExecutionStatus.PENDING
 
 
 def test_transaction_failure_preserves_previous_high_water_mark(tmp_path) -> None:
@@ -629,3 +641,68 @@ def test_cli_default_ledger_path_behavior() -> None:
 
     reset_args = root_parser.parse_args(["workflows", "state", "reset", "-s", "TEST-01"])
     assert reset_args.ledger_path == DEFAULT_LEDGER_PATH
+
+
+def test_initial_transaction_failure_keeps_last_timestamp_none(tmp_path, capsys) -> None:
+    """Failed initial transaction retains None watermark instead of wall-clock datetime.now."""
+    from imednet_workflows.cli import state_app
+
+    ledger_file = tmp_path / "initial_fail_ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+
+    with pytest.raises(RuntimeError, match="initial failure"):
+        with ledger.transaction("STUDY-INIT", "records") as tx:
+            assert tx["last_timestamp"] is None
+            raise RuntimeError("initial failure")
+
+    assert ledger.get_last_timestamp("STUDY-INIT", "records") is None
+    stream = ledger.read_state().studies["STUDY-INIT"].streams["records"]
+    assert stream.last_timestamp is None
+    assert stream.last_run_status == StreamExecutionStatus.FAILED
+
+    # CLI show command renders nullable last_timestamp cleanly in both setup_parser and state_app
+    state_app(["show", "-l", str(ledger_file)])
+    out = capsys.readouterr().out
+    assert "STUDY-INIT | records | None |" in out
+
+    root_parser = argparse.ArgumentParser()
+    subparsers = root_parser.add_subparsers(dest="subcommand")
+    setup_parser(subparsers)
+    parsed_show = root_parser.parse_args(["workflows", "state", "show", "-l", str(ledger_file)])
+    parsed_show.func(parsed_show)
+    sub_out = capsys.readouterr().out
+    assert "STUDY-INIT | records | None |" in sub_out
+
+
+def test_crashed_running_stream_transitions_to_running_and_success(tmp_path) -> None:
+    """Streams stuck in RUNNING status recover cleanly on retry without InvalidStateTransitionError."""
+    from imednet_workflows.state_ledger import StreamState, StudyState
+
+    ledger_file = tmp_path / "crash_recovery.json"
+    seeded = LedgerState(
+        studies={
+            "STUDY-CRASH": StudyState(
+                streams={
+                    "records": StreamState(
+                        last_timestamp=None,
+                        records_processed=0,
+                        last_run_status=StreamExecutionStatus.RUNNING,
+                    )
+                }
+            )
+        }
+    )
+    ledger_file.write_text(seeded.model_dump_json(indent=2), encoding="utf-8")
+
+    ledger = ExtractionStateLedger(str(ledger_file))
+    assert ledger.get_last_status("STUDY-CRASH", "records") == StreamExecutionStatus.RUNNING
+    assert ledger.get_last_timestamp("STUDY-CRASH", "records") is None
+
+    target_ts = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
+    with ledger.transaction("STUDY-CRASH", "records") as tx:
+        assert tx["last_timestamp"] is None
+        tx["new_timestamp"] = target_ts
+        tx["records_processed"] = 10
+
+    assert ledger.get_last_status("STUDY-CRASH", "records") == StreamExecutionStatus.SUCCESS
+    assert ledger.get_last_timestamp("STUDY-CRASH", "records") == target_ts

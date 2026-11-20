@@ -9,7 +9,6 @@ import pytest
 from imednet_workflows.state_ledger import (
     AirflowStateProvider,
     FileStateProvider,
-    InvalidStateTransitionError,
     LedgerState,
     StreamExecutionStatus,
     get_state_provider,
@@ -17,34 +16,30 @@ from imednet_workflows.state_ledger import (
 
 
 @pytest.fixture
-def mock_airflow():
+def mock_airflow(monkeypatch):
     """Mock airflow modules."""
     airflow_mock = MagicMock()
     xcom_mock = MagicMock()
     session_mock = MagicMock()
     python_mock = MagicMock()
+    sdk_mock = MagicMock()
+    sdk_mock.get_current_context.side_effect = RuntimeError("No SDK context")
 
-    sys.modules["airflow"] = airflow_mock
-    sys.modules["airflow.models"] = MagicMock()
-    sys.modules["airflow.models.xcom"] = xcom_mock
-    sys.modules["airflow.utils"] = MagicMock()
-    sys.modules["airflow.utils.session"] = session_mock
-    sys.modules["airflow.operators"] = MagicMock()
-    sys.modules["airflow.operators.python"] = python_mock
+    monkeypatch.setitem(sys.modules, "airflow", airflow_mock)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mock)
+    monkeypatch.setitem(sys.modules, "airflow.models", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.models.xcom", xcom_mock)
+    monkeypatch.setitem(sys.modules, "airflow.utils", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_mock)
+    monkeypatch.setitem(sys.modules, "airflow.operators", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.operators.python", python_mock)
 
-    yield {
+    return {
         "xcom": xcom_mock,
         "session": session_mock,
         "python": python_mock,
+        "sdk": sdk_mock,
     }
-
-    del sys.modules["airflow"]
-    del sys.modules["airflow.models"]
-    del sys.modules["airflow.models.xcom"]
-    del sys.modules["airflow.utils"]
-    del sys.modules["airflow.utils.session"]
-    del sys.modules["airflow.operators"]
-    del sys.modules["airflow.operators.python"]
 
 
 def test_get_state_provider(monkeypatch):
@@ -145,15 +140,19 @@ def test_airflow_set_last_timestamp_db(mock_airflow, monkeypatch):
     provider = AirflowStateProvider()
     mock_airflow["python"].get_current_context.side_effect = Exception("No context")
 
-    xcom_model = mock_airflow["xcom"].XCom
+    xcom_model = mock_airflow["xcom"].XComModel
 
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag1")
-    monkeypatch.setenv("AIRFLOW_CTX_EXECUTION_DATE", "2026-05-22T12:00:00+00:00")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "manual__2026-05-22T12:00:00+00:00")
 
     ts = datetime(2026, 5, 22, 12, 0, 0)
     provider.set_last_timestamp("ST1", "recs", ts)
 
-    xcom_model.set.assert_called()
+    xcom_model.set.assert_called_once()
+    call_kwargs = xcom_model.set.call_args.kwargs
+    assert call_kwargs["dag_id"] == "dag1"
+    assert call_kwargs["run_id"] == "manual__2026-05-22T12:00:00+00:00"
+    assert "execution_date" not in call_kwargs
 
 
 def test_airflow_transaction(mock_airflow):
@@ -262,7 +261,9 @@ def test_airflow_read_state_no_imports(monkeypatch):
     provider = AirflowStateProvider()
     import sys
 
+    monkeypatch.setitem(sys.modules, "airflow.sdk", None)
     monkeypatch.setitem(sys.modules, "airflow.models.xcom", None)
+    monkeypatch.setitem(sys.modules, "airflow.operators.python", None)
 
     state = provider.read_state()
     assert isinstance(state, LedgerState)
@@ -272,31 +273,49 @@ def test_airflow_read_state_no_imports(monkeypatch):
     assert provider.get_last_timestamp("ST1", "rec") is None
 
     # Set without imports
-    monkeypatch.setitem(sys.modules, "airflow.operators.python", None)
     provider.set_last_timestamp("ST1", "rec", datetime.now(timezone.utc))  # Shouldn't error
 
 
-def test_airflow_transaction_guard_running(mock_airflow):
-    """Airflow provider rejects transaction if stream is already RUNNING."""
+def test_airflow_transaction_recovers_running_and_initial_none(mock_airflow):
+    """Airflow provider recovers RUNNING streams and retains None on failed initial sync."""
     provider = AirflowStateProvider()
 
     context_mock = MagicMock()
     ti_mock = MagicMock()
     context_mock.__getitem__.return_value = ti_mock
-    mock_airflow["python"].get_current_context.return_value = context_mock
+    mock_airflow["sdk"].get_current_context.side_effect = None
+    mock_airflow["sdk"].get_current_context.return_value = context_mock
 
-    # Current stream is already in running status
+    # 1. Failed initial sync leaves last_timestamp as None
+    ti_mock.xcom_pull.return_value = None
+    with pytest.raises(RuntimeError, match="initial crash"):
+        with provider.transaction("ST1", "recs") as tx:
+            assert tx["last_timestamp"] is None
+            raise RuntimeError("initial crash")
+
+    running_push = ti_mock.xcom_push.call_args_list[0].kwargs["value"]
+    failed_push = ti_mock.xcom_push.call_args_list[1].kwargs["value"]
+    assert running_push["status"] == "running"
+    assert running_push["last_timestamp"] is None
+    assert failed_push["status"] == "failed"
+    assert failed_push["last_timestamp"] is None
+
+    # 2. Stream left in RUNNING status transitions cleanly to RUNNING and SUCCESS on retry
+    ti_mock.xcom_push.reset_mock()
     ti_mock.xcom_pull.return_value = {
         "last_timestamp": "2026-05-22T12:00:00+00:00",
         "status": "running",
     }
+    recovered_ts = datetime(2026, 5, 23, 12, 0, 0, tzinfo=timezone.utc)
+    with provider.transaction("ST1", "recs") as tx:
+        assert tx["last_timestamp"] == datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc)
+        tx["new_timestamp"] = recovered_ts
+        tx["records_processed"] = 7
 
-    with pytest.raises(
-        InvalidStateTransitionError,
-        match="Cannot transition stream state from 'running' to 'running'",
-    ):
-        with provider.transaction("ST1", "recs"):
-            pass
+    final_push = ti_mock.xcom_push.call_args.kwargs["value"]
+    assert final_push["status"] == "success"
+    assert final_push["last_timestamp"] == recovered_ts.isoformat()
+    assert final_push["records_processed"] == 7
 
 
 def test_airflow_transaction_error_preserves_high_water_mark(mock_airflow):

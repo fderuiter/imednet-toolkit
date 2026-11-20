@@ -136,7 +136,7 @@ class StateProviderProtocol(Protocol):
         self,
         study_key: str,
         stream_name: str,
-        timestamp: datetime,
+        timestamp: datetime | None,
         records_processed: int = 0,
         metadata: dict[str, Any] | None = None,
         status: Any = "success",
@@ -1365,16 +1365,19 @@ def run_streaming_export(
 
         pending_voided: list[Any] = []
         voided_batch_idx = 0
+        seen_candidates: list[tuple[int, datetime | None]] = []
+        accepted_ids: set[int] = set()
+        exported_timestamps: list[datetime] = []
 
         def _observe_and_route() -> Iterator[Any]:
-            nonlocal max_ts, total_reconciled, voided_batch_idx
+            nonlocal total_reconciled, voided_batch_idx
             for rec in raw_records:
                 rec_ts = extract_record_timestamp(rec)
-                if rec_ts is not None and (max_ts is None or rec_ts > max_ts):
-                    max_ts = rec_ts
 
                 if not opts["include_deleted"] and is_record_deleted(rec):
                     if reconcile_voided:
+                        if rec_ts is not None:
+                            exported_timestamps.append(rec_ts)
                         pending_voided.append(rec)
                         if len(pending_voided) >= opts["batch_size"]:
                             total_reconciled += sink_obj.reconcile_deleted(
@@ -1385,9 +1388,18 @@ def run_streaming_export(
                             voided_batch_idx += 1
                     continue
 
+                seen_candidates.append((id(rec), rec_ts))
                 yield rec
 
-        filtered_records = gate_fn(sdk, study_key, _observe_and_route(), config)
+        def _track_accepted(records_iter: Iterable[Any]) -> Iterator[Any]:
+            for rec in records_iter:
+                accepted_ids.add(id(rec))
+                rec_ts = extract_record_timestamp(rec)
+                if rec_ts is not None:
+                    exported_timestamps.append(rec_ts)
+                yield rec
+
+        filtered_records = _track_accepted(gate_fn(sdk, study_key, _observe_and_route(), config))
         for index, batch in enumerate(batches_fn(filtered_records, opts["batch_size"])):
             total_written += sink_obj.write_batch(batch, batch_id=f"{prefix}/{index}")
 
@@ -1397,6 +1409,18 @@ def run_streaming_export(
                 batch_id=f"{prefix}/voided/{voided_batch_idx}",
             )
             pending_voided.clear()
+
+        rejected_records = [
+            (rec_id, rec_ts) for rec_id, rec_ts in seen_candidates if rec_id not in accepted_ids
+        ]
+        if any(rec_ts is None for _, rec_ts in rejected_records):
+            max_ts = None
+        elif rejected_records:
+            min_rejected_ts = min(rec_ts for _, rec_ts in rejected_records if rec_ts is not None)
+            eligible_ts = [ts for ts in exported_timestamps if ts < min_rejected_ts]
+            max_ts = max(eligible_ts) if eligible_ts else None
+        elif exported_timestamps:
+            max_ts = max(exported_timestamps)
 
         if tx is not None:
             tx["records_processed"] = total_written + total_reconciled
