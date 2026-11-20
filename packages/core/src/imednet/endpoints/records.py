@@ -8,6 +8,7 @@ from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.core.endpoint.operations.record_create import RecordCreateOperation
 from imednet.core.endpoint.strategies import MappingParamProcessor
+from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
 from imednet.models.jobs import Job
 from imednet.models.records import Record
 from imednet.utils.batch_coordinator import (
@@ -16,7 +17,9 @@ from imednet.utils.batch_coordinator import (
     BatchCoordinator,
     BatchSubmissionSummary,
 )
-from imednet.utils.typing import JsonDict
+from imednet.utils.job_poller import JobProgressHandler
+from imednet.utils.tabular import normalize_records_input
+from imednet.utils.typing import RecordsInput
 from imednet.validation.cache import ValidationSchemaProtocol
 
 if TYPE_CHECKING:
@@ -61,7 +64,7 @@ class RecordsOperationDef:
     def create(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
@@ -71,7 +74,7 @@ class RecordsOperationDef:
 
         Args:
             study_key: The study key.
-            records_data: The data for the records to create.
+            records_data: Record dicts, a pandas DataFrame, or a CSV file path.
             email_notify: Whether to send email notifications.
             schema: Optional validation schema (SchemaCache or DataDictionary).
             skip_validation: Whether to skip schema validation if already validated.
@@ -79,10 +82,11 @@ class RecordsOperationDef:
         Returns:
             The background job for the creation operation.
         """
+        normalized = normalize_records_input(records_data, schema=schema)
         path = self._get_endpoint_path(study_key)  # type: ignore
         return RecordCreateOperation[Job](
             path=path,
-            records_data=records_data,
+            records_data=normalized,
             email_notify=email_notify,
             schema=schema,
             study_key=study_key,
@@ -96,18 +100,54 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
     def create_batch(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
+        wait_for_completion: bool = False,
+        timeout: float = 300.0,
+        interval: float = 5.0,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
-        """Validate once and submit records in bounded chunks (default 100 per POST)."""
+        """Validate once, submit records in bounded chunks, and optionally poll jobs."""
+        normalized = normalize_records_input(records_data, schema=schema)
         coordinator = BatchCoordinator(chunk_size=chunk_size)
+
+        def _poll_single(
+            batch_id: str,
+            *,
+            on_progress: JobProgressHandler | None = None,
+        ) -> Any:
+            jobs_ep = JobsEndpoint(client=self._require_sync_client())
+            return jobs_ep.poll(
+                study_key,
+                batch_id,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+            )
+
+        def _poll_many(
+            batch_ids: list[str],
+            *,
+            on_progress: JobProgressHandler | None = None,
+        ) -> Any:
+            jobs_ep = JobsEndpoint(client=self._require_sync_client())
+            return jobs_ep.poll_many(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+            )
+
         return coordinator.submit(
             study_key,
-            records_data,
+            normalized,
             lambda chunk: self.create(
                 study_key,
                 chunk,
@@ -117,6 +157,13 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
             ),
             schema=schema,
             skip_validation=skip_validation,
+            wait_for_completion=wait_for_completion,
+            poll_single=_poll_single if wait_for_completion else None,
+            poll_many=_poll_many if wait_for_completion else None,
+            on_progress=on_progress,
+            require_batch_id=wait_for_completion,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
         )
 
     def to_dataframe(
@@ -154,18 +201,54 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
     async def create_batch(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
+        wait_for_completion: bool = False,
+        timeout: float = 300.0,
+        interval: float = 5.0,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
-        """Validate once and asynchronously submit records in bounded chunks."""
+        """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
+        normalized = normalize_records_input(records_data, schema=schema)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
+
+        async def _poll_single(
+            batch_id: str,
+            *,
+            on_progress: JobProgressHandler | None = None,
+        ) -> Any:
+            jobs_ep = AsyncJobsEndpoint(async_client=self._require_async_client())
+            return await jobs_ep.poll(
+                study_key,
+                batch_id,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+            )
+
+        async def _poll_many(
+            batch_ids: list[str],
+            *,
+            on_progress: JobProgressHandler | None = None,
+        ) -> Any:
+            jobs_ep = AsyncJobsEndpoint(async_client=self._require_async_client())
+            return await jobs_ep.poll_many(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+            )
+
         return await coordinator.submit(
             study_key,
-            records_data,
+            normalized,
             lambda chunk: self.create(
                 study_key,
                 chunk,
@@ -175,6 +258,13 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
             ),
             schema=schema,
             skip_validation=skip_validation,
+            wait_for_completion=wait_for_completion,
+            poll_single=_poll_single if wait_for_completion else None,
+            poll_many=_poll_many if wait_for_completion else None,
+            on_progress=on_progress,
+            require_batch_id=wait_for_completion,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
         )
 
     async def to_dataframe(
