@@ -186,7 +186,7 @@ enabled by default.
   watermark only after ``SnowflakeExportSink.flush()`` succeeds.
 * Inside Apache Airflow tasks, pass :class:`~imednet_workflows.state_ledger.AirflowStateProvider`
   (or resolve ``get_state_provider(provider_name="airflow")``) so watermarks persist
-  in Airflow 3 ``Variable`` JSON state across scheduled DAG runs.
+  in Airflow ``Variable`` checkpoints across scheduled DAG runs.
 * When ``incremental=True``, ``idempotent=True``, and ``include_deleted=False``,
   ``Record`` items voided after the previous watermark are routed through
   ``SnowflakeExportSink.reconcile_deleted`` so warehouse tables stay synchronized

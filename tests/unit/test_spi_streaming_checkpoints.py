@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -492,119 +492,112 @@ def test_batch_or_flush_failure_preserves_watermark_and_marks_failed(tmp_path: P
 
 def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """AirflowStateProvider passes dateModified filter, updates checkpoint, and rolls back on error."""
-    import logging
-    import sys
-
-    if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__file__", None) is None
-    ):
-        for mod in list(sys.modules):
-            if mod == "airflow" or mod.startswith("airflow."):
-                sys.modules.pop(mod, None)
-
-    pytest.importorskip("airflow")
-    import airflow.settings
-    from airflow.configuration import conf
-    from airflow.models import Variable
-    from airflow.utils.db import initdb
-
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 
-    root_logger = logging.getLogger()
-    saved_handlers = list(root_logger.handlers)
-    saved_level = root_logger.level
+    var_store: dict[str, str] = {}
 
-    db_url = f"sqlite:///{tmp_path / 'airflow_checkpoint.db'}"
-    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
-    prev_settings_conn = airflow.settings.SQL_ALCHEMY_CONN
-    conf.set("database", "sql_alchemy_conn", db_url)
-    airflow.settings.SQL_ALCHEMY_CONN = db_url
-    airflow.settings.dispose_orm()
-    airflow.settings.configure_orm()
-    initdb()
+    class _FakeSdkVariable:
+        @staticmethod
+        def get(key: str, default: Any = None, deserialize_json: bool = False) -> Any:
+            if key not in var_store:
+                return default
+            raw = var_store[key]
+            return json.loads(raw) if deserialize_json else raw
 
-    try:
-        provider = AirflowStateProvider()
-        seen_kwargs: list[dict[str, Any]] = []
+        @staticmethod
+        def set(
+            key: str,
+            value: Any,
+            description: str | None = None,
+            serialize_json: bool = False,
+        ) -> None:
+            _ = description
+            var_store[key] = json.dumps(value) if serialize_json else str(value)
 
-        def _run1(**kwargs: Any) -> list[Record]:
-            seen_kwargs.append(kwargs)
-            return [_make_record(1, date_modified="2026-03-01T14:00:00Z")]
+        @staticmethod
+        def delete(key: str) -> None:
+            var_store.pop(key, None)
 
-        reads = [0]
-        mock_sinks = SimpleNamespace(
-            MongoDbExportSink=lambda config: _CountingSink(config, reads),
-            MongoDbSinkConfig=MongoDbSinkConfig,
-        )
-        sdk = MagicMock(sinks=mock_sinks)
-        sdk.records.list.side_effect = _run1
+        @staticmethod
+        def keys(prefix: str | None = None) -> list[str]:
+            if prefix is None:
+                return sorted(var_store.keys())
+            return sorted(k for k in var_store if k.startswith(prefix))
 
-        op1 = ImednetExportOperator(
-            task_id="af_inc_1",
-            study_key="STUDY-AF-INC",
-            destination="mongodb",
-            incremental=True,
-            stream_name="mongo_af",
-            state_provider=provider,
-            export_kwargs={
-                "uri": "mongodb://localhost:27017",
-                "database": "db",
-                "collection": "col",
-            },
-        )
-        monkeypatch.setattr(op1, "_get_sdk", lambda: sdk)
-        op1.execute({})
+    airflow_mod = ModuleType("airflow")
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.Variable = _FakeSdkVariable  # type: ignore[attr-defined]
+    airflow_mod.sdk = sdk_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(__import__("sys").modules, "airflow", airflow_mod)
+    monkeypatch.setitem(__import__("sys").modules, "airflow.sdk", sdk_mod)
+    monkeypatch.delitem(__import__("sys").modules, "airflow.sdk.execution_time", raising=False)
+    monkeypatch.delitem(
+        __import__("sys").modules, "airflow.sdk.execution_time.task_runner", raising=False
+    )
 
-        assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
-            2026, 3, 1, 14, 0, tzinfo=timezone.utc
-        )
+    provider = AirflowStateProvider()
+    seen_kwargs: list[dict[str, Any]] = []
 
-        # Second run fails mid-stream -> prior watermark preserved & status marked failed
-        def _run2(**kwargs: Any) -> list[Record]:
-            seen_kwargs.append(kwargs)
-            return [_make_record(2, date_modified="2026-03-02T10:00:00Z")]
+    def _run1(**kwargs: Any) -> list[Record]:
+        seen_kwargs.append(kwargs)
+        return [_make_record(1, date_modified="2026-03-01T14:00:00Z")]
 
-        sdk.records.list.side_effect = _run2
-        sdk.sinks = SimpleNamespace(
-            MongoDbExportSink=lambda config: _CountingSink(config, reads, fail_on_batch=0),
-            MongoDbSinkConfig=MongoDbSinkConfig,
-        )
-        op2 = ImednetExportOperator(
-            task_id="af_inc_2",
-            study_key="STUDY-AF-INC",
-            destination="mongodb",
-            incremental=True,
-            stream_name="mongo_af",
-            state_provider=provider,
-            export_kwargs={
-                "uri": "mongodb://localhost:27017",
-                "database": "db",
-                "collection": "col",
-            },
-        )
-        monkeypatch.setattr(op2, "_get_sdk", lambda: sdk)
+    reads = [0]
+    mock_sinks = SimpleNamespace(
+        MongoDbExportSink=lambda config: _CountingSink(config, reads),
+        MongoDbSinkConfig=MongoDbSinkConfig,
+    )
+    sdk = MagicMock(sinks=mock_sinks)
+    sdk.records.list.side_effect = _run1
 
-        with pytest.raises(ExportBatchError):
-            op2.execute({})
+    op1 = ImednetExportOperator(
+        task_id="af_inc_1",
+        study_key="STUDY-AF-INC",
+        destination="mongodb",
+        incremental=True,
+        stream_name="mongo_af",
+        state_provider=provider,
+        export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
+    )
+    monkeypatch.setattr(op1, "_get_sdk", lambda: sdk)
+    op1.execute({})
 
-        assert seen_kwargs[1]["dateModified"] == (">=", "2026-03-01T14:00:00Z")
-        assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
-            2026, 3, 1, 14, 0, tzinfo=timezone.utc
-        )
-        state_payload = Variable.get("imednet_state__STUDY-AF-INC__mongo_af", deserialize_json=True)
-        assert state_payload["status"] == "failed"
-    finally:
-        airflow.settings.dispose_orm()
-        airflow.settings.SQL_ALCHEMY_CONN = prev_settings_conn
-        if prev_conn:
-            conf.set("database", "sql_alchemy_conn", prev_conn)
-        airflow.settings.configure_orm()
-        root_logger.handlers = saved_handlers
-        root_logger.setLevel(saved_level)
+    assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
+        2026, 3, 1, 14, 0, tzinfo=timezone.utc
+    )
+
+    # Second run fails mid-stream -> prior watermark preserved & status marked failed
+    def _run2(**kwargs: Any) -> list[Record]:
+        seen_kwargs.append(kwargs)
+        return [_make_record(2, date_modified="2026-03-02T10:00:00Z")]
+
+    sdk.records.list.side_effect = _run2
+    sdk.sinks = SimpleNamespace(
+        MongoDbExportSink=lambda config: _CountingSink(config, reads, fail_on_batch=0),
+        MongoDbSinkConfig=MongoDbSinkConfig,
+    )
+    op2 = ImednetExportOperator(
+        task_id="af_inc_2",
+        study_key="STUDY-AF-INC",
+        destination="mongodb",
+        incremental=True,
+        stream_name="mongo_af",
+        state_provider=provider,
+        export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
+    )
+    monkeypatch.setattr(op2, "_get_sdk", lambda: sdk)
+
+    with pytest.raises(ExportBatchError):
+        op2.execute({})
+
+    assert seen_kwargs[1]["dateModified"] == (">=", "2026-03-01T14:00:00Z")
+    assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
+        2026, 3, 1, 14, 0, tzinfo=timezone.utc
+    )
+    state_payload = json.loads(var_store[provider._get_variable_key("STUDY-AF-INC", "mongo_af")])
+    assert state_payload["status"] == "failed"
 
 
 def test_initial_streaming_failure_and_empty_run_do_not_skip_historical_records(
@@ -658,108 +651,101 @@ def test_initial_streaming_failure_and_empty_run_do_not_skip_historical_records(
         2020, 1, 15, 8, 0, tzinfo=timezone.utc
     )
 
-    # 4. AirflowStateProvider initial failure also preserves None in Airflow 3 Variable for retry
-    import logging
-    import sys
+    # 4. AirflowStateProvider initial failure also preserves None in Variable for retry
+    var_store_hist: dict[str, str] = {}
 
-    if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__file__", None) is None
-    ):
-        for mod in list(sys.modules):
-            if mod == "airflow" or mod.startswith("airflow."):
-                sys.modules.pop(mod, None)
+    class _FakeHistSdkVariable:
+        @staticmethod
+        def get(key: str, default: Any = None, deserialize_json: bool = False) -> Any:
+            if key not in var_store_hist:
+                return default
+            raw = var_store_hist[key]
+            return json.loads(raw) if deserialize_json else raw
 
-    pytest.importorskip("airflow")
-    import airflow.settings
-    from airflow.configuration import conf
-    from airflow.models import Variable as OrmVariable
-    from airflow.utils.db import initdb
+        @staticmethod
+        def set(
+            key: str,
+            value: Any,
+            description: str | None = None,
+            serialize_json: bool = False,
+        ) -> None:
+            _ = description
+            var_store_hist[key] = json.dumps(value) if serialize_json else str(value)
 
-    root_logger = logging.getLogger()
-    saved_handlers = list(root_logger.handlers)
-    saved_level = root_logger.level
+        @staticmethod
+        def delete(key: str) -> None:
+            var_store_hist.pop(key, None)
 
-    db_url = f"sqlite:///{tmp_path / 'airflow_hist_checkpoint.db'}"
-    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
-    prev_settings_conn = airflow.settings.SQL_ALCHEMY_CONN
-    conf.set("database", "sql_alchemy_conn", db_url)
-    airflow.settings.SQL_ALCHEMY_CONN = db_url
-    airflow.settings.dispose_orm()
-    airflow.settings.configure_orm()
-    initdb()
+        @staticmethod
+        def keys(prefix: str | None = None) -> list[str]:
+            if prefix is None:
+                return sorted(var_store_hist.keys())
+            return sorted(k for k in var_store_hist if k.startswith(prefix))
 
-    try:
-        af_provider = AirflowStateProvider()
-        seen_af_calls: list[dict[str, Any]] = []
+    airflow_hist_mod = ModuleType("airflow")
+    sdk_hist_mod = ModuleType("airflow.sdk")
+    sdk_hist_mod.Variable = _FakeHistSdkVariable  # type: ignore[attr-defined]
+    airflow_hist_mod.sdk = sdk_hist_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(__import__("sys").modules, "airflow", airflow_hist_mod)
+    monkeypatch.setitem(__import__("sys").modules, "airflow.sdk", sdk_hist_mod)
+    monkeypatch.delitem(__import__("sys").modules, "airflow.sdk.execution_time", raising=False)
+    monkeypatch.delitem(
+        __import__("sys").modules, "airflow.sdk.execution_time.task_runner", raising=False
+    )
 
-        def _af_records(**kwargs: Any) -> list[Record]:
-            seen_af_calls.append(kwargs)
-            return [_make_record(7, date_modified=historical_ts)]
+    af_provider = AirflowStateProvider()
+    seen_af_calls: list[dict[str, Any]] = []
 
-        sdk.records.list.side_effect = _af_records
-        sdk.sinks = SimpleNamespace(
-            MongoDbExportSink=lambda config: _CountingSink(config, reads, fail_on_batch=0),
-            MongoDbSinkConfig=MongoDbSinkConfig,
-        )
-        op_fail = ImednetExportOperator(
-            task_id="af_hist_fail",
-            study_key="STUDY-AF-HIST",
-            destination="mongodb",
-            incremental=True,
-            stream_name="mongo_hist",
-            state_provider=af_provider,
-            export_kwargs={
-                "uri": "mongodb://localhost:27017",
-                "database": "db",
-                "collection": "col",
-            },
-        )
-        monkeypatch.setattr(op_fail, "_get_sdk", lambda: sdk)
-        with pytest.raises(ExportBatchError):
-            op_fail.execute({})
+    def _af_records(**kwargs: Any) -> list[Record]:
+        seen_af_calls.append(kwargs)
+        return [_make_record(7, date_modified=historical_ts)]
 
-        failed_payload = OrmVariable.get(
-            "imednet_state__STUDY-AF-HIST__mongo_hist",
-            deserialize_json=True,
-        )
-        assert failed_payload["status"] == "failed"
-        assert failed_payload["last_timestamp"] is None
-        assert af_provider.get_last_timestamp("STUDY-AF-HIST", "mongo_hist") is None
+    sdk.records.list.side_effect = _af_records
+    sdk.sinks = SimpleNamespace(
+        MongoDbExportSink=lambda config: _CountingSink(config, reads, fail_on_batch=0),
+        MongoDbSinkConfig=MongoDbSinkConfig,
+    )
+    op_fail = ImednetExportOperator(
+        task_id="af_hist_fail",
+        study_key="STUDY-AF-HIST",
+        destination="mongodb",
+        incremental=True,
+        stream_name="mongo_hist",
+        state_provider=af_provider,
+        export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
+    )
+    monkeypatch.setattr(op_fail, "_get_sdk", lambda: sdk)
+    with pytest.raises(ExportBatchError):
+        op_fail.execute({})
 
-        sdk.sinks = SimpleNamespace(
-            MongoDbExportSink=lambda config: _CountingSink(config, reads),
-            MongoDbSinkConfig=MongoDbSinkConfig,
-        )
-        op_retry = ImednetExportOperator(
-            task_id="af_hist_retry",
-            study_key="STUDY-AF-HIST",
-            destination="mongodb",
-            incremental=True,
-            stream_name="mongo_hist",
-            state_provider=af_provider,
-            export_kwargs={
-                "uri": "mongodb://localhost:27017",
-                "database": "db",
-                "collection": "col",
-            },
-        )
-        monkeypatch.setattr(op_retry, "_get_sdk", lambda: sdk)
-        op_retry.execute({})
+    hist_payload = json.loads(
+        var_store_hist[af_provider._get_variable_key("STUDY-AF-HIST", "mongo_hist")]
+    )
+    assert hist_payload["status"] == "failed"
+    assert hist_payload["last_timestamp"] is None
+    assert af_provider.get_last_timestamp("STUDY-AF-HIST", "mongo_hist") is None
 
-        assert "dateModified" not in seen_af_calls[0]
-        assert "dateModified" not in seen_af_calls[1]
-        assert af_provider.get_last_timestamp("STUDY-AF-HIST", "mongo_hist") == datetime(
-            2020, 1, 15, 8, 0, tzinfo=timezone.utc
-        )
-    finally:
-        airflow.settings.dispose_orm()
-        airflow.settings.SQL_ALCHEMY_CONN = prev_settings_conn
-        if prev_conn:
-            conf.set("database", "sql_alchemy_conn", prev_conn)
-        airflow.settings.configure_orm()
-        root_logger.handlers = saved_handlers
-        root_logger.setLevel(saved_level)
+    sdk.sinks = SimpleNamespace(
+        MongoDbExportSink=lambda config: _CountingSink(config, reads),
+        MongoDbSinkConfig=MongoDbSinkConfig,
+    )
+    op_retry = ImednetExportOperator(
+        task_id="af_hist_retry",
+        study_key="STUDY-AF-HIST",
+        destination="mongodb",
+        incremental=True,
+        stream_name="mongo_hist",
+        state_provider=af_provider,
+        export_kwargs={"uri": "mongodb://localhost:27017", "database": "db", "collection": "col"},
+    )
+    monkeypatch.setattr(op_retry, "_get_sdk", lambda: sdk)
+    op_retry.execute({})
+
+    assert "dateModified" not in seen_af_calls[0]
+    assert "dateModified" not in seen_af_calls[1]
+    assert af_provider.get_last_timestamp("STUDY-AF-HIST", "mongo_hist") == datetime(
+        2020, 1, 15, 8, 0, tzinfo=timezone.utc
+    )
 
 
 # ---------------------------------------------------------------------------

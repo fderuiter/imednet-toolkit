@@ -49,13 +49,15 @@ Connections
 Create an Airflow connection ``imednet_default`` (connection type ``imednet``,
 registered via ``apache_airflow_providers_imednet:get_provider_info``) or override
 ``imednet_conn_id``.
-Provide ``api_key`` and ``security_key`` via the login/password fields or in the
-``extra`` JSON (both unprefixed keys and Airflow UI custom-field ``extra__imednet__*``
-keys are supported, with password-masked custom fields registered for ``api_key``,
-``security_key``, and ``oidc_token``). ``base_url`` may be set via the connection
-``host`` field or in ``extra`` for a non-standard environment. The hook merges
-these settings with values from ``imednet.config.load_config`` so environment
-variables still apply.
+Provide ``api_key`` and ``security_key`` via the login/password fields, the
+password-masked Airflow UI custom fields (``extra__imednet__api_key``,
+``extra__imednet__security_key``, ``extra__imednet__oidc_token``), or in the
+``extra`` JSON. Base URL resolution honors an explicit ``base_url`` in ``extra``
+first, then resolves ``Connection.host`` (with optional ``scheme`` and ``port``)
+while stripping ``/api/v1/edc``, ``/api/v1``, and ``/api`` suffixes before
+falling back to ``imednet.config.load_config`` environment defaults.
+``ImednetHook.test_connection()`` validates credentials against the ``Study``
+endpoint and redacts sensitive tokens on error.
 
 For warehouse, graph, document, DuckDB, and transactional SQL exports, configure a
 separate Airflow connection and pass ``destination_conn_id`` on
@@ -63,15 +65,15 @@ separate Airflow connection and pass ``destination_conn_id`` on
 resolves destination credentials (Snowflake ``account``/``user``/``password``
 and coordinates, Neo4j ``uri``/``auth``/``database``, MongoDB ``uri`` and
 database settings, DuckDB ``db_path`` and ``table_name``, or SQLAlchemy
-connection URIs for ``sql``, ``sql_by_form``, and ``long_sql``) at task execution
-time rather than embedding secrets in DAG definitions.
+connection URIs including SQLite ``sqlite:////abs/path.db``,
+``sqlite:///rel/path.db``, and ``sqlite:///:memory:``) at task execution time
+rather than embedding secrets in DAG definitions.
 
 To prevent credential leakage in Airflow rendered task metadata and XComs,
-templated fields (``study_key``, ``output_path``, ``export_kwargs``,
-``modified_since``, ``record_filter``, ``record_data_filter``, and ``stream_name``)
-reject raw secret keys (such as ``password``, ``auth``, ``api_key``,
-``security_key``, ``token``, or ``conn_str`` containing credentials) as well as
-URIs with embedded userinfo.
+templated fields (``export_kwargs``, ``output_path``, ``modified_since``,
+``record_filter``, ``record_data_filter``, and ``stream_name``) reject raw secret
+keys (such as ``password``, ``auth``, ``api_key``, ``security_key``, ``token``, or
+``conn_str`` containing credentials) as well as URIs with embedded userinfo.
 
 For task-mapping discovery steps, ``ImednetHook`` provides explicit helper methods:
 
@@ -84,6 +86,8 @@ For task-mapping discovery steps, ``ImednetHook`` provides explicit helper metho
 - ``list_study_keys()`` returns primitive study keys only.
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
+- ``test_connection()`` probes ``sdk.studies.list()`` for Airflow UI/CLI connection
+  testing while redacting credentials from error messages.
 - ``resolve_destination_connection()`` resolves runtime destination connection
   settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb``, ``sql``,
   ``sql_by_form``, and ``long_sql`` targets.
@@ -94,8 +98,8 @@ The Airflow integration organizes hooks, operators, and sensors in dedicated
 subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, Excel, JSON, DuckDB, SQL,
-``sql_by_form``, ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
+records to any supported destination (CSV, Parquet, DuckDB, SQL, Snowflake,
+Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
@@ -112,7 +116,9 @@ Snowflake staging settings (``stage_prefix``,
 supplied via ``export_kwargs`` or connection ``extra`` metadata.
 ``ImednetJobSensor(study_key=..., batch_id=...)`` polls an asynchronous iMednet
 job identified by ``study_key`` and ``batch_id`` until it reaches a terminal
-state (see :ref:`rest_resource_jobs`).
+state (see :ref:`rest_resource_jobs`), fetching and validating any terminal
+``resultUrl`` payload so batch-level or per-``Record`` failures raise a redacted
+``AirflowException``.
 All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` instance
 from an Airflow connection. The production reference DAG above shows the recommended
 dynamic-mapping pattern: keep static settings (for example ``destination``,
@@ -191,15 +197,17 @@ and tabular export helpers while maintaining ``mask_phi=True`` by default:
 - ``incremental``: Enable transactional high-water mark reads and commits.
 - ``stream_name``: Stream key used to isolate checkpoints per destination or ``Form``.
 - ``state_provider``: Explicit checkpoint provider such as
-  :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (persisting
-  watermarks in Airflow 3 ``Variable`` JSON state under
-  ``imednet_state__<study_key>__<stream_name>``)
+  :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (persisting JSON
+  watermarks via ``airflow.sdk.Variable`` under
+  ``imednet_state:<study_key>:<stream_name>``, preserving per-``Study`` state
+  across dynamic task mapping order changes and rolling ``RUNNING`` checkpoints
+  back to ``FAILED`` on ``BaseException`` interrupts such as ``AirflowTaskTimeout``)
   or :class:`~imednet_workflows.ExtractionStateLedger`
   (:class:`~imednet_workflows.state_ledger.FileStateProvider`). When omitted on an
   ``incremental=True`` run, ``ImednetExportOperator`` defaults to the ``airflow``
   provider entry point automatically unless ``ledger_path`` is specified.
 - ``ledger_path``: Shared filesystem path used when persisting checkpoints with
-  ``ExtractionStateLedger`` instead of Airflow ``Variable`` state.
+  ``ExtractionStateLedger`` instead of Airflow ``Variable`` storage.
 - ``modified_since``: Initial UTC lower-bound watermark when no prior checkpoint exists.
 - ``record_filter``: ``Record`` metadata filter dictionary or expression string.
 - ``record_data_filter``: ``Variable`` payload filter expression (``recordDataFilter``).

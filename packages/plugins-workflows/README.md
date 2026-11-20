@@ -55,7 +55,7 @@ The following components are exposed via Python entry points:
 
 ## Features
 
-- **State Ledger Management**: High-water mark state tracking via File ledger (local JSON with atomic file updates and cooperative file-locking), SQLite WAL ledger, or Airflow 3 (`Variable` JSON state).
+- **State Ledger Management**: High-water mark state tracking via File ledger (local JSON with atomic file updates and cooperative file-locking) or Airflow (`Variable` checkpoints).
 - **Continuous Sync Workers**: Background polling loops (`SyncWorker`) with configurable polling intervals, execution callbacks, and clean shutdown/one-run modes.
 - **Local SQLite Caching**: Thread-safe caching mirroring records with WAL (Write-Ahead Logging) mode, custom locks, and tenacity-backed network retry resilience.
 - **Bounded Chunk Processing**: Memory-efficient record streaming partitions (`ChunkedRecordPipeline`) to export sequence-numbered Parquet/tabular files.

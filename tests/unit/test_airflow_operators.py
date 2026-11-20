@@ -179,6 +179,84 @@ def test_job_sensor(monkeypatch):
     assert sensor.poke({}) is False
 
 
+def test_job_sensor_fetches_result_url_and_fails_on_record_errors(monkeypatch):
+    """ImednetJobSensor.poke fetches terminal resultUrl and raises AirflowException on failed Records."""
+    import httpx
+
+    from imednet import ImednetSDK
+
+    _setup_airflow(monkeypatch)
+    import apache_airflow_providers_imednet.operators as ops
+    from apache_airflow_providers_imednet import sensors
+
+    importlib.reload(sensors)
+    _patch_basehook(monkeypatch)
+
+    result_payloads: list[object] = [
+        [{"recordKey": "REC-01", "status": "SUCCESS"}],
+        [
+            {"recordKey": "REC-01", "status": "SUCCESS"},
+            {"recordKey": "REC-02", "status": "FAILED", "error": "Invalid Study Variable"},
+        ],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/jobs/B-1"):
+            return httpx.Response(
+                200,
+                json={
+                    "batchId": "B-1",
+                    "state": "COMPLETED",
+                    "resultUrl": "https://edc.trn.imednetapi.com/results/B-1.json",
+                },
+            )
+        if request.url.path == "/results/B-1.json":
+            return httpx.Response(200, json=result_payloads.pop(0))
+        if request.url.path.endswith("/jobs/B-HTTP-ERR"):
+            return httpx.Response(
+                200,
+                json={
+                    "batchId": "B-HTTP-ERR",
+                    "state": "COMPLETED",
+                    "resultUrl": "https://edc.trn.imednetapi.com/results/err.json?api_key=RAW_SECRET_123",  # pragma: allowlist secret
+                },
+            )
+        return httpx.Response(
+            500,
+            json={"message": "Internal error token=RAW_SECRET_123"},  # pragma: allowlist secret
+        )
+
+    def _make_sdk() -> ImednetSDK:
+        return ImednetSDK(
+            api_key="k",
+            security_key="s",
+            base_url="https://edc.trn.imednetapi.com",
+            transport=httpx.MockTransport(handler),
+        )
+
+    hook_inst = MagicMock(get_sdk_client=MagicMock(side_effect=_make_sdk))
+    monkeypatch.setattr(sensors, "ImednetHook", MagicMock(return_value=hook_inst))
+
+    # 1. All Record items succeeded -> poke returns True
+    sensor_ok = sensors.ImednetJobSensor(task_id="s_ok", study_key="S", batch_id="B-1")
+    assert sensor_ok.poke({}) is True
+
+    # 2. Terminal COMPLETED Job with failed Record item in resultUrl -> raises AirflowException
+    sensor_rec_fail = sensors.ImednetJobSensor(task_id="s_fail", study_key="S", batch_id="B-1")
+    with pytest.raises(ops.AirflowException, match="Invalid Study Variable"):
+        sensor_rec_fail.poke({})
+
+    # 3. HTTP 500 fetching resultUrl -> raises AirflowException with secrets redacted
+    sensor_http_err = sensors.ImednetJobSensor(
+        task_id="s_http_err",
+        study_key="S",
+        batch_id="B-HTTP-ERR",
+    )
+    with pytest.raises(ops.AirflowException, match="failed to fetch resultUrl") as exc_info:
+        sensor_http_err.poke({})
+    assert "RAW_SECRET_123" not in str(exc_info.value)
+
+
 def test_provider_info_and_hook_metadata_contract():
     """Verify get_provider_info, entry point metadata, and ImednetHook attributes."""
     from importlib.metadata import distribution, entry_points

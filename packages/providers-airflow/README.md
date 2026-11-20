@@ -93,10 +93,10 @@ def my_task_logic() -> None:
 ## Features
 
 - **Connection Hook Management**: Secures connection variables via `ImednetHook`, resolving authorization keys/secrets and auto-masking sensitive values (`api_key`, `security_key`, `token`) as `***` during serialization.
-- **Dynamic Task Mapping & Templating**: Supports Airflow standard task mapping via `mapped_runtime_fields` (`study_key`, `output_path`, `export_kwargs`) and Jinja-templated filter/checkpoint fields (`modified_since`, `record_filter`, `record_data_filter`, `stream_name`).
+- **Dynamic Task Mapping & Templating**: Supports Airflow standard task mapping via Jinja-templated fields (`study_key`, `output_path`, `export_kwargs`).
 - **Lazy Database Ingestion**: Uses dynamic resolution to lazily import database drivers (such as `imednet_sinks`) during execution.
 - **State Polling Sensor**: `ImednetJobSensor` monitors asynchronous platform processes with robust exception handling and state polling.
-- **Flexible Tabular Exporters**: Exposes tabular serialization adapters for CSV, Parquet, Excel, JSON, DuckDB, and SQL (`sql`, `sql_by_form`, `long_sql`) formats.
+- **Flexible Tabular Exporters**: Exposes tabular serialization adapters for CSV, Parquet, JSON, and SQL formats.
 
 ## Component Description Table
 

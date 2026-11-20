@@ -252,6 +252,9 @@ Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
    * - ``batch_size``
      - ``500``
      - ``Record`` items per :meth:`write_batch` call.
+   * - ``max_buffered_records``
+     - ``None``
+     - Optional global upper bound on ``Record`` items buffered simultaneously across per-``Form`` streams (defaults to ``max(batch_size, 5000)``).
    * - ``max_retries``
      - ``3``
      - Retry attempts on transient destination errors.
@@ -317,7 +320,7 @@ Incremental exports decouple destination sinks from checkpoint persistence throu
 
   - ``default`` → :func:`imednet_workflows.state_ledger.get_state_provider` (auto-detects Airflow task context vs file ledger).
   - ``file`` → :class:`imednet_workflows.state_ledger.FileStateProvider` (also exported as the backward-compatible alias :class:`imednet_workflows.ExtractionStateLedger`).
-  - ``airflow`` → :class:`imednet_workflows.state_ledger.AirflowStateProvider` (persists stream watermarks in Airflow 3 ``Variable`` JSON state under ``imednet_state__<study_key>__<stream_name>``).
+  - ``airflow`` → :class:`imednet_workflows.state_ledger.AirflowStateProvider` (persists stream watermarks in Airflow ``Variable`` checkpoints).
 
 * :func:`~imednet.spi.sink_base.run_streaming_export` orchestrates end-to-end streaming
   writes across every ``ExportSink``:

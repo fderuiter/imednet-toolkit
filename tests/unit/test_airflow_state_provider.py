@@ -1,338 +1,547 @@
-"""Real Airflow 3 tests for AirflowStateProvider Variable checkpoints."""
+"""Real Apache Airflow 3.x execution tests for ``AirflowStateProvider``."""
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import logging
+import os
 import sys
-from datetime import UTC, datetime
+import textwrap
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from imednet_workflows.state_ledger import (
-    AirflowStateProvider,
-    InvalidStateTransitionError,
-    LedgerState,
-    StreamExecutionStatus,
-    get_state_provider,
-)
+if "airflow" not in sys.modules or getattr(sys.modules.get("airflow"), "__path__", None) is None:
+    for _mod in list(sys.modules):
+        if _mod == "airflow" or _mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+            sys.modules.pop(_mod, None)
+
+pytest.importorskip("airflow")
 
 
-@pytest.fixture(scope="module")
-def airflow_state_db(tmp_path_factory: pytest.TempPathFactory):
-    """Initialize an isolated SQLite Airflow 3 metadata database for Variable checkpoints."""
+def _load_dag_from_file(dag_file: Path, dag_id: str) -> Any:
+    """Load a DAG from a file inside ``AIRFLOW__CORE__DAGS_FOLDER``."""
+    spec = importlib.util.spec_from_file_location(dag_file.stem, dag_file)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[dag_file.stem] = module
+    spec.loader.exec_module(module)
+    return getattr(module, dag_id)
+
+
+@pytest.fixture
+def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Initialize an isolated Apache Airflow 3 SQLite metadata DB and DAG bundle directory."""
     if (
         "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+        or getattr(sys.modules.get("airflow"), "__path__", None) is None
     ):
-        for _mod in list(sys.modules):
-            if _mod == "airflow" or _mod.startswith("airflow."):
-                sys.modules.pop(_mod, None)
-
-    pytest.importorskip("airflow")
-    import airflow.settings
-    from airflow.configuration import conf
-    from airflow.utils.db import initdb
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+                sys.modules.pop(mod, None)
 
     root_logger = logging.getLogger()
     saved_handlers = list(root_logger.handlers)
     saved_level = root_logger.level
 
-    db_dir = tmp_path_factory.mktemp("airflow_state_provider")
-    db_url = f"sqlite:///{db_dir / 'airflow.db'}"
-    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
-
-    conf.set("database", "sql_alchemy_conn", db_url)
-    airflow.settings.SQL_ALCHEMY_CONN = db_url
-    airflow.settings.dispose_orm()
-    airflow.settings.configure_orm()
-    initdb()
-
-    yield db_dir
-
-    airflow.settings.dispose_orm()
-    if prev_conn:
-        conf.set("database", "sql_alchemy_conn", prev_conn)
-        airflow.settings.SQL_ALCHEMY_CONN = prev_conn
-    airflow.settings.configure_orm()
-    root_logger.handlers = saved_handlers
-    root_logger.setLevel(saved_level)
-
-
-@pytest.fixture(autouse=True)
-def _clean_variables(airflow_state_db: Path):
-    """Clear Airflow Variable rows before each test for deterministic isolation."""
-    _ = airflow_state_db
-    from airflow.models import Variable
-    from airflow.utils.session import create_session
-    from sqlalchemy import delete
-
-    with create_session() as session:
-        session.execute(delete(Variable))
-    yield
-
-
-def test_airflow_state_provider_set_get_and_timezone_normalization() -> None:
-    """AirflowStateProvider persists and reads Variable JSON state with UTC normalization."""
-    from airflow.models import Variable
-
-    provider = AirflowStateProvider()
-    assert provider.get_last_timestamp("STUDY_01", "records_stream") is None
-    assert provider.get_last_status("STUDY_01", "records_stream") is None
-
-    naive_ts = datetime(2026, 4, 10, 8, 30, 0)
-    provider.set_last_timestamp(
-        "STUDY_01",
-        "records_stream",
-        naive_ts,
-        records_processed=42,
-        status=StreamExecutionStatus.SUCCESS,
-        metadata={"batch_size": 500},
-    )
-
-    assert provider.get_last_timestamp("STUDY_01", "records_stream") == datetime(
-        2026, 4, 10, 8, 30, 0, tzinfo=UTC
-    )
-    assert provider.get_last_status("STUDY_01", "records_stream") == StreamExecutionStatus.SUCCESS
-
-    raw_var = Variable.get("imednet_state__STUDY_01__records_stream", deserialize_json=True)
-    assert raw_var["study_key"] == "STUDY_01"
-    assert raw_var["stream_name"] == "records_stream"
-    assert raw_var["records_processed"] == 42
-    assert raw_var["last_run_status"] == "success"
-
-
-def test_airflow_state_provider_transition_validation_and_force_override() -> None:
-    """AirflowStateProvider enforces transition rules unless force=True is supplied."""
-    provider = AirflowStateProvider()
-    t1 = datetime(2026, 4, 10, 9, 0, 0, tzinfo=UTC)
-    t2 = datetime(2026, 4, 10, 10, 0, 0, tzinfo=UTC)
-
-    provider.set_last_timestamp("STUDY_TR", "stream_a", t1, status=StreamExecutionStatus.RUNNING)
-
-    with pytest.raises(InvalidStateTransitionError):
-        provider.set_last_timestamp(
-            "STUDY_TR", "stream_a", t2, status=StreamExecutionStatus.RUNNING
-        )
-
-    provider.set_last_timestamp(
-        "STUDY_TR",
-        "stream_a",
-        t2,
-        status=StreamExecutionStatus.PENDING,
-        force=True,
-    )
-    assert provider.get_last_status("STUDY_TR", "stream_a") == StreamExecutionStatus.PENDING
-
-
-def test_airflow_state_provider_transaction_commit_and_rollback() -> None:
-    """AirflowStateProvider commits watermarks on success and preserves prior watermark on error."""
-    provider = AirflowStateProvider()
-    fallback_ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
-    committed_ts = datetime(2026, 1, 2, 12, 0, 0, tzinfo=UTC)
-
-    with provider.transaction("STUDY_TX", "airflow_csv", fallback_timestamp=fallback_ts) as tx:
-        assert tx["last_timestamp"] == fallback_ts
-        assert provider.get_last_status("STUDY_TX", "airflow_csv") == StreamExecutionStatus.RUNNING
-        tx["new_timestamp"] = committed_ts
-        tx["records_processed"] = 15
-        tx["metadata"] = {"dest": "csv"}
-
-    assert provider.get_last_timestamp("STUDY_TX", "airflow_csv") == committed_ts
-    assert provider.get_last_status("STUDY_TX", "airflow_csv") == StreamExecutionStatus.SUCCESS
-
-    with (
-        pytest.raises(RuntimeError, match="sink write failure"),
-        provider.transaction("STUDY_TX", "airflow_csv") as tx2,
-    ):
-        tx2["new_timestamp"] = datetime(2026, 1, 3, 12, 0, 0, tzinfo=UTC)
-        tx2["records_processed"] = 3
-        err_msg = (
-            "sink write failure for "
-            "postgresql://loader:secret@db.internal/edc"  # pragma: allowlist secret
-        )
-        raise RuntimeError(err_msg)
-
-    assert provider.get_last_timestamp("STUDY_TX", "airflow_csv") == committed_ts
-    assert provider.get_last_status("STUDY_TX", "airflow_csv") == StreamExecutionStatus.FAILED
-
-    ledger = provider.read_state()
-    entry = ledger.studies["STUDY_TX"].streams["airflow_csv"]
-    assert entry.last_timestamp == committed_ts
-    assert entry.records_processed == 3
-    assert entry.error_message is not None
-    assert "secret" not in entry.error_message
-
-
-def test_airflow_state_provider_redacts_sensitive_metadata() -> None:
-    """AirflowStateProvider redacts secret keys in metadata before storing Variable JSON."""
-    from airflow.models import Variable
-
-    provider = AirflowStateProvider()
-    provider.set_last_timestamp(
-        "STUDY_SEC",
-        "sql_records",
-        datetime(2026, 4, 12, 0, 0, 0, tzinfo=UTC),
-        metadata={
-            "api_key": "plaintext-key",  # pragma: allowlist secret
-            "safe_table": "clinical_records",
-        },
-    )
-    stored = Variable.get("imednet_state__STUDY_SEC__sql_records", deserialize_json=True)
-    assert stored["metadata"]["api_key"] != "plaintext-key"  # pragma: allowlist secret
-    assert stored["metadata"]["safe_table"] == "clinical_records"
-
-
-def test_airflow_state_provider_read_state_and_delete_entry_underscore_safety() -> None:
-    """read_state and delete_entry preserve study/stream underscores without prefix collisions."""
-    from airflow.models import Variable
-
-    provider = AirflowStateProvider()
-    ts = datetime(2026, 5, 1, 6, 0, 0, tzinfo=UTC)
-
-    provider.set_last_timestamp("STUDY_1", "sql_demographics", ts, records_processed=10)
-    provider.set_last_timestamp("STUDY_1", "sql_vitals", ts, records_processed=20)
-    provider.set_last_timestamp("STUDY_10", "sql_demographics", ts, records_processed=30)
-
-    # Also store a legacy-shaped payload without explicit study_key/stream_name fields
-    Variable.set(
-        "imednet_state__LEGACY_STUDY__airflow_json",
-        {"last_timestamp": "2026-05-01T06:00:00", "records_processed": 7, "status": "success"},
-        serialize_json=True,
-    )
-    # Unrelated Airflow Variable should be ignored by read_state()
-    Variable.set("unrelated_pipeline_setting", {"enabled": True}, serialize_json=True)
-
-    state = provider.read_state()
-    assert set(state.studies.keys()) == {"STUDY_1", "STUDY_10", "LEGACY_STUDY"}
-    assert set(state.studies["STUDY_1"].streams.keys()) == {"sql_demographics", "sql_vitals"}
-    assert state.studies["LEGACY_STUDY"].streams["airflow_json"].records_processed == 7
-
-    assert provider.delete_entry("STUDY_1", "missing_stream") is False
-    assert provider.delete_entry("STUDY_1", "sql_vitals") is True
-    assert "sql_vitals" not in provider.read_state().studies["STUDY_1"].streams
-
-    # Deleting whole STUDY_1 must not delete STUDY_10
-    assert provider.delete_entry("STUDY_1") is True
-    assert provider.delete_entry("STUDY_1") is False
-    remaining = provider.read_state()
-    assert "STUDY_1" not in remaining.studies
-    assert "STUDY_10" in remaining.studies
-
-
-def test_airflow_state_provider_executes_inside_real_airflow_task_runner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AirflowStateProvider round-trips checkpoints via Task SDK Variable inside dag.test()."""
-    from airflow.configuration import conf
-    from airflow.dag_processing.dagbag import DagBag
-
     dags_dir = tmp_path / "dags"
-    dags_dir.mkdir()
-    dag_file = dags_dir / "state_checkpoint_dag.py"
-    dag_file.write_text(
-        """from datetime import datetime
-from airflow.sdk import DAG, task
-from imednet_workflows.state_ledger import AirflowStateProvider
+    dags_dir.mkdir(parents=True, exist_ok=True)
+    db_path = tmp_path / "airflow.db"
+    db_uri = f"sqlite:///{db_path}"
 
-with DAG(
-    dag_id="verify_variable_state_provider",
-    start_date=datetime(2026, 1, 1),
-    schedule=None,
-    catchup=False,
-) as dag:
-
-    @task
-    def checkpoint_roundtrip() -> str:
-        provider = AirflowStateProvider()
-        with provider.transaction("SDK_STUDY", "sdk_stream") as tx:
-            tx["new_timestamp"] = datetime.fromisoformat("2026-06-15T10:30:00+00:00")
-            tx["records_processed"] = 12
-        state = provider.read_state()
-        assert state.studies["SDK_STUDY"].streams["sdk_stream"].records_processed == 12
-        ts = provider.get_last_timestamp("SDK_STUDY", "sdk_stream")
-        assert ts is not None
-        return ts.isoformat()
-
-    checkpoint_roundtrip()
-""",
-        encoding="utf-8",
-    )
-
-    import json
-    import os
-
-    import airflow.settings
+    from airflow import settings
+    from airflow.configuration import conf
     from airflow.dag_processing.bundles.manager import DagBundlesManager
-    from airflow.models.dagbundle import DagBundleModel
-    from airflow.utils.session import create_session
-    from sqlalchemy import delete
+    from airflow.utils import db
 
-    prev_ctx_env = {k: v for k, v in os.environ.items() if k.startswith("AIRFLOW_CTX_")}
-    prev_dags_folder = conf.get("core", "dags_folder", fallback=None)
-    prev_load_examples = conf.get("core", "load_examples", fallback=None)
-    prev_bundle_cfg = conf.get("dag_processor", "dag_bundle_config_list", fallback=None)
-    prev_settings_dags = airflow.settings.DAGS_FOLDER
+    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_dags = conf.get("core", "dags_folder", fallback=None)
+    prev_examples = conf.get("core", "load_examples", fallback=None)
+    prev_bundles = conf.get("dag_processor", "dag_bundle_config_list", fallback=None)
+    prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    prev_settings_dags = settings.DAGS_FOLDER
 
     bundle_cfg = json.dumps(
         [
             {
                 "name": "dags-folder",
                 "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
-                "kwargs": {"path": str(dags_dir), "refresh_interval": 1},
+                "kwargs": {"path": str(dags_dir), "refresh_interval": 0},
             }
         ]
     )
+
+    monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
     monkeypatch.setenv("AIRFLOW__CORE__DAGS_FOLDER", str(dags_dir))
     monkeypatch.setenv("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
+    monkeypatch.setenv("AIRFLOW__CORE__UNIT_TEST_MODE", "True")
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
     monkeypatch.setenv("AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST", bundle_cfg)
+
     conf.set("core", "dags_folder", str(dags_dir))
     conf.set("core", "load_examples", "False")
+    conf.set("database", "sql_alchemy_conn", db_uri)
     conf.set("dag_processor", "dag_bundle_config_list", bundle_cfg)
-    airflow.settings.DAGS_FOLDER = str(dags_dir)
-    DagBundlesManager()._bundle_config = {}
-    with create_session() as session:
-        session.execute(delete(DagBundleModel))
-    try:
-        bag = DagBag(dag_folder=str(dags_dir))
-        assert not bag.import_errors
-        dag_run = bag.dags["verify_variable_state_provider"].test()
-        assert str(dag_run.state) == "success"
-    finally:
-        for key in [k for k in os.environ if k.startswith("AIRFLOW_CTX_")]:
-            if key in prev_ctx_env:
-                os.environ[key] = prev_ctx_env[key]
-            else:
-                os.environ.pop(key, None)
-        airflow.settings.DAGS_FOLDER = prev_settings_dags
-        if prev_dags_folder:
-            conf.set("core", "dags_folder", prev_dags_folder)
-        if prev_load_examples is not None:
-            conf.set("core", "load_examples", prev_load_examples)
-        if prev_bundle_cfg is not None:
-            conf.set("dag_processor", "dag_bundle_config_list", prev_bundle_cfg)
-        DagBundlesManager()._bundle_config = {}
+    monkeypatch.setattr(settings, "DAGS_FOLDER", str(dags_dir))
+    monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    settings.dispose_orm()
+    settings.configure_orm()
+    db.initdb()
+    DagBundlesManager().sync_bundles_to_db()
 
-    provider = AirflowStateProvider()
-    assert provider.get_last_timestamp("SDK_STUDY", "sdk_stream") == datetime(
-        2026, 6, 15, 10, 30, 0, tzinfo=UTC
+    yield dags_dir
+
+    for env_key in list(os.environ):
+        if env_key.startswith("AIRFLOW_CTX_"):
+            os.environ.pop(env_key, None)
+
+    settings.dispose_orm()
+    settings.SQL_ALCHEMY_CONN = prev_settings_conn
+    settings.DAGS_FOLDER = prev_settings_dags
+    if prev_conn is not None:
+        conf.set("database", "sql_alchemy_conn", prev_conn)
+    if prev_dags is not None:
+        conf.set("core", "dags_folder", prev_dags)
+    if prev_examples is not None:
+        conf.set("core", "load_examples", prev_examples)
+    if prev_bundles is not None:
+        conf.set("dag_processor", "dag_bundle_config_list", prev_bundles)
+    settings.configure_orm()
+
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
+
+
+def test_airflow_state_provider_real_variable_lifecycle_and_runtime_task(
+    airflow_runtime_env: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify all 5 AirflowStateProvider methods outside and inside RuntimeTaskInstance."""
+    from imednet_workflows.state_ledger import (
+        AirflowStateProvider,
+        InvalidStateTransitionError,
+        StreamExecutionStatus,
     )
-    assert provider.delete_entry("SDK_STUDY", "sdk_stream") is True
+
+    provider = AirflowStateProvider(variable_prefix="imednet_real_state")
+    t1 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 6, 2, 12, 30, 0, tzinfo=timezone.utc)
+
+    # 1. Verify out-of-task Variable operations (CLI / inspection path)
+    assert provider.get_last_timestamp("STUDY:TRN_01", "records") is None
+    assert provider.get_last_status("STUDY:TRN_01", "records") is None
+
+    provider.set_last_timestamp(
+        "STUDY:TRN_01",
+        "records",
+        t1,
+        records_processed=15,
+        metadata={"source": "seed"},
+    )
+    provider.set_last_timestamp(
+        "STUDY:TRN_01",
+        "queries",
+        t1,
+        records_processed=4,
+    )
+    assert provider.get_last_timestamp("STUDY:TRN_01", "records") == t1
+    assert provider.get_last_status("STUDY:TRN_01", "records") == StreamExecutionStatus.SUCCESS
+
+    # Enforce state transition validation when force=False
+    provider.set_last_timestamp(
+        "STUDY_LOCK",
+        "records",
+        t1,
+        status=StreamExecutionStatus.RUNNING,
+    )
+    with pytest.raises(InvalidStateTransitionError):
+        provider.set_last_timestamp(
+            "STUDY_LOCK",
+            "records",
+            t2,
+            status=StreamExecutionStatus.RUNNING,
+        )
+    assert provider.delete_entry("STUDY_LOCK", "records") is True
+    assert provider.delete_entry("STUDY_LOCK", "records") is False
+
+    # 2. Execute inside a real Airflow 3 RuntimeTaskInstance (SUPERVISOR_COMMS + airflow.sdk.Variable)
+    report_file = tmp_path / "runtime_report.json"
+    dag_file = airflow_runtime_env / "dag_state_lifecycle.py"
+    dag_file.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            from datetime import datetime, timezone
+            from pathlib import Path
+            from airflow.sdk import DAG, task
+            from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+            with DAG("dag_state_lifecycle", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc)) as dag:
+                @task
+                def exercise_provider() -> None:
+                    p = AirflowStateProvider(variable_prefix="imednet_real_state")
+                    assert p._has_active_task_sdk_comms() is True
+                    prior = p.get_last_timestamp("STUDY:TRN_01", "records")
+                    with p.transaction("STUDY:TRN_01", "records") as tx:
+                        assert tx["last_timestamp"] == prior
+                        tx["new_timestamp"] = datetime(2026, 6, 2, 12, 30, 0, tzinfo=timezone.utc)
+                        tx["records_processed"] = 28
+                        tx["metadata"] = {{"run": "runtime_ti"}}
+
+                    ledger = p.read_state()
+                    deleted_queries = p.delete_entry("STUDY:TRN_01", "queries")
+                    after_stream_delete = p.read_state()
+                    Path({str(report_file)!r}).write_text(
+                        json.dumps({{
+                            "studies": list(ledger.studies.keys()),
+                            "records_processed": ledger.studies["STUDY:TRN_01"].streams["records"].records_processed,
+                            "deleted_queries": deleted_queries,
+                            "remaining_streams": list(after_stream_delete.studies["STUDY:TRN_01"].streams.keys()),
+                            "status": p.get_last_status("STUDY:TRN_01", "records").value,
+                        }})
+                    )
+
+                exercise_provider()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    dag = _load_dag_from_file(dag_file, "dag")
+    dag_run = dag.test()
+    assert str(dag_run.state) == "success"
+
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    assert report["studies"] == ["STUDY:TRN_01"]
+    assert report["records_processed"] == 28
+    assert report["deleted_queries"] is True
+    assert report["remaining_streams"] == ["records"]
+    assert report["status"] == StreamExecutionStatus.SUCCESS.value
+
+    assert provider.get_last_timestamp("STUDY:TRN_01", "records") == t2
+    assert provider.delete_entry("STUDY:TRN_01") is True
+    assert provider.delete_entry("STUDY:TRN_01") is False
+    assert provider.read_state().studies == {}
 
 
-def test_airflow_state_provider_offline_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AirflowStateProvider degrades cleanly when Airflow modules are unavailable."""
+def test_airflow_dynamic_mapping_order_changes_preserve_study_checkpoints(
+    airflow_runtime_env: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamic task mapping order changes never cross-contaminate per-Study Variable checkpoints."""
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    order_file = tmp_path / "study_order.json"
+    observed_file = tmp_path / "observed_watermarks.jsonl"
+    dag_file = airflow_runtime_env / "dag_mapped_checkpoints.py"
+
+    dag_file.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            from datetime import datetime, timezone
+            from pathlib import Path
+            from airflow.sdk import DAG, task
+            from imednet_workflows.state_ledger import AirflowStateProvider
+
+            WATERMARKS = {{
+                "STUDY_ALPHA": "2026-07-01T09:00:00+00:00",
+                "STUDY_BETA": "2026-08-15T18:45:00+00:00",
+            }}
+
+            with DAG("dag_mapped_checkpoints", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc)) as dag:
+                @task
+                def discover_studies() -> list[dict[str, str]]:
+                    studies = json.loads(Path({str(order_file)!r}).read_text(encoding="utf-8"))
+                    return [{{"study_key": sk}} for sk in studies]
+
+                @task
+                def sync_study(study_key: str) -> None:
+                    provider = AirflowStateProvider(variable_prefix="imednet_mapped_state")
+                    with provider.transaction(study_key, "records") as tx:
+                        prior = tx["last_timestamp"].isoformat() if tx["last_timestamp"] else None
+                        with Path({str(observed_file)!r}).open("a", encoding="utf-8") as fh:
+                            fh.write(json.dumps({{"study_key": study_key, "prior": prior}}) + "\\n")
+                        tx["new_timestamp"] = datetime.fromisoformat(WATERMARKS[study_key])
+                        tx["records_processed"] = 10
+
+                sync_study.expand_kwargs(discover_studies())
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    # Run 1: ["STUDY_ALPHA", "STUDY_BETA"] -> map_index 0 is ALPHA, map_index 1 is BETA
+    order_file.write_text(json.dumps(["STUDY_ALPHA", "STUDY_BETA"]), encoding="utf-8")
+    dag_run1 = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 9, 1, tzinfo=timezone.utc)
+    )
+    assert str(dag_run1.state) == "success"
+
+    # Run 2: Reverse order ["STUDY_BETA", "STUDY_ALPHA"] -> map_index 0 is BETA, map_index 1 is ALPHA
+    order_file.write_text(json.dumps(["STUDY_BETA", "STUDY_ALPHA"]), encoding="utf-8")
+    dag_run2 = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 9, 2, tzinfo=timezone.utc)
+    )
+    assert str(dag_run2.state) == "success"
+
+    events = [
+        json.loads(line) for line in observed_file.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert len(events) == 4
+    run2_events = {item["study_key"]: item["prior"] for item in events[2:]}
+    assert run2_events == {
+        "STUDY_BETA": "2026-08-15T18:45:00+00:00",
+        "STUDY_ALPHA": "2026-07-01T09:00:00+00:00",
+    }
+
+    provider = AirflowStateProvider(variable_prefix="imednet_mapped_state")
+    assert provider.get_last_timestamp("STUDY_ALPHA", "records") == datetime(
+        2026, 7, 1, 9, 0, tzinfo=timezone.utc
+    )
+    assert provider.get_last_timestamp("STUDY_BETA", "records") == datetime(
+        2026, 8, 15, 18, 45, tzinfo=timezone.utc
+    )
+
+
+def test_airflow_task_timeout_base_exception_rolls_back_and_retries(
+    airflow_runtime_env: Path,
+    tmp_path: Path,
+) -> None:
+    """AirflowTaskTimeout (BaseException) rolls RUNNING back to FAILED so retry succeeds."""
+    from airflow.sdk.exceptions import AirflowTaskTimeout
+
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    assert issubclass(AirflowTaskTimeout, BaseException)
+    assert not issubclass(AirflowTaskTimeout, Exception)
+
+    provider = AirflowStateProvider(variable_prefix="imednet_timeout_state")
+    prior_ts = datetime(2026, 4, 1, 0, 0, 0, tzinfo=timezone.utc)
+    provider.set_last_timestamp("STUDY_TIMEOUT", "records", prior_ts, records_processed=5)
+
+    flag_file = tmp_path / "should_timeout.json"
+    dag_file = airflow_runtime_env / "dag_timeout_rollback.py"
+    dag_file.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            from datetime import datetime, timezone
+            from pathlib import Path
+            from airflow.sdk import DAG, task
+            from airflow.sdk.exceptions import AirflowTaskTimeout
+            from imednet_workflows.state_ledger import AirflowStateProvider
+
+            with DAG("dag_timeout_rollback", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc)) as dag:
+                @task
+                def export_with_timeout() -> None:
+                    provider = AirflowStateProvider(variable_prefix="imednet_timeout_state")
+                    should_timeout = json.loads(Path({str(flag_file)!r}).read_text(encoding="utf-8"))
+                    with provider.transaction("STUDY_TIMEOUT", "records") as tx:
+                        tx["new_timestamp"] = datetime(2026, 4, 2, 0, 0, 0, tzinfo=timezone.utc)
+                        tx["records_processed"] = 50
+                        if should_timeout:
+                            raise AirflowTaskTimeout("Execution timed out after 30m")
+
+                export_with_timeout()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    # Attempt 1: Task times out with AirflowTaskTimeout (BaseException)
+    flag_file.write_text("true", encoding="utf-8")
+    dag_run1 = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 4, 2, tzinfo=timezone.utc)
+    )
+    assert str(dag_run1.state) == "failed"
+    assert provider.get_last_status("STUDY_TIMEOUT", "records") == StreamExecutionStatus.FAILED
+    assert provider.get_last_timestamp("STUDY_TIMEOUT", "records") == prior_ts
+
+    # Attempt 2: Retry succeeds cleanly (FAILED -> RUNNING -> SUCCESS) without wedging on RUNNING
+    flag_file.write_text("false", encoding="utf-8")
+    dag_run2 = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 4, 3, tzinfo=timezone.utc)
+    )
+    assert str(dag_run2.state) == "success"
+    assert provider.get_last_status("STUDY_TIMEOUT", "records") == StreamExecutionStatus.SUCCESS
+    assert provider.get_last_timestamp("STUDY_TIMEOUT", "records") == datetime(
+        2026, 4, 2, 0, 0, 0, tzinfo=timezone.utc
+    )
+
+
+def test_imednet_export_operator_incremental_idempotent_in_real_airflow_dag(
+    airflow_runtime_env: Path,
+    tmp_path: Path,
+) -> None:
+    """ImednetExportOperator(idempotent=True, incremental=True) uses Variable checkpoints in RuntimeTaskInstance."""
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    out_json = tmp_path / "exported_records.json"
+    queries_log = tmp_path / "seen_queries.jsonl"
+    dag_file = airflow_runtime_env / "dag_export_incremental.py"
+
+    dag_file.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import traceback
+            from datetime import datetime, timezone
+            from pathlib import Path
+            import httpx
+            import airflow.utils.session as af_session
+            from airflow.sdk import DAG
+            from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+            from imednet import ImednetSDK
+
+            class MockExportOperator(ImednetExportOperator):
+                def _get_sdk(self) -> ImednetSDK:
+                    def handler(request: httpx.Request) -> httpx.Response:
+                        if request.url.path.endswith("/variables"):
+                            return httpx.Response(
+                                200,
+                                json={{
+                                    "data": [
+                                        {{
+                                            "studyKey": "STUDY_EXPORT",
+                                            "variableId": 1,
+                                            "variableName": "AGE",
+                                            "variableType": "integer",
+                                            "label": "Age",
+                                            "formId": 10,
+                                            "formKey": "DM",
+                                            "formName": "Demographics",
+                                        }}
+                                    ],
+                                    "pagination": {{"totalPages": 1}},
+                                }},
+                            )
+                        if request.url.path.endswith("/records"):
+                            with Path({str(queries_log)!r}).open("a", encoding="utf-8") as fh:
+                                fh.write(json.dumps(dict(request.url.params)) + "\\n")
+                            return httpx.Response(
+                                200,
+                                json={{
+                                    "data": [
+                                        {{
+                                            "studyKey": "STUDY_EXPORT",
+                                            "recordId": 101,
+                                            "subjectId": 1,
+                                            "subjectKey": "SUBJ-1",
+                                            "formId": 10,
+                                            "formKey": "DM",
+                                            "dateCreated": "2026-09-10 12:00:00",
+                                            "dateModified": "2026-09-10 15:00:00",
+                                            "recordData": {{"AGE": 42}},
+                                        }}
+                                    ],
+                                    "pagination": {{"totalPages": 1}},
+                                }},
+                            )
+                        return httpx.Response(200, json={{"data": [], "pagination": {{"totalPages": 1}}}})
+
+                    return ImednetSDK(
+                        api_key="k",
+                        security_key="s",
+                        base_url="https://edc.trn.imednetapi.com",
+                        transport=httpx.MockTransport(handler),
+                    )
+
+                def execute(self, context):
+                    # Verify RuntimeTaskInstance only accesses Airflow DB via the FastAPI Execution API,
+                    # never via direct ORM create_session from imednet / provider / workflow modules.
+                    orig_create_session = af_session.create_session
+                    def _forbid_direct_orm(*args, **kwargs):
+                        stack_files = [frame.filename for frame in traceback.extract_stack()]
+                        has_imednet_caller = any(
+                            "/packages/" in fn for fn in stack_files
+                        )
+                        via_execution_api = any(
+                            "execution_api" in fn for fn in stack_files
+                        )
+                        if has_imednet_caller and not via_execution_api:
+                            raise AssertionError(
+                                "Direct SQLAlchemy session access forbidden inside RuntimeTaskInstance"
+                            )
+                        return orig_create_session(*args, **kwargs)
+                    af_session.create_session = _forbid_direct_orm
+                    try:
+                        return super().execute(context)
+                    finally:
+                        af_session.create_session = orig_create_session
+
+            with DAG("dag_export_incremental", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc)) as dag:
+                MockExportOperator(
+                    task_id="export_records",
+                    study_key="STUDY_EXPORT",
+                    destination="json",
+                    output_path={str(out_json)!r},
+                    idempotent=True,
+                    incremental=True,
+                    quality_gate_enabled=False,
+                )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    dag_run1 = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 9, 10, tzinfo=timezone.utc)
+    )
+    assert str(dag_run1.state) == "success"
+
+    dag_run2 = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 9, 11, tzinfo=timezone.utc)
+    )
+    assert str(dag_run2.state) == "success"
+
+    seen_params = [
+        json.loads(line) for line in queries_log.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert len(seen_params) == 2
+    assert "filter" not in seen_params[0]
+    assert "dateModified>=" in seen_params[1].get("filter", "")
+
     provider = AirflowStateProvider()
-    monkeypatch.setitem(sys.modules, "airflow", None)
-    monkeypatch.setitem(sys.modules, "airflow.models", None)
-    monkeypatch.setitem(sys.modules, "airflow.sdk", None)
+    assert (
+        provider.get_last_status("STUDY_EXPORT", "json_export_records")
+        == StreamExecutionStatus.SUCCESS
+    )
+    assert provider.get_last_timestamp("STUDY_EXPORT", "json_export_records") == datetime(
+        2026, 9, 10, 15, 0, 0, tzinfo=timezone.utc
+    )
 
-    assert provider.get_last_timestamp("OFFLINE", "s1") is None
-    assert provider.get_last_status("OFFLINE", "s1") is None
-    provider.set_last_timestamp("OFFLINE", "s1", datetime(2026, 1, 1, tzinfo=UTC))
-    assert provider.delete_entry("OFFLINE") is False
-    assert provider.read_state() == LedgerState()
 
-    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
-    assert isinstance(get_state_provider(), AirflowStateProvider)
+def test_airflow_state_provider_redacts_sensitive_error_and_metadata(
+    airflow_runtime_env: Path,
+) -> None:
+    """AirflowStateProvider redacts URI credentials and secret tokens before writing Variables."""
+    _ = airflow_runtime_env
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    provider = AirflowStateProvider()
+    provider.set_last_timestamp(
+        study_key="STUDY_REDACT",
+        stream_name="records",
+        timestamp=datetime(2026, 9, 12, 10, 0, 0, tzinfo=timezone.utc),
+        status=StreamExecutionStatus.FAILED,
+        error_message=(
+            "Export failed for postgresql://loader:RAW_DB_PASS@db.internal:5432/edc "  # pragma: allowlist secret
+            "with api_key=RAW_API_SECRET"  # pragma: allowlist secret
+        ),
+        metadata={
+            "target": "edc",
+            "password": "RAW_META_SECRET",  # pragma: allowlist secret
+        },
+        force=True,
+    )
+
+    stream_state = provider.read_state().studies["STUDY_REDACT"].streams["records"]
+    assert stream_state.error_message is not None
+    assert "RAW_DB_PASS" not in stream_state.error_message
+    assert "RAW_API_SECRET" not in stream_state.error_message
+    assert "RAW_META_SECRET" not in json.dumps(stream_state.metadata)
+    assert stream_state.metadata["target"] == "edc"

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import logging
-import sys
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 from urllib.parse import quote_plus
 
 from imednet import ImednetSDK
@@ -20,53 +19,20 @@ from .. import export
 from .._airflow_compat import AirflowException, Context
 from ..hooks import ImednetHook
 
-if TYPE_CHECKING:
+try:  # pragma: no cover - optional Airflow dependency
     try:
         from airflow.sdk.bases.operator import BaseOperator
-    except ImportError:
-        try:
-            from airflow.models import BaseOperator  # type: ignore[no-redef]
-        except ImportError:
+    except (ImportError, ModuleNotFoundError):
+        from airflow.models import BaseOperator  # type: ignore[no-redef]
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - placeholder fallback
 
-            class BaseOperator:  # type: ignore[no-redef]
-                """Fallback BaseOperator typing stub."""
+    class BaseOperator:  # type: ignore
+        """Fallback BaseOperator for offline tests."""
 
-                template_fields: Sequence[str] = ()
+        template_fields: Sequence[str] = ()
 
-                def __init__(self, *args: Any, **kwargs: Any) -> None:
-                    """Initialize fallback BaseOperator."""
-else:  # pragma: no cover - optional Airflow dependency
-
-    def _resolve_base_operator() -> type[Any]:
-        sdk_bases = sys.modules.get("airflow.sdk.bases")
-        if (
-            sdk_bases is None
-            or getattr(sdk_bases, "__file__", None) is not None
-            or hasattr(sdk_bases, "operator")
-        ):
-            try:
-                from airflow.sdk.bases.operator import BaseOperator as SdkBaseOperator
-
-                return SdkBaseOperator
-            except (ImportError, ModuleNotFoundError):
-                pass
-        try:
-            from airflow.models import BaseOperator as LegacyBaseOperator
-
-            return LegacyBaseOperator
-        except (ImportError, ModuleNotFoundError):
-
-            class _FallbackBaseOperator:
-                """Fallback BaseOperator for offline tests."""
-
-                template_fields: Sequence[str] = ()
-
-                def __init__(self, *args: Any, **kwargs: Any) -> None:
-                    """Initialize fallback BaseOperator."""
-
-            return _FallbackBaseOperator
-
-    BaseOperator = _resolve_base_operator()
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """Initialize fallback BaseOperator."""
 
 
 logger = logging.getLogger(__name__)
@@ -323,48 +289,48 @@ class ImednetExportOperator(BaseOperator):
 
     @property
     def modified_since(self) -> Any:
-        """Return the configured watermark filter."""
+        """Return the configured modified_since watermark."""
         return getattr(self, "_modified_since", None)
 
     @modified_since.setter
     def modified_since(self, value: Any) -> None:
-        """Validate and set modified_since, rejecting embedded secrets."""
+        """Validate and store modified_since without embedded secrets."""
         if value is not None:
             _validate_no_secrets_in_value(value, field_name="modified_since")
         self._modified_since = value
 
     @property
     def record_filter(self) -> Any:
-        """Return the configured record envelope filter."""
+        """Return the configured Record filter."""
         return getattr(self, "_record_filter", None)
 
     @record_filter.setter
     def record_filter(self, value: Any) -> None:
-        """Validate and set record_filter, rejecting secret keys or URI credentials."""
+        """Validate and store record_filter without embedded secrets."""
         if value is not None:
             _validate_no_secrets_in_value(value, field_name="record_filter")
         self._record_filter = value
 
     @property
     def record_data_filter(self) -> str | None:
-        """Return the configured record_data filter expression."""
+        """Return the configured Record data filter expression."""
         return getattr(self, "_record_data_filter", None)
 
     @record_data_filter.setter
     def record_data_filter(self, value: str | None) -> None:
-        """Validate and set record_data_filter, rejecting embedded URI credentials."""
+        """Validate and store record_data_filter without embedded secrets."""
         if value is not None:
             _validate_no_secrets_in_value(value, field_name="record_data_filter")
         self._record_data_filter = value
 
     @property
     def stream_name(self) -> str | None:
-        """Return the configured incremental checkpoint stream name."""
+        """Return the configured checkpoint stream name."""
         return getattr(self, "_stream_name", None)
 
     @stream_name.setter
     def stream_name(self, value: str | None) -> None:
-        """Validate and set stream_name, rejecting embedded URI credentials."""
+        """Validate and store stream_name without embedded secrets."""
         if value is not None:
             _validate_no_secrets_in_value(value, field_name="stream_name")
         self._stream_name = value
@@ -413,7 +379,20 @@ class ImednetExportOperator(BaseOperator):
             opts["mask_phi"] = effective_mask_phi
         return opts
 
-    def _build_tabular_kwargs(self, runtime_kwargs: dict[str, Any]) -> dict[str, Any]:
+    def _default_airflow_stream_name(self, dest: str, *, sink_prefix: bool = False) -> str:
+        """Return a task-scoped default stream name invariant across mapped task indexes."""
+        base = f"airflow_{dest}" if sink_prefix else dest
+        task_id = getattr(self, "task_id", None)
+        if isinstance(task_id, str) and task_id.strip():
+            return f"{base}_{task_id.strip()}"
+        return base
+
+    def _build_tabular_kwargs(
+        self,
+        runtime_kwargs: dict[str, Any],
+        *,
+        dest: str = "records",
+    ) -> dict[str, Any]:
         """Merge explicitly configured operational parameters into tabular export kwargs."""
         merged = dict(runtime_kwargs)
         explicit: frozenset[str] = getattr(self, "_explicit_tabular_options", frozenset())
@@ -429,6 +408,8 @@ class ImednetExportOperator(BaseOperator):
             and "ledger_path" not in merged
         ):
             merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
+            if "stream_name" not in merged:
+                merged["stream_name"] = self._default_airflow_stream_name(dest)
         return merged
 
     def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
@@ -456,6 +437,8 @@ class ImednetExportOperator(BaseOperator):
         stream_opts = self._collect_streaming_options(runtime_kwargs)
         if not config.mask_phi and "mask_phi" not in stream_opts:
             stream_opts["mask_phi"] = False
+        if config.max_buffered_records is not None:
+            stream_opts["max_buffered_records"] = config.max_buffered_records
 
         if dest == "snowflake":
             sink_cls = getattr(sinks, "SnowflakeExportSink", None)
@@ -564,35 +547,21 @@ class ImednetExportOperator(BaseOperator):
 
         return None
 
-    def _default_incremental_stream_name(self, dest: str, context: Context) -> str:
-        """Build a task-scoped default checkpoint stream name when stream_name is omitted."""
-        task_id = getattr(self, "task_id", None)
-        base_name = (
-            f"airflow_{dest}_{task_id}"
-            if isinstance(task_id, str) and task_id
-            else f"airflow_{dest}"
-        )
-        if isinstance(context, Mapping):
-            ti = context.get("ti")
-            map_index = getattr(ti, "map_index", None)
-            if type(map_index) is int and map_index >= 0:
-                return f"{base_name}__map_{map_index}"
-        return base_name
-
     def execute(self, context: Context) -> str | None:
         """Execute the export task."""
+        _ = context
         # Validate templated fields at runtime prior to any export work.
         validate_path_segment(self.study_key, name="study_key")
-        for templated_field in (
+        for templated_attr in (
             "output_path",
             "modified_since",
             "record_filter",
             "record_data_filter",
             "stream_name",
         ):
-            field_val = getattr(self, templated_field, None)
-            if field_val is not None:
-                _validate_no_secrets_in_value(field_val, field_name=templated_field)
+            attr_val = getattr(self, templated_attr, None)
+            if attr_val is not None:
+                _validate_no_secrets_in_value(attr_val, field_name=templated_attr)
         runtime_kwargs = self._get_runtime_export_kwargs()
         # Resolve destination early to fail fast on invalid configs (like legacy _get_export_callable)
         dest = self.destination
@@ -618,6 +587,7 @@ class ImednetExportOperator(BaseOperator):
         config = sink_base.SinkConfig(
             study_key=self.study_key,
             batch_size=int(runtime_kwargs.get("batch_size", self.batch_size)),
+            max_buffered_records=runtime_kwargs.get("max_buffered_records"),
             max_retries=int(runtime_kwargs.get("max_retries", self.max_retries)),
             retry_backoff=float(runtime_kwargs.get("retry_backoff", 1.0)),
             idempotent=bool(runtime_kwargs.get("idempotent", self.idempotent)),
@@ -634,8 +604,6 @@ class ImednetExportOperator(BaseOperator):
             ),
             **sink_stream_opts,
         )
-
-        default_stream_name = self._default_incremental_stream_name(dest, context)
 
         with closing(self._get_sdk()) as sdk:
             sink = None
@@ -663,12 +631,17 @@ class ImednetExportOperator(BaseOperator):
                     and config.state_provider is None
                 ):
                     stream_config = replace(config, include_deleted=True)
+                default_sink_stream = (
+                    self._default_airflow_stream_name(dest, sink_prefix=True)
+                    if stream_config.ledger_path is None and stream_config.state_provider is None
+                    else f"airflow_{dest}"
+                )
                 sink_base.run_streaming_export(
                     sdk,
                     self.study_key,
                     sink,
                     stream_config,
-                    stream_name=default_stream_name,
+                    stream_name=default_sink_stream,
                     batch_id_prefix=f"{self.study_key}/batch/{run_token}",
                     default_provider_name="airflow",
                 )
@@ -677,9 +650,7 @@ class ImednetExportOperator(BaseOperator):
                 if not export_callable:
                     raise AirflowException(f"Unsupported destination or export_func '{dest}'")
 
-                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
-                if tabular_kwargs.get("incremental"):
-                    tabular_kwargs.setdefault("stream_name", default_stream_name)
+                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs, dest=dest)
                 if dest == "duckdb":
                     conn_settings = self._resolve_destination_connection(dest)
                     db_path_arg = (
