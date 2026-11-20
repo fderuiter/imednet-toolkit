@@ -41,10 +41,33 @@ _SENSITIVE_KEYS = {
 class ImednetHook(BaseHook):
     """Retrieve an :class:`ImednetSDK` instance from an Airflow connection."""
 
-    def __init__(self, imednet_conn_id: str = "imednet_default") -> None:
+    conn_name_attr = "imednet_conn_id"
+    default_conn_name = "imednet_default"
+    conn_type = "imednet"
+    hook_name = "iMednet"
+
+    def __init__(self, imednet_conn_id: str = default_conn_name) -> None:
         """Initialize the Imednet hook."""
         super().__init__()
         self.imednet_conn_id = imednet_conn_id
+
+    @classmethod
+    def get_ui_field_behaviour(cls) -> dict[str, Any]:
+        """Return Airflow connection form UI field customizations for ``imednet``."""
+        return {
+            "hidden_fields": ["schema", "port"],
+            "relabeling": {
+                "host": "Base URL",
+                "login": "API Key",
+                "password": "Security Key",
+            },
+            "placeholders": {
+                "host": "https://edc.prod.imednetapi.com",
+                "login": "Your iMednet API key",
+                "password": "Your iMednet security key",
+                "extra": '{"timeout": 30.0, "strict_mode": false}',
+            },
+        }
 
     @staticmethod
     def _string_or_none(value: object) -> str | None:
@@ -316,21 +339,28 @@ class ImednetHook(BaseHook):
 
         return {}
 
+    def _extra_value(self, extras_dict: Mapping[str, object], key: str) -> object:
+        """Read an extra field supporting Airflow UI ``extra__imednet__`` prefixes."""
+        if key in extras_dict and extras_dict[key] is not None:
+            return extras_dict[key]
+        return extras_dict.get(f"extra__{self.conn_type}__{key}")
+
     def _resolved_config(self) -> Config:
         """Resolve hook configuration from Airflow connection fields and env fallback."""
         conn = self._get_airflow_connection(self.imednet_conn_id)
         extras_dict = self._connection_extras(conn)
 
         return load_config(
-            api_key=self._string_or_none(extras_dict.get("api_key"))
+            api_key=self._string_or_none(self._extra_value(extras_dict, "api_key"))
             or self._string_or_none(getattr(conn, "login", None)),
-            security_key=self._string_or_none(extras_dict.get("security_key"))
+            security_key=self._string_or_none(self._extra_value(extras_dict, "security_key"))
             or self._string_or_none(getattr(conn, "password", None)),
-            base_url=self._string_or_none(extras_dict.get("base_url")),
-            oidc_token=self._string_or_none(extras_dict.get("oidc_token")),
-            timeout=self._float_or_none(extras_dict.get("timeout")),
-            strict_mode=self._bool_or_none(extras_dict.get("strict_mode")),
-            simulation_mode=self._bool_or_none(extras_dict.get("simulation_mode")),
+            base_url=self._string_or_none(self._extra_value(extras_dict, "base_url"))
+            or self._string_or_none(getattr(conn, "host", None)),
+            oidc_token=self._string_or_none(self._extra_value(extras_dict, "oidc_token")),
+            timeout=self._float_or_none(self._extra_value(extras_dict, "timeout")),
+            strict_mode=self._bool_or_none(self._extra_value(extras_dict, "strict_mode")),
+            simulation_mode=self._bool_or_none(self._extra_value(extras_dict, "simulation_mode")),
         )
 
     @classmethod

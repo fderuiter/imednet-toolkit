@@ -24,7 +24,10 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_airflow_provider_modules():
-    """Unload provider modules upon module teardown to ensure other test suites stay hermetic."""
+    """Ensure provider modules load against real Airflow on setup and unload cleanly on teardown."""
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
     yield
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
@@ -270,3 +273,82 @@ def test_real_airflow_hook_describe_connection_redaction(real_airflow, synthetic
     assert desc["security_key"] == "***"
     assert desc["api_key_configured"] is True
     assert desc["security_key_configured"] is True
+
+
+def test_real_airflow_providers_manager_registers_imednet_connection_and_masks_secrets(
+    monkeypatch, real_airflow, managed_sdk
+):
+    """Verify Airflow 3 ProvidersManager discovers apache-airflow-providers-imednet and masks secrets."""
+    import warnings
+
+    from airflow.providers_manager import ProvidersManager
+    from airflow.sdk.bases.operator import BaseOperator as SdkBaseOperator
+    from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
+
+    import apache_airflow_providers_imednet as provider_pkg
+
+    hook_cls = real_airflow["ImednetHook"]
+    operator_cls = real_airflow["ImednetExportOperator"]
+    base_hook_cls = real_airflow["BaseHook"]
+
+    info = provider_pkg.get_provider_info()
+    assert info["package-name"] == "apache-airflow-providers-imednet"
+    assert hook_cls.conn_name_attr == "imednet_conn_id"
+    assert hook_cls.default_conn_name == "imednet_default"
+    assert hook_cls.conn_type == "imednet"
+    assert hook_cls.hook_name == "iMednet"
+    ui_behaviour = hook_cls.get_ui_field_behaviour()
+    assert "schema" in ui_behaviour["hidden_fields"]
+    assert ui_behaviour["relabeling"]["login"] == "API Key"
+    assert ui_behaviour["relabeling"]["password"] == "Security Key"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pm = ProvidersManager()
+        pm_runtime = ProvidersManagerTaskRuntime()
+        assert "apache-airflow-providers-imednet" in pm.providers
+        hook_info = pm_runtime.hooks.get("imednet")
+        assert hook_info is not None
+        assert hook_info.package_name == "apache-airflow-providers-imednet"
+        assert hook_info.connection_type == "imednet"
+        assert hook_info.connection_id_attribute_name == "imednet_conn_id"
+        assert hook_info.hook_name == "iMednet"
+
+        widgets = pm.connection_form_widgets
+        assert widgets["extra__imednet__api_key"].is_sensitive is True
+        assert widgets["extra__imednet__security_key"].is_sensitive is True
+        assert widgets["extra__imednet__oidc_token"].is_sensitive is True
+        assert widgets["extra__imednet__base_url"].is_sensitive is False
+        assert "imednet" in pm.field_behaviours
+        provider_warnings = [
+            w for w in caught if "imednet" in str(w.message).lower() or "imednet" in str(w.filename)
+        ]
+        assert provider_warnings == []
+
+    # Verify Connection(conn_type="imednet").get_hook() and UI prefixed extra fields
+    from airflow.sdk.definitions.connection import Connection as SdkConnection
+
+    ui_conn = SdkConnection(
+        conn_id="imednet_ui_conn",
+        conn_type="imednet",
+        host="https://ui.synthetic.example/api",
+        extra=json.dumps(
+            {
+                "extra__imednet__api_key": "ui-api-key",  # pragma: allowlist secret
+                "extra__imednet__security_key": "ui-sec-key",  # pragma: allowlist secret
+            }
+        ),
+    )
+    monkeypatch.setattr(base_hook_cls, "get_connection", classmethod(lambda cls, cid: ui_conn))
+    resolved_hook = ui_conn.get_hook()
+    assert isinstance(resolved_hook, hook_cls)
+    sdk_client = managed_sdk(resolved_hook.get_conn())
+    assert sdk_client.config.api_key == "ui-api-key"  # pragma: allowlist secret
+    assert sdk_client.config.security_key == "ui-sec-key"  # pragma: allowlist secret
+    assert str(sdk_client.config.base_url).rstrip("/") == "https://ui.synthetic.example/api"
+
+    # Verify ImednetExportOperator inherits from Airflow 3 Task SDK BaseOperator
+    assert issubclass(operator_cls, SdkBaseOperator)
+    assert "__all__" in dir(provider_pkg)
+    with pytest.raises(AttributeError):
+        _ = provider_pkg.nonexistent_symbol

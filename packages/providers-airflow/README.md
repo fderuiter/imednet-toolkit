@@ -71,11 +71,12 @@ def my_task_logic() -> None:
 
 ## Features
 
-- **Connection Hook Management**: Secures connection variables via `ImednetHook`, resolving authorization keys/secrets and auto-masking sensitive values (`api_key`, `security_key`, `token`) as `***` during serialization.
-- **Dynamic Task Mapping & Templating**: Supports Airflow standard task mapping via Jinja-templated fields (`study_key`, `output_path`, `export_kwargs`).
+- **Provider & Connection Discovery**: Registers `apache-airflow-providers-imednet` via `get_provider_info()` and exposes the `imednet` connection type through `ImednetHook`, resolving authorization keys/secrets and auto-masking sensitive values (`api_key`, `security_key`, `oidc_token`, `token`) as `***`.
+- **Dynamic Task Mapping & Templating**: Supports Airflow dynamic task mapping (`study_key`, `output_path`, `export_kwargs`) and Jinja-templated watermark/filter attributes (`modified_since`, `record_filter`, `record_data_filter`, `stream_name`).
+- **Incremental Variable Checkpoints**: Persists and reads incremental high-water mark state through Airflow 3 `Variable` JSON checkpoints when `incremental=True`.
 - **Lazy Database Ingestion**: Uses dynamic resolution to lazily import database drivers (such as `imednet_sinks`) during execution.
 - **State Polling Sensor**: `ImednetJobSensor` monitors asynchronous platform processes with robust exception handling and state polling.
-- **Flexible Tabular Exporters**: Exposes tabular serialization adapters for CSV, Parquet, JSON, and SQL formats.
+- **Flexible Tabular & SQL Exporters**: Exposes tabular serialization adapters for CSV, Parquet, Excel, JSON, DuckDB, `sql`, `sql_by_form`, and `long_sql` formats.
 
 ## Component Description Table
 

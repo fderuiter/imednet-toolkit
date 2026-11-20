@@ -42,11 +42,14 @@ focused operator/sensor usage patterns.
 Connections
 -----------
 
-Create an Airflow connection ``imednet_default`` or override ``imednet_conn_id``.
-Provide ``api_key`` and ``security_key`` via the login/password fields or in the
-``extra`` JSON. ``base_url`` may be added in ``extra`` for a non-standard
-environment. The hook merges these settings with values from
-``imednet.config.load_config`` so environment variables still apply.
+Create an Airflow connection ``imednet_default`` (connection type ``imednet``)
+or override ``imednet_conn_id``. ``ProvidersManager`` registers
+``apache-airflow-providers-imednet`` and exposes the ``imednet`` connection type
+via ``ImednetHook`` with masked secret fields. Provide ``api_key`` and
+``security_key`` via the login/password fields or in ``extra`` JSON, and set
+``host`` (or ``base_url`` in ``extra``) for a non-standard environment. The hook
+merges these settings with values from ``imednet.config.load_config`` so
+environment variables still apply.
 
 For warehouse, graph, document, and transactional SQL exports, configure a
 separate Airflow connection and pass ``destination_conn_id`` on
@@ -57,9 +60,11 @@ database settings, or SQLAlchemy connection URIs) at task execution time rather
 than embedding secrets in DAG definitions.
 
 To prevent credential leakage in Airflow rendered task metadata and XComs,
-templated fields (``export_kwargs`` and ``output_path``) reject raw secret keys
-(such as ``password``, ``auth``, ``api_key``, ``security_key``, ``token``, or
-``conn_str`` containing credentials) as well as URIs with embedded userinfo.
+templated fields (``export_kwargs``, ``output_path``, ``modified_since``,
+``record_filter``, ``record_data_filter``, and ``stream_name``) reject raw
+secret keys (such as ``password``, ``auth``, ``api_key``, ``security_key``,
+``token``, or ``conn_str`` containing credentials) as well as URIs with embedded
+userinfo.
 
 For task-mapping discovery steps, ``ImednetHook`` provides explicit helper methods:
 
@@ -73,7 +78,8 @@ For task-mapping discovery steps, ``ImednetHook`` provides explicit helper metho
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
 - ``resolve_destination_connection()`` resolves runtime destination connection
-  settings for ``snowflake``, ``neo4j``, ``mongodb``, and ``sql`` targets.
+  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``sql``, ``sql_by_form``,
+  and ``long_sql`` targets.
 
 Operators and Sensors
 ---------------------
@@ -81,9 +87,12 @@ The Airflow integration organizes hooks, operators, and sensors in dedicated
 subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, Snowflake, Neo4j, etc.)
-using the core SDK's universal sink interface. Common operational parameters
-(``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
+records to any supported destination (CSV, Parquet, Excel, JSON, DuckDB, SQL,
+``sql_by_form``, ``long_sql``, Snowflake, Neo4j, and MongoDB) using the core
+SDK's universal sink interface. When ``incremental=True`` is enabled,
+``ImednetExportOperator`` commits and reads high-water mark checkpoints via
+``AirflowStateProvider`` backed by Airflow 3 ``Variable`` JSON state. Common
+operational parameters (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
 across plugin sinks and tabular exports without leaking sink-level options into
 Pandas or JSON writer kwargs. PHI masking is enabled by default

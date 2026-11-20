@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import sys
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import replace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote_plus
 
 from imednet import ImednetSDK
@@ -18,17 +19,53 @@ from .. import export
 from .._airflow_compat import AirflowException, Context
 from ..hooks import ImednetHook
 
-try:  # pragma: no cover - optional Airflow dependency
-    from airflow.models import BaseOperator
-except (ImportError, ModuleNotFoundError):  # pragma: no cover - placeholder fallback
+if TYPE_CHECKING:
+    try:
+        from airflow.sdk.bases.operator import BaseOperator
+    except ImportError:
+        try:
+            from airflow.models import BaseOperator  # type: ignore[no-redef]
+        except ImportError:
 
-    class BaseOperator:  # type: ignore
-        """Fallback BaseOperator for offline tests."""
+            class BaseOperator:  # type: ignore[no-redef]
+                """Fallback BaseOperator typing stub."""
 
-        template_fields: Sequence[str] = ()
+                template_fields: Sequence[str] = ()
 
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            """Initialize fallback BaseOperator."""
+                def __init__(self, *args: Any, **kwargs: Any) -> None:
+                    """Initialize fallback BaseOperator."""
+else:  # pragma: no cover - optional Airflow dependency
+
+    def _resolve_base_operator() -> type[Any]:
+        sdk_bases = sys.modules.get("airflow.sdk.bases")
+        if (
+            sdk_bases is None
+            or getattr(sdk_bases, "__file__", None) is not None
+            or hasattr(sdk_bases, "operator")
+        ):
+            try:
+                from airflow.sdk.bases.operator import BaseOperator as SdkBaseOperator
+
+                return SdkBaseOperator
+            except (ImportError, ModuleNotFoundError):
+                pass
+        try:
+            from airflow.models import BaseOperator as LegacyBaseOperator
+
+            return LegacyBaseOperator
+        except (ImportError, ModuleNotFoundError):
+
+            class _FallbackBaseOperator:
+                """Fallback BaseOperator for offline tests."""
+
+                template_fields: Sequence[str] = ()
+
+                def __init__(self, *args: Any, **kwargs: Any) -> None:
+                    """Initialize fallback BaseOperator."""
+
+            return _FallbackBaseOperator
+
+    BaseOperator = _resolve_base_operator()
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +77,8 @@ _TABULAR_EXPORTS = {
     "excel": export.export_to_excel,
     "json": export.export_to_json,
     "sql": export.export_to_sql,
+    "sql_by_form": export.export_to_sql_by_form,
+    "long_sql": export.export_to_long_sql,
     "duckdb": export.export_to_duckdb,
 }
 
@@ -167,7 +206,13 @@ class ImednetExportOperator(BaseOperator):
 
     # Fields intended for Airflow `.partial().expand()` runtime mapping.
     mapped_runtime_fields: Sequence[str] = ("study_key", "output_path", "export_kwargs")
-    template_fields: Sequence[str] = mapped_runtime_fields
+    template_fields: Sequence[str] = (
+        *mapped_runtime_fields,
+        "modified_since",
+        "record_filter",
+        "record_data_filter",
+        "stream_name",
+    )
     template_fields_renderers = {"export_kwargs": "json"}  # noqa: RUF012
     _explicit_tabular_options: frozenset[str] = frozenset()
 
@@ -274,6 +319,54 @@ class ImednetExportOperator(BaseOperator):
     def export_kwargs(self, value: Mapping[str, Any] | None) -> None:
         """Validate and store export_kwargs without persisting raw credentials."""
         self._export_kwargs = _ValidatedExportKwargs(value)
+
+    @property
+    def modified_since(self) -> Any:
+        """Return the configured watermark filter."""
+        return getattr(self, "_modified_since", None)
+
+    @modified_since.setter
+    def modified_since(self, value: Any) -> None:
+        """Validate and set modified_since, rejecting embedded secrets."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="modified_since")
+        self._modified_since = value
+
+    @property
+    def record_filter(self) -> Any:
+        """Return the configured record envelope filter."""
+        return getattr(self, "_record_filter", None)
+
+    @record_filter.setter
+    def record_filter(self, value: Any) -> None:
+        """Validate and set record_filter, rejecting secret keys or URI credentials."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="record_filter")
+        self._record_filter = value
+
+    @property
+    def record_data_filter(self) -> str | None:
+        """Return the configured record_data filter expression."""
+        return getattr(self, "_record_data_filter", None)
+
+    @record_data_filter.setter
+    def record_data_filter(self, value: str | None) -> None:
+        """Validate and set record_data_filter, rejecting embedded URI credentials."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="record_data_filter")
+        self._record_data_filter = value
+
+    @property
+    def stream_name(self) -> str | None:
+        """Return the configured incremental checkpoint stream name."""
+        return getattr(self, "_stream_name", None)
+
+    @stream_name.setter
+    def stream_name(self, value: str | None) -> None:
+        """Validate and set stream_name, rejecting embedded URI credentials."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="stream_name")
+        self._stream_name = value
 
     def _get_sdk(self) -> ImednetSDK:
         """Resolve the SDK client from the configured Airflow connection at execute time."""
@@ -474,8 +567,16 @@ class ImednetExportOperator(BaseOperator):
         """Execute the export task."""
         _ = context
         # Validate templated fields at runtime prior to any export work.
-        if self.output_path is not None:
-            _validate_no_secrets_in_value(self.output_path, field_name="output_path")
+        for templated_field in (
+            "output_path",
+            "modified_since",
+            "record_filter",
+            "record_data_filter",
+            "stream_name",
+        ):
+            field_val = getattr(self, templated_field, None)
+            if field_val is not None:
+                _validate_no_secrets_in_value(field_val, field_name=templated_field)
         runtime_kwargs = self._get_runtime_export_kwargs()
         # Resolve destination early to fail fast on invalid configs (like legacy _get_export_callable)
         dest = self.destination
@@ -562,18 +663,16 @@ class ImednetExportOperator(BaseOperator):
                 if dest in ("sql", "sql_by_form", "long_sql"):
                     conn_settings = self._resolve_destination_connection(dest)
                     if dest == "sql_by_form":
+                        kw_conn_str = tabular_kwargs.pop("conn_str", None)
                         conn_str_arg = (
-                            self.output_path
-                            or tabular_kwargs.pop("conn_str", None)
-                            or conn_settings.get("conn_str")
+                            self.output_path or kw_conn_str or conn_settings.get("conn_str")
                         )
                         export_callable(sdk, self.study_key, conn_str_arg, **tabular_kwargs)
                         return redact_uri(str(conn_str_arg)) if conn_str_arg is not None else None
+                    kw_table = tabular_kwargs.pop("table", None)
+                    kw_table_name = tabular_kwargs.pop("table_name", None)
                     table_arg = (
-                        self.output_path
-                        or tabular_kwargs.pop("table", None)
-                        or tabular_kwargs.pop("table_name", None)
-                        or conn_settings.get("table")
+                        self.output_path or kw_table or kw_table_name or conn_settings.get("table")
                     )
                     if "conn_str" not in tabular_kwargs and conn_settings.get("conn_str"):
                         tabular_kwargs["conn_str"] = conn_settings["conn_str"]

@@ -629,3 +629,126 @@ def test_cli_default_ledger_path_behavior() -> None:
 
     reset_args = root_parser.parse_args(["workflows", "state", "reset", "-s", "TEST-01"])
     assert reset_args.ledger_path == DEFAULT_LEDGER_PATH
+
+
+def test_airflow_state_provider_real_variable_ledger_parity(tmp_path: Path) -> None:
+    """AirflowStateProvider persists, reads, and deletes Variable state on real Airflow 3."""
+    pytest.importorskip("airflow")
+    import airflow.settings
+    from airflow.configuration import conf
+    from airflow.models import Variable as OrmVariable
+    from airflow.utils.db import initdb
+
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    db_url = f"sqlite:///{tmp_path / 'state_ledger_af.db'}"
+    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    conf.set("database", "sql_alchemy_conn", db_url)
+    airflow.settings.SQL_ALCHEMY_CONN = db_url
+    airflow.settings.configure_orm()
+    initdb()
+
+    try:
+        provider = AirflowStateProvider()
+        with provider.transaction("STUDY_AF", "records") as tx:
+            tx["new_timestamp"] = datetime(2026, 5, 22, 14, 0, 0, tzinfo=timezone.utc)
+            tx["records_processed"] = 7
+
+        assert provider.get_last_status("STUDY_AF", "records") == StreamExecutionStatus.SUCCESS
+        assert provider.get_last_timestamp("STUDY_AF", "records") == datetime(
+            2026, 5, 22, 14, 0, 0, tzinfo=timezone.utc
+        )
+
+        # Cover study-prefix isolation, legacy string JSON payloads, and malformed payloads
+        provider.set_last_timestamp(
+            "STUDY_AF_OTHER",
+            "vitals",
+            datetime(2026, 5, 22, 15, 0, 0),
+        )
+        OrmVariable.set(
+            "imednet_state__LEGACY_STATUS__s1",
+            {"last_timestamp": "2026-05-22T15:00:00", "status": "unknown_legacy_status"},
+            serialize_json=True,
+        )
+        assert provider.get_last_status("LEGACY_STATUS", "s1") == StreamExecutionStatus.FAILED
+        OrmVariable.set(
+            "imednet_state__RAW_STUDY__raw_stream",
+            '{"last_timestamp": "2026-05-22T16:00:00", "records_processed": 2}',
+            serialize_json=False,
+        )
+        OrmVariable.set("imednet_state__BAD_JSON__s1", "{not-json", serialize_json=False)
+        OrmVariable.set(
+            "imednet_state__BAD_TS__s1",
+            {"last_timestamp": "not-a-timestamp"},
+            serialize_json=True,
+        )
+        OrmVariable.set(
+            "imednet_state__MISSING_TS__s1",
+            {"records_processed": 1},
+            serialize_json=True,
+        )
+        OrmVariable.set("imednet_state__malformed_key_no_delim", {"last_timestamp": "2026-01-01"})
+
+        assert provider.get_last_timestamp("BAD_TS", "s1") is None
+        assert provider.get_last_timestamp("MISSING_TS", "s1") is None
+        assert provider.get_last_status("BAD_JSON", "s1") is None
+
+        ledger = provider.read_state()
+        assert ledger.studies["STUDY_AF"].streams["records"].records_processed == 7
+        assert ledger.studies["RAW_STUDY"].streams["raw_stream"].records_processed == 2
+
+        # Whole-study deletion removes STUDY_AF without touching STUDY_AF_OTHER
+        assert provider.delete_entry("STUDY_AF") is True
+        assert provider.delete_entry("STUDY_AF") is False
+        assert "STUDY_AF_OTHER" in provider.read_state().studies
+    finally:
+        airflow.settings.dispose_orm()
+        if prev_conn:
+            conf.set("database", "sql_alchemy_conn", prev_conn)
+            airflow.settings.SQL_ALCHEMY_CONN = prev_conn
+
+
+def test_airflow_state_provider_task_sdk_runtime_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AirflowStateProvider routes through airflow.sdk.Variable when SUPERVISOR_COMMS is active."""
+    from types import ModuleType, SimpleNamespace
+
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    store: dict[str, Any] = {}
+
+    class FakeSdkVariable:
+        @classmethod
+        def get(cls, key: str, default: Any = None, deserialize_json: bool = False) -> Any:
+            _ = deserialize_json
+            return store.get(key, default)
+
+        @classmethod
+        def set(cls, key: str, value: Any, serialize_json: bool = False) -> None:
+            _ = serialize_json
+            store[key] = value
+
+        @classmethod
+        def delete(cls, key: str) -> None:
+            store.pop(key, None)
+
+        @classmethod
+        def keys(cls, prefix: str | None = None) -> list[str]:
+            return [k for k in store if prefix is None or k.startswith(prefix)]
+
+    fake_runner = ModuleType("airflow.sdk.execution_time.task_runner")
+    fake_runner.SUPERVISOR_COMMS = SimpleNamespace()  # type: ignore[attr-defined]
+    fake_sdk = ModuleType("airflow.sdk")
+    fake_sdk.Variable = FakeSdkVariable  # type: ignore[attr-defined]
+    fake_airflow = ModuleType("airflow")
+
+    monkeypatch.setitem(sys.modules, "airflow", fake_airflow)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", fake_sdk)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time.task_runner", fake_runner)
+
+    provider = AirflowStateProvider()
+    ts = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    provider.set_last_timestamp("SDK_S", "sdk_m", ts, records_processed=9)
+    assert provider.get_last_timestamp("SDK_S", "sdk_m") == ts
+    assert provider.read_state().studies["SDK_S"].streams["sdk_m"].records_processed == 9
+    assert provider.delete_entry("SDK_S", "missing") is False
+    assert provider.delete_entry("SDK_S", "sdk_m") is True

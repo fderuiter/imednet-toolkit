@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -78,6 +78,7 @@ EXPORT_FUNCTIONS = [
     "export_to_json",
     "export_to_sql",
     "export_to_sql_by_form",
+    "export_to_long_sql",
 ]
 
 
@@ -1235,3 +1236,70 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     op_hard.execute({"run_id": "scheduled__2026-04-03T00:00:00+00:00"})
 
     assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]
+
+
+def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ImednetExportOperator dispatches sql_by_form and long_sql destinations via export wrappers."""
+    from apache_airflow_providers_imednet import export
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+
+    fake_conn = SimpleNamespace(
+        conn_type="postgresql",
+        host="db.internal",
+        login="loader",
+        password="secret",  # pragma: allowlist secret
+        schema="edc",
+        port=5432,
+        extra={},
+    )
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, conn_id: fake_conn if conn_id == "pg_dest" else None),
+    )
+
+    sdk = MagicMock()
+    by_form_mock = MagicMock()
+    long_sql_mock = MagicMock()
+    monkeypatch.setattr(export, "export_to_sql_by_form", by_form_mock)
+    monkeypatch.setattr(export, "export_to_long_sql", long_sql_mock)
+
+    op_by_form = ImednetExportOperator(
+        task_id="exp_sql_by_form",
+        study_key="STUDY_SQL",
+        destination="sql_by_form",
+        destination_conn_id="pg_dest",
+        export_kwargs={"if_exists": "replace"},
+    )
+    monkeypatch.setattr(op_by_form, "_get_sdk", lambda: sdk)
+    ret_by_form = op_by_form.execute({})
+
+    by_form_mock.assert_called_once_with(
+        sdk,
+        "STUDY_SQL",
+        "postgresql://loader:secret@db.internal:5432/edc",  # pragma: allowlist secret
+        if_exists="replace",
+    )
+    assert ret_by_form is not None
+    assert "secret" not in ret_by_form
+
+    op_long = ImednetExportOperator(
+        task_id="exp_long_sql",
+        study_key="STUDY_SQL",
+        destination="long_sql",
+        output_path="long_records",
+        destination_conn_id="pg_dest",
+        export_kwargs={"table_name": "ignored_when_output_path_set", "chunk_size": 250},
+    )
+    monkeypatch.setattr(op_long, "_get_sdk", lambda: sdk)
+    ret_long = op_long.execute({})
+
+    long_sql_mock.assert_called_once_with(
+        sdk,
+        "STUDY_SQL",
+        "long_records",
+        conn_str="postgresql://loader:secret@db.internal:5432/edc",  # pragma: allowlist secret
+        chunk_size=250,
+    )
+    assert ret_long == "long_records"
