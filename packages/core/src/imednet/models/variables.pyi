@@ -11,20 +11,20 @@ class Variable(ImednetBaseModel):
 
     label: str | None = Field(default=None, alias="label")
     variable_oid: str | None = Field(default=None, alias="variableOid")
-    study_key: str | None
-    variable_id: int | None
-    variable_type: str | None
-    variable_name: str | None
-    sequence: int | None
-    revision: int | None
-    date_created: str | None
-    date_modified: str | None
-    form_id: int | None
-    form_key: str | None
-    form_name: str | None
-    blinded: bool | None
-    deleted: bool | None
-    disabled: bool | None
-    last_updated: str | None
+    study_key: str | None = None
+    variable_id: int | None = None
+    variable_type: str | None = None
+    variable_name: str | None = None
+    sequence: int | None = None
+    revision: int | None = None
+    date_created: str | None = None
+    date_modified: str | None = None
+    form_id: int | None = None
+    form_key: str | None = None
+    form_name: str | None = None
+    blinded: bool | None = None
+    deleted: bool | None = None
+    disabled: bool | None = None
+    last_updated: str | None = None
 
 __all__ = ["Variable"]
