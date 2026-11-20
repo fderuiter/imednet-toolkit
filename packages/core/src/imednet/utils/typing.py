@@ -1,16 +1,25 @@
 """Type definitions for imednet SDK utilities."""
 
-from typing import Any, TypeAlias, Union
-
-try:
-    import pandas as pd
-
-    DataFrame: TypeAlias = pd.DataFrame
-except ImportError:
-    DataFrame: TypeAlias = Any  # type: ignore
+import os
+from typing import TYPE_CHECKING, Any, TypeAlias, Union
 
 #: Generic JSON object type (mapping of string keys to arbitrary values).
 JsonDict = dict[str, Any]
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+    DataFrame: TypeAlias = pd.DataFrame
+    RecordsInput: TypeAlias = list[JsonDict] | pd.DataFrame | str | os.PathLike[str]
+else:
+    try:
+        import pandas as _runtime_pd
+
+        DataFrame = _runtime_pd.DataFrame
+        RecordsInput = list[JsonDict] | _runtime_pd.DataFrame | str | os.PathLike[str]
+    except ImportError:
+        DataFrame = Any
+        RecordsInput = list[JsonDict] | str | os.PathLike[str]
 
 #: Accepted types for an endpoint item-ID parameter (path segment or filter value).
 ItemId = Union[str, int]  # noqa: UP007
@@ -31,4 +40,4 @@ FilterValue = Union[  # noqa: UP007
     list[FilterScalar],
 ]
 
-__all__ = ["FilterScalar", "FilterValue", "ItemId", "JsonDict"]
+__all__ = ["FilterScalar", "FilterValue", "ItemId", "JsonDict", "RecordsInput"]

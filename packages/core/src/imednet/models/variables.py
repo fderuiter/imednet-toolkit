@@ -13,6 +13,7 @@ class Variable(ImednetBaseModel):
 
     label: str | None = Field(default=None, alias="label")
     variable_oid: str | None = Field(default=None, alias="variableOid")
+    required: bool | str | None = Field(default=None, alias="required")
 
 
 Variable = ModelEngine.get_model('Variable', Variable)

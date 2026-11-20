@@ -7,16 +7,19 @@ import logging
 import math
 import re
 import threading
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
+    Literal,
     TypeVar,
     cast,
+    overload,
 )
 
 from typing_extensions import Protocol, runtime_checkable
@@ -25,6 +28,8 @@ from imednet.core.context import get_study_context
 from imednet.datadict.logic import LogicTreeEvaluator, extract_variable_constraints
 from imednet.datadict.models import DataDictionary
 from imednet.errors import UnknownVariableTypeError, ValidationError
+from imednet.utils.security import global_sensitivity_registry
+from imednet.utils.tabular import MASKED_SENTINEL, _contains_masked_sentinel
 
 from ..models.variables import Variable
 from ._base import _extract_form_ref, _ValidatorMixin
@@ -702,6 +707,94 @@ def _is_empty_value(value: Any) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class RecordValidationIssue:
+    """Structured single validation error or warning produced during schema validation."""
+
+    record_index: int
+    form_key: str | None
+    variable_name: str | None
+    message: str
+    rule_id: str | None = None
+    severity: Literal["error", "warning"] = "error"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize validation issue to a JSON-compatible dictionary."""
+        payload: dict[str, Any] = {
+            "recordIndex": self.record_index,
+            "formKey": self.form_key,
+            "variableName": self.variable_name,
+            "message": self.message,
+            "severity": self.severity,
+        }
+        if self.rule_id is not None:
+            payload["ruleId"] = self.rule_id
+        return payload
+
+
+@dataclass
+class BatchValidationReport:
+    """Aggregated multi-record validation report collecting all constraint errors and warnings."""
+
+    total_records: int = 0
+    valid_records: int = 0
+    invalid_records: int = 0
+    errors: list[RecordValidationIssue] = field(default_factory=list)
+    warnings: list[RecordValidationIssue] = field(default_factory=list)
+
+    @property
+    def is_valid(self) -> bool:
+        """Return True when zero validation errors were recorded."""
+        return len(self.errors) == 0
+
+    @property
+    def error_count(self) -> int:
+        """Return total number of validation errors across the batch."""
+        return len(self.errors)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the batch validation report to a JSON-compatible dictionary."""
+        return {
+            "isValid": self.is_valid,
+            "totalRecords": self.total_records,
+            "validRecords": self.valid_records,
+            "invalidRecords": self.invalid_records,
+            "errorCount": len(self.errors),
+            "warningCount": len(self.warnings),
+            "errors": [err.to_dict() for err in self.errors],
+            "warnings": [warn.to_dict() for warn in self.warnings],
+        }
+
+    def format_summary(self) -> str:
+        """Format a concise PHI-safe summary of all validation errors."""
+        if not self.errors:
+            return f"Validation passed ({self.total_records} record(s))."
+        lines = [
+            f"Batch validation failed with {len(self.errors)} error(s) "
+            f"across {self.invalid_records}/{self.total_records} record(s):"
+        ]
+        for issue in self.errors:
+            loc = f"Row {issue.record_index}"
+            if issue.form_key:
+                loc += f" [form={issue.form_key}]"
+            if issue.variable_name:
+                loc += f" [variable={issue.variable_name}]"
+            lines.append(f"  - {loc}: {issue.message}")
+        return "\n".join(lines)
+
+    def raise_for_errors(self) -> None:
+        """Raise :class:`ValidationError` with ``validation_report`` attached if invalid."""
+        if not self.is_valid:
+            raise ValidationError(self.format_summary(), validation_report=self)
+
+
+def _display_constraint_value(name: str, value: Any) -> Any:
+    """Redact clinical values for PHI-sensitive variable names in error messages."""
+    if global_sensitivity_registry.is_sensitive(name):
+        return MASKED_SENTINEL
+    return value
+
+
 def _validate_choice_membership(
     name: str,
     form_key: str,
@@ -727,16 +820,18 @@ def _validate_choice_membership(
 
         invalid = [tok for tok in tokens if tok not in allowed]
         if invalid:
+            shown = [MASKED_SENTINEL] if global_sensitivity_registry.is_sensitive(name) else invalid
             raise ValidationError(
-                f"Invalid choice(s) {invalid} for variable '{name}' on form '{form_key}'. "
+                f"Invalid choice(s) {shown} for variable '{name}' on form '{form_key}'. "
                 f"Allowed values: {choices}"
             )
         return
 
     str_val = str(value)
     if str_val not in allowed:
+        shown_val = _display_constraint_value(name, value)
         raise ValidationError(
-            f"Invalid choice '{value}' for variable '{name}' on form '{form_key}'. "
+            f"Invalid choice '{shown_val}' for variable '{name}' on form '{form_key}'. "
             f"Allowed values: {choices}"
         )
 
@@ -761,13 +856,14 @@ def _validate_numeric_bounds(
     if num is None or not math.isfinite(num):
         return
 
+    shown_val = _display_constraint_value(name, value)
     if min_value is not None and num < min_value:
         raise ValidationError(
-            f"Value {value} for variable '{name}' on form '{form_key}' is below minimum {min_value}"
+            f"Value {shown_val} for variable '{name}' on form '{form_key}' is below minimum {min_value}"
         )
     if max_value is not None and num > max_value:
         raise ValidationError(
-            f"Value {value} for variable '{name}' on form '{form_key}' exceeds maximum {max_value}"
+            f"Value {shown_val} for variable '{name}' on form '{form_key}' exceeds maximum {max_value}"
         )
 
 
@@ -789,77 +885,251 @@ def _validate_text_length(
         )
 
 
+def _check_required_variables_only(
+    variables: Mapping[str, Any],
+    form_key: str,
+    data: Mapping[str, Any],
+    *,
+    collect_errors: bool,
+    record_index: int,
+    errors: list[RecordValidationIssue],
+    warnings: list[RecordValidationIssue],
+) -> None:
+    """Enforce ``required`` variable flags on API ``BaseSchemaCache`` schemas."""
+    for name, var_obj in variables.items():
+        constraints = extract_variable_constraints(var_obj)
+        if constraints.required_policy == "no":
+            continue
+        if name not in data or _is_empty_value(data[name]):
+            msg = f"Required variable '{name}' on form '{form_key}' is missing or empty"
+            if constraints.required_policy == "yes":
+                if not collect_errors:
+                    raise ValidationError(msg)
+                errors.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=form_key,
+                        variable_name=name,
+                        message=msg,
+                        rule_id="required",
+                    )
+                )
+            elif constraints.required_policy == "auto_query":
+                logger.warning(
+                    "Auto Query: variable '%s' on form '%s' is missing or empty.",
+                    name,
+                    form_key,
+                )
+                warnings.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=form_key,
+                        variable_name=name,
+                        message=msg,
+                        rule_id="required_auto_query",
+                        severity="warning",
+                    )
+                )
+
+
+@overload
 def validate_record_data(
     schema: ValidationSchemaProtocol,
     form_key: str,
     data: dict[str, Any],
     *,
     study_key: str | None = None,
-) -> None:
+    collect_errors: Literal[False] = False,
+    record_index: int = 0,
+) -> None: ...
+
+
+@overload
+def validate_record_data(
+    schema: ValidationSchemaProtocol,
+    form_key: str,
+    data: dict[str, Any],
+    *,
+    study_key: str | None = None,
+    collect_errors: Literal[True],
+    record_index: int = 0,
+) -> BatchValidationReport: ...
+
+
+@overload
+def validate_record_data(
+    schema: ValidationSchemaProtocol,
+    form_key: str,
+    data: dict[str, Any],
+    *,
+    study_key: str | None = None,
+    collect_errors: bool = False,
+    record_index: int = 0,
+) -> BatchValidationReport | None: ...
+
+
+def validate_record_data(
+    schema: ValidationSchemaProtocol,
+    form_key: str,
+    data: dict[str, Any],
+    *,
+    study_key: str | None = None,
+    collect_errors: bool = False,
+    record_index: int = 0,
+) -> BatchValidationReport | None:
     """Validate ``data`` for ``form_key`` using the provided validation schema.
 
     Raises:
-        ValidationError: If the form key is not present in the schema or the data
+        ValidationError: If ``collect_errors=False`` and the form key or data
             fails validation checks.
     """
+    errors: list[RecordValidationIssue] = []
+    warnings: list[RecordValidationIssue] = []
+
+    def _finish() -> BatchValidationReport | None:
+        if not collect_errors:
+            return None
+        return BatchValidationReport(
+            total_records=1,
+            valid_records=0 if errors else 1,
+            invalid_records=1 if errors else 0,
+            errors=errors,
+            warnings=warnings,
+        )
+
+    def _record_error(
+        message: str,
+        *,
+        variable_name: str | None = None,
+        rule_id: str | None = None,
+        exc: ValidationError | None = None,
+    ) -> None:
+        if not collect_errors:
+            if exc is not None:
+                raise exc
+            raise ValidationError(message)
+        errors.append(
+            RecordValidationIssue(
+                record_index=record_index,
+                form_key=form_key,
+                variable_name=variable_name,
+                message=message,
+                rule_id=rule_id,
+            )
+        )
+
     variables = (
         schema.variables_for_form(form_key, study_key=study_key)
         if isinstance(schema, BaseSchemaCache)
         else schema.variables_for_form(form_key)
     )
     if not variables:
+        unknown_form = True
         if isinstance(schema, DataDictionary):
             form_obj = schema.form_for_key(form_key)
-            if form_obj is None or not schema.rules_for_form(form_key):
-                raise ValidationError(f"Unknown form {form_key}")
-        else:
-            # The cache has no variables for the given form key, so treat it as an
-            # unknown form and fail fast.
-            raise ValidationError(f"Unknown form {form_key}")
+            if form_obj is not None and schema.rules_for_form(form_key):
+                unknown_form = False
+        if unknown_form:
+            _record_error(f"Unknown form {form_key}", rule_id="unknown_form")
+            return _finish()
 
     unknown = [k for k in data if k not in variables]
     if unknown:
-        raise ValidationError(f"Unknown variables for form {form_key}: {', '.join(unknown)}")
+        _record_error(
+            f"Unknown variables for form {form_key}: {', '.join(unknown)}",
+            variable_name=unknown[0] if len(unknown) == 1 else None,
+            rule_id="unknown_variable",
+        )
+        if not collect_errors:
+            return None
 
+    type_failed_vars: set[str] = set()
     for name, value in data.items():
+        if _contains_masked_sentinel(value):
+            type_failed_vars.add(name)
+            _record_error(
+                f"Variable '{name}' on form '{form_key}' contains masked PHI sentinel '{MASKED_SENTINEL}'",
+                variable_name=name,
+                rule_id="masked_phi",
+            )
+            continue
+        if name not in variables:
+            continue
         var_obj = variables[name]
         vtype = getattr(var_obj, "variable_type", getattr(var_obj, "variableType", None))
-        _check_type(vtype, value)
+        try:
+            _check_type(vtype, value)
+        except ValidationError as exc:
+            type_failed_vars.add(name)
+            _record_error(exc.message, variable_name=name, rule_id="type", exc=exc)
 
-    # Fast path for API SchemaCache (no codelists, bounds, required policies, or XML rules)
+    # Fast path for API SchemaCache (enforce required flags when defined; skip codelists, bounds, and XML rules)
     if isinstance(schema, BaseSchemaCache):
-        return
+        _check_required_variables_only(
+            variables,
+            form_key,
+            data,
+            collect_errors=collect_errors,
+            record_index=record_index,
+            errors=errors,
+            warnings=warnings,
+        )
+        return _finish()
 
     for name, var_obj in variables.items():
+        if name in type_failed_vars:
+            continue
         constraints = extract_variable_constraints(var_obj)
         is_missing = name not in data or _is_empty_value(data[name])
         if is_missing:
             if constraints.required_policy == "yes":
-                raise ValidationError(
-                    f"Required variable '{name}' on form '{form_key}' is missing or empty"
+                _record_error(
+                    f"Required variable '{name}' on form '{form_key}' is missing or empty",
+                    variable_name=name,
+                    rule_id="required",
                 )
-            if constraints.required_policy == "auto_query":
+            elif constraints.required_policy == "auto_query":
+                warn_msg = f"Required variable '{name}' on form '{form_key}' is missing or empty"
                 logger.warning(
                     "Auto Query: variable '%s' on form '%s' is missing or empty.",
                     name,
                     form_key,
+                )
+                warnings.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=form_key,
+                        variable_name=name,
+                        message=warn_msg,
+                        rule_id="required_auto_query",
+                        severity="warning",
+                    )
                 )
             continue
 
         value = data[name]
         vtype = getattr(var_obj, "variable_type", getattr(var_obj, "variableType", None))
         if constraints.choices:
-            _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
+            try:
+                _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
+            except ValidationError as exc:
+                _record_error(exc.message, variable_name=name, rule_id="choice", exc=exc)
         if constraints.min_value is not None or constraints.max_value is not None:
-            _validate_numeric_bounds(
-                name, form_key, value, constraints.min_value, constraints.max_value
-            )
+            try:
+                _validate_numeric_bounds(
+                    name, form_key, value, constraints.min_value, constraints.max_value
+                )
+            except ValidationError as exc:
+                _record_error(exc.message, variable_name=name, rule_id="bounds", exc=exc)
         if isinstance(value, str) and (
             constraints.min_length is not None or constraints.max_length is not None
         ):
-            _validate_text_length(
-                name, form_key, value, constraints.min_length, constraints.max_length
-            )
+            try:
+                _validate_text_length(
+                    name, form_key, value, constraints.min_length, constraints.max_length
+                )
+            except ValidationError as exc:
+                _record_error(exc.message, variable_name=name, rule_id="length", exc=exc)
 
     rules_getter = getattr(schema, "rules_for_form", None)
     if callable(rules_getter):
@@ -873,11 +1143,41 @@ def validate_record_data(
                     form_key,
                     warn.message,
                 )
-            if report.errors:
-                first_err = report.errors[0]
-                raise ValidationError(
-                    f"Rule '{first_err.rule_name}' failed on form '{form_key}': {first_err.message}"
+                warnings.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=form_key,
+                        variable_name=None,
+                        message=f"Query rule '{warn.rule_name}' triggered on form '{form_key}': {warn.message}",
+                        rule_id=str(warn.rule_id) if warn.rule_id is not None else warn.rule_name,
+                        severity="warning",
+                    )
                 )
+            if report.errors:
+                if not collect_errors:
+                    first_err = report.errors[0]
+                    raise ValidationError(
+                        f"Rule '{first_err.rule_name}' failed on form '{form_key}': {first_err.message}"
+                    )
+                for rule_err in report.errors:
+                    errors.append(
+                        RecordValidationIssue(
+                            record_index=record_index,
+                            form_key=form_key,
+                            variable_name=None,
+                            message=(
+                                f"Rule '{rule_err.rule_name}' failed on form '{form_key}': "
+                                f"{rule_err.message}"
+                            ),
+                            rule_id=(
+                                str(rule_err.rule_id)
+                                if rule_err.rule_id is not None
+                                else rule_err.rule_name
+                            ),
+                        )
+                    )
+
+    return _finish()
 
 
 def calculate_readiness_score(
@@ -922,28 +1222,25 @@ def calculate_readiness_score(
         vtype = getattr(var, "variable_type", getattr(var, "variableType", None))
         try:
             _check_type(vtype, value)
-            if not is_cache:
-                constraints = extract_variable_constraints(var)
-                if _is_empty_value(value):
-                    if constraints.required_policy == "yes":
-                        raise ValidationError("Required variable is empty")
-                    if constraints.required_policy == "auto_query":
-                        reasons.append(f"Auto Query warning for variable {name}: value is empty")
-                else:
-                    if constraints.choices:
-                        _validate_choice_membership(
-                            name, form_key, vtype, value, constraints.choices
-                        )
-                    if constraints.min_value is not None or constraints.max_value is not None:
-                        _validate_numeric_bounds(
-                            name, form_key, value, constraints.min_value, constraints.max_value
-                        )
-                    if isinstance(value, str) and (
-                        constraints.min_length is not None or constraints.max_length is not None
-                    ):
-                        _validate_text_length(
-                            name, form_key, value, constraints.min_length, constraints.max_length
-                        )
+            constraints = extract_variable_constraints(var)
+            if _is_empty_value(value):
+                if constraints.required_policy == "yes":
+                    raise ValidationError("Required variable is empty")
+                if constraints.required_policy == "auto_query":
+                    reasons.append(f"Auto Query warning for variable {name}: value is empty")
+            elif not is_cache:
+                if constraints.choices:
+                    _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
+                if constraints.min_value is not None or constraints.max_value is not None:
+                    _validate_numeric_bounds(
+                        name, form_key, value, constraints.min_value, constraints.max_value
+                    )
+                if isinstance(value, str) and (
+                    constraints.min_length is not None or constraints.max_length is not None
+                ):
+                    _validate_text_length(
+                        name, form_key, value, constraints.min_length, constraints.max_length
+                    )
             valid_count += 1
         except Exception as e:
             reasons.append(f"Variable {name} invalid: {e!s}")
@@ -963,45 +1260,145 @@ def calculate_readiness_score(
     return score, reasons
 
 
+@overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
     record: dict[str, Any],
     *,
     study_key: str | None = None,
-) -> None:
+    collect_errors: Literal[False] = False,
+    record_index: int = 0,
+) -> None: ...
+
+
+@overload
+def validate_record_entry(
+    schema: ValidationSchemaProtocol,
+    record: dict[str, Any],
+    *,
+    study_key: str | None = None,
+    collect_errors: Literal[True],
+    record_index: int = 0,
+) -> BatchValidationReport: ...
+
+
+@overload
+def validate_record_entry(
+    schema: ValidationSchemaProtocol,
+    record: dict[str, Any],
+    *,
+    study_key: str | None = None,
+    collect_errors: bool = False,
+    record_index: int = 0,
+) -> BatchValidationReport | None: ...
+
+
+def validate_record_entry(
+    schema: ValidationSchemaProtocol,
+    record: dict[str, Any],
+    *,
+    study_key: str | None = None,
+    collect_errors: bool = False,
+    record_index: int = 0,
+) -> BatchValidationReport | None:
     """Validate a single record entry against the schema.
 
     Resolves the form key from "formKey", "form_key", "formId", or "form_id".
-
-    Args:
-        schema: The validation schema to use.
-        record: The record data dictionary.
-        study_key: Optional study key for study-partitioned schema caches.
-
-    Raises:
-        ValidationError: If the form key or form ID is not present in the schema
-            or the data fails validation checks.
     """
     raw_study = study_key or record.get("studyKey") or record.get("study_key")
     eff_study_key = str(raw_study) if raw_study else None
     fk, fid = _extract_form_ref(record)
     if not fk and fid is not None:
         if isinstance(fid, bool):
-            raise ValidationError(f"Unknown form ID {fid}")
+            msg = f"Unknown form ID {fid}"
+            if not collect_errors:
+                raise ValidationError(msg)
+            return BatchValidationReport(
+                total_records=1,
+                valid_records=0,
+                invalid_records=1,
+                errors=[
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=None,
+                        variable_name=None,
+                        message=msg,
+                        rule_id="unknown_form_id",
+                    )
+                ],
+            )
         fk = (
             schema.form_key_from_id(fid, study_key=eff_study_key)
             if isinstance(schema, BaseSchemaCache)
             else schema.form_key_from_id(fid)
         )
         if not fk:
-            raise ValidationError(f"Unknown form ID {fid}")
+            msg = f"Unknown form ID {fid}"
+            if not collect_errors:
+                raise ValidationError(msg)
+            return BatchValidationReport(
+                total_records=1,
+                valid_records=0,
+                invalid_records=1,
+                errors=[
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=None,
+                        variable_name=None,
+                        message=msg,
+                        rule_id="unknown_form_id",
+                    )
+                ],
+            )
     if fk:
-        validate_record_data(
+        return validate_record_data(
             schema,
             fk,
             record.get("recordData", record.get("data", {})),
             study_key=eff_study_key,
+            collect_errors=collect_errors,
+            record_index=record_index,
         )
+    if collect_errors:
+        return BatchValidationReport(total_records=1, valid_records=1, invalid_records=0)
+    return None
+
+
+def validate_records_batch(
+    schema: ValidationSchemaProtocol,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    study_key: str | None = None,
+    collect_errors: bool = True,
+) -> BatchValidationReport:
+    """Validate a sequence of records against *schema*, aggregating errors when requested."""
+    aggregated = BatchValidationReport(total_records=len(records))
+    for idx, rec in enumerate(records):
+        rec_dict = rec if isinstance(rec, dict) else dict(rec)
+        if collect_errors:
+            entry_report = validate_record_entry(
+                schema,
+                rec_dict,
+                study_key=study_key,
+                collect_errors=True,
+                record_index=idx,
+            )
+            if entry_report.is_valid:
+                aggregated.valid_records += 1
+            else:
+                aggregated.invalid_records += 1
+                aggregated.errors.extend(entry_report.errors)
+            aggregated.warnings.extend(entry_report.warnings)
+        else:
+            validate_record_entry(
+                schema,
+                rec_dict,
+                study_key=study_key,
+                collect_errors=False,
+                record_index=idx,
+            )
+            aggregated.valid_records += 1
+    return aggregated
 
 
 class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
@@ -1075,10 +1472,59 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
             study_key=study_key,
         )
 
-    def validate_batch(self, study_key: str, records: list[dict[str, Any]]) -> None:
+    @overload
+    def validate_batch(
+        self,
+        study_key: str,
+        records: list[dict[str, Any]],
+        *,
+        collect_errors: Literal[False] = False,
+    ) -> None: ...
+
+    @overload
+    def validate_batch(
+        self,
+        study_key: str,
+        records: list[dict[str, Any]],
+        *,
+        collect_errors: Literal[True],
+    ) -> BatchValidationReport: ...
+
+    @overload
+    def validate_batch(
+        self,
+        study_key: str,
+        records: list[dict[str, Any]],
+        *,
+        collect_errors: bool = False,
+    ) -> BatchValidationReport | None: ...
+
+    def validate_batch(
+        self,
+        study_key: str,
+        records: list[dict[str, Any]],
+        *,
+        collect_errors: bool = False,
+    ) -> BatchValidationReport | None:
         """Validate a batch of record payloads."""
+        if not collect_errors:
+            for rec in records:
+                self.validate_record(study_key, rec)
+            return None
+
+        refreshed = False
         for rec in records:
-            self.validate_record(study_key, rec)
+            _, needs_refresh = self._needs_refresh(rec, study_key=study_key)
+            if needs_refresh and not refreshed:
+                self.refresh(study_key)
+                refreshed = True
+                break
+        return validate_records_batch(
+            self.schema,
+            records,
+            study_key=study_key,
+            collect_errors=True,
+        )
 
 
 class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
@@ -1115,7 +1561,56 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
             study_key=study_key,
         )
 
-    async def validate_batch(self, study_key: str, records: list[dict[str, Any]]) -> None:
+    @overload
+    async def validate_batch(
+        self,
+        study_key: str,
+        records: list[dict[str, Any]],
+        *,
+        collect_errors: Literal[False] = False,
+    ) -> None: ...
+
+    @overload
+    async def validate_batch(
+        self,
+        study_key: str,
+        records: list[dict[str, Any]],
+        *,
+        collect_errors: Literal[True],
+    ) -> BatchValidationReport: ...
+
+    @overload
+    async def validate_batch(
+        self,
+        study_key: str,
+        records: list[dict[str, Any]],
+        *,
+        collect_errors: bool = False,
+    ) -> BatchValidationReport | None: ...
+
+    async def validate_batch(
+        self,
+        study_key: str,
+        records: list[dict[str, Any]],
+        *,
+        collect_errors: bool = False,
+    ) -> BatchValidationReport | None:
         """Validate a batch of record payloads asynchronously."""
+        if not collect_errors:
+            for rec in records:
+                await self.validate_record(study_key, rec)
+            return None
+
+        refreshed = False
         for rec in records:
-            await self.validate_record(study_key, rec)
+            _, needs_refresh = self._needs_refresh(rec, study_key=study_key)
+            if needs_refresh and not refreshed:
+                await self.refresh(study_key)
+                refreshed = True
+                break
+        return validate_records_batch(
+            self.schema,
+            records,
+            study_key=study_key,
+            collect_errors=True,
+        )

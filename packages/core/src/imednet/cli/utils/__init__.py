@@ -10,6 +10,7 @@ from .args import (
     add_output_format,
     parse_filter_args,
     parse_record_data_filter,
+    positive_int,
     resolve_endpoint_filter_attributes,
     resolve_output_format,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "is_tty",
     "parse_filter_args",
     "parse_record_data_filter",
+    "positive_int",
     "print_error",
     "register_list_command",
     "resolve_endpoint_filter_attributes",

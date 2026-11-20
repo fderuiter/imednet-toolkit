@@ -734,3 +734,119 @@ def test_console_width_override_and_attribute() -> None:
 
     c2.width = 75
     assert c2.width == 75
+
+
+def test_status_step_interactive_and_non_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Status.step updates spinner on interactive TTYs and emits plain lines when non-interactive."""
+    term = SimulatedTerminal(cols=80)
+    c_tty = Console(stream=term)
+    with c_tty.status("Starting...", announce_non_interactive=False) as st:
+        st.step("Cycle 1 complete")
+        assert term.occupied_rows() == [0]
+        st.step("Cycle 2 complete")
+        assert term.occupied_rows() == [0]
+    assert term.occupied_rows() == []
+
+    buf = io.StringIO()
+    buf.isatty = lambda: False  # type: ignore[assignment]
+    c_pipe = Console(stream=buf)
+    with c_pipe.status("Starting...", announce_non_interactive=False) as st_pipe:
+        st_pipe.step("\033[32mCycle 1\033[0m: synced 10 records.")
+        st_pipe.update("Sleeping 9s...")
+        st_pipe.step("Cycle 2: synced 15 records.")
+    assert buf.getvalue().splitlines() == [
+        "Cycle 1: synced 10 records.",
+        "Cycle 2: synced 15 records.",
+    ]
+
+    # Suppressed in JSON output mode
+    buf_json = io.StringIO()
+    buf_json.isatty = lambda: False  # type: ignore[assignment]
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    with Console(stream=buf_json).status("Starting...", announce_non_interactive=False) as st_json:
+        st_json.step("Cycle 1")
+    assert buf_json.getvalue() == ""
+
+
+def test_sync_worker_cli_interval_bounds_and_non_interactive_telemetry_and_fatal_api_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sync-worker validates --interval > 0, emits 1 stderr line/cycle in --no-interactive, and exits 1 on 401/403/404."""
+    from tests.unit.cli.test_cli import CliRunner
+
+    from imednet import cli
+    from imednet.spi.errors import AuthenticationError, ForbiddenError, NotFoundError
+
+    runner = CliRunner()
+
+    # 1. Zero and negative intervals exit with argparse status code 2
+    for bad_interval in ("0", "-5", "abc"):
+        res_bad = runner.invoke(
+            cli.app, ["workflows", "sync-worker", "STUDY-X", "--interval", bad_interval]
+        )
+        assert res_bad.exit_code == 2
+        assert res_bad.stdout == ""
+        assert "--interval" in res_bad.stderr
+
+    # 2. --no-interactive emits one stderr progress line per completed cycle and zero stdout lines
+    def _two_cycles(on_cycle=None, on_sleep_tick=None) -> None:
+        if on_cycle:
+            on_cycle(1, 12)
+        if on_sleep_tick:
+            on_sleep_tick(1, 5)
+        if on_cycle:
+            on_cycle(2, 18)
+
+    mock_worker = MagicMock()
+    mock_worker.run_forever.side_effect = _two_cycles
+    mock_sdk = MagicMock()
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet_workflows.cached_loader.CachedRecordsLoader", MagicMock()),
+        patch("imednet_workflows.cli.SyncWorker", return_value=mock_worker),
+    ):
+        res_cycles = runner.invoke(
+            cli.app,
+            ["workflows", "sync-worker", "STUDY-X", "--interval", "5", "--no-interactive"],
+        )
+
+    assert res_cycles.exit_code == 0
+    assert res_cycles.stdout == ""
+    assert res_cycles.stderr.splitlines() == [
+        "Study 'STUDY-X' - cycle 1: synced 12 records.",
+        "Study 'STUDY-X' - cycle 2: synced 18 records.",
+    ]
+    mock_sdk.close.assert_called_once()
+
+    # 3. Permanent 401, 403, 404 ApiErrors propagate out of SyncWorker, redact secrets, and exit 1
+    api_secret = "ak_live_super_secret_991"  # pragma: allowlist secret
+    sec_secret = "sk_live_super_secret_992"  # pragma: allowlist secret
+    oidc_secret = "oidc_eyJ_super_secret_993"  # pragma: allowlist secret
+    monkeypatch.setenv("IMEDNET_API_KEY", api_secret)
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", sec_secret)
+    monkeypatch.setenv("IMEDNET_OIDC_TOKEN", oidc_secret)
+
+    for perm_exc in (
+        AuthenticationError(f"401 invalid key {api_secret} {oidc_secret}"),
+        ForbiddenError(f"403 denied {sec_secret}"),
+        NotFoundError(f"404 missing study {api_secret}"),
+    ):
+        sdk_inst = MagicMock()
+        failing_worker = MagicMock()
+        failing_worker.run_forever.side_effect = perm_exc
+        with (
+            patch("imednet.cli.utils.context.get_sdk", return_value=sdk_inst),
+            patch("imednet_workflows.cached_loader.CachedRecordsLoader", MagicMock()),
+            patch("imednet_workflows.cli.SyncWorker", return_value=failing_worker),
+        ):
+            res_err = runner.invoke(
+                cli.app,
+                ["workflows", "sync-worker", "STUDY-X", "--no-interactive"],
+            )
+        assert res_err.exit_code == 1
+        assert res_err.stdout == ""
+        assert "********" in res_err.stderr
+        for leaked in (api_secret, sec_secret, oidc_secret):
+            assert leaked not in res_err.stderr
+            assert leaked not in res_err.stdout
+        sdk_inst.close.assert_called_once()

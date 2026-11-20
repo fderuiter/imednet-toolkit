@@ -9,7 +9,13 @@ from imednet.spi.utils import (
     AsyncBatchCoordinator,
     BatchCoordinator,
     BatchSubmissionSummary,
-    JobPollSummary,
+    JobProgressHandler,
+    RecordsInput,
+    normalize_records_input,
+    poll_facade_many_async,
+    poll_facade_many_sync,
+    poll_facade_single_async,
+    poll_facade_single_sync,
 )
 from imednet.spi.validation import (
     AsyncSchemaValidator,
@@ -34,80 +40,10 @@ def _extract_record_form_ref(record: dict[str, Any]) -> tuple[str | None, Any]:
     return fk, fid
 
 
-def _poll_many_sync(
-    sdk: "ImednetFacade",
-    study_key: str,
-    batch_ids: list[str],
-    *,
-    timeout: int,
-    poll_interval: int,
-) -> JobPollSummary:
-    """Poll multiple batch IDs via facade poll_jobs with fallback to poll_job."""
-    poll_jobs_fn = getattr(sdk, "poll_jobs", None)
-    if callable(poll_jobs_fn):
-        candidate = poll_jobs_fn(
-            study_key,
-            batch_ids,
-            timeout=float(timeout),
-            interval=float(poll_interval),
-        )
-        if isinstance(candidate, JobPollSummary):
-            return candidate
-
-    results = {}
-    failures = {}
-    for bid in batch_ids:
-        try:
-            results[bid] = sdk.poll_job(study_key, bid, timeout=timeout, interval=poll_interval)
-        except Exception as exc:
-            failures[bid] = exc
-            raise
-    return JobPollSummary(
-        study_key=study_key,
-        results=results,
-        failures=failures,
-        elapsed_total=0.0,
-    )
-
-
-async def _poll_many_async(
-    sdk: "AsyncImednetFacade",
-    study_key: str,
-    batch_ids: list[str],
-    *,
-    timeout: int,
-    poll_interval: int,
-) -> JobPollSummary:
-    """Asynchronously poll multiple batch IDs via async_poll_jobs with fallback."""
-    poll_jobs_fn = getattr(sdk, "async_poll_jobs", None)
-    if callable(poll_jobs_fn):
-        maybe_coro = poll_jobs_fn(
-            study_key,
-            batch_ids,
-            timeout=float(timeout),
-            interval=float(poll_interval),
-        )
-        if hasattr(maybe_coro, "__await__"):
-            candidate = await maybe_coro
-            if isinstance(candidate, JobPollSummary):
-                return candidate
-
-    results = {}
-    failures = {}
-    for bid in batch_ids:
-        try:
-            results[bid] = await sdk.async_poll_job(
-                study_key, bid, timeout=timeout, interval=poll_interval
-            )
-        except Exception as exc:
-            failures[bid] = exc
-            raise
-    return JobPollSummary(
-        study_key=study_key,
-        results=results,
-        failures=failures,
-        elapsed_total=0.0,
-    )
+_poll_single_sync = poll_facade_single_sync
+_poll_single_async = poll_facade_single_async
+_poll_many_sync = poll_facade_many_sync
+_poll_many_async = poll_facade_many_async
 
 
 class RecordUpdateWorkflow:
@@ -239,47 +175,67 @@ class RecordUpdateWorkflow:
     def create_or_update_records_batch(
         self,
         study_key: str,
-        records_data: list[dict[str, Any]],
+        records_data: RecordsInput,
         wait_for_completion: bool = False,
         timeout: int = 300,
         poll_interval: int = 5,
         *,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and return a batch summary."""
         active_schema, is_offline = self._resolve_active_schema(schema)
+        normalized = normalize_records_input(records_data, schema=active_schema)
         if not is_offline:
-            self._validate_form_key(study_key, records_data)
+            self._validate_form_key(study_key, normalized)
         sdk = cast("ImednetFacade", self._sdk)
         coordinator = BatchCoordinator(chunk_size=chunk_size or self._batch_size)
         return coordinator.submit(
             study_key,
-            records_data,
+            normalized,
             lambda chunk: sdk.create_record(study_key, chunk, schema=active_schema),
             schema=active_schema,
             validate_batch_fn=(
                 None if is_offline else cast(SchemaValidator, self._validator).validate_batch
             ),
             wait_for_completion=wait_for_completion,
-            poll_single=lambda bid: sdk.poll_job(
-                study_key, bid, timeout=timeout, interval=poll_interval
+            poll_single=lambda bid, *, on_progress=None: _poll_single_sync(
+                sdk,
+                study_key,
+                bid,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                on_progress=on_progress,
             ),
-            poll_many=lambda bids: _poll_many_sync(
-                sdk, study_key, bids, timeout=timeout, poll_interval=poll_interval
+            poll_many=lambda bids, *, on_progress=None: _poll_many_sync(
+                sdk,
+                study_key,
+                bids,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                on_progress=on_progress,
             ),
+            on_progress=on_progress,
             require_batch_id=True,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
         )
 
     def create_or_update_records(
         self,
         study_key: str,
-        records_data: list[dict[str, Any]],
+        records_data: RecordsInput,
         wait_for_completion: bool = False,
         timeout: int = 300,
         poll_interval: int = 5,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> Job:
         """Submit records for creation or update and optionally wait for completion."""
         summary = self.create_or_update_records_batch(
@@ -289,6 +245,9 @@ class RecordUpdateWorkflow:
             timeout=timeout,
             poll_interval=poll_interval,
             schema=schema,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
         )
         if summary.last_job is not None:
             return summary.last_job
@@ -297,47 +256,67 @@ class RecordUpdateWorkflow:
     async def async_create_or_update_records_batch(
         self,
         study_key: str,
-        records_data: list[dict[str, Any]],
+        records_data: RecordsInput,
         wait_for_completion: bool = False,
         timeout: int = 300,
         poll_interval: int = 5,
         *,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
         active_schema, is_offline = self._resolve_active_schema(schema)
+        normalized = normalize_records_input(records_data, schema=active_schema)
         if not is_offline:
-            await self._async_validate_form_key(study_key, records_data)
+            await self._async_validate_form_key(study_key, normalized)
         sdk = cast("AsyncImednetFacade", self._sdk)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size or self._batch_size)
         return await coordinator.submit(
             study_key,
-            records_data,
+            normalized,
             lambda chunk: sdk.async_create_record(study_key, chunk, schema=active_schema),
             schema=active_schema,
             validate_batch_fn=(
                 None if is_offline else cast(AsyncSchemaValidator, self._validator).validate_batch
             ),
             wait_for_completion=wait_for_completion,
-            poll_single=lambda bid: sdk.async_poll_job(
-                study_key, bid, timeout=timeout, interval=poll_interval
+            poll_single=lambda bid, *, on_progress=None: _poll_single_async(
+                sdk,
+                study_key,
+                bid,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                on_progress=on_progress,
             ),
-            poll_many=lambda bids: _poll_many_async(
-                sdk, study_key, bids, timeout=timeout, poll_interval=poll_interval
+            poll_many=lambda bids, *, on_progress=None: _poll_many_async(
+                sdk,
+                study_key,
+                bids,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                on_progress=on_progress,
             ),
+            on_progress=on_progress,
             require_batch_id=True,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
         )
 
     async def async_create_or_update_records(
         self,
         study_key: str,
-        records_data: list[dict[str, Any]],
+        records_data: RecordsInput,
         wait_for_completion: bool = False,
         timeout: int = 300,
         poll_interval: int = 5,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> Job:
         """Asynchronous variant of :meth:`create_or_update_records`."""
         summary = await self.async_create_or_update_records_batch(
@@ -347,6 +326,9 @@ class RecordUpdateWorkflow:
             timeout=timeout,
             poll_interval=poll_interval,
             schema=schema,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
         )
         if summary.last_job is not None:
             return summary.last_job

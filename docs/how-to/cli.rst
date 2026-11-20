@@ -132,8 +132,8 @@ and ``stdout`` are connected to a capable TTY, while single-job commands
 (``imednet jobs status`` and ``imednet jobs wait``) always print a static summary
 table to ``stdout`` and exit immediately.
 
-Pass ``--no-interactive`` (at the root command or on ``imednet tui``, read, export, and
-workflow subcommands) or set ``IMEDNET_NON_INTERACTIVE=1`` to disable full-screen ``curses`` grids,
+Pass ``--no-interactive`` (at the root command or on ``imednet tui``, read, write, export,
+and workflow subcommands) or set ``IMEDNET_NON_INTERACTIVE=1`` to disable full-screen ``curses`` grids,
 live ``stderr`` spinners, and interactive ``stdin`` prompts. Passing
 ``imednet tui --no-interactive`` (or invoking ``imednet tui`` while
 ``IMEDNET_NON_INTERACTIVE`` is enabled) exits immediately with status code ``1``, even

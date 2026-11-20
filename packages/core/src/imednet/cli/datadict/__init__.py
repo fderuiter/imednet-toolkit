@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from contextlib import closing
 from pathlib import Path
 
 from ...datadict import (
@@ -22,8 +21,11 @@ from ...datadict import (
     validate,
 )
 from ...datadict.models import DataDictionary
-from ..decorators import validate_cli_path_segment
-from ..utils import get_sdk, resolve_output_format
+from ...sdk import ImednetSDK
+from ..decorators import redact_cli_secrets, validate_cli_path_segment, with_sdk
+from ..utils import get_sdk, print_error, resolve_output_format
+
+__all__ = ["get_sdk", "setup_parser"]
 
 
 def _handle_to_odm(args: argparse.Namespace) -> None:
@@ -32,7 +34,7 @@ def _handle_to_odm(args: argparse.Namespace) -> None:
         input_text = Path(args.file).read_text(encoding="utf-8")
         dd = DataDictionary.model_validate_json(input_text)
     except Exception as exc:
-        print(f"Error reading data dictionary from '{args.file}': {exc}", file=sys.stderr)
+        print_error(redact_cli_secrets(f"Error reading data dictionary from '{args.file}': {exc}"))
         sys.exit(1)
 
     try:
@@ -42,7 +44,7 @@ def _handle_to_odm(args: argparse.Namespace) -> None:
         else:
             print(to_odm_xml(dd, file_oid=getattr(args, "file_oid", None)), end="")
     except Exception as exc:
-        print(f"Error exporting to CDISC ODM XML: {exc}", file=sys.stderr)
+        print_error(redact_cli_secrets(f"Error exporting to CDISC ODM XML: {exc}"))
         sys.exit(1)
 
 
@@ -55,7 +57,7 @@ def _handle_from_csv(args: argparse.Namespace) -> None:
             no_raw_xml=args.no_raw_xml,
         )
     except Exception as exc:
-        print(f"Error loading from CSV: {exc}", file=sys.stderr)
+        print_error(redact_cli_secrets(f"Error loading from CSV: {exc}"))
         sys.exit(1)
 
     if args.output:
@@ -75,7 +77,7 @@ def _handle_from_odm(args: argparse.Namespace) -> None:
             no_raw_xml=args.no_raw_xml,
         )
     except Exception as exc:
-        print(f"Error loading from CDISC ODM: {exc}", file=sys.stderr)
+        print_error(redact_cli_secrets(f"Error loading from CDISC ODM: {exc}"))
         sys.exit(1)
 
     if args.output:
@@ -95,12 +97,28 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
             no_raw_xml=args.no_raw_xml,
         )
     except Exception as exc:
-        print(f"Error loading from REDCap: {exc}", file=sys.stderr)
+        print_error(redact_cli_secrets(f"Error loading from REDCap: {exc}"))
         sys.exit(1)
 
     if args.output:
         to_file(dd, args.output)
         print(f"Successfully wrote data dictionary to '{args.output}'")
+    else:
+        print(to_json(dd), end="")
+
+
+@with_sdk
+def _from_api(
+    sdk: ImednetSDK,
+    study_key: str,
+    output: str | None = None,
+    no_raw_xml: bool = False,
+) -> None:
+    """Load data dictionary from live API with managed SDK lifecycle and error redaction."""
+    dd = load_from_api(sdk, study_key, no_raw_xml=no_raw_xml)
+    if output:
+        to_file(dd, output)
+        print(f"Successfully wrote data dictionary to '{output}'")
     else:
         print(to_json(dd), end="")
 
@@ -108,18 +126,11 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
 def _handle_from_api(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-api` command."""
     validate_cli_path_segment(args.study_key, name="study_key")
-    try:
-        with closing(get_sdk()) as sdk:
-            dd = load_from_api(sdk, args.study_key, no_raw_xml=args.no_raw_xml)
-    except Exception as exc:
-        print(f"Error loading from API: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    if args.output:
-        to_file(dd, args.output)
-        print(f"Successfully wrote data dictionary to '{args.output}'")
-    else:
-        print(to_json(dd), end="")
+    _from_api(
+        study_key=args.study_key,
+        output=args.output,
+        no_raw_xml=args.no_raw_xml,
+    )
 
 
 def _handle_validate(args: argparse.Namespace) -> None:
@@ -130,14 +141,14 @@ def _handle_validate(args: argparse.Namespace) -> None:
             schema_text = Path(args.schema).read_text(encoding="utf-8")
             schema_dict = json.loads(schema_text)
         except Exception as exc:
-            print(f"Error reading schema file '{args.schema}': {exc}", file=sys.stderr)
+            print_error(redact_cli_secrets(f"Error reading schema file '{args.schema}': {exc}"))
             sys.exit(1)
 
     errors = validate(args.file, schema=schema_dict)
     if errors:
-        print(f"Validation failed with {len(errors)} error(s):", file=sys.stderr)
+        print_error(f"Validation failed with {len(errors)} error(s):")
         for err in errors:
-            print(f"  - {err}", file=sys.stderr)
+            print_error(redact_cli_secrets(f"  - {err}"))
         sys.exit(1)
     else:
         print(f"Validation passed: '{args.file}' conforms to the data dictionary specification.")
@@ -149,14 +160,16 @@ def _handle_diff(args: argparse.Namespace) -> None:
         old_text = Path(args.old).read_text(encoding="utf-8")
         old_dd = DataDictionary.model_validate_json(old_text)
     except Exception as exc:
-        print(f"Error reading baseline data dictionary '{args.old}': {exc}", file=sys.stderr)
+        print_error(
+            redact_cli_secrets(f"Error reading baseline data dictionary '{args.old}': {exc}")
+        )
         sys.exit(1)
 
     try:
         new_text = Path(args.new).read_text(encoding="utf-8")
         new_dd = DataDictionary.model_validate_json(new_text)
     except Exception as exc:
-        print(f"Error reading target data dictionary '{args.new}': {exc}", file=sys.stderr)
+        print_error(redact_cli_secrets(f"Error reading target data dictionary '{args.new}': {exc}"))
         sys.exit(1)
 
     report = diff(old_dd, new_dd)
@@ -180,7 +193,7 @@ def _handle_schema(args: argparse.Namespace) -> None:
             Path(args.output).write_text(json_text, encoding="utf-8")
             print(f"Successfully wrote schema to '{args.output}'")
         except Exception as exc:
-            print(f"Error writing schema to '{args.output}': {exc}", file=sys.stderr)
+            print_error(redact_cli_secrets(f"Error writing schema to '{args.output}': {exc}"))
             sys.exit(1)
     else:
         print(json_text, end="")
