@@ -62,3 +62,36 @@ def test_build_safe_path_prevents_double_slashes() -> None:
 
     assert path == "/api/v1/edc/studies/study/subjects/record"
     assert "//" not in path
+
+
+@pytest.mark.parametrize(
+    "raw_base_url",
+    [
+        "https://edc.trn.imednetapi.com/api",
+        "https://edc.trn.imednetapi.com/api/v1",
+        "https://edc.trn.imednetapi.com/api/v1/edc",
+        "https://edc.trn.imednetapi.com/api/v1/edc/",
+    ],
+)
+def test_client_strips_edc_api_suffixes_without_duplication(raw_base_url: str) -> None:
+    """Client strips /api, /api/v1, and /api/v1/edc so EDC endpoints never duplicate paths."""
+    seen_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        return httpx.Response(200, json={"data": [], "pagination": {"totalPages": 1}})
+
+    from imednet import ImednetSDK
+
+    with ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url=raw_base_url,
+        transport=httpx.MockTransport(handler),
+    ) as sdk:
+        assert sdk._client.base_url == "https://edc.trn.imednetapi.com"
+        list(sdk.studies.list())
+
+    assert len(seen_urls) == 1
+    assert seen_urls[0].startswith("https://edc.trn.imednetapi.com/api/v1/edc/studies")
+    assert "/api/v1/edc/api/v1/edc" not in seen_urls[0]
