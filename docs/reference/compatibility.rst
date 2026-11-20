@@ -46,8 +46,9 @@ and the independent lockfile audit are documented in
 :doc:`security_exceptions`.
 
 Install core with ``pip install imednet``. Use ``imednet[cli]`` for optional dotenv
-and logging helpers, ``imednet[export]`` for tabular workflows, or
-``imednet[mongodb]``, ``imednet[neo4j]``, ``imednet[snowflake]`` for sinks.
+and logging helpers, ``imednet[export]`` for tabular workflows, ``imednet[tui]``
+for the interactive terminal UI, or ``imednet[mongodb]``, ``imednet[neo4j]``,
+``imednet[snowflake]`` for sinks.
 Install the Airflow distribution separately. Extras are dependency bundles, not
 separate versions or guarantees that external services are configured.
 

@@ -110,7 +110,7 @@ To run the containerized integration tests for the MongoDB and Neo4j sinks local
 This spins up the required database containers, waits for service initialization, enables the `IMEDNET_TEST_CONTAINERS=1` gate for `packages/plugins-sinks/tests/integration/test_containerized_sinks.py`, and tears the containers and volumes down afterwards (even if a test fails).
 
 ## Strict typing enforcement
-Strict static typing (`strict = true` in `[tool.mypy]`) is enforced across all five workspace packages and endpoint typing contracts.
+Strict static typing (`strict = true` in `[tool.mypy]`) is enforced across all five workspace packages, examples, and endpoint typing contracts.
 
 ### Current baseline
 - `packages/core/src/imednet`: **0** mypy errors
@@ -118,10 +118,11 @@ Strict static typing (`strict = true` in `[tool.mypy]`) is enforced across all f
 - `packages/providers-airflow/src/apache_airflow_providers_imednet`: **0** mypy errors
 - `packages/plugins-sinks/src/imednet_sinks`: **0** mypy errors
 - `packages/plugins-tui/src/imednet_tui`: **0** mypy errors
+- `examples`: **0** mypy errors
 - `tests/typing/endpoint_contracts.py`: **0** mypy errors
 
 ### Typing rules
-- Keep `[tool.mypy]` `strict = true` across all five workspace packages (`uv run mypy packages tests/typing/endpoint_contracts.py`).
+- Keep `[tool.mypy]` `strict = true` across all five workspace packages, examples, and endpoint contracts (`uv run mypy packages examples tests/typing/endpoint_contracts.py`).
 - `imednet.models.*` and `imednet.errors.*` additionally retain explicit strict overrides and generated `.pyi` stub parity (`uv run python -m imednet.models.engine --check`).
 - `ignore_missing_imports` must stay scoped only to third-party modules that do not ship complete typing information, and `disallow_subclassing_any = false` is scoped solely to `apache_airflow_providers_imednet.*` for untyped Airflow base classes.
 - CI enforces strict `mypy` across all five packages so typing regressions cannot land.
@@ -292,12 +293,13 @@ def fetch_records(study_key: str, page: int = 0) -> list[Record]:
 
 Before opening a pull request that adds or modifies public APIs:
 
-1. Run strict `mypy` across all five workspace packages and endpoint contracts (`uv run mypy packages tests/typing/endpoint_contracts.py` or individually):
+1. Run strict `mypy` across all five workspace packages, examples, and endpoint contracts (`uv run mypy packages examples tests/typing/endpoint_contracts.py` or individually):
    - `mypy packages/core/src/imednet`
    - `mypy packages/plugins-workflows/src/imednet_workflows`
    - `mypy packages/providers-airflow/src/apache_airflow_providers_imednet`
    - `mypy packages/plugins-sinks/src/imednet_sinks`
    - `mypy packages/plugins-tui/src/imednet_tui`
+   - `mypy examples`
    - `mypy tests/typing/endpoint_contracts.py`
 2. Run `hatch run docs` (or `uv run python scripts/build_docs.py`) locally. This command stages and
    updates `docs/reference/api/` via `sphinx-apidoc` and compiles the HTML with `-W --keep-going`,

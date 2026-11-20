@@ -14,6 +14,7 @@ from typing import Any
 _IGNORED_PREFIXES = ("docs/", "examples/", ".agents/")
 _WORKFLOW_UNIT_TESTS = frozenset(
     {
+        "tests/integration/test_sync_worker_integration.py",
         "tests/unit/test_chunked_pipeline.py",
         "tests/unit/test_config_version_control.py",
         "tests/unit/test_duckdb_ingestion_workflow.py",
@@ -21,9 +22,16 @@ _WORKFLOW_UNIT_TESTS = frozenset(
         "tests/unit/test_record_mapper.py",
         "tests/unit/test_record_mapper_hierarchy.py",
         "tests/unit/test_state_ledger.py",
+        "tests/unit/test_state_ledger_providers.py",
         "tests/unit/test_study_structure.py",
         "tests/unit/test_sync_worker.py",
         "tests/unit/test_cached_records_loader.py",
+    }
+)
+_CORE_AND_WORKFLOW_TESTS = frozenset(
+    {
+        "tests/unit/test_batch_validation_and_polling.py",
+        "tests/unit/test_tabular_import.py",
     }
 )
 _SHARED_TEST_PREFIXES = ("tests/fixtures/", "tests/utils/", "tests/typing/")
@@ -116,7 +124,7 @@ def _owners_for_top_level_test(
             name_to_dir,
         )
 
-    if normalized.startswith("tests/unit/cli/"):
+    if normalized.startswith("tests/unit/cli/") or normalized in _CORE_AND_WORKFLOW_TESTS:
         return _resolve_package_dirs(
             [("core", "imednet"), ("plugins-workflows", "imednet-workflows")],
             packages,

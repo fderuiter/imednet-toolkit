@@ -21,7 +21,7 @@ One map across our unified **31-skill** suite (`obra/superpowers` discipline + `
    - **Single feature / PR (default):** `writing-plans` -> bite-sized Python TDD plan in `docs/superpowers/plans/`.
    - **Multi-PR epic / backlog:** `/to-spec` (GitHub spec issue aligned with `.github/ISSUE_TEMPLATE/`) -> `/to-tickets` (vertical tracer-bullet GitHub issues with native blocking edges).
    - **Huge multi-session fog of war:** `/wayfinder` (maps `type:epic` decision tickets before collapsing into `/to-spec`).
-4. **Isolated Workspace:** `using-git-worktrees` (`uv sync --locked --extra dev --extra docs`, `.venv` / `scripts/env.ps1`, baseline `pytest`).
+4. **Isolated Workspace:** `using-git-worktrees` (`uv sync --locked --all-packages --all-extras`, `.venv` / `scripts/env.ps1`, baseline `pytest`).
 5. **Implement:**
    - Parallel multi-task / strict review per task -> `subagent-driven-development` (uses `Agent` on Claude, `spawn_agent` on Codex, `invoke_subagent`/`swarm` on Antigravity).
    - Single-session inline execution -> `executing-plans`.

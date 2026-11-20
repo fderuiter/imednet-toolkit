@@ -36,9 +36,12 @@ Describe the tests added or updated. If tests were intentionally skipped, explai
 - [ ] `hatch run mypy packages/core/src/imednet`
 - [ ] `hatch run mypy packages/plugins-workflows/src/imednet_workflows` _(if workflows changed)_
 - [ ] `hatch run mypy packages/providers-airflow/src/apache_airflow_providers_imednet` _(if Airflow changed)_
+- [ ] `hatch run mypy packages/plugins-sinks/src/imednet_sinks` _(if sinks changed)_
+- [ ] `hatch run mypy packages/plugins-tui/src/imednet_tui` _(if TUI changed)_
+- [ ] `hatch run mypy examples tests/typing/endpoint_contracts.py`
 
 ### Tests
-- [ ] `hatch run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov-fail-under=90`
+- [ ] `hatch run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_sinks --cov=imednet_tui --cov-fail-under=90`
 - [ ] All new and existing tests pass
 - [ ] Coverage remains >= 90%
 

@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.resolve()
@@ -69,8 +70,27 @@ def validate_scenario(name, install_items, smoke_checks, dist_dir: Path):
             python_bin = venv_dir / "bin" / "python"
             imednet_bin = venv_dir / "bin" / "imednet"
 
-        # Find wheels in dist_dir
+        # Find wheels in dist_dir and constrain all workspace packages to freshly built wheels
         all_wheels = sorted(dist_dir.glob("*.whl"))
+        workspace_wheels: dict[str, Path] = {}
+        for pkg_path in sorted(PACKAGES_DIR.iterdir()):
+            manifest = pkg_path / "pyproject.toml"
+            if pkg_path.is_dir() and manifest.exists():
+                pkg_name = tomllib.loads(manifest.read_text(encoding="utf-8"))["project"]["name"]
+                normalized_pkg = pkg_name.replace("-", "_")
+                matching = [w for w in all_wheels if w.name.startswith(normalized_pkg + "-")]
+                if matching:
+                    workspace_wheels[pkg_name] = max(matching)
+
+        constraints_file = Path(tmpdir) / "workspace-constraints.txt"
+        constraints_file.write_text(
+            "\n".join(
+                f"{pkg_name} @ {wheel_path.resolve().as_uri()}"
+                for pkg_name, wheel_path in sorted(workspace_wheels.items())
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
         # Prepare install command using uv pip install (no pip required in venv)
         install_args = [
@@ -81,16 +101,15 @@ def validate_scenario(name, install_items, smoke_checks, dist_dir: Path):
             str(python_bin),
             "--find-links",
             str(dist_dir),
+            "-c",
+            str(constraints_file),
         ]
 
         for item in install_items:
             base_pkg = item.split("[")[0]
             extra = item[len(base_pkg) :] if "[" in item else ""
-            normalized_base = base_pkg.replace("-", "_")
-            matching_wheels = [w for w in all_wheels if w.name.startswith(normalized_base + "-")]
-
-            if matching_wheels:
-                wheel_path = max(matching_wheels)
+            wheel_path = workspace_wheels.get(base_pkg)
+            if wheel_path is not None:
                 install_args.append(f"{base_pkg}{extra} @ {wheel_path.resolve().as_uri()}")
             else:
                 install_args.append(item)
@@ -252,6 +271,14 @@ def main():
                     {"cmd": "import pandas"},
                     {"cmd": "import imednet_workflows"},
                     {"cmd": "imednet export csv --help"},
+                ],
+            },
+            {
+                "name": "core-tui",
+                "install": ["imednet[tui]"],
+                "smoke": [
+                    {"cmd": "import imednet_tui"},
+                    {"cmd": "imednet tui --help", "contains": "usage:"},
                 ],
             },
         ]

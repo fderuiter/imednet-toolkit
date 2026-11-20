@@ -389,7 +389,7 @@ fi
 
 say ""
 say "Common Developer Commands Cheatsheet:"
-say "  • Run full CI quality gate:   uv run ruff check . && uv run ruff format --check . && uv run mypy packages tests/typing/endpoint_contracts.py"
+say "  • Run full CI quality gate:   uv run ruff check . && uv run ruff format --check . && uv run mypy packages examples tests/typing/endpoint_contracts.py"
 say "  • Run test suite:             uv run pytest -q"
 say "  • Build documentation:        uv run python scripts/build_docs.py"
 say "  • Run security audit:         uv run --with pip-audit pip-audit -s osv"

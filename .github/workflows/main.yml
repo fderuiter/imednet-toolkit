@@ -363,6 +363,7 @@ jobs:
             uv-venv-${{ runner.os }}-${{ matrix.python-version }}-
 
       - name: Download Built Artifacts
+        if: needs.plan.outputs.build_matrix != '[]'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*
@@ -390,12 +391,10 @@ jobs:
             TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*sinks* --ignore-glob=*tui/* tests/"
             COV_ARGS="--cov=imednet"
           elif [ "$PACKAGE" = "plugins-workflows" ]; then
-
-
-            TEST_ARGS="tests/unit/test_workflows*.py tests/unit/workflows/ tests/workflows/ tests/unit/test_chunked_pipeline.py tests/unit/cli/ tests/unit/test_config_version_control.py tests/unit/test_duckdb_ingestion_workflow.py tests/unit/test_job_poller.py tests/unit/test_record_mapper.py tests/unit/test_record_mapper_hierarchy.py tests/unit/test_state_ledger.py tests/unit/test_study_structure.py tests/unit/test_sync_worker.py tests/unit/test_cached_records_loader.py"
+            TEST_ARGS="tests/unit/test_workflows*.py tests/integration/test_workflows*.py tests/integration/test_sync_worker_integration.py tests/unit/workflows/ tests/workflows/ tests/unit/test_chunked_pipeline.py tests/unit/cli/ tests/unit/test_config_version_control.py tests/unit/test_duckdb_ingestion_workflow.py tests/unit/test_job_poller.py tests/unit/test_record_mapper.py tests/unit/test_record_mapper_hierarchy.py tests/unit/test_state_ledger.py tests/unit/test_state_ledger_providers.py tests/unit/test_study_structure.py tests/unit/test_sync_worker.py tests/unit/test_cached_records_loader.py tests/unit/test_batch_validation_and_polling.py tests/unit/test_tabular_import.py"
             COV_ARGS="--cov=imednet_workflows"
           elif [ "$PACKAGE" = "providers-airflow" ]; then
-            TEST_ARGS="tests/unit/test_airflow*.py"
+            TEST_ARGS="tests/unit/test_airflow*.py tests/integration/test_airflow*.py"
             COV_ARGS="--cov=apache_airflow_providers_imednet"
           elif [ "$PACKAGE" = "plugins-sinks" ]; then
             TEST_ARGS="packages/plugins-sinks/tests/"

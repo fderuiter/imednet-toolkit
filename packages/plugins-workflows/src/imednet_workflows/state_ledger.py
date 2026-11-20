@@ -746,7 +746,7 @@ class AirflowStateProvider(BaseStateProvider):
             provide_session = getattr(session_mod, "provide_session", None)
             if legacy_xcom is not None and callable(provide_session):
 
-                @provide_session  # type: ignore[misc]
+                @provide_session  # type: ignore[misc,untyped-decorator]
                 def _get_xcom(session: Any = None) -> Any:
                     return (
                         session.query(legacy_xcom)
@@ -1072,7 +1072,7 @@ class AirflowStateProvider(BaseStateProvider):
         if legacy_xcom is None or not callable(provide_session):
             return False
 
-        @provide_session  # type: ignore[misc]
+        @provide_session  # type: ignore[misc,untyped-decorator]
         def _delete_xcom(session: Any = None) -> bool:
             query = session.query(legacy_xcom)
             if stream_name:
@@ -1162,7 +1162,7 @@ class AirflowStateProvider(BaseStateProvider):
         provide_session = getattr(session_mod, "provide_session", None)
         if legacy_xcom is not None and callable(provide_session):
 
-            @provide_session  # type: ignore[misc]
+            @provide_session  # type: ignore[misc,untyped-decorator]
             def _get_all_xcoms(session: Any = None) -> Any:
                 return (
                     session.query(legacy_xcom)

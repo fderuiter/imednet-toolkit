@@ -31,6 +31,7 @@ def test_ci_uses_canonical_full_verification():
     assert "docs" not in scripts["verify"]
     assert "mypy packages/plugins-sinks/src/imednet_sinks" in scripts["verify-static"]
     assert "mypy packages/plugins-tui/src/imednet_tui" in scripts["verify-static"]
+    assert "mypy examples" in scripts["verify-static"]
     for cov_pkg in (
         "--cov=imednet",
         "--cov=imednet_workflows",
@@ -47,6 +48,9 @@ def test_ci_uses_canonical_full_verification():
     assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in run_blocks)
     assert any(
+        "uv run mypy packages examples tests/typing/endpoint_contracts.py" in r for r in run_blocks
+    )
+    assert any(
         "--cov=imednet_sinks" in r and "--cov=imednet_tui" in r and "--cov-fail-under=90" in r
         for r in run_blocks
     )
@@ -54,6 +58,13 @@ def test_ci_uses_canonical_full_verification():
     assert not any("pip install" in r for r in run_blocks)
     assert not any("hatch run" in r for r in run_blocks)
     assert not any("build_docs.py" in r for r in run_blocks)
+
+    test_steps = pipeline["jobs"]["test"]["steps"]
+    download_step = next(s for s in test_steps if s.get("name") == "Download Built Artifacts")
+    assert download_step.get("if") == "needs.plan.outputs.build_matrix != '[]'"
+    run_tests_step = next(s for s in test_steps if s.get("name") == "Run Tests")
+    assert "tests/integration/test_airflow*.py" in run_tests_step["run"]
+    assert "tests/integration/test_workflows*.py" in run_tests_step["run"]
 
 
 def test_ci_docs_job_enforces_clean_working_tree_and_validation():
