@@ -77,6 +77,7 @@ class BaseClient:
             else None
         )
         effective_source = credential_source if auth is None else None
+        require_creds = auth is None and transport is None
         if config is not None:
             resolved_config = merge_config_overrides(
                 config,
@@ -88,7 +89,8 @@ class BaseClient:
                 strict_mode=strict_mode,
                 simulation_mode=simulation_mode,
                 credential_source=effective_source,
-                require_credentials=auth is None,
+                require_credentials=require_creds,
+                has_transport=transport is not None,
             )
         else:
             resolved_config = load_config(
@@ -100,7 +102,8 @@ class BaseClient:
                 strict_mode=strict_mode,
                 simulation_mode=simulation_mode,
                 credential_source=effective_source,
-                require_credentials=auth is None,
+                require_credentials=require_creds,
+                has_transport=transport is not None,
             )
 
         self.config = resolved_config

@@ -260,13 +260,56 @@ source = { editable = "packages/providers-airflow" }
 dependencies = [
     { name = "apache-airflow" },
     { name = "imednet" },
+    { name = "imednet-workflows" },
+]
+
+[package.optional-dependencies]
+duckdb = [
+    { name = "duckdb" },
+]
+export = [
+    { name = "duckdb" },
+    { name = "imednet-workflows" },
+    { name = "openpyxl" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "sqlalchemy" },
+]
+mongodb = [
+    { name = "imednet-plugins-sinks" },
+    { name = "pymongo" },
+]
+neo4j = [
+    { name = "imednet-plugins-sinks" },
+    { name = "neo4j" },
+]
+snowflake = [
+    { name = "imednet-plugins-sinks" },
+    { name = "pyarrow" },
+    { name = "snowflake-connector-python" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "apache-airflow", specifier = ">=3.2.0,<4.0.0" },
+    { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.1.0,<2.0.0" },
+    { name = "duckdb", marker = "extra == 'export'", specifier = ">=1.1.0,<2.0.0" },
     { name = "imednet", editable = "packages/core" },
+    { name = "imednet-plugins-sinks", marker = "extra == 'mongodb'", editable = "packages/plugins-sinks" },
+    { name = "imednet-plugins-sinks", marker = "extra == 'neo4j'", editable = "packages/plugins-sinks" },
+    { name = "imednet-plugins-sinks", marker = "extra == 'snowflake'", editable = "packages/plugins-sinks" },
+    { name = "imednet-workflows", editable = "packages/plugins-workflows" },
+    { name = "imednet-workflows", marker = "extra == 'export'", editable = "packages/plugins-workflows" },
+    { name = "neo4j", marker = "extra == 'neo4j'", specifier = ">=6.2.0,<7.0.0" },
+    { name = "openpyxl", marker = "extra == 'export'", specifier = ">=3.1,<4.0" },
+    { name = "pandas", marker = "extra == 'export'", specifier = ">=2.2.3,<3.0.0" },
+    { name = "pyarrow", marker = "extra == 'export'", specifier = ">=14.0.1" },
+    { name = "pyarrow", marker = "extra == 'snowflake'", specifier = ">=14.0.1" },
+    { name = "pymongo", marker = "extra == 'mongodb'", specifier = ">=4.0,<5.0" },
+    { name = "snowflake-connector-python", marker = "extra == 'snowflake'", specifier = ">=3.0.0" },
+    { name = "sqlalchemy", marker = "extra == 'export'", specifier = ">=2.0,<3.0" },
 ]
+provides-extras = ["duckdb", "export", "mongodb", "neo4j", "snowflake"]
 
 [[package]]
 name = "apache-airflow-providers-smtp"

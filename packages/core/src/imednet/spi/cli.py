@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING, Any
 
-from imednet.cli.decorators import with_sdk
+from imednet.cli.decorators import validate_cli_path_segment, with_sdk
 from imednet.cli.utils import (
     NO_COLOR_ENV,
     NON_INTERACTIVE_ENV,
@@ -11,8 +11,11 @@ from imednet.cli.utils import (
     Console,
     Status,
     add_no_interactive,
+    add_output_format,
     clear_line,
     console,
+    display_list,
+    emit_json,
     fetching_status,
     format_job_progress,
     is_dumb_terminal,
@@ -23,6 +26,7 @@ from imednet.cli.utils import (
     parse_record_data_filter,
     print_error,
     resolve_endpoint_filter_attributes,
+    resolve_output_format,
     supports_ansi_color,
     supports_fullscreen_ui,
     supports_interactive_stdin,
@@ -40,8 +44,11 @@ __all__ = [
     "Console",
     "Status",
     "add_no_interactive",
+    "add_output_format",
     "clear_line",
     "console",
+    "display_list",
+    "emit_json",
     "fetching_status",
     "format_job_progress",
     "is_dumb_terminal",
@@ -53,10 +60,12 @@ __all__ = [
     "parse_record_data_filter",
     "print_error",
     "resolve_endpoint_filter_attributes",
+    "resolve_output_format",
     "supports_ansi_color",
     "supports_fullscreen_ui",
     "supports_interactive_stdin",
     "supports_live_status",
+    "validate_cli_path_segment",
     "with_sdk",
 ]
 

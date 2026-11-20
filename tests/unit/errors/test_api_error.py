@@ -18,17 +18,30 @@ from imednet.errors import (
 
 def test_api_error_str_representation():
     """Test that api error str representation."""
-    # Test basic instantiation with string
+    # Test basic instantiation with string (omits duplicate Response: text)
     err = ApiError("Something went wrong")
-    assert str(err) == "Something went wrong (Response: Something went wrong)"
+    assert str(err) == "Something went wrong"
 
     # Test with status code
     err2 = ApiError("Not Found", status_code=404)
-    assert str(err2) == "Not Found (Status Code: 404, Response: Not Found)"
+    assert str(err2) == "Not Found (Status Code: 404)"
 
     # Test with dictionary response
     err3 = ApiError({"error": "Bad Request"}, status_code=400)
     assert str(err3) == "Bad Request (Status Code: 400, Response: {'error': 'Bad Request'})"
+
+
+def test_top_level_error_exports_and_not_found_str():
+    """Top-level imednet exports ImednetError, ApiError, and NotFoundError cleanly."""
+    from imednet import ApiError as TopApiError
+    from imednet import ImednetError as TopImednetError
+    from imednet import NotFoundError as TopNotFoundError
+
+    assert TopApiError is ApiError
+    assert TopNotFoundError is NotFoundError
+    assert issubclass(TopNotFoundError, TopApiError)
+    assert issubclass(TopApiError, TopImednetError)
+    assert str(TopNotFoundError("msg")) == "msg"
 
 
 def test_api_error_empty_response():

@@ -19,7 +19,7 @@ Role-Based Pathways & Interactive Showcase
       .. rubric:: Clinical Data Managers
          :class: role-card-title
 
-      Curated workflows for Study Data Dictionary management, Subject registration, UAT edit check verification, and Record validation.
+      Curated workflows for Study Data Dictionary schemas, pre-live UAT validation, Subject registration, and bulk Record creation using ``imednet datadict`` (``from-csv``, ``from-odm``, ``to-odm``, ``from-redcap``, ``from-api``, ``validate``, ``diff``, and ``schema``).
 
       .. raw:: html
 
@@ -33,7 +33,6 @@ Role-Based Pathways & Interactive Showcase
       * :doc:`how-to/workflows/uat_workflow`
       * :doc:`how-to/register_subjects`
       * :doc:`how-to/workflows/bulk_submission`
-      * :doc:`how-to/verification`
 
    .. container:: role-card role-pathway-section
 
@@ -61,7 +60,7 @@ Role-Based Pathways & Interactive Showcase
       .. rubric:: Regulatory Compliance Auditors
          :class: role-card-title
 
-      Accessibility conformance disclosures (VPAT / WCAG 2.1 AA), governance policies, standards, and architecture records.
+      21 CFR Part 11 Record revision audit trails, analytical DuckDB lineage, PHI Variable masking, configuration governance, and VPAT / WCAG 2.1 AA conformance disclosures.
 
       .. raw:: html
 
@@ -71,11 +70,11 @@ Role-Based Pathways & Interactive Showcase
             </button>
          </div>
 
-      * :doc:`reference/VPAT`
+      * :doc:`how-to/audit_compliance`
+      * :doc:`how-to/duckdb_integration`
+      * :doc:`how-to/export_destinations`
       * :doc:`reference/governance`
-      * :doc:`reference/project_standards`
-      * :doc:`reference/security_exceptions`
-      * :doc:`adr/index`
+      * :doc:`reference/VPAT`
 
 .. raw:: html
 
@@ -201,10 +200,13 @@ Role-Based Pathways & Interactive Showcase
          </div>
 
          <div class="quick-start-callout">
-            <p>Manage Study Data Dictionaries, CDISC ODM metadata, and automated UAT edit check verification:</p>
-            <a href="how-to/data_dictionary.html">Read Data Dictionary Guide &rarr;</a>
-            &nbsp;&middot;&nbsp;
-            <a href="how-to/workflows/uat_workflow.html">Run UAT Workflow Guide &rarr;</a>
+            <p>Compile, convert, diff, and validate canonical Study Data Dictionary schemas with <code>imednet datadict</code> (<code>from-csv</code>, <code>from-odm</code>, <code>to-odm</code>, <code>from-redcap</code>, <code>from-api</code>, <code>validate</code>, <code>diff</code>, <code>schema</code>):</p>
+            <div class="quick-start-callout-links">
+               <a href="how-to/data_dictionary.html">Data Dictionary Guide &rarr;</a>
+               <a href="how-to/workflows/uat_workflow.html">UAT Workflow &rarr;</a>
+               <a href="how-to/register_subjects.html">Subject Registration &rarr;</a>
+               <a href="how-to/workflows/bulk_submission.html">Bulk Record Creation &rarr;</a>
+            </div>
          </div>
       </div>
 
@@ -249,8 +251,14 @@ Role-Based Pathways & Interactive Showcase
          </div>
 
          <div class="quick-start-callout">
-            <p>Review our formal accessibility conformance disclosures and compliance records:</p>
-            <a href="reference/VPAT.html">Read VPAT Statement &rarr;</a>
+            <p>Verify 21 CFR Part 11 RecordRevision chains, DuckDB lineage, PHI Variable masking, governance provenance, and VPAT disclosures:</p>
+            <div class="quick-start-callout-links">
+               <a href="how-to/audit_compliance.html">Audit &amp; Compliance Guide &rarr;</a>
+               <a href="how-to/duckdb_integration.html">DuckDB Lineage &rarr;</a>
+               <a href="how-to/export_destinations.html">PHI Masking &amp; Exports &rarr;</a>
+               <a href="reference/governance.html">Governance Provenance &rarr;</a>
+               <a href="reference/VPAT.html">Read VPAT Statement &rarr;</a>
+            </div>
          </div>
       </div>
    </div>
@@ -275,6 +283,7 @@ This documentation is organized according to the Diátaxis framework into four m
 
    how-to/cli
    how-to/data_dictionary
+   how-to/audit_compliance
    how-to/logging_and_tracing
    how-to/pagination
    how-to/form_builder
@@ -282,9 +291,19 @@ This documentation is organized according to the Diátaxis framework into four m
    how-to/caching
    how-to/retry_policy
    how-to/job_polling
+   how-to/domain_lifecycles
+   how-to/simulation_testing
    how-to/airflow
    how-to/workflows/uat_workflow
+   how-to/workflows/uat_inspector
    how-to/workflows/bulk_submission
+   how-to/workflows/data_extraction
+   how-to/workflows/record_update
+   how-to/workflows/subject_data
+   how-to/workflows/query_management
+   how-to/workflows/triage_store
+   how-to/workflows/schema_profiler
+   how-to/workflows/chunked_pipeline
    how-to/export_destinations
    how-to/duckdb_integration
    how-to/snowflake_export
