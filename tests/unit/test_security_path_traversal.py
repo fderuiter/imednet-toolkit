@@ -332,6 +332,8 @@ def test_airflow_sensor_and_export_operator_reject_unsafe_segments_before_sdk(
         ["jobs", "wait", "ALLOWED_STUDY", "%2e%2e/CANARY_STUDY/records", "--format", "json"],
         ["sites", "list", "CANARY_STUDY/records#", "--format", "json"],
         ["records", "list", "CANARY_STUDY/users?", "--format", "json"],
+        ["subjects", "list", "CANARY_STUDY/subjects?", "--format", "json"],
+        ["codings", "list", "CANARY_STUDY/codings#", "--format", "json"],
         ["export", "csv", "../CANARY_STUDY", "/tmp/unused.csv"],
         ["datadict", "from-api", "--study-key", "../../CANARY_STUDY"],
         ["workflows", "extract-records", "../CANARY_STUDY"],
