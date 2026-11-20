@@ -197,7 +197,7 @@ class BaseRequestExecutor(ABC):
             if isinstance(result, httpx.Response):
                 retry_after_seconds = self._parse_retry_after_seconds(result)
                 if retry_after_seconds is not None:
-                    return retry_after_seconds
+                    return min(retry_after_seconds, self.retry_config.max_retry_after)
         return float(self._jitter_wait(retry_state))
 
     def _get_retryer_kwargs(self, method: str) -> dict[str, Any]:

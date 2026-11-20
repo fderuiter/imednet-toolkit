@@ -11,10 +11,11 @@ __all__ = [  # noqa: RUF022
     "DEFAULT_TIMEOUT",
     "DEFAULT_RETRIES",
     "DEFAULT_BACKOFF_FACTOR",
+    "DEFAULT_MAX_RETRY_AFTER",
     "DEFAULT_PAGE_SIZE",
     "LARGE_PAGE_SIZE",
-    "MAX_PAGE_SIZE",
     "MAX_SQLITE_COLUMNS",
+    "MAX_PAGE_SIZE",
     "TERMINAL_JOB_STATES",
     # HTTP Headers
     "HEADER_ACCEPT",
@@ -38,6 +39,9 @@ DEFAULT_RETRIES = 3
 
 DEFAULT_BACKOFF_FACTOR = 1.0
 """Default backoff factor for exponential retry delays."""
+
+DEFAULT_MAX_RETRY_AFTER = 60.0
+"""Default maximum delay in seconds honored from HTTP Retry-After headers."""
 
 # Pagination Configuration
 DEFAULT_PAGE_SIZE = 100

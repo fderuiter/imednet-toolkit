@@ -87,10 +87,10 @@ class UniversalExecutor:
             self.retry_config = RetryConfig(retry_policy=DefaultOperationRetryPolicy())
         else:
             self.retry_config = retry_config
+        self.operation_name = operation_name
         self.circuit_breaker = (
             circuit_breaker if circuit_breaker is not None else get_global_circuit_breaker()
         )
-        self.operation_name = operation_name
         self.attributes = attributes
         self._jitter_wait = wait_random_exponential(multiplier=self.retry_config.backoff_factor)
         self.wait_strategy = wait_strategy or (lambda rs: float(self._jitter_wait(rs)))

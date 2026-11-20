@@ -622,6 +622,67 @@ def test_extraction_engine_rejects_class_traversal_payloads(
     assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)
 
 
+def test_extraction_engine_rejects_format_and_fstring_payloads(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that format, format_map, bare format access, and f-strings fail safely in extraction."""
+    sample_record = Record(
+        record_id=1,
+        study_key="VERIFY_STUDY",
+        form_key="AE",
+        subject_key="CANARY_SUBJ_01",
+        date_created=datetime(2026, 1, 1),
+        record_data={"ae_term": "headache"},
+    )
+    format_cfg = StudyConfiguration(
+        studyKey="VERIFY_STUDY",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                targetField="subjectKey",
+                sourceFormKey="AE",
+                sourceVariableName="subjectKey",
+            ),
+            MappingRule(
+                domain="AE",
+                targetField="aeTerm",
+                sourceFormKey="AE",
+                sourceVariableName="ae_term",
+                businessLogic='"{0.__dict__[subject_key]}".format(context)',
+            ),
+            MappingRule(
+                domain="AE",
+                targetField="aeSeverity",
+                sourceFormKey="AE",
+                sourceVariableName="ae_term",
+                fallbackValue="MILD",
+                businessLogic='"{ctx.__dict__[subject_key]}".format_map({"ctx": context})',
+            ),
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        res = extract_canonical_records([sample_record], format_cfg)
+
+    assert len(res.adverse_events) == 1
+    assert res.adverse_events[0].ae_term == "headache"
+    assert res.adverse_events[0].ae_severity == "headache"
+    assert any("Derivation logic failed for CANARY_SUBJ_01" in r.message for r in caplog.records)
+
+    # Also verify bare "".format attribute retrieval and f-strings return None safely
+    ctx = SubjectContext("CANARY_SUBJ_01")
+    for expr in ('"".format', '"".format_map', 'f"{context.subject_key}"'):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            derived = _evaluate_business_logic(
+                expr, sample_record, {"aeTerm": "headache"}, ctx, value="headache"
+            )
+        assert derived is None
+        assert any(
+            "Derivation logic failed for CANARY_SUBJ_01" in r.message for r in caplog.records
+        )
+
+
 def test_extraction_engine_rejects_mutator_methods_and_defends_state(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

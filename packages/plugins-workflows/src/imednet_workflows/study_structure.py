@@ -1,7 +1,3 @@
-"""Study structure module."""
-
-from typing import Any
-
 """Workflow for retrieving and aggregating study structural metadata."""
 
 import asyncio
@@ -38,10 +34,17 @@ def _build_study_structure(
         if var.form_id is not None:
             variables_by_form_id.setdefault(var.form_id, []).append(var)
 
+    all_form_structures: list[FormStructure] = [
+        FormStructure.from_form(f, variables_by_form_id.get(f.form_id, []))
+        for f in forms
+        if f.form_id is not None
+    ]
+
     interval_structures: list[IntervalStructure] = []
     for interval in intervals:
         form_structures: list[FormStructure] = []
-        for form_summary in getattr(interval, 'forms', []):
+        for form_summary in getattr(interval, "forms", []):
+            full_form: Form | None = None
             if form_summary.form_id is not None:
                 full_form = forms_by_id.get(form_summary.form_id)
             if full_form and full_form.form_id is not None:
@@ -50,7 +53,11 @@ def _build_study_structure(
 
         interval_structures.append(IntervalStructure.from_interval(interval, form_structures))
 
-    return StudyStructure(studyKey=study_key, intervals=interval_structures)
+    return StudyStructure(
+        studyKey=study_key,
+        intervals=interval_structures,
+        forms=all_form_structures,
+    )
 
 
 def get_study_structure(sdk: "ImednetFacade", study_key: str) -> StudyStructure:

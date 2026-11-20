@@ -85,6 +85,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from types import TracebackType
@@ -111,7 +112,12 @@ from imednet.utils.filters import (
     validate_filter_operator,
     validate_record_filter,
 )
-from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.security import (
+    _normalize_key,
+    global_sensitivity_registry,
+    mask_clinical_phi,
+)
+from imednet.utils.url import redact_url_query
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +143,7 @@ class StateProviderProtocol(Protocol):
         self,
         study_key: str,
         stream_name: str,
-        timestamp: datetime,
+        timestamp: datetime | None,
         records_processed: int = 0,
         metadata: dict[str, Any] | None = None,
         status: Any = "success",
@@ -563,19 +569,26 @@ class ExportSink(ABC):
         from imednet.errors import ExportBatchError
 
         attempts = 0
+        last_raw_exc: Exception | None = None
 
         def execute_batch() -> int:
-            nonlocal attempts
+            nonlocal attempts, last_raw_exc
             attempts += 1
             # Driver messages may contain credentials, URIs or payloads. Only
             # sanitized exceptions may cross the executor/telemetry boundary.
             try:
                 return execute_fn()
-            except ExportConfigurationError:
+            except ExportConfigurationError as exc:
+                last_raw_exc = exc
                 raise ExportConfigurationError("Invalid export configuration.") from None
-            except (ValueError, TypeError):
+            except TypeError as exc:
+                last_raw_exc = exc
+                raise TypeError("Invalid export batch input.") from None
+            except ValueError as exc:
+                last_raw_exc = exc
                 raise ValueError("Invalid export batch input.") from None
-            except Exception:
+            except Exception as exc:
+                last_raw_exc = exc
                 raise RuntimeError("Export destination operation failed.") from None
 
         executor = UniversalExecutor(
@@ -592,11 +605,13 @@ class ExportSink(ABC):
         )
         try:
             return executor.execute(execute_batch)
-        except Exception:
+        except Exception as exec_err:
+            root_exc = last_raw_exc if last_raw_exc is not None else exec_err
+            sanitized_cause = _sanitize_batch_cause(root_exc)
             raise ExportBatchError(
                 f"Batch {batch_id!r} failed after {attempts} attempts.",
                 batch_id=batch_id,
-            ) from None
+            ) from sanitized_cause
 
     # ------------------------------------------------------------------
     # Context-manager support
@@ -626,7 +641,55 @@ class ExportSink(ABC):
 
 # Regex that matches the user-info component of a URI
 # e.g.  mongodb://user:pass@host  ->  mongodb://***@host
-_URI_USERINFO_RE = re.compile(r"(://)[^@/]+@")
+_URI_USERINFO_RE = re.compile(r"(://)[^@/\s\"']+@")
+_URL_IN_TEXT_RE = re.compile(r'''[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'>]*[^\s"'>.,;:!?\)\]]''')
+_AUTH_SCHEME_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\b")
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_KEY_VALUE_PAIR_RE = re.compile(
+    r"""(?P<key>"[^"\r\n]+"|'[^'\r\n]+'|\b[A-Za-z_][A-Za-z0-9_-]*)"""
+    r"""(?P<sep>\s*(?::(?!//)|=)\s*)"""
+    r"""(?P<val>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?![{\[])[^\s,;}\])&'"]+)"""
+)
+_CREDENTIAL_KEY_NAMES = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "client_secret",
+        "api_key",
+        "apikey",
+        "x_api_key",
+        "security_key",
+        "x_imn_security_key",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "oidc_token",
+        "auth_token",
+        "bearer_token",
+        "private_key",
+        "passphrase",
+        "authorization",
+        "credential",
+        "credentials",
+    }
+)
+_CREDENTIAL_KEY_SUFFIXES = (
+    "_password",
+    "_passwd",
+    "_pwd",
+    "_secret",
+    "_token",
+    "_api_key",
+    "_apikey",
+    "_security_key",
+    "_private_key",
+    "_passphrase",
+)
 
 
 def _redact_uri(uri: str) -> str:
@@ -639,6 +702,139 @@ def _redact_uri(uri: str) -> str:
         'neo4j+s://bolt.example.com'
     """
     return _URI_USERINFO_RE.sub(r"\1***@", uri)
+
+
+def _is_credential_key(raw_key: str) -> bool:
+    """Return True if *raw_key* identifies a secret, password, key, or auth token."""
+    norm = _normalize_key(raw_key)
+    if not norm or global_sensitivity_registry.is_exempt(norm):
+        return False
+    return norm in _CREDENTIAL_KEY_NAMES or norm.endswith(_CREDENTIAL_KEY_SUFFIXES)
+
+
+def _scrub_key_value_match(match: re.Match[str]) -> str:
+    """Replace sensitive PHI or credential scalar values in matched key-value pairs."""
+    key_token = match.group("key")
+    sep = match.group("sep")
+    val_token = match.group("val")
+    unquoted_key = key_token.strip("\"'")
+
+    if global_sensitivity_registry.is_sensitive(unquoted_key):
+        replacement = "***MASKED***"
+    elif _is_credential_key(unquoted_key):
+        replacement = "***"
+    else:
+        return match.group(0)
+
+    if len(val_token) >= 2 and val_token[0] == val_token[-1] and val_token[0] in ("'", '"'):
+        quote = val_token[0]
+        return f"{key_token}{sep}{quote}{replacement}{quote}"
+    return f"{key_token}{sep}{replacement}"
+
+
+def _sanitize_text_content(text: str) -> str:
+    """Scrub connection URIs, query secrets, auth tokens, and clinical PHI from *text*."""
+    if not text:
+        return text
+    sanitized = _redact_uri(text)
+    sanitized = _URL_IN_TEXT_RE.sub(lambda m: redact_url_query(m.group(0)), sanitized)
+    sanitized = _AUTH_SCHEME_RE.sub(r"\1 ***", sanitized)
+    sanitized = _JWT_RE.sub("***", sanitized)
+    sanitized = _KEY_VALUE_PAIR_RE.sub(_scrub_key_value_match, sanitized)
+    sanitized = _SSN_RE.sub("***MASKED***", sanitized)
+    return _EMAIL_RE.sub("***MASKED***", sanitized)
+
+
+def _sanitize_exception_message(exc: BaseException) -> str:
+    """Extract and scrub an exception message using URI redaction and PHI masking."""
+    args = getattr(exc, "args", ())
+    if isinstance(args, tuple) and any(isinstance(a, (dict, list, tuple)) for a in args):
+        masked_args = mask_clinical_phi(args, registry=global_sensitivity_registry)
+        raw_text = str(masked_args[0]) if len(masked_args) == 1 else str(masked_args)
+    else:
+        try:
+            raw_text = str(exc)
+        except Exception:
+            raw_text = ""
+    return _sanitize_text_content(raw_text)
+
+
+def _clear_exception_chain(exc: Exception) -> Exception:
+    """Detach inner context and cause references to prevent raw frame/driver leakage."""
+    exc.__cause__ = None
+    exc.__context__ = None
+    exc.__suppress_context__ = True
+    return exc
+
+
+def _sanitize_batch_cause(exc: BaseException) -> Exception:
+    """Construct a sanitized cause preserving the root exception class."""
+    sanitized_msg = _sanitize_exception_message(exc)
+    exc_cls: type[Exception] = type(exc) if isinstance(exc, Exception) else RuntimeError
+
+    if isinstance(exc, OSError) and isinstance(exc.errno, int):
+        strerror = (
+            _sanitize_text_content(exc.strerror) if isinstance(exc.strerror, str) else sanitized_msg
+        )
+        with contextlib.suppress(Exception):
+            return _clear_exception_chain(exc_cls(exc.errno, strerror))
+
+    with contextlib.suppress(Exception):
+        inst = exc_cls(sanitized_msg)
+        _ = str(inst)
+        return _clear_exception_chain(inst)
+
+    with contextlib.suppress(Exception):
+        raw_inst = exc_cls.__new__(exc_cls)
+        Exception.__init__(raw_inst, sanitized_msg)
+        _ = str(raw_inst)
+        return _clear_exception_chain(raw_inst)
+
+    fallback_msg = f"{exc_cls.__name__}: {sanitized_msg}" if sanitized_msg else exc_cls.__name__
+    return _clear_exception_chain(RuntimeError(fallback_msg))
+
+
+def normalize_sink_value(value: Any, *, by_alias: bool = False) -> Any:
+    """Dump Pydantic models, ``Enum`` values, and tuples into plain containers.
+
+    Leaves scalar ``Decimal``, ``datetime``, and ``date`` instances intact so
+    each destination sink can encode them without lossy float conversion.
+    """
+    if value is None or value.__class__ in (str, int, float, bool):
+        return value
+    if isinstance(value, NonCallableMock):
+        return value
+    if isinstance(value, Enum):
+        return normalize_sink_value(value.value, by_alias=by_alias)
+    if value.__class__ is dict:
+        return {
+            str(normalize_sink_value(k.value, by_alias=by_alias))
+            if isinstance(k, Enum)
+            else (k if k.__class__ is str else str(k)): normalize_sink_value(v, by_alias=by_alias)
+            for k, v in value.items()
+        }
+    if value.__class__ in (list, tuple):
+        return [normalize_sink_value(item, by_alias=by_alias) for item in value]
+    model_dump = getattr(type(value), "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = value.model_dump(mode="json", by_alias=by_alias)
+        except TypeError:
+            dumped = value.model_dump()
+        if dumped is not value and isinstance(
+            dumped, (Mapping, list, tuple, str, int, float, bool)
+        ):
+            return normalize_sink_value(dumped, by_alias=by_alias)
+    if isinstance(value, Mapping):
+        return {
+            str(normalize_sink_value(k.value, by_alias=by_alias))
+            if isinstance(k, Enum)
+            else str(k): normalize_sink_value(v, by_alias=by_alias)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [normalize_sink_value(item, by_alias=by_alias) for item in value]
+    return value
 
 
 def _require_optional_dep(package: str, extras_key: str) -> Any:
@@ -1432,6 +1628,7 @@ __all__ = [
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
+    "normalize_sink_value",
     "normalize_watermark_datetime",
     "redact_batch_records",
     "run_streaming_export",

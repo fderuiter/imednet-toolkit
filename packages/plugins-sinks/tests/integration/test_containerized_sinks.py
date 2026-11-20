@@ -153,15 +153,48 @@ def test_neo4j_containerized_merges(fake_records, monkeypatch):
         idempotent=True,
     )
 
+    unscheduled_records = [
+        FakeRecord(
+            record_id=3,
+            subject_id="SUBJ-001",
+            subject_key="SUBJ-001",
+            form_id=25,
+            form_key="AE",
+            visit_name="",
+            visit_id=0,
+            record_data={"adverse_event": "Headache"},
+        ),
+        FakeRecord(
+            record_id=4,
+            subject_id="SUBJ-002",
+            subject_key="SUBJ-002",
+            form_id=25,
+            form_key="AE",
+            visit_name="",
+            visit_id=0,
+            record_data={"adverse_event": "Nausea"},
+        ),
+    ]
+
     with Neo4jExportSink(config=config) as sink:
-        sink.write_batch(fake_records, batch_id="STUDY1/test/0")
+        sink.write_batch([*fake_records, unscheduled_records[0]], batch_id="STUDY1/test/0")
+
+    append_config = Neo4jSinkConfig(
+        study_key="STUDY1",
+        uri=uri,
+        auth=auth,
+        batch_size=10,
+        idempotent=False,
+    )
+    with Neo4jExportSink(config=append_config) as append_sink:
+        append_sink.write_batch([unscheduled_records[1]], batch_id="STUDY1/test/1")
 
     # Verify directly via Neo4j Driver
     driver = neo4j.GraphDatabase.driver(uri, auth=auth)
     with driver.session() as session:
         result = session.run("MATCH (n:Record) RETURN count(n) AS count")
         count = result.single()["count"]
-        assert count == 2
+        assert count == 4
 
         result2 = session.run("MATCH (n:Record {record_id: 2}) RETURN n.record_data AS record_data")
         import json
@@ -169,16 +202,44 @@ def test_neo4j_containerized_merges(fake_records, monkeypatch):
         record_data = json.loads(result2.single()["record_data"])
         assert record_data["heart_rate"] == 75
 
-        # Verify topology mapping
+        # Verify topology mapping and Subject-scoped Visit isolation
         topology_query = (
             "MATCH path=(s:Study {study_key: 'STUDY1'})"
             "-[:HAS_SUBJECT]->(su:Subject {subject_key: 'SUBJ-001'})"
-            "-[:HAS_VISIT]->(v:Visit {visit_id: 10})"
+            "-[:HAS_VISIT]->(v:Visit {visit_id: 10, subject_key: 'SUBJ-001', study_key: 'STUDY1'})"
             "-[:HAS_RECORD]->(r:Record {record_id: 1}) "
             "RETURN count(path) AS paths"
         )
         result3 = session.run(topology_query)
         paths = result3.single()["paths"]
         assert paths == 1
+
+        # Verify unscheduled Records link directly from Subject without Visit nodes
+        for subj_key, rec_id in [("SUBJ-001", 3), ("SUBJ-002", 4)]:
+            unscheduled_query = (
+                f"MATCH path=(:Study {{study_key: 'STUDY1'}})"
+                f"-[:HAS_SUBJECT]->(:Subject {{subject_key: '{subj_key}'}})"
+                f"-[:HAS_RECORD]->(:Record {{record_id: {rec_id}}}) "
+                "RETURN count(path) AS paths"
+            )
+            assert session.run(unscheduled_query).single()["paths"] == 1
+            visit_edge_query = (
+                f"MATCH (:Visit)-[:HAS_RECORD]->(:Record {{record_id: {rec_id}}}) "
+                "RETURN count(*) AS cnt"
+            )
+            assert session.run(visit_edge_query).single()["cnt"] == 0
+
+        leak_query = (
+            "MATCH (:Subject {subject_key: 'SUBJ-001'})-[:HAS_VISIT|HAS_RECORD*1..2]"
+            "->(:Record {record_id: 2}) "
+            "RETURN count(*) AS leaks"
+        )
+        assert session.run(leak_query).single()["leaks"] == 0
+
+        unscheduled_leak_query = (
+            "MATCH (:Subject {subject_key: 'SUBJ-001'})-[:HAS_RECORD]->(:Record {record_id: 4}) "
+            "RETURN count(*) AS leaks"
+        )
+        assert session.run(unscheduled_leak_query).single()["leaks"] == 0
 
     driver.close()

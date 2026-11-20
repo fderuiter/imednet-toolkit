@@ -364,27 +364,183 @@ def test_interactive_records_list_2500_study_issues_single_http_request_and_show
     assert params["page"] == "0"
     assert params["size"] == "100"
     assert len(captured_grid_kwargs["items"]) == 100
+    assert captured_grid_kwargs["truncated"] is True
+    assert callable(captured_grid_kwargs["on_load_all"])
     assert "truncated" in captured_grid_kwargs["status_notice"].lower()
+    assert "[a]" in captured_grid_kwargs["status_notice"]
     assert "--all" in captured_grid_kwargs["status_notice"]
 
-    # Also verify InteractiveDataGrid renders the status_notice in its header and status bars
-    win = _CaptureWindow(height=20, width=140)
-    with (
-        patch("curses.has_colors", return_value=False),
-        patch("curses.curs_set"),
-    ):
-        grid = InteractiveDataGrid(
-            win,
-            items=captured_grid_kwargs["items"],
-            fields=["ID", "Subject", "Form", "Status", "Created"],
-            label="records",
-            details=captured_grid_kwargs["details"],
-            status_notice=captured_grid_kwargs["status_notice"],
-        )
-        grid.draw()
+    # Verify InteractiveDataGrid renders unclipped notices on both wide (140x20) and 80x24 viewports
+    for height, width in ((20, 140), (24, 80)):
+        win = _CaptureWindow(height=height, width=width)
+        with (
+            patch("curses.has_colors", return_value=False),
+            patch("curses.curs_set"),
+        ):
+            grid = InteractiveDataGrid(
+                win,
+                items=captured_grid_kwargs["items"],
+                fields=["ID", "Subject", "Form", "Status", "Created"],
+                label="records",
+                details=captured_grid_kwargs["details"],
+                status_notice=captured_grid_kwargs["status_notice"],
+                truncated=captured_grid_kwargs["truncated"],
+                on_load_all=captured_grid_kwargs["on_load_all"],
+            )
+            grid.draw()
 
-    assert "truncated" in win.lines[0].lower()
-    assert "truncated" in win.lines[19].lower()
+        for row_idx in (0, height - 1):
+            assert "truncated" in win.lines[row_idx].lower()
+            assert "[a]" in win.lines[row_idx]
+            assert "--all" in win.lines[row_idx]
+
+        if width == 80:
+            grid._handle_normal_input(" ")
+            grid.draw()
+            top_grid_pane = win.lines[0][:43]
+            assert "truncated" in top_grid_pane.lower()
+            assert "[a]" in top_grid_pane
+            assert "--all" in top_grid_pane
+            assert "[[/]] Scroll" in win.lines[23]
+            assert "[Esc] Close" in win.lines[23]
+            assert "[a]" in win.lines[23]
+            assert "--all" in win.lines[23]
+
+
+@pytest.mark.parametrize(
+    ("argv", "endpoint_path", "item_factory", "match_token"),
+    [
+        (
+            ["studies", "list"],
+            "/api/v1/edc/studies",
+            lambda n: {"studyKey": f"ST-{n:04d}", "studyName": f"Study {n}"},
+            "ST-0225",
+        ),
+        (
+            ["record-revisions", "list", "S1"],
+            "/api/v1/edc/studies/S1/recordRevisions",
+            lambda n: {"recordRevisionId": n, "studyKey": "S1", "subjectKey": f"REV-{n:04d}"},
+            "REV-0225",
+        ),
+        (
+            ["records", "list", "S1"],
+            "/api/v1/edc/studies/S1/records",
+            lambda n: {
+                "recordId": n,
+                "studyKey": "S1",
+                "subjectKey": f"REC-{n:04d}",
+                "formKey": "DM",
+                "recordStatus": "Active",
+            },
+            "REC-0225",
+        ),
+        (
+            ["subjects", "list", "S1"],
+            "/api/v1/edc/studies/S1/subjects",
+            lambda n: {"subjectId": n, "studyKey": "S1", "subjectKey": f"SUB-{n:04d}"},
+            "SUB-0225",
+        ),
+        (
+            ["users", "list", "S1"],
+            "/api/v1/edc/studies/S1/users",
+            lambda n: {"userId": f"U-{n}", "login": f"user_{n:04d}"},
+            "user_0225",
+        ),
+        (
+            ["codings", "list", "S1"],
+            "/api/v1/edc/studies/S1/codings",
+            lambda n: {"codingId": n, "studyKey": "S1", "code": f"CD-{n:04d}", "variable": "AE"},
+            "CD-0225",
+        ),
+    ],
+)
+@respx.mock
+def test_interactive_cli_list_key_a_drains_remaining_pages_without_refetching_page_zero(
+    argv: list[str],
+    endpoint_path: str,
+    item_factory: Any,
+    match_token: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pressing 'a' in InteractiveDataGrid drains pages 1..2 without re-fetching page 0 and updates filter."""
+    sdk = _make_sdk()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+
+    requested_pages: list[int] = []
+
+    def _responder(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        size = int(request.url.params["size"])
+        requested_pages.append(page)
+        start = page * 100
+        count = 100 if page < 2 else 50
+        data = [item_factory(start + idx + 1) for idx in range(count)]
+        return httpx.Response(
+            200,
+            json=_paginated_payload(data, page=page, size=size, total_pages=3, total_items=250),
+        )
+
+    respx.get(f"https://api.test{endpoint_path}").mock(side_effect=_responder)
+
+    observed_final_matches: list[int] = []
+    observed_total_entries: list[int] = []
+
+    def _drive_grid(**kwargs: Any) -> bool:
+        # Before pressing 'a', only page 0 has been fetched
+        assert requested_pages == [0]
+        win = _CaptureWindow(height=24, width=80)
+        with (
+            patch("curses.has_colors", return_value=False),
+            patch("curses.curs_set"),
+        ):
+            grid = InteractiveDataGrid(
+                win,
+                items=kwargs["items"],
+                fields=kwargs["fields"],
+                label=kwargs["label"],
+                details=kwargs["details"],
+                status_notice=kwargs.get("status_notice"),
+                truncated=kwargs.get("truncated"),
+                on_load_all=kwargs.get("on_load_all"),
+            )
+            grid._handle_normal_input("/")
+            for ch in match_token:
+                grid._handle_search_input(ch)
+            grid._handle_search_input(10)
+            assert len(grid.filtered_entries) == 0
+
+            # Press 'a' while SDK context is still live inside @with_sdk
+            grid._handle_normal_input("a")
+            observed_total_entries.append(len(grid.all_entries))
+            observed_final_matches.append(len(grid.filtered_entries))
+        return True
+
+    monkeypatch.setattr("imednet.cli.utils.grid.run_interactive_grid", _drive_grid)
+    cli.app(argv)
+
+    assert requested_pages == [0, 1, 2]
+    assert observed_total_entries == [250]
+    assert observed_final_matches == [1]
+
+
+def test_collect_list_items_with_remainder_handles_sequences_and_plain_iterators() -> None:
+    """collect_list_items_with_remainder drains Sequence and non-paginated Iterable remainders once."""
+    from imednet.cli.utils.args import collect_list_items_with_remainder
+
+    seq_items, seq_trunc, seq_more = collect_list_items_with_remainder([1, 2, 3, 4, 5], 3)
+    assert seq_items == [1, 2, 3]
+    assert seq_trunc is True
+    assert seq_more is not None
+    assert seq_more() == [4, 5]
+    assert seq_more() == []
+
+    gen_items, gen_trunc, gen_more = collect_list_items_with_remainder((x for x in range(6)), 4)
+    assert gen_items == [0, 1, 2, 3]
+    assert gen_trunc is True
+    assert gen_more is not None
+    assert gen_more() == [4, 5]
+    assert gen_more() == []
 
 
 @respx.mock
