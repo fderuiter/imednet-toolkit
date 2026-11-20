@@ -39,25 +39,27 @@ class RateLimitServerRetry(RetryPolicy):
         return False
 
 
-responses: Iterator[httpx.Response] = iter(
-    [
-        httpx.Response(429, json={"metadata": {"status": "TOO_MANY_REQUESTS"}}),
-        httpx.Response(500, json={"metadata": {"status": "SERVER_ERROR"}}),
-        httpx.Response(200, json={"data": "ok"}),
-    ]
-)
-
-
-def responder(_: httpx.Request) -> httpx.Response:
-    """Return the next canned HTTP response in the mock sequence."""
-    return next(responses)
+def _build_responses() -> Iterator[httpx.Response]:
+    """Return a fresh sequence of 429, 500, and 200 mock responses."""
+    return iter(
+        [
+            httpx.Response(429, json={"metadata": {"status": "TOO_MANY_REQUESTS"}}),
+            httpx.Response(500, json={"metadata": {"status": "SERVER_ERROR"}}),
+            httpx.Response(200, json={"data": "ok"}),
+        ]
+    )
 
 
 class MockClient(Client):
     """HTTP client wired to an in-memory mock transport for retry testing."""
 
     def _create_client(self, auth: AuthStrategy) -> httpx.Client:
-        """Create an httpx.Client backed by the mock responder transport."""
+        """Create an httpx.Client backed by a fresh mock responder sequence."""
+        responses = _build_responses()
+
+        def responder(_: httpx.Request) -> httpx.Response:
+            return next(responses)
+
         return httpx.Client(
             base_url=self.base_url,
             headers={
@@ -112,8 +114,10 @@ def main() -> None:
             client.get("/studies")
     except RateLimitError:
         print("Request failed with rate limit error", file=sys.stderr)
+        sys.exit(1)
     except ServerError:
         print("Request failed with server error", file=sys.stderr)
+        sys.exit(1)
     else:
         print("Request succeeded")
 

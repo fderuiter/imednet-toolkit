@@ -87,6 +87,7 @@ def test_flattened_dataframe_roundtrip_succeeds_in_simulation_transport() -> Non
     sdk, state, captured_requests = _make_sim_sdk()
 
     initial_records = state.get_records("STUDY")
+    initial_revisions = state.get_record_revisions("STUDY")
     assert len(initial_records) >= 1
 
     df = sdk.records.to_dataframe("STUDY", flatten=True, mask_phi=False)
@@ -136,7 +137,9 @@ def test_flattened_dataframe_roundtrip_succeeds_in_simulation_transport() -> Non
             assert forbidden_key not in item["data"]
 
     updated_records = state.get_records("STUDY")
-    assert len(updated_records) == len(initial_records) + len(df)
+    updated_revisions = state.get_record_revisions("STUDY")
+    assert len(updated_records) == len(initial_records)
+    assert len(updated_revisions) == len(initial_revisions) + len(df)
 
 
 def test_csv_with_masked_sentinel_raises_validation_error_before_any_http_request(
