@@ -17,34 +17,26 @@ from imednet_workflows.state_ledger import (
 
 
 @pytest.fixture
-def mock_airflow():
-    """Mock airflow modules."""
+def mock_airflow(monkeypatch):
+    """Mock airflow modules without evicting real airflow imports across tests."""
     airflow_mock = MagicMock()
     xcom_mock = MagicMock()
     session_mock = MagicMock()
     python_mock = MagicMock()
 
-    sys.modules["airflow"] = airflow_mock
-    sys.modules["airflow.models"] = MagicMock()
-    sys.modules["airflow.models.xcom"] = xcom_mock
-    sys.modules["airflow.utils"] = MagicMock()
-    sys.modules["airflow.utils.session"] = session_mock
-    sys.modules["airflow.operators"] = MagicMock()
-    sys.modules["airflow.operators.python"] = python_mock
+    monkeypatch.setitem(sys.modules, "airflow", airflow_mock)
+    monkeypatch.setitem(sys.modules, "airflow.models", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.models.xcom", xcom_mock)
+    monkeypatch.setitem(sys.modules, "airflow.utils", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_mock)
+    monkeypatch.setitem(sys.modules, "airflow.operators", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.operators.python", python_mock)
 
     yield {
         "xcom": xcom_mock,
         "session": session_mock,
         "python": python_mock,
     }
-
-    del sys.modules["airflow"]
-    del sys.modules["airflow.models"]
-    del sys.modules["airflow.models.xcom"]
-    del sys.modules["airflow.utils"]
-    del sys.modules["airflow.utils.session"]
-    del sys.modules["airflow.operators"]
-    del sys.modules["airflow.operators.python"]
 
 
 def test_get_state_provider(monkeypatch):

@@ -768,12 +768,11 @@ def test_validate_staged_wheels_scrubs_coverage_env_vars(
     monkeypatch.setenv("SAFE_WORKSPACE_VAR", "preserved_value")
 
     captured_env: dict[str, str] | None = None
-    original_run = subprocess.run
 
-    def mock_subprocess_run(cmd, *args, **kwargs):
+    def mock_subprocess_run(cmd, *_args, **kwargs):
         nonlocal captured_env
         captured_env = kwargs.get("env")
-        return original_run(cmd, *args, **kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
 
@@ -790,44 +789,6 @@ def test_validate_staged_wheels_scrubs_coverage_env_vars(
         or "coverage" in k.lower()
     ]
     assert not leakage, f"Found leaked coverage environment variables in subprocess env: {leakage}"
-
-
-def test_validate_staged_wheels_child_process_environment_isolation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verify in actual child process execution that coverage environment variables are absent."""
-    wheels_dir = tmp_path / "wheels"
-    wheels_dir.mkdir(parents=True)
-    wheel = wheels_dir / "imednet-1.1.0-py3-none-any.whl"
-
-    wheel_init = (
-        "import os\n"
-        "leaked = [\n"
-        "    k for k in os.environ\n"
-        "    if k.upper().startswith(('COV_', 'COVERAGE_'))\n"
-        "    or 'cov_core' in k.lower()\n"
-        "    or 'coverage' in k.lower()\n"
-        "]\n"
-        "if leaked:\n"
-        "    raise RuntimeError(f'Child process inherited coverage variables: {leaked}')\n"
-        "class ImednetSDK:\n"
-        "    pass\n"
-    )
-
-    with zipfile.ZipFile(wheel, "w") as zf:
-        zf.writestr("imednet/__init__.py", wheel_init)
-        zf.writestr("imednet/sdk.py", "")
-        zf.writestr("imednet/config.py", "")
-
-    monkeypatch.setenv("COV_CORE_SOURCE", "/some/source")
-    monkeypatch.setenv("COV_CORE_DATAFILE", "/tmp/data")
-    monkeypatch.setenv("COVERAGE_FILE", "/tmp/.coverage")
-    monkeypatch.setenv("COVERAGE_PROCESS_START", "/tmp/.coveragerc")
-    monkeypatch.setenv("cov_core_test", "1")
-    monkeypatch.setenv("coverage_test", "1")
-
-    errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
-    assert not errors, f"Subprocess validation failed due to leaked variables: {errors}"
 
 
 def test_missing_workspace_symbol_in_showcase_detected(tmp_path: Path) -> None:

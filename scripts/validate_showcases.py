@@ -1232,6 +1232,14 @@ CONTEXT_DISALLOWED_SYNONYMS: dict[str, tuple[str, ...]] = {
 _JS_BROWSER_GLOBALS_PATTERN = re.compile(
     r"\bwindow\.(?:location|history|addEventListener|dispatchEvent)\b"
 )
+_ANY_DISALLOWED_SYNONYM_PATTERN = re.compile(
+    r"\b(?:"
+    + "|".join(
+        re.escape(synonym) for forms in CONTEXT_DISALLOWED_SYNONYMS.values() for synonym in forms
+    )
+    + r")\b",
+    re.IGNORECASE,
+)
 
 
 def extract_showcase_sdk_snippets(showcase_js_path: Path) -> tuple[dict[str, str], list[str]]:
@@ -1284,6 +1292,8 @@ def validate_canonical_showcase_terminology(file_path: Path) -> list[str]:
         scan_line = raw_line
         if file_path.suffix == ".js":
             scan_line = _JS_BROWSER_GLOBALS_PATTERN.sub("", scan_line)
+        if not _ANY_DISALLOWED_SYNONYM_PATTERN.search(scan_line):
+            continue
 
         for canonical_term, disallowed_forms in CONTEXT_DISALLOWED_SYNONYMS.items():
             for synonym in disallowed_forms:

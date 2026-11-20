@@ -202,6 +202,20 @@ try:
             cursor.close()
 except ImportError:
     pass
+try:
+    import duckdb as _duckdb
+
+    _orig_duckdb_connect = _duckdb.connect
+
+    def _fast_duckdb_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        cfg = dict(kwargs.get("config") or {})
+        cfg.setdefault("threads", "1")
+        kwargs["config"] = cfg
+        return _orig_duckdb_connect(*args, **kwargs)
+
+    _duckdb.connect = _fast_duckdb_connect  # type: ignore[assignment]
+except ImportError:
+    pass
 
 
 def pytest_addoption(parser):

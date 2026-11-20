@@ -1143,6 +1143,41 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
     assert "unmapped_val" in df_dict_snake.columns
 
 
+def test_sdtm_transformation_caches_model_aliases_and_normalized_keys() -> None:
+    """Verify SDTM transformation caches model field aliases and normalized keys deterministically."""
+
+    class CachedAE(BaseModel):
+        subject_key: str = Field(alias="patientId")
+        ae_term: str = Field(alias="reportedTerm")
+        ae_severity: str = Field(alias="grade")
+        ae_start_date: str = Field(alias="onset")
+        ae_end_date: str = Field(alias="resolution")
+        extra_score: int = 100
+
+    records = [
+        CachedAE(
+            patientId=f"SUBJ-{i}",
+            reportedTerm="Headache",
+            grade="MILD",
+            onset="2026-01-15 09:30:00",
+            resolution="2026-01-16 18:00:00",
+        )
+        for i in range(5)
+    ]
+
+    _get_model_field_aliases.cache_clear()
+    _normalize_key.cache_clear()
+
+    df = transform_records_to_sdtm(records, domain="AE", study_key="STUDY01")
+    assert len(df) == 5
+    assert df.iloc[0]["USUBJID"] == "SUBJ-0"
+    assert df.iloc[0]["AESTDTC"] == "2026-01-15T09:30:00"
+    assert df.iloc[0]["AEENDTC"] == "2026-01-16T18:00:00"
+    assert _get_model_field_aliases.cache_info().hits >= 4
+    assert _normalize_key.cache_info().hits > 0
+
+
+@pytest.mark.performance
 def test_sdtm_transformation_large_batch_benchmark() -> None:
     """Benchmark SDTM transformation on a large batch verifying cached aliases and date parsing dispatch."""
     import time
