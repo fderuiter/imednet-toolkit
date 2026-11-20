@@ -22,16 +22,18 @@ from ..utils import (
     parse_record_data_filter,
     print_error,
     resolve_study_key,
+    simulation_mode_context,
 )
 
 
 def _add_export_study_args(parser: argparse.ArgumentParser) -> None:
-    """Attach hybrid ``study_key`` and ``--simulation`` arguments to an export subcommand."""
+    """Attach hybrid study key and simulation flags to an export subcommand."""
     add_study_key_args(parser)
     add_simulation_arg(parser)
 
 
 def _resolve_export_study(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str:
+    """Resolve and validate study_key for an export subcommand."""
     study_key = resolve_study_key(parser, args, required=True)
     assert study_key is not None
     validate_cli_path_segment(study_key, name="study_key")
@@ -232,14 +234,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 **stream_kwargs,
             )
 
-    pq_parser.set_defaults(
-        func=lambda args: export_parquet(
-            study_key=_resolve_export_study(pq_parser, args),
-            path=args.path,
-            use_labels=args.use_labels,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_pq(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(pq_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_parquet(
+                study_key=study_key,
+                path=args.path,
+                use_labels=args.use_labels,
+                **stream_kwargs,
+            )
+
+    pq_parser.set_defaults(func=_dispatch_pq)
 
     # csv
     csv_parser = sub.add_parser("csv", help="Export study records to a CSV file.")
@@ -275,14 +281,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 **stream_kwargs,
             )
 
-    csv_parser.set_defaults(
-        func=lambda args: export_csv(
-            study_key=_resolve_export_study(csv_parser, args),
-            path=args.path,
-            use_labels=args.use_labels,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_csv(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(csv_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_csv(
+                study_key=study_key,
+                path=args.path,
+                use_labels=args.use_labels,
+                **stream_kwargs,
+            )
+
+    csv_parser.set_defaults(func=_dispatch_csv)
 
     # excel
     xl_parser = sub.add_parser("excel", help="Export study records to an Excel workbook.")
@@ -321,14 +331,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 **stream_kwargs,
             )
 
-    xl_parser.set_defaults(
-        func=lambda args: export_excel(
-            study_key=_resolve_export_study(xl_parser, args),
-            path=args.path,
-            use_labels=args.use_labels,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_xl(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(xl_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_excel(
+                study_key=study_key,
+                path=args.path,
+                use_labels=args.use_labels,
+                **stream_kwargs,
+            )
+
+    xl_parser.set_defaults(func=_dispatch_xl)
 
     # json
     json_parser = sub.add_parser("json", help="Export study records to a JSON file.")
@@ -368,15 +382,19 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 **stream_kwargs,
             )
 
-    json_parser.set_defaults(
-        func=lambda args: export_json_cmd(
-            study_key=_resolve_export_study(json_parser, args),
-            path=args.path,
-            use_labels=args.use_labels,
-            hierarchical=args.hierarchical,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_json(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(json_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_json_cmd(
+                study_key=study_key,
+                path=args.path,
+                use_labels=args.use_labels,
+                hierarchical=args.hierarchical,
+                **stream_kwargs,
+            )
+
+    json_parser.set_defaults(func=_dispatch_json)
 
     # duckdb
     ddb_parser = sub.add_parser("duckdb", help="Export study records to a DuckDB table.")
@@ -435,17 +453,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 **stream_kwargs,
             )
 
-    ddb_parser.set_defaults(
-        func=lambda args: export_duckdb(
-            study_key=_resolve_export_study(ddb_parser, args),
-            table_name=args.table_name,
-            db_path=args.db_path,
-            vars_=args.vars_,
-            forms=args.forms,
-            use_labels=args.use_labels,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_ddb(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(ddb_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_duckdb(
+                study_key=study_key,
+                table_name=args.table_name,
+                db_path=args.db_path,
+                vars_=args.vars_,
+                forms=args.forms,
+                use_labels=args.use_labels,
+                **stream_kwargs,
+            )
+
+    ddb_parser.set_defaults(func=_dispatch_ddb)
 
     # sql
     sql_parser = sub.add_parser("sql", help="Export study records to a SQL table.")
@@ -513,18 +535,22 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     **stream_kwargs,
                 )
 
-    sql_parser.set_defaults(
-        func=lambda args: export_sql(
-            study_key=_resolve_export_study(sql_parser, args),
-            table=args.table,
-            connection_string=args.connection_string,
-            single_table=args.single_table,
-            long_format=args.long_format,
-            vars_=args.vars_,
-            forms=args.forms,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_sql(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(sql_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_sql(
+                study_key=study_key,
+                table=args.table,
+                connection_string=args.connection_string,
+                single_table=args.single_table,
+                long_format=args.long_format,
+                vars_=args.vars_,
+                forms=args.forms,
+                **stream_kwargs,
+            )
+
+    sql_parser.set_defaults(func=_dispatch_sql)
 
     # mongodb
     m_parser = sub.add_parser("mongodb", help="Export study records to MongoDB document envelopes.")
@@ -571,17 +597,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         with fetching_status("records for MongoDB export", study_key):
             sdk.sinks.export_to_mongodb(sdk, study_key, config=cfg)
 
-    m_parser.set_defaults(
-        func=lambda args: export_mongodb(
-            study_key=_resolve_export_study(m_parser, args),
-            uri=args.uri,
-            database=args.database,
-            collection=args.collection,
-            batch_size=args.batch_size,
-            upsert=args.upsert,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_mongodb(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(m_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_mongodb(
+                study_key=study_key,
+                uri=args.uri,
+                database=args.database,
+                collection=args.collection,
+                batch_size=args.batch_size,
+                upsert=args.upsert,
+                **stream_kwargs,
+            )
+
+    m_parser.set_defaults(func=_dispatch_mongodb)
 
     # neo4j
     n_parser = sub.add_parser(
@@ -632,18 +662,22 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         with fetching_status("records for Neo4j export", study_key):
             sdk.sinks.export_to_neo4j(sdk, study_key, config=cfg)
 
-    n_parser.set_defaults(
-        func=lambda args: export_neo4j(
-            study_key=_resolve_export_study(n_parser, args),
-            uri=args.uri,
-            username=args.username,
-            password=args.password,
-            database=args.database,
-            batch_size=args.batch_size,
-            merge=args.merge,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_neo4j(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(n_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_neo4j(
+                study_key=study_key,
+                uri=args.uri,
+                username=args.username,
+                password=args.password,
+                database=args.database,
+                batch_size=args.batch_size,
+                merge=args.merge,
+                **stream_kwargs,
+            )
+
+    n_parser.set_defaults(func=_dispatch_neo4j)
 
     # snowflake
     s_parser = sub.add_parser(
@@ -726,22 +760,26 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         with fetching_status("records for Snowflake export", study_key):
             sdk.sinks.export_to_snowflake(sdk, study_key, config=cfg)
 
-    s_parser.set_defaults(
-        func=lambda args: export_snowflake(
-            study_key=_resolve_export_study(s_parser, args),
-            account=args.account,
-            user=args.user,
-            password=args.password,
-            database=args.database,
-            schema=args.schema,
-            warehouse=args.warehouse,
-            stage=args.stage,
-            table=args.table,
-            stage_prefix=args.stage_prefix,
-            local_staging_dir=args.local_staging_dir,
-            manifest_path=args.manifest_path,
-            batch_size=args.batch_size,
-            idempotent=args.idempotent,
-            **_extract_streaming_kwargs(args),
-        )
-    )
+    def _dispatch_snowflake(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(s_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_snowflake(
+                study_key=study_key,
+                account=args.account,
+                user=args.user,
+                password=args.password,
+                database=args.database,
+                schema=args.schema,
+                warehouse=args.warehouse,
+                stage=args.stage,
+                table=args.table,
+                stage_prefix=args.stage_prefix,
+                local_staging_dir=args.local_staging_dir,
+                manifest_path=args.manifest_path,
+                batch_size=args.batch_size,
+                idempotent=args.idempotent,
+                **stream_kwargs,
+            )
+
+    s_parser.set_defaults(func=_dispatch_snowflake)

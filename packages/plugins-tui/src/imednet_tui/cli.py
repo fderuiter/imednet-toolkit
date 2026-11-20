@@ -95,12 +95,16 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     def run_tui_command(args: argparse.Namespace | None = None) -> None:
         if args is not None:
             resolved_study = resolve_study_key(tui_parser, args, required=False)
+            if resolved_study is None:
+                legacy_study = getattr(args, "study", None)
+                if legacy_study and str(legacy_study).strip():
+                    resolved_study = str(legacy_study).strip()
+                    args.study_key = resolved_study
             if resolved_study is not None:
                 validate_cli_path_segment(resolved_study, name="study_key")
-                args.study_key = resolved_study
             raw_batches = getattr(args, "batch_ids", None) or getattr(args, "batch", None)
-            for batch_id in _parse_batch_args(raw_batches):
-                validate_cli_path_segment(batch_id, name="batch_id")
+            for bid in _parse_batch_args(raw_batches):
+                validate_cli_path_segment(bid, name="batch_id")
 
         force = bool(args and getattr(args, "force", False))
         if not force and not is_interactive_terminal():

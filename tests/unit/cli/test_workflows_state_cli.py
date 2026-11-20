@@ -296,147 +296,149 @@ class TestResetState:
             )
 
         assert result.exit_code == 1
+        assert "Failed to reset ledger state" in result.output
         assert result.stdout == ""
         assert "Failed to reset ledger state" in result.stderr
 
 
-class TestStateContractsAndInteractiveShow:
-    """Tests for stderr error contracts, JSON envelopes, interactive show, and hybrid Study flags."""
+class TestHeadlessStateRecoveryAndContracts:
+    """Verify headless state recovery, stderr diagnostics, and interrupt exit codes."""
 
-    def test_state_errors_write_only_to_stderr_with_empty_stdout(
-        self, runner: CliRunner, tmp_path
+    @pytest.mark.parametrize("initial_status", ["failed", "pending"])
+    def test_headless_state_set_recovers_failed_and_pending_streams(
+        self, runner: CliRunner, tmp_path, initial_status: str
     ) -> None:
-        """Verify state set, reset, and show write error diagnostics to stderr with empty stdout."""
-        ledger_path = str(tmp_path / "ledger.json")
+        """Headless workflows state set --force recovers failed and pending streams to success."""
+        from imednet.cli import app as main_app
+        from imednet_workflows.state_ledger import FileStateProvider, InvalidStateTransitionError
 
-        bad_ts = runner.invoke(
-            state_app,
+        ledger_path = tmp_path / "ledger.json"
+        provider = FileStateProvider(ledger_path)
+        ts_old = datetime(2026, 5, 20, 8, 0, 0, tzinfo=timezone.utc)
+        ts_new = "2026-05-22T12:00:00Z"
+
+        provider.set_last_timestamp(
+            study_key="STUDY-REC",
+            stream_name="records",
+            timestamp=ts_old,
+            records_processed=5,
+            status=initial_status,  # type: ignore[arg-type]
+            error_message="boom" if initial_status == "failed" else None,
+            force=True,
+        )
+
+        # Programmatic non-forced update must still enforce strict transition matrix
+        with pytest.raises(InvalidStateTransitionError):
+            provider.set_last_timestamp(
+                study_key="STUDY-REC",
+                stream_name="records",
+                timestamp=datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc),
+                status="success",
+                force=False,
+            )
+
+        # Non-forced CLI set routes diagnostic to stderr and exits 1
+        rejected = runner.invoke(
+            main_app,
             [
+                "workflows",
+                "state",
                 "set",
                 "--study-key",
-                "STUDY-01",
+                "STUDY-REC",
                 "--stream",
                 "records",
                 "--timestamp",
-                "invalid-ts",
+                ts_new,
+                "--records-processed",
+                "12",
                 "--ledger-path",
+                str(ledger_path),
+            ],
+        )
+        assert rejected.exit_code == 1
+        assert rejected.stdout == ""
+        assert "Failed to write ledger" in rejected.stderr
+
+        # Headless CLI recovery via top-level workflows state set --force succeeds with exit code 0
+        result = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY-REC",
+                "--stream",
+                "records",
+                "--timestamp",
+                ts_new,
+                "--records-processed",
+                "12",
+                "--ledger-path",
+                str(ledger_path),
+                "--force",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Successfully set high-water mark" in result.stdout
+        assert result.stderr == ""
+
+        updated = provider.read_state().studies["STUDY-REC"].streams["records"]
+        assert updated.last_run_status == "success"
+        assert updated.records_processed == 12
+        assert updated.error_message is None
+
+    def test_state_diagnostics_route_exclusively_to_stderr(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        """State command errors write only to stderr in both main app and state_app."""
+        from imednet.cli import app as main_app
+
+        ledger_path = str(tmp_path / "ledger.json")
+
+        res_bad_ts = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "-s",
+                "S1",
+                "-m",
+                "records",
+                "-t",
+                "invalid-ts",
+                "-l",
                 ledger_path,
             ],
         )
-        assert bad_ts.exit_code == 1
-        assert bad_ts.stdout == ""
-        assert "Invalid ISO timestamp" in bad_ts.stderr
-
-        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
-            mock_ledger.return_value.set_last_timestamp.side_effect = OSError("disk full")
-            write_err = runner.invoke(
-                state_app,
-                [
-                    "set",
-                    "STUDY-01",
-                    "--stream",
-                    "records",
-                    "--timestamp",
-                    "2026-05-22T12:00:00Z",
-                    "--ledger-path",
-                    ledger_path,
-                ],
-            )
-        assert write_err.exit_code == 1
-        assert write_err.stdout == ""
-        assert "Failed to write ledger" in write_err.stderr
+        assert res_bad_ts.exit_code == 1
+        assert res_bad_ts.stdout == ""
+        assert "Invalid ISO timestamp format" in res_bad_ts.stderr
 
         with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
             mock_ledger.return_value.read_state.side_effect = OSError("corrupt ledger")
-            show_err = runner.invoke(
-                state_app,
-                ["show", "--ledger-path", ledger_path, "--format", "json"],
-            )
-        assert show_err.exit_code == 1
-        assert show_err.stdout == ""
-        assert "Failed to read ledger" in show_err.stderr
+            res_show = runner.invoke(main_app, ["workflows", "state", "show", "-l", ledger_path])
+        assert res_show.exit_code == 1
+        assert res_show.stdout == ""
+        assert "Failed to read ledger" in res_show.stderr
 
-    def test_state_show_format_json_emits_v1_envelope(self, runner: CliRunner, tmp_path) -> None:
-        """Verify state show --format json emits a v1 JSON envelope on stdout."""
-        import json
+    def test_state_commands_keyboard_interrupt_exits_130(self, runner: CliRunner, tmp_path) -> None:
+        """Ctrl+C in state_app and workflows state exits 130 with Aborted by user. on stderr."""
+        from imednet.cli import app as main_app
 
         ledger_path = str(tmp_path / "ledger.json")
-        state = _make_ledger_state("STUDY-01", "records")
         with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
-            mock_ledger.return_value.read_state.return_value = state
-            result = runner.invoke(
-                state_app,
-                ["show", "STUDY-01", "--ledger-path", ledger_path, "--format", "json"],
-            )
+            mock_ledger.return_value.read_state.side_effect = KeyboardInterrupt()
+            res_standalone = runner.invoke(state_app, ["show", "-l", ledger_path])
+            res_main = runner.invoke(main_app, ["workflows", "state", "show", "-l", ledger_path])
 
-        assert result.exit_code == 0
-        assert result.stderr == ""
-        payload = json.loads(result.stdout)
-        assert payload["schemaVersion"] == "1.0"
-        assert payload["resource"] == "ledger_state"
-        assert payload["status"] == "complete"
-        assert payload["count"] == 1
-        assert payload["items"][0]["studyKey"] == "STUDY-01"
-        assert payload["items"][0]["streamName"] == "records"
-        assert payload["items"][0]["recordsProcessed"] == 42
-
-    def test_state_show_interactive_prompts_on_tty_and_rejects_piped_or_no_interactive(
-        self, runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Verify state show --interactive prompts on TTY and exits 1 on piped stdin or --no-interactive."""
-        import io
-
-        ledger_path = str(tmp_path / "ledger.json")
-        state = _make_ledger_state("STUDY-01", "records")
-        state.studies["STUDY-02"] = _make_ledger_state("STUDY-02", "visits").studies["STUDY-02"]
-
-        class FakeTtyStdin(io.StringIO):
-            def isatty(self) -> bool:
-                return True
-
-        monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
-        monkeypatch.setattr("sys.stdin", FakeTtyStdin("STUDY-01\n"))
-        with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
-            mock_ledger.return_value.read_state.return_value = state
-            tty_res = runner.invoke(
-                state_app,
-                ["show", "--ledger-path", ledger_path, "--interactive"],
-            )
-        assert tty_res.exit_code == 0
-        assert "Enter study key to filter" in tty_res.stderr
-        assert "STUDY-01" in tty_res.stdout
-        assert "STUDY-02" not in tty_res.stdout
-
-        # Piped (non-TTY) stdin exits 1 with stderr diagnostic and empty stdout
-        monkeypatch.setattr("sys.stdin", io.StringIO("STUDY-01\n"))
-        piped_res = runner.invoke(
-            state_app,
-            ["show", "--ledger-path", ledger_path, "--interactive"],
-        )
-        assert piped_res.exit_code == 1
-        assert piped_res.stdout == ""
-        assert "Interactive prompts require an interactive TTY" in piped_res.stderr
-
-        # --no-interactive exits 1 even when stdin is a TTY
-        monkeypatch.setattr("sys.stdin", FakeTtyStdin("STUDY-01\n"))
-        no_int_res = runner.invoke(
-            state_app,
-            ["show", "--ledger-path", ledger_path, "--interactive", "--no-interactive"],
-        )
-        assert no_int_res.exit_code == 1
-        assert no_int_res.stdout == ""
-        assert "Interactive prompts require an interactive TTY" in no_int_res.stderr
-
-    def test_state_hybrid_study_key_conflict_exits_2(self, runner: CliRunner, tmp_path) -> None:
-        """Verify conflicting positional and --study-key on state commands exits 2."""
-        ledger_path = str(tmp_path / "ledger.json")
-        res = runner.invoke(
-            state_app,
-            ["show", "STUDY-01", "--study-key", "STUDY-02", "--ledger-path", ledger_path],
-        )
-        assert res.exit_code == 2
-        assert res.stdout == ""
-        assert "conflicting" in res.stderr
+        for res in (res_standalone, res_main):
+            assert res.exit_code == 130
+            assert res.stdout == ""
+            assert "Aborted by user." in res.stderr
+            assert "Traceback" not in res.stderr
 
 
 class _InteractiveStringIO:
@@ -741,3 +743,77 @@ def test_set_state_force_flag_overrides_stuck_stream(runner: CliRunner, tmp_path
         2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc
     )
     assert ledger.get_last_status("STUDY-STUCK", "records") == StreamExecutionStatus.SUCCESS
+
+
+def test_show_state_json_envelope_and_hybrid_study_key(runner: CliRunner, tmp_path) -> None:
+    """workflows state show --format json emits v1 ledger_state envelope and supports positional study_key."""
+    import json
+
+    from imednet.cli import app as main_app
+
+    ledger_path = str(tmp_path / "ledger.json")
+    state = _make_ledger_state("STUDY-01", "records")
+    state.studies["STUDY-02"] = _make_ledger_state("STUDY-02", "visits").studies["STUDY-02"]
+
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        mock_ledger.return_value.read_state.return_value = state
+        res_standalone = runner.invoke(
+            state_app, ["show", "STUDY-01", "--ledger-path", ledger_path, "--format", "json"]
+        )
+        res_main = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "show",
+                "--study-key",
+                "STUDY-01",
+                "--ledger-path",
+                ledger_path,
+                "--format",
+                "json",
+            ],
+        )
+
+    for res in (res_standalone, res_main):
+        assert res.exit_code == 0
+        assert res.stderr == ""
+        payload = json.loads(res.stdout)
+        assert payload["schemaVersion"] == "1.0"
+        assert payload["resource"] == "ledger_state"
+        assert payload["status"] == "complete"
+        assert payload["count"] == 1
+        assert payload["items"] == [
+            {
+                "studyKey": "STUDY-01",
+                "streamName": "records",
+                "lastTimestamp": "2026-05-22T12:00:00+00:00",
+                "recordsProcessed": 42,
+                "status": "success",
+                "errorMessage": None,
+            }
+        ]
+
+
+def test_show_state_rejects_interactive_json_and_conflicting_study_keys(
+    runner: CliRunner, tmp_path
+) -> None:
+    """workflows state show rejects --interactive --format json (exit 1) and conflicting study keys (exit 2)."""
+    from imednet.cli import app as main_app
+
+    ledger_path = str(tmp_path / "ledger.json")
+    conflict_fmt = runner.invoke(
+        main_app,
+        ["workflows", "state", "show", "--interactive", "--format", "json", "-l", ledger_path],
+    )
+    assert conflict_fmt.exit_code == 1
+    assert conflict_fmt.stdout == ""
+    assert "Cannot combine --interactive with --format json" in conflict_fmt.stderr
+
+    conflict_study = runner.invoke(
+        main_app,
+        ["workflows", "state", "show", "STUDY-A", "--study-key", "STUDY-B", "-l", ledger_path],
+    )
+    assert conflict_study.exit_code == 2
+    assert conflict_study.stdout == ""
+    assert "conflicting values provided for study_key" in conflict_study.stderr

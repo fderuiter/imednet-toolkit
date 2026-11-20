@@ -304,6 +304,8 @@ class Status:
         console: Console,
         spinner: str | None = None,
         refresh_per_second: float = 12.5,
+        *,
+        announce_non_interactive: bool = True,
     ) -> None:
         """Initialize a status controller.
 
@@ -312,6 +314,8 @@ class Status:
             console: Console instance managing stream output.
             spinner: Optional spinner style identifier.
             refresh_per_second: Target frame refresh rate.
+            announce_non_interactive: Whether to emit the initial message on
+                stderr when entering non-interactive mode.
         """
         self._msg = str(msg)
         self.console = console
@@ -325,6 +329,7 @@ class Status:
         self._entered = False
         self._frames: Sequence[str] = _SPINNER_FRAMES
         self._lines_rendered: int = 1
+        self._announce_non_interactive = announce_non_interactive
 
     @property
     def lines_rendered(self) -> int:
@@ -347,6 +352,27 @@ class Status:
             self._msg = str(msg)
         if self._interactive and self._entered:
             self._render_frame()
+
+    def step(self, msg: str) -> None:
+        """Emit a mode-aware step update for long-running loops.
+
+        Updates the live spinner on interactive TTYs and writes a structured
+        plain-text line to ``stderr`` when non-interactive (unless JSON output
+        mode is active).
+        """
+        with self._lock:
+            self._msg = str(msg)
+        if self._interactive and self._entered:
+            self._render_frame()
+            return
+        if is_json_output_mode():
+            return
+        stream = self.console.stream
+        try:
+            clean_msg = _ANSI_REGEX.sub("", str(msg))
+            print(clean_msg, file=stream, flush=True)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
 
     def _render_frame(self, frame_idx: int = 0) -> None:
         stream = self.console.stream
@@ -424,7 +450,7 @@ class Status:
             )
             is_test_captured = stream is sys.stderr and is_string_io
 
-            if not is_json_mode and not is_test_captured:
+            if self._announce_non_interactive and not is_json_mode and not is_test_captured:
                 try:
                     clean_msg = _ANSI_REGEX.sub("", self._msg)
                     print(clean_msg, file=stream, flush=True)
@@ -501,9 +527,17 @@ class Console:
         msg: str,
         spinner: str | None = None,
         refresh_per_second: float = 12.5,
+        *,
+        announce_non_interactive: bool = True,
     ) -> Status:
         """Create a live status context manager."""
-        return Status(msg, console=self, spinner=spinner, refresh_per_second=refresh_per_second)
+        return Status(
+            msg,
+            console=self,
+            spinner=spinner,
+            refresh_per_second=refresh_per_second,
+            announce_non_interactive=announce_non_interactive,
+        )
 
 
 _DummyConsole = Console
@@ -544,7 +578,7 @@ def _format_cell_value(value: Any, key: str | None = None) -> str:
             _sanitize_cell_text(str(x.value if isinstance(x, Enum) else x)) for x in value
         )
         return _truncate(s)
-    if isinstance(value, (list, dict)):
+    if isinstance(value, (list, dict, tuple)):
         return _truncate(_sanitize_cell_text(str(_normalize_enums(value))))
     return _sanitize_cell_text(str(value))
 

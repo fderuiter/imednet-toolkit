@@ -1077,3 +1077,107 @@ def test_wizard_validate_filter_syntax_enforces_endpoint_allowlists() -> None:
     assert ok_study is False
     assert study_err is not None
     assert "'study_key' and 'studyKey' cannot be used in --filter" in study_err
+
+
+def test_validate_filter_syntax_compound_and_or() -> None:
+    """validate_filter_syntax supports compound ';' AND and ',' OR clauses with 4-tuple return."""
+    from imednet.spi.models import Subject
+
+    ok_and, key_and, val_and, err_and = validate_filter_syntax(
+        "form_key=DEMO;record_id>=2", model=Record
+    )
+    assert (ok_and, key_and, err_and) == (True, "filter", None)
+    assert val_and == {"form_key": "DEMO", "record_id": (">=", 2)}
+
+    ok_or, key_or, val_or, err_or = validate_filter_syntax(
+        "subject_status=Screened,subject_status=Enrolled", model=Subject
+    )
+    assert (ok_or, key_or, err_or) == (True, "filter", None)
+    assert val_or == "subjectStatus==Screened,subjectStatus==Enrolled"
+
+    ok_mixed, key_mixed, val_mixed, err_mixed = validate_filter_syntax(
+        "form_key=DEMO;revision>=2,record_id=1", model=Record
+    )
+    assert (ok_mixed, key_mixed, val_mixed) == (False, None, None)
+    assert err_mixed is not None
+    assert "cannot combine both ';'" in err_mixed
+
+
+def test_prompt_filters_compound_and_cross_prompt_exclusivity() -> None:
+    """prompt_filters enforces connector exclusivity and duplicate AND checks across prompts."""
+    from imednet.spi.models import Subject
+
+    # Entering an OR filter first, then attempting an additional filter must re-prompt on stderr
+    err_buf = io.StringIO()
+    with (
+        patch(
+            "sys.stdin",
+            _TTYStringIO("subject_status=Screened,subject_status=Enrolled\nsite_name=Alpha\n\n"),
+        ),
+        patch("sys.stderr", err_buf),
+    ):
+        collected_or = prompt_filters("subject filter", "subject_status=Screened", model=Subject)
+    assert collected_or == ["subject_status=Screened,subject_status=Enrolled"]
+    assert "cannot combine both ';'" in err_buf.getvalue()
+
+    # Duplicate canonical AND attribute across two separate prompts is rejected and re-prompted
+    err_dup = io.StringIO()
+    with (
+        patch("sys.stdin", _TTYStringIO("record_id>=1\nrecordId<=10\nform_key=DEMO\n\n")),
+        patch("sys.stderr", err_dup),
+    ):
+        collected_and = prompt_filters("record filter", "form_key=DEMO", model=Record)
+    assert collected_and == ["record_id>=1", "form_key=DEMO"]
+    assert "Duplicate filter attribute 'recordId'" in err_dup.getvalue()
+
+
+def test_extract_records_interactive_accepts_compound_and_or_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """workflows extract-records --interactive accepts ';' AND and ',' OR filters via flags and prompts."""
+    monkeypatch.setenv("IMEDNET_API_KEY", "test_key")  # pragma: allowlist secret
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "test_sec")  # pragma: allowlist secret
+
+    mock_workflow = MagicMock()
+    mock_workflow.extract_records_by_criteria.return_value = []
+    monkeypatch.setattr(
+        "imednet_workflows.cli.DataExtractionWorkflow",
+        MagicMock(return_value=mock_workflow),
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=MagicMock()))
+
+    # Flag supplies compound ';' record filter; prompt supplies compound ',' subject filter
+    stdin_input = (
+        "\n".join(
+            [
+                "STUDY_COMPOUND",
+                "",  # finish record filters
+                "subject_status=Screened,subject_status=Enrolled",
+                "",  # finish subject filters
+                "",  # skip visit filters
+            ]
+        )
+        + "\n"
+    )
+
+    result = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "extract-records",
+            "--record-filter",
+            "form_key=DEMO;record_id>=2",
+            "--interactive",
+        ],
+        stdin_input=stdin_input,
+    )
+
+    assert result.exit_code == 0
+    mock_workflow.extract_records_by_criteria.assert_called_once()
+    call_kwargs = mock_workflow.extract_records_by_criteria.call_args.kwargs
+    assert call_kwargs["study_key"] == "STUDY_COMPOUND"
+    assert call_kwargs["record_filter"] == {"form_key": "DEMO", "record_id": (">=", 2)}
+    assert call_kwargs["subject_filter"] == {
+        "filter": "subjectStatus==Screened,subjectStatus==Enrolled"
+    }
+    assert call_kwargs["visit_filter"] is None

@@ -12,7 +12,7 @@ from imednet.sdk import ImednetSDK
 from imednet.utils.validators import parse_bool
 
 from .output import Status, console, print_error
-from .terminal import SIMULATION_MODE_ENV, redact_secrets
+from .terminal import SIMULATION_MODE_ENV
 
 
 @contextmanager
@@ -33,7 +33,9 @@ def simulation_mode_context(enabled: bool = False) -> Iterator[None]:
 
 
 def _format_config_error(exc: ValueError) -> str:
-    detail = redact_secrets(str(exc))
+    from ..decorators import redact_cli_secrets
+
+    detail = redact_cli_secrets(str(exc))
     hint = "Tip: Pass --simulation or set IMEDNET_SIMULATION_MODE=true for offline simulation."
     if "Security key is required" in detail:
         return f"Error: IMEDNET_SECURITY_KEY environment variable must be set ({detail}). {hint}"
@@ -73,7 +75,9 @@ def get_sdk() -> ImednetSDK:
     try:
         return ImednetSDK(config=config)
     except Exception as exc:  # pragma: no cover - defensive
-        print_error(f"Error initializing SDK: {redact_secrets(str(exc))}")
+        from ..decorators import redact_cli_secrets
+
+        print_error(f"Error initializing SDK: {redact_cli_secrets(str(exc))}")
         sys.exit(1)
 
 

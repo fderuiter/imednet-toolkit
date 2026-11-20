@@ -20,7 +20,7 @@ from .args import (
     resolve_output_format,
     resolve_study_key,
 )
-from .context import fetching_status
+from .context import fetching_status, simulation_mode_context
 from .output import display_list
 
 
@@ -127,16 +127,17 @@ def register_list_command(
                 allowed_attributes=allowed_attributes,
                 disallow_study_key=True,
             )
-            list_cmd(
-                study_key=study_key,
-                output_format=resolved_format,
-                filter_args=args.filter_args,
-                sort=args.sort,
-                limit=args.limit,
-                fetch_all=args.fetch_all,
-                no_interactive=no_interactive,
-                _prepared_query=prepared,
-            )
+            with simulation_mode_context(bool(getattr(args, "simulation", False))):
+                list_cmd(
+                    study_key=study_key,
+                    output_format=resolved_format,
+                    filter_args=args.filter_args,
+                    sort=args.sort,
+                    limit=args.limit,
+                    fetch_all=args.fetch_all,
+                    no_interactive=no_interactive,
+                    _prepared_query=prepared,
+                )
 
         list_parser.set_defaults(func=_dispatch_study_list)
 
@@ -199,14 +200,15 @@ def register_list_command(
                 model=resolved_model,
                 allowed_attributes=allowed_attributes,
             )
-            list_cmd_no_study(
-                output_format=resolved_format,
-                filter_args=args.filter_args,
-                sort=args.sort,
-                limit=args.limit,
-                fetch_all=args.fetch_all,
-                no_interactive=no_interactive,
-                _prepared_query=prepared,
-            )
+            with simulation_mode_context(bool(getattr(args, "simulation", False))):
+                list_cmd_no_study(
+                    output_format=resolved_format,
+                    filter_args=args.filter_args,
+                    sort=args.sort,
+                    limit=args.limit,
+                    fetch_all=args.fetch_all,
+                    no_interactive=no_interactive,
+                    _prepared_query=prepared,
+                )
 
         list_parser.set_defaults(func=_dispatch_no_study_list)

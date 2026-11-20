@@ -369,3 +369,107 @@ def test_cli_odm_round_trip_divergent_variables_and_auto_query(
     diff_payload = json.loads(captured.out)
     assert diff_payload["has_changes"] is False
     assert diff_payload["total_changes"] == 0
+
+
+def test_cli_datadict_redacts_credentials_across_stderr_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """datadict subcommands redact IMEDNET_API_KEY, IMEDNET_SECURITY_KEY, and IMEDNET_OIDC_TOKEN on stderr."""
+    from imednet.errors import AuthenticationError
+
+    api_secret = "datadict_api_secret_val_111"  # pragma: allowlist secret
+    sec_secret = "datadict_sec_secret_val_222"  # pragma: allowlist secret
+    oidc_secret = "datadict_oidc_token_val_333"  # pragma: allowlist secret
+    monkeypatch.setenv("IMEDNET_API_KEY", api_secret)
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", sec_secret)
+    monkeypatch.setenv("IMEDNET_OIDC_TOKEN", oidc_secret)
+
+    leak_msg = f"failure with {api_secret} and {sec_secret} and {oidc_secret}"
+
+    # 1. from-api with AuthenticationError and unexpected RuntimeError closes SDK and redacts
+    for err in (AuthenticationError(leak_msg), RuntimeError(leak_msg)):
+        mock_sdk = Mock()
+        with (
+            patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+            patch("imednet.cli.datadict.load_from_api", side_effect=err),
+            pytest.raises(SystemExit) as exc_api,
+        ):
+            app(["datadict", "from-api", "--study-key", "STUDY1"])
+        assert exc_api.value.code == 1
+        mock_sdk.close.assert_called_once()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "********" in captured.err
+        for secret in (api_secret, sec_secret, oidc_secret):
+            assert secret not in captured.err
+
+    # 2. File-based datadict subcommands redact secrets in exception/validation messages
+    valid_dd = tmp_path / "valid_dd.json"
+    valid_dd.write_text(
+        json.dumps({"metadata": {"schemaVersion": "1.0.0"}, "forms": []}),
+        encoding="utf-8",
+    )
+
+    subcommand_patches = [
+        (
+            ["datadict", "from-csv", "in.csv"],
+            "imednet.cli.datadict.load_from_csv",
+            RuntimeError(leak_msg),
+        ),
+        (
+            ["datadict", "from-odm", "in.xml"],
+            "imednet.cli.datadict.load_from_cdisc_odm",
+            RuntimeError(leak_msg),
+        ),
+        (
+            ["datadict", "from-redcap", "in.csv"],
+            "imednet.cli.datadict.load_from_redcap",
+            RuntimeError(leak_msg),
+        ),
+        (
+            ["datadict", "to-odm", str(valid_dd)],
+            "imednet.cli.datadict.to_odm_xml",
+            RuntimeError(leak_msg),
+        ),
+        (["datadict", "validate", str(valid_dd)], "imednet.cli.datadict.validate", [leak_msg]),
+    ]
+    for argv, target, effect in subcommand_patches:
+        kwargs = {"return_value": effect} if isinstance(effect, list) else {"side_effect": effect}
+        with patch(target, **kwargs), pytest.raises(SystemExit) as exc_sub:
+            app(argv)
+        assert exc_sub.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "********" in captured.err
+        for secret in (api_secret, sec_secret, oidc_secret):
+            assert secret not in captured.err
+
+
+def test_cli_datadict_keyboard_interrupt_exits_130(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ctrl+C in datadict subcommands prints Aborted by user. to stderr and exits 130."""
+    with (
+        patch("imednet.cli.datadict.load_from_csv", side_effect=KeyboardInterrupt()),
+        pytest.raises(SystemExit) as exc_csv,
+    ):
+        app(["datadict", "from-csv", "some_dir"])
+    assert exc_csv.value.code == 130
+    cap_csv = capsys.readouterr()
+    assert cap_csv.out == ""
+    assert "Aborted by user." in cap_csv.err
+
+    mock_sdk = Mock()
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet.cli.datadict.load_from_api", side_effect=KeyboardInterrupt()),
+        pytest.raises(SystemExit) as exc_api,
+    ):
+        app(["datadict", "from-api", "--study-key", "STUDY1"])
+    assert exc_api.value.code == 130
+    mock_sdk.close.assert_called_once()
+    cap_api = capsys.readouterr()
+    assert cap_api.out == ""
+    assert "Aborted by user." in cap_api.err

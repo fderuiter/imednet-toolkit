@@ -10,9 +10,8 @@ Enabling Simulation Mode in ``ImednetSDK``
 ------------------------------------------
 
 Pass ``simulation_mode=True`` to :class:`~imednet.ImednetSDK` or
-:class:`~imednet.AsyncImednetSDK`—set ``IMEDNET_SIMULATION_MODE=true`` in the
-environment, or pass ``--simulation`` on the :doc:`/how-to/cli`—to route all
-endpoint requests through ``SimulationTransport`` backed
+:class:`~imednet.AsyncImednetSDK`—or set ``IMEDNET_SIMULATION_MODE=true`` in the
+environment—to route all endpoint requests through ``SimulationTransport`` backed
 by deterministic fixtures for ``Study`` ``"STUDY"`` (including ``Site`` ``"SITE"``,
 ``Form`` definitions ``"F_DM"`` and ``"F_VS"``, ``Subject`` ``"SUBJ-001"``,
 ``Visit`` / ``Interval`` schedules, ``Record`` items, ``RecordRevision`` audit
@@ -42,6 +41,22 @@ entries, and ``Query`` items):
        assert status.is_successful is True
 
    reset_default_simulation_state()
+
+Running the CLI in Simulation Mode
+----------------------------------
+
+Pass ``--simulation`` on the root ``imednet`` command or any API-backed subcommand
+(or set ``IMEDNET_SIMULATION_MODE=true``) to exercise CLI tables, JSON envelopes,
+exports, write commands, workflows, and the Textual TUI offline without API keys:
+
+.. code-block:: bash
+
+   imednet studies list --simulation --no-interactive
+   imednet forms list STUDY --simulation --format json
+   imednet datadict from-api STUDY --simulation -o sim_datadict.json
+   imednet export json STUDY ./sim_records.json --simulation --no-interactive
+   imednet subject-data STUDY SUB1 --simulation --format json
+   imednet tui STUDY --simulation
 
 Isolated Per-Test ``SimulationState`` Injection
 -----------------------------------------------

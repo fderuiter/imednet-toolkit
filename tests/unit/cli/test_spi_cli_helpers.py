@@ -1,395 +1,443 @@
-"""Unit tests for shared SPI CLI helpers, hybrid Study flags, simulation mode, and output contracts."""
+"""Unit tests for shared SPI CLI helpers, simulation mode, and hybrid study_key contracts."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from unittest.mock import patch
 
 import pytest
 
-from imednet import cli
+from imednet import cli as cli_mod
 from imednet.cli.utils.output import _format_cell_value
-from imednet.models.queries import QueryStatus
-from imednet.models.records import RecordStatus
-from imednet.simulation.state import get_default_simulation_state
-from imednet.simulation.transport import SimulationTransport
+from imednet.simulation import reset_default_simulation_state
 from imednet.spi import cli as spi_cli
 
 
+class _SampleRole(Enum):
+    ADMIN = "Admin"
+    COORDINATOR = "Coordinator"
+
+
 @pytest.fixture(autouse=True)
-def _reset_simulation_state() -> None:
-    """Reset the shared simulation state before each test."""
-    get_default_simulation_state().reset()
-
-
-def _invoke_cli(capsys: pytest.CaptureFixture[str], argv: list[str]) -> tuple[int, str, str]:
-    capsys.readouterr()
-    code = 0
-    try:
-        cli.app(argv)
-    except SystemExit as exc:
-        code = int(exc.code) if isinstance(exc.code, int) else (0 if exc.code is None else 1)
-    captured = capsys.readouterr()
-    return code, captured.out, captured.err
+def _clean_cli_env(monkeypatch: pytest.MonkeyPatch):
+    """Ensure API credentials and simulation env vars start clean and reset simulation state."""
+    for var in (
+        "IMEDNET_API_KEY",
+        "IMEDNET_SECURITY_KEY",
+        "IMEDNET_OIDC_TOKEN",
+        "IMEDNET_SIMULATION_MODE",
+        "IMEDNET_CLI_OUTPUT_FORMAT",
+        "IMEDNET_NON_INTERACTIVE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **kw: False)
+    reset_default_simulation_state()
+    yield
+    reset_default_simulation_state()
 
 
 def test_spi_cli_exports_shared_helpers() -> None:
-    """Verify imednet.spi.cli exports output, Study flag, and simulation helpers in __all__."""
-    expected_exports = {
+    """Verify imednet.spi.cli exposes shared study-key, simulation, and redaction helpers."""
+    expected = {
         "SIMULATION_MODE_ENV",
         "UniqueStoreAction",
-        "add_output_format",
         "add_simulation_arg",
         "add_study_key_args",
-        "display_list",
-        "emit_json",
+        "cli_execution_guard",
+        "positive_int",
+        "redact_cli_secrets",
         "resolve_hybrid_study_and_key",
-        "resolve_output_format",
         "resolve_study_key",
         "simulation_mode_context",
-        "validate_cli_path_segment",
     }
-    assert expected_exports.issubset(set(spi_cli.__all__))
-    for symbol in expected_exports:
-        assert hasattr(spi_cli, symbol), f"Missing SPI symbol {symbol}"
+    assert expected.issubset(set(spi_cli.__all__))
+    for name in expected:
+        assert hasattr(spi_cli, name)
 
 
 def test_format_cell_value_normalizes_nested_enums() -> None:
-    """Verify _format_cell_value formats nested Enum values without Python repr brackets."""
-    nested = {
-        "record_status": RecordStatus.COMPLETE,
-        "statuses": [QueryStatus.OPEN, ("nested", RecordStatus.COMPLETE)],
-    }
-    formatted = _format_cell_value(nested)
-    assert "Complete" in formatted
-    assert "OPEN" in formatted
-    assert "<RecordStatus" not in formatted
-    assert "<QueryStatus" not in formatted
+    """Verify _format_cell_value serializes nested Enum values without repr brackets."""
+    list_text = _format_cell_value([_SampleRole.ADMIN, _SampleRole.COORDINATOR])
+    assert list_text == "Admin, Coordinator"
+    assert "_SampleRole" not in list_text
+
+    dict_text = _format_cell_value({"role": _SampleRole.ADMIN})
+    assert dict_text == "{'role': 'Admin'}"
+    assert "_SampleRole" not in dict_text
+
+    nested_list_text = _format_cell_value([{"role": _SampleRole.ADMIN}])
+    assert nested_list_text == "[{'role': 'Admin'}]"
+    assert "_SampleRole" not in nested_list_text
+
+    tuple_text = _format_cell_value((_SampleRole.COORDINATOR,))
+    assert tuple_text == "('Coordinator',)"
+    assert "_SampleRole" not in tuple_text
 
 
-def test_subject_data_and_extract_records_simulation_json_envelopes(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Verify --simulation + --format json on subject-data and extract-records without credentials."""
-    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
-    monkeypatch.delenv("IMEDNET_SIMULATION_MODE", raising=False)
-
-    code_subj, out_subj, err_subj = _invoke_cli(
-        capsys,
-        ["subject-data", "--simulation", "STUDY", "SUB1", "--format", "json"],
+def test_resolve_hybrid_study_and_key_grammar() -> None:
+    """Verify deterministic hybrid positional/flag resolution and conflict exit code 2."""
+    parser = argparse.ArgumentParser()
+    spi_cli.add_study_key_args(parser)
+    parser.add_argument(
+        "-k",
+        "--subject-key",
+        dest="subject_key_flag",
+        default=None,
+        action=spi_cli.UniqueStoreAction,
     )
-    assert code_subj == 0, err_subj
-    subj_payload = json.loads(out_subj)
-    assert subj_payload["schemaVersion"] == "1.0"
-    assert subj_payload["resource"] == "subject_data"
-    assert subj_payload["status"] == "complete"
-    assert subj_payload["count"] == 1
-    assert isinstance(subj_payload["items"], list)
-    assert "IMEDNET_SIMULATION_MODE" not in os.environ
+    parser.add_argument("subject_key", nargs="?", default=None)
 
-    code_ext, out_ext, err_ext = _invoke_cli(
-        capsys,
-        ["workflows", "extract-records", "--simulation", "DEMO", "--format", "json"],
-    )
-    assert code_ext == 0, err_ext
-    ext_payload = json.loads(out_ext)
-    assert ext_payload["schemaVersion"] == "1.0"
-    assert ext_payload["resource"] == "records"
-    assert ext_payload["status"] == "complete"
-    assert isinstance(ext_payload["items"], list)
-    assert "IMEDNET_SIMULATION_MODE" not in os.environ
+    # Positional pair
+    ns = parser.parse_args(["STUDY-1", "SUBJ-1"])
+    assert spi_cli.resolve_hybrid_study_and_key(parser, ns) == ("STUDY-1", "SUBJ-1")
 
-    code_seeded, out_seeded, err_seeded = _invoke_cli(
-        capsys,
-        ["workflows", "extract-records", "--simulation", "STUDY", "--format", "json"],
-    )
-    assert code_seeded == 0, err_seeded
-    seeded_payload = json.loads(out_seeded)
-    assert seeded_payload["count"] == 2
-    assert seeded_payload["items"][0]["recordStatus"] == "Complete"
+    # Flag study + single positional -> maps positional to subject_key
+    ns = parser.parse_args(["--study-key", "STUDY-1", "SUBJ-1"])
+    assert spi_cli.resolve_hybrid_study_and_key(parser, ns) == ("STUDY-1", "SUBJ-1")
 
+    # Flag subject + single positional -> maps positional to study_key
+    ns = parser.parse_args(["STUDY-1", "--subject-key", "SUBJ-1"])
+    assert spi_cli.resolve_hybrid_study_and_key(parser, ns) == ("STUDY-1", "SUBJ-1")
 
-def test_subject_data_and_extract_records_default_tables_clean_enums(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Verify default table output formats Enum values cleanly without <...> repr brackets."""
-    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
+    # Matching flag + positional pair allowed
+    ns = parser.parse_args(["--study-key", "STUDY-1", "STUDY-1", "SUBJ-1"])
+    assert spi_cli.resolve_hybrid_study_and_key(parser, ns) == ("STUDY-1", "SUBJ-1")
 
-    code_subj, out_subj, err_subj = _invoke_cli(
-        capsys,
-        ["subject-data", "--simulation", "STUDY", "SUB1", "--no-interactive"],
-    )
-    assert code_subj == 0, err_subj
-    assert "Found 1 subject data:" in out_subj
-    assert "SUB1" in out_subj
-    assert "<RecordStatus" not in out_subj
-    assert "<QueryStatus" not in out_subj
-    assert "{" not in out_subj
+    # Conflicting duplicate flags rejected by UniqueStoreAction
+    with pytest.raises(SystemExit) as dup_exc:
+        parser.parse_args(["--study-key", "STUDY-A", "-s", "STUDY-B", "SUBJ-1"])
+    assert dup_exc.value.code == 2
 
-    code_ext, out_ext, err_ext = _invoke_cli(
-        capsys,
-        ["workflows", "extract-records", "--simulation", "STUDY", "--no-interactive"],
-    )
-    assert code_ext == 0, err_ext
-    assert "Found 2 matching records:" in out_ext
-    assert "Complete" in out_ext
-    assert "<RecordStatus" not in out_ext
+    # Conflicting flag vs positional rejected with exit code 2
+    ns_conflict = parser.parse_args(["--study-key", "STUDY-A", "STUDY-B", "SUBJ-1"])
+    with pytest.raises(SystemExit) as conf_exc:
+        spi_cli.resolve_hybrid_study_and_key(parser, ns_conflict)
+    assert conf_exc.value.code == 2
 
 
 @pytest.mark.parametrize(
-    ("pos_argv", "flag_argv", "conflict_argv"),
+    ("argv", "expected_resource"),
     [
+        (["--simulation", "studies", "list", "--format", "json"], "studies"),
+        (["forms", "list", "STUDY", "--simulation", "--format", "json"], "forms"),
+        (["forms", "list", "--study-key", "STUDY", "--simulation", "--format", "json"], "forms"),
+        (["subjects", "list", "-s", "STUDY", "--simulation", "--format", "json"], "subjects"),
         (
-            ["forms", "list", "--simulation", "STUDY", "--format", "json"],
-            ["forms", "list", "--simulation", "--study-key", "STUDY", "--format", "json"],
-            ["forms", "list", "--simulation", "STUDY", "--study-key", "OTHER"],
+            ["records", "list", "--study-key", "STUDY", "--simulation", "--format", "json"],
+            "records",
         ),
         (
-            ["records", "list", "--simulation", "STUDY", "--format", "json"],
-            ["records", "list", "--simulation", "-s", "STUDY", "--format", "json"],
-            ["records", "list", "--simulation", "STUDY", "-s", "OTHER"],
+            ["codings", "list", "--study-key", "STUDY", "--simulation", "--format", "json"],
+            "codings",
         ),
+        (["users", "list", "--study-key", "STUDY", "--simulation", "--format", "json"], "users"),
         (
-            ["subjects", "list", "--simulation", "STUDY", "--format", "json"],
-            ["subjects", "list", "--simulation", "--study-key", "STUDY", "--format", "json"],
-            ["subjects", "list", "--simulation", "STUDY", "--study-key", "OTHER"],
-        ),
-        (
-            ["codings", "list", "--simulation", "STUDY", "--format", "json"],
-            ["codings", "list", "--simulation", "--study-key", "STUDY", "--format", "json"],
-            ["codings", "list", "--simulation", "STUDY", "--study-key", "OTHER"],
-        ),
-        (
-            ["users", "list", "--simulation", "STUDY", "--format", "json"],
-            ["users", "list", "--simulation", "--study-key", "STUDY", "--format", "json"],
-            ["users", "list", "--simulation", "STUDY", "--study-key", "OTHER"],
-        ),
-        (
-            ["datadict", "from-api", "--simulation", "STUDY", "--no-raw-xml"],
-            ["datadict", "from-api", "--simulation", "--study-key", "STUDY", "--no-raw-xml"],
-            ["datadict", "from-api", "--simulation", "STUDY", "--study-key", "OTHER"],
-        ),
-        (
-            ["workflows", "extract-records", "--simulation", "STUDY", "--format", "json"],
             [
                 "workflows",
                 "extract-records",
-                "--simulation",
                 "--study-key",
                 "STUDY",
+                "--simulation",
                 "--format",
                 "json",
             ],
-            ["workflows", "extract-records", "--simulation", "STUDY", "--study-key", "OTHER"],
+            "records",
+        ),
+        (
+            [
+                "subject-data",
+                "--study-key",
+                "STUDY",
+                "SUB1",
+                "--simulation",
+                "--format",
+                "json",
+            ],
+            "subject_data",
         ),
     ],
 )
-def test_hybrid_positional_and_study_key_flag_parity_and_conflicts(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    pos_argv: list[str],
-    flag_argv: list[str],
-    conflict_argv: list[str],
-) -> None:
-    """Verify core Study commands, datadict from-api, and workflows accept STUDY and --study-key and exit 2 on conflict."""
-    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
-
-    code_pos, out_pos, err_pos = _invoke_cli(capsys, pos_argv)
-    assert code_pos == 0, err_pos
-
-    code_flag, out_flag, err_flag = _invoke_cli(capsys, flag_argv)
-    assert code_flag == 0, err_flag
-    pos_json = json.loads(out_pos)
-    flag_json = json.loads(out_flag)
-    if isinstance(pos_json.get("metadata"), dict):
-        pos_json["metadata"].pop("generatedAt", None)
-    if isinstance(flag_json.get("metadata"), dict):
-        flag_json["metadata"].pop("generatedAt", None)
-    assert pos_json == flag_json
-
-    code_conflict, out_conflict, err_conflict = _invoke_cli(capsys, conflict_argv)
-    assert code_conflict == 2
-    assert out_conflict == ""
-    assert "conflicting" in err_conflict
-
-
-def test_export_and_jobs_hybrid_study_key_and_conflict(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    """Verify export and jobs commands support --study-key and reject conflicting Study keys."""
-    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
-
-    dest = tmp_path / "exported.json"
-    code_ok, _, err_ok = _invoke_cli(
-        capsys,
-        ["export", "json", "--simulation", "--study-key", "STUDY", str(dest)],
-    )
-    assert code_ok == 0, err_ok
-    assert dest.exists()
-
-    code_export_conflict, _, err_export_conflict = _invoke_cli(
-        capsys,
-        ["export", "json", "--simulation", "STUDY", str(dest), "--study-key", "OTHER"],
-    )
-    assert code_export_conflict == 2
-    assert "conflicting" in err_export_conflict
-
-    code_jobs_conflict, _, err_jobs_conflict = _invoke_cli(
-        capsys,
-        ["jobs", "status", "STUDY", "BATCH-1", "--study-key", "OTHER"],
-    )
-    assert code_jobs_conflict == 2
-    assert "conflicting" in err_jobs_conflict
-
-
-def test_records_list_output_flag_writes_file_and_emits_deprecation_warning(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    """Verify records list --simulation DEMO -o json writes ./records.json and warns on stderr."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
-
-    code, out, err = _invoke_cli(capsys, ["records", "list", "--simulation", "DEMO", "-o", "json"])
-    assert code == 0, err
-    assert (tmp_path / "records.json").exists()
-    assert "Saved" in out
-    assert "deprecated" in err.lower()
-    assert "--format json" in err
-    assert "imednet export" in err
-
-
-def test_root_simulation_flag_restores_previous_environment(
-    monkeypatch: pytest.MonkeyPatch,
+def test_simulation_mode_offline_json_reads_and_env_restoration(
+    argv: list[str],
+    expected_resource: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Verify imednet --simulation initializes SimulationTransport and restores env vars on exit."""
-    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
-    monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "false")
+    """Verify --simulation executes read commands offline and restores SIMULATION_MODE_ENV."""
+    cli_mod.app(argv)
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert spi_cli.SIMULATION_MODE_ENV not in os.environ
 
-    code, out, err = _invoke_cli(capsys, ["--simulation", "studies", "list", "--format", "json"])
-    assert code == 0, err
     payload = json.loads(out)
     assert payload["schemaVersion"] == "1.0"
-    assert payload["count"] >= 1
-    assert os.environ.get("IMEDNET_SIMULATION_MODE") == "false"
-
-    monkeypatch.delenv("IMEDNET_SIMULATION_MODE", raising=False)
-    code2, _, err2 = _invoke_cli(capsys, ["--simulation", "studies", "list", "--format", "json"])
-    assert code2 == 0, err2
-    assert "IMEDNET_SIMULATION_MODE" not in os.environ
+    assert payload["resource"] == expected_resource
+    assert payload["status"] == "complete"
+    assert isinstance(payload["items"], list)
 
 
-def test_tui_simulation_initializes_simulation_transport_and_restores_env(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Verify imednet tui --simulation --force uses SimulationTransport and restores env."""
-    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
-    monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "false")
-
-    captured_sdks: list[Any] = []
-
-    def _fake_run_tui(sdk: Any, **kwargs: Any) -> None:
-        captured_sdks.append((sdk, kwargs))
-
-    monkeypatch.setattr("imednet_tui.app.run_tui", _fake_run_tui)
-
-    code, out, err = _invoke_cli(capsys, ["tui", "DEMO-STUDY", "--simulation", "--force"])
-    assert code == 0, err
-    assert out == ""
-    assert len(captured_sdks) == 1
-    sdk_obj, run_kwargs = captured_sdks[0]
-    assert run_kwargs["force"] is True
-    assert run_kwargs["study_key"] == "DEMO-STUDY"
-    assert sdk_obj.config.simulation_mode is True
-    assert isinstance(sdk_obj._client._client._transport, SimulationTransport)
-    assert os.environ.get("IMEDNET_SIMULATION_MODE") == "false"
-
-
-def test_partial_credentials_surface_missing_key_and_simulation_hint_with_redaction(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_simulation_mode_datadict_export_and_write_commands(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Verify partial credentials print specific missing key error, simulation hint, and redact secrets."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("IMEDNET_API_KEY", "super-secret-api-key-value")
-    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
-    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
-    monkeypatch.delenv("IMEDNET_SIMULATION_MODE", raising=False)
+    """Verify --simulation and hybrid study_key work on datadict, export, and write commands."""
+    # 1. datadict from-api positional STUDY
+    dd_path = tmp_path / "sim_dd.json"
+    cli_mod.app(["datadict", "from-api", "STUDY", "--simulation", "-o", str(dd_path)])
+    capsys.readouterr()
+    assert dd_path.exists()
+    dd_json = json.loads(dd_path.read_text(encoding="utf-8"))
+    assert dd_json["metadata"]["studyKey"] == "STUDY"
+    assert isinstance(dd_json.get("forms"), list)
 
-    code, out, err = _invoke_cli(capsys, ["studies", "list"])
-    assert code == 1
-    assert out == ""
-    assert "IMEDNET_SECURITY_KEY" in err
-    assert "Security key is required" in err
-    assert "--simulation" in err
-    assert "super-secret-api-key-value" not in err
+    # 2. export json with --study-key flag + positional path
+    export_path = tmp_path / "exported_records.json"
+    cli_mod.app(
+        [
+            "export",
+            "json",
+            "--study-key",
+            "STUDY",
+            str(export_path),
+            "--simulation",
+            "--no-interactive",
+        ]
+    )
+    capsys.readouterr()
+    assert export_path.exists()
+    exported = json.loads(export_path.read_text(encoding="utf-8"))
+    assert isinstance(exported, list)
+    assert len(exported) >= 1
 
-    # Also test missing IMEDNET_API_KEY when only IMEDNET_SECURITY_KEY is set
-    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
-    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "super-secret-sec-key-value")
+    # 3. records create with --study-key and --simulation --dry-run --format json
+    cli_mod.app(
+        [
+            "records",
+            "create",
+            "--study-key",
+            "STUDY",
+            "--form-key",
+            "F_VS",
+            "--site-name",
+            "SITE",
+            "--subject-key",
+            "SUB1",
+            "--interval-name",
+            "Baseline",
+            "-d",
+            "V_WEIGHT=72.5",
+            "--dry-run",
+            "--simulation",
+            "--format",
+            "json",
+        ]
+    )
+    create_out, create_err = capsys.readouterr()
+    assert create_err == ""
+    create_payload = json.loads(create_out)
+    assert create_payload["resource"] == "records_create"
+    assert create_payload["items"][0]["studyKey"] == "STUDY"
 
-    code2, out2, err2 = _invoke_cli(capsys, ["studies", "list"])
-    assert code2 == 1
-    assert out2 == ""
-    assert "IMEDNET_API_KEY" in err2
-    assert "API key is required" in err2
-    assert "--simulation" in err2
-    assert "super-secret-sec-key-value" not in err2
+    # 4. records import with --study-key and --simulation --dry-run --format json
+    import_input = tmp_path / "import_records.json"
+    import_input.write_text(
+        json.dumps(
+            [
+                {
+                    "formKey": "F_VS",
+                    "siteName": "SITE",
+                    "subjectKey": "SUB1",
+                    "intervalName": "Baseline",
+                    "data": {"V_WEIGHT": 71.0},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cli_mod.app(
+        [
+            "records",
+            "import",
+            "--study-key",
+            "STUDY",
+            str(import_input),
+            "--dry-run",
+            "--simulation",
+            "--format",
+            "json",
+        ]
+    )
+    imp_out, imp_err = capsys.readouterr()
+    assert imp_err == ""
+    imp_payload = json.loads(imp_out)
+    assert imp_payload["resource"] == "records_import"
+    assert imp_payload["items"][0]["studyKey"] == "STUDY"
+
+    # 5. subjects register with --study-key and --simulation --dry-run --format json
+    cli_mod.app(
+        [
+            "subjects",
+            "register",
+            "--study-key",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--site-name",
+            "SITE",
+            "--subject-key",
+            "SUBJ-NEW-01",
+            "-d",
+            "V_AGE=42",
+            "--dry-run",
+            "--simulation",
+            "--format",
+            "json",
+        ]
+    )
+    reg_out, reg_err = capsys.readouterr()
+    assert reg_err == ""
+    reg_payload = json.loads(reg_out)
+    assert reg_payload["resource"] == "subjects_register"
+    assert reg_payload["items"][0]["studyKey"] == "STUDY"
 
 
 @pytest.mark.parametrize(
     "argv",
     [
-        ["codings", "list", "--study-key", "../CANARY_STUDY"],
-        ["subjects", "list", "--study-key", "../CANARY_STUDY"],
-        ["users", "list", "--study-key", "../CANARY_STUDY"],
-        ["records", "list", "--study-key", "../CANARY_STUDY"],
-        ["forms", "list", "--study-key", "../CANARY_STUDY"],
-        ["export", "json", "--study-key", "../CANARY_STUDY", "/tmp/unused.json"],
-        ["datadict", "from-api", "--study-key", "../CANARY_STUDY"],
-        ["workflows", "extract-records", "--study-key", "../CANARY_STUDY"],
-        ["tui", "--study-key", "../CANARY_STUDY", "--force"],
-        ["tui", "STUDY", "--batch", "../CANARY_BATCH", "--force"],
+        ["forms", "list", "STUDY-A", "--study-key", "STUDY-B"],
+        ["subjects", "list", "STUDY-A", "-s", "STUDY-B"],
+        ["records", "list", "STUDY-A", "--study-key", "STUDY-B"],
+        ["records", "create", "STUDY-A", "--study-key", "STUDY-B", "--form-key", "F_VS"],
+        ["records", "import", "STUDY-A", "input.json", "--study-key", "STUDY-B"],
+        [
+            "subjects",
+            "register",
+            "STUDY-A",
+            "--study-key",
+            "STUDY-B",
+            "--form-key",
+            "F_DM",
+            "--site-name",
+            "SITE",
+        ],
+        ["codings", "list", "STUDY-A", "--study-key", "STUDY-B"],
+        ["users", "list", "STUDY-A", "--study-key", "STUDY-B"],
+        ["jobs", "status", "STUDY-A", "BATCH-1", "--study-key", "STUDY-B"],
+        ["jobs", "wait", "STUDY-A", "BATCH-1", "--study-key", "STUDY-B"],
+        ["export", "json", "STUDY-A", "out.json", "--study-key", "STUDY-B"],
+        ["datadict", "from-api", "STUDY-A", "--study-key", "STUDY-B"],
+        ["datadict", "from-odm", "in.xml", "--study-key", "STUDY-A", "--study-key", "STUDY-B"],
+        ["datadict", "from-redcap", "in.csv", "--study-key", "STUDY-A", "--study-key", "STUDY-B"],
+        ["workflows", "extract-records", "STUDY-A", "--study-key", "STUDY-B"],
+        ["workflows", "sync-worker", "STUDY-A", "--study-key", "STUDY-B", "--once"],
+        ["workflows", "uat", "run", "STUDY-A", "--study-key", "STUDY-B"],
     ],
 )
-def test_hybrid_study_key_and_tui_reject_unsafe_path_segments_before_sdk(
+def test_conflicting_study_keys_exit_two_on_stderr(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify conflicting positional and flag study_key values exit 2 without touching stdout."""
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.app(argv)
+    assert exc_info.value.code == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "conflicting values provided for study_key" in err
+
+
+def test_records_list_legacy_output_emits_deprecation_warning(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    argv: list[str],
 ) -> None:
-    """Verify --study-key and tui flags reject path traversal via validate_cli_path_segment before SDK init."""
+    """Verify records list -o json writes records.json and emits a stderr deprecation warning."""
+    monkeypatch.chdir(tmp_path)
+    cli_mod.app(["records", "list", "STUDY", "--simulation", "-o", "json"])
+    _, err = capsys.readouterr()
+    assert "Warning: '-o/--output' on 'records list' is deprecated" in err
+    assert (tmp_path / "records.json").exists()
 
-    def _fail_get_sdk() -> Any:
-        raise AssertionError("get_sdk must not be called")
 
-    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _fail_get_sdk)
-    monkeypatch.setattr("imednet.cli.datadict.get_sdk", _fail_get_sdk)
+def test_missing_and_partial_credentials_diagnostics_and_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify get_sdk reports missing counterpart keys, hints --simulation, and redacts secrets."""
+    # Neither key set
+    with pytest.raises(SystemExit) as exc_none:
+        cli_mod.app(["studies", "list"])
+    assert exc_none.value.code == 1
+    out_none, err_none = capsys.readouterr()
+    assert out_none == ""
+    assert "IMEDNET_API_KEY and IMEDNET_SECURITY_KEY environment variables must be set." in err_none
+    assert "--simulation" in err_none
 
-    code, out, err = _invoke_cli(capsys, argv)
-    assert code == 1
+    # Only API key set -> names IMEDNET_SECURITY_KEY and never prints API key
+    dummy_api_secret = "super-secret-api-key-value"  # pragma: allowlist secret
+    monkeypatch.setenv("IMEDNET_API_KEY", dummy_api_secret)
+    with pytest.raises(SystemExit) as exc_api_only:
+        cli_mod.app(["studies", "list"])
+    assert exc_api_only.value.code == 1
+    out_api, err_api = capsys.readouterr()
+    assert out_api == ""
+    assert "IMEDNET_SECURITY_KEY environment variable must be set" in err_api
+    assert "--simulation" in err_api
+    assert dummy_api_secret not in err_api
+
+    # Only security key set -> names IMEDNET_API_KEY and never prints security key
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    dummy_sec_secret = "super-secret-sec-key-value"  # pragma: allowlist secret
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", dummy_sec_secret)
+    with pytest.raises(SystemExit) as exc_sec_only:
+        cli_mod.app(["studies", "list"])
+    assert exc_sec_only.value.code == 1
+    out_sec, err_sec = capsys.readouterr()
+    assert out_sec == ""
+    assert "IMEDNET_API_KEY environment variable must be set" in err_sec
+    assert dummy_sec_secret not in err_sec
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["users", "list", "../evil"],
+        ["jobs", "status", "../evil", "BATCH-1"],
+        ["jobs", "wait", "../evil", "BATCH-1"],
+        ["records", "create", "../evil", "--form-key", "F_VS"],
+        ["records", "import", "../evil", "nonexistent.csv"],
+        ["subjects", "register", "../evil", "--form-key", "F_DM", "--site-name", "SITE"],
+        ["workflows", "sync-worker", "../evil", "--once"],
+        ["workflows", "uat", "run", "../evil"],
+        ["subject-data", "../evil", "SUBJ-001"],
+        ["subject-data", "STUDY", "../evil"],
+    ],
+)
+def test_preflight_path_traversal_rejected_before_sdk_init(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify invalid path segments exit 1 on stderr before get_sdk() is invoked."""
+    with patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk:
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.app(argv)
+    assert exc_info.value.code == 1
+    mock_get_sdk.assert_not_called()
+    out, err = capsys.readouterr()
     assert out == ""
     assert "Error:" in err
+
+
+def test_extract_records_rejects_interactive_with_json_format(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify workflows extract-records rejects combining --interactive and --format json."""
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.app(["workflows", "extract-records", "--interactive", "--format", "json"])
+    assert exc_info.value.code == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "Cannot combine --interactive with --format json" in err

@@ -13,6 +13,7 @@ from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
+from imednet.utils.tabular import ensure_no_masked_sentinel
 from imednet.validation.cache import (
     ValidationSchemaProtocol,
     is_schema_record_prevalidated,
@@ -68,6 +69,7 @@ class RecordCreateOperation(Operation[T]):
         self.study_key = study_key if study_key is not None else _infer_study_key_from_path(path)
         self.skip_validation = skip_validation
 
+        ensure_no_masked_sentinel(self.records_data)
         self._validate()
         self.headers = self._build_headers()
 

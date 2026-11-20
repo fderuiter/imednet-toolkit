@@ -7,10 +7,11 @@ import sys
 from typing import Any
 
 from ...sdk import ImednetSDK
-from ..decorators import with_sdk
+from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import (
     fetching_status,
     format_job_progress,
+    simulation_mode_context,
     supports_live_status,
 )
 from ..utils.args import (
@@ -63,11 +64,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     def _dispatch_job_status(args: argparse.Namespace) -> None:
         study_key = resolve_study_key(status_parser, args, required=True)
         assert study_key is not None
-        job_status(
-            study_key=study_key,
-            batch_id=args.batch_id,
-            output_format=resolve_output_format(args.output_format),
-        )
+        validate_cli_path_segment(study_key, name="study_key")
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            job_status(
+                study_key=study_key,
+                batch_id=args.batch_id,
+                output_format=resolve_output_format(args.output_format),
+            )
 
     status_parser.set_defaults(func=_dispatch_job_status)
 
@@ -122,12 +125,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     def _dispatch_job_wait(args: argparse.Namespace) -> None:
         study_key = resolve_study_key(wait_parser, args, required=True)
         assert study_key is not None
-        job_wait(
-            study_key=study_key,
-            batch_id=args.batch_id,
-            interval=args.interval,
-            timeout=args.timeout,
-            output_format=resolve_output_format(args.output_format),
-        )
+        validate_cli_path_segment(study_key, name="study_key")
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            job_wait(
+                study_key=study_key,
+                batch_id=args.batch_id,
+                interval=args.interval,
+                timeout=args.timeout,
+                output_format=resolve_output_format(args.output_format),
+            )
 
     wait_parser.set_defaults(func=_dispatch_job_wait)

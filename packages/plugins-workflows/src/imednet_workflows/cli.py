@@ -11,30 +11,32 @@ import argparse
 import os
 import sys
 from datetime import UTC, datetime
-from enum import Enum
 from typing import Any
 
 from imednet.sdk import ImednetSDK
 from imednet.spi.cli import (
     NON_INTERACTIVE_ENV,
     OUTPUT_FORMAT_ENV,
-    STUDY_KEY_ARG,
     UniqueStoreAction,
     add_no_interactive,
     add_output_format,
     add_simulation_arg,
     add_study_key_args,
     clear_line,
+    cli_execution_guard,
     console,
     display_list,
     emit_json,
     fetching_status,
     is_json_output_mode,
     parse_filter_args,
+    positive_int,
     print_error,
+    redact_cli_secrets,
     resolve_hybrid_study_and_key,
     resolve_output_format,
     resolve_study_key,
+    simulation_mode_context,
     validate_cli_path_segment,
     with_sdk,
 )
@@ -44,8 +46,6 @@ from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncWorker, SyncWorkerConfig, SyncWorkerState
-
-_UniqueStoreAction = UniqueStoreAction
 
 
 def _execute_set_state(
@@ -243,13 +243,13 @@ def _execute_show_state(
     study_key: str | None = None,
     *,
     interactive: bool = False,
-    output_format: str | None = None,
     no_interactive: bool = False,
+    output_format: str | None = None,
 ) -> None:
-    """Display or serialize high-water mark ledger records."""
+    """Display current high-water mark records and stream metadata from the ledger."""
     resolved_format = resolve_output_format(output_format)
     if interactive and resolved_format == "json":
-        print_error("Error: Cannot combine --interactive and --format json.")
+        print_error("Error: Cannot combine --interactive with --format json.")
         sys.exit(1)
 
     if interactive:
@@ -274,12 +274,7 @@ def _execute_show_state(
         if study_key and s_key != study_key:
             continue
         for stream_name, stream_state in study_state.streams.items():
-            status_val = (
-                stream_state.last_run_status.value
-                if isinstance(stream_state.last_run_status, Enum)
-                else str(stream_state.last_run_status)
-            )
-            ts_val = (
+            ts_iso = (
                 stream_state.last_timestamp.isoformat()
                 if stream_state.last_timestamp is not None
                 else None
@@ -288,11 +283,10 @@ def _execute_show_state(
                 {
                     "studyKey": s_key,
                     "streamName": stream_name,
-                    "lastTimestamp": ts_val,
+                    "lastTimestamp": ts_iso,
                     "recordsProcessed": stream_state.records_processed,
-                    "status": status_val,
+                    "status": str(stream_state.last_run_status),
                     "errorMessage": stream_state.error_message,
-                    "metadata": stream_state.metadata,
                 }
             )
 
@@ -307,9 +301,9 @@ def _execute_show_state(
     for entry in entries:
         ts_str = entry["lastTimestamp"] if entry["lastTimestamp"] is not None else "None"
         print(
-            f"{entry['studyKey']} | {entry['streamName']} | {ts_str} | "
-            f"{entry['recordsProcessed']} | {entry['status']} | {entry['errorMessage'] or ''}"
+            f"{entry['studyKey']} | {entry['streamName']} | {ts_str} | {entry['recordsProcessed']} | {entry['status']} | {entry['errorMessage'] or ''}"
         )
+
     if not entries:
         print("No ledger entries found matching filters.")
 
@@ -333,17 +327,17 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     )
     add_output_format(show_parser)
 
-    def _handle_show_state(args: argparse.Namespace) -> None:
+    def _dispatch_show_state(args: argparse.Namespace) -> None:
         study_key = resolve_study_key(show_parser, args, required=False)
         _execute_show_state(
             ledger_path=args.ledger_path,
             study_key=study_key,
             interactive=args.interactive,
-            output_format=resolve_output_format(getattr(args, "output_format", None)),
             no_interactive=getattr(args, "no_interactive", False),
+            output_format=getattr(args, "output_format", None),
         )
 
-    show_parser.set_defaults(func=_handle_show_state)
+    show_parser.set_defaults(func=_dispatch_show_state)
 
     set_parser = state_sub.add_parser(
         "set", help="Manually set a high-water mark timestamp for a study and stream."
@@ -371,7 +365,7 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     )
     add_no_interactive(set_parser)
 
-    def _handle_set_state(args: argparse.Namespace) -> None:
+    def _dispatch_set_state(args: argparse.Namespace) -> None:
         study_key = resolve_study_key(set_parser, args, required=False)
         _execute_set_state(
             study_key=study_key,
@@ -385,7 +379,7 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
             force=getattr(args, "force", False),
         )
 
-    set_parser.set_defaults(func=_handle_set_state)
+    set_parser.set_defaults(func=_dispatch_set_state)
 
     reset_parser = state_sub.add_parser(
         "reset", help="Reset (clear) high-water mark state for a study/stream."
@@ -407,7 +401,7 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     )
     add_no_interactive(reset_parser)
 
-    def _handle_reset_state(args: argparse.Namespace) -> None:
+    def _dispatch_reset_state(args: argparse.Namespace) -> None:
         study_key = resolve_study_key(reset_parser, args, required=False)
         _execute_reset_state(
             study_key=study_key,
@@ -418,7 +412,7 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
             no_interactive=getattr(args, "no_interactive", False),
         )
 
-    reset_parser.set_defaults(func=_handle_reset_state)
+    reset_parser.set_defaults(func=_dispatch_reset_state)
 
 
 def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
@@ -550,31 +544,31 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         no_interactive = getattr(args, "no_interactive", False)
         output_format = resolve_output_format(getattr(args, "output_format", None))
         if args.interactive and output_format == "json":
-            print_error("Error: Cannot combine --interactive and --format json.")
+            print_error("Error: Cannot combine --interactive with --format json.")
             sys.exit(1)
-
         study_key = resolve_study_key(extract_parser, args, required=not args.interactive)
-        if study_key is not None:
-            validate_cli_path_segment(study_key, name="study_key")
         if args.interactive:
             from .wizard import ensure_interactive_stdin
 
             ensure_interactive_stdin(force_non_interactive=no_interactive)
         else:
+            assert study_key is not None
+            validate_cli_path_segment(study_key, name="study_key")
             from imednet.spi.models import Record, Subject, Visit
 
             parse_filter_args(args.record_filter, model=Record)
             parse_filter_args(args.subject_filter, model=Subject)
             parse_filter_args(args.visit_filter, model=Visit)
-        extract_records(
-            study_key=study_key,
-            record_filter=args.record_filter,
-            subject_filter=args.subject_filter,
-            visit_filter=args.visit_filter,
-            interactive=args.interactive,
-            no_interactive=no_interactive,
-            output_format=output_format,
-        )
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            extract_records(
+                study_key=study_key,
+                record_filter=args.record_filter,
+                subject_filter=args.subject_filter,
+                visit_filter=args.visit_filter,
+                interactive=args.interactive,
+                no_interactive=no_interactive,
+                output_format=output_format,
+            )
 
     extract_parser.set_defaults(func=_handle_extract_records)
 
@@ -583,7 +577,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
     add_study_key_args(sync_parser)
     sync_parser.add_argument(
-        "--interval", type=int, default=900, help="Polling interval in seconds."
+        "--interval", type=positive_int, default=900, help="Polling interval in seconds."
     )
     sync_parser.add_argument(
         "--once", action="store_true", help="Run a single sync cycle and exit."
@@ -610,15 +604,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             print(f"Synced {count} cached records for study '{study_key}'.")
             return
 
-        print(
-            f"Starting sync worker for study '{study_key}' "
-            f"(interval={interval}s). Press Ctrl+C to stop."
-        )
         try:
-            with console.status(f"Starting sync worker for study '{study_key}'...") as status:
+            with console.status(
+                f"Starting sync worker for study '{study_key}' (interval={interval}s). Press Ctrl+C to stop.",
+                announce_non_interactive=False,
+            ) as status:
 
                 def on_cycle(cycle: int, count: int) -> None:
-                    status.update(f"Study '{study_key}' - cycle {cycle}: synced {count} records.")
+                    status.step(f"Study '{study_key}' - cycle {cycle}: synced {count} records.")
 
                 def on_sleep_tick(cycle: int, remaining: int) -> None:
                     status.update(
@@ -631,10 +624,11 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     worker.run_forever()
             if worker.state == SyncWorkerState.FAILED:
                 err_detail = f": {worker.last_error}" if worker.last_error is not None else ""
-                print(
-                    f"Sync worker failed after {worker.consecutive_failures}/"
-                    f"{worker.max_consecutive_failures} consecutive failures{err_detail}",
-                    file=sys.stderr,
+                print_error(
+                    redact_cli_secrets(
+                        f"Sync worker failed after {worker.consecutive_failures}/"
+                        f"{worker.max_consecutive_failures} consecutive failures{err_detail}"
+                    )
                 )
                 sys.exit(1)
         except KeyboardInterrupt:
@@ -645,7 +639,9 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     def _handle_sync_worker(args: argparse.Namespace) -> None:
         study_key = resolve_study_key(sync_parser, args, required=True)
         assert study_key is not None
-        sync_worker(study_key=study_key, interval=args.interval, once=args.once)
+        validate_cli_path_segment(study_key, name="study_key")
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            sync_worker(study_key=study_key, interval=args.interval, once=args.once)
 
     sync_parser.set_defaults(func=_handle_sync_worker)
 
@@ -775,15 +771,19 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             from .wizard import ensure_interactive_stdin
 
             ensure_interactive_stdin(force_non_interactive=no_interactive)
-        uat_run(
-            study_key=study_key,
-            interactive=args.interactive,
-            subject_count=args.subject_count,
-            site_name=args.site_name,
-            enabled_form_keys=args.enabled_form_keys,
-            email_notify=args.email_notify,
-            no_interactive=no_interactive,
-        )
+        else:
+            assert study_key is not None
+            validate_cli_path_segment(study_key, name="study_key")
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            uat_run(
+                study_key=study_key,
+                interactive=args.interactive,
+                subject_count=args.subject_count,
+                site_name=args.site_name,
+                enabled_form_keys=args.enabled_form_keys,
+                email_notify=args.email_notify,
+                no_interactive=no_interactive,
+            )
 
     uat_run_parser.set_defaults(func=_handle_uat_run)
 
@@ -801,7 +801,7 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "Flags take precedence over positional arguments."
         ),
     )
-    add_study_key_args(subj_parser, include_positional=False)
+    add_study_key_args(subj_parser)
     subj_parser.add_argument(
         "-k",
         "--subject-key",
@@ -811,7 +811,6 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         action=UniqueStoreAction,
         help="The key identifying the subject.",
     )
-    subj_parser.add_argument("study_key", nargs="?", default=None, help=STUDY_KEY_ARG)
     subj_parser.add_argument(
         "subject_key", nargs="?", default=None, help="The key identifying the subject."
     )
@@ -864,13 +863,21 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         )
 
     def handle_subject_data(args: argparse.Namespace) -> None:
-        study_key, subject_key = resolve_hybrid_study_and_key(subj_parser, args)
-        subject_data(
-            study_key=study_key,
-            subject_key=subject_key,
-            output_format=resolve_output_format(getattr(args, "output_format", None)),
-            no_interactive=getattr(args, "no_interactive", False),
+        study_key, subject_key = resolve_hybrid_study_and_key(
+            subj_parser,
+            args,
+            secondary_dest="subject_key",
+            secondary_flag_dest="subject_key_flag",
         )
+        validate_cli_path_segment(study_key, name="study_key")
+        validate_cli_path_segment(subject_key, name="subject_key")
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            subject_data(
+                study_key=study_key,
+                subject_key=subject_key,
+                output_format=resolve_output_format(getattr(args, "output_format", None)),
+                no_interactive=getattr(args, "no_interactive", False),
+            )
 
     subj_parser.set_defaults(func=handle_subject_data)
 
@@ -889,17 +896,13 @@ def state_app(args: list[str] | None = None) -> None:
     try:
         if getattr(parsed, "no_interactive", False):
             os.environ[NON_INTERACTIVE_ENV] = "1"
-        explicit_format = getattr(parsed, "output_format", None)
-        if explicit_format == "json":
+        if getattr(parsed, "output_format", None) == "json":
             os.environ[OUTPUT_FORMAT_ENV] = "json"
-        elif explicit_format == "table":
-            os.environ.pop(OUTPUT_FORMAT_ENV, None)
-        elif old_output_format is not None and old_output_format.strip().lower() == "json":
-            os.environ[OUTPUT_FORMAT_ENV] = "json"
-        if hasattr(parsed, "func"):
-            parsed.func(parsed)
-        else:
-            parser.print_help()
+        with cli_execution_guard():
+            if hasattr(parsed, "func"):
+                parsed.func(parsed)
+            else:
+                parser.print_help()
     finally:
         if old_non_interactive is not None:
             os.environ[NON_INTERACTIVE_ENV] = old_non_interactive

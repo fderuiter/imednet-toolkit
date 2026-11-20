@@ -219,8 +219,9 @@ def test_tui_plugin_study_and_repeatable_batch_options(monkeypatch):
         )
 
 
-def test_tui_plugin_positional_study_and_conflict(monkeypatch):
-    """Verify tui accepts positional STUDY, --study-key STUDY, and exits 2 on conflicts."""
+def test_tui_positional_study_and_flag_conflict_exits_two(monkeypatch, capsys):
+    """Verify tui accepts positional STUDY and exits 2 on conflicting --study-key."""
+    from imednet import cli as cli_mod
     from imednet_tui.cli import setup_parser
 
     class DummyEntryPoint:
@@ -236,18 +237,18 @@ def test_tui_plugin_positional_study_and_conflict(monkeypatch):
         ),
     )
 
-    parser = get_parser()
-    pos_args = parser.parse_args(["tui", "DEMO-POS", "--force"])
     with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
         patch("imednet_tui.app.run_tui") as mock_run_tui,
-        patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
     ):
-        mock_sdk = MagicMock()
-        mock_get_sdk.return_value = mock_sdk
-        pos_args.func(pos_args)
-        mock_run_tui.assert_called_once_with(mock_sdk, force=True, study_key="DEMO-POS")
+        cli_mod.app(["tui", "STUDY", "--simulation"])
+        assert mock_run_tui.call_count == 1
+        assert mock_run_tui.call_args.kwargs["study_key"] == "STUDY"
+        assert "IMEDNET_SIMULATION_MODE" not in os.environ
 
-    conflict_args = parser.parse_args(["tui", "DEMO-POS", "--study-key", "DEMO-FLAG", "--force"])
     with pytest.raises(SystemExit) as exc_info:
-        conflict_args.func(conflict_args)
+        cli_mod.app(["tui", "STUDY-A", "--study-key", "STUDY-B"])
     assert exc_info.value.code == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "conflicting values provided for study_key" in err

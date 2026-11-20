@@ -7,7 +7,7 @@ from typing import Any
 
 from ...sdk import ImednetSDK
 from ..decorators import validate_cli_path_segment, with_sdk
-from ..utils import display_list, fetching_status
+from ..utils import display_list, fetching_status, simulation_mode_context
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
@@ -143,14 +143,15 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         study_key = resolve_study_key(list_parser, args, required=True)
         assert study_key is not None
         validate_cli_path_segment(study_key, name="study_key")
-        list_users(
-            study_key=study_key,
-            include_inactive=args.include_inactive,
-            output_format=resolve_output_format(args.output_format),
-            sort=args.sort,
-            limit=args.limit,
-            fetch_all=args.fetch_all,
-            no_interactive=getattr(args, "no_interactive", False),
-        )
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            list_users(
+                study_key=study_key,
+                include_inactive=args.include_inactive,
+                output_format=resolve_output_format(args.output_format),
+                sort=args.sort,
+                limit=args.limit,
+                fetch_all=args.fetch_all,
+                no_interactive=getattr(args, "no_interactive", False),
+            )
 
     list_parser.set_defaults(func=_dispatch_list_users)
