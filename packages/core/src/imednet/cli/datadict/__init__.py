@@ -22,7 +22,7 @@ from ...datadict import (
 )
 from ...datadict.models import DataDictionary
 from ...sdk import ImednetSDK
-from ..decorators import redact_cli_secrets, with_sdk
+from ..decorators import redact_cli_secrets, validate_cli_path_segment, with_sdk
 from ..utils import get_sdk, print_error
 
 __all__ = ["get_sdk", "setup_parser"]
@@ -125,6 +125,7 @@ def _from_api(
 
 def _handle_from_api(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-api` command."""
+    validate_cli_path_segment(args.study_key, name="study_key")
     _from_api(
         study_key=args.study_key,
         output=args.output,

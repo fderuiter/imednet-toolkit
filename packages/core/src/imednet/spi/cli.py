@@ -2,7 +2,12 @@
 
 from typing import TYPE_CHECKING, Any
 
-from imednet.cli.decorators import cli_execution_guard, redact_cli_secrets, with_sdk
+from imednet.cli.decorators import (
+    cli_execution_guard,
+    redact_cli_secrets,
+    validate_cli_path_segment,
+    with_sdk,
+)
 from imednet.cli.utils import (
     NO_COLOR_ENV,
     NON_INTERACTIVE_ENV,
@@ -61,6 +66,7 @@ __all__ = [
     "supports_fullscreen_ui",
     "supports_interactive_stdin",
     "supports_live_status",
+    "validate_cli_path_segment",
     "with_sdk",
 ]
 

@@ -10,12 +10,22 @@ from imednet import AsyncImednetSDK, ImednetSDK
 from imednet.config import load_config
 from imednet.errors import BadRequestError, NotFoundError, ValidationError
 from imednet.models.base import ApiResponse
-from imednet.models.records import Record
+from imednet.models.jobs import JobState, JobStatus
+from imednet.models.record_revisions import validate_record_revision_chain
+from imednet.models.records import (
+    CreateNewRecordRequest,
+    Record,
+    RecordData,
+    RegisterSubjectRequest,
+    UpdateScheduledRecordRequest,
+)
+from imednet.models.subjects import SubjectStatus
 from imednet.simulation import (
     SimulationState,
     create_simulation_transport,
     reset_default_simulation_state,
 )
+from imednet.utils.job_poller import AsyncJobPoller, JobFailedError, JobPoller
 
 
 @pytest.fixture(autouse=True)
@@ -668,10 +678,15 @@ def test_simulation_filter_sort_and_state_edge_cases():
     assert len(state.get_codings(None)) >= 2
     assert len(state.get_record_revisions(None)) >= 2
     assert len(state.get_users(None)) >= 3
-    assert state.get_job("STUDY", "AUTO-BATCH")["state"] == "COMPLETED"
+    assert state.get_job("STUDY", "AUTO-BATCH") is None
+    assert state.get_job_results("STUDY", "AUTO-BATCH") is None
 
     transport = create_simulation_transport(state)
     client = httpx.Client(transport=transport, base_url="https://sim.local")
+    assert client.get("/api/v1/edc/studies/STUDY/jobs/AUTO-BATCH").status_code == 404
+    assert client.get("/api/v1/edc/studies/STUDY/jobs/AUTO-BATCH/results").status_code == 404
+    assert client.get("/api/v1/edc/jobs/AUTO-BATCH").status_code == 404
+    assert client.get("/api/v1/edc/jobs/AUTO-BATCH/results").status_code == 404
 
     # Boolean filter, numeric string ordering, timezone offset ISO datetime, and 'and' connector
     assert (
@@ -829,3 +844,374 @@ def test_simulation_filters_sorting_and_subresources():
 
         bool_filtered = list(sdk.records.list(study_key="STUDY", deleted=False))
         assert len(bool_filtered) >= 2
+
+
+@pytest.mark.asyncio
+async def test_simulation_job_lifecycles_open_terminal_and_404():
+    """Verify OPEN/active job transitions via JobPoller, terminal immutability, and 404 lookups."""
+    state = SimulationState()
+    state.jobs["JOB-OPEN"] = {
+        "jobId": "JOB-OPEN",
+        "batchId": "JOB-OPEN",
+        "state": "OPEN",
+        "progress": 0,
+        "totalRecords": 3,
+        "successfulRecords": 0,
+        "failedRecords": 0,
+        "results": {"status": "Open", "total": 3, "success": 0, "failed": 0},
+        "dateCreated": "2026-02-01T10:00:00Z",
+        "dateStarted": None,
+        "dateFinished": None,
+        "_internal_marker": "strip-me",
+    }
+    state.jobs["JOB-ASYNC-OPEN"] = {
+        "jobId": "JOB-ASYNC-OPEN",
+        "batchId": "JOB-ASYNC-OPEN",
+        "state": JobState.OPEN,
+        "progress": 10,
+        "results": [
+            {"recordId": 601, "status": "SUCCESS"},
+            {"recordId": 602, "status": "SUCCESS"},
+        ],
+        "totalRecords": 2,
+        "successfulRecords": 0,
+        "failedRecords": 0,
+        "dateCreated": "2026-02-01T11:00:00",
+        "dateStarted": None,
+        "dateFinished": None,
+    }
+    state.jobs["JOB-LEGACY-POLL"] = {
+        "jobId": "JOB-LEGACY-POLL",
+        "batchId": "JOB-LEGACY-POLL",
+        "state": "QUEUED",
+        "progress": 25,
+        "dateCreated": "not-an-iso-timestamp",
+        "_poll_count": 1,
+    }
+    for terminal in ("FAILED", "CANCELLED", "TIMEOUT"):
+        batch_key = f"JOB-{terminal}"
+        state.jobs[batch_key] = {
+            "jobId": batch_key,
+            "batchId": batch_key,
+            "state": terminal,
+            "progress": 100,
+            "totalRecords": 1,
+            "successfulRecords": 0,
+            "failedRecords": 1,
+            "resultError": f"Simulated {terminal}",
+            "dateCreated": "2026-02-01T12:00:00Z",
+            "dateStarted": "2026-02-01T12:00:01Z",
+            "dateFinished": "2026-02-01T12:00:05Z",
+        }
+
+    transport = create_simulation_transport(state)
+    with patch.dict(os.environ, {}, clear=True):
+        sdk = ImednetSDK(transport=transport, simulation_mode=True)
+
+        # Poll JOB-OPEN through JobPoller: poll 1 -> OPEN, poll 2 -> COMPLETED
+        observed_states: list[JobState | str | None] = []
+        poller = JobPoller(sdk.jobs.get)
+        completed_open = poller.run(
+            "STUDY",
+            "JOB-OPEN",
+            interval=0.001,
+            timeout=5.0,
+            on_progress=lambda event: observed_states.append(event.status.state),
+        )
+        assert observed_states == [JobState.OPEN, JobState.COMPLETED]
+        assert completed_open.state == JobState.COMPLETED
+        assert completed_open.is_successful is True
+        assert completed_open.progress == 100
+        assert completed_open.date_started == "2026-02-01T10:00:00Z"
+        assert completed_open.date_finished == "2026-02-01T10:00:05Z"
+        assert completed_open.successful_records == 3
+        assert completed_open.results == {
+            "status": "Completed",
+            "total": 3,
+            "success": 3,
+            "failed": 0,
+        }
+        assert state._job_poll_counts["JOB-OPEN"] == 2
+        assert all(not k.startswith("_") for j in state.get_jobs("STUDY") for k in j)
+
+        # Legacy _poll_count=1 migrates to _job_poll_counts and completes on next poll
+        completed_legacy = sdk.poll_job("STUDY", "JOB-LEGACY-POLL", interval=0.001, timeout=5.0)
+        assert completed_legacy.state == JobState.COMPLETED
+        assert completed_legacy.date_finished == "2026-01-02T00:00:05Z"
+        assert "_poll_count" not in state.jobs["JOB-LEGACY-POLL"]
+
+        # Terminal FAILED, CANCELLED, and TIMEOUT jobs stay unchanged and raise JobFailedError
+        for terminal in (JobState.FAILED, JobState.CANCELLED, JobState.TIMEOUT):
+            batch_key = f"JOB-{terminal.value}"
+            first_check = sdk.jobs.get("STUDY", batch_key)
+            second_check = sdk.jobs.get("STUDY", batch_key)
+            assert first_check.state == terminal
+            assert second_check.state == terminal
+            assert batch_key not in state._job_poll_counts
+            with pytest.raises(JobFailedError):
+                sdk.jobs.poll("STUDY", batch_key, interval=0.001, timeout=5.0)
+
+        # Missing batch_id raises NotFoundError on sync lookups and pollers
+        with pytest.raises(NotFoundError):
+            sdk.jobs.get("STUDY", "UNKNOWN-BATCH-ID")
+        with pytest.raises(NotFoundError):
+            sdk.get_job("STUDY", "UNKNOWN-BATCH-ID")
+        with pytest.raises(NotFoundError):
+            sdk.poll_job("STUDY", "UNKNOWN-BATCH-ID", interval=0.001, timeout=5.0)
+
+        # Async JobPoller + AsyncImednetSDK parity for OPEN progression and 404
+        async with AsyncImednetSDK(transport=transport, simulation_mode=True) as async_sdk:
+            async_observed: list[JobState | str | None] = []
+            async_poller = AsyncJobPoller(async_sdk.jobs.get)
+            async_done = await async_poller.run(
+                "STUDY",
+                "JOB-ASYNC-OPEN",
+                interval=0.001,
+                timeout=5.0,
+                on_progress=lambda event: async_observed.append(event.status.state),
+            )
+            assert async_observed == [JobState.OPEN, JobState.COMPLETED]
+            assert async_done.state == JobState.COMPLETED
+            assert async_done.is_successful is True
+            assert async_done.successful_records == 2
+            assert async_done.failed_records == 0
+            assert async_done.date_started == "2026-02-01T11:00:00"
+            assert async_done.date_finished == "2026-02-01T11:00:05Z"
+
+            with pytest.raises(NotFoundError):
+                await async_sdk.jobs.get("STUDY", "MISSING-ASYNC-BATCH")
+            with pytest.raises(NotFoundError):
+                await async_sdk.async_poll_job(
+                    "STUDY", "MISSING-ASYNC-BATCH", interval=0.001, timeout=5.0
+                )
+
+
+@pytest.mark.asyncio
+async def test_simulation_strict_mode_validation():
+    """Verify IMEDNET_STRICT_MODE=true passes across jobs, subjects, records, and revisions."""
+    state = SimulationState()
+    state.jobs["JOB-STRICT-OPEN"] = {
+        "jobId": "JOB-STRICT-OPEN",
+        "batchId": "JOB-STRICT-OPEN",
+        "state": "OPEN",
+        "progress": 0,
+        "totalRecords": 1,
+        "successfulRecords": 0,
+        "failedRecords": 0,
+        "results": {"status": "Open", "total": 1, "success": 0, "failed": 0},
+        "dateCreated": "2026-03-01T00:00:00Z",
+        "dateStarted": None,
+        "dateFinished": None,
+        "_private_note": "must-not-leak",
+    }
+    transport = create_simulation_transport(state)
+
+    with patch.dict(os.environ, {"IMEDNET_STRICT_MODE": "true"}, clear=True):
+        sdk = ImednetSDK(transport=transport, simulation_mode=True)
+
+        # Seeded RUNNING -> COMPLETED and OPEN -> COMPLETED validate cleanly in strict mode
+        polled_seeded = sdk.jobs.poll("STUDY", "JOB-1002", interval=0.001, timeout=5.0)
+        assert polled_seeded.state == JobState.COMPLETED
+        assert polled_seeded.date_finished == "2026-01-02T00:00:05Z"
+
+        polled_open = sdk.jobs.poll("STUDY", "JOB-STRICT-OPEN", interval=0.001, timeout=5.0)
+        assert polled_open.state == JobState.COMPLETED
+
+        # Validate all get_jobs() entries against JobStatus in strict mode
+        raw_jobs = state.get_jobs("STUDY")
+        assert len(raw_jobs) >= 3
+        for raw_job in raw_jobs:
+            validated_job = JobStatus.model_validate(raw_job)
+            assert validated_job.batch_id is not None
+
+        # Create/register/update records under strict mode (validates Job + resultUrl polling)
+        job = sdk.records.create(
+            study_key="STUDY",
+            records_data=[
+                RegisterSubjectRequest(
+                    formKey="F_DM",
+                    siteName="SITE",
+                    data=RecordData({"V_AGE": 41, "V_GENDER": "Female"}),
+                ).model_dump(by_alias=True),
+                UpdateScheduledRecordRequest(
+                    subjectKey="SUB1",
+                    formKey="F_VS",
+                    intervalName="Baseline",
+                    data=RecordData({"V_WEIGHT": 70.1}),
+                ).model_dump(by_alias=True),
+            ],
+        )
+        polled_batch = sdk.jobs.poll("STUDY", job.batch_id or "", interval=0.001, timeout=5.0)
+        assert polled_batch.is_successful is True
+        assert polled_batch.successful_records == 2
+
+        subjects = list(sdk.subjects.list(study_key="STUDY"))
+        records = list(sdk.records.list(study_key="STUDY"))
+        revisions = list(sdk.record_revisions.list(study_key="STUDY"))
+        assert len(subjects) == 2
+        assert len(records) == 3
+        assert len(revisions) == 4
+
+        async with AsyncImednetSDK(transport=transport, simulation_mode=True) as async_sdk:
+            async_subjects = [s async for s in async_sdk.subjects.list(study_key="STUDY")]
+            async_records = [r async for r in async_sdk.records.list(study_key="STUDY")]
+            async_revisions = [
+                rev async for rev in async_sdk.record_revisions.list(study_key="STUDY")
+            ]
+            assert len(async_subjects) == 2
+            assert len(async_records) == 3
+            assert len(async_revisions) == 4
+
+
+@pytest.mark.asyncio
+async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
+    """Verify RegisterSubjectRequest, UpdateScheduledRecordRequest, CreateNewRecordRequest, and reset."""
+    state = SimulationState()
+    transport = create_simulation_transport(state)
+
+    with patch.dict(os.environ, {}, clear=True):
+        sdk = ImednetSDK(transport=transport, simulation_mode=True)
+
+        # 1. RegisterSubjectRequest enrolls a new Subject and resolves siteId from self.sites
+        reg_req = RegisterSubjectRequest(
+            formKey="F_DM",
+            siteName="North Site",
+            data=RecordData({"V_AGE": 29, "V_GENDER": "Male"}),
+        )
+        sdk.records.create(
+            study_key="DEMO-STUDY",
+            records_data=[reg_req.model_dump(by_alias=True)],
+        )
+        demo_subjects = list(sdk.subjects.list(study_key="DEMO-STUDY"))
+        assert len(demo_subjects) == 2
+        enrolled = next(s for s in demo_subjects if s.subject_key != "SUBJ-001")
+        assert enrolled.subject_id == 203
+        assert enrolled.site_id == 102
+        assert enrolled.site_name == "North Site"
+        assert enrolled.subject_status == SubjectStatus.ENROLLED
+
+        # 2. UpdateScheduledRecordRequest updates existing scheduled record (602, Baseline) in place
+        before_study_records = list(sdk.records.list(study_key="STUDY"))
+        assert len(before_study_records) == 2
+
+        sched_update = UpdateScheduledRecordRequest(
+            subjectKey="SUB1",
+            formKey="F_VS",
+            intervalName="Baseline",
+            data=RecordData({"V_WEIGHT": 71.5}),
+        )
+        sdk.records.create(
+            study_key="STUDY",
+            records_data=[sched_update.model_dump(by_alias=True)],
+        )
+        after_sched_update = list(sdk.records.list(study_key="STUDY"))
+        assert len(after_sched_update) == 2
+        updated_602 = sdk.records.get(study_key="STUDY", item_id=602)
+        assert updated_602.record_data["V_WEIGHT"] == 71.5
+        assert updated_602.interval_id == 501
+        assert updated_602.visit_id == 401
+
+        # 3. UpdateScheduledRecordRequest targeting a valid Visit/Interval with no existing Record
+        #    inserts a new scheduled Record + initial RecordRevision, then updates it in place
+        followup_req = UpdateScheduledRecordRequest(
+            subjectKey="SUB1",
+            formKey="F_VS",
+            intervalName="Follow-Up Month 1",
+            data=RecordData({"V_WEIGHT": 69.2}),
+        )
+        sdk.records.create(
+            study_key="STUDY",
+            records_data=[followup_req.model_dump(by_alias=True)],
+        )
+        records_with_followup = list(sdk.records.list(study_key="STUDY"))
+        assert len(records_with_followup) == 3
+        followup_rec = next(r for r in records_with_followup if r.interval_id == 502)
+        assert followup_rec.visit_id == 402
+        assert followup_rec.subject_id == 201
+        assert followup_rec.record_data["V_WEIGHT"] == 69.2
+
+        # 4. Async client updates Follow-Up Month 1 in place and appends unscheduled records
+        async with AsyncImednetSDK(transport=transport, simulation_mode=True) as async_sdk:
+            followup_update_2 = UpdateScheduledRecordRequest(
+                subjectKey="SUB1",
+                formKey="F_VS",
+                intervalName="Follow-Up Month 1",
+                data=RecordData({"V_WEIGHT": 70.0}),
+            )
+            unsched_1 = CreateNewRecordRequest(
+                subjectKey="SUB1",
+                formKey="F_VS",
+                data=RecordData({"V_WEIGHT": 73.1}),
+            )
+            unsched_2 = CreateNewRecordRequest(
+                subjectKey="SUB1",
+                formKey="F_VS",
+                data=RecordData({"V_WEIGHT": 74.8}),
+            )
+            await async_sdk.records.create(
+                study_key="STUDY",
+                records_data=[
+                    followup_update_2.model_dump(by_alias=True),
+                    unsched_1.model_dump(by_alias=True),
+                    unsched_2.model_dump(by_alias=True),
+                ],
+            )
+
+            final_records = [r async for r in async_sdk.records.list(study_key="STUDY")]
+            assert len(final_records) == 5
+            unscheduled_records = [r for r in final_records if r.interval_id is None]
+            assert len(unscheduled_records) == 2
+            assert all(r.visit_id is None for r in unscheduled_records)
+            assert [r.record_data["V_WEIGHT"] for r in unscheduled_records] == [73.1, 74.8]
+
+            refreshed_followup = await async_sdk.records.get(
+                study_key="STUDY", item_id=followup_rec.record_id
+            )
+            assert refreshed_followup.record_data["V_WEIGHT"] == 70.0
+
+            # 5. RecordRevision history is study-scoped and monotonically chained per record
+            study_revisions = [
+                rev async for rev in async_sdk.record_revisions.list(study_key="STUDY")
+            ]
+            demo_revisions = [
+                rev async for rev in async_sdk.record_revisions.list(study_key="DEMO-STUDY")
+            ]
+            assert len(demo_revisions) == 1
+            assert demo_revisions[0].subject_id == 203
+            validate_record_revision_chain(study_revisions)
+
+            rev_602 = [r for r in study_revisions if r.record_id == 602]
+            assert [r.record_revision for r in rev_602] == [1, 2]
+            assert [r.data_revision for r in rev_602] == [1, 2]
+
+            rev_followup = [r for r in study_revisions if r.record_id == followup_rec.record_id]
+            assert [r.record_revision for r in rev_followup] == [1, 2]
+
+        # 6. Record status transitions & soft-deleted terminal guard
+        sdk.records.create(
+            study_key="STUDY",
+            records_data=[{"recordId": 602, "recordStatus": "Verified"}],
+        )
+        sdk.records.create(
+            study_key="STUDY",
+            records_data=[{"recordId": 602, "recordStatus": "DELETED"}],
+        )
+        deleted_602 = sdk.records.get(study_key="STUDY", item_id=602)
+        assert deleted_602.is_deleted is True
+        rev_602_after_status = [
+            r for r in sdk.record_revisions.list(study_key="STUDY") if r.record_id == 602
+        ]
+        assert [r.record_revision for r in rev_602_after_status] == [1, 2, 3, 4]
+        assert [r.data_revision for r in rev_602_after_status] == [1, 2, 2, 2]
+
+        with pytest.raises(ValueError, match="Cannot transition soft-deleted Record"):
+            state.create_records("STUDY", [{"recordId": 602, "recordStatus": "Complete"}])
+
+        # 7. reset() restores clean counters, poll counts, and seeded record_revisions
+        _ = state.get_job("STUDY", "JOB-1002")
+        assert state._job_poll_counts
+        state.reset()
+        assert state._job_poll_counts == {}
+        assert state._next_subject_id == 202
+        assert state._next_revision_id == 1202
+        assert len(state.record_revisions) == 2
