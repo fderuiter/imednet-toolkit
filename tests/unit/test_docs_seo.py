@@ -23,6 +23,14 @@ def test_conf_sets_empty_templates_path_and_seo_hooks() -> None:
 
 
 @pytest.mark.unit
+def test_conf_resolves_compatible_mermaid_version() -> None:
+    """Verify docs/conf.py selects Mermaid 10.2.0 for 0.x and >=10.3.0 for sphinxcontrib-mermaid >=1.0."""
+    assert docs_conf._resolve_mermaid_version("0.9.2") == "10.2.0"
+    assert docs_conf._resolve_mermaid_version("2.1.1") == "11.12.1"
+    assert docs_conf._resolve_mermaid_version("invalid") == "10.2.0"
+
+
+@pytest.mark.unit
 def test_check_sphinx_seo_configuration_detects_invalid_configs(tmp_path: Path) -> None:
     """Verify check_sphinx_seo_configuration flags missing hooks, meta tags, or non-empty templates_path."""
     docs_dir = tmp_path / "docs"
