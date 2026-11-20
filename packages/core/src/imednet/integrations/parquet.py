@@ -3,20 +3,36 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 from importlib import import_module
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 from unittest.mock import NonCallableMock
 
+import pandas as pd
+
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
 from .enrichment import resolve_enrichment_pipeline
-from .export import _mask_df, _record_mapper
+from .export import (
+    _build_form_export_contexts,
+    _build_tabular_sink_config,
+    _canonical_record_id,
+    _config_has_streaming_options,
+    _filter_df_excluding_record_ids,
+    _FormExportContext,
+    _is_incremental_config,
+    _mask_df,
+    _record_mapper,
+    _stream_records_across_forms,
+)
 from .parquet_engine import PyArrowDatasetPartitionedStorageEngine
 from .sink_base import (
     BoundedFormBufferRouter,
     extract_record_form_ref,
+    extract_record_id,
     validate_max_buffered_records,
 )
 
@@ -93,7 +109,7 @@ def _write_hive_form_rows(
     study_key: str,
     form_key: str,
     skip_empty: bool,
-) -> None:
+) -> int:
     """Convert parsed form rows into an Arrow table and commit to the Hive partition."""
     df = mapper._build_dataframe(
         rows,
@@ -102,7 +118,7 @@ def _write_hive_form_rows(
         use_labels_as_columns,
     )
     if skip_empty and df.empty:
-        return
+        return 0
     df.columns = df.columns.astype(str)
     df = df.loc[:, ~df.columns.str.lower().duplicated()]
     if mask_phi and not df.empty:
@@ -114,6 +130,55 @@ def _write_hive_form_rows(
         study_key=study_key,
         form_key=form_key,
     )
+    return len(df)
+
+
+def _prune_hive_partition_record_ids(
+    files: list[Path],
+    excluded_ids: set[str],
+    *,
+    pyarrow_module: ModuleType,
+    storage_engine: PyArrowDatasetPartitionedStorageEngine,
+    base_dir: str,
+    study_key: str,
+    form_key: str,
+) -> None:
+    """Prune superseded or voided record IDs from pre-existing Hive partition Parquet files."""
+    if not files or not excluded_ids:
+        return
+    partition_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}"
+    for pf in files:
+        if not pf.exists():
+            continue
+        existing_df = pd.read_parquet(pf, engine="pyarrow")
+        filtered_df = _filter_df_excluding_record_ids(existing_df, excluded_ids)
+        if len(filtered_df) == len(existing_df):
+            continue
+        if not filtered_df.empty:
+            for part_col in ("study_key", "form_key"):
+                if part_col in filtered_df.columns:
+                    filtered_df = filtered_df.drop(columns=[part_col])
+            replacement_table = pyarrow_module.Table.from_pandas(
+                filtered_df.reset_index(drop=True),
+                preserve_index=False,
+            )
+            storage_engine.write_form_table(
+                replacement_table,
+                base_dir=base_dir,
+                study_key=study_key,
+                form_key=form_key,
+            )
+        pf.unlink(missing_ok=True)
+        if pf.parent != partition_dir and pf.parent.exists() and not any(pf.parent.iterdir()):
+            with contextlib.suppress(OSError):
+                pf.parent.rmdir()
+    if partition_dir.exists() and not any(partition_dir.rglob("*.parquet")):
+        for child in sorted(partition_dir.rglob("*"), reverse=True):
+            if child.is_dir():
+                with contextlib.suppress(OSError):
+                    child.rmdir()
+        with contextlib.suppress(OSError):
+            partition_dir.rmdir()
 
 
 def export_to_hive_parquet(
@@ -127,6 +192,7 @@ def export_to_hive_parquet(
     chunk_size: int = 5_000,
     mask_phi: bool = True,
     max_buffered_records: int | None = None,
+    **kwargs: Any,
 ) -> None:
     """Export study records to a Hive-partitioned Parquet directory layout."""
     pyarrow_module = _ensure_pyarrow()
@@ -135,13 +201,128 @@ def export_to_hive_parquet(
     validate_max_buffered_records(max_buffered_records)
     validate_partition_key(study_key)
 
-    mapper = _build_record_mapper(sdk, chunk_size=chunk_size, mask_phi=mask_phi)
+    extra_kwargs = dict(kwargs)
+    extra_kwargs.setdefault("batch_size", chunk_size)
+    if max_buffered_records is not None:
+        extra_kwargs["max_buffered_records"] = max_buffered_records
+    manifest_path = extra_kwargs.pop("manifest_path", None)
+    config = _build_tabular_sink_config(
+        study_key,
+        extra_kwargs,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        manifest_path=manifest_path,
+        mask_phi=mask_phi,
+    )
+    if config.pandas_kwargs:
+        unexpected = next(iter(config.pandas_kwargs))
+        raise TypeError(
+            f"export_to_hive_parquet() got an unexpected keyword argument {unexpected!r}"
+        )
+
+    effective_mask_phi = config.mask_phi
+    mapper = _build_record_mapper(sdk, chunk_size=config.batch_size, mask_phi=effective_mask_phi)
     if hasattr(mapper, "_active_study_key"):
         mapper._active_study_key = study_key
     pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
+
+    if _config_has_streaming_options(config) or config.quality_gate_enabled:
+        contexts, all_variables = _build_form_export_contexts(
+            sdk,
+            study_key,
+            mapper,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            mask_phi=effective_mask_phi,
+            pipeline=pipeline,
+            stream_prefix="hive_parquet",
+            custom_stream_prefix=config.stream_name,
+            validate_form_key_fn=validate_partition_key,
+        )
+        if not contexts:
+            return
+
+        is_incremental = _is_incremental_config(config)
+        preexisting_files: dict[str, list[Path]] = {}
+        superseded_ids: dict[str, set[str]] = {ctx.form_key: set() for ctx in contexts}
+        if is_incremental and config.idempotent:
+            for ctx in contexts:
+                part_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={ctx.form_key}"
+                preexisting_files[ctx.form_key] = (
+                    sorted(part_dir.rglob("*.parquet")) if part_dir.exists() else []
+                )
+
+        def _on_hive_active(ctx: _FormExportContext, batch: list[Any], _batch_idx: int) -> int:
+            parsed_rows, _ = mapper._parse_records(batch, ctx.record_model)
+            rows = (
+                [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
+                if pipeline is not None and not has_native_enrichment
+                else parsed_rows
+            )
+            written = _write_hive_form_rows(
+                rows,
+                mapper=mapper,
+                variable_keys=ctx.variable_keys,
+                label_map=ctx.label_map,
+                use_labels_as_columns=use_labels_as_columns,
+                mask_phi=effective_mask_phi,
+                phi_keys=phi_keys,
+                pyarrow_module=pyarrow_module,
+                storage_engine=storage_engine,
+                base_dir=base_dir,
+                study_key=study_key,
+                form_key=ctx.form_key,
+                skip_empty=True,
+            )
+            if is_incremental and config.idempotent and written > 0:
+                for rec in batch:
+                    cid = _canonical_record_id(extract_record_id(rec))
+                    if cid is not None:
+                        superseded_ids[ctx.form_key].add(cid)
+            return written
+
+        def _on_hive_voided(ctx: _FormExportContext, batch: list[Any], _batch_idx: int) -> int:
+            if not (is_incremental and config.idempotent):
+                return 0
+            cids = [
+                cid
+                for rec in batch
+                if (cid := _canonical_record_id(extract_record_id(rec))) is not None
+            ]
+            superseded_ids[ctx.form_key].update(cids)
+            return len(cids)
+
+        def _reconcile_partitions_before_checkpoints() -> None:
+            if not (is_incremental and config.idempotent):
+                return
+            for ctx in contexts:
+                _prune_hive_partition_record_ids(
+                    preexisting_files.get(ctx.form_key, []),
+                    superseded_ids[ctx.form_key],
+                    pyarrow_module=pyarrow_module,
+                    storage_engine=storage_engine,
+                    base_dir=base_dir,
+                    study_key=study_key,
+                    form_key=ctx.form_key,
+                )
+
+        _stream_records_across_forms(
+            sdk,
+            study_key,
+            config,
+            contexts,
+            all_variables,
+            on_active_batch=_on_hive_active,
+            on_voided_batch=_on_hive_voided,
+            on_before_checkpoints=_reconcile_partitions_before_checkpoints,
+        )
+        return
+
     forms = list(sdk.forms.list(study_key=study_key))
 
     form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}

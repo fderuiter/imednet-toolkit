@@ -323,3 +323,173 @@ def test_export_to_hive_parquet_validates_chunk_and_buffer_bounds(tmp_path: Path
 
     parquet_mod.export_to_hive_parquet(sdk, "STUDY", str(tmp_path), form_whitelist=[])
     sdk.records.list.assert_not_called()
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'unknown_option'"):
+        parquet_mod.export_to_hive_parquet(
+            sdk,
+            "STUDY",
+            str(tmp_path),
+            unknown_option=True,
+        )
+
+
+def test_export_to_hive_parquet_streaming_checkpoints_incremental_upsert_and_voided_reconcile(
+    tmp_path: Path,
+) -> None:
+    """Verify export_to_hive_parquet supports all 8 streaming checkpoint options with single-pass incremental reconciliation."""
+    pytest.importorskip("pyarrow")
+    duckdb_mod = pytest.importorskip("duckdb")
+    from datetime import UTC, datetime
+
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    sdk = MagicMock()
+    forms = [
+        Form(form_id=1, form_key="DEMO", form_name="Demographics"),
+        Form(form_id=2, form_key="VITALS", form_name="Vitals"),
+    ]
+    variables = [
+        Variable(
+            variable_name="AGE", label="Age", variable_type="integer", form_id=1, form_key="DEMO"
+        ),
+        Variable(
+            variable_name="HR",
+            label="Heart Rate",
+            variable_type="integer",
+            form_id=2,
+            form_key="VITALS",
+        ),
+    ]
+    sdk.forms.list.side_effect = lambda **_kw: iter(forms)
+    sdk.variables.list.side_effect = lambda **_kw: iter(variables)
+    sdk.get_variables.side_effect = AssertionError(
+        "quality_gate_enabled should reuse pre-fetched study variables without refresh()"
+    )
+
+    initial_records = [
+        Record(
+            record_id=101,
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=1,
+            form_key="DEMO",
+            date_modified="2026-06-01T00:00:00Z",
+            record_data={"AGE": 40},
+        ),
+        Record(
+            record_id=201,
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=2,
+            form_key="VITALS",
+            date_modified="2026-06-01T00:00:00Z",
+            record_data={"HR": 70},
+        ),
+        Record(
+            record_id=202,
+            subject_key="SUBJ-2",
+            visit_id=1,
+            form_id=2,
+            form_key="VITALS",
+            date_modified="2026-06-02T00:00:00Z",
+            record_data={"HR": 82},
+        ),
+        # Low-readiness record (empty record_data) dropped by quality gate
+        Record(
+            record_id=299,
+            subject_key="SUBJ-9",
+            visit_id=1,
+            form_id=2,
+            form_key="VITALS",
+            date_modified="2026-06-02T00:00:00Z",
+            record_data={},
+        ),
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(initial_records)
+
+    lake_dir = tmp_path / "hive_inc"
+    ledger_path = tmp_path / "hive_ledger.json"
+
+    parquet_mod.export_to_hive_parquet(
+        sdk,
+        "HIVE_INC",
+        str(lake_dir),
+        incremental=True,
+        stream_name="lake",
+        ledger_path=str(ledger_path),
+        modified_since="2026-05-01T00:00:00Z",
+        record_filter={"subjectKey": "SUBJ-1,SUBJ-2,SUBJ-9"},
+        record_data_filter=None,
+        include_deleted=False,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=50.0,
+        mask_phi=False,
+    )
+
+    provider = FileStateProvider(str(ledger_path))
+    assert provider.get_last_timestamp("HIVE_INC", "lake_DEMO") == datetime(
+        2026, 6, 1, 0, 0, tzinfo=UTC
+    )
+    assert provider.get_last_timestamp("HIVE_INC", "lake_VITALS") == datetime(
+        2026, 6, 2, 0, 0, tzinfo=UTC
+    )
+
+    # Run 2: update DEMO record 101 and void VITALS record 201 in a single pass
+    delta_records = [
+        Record(
+            record_id=101,
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=1,
+            form_key="DEMO",
+            date_modified="2026-06-05T00:00:00Z",
+            record_data={"AGE": 41},
+        ),
+        Record(
+            record_id=201,
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=2,
+            form_key="VITALS",
+            deleted=True,
+            date_modified="2026-06-06T00:00:00Z",
+            record_data={},
+        ),
+    ]
+    sdk.records.list.reset_mock()
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_records)
+
+    parquet_mod.export_to_hive_parquet(
+        sdk,
+        "HIVE_INC",
+        str(lake_dir),
+        incremental=True,
+        stream_name="lake",
+        state_provider=provider,
+        include_deleted=False,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=50.0,
+        mask_phi=False,
+    )
+
+    assert sdk.records.list.call_count == 1
+    assert provider.get_last_timestamp("HIVE_INC", "lake_DEMO") == datetime(
+        2026, 6, 5, 0, 0, tzinfo=UTC
+    )
+    assert provider.get_last_timestamp("HIVE_INC", "lake_VITALS") == datetime(
+        2026, 6, 6, 0, 0, tzinfo=UTC
+    )
+
+    query = parquet_mod.hive_parquet_query(str(lake_dir))
+    with duckdb_mod.connect(":memory:") as dconn:
+        rows = dconn.execute(
+            f'SELECT "form_key", "recordId", "AGE", "HR" FROM ({query}) ORDER BY "form_key", "recordId"'
+        ).fetchall()
+
+    assert rows == [
+        ("DEMO", 101, 41, None),
+        ("VITALS", 202, None, 82),
+    ]

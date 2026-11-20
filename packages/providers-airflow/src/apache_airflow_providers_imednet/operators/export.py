@@ -366,6 +366,8 @@ class ImednetExportOperator(BaseOperator):
         stream_opts = self._collect_streaming_options(runtime_kwargs)
         if not config.mask_phi and "mask_phi" not in stream_opts:
             stream_opts["mask_phi"] = False
+        if config.max_buffered_records is not None:
+            stream_opts["max_buffered_records"] = config.max_buffered_records
 
         if dest == "snowflake":
             sink_cls = getattr(sinks, "SnowflakeExportSink", None)
@@ -506,6 +508,7 @@ class ImednetExportOperator(BaseOperator):
         config = sink_base.SinkConfig(
             study_key=self.study_key,
             batch_size=int(runtime_kwargs.get("batch_size", self.batch_size)),
+            max_buffered_records=runtime_kwargs.get("max_buffered_records"),
             max_retries=int(runtime_kwargs.get("max_retries", self.max_retries)),
             retry_backoff=float(runtime_kwargs.get("retry_backoff", 1.0)),
             idempotent=bool(runtime_kwargs.get("idempotent", self.idempotent)),

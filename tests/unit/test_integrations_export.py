@@ -1951,6 +1951,8 @@ def test_incremental_sql_by_form_watermarks_reconcile_deleted_and_post_flush_che
     assert provider.get_last_timestamp("INC_STUDY", "sql_DEMO") == ts_june_5
     assert provider.get_last_timestamp("INC_STUDY", "sql_VITALS") == ts_june_2
     assert provider.get_last_timestamp("INC_STUDY", "sql_UNCHANGED") == ts_june_5
+    for s_name in ("sql_DEMO", "sql_VITALS", "sql_UNCHANGED"):
+        assert str(provider.get_last_status("INC_STUDY", s_name)).lower().endswith("failed")
 
     # 2. Restore flush and re-run -> single /records call, deleted row reconciled, checkpoints committed post-flush
     monkeypatch.setattr(export_mod.TabularSQLSink, "flush", orig_flush)
@@ -1963,9 +1965,10 @@ def test_incremental_sql_by_form_watermarks_reconcile_deleted_and_post_flush_che
 
     @contextlib.contextmanager
     def _spy_tx(study_key: str, stream_name: str, fallback_timestamp: Any = None):
-        flush_order.append(f"commit:{stream_name}")
+        flush_order.append(f"enter:{stream_name}")
         with orig_tx(study_key, stream_name, fallback_timestamp=fallback_timestamp) as tx:
             yield tx
+        flush_order.append(f"commit:{stream_name}")
 
     monkeypatch.setattr(export_mod.TabularSQLSink, "flush", _spy_flush)
     monkeypatch.setattr(provider, "transaction", _spy_tx)
@@ -1981,8 +1984,9 @@ def test_incremental_sql_by_form_watermarks_reconcile_deleted_and_post_flush_che
     )
 
     assert sdk.records.list.call_count == 1
-    assert set(flush_order[:3]) == {"flush:DEMO", "flush:VITALS", "flush:UNCHANGED"}
-    assert flush_order[3:] == ["commit:sql_DEMO", "commit:sql_VITALS", "commit:sql_UNCHANGED"]
+    assert flush_order[:3] == ["enter:sql_DEMO", "enter:sql_VITALS", "enter:sql_UNCHANGED"]
+    assert set(flush_order[3:6]) == {"flush:DEMO", "flush:VITALS", "flush:UNCHANGED"}
+    assert set(flush_order[6:]) == {"commit:sql_DEMO", "commit:sql_VITALS", "commit:sql_UNCHANGED"}
 
     with sqlite3.connect(sql_path) as conn:
         demo_rows = conn.execute(
@@ -2152,3 +2156,102 @@ def test_by_form_exports_bound_memory_and_preserve_phi_masking(
         )
     assert masked_vals == ["***MASKED***", "***MASKED***", "***MASKED***"]
     assert unmasked_vals == ["Alice 1", "Alice 11", "Alice 6"]
+
+
+def test_by_form_exports_recover_stale_running_lease_without_premature_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify stale RUNNING leases are recovered inside transaction without premature SUCCESS on failure."""
+    import json
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [SimpleNamespace(form_id=1, form_key="DEMO")]
+    vars_list = [
+        Variable(
+            variable_name="AGE", label="Age", variable_type="integer", form_id=1, form_key="DEMO"
+        )
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.return_value = vars_list
+
+    ledger_file = tmp_path / "stale_lease_ledger.json"
+    ledger_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "studies": {
+                    "STALE_STUDY": {
+                        "streams": {
+                            "sql_DEMO": {
+                                "last_timestamp": "2026-06-01T00:00:00+00:00",
+                                "status": "RUNNING",
+                                "updated_at": "2020-01-01T00:00:00+00:00",
+                                "records_processed": 5,
+                                "owner_pid": 99999999,
+                                "owner_host": "crashed-worker",
+                                "lease_expires_at": "2020-01-01T00:05:00+00:00",
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = FileStateProvider(str(ledger_file))
+
+    delta_records = [
+        Record(
+            record_id=10,
+            subject_key="S1",
+            visit_id=1,
+            form_id=1,
+            form_key="DEMO",
+            date_modified="2026-06-05T00:00:00Z",
+            record_data={"AGE": 33},
+        )
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_records)
+
+    orig_flush = export_mod.TabularSQLSink.flush
+
+    def _boom_flush(_self_sink: export_mod.TabularSQLSink) -> None:
+        raise RuntimeError("mid-flush failure after stale lease recovery")
+
+    monkeypatch.setattr(export_mod.TabularSQLSink, "flush", _boom_flush)
+    sql_path = tmp_path / "stale.sqlite"
+    with pytest.raises(RuntimeError, match="mid-flush failure after stale lease recovery"):
+        export_mod.export_to_sql_by_form(
+            sdk,
+            "STALE_STUDY",
+            f"sqlite:///{sql_path}",
+            incremental=True,
+            state_provider=provider,
+            mask_phi=False,
+        )
+
+    assert str(provider.get_last_status("STALE_STUDY", "sql_DEMO")).lower().endswith("failed")
+    assert provider.get_last_timestamp("STALE_STUDY", "sql_DEMO") == datetime(
+        2026, 6, 1, 0, 0, tzinfo=UTC
+    )
+
+    monkeypatch.setattr(export_mod.TabularSQLSink, "flush", orig_flush)
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_records)
+    export_mod.export_to_sql_by_form(
+        sdk,
+        "STALE_STUDY",
+        f"sqlite:///{sql_path}",
+        incremental=True,
+        state_provider=provider,
+        mask_phi=False,
+    )
+    assert str(provider.get_last_status("STALE_STUDY", "sql_DEMO")).lower().endswith("success")
+    assert provider.get_last_timestamp("STALE_STUDY", "sql_DEMO") == datetime(
+        2026, 6, 5, 0, 0, tzinfo=UTC
+    )

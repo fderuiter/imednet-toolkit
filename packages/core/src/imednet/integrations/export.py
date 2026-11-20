@@ -3263,6 +3263,7 @@ class _FormExportContext:
     total_reconciled: int = 0
     max_ts: datetime | None = None
     sink: Any = None
+    tx: dict[str, Any] | None = None
 
 
 def _build_form_export_contexts(
@@ -3368,147 +3369,141 @@ def _stream_records_across_forms(
             else get_state_provider(ledger_path=opts["ledger_path"])
         )
 
-    for ctx in contexts:
-        if provider is not None:
-            get_status = getattr(provider, "get_last_status", None)
-            if callable(get_status):
-                cur_status = get_status(study_key, ctx.stream_name)
-                if cur_status is not None and str(cur_status).lower().endswith("running"):
-                    with provider.transaction(
+    with contextlib.ExitStack() as tx_stack:
+        for ctx in contexts:
+            if provider is not None:
+                ctx.tx = tx_stack.enter_context(
+                    provider.transaction(
                         study_key,
                         ctx.stream_name,
                         fallback_timestamp=opts["modified_since"],
-                    ):
-                        pass
-            get_last_ts = getattr(provider, "get_last_timestamp", None)
-            raw_last = get_last_ts(study_key, ctx.stream_name) if callable(get_last_ts) else None
-            ctx.watermark = (
-                normalize_watermark_datetime(raw_last)
-                if isinstance(raw_last, (datetime, str))
-                else None
-            ) or opts["modified_since"]
+                    )
+                )
+                raw_last = ctx.tx.get("last_timestamp")
+                ctx.watermark = (
+                    normalize_watermark_datetime(raw_last)
+                    if isinstance(raw_last, (datetime, str))
+                    else None
+                ) or opts["modified_since"]
+            else:
+                ctx.watermark = opts["modified_since"]
+
+        if all(ctx.watermark is not None for ctx in contexts):
+            study_watermark: datetime | None = min(
+                cast(datetime, ctx.watermark) for ctx in contexts
+            )
         else:
-            ctx.watermark = opts["modified_since"]
+            study_watermark = None
 
-    if all(ctx.watermark is not None for ctx in contexts):
-        study_watermark: datetime | None = min(cast(datetime, ctx.watermark) for ctx in contexts)
-    else:
-        study_watermark = None
+        any_reconcile_voided = any(
+            (not opts["include_deleted"])
+            and opts["idempotent"]
+            and (use_checkpoint or ctx.watermark is not None)
+            for ctx in contexts
+        )
+        exclude_deleted_upstream = (not opts["include_deleted"]) and (not any_reconcile_voided)
 
-    any_reconcile_voided = any(
-        (not opts["include_deleted"])
-        and opts["idempotent"]
-        and (use_checkpoint or ctx.watermark is not None)
-        for ctx in contexts
-    )
-    exclude_deleted_upstream = (not opts["include_deleted"]) and (not any_reconcile_voided)
+        by_form_id = {ctx.form_id: ctx for ctx in contexts}
+        by_form_key = {ctx.form_key: ctx for ctx in contexts}
 
-    by_form_id = {ctx.form_id: ctx for ctx in contexts}
-    by_form_key = {ctx.form_key: ctx for ctx in contexts}
+        def _resolve_ctx(record: Any) -> _FormExportContext | None:
+            fid, fk = extract_record_form_ref(record)
+            if fid is not None and fid in by_form_id:
+                return by_form_id[fid]
+            if fk is not None and fk in by_form_key:
+                return by_form_key[fk]
+            return None
 
-    def _resolve_ctx(record: Any) -> _FormExportContext | None:
-        fid, fk = extract_record_form_ref(record)
-        if fid is not None and fid in by_form_id:
-            return by_form_id[fid]
-        if fk is not None and fk in by_form_key:
-            return by_form_key[fk]
-        return None
+        effective_form_whitelist = (
+            [ctx.form_id for ctx in contexts] if config.form_whitelist is not None else None
+        )
+        merged_filter = _merge_form_whitelist_into_filter(
+            opts["record_filter"], effective_form_whitelist
+        )
+        raw_records = iter_filtered_sdk_records(
+            sdk,
+            study_key,
+            watermark=study_watermark,
+            record_filter=merged_filter,
+            record_data_filter=opts["record_data_filter"],
+            exclude_deleted_upstream=exclude_deleted_upstream,
+        )
 
-    effective_form_whitelist = (
-        [ctx.form_id for ctx in contexts] if config.form_whitelist is not None else None
-    )
-    merged_filter = _merge_form_whitelist_into_filter(
-        opts["record_filter"], effective_form_whitelist
-    )
-    raw_records = iter_filtered_sdk_records(
-        sdk,
-        study_key,
-        watermark=study_watermark,
-        record_filter=merged_filter,
-        record_data_filter=opts["record_data_filter"],
-        exclude_deleted_upstream=exclude_deleted_upstream,
-    )
+        def _handle_active_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
+            ctx = by_form_key[fk]
+            written = on_active_batch(ctx, batch, batch_idx)
+            ctx.total_written += written
+            if written > 0:
+                ctx.wrote_any = True
 
-    def _handle_active_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
-        ctx = by_form_key[fk]
-        written = on_active_batch(ctx, batch, batch_idx)
-        ctx.total_written += written
-        if written > 0:
-            ctx.wrote_any = True
+        def _handle_voided_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
+            if on_voided_batch is None:
+                return
+            ctx = by_form_key[fk]
+            ctx.total_reconciled += on_voided_batch(ctx, batch, batch_idx)
 
-    def _handle_voided_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
-        if on_voided_batch is None:
-            return
-        ctx = by_form_key[fk]
-        ctx.total_reconciled += on_voided_batch(ctx, batch, batch_idx)
+        router = BoundedFormBufferRouter(
+            [ctx.form_key for ctx in contexts],
+            batch_size=opts["batch_size"],
+            max_buffered_records=opts["max_buffered_records"],
+            on_flush_active=_handle_active_flush,
+            on_flush_voided=_handle_voided_flush if any_reconcile_voided else None,
+        )
 
-    router = BoundedFormBufferRouter(
-        [ctx.form_key for ctx in contexts],
-        batch_size=opts["batch_size"],
-        max_buffered_records=opts["max_buffered_records"],
-        on_flush_active=_handle_active_flush,
-        on_flush_voided=_handle_voided_flush if any_reconcile_voided else None,
-    )
-
-    def _observe_and_route() -> Iterator[Any]:
-        for rec in raw_records:
-            ctx = _resolve_ctx(rec)
-            if ctx is None:
-                continue
-            rec_ts = extract_record_timestamp(rec)
-            if ctx.watermark is not None:
-                if rec_ts is not None:
-                    if rec_ts < ctx.watermark:
+        def _observe_and_route() -> Iterator[Any]:
+            for rec in raw_records:
+                ctx = _resolve_ctx(rec)
+                if ctx is None:
+                    continue
+                rec_ts = extract_record_timestamp(rec)
+                if ctx.watermark is not None:
+                    if rec_ts is not None:
+                        if rec_ts < ctx.watermark:
+                            continue
+                    elif study_watermark is None or study_watermark < ctx.watermark:
                         continue
-                elif study_watermark is None or study_watermark < ctx.watermark:
+
+                if rec_ts is not None and (ctx.max_ts is None or rec_ts > ctx.max_ts):
+                    ctx.max_ts = rec_ts
+
+                if not opts["include_deleted"] and is_record_deleted(rec):
+                    if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
+                        router.add_voided(ctx.form_key, rec)
                     continue
 
-            if rec_ts is not None and (ctx.max_ts is None or rec_ts > ctx.max_ts):
-                ctx.max_ts = rec_ts
+                yield rec
 
-            if not opts["include_deleted"] and is_record_deleted(rec):
-                if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
-                    router.add_voided(ctx.form_key, rec)
-                continue
-
-            yield rec
-
-    if apply_quality_gate is _DEFAULT_APPLY_QUALITY_GATE:
-        gated_records: Iterable[Any] = apply_quality_gate(
-            sdk,
-            study_key,
-            _observe_and_route(),
-            config,
-            variables=all_variables,
-            forms=[ctx.form for ctx in contexts],
-        )
-    else:
-        gated_records = apply_quality_gate(
-            sdk,
-            study_key,
-            _observe_and_route(),
-            config,
-        )
-
-    for rec in gated_records:
-        matched_ctx = _resolve_ctx(rec)
-        if matched_ctx is not None:
-            router.add_active(matched_ctx.form_key, rec)
-    router.flush_all()
-
-    if on_before_checkpoints is not None:
-        on_before_checkpoints()
-
-    if provider is not None:
-        for ctx in contexts:
-            with provider.transaction(
+        if apply_quality_gate is _DEFAULT_APPLY_QUALITY_GATE:
+            gated_records: Iterable[Any] = apply_quality_gate(
+                sdk,
                 study_key,
-                ctx.stream_name,
-                fallback_timestamp=opts["modified_since"],
-            ) as tx:
-                tx["records_processed"] = ctx.total_written + ctx.total_reconciled
+                _observe_and_route(),
+                config,
+                variables=all_variables,
+                forms=[ctx.form for ctx in contexts],
+            )
+        else:
+            gated_records = apply_quality_gate(
+                sdk,
+                study_key,
+                _observe_and_route(),
+                config,
+            )
+
+        for rec in gated_records:
+            matched_ctx = _resolve_ctx(rec)
+            if matched_ctx is not None:
+                router.add_active(matched_ctx.form_key, rec)
+        router.flush_all()
+
+        if on_before_checkpoints is not None:
+            on_before_checkpoints()
+
+        for ctx in contexts:
+            if ctx.tx is not None:
+                ctx.tx["records_processed"] = ctx.total_written + ctx.total_reconciled
                 if ctx.max_ts is not None:
-                    tx["new_timestamp"] = ctx.max_ts
+                    ctx.tx["new_timestamp"] = ctx.max_ts
 
 
 def _make_form_sink_config(
