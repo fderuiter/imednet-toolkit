@@ -25,10 +25,26 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_airflow_provider_modules():
     """Unload provider modules upon module teardown to ensure other test suites stay hermetic."""
+    import logging
+
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+                sys.modules.pop(mod, None)
+
     yield
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
             sys.modules.pop(mod, None)
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
 
 
 @pytest.fixture
@@ -438,3 +454,35 @@ def test_real_airflow_hook_test_connection_and_provider_discovery(monkeypatch, r
     assert ok_fail is False
     assert "SUPER_SECRET_API_KEY" not in err_msg
     assert "SUPER_SECRET_SEC_KEY" not in err_msg
+
+
+def test_real_airflow_providers_manager_and_task_runtime_discover_imednet(real_airflow):
+    """Verify ProvidersManager and ProvidersManagerTaskRuntime discover apache-airflow-providers-imednet and ImednetHook."""
+    from airflow.providers_manager import ProvidersManager
+    from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
+
+    hook_cls = real_airflow["ImednetHook"]
+
+    pm = ProvidersManager()
+    pm._cleanup()
+    providers = pm.providers
+    assert "apache-airflow-providers-imednet" in providers
+    assert providers["apache-airflow-providers-imednet"].data["name"] == "iMednet"
+
+    hooks = pm.hooks
+    assert "imednet" in hooks
+    assert hooks["imednet"] is not None
+    assert hooks["imednet"].connection_type == "imednet"
+    assert hooks["imednet"].hook_name == "iMednet"
+    assert hooks["imednet"].hook_class_name == "airflow.providers.imednet.hooks.ImednetHook"
+
+    from airflow.providers.imednet.hooks import ImednetHook as AliasedImednetHook
+
+    assert AliasedImednetHook is hook_cls
+
+    runtime_pm = ProvidersManagerTaskRuntime()
+    runtime_pm._cleanup()
+    runtime_hooks = runtime_pm.hooks
+    assert "imednet" in runtime_hooks
+    assert runtime_hooks["imednet"] is not None
+    assert runtime_hooks["imednet"].connection_type == "imednet"

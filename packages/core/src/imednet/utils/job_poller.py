@@ -23,6 +23,7 @@ from imednet.models.jobs import (
     validate_job_transition,
 )
 from imednet.utils.secrets import redact_sensitive_payload
+from imednet.utils.url import validate_path_segment
 
 logger = logging.getLogger(__name__)
 _ORIGINAL_TIME_SLEEP = time.sleep
@@ -479,6 +480,8 @@ class JobPoller(BaseJobPoller):
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Synchronously poll a job until completion."""
+        validate_path_segment(study_key, name="study_key")
+        validate_path_segment(batch_id, name="batch_id")
         return self._run_with_stop(
             study_key,
             batch_id,
@@ -499,6 +502,8 @@ class JobPoller(BaseJobPoller):
         stop_event: threading.Event | None = None,
     ) -> JobStatus:
         """Synchronously poll a job until completion or cooperative stop_event signal."""
+        validate_path_segment(study_key, name="study_key")
+        validate_path_segment(batch_id, name="batch_id")
         start = time.monotonic()
         poll_number = 0
         last_status: JobStatus | None = None
@@ -596,6 +601,9 @@ class JobPoller(BaseJobPoller):
         """
         results: dict[str, JobStatus] = {}
         failures: dict[str, Exception] = {}
+        validate_path_segment(study_key, name="study_key")
+        for batch_id in batch_ids:
+            validate_path_segment(batch_id, name="batch_id")
         lock = threading.Lock()
         stop_event = threading.Event()
         first_failure: Exception | None = None
@@ -687,6 +695,8 @@ class AsyncJobPoller(BaseJobPoller):
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Asynchronously poll a job until completion."""
+        validate_path_segment(study_key, name="study_key")
+        validate_path_segment(batch_id, name="batch_id")
         start = time.monotonic()
         poll_number = 0
         last_status: JobStatus | None = None
@@ -783,6 +793,9 @@ class AsyncJobPoller(BaseJobPoller):
         start = time.monotonic()
         results: dict[str, JobStatus] = {}
         failures: dict[str, Exception] = {}
+        validate_path_segment(study_key, name="study_key")
+        for batch_id in batch_ids:
+            validate_path_segment(batch_id, name="batch_id")
 
         if not batch_ids:
             return JobPollSummary(

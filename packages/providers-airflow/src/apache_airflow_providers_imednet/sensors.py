@@ -71,7 +71,11 @@ class ImednetJobSensor(BaseSensorOperator):
             evaluate_job_state,
             fetch_terminal_job_result,
             resolve_sdk_result_fetcher,
+            validate_path_segment,
         )
+
+        validate_path_segment(self.study_key, name="study_key")
+        validate_path_segment(self.batch_id, name="batch_id")
 
         with closing(self._get_sdk()) as sdk:
             job: JobStatus = sdk.jobs.get(self.study_key, self.batch_id)

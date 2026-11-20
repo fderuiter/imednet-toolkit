@@ -50,12 +50,14 @@ class ImednetHook(BaseHook):
     conn_name_attr = "imednet_conn_id"
     default_conn_name = "imednet_default"
     conn_type = "imednet"
-    hook_name = "iMedNet"
+    hook_name = "iMednet"
 
     def __init__(self, imednet_conn_id: str = default_conn_name) -> None:
         """Initialize the Imednet hook."""
         super().__init__()
         self.imednet_conn_id = imednet_conn_id
+        if self.conn_name_attr != "imednet_conn_id":
+            setattr(self, self.conn_name_attr, imednet_conn_id)
 
     @staticmethod
     def _string_or_none(value: object) -> str | None:
@@ -333,6 +335,23 @@ class ImednetHook(BaseHook):
             table = cls._string_or_none(extras.get("table"))
             if table:
                 resolved["table"] = table
+            return resolved
+
+        if dest == "duckdb":
+            resolved = {}
+            db_path = (
+                cls._string_or_none(extras.get("db_path"))
+                or cls._string_or_none(extras.get("path"))
+                or cls._string_or_none(getattr(conn, "host", None))
+                or cls._string_or_none(getattr(conn, "schema", None))
+            )
+            if db_path:
+                resolved["db_path"] = db_path
+            table_name = cls._string_or_none(extras.get("table_name")) or cls._string_or_none(
+                extras.get("table")
+            )
+            if table_name:
+                resolved["table_name"] = table_name
             return resolved
 
         return {}

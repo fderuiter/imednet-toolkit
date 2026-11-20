@@ -9,7 +9,7 @@ from typing import Any
 from ...endpoints.records import RecordsEndpoint
 from ...models.records import Record
 from ...sdk import ImednetSDK
-from ..decorators import with_sdk
+from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status, print_error
 from ..utils.args import (
     add_list_query_args,
@@ -115,6 +115,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             )
 
     def _dispatch_list_records(args: argparse.Namespace) -> None:
+        validate_cli_path_segment(args.study_key, name="study_key")
         no_interactive = getattr(args, "no_interactive", False)
         _validate_records_output(args.output, args.output_format)
         prepared = prepare_list_query(

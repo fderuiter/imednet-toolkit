@@ -209,6 +209,7 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
 
         self._circuit_breaker = CircuitBreaker()
         self._executor = self._create_executor(self._client, self.retry_config)
+        self._executor.circuit_breaker = self._circuit_breaker
 
     def _create_client(self, auth: AuthStrategy) -> ClientT:
         """Create the underlying httpx client with origin-scoped authentication."""

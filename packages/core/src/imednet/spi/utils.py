@@ -66,7 +66,7 @@ from imednet.utils.security import (
     validate_partition_key,
 )
 from imednet.utils.serialization import flatten
-from imednet.utils.url import redact_sensitive_text
+from imednet.utils.url import redact_sensitive_text, validate_path_segment
 from imednet.utils.validators import is_boolean_token, is_missing_value, parse_bool
 
 __all__ = [
@@ -124,4 +124,5 @@ __all__ = [
     "sqlite_connection",
     "validate_filter_key",
     "validate_partition_key",
+    "validate_path_segment",
 ]

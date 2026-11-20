@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import sys
 import textwrap
@@ -12,6 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+if "airflow" not in sys.modules or getattr(sys.modules.get("airflow"), "__path__", None) is None:
+    for _mod in list(sys.modules):
+        if _mod == "airflow" or _mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+            sys.modules.pop(_mod, None)
 
 pytest.importorskip("airflow")
 
@@ -27,8 +33,12 @@ def _load_dag_from_file(dag_file: Path, dag_id: str) -> Any:
 
 
 @pytest.fixture
-def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Initialize an isolated Apache Airflow 3 SQLite metadata DB and DAG bundle directory."""
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
     dags_dir = tmp_path / "dags"
     dags_dir.mkdir(parents=True, exist_ok=True)
     db_path = tmp_path / "airflow.db"
@@ -43,6 +53,12 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     from airflow.configuration import conf
     from airflow.dag_processing.bundles.manager import DagBundlesManager
     from airflow.utils import db
+
+    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_dags = conf.get("core", "dags_folder", fallback=None)
+    prev_examples = conf.get("core", "load_examples", fallback=None)
+    prev_bundles = conf.get("dag_processor", "dag_bundle_config_list", fallback=None)
+    prev_settings_conn = settings.SQL_ALCHEMY_CONN
 
     conf.set("core", "dags_folder", str(dags_dir))
     conf.set("core", "load_examples", "False")
@@ -62,6 +78,7 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     )
     monkeypatch.setattr(settings, "DAGS_FOLDER", str(dags_dir))
     monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", f"sqlite:///{db_path}")
+    settings.dispose_orm()
     settings.configure_orm()
     db.initdb()
     DagBundlesManager().sync_bundles_to_db()
@@ -72,6 +89,18 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
         if env_key.startswith("AIRFLOW_CTX_"):
             os.environ.pop(env_key, None)
     settings.dispose_orm()
+    settings.SQL_ALCHEMY_CONN = prev_settings_conn
+    if prev_conn is not None:
+        conf.set("database", "sql_alchemy_conn", prev_conn)
+    if prev_dags is not None:
+        conf.set("core", "dags_folder", prev_dags)
+    if prev_examples is not None:
+        conf.set("core", "load_examples", prev_examples)
+    if prev_bundles is not None:
+        conf.set("dag_processor", "dag_bundle_config_list", prev_bundles)
+    settings.configure_orm()
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
 
 
 def test_airflow_state_provider_real_variable_lifecycle_and_runtime_task(

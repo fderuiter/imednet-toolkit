@@ -9,6 +9,9 @@ from __future__ import annotations
 from importlib import import_module
 
 from . import export
+from .get_provider_info import _ensure_airflow_provider_finder, get_provider_info
+
+_ensure_airflow_provider_finder()
 
 try:  # pragma: no cover - optional Airflow dependencies may be missing
     from .hooks import ImednetHook
@@ -32,4 +35,5 @@ __all__ = [
     "ImednetHook",
     "ImednetJobSensor",
     "export",
+    "get_provider_info",
 ]

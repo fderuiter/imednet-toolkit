@@ -8,15 +8,30 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "imednet>=1.0.0,<2.0.0",
+    "imednet-workflows>=1.0.0,<2.0.0",
     "apache-airflow>=3.2.0,<4.0.0"
 ]
+
+[project.optional-dependencies]
+duckdb = ["duckdb>=1.1.0,<2.0.0"]
+export = [
+    "pandas>=2.2.3,<3.0.0",
+    "sqlalchemy>=2.0,<3.0",
+    "pyarrow>=14.0.1",
+    "openpyxl>=3.1,<4.0",
+    "duckdb>=1.1.0,<2.0.0",
+    "imednet-workflows"
+]
+mongodb = ["imednet-plugins-sinks", "pymongo>=4.0,<5.0"]
+neo4j = ["imednet-plugins-sinks", "neo4j>=6.2.0,<7.0.0"]
+snowflake = ["imednet-plugins-sinks", "snowflake-connector-python>=3.0.0", "pyarrow>=14.0.1"]
+
+[project.entry-points."apache_airflow_provider"]
+provider_info = "apache_airflow_providers_imednet:get_provider_info"
 
 [project.urls]
 repository = "https://github.com/fderuiter/imednet-toolkit"
 documentation = "https://fderuiter.github.io/imednet-toolkit/"
-
-[project.entry-points."apache_airflow_provider"]
-provider_info = "apache_airflow_providers_imednet.get_provider_info:get_provider_info"
 
 [build-system]
 requires = ["hatchling"]
