@@ -16,6 +16,7 @@ study_key = os.getenv("IMEDNET_STUDY_KEY") or "STUDY"
 site_name = os.getenv("IMEDNET_SITE_NAME") or "SITE"
 
 with ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url) as sdk:
+    assert sdk.workflows is not None
     workflow = sdk.workflows.query_management
     queries = workflow.get_queries_by_site(study_key=study_key, site_key=site_name)
     print(f"Queries for site {site_name}: {len(queries)}")

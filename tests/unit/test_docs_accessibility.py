@@ -968,6 +968,22 @@ def test_thebe_cascade_focus_and_forced_colors_css() -> None:
     ):
         assert sys_token in css_content
 
+    # Dead showcase selectors must not regress in custom.css
+    for dead_selector in (
+        ".persona-tab-btn",
+        ".output-subtab-btn",
+        ".explorer-secondary-btn",
+        ".status-pill-",
+    ):
+        assert dead_selector not in css_content, (
+            f"Dead selector {dead_selector!r} found in docs/_static/custom.css"
+        )
+
+    # Scoped flex layout and focus-visible rules for showcase controls
+    assert ".explorer-json-wrapper:not([hidden])" in css_content
+    assert ".explorer-copy-btn:focus-visible" in css_content
+    assert ".quick-start-callout a:focus-visible" in css_content
+
 
 @pytest.mark.unit
 def test_diagram_validator_skips_acc_directives_and_verifies_all_15_diagrams() -> None:
@@ -1579,6 +1595,607 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         "document.activeElement && document.activeElement.id"
                     )
                     assert focused_id == tabs.nth(count - 1).get_attribute("id")
+
+                # --------------------------------------------------------------
+                # 4. Showcase index.html: forced-colors, prefers-contrast: more,
+                #    focus-visible, 375px mobile layout, clipboard & hashchange
+                # --------------------------------------------------------------
+                idx_page_errors: list[str] = []
+                idx_page.on("pageerror", lambda exc: idx_page_errors.append(str(exc)))
+                idx_page.add_script_tag(content=contrast_helper_js)
+                idx_page.evaluate(
+                    """() => {
+                        window.__unhandledRejections = [];
+                        window.addEventListener('unhandledrejection', (ev) => {
+                            ev.preventDefault();
+                            window.__unhandledRejections.push(
+                                String(ev.reason && (ev.reason.message || ev.reason))
+                            );
+                        });
+                    }"""
+                )
+
+                # Reset to Integration Engineer / Tabular View at desktop viewport
+                idx_page.set_viewport_size({"width": 1280, "height": 900})
+                idx_page.locator("#tab-integration").click()
+                idx_page.locator("#ie-tab-table").click()
+
+                # 4a. Default mode :focus-visible on .explorer-copy-btn and .quick-start-callout a
+                idx_page.locator("#ie-tab-json").click()
+                idx_page.locator("#ie-copy-btn").focus()
+                idx_page.keyboard.press("Shift")
+                copy_focus_default = idx_page.evaluate(
+                    """() => {
+                        const btn = document.getElementById('ie-copy-btn');
+                        const cs = getComputedStyle(btn);
+                        return {
+                            matches: btn.matches(':focus-visible'),
+                            style: cs.outlineStyle,
+                            width: cs.outlineWidth
+                        };
+                    }"""
+                )
+                assert copy_focus_default == {
+                    "matches": True,
+                    "style": "solid",
+                    "width": "2px",
+                }
+
+                callout_link = idx_page.locator("#panel-integration .quick-start-callout a")
+                callout_link.focus()
+                idx_page.keyboard.press("Shift")
+                callout_focus_default = idx_page.evaluate(
+                    """() => {
+                        const link = document.querySelector('#panel-integration .quick-start-callout a');
+                        const cs = getComputedStyle(link);
+                        return {
+                            matches: link.matches(':focus-visible'),
+                            style: cs.outlineStyle,
+                            width: cs.outlineWidth
+                        };
+                    }"""
+                )
+                assert callout_focus_default == {
+                    "matches": True,
+                    "style": "solid",
+                    "width": "2px",
+                }
+
+                # 4b. @media (forced-colors: active) on index.html
+                idx_page.emulate_media(forced_colors="active")
+                idx_page.locator("#tab-integration").click()
+                idx_page.locator("#ie-tab-table").click()
+                fc_ie_audit = idx_page.evaluate(
+                    """() => {
+                        const probe = document.createElement('span');
+                        probe.style.cssText =
+                            'forced-color-adjust: none !important; background-color: Highlight !important; color: HighlightText !important; border: 1px solid CanvasText !important; display: none;';
+                        document.body.appendChild(probe);
+                        const probeCs = getComputedStyle(probe);
+                        const sysHighlight = probeCs.backgroundColor;
+                        const sysHighlightText = probeCs.color;
+                        const sysCanvasText = probeCs.borderTopColor;
+                        probe.remove();
+
+                        const borderInfo = (el) => {
+                            const cs = getComputedStyle(el);
+                            const styles = [
+                                cs.borderTopStyle,
+                                cs.borderRightStyle,
+                                cs.borderBottomStyle,
+                                cs.borderLeftStyle
+                            ];
+                            const widths = [
+                                parseFloat(cs.borderTopWidth),
+                                parseFloat(cs.borderRightWidth),
+                                parseFloat(cs.borderBottomWidth),
+                                parseFloat(cs.borderLeftWidth)
+                            ];
+                            return {
+                                bg: cs.backgroundColor,
+                                color: cs.color,
+                                borderColor: cs.borderTopColor,
+                                allSolid: styles.every((s) => s === 'solid'),
+                                minWidth: Math.min(...widths)
+                            };
+                        };
+
+                        return {
+                            sysHighlight,
+                            sysHighlightText,
+                            sysCanvasText,
+                            activePersonaTab: borderInfo(document.getElementById('tab-integration')),
+                            inactivePersonaTab: borderInfo(document.getElementById('tab-datamanager')),
+                            activeOutputTab: borderInfo(document.getElementById('ie-tab-table')),
+                            inactiveOutputTab: borderInfo(document.getElementById('ie-tab-json')),
+                            clientBadge: borderInfo(document.querySelector('.showcase-client-badge')),
+                            statusBadge: borderInfo(document.querySelector('#ie-view-table .status-badge'))
+                        };
+                    }"""
+                )
+                for active_key in ("activePersonaTab", "activeOutputTab"):
+                    act = fc_ie_audit[active_key]
+                    assert act["bg"] == fc_ie_audit["sysHighlight"], (
+                        f"forced-colors {active_key} bg {act['bg']} != Highlight {fc_ie_audit['sysHighlight']}"
+                    )
+                    assert act["color"] == fc_ie_audit["sysHighlightText"], (
+                        f"forced-colors {active_key} color {act['color']} != HighlightText {fc_ie_audit['sysHighlightText']}"
+                    )
+                    assert act["allSolid"] is True
+                    assert act["minWidth"] >= 1.0
+
+                assert (
+                    fc_ie_audit["activePersonaTab"]["bg"] != fc_ie_audit["inactivePersonaTab"]["bg"]
+                )
+                assert (
+                    fc_ie_audit["activeOutputTab"]["bg"] != fc_ie_audit["inactiveOutputTab"]["bg"]
+                )
+                for bordered_key in (
+                    "inactivePersonaTab",
+                    "inactiveOutputTab",
+                    "clientBadge",
+                    "statusBadge",
+                ):
+                    info = fc_ie_audit[bordered_key]
+                    assert info["allSolid"] is True, (
+                        f"forced-colors {bordered_key} missing solid border"
+                    )
+                    assert info["minWidth"] >= 1.0, (
+                        f"forced-colors {bordered_key} border width {info['minWidth']} < 1px"
+                    )
+                for canvas_badge_key in ("clientBadge", "statusBadge"):
+                    assert (
+                        fc_ie_audit[canvas_badge_key]["borderColor"] == fc_ie_audit["sysCanvasText"]
+                    )
+
+                idx_page.locator("#tab-datamanager").click()
+                idx_page.locator("#cdm-tab-crf").click()
+                fc_cdm_badges = idx_page.evaluate(
+                    """() => {
+                        const probe = document.createElement('span');
+                        probe.style.cssText =
+                            'forced-color-adjust: none !important; border: 1px solid CanvasText !important; display: none;';
+                        document.body.appendChild(probe);
+                        const sysCanvasText = getComputedStyle(probe).borderTopColor;
+                        probe.remove();
+
+                        const check = (sel) => {
+                            const el = document.querySelector(sel);
+                            const cs = getComputedStyle(el);
+                            return {
+                                allSolid: [
+                                    cs.borderTopStyle,
+                                    cs.borderRightStyle,
+                                    cs.borderBottomStyle,
+                                    cs.borderLeftStyle
+                                ].every((s) => s === 'solid'),
+                                minWidth: Math.min(
+                                    parseFloat(cs.borderTopWidth),
+                                    parseFloat(cs.borderRightWidth),
+                                    parseFloat(cs.borderBottomWidth),
+                                    parseFloat(cs.borderLeftWidth)
+                                ),
+                                borderColor: cs.borderTopColor
+                            };
+                        };
+                        return {
+                            sysCanvasText,
+                            crfTag: check('#cdm-view-crf .crf-tag'),
+                            crfRequired: check('#cdm-view-crf .crf-badge-required'),
+                            crfOptional: check('#cdm-view-crf .crf-badge-optional')
+                        };
+                    }"""
+                )
+                for crf_key in ("crfTag", "crfRequired", "crfOptional"):
+                    c_info = fc_cdm_badges[crf_key]
+                    assert c_info["allSolid"] is True
+                    assert c_info["minWidth"] >= 1.0
+                    assert c_info["borderColor"] == fc_cdm_badges["sysCanvasText"]
+
+                idx_page.locator("#cdm-tab-json").click()
+                idx_page.locator("#cdm-copy-btn").focus()
+                idx_page.keyboard.press("Shift")
+                fc_copy_focus = idx_page.evaluate(
+                    """() => {
+                        const btn = document.getElementById('cdm-copy-btn');
+                        const cs = getComputedStyle(btn);
+                        return {
+                            allSolid: [
+                                cs.borderTopStyle,
+                                cs.borderRightStyle,
+                                cs.borderBottomStyle,
+                                cs.borderLeftStyle
+                            ].every((s) => s === 'solid'),
+                            minWidth: Math.min(
+                                parseFloat(cs.borderTopWidth),
+                                parseFloat(cs.borderRightWidth),
+                                parseFloat(cs.borderBottomWidth),
+                                parseFloat(cs.borderLeftWidth)
+                            ),
+                            matchesFocus: btn.matches(':focus-visible'),
+                            outlineStyle: cs.outlineStyle,
+                            outlineWidth: cs.outlineWidth
+                        };
+                    }"""
+                )
+                assert fc_copy_focus["allSolid"] is True
+                assert fc_copy_focus["minWidth"] >= 1.0
+                assert fc_copy_focus["matchesFocus"] is True
+                assert fc_copy_focus["outlineStyle"] == "solid"
+                assert fc_copy_focus["outlineWidth"] == "2px"
+
+                callout_links = idx_page.locator("#panel-datamanager .quick-start-callout a")
+                callout_count = callout_links.count()
+                assert callout_count >= 1
+                for i in range(callout_count):
+                    callout_links.nth(i).focus()
+                    idx_page.keyboard.press("Shift")
+                    fc_callout_focus = idx_page.evaluate(
+                        """(idx) => {
+                            const link = document.querySelectorAll(
+                                '#panel-datamanager .quick-start-callout a'
+                            )[idx];
+                            const cs = getComputedStyle(link);
+                            return {
+                                matches: link.matches(':focus-visible'),
+                                style: cs.outlineStyle,
+                                width: cs.outlineWidth
+                            };
+                        }""",
+                        i,
+                    )
+                    assert fc_callout_focus == {
+                        "matches": True,
+                        "style": "solid",
+                        "width": "2px",
+                    }
+                idx_page.emulate_media(forced_colors="none")
+
+                # 4c. @media (prefers-contrast: more) >= 7.0:1 across light and dark modes on index.html
+                idx_page.emulate_media(contrast="more")
+                for theme in ("light", "dark"):
+                    idx_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    idx_page.locator("#tab-integration").click()
+                    idx_page.locator("#ie-tab-table").click()
+                    idx_page.locator("#ie-dataset-select").select_option("records")
+                    ie_records_hc = idx_page.evaluate(
+                        """() => {
+                            const h = window.__wcagHelpers;
+                            const badges = Array.from(document.querySelectorAll('#ie-view-table .status-badge'));
+                            return {
+                                clientBadge: h.elementContrast(document.querySelector('.showcase-client-badge')),
+                                ieMetricBadge: h.elementContrast(document.getElementById('ie-metric-badge')),
+                                minStatusSuccess: Math.min(...badges.map((b) => h.elementContrast(b)))
+                            };
+                        }"""
+                    )
+                    idx_page.locator("#ie-dataset-select").select_option("queries")
+                    ie_queries_hc = idx_page.evaluate(
+                        """() => {
+                            const h = window.__wcagHelpers;
+                            const badges = Array.from(document.querySelectorAll('#ie-view-table .status-badge'));
+                            return {
+                                minStatusQueries: Math.min(...badges.map((b) => h.elementContrast(b)))
+                            };
+                        }"""
+                    )
+                    idx_page.locator("#ie-dataset-select").select_option("records")
+
+                    idx_page.locator("#tab-datamanager").click()
+                    idx_page.locator("#cdm-tab-crf").click()
+                    cdm_hc = idx_page.evaluate(
+                        """() => {
+                            const h = window.__wcagHelpers;
+                            return {
+                                cdmMetricBadge: h.elementContrast(document.getElementById('cdm-metric-badge')),
+                                crfTag: h.elementContrast(document.querySelector('#cdm-view-crf .crf-tag')),
+                                crfRequired: h.elementContrast(document.querySelector('#cdm-view-crf .crf-badge-required')),
+                                crfOptional: h.elementContrast(document.querySelector('#cdm-view-crf .crf-badge-optional'))
+                            };
+                        }"""
+                    )
+                    combined_hc = {**ie_records_hc, **ie_queries_hc, **cdm_hc}
+                    for badge_name, ratio_val in combined_hc.items():
+                        assert ratio_val >= 7.0, (
+                            f"index.html prefers-contrast: more ({theme}) {badge_name} "
+                            f"contrast {ratio_val:.2f}:1 < 7.0:1"
+                        )
+
+                idx_page.emulate_media(contrast="no-preference")
+                idx_page.evaluate("document.body.setAttribute('data-theme', 'light')")
+
+                # 4d. Mobile 375x812 viewport: wrapped tabs, non-overlapping JSON copy buttons, >= 44px targets
+                idx_page.set_viewport_size({"width": 375, "height": 812})
+                idx_page.evaluate("window.dispatchEvent(new Event('resize'))")
+                idx_page.wait_for_timeout(60)
+
+                mobile_tabs_audit = idx_page.evaluate(
+                    """() => {
+                        const container = document.querySelector('.showcase-persona-tabs');
+                        const cRect = container.getBoundingClientRect();
+                        const cStyle = getComputedStyle(container);
+                        const tabs = ['tab-integration', 'tab-datamanager', 'tab-auditor'].map((id) => {
+                            const el = document.getElementById(id);
+                            const r = el.getBoundingClientRect();
+                            const cs = getComputedStyle(el);
+                            return {
+                                id,
+                                left: r.left,
+                                right: r.right,
+                                height: r.height,
+                                whiteSpace: cs.whiteSpace,
+                                fitsHorizontally: r.left >= cRect.left - 0.5 && r.right <= cRect.right + 0.5
+                            };
+                        });
+                        return {
+                            flexWrap: cStyle.flexWrap,
+                            overflowing: container.scrollWidth > container.clientWidth + 1,
+                            tabs
+                        };
+                    }"""
+                )
+                assert mobile_tabs_audit["flexWrap"] == "wrap"
+                assert mobile_tabs_audit["overflowing"] is False, (
+                    "Persona tabs container horizontally overflows at 375px"
+                )
+                for t_info in mobile_tabs_audit["tabs"]:
+                    assert t_info["whiteSpace"] == "normal"
+                    assert t_info["fitsHorizontally"] is True, (
+                        f"#{t_info['id']} horizontally clipped at 375px: {t_info}"
+                    )
+                    assert t_info["height"] >= 44.0, (
+                        f"#{t_info['id']} mobile height {t_info['height']:.1f}px < 44px"
+                    )
+
+                panel_json_specs = [
+                    (
+                        "#tab-integration",
+                        "#ie-tab-table",
+                        "#ie-tab-json",
+                        "ie-view-json",
+                        "ie-copy-btn",
+                        "ie-json-pre",
+                        "#ie-dataset-select",
+                        True,
+                    ),
+                    (
+                        "#tab-datamanager",
+                        "#cdm-tab-crf",
+                        "#cdm-tab-json",
+                        "cdm-view-json",
+                        "cdm-copy-btn",
+                        "cdm-json-pre",
+                        "#cdm-form-select",
+                        False,
+                    ),
+                    (
+                        "#tab-auditor",
+                        "#aud-tab-table",
+                        "#aud-tab-json",
+                        "aud-view-json",
+                        "aud-copy-btn",
+                        "aud-json-pre",
+                        "#aud-scenario-select",
+                        False,
+                    ),
+                ]
+                for (
+                    persona_sel,
+                    primary_subtab_sel,
+                    json_subtab_sel,
+                    wrapper_id,
+                    copy_id,
+                    pre_id,
+                    select_sel,
+                    has_mode_pills,
+                ) in panel_json_specs:
+                    idx_page.locator(persona_sel).click()
+                    idx_page.locator(primary_subtab_sel).click()
+                    # Hidden JSON wrapper must stay display: none
+                    hidden_display = idx_page.evaluate(
+                        f"getComputedStyle(document.getElementById('{wrapper_id}')).display"
+                    )
+                    assert hidden_display == "none", (
+                        f"Hidden #{wrapper_id} must remain display: none, got {hidden_display!r}"
+                    )
+
+                    idx_page.locator(json_subtab_sel).click()
+                    mobile_panel_audit = idx_page.evaluate(
+                        f"""() => {{
+                            const intersects = (a, b) => !(
+                                a.right <= b.left ||
+                                a.left >= b.right ||
+                                a.bottom <= b.top ||
+                                a.top >= b.bottom
+                            );
+                            const wrapper = document.getElementById('{wrapper_id}');
+                            const copyBtn = document.getElementById('{copy_id}');
+                            const pre = document.getElementById('{pre_id}');
+                            const selectEl = document.querySelector('{select_sel}');
+                            const outTabs = Array.from(wrapper.parentElement.querySelectorAll('.explorer-output-tab'));
+                            const modePills = {str(has_mode_pills).lower()}
+                                ? Array.from(wrapper.parentElement.querySelectorAll('.mode-pill-btn'))
+                                : [];
+
+                            const btnBefore = copyBtn.getBoundingClientRect();
+                            const preBefore = pre.getBoundingClientRect();
+                            const overlapBefore = intersects(btnBefore, preBefore);
+
+                            pre.scrollTop = pre.scrollHeight;
+                            pre.scrollLeft = pre.scrollWidth;
+                            const btnAfter = copyBtn.getBoundingClientRect();
+                            const preAfter = pre.getBoundingClientRect();
+                            const overlapAfter = intersects(btnAfter, preAfter);
+
+                            return {{
+                                wrapperDisplay: getComputedStyle(wrapper).display,
+                                wrapperFlexDir: getComputedStyle(wrapper).flexDirection,
+                                overlapBefore,
+                                overlapAfter,
+                                btnAbovePre: btnAfter.bottom <= preAfter.top + 0.5,
+                                copyHeight: btnBefore.height,
+                                selectHeight: selectEl.getBoundingClientRect().height,
+                                minOutputTabHeight: Math.min(...outTabs.map((t) => t.getBoundingClientRect().height)),
+                                minModePillHeight: modePills.length
+                                    ? Math.min(...modePills.map((p) => p.getBoundingClientRect().height))
+                                    : 44.0
+                            }};
+                        }}"""
+                    )
+                    assert mobile_panel_audit["wrapperDisplay"] == "flex"
+                    assert mobile_panel_audit["wrapperFlexDir"] == "column"
+                    assert mobile_panel_audit["overlapBefore"] is False, (
+                        f"#{copy_id} overlaps #{pre_id} before scrolling at 375px"
+                    )
+                    assert mobile_panel_audit["overlapAfter"] is False, (
+                        f"#{copy_id} overlaps #{pre_id} after scrolling at 375px"
+                    )
+                    assert mobile_panel_audit["btnAbovePre"] is True
+                    assert mobile_panel_audit["copyHeight"] >= 44.0
+                    assert mobile_panel_audit["selectHeight"] >= 44.0
+                    assert mobile_panel_audit["minOutputTabHeight"] >= 44.0
+                    assert mobile_panel_audit["minModePillHeight"] >= 44.0
+
+                # 4e. Copy button dimension stability, clipboard failure/missing announcements, and hashchange preservation
+                idx_page.set_viewport_size({"width": 1280, "height": 900})
+                idx_page.locator("#tab-integration").click()
+                idx_page.locator("#ie-tab-json").click()
+
+                # Mock resolved clipboard to verify stable button dimensions and 1500ms reset
+                idx_page.evaluate(
+                    """() => {
+                        Object.defineProperty(navigator, 'clipboard', {
+                            configurable: true,
+                            value: { writeText: () => Promise.resolve() }
+                        });
+                    }"""
+                )
+                dims_before = idx_page.evaluate(
+                    """() => {
+                        const r = document.getElementById('ie-copy-btn').getBoundingClientRect();
+                        return { width: r.width, height: r.height };
+                    }"""
+                )
+                idx_page.locator("#ie-copy-btn").click()
+                idx_page.wait_for_function(
+                    "() => document.getElementById('ie-copy-btn').textContent === 'Copied!'"
+                )
+                dims_copied = idx_page.evaluate(
+                    """() => {
+                        const r = document.getElementById('ie-copy-btn').getBoundingClientRect();
+                        return {
+                            width: r.width,
+                            height: r.height,
+                            badge: document.getElementById('ie-metric-badge').textContent
+                        };
+                    }"""
+                )
+                assert abs(dims_copied["width"] - dims_before["width"]) < 0.5
+                assert abs(dims_copied["height"] - dims_before["height"]) < 0.5
+                assert "Copied to clipboard" in dims_copied["badge"]
+
+                idx_page.wait_for_function(
+                    "() => document.getElementById('ie-copy-btn').textContent === 'Copy JSON'",
+                    timeout=3000,
+                )
+
+                # Mock rejected clipboard (NotAllowedError) across all 3 panels
+                idx_page.evaluate(
+                    """() => {
+                        Object.defineProperty(navigator, 'clipboard', {
+                            configurable: true,
+                            value: {
+                                writeText: () => Promise.reject(
+                                    new DOMException('Write permission denied.', 'NotAllowedError')
+                                )
+                            }
+                        });
+                    }"""
+                )
+                for persona_sel, json_subtab_sel, copy_id, badge_id in [
+                    ("#tab-integration", "#ie-tab-json", "ie-copy-btn", "ie-metric-badge"),
+                    ("#tab-datamanager", "#cdm-tab-json", "cdm-copy-btn", "cdm-metric-badge"),
+                    ("#tab-auditor", "#aud-tab-json", "aud-copy-btn", "aud-metric-badge"),
+                ]:
+                    idx_page.locator(persona_sel).click()
+                    idx_page.locator(json_subtab_sel).click()
+                    pre_click_rect = idx_page.evaluate(
+                        f"""() => {{
+                            const r = document.getElementById('{copy_id}').getBoundingClientRect();
+                            return {{ width: r.width, height: r.height }};
+                        }}"""
+                    )
+                    idx_page.locator(f"#{copy_id}").click()
+                    idx_page.wait_for_function(
+                        f"() => document.getElementById('{copy_id}').textContent === 'Copy failed'"
+                    )
+                    fail_state = idx_page.evaluate(
+                        f"""() => {{
+                            const r = document.getElementById('{copy_id}').getBoundingClientRect();
+                            return {{
+                                width: r.width,
+                                height: r.height,
+                                badge: document.getElementById('{badge_id}').textContent
+                            }};
+                        }}"""
+                    )
+                    assert abs(fail_state["width"] - pre_click_rect["width"]) < 0.5
+                    assert abs(fail_state["height"] - pre_click_rect["height"]) < 0.5
+                    assert "Copy JSON failed" in fail_state["badge"]
+                    assert "Clipboard unavailable" in fail_state["badge"]
+
+                # Missing navigator.clipboard API fallback check
+                idx_page.evaluate(
+                    """() => {
+                        Object.defineProperty(navigator, 'clipboard', {
+                            configurable: true,
+                            value: undefined
+                        });
+                    }"""
+                )
+                idx_page.locator("#aud-verify-btn").click()
+                idx_page.locator("#aud-copy-btn").click()
+                missing_clip_badge = idx_page.evaluate(
+                    "document.getElementById('aud-metric-badge').textContent"
+                )
+                assert "Copy JSON failed" in missing_clip_badge
+                assert "Clipboard unavailable" in missing_clip_badge
+
+                idx_page.wait_for_timeout(80)
+                unhandled = idx_page.evaluate("window.__unhandledRejections")
+                assert unhandled == [], f"Unhandled clipboard rejections detected: {unhandled}"
+                assert idx_page_errors == [], (
+                    f"Page errors detected on index.html: {idx_page_errors}"
+                )
+
+                # In-page anchor navigation (#documentation-overview) preserves active persona panel
+                for persona_btn_id, panel_id in [
+                    ("tab-datamanager", "panel-datamanager"),
+                    ("tab-auditor", "panel-auditor"),
+                ]:
+                    idx_page.locator(f"#{persona_btn_id}").click()
+                    idx_page.evaluate("window.location.hash = '#documentation-overview'")
+                    idx_page.wait_for_timeout(50)
+                    hash_state = idx_page.evaluate(
+                        f"""() => {{
+                            const tab = document.getElementById('{persona_btn_id}');
+                            const panel = document.getElementById('{panel_id}');
+                            return {{
+                                hash: window.location.hash,
+                                tabSelected: tab.getAttribute('aria-selected'),
+                                panelHidden: panel.hasAttribute('hidden'),
+                                integrationHidden: document.getElementById('panel-integration').hasAttribute('hidden')
+                            }};
+                        }}"""
+                    )
+                    assert hash_state["hash"] == "#documentation-overview"
+                    assert hash_state["tabSelected"] == "true", (
+                        f"#{persona_btn_id} lost selection on #documentation-overview hashchange"
+                    )
+                    assert hash_state["panelHidden"] is False, (
+                        f"#{panel_id} was hidden on #documentation-overview hashchange"
+                    )
+                    assert hash_state["integrationHidden"] is True
 
                 idx_page.close()
                 context.close()
