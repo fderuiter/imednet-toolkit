@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from collections.abc import Sequence
 from typing import Any
 
-from imednet.spi.cli import STUDY_KEY_ARG, is_interactive_terminal, print_error, with_sdk
+from imednet.spi.cli import (
+    STUDY_KEY_ARG,
+    add_no_interactive,
+    is_non_interactive,
+    print_error,
+    with_sdk,
+)
 from imednet.spi.facade import ImednetFacade
+
+from .terminal import is_interactive_terminal
 
 _BATCH_SPLIT_RE = re.compile(r"[\s,]+")
 
@@ -56,6 +65,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     tui_parser.add_argument(
         "--high-contrast",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Enable high-contrast mode for accessibility.",
     )
     tui_parser.add_argument(
@@ -63,6 +73,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         action="store_true",
         help="Force launch even if terminal streams appear non-interactive.",
     )
+    add_no_interactive(tui_parser)
 
     @with_sdk
     def _launch(sdk: ImednetFacade, args: argparse.Namespace | None = None) -> None:
@@ -90,11 +101,25 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         run_tui(sdk, **run_kwargs)
 
     def run_tui_command(args: argparse.Namespace | None = None) -> None:
-        force = bool(args and getattr(args, "force", False))
-        if not force and not is_interactive_terminal():
-            print_error("Error: Interactive terminal required to run the TUI interface.")
-            raise SystemExit(1)
+        old_high_contrast = os.environ.get("IMEDNET_HIGH_CONTRAST")
+        try:
+            no_interactive = bool(args and getattr(args, "no_interactive", False))
+            if no_interactive or is_non_interactive():
+                print_error(
+                    "Error: Interactive terminal required; cannot run the TUI in non-interactive mode."
+                )
+                raise SystemExit(1)
 
-        _launch(args)
+            force = bool(args and getattr(args, "force", False))
+            if not force and not is_interactive_terminal():
+                print_error("Error: Interactive terminal required to run the TUI interface.")
+                raise SystemExit(1)
+
+            _launch(args)
+        finally:
+            if old_high_contrast is not None:
+                os.environ["IMEDNET_HIGH_CONTRAST"] = old_high_contrast
+            else:
+                os.environ.pop("IMEDNET_HIGH_CONTRAST", None)
 
     tui_parser.set_defaults(func=run_tui_command)

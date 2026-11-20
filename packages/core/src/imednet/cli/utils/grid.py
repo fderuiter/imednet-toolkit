@@ -27,6 +27,7 @@ from .output import (
     _display_width,
     _fit_display_width,
     _format_cell_value,
+    _is_16_color_terminal,
     _iter_graphemes,
     _sanitize_cell_text,
     _slice_display_width,
@@ -281,6 +282,43 @@ class InteractiveDataGrid:
                 self.color_attrs["blue"] = curses.color_pair(4)
                 self.color_attrs["magenta"] = curses.color_pair(5)
                 self.color_attrs["cyan"] = curses.color_pair(6)
+
+                colors_count = getattr(curses, "COLORS", 0)
+                if colors_count >= 256 and not _is_16_color_terminal():
+                    bg_black = 16
+                    fg_success = 47
+                    fg_warning = 226
+                    fg_danger = 213
+                    can_change = getattr(curses, "can_change_color", None)
+                    init_color = getattr(curses, "init_color", None)
+                    if callable(can_change) and callable(init_color) and can_change():
+                        with contextlib.suppress(curses.error):
+                            init_color(250, 0, 0, 0)
+                            init_color(251, 0, 1000, 400)
+                            init_color(252, 1000, 1000, 0)
+                            init_color(253, 1000, 600, 1000)
+                            bg_black = 250
+                            fg_success = 251
+                            fg_warning = 252
+                            fg_danger = 253
+                    curses.init_pair(7, fg_success, bg_black)
+                    curses.init_pair(8, fg_warning, bg_black)
+                    curses.init_pair(9, fg_danger, bg_black)
+                    self.color_attrs["hc_success"] = curses.color_pair(7) | curses.A_BOLD
+                    self.color_attrs["hc_warning"] = curses.color_pair(8) | curses.A_BOLD
+                    self.color_attrs["hc_danger"] = (
+                        curses.color_pair(9) | curses.A_BOLD | curses.A_UNDERLINE
+                    )
+                else:
+                    bright_white = 15 if colors_count >= 16 else curses.COLOR_WHITE
+                    curses.init_pair(7, bright_white, curses.COLOR_BLACK)
+                    curses.init_pair(8, curses.COLOR_BLACK, bright_white)
+                    curses.init_pair(9, bright_white, curses.COLOR_BLACK)
+                    self.color_attrs["hc_success"] = curses.color_pair(7) | curses.A_BOLD
+                    self.color_attrs["hc_warning"] = curses.color_pair(8)
+                    self.color_attrs["hc_danger"] = (
+                        curses.color_pair(9) | curses.A_BOLD | curses.A_UNDERLINE
+                    )
 
     def _get_status_attr(self, status_val: str) -> int:
         """Return the curses color attribute for a clinical status value."""

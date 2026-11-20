@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import importlib
 import io
@@ -13,7 +14,7 @@ import sys
 import threading
 from collections.abc import Callable
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -452,12 +453,21 @@ def test_pty_ansi_color_and_high_contrast_policy(monkeypatch: pytest.MonkeyPatch
     _, out_std, _ = _run_on_split_ptys(lambda: cli.app(["jobs", "status", "S1", "B-COLOR"]))
     assert "\x1b[32mCOMPLETED\x1b[0m" in out_std
 
-    # High-contrast TTY color (even with --no-interactive): blue (\x1b[34m)
+    # High-contrast TTY color (even with --no-interactive): #00FF66 on #000000 (>= 7:1)
     _, out_hc, _ = _run_on_split_ptys(
         lambda: cli.app(["--high-contrast", "--no-interactive", "jobs", "status", "S1", "B-COLOR"])
     )
-    assert "\x1b[34mCOMPLETED\x1b[0m" in out_hc
-    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    assert "\x1b[1;38;2;0;255;102;48;2;0;0;0mCOMPLETED\x1b[0m" in out_hc
+    assert "IMEDNET_HIGH_CONTRAST" not in os.environ
+
+    # High-contrast 16-color terminal fallback: bright white on black (>= 7:1)
+    monkeypatch.setenv("TERM", "vt100")
+    _, out_hc_16, _ = _run_on_split_ptys(
+        lambda: cli.app(["--high-contrast", "--no-interactive", "jobs", "status", "S1", "B-COLOR"])
+    )
+    assert "\x1b[1;97;40mCOMPLETED\x1b[0m" in out_hc_16
+    assert "IMEDNET_HIGH_CONTRAST" not in os.environ
+    monkeypatch.setenv("TERM", "xterm-256color")
 
     # NO_COLOR=1 strips all SGR colors on both stdout tables and stderr print_error
     monkeypatch.setenv("NO_COLOR", "1")
@@ -515,3 +525,152 @@ def test_open_pipe_stdin_exits_immediately_without_hanging_on_pty_output(
     finally:
         pipe_in.close()
         os.close(w_fd)
+
+
+@pytest.mark.skipif(pty is None, reason="POSIX pty module required")
+@pytest.mark.parametrize(
+    (
+        "config_name",
+        "stdin_pty",
+        "stdout_pty",
+        "env_overrides",
+        "cli_args",
+        "expected_interactive",
+    ),
+    [
+        ("1_interactive_pty", True, True, {"TERM": "xterm-256color"}, ["tui"], True),
+        ("2_piped_stdin", False, True, {"TERM": "xterm-256color"}, ["tui"], False),
+        ("3_piped_stdout", True, False, {"TERM": "xterm-256color"}, ["tui"], False),
+        ("4_piped_both", False, False, {"TERM": "xterm-256color"}, ["tui"], False),
+        (
+            "5_env_non_interactive_true",
+            True,
+            True,
+            {"TERM": "xterm-256color", "IMEDNET_NON_INTERACTIVE": "true"},
+            ["tui"],
+            False,
+        ),
+        (
+            "6_flag_no_interactive",
+            True,
+            True,
+            {"TERM": "xterm-256color"},
+            ["tui", "--no-interactive"],
+            False,
+        ),
+        ("7_term_dumb_upper", True, True, {"TERM": "DUMB"}, ["tui"], False),
+        (
+            "8_json_output_env",
+            True,
+            True,
+            {"TERM": "xterm-256color", "IMEDNET_CLI_OUTPUT_FORMAT": "json"},
+            ["tui"],
+            False,
+        ),
+    ],
+)
+def test_all_eight_pty_configurations_match_across_core_and_tui(
+    monkeypatch: pytest.MonkeyPatch,
+    config_name: str,
+    stdin_pty: bool,
+    stdout_pty: bool,
+    env_overrides: dict[str, str],
+    cli_args: list[str],
+    expected_interactive: bool,
+) -> None:
+    """Verify all 8 PTY configurations match across supports_fullscreen_ui and imednet tui."""
+    from imednet_tui.cli import setup_parser
+    from imednet_tui.terminal import is_interactive_terminal as tui_is_interactive
+
+    class _DummyTuiEP:
+        name = "tui"
+
+        def load(self) -> Any:
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: [_DummyTuiEP()] if kwargs.get("group") == "imednet.cli_plugins" else [],
+    )
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    for k, v in env_overrides.items():
+        monkeypatch.setenv(k, v)
+
+    assert pty is not None
+    in_master: int | None = None
+    out_master: int | None = None
+    in_r: int | None = None
+    in_w: int | None = None
+    out_r: int | None = None
+    out_w: int | None = None
+    err_buf = io.StringIO()
+
+    try:
+        if stdin_pty:
+            in_master, in_slave = pty.openpty()
+            in_file = os.fdopen(in_slave, "r", encoding="utf-8", closefd=True)
+        else:
+            in_r, in_w = os.pipe()
+            in_file = os.fdopen(in_r, "r", encoding="utf-8", closefd=True)
+            in_r = None
+
+        if stdout_pty:
+            out_master, out_slave = pty.openpty()
+            out_file = os.fdopen(out_slave, "w", encoding="utf-8", closefd=True)
+        else:
+            out_r, out_w = os.pipe()
+            out_file = os.fdopen(out_w, "w", encoding="utf-8", closefd=True)
+            out_w = None
+
+        with (
+            patch.object(sys, "stdin", in_file),
+            patch.object(sys, "stdout", out_file),
+            patch.object(sys, "stderr", err_buf),
+            patch("imednet_tui.app.run_tui") as mock_run_tui,
+            patch("imednet.cli.utils.context.get_sdk", return_value=MagicMock()),
+        ):
+            if "--no-interactive" not in cli_args:
+                assert spi_cli.supports_fullscreen_ui() is expected_interactive, config_name
+                assert tui_is_interactive() is expected_interactive, config_name
+
+            if expected_interactive:
+                cli.app(cli_args)
+                mock_run_tui.assert_called_once()
+            else:
+                with pytest.raises(SystemExit) as exc_info:
+                    cli.app(cli_args)
+                assert exc_info.value.code == 1, config_name
+                mock_run_tui.assert_not_called()
+    finally:
+        for f_obj in ("in_file", "out_file"):
+            if f_obj in locals():
+                with contextlib.suppress(OSError):
+                    locals()[f_obj].close()
+        for fd in (in_master, out_master, in_r, in_w, out_r, out_w):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+
+def test_high_contrast_env_cleanup_on_success_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify IMEDNET_HIGH_CONTRAST is restored or unset inside finally blocks across CLI runs."""
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+
+    mock_sdk = MagicMock()
+    mock_sdk.studies.list.side_effect = RuntimeError("Simulated SDK failure")
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        cli.app(["--high-contrast", "--no-interactive", "studies", "list"])
+    assert exc_info.value.code == 1
+    assert "IMEDNET_HIGH_CONTRAST" not in os.environ
+
+    # Pre-existing value is preserved even after --high-contrast run
+    monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "0")
+    cli.app(["--high-contrast", "studies"])
+    assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "0"

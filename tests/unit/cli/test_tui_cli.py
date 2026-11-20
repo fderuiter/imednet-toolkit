@@ -217,3 +217,103 @@ def test_tui_plugin_study_and_repeatable_batch_options(monkeypatch):
             study_key="STUDY-ONC-01",
             batch_ids=["BATCH-101", "BATCH-102", "BATCH-103"],
         )
+
+
+@pytest.mark.parametrize(
+    ("cli_argv", "extra_env"),
+    [
+        (["tui", "--no-interactive"], {}),
+        (["--no-interactive", "tui"], {}),
+        (["tui", "--no-interactive", "--force"], {}),
+        (["--no-interactive", "tui", "--force"], {}),
+        (["tui", "--force"], {"IMEDNET_NON_INTERACTIVE": "1"}),
+        (["tui", "--force"], {"IMEDNET_NON_INTERACTIVE": "true"}),
+        (["tui", "--force"], {"IMEDNET_NON_INTERACTIVE": "YES"}),
+    ],
+)
+def test_tui_no_interactive_exits_with_code_one_even_when_forced(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cli_argv: list[str],
+    extra_env: dict[str, str],
+) -> None:
+    """Verify --no-interactive and IMEDNET_NON_INTERACTIVE exit with code 1 even with --force."""
+    from imednet import cli as cli_mod
+    from imednet_tui.cli import setup_parser
+
+    class DummyEntryPoint:
+        name = "tui"
+
+        def load(self):
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: (
+            [DummyEntryPoint()] if kwargs.get("group") == "imednet.cli_plugins" else []
+        ),
+    )
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    for key, val in extra_env.items():
+        monkeypatch.setenv(key, val)
+
+    with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+        patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        cli_mod.app(cli_argv)
+
+    assert exc_info.value.code == 1
+    _, err = capsys.readouterr()
+    assert "non-interactive" in err.lower()
+    mock_run_tui.assert_not_called()
+    mock_get_sdk.assert_not_called()
+
+
+def test_tui_root_high_contrast_and_finally_env_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify root --high-contrast propagates to tui and IMEDNET_HIGH_CONTRAST is restored in finally."""
+    from imednet import cli as cli_mod
+    from imednet_tui.cli import setup_parser
+
+    class DummyEntryPoint:
+        name = "tui"
+
+        def load(self):
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: (
+            [DummyEntryPoint()] if kwargs.get("group") == "imednet.cli_plugins" else []
+        ),
+    )
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+
+    def _mutating_run_tui(*_args, **_kwargs):
+        os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
+        raise RuntimeError("boom inside tui")
+
+    with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
+        patch("imednet_tui.app.run_tui", side_effect=_mutating_run_tui) as mock_run_tui,
+        patch("imednet.cli.utils.context.get_sdk", return_value=MagicMock()),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        cli_mod.app(["--high-contrast", "tui"])
+
+    assert exc_info.value.code == 1
+    assert mock_run_tui.call_args.kwargs.get("high_contrast") is True
+    assert "IMEDNET_HIGH_CONTRAST" not in os.environ
+
+    # Pre-existing IMEDNET_HIGH_CONTRAST value is restored on exit
+    monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "0")
+    with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
+        patch("imednet_tui.app.run_tui", side_effect=_mutating_run_tui),
+        patch("imednet.cli.utils.context.get_sdk", return_value=MagicMock()),
+        pytest.raises(SystemExit),
+    ):
+        cli_mod.app(["--high-contrast", "tui"])
+    assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "0"

@@ -498,11 +498,31 @@ def test_print_table_job_state_colors(
     assert "\033[31mCANCELLED\033[0m" in captured.out
 
     monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("COLORTERM", raising=False)
     _print_table(items, ["batch_id", "state"])
     captured_hc = capfd.readouterr()
-    assert "\033[33mRUNNING\033[0m" in captured_hc.out
-    assert "\033[34mCOMPLETE\033[0m" in captured_hc.out
-    assert "\033[35mCANCELLED\033[0m" in captured_hc.out
+    assert "\033[1;38;2;255;255;0;48;2;0;0;0mRUNNING\033[0m" in captured_hc.out
+    assert "\033[1;38;2;0;255;102;48;2;0;0;0mCOMPLETE\033[0m" in captured_hc.out
+    assert "\033[1;38;2;255;153;255;48;2;0;0;0mCANCELLED\033[0m" in captured_hc.out
+
+    # 16-color fallback emits explicit black-and-white pairs
+    monkeypatch.setenv("TERM", "xterm-16color")
+    _print_table(items, ["batch_id", "state"])
+    captured_hc_16 = capfd.readouterr()
+    assert "\033[30;107mRUNNING\033[0m" in captured_hc_16.out
+    assert "\033[1;97;40mCOMPLETE\033[0m" in captured_hc_16.out
+    assert "\033[1;4;97;40mCANCELLED\033[0m" in captured_hc_16.out
+
+    # COLORTERM=truecolor overrides 16-color TERM; COLORTERM=16color forces 16-color fallback
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    _print_table(items, ["batch_id", "state"])
+    assert "\033[1;38;2;0;255;102;48;2;0;0;0mCOMPLETE\033[0m" in capfd.readouterr().out
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "16color")
+    _print_table(items, ["batch_id", "state"])
+    assert "\033[1;97;40mCOMPLETE\033[0m" in capfd.readouterr().out
 
 
 def test_format_cell_value_sanitizes_control_characters() -> None:

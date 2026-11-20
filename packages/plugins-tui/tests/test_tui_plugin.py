@@ -124,11 +124,40 @@ def test_public_exports_preserved() -> None:
     assert expected.issubset(set(tui_app_mod.__all__))
 
 
-def test_terminal_helper_imported_from_spi_cli() -> None:
-    """Verify imednet_tui shares is_interactive_terminal from imednet.spi.cli."""
-    assert tui_app_mod.is_interactive_terminal is spi_cli.is_interactive_terminal
-    assert tui_cli_mod.is_interactive_terminal is spi_cli.is_interactive_terminal
-    assert tui_terminal_mod.is_interactive_terminal is spi_cli.is_interactive_terminal
+def test_terminal_helper_imported_from_spi_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify imednet_tui.terminal delegates is_interactive_terminal to imednet.spi.cli.supports_fullscreen_ui."""
+    assert tui_terminal_mod.supports_fullscreen_ui is spi_cli.supports_fullscreen_ui
+    assert tui_app_mod.is_interactive_terminal is tui_terminal_mod.is_interactive_terminal
+    assert tui_cli_mod.is_interactive_terminal is tui_terminal_mod.is_interactive_terminal
+
+    class _TTYStream:
+        def isatty(self) -> bool:
+            return True
+
+    tty_in = _TTYStream()
+    tty_out = _TTYStream()
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
+    monkeypatch.setattr("sys.argv", ["imednet", "tui"])
+    assert tui_terminal_mod.is_interactive_terminal(stdin=tty_in, stdout=tty_out) is True
+
+    # Truthy IMEDNET_NON_INTERACTIVE values ("1", "true", "yes", case-insensitive) block TUI
+    for truthy_val in ("1", "true", "TRUE", "yes", "YES"):
+        monkeypatch.setenv("IMEDNET_NON_INTERACTIVE", truthy_val)
+        assert tui_terminal_mod.is_interactive_terminal(stdin=tty_in, stdout=tty_out) is False
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+
+    # Case-insensitive TERM=DUMB and empty TERM block TUI
+    for bad_term in ("dumb", "DUMB", "  DUMB  ", ""):
+        monkeypatch.setenv("TERM", bad_term)
+        assert tui_terminal_mod.is_interactive_terminal(stdin=tty_in, stdout=tty_out) is False
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+    # JSON output mode blocks TUI
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    assert tui_terminal_mod.is_interactive_terminal(stdin=tty_in, stdout=tty_out) is False
 
 
 def test_app_instantiation_and_base_url_reads_sdk_config(mock_sdk: MagicMock) -> None:
@@ -2514,10 +2543,9 @@ async def test_pilot_viewport_geometry_tab_stability_and_unclipped_subject_table
 
         jobs_pane_region = bottom_pane.region
         jobs_pane_height = bottom_pane.size.height
-        jobs_monitor_content_size = job_monitor.content_region.size
-        assert job_monitor.styles.border.top[0] == "solid"
+        assert job_monitor.styles.border.top[0] in ("", "none")
 
-        # Switch to Logs tab and verify #bottom-pane height and inner content region do not shift
+        # Switch to Logs tab and verify #bottom-pane height and outer region do not shift
         bottom_pane.active = "logs-tab"
         await _settle(pilot)
 
@@ -2525,9 +2553,8 @@ async def test_pilot_viewport_geometry_tab_stability_and_unclipped_subject_table
         assert bottom_pane.size.height == jobs_pane_height
         assert log_viewer.border_title == "Logs"
         assert log_viewer.styles.border.top[0] == "solid"
-        assert log_viewer.content_region.size == jobs_monitor_content_size
 
-        # Verify high-contrast mode applies matching heavy borders on both LogViewer and JobMonitor
+        # Verify high-contrast mode keeps JobMonitor borderless and applies heavy border on LogViewer
         await pilot.press("h")
         await _settle(pilot)
         assert log_viewer.styles.border.top[0] == "heavy"
@@ -2535,7 +2562,7 @@ async def test_pilot_viewport_geometry_tab_stability_and_unclipped_subject_table
 
         bottom_pane.active = "jobs-tab"
         await _settle(pilot)
-        assert job_monitor.styles.border.top[0] == "heavy"
+        assert job_monitor.styles.border.top[0] in ("", "none")
         assert bottom_pane.size.height == jobs_pane_height
 
 
@@ -2629,3 +2656,123 @@ async def test_dynamic_resize_across_compact_threshold_preserves_state_and_scrol
         assert "compact" in dashboard.classes
         assert dashboard.selected_study_key == "STUDY-RESIZE"
         assert dashboard.selected_site_id == "SITE-202"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("viewport", "min_job_table_height"),
+    [
+        ((80, 20), 4),  # >= 4 height (header + at least 3 visible data rows)
+        ((80, 24), 6),  # >= 6 height (header + at least 5 visible data rows)
+    ],
+)
+async def test_high_contrast_compact_truncated_job_table_rows_and_logviewer_contrast(
+    viewport: tuple[int, int],
+    min_job_table_height: int,
+) -> None:
+    """Verify JobTable height >= 4 on 80x20 and >= 6 on 80x24, inverted 1-line #truncation-notice, and 21:1 LogViewer."""
+    from textual.color import Color
+    from textual.widgets import Static, TabbedContent
+
+    from imednet_tui.app import DEFAULT_FETCH_LIMIT, JobTable, LogViewer
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    # Trigger truncation across studies, sites, and subjects (DEFAULT_FETCH_LIMIT + 1 items)
+    studies = [
+        MagicMock(study_key=f"STUDY-{i:03d}", study_name=f"Clinical Study {i:03d}")
+        for i in range(DEFAULT_FETCH_LIMIT + 5)
+    ]
+    sites = [
+        MagicMock(site_id=f"SITE-{i:03d}", site_name=f"Clinical Site {i:03d}")
+        for i in range(DEFAULT_FETCH_LIMIT + 5)
+    ]
+    subjects = [
+        MagicMock(
+            subject_id=f"SUBJ-{i:03d}",
+            site_id="SITE-000",
+            subject_status="Enrolled",
+            date_created="2026-03-01T09:00:00Z",
+        )
+        for i in range(DEFAULT_FETCH_LIMIT + 5)
+    ]
+    sdk.async_get_studies = AsyncMock(return_value=studies)
+    sdk.async_get_sites = AsyncMock(return_value=sites)
+    sdk.async_get_subjects = AsyncMock(return_value=subjects)
+
+    batch_ids = [f"BATCH-HC-{i:02d}" for i in range(1, 8)]
+    sdk.async_get_job = AsyncMock(
+        side_effect=lambda sk, bid: JobStatus(
+            batch_id=bid,
+            state=JobState.RUNNING,
+            progress=45,
+            total_records=100,
+            failed_records=0,
+            date_created="2026-03-01T10:00:00Z",
+        )
+    )
+
+    app = ImednetTuiApp(
+        sdk,
+        high_contrast=True,
+        study_key="STUDY-000",
+        batch_ids=batch_ids,
+    )
+    async with app.run_test(size=viewport) as pilot:
+        await _settle(pilot)
+
+        assert isinstance(app.screen, DashboardScreen)
+        dashboard = app.screen
+        assert "high-contrast" in dashboard.classes
+        assert "compact" in dashboard.classes
+
+        trunc_notice = dashboard.query_one("#truncation-notice", Static)
+        assert "visible" in trunc_notice.classes
+        assert trunc_notice.size.height == 1
+        assert trunc_notice.region.height == 1
+        assert trunc_notice.styles.border.bottom[0] in ("", "none")
+        assert trunc_notice.styles.background == Color(255, 255, 255)
+        assert trunc_notice.styles.color == Color(0, 0, 0)
+
+        job_monitor = dashboard.query_one(JobMonitor)
+        job_notice = dashboard.query_one("#job_monitor_notice", Static)
+        job_notice.update(
+            "Tracking 7 asynchronous clinical batch jobs with extended diagnostic message that must remain capped to 1 line"
+        )
+        await _settle(pilot)
+
+        assert job_monitor.styles.border.top[0] in ("", "none")
+        assert job_notice.size.height == 1
+
+        job_table = dashboard.query_one("#job_table", JobTable)
+        assert job_table.row_count == 7
+        assert job_table.size.height >= min_job_table_height
+
+        # Switch to Logs tab and verify LogViewer renders #000000 bg and #FFFFFF fg (21:1) unfocused & focused
+        bottom_pane = dashboard.query_one("#bottom-pane", TabbedContent)
+        log_viewer = dashboard.query_one(LogViewer)
+        log_viewer.write_line("High-contrast audit log entry")
+        bottom_pane.active = "logs-tab"
+        await _settle(pilot)
+
+        assert log_viewer.styles.background == Color(0, 0, 0)
+        assert log_viewer.styles.color == Color(255, 255, 255)
+        unfocused_segments = list(log_viewer.render_line(0))
+        assert unfocused_segments
+        for seg in unfocused_segments:
+            assert seg.style is not None
+            assert seg.style.bgcolor is not None
+            assert seg.style.bgcolor.triplet == (0, 0, 0)
+            assert seg.style.color is not None
+            assert seg.style.color.triplet == (255, 255, 255)
+
+        log_viewer.focus()
+        await _settle(pilot)
+        focused_segments = list(log_viewer.render_line(0))
+        assert focused_segments
+        for seg in focused_segments:
+            assert seg.style is not None
+            assert seg.style.bgcolor is not None
+            assert seg.style.bgcolor.triplet == (0, 0, 0)
+            assert seg.style.color is not None
+            assert seg.style.color.triplet == (255, 255, 255)

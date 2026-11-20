@@ -38,16 +38,19 @@ When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a no
 table with live filtering and a side inspection panel:
 
 * ``Up`` / ``Down`` (or ``k`` / ``j``), ``Page Up`` / ``Page Down``, ``Home`` / ``End``: navigate rows.
+* ``Left`` / ``Right`` (or ``h`` / ``l``): scroll columns horizontally across wide tables.
 * ``/``: enter live search mode across table columns, submission metadata, and form variables (``Enter`` or ``Esc`` exits search input; ``Esc`` in normal mode clears the active filter).
-* ``Space``: toggle the side inspection panel (``[`` / ``]`` or ``{`` / ``}`` scrolls panel lines).
+* ``Space``: toggle the side inspection panel (``[`` / ``]`` scrolls panel lines and ``{`` / ``}`` scrolls panel pages).
 * ``q``: exit ``InteractiveDataGrid``.
 
-Set ``IMEDNET_NON_INTERACTIVE=1`` (or pipe stdout in scripts and CI) to bypass
-``InteractiveDataGrid`` and emit plain ASCII tabular output instead:
+Set ``IMEDNET_NON_INTERACTIVE=1`` or pass ``--no-interactive`` (or pipe stdout in scripts
+and CI) to bypass ``InteractiveDataGrid`` and emit plain ASCII tabular output instead, or
+use ``imednet tui --no-interactive`` to block full-screen TUI launches with exit code ``1``:
 
 .. code-block:: bash
 
    IMEDNET_NON_INTERACTIVE=1 imednet studies list
+   imednet tui --no-interactive
 
 Interactive workflow wizards
 ----------------------------
@@ -103,13 +106,16 @@ and ``stdout`` are connected to a capable TTY, while single-job commands
 (``imednet jobs status`` and ``imednet jobs wait``) always print a static summary
 table to ``stdout`` and exit immediately.
 
-Pass ``--no-interactive`` (at the root command or on read/workflow subcommands) or
-set ``IMEDNET_NON_INTERACTIVE=1`` to disable full-screen ``curses`` grids, live
-``stderr`` spinners, and interactive ``stdin`` prompts. Set ``NO_COLOR=1`` (or any
-non-empty value) or ``TERM=dumb`` to suppress ANSI color escape sequences across
-tables and diagnostics while preserving ``--high-contrast`` palettes when color
-output is permitted. Interactive workflow wizards reject piped or non-TTY ``stdin``
-streams immediately with exit code ``1``.
+Pass ``--no-interactive`` (at the root command or on ``imednet tui``, read, and workflow
+subcommands) or set ``IMEDNET_NON_INTERACTIVE=1`` to disable full-screen ``curses`` grids,
+live ``stderr`` spinners, and interactive ``stdin`` prompts. Passing
+``imednet tui --no-interactive`` (or invoking ``imednet tui`` while
+``IMEDNET_NON_INTERACTIVE`` is enabled) exits immediately with status code ``1``, even
+when ``--force`` is supplied. Set ``NO_COLOR=1`` (or any non-empty value) or
+``TERM=dumb`` to suppress ANSI color escape sequences across tables and diagnostics
+while preserving ``--high-contrast`` palettes when color output is permitted.
+Interactive workflow wizards reject piped or non-TTY ``stdin`` streams immediately with
+exit code ``1``.
 
 Server-side filters, sorting, and bounded fetches
 -------------------------------------------------

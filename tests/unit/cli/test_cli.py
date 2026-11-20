@@ -9,6 +9,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 from unittest.mock import ANY, MagicMock
 
 import pytest
@@ -1211,9 +1212,10 @@ def test_jobs_status_colors_on_tty(
 @pytest.mark.parametrize(
     ("state", "expected_code"),
     [
-        ("COMPLETE", "\x1b[34mCOMPLETE\x1b[0m"),
-        ("CANCELLED", "\x1b[35mCANCELLED\x1b[0m"),
-        ("TIMEOUT", "\x1b[35mTIMEOUT\x1b[0m"),
+        ("COMPLETE", "\x1b[1;38;2;0;255;102;48;2;0;0;0mCOMPLETE\x1b[0m"),
+        ("RUNNING", "\x1b[1;38;2;255;255;0;48;2;0;0;0mRUNNING\x1b[0m"),
+        ("CANCELLED", "\x1b[1;38;2;255;153;255;48;2;0;0;0mCANCELLED\x1b[0m"),
+        ("TIMEOUT", "\x1b[1;38;2;255;153;255;48;2;0;0;0mTIMEOUT\x1b[0m"),
     ],
 )
 def test_jobs_status_colors_high_contrast(
@@ -1223,10 +1225,11 @@ def test_jobs_status_colors_high_contrast(
     state: str,
     expected_code: str,
 ) -> None:
-    """Test that job states honor high contrast color mapping on TTY."""
+    """Test that job states honor >= 7:1 high contrast badge mapping on TTY."""
     job = JobStatus(batchId="BATCH_HC", jobId="JOB_HC", state=state, progress=50)
     sdk.get_job.return_value = job
     monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
+    monkeypatch.setenv("TERM", "xterm-256color")
     result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH_HC"], tty=True)
     assert result.exit_code == 0
     assert expected_code in result.stdout
@@ -1412,14 +1415,23 @@ def test_noun_commands_show_contextual_help(runner: CliRunner, cmd: str) -> None
 
 
 def test_high_contrast_with_subcommand(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Invoking imednet --high-contrast records displays records help and sets the env var."""
+    """Invoking imednet --high-contrast records activates high contrast during run and cleans up afterward."""
     monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    observed_during_run: list[str | None] = []
+    orig_find = cli._find_active_subparser
+
+    def _spy_find(parser: Any, raw_args: list[str]) -> Any:
+        observed_during_run.append(os.environ.get("IMEDNET_HIGH_CONTRAST"))
+        return orig_find(parser, raw_args)
+
+    monkeypatch.setattr(cli, "_find_active_subparser", _spy_find)
     result = runner.invoke(cli.app, ["--high-contrast", "records"])
     assert result.exit_code == 0
     assert "usage:" in result.stdout
     assert " records " in result.stdout
     assert "iMednet SDK Command Line Interface" not in result.stdout
-    assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+    assert observed_during_run == ["1"]
+    assert "IMEDNET_HIGH_CONTRAST" not in os.environ
 
 
 def test_plugin_subparser_help(runner: CliRunner) -> None:
