@@ -208,14 +208,25 @@ def test_active_subparser_help_without_subactions(runner, monkeypatch):
     assert " export " in result.stdout
     assert "iMednet SDK Command Line Interface" not in result.stdout
 
-    # --high-contrast records displays records help and activates high contrast
+    # --high-contrast records displays records help, activates high contrast during run, and cleans up
     monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    import imednet.cli as cli_mod
+
+    observed_hc: list[str | None] = []
+    orig_find = cli_mod._find_active_subparser
+
+    def _spy_find(parser, raw_args):
+        observed_hc.append(os.environ.get("IMEDNET_HIGH_CONTRAST"))
+        return orig_find(parser, raw_args)
+
+    monkeypatch.setattr(cli_mod, "_find_active_subparser", _spy_find)
     result = runner.invoke(app, ["--high-contrast", "records"])
     assert result.exit_code == 0
     assert "usage:" in result.stdout
     assert " records " in result.stdout
     assert "iMednet SDK Command Line Interface" not in result.stdout
-    assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+    assert observed_hc == ["1"]
+    assert "IMEDNET_HIGH_CONTRAST" not in os.environ
 
     # workflows plugin subcommand displays workflows help
     result = runner.invoke(app, ["workflows"])

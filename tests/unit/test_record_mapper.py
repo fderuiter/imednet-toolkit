@@ -1258,3 +1258,603 @@ def test_record_mapper_applies_committed_study_config_phi_in_dataframe_and_hiera
         out_rec = tree[0]["visits"][0]["forms"][0]["records"][0]
         assert out_rec["Hospital Chart Code"] == "***MASKED***"
         assert out_rec["Heart Rate"] == 71
+
+
+def test_format_iso8601_dtc_phi_redaction_and_masked_sentinel() -> None:
+    """Verify format_iso8601_dtc drops ***MASKED*** and emits ISO YYYY or None when redacting."""
+    assert format_iso8601_dtc("***MASKED***") is None
+    assert format_iso8601_dtc("  ***MASKED***  ", mask_phi=True) is None
+    assert format_iso8601_dtc(datetime(1985, 7, 19, 9, 30, 0), mask_phi=True) == "1985"
+    assert format_iso8601_dtc(date(1972, 11, 3), redact_to_year=True) == "1972"
+    assert format_iso8601_dtc("1985-07-19T09:30:00", mask_phi=True) == "1985"
+    assert format_iso8601_dtc("07/19/1985", mask_phi=True) == "1985"
+    assert format_iso8601_dtc("19-JUL-1985", mask_phi=True) == "1985"
+    assert format_iso8601_dtc("1985", mask_phi=True) == "1985"
+    assert format_iso8601_dtc("1985-07", mask_phi=True) == "1985"
+    assert format_iso8601_dtc("1985-UN-UN", mask_phi=True) == "1985"
+    assert format_iso8601_dtc(1985, mask_phi=True) == "1985"
+    assert format_iso8601_dtc(12345, mask_phi=True) is None
+    assert format_iso8601_dtc("invalid-date", mask_phi=True) is None
+    assert format_iso8601_dtc(None, mask_phi=True) is None
+    assert format_iso8601_dtc("", mask_phi=True) is None
+    assert format_iso8601_dtc(True, mask_phi=True) is None
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5000])
+def test_sdtm_streaming_and_full_export_produce_identical_unique_seq_across_chunk_sizes(
+    chunk_size: int,
+) -> None:
+    """Verify iter_sdtm_dataframes and sdtm_dataframe match identically across chunk sizes."""
+    import pandas as pd
+
+    ungrouped_ae_records = [
+        Record(
+            record_id=105,
+            subject_key="SUBJ-02",
+            form_id=20,
+            record_data={"aeTerm": "Nausea", "aeStartDate": "2026-03-10", "aeSerious": False},
+        ),
+        Record(
+            record_id=103,
+            subject_key="SUBJ-01",
+            form_id=20,
+            record_data={"aeTerm": "Headache", "aeStartDate": "2026-02-05", "aeSerious": False},
+        ),
+        Record(
+            record_id=101,
+            subject_key="SUBJ-01",
+            form_id=20,
+            record_data={"aeTerm": "Fatigue", "aeStartDate": "2026-02-05", "aeSerious": True},
+        ),
+        Record(
+            record_id=104,
+            subject_key="SUBJ-02",
+            form_id=20,
+            record_data={"aeTerm": "Dizziness", "aeStartDate": "2026-01-15", "aeSerious": False},
+        ),
+        Record(
+            record_id=102,
+            subject_key="SUBJ-01",
+            form_id=20,
+            record_data={"aeTerm": "Fatigue", "aeStartDate": "2026-02-05", "aeSerious": False},
+        ),
+        Record(
+            record_id=106,
+            subject_key="SUBJ-01",
+            form_id=20,
+            record_data={"aeTerm": "Cough", "aeStartDate": None, "aeSerious": False},
+        ),
+    ]
+    sdk = MagicMock()
+    sdk.records.list.side_effect = lambda **_kw: iter(ungrouped_ae_records)
+
+    mapper = RecordMapper(sdk, chunk_size=chunk_size)
+    full_df = mapper.sdtm_dataframe("STUDY-SEQ", domain="AE")
+    streamed_df = pd.concat(
+        list(mapper.iter_sdtm_dataframes("STUDY-SEQ", domain="AE")),
+        ignore_index=True,
+    )
+
+    pd.testing.assert_frame_equal(streamed_df, full_df)
+    key_tuples = list(full_df[["STUDYID", "USUBJID", "AESEQ"]].itertuples(index=False, name=None))
+    assert len(key_tuples) == len(set(key_tuples))
+    assert key_tuples == [
+        ("STUDY-SEQ", "SUBJ-01", 1),
+        ("STUDY-SEQ", "SUBJ-01", 2),
+        ("STUDY-SEQ", "SUBJ-01", 3),
+        ("STUDY-SEQ", "SUBJ-01", 4),
+        ("STUDY-SEQ", "SUBJ-02", 1),
+        ("STUDY-SEQ", "SUBJ-02", 2),
+    ]
+    subj1 = full_df[full_df["USUBJID"] == "SUBJ-01"]
+    # Tie-broken by (--DTC, AETERM, recordId), with missing --DTC last
+    assert list(subj1["AETERM"]) == ["Fatigue", "Fatigue", "Headache", "Cough"]
+    assert list(subj1["AESER"]) == ["Y", "N", "N", "N"]
+    subj2 = full_df[full_df["USUBJID"] == "SUBJ-02"]
+    assert list(subj2["AETERM"]) == ["Dizziness", "Nausea"]
+
+
+def test_sdtm_sort_query_simulation_transport_multi_form_and_cached_loader_parity(
+    tmp_path,
+) -> None:
+    """Verify MappingParamProcessor sort query, multi-form merge, and CachedRecordsLoader parity."""
+    import httpx
+    import pandas as pd
+
+    from imednet.sdk import ImednetSDK
+    from imednet.simulation import SimulationState, SimulationTransport
+    from imednet_workflows.cached_loader import CachedRecordsLoader
+
+    state = SimulationState()
+    state.studies = [{"studyKey": "STUDY-SIM", "studyName": "Sim Study"}]
+    state.forms = [
+        {"studyKey": "STUDY-SIM", "formId": 10, "formKey": "AE1", "formName": "AE Form 1"},
+        {"studyKey": "STUDY-SIM", "formId": 20, "formKey": "AE2", "formName": "AE Form 2"},
+    ]
+    state.variables = [
+        {"studyKey": "STUDY-SIM", "variableName": "aeTerm", "label": "AE Term", "formId": 10},
+        {"studyKey": "STUDY-SIM", "variableName": "aeStartDate", "label": "Start", "formId": 10},
+        {"studyKey": "STUDY-SIM", "variableName": "aeTerm", "label": "AE Term", "formId": 20},
+        {"studyKey": "STUDY-SIM", "variableName": "aeStartDate", "label": "Start", "formId": 20},
+    ]
+    state.records = [
+        {
+            "studyKey": "STUDY-SIM",
+            "recordId": 30,
+            "formId": 20,
+            "formKey": "AE2",
+            "subjectKey": "SUBJ-02",
+            "visitId": 1,
+            "deleted": False,
+            "recordStatus": "Complete",
+            "dateModified": "2026-03-01T10:00:00Z",
+            "recordData": {"aeTerm": "Rash", "aeStartDate": "2026-03-02"},
+        },
+        {
+            "studyKey": "STUDY-SIM",
+            "recordId": 10,
+            "formId": 10,
+            "formKey": "AE1",
+            "subjectKey": "SUBJ-01",
+            "visitId": 1,
+            "deleted": False,
+            "recordStatus": "Complete",
+            "dateModified": "2026-03-01T10:00:00Z",
+            "recordData": {"aeTerm": "Nausea", "aeStartDate": "2026-03-05"},
+        },
+        {
+            "studyKey": "STUDY-SIM",
+            "recordId": 20,
+            "formId": 20,
+            "formKey": "AE2",
+            "subjectKey": "SUBJ-01",
+            "visitId": 1,
+            "deleted": False,
+            "recordStatus": "Complete",
+            "dateModified": "2026-03-01T10:00:00Z",
+            "recordData": {"aeTerm": "Headache", "aeStartDate": "2026-03-01"},
+        },
+        {
+            "studyKey": "STUDY-SIM",
+            "recordId": 40,
+            "formId": 10,
+            "formKey": "AE1",
+            "subjectKey": "SUBJ-02",
+            "visitId": 1,
+            "deleted": False,
+            "recordStatus": "Complete",
+            "dateModified": "2026-03-01T10:00:00Z",
+            "recordData": {"aeTerm": "Chills", "aeStartDate": "2026-03-01"},
+        },
+    ]
+
+    transport = SimulationTransport(state=state)
+    record_query_params: list[dict[str, str]] = []
+    orig_handle = transport.handle_request
+
+    def spy_handle(request: httpx.Request) -> httpx.Response:
+        if request.method.upper() == "GET" and request.url.path.endswith("/records"):
+            record_query_params.append(dict(request.url.params))
+        return orig_handle(request)
+
+    transport.handle_request = spy_handle  # type: ignore[method-assign]
+    sdk = ImednetSDK(simulation_mode=True, transport=transport)
+
+    # Non-SDTM calls preserve existing query contract without injecting sort
+    non_sdtm_mapper = RecordMapper(sdk, chunk_size=2)
+    _ = non_sdtm_mapper.dataframe("STUDY-SIM", use_labels_as_columns=False)
+    assert record_query_params
+    assert all("sort" not in params for params in record_query_params)
+
+    # Single-query and multi-form SDTM streams request sort="subjectKey,asc;recordId,asc"
+    record_query_params.clear()
+    sdk_sdtm_chunks = list(
+        non_sdtm_mapper.iter_sdtm_dataframes("STUDY-SIM", domain="AE", form_whitelist=[10, 20])
+    )
+    assert record_query_params
+    assert all(
+        params.get("sort") == "subjectKey,asc;recordId,asc" for params in record_query_params
+    )
+    sdk_sdtm_df = pd.concat(sdk_sdtm_chunks, ignore_index=True)
+
+    # CachedRecordsLoader produces identical <DOM>SEQ assignments
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "sim-sdtm-cache")
+    cached_mapper = RecordMapper(sdk, loader=loader, chunk_size=1)
+    cached_sdtm_df = pd.concat(
+        list(cached_mapper.iter_sdtm_dataframes("STUDY-SIM", domain="AE", form_whitelist=[10, 20])),
+        ignore_index=True,
+    )
+
+    pd.testing.assert_frame_equal(sdk_sdtm_df, cached_sdtm_df)
+    assert list(
+        sdk_sdtm_df[["USUBJID", "AESEQ", "AETERM", "AESTDTC"]].itertuples(index=False, name=None)
+    ) == [
+        ("SUBJ-01", 1, "Headache", "2026-03-01"),
+        ("SUBJ-01", 2, "Nausea", "2026-03-05"),
+        ("SUBJ-02", 1, "Chills", "2026-03-01"),
+        ("SUBJ-02", 2, "Rash", "2026-03-02"),
+    ]
+
+    # Legacy/ungrouped custom loader without order_by_subject still sorts before assigning <DOM>SEQ
+    class _LegacyUngroupedLoader:
+        def sync_records(self, study_key: str) -> None:
+            loader.sync_records(study_key)
+
+        def iter_cached_records(self, study_key: str, *, chunk_size: int = 2):
+            return loader.iter_cached_records(
+                study_key, chunk_size=chunk_size, order_by_subject=False
+            )
+
+    legacy_mapper = RecordMapper(sdk, loader=_LegacyUngroupedLoader(), chunk_size=1)  # type: ignore[arg-type]
+    legacy_df = pd.concat(
+        list(legacy_mapper.iter_sdtm_dataframes("STUDY-SIM", domain="AE")),
+        ignore_index=True,
+    )
+    pd.testing.assert_frame_equal(legacy_df, sdk_sdtm_df)
+
+
+def test_dm_exports_enforce_iso_brthdtc_omit_dmseq_and_apply_study_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify all 6 SDTM export paths apply StudyConfiguration, ISO BRTHDTC redaction, and omit DMSEQ."""
+    import pandas as pd
+
+    import imednet_workflows.record_mapper as rm_mod
+    from imednet.integrations.enrichment import EnrichmentPipeline
+    from imednet.models.study_config import MappingRule, StudyConfiguration
+
+    cfg = StudyConfiguration(
+        study_key="STUDY-DM",
+        phi_fields=["siteChartCode", "investigatorNote"],
+        terminology_lookups={
+            "SEX": {"1": "F", "2": "M"},
+            "DM.ETHNIC": {"H": "HISPANIC OR LATINO", "NH": "NOT HISPANIC OR LATINO"},
+        },
+        mappings=[
+            MappingRule(
+                domain="DM",
+                target_field="ARM",
+                source_form_key="DM",
+                source_variable_name="rawArm",
+                business_logic="value.strip().upper()",
+            ),
+            MappingRule(
+                domain="DM",
+                target_field="INVESTIGATOR_NOTE",
+                source_form_key="DM",
+                source_variable_name="investigatorNote",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        rm_mod,
+        "resolve_enrichment_pipeline",
+        lambda sk: EnrichmentPipeline(cfg) if sk == "STUDY-DM" else None,
+    )
+
+    records = [
+        Record(
+            record_id=2,
+            study_key="STUDY-DM",
+            subject_key="SUBJ-02",
+            form_id=10,
+            record_data={
+                "subjid": "002",
+                "birthDate": "",
+                "sex": "2",
+                "ethnic": "NH",
+                "rawArm": " placebo ",
+                "SUBJINIT": "AB",
+                "site_chart_code": "CH-200",
+                "investigatorNote": "Private note 2",
+            },
+        ),
+        Record(
+            record_id=1,
+            study_key="STUDY-DM",
+            subject_key="SUBJ-01",
+            form_id=10,
+            record_data={
+                "subjid": "001",
+                "birthDate": "1985-07-19",
+                "sex": "1",
+                "ethnic": "H",
+                "rawArm": " active ",
+                "SUBJINIT": "JD",
+                "site_chart_code": "CH-100",
+                "investigatorNote": "Private note 1",
+                "DMSEQ": 99,
+            },
+        ),
+    ]
+    sdk = MagicMock()
+    sdk.records.list.side_effect = lambda **_kw: iter(records)
+
+    mapper = RecordMapper(sdk, chunk_size=1)
+    dfs_masked = [
+        mapper.sdtm_dataframe("STUDY-DM", domain="DM"),
+        pd.concat(list(mapper.iter_sdtm_dataframes("STUDY-DM", domain="DM")), ignore_index=True),
+        mapper.dataframe("STUDY-DM", as_sdtm=True, domain="DM"),
+        pd.concat(
+            list(mapper.iter_dataframes("STUDY-DM", as_sdtm=True, domain="DM")),
+            ignore_index=True,
+        ),
+        mapper.transform_to_sdtm(records, domain="DM", study_key="STUDY-DM"),
+        transform_records_to_sdtm(records, domain="DM", study_key="STUDY-DM"),
+    ]
+
+    for df in dfs_masked:
+        assert "DMSEQ" not in df.columns
+        assert list(df["STUDYID"]) == ["STUDY-DM", "STUDY-DM"]
+        assert list(df["USUBJID"]) == ["SUBJ-01", "SUBJ-02"]
+        assert list(df["SUBJID"]) == ["001", "002"]
+        assert list(df["BRTHDTC"]) == ["1985", None]
+        assert list(df["SEX"]) == ["F", "M"]
+        assert list(df["ETHNIC"]) == ["HISPANIC OR LATINO", "NOT HISPANIC OR LATINO"]
+        assert list(df["ARM"]) == ["ACTIVE", "PLACEBO"]
+        assert list(df["SUBJINIT"]) == ["***MASKED***", "***MASKED***"]
+        assert list(df["site_chart_code"]) == ["***MASKED***", "***MASKED***"]
+        assert list(df["INVESTIGATOR_NOTE"]) == ["***MASKED***", "***MASKED***"]
+
+    # Empty DM export also omits DMSEQ
+    sdk.records.list.side_effect = lambda **_kw: iter([])
+    empty_dm = mapper.sdtm_dataframe("STUDY-DM", domain="DM")
+    assert empty_dm.empty
+    assert "DMSEQ" not in empty_dm.columns
+
+    # Explicit mask_phi=False per call and via constructor preserves full BRTHDTC and PHI text
+    sdk.records.list.side_effect = lambda **_kw: iter(records)
+    opt_out_dfs = [
+        mapper.sdtm_dataframe("STUDY-DM", domain="DM", mask_phi=False),
+        pd.concat(
+            list(mapper.iter_sdtm_dataframes("STUDY-DM", domain="DM", mask_phi=False)),
+            ignore_index=True,
+        ),
+        mapper.dataframe("STUDY-DM", as_sdtm=True, domain="DM", mask_phi=False),
+        pd.concat(
+            list(mapper.iter_dataframes("STUDY-DM", as_sdtm=True, domain="DM", mask_phi=False)),
+            ignore_index=True,
+        ),
+        mapper.transform_to_sdtm(records, domain="DM", study_key="STUDY-DM", mask_phi=False),
+        transform_records_to_sdtm(records, domain="DM", study_key="STUDY-DM", mask_phi=False),
+        RecordMapper(sdk, mask_phi=False).sdtm_dataframe("STUDY-DM", domain="DM"),
+    ]
+    for df_raw in opt_out_dfs:
+        assert "DMSEQ" not in df_raw.columns
+        assert list(df_raw["BRTHDTC"]) == ["1985-07-19", None]
+        assert list(df_raw["SUBJINIT"]) == ["JD", "AB"]
+        assert list(df_raw["site_chart_code"]) == ["CH-100", "CH-200"]
+        assert list(df_raw["INVESTIGATOR_NOTE"]) == ["Private note 1", "Private note 2"]
+        assert list(df_raw["SEX"]) == ["F", "M"]
+        assert list(df_raw["ARM"]) == ["ACTIVE", "PLACEBO"]
+
+
+def test_sdtm_generator_streams_and_form_whitelist_variants() -> None:
+    """Verify ordered and ungrouped generator streams, voided records, and form_whitelist variants."""
+    import pandas as pd
+
+    # 1. Ordered generator stream across multiple subject groups and chunks, skipping voided records
+    def _ordered_gen():
+        yield Record(
+            record_id=999,
+            subject_key="SUBJ-00",
+            form_id=10,
+            deleted=True,
+            record_data={"aeTerm": "Voided", "aeStartDate": "2026-01-01"},
+        )
+        for subj_idx in range(1, 7):
+            subj = f"SUBJ-{subj_idx:02d}"
+            yield Record(
+                record_id=subj_idx * 10 + 2,
+                subject_key=subj,
+                form_id=10,
+                record_data={"aeTerm": "Later", "aeStartDate": "2026-02-02"},
+            )
+            yield Record(
+                record_id=subj_idx * 10 + 1,
+                subject_key=subj,
+                form_id=10,
+                record_data={"aeTerm": "Earlier", "aeStartDate": "2026-02-01"},
+            )
+
+    sdk_ordered = MagicMock()
+    sdk_ordered.records.list.side_effect = lambda **_kw: _ordered_gen()
+    mapper_ordered = RecordMapper(sdk_ordered, chunk_size=2)
+    ordered_chunks = list(mapper_ordered.iter_sdtm_dataframes("STUDY-GEN", domain="AE"))
+    assert len(ordered_chunks) == 6
+    ordered_df = pd.concat(ordered_chunks, ignore_index=True)
+    assert len(ordered_df) == 12
+    assert list(ordered_df["AESEQ"]) == [1, 2] * 6
+    assert list(ordered_df["AETERM"]) == ["Earlier", "Later"] * 6
+
+    # 2. Ungrouped generator stream triggers pre-yield drain and global sort
+    def _ungrouped_gen():
+        yield Record(
+            record_id=2,
+            subject_key="SUBJ-02",
+            form_id=10,
+            record_data={"aeTerm": "B2", "aeStartDate": "2026-03-02"},
+        )
+        yield Record(
+            record_id=1,
+            subject_key="SUBJ-01",
+            form_id=10,
+            record_data={"aeTerm": "A1", "aeStartDate": "2026-03-01"},
+        )
+        yield Record(
+            record_id=888,
+            subject_key="SUBJ-01",
+            form_id=10,
+            deleted=True,
+            record_data={"aeTerm": "Skip", "aeStartDate": "2026-03-01"},
+        )
+        yield Record(
+            record_id=3,
+            subject_key="SUBJ-02",
+            form_id=10,
+            record_data={"aeTerm": "B1", "aeStartDate": "2026-03-01"},
+        )
+
+    sdk_ungrouped = MagicMock()
+    sdk_ungrouped.records.list.side_effect = lambda **_kw: _ungrouped_gen()
+    mapper_ungrouped = RecordMapper(sdk_ungrouped, chunk_size=2)
+    ungrouped_df = pd.concat(
+        list(mapper_ungrouped.iter_sdtm_dataframes("STUDY-GEN", domain="AE")),
+        ignore_index=True,
+    )
+    assert list(
+        ungrouped_df[["USUBJID", "AESEQ", "AETERM"]].itertuples(index=False, name=None)
+    ) == [
+        ("SUBJ-01", 1, "A1"),
+        ("SUBJ-02", 1, "B1"),
+        ("SUBJ-02", 2, "B2"),
+    ]
+
+    # 3. Legacy sdk.get_records returning lists for multi-form, single-form, and empty form_whitelist
+    sdk_legacy = MagicMock(spec=["get_records"])
+    form_rows = {
+        10: [
+            Record(
+                record_id=20,
+                subject_key="SUBJ-02",
+                form_id=10,
+                record_data={"aeTerm": "Form10-S2", "aeStartDate": "2026-04-02"},
+            ),
+            Record(
+                record_id=10,
+                subject_key="SUBJ-01",
+                form_id=10,
+                record_data={"aeTerm": "Form10-S1", "aeStartDate": "2026-04-02"},
+            ),
+        ],
+        20: [
+            Record(
+                record_id=15,
+                subject_key="SUBJ-01",
+                form_id=20,
+                record_data={"aeTerm": "Form20-S1", "aeStartDate": "2026-04-01"},
+            ),
+        ],
+    }
+    sdk_legacy.get_records.side_effect = lambda **kw: list(form_rows.get(kw.get("formId"), []))
+    legacy_mapper = RecordMapper(sdk_legacy, chunk_size=2)
+
+    empty_whitelist_df = legacy_mapper.sdtm_dataframe("STUDY-LEG", domain="AE", form_whitelist=[])
+    assert empty_whitelist_df.empty
+
+    single_form_df = legacy_mapper.sdtm_dataframe("STUDY-LEG", domain="AE", form_whitelist=[10])
+    assert list(single_form_df["USUBJID"]) == ["SUBJ-01", "SUBJ-02"]
+
+    multi_form_df = legacy_mapper.sdtm_dataframe("STUDY-LEG", domain="AE", form_whitelist=[10, 20])
+    assert list(
+        multi_form_df[["USUBJID", "AESEQ", "AETERM"]].itertuples(index=False, name=None)
+    ) == [
+        ("SUBJ-01", 1, "Form20-S1"),
+        ("SUBJ-01", 2, "Form10-S1"),
+        ("SUBJ-02", 1, "Form10-S2"),
+    ]
+
+
+def test_sdtm_variable_whitelist_projection_and_custom_domain_phi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify variable_whitelist projection, mapped USUBJID, and custom domain nested/date PHI redaction."""
+    import imednet_workflows.record_mapper as rm_mod
+    from imednet.integrations.enrichment import EnrichmentPipeline
+    from imednet.models.study_config import MappingRule, StudyConfiguration
+
+    cfg = StudyConfiguration(
+        study_key="STUDY-LB",
+        phi_fields=["AESER", "AESTDTC", "secretTag"],
+        mappings=[
+            MappingRule(
+                domain="LB",
+                target_field="USUBJID",
+                source_form_key="LB",
+                source_variable_name="rawSubj",
+                business_logic="value.upper()",
+            ),
+            MappingRule(
+                domain="LB",
+                target_field="LBTESTCD",
+                source_form_key="LB",
+                source_variable_name="rawLabCode",
+                business_logic="value.upper()",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        rm_mod,
+        "resolve_enrichment_pipeline",
+        lambda sk: EnrichmentPipeline(cfg) if sk in {"STUDY-LB", "STUDY-AE-SENS"} else None,
+    )
+
+    sdk = MagicMock()
+    lb_records: list[Any] = [
+        Record(
+            record_id=2,
+            subject_key="orig-2",
+            form_id=30,
+            record_data={
+                "rawSubj": "subj-b",
+                "rawLabCode": "hgb",
+                "LBDTC": "2026-05-02 08:15:00",
+                "BRTHDTC": "1980-04-12",
+                "droppedExtra": "ignore-me",
+                "auditMeta": {
+                    "patientName": "Alice Smith",
+                    "secretTag": "TAG-9",  # pragma: allowlist secret
+                },
+            },
+        ),
+        {
+            "recordId": 1,
+            "record_data": {
+                "rawSubj": "subj-a",
+                "rawLabCode": "wbc",
+                "LBDTC": "2026-05-01 07:00:00",
+                "BRTHDTC": "1975-11-30",
+                "droppedExtra": "ignore-dict",
+                "auditMeta": {
+                    "patientName": "Bob Jones",
+                    "secretTag": "TAG-1",  # pragma: allowlist secret
+                },
+            },
+        },
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(lb_records)
+    mapper = RecordMapper(sdk, chunk_size=1)
+
+    assert list(mapper.iter_sdtm_dataframes("STUDY-LB", domain="LB", variable_whitelist=[])) == []
+
+    lb_df = mapper.sdtm_dataframe(
+        "STUDY-LB",
+        domain="LB",
+        variable_whitelist=["USUBJID", "LBTESTCD", "LBDTC", "BRTHDTC", "auditMeta"],
+    )
+    assert "droppedExtra" not in lb_df.columns
+    assert list(lb_df["USUBJID"]) == ["SUBJ-A", "SUBJ-B"]
+    assert list(lb_df["LBSEQ"]) == [1, 1]
+    assert list(lb_df["LBTESTCD"]) == ["WBC", "HGB"]
+    assert list(lb_df["LBDTC"]) == ["2026-05-01T07:00:00", "2026-05-02T08:15:00"]
+    assert list(lb_df["BRTHDTC"]) == ["1975", "1980"]
+    assert lb_df.iloc[0]["auditMeta"] == {
+        "patientName": "***MASKED***",
+        "secretTag": "***MASKED***",
+    }
+
+    # Sensitive standard DTC and flag variables via custom phi_fields
+    ae_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "SUBJ-1",
+                "aeTerm": "Rash",
+                "aeSerious": True,
+                "aeStartDate": "2026-05-01",
+            }
+        ],
+        domain="AE",
+        study_key="STUDY-AE-SENS",
+    )
+    assert ae_df.iloc[0]["AESER"] == "***MASKED***"
+    assert ae_df.iloc[0]["AESTDTC"] is None
