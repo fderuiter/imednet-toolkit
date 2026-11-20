@@ -2255,3 +2255,135 @@ def test_by_form_exports_recover_stale_running_lease_without_premature_commit(
     assert provider.get_last_timestamp("STALE_STUDY", "sql_DEMO") == datetime(
         2026, 6, 5, 0, 0, tzinfo=UTC
     )
+
+
+def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip(
+    tmp_path: Path,
+) -> None:
+    """Verify by-form exports enforce Variable(required=True) in one pass and integrate with dataframe_to_records."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    from imednet.errors import ValidationError
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet.utils.pandas import MASKED_SENTINEL, dataframe_to_records
+    from imednet.validation.cache import SchemaCache
+
+    duckdb_mod = pytest.importorskip("duckdb")
+
+    sdk = MagicMock()
+    forms = [
+        SimpleNamespace(form_id=10, form_key="DEMO"),
+        SimpleNamespace(form_id=20, form_key="VITALS"),
+    ]
+    sdk.forms.list.return_value = forms
+    vars_list = [
+        Variable(
+            variable_name="patientName",
+            label="Patient Name",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+            required=True,
+        ),
+        Variable(
+            variable_name="SITE_CODE",
+            label="Site Code",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="HR",
+            label="Heart Rate",
+            variable_type="int",
+            form_id=20,
+            form_key="VITALS",
+            required=True,
+        ),
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.side_effect = AssertionError("must reuse prefetched variables")
+
+    records = [
+        Record(
+            record_id=101,
+            study_key="RT_STUDY",
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMO",
+            record_data={"patientName": "Jane Doe", "SITE_CODE": "0042"},
+        ),
+        Record(
+            record_id=102,
+            study_key="RT_STUDY",
+            subject_key="SUBJ-2",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMO",
+            record_data={"patientName": "", "SITE_CODE": "0099"},
+        ),
+        Record(
+            record_id=201,
+            study_key="RT_STUDY",
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=20,
+            form_key="VITALS",
+            record_data={"HR": 72},
+        ),
+    ]
+
+    sql_masked = tmp_path / "rt_masked.sqlite"
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+    export_mod.export_to_sql_by_form(
+        sdk,
+        "RT_STUDY",
+        f"sqlite:///{sql_masked}",
+        quality_gate_enabled=True,
+        min_schema_readiness_score=100.0,
+    )
+    assert sdk.variables.list.call_count == 1
+
+    with sqlite3.connect(sql_masked) as sconn:
+        demo_masked_df = pd.read_sql_query('SELECT * FROM "DEMO"', sconn)
+    assert len(demo_masked_df) == 1
+    assert demo_masked_df["patientName"].iloc[0] == MASKED_SENTINEL
+    with pytest.raises(ValidationError, match="contains masked PHI sentinel"):
+        dataframe_to_records(demo_masked_df)
+
+    ddb_unmasked = tmp_path / "rt_unmasked.duckdb"
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+    export_mod.export_to_duckdb_by_form(
+        sdk,
+        "RT_STUDY",
+        str(ddb_unmasked),
+        quality_gate_enabled=True,
+        min_schema_readiness_score=100.0,
+        mask_phi=False,
+    )
+
+    schema = SchemaCache()
+    schema.populate(vars_list)
+    with duckdb_mod.connect(str(ddb_unmasked)) as uconn:
+        demo_unmasked_df = uconn.execute('SELECT * FROM "DEMO"').df()
+        vitals_unmasked_df = uconn.execute('SELECT * FROM "VITALS"').df()
+
+    demo_payloads = dataframe_to_records(demo_unmasked_df, schema=schema)
+    vitals_payloads = dataframe_to_records(vitals_unmasked_df, schema=schema)
+    assert demo_payloads == [
+        {
+            "formId": 10,
+            "subjectKey": "SUBJ-1",
+            "data": {"patientName": "Jane Doe", "SITE_CODE": "0042"},
+        }
+    ]
+    assert vitals_payloads == [
+        {
+            "formId": 20,
+            "subjectKey": "SUBJ-1",
+            "data": {"HR": 72},
+        }
+    ]

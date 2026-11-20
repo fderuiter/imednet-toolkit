@@ -117,6 +117,7 @@ from imednet.utils.security import (
     global_sensitivity_registry,
     mask_clinical_phi,
 )
+from imednet.utils.tabular import MASKED_SENTINEL
 from imednet.utils.url import redact_url_query
 
 logger = logging.getLogger(__name__)
@@ -360,7 +361,7 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
     )
     for col in sensitive_cols:
         if len(masked) > 0:
-            masked[col] = "***MASKED***"
+            masked[col] = MASKED_SENTINEL
 
     if len(masked) == 0:
         return masked
@@ -402,8 +403,8 @@ def _redact_single_record(item: Any) -> Any:
                 continue
             if global_sensitivity_registry.is_sensitive(field_name):
                 val = getattr(item, field_name, None)
-                if val is not None and val != "***MASKED***":
-                    updates[field_name] = "***MASKED***"
+                if val is not None and val != MASKED_SENTINEL:
+                    updates[field_name] = MASKED_SENTINEL
         return item.model_copy(update=updates) if updates else item
 
     record_data = getattr(item, "record_data", None)
@@ -742,7 +743,7 @@ def _scrub_key_value_match(match: re.Match[str]) -> str:
     unquoted_key = key_token.strip("\"'")
 
     if global_sensitivity_registry.is_sensitive(unquoted_key):
-        replacement = "***MASKED***"
+        replacement = MASKED_SENTINEL
     elif _is_credential_key(unquoted_key):
         replacement = "***"
     else:
@@ -763,8 +764,8 @@ def _sanitize_text_content(text: str) -> str:
     sanitized = _AUTH_SCHEME_RE.sub(r"\1 ***", sanitized)
     sanitized = _JWT_RE.sub("***", sanitized)
     sanitized = _KEY_VALUE_PAIR_RE.sub(_scrub_key_value_match, sanitized)
-    sanitized = _SSN_RE.sub("***MASKED***", sanitized)
-    return _EMAIL_RE.sub("***MASKED***", sanitized)
+    sanitized = _SSN_RE.sub(MASKED_SENTINEL, sanitized)
+    return _EMAIL_RE.sub(MASKED_SENTINEL, sanitized)
 
 
 def _sanitize_exception_message(exc: BaseException) -> str:

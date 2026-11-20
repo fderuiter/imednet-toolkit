@@ -1117,6 +1117,70 @@ class TestQualityGatePrefetchedVariablesAndBufferRouter:
         )
         assert retained == [valid_demo, valid_vitals]
 
+    def test_apply_quality_gate_prefetched_variables_enforces_required_flag(self):
+        """Assert prefetched Variable(required=True) preserves required policy on cloned variables without SDK calls."""
+        from types import SimpleNamespace
+
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+
+        sdk = MagicMock()
+        sdk.variables.list.side_effect = AssertionError("must not fetch /variables again")
+        sdk.get_variables.side_effect = AssertionError("must not fetch /variables again")
+
+        forms = [SimpleNamespace(form_id=10, form_key="DEMO")]
+        variables = [
+            Variable(
+                variable_name="SUBJ_CODE",
+                variable_type="text",
+                form_id=10,
+                form_key="",
+                required=True,
+            ),
+            Variable(
+                variable_name="AGE",
+                variable_type="int",
+                form_id=10,
+                form_key="",
+            ),
+        ]
+
+        complete_rec = Record(
+            record_id=1,
+            form_id=10,
+            form_key="",
+            record_data={"SUBJ_CODE": "S-001", "AGE": 44},
+        )
+        blank_required_rec = Record(
+            record_id=2,
+            form_id=10,
+            form_key="DEMO",
+            record_data={"SUBJ_CODE": "", "AGE": 44},
+        )
+        none_required_rec = Record(
+            record_id=3,
+            form_id=10,
+            form_key="",
+            record_data={"SUBJ_CODE": None, "AGE": 44},
+        )
+
+        cfg = SinkConfig(
+            study_key="STUDY_REQ",
+            quality_gate_enabled=True,
+            min_schema_readiness_score=100.0,
+        )
+        retained = list(
+            sink_base_mod.apply_quality_gate(
+                sdk,
+                "STUDY_REQ",
+                [complete_rec, blank_required_rec, none_required_rec],
+                cfg,
+                variables=variables,
+                forms=forms,
+            )
+        )
+        assert retained == [complete_rec]
+
     def test_bounded_form_buffer_router_and_form_ref_extraction(self):
         """Verify BoundedFormBufferRouter flushes on batch_size and global memory ceiling."""
         from types import SimpleNamespace

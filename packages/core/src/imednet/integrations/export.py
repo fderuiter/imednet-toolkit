@@ -52,6 +52,7 @@ except ImportError:
 from imednet.constants import MAX_SQLITE_COLUMNS
 from imednet.utils import sanitize_csv_formula
 from imednet.utils.security import _normalize_key, global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.tabular import MASKED_SENTINEL
 
 from .. import ImednetClient
 from ..sdk import ImednetSDK
@@ -125,7 +126,7 @@ def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFr
     )
     for col in sensitive_cols:
         if len(df) > 0:
-            df[col] = "***MASKED***"
+            df[col] = MASKED_SENTINEL
 
     if len(df) == 0:
         return df
@@ -3932,7 +3933,7 @@ def _unpack_long_sql_rows(
             elif global_sensitivity_registry.is_sensitive(name) or _is_custom_phi_key(
                 name, phi_keys
             ):
-                masked_value = "***MASKED***"
+                masked_value = MASKED_SENTINEL
             else:
                 masked_value = mask_clinical_phi(value)
                 if phi_keys:
