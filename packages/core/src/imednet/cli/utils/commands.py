@@ -14,7 +14,7 @@ from .args import (
     add_list_query_args,
     add_no_interactive,
     add_output_format,
-    collect_list_items,
+    collect_list_items_with_remainder,
     prepare_list_query,
     resolve_output_format,
 )
@@ -91,7 +91,7 @@ def register_list_command(
                 )
             )
             with fetching_status(name, study_key):
-                items, truncated = collect_list_items(
+                items, truncated, load_remaining = collect_list_items_with_remainder(
                     getattr(sdk, attr).list(study_key, **req_kwargs),
                     effective_limit,
                 )
@@ -104,6 +104,7 @@ def register_list_command(
                 details=items,
                 truncated=truncated,
                 interactive=False if no_interactive else None,
+                on_load_all=load_remaining,
             )
 
         def _dispatch_study_list(args: argparse.Namespace) -> None:
@@ -163,7 +164,7 @@ def register_list_command(
                 )
             )
             with fetching_status(name):
-                items, truncated = collect_list_items(
+                items, truncated, load_remaining = collect_list_items_with_remainder(
                     getattr(sdk, attr).list(**req_kwargs),
                     effective_limit,
                 )
@@ -176,6 +177,7 @@ def register_list_command(
                 details=items,
                 truncated=truncated,
                 interactive=False if no_interactive else None,
+                on_load_all=load_remaining,
             )
 
         def _dispatch_no_study_list(args: argparse.Namespace) -> None:

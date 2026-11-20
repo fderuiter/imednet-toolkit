@@ -935,3 +935,211 @@ def test_readonly_explorer_immediate_scenario_and_mode_updates_via_node() -> Non
     assert out["queriesRestSnippet"].startswith("GET /api/v1/edc/studies/STUDY/queries HTTP/1.1")
     assert out["queriesRestLang"] == "language-http"
     assert out["copiedText"] == out["queriesRestSnippet"]
+
+
+def test_showcase_hashchange_preserves_persona_and_clipboard_errors_announce_via_node() -> None:
+    """Verify non-panel hashchange preserves active persona and rejected/missing clipboard announces fallback."""
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node runtime not available for DOM mock evaluation")
+
+    repo_root = get_repo_root()
+    script_path = repo_root / "docs" / "_static" / "showcase.js"
+
+    js_test = f"""
+    const fs = require('fs');
+    const code = fs.readFileSync('{script_path.as_posix()}', 'utf8');
+
+    const unhandled = [];
+    process.on('unhandledRejection', (reason) => {{
+        unhandled.push(String(reason));
+    }});
+
+    Object.defineProperty(globalThis, 'navigator', {{
+        configurable: true,
+        value: {{
+            clipboard: {{
+                writeText: () => Promise.reject(new Error('NotAllowedError'))
+            }}
+        }}
+    }});
+
+    function makeElement(id, tagName = 'div', extraAttrs = {{}}) {{
+        const attrs = {{ ...extraAttrs }};
+        const classes = new Set();
+        const handlers = {{}};
+        return {{
+            id,
+            tagName,
+            value: id === 'ie-dataset-select' ? 'records' : (id === 'cdm-form-select' ? 'VS' : 'part11'),
+            textContent: '',
+            innerHTML: '',
+            className: '',
+            clientWidth: 400,
+            scrollWidth: 400,
+            classList: {{
+                add: (...cls) => cls.forEach((c) => classes.add(c)),
+                remove: (...cls) => cls.forEach((c) => classes.delete(c)),
+                toggle: (cls, force) => {{
+                    if (force === undefined) force = !classes.has(cls);
+                    if (force) classes.add(cls); else classes.delete(cls);
+                    return force;
+                }},
+                contains: (cls) => classes.has(cls)
+            }},
+            setAttribute: (k, v) => {{ attrs[k] = String(v); }},
+            removeAttribute: (k) => {{ delete attrs[k]; }},
+            getAttribute: (k) => (k in attrs ? attrs[k] : null),
+            hasAttribute: (k) => k in attrs,
+            addEventListener: (ev, cb) => {{
+                handlers[ev] = handlers[ev] || [];
+                handlers[ev].push(cb);
+            }},
+            trigger: (ev) => {{
+                (handlers[ev] || []).forEach((cb) => cb({{ preventDefault: () => {{}} }}));
+            }}
+        }};
+    }}
+
+    const personaTabs = [
+        makeElement('tab-integration', 'button', {{ 'data-target': 'panel-integration', 'aria-selected': 'true' }}),
+        makeElement('tab-datamanager', 'button', {{ 'data-target': 'panel-datamanager', 'aria-selected': 'false' }}),
+        makeElement('tab-auditor', 'button', {{ 'data-target': 'panel-auditor', 'aria-selected': 'false' }})
+    ];
+    const panels = [
+        makeElement('panel-integration', 'div'),
+        makeElement('panel-datamanager', 'div', {{ hidden: 'true' }}),
+        makeElement('panel-auditor', 'div', {{ hidden: 'true' }})
+    ];
+    const elements = {{
+        '#ie-dataset-select': makeElement('ie-dataset-select', 'select'),
+        '#ie-mode-sdk': makeElement('ie-mode-sdk', 'button'),
+        '#ie-mode-rest': makeElement('ie-mode-rest', 'button'),
+        '#ie-code-display': makeElement('ie-code-display', 'code'),
+        '#ie-snippet-copy-btn': makeElement('ie-snippet-copy-btn', 'button'),
+        '#ie-metric-badge': makeElement('ie-metric-badge', 'div'),
+        '#ie-tab-table': makeElement('ie-tab-table', 'button'),
+        '#ie-tab-json': makeElement('ie-tab-json', 'button'),
+        '#ie-view-table': makeElement('ie-view-table', 'div'),
+        '#ie-view-json': makeElement('ie-view-json', 'div'),
+        '#ie-json-pre code': makeElement('ie-json-code', 'code'),
+        '#ie-copy-btn': makeElement('ie-copy-btn', 'button'),
+        '#cdm-form-select': makeElement('cdm-form-select', 'select'),
+        '#cdm-validate-btn': makeElement('cdm-validate-btn', 'button'),
+        '#cdm-metric-badge': makeElement('cdm-metric-badge', 'div'),
+        '#cdm-tab-crf': makeElement('cdm-tab-crf', 'button'),
+        '#cdm-tab-json': makeElement('cdm-tab-json', 'button'),
+        '#cdm-view-crf': makeElement('cdm-view-crf', 'div'),
+        '#cdm-view-json': makeElement('cdm-view-json', 'div'),
+        '#cdm-json-pre code': makeElement('cdm-json-code', 'code'),
+        '#cdm-copy-btn': makeElement('cdm-copy-btn', 'button'),
+        '#aud-scenario-select': makeElement('aud-scenario-select', 'select'),
+        '#aud-verify-btn': makeElement('aud-verify-btn', 'button'),
+        '#aud-metric-badge': makeElement('aud-metric-badge', 'div'),
+        '#aud-tab-table': makeElement('aud-tab-table', 'button'),
+        '#aud-tab-json': makeElement('aud-tab-json', 'button'),
+        '#aud-view-table': makeElement('aud-view-table', 'div'),
+        '#aud-view-json': makeElement('aud-view-json', 'div'),
+        '#aud-json-pre code': makeElement('aud-json-code', 'code'),
+        '#aud-copy-btn': makeElement('aud-copy-btn', 'button')
+    }};
+
+    const root = makeElement('interactive-showcase-root', 'div');
+    root.querySelector = (sel) => elements[sel] || null;
+    root.querySelectorAll = (sel) => {{
+        if (sel === '.showcase-persona-tab') return personaTabs;
+        if (sel === '.showcase-panel') return panels;
+        return [];
+    }};
+
+    const winHandlers = {{}};
+    global.window = {{
+        addEventListener: (ev, cb) => {{
+            winHandlers[ev] = winHandlers[ev] || [];
+            winHandlers[ev].push(cb);
+        }},
+        history: {{
+            replaceState: (_state, _title, url) => {{
+                global.window.location.hash = url;
+            }}
+        }},
+        location: {{ hash: '#documentation-overview' }}
+    }};
+    global.document = {{
+        readyState: 'complete',
+        getElementById: (id) => {{
+            if (id === 'interactive-showcase-root') return root;
+            return panels.find((p) => p.id === id) || null;
+        }},
+        querySelectorAll: () => [],
+        addEventListener: () => {{}},
+        body: makeElement('body')
+    }};
+
+    eval(code);
+
+    (async () => {{
+        const out = {{}};
+        // Initial non-panel hash falls back to panel-integration
+        out.initialIntegrationActive = !panels[0].hasAttribute('hidden');
+
+        // Activate Clinical Data Manager, then navigate hash to #documentation-overview
+        personaTabs[1].trigger('click');
+        global.window.location.hash = '#documentation-overview';
+        (winHandlers['hashchange'] || []).forEach((cb) => cb());
+        out.cdmSelectedAfterAnchor = personaTabs[1].getAttribute('aria-selected');
+        out.cdmHiddenAfterAnchor = panels[1].hasAttribute('hidden');
+
+        // Activate Auditor, then navigate hash to #documentation-overview
+        personaTabs[2].trigger('click');
+        global.window.location.hash = '#documentation-overview';
+        (winHandlers['hashchange'] || []).forEach((cb) => cb());
+        out.audSelectedAfterAnchor = personaTabs[2].getAttribute('aria-selected');
+        out.audHiddenAfterAnchor = panels[2].hasAttribute('hidden');
+
+        // Valid panel hashchange still switches persona
+        global.window.location.hash = '#panel-datamanager';
+        (winHandlers['hashchange'] || []).forEach((cb) => cb());
+        out.switchedViaValidHash = personaTabs[1].getAttribute('aria-selected');
+
+        // Rejected clipboard announces failure in all three metric badges without unhandled rejection
+        elements['#ie-copy-btn'].trigger('click');
+        elements['#cdm-copy-btn'].trigger('click');
+        await new Promise((r) => setTimeout(r, 20));
+        out.ieFailBadge = elements['#ie-metric-badge'].textContent;
+        out.cdmFailBadge = elements['#cdm-metric-badge'].textContent;
+        out.ieBtnLabel = elements['#ie-copy-btn'].textContent;
+
+        // Missing navigator.clipboard also announces fallback synchronously
+        Object.defineProperty(globalThis, 'navigator', {{
+            configurable: true,
+            value: {{}}
+        }});
+        elements['#aud-copy-btn'].trigger('click');
+        out.audFailBadge = elements['#aud-metric-badge'].textContent;
+        out.unhandled = unhandled;
+
+        console.log(JSON.stringify(out));
+        process.exit(0);
+    }})();
+    """
+
+    res = subprocess.run(
+        [node_bin, "-e", js_test],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = json.loads(res.stdout)
+
+    assert out["initialIntegrationActive"] is True
+    assert out["cdmSelectedAfterAnchor"] == "true"
+    assert out["cdmHiddenAfterAnchor"] is False
+    assert out["audSelectedAfterAnchor"] == "true"
+    assert out["audHiddenAfterAnchor"] is False
+    assert out["switchedViaValidHash"] == "true"
+    assert "Copy JSON failed" in out["ieFailBadge"]
+    assert "Copy JSON failed" in out["cdmFailBadge"]
+    assert "Copy JSON failed" in out["audFailBadge"]
+    assert out["ieBtnLabel"] == "Copy failed"
+    assert out["unhandled"] == []

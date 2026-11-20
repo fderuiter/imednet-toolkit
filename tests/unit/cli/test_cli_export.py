@@ -1,6 +1,7 @@
 """Unit tests for cli export."""
 
 import importlib.util
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -648,3 +649,163 @@ def test_cli_export_all_9_subcommands_accept_no_interactive_and_suppress_spinner
     assert "\x1b[?25l" not in err_text
     assert "\x1b[?25h" not in err_text
     assert "IMEDNET_NON_INTERACTIVE" not in os.environ
+
+
+def test_cli_export_json_hierarchical_honors_incremental_filters_ledger_and_quality_gate(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify `imednet export json --hierarchical` applies streaming filters, ledger checkpoints, and quality gate."""
+    import json
+    from datetime import UTC, datetime
+
+    from imednet.models.forms import Form
+    from imednet.models.intervals import FormSummary, Interval
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    vars_list = [
+        Variable(
+            variable_name="SCORE", label="Score", variable_type="int", form_id=10, form_key="F_VS"
+        )
+    ]
+    forms_list = [
+        Form(
+            form_id=10,
+            form_key="F_VS",
+            form_name="Vital Signs",
+            form_type="Standard",
+            date_created="2026-01-01T00:00:00Z",
+            date_modified="2026-01-01T00:00:00Z",
+        )
+    ]
+    intervals_list = [
+        Interval(
+            interval_id=1,
+            interval_name="V1",
+            interval_sequence=1,
+            interval_description="V1",
+            interval_group_name="G1",
+            date_created="2026-01-01T00:00:00Z",
+            date_modified="2026-01-01T00:00:00Z",
+            forms=[FormSummary(form_id=10, form_key="F_VS", form_name="Vital Signs")],
+        )
+    ]
+    sdk.get_variables.return_value = vars_list
+    sdk.variables.list.return_value = vars_list
+    sdk.get_forms.return_value = forms_list
+    sdk.forms.list.return_value = forms_list
+    sdk.get_intervals.return_value = intervals_list
+
+    r1 = Record(
+        record_id=1,
+        study_key="S_CLI",
+        subject_key="SUBJ-1",
+        visit_id=1,
+        form_id=10,
+        form_key="F_VS",
+        record_status="Complete",
+        date_created=datetime(2026, 6, 1, tzinfo=UTC),
+        date_modified=datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+        record_data={"SCORE": 85},
+    )
+    r2_filtered_out = Record(
+        record_id=2,
+        study_key="S_CLI",
+        subject_key="SUBJ-2",
+        visit_id=1,
+        form_id=10,
+        form_key="F_VS",
+        record_status="Complete",
+        date_created=datetime(2026, 6, 1, tzinfo=UTC),
+        date_modified=datetime(2026, 6, 1, 10, 5, tzinfo=UTC),
+        record_data={"SCORE": 20},
+    )
+    seen_calls: list[dict[str, object]] = []
+
+    def _matches_subj1(call_kw: dict[str, object]) -> bool:
+        for key in ("subject_key", "subjectKey"):
+            val = call_kw.get(key)
+            if val in {"SUBJ-1", ("==", "SUBJ-1"), ("=", "SUBJ-1")}:
+                return True
+        return "subjectKey==SUBJ-1" in str(call_kw.get("filter", ""))
+
+    def _list_records(**kw: object) -> object:
+        seen_calls.append(dict(kw))
+        rdf = str(kw.get("record_data_filter", "") or "")
+        rows = [r1, r2_filtered_out]
+        if _matches_subj1(dict(kw)):
+            rows = [r for r in rows if r.subject_key == "SUBJ-1"]
+        if "SCORE>=50" in rdf:
+            rows = [r for r in rows if int((r.record_data or {}).get("SCORE", 0)) >= 50]
+        return iter([r.model_copy(deep=True) for r in rows])
+
+    sdk.records.list.side_effect = _list_records
+    monkeypatch.setattr(cli, "export_to_json", export_mod.export_to_json)
+
+    out_file = tmp_path / "cli_hier.json"
+    ledger_file = tmp_path / "ledger.json"
+
+    res1 = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "json",
+            "S_CLI",
+            str(out_file),
+            "--hierarchical",
+            "--incremental",
+            "--ledger-path",
+            str(ledger_file),
+            "--since",
+            "2026-06-01T00:00:00Z",
+            "--filter",
+            "subjectKey==SUBJ-1",
+            "--record-data-filter",
+            "SCORE>=50",
+            "--quality-gate",
+            "--min-readiness-score",
+            "0.0",
+        ],
+    )
+    assert res1.exit_code == 0, res1.output
+    data1 = json.loads(out_file.read_text(encoding="utf-8"))
+    assert len(data1) == 1
+    assert data1[0]["subject_key"] == "SUBJ-1"
+    assert data1[0]["visits"][0]["forms"][0]["records"][0]["recordId"] == 1
+    assert any(
+        _matches_subj1(c)
+        and (
+            isinstance(c.get("dateModified"), tuple) or "dateModified>=" in str(c.get("filter", ""))
+        )
+        and c.get("record_data_filter") == "SCORE>=50"
+        for c in seen_calls
+    ), f"Unexpected SDK list calls: {seen_calls}"
+
+    provider = FileStateProvider(str(ledger_file))
+    assert provider.get_last_timestamp("S_CLI", "json_hierarchical") == datetime(
+        2026, 6, 1, 10, 0, tzinfo=UTC
+    )
+
+    # Zero-delta incremental CLI rerun preserves existing hierarchical archive
+    sdk.records.list.side_effect = lambda **_kw: iter([])
+    res2 = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "json",
+            "S_CLI",
+            str(out_file),
+            "--hierarchical",
+            "--incremental",
+            "--ledger-path",
+            str(ledger_file),
+        ],
+    )
+    assert res2.exit_code == 0, res2.output
+    data2 = json.loads(out_file.read_text(encoding="utf-8"))
+    assert len(data2) == 1
+    assert data2[0]["visits"][0]["forms"][0]["records"][0]["recordId"] == 1

@@ -34,7 +34,7 @@ from imednet.spi.cli import (
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectDataWorkflow
-from .sync_worker import SyncWorker, SyncWorkerConfig
+from .sync_worker import SyncWorker, SyncWorkerConfig, SyncWorkerState
 
 
 def _execute_set_state(
@@ -46,6 +46,7 @@ def _execute_set_state(
     interactive: bool = False,
     parser: argparse.ArgumentParser | None = None,
     no_interactive: bool = False,
+    force: bool = False,
 ) -> None:
     """Execute high-water mark timestamp update for a study/stream in the ledger."""
     if not interactive:
@@ -81,6 +82,7 @@ def _execute_set_state(
                 timestamp=dt,
                 records_processed=records_processed,
                 status="success",
+                force=force,
             )
             print(
                 f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
@@ -260,8 +262,13 @@ def _execute_show_state(
             continue
         for stream_name, stream_state in study_state.streams.items():
             has_data = True
+            ts_str = (
+                stream_state.last_timestamp.isoformat()
+                if stream_state.last_timestamp is not None
+                else "None"
+            )
             print(
-                f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
+                f"{s_key} | {stream_name} | {ts_str} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
             )
 
     if not has_data:
@@ -311,6 +318,12 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
         help="Path to the pipeline ledger JSON file.",
     )
     set_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force state transition override even when the current status disallows it.",
+    )
+    set_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
     add_no_interactive(set_parser)
@@ -324,6 +337,7 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
             interactive=args.interactive,
             parser=set_parser,
             no_interactive=getattr(args, "no_interactive", False),
+            force=getattr(args, "force", False),
         )
     )
 
@@ -558,6 +572,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     worker.run_forever(on_cycle=on_cycle, on_sleep_tick=on_sleep_tick)
                 except TypeError:
                     worker.run_forever()
+            if worker.state == SyncWorkerState.FAILED:
+                err_detail = f": {worker.last_error}" if worker.last_error is not None else ""
+                print(
+                    f"Sync worker failed after {worker.consecutive_failures}/"
+                    f"{worker.max_consecutive_failures} consecutive failures{err_detail}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         except KeyboardInterrupt:
             clear_line()
             worker.stop()
