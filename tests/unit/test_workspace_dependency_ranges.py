@@ -56,6 +56,8 @@ def test_snowflake_extras_declare_connector_and_pyarrow():
         *root_project.get("dependencies", []),
         *root_project.get("optional-dependencies", {}).get("dev", []),
         *root_project.get("optional-dependencies", {}).get("docs", []),
+        *root_pyproject.get("dependency-groups", {}).get("dev", []),
+        *root_pyproject.get("dependency-groups", {}).get("docs", []),
         *root_pyproject["tool"]["hatch"]["envs"]["default"].get("dependencies", []),
         *core_project_deps(core_pyproject),
         *core_project_deps(sinks_pyproject),
@@ -111,7 +113,11 @@ def test_snowflake_extras_declare_connector_and_pyarrow():
     workspace_locked = by_name["imednet-workspace"]
     workspace_dev_names = {
         canonicalize_name(dep["name"])
-        for group in workspace_locked.get("optional-dependencies", {}).values()
+        for group_table in (
+            workspace_locked.get("optional-dependencies", {}),
+            workspace_locked.get("dev-dependencies", {}),
+        )
+        for group in group_table.values()
         for dep in group
     }
     assert "snowflake-connector-python" not in workspace_dev_names

@@ -1059,9 +1059,9 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     import re
     from types import SimpleNamespace
 
-    import imednet_sinks.warehouse as wh_mod
     import pyarrow.parquet as pq
 
+    import imednet_sinks.warehouse as wh_mod
     from apache_airflow_providers_imednet.hooks import ImednetHook
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
     from imednet.models.records import Record

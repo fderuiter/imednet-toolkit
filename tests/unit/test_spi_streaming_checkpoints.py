@@ -15,9 +15,6 @@ import httpx
 import pandas as pd
 import pytest
 import respx
-from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig, export_to_mongodb
-from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig, export_to_neo4j
-from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig, export_to_snowflake
 
 from imednet import cli
 from imednet.errors import ExportBatchError
@@ -52,6 +49,9 @@ from imednet.spi.sink_base import (
     iter_batches,
     run_streaming_export,
 )
+from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig, export_to_mongodb
+from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig, export_to_neo4j
+from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig, export_to_snowflake
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 from imednet_workflows.extraction_engine import extract_canonical_records
 from imednet_workflows.record_mapper import RecordMapper, transform_records_to_sdtm

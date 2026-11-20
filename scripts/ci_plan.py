@@ -8,9 +8,26 @@ import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
+from fnmatch import fnmatchcase
 from typing import Any
 
 _IGNORED_PREFIXES = ("docs/", "examples/", ".agents/")
+_WORKFLOW_UNIT_TESTS = frozenset(
+    {
+        "tests/unit/test_chunked_pipeline.py",
+        "tests/unit/test_config_version_control.py",
+        "tests/unit/test_duckdb_ingestion_workflow.py",
+        "tests/unit/test_job_poller.py",
+        "tests/unit/test_record_mapper.py",
+        "tests/unit/test_record_mapper_hierarchy.py",
+        "tests/unit/test_state_ledger.py",
+        "tests/unit/test_study_structure.py",
+        "tests/unit/test_sync_worker.py",
+        "tests/unit/test_cached_records_loader.py",
+    }
+)
+_SHARED_TEST_PREFIXES = ("tests/fixtures/", "tests/utils/", "tests/typing/")
+_SHARED_TEST_FILES = frozenset({"tests/__init__.py", "tests/conftest.py"})
 
 
 def _normalize_path(file_path: str) -> str:
@@ -36,6 +53,77 @@ def parse_dependency_name(dep_str: str) -> str:
     if match:
         return match.group(1)
     return dep_str.strip()
+
+
+def _resolve_package_dirs(
+    candidates: Sequence[tuple[str, str]],
+    packages: Mapping[str, Mapping[str, Any]],
+    name_to_dir: Mapping[str, str],
+) -> set[str]:
+    """Resolve canonical (dir_name, package_name) candidates against loaded workspace packages."""
+    resolved: set[str] = set()
+    for dir_name, pkg_name in candidates:
+        if dir_name in packages:
+            resolved.add(dir_name)
+        elif pkg_name in name_to_dir:
+            resolved.add(name_to_dir[pkg_name])
+    return resolved
+
+
+def _owners_for_top_level_test(
+    normalized: str,
+    packages: Mapping[str, Mapping[str, Any]],
+    name_to_dir: Mapping[str, str],
+) -> set[str]:
+    """Map top-level tests/ paths to owning package directories per .github/workflows/main.yml."""
+    if normalized in _SHARED_TEST_FILES or normalized.startswith(_SHARED_TEST_PREFIXES):
+        return set(packages.keys())
+
+    if fnmatchcase(normalized, "tests/unit/test_airflow*.py") or "airflow" in normalized:
+        return _resolve_package_dirs(
+            [("providers-airflow", "apache-airflow-providers-imednet")],
+            packages,
+            name_to_dir,
+        )
+
+    if (
+        normalized == "tests/unit/cli/test_tui_cli.py"
+        or normalized.startswith("tests/unit/tui/")
+        or "/tui/" in normalized
+    ):
+        return _resolve_package_dirs(
+            [("plugins-tui", "imednet-tui")],
+            packages,
+            name_to_dir,
+        )
+
+    if "sinks" in normalized:
+        return _resolve_package_dirs(
+            [("plugins-sinks", "imednet-plugins-sinks")],
+            packages,
+            name_to_dir,
+        )
+
+    if (
+        fnmatchcase(normalized, "tests/unit/test_workflows*.py")
+        or normalized.startswith(("tests/unit/workflows/", "tests/workflows/"))
+        or normalized in _WORKFLOW_UNIT_TESTS
+        or "workflows" in normalized
+    ):
+        return _resolve_package_dirs(
+            [("plugins-workflows", "imednet-workflows")],
+            packages,
+            name_to_dir,
+        )
+
+    if normalized.startswith("tests/unit/cli/"):
+        return _resolve_package_dirs(
+            [("core", "imednet"), ("plugins-workflows", "imednet-workflows")],
+            packages,
+            name_to_dir,
+        )
+
+    return _resolve_package_dirs([("core", "imednet")], packages, name_to_dir)
 
 
 def plan_ci_impact(
@@ -76,6 +164,13 @@ def plan_ci_impact(
                 else:
                     build_impacted.add(changed_pkg_dir)
                 continue
+
+        if normalized.startswith("tests/"):
+            owners = _owners_for_top_level_test(normalized, packages, name_to_dir)
+            if owners:
+                test_only_impacted.update(owners)
+                continue
+
         return fallback()
 
     behavior_changed = set(build_impacted)
@@ -93,7 +188,9 @@ def plan_ci_impact(
                     break
 
     test_impacted = behavior_changed.union(test_only_impacted)
-    return {"build": list(build_impacted), "test": list(test_impacted)}
+    ordered_build = [pkg for pkg in packages if pkg in build_impacted]
+    ordered_test = [pkg for pkg in packages if pkg in test_impacted]
+    return {"build": ordered_build, "test": ordered_test}
 
 
 def main() -> None:
@@ -101,7 +198,7 @@ def main() -> None:
     import tomllib
 
     packages: dict[str, dict[str, Any]] = {}
-    for pyproject in glob.glob("packages/*/pyproject.toml"):
+    for pyproject in sorted(glob.glob("packages/*/pyproject.toml")):
         with open(pyproject, "rb") as f:
             data = tomllib.load(f)
         pkg_dir = os.path.basename(os.path.dirname(pyproject))

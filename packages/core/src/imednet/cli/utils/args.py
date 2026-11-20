@@ -36,18 +36,19 @@ def resolve_endpoint_filter_attributes(model: type[Any] | None) -> frozenset[str
     """Resolve documented endpoint ``FILTER_ATTRIBUTES`` for a registered SDK model."""
     if model is None:
         return None
-    if model in _ENDPOINT_FILTER_ATTRS_CACHE:
-        return _ENDPOINT_FILTER_ATTRS_CACHE[model]
+    target_model: type[Any] = model
+    if target_model in _ENDPOINT_FILTER_ATTRS_CACHE:
+        return _ENDPOINT_FILTER_ATTRS_CACHE[target_model]
     from imednet.endpoints.registry import ENDPOINT_REGISTRY
 
     resolved: frozenset[str] | None = None
     for endpoint_cls in ENDPOINT_REGISTRY.values():
-        if getattr(endpoint_cls, "MODEL", None) is model:
+        if getattr(endpoint_cls, "MODEL", None) is target_model:
             attrs = getattr(endpoint_cls, "FILTER_ATTRIBUTES", None)
             if isinstance(attrs, frozenset):
                 resolved = attrs
                 break
-    _ENDPOINT_FILTER_ATTRS_CACHE[model] = resolved
+    _ENDPOINT_FILTER_ATTRS_CACHE[target_model] = resolved
     return resolved
 
 

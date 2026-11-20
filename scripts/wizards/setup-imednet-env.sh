@@ -306,19 +306,19 @@ pause "Press Enter to proceed to workspace dependency sync..."
 stage "Workspace Dependency Sync"
 say "Synchronizing the monorepo workspace virtual environment (.venv)..."
 say "This installs all 5 packages in editable mode along with dev (pytest, ruff, mypy) and docs dependencies."
-if confirm "Run 'uv sync --all-packages --extra dev --extra docs' now?"; then
+if confirm "Run 'uv sync --locked --all-packages --all-extras' now?"; then
   if command -v uv >/dev/null 2>&1; then
-    say "Running 'uv sync --all-packages --extra dev --extra docs'..."
-    if uv sync --all-packages --extra dev --extra docs; then
+    say "Running 'uv sync --locked --all-packages --all-extras'..."
+    if uv sync --locked --all-packages --all-extras; then
       say "✓ Workspace dependencies synchronized successfully."
     else
-      warn "uv sync encountered issues. You can re-run 'uv sync --all-packages --extra dev --extra docs' later."
+      warn "uv sync encountered issues. You can re-run 'uv sync --locked --all-packages --all-extras' later."
     fi
   else
-    warn "uv is not available. Please install uv and run 'uv sync --all-packages --extra dev --extra docs'."
+    warn "uv is not available. Please install uv and run 'uv sync --locked --all-packages --all-extras'."
   fi
 else
-  say "Skipping dependency sync. Run 'uv sync --all-packages --extra dev --extra docs' when ready."
+  say "Skipping dependency sync. Run 'uv sync --locked --all-packages --all-extras' when ready."
 fi
 pause "Press Enter to proceed to EDC credentials configuration..."
 
@@ -381,7 +381,7 @@ stage "SDK Self-Test & Verification"
 say "Verifying that your .env file can be loaded by the SDK..."
 
 if command -v uv >/dev/null 2>&1; then
-  uv run python -c "from imednet.config import load_config; cfg = load_config(); print('  ✓ Config loaded successfully. Base URL:', cfg.base_url)" || warn "Could not run python check via uv. Run 'uv sync --all-packages' to install dependencies."
+  uv run python -c "from imednet.config import load_config; cfg = load_config(); print('  ✓ Config loaded successfully. Base URL:', cfg.base_url)" || warn "Could not run python check via uv. Run 'uv sync --locked --all-packages --all-extras' to install dependencies."
   uv run imednet --help >/dev/null 2>&1 && say "  ✓ imednet CLI is installed and accessible." || true
 elif command -v python >/dev/null 2>&1; then
   python -c "from imednet.config import load_config; cfg = load_config(); print('  ✓ Config loaded successfully. Base URL:', cfg.base_url)" || warn "Could not run python check. Ensure virtual environment is activated."
@@ -389,7 +389,7 @@ fi
 
 say ""
 say "Common Developer Commands Cheatsheet:"
-say "  • Run full CI quality gate:   uv run ruff check . && uv run ruff format --check . && uv run mypy packages/core/src/imednet"
+say "  • Run full CI quality gate:   uv run ruff check . && uv run ruff format --check . && uv run mypy packages tests/typing/endpoint_contracts.py"
 say "  • Run test suite:             uv run pytest -q"
 say "  • Build documentation:        uv run python scripts/build_docs.py"
 say "  • Run security audit:         uv run --with pip-audit pip-audit -s osv"

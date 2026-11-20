@@ -3,7 +3,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import venv
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.resolve()
@@ -15,20 +14,35 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kwargs)
 
 
+def _resolve_uv() -> str:
+    uv_bin = shutil.which("uv")
+    if uv_bin is None:
+        raise FileNotFoundError("Required tool 'uv' was not found on PATH.")
+    return uv_bin
+
+
 def build_wheels(dist_dir: Path):
+    uv_bin = _resolve_uv()
     if dist_dir.exists():
         shutil.rmtree(dist_dir)
-    dist_dir.mkdir()
+    dist_dir.mkdir(parents=True)
 
-    # Pre-install build in the current environment to ensure we can build
-    subprocess.run([sys.executable, "-m", "pip", "install", "build"], check=True)
-
-    for pkg_path in PACKAGES_DIR.iterdir():
+    for pkg_path in sorted(PACKAGES_DIR.iterdir()):
         if pkg_path.is_dir() and (pkg_path / "pyproject.toml").exists():
             print(f"Building wheel for {pkg_path.name}...")
-            run(
-                [sys.executable, "-m", "build", "--wheel", "--outdir", str(dist_dir), str(pkg_path)]
-            )
+            build_cmd = [
+                uv_bin,
+                "build",
+                "--wheel",
+                "--no-create-gitignore",
+                "--out-dir",
+                str(dist_dir),
+                str(pkg_path),
+            ]
+            try:
+                run([*build_cmd, "--offline"])
+            except subprocess.CalledProcessError:
+                run(build_cmd)
 
 
 def validate_scenario(name, install_items, smoke_checks, dist_dir: Path):
@@ -40,27 +54,34 @@ def validate_scenario(name, install_items, smoke_checks, dist_dir: Path):
         "not_contains": "unexpected output substring"
     }
     """
+    uv_bin = _resolve_uv()
     print(f"\n>>> Validating Scenario: {name}")
     with tempfile.TemporaryDirectory() as tmpdir:
         venv_dir = Path(tmpdir) / "venv"
         print(f"Creating venv at {venv_dir}")
-        venv.create(venv_dir, with_pip=True)
+        run([uv_bin, "venv", "--python", sys.executable, str(venv_dir)], cwd=tmpdir)
 
         # Get venv paths
         if os.name == "nt":
             python_bin = venv_dir / "Scripts" / "python.exe"
-            pip_bin = venv_dir / "Scripts" / "pip.exe"
             imednet_bin = venv_dir / "Scripts" / "imednet.exe"
         else:
             python_bin = venv_dir / "bin" / "python"
-            pip_bin = venv_dir / "bin" / "pip"
             imednet_bin = venv_dir / "bin" / "imednet"
 
         # Find wheels in dist_dir
-        all_wheels = list(dist_dir.glob("*.whl"))
+        all_wheels = sorted(dist_dir.glob("*.whl"))
 
-        # Prepare install command
-        install_args = [str(pip_bin), "install", "--find-links", str(dist_dir)]
+        # Prepare install command using uv pip install (no pip required in venv)
+        install_args = [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            str(python_bin),
+            "--find-links",
+            str(dist_dir),
+        ]
 
         for item in install_items:
             base_pkg = item.split("[")[0]
@@ -70,13 +91,16 @@ def validate_scenario(name, install_items, smoke_checks, dist_dir: Path):
 
             if matching_wheels:
                 wheel_path = max(matching_wheels)
-                install_args.append(f"{wheel_path.name}{extra}")
+                install_args.append(f"{base_pkg}{extra} @ {wheel_path.resolve().as_uri()}")
             else:
                 install_args.append(item)
 
         print(f"Installing packages: {install_items}")
         try:
-            run(install_args, cwd=str(dist_dir))
+            try:
+                run([*install_args, "--offline"], cwd=tmpdir)
+            except subprocess.CalledProcessError:
+                run(install_args, cwd=tmpdir)
         except subprocess.CalledProcessError as e:
             print(f"Installation failed: {e.stdout}\n{e.stderr}")
             raise
