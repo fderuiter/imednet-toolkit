@@ -14,7 +14,7 @@ from imednet.spi.utils import (
     JobTimeoutError,
 )
 
-from .cached_loader import CachedRecordsLoader
+from .cached_loader import CachedRecordsLoader, StudySyncState, StudySyncStatus
 from .chunked_pipeline import ChunkedRecordPipeline, iter_chunks
 from .config_version_control import ConfigVersionStore
 from .duckdb_centralizer import DuckDBIngestionWorkflow
@@ -40,7 +40,7 @@ from .state_ledger import (
 )
 from .study_structure import async_get_study_structure, get_study_structure
 from .subject_data import SubjectDataWorkflow
-from .sync_worker import SyncWorker, SyncWorkerConfig
+from .sync_worker import SyncErrorCallback, SyncWorker, SyncWorkerConfig, SyncWorkerState
 from .triage_store import TriageStore
 from .uat import UATSpecification
 
@@ -77,9 +77,13 @@ __all__ = [
     "StandardsReadinessValidator",
     "StreamExecutionStatus",
     "StreamState",
+    "StudySyncState",
+    "StudySyncStatus",
     "SubjectDataWorkflow",
+    "SyncErrorCallback",
     "SyncWorker",
     "SyncWorkerConfig",
+    "SyncWorkerState",
     "TriageStore",
     "UATSpecification",
     "async_get_study_structure",
