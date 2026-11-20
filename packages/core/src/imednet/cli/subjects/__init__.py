@@ -8,7 +8,7 @@ from typing import Any
 from ...endpoints.subjects import SubjectsEndpoint
 from ...models.subjects import Subject
 from ...sdk import ImednetSDK
-from ..decorators import with_sdk
+from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status
 from ..utils.args import (
     add_list_query_args,
@@ -100,6 +100,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
     def _dispatch_list_subjects(args: argparse.Namespace) -> None:
+        validate_cli_path_segment(args.study_key, name="study_key")
         no_interactive = getattr(args, "no_interactive", False)
         resolved_format = resolve_output_format(args.output_format)
         prepared = prepare_list_query(

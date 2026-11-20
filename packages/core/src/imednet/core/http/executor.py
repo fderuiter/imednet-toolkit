@@ -19,7 +19,11 @@ from tenacity import (
 
 from imednet.core.http.handlers import handle_response
 from imednet.core.http.monitor import RequestMonitor
-from imednet.core.operations.circuit_breaker import CircuitBreaker, get_global_circuit_breaker
+from imednet.core.operations.circuit_breaker import (
+    CircuitBreaker,
+    ProbeLease,
+    get_global_circuit_breaker,
+)
 from imednet.core.retry import RetryConfig, RetryState
 
 _SUPPRESSED_LOG_LEVEL = logging.CRITICAL + 1
@@ -46,7 +50,7 @@ class BaseRequestExecutor(ABC):
             send: The function to use for sending requests (sync or async).
             tracer: Optional OpenTelemetry tracer for monitoring.
             retry_config: Centralized configuration for retry behaviors.
-            circuit_breaker: Optional instance-scoped circuit breaker.
+            circuit_breaker: Scoped circuit breaker instance for this executor.
         """
         self.send = send
         self.tracer = tracer
@@ -90,13 +94,16 @@ class BaseRequestExecutor(ABC):
             Returns:
                 bool: True if the request should be retried.
             """
+            exc = (
+                retry_state.outcome.exception()
+                if retry_state.outcome and retry_state.outcome.failed
+                else None
+            )
+            if exc is not None and not isinstance(exc, Exception):
+                return False
             state = RetryState(
                 attempt_number=retry_state.attempt_number,
-                exception=(
-                    retry_state.outcome.exception()
-                    if retry_state.outcome and retry_state.outcome.failed
-                    else None
-                ),
+                exception=exc,
                 result=(
                     retry_state.outcome.result()
                     if retry_state.outcome and not retry_state.outcome.failed
@@ -108,28 +115,44 @@ class BaseRequestExecutor(ABC):
 
         return should_retry
 
-    def _process_result(
-        self, response: httpx.Response | None, monitor: RequestMonitor
+    @staticmethod
+    def _record_response_outcome(response: httpx.Response, lease: ProbeLease) -> None:
+        """Record a single circuit-breaker outcome for an HTTP response before error mapping."""
+        status = response.status_code
+        if status == 429:
+            lease.record_rate_limit()
+        elif status >= 500:
+            lease.record_failure()
+        else:
+            lease.record_success()
+
+    def _finalize_response(
+        self,
+        response: httpx.Response | None,
+        lease: ProbeLease,
+        monitor: RequestMonitor,
     ) -> httpx.Response:
-        """Record circuit-breaker and telemetry state for an HTTP response."""
-        if response is not None:
-            if response.status_code < 500:
-                self.circuit_breaker.record_success()
-            else:
-                self.circuit_breaker.record_failure()
+        """Classify breaker outcome once, record telemetry, and map HTTP error responses."""
+        if response is None:
+            lease.record_failure()
+            raise RuntimeError("Request failed without response or exception")
+        self._record_response_outcome(response, lease)
+        monitor.on_success(response)
+        return handle_response(response)
 
-            monitor.on_success(response)
+    def _extract_or_fail_retry_error(
+        self,
+        error: RetryError,
+        lease: ProbeLease,
+        monitor: RequestMonitor,
+    ) -> httpx.Response:
+        """Extract response from exhausted retries or record one transport failure and escalate."""
+        if error.last_attempt and not error.last_attempt.failed:
+            response: httpx.Response = error.last_attempt.result()
             return response
-        raise RuntimeError("Request failed without response or exception")
-
-    def _process_retry_error(self, e: RetryError, monitor: RequestMonitor) -> httpx.Response:
-        """Handle RetryError, delegating response outcomes or recording network failure."""
-        if e.last_attempt and not e.last_attempt.failed:
-            response: httpx.Response = e.last_attempt.result()
-            return self._process_result(response, monitor)
-        self.circuit_breaker.record_failure()
-        monitor.on_retry_error(e)
-        raise e
+        lease.record_failure()
+        monitor.on_retry_error(error)
+        raise error
 
     @staticmethod
     def _parse_retry_after_seconds(response: httpx.Response) -> float | None:
@@ -184,16 +207,9 @@ class BaseRequestExecutor(ABC):
             "retry_predicate": self._get_retry_predicate(method),
         }
 
-    def _prepare_request(self) -> bool:
-        """Perform pre-flight checks before executing the request."""
-        return self.circuit_breaker.check_request_allowed()
-
-    def _handle_exception(self, e: Exception, monitor: RequestMonitor) -> httpx.Response:
-        """Handle exceptions raised during request execution."""
-        if isinstance(e, RetryError):
-            return self._process_retry_error(e, monitor)
-        self.circuit_breaker.record_failure()
-        raise
+    def _prepare_request(self) -> ProbeLease:
+        """Admit a new request through the circuit breaker and return its lease."""
+        return self.circuit_breaker.acquire()
 
     @abstractmethod
     def __call__(self, method: str, url: str, **kwargs: Any) -> Any:
@@ -216,9 +232,9 @@ class SyncRequestExecutor(BaseRequestExecutor):
             send: The synchronous function to use for sending requests.
             tracer: Optional OpenTelemetry tracer for monitoring.
             retry_config: Centralized configuration for retry behaviors.
-            circuit_breaker: Optional instance-scoped circuit breaker.
+            circuit_breaker: Scoped circuit breaker instance for this executor.
         """
-        super().__init__(send, tracer, retry_config, circuit_breaker)
+        super().__init__(send, tracer, retry_config, circuit_breaker=circuit_breaker)
 
     def __call__(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Execute the request synchronously.
@@ -235,8 +251,6 @@ class SyncRequestExecutor(BaseRequestExecutor):
             CircuitBreakerError: If the circuit is open.
             Exception: Re-raises exceptions from the send function or retryer.
         """
-        probe_acquired = self._prepare_request()
-        settled = False
 
         def send_fn() -> httpx.Response:
             """Wrapper to send the request with suppressed logging.
@@ -249,19 +263,15 @@ class SyncRequestExecutor(BaseRequestExecutor):
 
         retryer = self.retry_config.create_retryer(**self._get_retryer_kwargs(method))
 
-        try:
-            with RequestMonitor(self.tracer, method, url) as monitor:
-                try:
-                    response: httpx.Response | None = retryer(send_fn)
-                    checked = self._process_result(response, monitor)
-                    settled = True
-                except Exception as e:
-                    settled = True
-                    checked = self._handle_exception(e, monitor)
-                return handle_response(checked)
-        finally:
-            if probe_acquired and not settled:
-                self.circuit_breaker.release_probe()
+        with self._prepare_request() as lease, RequestMonitor(self.tracer, method, url) as monitor:
+            try:
+                response: httpx.Response | None = retryer(send_fn)
+            except RetryError as err:
+                response = self._extract_or_fail_retry_error(err, lease, monitor)
+            except Exception:
+                lease.record_failure()
+                raise
+            return self._finalize_response(response, lease, monitor)
 
 
 class AsyncRequestExecutor(BaseRequestExecutor):
@@ -280,9 +290,9 @@ class AsyncRequestExecutor(BaseRequestExecutor):
             send: The asynchronous function to use for sending requests.
             tracer: Optional OpenTelemetry tracer for monitoring.
             retry_config: Centralized configuration for retry behaviors.
-            circuit_breaker: Optional instance-scoped circuit breaker.
+            circuit_breaker: Scoped circuit breaker instance for this executor.
         """
-        super().__init__(send, tracer, retry_config, circuit_breaker)
+        super().__init__(send, tracer, retry_config, circuit_breaker=circuit_breaker)
 
     async def __call__(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Execute the request asynchronously.
@@ -299,8 +309,6 @@ class AsyncRequestExecutor(BaseRequestExecutor):
             CircuitBreakerError: If the circuit is open.
             Exception: Re-raises exceptions from the send function or retryer.
         """
-        probe_acquired = self._prepare_request()
-        settled = False
 
         async def send_fn() -> httpx.Response:
             """Wrapper to send the request with suppressed logging.
@@ -313,16 +321,15 @@ class AsyncRequestExecutor(BaseRequestExecutor):
 
         retryer = self.retry_config.create_async_retryer(**self._get_retryer_kwargs(method))
 
-        try:
-            async with RequestMonitor(self.tracer, method, url) as monitor:
-                try:
-                    response: httpx.Response | None = await retryer(send_fn)
-                    checked = self._process_result(response, monitor)
-                    settled = True
-                except Exception as e:
-                    settled = True
-                    checked = self._handle_exception(e, monitor)
-                return handle_response(checked)
-        finally:
-            if probe_acquired and not settled:
-                self.circuit_breaker.release_probe()
+        async with (
+            self._prepare_request() as lease,
+            RequestMonitor(self.tracer, method, url) as monitor,
+        ):
+            try:
+                response: httpx.Response | None = await retryer(send_fn)
+            except RetryError as err:
+                response = self._extract_or_fail_retry_error(err, lease, monitor)
+            except Exception:
+                lease.record_failure()
+                raise
+            return self._finalize_response(response, lease, monitor)

@@ -519,9 +519,16 @@ def test_open_pipe_stdin_exits_immediately_without_hanging_on_pty_output(
 
 def test_spi_cli_reexports_output_and_format_helpers() -> None:
     """Verify imednet.spi.cli re-exports unified CLI format and output helpers."""
+    import imednet.cli.decorators as decorators_mod
     import imednet.cli.utils.args as args_mod
 
-    for name in ("add_output_format", "resolve_output_format", "display_list", "emit_json"):
+    for name in (
+        "add_output_format",
+        "resolve_output_format",
+        "display_list",
+        "emit_json",
+        "validate_cli_path_segment",
+    ):
         assert name in spi_cli.__all__, f"{name} missing from imednet.spi.cli.__all__"
         assert hasattr(spi_cli, name), f"{name} missing on imednet.spi.cli"
 
@@ -529,3 +536,4 @@ def test_spi_cli_reexports_output_and_format_helpers() -> None:
     assert spi_cli.resolve_output_format is args_mod.resolve_output_format
     assert spi_cli.display_list is output_mod.display_list
     assert spi_cli.emit_json is output_mod.emit_json
+    assert spi_cli.validate_cli_path_segment is decorators_mod.validate_cli_path_segment
