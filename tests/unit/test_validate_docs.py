@@ -308,3 +308,15 @@ def test_sphinx_html_renders_curated_core_pagination_sdk_and_endpoints(tmp_path:
     assert "model_validate" not in ep_text
     assert "RecordsEndpoint.to_dataframe" in ep_text
     assert "AsyncRecordsEndpoint.to_dataframe" in ep_text
+
+
+def test_conf_resolves_mermaid_version_across_extension_majors(monkeypatch) -> None:
+    """_resolve_mermaid_version returns 10.2.0 for <1.0 and >=10.3.0-compatible version for >=1.0."""
+    import importlib.metadata
+
+    conf = _load_docs_conf()
+    monkeypatch.setattr(importlib.metadata, "version", lambda _pkg: "0.9.2")
+    assert conf._resolve_mermaid_version() == "10.2.0"
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda _pkg: "2.0.0")
+    assert conf._resolve_mermaid_version() == "10.9.1"

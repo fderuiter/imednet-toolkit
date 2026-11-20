@@ -5,6 +5,7 @@ import ast
 import functools
 import html
 import importlib
+import importlib.metadata
 import importlib.util
 import inspect
 import json
@@ -216,51 +217,59 @@ text.noteText > tspan {
 }
 """
 
-mermaid_version = "10.2.0"
-mermaid_init_js = (
-    "mermaid.initialize("
-    + json.dumps(
-        {
-            "startOnLoad": True,
-            "theme": "base",
-            "useMaxWidth": False,
-            "flowchart": {"useMaxWidth": False, "htmlLabels": True},
-            "sequence": {"useMaxWidth": False},
-            "themeVariables": {
-                "background": "#ffffff",
-                "primaryColor": "#f8f9fa",
-                "primaryTextColor": "#1f2328",
-                "primaryBorderColor": "#005fb8",
-                "lineColor": "#4a5056",
-                "secondaryColor": "#eef2f6",
-                "tertiaryColor": "#f8f9fa",
-                "mainBkg": "#f8f9fa",
-                "nodeBorder": "#005fb8",
-                "clusterBkg": "#f0f3f6",
-                "clusterBorder": "#4a5056",
-                "titleColor": "#1f2328",
-                "edgeLabelBackground": "#ffffff",
-                "actorBkg": "#f8f9fa",
-                "actorBorder": "#005fb8",
-                "actorTextColor": "#1f2328",
-                "actorLineColor": "#4a5056",
-                "signalColor": "#4a5056",
-                "signalTextColor": "#1f2328",
-                "labelBoxBkgColor": "#f8f9fa",
-                "labelBoxBorderColor": "#4a5056",
-                "labelTextColor": "#1f2328",
-                "loopTextColor": "#1f2328",
-                "noteBkgColor": "#fff8c5",
-                "noteTextColor": "#1f2328",
-                "noteBorderColor": "#92400e",
-                "activationBkgColor": "#eef2f6",
-                "activationBorderColor": "#005fb8",
-            },
-            "themeCSS": _MERMAID_THEME_CSS,
-        }
-    )
-    + ");"
-)
+
+def _resolve_mermaid_version() -> str:
+    """Return '10.2.0' for sphinxcontrib-mermaid <1.0 (UMD) and '10.9.1' for >=1.0 (ESM)."""
+    try:
+        raw_version = importlib.metadata.version("sphinxcontrib-mermaid")
+        major_str = raw_version.split(".", 1)[0]
+        if int(major_str) >= 1:
+            return "10.9.1"
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return "10.2.0"
+    return "10.2.0"
+
+
+mermaid_version = _resolve_mermaid_version()
+mermaid_init_config: dict[str, Any] = {
+    "startOnLoad": True,
+    "theme": "base",
+    "useMaxWidth": False,
+    "flowchart": {"useMaxWidth": False, "htmlLabels": True},
+    "sequence": {"useMaxWidth": False},
+    "themeVariables": {
+        "background": "#ffffff",
+        "primaryColor": "#f8f9fa",
+        "primaryTextColor": "#1f2328",
+        "primaryBorderColor": "#005fb8",
+        "lineColor": "#4a5056",
+        "secondaryColor": "#eef2f6",
+        "tertiaryColor": "#f8f9fa",
+        "mainBkg": "#f8f9fa",
+        "nodeBorder": "#005fb8",
+        "clusterBkg": "#f0f3f6",
+        "clusterBorder": "#4a5056",
+        "titleColor": "#1f2328",
+        "edgeLabelBackground": "#ffffff",
+        "actorBkg": "#f8f9fa",
+        "actorBorder": "#005fb8",
+        "actorTextColor": "#1f2328",
+        "actorLineColor": "#4a5056",
+        "signalColor": "#4a5056",
+        "signalTextColor": "#1f2328",
+        "labelBoxBkgColor": "#f8f9fa",
+        "labelBoxBorderColor": "#4a5056",
+        "labelTextColor": "#1f2328",
+        "loopTextColor": "#1f2328",
+        "noteBkgColor": "#fff8c5",
+        "noteTextColor": "#1f2328",
+        "noteBorderColor": "#92400e",
+        "activationBkgColor": "#eef2f6",
+        "activationBorderColor": "#005fb8",
+    },
+    "themeCSS": _MERMAID_THEME_CSS,
+}
+mermaid_init_js = "mermaid.initialize(" + json.dumps(mermaid_init_config) + ");"
 
 _PYODIDE_WHEEL_SPECS: tuple[tuple[str, str], ...] = (
     ("imednet", "core"),
