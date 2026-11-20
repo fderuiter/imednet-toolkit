@@ -23,6 +23,18 @@ def test_conf_sets_empty_templates_path_and_seo_hooks() -> None:
 
 
 @pytest.mark.unit
+def test_docs_mermaid_dependency_compatible_with_configured_mermaid_version() -> None:
+    """Verify pyproject.toml pins sphinxcontrib-mermaid <1.0.0 while mermaid_version is 10.2.0."""
+    import tomllib
+
+    pyproject_data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    docs_deps: list[str] = pyproject_data["project"]["optional-dependencies"]["docs"]
+    mermaid_specs = [dep for dep in docs_deps if dep.startswith("sphinxcontrib-mermaid")]
+    assert mermaid_specs == ["sphinxcontrib-mermaid>=0.9.2,<1.0.0"]
+    assert docs_conf.mermaid_version == "10.2.0"
+
+
+@pytest.mark.unit
 def test_check_sphinx_seo_configuration_detects_invalid_configs(tmp_path: Path) -> None:
     """Verify check_sphinx_seo_configuration flags missing hooks, meta tags, or non-empty templates_path."""
     docs_dir = tmp_path / "docs"

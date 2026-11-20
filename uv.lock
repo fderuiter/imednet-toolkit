@@ -1470,7 +1470,7 @@ requires-dist = [
     { name = "sphinx-argparse", marker = "extra == 'docs'", specifier = ">=0.5.0" },
     { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'" },
     { name = "sphinx-rtd-theme", marker = "extra == 'docs'", specifier = ">=3.0.2,<4.0.0" },
-    { name = "sphinxcontrib-mermaid", marker = "extra == 'docs'", specifier = ">=0.9.2,<2.2.0" },
+    { name = "sphinxcontrib-mermaid", marker = "extra == 'docs'", specifier = ">=0.9.2,<1.0.0" },
     { name = "sqlalchemy", marker = "extra == 'dev'", specifier = ">=2.0,<3.0.0" },
 ]
 provides-extras = ["dev", "docs"]
