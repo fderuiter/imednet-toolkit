@@ -223,8 +223,8 @@ class QueryManagementWorkflow:
 
     @staticmethod
     def _resolve_triage_store(
-        store: TriageStore | TriageStoreProtocol | str | Path | None,
-    ) -> TriageStore | TriageStoreProtocol:
+        store: TriageStoreProtocol | str | Path | None,
+    ) -> TriageStoreProtocol:
         """Resolve a TriageStore instance from argument or imednet.stores entry point."""
         if store is not None and not isinstance(store, (str, Path)):
             return store
@@ -371,7 +371,7 @@ class QueryManagementWorkflow:
     def sync_queries_to_triage(
         self,
         study_key: str,
-        store: TriageStore | TriageStoreProtocol | str | Path | None = None,
+        store: TriageStoreProtocol | str | Path | None = None,
         *,
         additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         unresolved_only: bool = False,

@@ -20,9 +20,18 @@ from imednet.models.subjects import Subject
 from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
+from imednet.plugins import (
+    AsyncSinksNamespaceProtocol,
+    AsyncWorkflowsNamespaceProtocol,
+    PluginProtocol,
+    SinksNamespaceProtocol,
+    SyncWorkflowsNamespaceProtocol,
+    TriageStoreProtocol,
+    WorkflowsNamespaceProtocol,
+)
 from imednet.utils.batch_coordinator import DEFAULT_BATCH_CHUNK_SIZE, BatchSubmissionSummary
 from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
-from imednet.utils.typing import FilterValue, JsonDict
+from imednet.utils.typing import FilterValue, RecordsInput
 
 if TYPE_CHECKING:
     from imednet.validation.cache import ValidationSchemaProtocol
@@ -189,7 +198,7 @@ class ImednetFacade(Protocol):
     def create_record(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: "ValidationSchemaProtocol | None" = None,
@@ -199,7 +208,7 @@ class ImednetFacade(Protocol):
 
         Args:
             study_key: The unique identifier for the study.
-            records_data: List of dictionaries containing record field data.
+            records_data: Record dicts, a pandas DataFrame, or a CSV file path.
             email_notify: Optional email notification settings.
             schema: Optional validation schema.
             skip_validation: Optional flag to skip validation when pre-validated.
@@ -212,7 +221,7 @@ class ImednetFacade(Protocol):
     def create_records_batch(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: "ValidationSchemaProtocol | None" = None,
@@ -221,6 +230,9 @@ class ImednetFacade(Protocol):
         wait_for_completion: bool = False,
         timeout: float = 300.0,
         interval: float = 5.0,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Submit records in bounded chunks with optional multi-job polling."""
         ...
@@ -430,7 +442,7 @@ class AsyncImednetFacade(Protocol):
     async def async_create_record(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: "ValidationSchemaProtocol | None" = None,
@@ -440,7 +452,7 @@ class AsyncImednetFacade(Protocol):
 
         Args:
             study_key: The unique identifier for the study.
-            records_data: List of dictionaries containing record field data.
+            records_data: Record dicts, a pandas DataFrame, or a CSV file path.
             email_notify: Optional email notification settings.
             schema: Optional validation schema.
             skip_validation: Optional flag to skip validation when pre-validated.
@@ -453,7 +465,7 @@ class AsyncImednetFacade(Protocol):
     async def async_create_records_batch(
         self,
         study_key: str,
-        records_data: list[JsonDict],
+        records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
         schema: "ValidationSchemaProtocol | None" = None,
@@ -462,6 +474,9 @@ class AsyncImednetFacade(Protocol):
         wait_for_completion: bool = False,
         timeout: float = 300.0,
         interval: float = 5.0,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Asynchronously submit records in bounded chunks with optional multi-job polling."""
         ...
@@ -508,31 +523,13 @@ class AsyncImednetFacade(Protocol):
         ...
 
 
-from imednet.plugins import (
-    AsyncRecordUpdateWorkflowProtocol,
-    AsyncSinksNamespaceProtocol,
-    AsyncStudySchemaInspectorProtocol,
-    AsyncWorkflowsNamespaceProtocol,
-    SinksNamespaceProtocol,
-    SyncRecordUpdateWorkflowProtocol,
-    SyncSinksNamespaceProtocol,
-    SyncStudySchemaInspectorProtocol,
-    SyncWorkflowsNamespaceProtocol,
-    TriageStoreProtocol,
-    WorkflowsNamespaceProtocol,
-)
-
 __all__ = [
     "AsyncImednetFacade",
-    "AsyncRecordUpdateWorkflowProtocol",
     "AsyncSinksNamespaceProtocol",
-    "AsyncStudySchemaInspectorProtocol",
     "AsyncWorkflowsNamespaceProtocol",
     "ImednetFacade",
+    "PluginProtocol",
     "SinksNamespaceProtocol",
-    "SyncRecordUpdateWorkflowProtocol",
-    "SyncSinksNamespaceProtocol",
-    "SyncStudySchemaInspectorProtocol",
     "SyncWorkflowsNamespaceProtocol",
     "TriageStoreProtocol",
     "WorkflowsNamespaceProtocol",

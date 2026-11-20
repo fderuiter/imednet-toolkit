@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 class Workflows:
     """Namespace for accessing workflow classes."""
 
-    def __init__(self, sdk_instance: ImednetFacade) -> None:
+    def __init__(self, sdk_instance: ImednetFacade):
         """Initialize the workflows namespace.
 
         Args:

@@ -44,7 +44,7 @@ from __future__ import annotations
 import inspect
 import os
 import sys
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, overload, runtime_checkable
@@ -69,17 +69,43 @@ if TYPE_CHECKING:
     from .models.visits import Visit
     from .spi.facade import AsyncImednetFacade, ImednetFacade
     from .utils.batch_coordinator import BatchSubmissionSummary
+    from .utils.job_poller import JobProgressHandler
+    from .utils.typing import RecordsInput
     from .validation.cache import ValidationSchemaProtocol
 
-if sys.version_info < (3, 12) and not TYPE_CHECKING:  # pragma: no cover
-    from typing import _get_protocol_attrs, _ProtocolMeta
+if not TYPE_CHECKING:
+    from typing import _ProtocolMeta
 
-    class _SafeRuntimeProtocolMeta(_ProtocolMeta):
-        """Protocol metaclass avoiding eager property evaluation during runtime isinstance checks."""
+    class _WorkflowsRuntimeProtocolMeta(_ProtocolMeta):
+        """Protocol metaclass supporting lazy descriptors and mode-aware WorkflowRegistry checks."""
 
         def __instancecheck__(self, instance: Any) -> bool:
-            """Check protocol attribute presence statically without invoking descriptors."""
-            if getattr(self, "_is_runtime_protocol", False):
+            """Check WorkflowRegistry mode/entry-points or static descriptors without eager imports."""
+            entry_points_map = getattr(instance, "_entry_points", None)
+            is_async_fn = getattr(instance, "_is_async_sdk", None)
+            if isinstance(entry_points_map, dict) and callable(is_async_fn):
+                is_async = bool(is_async_fn())
+                if self is SyncWorkflowsNamespaceProtocol:
+                    required = {
+                        "data_extraction",
+                        "duckdb_centralizer",
+                        "query_management",
+                        "record_mapper",
+                        "record_update",
+                        "register_subjects",
+                        "subject_data",
+                        "uat",
+                        "uat_inspector",
+                    }
+                    return (not is_async) and required.issubset(entry_points_map)
+                if self is AsyncWorkflowsNamespaceProtocol:
+                    required = {"record_update", "register_subjects", "uat_inspector"}
+                    return is_async and required.issubset(entry_points_map)
+            if sys.version_info < (3, 12) and getattr(
+                self, "_is_runtime_protocol", False
+            ):  # pragma: no cover
+                from typing import _get_protocol_attrs
+
                 for attr in _get_protocol_attrs(self):
                     try:
                         inspect.getattr_static(instance, attr)
@@ -307,13 +333,16 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
     def create_or_update_records_batch(
         self,
         study_key: str,
-        records_data: list[dict[str, Any]],
+        records_data: RecordsInput,
         wait_for_completion: bool = False,
         timeout: int = 300,
         poll_interval: int = 5,
         *,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and return a batch summary."""
         ...
@@ -321,12 +350,15 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
     def create_or_update_records(
         self,
         study_key: str,
-        records_data: list[dict[str, Any]],
+        records_data: RecordsInput,
         wait_for_completion: bool = False,
         timeout: int = 300,
         poll_interval: int = 5,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> Job:
         """Submit records for creation or update and return the resulting Job."""
         ...
@@ -391,13 +423,16 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
     async def async_create_or_update_records_batch(
         self,
         study_key: str,
-        records_data: list[dict[str, Any]],
+        records_data: RecordsInput,
         wait_for_completion: bool = False,
         timeout: int = 300,
         poll_interval: int = 5,
         *,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
         ...
@@ -405,12 +440,15 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
     async def async_create_or_update_records(
         self,
         study_key: str,
-        records_data: list[dict[str, Any]],
+        records_data: RecordsInput,
         wait_for_completion: bool = False,
         timeout: int = 300,
         poll_interval: int = 5,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> Job:
         """Asynchronously submit records for creation or update and return the Job."""
         ...
@@ -509,13 +547,13 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         ...
 
 
-class RegisterSubjectsWorkflowProtocol(Protocol):
-    """Structural contract for ``sdk.workflows.register_subjects``."""
+class SyncRegisterSubjectsWorkflowProtocol(Protocol):
+    """Synchronous contract for ``sdk.workflows.register_subjects`` on ``ImednetSDK``."""
 
     def register_subjects_batch(
         self,
         study_key: str,
-        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]],
+        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
         email_notify: str | None = None,
         wait_for_completion: bool = False,
         timeout: int = 300,
@@ -526,6 +564,9 @@ class RegisterSubjectsWorkflowProtocol(Protocol):
         skip_existing: bool = False,
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate sites and submit subject registrations in bounded chunks."""
         ...
@@ -533,7 +574,7 @@ class RegisterSubjectsWorkflowProtocol(Protocol):
     def register_subjects(
         self,
         study_key: str,
-        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]],
+        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
         email_notify: str | None = None,
         wait_for_completion: bool = False,
         timeout: int = 300,
@@ -543,8 +584,116 @@ class RegisterSubjectsWorkflowProtocol(Protocol):
         skip_existing: bool = False,
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
     ) -> Job:
         """Register one or more subjects in a study."""
+        ...
+
+    async def async_register_subjects_batch(
+        self,
+        study_key: str,
+        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        chunk_size: int | None = None,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> BatchSubmissionSummary:
+        """Asynchronously register subjects in bounded chunks."""
+        ...
+
+    async def async_register_subjects(
+        self,
+        study_key: str,
+        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> Job:
+        """Asynchronously register one or more subjects in a study."""
+        ...
+
+
+RegisterSubjectsWorkflowProtocol = SyncRegisterSubjectsWorkflowProtocol
+
+
+class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
+    """Asynchronous contract for ``sdk.workflows.register_subjects`` on ``AsyncImednetSDK``."""
+
+    async def async_register_subjects_batch(
+        self,
+        study_key: str,
+        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        chunk_size: int | None = None,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> BatchSubmissionSummary:
+        """Asynchronously validate sites and submit subject registrations in bounded chunks."""
+        ...
+
+    async def async_register_subjects(
+        self,
+        study_key: str,
+        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> Job:
+        """Asynchronously register one or more subjects in a study."""
+        ...
+
+    @deprecated(
+        "register_subjects_batch() is synchronous and raises TypeError on AsyncImednetSDK; "
+        "use await async_register_subjects_batch(...) instead."
+    )
+    def register_subjects_batch(self, *args: Any, **kwargs: Any) -> Never:
+        """Rejected synchronous batch subject registration stub on AsyncImednetSDK."""
+        ...
+
+    @deprecated(
+        "register_subjects() is synchronous and raises TypeError on AsyncImednetSDK; "
+        "use await async_register_subjects(...) instead."
+    )
+    def register_subjects(self, *args: Any, **kwargs: Any) -> Never:
+        """Rejected synchronous subject registration stub on AsyncImednetSDK."""
         ...
 
 
@@ -699,8 +848,73 @@ class UATRunResultProtocol(Protocol):
         ...
 
     @property
+    def started_at(self) -> datetime:
+        """UTC timestamp when the UAT run started."""
+        ...
+
+    @property
+    def completed_at(self) -> datetime | None:
+        """UTC timestamp when the UAT run finished, if completed."""
+        ...
+
+    @property
+    def state(self) -> str:
+        """Current or final lifecycle state value."""
+        ...
+
+    @property
+    def state_history(self) -> Sequence[str]:
+        """Ordered sequence of visited lifecycle states."""
+        ...
+
+    @property
+    def failure_phase(self) -> str | None:
+        """Phase in which execution failed, if any."""
+        ...
+
+    @property
+    def failed_phase(self) -> str | None:
+        """Alias for ``failure_phase``."""
+        ...
+
+    @property
+    def error_message(self) -> str | None:
+        """Failure message captured when a phase errors."""
+        ...
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the run reached a terminal lifecycle state."""
+        ...
+
+    @property
     def overall_success(self) -> bool:
         """Whether all UAT batches completed without failure."""
+        ...
+
+    @property
+    def spec(self) -> Any:
+        """Generated or supplied UAT specification."""
+        ...
+
+    @property
+    def record_sets(self) -> Sequence[Any]:
+        """Generated synthetic record sets submitted during the run."""
+        ...
+
+    @property
+    def submission_result(self) -> Any:
+        """Bulk submission result produced by the submit phase."""
+        ...
+
+    @property
+    def poll_summary(self) -> Any:
+        """Job polling summary produced by the monitor phase."""
+        ...
+
+    @property
+    def phase_durations(self) -> Mapping[str, float]:
+        """Elapsed seconds recorded per execution phase."""
         ...
 
     def summary(self) -> str:
@@ -710,6 +924,25 @@ class UATRunResultProtocol(Protocol):
 
 class UATWorkflowProtocol(Protocol):
     """Structural contract for ``sdk.workflows.uat``."""
+
+    @property
+    def state(self) -> str:
+        """Current lifecycle state of the UAT workflow."""
+        ...
+
+    @property
+    def state_history(self) -> Sequence[str]:
+        """Recorded lifecycle state transitions for the current or latest run."""
+        ...
+
+    @property
+    def last_result(self) -> UATRunResultProtocol | None:
+        """Result from the most recent ``run()`` invocation, if any."""
+        ...
+
+    def transition_to(self, target: str) -> str:
+        """Transition workflow state along a valid lifecycle edge."""
+        ...
 
     def run(
         self,
@@ -727,6 +960,33 @@ class UATWorkflowProtocol(Protocol):
 
     def inspect(self, study_key: str) -> StudySnapshotProtocol:
         """Inspect study metadata via StudySchemaInspector."""
+        ...
+
+    def build_spec(self, snapshot: Any, **kwargs: Any) -> Any:
+        """Auto-generate a UAT specification from a study snapshot."""
+        ...
+
+    def generate(
+        self,
+        spec: Any,
+        snapshot: Any,
+        *,
+        data_dictionary: DataDictionary | None = None,
+    ) -> list[Any]:
+        """Generate synthetic record sets from a UAT specification and snapshot."""
+        ...
+
+    def submit(
+        self,
+        study_key: str,
+        record_sets: list[Any],
+        email_notify: bool | str | None = None,
+    ) -> Any:
+        """Submit generated UAT record sets in two phases."""
+        ...
+
+    def monitor(self, study_key: str, submission_result: Any) -> Any:
+        """Poll submitted UAT job batches to completion."""
         ...
 
     def reset(self) -> None:
@@ -764,8 +1024,8 @@ class SyncWorkflowsNamespaceProtocol(Protocol):
         ...
 
     @property
-    def register_subjects(self) -> RegisterSubjectsWorkflowProtocol:
-        """Access the bulk subject registration workflow."""
+    def register_subjects(self) -> SyncRegisterSubjectsWorkflowProtocol:
+        """Access the synchronous bulk subject registration workflow."""
         ...
 
     @property
@@ -791,6 +1051,11 @@ class AsyncWorkflowsNamespaceProtocol(Protocol):
     @property
     def record_update(self) -> AsyncRecordUpdateWorkflowProtocol:
         """Access the async-capable record submission and update workflow."""
+        ...
+
+    @property
+    def register_subjects(self) -> AsyncRegisterSubjectsWorkflowProtocol:
+        """Access the async-capable bulk subject registration workflow."""
         ...
 
     @property
@@ -836,15 +1101,6 @@ class AsyncWorkflowsNamespaceProtocol(Protocol):
 
     @property
     @deprecated(
-        "Workflow 'register_subjects' is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK or sdk.workflows.record_update.async_register_subject(...) instead."
-    )
-    def register_subjects(self) -> Never:
-        """Rejected synchronous-only workflow stub on AsyncImednetSDK."""
-        ...
-
-    @property
-    @deprecated(
         "Workflow 'subject_data' is synchronous-only and raises TypeError on AsyncImednetSDK; "
         "use ImednetSDK instead."
     )
@@ -871,14 +1127,13 @@ if not TYPE_CHECKING:
         "query_management": QueryManagementWorkflowProtocol,
         "record_mapper": RecordMapperProtocol,
         "record_update": SyncRecordUpdateWorkflowProtocol,
-        "register_subjects": RegisterSubjectsWorkflowProtocol,
+        "register_subjects": SyncRegisterSubjectsWorkflowProtocol,
         "subject_data": SubjectDataWorkflowProtocol,
         "uat": UATWorkflowProtocol,
         "uat_inspector": SyncStudySchemaInspectorProtocol,
     }
-    if sys.version_info < (3, 12):  # pragma: no cover
-        SyncWorkflowsNamespaceProtocol.__class__ = _SafeRuntimeProtocolMeta
-        AsyncWorkflowsNamespaceProtocol.__class__ = _SafeRuntimeProtocolMeta
+    SyncWorkflowsNamespaceProtocol.__class__ = _WorkflowsRuntimeProtocolMeta
+    AsyncWorkflowsNamespaceProtocol.__class__ = _WorkflowsRuntimeProtocolMeta
 
 
 class MongoDbSinkConfigProtocol(Protocol):
@@ -1311,9 +1566,7 @@ class PluginProtocol(Protocol):
         assert isinstance(create_workflows, PluginProtocol)
     """
 
-    def __call__(
-        self, sdk_instance: ImednetFacade | AsyncImednetFacade
-    ) -> WorkflowsNamespaceProtocol:
+    def __call__(self, sdk_instance: ImednetFacade, /) -> WorkflowsNamespaceProtocol:
         """Initialize the workflows plugin with an SDK instance."""
         ...
 
@@ -1323,7 +1576,7 @@ class SinksPluginProtocol(Protocol):
     """Protocol for the sinks plugin factory."""
 
     def __call__(
-        self, sdk_instance: ImednetFacade | AsyncImednetFacade
+        self, sdk_instance: ImednetFacade | AsyncImednetFacade, /
     ) -> SinksNamespaceProtocol | AsyncSinksNamespaceProtocol:
         """Initialize the sinks plugin with an SDK instance."""
         ...
@@ -1331,6 +1584,7 @@ class SinksPluginProtocol(Protocol):
 
 __all__ = [
     "AsyncRecordUpdateWorkflowProtocol",
+    "AsyncRegisterSubjectsWorkflowProtocol",
     "AsyncSinksNamespaceProtocol",
     "AsyncStudySchemaInspectorProtocol",
     "AsyncWorkflowsNamespaceProtocol",
@@ -1358,6 +1612,7 @@ __all__ = [
     "SubjectComprehensiveDataProtocol",
     "SubjectDataWorkflowProtocol",
     "SyncRecordUpdateWorkflowProtocol",
+    "SyncRegisterSubjectsWorkflowProtocol",
     "SyncSinksNamespaceProtocol",
     "SyncStudySchemaInspectorProtocol",
     "SyncWorkflowsNamespaceProtocol",

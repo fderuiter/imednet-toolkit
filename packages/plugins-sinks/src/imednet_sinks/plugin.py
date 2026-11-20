@@ -12,9 +12,8 @@ from typing import TYPE_CHECKING, Any, cast, overload
 
 from typing_extensions import deprecated
 
-from imednet import AsyncImednetSDK, ImednetSDK
-
 if TYPE_CHECKING:
+    from imednet.sdk import ImednetSDK
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
     from .document import MongoDbExportSink, MongoDbSinkConfig
@@ -22,29 +21,15 @@ if TYPE_CHECKING:
     from .warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
 
-def _is_async_sdk(sdk: Any) -> bool:
-    """Return True when ``sdk`` is an asynchronous SDK or facade instance."""
-    if isinstance(sdk, AsyncImednetSDK):
-        return True
-    return hasattr(sdk, "async_get_studies") and not callable(getattr(sdk, "get_studies", None))
-
-
-def _ensure_sync_sdk(sdk: Any, method_name: str) -> None:
-    """Raise TypeError when a synchronous sink export helper is called with AsyncImednetSDK."""
-    if _is_async_sdk(sdk):
-        raise TypeError(
-            f"SinksNamespace.{method_name}() is synchronous-only and cannot be called on "
-            "AsyncImednetSDK. Instantiate synchronous ImednetSDK(...) to run sink exports."
-        )
-
-
 class SinksNamespace:
     """Namespace for accessing data export sinks.
 
     This class is typically instantiated by the SDK and exposed via
-    ``sdk.sinks``. It provides bound export methods and properties to access
-    sink configuration and export sink classes.
+    ``sdk.sinks``. It provides bound export methods and sink configuration /
+    class definitions.
     """
+
+    supports_async = True
 
     def __init__(self, sdk: ImednetFacade | AsyncImednetFacade) -> None:
         """Initialize the sinks namespace.
@@ -54,84 +39,75 @@ class SinksNamespace:
         """
         self._sdk = sdk
 
+    def _ensure_sync_sdk(self, helper_name: str, target: object) -> ImednetSDK:
+        """Verify *target* is a synchronous SDK facade before running a sink export."""
+        if hasattr(target, "async_get_records") and not callable(
+            getattr(target, "get_records", None)
+        ):
+            raise TypeError(
+                f"SinksNamespace.{helper_name}() requires a synchronous ImednetSDK "
+                f"(ImednetFacade); AsyncImednetSDK is not supported by synchronous "
+                f"sink export helpers."
+            )
+        return cast("ImednetSDK", target)
+
     def _resolve_export_call(
         self,
-        method_name: str,
+        helper_name: str,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> tuple[ImednetSDK, str, tuple[Any, ...], dict[str, Any]]:
-        """Resolve bound vs deprecated ``(sdk, study_key, ...)`` call arguments."""
-        _ensure_sync_sdk(self._sdk, method_name)
+    ) -> tuple[ImednetSDK, tuple[Any, ...], dict[str, Any]]:
+        """Resolve bound ``(study_key, ...)`` or deprecated ``(sdk, study_key, ...)`` calls."""
         resolved_kwargs = dict(kwargs)
-
-        if not args:
-            if "sdk" in resolved_kwargs:
-                explicit_sdk = resolved_kwargs.pop("sdk")
-                _ensure_sync_sdk(explicit_sdk, method_name)
-                warnings.warn(
-                    f"Passing 'sdk' to sdk.sinks.{method_name}() is deprecated; "
-                    "pass 'study_key' as the first argument.",
-                    DeprecationWarning,
-                    stacklevel=3,
-                )
-                target_sdk = explicit_sdk
-            else:
-                target_sdk = self._sdk
-
-            if "study_key" not in resolved_kwargs:
-                raise TypeError(
-                    f"SinksNamespace.{method_name}() missing 1 required positional argument: "
-                    "'study_key'"
-                )
-            study_key = resolved_kwargs.pop("study_key")
-            if not isinstance(study_key, str):
-                raise TypeError(
-                    f"SinksNamespace.{method_name}() expected 'study_key' to be a str, "
-                    f"got {type(study_key).__name__}."
-                )
-            return cast(ImednetSDK, target_sdk), study_key, (), resolved_kwargs
-
-        first = args[0]
-        if isinstance(first, str):
-            target_sdk = self._sdk
-            if "sdk" in resolved_kwargs:
-                explicit_sdk = resolved_kwargs.pop("sdk")
-                _ensure_sync_sdk(explicit_sdk, method_name)
-                warnings.warn(
-                    f"Passing 'sdk' to sdk.sinks.{method_name}() is deprecated; "
-                    "pass 'study_key' as the first argument.",
-                    DeprecationWarning,
-                    stacklevel=3,
-                )
-                target_sdk = explicit_sdk
-            return cast(ImednetSDK, target_sdk), first, args[1:], resolved_kwargs
-
-        _ensure_sync_sdk(first, method_name)
-        if len(args) >= 2:
-            study_key = args[1]
-            remaining_args = args[2:]
-        elif "study_key" in resolved_kwargs:
-            study_key = resolved_kwargs.pop("study_key")
-            remaining_args = ()
-        else:
-            raise TypeError(
-                f"SinksNamespace.{method_name}() expected 'study_key' (str) as the first "
-                f"argument, got {type(first).__name__}."
-            )
-
-        if not isinstance(study_key, str):
-            raise TypeError(
-                f"SinksNamespace.{method_name}() expected 'study_key' to be a str, "
-                f"got {type(study_key).__name__}."
-            )
-
-        warnings.warn(
-            f"Passing 'sdk' to sdk.sinks.{method_name}() is deprecated; "
-            "pass 'study_key' as the first argument.",
-            DeprecationWarning,
-            stacklevel=3,
+        depr_msg = (
+            f"Passing 'sdk' to sdk.sinks.{helper_name}() is deprecated and will be "
+            f"removed in a future release; call sdk.sinks.{helper_name}(study_key, ...) "
+            f"directly on the bound SDK instance."
         )
-        return cast(ImednetSDK, first), study_key, remaining_args, resolved_kwargs
+
+        if "sdk" in resolved_kwargs:
+            explicit_sdk = resolved_kwargs.pop("sdk")
+            warnings.warn(depr_msg, DeprecationWarning, stacklevel=3)
+            sync_sdk = self._ensure_sync_sdk(helper_name, explicit_sdk)
+            rest_args = args
+        elif args and not isinstance(args[0], str):
+            first = args[0]
+            looks_like_sdk = callable(getattr(first, "get_records", None)) or hasattr(
+                first, "async_get_records"
+            )
+            if len(args) == 1 and "study_key" not in resolved_kwargs and not looks_like_sdk:
+                self._ensure_sync_sdk(helper_name, self._sdk)
+                raise TypeError(
+                    f"SinksNamespace.{helper_name}() 'study_key' must be a str, "
+                    f"got {type(first).__name__}."
+                )
+            warnings.warn(depr_msg, DeprecationWarning, stacklevel=3)
+            sync_sdk = self._ensure_sync_sdk(helper_name, first)
+            rest_args = args[1:]
+        else:
+            sync_sdk = self._ensure_sync_sdk(helper_name, self._sdk)
+            rest_args = args
+
+        if not rest_args and "study_key" not in resolved_kwargs:
+            raise TypeError(
+                f"SinksNamespace.{helper_name}() missing 1 required positional argument: "
+                f"'study_key'"
+            )
+        if rest_args and "study_key" in resolved_kwargs:
+            raise TypeError(
+                f"SinksNamespace.{helper_name}() got multiple values for argument 'study_key'"
+            )
+        if rest_args and not isinstance(rest_args[0], str):
+            raise TypeError(
+                f"SinksNamespace.{helper_name}() 'study_key' must be a str, "
+                f"got {type(rest_args[0]).__name__}."
+            )
+        if "study_key" in resolved_kwargs and not isinstance(resolved_kwargs["study_key"], str):
+            raise TypeError(
+                f"SinksNamespace.{helper_name}() 'study_key' must be a str, "
+                f"got {type(resolved_kwargs['study_key']).__name__}."
+            )
+        return sync_sdk, rest_args, resolved_kwargs
 
     @overload
     def export_to_mongodb(
@@ -165,13 +141,13 @@ class SinksNamespace:
     ) -> int: ...
 
     def export_to_mongodb(self, *args: Any, **kwargs: Any) -> int:
-        """Export study records to MongoDB using the bound SDK client."""
-        target_sdk, study_key, rest_args, rest_kwargs = self._resolve_export_call(
-            "export_to_mongodb", args, kwargs
-        )
+        """Export study records to MongoDB using the bound SDK instance."""
         from .document import export_to_mongodb
 
-        return export_to_mongodb(target_sdk, study_key, *rest_args, **rest_kwargs)
+        sync_sdk, rest_args, resolved_kwargs = self._resolve_export_call(
+            "export_to_mongodb", args, kwargs
+        )
+        return export_to_mongodb(sync_sdk, *rest_args, **resolved_kwargs)
 
     @property
     def MongoDbSinkConfig(self) -> type[MongoDbSinkConfig]:
@@ -217,13 +193,13 @@ class SinksNamespace:
     ) -> int: ...
 
     def export_to_neo4j(self, *args: Any, **kwargs: Any) -> int:
-        """Export study records to Neo4j using the bound SDK client."""
-        target_sdk, study_key, rest_args, rest_kwargs = self._resolve_export_call(
-            "export_to_neo4j", args, kwargs
-        )
+        """Export study records to Neo4j using the bound SDK instance."""
         from .graph import export_to_neo4j
 
-        return export_to_neo4j(target_sdk, study_key, *rest_args, **rest_kwargs)
+        sync_sdk, rest_args, resolved_kwargs = self._resolve_export_call(
+            "export_to_neo4j", args, kwargs
+        )
+        return export_to_neo4j(sync_sdk, *rest_args, **resolved_kwargs)
 
     @property
     def Neo4jSinkConfig(self) -> type[Neo4jSinkConfig]:
@@ -263,13 +239,13 @@ class SinksNamespace:
     ) -> int: ...
 
     def export_to_snowflake(self, *args: Any, **kwargs: Any) -> int:
-        """Export study records to Snowflake using the bound SDK client."""
-        target_sdk, study_key, rest_args, rest_kwargs = self._resolve_export_call(
-            "export_to_snowflake", args, kwargs
-        )
+        """Export study records to Snowflake using the bound SDK instance."""
         from .warehouse import export_to_snowflake
 
-        return export_to_snowflake(target_sdk, study_key, *rest_args, **rest_kwargs)
+        sync_sdk, rest_args, resolved_kwargs = self._resolve_export_call(
+            "export_to_snowflake", args, kwargs
+        )
+        return export_to_snowflake(sync_sdk, *rest_args, **resolved_kwargs)
 
     @property
     def SnowflakeSinkConfig(self) -> type[SnowflakeSinkConfig]:

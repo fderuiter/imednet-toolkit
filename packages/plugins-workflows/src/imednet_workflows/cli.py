@@ -20,13 +20,16 @@ from imednet.spi.cli import (
     add_no_interactive,
     add_output_format,
     clear_line,
+    cli_execution_guard,
     console,
     display_list,
     emit_json,
     fetching_status,
     is_json_output_mode,
     parse_filter_args,
+    positive_int,
     print_error,
+    redact_cli_secrets,
     resolve_output_format,
     validate_cli_path_segment,
     with_sdk,
@@ -531,7 +534,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
     sync_parser.add_argument("study_key", help=STUDY_KEY_ARG)
     sync_parser.add_argument(
-        "--interval", type=int, default=900, help="Polling interval in seconds."
+        "--interval", type=positive_int, default=900, help="Polling interval in seconds."
     )
     sync_parser.add_argument(
         "--once", action="store_true", help="Run a single sync cycle and exit."
@@ -557,15 +560,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             print(f"Synced {count} cached records for study '{study_key}'.")
             return
 
-        print(
-            f"Starting sync worker for study '{study_key}' "
-            f"(interval={interval}s). Press Ctrl+C to stop."
-        )
         try:
-            with console.status(f"Starting sync worker for study '{study_key}'...") as status:
+            with console.status(
+                f"Starting sync worker for study '{study_key}' (interval={interval}s). Press Ctrl+C to stop.",
+                announce_non_interactive=False,
+            ) as status:
 
                 def on_cycle(cycle: int, count: int) -> None:
-                    status.update(f"Study '{study_key}' - cycle {cycle}: synced {count} records.")
+                    status.step(f"Study '{study_key}' - cycle {cycle}: synced {count} records.")
 
                 def on_sleep_tick(cycle: int, remaining: int) -> None:
                     status.update(
@@ -578,10 +580,11 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     worker.run_forever()
             if worker.state == SyncWorkerState.FAILED:
                 err_detail = f": {worker.last_error}" if worker.last_error is not None else ""
-                print(
-                    f"Sync worker failed after {worker.consecutive_failures}/"
-                    f"{worker.max_consecutive_failures} consecutive failures{err_detail}",
-                    file=sys.stderr,
+                print_error(
+                    redact_cli_secrets(
+                        f"Sync worker failed after {worker.consecutive_failures}/"
+                        f"{worker.max_consecutive_failures} consecutive failures{err_detail}"
+                    )
                 )
                 sys.exit(1)
         except KeyboardInterrupt:
@@ -922,10 +925,11 @@ def state_app(args: list[str] | None = None) -> None:
     try:
         if getattr(parsed, "no_interactive", False):
             os.environ[NON_INTERACTIVE_ENV] = "1"
-        if hasattr(parsed, "func"):
-            parsed.func(parsed)
-        else:
-            parser.print_help()
+        with cli_execution_guard():
+            if hasattr(parsed, "func"):
+                parsed.func(parsed)
+            else:
+                parser.print_help()
     finally:
         if old_non_interactive is not None:
             os.environ[NON_INTERACTIVE_ENV] = old_non_interactive

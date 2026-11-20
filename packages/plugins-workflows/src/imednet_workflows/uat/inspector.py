@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from pydantic import Field
 
-from imednet import AsyncImednetSDK
 from imednet.spi.models import (
     Form,
     ImednetBaseModel,
@@ -91,7 +90,7 @@ class StudySchemaInspector:
     use external synchronization or separate inspector instances for that access pattern.
     """
 
-    supports_async: bool = True
+    supports_async = True
 
     def __init__(self, sdk: ImednetFacade | AsyncImednetFacade) -> None:
         """Initialize the study schema inspector.
@@ -102,21 +101,15 @@ class StudySchemaInspector:
         self._sdk = sdk
         self._cache: dict[str, StudySnapshot] = {}
 
-    def _is_async_sdk(self) -> bool:
-        """Return True when the bound SDK is asynchronous."""
-        if isinstance(self._sdk, AsyncImednetSDK):
-            return True
-        return hasattr(self._sdk, "async_get_forms") and not callable(
-            getattr(self._sdk, "get_forms", None)
-        )
-
     def inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
         """Synchronously fetch and return a study snapshot."""
-        if self._is_async_sdk():
+        if hasattr(self._sdk, "async_get_forms") and not callable(
+            getattr(self._sdk, "get_forms", None)
+        ):
             raise TypeError(
-                "StudySchemaInspector.inspect() cannot be called with AsyncImednetSDK. "
-                "Use 'await sdk.workflows.uat_inspector.async_inspect(...)' instead, "
-                "or instantiate synchronous ImednetSDK."
+                "StudySchemaInspector.inspect() requires a synchronous ImednetSDK "
+                "(ImednetFacade). With AsyncImednetSDK, await "
+                "inspector.async_inspect(...) instead."
             )
         if not force_refresh and study_key in self._cache:
             return self._cache[study_key]

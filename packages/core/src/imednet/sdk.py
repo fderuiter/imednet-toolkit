@@ -65,7 +65,6 @@ _SYNC_ONLY_WORKFLOW_NAMES: frozenset[str] = frozenset(
         "duckdb_centralizer",
         "query_management",
         "record_mapper",
-        "register_subjects",
         "subject_data",
         "uat",
     }
@@ -118,7 +117,7 @@ class WorkflowRegistry:
         raise TypeError(
             f"Workflow '{name}' is synchronous-only and cannot be used with AsyncImednetSDK. "
             "Use synchronous ImednetSDK(...) for this workflow, or use an async-capable "
-            "workflow ('record_update' or 'uat_inspector')."
+            "workflow ('record_update', 'register_subjects', or 'uat_inspector')."
         )
 
     def __getattr__(self, name: str) -> Any:

@@ -9,11 +9,15 @@ from .cache import (
     AsyncSchemaValidator,
     BaseSchemaCache,
     BaseSchemaValidator,
+    BatchValidationReport,
+    RecordValidationIssue,
     SchemaCache,
     SchemaValidator,
     ValidationSchemaProtocol,
+    calculate_readiness_score,
     validate_record_data,
     validate_record_entry,
+    validate_records_batch,
 )
 
 __all__ = [
@@ -21,9 +25,13 @@ __all__ = [
     "AsyncSchemaValidator",
     "BaseSchemaCache",
     "BaseSchemaValidator",
+    "BatchValidationReport",
+    "RecordValidationIssue",
     "SchemaCache",
     "SchemaValidator",
     "ValidationSchemaProtocol",
+    "calculate_readiness_score",
     "validate_record_data",
     "validate_record_entry",
+    "validate_records_batch",
 ]

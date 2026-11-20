@@ -68,24 +68,32 @@ Plugin contract
 ---------------
 
 An individual workflow registered under ``imednet.workflows`` is any class or
-callable that accepts the SDK instance as its sole positional argument.
+callable that accepts the SDK instance as its sole positional argument. By
+default, workflows are synchronous-only and raise :exc:`TypeError` when
+accessed on :class:`~imednet.sdk.AsyncImednetSDK`. Workflows that support
+asynchronous execution on ``AsyncImednetSDK`` must declare
+``supports_async = True`` on the workflow class or factory.
 
 A namespace-level plugin factory registered under ``imednet.plugins`` satisfies
 :class:`~imednet.plugins.PluginProtocol` (or returns a
 :class:`~imednet.plugins.SinksNamespaceProtocol` /
-:class:`~imednet.plugins.WorkflowsNamespaceProtocol` namespace):
+:class:`~imednet.plugins.AsyncSinksNamespaceProtocol` /
+:class:`~imednet.plugins.SyncWorkflowsNamespaceProtocol` /
+:class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol` namespace):
 
 .. testcode::
 
     from typing import Any, Protocol
-    from imednet.plugins import WorkflowsNamespaceProtocol
+    from imednet.plugins import SyncWorkflowsNamespaceProtocol
 
     class PluginProtocol(Protocol):
-        def __call__(self, sdk_instance: Any) -> WorkflowsNamespaceProtocol: ...
+        def __call__(self, sdk_instance: Any) -> SyncWorkflowsNamespaceProtocol: ...
 
 The built-in ``imednet-workflows`` package registers the following workflow
 attributes under ``imednet.workflows`` (matching
-:class:`~imednet.plugins.WorkflowsNamespaceProtocol`):
+:class:`~imednet.plugins.SyncWorkflowsNamespaceProtocol` on ``ImednetSDK``, with
+``record_update``, ``register_subjects``, and ``uat_inspector`` also enabled on
+:class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol` for ``AsyncImednetSDK``):
 
 * ``data_extraction``
 * ``duckdb_centralizer``
@@ -186,7 +194,22 @@ API reference
    :undoc-members:
    :noindex:
 
-.. autoclass:: imednet.plugins.WorkflowsNamespaceProtocol
+.. autoclass:: imednet.plugins.SyncWorkflowsNamespaceProtocol
+   :members:
+   :undoc-members:
+   :noindex:
+
+.. autoclass:: imednet.plugins.AsyncWorkflowsNamespaceProtocol
+   :members:
+   :undoc-members:
+   :noindex:
+
+.. autoclass:: imednet.plugins.SinksNamespaceProtocol
+   :members:
+   :undoc-members:
+   :noindex:
+
+.. autoclass:: imednet.plugins.AsyncSinksNamespaceProtocol
    :members:
    :undoc-members:
    :noindex:
