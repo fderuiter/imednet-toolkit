@@ -83,6 +83,44 @@ def test_enrichment_pipeline_rejects_class_traversal_payload(
     )
 
 
+@pytest.mark.parametrize(
+    "malicious_logic",
+    [
+        '"{0.__class__}".format(value)',
+        '"{v.__class__}".format_map({"v": value})',
+        '"".format',
+        '"".format_map',
+        'f"{value}"',
+    ],
+)
+def test_enrichment_pipeline_rejects_format_and_fstring_payloads(
+    malicious_logic: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that format, format_map, bare format attribute access, and f-strings fail safely."""
+    config = StudyConfiguration(
+        study_key="STUDY-FORMAT-BLOCK",
+        mappings=[
+            MappingRule(
+                domain="DM",
+                target_field="sanitized",
+                source_form_key="DM_FORM",
+                source_variable_name="raw_input",
+                business_logic=malicious_logic,
+            ),
+        ],
+    )
+
+    pipeline = EnrichmentPipeline(config)
+    data = {"raw_input": "original_value"}
+
+    with caplog.at_level(logging.WARNING):
+        result = pipeline.process(data)
+
+    assert result["sanitized"] == "original_value"
+    assert any("Security warning" in r.message and "forbidden" in r.message for r in caplog.records)
+
+
 def test_enrichment_pipeline_syntax_error_fallback(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -693,3 +731,114 @@ def test_real_config_version_store_end_to_end_and_missing_key_fail_closed(
     closed_mapped = CentralizedMapper(mode="document").map_record(rec, study_key="STUDY-REAL-GOV")
     assert closed_mapped["record_data"]["ssn"] == "***MASKED***"
     assert closed_mapped["record_data"]["sponsor_subject_code"] == "SP-19"
+
+
+def test_centralized_mapper_applies_uppercase_and_camelcase_rules_before_snake_case() -> None:
+    """CentralizedMapper applies uppercase and camelCase terminologyLookups and mappings before flatten and _to_snake_case."""
+    from imednet.integrations.enrichment import CentralizedMapper
+
+    study_cfg = StudyConfiguration(
+        studyKey="STUDY-CASE",
+        phiFields=["chartNumber", "subjectKey", "recordId", "studyKey"],
+        terminologyLookups={
+            "SEX": {"1": "Female", "2": "Male"},
+            "armCode": {"A": "Active", "B": "Placebo"},
+            "bpFlag": {"H": "High"},
+        },
+        mappings=[
+            MappingRule(
+                domain="DM",
+                targetField="DMSEX",
+                sourceFormKey="DM",
+                sourceVariableName="SEX",
+            ),
+            MappingRule(
+                domain="DM",
+                targetField="treatmentArm",
+                sourceFormKey="DM",
+                sourceVariableName="armCode",
+                businessLogic="str(value).upper()",
+            ),
+            MappingRule(
+                domain="VS",
+                targetField="BpCategory",
+                sourceFormKey="VS",
+                sourceVariableName="bpFlag",
+            ),
+        ],
+    )
+
+    record = SimpleNamespace(
+        record_id=55,
+        study_key="STUDY-CASE",
+        subject_key="SUBJ-055",
+        visit_id=1,
+        form_id=10,
+        record_data={
+            "SEX": "1",
+            "armCode": "A",
+            "chartNumber": "CH-055",
+            "vitals": {"bpFlag": "H", "heartRate": 70},
+        },
+    )
+
+    doc_mapper = CentralizedMapper(mode="document", study_config=study_cfg)
+    doc_out = doc_mapper.map_record(record, study_key="STUDY-CASE")
+    assert doc_out["study_key"] == "STUDY-CASE"
+    assert doc_out["subject_key"] == "SUBJ-055"
+    assert doc_out["record_id"] == 55
+    assert doc_out["record_data"]["dmsex"] == "Female"
+    assert doc_out["record_data"]["treatment_arm"] == "ACTIVE"
+    assert doc_out["record_data"]["chart_number"] == "***MASKED***"
+    assert doc_out["record_data"]["vitals"] == {"BpCategory": "High", "heartRate": 70}
+
+    tab_mapper = CentralizedMapper(mode="tabular", study_config=study_cfg)
+    tab_out = tab_mapper.map_record(record, study_key="STUDY-CASE")
+    assert tab_out["record_data"]["dmsex"] == "Female"
+    assert tab_out["record_data"]["treatment_arm"] == "ACTIVE"
+    assert tab_out["record_data"]["chart_number"] == "***MASKED***"
+    assert tab_out["record_data"]["vitals.bp_category"] == "High"
+    assert tab_out["record_data"]["vitals.heart_rate"] == 70
+
+
+def test_enrichment_pipeline_exact_first_and_snake_case_fallback_for_prenormalized_dicts() -> None:
+    """EnrichmentPipeline matches exact sourceVariableName keys first and falls back to normalized snake_case."""
+    config = StudyConfiguration(
+        studyKey="STUDY-FALLBACK-CASE",
+        terminologyLookups={
+            "ARM_CODE": {"A": "ExactUpperActive"},
+            "arm_code": {"A": "ExactSnakeActive"},
+            "visitType": {"1": "Scheduled"},
+        },
+        mappings=[
+            MappingRule(
+                domain="DM",
+                targetField="arm_upper",
+                sourceFormKey="DM",
+                sourceVariableName="ARM_CODE",
+            ),
+            MappingRule(
+                domain="DM",
+                targetField="arm_snake",
+                sourceFormKey="DM",
+                sourceVariableName="arm_code",
+            ),
+            MappingRule(
+                domain="SV",
+                targetField="visit_label",
+                sourceFormKey="SV",
+                sourceVariableName="visitType",
+            ),
+        ],
+    )
+
+    pipeline = EnrichmentPipeline(config)
+    raw_and_prenormalized = {
+        "ARM_CODE": "A",
+        "arm_code": "A",
+        "visit_type": "1",
+    }
+    enriched = pipeline.process(raw_and_prenormalized)
+    assert enriched["arm_upper"] == "ExactUpperActive"
+    assert enriched["arm_snake"] == "ExactSnakeActive"
+    assert enriched["visit_label"] == "Scheduled"

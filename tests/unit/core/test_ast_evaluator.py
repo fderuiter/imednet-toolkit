@@ -269,6 +269,63 @@ def test_evaluator_rejects_class_hierarchy_traversal_payloads(
             assert any("Security warning" in r.message for r in caplog.records)
 
 
+def test_evaluator_rejects_format_and_fstring_traversal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that str.format, str.format_map, bare format attributes, and f-strings are blocked."""
+    from imednet.utils.evaluator import DEFAULT_SAFE_METHODS
+
+    assert "format" not in DEFAULT_SAFE_METHODS
+    assert "format_map" not in DEFAULT_SAFE_METHODS
+
+    dummy = DummyObject(99)
+    env = {"obj": dummy, "value": "safe"}
+
+    forbidden_exprs = [
+        '"{0._secret}".format(obj)',
+        '"{0.__dict__[_secret]}".format(obj)',
+        '"{target._secret}".format_map({"target": obj})',
+        '"".format',
+        '"".format_map',
+        "value.format",
+        "obj.double",
+        'f"{value}"',
+        'f"{obj._secret}"',
+    ]
+
+    for expr in forbidden_exprs:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(RestrictedEvaluationError):
+                evaluate_expression(expr, env, raise_on_error=True)
+            assert any("Security warning" in r.message for r in caplog.records)
+
+        # Fallback path when raise_on_error=False
+        assert evaluate_expression(expr, env, default="BLOCKED", raise_on_error=False) == "BLOCKED"
+
+    # RestrictedAstEvaluator wrapper must also reject format and format_map
+    fmt_eval = RestrictedAstEvaluator('"{0._secret}".format(obj)')
+    with pytest.raises(RestrictedEvaluationError, match="Method 'format' is forbidden"):
+        fmt_eval.evaluate(env, raise_on_error=True)
+    assert fmt_eval.evaluate(env, default="SAFE_DEFAULT") == "SAFE_DEFAULT"
+
+    fmt_map_eval = RestrictedAstEvaluator('"{x._secret}".format_map({"x": obj})')
+    with pytest.raises(RestrictedEvaluationError, match="Method 'format_map' is forbidden"):
+        fmt_map_eval.evaluate(env, raise_on_error=True)
+
+    attr_eval = RestrictedAstEvaluator('"".format')
+    with pytest.raises(RestrictedEvaluationError, match="Method 'format' is forbidden"):
+        attr_eval.evaluate(env, raise_on_error=True)
+
+    with pytest.raises(RestrictedEvaluationError, match="AST node 'JoinedStr' is forbidden"):
+        RestrictedAstEvaluator('f"{obj._secret}"')
+
+    # Approved string transformations and non-callable attribute reads remain intact
+    assert evaluate_expression("value.upper() + '_OK'", env) == "SAFE_OK"
+    assert evaluate_expression("obj.value", env) == 99
+    assert callable(evaluate_expression("''.strip", env))
+
+
 def test_evaluator_rejects_complex_rce_payload(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

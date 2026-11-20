@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import sys
 from builtins import __import__ as builtin_import
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from imednet.models.record_revisions import RecordRevision
+from imednet.models.records import RecordStatus
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 
@@ -187,3 +189,113 @@ def test_duckdb_workflow_import_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ImportError, match=r"pip install"):
         DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+
+def test_ingest_revisions_bulk_staging_calls_and_empty_batch() -> None:
+    """Test bulk ingestion registers/unregisters once per non-empty batch and skips empty."""
+    pytest.importorskip("duckdb")
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    real_conn = workflow._connection
+    spy_conn = MagicMock(wraps=real_conn)
+    workflow._connection = spy_conn
+
+    revisions = [
+        RecordRevision(
+            record_revision_id=1,
+            record_id=1,
+            form_key="F1",
+            record_revision=1,
+            user="alice",
+            date_created="2024-01-01T10:00:00Z",
+        ),
+        RecordRevision(
+            record_revision_id=2,
+            record_id=2,
+            form_key="F1",
+            record_revision=1,
+            user="bob",
+            date_created="2024-01-01T11:00:00Z",
+        ),
+    ]
+
+    with patch.object(
+        DataExtractionWorkflow,
+        "extract_audit_trail",
+        side_effect=[[], revisions],
+    ):
+        assert workflow.ingest_revisions("STUDY", mode="replace") == 0
+        spy_conn.register.assert_not_called()
+        spy_conn.unregister.assert_not_called()
+
+        assert workflow.ingest_revisions("STUDY", mode="append") == 2
+        spy_conn.register.assert_called_once()
+        spy_conn.unregister.assert_called_once()
+        spy_conn.executemany.assert_not_called()
+
+
+def test_ingest_revisions_bigint_aware_timestamps_and_pandas_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test 64-bit BIGINTs, aware datetimes, RecordStatus enums, and pandas fallback."""
+    pytest.importorskip("duckdb")
+    import pandas as pd
+
+    def fake_import(
+        name: str,
+        globals_arg: Any = None,
+        locals_arg: Any = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> Any:
+        if name == "pyarrow" or name.startswith("pyarrow."):
+            raise ImportError("No module named pyarrow")
+        return builtin_import(name, globals_arg, locals_arg, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "pyarrow", raising=False)
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    big_id = (1 << 54) + 99
+    revisions = [
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=big_id,
+            record_id=big_id + 1,
+            record_oid="OID-BIG",
+            form_key="VITALS",
+            subject_key="SUBJ-9",
+            site_id=big_id + 2,
+            interval_id=big_id + 3,
+            record_status=RecordStatus.LOCKED,
+            record_revision=3,
+            data_revision=2,
+            user="alice",
+            role="CRC",
+            reason_for_change="Bulk insert check",
+            deleted=False,
+            date_created=datetime(2024, 3, 15, 15, 30, 0, tzinfo=timezone(timedelta(hours=3))),
+            last_updated="   ",
+        )
+    ]
+
+    rows = list(workflow._to_rows("STUDY", revisions))
+    staging_df = workflow._build_staging_relation(rows)
+    assert isinstance(staging_df, pd.DataFrame)
+
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=revisions):
+        assert workflow.ingest_revisions("STUDY", mode="replace") == 1
+
+    result = workflow._connection.execute(
+        "SELECT record_revision_id, record_id, site_id, interval_id, "
+        "record_status, date_created, last_updated FROM bronze_revisions"
+    ).fetchone()
+    assert result == (
+        big_id,
+        big_id + 1,
+        big_id + 2,
+        big_id + 3,
+        "Locked",
+        datetime(2024, 3, 15, 12, 30, 0),
+        None,
+    )
