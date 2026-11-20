@@ -57,7 +57,7 @@ The following components are exposed via Python entry points:
 - **Custom Pollers (`imednet.pollers`)**: `JobPoller`, `AsyncJobPoller`.
 - **Custom Mappers (`imednet.mappers`)**: `RecordMapper`.
 - **Data Loaders (`imednet.loaders`)**: `CachedRecordsLoader`.
-- **Config Stores (`imednet.stores`)**: `ConfigVersionStore`.
+- **Config Stores (`imednet.stores`)**: `ConfigVersionStore`, `TriageStore`.
 
 ## Features
 

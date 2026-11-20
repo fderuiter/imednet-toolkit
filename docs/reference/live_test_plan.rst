@@ -64,9 +64,11 @@ non-destructive calls. Each bullet corresponds to a separate live test.
 - ``DataExtractionWorkflow.extract_audit_trail``
 - ``SubjectDataWorkflow.get_all_subject_data``
 - ``QueryManagementWorkflow.get_open_queries``
+- ``QueryManagementWorkflow.get_unresolved_queries``
 - ``QueryManagementWorkflow.get_queries_for_subject``
 - ``QueryManagementWorkflow.get_queries_by_site``
 - ``QueryManagementWorkflow.get_query_state_counts``
+- ``QueryManagementWorkflow.sync_queries_to_triage``
 - ``RecordMapper.dataframe``
 - ``RecordUpdateWorkflow.create_or_update_records``
 - ``RecordUpdateWorkflow.register_subject``

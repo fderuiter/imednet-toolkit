@@ -15,10 +15,21 @@ from ..utils.args import (
     add_output_format,
     add_simulation_arg,
     add_study_key_args,
-    collect_list_items,
+    collect_list_items_with_remainder,
     prepare_list_query,
     resolve_study_key,
 )
+
+
+def _subject_view_model(s: Any) -> dict[str, Any]:
+    keywords_str = ", ".join(k.keyword_name for k in s.keywords)
+    return {
+        "subject_key": s.subject_key,
+        "status": s.subject_status,
+        "site": s.site_name,
+        "enrollment_date": s.enrollment_start_date,
+        "keywords": keywords_str,
+    }
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -65,7 +76,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
         with fetching_status("subjects", study_key):
-            subjects_list, truncated = collect_list_items(
+            subjects_list, truncated, load_remaining = collect_list_items_with_remainder(
                 sdk.subjects.list(study_key, **req_kwargs),
                 effective_limit,
             )
@@ -73,18 +84,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if output_format == "json":
             display_list(subjects_list, "subjects", output_format="json")
             return
-        view_models = []
-        for s in subjects_list:
-            keywords_str = ", ".join(k.keyword_name for k in s.keywords)
-            view_models.append(
-                {
-                    "subject_key": s.subject_key,
-                    "status": s.subject_status,
-                    "site": s.site_name,
-                    "enrollment_date": s.enrollment_start_date,
-                    "keywords": keywords_str,
-                }
-            )
+        view_models = [_subject_view_model(s) for s in subjects_list]
+
+        def _load_more_subjects() -> tuple[list[dict[str, Any]], list[Any]]:
+            more = load_remaining() if load_remaining is not None else []
+            return [_subject_view_model(s) for s in more], more
 
         display_list(
             view_models,
@@ -93,6 +97,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             details=subjects_list,
             truncated=truncated,
             interactive=False if no_interactive else None,
+            on_load_all=_load_more_subjects if load_remaining is not None else None,
         )
 
     def _dispatch_list_subjects(args: argparse.Namespace) -> None:

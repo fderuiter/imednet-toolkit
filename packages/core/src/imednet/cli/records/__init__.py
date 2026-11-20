@@ -16,11 +16,21 @@ from ..utils.args import (
     add_output_format,
     add_simulation_arg,
     add_study_key_args,
-    collect_list_items,
+    collect_list_items_with_remainder,
     prepare_list_query,
     resolve_study_key,
 )
 from ..utils.export import export_list_to_file
+
+
+def _record_view_model(r: Any) -> dict[str, Any]:
+    return {
+        "ID": r.record_id,
+        "Subject": r.subject_key,
+        "Form": r.form_key,
+        "Status": r.record_status,
+        "Created": r.date_created,
+    }
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -82,7 +92,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             req_kwargs, effective_limit = _prepared_query
 
         with fetching_status("records", study_key):
-            records, truncated = collect_list_items(
+            records, truncated, load_remaining = collect_list_items_with_remainder(
                 sdk.records.list(study_key, **req_kwargs),
                 effective_limit,
             )
@@ -96,17 +106,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             )
             export_list_to_file(records, "records", output.lower())
         else:
-            view_models = []
-            for r in records:
-                view_models.append(
-                    {
-                        "ID": r.record_id,
-                        "Subject": r.subject_key,
-                        "Form": r.form_key,
-                        "Status": r.record_status,
-                        "Created": r.date_created,
-                    }
-                )
+            view_models = [_record_view_model(r) for r in records]
+
+            def _load_more_records() -> tuple[list[dict[str, Any]], list[Any]]:
+                more = load_remaining() if load_remaining is not None else []
+                return [_record_view_model(r) for r in more], more
+
             display_list(
                 view_models,
                 "records",
@@ -114,6 +119,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 details=records,
                 truncated=truncated,
                 interactive=False if no_interactive else None,
+                on_load_all=_load_more_records if load_remaining is not None else None,
             )
 
     def _dispatch_list_records(args: argparse.Namespace) -> None:

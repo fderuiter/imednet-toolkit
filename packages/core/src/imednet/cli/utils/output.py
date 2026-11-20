@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 import unicodedata
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import date, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -601,6 +601,30 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
         print(" | ".join(colored_row))
 
 
+def _project_item_to_row(
+    item: Any,
+    field_keys: list[str],
+    *,
+    explicit_fields: bool,
+) -> dict[str, Any]:
+    """Convert a domain model or dict into a table row dict matching ``field_keys``."""
+    if explicit_fields:
+        if isinstance(item, dict):
+            return {k: item.get(k) for k in field_keys}
+        return {k: getattr(item, k, None) for k in field_keys}
+    if isinstance(item, dict):
+        return dict(item)
+    if hasattr(item, "model_dump"):
+        dumped = item.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    if hasattr(item, "dict"):
+        dumped_legacy = item.dict()
+        if isinstance(dumped_legacy, dict):
+            return dumped_legacy
+    return {k: getattr(item, k, None) for k in field_keys}
+
+
 def display_list(
     items: Sequence[Any],
     label: str,
@@ -612,6 +636,7 @@ def display_list(
     interactive: bool | None = None,
     truncated: bool = False,
     status_notice: str | None = None,
+    on_load_all: Callable[[], Any] | None = None,
 ) -> None:
     """Display a human table or one versioned JSON response without progress text."""
     if output_format == "json":
@@ -631,14 +656,11 @@ def display_list(
 
     field_keys: list[str] = []
     data_list: list[dict[str, Any]] = []
+    explicit_fields = bool(fields)
 
     if fields:
         field_keys = list(fields)
-        for item in items:
-            if isinstance(item, dict):
-                data_list.append({k: item.get(k) for k in field_keys})
-            else:
-                data_list.append({k: getattr(item, k, None) for k in field_keys})
+        data_list = [_project_item_to_row(item, field_keys, explicit_fields=True) for item in items]
     else:
         first = items[0]
         if hasattr(first, "model_dump"):
@@ -669,14 +691,44 @@ def display_list(
     should_run_interactive = interactive if interactive is not None else is_interactive_terminal()
     if should_run_interactive:
         effective_details = details if details is not None else items
+        grid_notice = status_notice or (
+            f"Showing first {len(items)} {label} (truncated; press [a] or pass --all)"
+            if truncated and on_load_all is not None
+            else effective_notice
+        )
         grid_kwargs: dict[str, Any] = {
             "items": data_list,
             "fields": field_keys,
             "label": label,
             "details": effective_details,
         }
-        if effective_notice is not None:
-            grid_kwargs["status_notice"] = effective_notice
+        if truncated:
+            grid_kwargs["truncated"] = True
+        if grid_notice is not None:
+            grid_kwargs["status_notice"] = grid_notice
+        if on_load_all is not None:
+
+            def _wrapped_load_all() -> tuple[list[dict[str, Any]], list[Any]]:
+                loaded = on_load_all()
+                if (
+                    isinstance(loaded, tuple)
+                    and len(loaded) == 2
+                    and not isinstance(loaded[0], (str, bytes, dict))
+                ):
+                    raw_rows, raw_details = loaded
+                    projected = [
+                        _project_item_to_row(r, field_keys, explicit_fields=explicit_fields)
+                        for r in raw_rows
+                    ]
+                    return projected, list(raw_details)
+                raw_items = list(loaded)
+                projected_items = [
+                    _project_item_to_row(r, field_keys, explicit_fields=explicit_fields)
+                    for r in raw_items
+                ]
+                return projected_items, raw_items
+
+            grid_kwargs["on_load_all"] = _wrapped_load_all
         grid_ran = run_interactive_grid(**grid_kwargs)
         if grid_ran:
             return

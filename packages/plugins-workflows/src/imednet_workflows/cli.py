@@ -38,7 +38,7 @@ from imednet.spi.cli import (
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectComprehensiveData, SubjectDataWorkflow
-from .sync_worker import SyncWorker, SyncWorkerConfig
+from .sync_worker import SyncWorker, SyncWorkerConfig, SyncWorkerState
 
 _UniqueStoreAction = UniqueStoreAction
 _RECORD_SUMMARY_FIELDS: list[str] = [
@@ -60,6 +60,7 @@ def _execute_set_state(
     interactive: bool = False,
     parser: argparse.ArgumentParser | None = None,
     no_interactive: bool = False,
+    force: bool = False,
 ) -> None:
     """Execute high-water mark timestamp update for a study/stream in the ledger."""
     if not interactive:
@@ -95,6 +96,7 @@ def _execute_set_state(
                 timestamp=dt,
                 records_processed=records_processed,
                 status="success",
+                force=force,
             )
             print(
                 f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
@@ -279,11 +281,16 @@ def _execute_show_state(
                 if isinstance(stream_state.last_run_status, Enum)
                 else str(stream_state.last_run_status)
             )
+            ts_val = (
+                stream_state.last_timestamp.isoformat()
+                if stream_state.last_timestamp is not None
+                else None
+            )
             entries.append(
                 {
                     "studyKey": s_key,
                     "streamName": stream_name,
-                    "lastTimestamp": stream_state.last_timestamp.isoformat(),
+                    "lastTimestamp": ts_val,
                     "recordsProcessed": stream_state.records_processed,
                     "status": status_val,
                     "errorMessage": stream_state.error_message,
@@ -300,8 +307,9 @@ def _execute_show_state(
         "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
     )
     for entry in entries:
+        ts_str = entry["lastTimestamp"] if entry["lastTimestamp"] is not None else "None"
         print(
-            f"{entry['studyKey']} | {entry['streamName']} | {entry['lastTimestamp']} | "
+            f"{entry['studyKey']} | {entry['streamName']} | {ts_str} | "
             f"{entry['recordsProcessed']} | {entry['status']} | {entry['errorMessage'] or ''}"
         )
     if not entries:
@@ -353,6 +361,12 @@ def _register_state_subcommands(state_sub: argparse._SubParsersAction[Any]) -> N
         help="Path to the pipeline ledger JSON file.",
     )
     set_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force state transition override even when the current status disallows it.",
+    )
+    set_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
     add_no_interactive(set_parser)
@@ -368,6 +382,7 @@ def _register_state_subcommands(state_sub: argparse._SubParsersAction[Any]) -> N
             interactive=args.interactive,
             parser=set_parser,
             no_interactive=getattr(args, "no_interactive", False),
+            force=getattr(args, "force", False),
         )
 
     set_parser.set_defaults(func=_handle_set_state)
@@ -660,6 +675,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     worker.run_forever(on_cycle=on_cycle, on_sleep_tick=on_sleep_tick)
                 except TypeError:
                     worker.run_forever()
+            if worker.state == SyncWorkerState.FAILED:
+                err_detail = f": {worker.last_error}" if worker.last_error is not None else ""
+                print(
+                    f"Sync worker failed after {worker.consecutive_failures}/"
+                    f"{worker.max_consecutive_failures} consecutive failures{err_detail}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         except KeyboardInterrupt:
             clear_line()
             worker.stop()

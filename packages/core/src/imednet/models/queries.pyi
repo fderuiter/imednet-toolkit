@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any
 
@@ -41,7 +42,14 @@ def validate_query_transition(
 ) -> bool: ...
 
 validate_transition = validate_query_transition
+_CLAUSE_SPLIT_RE = re.compile('[,;|/()]|\\bbut\\b')
+_WORD_TOKEN_RE = re.compile("[a-z0-9']+")
+_NEGATION_RE = re.compile("^(?:not|no|non|un|never|without|neither|nor|cannot|.*n't)$")
+_ANSWER_TOKEN_RE = re.compile("^(?:re)?answer(?:s|ed|ing)?$")
+_CANCEL_TOKEN_RE = re.compile("^(?:re)?cancel(?:s|ed|led|ing|ling|lation)?$")
+_CLOSE_TOKEN_RE = re.compile("^(?:re)?(?:close|closes|closed|closing|closure)$")
 
+def _has_non_negated_token(text: str, pattern: re.Pattern[str]) -> bool: ...
 def calculate_legacy_status(query_comments: list[Any] | None) -> QueryStatus: ...
 
 class QueryComment(ImednetBaseModel):
