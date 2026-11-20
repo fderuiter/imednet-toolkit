@@ -1056,3 +1056,184 @@ class TestExportSinkBatchRedactionContract:
         opt_out_sink = CustomAuditSink(spi_sinks.SinkConfig(study_key="STUDY1", mask_phi=False))
         opt_out_sink.write_batch([phi_record], batch_id="audit/1")
         assert opt_out_sink.captured_batches[0][0][0].record_data["patientName"] == "Jane Doe"
+
+
+class TestQualityGatePrefetchedVariablesAndBufferRouter:
+    """Tests for reusable Study Variables in apply_quality_gate and BoundedFormBufferRouter."""
+
+    def test_apply_quality_gate_reuses_prefetched_variables_without_refresh(self):
+        """Assert apply_quality_gate populates schema from prefetched variables without SDK calls."""
+        from types import SimpleNamespace
+
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+
+        sdk = MagicMock()
+        sdk.variables.list.side_effect = AssertionError("must not fetch /variables again")
+        sdk.get_variables.side_effect = AssertionError("must not fetch /variables again")
+
+        forms = [
+            SimpleNamespace(form_id=10, form_key="DEMO"),
+            SimpleNamespace(form_id=20, form_key="VITALS"),
+        ]
+        variables = [
+            Variable(variable_name="AGE", variable_type="int", form_id=10, form_key=""),
+            SimpleNamespace(variable_name="HR", variable_type="int", form_id=20, form_key=None),
+        ]
+
+        valid_demo = Record(
+            record_id=1,
+            form_id=10,
+            form_key="",
+            record_data={"AGE": 52},
+        )
+        invalid_vitals = Record(
+            record_id=2,
+            form_id=20,
+            form_key="VITALS",
+            record_data={},
+        )
+        valid_vitals = Record(
+            record_id=3,
+            form_id=20,
+            form_key="",
+            record_data={"HR": 68},
+        )
+
+        cfg = SinkConfig(
+            study_key="STUDY_REUSE",
+            quality_gate_enabled=True,
+            min_schema_readiness_score=100.0,
+        )
+        retained = list(
+            sink_base_mod.apply_quality_gate(
+                sdk,
+                "STUDY_REUSE",
+                [valid_demo, invalid_vitals, valid_vitals],
+                cfg,
+                variables=variables,
+                forms=forms,
+            )
+        )
+        assert retained == [valid_demo, valid_vitals]
+
+    def test_apply_quality_gate_prefetched_variables_enforces_required_flag(self):
+        """Assert prefetched Variable(required=True) preserves required policy on cloned variables without SDK calls."""
+        from types import SimpleNamespace
+
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+
+        sdk = MagicMock()
+        sdk.variables.list.side_effect = AssertionError("must not fetch /variables again")
+        sdk.get_variables.side_effect = AssertionError("must not fetch /variables again")
+
+        forms = [SimpleNamespace(form_id=10, form_key="DEMO")]
+        variables = [
+            Variable(
+                variable_name="SUBJ_CODE",
+                variable_type="text",
+                form_id=10,
+                form_key="",
+                required=True,
+            ),
+            Variable(
+                variable_name="AGE",
+                variable_type="int",
+                form_id=10,
+                form_key="",
+            ),
+        ]
+
+        complete_rec = Record(
+            record_id=1,
+            form_id=10,
+            form_key="",
+            record_data={"SUBJ_CODE": "S-001", "AGE": 44},
+        )
+        blank_required_rec = Record(
+            record_id=2,
+            form_id=10,
+            form_key="DEMO",
+            record_data={"SUBJ_CODE": "", "AGE": 44},
+        )
+        none_required_rec = Record(
+            record_id=3,
+            form_id=10,
+            form_key="",
+            record_data={"SUBJ_CODE": None, "AGE": 44},
+        )
+
+        cfg = SinkConfig(
+            study_key="STUDY_REQ",
+            quality_gate_enabled=True,
+            min_schema_readiness_score=100.0,
+        )
+        retained = list(
+            sink_base_mod.apply_quality_gate(
+                sdk,
+                "STUDY_REQ",
+                [complete_rec, blank_required_rec, none_required_rec],
+                cfg,
+                variables=variables,
+                forms=forms,
+            )
+        )
+        assert retained == [complete_rec]
+
+    def test_bounded_form_buffer_router_and_form_ref_extraction(self):
+        """Verify BoundedFormBufferRouter flushes on batch_size and global memory ceiling."""
+        from types import SimpleNamespace
+
+        with pytest.raises(ValueError, match="max_buffered_records must be a positive integer"):
+            SinkConfig(study_key="S", max_buffered_records=0)
+        with pytest.raises(ValueError, match="max_buffered_records must be a positive integer"):
+            SinkConfig(study_key="S", max_buffered_records=True)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="batch_size must be greater than 0"):
+            sink_base_mod.BoundedFormBufferRouter(
+                ["F1"], batch_size=0, on_flush_active=lambda *_: None
+            )
+
+        assert sink_base_mod.extract_record_form_ref({"formId": "42", "formKey": " AE "}) == (
+            42,
+            "AE",
+        )
+        assert sink_base_mod.extract_record_form_ref({"form_id": True, "form_key": ""}) == (
+            None,
+            None,
+        )
+        assert sink_base_mod.extract_record_form_ref(SimpleNamespace(formId=7, formKey="CM")) == (
+            7,
+            "CM",
+        )
+
+        active_flushes: list[tuple[str, list[int], int]] = []
+        voided_flushes: list[tuple[str, list[int], int]] = []
+
+        router = sink_base_mod.BoundedFormBufferRouter(
+            ["F1", "F2", "F3"],
+            batch_size=10,
+            max_buffered_records=4,
+            on_flush_active=lambda fk, b, idx: active_flushes.append((fk, b, idx)),
+            on_flush_voided=lambda fk, b, idx: voided_flushes.append((fk, b, idx)),
+        )
+
+        # Add 2 items to F1, 1 to F2, then 1 voided to F3 -> total hits ceiling=4 -> evicts F1 (len 2)
+        router.add_active("F1", 101)
+        router.add_active("F1", 102)
+        router.add_active("F2", 201)
+        router.add_voided("F3", 301)
+
+        assert router.peak_buffered == 4
+        assert router.total_buffered == 2
+        assert active_flushes == [("F1", [101, 102], 0)]
+
+        # Add 2 more voided to F3 -> F3 voided reaches 3 while F2 active is 1 -> total hits 4 -> evicts F3 voided
+        router.add_voided("F3", 302)
+        router.add_voided("F3", 303)
+        assert voided_flushes == [("F3", [301, 302, 303], 0)]
+        assert router.total_buffered == 1
+
+        router.flush_all()
+        assert active_flushes == [("F1", [101, 102], 0), ("F2", [201], 0)]
+        assert router.total_buffered == 0

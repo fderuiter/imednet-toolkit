@@ -252,6 +252,9 @@ Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
    * - ``batch_size``
      - ``500``
      - ``Record`` items per :meth:`write_batch` call.
+   * - ``max_buffered_records``
+     - ``None``
+     - Optional global upper bound on ``Record`` items buffered simultaneously across per-``Form`` streams (defaults to ``max(batch_size, 5000)``).
    * - ``max_retries``
      - ``3``
      - Retry attempts on transient destination errors.
