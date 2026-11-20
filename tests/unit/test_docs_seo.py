@@ -5,11 +5,14 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 from defusedxml import ElementTree as DefusedET
 from docs import conf as docs_conf
+from packaging.requirements import Requirement
+from packaging.version import Version
 from scripts.validate_docs import check_built_html_seo, check_sphinx_seo_configuration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +23,24 @@ def test_conf_sets_empty_templates_path_and_seo_hooks() -> None:
     """Verify docs/conf.py sets templates_path = [] and passes static SEO config check."""
     assert docs_conf.templates_path == []
     assert check_sphinx_seo_configuration(REPO_ROOT) is False
+
+
+@pytest.mark.unit
+def test_pyproject_mermaid_constraint_matches_conf_mermaid_version() -> None:
+    """Ensure pyproject.toml blocks sphinxcontrib-mermaid >=1.0.0 while conf.py uses Mermaid <=10.2.0."""
+    pyproject_data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    docs_deps = pyproject_data["project"]["optional-dependencies"]["docs"]
+    mermaid_reqs = [
+        Requirement(dep) for dep in docs_deps if Requirement(dep).name == "sphinxcontrib-mermaid"
+    ]
+    assert len(mermaid_reqs) == 1
+    specifier = mermaid_reqs[0].specifier
+    assert Version("0.9.2") in specifier
+    if Version(docs_conf.mermaid_version) <= Version("10.2.0"):
+        assert Version("1.0.0") not in specifier, (
+            "sphinxcontrib-mermaid >=1.0.0 rejects mermaid_version <=10.2.0; "
+            "keep sphinxcontrib-mermaid <1.0.0 unless docs/conf.py and offline Mermaid fixtures are upgraded."
+        )
 
 
 @pytest.mark.unit
