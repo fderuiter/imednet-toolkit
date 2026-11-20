@@ -775,3 +775,58 @@ def test_dynamic_models_preserve_runtime_module_doc_all_and_field_descriptions()
     assert EXPECTED_14_MODELS.issubset(seen_models)
     assert {"Keyword", "QueryComment", "Role", "SubjectKeyword"}.issubset(seen_models)
     assert described_contract_fields >= 150
+
+
+def test_generated_stubs_emit_none_defaults_and_wrap_lines_within_100_chars():
+    """Verify all 13 .pyi stubs emit = None defaults on optional fields and wrap <= 100 chars."""
+    import ast
+
+    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
+    pyi_files = sorted(models_dir.glob("*.pyi"))
+    assert len(pyi_files) == 13
+    assert engine._run_cli([str(models_dir), "--check"]) == 0
+
+    found_classes: dict[str, ast.ClassDef] = {}
+    for pyi_file in pyi_files:
+        content = pyi_file.read_text(encoding="utf-8")
+        for lineno, line in enumerate(content.splitlines(), start=1):
+            assert len(line) <= 100, (
+                f"{pyi_file.name}:{lineno} exceeds 100 characters ({len(line)}): {line}"
+            )
+        tree = ast.parse(content, filename=str(pyi_file))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                found_classes[node.name] = node
+
+    assert EXPECTED_14_MODELS.issubset(found_classes)
+    for model_name in EXPECTED_14_MODELS:
+        cls_def = found_classes[model_name]
+        ann_assigns = [
+            stmt
+            for stmt in cls_def.body
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+        ]
+        assert ann_assigns, f"{model_name} stub has no field annotations"
+        for stmt in ann_assigns:
+            assert stmt.value is not None, (
+                f"{model_name}.{stmt.target.id} in .pyi stub is missing a default value"
+            )
+
+    wrapped_field = engine._wrap_field_stub(
+        "    ",
+        "extremely_long_dynamic_attribute_name_exceeding_one_hundred_chars",
+        "dict[str, list[str]] | int | None",
+        "None",
+    )
+    assert len(wrapped_field) > 1
+    assert all(len(line) <= 100 for line in wrapped_field)
+
+    wrapped_import = engine._format_from_import(
+        "from imednet.models.base",
+        [
+            "VeryLongModelHelperNameOne",
+            "VeryLongModelHelperNameTwo",
+            "VeryLongModelHelperNameThree",
+        ],
+    )
+    assert all(len(line) <= 100 for line in wrapped_import.splitlines())

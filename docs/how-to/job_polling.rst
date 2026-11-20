@@ -20,12 +20,12 @@ asynchronous callers:
 
    # Synchronous single-Job polling
    sdk = ImednetSDK()
-   status = sdk.poll_job("STUDY", "BATCH-001", interval=0.05, timeout=10)
+   status = sdk.poll_job("STUDY", "BATCH", interval=0.05, timeout=10)
 
    # Asynchronous single-Job polling
    async def wait_async() -> None:
        async with AsyncImednetSDK() as async_sdk:
-           await async_sdk.async_poll_job("STUDY", "BATCH-001", interval=0.05, timeout=10)
+           await async_sdk.async_poll_job("STUDY", "BATCH", interval=0.05, timeout=10)
 
 Chunked Batch Submission and Multi-Job Polling
 ----------------------------------------------

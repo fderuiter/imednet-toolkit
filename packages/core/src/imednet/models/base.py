@@ -62,6 +62,16 @@ def _optional_datetime(v: Any) -> Any:
     return None if is_missing_value(v) else parse_datetime(v)
 
 
+def _optional_list(v: Any) -> Any:
+    """Convert value to list, returning None if missing."""
+    return None if is_missing_value(v) else parse_list_or_default(v)
+
+
+def _optional_dict(v: Any) -> Any:
+    """Convert value to dict, returning None if missing."""
+    return None if is_missing_value(v) else parse_dict_or_default(v)
+
+
 def _extract_single_item(v: Any) -> Any:
     """Extract the first item if a list is provided where an object was expected."""
     if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
@@ -98,9 +108,9 @@ def _get_normalizer(cls: type[BaseModel], field_name: str) -> Callable[[Any], An
     normalizer = _identity
 
     if origin is list:
-        normalizer = parse_list_or_default
+        normalizer = _optional_list if optional else parse_list_or_default
     elif origin is dict:
-        normalizer = parse_dict_or_default
+        normalizer = _optional_dict if optional else parse_dict_or_default
     elif annotation is str:
         normalizer = _optional_str if optional else parse_str_or_default
     elif annotation is int:

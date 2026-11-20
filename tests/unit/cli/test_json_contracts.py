@@ -329,3 +329,152 @@ def test_list_filters_reach_sdk_in_json_mode(
     assert payload["resource"] == attr
     assert payload["count"] == 0
     assert payload["items"] == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_resource", "setup_attr"),
+    [
+        (["studies", "list"], "studies", "studies"),
+        (["sites", "list", "S"], "sites", "sites"),
+        (["forms", "list", "S"], "forms", "forms"),
+        (["intervals", "list", "S"], "intervals", "intervals"),
+        (["queries", "list", "S"], "queries", "queries"),
+        (["record-revisions", "list", "S"], "record_revisions", "record_revisions"),
+        (["variables", "list", "S"], "variables", "variables"),
+        (["visits", "list", "S"], "visits", "visits"),
+        (["records", "list", "S"], "records", "records"),
+        (["subjects", "list", "S"], "subjects", "subjects"),
+        (["codings", "list", "S"], "codings", "codings"),
+        (["users", "list", "S"], "users", "users"),
+        (["jobs", "status", "S", "B"], "jobs", "get_job"),
+        (["jobs", "wait", "S", "B"], "jobs", "poll_job"),
+    ],
+)
+def test_env_output_format_json_honored_across_all_14_core_commands(
+    sdk,
+    monkeypatch,
+    capsys,
+    argv,
+    expected_resource,
+    setup_attr,
+):
+    """Verify IMEDNET_CLI_OUTPUT_FORMAT=json produces JSON across all 14 core --format commands."""
+    import os
+
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    if setup_attr in ("get_job", "poll_job"):
+        getattr(sdk, setup_attr).return_value = JobStatus(batchId="B", state="COMPLETED")
+    else:
+        getattr(sdk, setup_attr).list.return_value = []
+
+    cli.app(argv)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["status"] == "complete"
+    assert payload["resource"] == expected_resource
+    assert os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+
+
+def test_datadict_diff_honors_env_output_format_json_and_explicit_overrides(
+    tmp_path, monkeypatch, capsys
+):
+    """Verify datadict diff honors IMEDNET_CLI_OUTPUT_FORMAT=json and explicit --format overrides."""
+    import os
+
+    old_file = tmp_path / "old.json"
+    new_file = tmp_path / "new.json"
+    old_file.write_text(
+        json.dumps(
+            {
+                "metadata": {"schemaVersion": "1.0.0"},
+                "forms": [{"formKey": "DM", "formName": "Demographics", "variables": []}],
+                "unassignedBusinessLogic": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    new_file.write_text(
+        json.dumps(
+            {
+                "metadata": {"schemaVersion": "1.0.0"},
+                "forms": [{"formKey": "DM", "formName": "Demographics v2", "variables": []}],
+                "unassignedBusinessLogic": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    cli.app(["datadict", "diff", str(old_file), str(new_file)])
+    diff_json = json.loads(capsys.readouterr().out)
+    assert diff_json["has_changes"] is True
+    assert os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+
+    # Explicit --format text overrides IMEDNET_CLI_OUTPUT_FORMAT=json
+    cli.app(["datadict", "diff", str(old_file), str(new_file), "--format", "text"])
+    text_out = capsys.readouterr().out
+    assert "Demographics v2" in text_out
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(text_out)
+    assert os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+
+    # Explicit --format md overrides IMEDNET_CLI_OUTPUT_FORMAT=json
+    cli.app(["datadict", "diff", str(old_file), str(new_file), "--format", "md"])
+    md_out = capsys.readouterr().out
+    assert "#" in md_out
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(md_out)
+    assert os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+
+
+def test_explicit_table_format_overrides_env_output_format_json(sdk, monkeypatch, capsys):
+    """Verify explicit --format table overrides IMEDNET_CLI_OUTPUT_FORMAT=json."""
+    import os
+
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    sdk.studies.list.return_value = [Study(studyKey="S1", studyName="Override Trial")]
+    cli.app(["studies", "list", "--format", "table", "--no-interactive"])
+    captured = capsys.readouterr()
+    assert "Found 1 studies:" in captured.out
+    assert "Override Trial" in captured.out
+    assert os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+
+
+def test_env_output_format_json_skips_interactive_limit_and_grid(sdk, monkeypatch, capsys):
+    """Verify IMEDNET_CLI_OUTPUT_FORMAT=json bypasses the 100-item TTY cap and InteractiveDataGrid."""
+    import imednet.cli.utils.grid as grid_mod
+
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    grid_spy = MagicMock(return_value=True)
+    monkeypatch.setattr(grid_mod, "is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(grid_mod, "run_interactive_grid", grid_spy)
+
+    sdk.studies.list.return_value = [
+        Study(studyKey=f"S-{idx}", studyName=f"Study {idx}") for idx in range(150)
+    ]
+    cli.app(["studies", "list"])
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["count"] == 150
+    assert len(payload["items"]) == 150
+    grid_spy.assert_not_called()
+
+
+@pytest.mark.parametrize("output_ext", ["json", "csv"])
+def test_records_output_file_conflicts_with_env_output_format_json(
+    sdk, tmp_path, monkeypatch, capsys, output_ext
+):
+    """Verify records list --output combined with IMEDNET_CLI_OUTPUT_FORMAT=json exits 1."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    with pytest.raises(SystemExit) as exc:
+        cli.app(["records", "list", "S", "--output", output_ext])
+    captured = capsys.readouterr()
+    assert exc.value.code == 1
+    assert captured.out == ""
+    assert "Choose --format json for stdout or --output for a file." in captured.err
+    assert not (tmp_path / f"records.{output_ext}").exists()
+    sdk.records.list.assert_not_called()

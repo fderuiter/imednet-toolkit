@@ -17,26 +17,26 @@ class Interval(ImednetBaseModel):
     """Represents a visit interval or event within the study timeline."""
 
     forms: list[FormSummary] | None = Field(default=None, alias="forms")
-    study_key: str | None
-    interval_id: int | None
-    interval_name: str | None
-    interval_description: str | None
-    interval_sequence: int | None
-    interval_group_id: int | None
-    interval_group_name: str | None
-    disabled: bool | None
-    date_created: str | None
-    date_modified: str | None
-    actual_date: str | None
-    actual_date_form: str | None
-    defined_using_interval: str | None
-    due_date_will_be_in: int | None
-    epro_grace_period: int | None
-    negative_slack: int | None
-    positive_slack: int | None
-    timeline: str | None
-    window_calculation_date: str | None
-    window_calculation_form: str | None
-    last_updated: str | None
+    study_key: str | None = None
+    interval_id: int | None = None
+    interval_name: str | None = None
+    interval_description: str | None = None
+    interval_sequence: int | None = None
+    interval_group_id: int | None = None
+    interval_group_name: str | None = None
+    disabled: bool | None = None
+    date_created: str | None = None
+    date_modified: str | None = None
+    actual_date: str | None = None
+    actual_date_form: str | None = None
+    defined_using_interval: str | None = None
+    due_date_will_be_in: int | None = None
+    epro_grace_period: int | None = None
+    negative_slack: int | None = None
+    positive_slack: int | None = None
+    timeline: str | None = None
+    window_calculation_date: str | None = None
+    window_calculation_form: str | None = None
+    last_updated: str | None = None
 
 __all__ = ["FormSummary", "Interval"]
