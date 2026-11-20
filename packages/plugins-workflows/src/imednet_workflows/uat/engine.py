@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -13,6 +12,7 @@ from imednet.spi.facade import ImednetFacade
 from imednet.spi.utils import (
     JobFailedError,
     JobPoller,
+    JobPollSummary,
     JobTimeoutError,
     PathTraversalValidationError,
     validate_path_segment,
@@ -398,25 +398,32 @@ class UATExecutionEngine:
             return cleaned
         return None
 
-    def _build_job_poller(self) -> JobPoller:
-        """Create a ``JobPoller`` wired to ``sdk.get_job`` (and ``fetch_result`` when real)."""
-        fetch_result_fn: Callable[[str], Any] | None = None
-        jobs_ep = getattr(self._sdk, "jobs", None)
-        require_sync = getattr(jobs_ep, "_require_sync_client", None)
-        if callable(require_sync) and not type(require_sync).__module__.startswith("unittest.mock"):
-            try:
-                client = require_sync()
-                candidate = getattr(client, "get", None)
-                if callable(candidate) and not type(candidate).__module__.startswith(
-                    "unittest.mock"
-                ):
-                    fetch_result_fn = candidate
-            except Exception:
-                fetch_result_fn = None
-
-        if fetch_result_fn is not None:
-            return JobPoller(get_job=self._sdk.get_job, fetch_result=fetch_result_fn)
-        return JobPoller(get_job=self._sdk.get_job)
+    def _poll_verification_batches(
+        self,
+        study_key: str,
+        batch_ids: list[str],
+        *,
+        interval: float,
+        timeout: float,
+    ) -> JobPollSummary:
+        """Poll UAT verification batches via ImednetFacade.poll_jobs with Mock fallback."""
+        if callable(getattr(self._sdk, "poll_jobs", None)):
+            summary = self._sdk.poll_jobs(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+                fail_fast=False,
+            )
+            if isinstance(summary, JobPollSummary):
+                return summary
+        return JobPoller(get_job=self._sdk.get_job).poll_many(
+            study_key,
+            batch_ids,
+            interval=interval,
+            timeout=timeout,
+            fail_fast=False,
+        )
 
     def _classify_polled_batch(
         self,
@@ -581,13 +588,11 @@ class UATExecutionEngine:
                 self._poll_interval if poll_interval is None else float(poll_interval)
             )
             effective_timeout = self._poll_timeout if poll_timeout is None else float(poll_timeout)
-            poller = self._build_job_poller()
-            summary = poller.poll_many(
+            summary = self._poll_verification_batches(
                 study_key,
                 batch_ids,
                 interval=effective_interval,
                 timeout=effective_timeout,
-                fail_fast=False,
             )
             for pending_result, batch_id in pending_jobs:
                 self._classify_polled_batch(pending_result, batch_id, summary, report)

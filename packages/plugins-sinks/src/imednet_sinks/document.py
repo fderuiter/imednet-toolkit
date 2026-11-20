@@ -76,22 +76,26 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from imednet.spi.sinks import CentralizedMapper
+from typing import Any
 
 from imednet.errors import ExportConfigurationError
 from imednet.sdk import ImednetSDK
 from imednet.spi.sink_base import (
-    ExportSink,
-    SinkConfig,
     _redact_uri,
     _require_optional_dep,
+)
+from imednet.spi.sinks import (
+    CentralizedMapper,
+    ExportSink,
+    SinkConfig,
     apply_quality_gate,
+    build_sink_mapper,
     extract_record_id,
+    normalize_sink_value,
+    require_optional_dep,
     run_streaming_export,
 )
 
@@ -127,12 +131,29 @@ def _make_document_id(study_key: str, record_id: Any) -> str:
     return f"{study_key}/{record_id}"
 
 
+def _encode_bson_scalars(value: Any) -> Any:
+    """Recursively encode pure ``date`` values to ISO strings and ``Decimal`` to ``Decimal128``."""
+    if isinstance(value, dict):
+        return {k: _encode_bson_scalars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_encode_bson_scalars(item) for item in value]
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        bson_mod = require_optional_dep("bson", "mongodb")
+        return bson_mod.Decimal128(value)
+    return value
+
+
 def _post_process_document(doc: dict[str, Any]) -> dict[str, Any]:
     study_key = doc.get("study_key")
     record_id = doc.get("record_id")
     doc["_id"] = _make_document_id(str(study_key), record_id)
     doc["exported_at"] = datetime.now(tz=UTC).isoformat()
-    return doc
+    normalized: dict[str, Any] = normalize_sink_value(doc)
+    return _encode_bson_scalars(normalized)  # type: ignore[no-any-return]
 
 
 def _record_to_document(
@@ -144,8 +165,6 @@ def _record_to_document(
 ) -> dict[str, Any]:
     """Wrap a typed ``Record`` model in the standard document envelope."""
     if mapper is None:
-        from imednet.spi.sinks import CentralizedMapper
-
         mapper = CentralizedMapper(
             mode="document",
             post_processor=_post_process_document,
@@ -209,22 +228,30 @@ class MongoDbExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
-        from imednet.spi.sinks import build_sink_mapper
+        if not records:
+            return 0
 
         mapper = build_sink_mapper(
             self.config,
             mode="document",
             post_processor=_post_process_document,
         )
-        custom_pipeline = self.config.extra.get("enrichment_pipeline")
-        if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
-            mapper.register_pipeline(self._study_key, custom_pipeline)
-        docs = [_record_to_document(r, self._study_key, mapper=mapper) for r in records]
-        if not docs:
-            return 0
+        mapped_docs: list[dict[str, Any]] | None = None
 
         def execute_export() -> int:
             """Perform the actual write or upsert operation to MongoDB."""
+            nonlocal mapped_docs
+            if mapped_docs is None:
+                try:
+                    mapped_docs = [
+                        _record_to_document(r, self._study_key, mapper=mapper) for r in records
+                    ]
+                except ExportConfigurationError:
+                    raise
+                except Exception:
+                    raise TypeError("Malformed MongoDB record batch payload.") from None
+            if not mapped_docs:
+                return 0
             if self.config.idempotent:
                 pymongo = _require_optional_dep("pymongo", "mongodb")
                 ops = [
@@ -233,12 +260,12 @@ class MongoDbExportSink(ExportSink):
                         {"$set": doc},
                         upsert=True,
                     )
-                    for doc in docs
+                    for doc in mapped_docs
                 ]
                 self._collection.bulk_write(ops, ordered=False)
-                written = len(docs)
+                written = len(mapped_docs)
             else:
-                result = self._collection.insert_many(docs, ordered=False)
+                result = self._collection.insert_many(mapped_docs, ordered=False)
                 written = len(result.inserted_ids)
 
             logger.debug("Wrote batch %s (%d records)", batch_id, written)
