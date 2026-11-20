@@ -429,4 +429,297 @@ def test_subject_data_help_text(runner: CliRunner) -> None:
     assert result.exit_code == 0
     assert "--study-key" in result.stdout
     assert "--subject-key" in result.stdout
+    assert "--format" in result.stdout
+    assert "--no-interactive" in result.stdout
     assert "hybrid" in result.stdout.lower()
+
+
+def _make_sample_subject_data() -> Any:
+    """Build a populated SubjectComprehensiveData instance with real domain models."""
+    from datetime import datetime, timezone
+
+    from imednet.models.queries import Query, QueryComment, QueryStatus
+    from imednet.models.records import Record
+    from imednet.models.subjects import Subject, SubjectKeyword
+    from imednet.models.visits import Visit
+    from imednet_workflows.subject_data import SubjectComprehensiveData
+
+    subject = Subject(
+        study_key="STUDY-1",
+        subject_key="SUBJ-1",
+        subject_status="Screened",
+        site_name="Site Alpha",
+        enrollment_start_date="2026-03-01",
+        date_created=datetime(2026, 3, 1, 9, 30, tzinfo=timezone.utc),
+        keywords=[SubjectKeyword(keyword_name="Enrolled", keyword_key="ENR")],
+    )
+    visit = Visit(
+        study_key="STUDY-1",
+        visit_id=10,
+        subject_key="SUBJ-1",
+        interval_name="Screening",
+    )
+    record = Record(
+        study_key="STUDY-1",
+        record_id=101,
+        subject_key="SUBJ-1",
+        form_key="DEMO",
+        record_status="Record Complete",
+        record_data={"AGE": 44, "SEX": "F"},
+        date_created=datetime(2026, 3, 2, 14, 15, tzinfo=timezone.utc),
+    )
+    query = Query(
+        study_key="STUDY-1",
+        subject_key="SUBJ-1",
+        description="Confirm birth year",
+        status=QueryStatus.OPEN,
+        query_comments=[QueryComment(sequence=1, comment="Please verify DOB")],
+    )
+    return SubjectComprehensiveData(
+        subject_details=subject,
+        visits=[visit],
+        records=[record],
+        queries=[query],
+    )
+
+
+@pytest.mark.parametrize(
+    ("cli_args", "use_env"),
+    [
+        (["subject-data", "STUDY-1", "SUBJ-1", "--format", "json"], False),
+        (["subject-data", "-s", "STUDY-1", "-k", "SUBJ-1", "--format", "json"], False),
+        (["subject-data", "STUDY-1", "-k", "SUBJ-1", "--format", "json"], False),
+        (["subject-data", "STUDY-1", "SUBJ-1"], True),
+        (["subject-data", "--study-key", "STUDY-1", "--subject", "SUBJ-1"], True),
+    ],
+)
+def test_subject_data_json_format_flag_and_env(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    cli_args: list[str],
+    use_env: bool,
+) -> None:
+    """Verify subject-data emits valid schemaVersion 1.0 JSON via --format json and env var."""
+    import json
+
+    sample = _make_sample_subject_data()
+    mock_workflow.get_all_subject_data.return_value = sample
+    if use_env:
+        monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    else:
+        monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
+
+    result = runner.invoke(cli.app, cli_args)
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    payload = json.loads(result.stdout)
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "subject_data"
+    assert payload["status"] == "complete"
+    assert payload["count"] == 1
+    item = payload["items"][0]
+    assert item["subject_details"]["subjectKey"] == "SUBJ-1"
+    assert item["subject_details"]["siteName"] == "Site Alpha"
+    assert item["records"][0]["recordId"] == 101
+    assert item["visits"][0]["intervalName"] == "Screening"
+    assert item["queries"][0]["description"] == "Confirm birth year"
+    assert item["queries"][0]["status"] == "OPEN"
+    assert item["queries"][0]["queryComments"][0]["comment"] == "Please verify DOB"
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        [],
+        ["--format", "json"],
+    ],
+)
+def test_subject_data_missing_subject_exits_one_on_stderr(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    extra_args: list[str],
+) -> None:
+    """Verify unknown subject writes diagnostic to stderr, leaves stdout empty, and exits 1."""
+    from imednet_workflows.subject_data import SubjectComprehensiveData
+
+    mock_workflow.get_all_subject_data.return_value = SubjectComprehensiveData(subject_details=None)
+    result = runner.invoke(cli.app, ["subject-data", "STUDY", "UNKNOWN", *extra_args])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "UNKNOWN" in result.stderr
+    assert "STUDY" in result.stderr
+
+
+def test_subject_data_interactive_grid_and_piped_table_views(
+    runner: CliRunner,
+    sdk: MagicMock,
+    mock_workflow: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify subject-data launches InteractiveDataGrid on TTY and ASCII tables on pipes."""
+    import imednet.cli.utils.grid as grid_mod
+
+    sample = _make_sample_subject_data()
+    mock_workflow.get_all_subject_data.return_value = sample
+
+    # Piped output renders aligned ASCII table without Python repr text
+    piped = runner.invoke(cli.app, ["subject-data", "STUDY-1", "SUBJ-1"])
+    assert piped.exit_code == 0
+    assert "Found 1 subject data:" in piped.stdout
+    assert "SUBJ-1" in piped.stdout
+    assert "Site Alpha" in piped.stdout
+    assert "Enrolled" in piped.stdout
+    assert "SubjectComprehensiveData(" not in piped.stdout
+
+    # Explicit --format table overrides IMEDNET_CLI_OUTPUT_FORMAT=json
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    override = runner.invoke(cli.app, ["subject-data", "STUDY-1", "SUBJ-1", "--format", "table"])
+    assert override.exit_code == 0
+    assert "Found 1 subject data:" in override.stdout
+    monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
+
+    # Interactive TTY launches InteractiveDataGrid unless --no-interactive is passed
+    grid_spy = MagicMock(return_value=True)
+    monkeypatch.setattr(grid_mod, "is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(grid_mod, "run_interactive_grid", grid_spy)
+
+    tty_res = runner.invoke(cli.app, ["subject-data", "STUDY-1", "SUBJ-1"])
+    assert tty_res.exit_code == 0
+    grid_spy.assert_called_once()
+    assert grid_spy.call_args.kwargs["label"] == "subject data"
+    assert grid_spy.call_args.kwargs["details"] == [sample]
+
+    grid_spy.reset_mock()
+    no_int_res = runner.invoke(cli.app, ["subject-data", "STUDY-1", "SUBJ-1", "--no-interactive"])
+    assert no_int_res.exit_code == 0
+    grid_spy.assert_not_called()
+    assert "Found 1 subject data:" in no_int_res.stdout
+
+
+def test_extract_records_json_format_and_env_suppress_progress(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify extract-records emits schemaVersion 1.0 JSON and suppresses stderr print_progress."""
+    import json
+    from datetime import datetime, timezone
+
+    from imednet.models.records import Record
+
+    rec1 = Record(
+        study_key="STUDY-1",
+        record_id=201,
+        subject_key="SUBJ-01",
+        form_key="DEMO",
+        record_status="Record Complete",
+        record_data={"AGE": 31},
+        date_created=datetime(2026, 4, 10, 8, 0, tzinfo=timezone.utc),
+    )
+    rec2 = Record(
+        study_key="STUDY-1",
+        record_id=202,
+        subject_key="SUBJ-02",
+        form_key="AE",
+        record_status="Data Entry Complete",
+        record_data={"AETERM": "Headache"},
+        date_created=datetime(2026, 4, 11, 9, 0, tzinfo=timezone.utc),
+    )
+    extraction_wf = MagicMock()
+    extraction_wf.extract_records_by_criteria.return_value = [rec1, rec2]
+    monkeypatch.setattr(
+        "imednet_workflows.cli.DataExtractionWorkflow",
+        MagicMock(return_value=extraction_wf),
+    )
+
+    # 1. Explicit --format json
+    res_flag = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "extract-records",
+            "STUDY-1",
+            "--record-filter",
+            "form_key=DEMO",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_flag.exit_code == 0
+    assert res_flag.stderr == ""
+    payload_flag = json.loads(res_flag.stdout)
+    assert payload_flag["schemaVersion"] == "1.0"
+    assert payload_flag["resource"] == "records"
+    assert payload_flag["status"] == "complete"
+    assert payload_flag["count"] == 2
+    assert payload_flag["items"] == [
+        rec1.model_dump(mode="json", by_alias=True),
+        rec2.model_dump(mode="json", by_alias=True),
+    ]
+
+    # 2. IMEDNET_CLI_OUTPUT_FORMAT=json without --format flag
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    res_env = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY-1"])
+    assert res_env.exit_code == 0
+    assert res_env.stderr == ""
+    payload_env = json.loads(res_env.stdout)
+    assert payload_env["schemaVersion"] == "1.0"
+    assert payload_env["resource"] == "records"
+    assert payload_env["count"] == 2
+
+
+def test_extract_records_interactive_grid_and_piped_table_and_env_override(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify extract-records opens InteractiveDataGrid on TTY and prints ASCII tables on pipes."""
+    from datetime import datetime, timezone
+
+    import imednet.cli.utils.grid as grid_mod
+    from imednet.models.records import Record
+
+    rec = Record(
+        study_key="STUDY-1",
+        record_id=301,
+        subject_key="SUBJ-09",
+        form_key="VS",
+        record_status="Record Complete",
+        date_created=datetime(2026, 4, 12, 10, 30, tzinfo=timezone.utc),
+    )
+    extraction_wf = MagicMock()
+    extraction_wf.extract_records_by_criteria.return_value = [rec]
+    monkeypatch.setattr(
+        "imednet_workflows.cli.DataExtractionWorkflow",
+        MagicMock(return_value=extraction_wf),
+    )
+
+    # Piped run prints ASCII table (no raw Record(...) repr)
+    piped = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY-1"])
+    assert piped.exit_code == 0
+    assert "Found 1 matching records:" in piped.stdout
+    assert "SUBJ-09" in piped.stdout
+    assert "Record(" not in piped.stdout
+    assert "Extracting records for study 'STUDY-1'..." in piped.stderr
+
+    # Explicit --format table overrides IMEDNET_CLI_OUTPUT_FORMAT=json
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    override = runner.invoke(
+        cli.app, ["workflows", "extract-records", "STUDY-1", "--format", "table"]
+    )
+    assert override.exit_code == 0
+    assert "Found 1 matching records:" in override.stdout
+    monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
+
+    # Interactive TTY launches InteractiveDataGrid
+    grid_spy = MagicMock(return_value=True)
+    monkeypatch.setattr(grid_mod, "is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(grid_mod, "run_interactive_grid", grid_spy)
+
+    tty_res = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY-1"])
+    assert tty_res.exit_code == 0
+    grid_spy.assert_called_once()
+    assert grid_spy.call_args.kwargs["details"] == [rec]

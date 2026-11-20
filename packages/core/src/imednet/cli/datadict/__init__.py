@@ -23,7 +23,7 @@ from ...datadict import (
 from ...datadict.models import DataDictionary
 from ...sdk import ImednetSDK
 from ..decorators import redact_cli_secrets, validate_cli_path_segment, with_sdk
-from ..utils import get_sdk, print_error
+from ..utils import get_sdk, print_error, resolve_output_format
 
 __all__ = ["get_sdk", "setup_parser"]
 
@@ -173,10 +173,11 @@ def _handle_diff(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     report = diff(old_dd, new_dd)
+    output_format = resolve_output_format(args.format, default="text")
 
-    if args.format == "json":
+    if output_format == "json":
         print(report.to_json(), end="")
-    elif args.format == "md":
+    elif output_format == "md":
         print(report.to_markdown(), end="")
     else:
         print(report.to_text(), end="")
@@ -359,7 +360,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     diff_parser.add_argument(
         "--format",
         choices=["text", "json", "md"],
-        default="text",
+        default=None,
         help="Output format: text, json, or md (default: text).",
     )
     diff_parser.set_defaults(func=_handle_diff)

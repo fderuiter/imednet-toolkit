@@ -381,9 +381,23 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
     Uses composable operations to provide standard list/get read operations.
     """
 
+    _lookup_key_hint: str | None = None
+
     def _validate_item_id(self, item_id: ItemId) -> ItemId:
         """Validate a single-item identifier before constructing the lookup filter."""
-        validate_path_segment(item_id, name="item_id")
+        if isinstance(item_id, str):
+            validate_path_segment(item_id, name="item_id")
+        if isinstance(item_id, bool) or not isinstance(item_id, int) or item_id < 0:
+            endpoint_label = (
+                f"{self.PATH[:1].upper()}{self.PATH[1:]}" if self.PATH else type(self).__name__
+            )
+            hint_key = self._lookup_key_hint or self._id_param
+            raise ValueError(
+                f"{endpoint_label} endpoint get() requires a non-negative integer "
+                f"{self._id_param}, got {item_id!r}. "
+                f"To look up {self.PATH or 'items'} by {hint_key}, "
+                f"use list(study_key, {hint_key}=...)."
+            )
         return item_id
 
     def _validate_get_result(self, items: list[T], study_key: str | None, item_id: ItemId) -> T:
