@@ -119,12 +119,84 @@ def test_snake_case_memoization_and_edge_cases():
     assert info.currsize <= 1024
 
 
+def test_warehouse_arrow_single_pass_and_latency(monkeypatch):
+    """Verify single-pass warehouse Arrow conversion avoids redundant scans and meets latency target."""
+    import imednet_sinks.warehouse as wh_mod
+
+    cache = SchemaCache()
+    small_batch = generate_records(200, cache)
+
+    call_counts = {"normalize": 0, "omit_empty": 0, "scalar_family": 0, "validate_keys": 0}
+    orig_norm = wh_mod._normalize_warehouse_value
+    orig_omit = wh_mod._omit_empty_structs
+    orig_fam = wh_mod._scalar_family
+    orig_val = wh_mod._validate_nested_variable_keys
+
+    monkeypatch.setattr(
+        wh_mod,
+        "_normalize_warehouse_value",
+        lambda v: (
+            call_counts.__setitem__("normalize", call_counts["normalize"] + 1),
+            orig_norm(v),
+        )[1],
+    )
+    monkeypatch.setattr(
+        wh_mod,
+        "_omit_empty_structs",
+        lambda r: (
+            call_counts.__setitem__("omit_empty", call_counts["omit_empty"] + 1),
+            orig_omit(r),
+        )[1],
+    )
+    monkeypatch.setattr(
+        wh_mod,
+        "_scalar_family",
+        lambda v: (
+            call_counts.__setitem__("scalar_family", call_counts["scalar_family"] + 1),
+            orig_fam(v),
+        )[1],
+    )
+    monkeypatch.setattr(
+        wh_mod,
+        "_validate_nested_variable_keys",
+        lambda v: (
+            call_counts.__setitem__("validate_keys", call_counts["validate_keys"] + 1),
+            orig_val(v),
+        )[1],
+    )
+
+    tbl_small = _records_to_arrow_table(small_batch, study_key="STUDY_BENCH")
+    assert tbl_small.num_rows == 200
+    assert call_counts == {
+        "normalize": 0,
+        "omit_empty": 0,
+        "scalar_family": 0,
+        "validate_keys": 200,
+    }
+
+    monkeypatch.undo()
+    batch_10k = generate_records(10000, cache)
+    # Warm study pipeline cache once (matching SnowflakeExportSink batch conversion)
+    _records_to_arrow_table(batch_10k[:1], study_key="STUDY_BENCH")
+    start = time.perf_counter()
+    tbl_10k = _records_to_arrow_table(batch_10k, study_key="STUDY_BENCH")
+    study_batch_elapsed = time.perf_counter() - start
+    assert tbl_10k.num_rows == 10000
+    assert study_batch_elapsed < 0.75, (
+        f"Expected 10,000-record study Arrow conversion < 0.75s, got {study_batch_elapsed:.4f}s"
+    )
+
+
 def test_performance_suite():
     historical_file = Path("performance_cache.json")
     threshold = 0.05
 
     print("Running SDK Observability & Performance Suite...")
     current_results = run_benchmarks(10000)
+    assert current_results["snowflake_arrow_conversion_latency"] < 1.25, (
+        f"Expected snowflake_arrow_conversion_latency < 1.25s, got "
+        f"{current_results['snowflake_arrow_conversion_latency']:.4f}s"
+    )
 
     # Ensure file exists before trying to open for a+ (which doesn't exist in standard open modes safely without truncating, so we use 'a+' or just touch it)
     if not historical_file.exists():

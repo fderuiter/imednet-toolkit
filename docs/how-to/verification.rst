@@ -17,6 +17,7 @@ Before proposing any solution, execute and pass all CI quality gates locally.
       hatch run mypy packages/providers-airflow/src/apache_airflow_providers_imednet
       hatch run mypy packages/plugins-sinks/src/imednet_sinks
       hatch run mypy packages/plugins-tui/src/imednet_tui
+      hatch run mypy examples
       hatch run mypy tests/typing/endpoint_contracts.py
       hatch run pytest -q \
         --cov=imednet \

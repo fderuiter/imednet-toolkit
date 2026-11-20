@@ -1001,6 +1001,29 @@ def test_sync_worker_command_handles_keyboard_interrupt(
     assert "Sync worker termination requested. Exiting cleanly." in result.stdout
 
 
+def test_sync_worker_command_exits_nonzero_when_worker_fails(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that sync-worker exits with code 1 when worker stops in FAILED state."""
+    from imednet_workflows.sync_worker import SyncWorkerState
+
+    worker = MagicMock()
+    worker.state = SyncWorkerState.FAILED
+    worker.consecutive_failures = 3
+    worker.max_consecutive_failures = 3
+    worker.last_error = RuntimeError("upstream unavailable")
+    loader_cls = MagicMock()
+    monkeypatch.setattr("imednet_workflows.cached_loader.CachedRecordsLoader", loader_cls)
+    monkeypatch.setattr("imednet_workflows.cli.SyncWorker", MagicMock(return_value=worker))
+
+    result = runner.invoke(cli.app, ["workflows", "sync-worker", "STUDY", "--interval", "1"])
+
+    assert result.exit_code == 1
+    assert (
+        "Sync worker failed after 3/3 consecutive failures: upstream unavailable" in result.stderr
+    )
+
+
 def test_queries_list_success(runner: CliRunner, sdk: MagicMock) -> None:
     """Test that queries list success."""
     obj = MagicMock()

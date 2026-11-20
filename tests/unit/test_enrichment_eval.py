@@ -83,6 +83,44 @@ def test_enrichment_pipeline_rejects_class_traversal_payload(
     )
 
 
+@pytest.mark.parametrize(
+    "malicious_logic",
+    [
+        '"{0.__class__}".format(value)',
+        '"{v.__class__}".format_map({"v": value})',
+        '"".format',
+        '"".format_map',
+        'f"{value}"',
+    ],
+)
+def test_enrichment_pipeline_rejects_format_and_fstring_payloads(
+    malicious_logic: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that format, format_map, bare format attribute access, and f-strings fail safely."""
+    config = StudyConfiguration(
+        study_key="STUDY-FORMAT-BLOCK",
+        mappings=[
+            MappingRule(
+                domain="DM",
+                target_field="sanitized",
+                source_form_key="DM_FORM",
+                source_variable_name="raw_input",
+                business_logic=malicious_logic,
+            ),
+        ],
+    )
+
+    pipeline = EnrichmentPipeline(config)
+    data = {"raw_input": "original_value"}
+
+    with caplog.at_level(logging.WARNING):
+        result = pipeline.process(data)
+
+    assert result["sanitized"] == "original_value"
+    assert any("Security warning" in r.message and "forbidden" in r.message for r in caplog.records)
+
+
 def test_enrichment_pipeline_syntax_error_fallback(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -85,6 +85,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -257,6 +258,33 @@ class SnowflakeSinkConfig(SinkConfig):
     _validate_identifiers = validate_identifiers
 
 
+_SCALAR_CLASSES = (str, int, float, bool, type(None))
+
+
+def _needs_warehouse_normalization(value: Any) -> bool:
+    """Return True when *value* contains nested models, tuples, enums, or non-str dict keys."""
+    cls = value.__class__
+    if cls in _SCALAR_CLASSES:
+        return False
+    if cls is dict:
+        for k, v in value.items():
+            if k.__class__ is not str or (
+                v.__class__ not in _SCALAR_CLASSES and _needs_warehouse_normalization(v)
+            ):
+                return True
+        return False
+    if cls is list:
+        return any(
+            item.__class__ not in _SCALAR_CLASSES and _needs_warehouse_normalization(item)
+            for item in value
+        )
+    if cls is tuple or isinstance(value, Enum):
+        return True
+    if callable(getattr(cls, "model_dump", None)):
+        return True
+    return isinstance(value, (dict, list, tuple))
+
+
 def _normalize_warehouse_value(value: Any) -> Any:
     """Recursively normalize Pydantic models, enums, and tuples into plain containers."""
     return normalize_sink_value(value)
@@ -288,14 +316,21 @@ def _validate_variable_key_segments(raw_key: str) -> tuple[tuple[str, str], ...]
 
 def _validate_nested_variable_keys(value: Any) -> None:
     """Validate all dictionary keys in *value* prior to flattening so empty unsafe keys still fail."""
-    if isinstance(value, Mapping):
+    cls = value.__class__
+    if cls is dict or isinstance(value, Mapping):
         for k, v in value.items():
-            _validate_variable_key_segments(str(k) if not isinstance(k, str) else k)
-            if isinstance(v, (Mapping, list, tuple)):
+            _validate_variable_key_segments(k if k.__class__ is str else str(k))
+            v_cls = v.__class__
+            if v_cls not in _SCALAR_CLASSES and (
+                v_cls in (dict, list, tuple) or isinstance(v, Mapping)
+            ):
                 _validate_nested_variable_keys(v)
-    elif isinstance(value, (list, tuple)):
+    elif cls in (list, tuple) or isinstance(value, (list, tuple)):
         for item in value:
-            if isinstance(item, (Mapping, list, tuple)):
+            item_cls = item.__class__
+            if item_cls not in _SCALAR_CLASSES and (
+                item_cls in (dict, list, tuple) or isinstance(item, Mapping)
+            ):
                 _validate_nested_variable_keys(item)
 
 
@@ -321,13 +356,22 @@ def _normalize_variable_column(raw_key: str, metadata_keys: frozenset[str]) -> s
     return col
 
 
+def _contains_empty_dict(value: dict[str, Any]) -> bool:
+    """Return True when *value* is empty or recursively contains an empty dict."""
+    if not value:
+        return True
+    return any(isinstance(v, dict) and _contains_empty_dict(v) for v in value.values())
+
+
 def _omit_empty_structs(row: dict[str, Any]) -> dict[str, Any]:
     """Omit empty nested dictionaries so PyArrow never infers zero-field struct columns."""
-    if not any(isinstance(v, dict) for v in row.values()):
+    if not any(isinstance(v, dict) and _contains_empty_dict(v) for v in row.values()):
         return row
     cleaned: dict[str, Any] = {}
     for k, v in row.items():
         if isinstance(v, dict):
+            if not v:
+                continue
             nested = _omit_empty_structs(v)
             if not nested:
                 continue
@@ -337,7 +381,16 @@ def _omit_empty_structs(row: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-_SCALAR_CLASSES = (str, int, float, bool, type(None))
+def _has_sensitive_record_metadata() -> bool:
+    """Return True if any canonical ``Record`` metadata key is marked sensitive."""
+    return any(
+        global_sensitivity_registry.is_sensitive(k)
+        for k in _RECORD_METADATA_KEYS
+        if k != "record_data"
+    )
+
+
+_DEFAULT_VAR_COL_CACHE: dict[str, str] = {}
 
 
 def _post_process_warehouse(
@@ -345,33 +398,64 @@ def _post_process_warehouse(
     *,
     mask_phi: bool = True,
     _record_data_masked: bool = False,
+    _sensitive_metadata: bool | None = None,
+    _record_data_validated: bool = False,
 ) -> dict[str, Any]:
     """Apply PHI masking, flatten ``record_data`` variables, and protect metadata columns."""
-    if any(v.__class__ not in _SCALAR_CLASSES for k, v in row.items() if k != "record_data"):
-        normalized_row: dict[str, Any] = _normalize_warehouse_value(row)
-    else:
-        rd_raw = row.get("record_data")
-        if rd_raw is not None and rd_raw.__class__ not in _SCALAR_CLASSES:
-            row["record_data"] = _normalize_warehouse_value(rd_raw)
-        normalized_row = row
+    has_nested_dict = False
+    for k, v in row.items():
+        if k == "record_data":
+            continue
+        v_cls = v.__class__
+        if v_cls not in _SCALAR_CLASSES:
+            if k == "keywords" and v_cls is list and not v:
+                row[k] = "[]"
+                continue
+            if isinstance(v, Enum):
+                row[k] = v.value if v.value.__class__ is str else str(v)
+                continue
+            if _needs_warehouse_normalization(v):
+                norm_v = _normalize_warehouse_value(v)
+                row[k] = norm_v
+                if k != "keywords" and (norm_v.__class__ is dict or isinstance(norm_v, dict)):
+                    has_nested_dict = True
+            elif k != "keywords" and (v_cls is dict or isinstance(v, dict)):
+                has_nested_dict = True
 
+    extra_meta: list[str] = (
+        []
+        if row.keys() <= _RECORD_METADATA_KEYS
+        else [k for k in row if k not in _RECORD_METADATA_KEYS and isinstance(k, str)]
+    )
+
+    need_row_mask = False
     if mask_phi:
-        if not _record_data_masked or any(
-            isinstance(k, str) and global_sensitivity_registry.is_sensitive(k)
-            for k in normalized_row
-            if k != "record_data"
-        ):
-            masked_row: dict[str, Any] = mask_clinical_phi(normalized_row)
+        if not _record_data_masked:
+            need_row_mask = True
         else:
-            masked_row = normalized_row
-    else:
-        masked_row = normalized_row
+            sensitive_meta = (
+                _has_sensitive_record_metadata()
+                if _sensitive_metadata is None
+                else _sensitive_metadata
+            )
+            need_row_mask = sensitive_meta or bool(
+                extra_meta and any(global_sensitivity_registry.is_sensitive(k) for k in extra_meta)
+            )
 
-    extra_meta = [
-        k
-        for k in masked_row
-        if k != "record_data" and isinstance(k, str) and k not in _RECORD_METADATA_KEYS
-    ]
+    rd_normalized = False
+    if need_row_mask:
+        rd_raw = row.get("record_data")
+        if (
+            rd_raw is not None
+            and rd_raw.__class__ not in _SCALAR_CLASSES
+            and _needs_warehouse_normalization(rd_raw)
+        ):
+            row["record_data"] = _normalize_warehouse_value(rd_raw)
+        rd_normalized = True
+        masked_row: dict[str, Any] = mask_clinical_phi(row)
+    else:
+        masked_row = row
+
     metadata_keys = (
         _RECORD_METADATA_KEYS | frozenset(extra_meta) if extra_meta else _RECORD_METADATA_KEYS
     )
@@ -380,7 +464,7 @@ def _post_process_warehouse(
     flat_vars: dict[str, Any] = {}
     if raw_payload is None:
         masked_row["record_data"] = "{}"
-    elif isinstance(raw_payload, str):
+    elif raw_payload.__class__ is str or isinstance(raw_payload, str):
         masked_row["record_data"] = raw_payload
         try:
             parsed_payload = json.loads(raw_payload)
@@ -392,34 +476,77 @@ def _post_process_warehouse(
             )
             _validate_nested_variable_keys(masked_parsed)
             flat_vars = flatten(masked_parsed)
-    elif isinstance(raw_payload, Mapping):
+    elif raw_payload.__class__ is dict or isinstance(raw_payload, Mapping):
         payload_dict: dict[str, Any] = (
-            raw_payload if isinstance(raw_payload, dict) else dict(raw_payload)
+            raw_payload if raw_payload.__class__ is dict else dict(raw_payload)
         )
-        _validate_nested_variable_keys(payload_dict)
-        masked_row["record_data"] = json.dumps(payload_dict, default=str)
         if payload_dict:
-            if any(isinstance(v, (Mapping, list, tuple)) for v in payload_dict.values()):
-                flat_vars = flatten(payload_dict)
-            else:
-                flat_vars = payload_dict
+            has_nested_payload = False
+            all_json_primitives = True
+            needs_rd_norm = False
+            for pk, pv in payload_dict.items():
+                if not rd_normalized and pk.__class__ is not str:
+                    needs_rd_norm = True
+                pv_cls = pv.__class__
+                if pv_cls not in _SCALAR_CLASSES:
+                    all_json_primitives = False
+                    if not rd_normalized and _needs_warehouse_normalization(pv):
+                        needs_rd_norm = True
+                    elif pv_cls in (dict, list, tuple) or isinstance(pv, Mapping):
+                        has_nested_payload = True
+            if needs_rd_norm:
+                payload_dict = _normalize_warehouse_value(payload_dict)
+                has_nested_payload = any(
+                    v.__class__ not in _SCALAR_CLASSES
+                    and (v.__class__ in (dict, list, tuple) or isinstance(v, Mapping))
+                    for v in payload_dict.values()
+                )
+            if not _record_data_validated:
+                _validate_nested_variable_keys(payload_dict)
+            masked_row["record_data"] = (
+                json.dumps(payload_dict)
+                if all_json_primitives and not needs_rd_norm
+                else json.dumps(payload_dict, default=str)
+            )
+            flat_vars = flatten(payload_dict) if has_nested_payload else payload_dict
+        else:
+            masked_row["record_data"] = "{}"
     else:
+        if not rd_normalized and _needs_warehouse_normalization(raw_payload):
+            raw_payload = _normalize_warehouse_value(raw_payload)
         masked_row["record_data"] = json.dumps(raw_payload, default=str)
 
     keywords = masked_row.get("keywords")
-    if isinstance(keywords, (list, dict, tuple)):
+    if keywords.__class__ not in _SCALAR_CLASSES and isinstance(keywords, (list, dict, tuple)):
         masked_row["keywords"] = json.dumps(keywords, default=str)
 
+    default_col_cache = _DEFAULT_VAR_COL_CACHE if not extra_meta else None
     for var_key, var_val in flat_vars.items():
-        col_name = _normalize_variable_column(var_key, metadata_keys)
-        if isinstance(var_val, dict) and not var_val:
+        if default_col_cache is not None:
+            col_name_cached = default_col_cache.get(var_key)
+            if col_name_cached is None:
+                col_name = _normalize_variable_column(var_key, _RECORD_METADATA_KEYS)
+                if len(default_col_cache) < 2048:
+                    default_col_cache[var_key] = col_name
+            else:
+                col_name = col_name_cached
+        else:
+            col_name = _normalize_variable_column(var_key, metadata_keys)
+        val_cls = var_val.__class__
+        if val_cls in _SCALAR_CLASSES:
+            masked_row[col_name] = var_val
+        elif isinstance(var_val, Enum):
+            masked_row[col_name] = var_val.value if var_val.value.__class__ is str else str(var_val)
+        elif isinstance(var_val, dict) and not var_val:
             continue
-        if isinstance(var_val, (dict, list, tuple)):
+        elif isinstance(var_val, (dict, list, tuple)):
             masked_row[col_name] = json.dumps(var_val, default=str)
         else:
             masked_row[col_name] = var_val
 
-    return _omit_empty_structs(masked_row)
+    if has_nested_dict:
+        return _omit_empty_structs(masked_row)
+    return masked_row
 
 
 def _post_process_warehouse_mapped(row: dict[str, Any]) -> dict[str, Any]:
@@ -451,47 +578,122 @@ def _scalar_family(value: Any) -> str:
     return "other"
 
 
+_EXACT_SCALAR_FAMILIES: dict[type[Any], str] = {
+    str: "str",
+    int: "num",
+    float: "num",
+    bool: "bool",
+    Decimal: "decimal",
+    datetime: "datetime",
+    date: "date",
+    dict: "json",
+    list: "json",
+    tuple: "json",
+}
+
+
+def _coerce_cell_to_str(val: Any) -> str:
+    """Convert a conflicting non-null cell value into a string for Arrow coercion."""
+    if isinstance(val, (dict, list, tuple)):
+        return json.dumps(val, default=str)
+    if isinstance(val, Enum):
+        return val.value if val.value.__class__ is str else str(val)
+    return str(val)
+
+
+_UNSEEN_CELL = object()
+_MIXED_CELL_CLS = object()
+
+
 def _harmonize_tabular_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Align column keys across heterogeneous form rows and coerce conflicting scalar types."""
     if not rows:
         return rows
 
     ordered_cols: list[str] = []
-    seen_cols: set[str] = set()
+    col_exact_cls: dict[str, Any] = {}
+    col_families: dict[str, str | None] = {}
+    exact_families = _EXACT_SCALAR_FAMILIES
+    unseen = _UNSEEN_CELL
+    mixed_cls = _MIXED_CELL_CLS
+
     for row in rows:
-        for col in row:
-            if col not in seen_cols:
-                seen_cols.add(col)
+        for col, val in row.items():
+            expected_cls = col_exact_cls.get(col, unseen)
+            if val is None:
+                if expected_cls is unseen:
+                    ordered_cols.append(col)
+                    col_exact_cls[col] = None
+                    col_families[col] = None
+                continue
+            v_cls = val.__class__
+            if v_cls is expected_cls:
+                continue
+            if expected_cls is unseen:
                 ordered_cols.append(col)
-
-    if len(rows) == 1 and not any(isinstance(v, (dict, list, tuple)) for v in rows[0].values()):
-        return rows
-
-    coerce_to_str: set[str] = set()
-    for col in ordered_cols:
-        families = {_scalar_family(r[col]) for r in rows if r.get(col) is not None}
-        if not families or "other" in families:
-            continue
-        if "json" in families or len(families) > 1:
-            coerce_to_str.add(col)
-
-    if not coerce_to_str and all(len(r) == len(ordered_cols) for r in rows):
-        return rows
-
-    harmonized: list[dict[str, Any]] = []
-    for row in rows:
-        aligned: dict[str, Any] = {}
-        for col in ordered_cols:
-            val = row.get(col)
-            if val is not None and col in coerce_to_str:
-                aligned[col] = (
-                    json.dumps(val, default=str)
-                    if isinstance(val, (dict, list, tuple))
-                    else str(val)
-                )
+                fam = exact_families.get(v_cls)
+                if fam is None:
+                    fam = _scalar_family(val)
+                    col_exact_cls[col] = mixed_cls
+                elif fam == "json":
+                    col_exact_cls[col] = mixed_cls
+                else:
+                    col_exact_cls[col] = v_cls
+                col_families[col] = "coerce" if fam == "json" else fam
+            elif expected_cls is None:
+                fam = exact_families.get(v_cls)
+                if fam is None:
+                    fam = _scalar_family(val)
+                    col_exact_cls[col] = mixed_cls
+                elif fam == "json":
+                    col_exact_cls[col] = mixed_cls
+                else:
+                    col_exact_cls[col] = v_cls
+                col_families[col] = "coerce" if fam == "json" else fam
             else:
-                aligned[col] = val
-        harmonized.append(aligned)
+                col_exact_cls[col] = mixed_cls
+                prev = col_families[col]
+                if prev == "other":
+                    continue
+                fam = exact_families.get(v_cls)
+                if fam is None:
+                    fam = _scalar_family(val)
+                if fam == "other":
+                    col_families[col] = "other"
+                elif prev != "coerce" and (fam == "json" or fam != prev):
+                    col_families[col] = "coerce"
+
+    coerce_to_str: set[str] = {col for col, state in col_families.items() if state == "coerce"}
+    first_row = rows[0]
+    needs_first_align = len(first_row) < len(ordered_cols)
+
+    if not coerce_to_str:
+        if not needs_first_align:
+            return rows
+        aligned_first = dict(first_row)
+        for col in ordered_cols[len(first_row) :]:
+            aligned_first[col] = None
+        return [aligned_first, *rows[1:]]
+
+    aligned_first = dict(first_row)
+    for col in coerce_to_str:
+        val = aligned_first.get(col)
+        if val is not None and val.__class__ is not str:
+            aligned_first[col] = _coerce_cell_to_str(val)
+    if needs_first_align:
+        for col in ordered_cols[len(first_row) :]:
+            aligned_first[col] = None
+
+    harmonized: list[dict[str, Any]] = [aligned_first]
+    for row in rows[1:]:
+        copied: dict[str, Any] | None = None
+        for col in coerce_to_str:
+            val = row.get(col)
+            if val is not None and val.__class__ is not str:
+                if copied is None:
+                    copied = dict(row)
+                copied[col] = _coerce_cell_to_str(val)
+        harmonized.append(row if copied is None else copied)
     return harmonized
 
 
@@ -571,16 +773,41 @@ def _records_to_arrow_table(
 ) -> Any:
     """Convert *records* to a flattened tabular ``pyarrow.Table``."""
     pa = _require_optional_dep("pyarrow", "snowflake")
+    last_model_cls: type[Any] | None = None
     for rec in records:
-        raw_rd = (
-            rec.get("record_data")
-            if isinstance(rec, Mapping)
-            else getattr(rec, "record_data", None)
-        )
-        if isinstance(raw_rd, Mapping):
+        rec_cls = rec.__class__
+        if rec_cls is last_model_cls:
+            raw_rd = rec.record_data
+        elif rec_cls is dict or isinstance(rec, Mapping):
+            raw_rd = rec.get("record_data")
+        else:
+            raw_rd = getattr(rec, "record_data", None)
+            if "record_data" in getattr(rec_cls, "model_fields", ()):
+                last_model_cls = rec_cls
+        if raw_rd is not None and (raw_rd.__class__ is dict or isinstance(raw_rd, Mapping)):
             _validate_nested_variable_keys(raw_rd)
-    post_proc = _post_process_warehouse_mapped if mask_phi else _post_process_warehouse_unmasked
+
+    def _make_mapped_post_proc(batch_sensitive: bool) -> Any:
+        def _batch_post_proc_mapped(row: dict[str, Any]) -> dict[str, Any]:
+            return _post_process_warehouse(
+                row,
+                mask_phi=True,
+                _record_data_masked=True,
+                _sensitive_metadata=batch_sensitive,
+                _record_data_validated=True,
+            )
+
+        return _batch_post_proc_mapped
+
+    def _batch_post_proc_unmasked(row: dict[str, Any]) -> dict[str, Any]:
+        return _post_process_warehouse(
+            row,
+            mask_phi=False,
+            _record_data_validated=True,
+        )
+
     if mapper is None:
+        post_proc = _make_mapped_post_proc(False) if mask_phi else _batch_post_proc_unmasked
         mapper = CentralizedMapper(
             mode="tabular",
             post_processor=post_proc,
@@ -588,19 +815,53 @@ def _records_to_arrow_table(
         )
         raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
     else:
-        mapped_rows = [mapper.map_record(r, study_key=study_key) for r in records]
-        if getattr(mapper, "post_processor", None) in (
-            _post_process_warehouse,
+        orig_post_proc = getattr(mapper, "post_processor", None)
+        if isinstance(mapper, CentralizedMapper) and orig_post_proc in (
             _post_process_warehouse_mapped,
             _post_process_warehouse_unmasked,
         ):
-            raw_rows = mapped_rows
-        else:
-            effective_mask = getattr(mapper, "mask_phi", mask_phi) is not False
-            fallback_proc = (
-                _post_process_warehouse if effective_mask else _post_process_warehouse_unmasked
+            mapper.post_processor = (
+                _make_mapped_post_proc(
+                    False if mapper.mask_phi else _has_sensitive_record_metadata()
+                )
+                if orig_post_proc is _post_process_warehouse_mapped
+                else _batch_post_proc_unmasked
             )
-            raw_rows = [fallback_proc(dict(row)) for row in mapped_rows]
+            try:
+                raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+            finally:
+                mapper.post_processor = orig_post_proc
+        else:
+            mapped_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+            if orig_post_proc in (
+                _post_process_warehouse,
+                _post_process_warehouse_mapped,
+                _post_process_warehouse_unmasked,
+            ):
+                raw_rows = mapped_rows
+            else:
+                effective_mask = getattr(mapper, "mask_phi", mask_phi) is not False
+                is_tabular_centralized = (
+                    isinstance(mapper, CentralizedMapper) and mapper.mode == "tabular"
+                )
+                centralized_masked_meta = (
+                    isinstance(mapper, CentralizedMapper) and mapper.mask_phi is True
+                )
+                batch_sensitive = (
+                    False
+                    if (not effective_mask or centralized_masked_meta)
+                    else _has_sensitive_record_metadata()
+                )
+                raw_rows = [
+                    _post_process_warehouse(
+                        dict(row),
+                        mask_phi=effective_mask,
+                        _record_data_masked=effective_mask and is_tabular_centralized,
+                        _sensitive_metadata=batch_sensitive,
+                        _record_data_validated=is_tabular_centralized,
+                    )
+                    for row in mapped_rows
+                ]
 
     rows = _harmonize_tabular_rows(raw_rows)
     return pa.Table.from_pylist(rows)

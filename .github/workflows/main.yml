@@ -221,7 +221,7 @@ jobs:
         run: |
           uv run ruff format --check .
           uv run ruff check .
-          uv run mypy packages tests/typing/endpoint_contracts.py
+          uv run mypy packages examples tests/typing/endpoint_contracts.py
           uv run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_sinks --cov=imednet_tui --cov-fail-under=90
 
       - name: Verify Model Type Stubs
