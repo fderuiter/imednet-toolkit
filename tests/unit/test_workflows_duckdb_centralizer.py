@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import UTC, date, datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from imednet.models.record_revisions import RecordRevision
+from imednet.models.records import RecordStatus
 from imednet_workflows.data_extraction import DataExtractionWorkflow
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
@@ -294,3 +296,418 @@ def test_build_silver_view_accepts_valid_study_keys(valid_key: str) -> None:
     pytest.importorskip("duckdb")
     workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
     workflow.build_silver_view(valid_key)
+
+
+def test_ingest_revisions_uses_bulk_register_without_executemany() -> None:
+    """Test bulk staging calls register and unregister once per non-empty batch."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    real_conn = workflow._connection
+    spy_conn = MagicMock(wraps=real_conn)
+    workflow._connection = spy_conn
+
+    batch_one = [
+        RecordRevision(
+            record_revision_id=10,
+            record_id=1,
+            form_key="DEMO",
+            record_revision=1,
+            user="alice",
+            date_created="2024-01-01T10:00:00Z",
+        ),
+        RecordRevision(
+            record_revision_id=11,
+            record_id=1,
+            form_key="DEMO",
+            record_revision=2,
+            user="bob",
+            date_created="2024-01-02T10:00:00Z",
+        ),
+    ]
+    batch_two = [
+        RecordRevision(
+            record_revision_id=20,
+            record_id=2,
+            form_key="VITALS",
+            record_revision=1,
+            user="carol",
+            date_created="2024-01-03T10:00:00Z",
+        ),
+    ]
+
+    with patch.object(
+        DataExtractionWorkflow,
+        "extract_audit_trail",
+        side_effect=[batch_one, batch_two],
+    ):
+        assert workflow.ingest_revisions("STUDY", mode="replace") == 2
+        assert workflow.ingest_revisions("STUDY", mode="append") == 1
+
+    spy_conn.executemany.assert_not_called()
+    assert spy_conn.register.call_count == 2
+    assert spy_conn.unregister.call_count == 2
+    registered_views = [c.args[0] for c in spy_conn.register.call_args_list]
+    unregistered_views = [c.args[0] for c in spy_conn.unregister.call_args_list]
+    assert registered_views == unregistered_views
+    assert len(set(registered_views)) == 2
+
+
+def test_ingest_revisions_empty_batch_ensures_table_and_skips_staging() -> None:
+    """Test empty batches ensure bronze_revisions exists, skip staging, and return 0."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    real_conn = workflow._connection
+    spy_conn = MagicMock(wraps=real_conn)
+    workflow._connection = spy_conn
+
+    with patch.object(
+        DataExtractionWorkflow,
+        "extract_audit_trail",
+        return_value=iter(()),
+    ):
+        assert workflow.ingest_revisions("STUDY", mode="replace") == 0
+
+    spy_conn.register.assert_not_called()
+    spy_conn.unregister.assert_not_called()
+    spy_conn.executemany.assert_not_called()
+    count = real_conn.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()[0]
+    assert count == 0
+
+
+def test_ingest_revisions_preserves_64bit_bigint_and_nullable_fields() -> None:
+    """Test nullable 64-bit BIGINT fields preserve precision without float64 rounding."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    large_rev_id = (1 << 53) + 1
+    large_rec_id = (1 << 62) + 7
+    large_site_id = (1 << 55) + 3
+    large_interval_id = (1 << 58) + 9
+
+    revisions = [
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=large_rev_id,
+            record_id=large_rec_id,
+            site_id=large_site_id,
+            interval_id=large_interval_id,
+            form_key="DEMO",
+            record_revision=1,
+            data_revision=1,
+            deleted=True,
+            date_created="2024-01-01T10:00:00Z",
+        ),
+        SimpleNamespace(
+            study_key=None,
+            record_revision_id=None,
+            record_id=None,
+            record_oid=None,
+            form_key=None,
+            subject_key=None,
+            site_id=None,
+            interval_id=None,
+            record_status=None,
+            record_revision=None,
+            data_revision=None,
+            user=None,
+            role=None,
+            reason_for_change=None,
+            deleted=None,
+            date_created=None,
+            last_updated=None,
+        ),
+    ]
+
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=revisions):
+        assert workflow.ingest_revisions("FALLBACK_STUDY", mode="replace") == 2
+
+    rows = workflow._connection.execute("""
+        SELECT
+            study_key,
+            record_revision_id,
+            record_id,
+            site_id,
+            interval_id,
+            record_revision,
+            data_revision,
+            deleted
+        FROM bronze_revisions
+        ORDER BY study_key DESC
+        """).fetchall()
+    assert rows == [
+        (
+            "STUDY",
+            large_rev_id,
+            large_rec_id,
+            large_site_id,
+            large_interval_id,
+            1,
+            1,
+            True,
+        ),
+        ("FALLBACK_STUDY", None, None, None, None, None, None, False),
+    ]
+
+
+def test_ingest_revisions_normalizes_enums_and_timestamps() -> None:
+    """Test RecordStatus enums, aware datetimes, and blank timestamp strings."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    tz_plus2 = timezone(timedelta(hours=2))
+    tz_minus5 = timezone(timedelta(hours=-5))
+
+    revisions = [
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=1,
+            record_id=10,
+            record_oid=12345,
+            form_key="DEMO",
+            subject_key="SUBJ-1",
+            site_id=1,
+            interval_id=1,
+            record_status=RecordStatus.RECORD_COMPLETE,
+            record_revision=1,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="Aware timestamps",
+            deleted=False,
+            date_created=datetime(2024, 5, 1, 14, 30, 0, tzinfo=tz_plus2),
+            last_updated=datetime(2024, 5, 1, 8, 15, 0, tzinfo=tz_minus5),
+        ),
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=2,
+            record_id=11,
+            record_oid="OID-11",
+            form_key="DEMO",
+            subject_key="SUBJ-2",
+            site_id=1,
+            interval_id=1,
+            record_status="Custom Study Status",
+            record_revision=1,
+            data_revision=0,
+            user="bob",
+            role="PI",
+            reason_for_change="Blank and naive timestamps",
+            deleted=False,
+            date_created=datetime(2024, 5, 2, 9, 0, 0),
+            last_updated="   ",
+        ),
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=3,
+            record_id=12,
+            record_oid="OID-12",
+            form_key="DEMO",
+            subject_key="SUBJ-3",
+            site_id=1,
+            interval_id=1,
+            record_status=RecordStatus.SIGNED,
+            record_revision=1,
+            data_revision=1,
+            user="carol",
+            role="PI",
+            reason_for_change="Date fallback and empty string",
+            deleted=False,
+            date_created=date(2024, 5, 3),
+            last_updated="",
+        ),
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=4,
+            record_id=13,
+            record_oid="OID-13",
+            form_key="DEMO",
+            subject_key="SUBJ-4",
+            site_id=1,
+            interval_id=1,
+            record_status=RecordStatus.VERIFIED,
+            record_revision=1,
+            data_revision=1,
+            user="dave",
+            role="DM",
+            reason_for_change="UTC aware",
+            deleted=False,
+            date_created=datetime(2024, 5, 4, 16, 45, 30, tzinfo=UTC),
+            last_updated=None,
+        ),
+    ]
+
+    row_tuples = list(workflow._to_rows("STUDY", revisions))
+    assert type(row_tuples[0][8]) is str
+    assert row_tuples[0][8] == "Record Complete"
+    assert row_tuples[0][3] == "12345"
+
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=revisions):
+        assert workflow.ingest_revisions("STUDY", mode="replace") == 4
+
+    stored = workflow._connection.execute("""
+        SELECT record_revision_id, record_oid, record_status, date_created, last_updated
+        FROM bronze_revisions
+        ORDER BY record_revision_id
+        """).fetchall()
+    assert stored == [
+        (
+            1,
+            "12345",
+            "Record Complete",
+            datetime(2024, 5, 1, 12, 30, 0),
+            datetime(2024, 5, 1, 13, 15, 0),
+        ),
+        (
+            2,
+            "OID-11",
+            "Custom Study Status",
+            datetime(2024, 5, 2, 9, 0, 0),
+            None,
+        ),
+        (
+            3,
+            "OID-12",
+            "Signed",
+            datetime(2024, 5, 3, 0, 0, 0),
+            None,
+        ),
+        (
+            4,
+            "OID-13",
+            "Verified",
+            datetime(2024, 5, 4, 16, 45, 30),
+            None,
+        ),
+    ]
+
+
+def test_ingest_revisions_falls_back_to_pandas_without_pyarrow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test staging falls back to pandas DataFrame with expected dtypes when pyarrow is absent."""
+    pytest.importorskip("duckdb")
+    import pandas as pd
+
+    builtin_import = __import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):  # type: ignore[no-untyped-def]
+        if name == "pyarrow" or name.startswith("pyarrow."):
+            raise ImportError("No module named pyarrow")
+        return builtin_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "pyarrow", raising=False)
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    empty_df = workflow._build_staging_relation([])
+    assert isinstance(empty_df, pd.DataFrame)
+    assert len(empty_df) == 0
+    assert str(empty_df["record_revision_id"].dtype) == "Int64"
+    assert str(empty_df["record_revision"].dtype) == "Int32"
+    assert str(empty_df["deleted"].dtype) == "bool"
+    assert str(empty_df["study_key"].dtype) == "object"
+
+    large_id = (1 << 53) + 1
+    revisions = [
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=large_id,
+            record_id=large_id + 2,
+            record_oid="OID-1",
+            form_key="DEMO",
+            subject_key="SUBJ-1",
+            site_id=large_id + 4,
+            interval_id=large_id + 6,
+            record_status=RecordStatus.RECORD_COMPLETE,
+            record_revision=2,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="Pandas fallback",
+            deleted=False,
+            date_created=datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=2))),
+            last_updated=None,
+        ),
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=None,
+            record_id=None,
+            record_oid=None,
+            form_key="DEMO",
+            subject_key=None,
+            site_id=None,
+            interval_id=None,
+            record_status=None,
+            record_revision=None,
+            data_revision=None,
+            user=None,
+            role=None,
+            reason_for_change=None,
+            deleted=True,
+            date_created=None,
+            last_updated=None,
+        ),
+    ]
+
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=revisions):
+        assert workflow.ingest_revisions("STUDY", mode="replace") == 2
+
+    rows = workflow._connection.execute("""
+        SELECT record_revision_id, record_id, site_id, interval_id, record_status, date_created, deleted
+        FROM bronze_revisions
+        ORDER BY deleted ASC
+        """).fetchall()
+    assert rows == [
+        (
+            large_id,
+            large_id + 2,
+            large_id + 4,
+            large_id + 6,
+            "Record Complete",
+            datetime(2024, 6, 1, 10, 0, 0),
+            False,
+        ),
+        (None, None, None, None, None, None, True),
+    ]
+
+
+def test_ingest_revisions_unregisters_staging_view_on_insert_failure() -> None:
+    """Test temporary staging view is unregistered even when INSERT fails."""
+    pytest.importorskip("duckdb")
+    import duckdb
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    real_conn = workflow._connection
+    spy_conn = MagicMock(wraps=real_conn)
+
+    def failing_execute(query: str, *args: object, **kwargs: object) -> object:
+        if "INSERT INTO bronze_revisions" in query:
+            raise RuntimeError("Simulated DuckDB insert failure")
+        return real_conn.execute(query, *args, **kwargs)
+
+    spy_conn.execute.side_effect = failing_execute
+    workflow._connection = spy_conn
+
+    revisions = [
+        RecordRevision(
+            record_revision_id=1,
+            record_id=1,
+            form_key="DEMO",
+            record_revision=1,
+            user="alice",
+            date_created="2024-01-01T10:00:00Z",
+        )
+    ]
+
+    with (
+        patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=revisions),
+        pytest.raises(RuntimeError, match="Simulated DuckDB insert failure"),
+    ):
+        workflow.ingest_revisions("STUDY", mode="append")
+
+    spy_conn.register.assert_called_once()
+    spy_conn.unregister.assert_called_once()
+    view_name = spy_conn.register.call_args.args[0]
+    assert spy_conn.unregister.call_args.args[0] == view_name
+    with pytest.raises(duckdb.CatalogException):
+        real_conn.execute(f'SELECT * FROM "{view_name}"')
