@@ -94,8 +94,8 @@ def test_imednet_hook_returns_sdk(monkeypatch):
     sdk = hook.get_sdk_client()
 
     assert isinstance(sdk, sdk_mod.ImednetSDK)
-    assert sdk._client._client.headers["x-api-key"] == "KEY"
-    assert sdk._client._client.headers["x-imn-security-key"] == "SEC"
+    assert sdk.auth.get_headers() == {"x-api-key": "KEY", "x-imn-security-key": "SEC"}
+    assert "x-api-key" not in sdk._client._client.headers
     assert sdk._client.base_url == "https://example.com"
 
 
@@ -253,8 +253,7 @@ def test_imednet_hook_non_dict_extras(monkeypatch):
     hook = ImednetHook()
     sdk = hook.get_sdk_client()
 
-    assert sdk._client._client.headers["x-api-key"] == "KEY"
-    assert sdk._client._client.headers["x-imn-security-key"] == "SEC"
+    assert sdk.auth.get_headers() == {"x-api-key": "KEY", "x-imn-security-key": "SEC"}
 
 
 def test_imednet_hook_get_extra_json_fallback(monkeypatch):
@@ -284,8 +283,10 @@ def test_imednet_hook_get_extra_json_fallback(monkeypatch):
     hook = ImednetHook()
     sdk = hook.get_sdk_client()
 
-    assert sdk._client._client.headers["x-api-key"] == "GET_EXTRA_KEY"
-    assert sdk._client._client.headers["x-imn-security-key"] == "GET_EXTRA_SEC"
+    assert sdk.auth.get_headers() == {
+        "x-api-key": "GET_EXTRA_KEY",
+        "x-imn-security-key": "GET_EXTRA_SEC",
+    }
     assert sdk._client.base_url == "https://get-extra"
     conn.get_extra.assert_called_once_with()
 
@@ -316,8 +317,10 @@ def test_imednet_hook_extra_json_string_fallback(monkeypatch):
     hook = ImednetHook()
     sdk = hook.get_sdk_client()
 
-    assert sdk._client._client.headers["x-api-key"] == "EXTRA_FIELD_KEY"
-    assert sdk._client._client.headers["x-imn-security-key"] == "EXTRA_FIELD_SEC"
+    assert sdk.auth.get_headers() == {
+        "x-api-key": "EXTRA_FIELD_KEY",
+        "x-imn-security-key": "EXTRA_FIELD_SEC",
+    }
     assert sdk._client.base_url == "https://extra"
     conn.get_extra.assert_called_once_with()
 
@@ -343,8 +346,7 @@ def test_imednet_hook_non_string_login(monkeypatch):
 
     hook = ImednetHook()
     sdk = hook.get_sdk_client()
-    assert sdk._client._client.headers["x-api-key"] == "FALLBACK_KEY"
-    assert sdk._client._client.headers["x-imn-security-key"] == "SEC"
+    assert sdk.auth.get_headers() == {"x-api-key": "FALLBACK_KEY", "x-imn-security-key": "SEC"}
 
 
 def test_imednet_hook_non_string_password(monkeypatch):
@@ -371,8 +373,7 @@ def test_imednet_hook_non_string_password(monkeypatch):
 
     hook = ImednetHook()
     sdk = hook.get_sdk_client()
-    assert sdk._client._client.headers["x-api-key"] == "KEY"
-    assert sdk._client._client.headers["x-imn-security-key"] == "FALLBACK_SEC"
+    assert sdk.auth.get_headers() == {"x-api-key": "KEY", "x-imn-security-key": "FALLBACK_SEC"}
 
 
 def test_imednet_hook_environment_fallback(monkeypatch):
@@ -399,8 +400,7 @@ def test_imednet_hook_environment_fallback(monkeypatch):
 
     hook = ImednetHook()
     sdk = hook.get_sdk_client()
-    assert sdk._client._client.headers["x-api-key"] == "ENV_KEY"
-    assert sdk._client._client.headers["x-imn-security-key"] == "ENV_SEC"
+    assert sdk.auth.get_headers() == {"x-api-key": "ENV_KEY", "x-imn-security-key": "ENV_SEC"}
     assert sdk._client.base_url != "456"
 
 
@@ -461,8 +461,7 @@ def test_imednet_hook_prefers_extras_over_environment(monkeypatch):
 
     hook = ImednetHook()
     sdk = hook.get_sdk_client()
-    assert sdk._client._client.headers["x-api-key"] == "EXTRA_KEY"
-    assert sdk._client._client.headers["x-imn-security-key"] == "EXTRA_SEC"
+    assert sdk.auth.get_headers() == {"x-api-key": "EXTRA_KEY", "x-imn-security-key": "EXTRA_SEC"}
 
 
 def test_imednet_hook_study_discovery_serialization_safe(monkeypatch):
@@ -552,6 +551,7 @@ def _setup_airflow_for_dag(monkeypatch):
     decorators_mod.task = _DummyTaskDecorator()
     airflow_mod.DAG = _DummyDAG
     airflow_mod.decorators = decorators_mod
+    airflow_mod.sdk.DAG = _DummyDAG
     airflow_mod.sdk.task = _DummyTaskDecorator()
     monkeypatch.setitem(sys.modules, "airflow.decorators", decorators_mod)
 

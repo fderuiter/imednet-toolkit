@@ -524,3 +524,339 @@ def test_cached_loader_incremental_sync_with_simulation_transport(tmp_path: Path
     assert by_id[601].record_data == {"V_AGE": 45, "V_GENDER": "Female"}
     assert by_id[602].record_data == {"V_WEIGHT": 71.0}
     assert by_id[1001].record_data == {"V_WEIGHT": 72.5}
+
+
+def _null_timestamp_record(record_id: int, study_key: str = "STUDY") -> Record:
+    """Create a draft Record instance whose date_modified is None."""
+    return Record(
+        study_key=study_key,
+        form_id=10,
+        form_key="DRAFT_FORM",
+        record_id=record_id,
+        subject_key=f"S{record_id}",
+        date_modified=None,
+        record_data={"draft_value": record_id},
+    )
+
+
+def test_date_modified_none_stored_as_sql_null_and_sync_state_tracked(tmp_path: Path) -> None:
+    """Verify date_modified=None is stored as SQL NULL and study_sync_state tracks epoch/watermark."""
+    from imednet_workflows.cached_loader import StudySyncStatus
+
+    sdk = MagicMock()
+    r1 = _null_timestamp_record(1)
+    r2 = _record(2, "2024-02-01 00:00:00+00:00")
+    projected = [
+        Record(study_key="STUDY", record_id=1, form_key="DRAFT_FORM", record_data=None),
+        Record(study_key="STUDY", record_id=2, form_key="FORM", record_data=None),
+    ]
+    sdk.get_records.side_effect = [[r1, r2], projected]
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    loader.sync_records("STUDY", reconcile=True)
+
+    with get_sqlite_connection(loader.db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT record_id, date_modified, upserted_epoch
+            FROM record_cache
+            WHERE study_key = ?
+            ORDER BY record_id
+            """,
+            ("STUDY",),
+        ).fetchall()
+
+    assert rows[0]["record_id"] == 1
+    assert rows[0]["date_modified"] is None
+    assert rows[0]["upserted_epoch"] == 1
+    assert rows[1]["record_id"] == 2
+    assert rows[1]["date_modified"] == "2024-02-01 00:00:00+00:00"
+    assert rows[1]["upserted_epoch"] == 1
+
+    state = loader.get_study_sync_state("STUDY")
+    assert state.sync_epoch == 1
+    assert state.high_water_mark == "2024-02-01 00:00:00+00:00"
+    assert state.initial_sync_complete is True
+    assert state.status == StudySyncStatus.SYNCED
+    assert state.last_synced_at is not None
+    assert state.error_message is None
+
+
+def test_study_with_only_null_timestamps_uses_lightweight_reconcile_after_initial_load(
+    tmp_path: Path,
+) -> None:
+    """Study with only date_modified=None runs one full load, then lightweight reconcile on later cycles."""
+    sdk = MagicMock()
+    r1 = _null_timestamp_record(1)
+    r2 = _null_timestamp_record(2)
+    r3 = _null_timestamp_record(3)
+
+    proj_cycle_1 = [
+        Record(study_key="STUDY", record_id=1, form_key="DRAFT_FORM", record_data=None),
+        Record(study_key="STUDY", record_id=2, form_key="DRAFT_FORM", record_data=None),
+    ]
+    # Cycle 2: record 1 deleted upstream, record 3 created with date_modified=None
+    proj_cycle_2 = [
+        Record(study_key="STUDY", record_id=2, form_key="DRAFT_FORM", record_data=None),
+        Record(study_key="STUDY", record_id=3, form_key="DRAFT_FORM", record_data=None),
+    ]
+    proj_cycle_3 = proj_cycle_2
+
+    sdk.get_records.side_effect = [
+        [r1, r2],  # Cycle 1: initial full load (record_data_filter=None)
+        proj_cycle_1,  # Cycle 1: active ID projection (record_data_filter="none")
+        proj_cycle_2,  # Cycle 2: lightweight active ID projection only (NO unfiltered full load!)
+        [r3],  # Cycle 2: targeted backfill for missing record_id=[3]
+        proj_cycle_3,  # Cycle 3: lightweight active ID projection only, zero missing IDs
+    ]
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    loader.sync_records("STUDY", reconcile=True)
+    assert [r.record_id for r in loader.get_cached_records("STUDY")] == [1, 2]
+    assert loader.get_study_sync_state("STUDY").high_water_mark is None
+
+    loader.sync_records("STUDY", reconcile=True)
+    assert [r.record_id for r in loader.get_cached_records("STUDY")] == [2, 3]
+
+    loader.sync_records("STUDY", reconcile=True)
+    assert [r.record_id for r in loader.get_cached_records("STUDY")] == [2, 3]
+
+    assert sdk.get_records.call_count == 5
+    assert sdk.records.list.call_count == 0
+    # Unfiltered full study load happened strictly once (call 0)
+    assert sdk.get_records.call_args_list[0].kwargs == {
+        "study_key": "STUDY",
+        "record_data_filter": None,
+    }
+    assert sdk.get_records.call_args_list[2].kwargs == {
+        "study_key": "STUDY",
+        "record_data_filter": "none",
+        "deleted": False,
+    }
+    assert sdk.get_records.call_args_list[3].kwargs == {
+        "study_key": "STUDY",
+        "record_id": [3],
+        "record_data_filter": None,
+    }
+    assert sdk.get_records.call_args_list[4].kwargs == {
+        "study_key": "STUDY",
+        "record_data_filter": "none",
+        "deleted": False,
+    }
+
+
+def test_timestamped_study_backfills_new_null_timestamp_record_during_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Timestamped study ingests newly created date_modified=None records found during reconciliation."""
+    sdk = MagicMock()
+    r1 = _record(1, "2024-01-01 00:00:00+00:00")
+    r2 = _record(2, "2024-01-02 00:00:00+00:00")
+    r3_draft = _null_timestamp_record(3)
+    r4_stamped = _record(4, "2024-01-05 00:00:00+00:00")
+
+    sdk.get_records.side_effect = [
+        [r1, r2],  # Cycle 1 full load
+        [
+            Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None),
+            Record(study_key="STUDY", record_id=2, form_key="FORM", record_data=None),
+        ],  # Cycle 1 active IDs
+        [
+            Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None),
+            Record(study_key="STUDY", record_id=2, form_key="FORM", record_data=None),
+            Record(study_key="STUDY", record_id=3, form_key="DRAFT_FORM", record_data=None),
+            Record(study_key="STUDY", record_id=4, form_key="FORM", record_data=None),
+        ],  # Cycle 2 active IDs include untimestamped record 3
+        [r3_draft],  # Cycle 2 backfill for missing record 3
+    ]
+    # Delta query with dateModified >= 2024-01-02 returns only timestamped r4_stamped, omitting r3_draft
+    sdk.records.list.side_effect = [[r4_stamped]]
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    loader.sync_records("STUDY", reconcile=True)
+    loader.sync_records("STUDY", reconcile=True)
+
+    cached = {r.record_id: r for r in loader.get_cached_records("STUDY")}
+    assert sorted(k for k in cached if k is not None) == [1, 2, 3, 4]
+    assert cached[3].record_data == {"draft_value": 3}
+    assert cached[3].date_modified is None
+
+    state = loader.get_study_sync_state("STUDY")
+    assert state.high_water_mark == "2024-01-05 00:00:00+00:00"
+    assert state.sync_epoch == 3
+
+
+def test_sync_records_preserves_high_water_mark_when_any_step_fails(tmp_path: Path) -> None:
+    """Watermark remains at previous value when delta, active-ID, backfill, or reconcile fails."""
+    from imednet_workflows.cached_loader import StudySyncStatus
+
+    sdk = MagicMock()
+    r1 = _record(1, "2024-01-02 00:00:00+00:00")
+    r2_newer = _record(2, "2024-01-10 00:00:00+00:00")
+
+    sdk.get_records.side_effect = [
+        [r1],
+        [Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None)],
+    ]
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path, retry_attempts=1)
+    loader.sync_records("STUDY", reconcile=True)
+    assert loader.get_study_sync_state("STUDY").high_water_mark == "2024-01-02 00:00:00+00:00"
+
+    # 1. Delta fetch failure preserves high_water_mark
+    sdk.records.list.side_effect = RuntimeError("delta network error")
+    with pytest.raises(RuntimeError, match="delta network error"):
+        loader.sync_records("STUDY", reconcile=True)
+    state = loader.get_study_sync_state("STUDY")
+    assert state.high_water_mark == "2024-01-02 00:00:00+00:00"
+    assert state.status == StudySyncStatus.FAILED
+    assert state.error_message == "delta network error"
+
+    # 2. Backfill failure after delta upsert of newer r2_newer still preserves previous high_water_mark
+    sdk.records.list.side_effect = [[r2_newer]]
+    sdk.get_records.side_effect = [
+        [
+            Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None),
+            Record(study_key="STUDY", record_id=2, form_key="FORM", record_data=None),
+            Record(study_key="STUDY", record_id=3, form_key="DRAFT_FORM", record_data=None),
+        ],
+        RuntimeError("backfill timeout"),
+    ]
+    with pytest.raises(RuntimeError, match="backfill timeout"):
+        loader.sync_records("STUDY", reconcile=True)
+    state = loader.get_study_sync_state("STUDY")
+    assert state.high_water_mark == "2024-01-02 00:00:00+00:00"
+    assert state.status == StudySyncStatus.FAILED
+    assert state.error_message == "backfill timeout"
+
+    # 3. Reconciliation failure preserves previous high_water_mark
+    sdk.records.list.side_effect = [[r2_newer]]
+    sdk.get_records.side_effect = [
+        [
+            Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None),
+            Record(study_key="STUDY", record_id=2, form_key="FORM", record_data=None),
+        ]
+    ]
+    from unittest.mock import patch
+
+    with (
+        patch.object(loader, "reconcile_cache", side_effect=RuntimeError("disk full")),
+        pytest.raises(RuntimeError, match="disk full"),
+    ):
+        loader.sync_records("STUDY", reconcile=True)
+    state = loader.get_study_sync_state("STUDY")
+    assert state.high_water_mark == "2024-01-02 00:00:00+00:00"
+    assert state.status == StudySyncStatus.FAILED
+    assert state.error_message == "disk full"
+
+
+def test_initialise_cache_migrates_legacy_sqlite_schema_in_place(tmp_path: Path) -> None:
+    """Legacy records_cache.sqlite3 is migrated in place without deleting cached Study data."""
+    import json
+
+    from imednet_workflows.cached_loader import StudySyncStatus
+
+    db_path = tmp_path / "records_cache.sqlite3"
+    r1 = _record(1, "2024-03-01 00:00:00+00:00")
+    r2_null = _null_timestamp_record(2)
+    r3_null_only_study = _null_timestamp_record(10, study_key="NULL_STUDY")
+
+    # Build a legacy SQLite database matching the pre-epoch NOT NULL schema
+    conn = get_sqlite_connection(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE record_cache (
+                study_key TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                form_key TEXT NOT NULL,
+                date_modified TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (study_key, record_id)
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO record_cache (study_key, record_id, form_key, date_modified, payload) VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    "STUDY",
+                    1,
+                    "FORM",
+                    "2024-03-01 00:00:00+00:00",
+                    json.dumps(r1.model_dump(mode="json", by_alias=True), sort_keys=True),
+                ),
+                (
+                    "STUDY",
+                    2,
+                    "DRAFT_FORM",
+                    "",  # Legacy coerced empty string for date_modified=None
+                    json.dumps(r2_null.model_dump(mode="json", by_alias=True), sort_keys=True),
+                ),
+                (
+                    "NULL_STUDY",
+                    10,
+                    "DRAFT_FORM",
+                    "",
+                    json.dumps(
+                        r3_null_only_study.model_dump(mode="json", by_alias=True), sort_keys=True
+                    ),
+                ),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    cached_study = loader.get_cached_records("STUDY")
+    assert [r.record_id for r in cached_study] == [1, 2]
+    assert [r.record_id for r in loader.get_cached_records("NULL_STUDY")] == [10]
+
+    with get_sqlite_connection(db_path) as migrated_conn:
+        row_2 = migrated_conn.execute(
+            "SELECT date_modified, upserted_epoch FROM record_cache WHERE study_key = ? AND record_id = 2",
+            ("STUDY",),
+        ).fetchone()
+        assert row_2["date_modified"] is None
+        assert row_2["upserted_epoch"] == 1
+
+    study_state = loader.get_study_sync_state("STUDY")
+    assert study_state.sync_epoch == 1
+    assert study_state.high_water_mark == "2024-03-01 00:00:00+00:00"
+    assert study_state.initial_sync_complete is True
+    assert study_state.status == StudySyncStatus.SYNCED
+
+    null_study_state = loader.get_study_sync_state("NULL_STUDY")
+    assert null_study_state.sync_epoch == 1
+    assert null_study_state.high_water_mark is None
+    assert null_study_state.initial_sync_complete is True
+    assert null_study_state.status == StudySyncStatus.SYNCED
+
+
+def test_reconcile_cache_epoch_fencing_retains_newer_upserts(tmp_path: Path) -> None:
+    """reconcile_cache prunes orphans up to max_epoch while retaining newer concurrent upserts."""
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    r1 = _record(1, "2024-01-01 00:00:00+00:00")
+    r2_deleted = _record(2, "2024-01-02 00:00:00+00:00")
+    r3_concurrent_insert = _record(3, "2024-01-03 00:00:00+00:00")
+
+    with get_sqlite_connection(loader.db_path) as conn:
+        # Epoch 1: r1 and r2_deleted are cached
+        loader._upsert_records(conn, [r1, r2_deleted])
+        pre_reconcile_epoch = loader.get_study_sync_state("STUDY", conn=conn).sync_epoch
+        assert pre_reconcile_epoch == 1
+
+        # Simulate a stale upstream active-ID snapshot {1} captured at epoch 1,
+        # while a concurrent sync cycle upserts r3_concurrent_insert at epoch 2.
+        loader._upsert_records(conn, [r3_concurrent_insert])
+        assert loader.get_study_sync_state("STUDY", conn=conn).sync_epoch == 2
+
+        loader.reconcile_cache(conn, "STUDY", {1}, max_epoch=pre_reconcile_epoch)
+
+    remaining_ids = [r.record_id for r in loader.get_cached_records("STUDY")]
+    assert remaining_ids == [1, 3]

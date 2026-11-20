@@ -54,8 +54,10 @@ WORKSPACE_PACKAGES = {
 
 LITERALINCLUDE_PATTERN = re.compile(r"^\s*\.\.\s+literalinclude::\s+(\S+)")
 RST_PYTHON_BLOCK_PATTERN = re.compile(
-    r"^(\s*)\.\.\s+(?:testcode|code-block)::(?:\s+(python|py))?\s*$"
+    r"^(\s*)\.\.\s+(?:testcode|code-block|sourcecode)::(?:\s+(python|py))?\s*$"
 )
+MD_PYTHON_FENCE_OPEN_PATTERN = re.compile(r"^(\s*)```(?:python|py)\s*$")
+MD_PYTHON_FENCE_CLOSE_PATTERN = re.compile(r"^\s*```\s*$")
 
 
 def configure_sys_path(repo_root: Path) -> None:
@@ -261,6 +263,41 @@ def validate_ast_docstrings(tree: ast.AST) -> list[tuple[int, str]]:
     return diagnostics
 
 
+def _is_workflow_showcase(py_file: Path, examples_dir: Path) -> bool:
+    """Return True if py_file is a top-level workflow_*.py showcase or inside examples/workflows/."""
+    if py_file.name.startswith("workflow_"):
+        return True
+    with contextlib.suppress(ValueError):
+        rel_parts = py_file.resolve().relative_to(examples_dir.resolve()).parts
+        return "workflows" in rel_parts
+    return False
+
+
+def validate_ast_workflow_bindings(tree: ast.AST) -> list[tuple[int, str]]:
+    """Reject discarded workflow or record-set constructor calls in workflow showcases."""
+    diagnostics: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        callee_name: str | None = None
+        if isinstance(func, ast.Name):
+            callee_name = func.id
+        elif isinstance(func, ast.Attribute):
+            callee_name = func.attr
+        if callee_name and (
+            callee_name.endswith(("Workflow", "RecordSet")) or callee_name == "ImednetSDK"
+        ):
+            diagnostics.append(
+                (
+                    getattr(node, "lineno", 1),
+                    f"Unassigned '{callee_name}(...)' call discards its instance without executing workflow actions",
+                )
+            )
+    diagnostics.sort(key=lambda item: item[0])
+    return diagnostics
+
+
 def validate_showcase_ast_and_imports(
     examples_dir: Path, repo_root: Path | None = None
 ) -> list[str]:
@@ -295,6 +332,10 @@ def validate_showcase_ast_and_imports(
 
         for lineno, reason in validate_ast_imports(tree):
             errors.append(f"{py_file}:{lineno}: {reason}")
+
+        if _is_workflow_showcase(py_file, examples_dir):
+            for lineno, reason in validate_ast_workflow_bindings(tree):
+                errors.append(f"{py_file}:{lineno}: {reason}")
 
     return errors
 
@@ -451,6 +492,22 @@ def execute_showcases_in_simulation(
                 err_reason = _find_output_error(proc.stdout, proc.stderr)
                 if err_reason is not None:
                     errors.append(f"{py_file}: {err_reason}")
+                    continue
+
+                if _is_workflow_showcase(py_file, examples_dir):
+                    combined_output = f"{proc.stdout}\n{proc.stderr}"
+                    if "Skipping execution" in combined_output:
+                        errors.append(
+                            f"{py_file}: Workflow showcase skipped execution instead of running in simulation mode"
+                        )
+                    elif py_file.name.startswith("workflow_") and not proc.stdout.strip():
+                        errors.append(
+                            f"{py_file}: Workflow showcase produced empty stdout (silent no-op) in simulation mode"
+                        )
+                    elif not (proc.stdout.strip() or proc.stderr.strip()):
+                        errors.append(
+                            f"{py_file}: Workflow showcase produced empty output (silent no-op) in simulation mode"
+                        )
 
     return errors
 
@@ -746,18 +803,68 @@ def _validate_inline_rst_python_blocks(doc_file: Path, doc_lines: list[str]) -> 
         try:
             tree = ast.parse(textwrap.dedent(snippet), filename=str(doc_file))
         except SyntaxError as exc:
-            if is_testcode:
-                line_offset = (exc.lineno or 1) - 1
-                errors.append(
-                    f"{doc_file}:{block_start_idx + 1 + line_offset}: "
-                    f"Inline testcode syntax error: {exc.msg}"
-                )
+            line_offset = (exc.lineno or 1) - 1
+            label = (
+                "Inline testcode syntax error"
+                if is_testcode
+                else "Inline Python block syntax error"
+            )
+            errors.append(f"{doc_file}:{block_start_idx + 1 + line_offset}: {label}: {exc.msg}")
             continue
 
         for rel_lineno, reason in validate_ast_imports(tree, workspace_only=True):
             abs_lineno = block_start_idx + max(rel_lineno, 1)
             errors.append(
                 f"{doc_file}:{abs_lineno}: {reason} (in directive at line {directive_lineno})"
+            )
+
+    return errors
+
+
+def _validate_markdown_python_blocks(md_file: Path, md_lines: list[str]) -> list[str]:
+    """Validate syntax and workspace symbol imports inside fenced Markdown Python blocks."""
+    errors: list[str] = []
+    idx = 0
+    total = len(md_lines)
+
+    while idx < total:
+        match = MD_PYTHON_FENCE_OPEN_PATTERN.match(md_lines[idx])
+        if not match:
+            idx += 1
+            continue
+
+        fence_indent = len(match.group(1))
+        fence_lineno = idx + 1
+        idx += 1
+        block_start_idx = idx
+        buf: list[str] = []
+
+        while idx < total and not MD_PYTHON_FENCE_CLOSE_PATTERN.match(md_lines[idx]):
+            raw = md_lines[idx]
+            buf.append(raw[fence_indent:] if len(raw) >= fence_indent else raw)
+            idx += 1
+
+        if idx < total:
+            idx += 1
+
+        snippet = textwrap.dedent("\n".join(buf))
+        if not snippet.strip():
+            continue
+
+        try:
+            tree = ast.parse(snippet, filename=str(md_file))
+        except SyntaxError as exc:
+            line_offset = (exc.lineno or 1) - 1
+            errors.append(
+                f"{md_file}:{block_start_idx + 1 + line_offset}: "
+                f"Markdown Python block syntax error: {exc.msg}"
+            )
+            continue
+
+        for rel_lineno, reason in validate_ast_imports(tree, workspace_only=True):
+            abs_lineno = block_start_idx + max(rel_lineno, 1)
+            errors.append(
+                f"{md_file}:{abs_lineno}: {reason} (in fenced block at line {fence_lineno})"
             )
 
     return errors
@@ -885,6 +992,33 @@ def validate_documentation_literal_includes(
 
         if doc_file.suffix == ".rst":
             errors.extend(_validate_inline_rst_python_blocks(doc_file, doc_lines))
+        elif doc_file.suffix == ".md":
+            errors.extend(_validate_markdown_python_blocks(doc_file, doc_lines))
+
+    if repo_root is not None:
+        seen_md = {p.resolve() for p in doc_files if p.suffix == ".md"}
+        extra_md_candidates: list[Path] = []
+        root_readme = repo_root / "README.md"
+        if root_readme.is_file():
+            extra_md_candidates.append(root_readme)
+        packages_dir = repo_root / "packages"
+        if packages_dir.exists():
+            extra_md_candidates.extend(sorted(packages_dir.glob("*/README.md")))
+        examples_dir = repo_root / "examples"
+        if examples_dir.exists():
+            extra_md_candidates.extend(sorted(examples_dir.rglob("*.md")))
+
+        for md_file in extra_md_candidates:
+            resolved_md = md_file.resolve()
+            if resolved_md in seen_md or not md_file.is_file():
+                continue
+            seen_md.add(resolved_md)
+            try:
+                md_content = md_file.read_text(encoding="utf-8")
+            except Exception as exc:
+                errors.append(f"{md_file}: Failed to read file: {exc}")
+                continue
+            errors.extend(_validate_markdown_python_blocks(md_file, md_content.splitlines()))
 
     return errors
 

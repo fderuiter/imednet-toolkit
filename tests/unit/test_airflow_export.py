@@ -110,7 +110,10 @@ def test_spi_export_delegation_with_dispatcher_binding() -> None:
     """Resolve real SPI bindings independently of package attribute import order."""
     script = '''
 import importlib
+import sys
 from unittest.mock import patch
+
+sys.modules["airflow"] = None
 import imednet.integrations as integrations
 
 # A cached submodule import must not decide whether `export` is callable or a module.
@@ -189,7 +192,7 @@ def test_export_operator_dispatches_duckdb(monkeypatch: pytest.MonkeyPatch) -> N
         mock_sdk,
         "STUDY-123",
         "/tmp/test_study.duckdb",
-        table_name="clinical_records",
+        "clinical_records",
     )
     assert result == "/tmp/test_study.duckdb"
 
@@ -1239,3 +1242,365 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     op_hard.execute({"run_id": "scheduled__2026-04-03T00:00:00+00:00"})
 
     assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]
+
+
+def test_export_operator_duckdb_default_table_custom_table_and_conn_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify DuckDB operator/hook resolution across default table, custom table, and destination_conn_id."""
+    from types import SimpleNamespace
+
+    import duckdb
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    conn_obj = SimpleNamespace(
+        host=str(tmp_path / "from_conn.duckdb"),
+        schema=None,
+        extra_dejson={"table": "conn_records"},
+    )
+    monkeypatch.setattr(
+        ImednetHook, "_get_airflow_connection", classmethod(lambda cls, cid: conn_obj)
+    )
+    resolved = ImednetHook.resolve_destination_connection("duckdb_target", "duckdb")
+    assert resolved == {
+        "db_path": str(tmp_path / "from_conn.duckdb"),
+        "table_name": "conn_records",
+    }
+
+    records = [
+        Record.model_validate(
+            {
+                "studyKey": "STUDY_DUCK",
+                "recordId": 101,
+                "subjectId": 1,
+                "subjectKey": "SUBJ-01",
+                "formKey": "DEMO",
+                "dateModified": "2026-01-10T00:00:00Z",
+                "recordData": {"AGE": 44, "PATIENT_NAME": "Alice Doe"},
+            }
+        ),
+        Record.model_validate(
+            {
+                "studyKey": "STUDY_DUCK",
+                "recordId": 102,
+                "subjectId": 2,
+                "subjectKey": "SUBJ-02",
+                "formKey": "DEMO",
+                "dateModified": "2026-01-11T00:00:00Z",
+                "recordData": {"AGE": 51, "PATIENT_NAME": "Bob Roe"},
+            }
+        ),
+    ]
+    variables = [
+        Variable.model_validate(
+            {
+                "studyKey": "STUDY_DUCK",
+                "variableId": 1,
+                "variableName": "AGE",
+                "formId": 10,
+                "formKey": "DEMO",
+                "formName": "Demographics",
+                "label": "Age",
+            }
+        ),
+        Variable.model_validate(
+            {
+                "studyKey": "STUDY_DUCK",
+                "variableId": 2,
+                "variableName": "PATIENT_NAME",
+                "formId": 10,
+                "formKey": "DEMO",
+                "formName": "Demographics",
+                "label": "Patient Name",
+            }
+        ),
+    ]
+
+    sdk = MagicMock()
+    sdk.records.list.side_effect = lambda **_kw: iter(records)
+    sdk.get_variables.return_value = variables
+    sdk.variables.list.return_value = variables
+    sdk.studies.get_configuration = MagicMock(side_effect=AttributeError)
+
+    default_db = tmp_path / "default_tbl.duckdb"
+    op_default = ImednetExportOperator(
+        task_id="duckdb_default",
+        study_key="STUDY_DUCK",
+        destination="duckdb",
+        output_path=str(default_db),
+    )
+    monkeypatch.setattr(op_default, "_get_sdk", lambda: sdk)
+    assert op_default.execute({}) == str(default_db)
+
+    custom_db = tmp_path / "custom_tbl.duckdb"
+    op_custom = ImednetExportOperator(
+        task_id="duckdb_custom_table",
+        study_key="STUDY_DUCK",
+        destination="duckdb",
+        output_path=str(custom_db),
+        export_kwargs={"table": "study_records_v1"},
+    )
+    monkeypatch.setattr(op_custom, "_get_sdk", lambda: sdk)
+    assert op_custom.execute({}) == str(custom_db)
+
+    op_conn = ImednetExportOperator(
+        task_id="duckdb_conn",
+        study_key="STUDY_DUCK",
+        destination="duckdb",
+        destination_conn_id="duckdb_target",
+    )
+    monkeypatch.setattr(op_conn, "_get_sdk", lambda: sdk)
+    assert op_conn.execute({}) == str(tmp_path / "from_conn.duckdb")
+
+    for db_file, tbl_name in [
+        (default_db, "records"),
+        (custom_db, "study_records_v1"),
+        (tmp_path / "from_conn.duckdb", "conn_records"),
+    ]:
+        with duckdb.connect(str(db_file), read_only=True, config={"threads": "1"}) as con:
+            rows = con.execute(
+                f'SELECT "recordId", "subjectKey", "PATIENT_NAME", "AGE" FROM {tbl_name} ORDER BY "recordId"'
+            ).fetchall()
+        assert rows == [
+            (101, "SUBJ-01", "***MASKED***", 44),
+            (102, "SUBJ-02", "***MASKED***", 51),
+        ]
+
+
+def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and_reconcile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify two consecutive incremental ImednetExportOperator runs retain all 10 records and reconcile deltas."""
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+
+    import pandas as pd
+
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("openpyxl")
+    duckdb = pytest.importorskip("duckdb")
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.forms import Form
+    from imednet.models.intervals import FormSummary, Interval
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    ledger_file = tmp_path / "af_ledger.json"
+
+    vars_list = [
+        Variable(
+            variable_name="SCORE", label="Score", variable_type="int", form_id=10, form_key="F_VS"
+        )
+    ]
+    forms_list = [
+        Form(
+            form_id=10,
+            form_key="F_VS",
+            form_name="Vital Signs",
+            form_type="Standard",
+            date_created="2026-01-01T00:00:00Z",
+            date_modified="2026-01-01T00:00:00Z",
+        )
+    ]
+    intervals_list = [
+        Interval(
+            interval_id=1,
+            interval_name="V1",
+            interval_sequence=1,
+            interval_description="V1",
+            interval_group_name="G1",
+            date_created="2026-01-01T00:00:00Z",
+            date_modified="2026-01-01T00:00:00Z",
+            forms=[FormSummary(form_id=10, form_key="F_VS", form_name="Vital Signs")],
+        )
+    ]
+
+    upstream_records: dict[int, Record] = {
+        rid: Record(
+            record_id=rid,
+            study_key="STUDY_AF_10",
+            subject_key=f"SUBJ-{rid:02d}",
+            visit_id=1,
+            form_id=10,
+            form_key="F_VS",
+            record_status="Complete",
+            deleted=False,
+            date_created=datetime(2026, 6, 1, 0, 0, tzinfo=UTC),
+            date_modified=datetime(2026, 6, 1, 12, rid, tzinfo=UTC),
+            record_data={"SCORE": rid * 10},
+        )
+        for rid in range(1, 11)
+    }
+
+    def _query_records(**kw: object) -> object:
+        from imednet.integrations.sink_base import (
+            extract_record_timestamp,
+            normalize_watermark_datetime,
+        )
+
+        flt = str(kw.get("filter", "") or "")
+        items = list(upstream_records.values())
+        if kw.get("deleted") is False or "deleted==false" in flt:
+            items = [r for r in items if not r.deleted]
+        dm = kw.get("dateModified")
+        if isinstance(dm, tuple) and len(dm) == 2 and dm[0] == ">=":
+            wm_dt = normalize_watermark_datetime(str(dm[1]))
+            if wm_dt is not None:
+                items = [
+                    r
+                    for r in items
+                    if (ts := extract_record_timestamp(r)) is not None and ts >= wm_dt
+                ]
+        elif "dateModified>=" in flt:
+            wm_part = [p for p in flt.split(";") if p.startswith("dateModified>=")][0]
+            wm_str = wm_part.split(">=", 1)[1]
+            wm_dt = normalize_watermark_datetime(wm_str)
+            if wm_dt is not None:
+                items = [
+                    r
+                    for r in items
+                    if (ts := extract_record_timestamp(r)) is not None and ts >= wm_dt
+                ]
+        return iter([r.model_copy(deep=True) for r in items])
+
+    sdk = MagicMock(sinks=None)
+    sdk.get_variables.return_value = vars_list
+    sdk.variables.list.return_value = vars_list
+    sdk.get_forms.return_value = forms_list
+    sdk.forms.list.return_value = forms_list
+    sdk.get_intervals.return_value = intervals_list
+    sdk.records.list.side_effect = _query_records
+
+    sql_db = tmp_path / "af_records.sqlite"
+    monkeypatch.setattr(
+        ImednetHook,
+        "resolve_destination_connection",
+        classmethod(
+            lambda cls, cid, dest: {"conn_str": f"sqlite:///{sql_db}"} if dest == "sql" else {}
+        ),
+    )
+
+    csv_out = tmp_path / "af.csv"
+    pq_out = tmp_path / "af.parquet"
+    xl_out = tmp_path / "af.xlsx"
+    json_out = tmp_path / "af.json"
+    hier_out = tmp_path / "af_hier.json"
+    ddb_out = tmp_path / "af.duckdb"
+
+    specs = [
+        ("csv", str(csv_out), {}, None),
+        ("parquet", str(pq_out), {}, None),
+        ("excel", str(xl_out), {}, None),
+        ("json", str(json_out), {}, None),
+        ("json_hier", str(hier_out), {"hierarchical": True}, None),
+        ("duckdb", str(ddb_out), {"table_name": "records"}, None),
+        ("sql", None, {"table": "records"}, "sql_conn"),
+    ]
+
+    ops: list[tuple[str, ImednetExportOperator]] = []
+    for label, out_path, extra_kw, dest_conn in specs:
+        dest_name = "json" if label == "json_hier" else label
+        op = ImednetExportOperator(
+            task_id=f"sync_{label}",
+            study_key="STUDY_AF_10",
+            destination=dest_name,
+            output_path=out_path,
+            destination_conn_id=dest_conn,
+            incremental=True,
+            stream_name=f"stream_{label}",
+            ledger_path=str(ledger_file),
+            quality_gate_enabled=False,
+            export_kwargs=extra_kw,
+        )
+        monkeypatch.setattr(op, "_get_sdk", lambda: sdk)
+        op.execute({"run_id": "run_1"})
+        ops.append((label, op))
+
+    # Run 2: zero-delta incremental execution retains all 10 records across every destination
+    for _label, op in ops:
+        op.execute({"run_id": "run_2"})
+
+    assert sorted(pd.read_csv(csv_out)["recordId"].tolist()) == list(range(1, 11))
+    assert sorted(pd.read_parquet(pq_out)["recordId"].tolist()) == list(range(1, 11))
+    assert sorted(pd.read_excel(xl_out)["recordId"].tolist()) == list(range(1, 11))
+    assert sorted(r["recordId"] for r in json.loads(json_out.read_text(encoding="utf-8"))) == list(
+        range(1, 11)
+    )
+    hier_loaded = json.loads(hier_out.read_text(encoding="utf-8"))
+    hier_ids = sorted(
+        rec["recordId"]
+        for subj in hier_loaded
+        for v in subj["visits"]
+        for f in v["forms"]
+        for rec in f["records"]
+    )
+    assert hier_ids == list(range(1, 11))
+    with duckdb.connect(str(ddb_out), config={"threads": "1"}) as dconn:
+        assert [
+            r[0]
+            for r in dconn.execute(
+                'SELECT "recordId" FROM "records" ORDER BY "recordId"'
+            ).fetchall()
+        ] == list(range(1, 11))
+    with sqlite3.connect(sql_db) as sconn:
+        assert [
+            r[0]
+            for r in sconn.execute(
+                'SELECT "recordId" FROM "records" ORDER BY "recordId"'
+            ).fetchall()
+        ] == list(range(1, 11))
+
+    # Run 3: update record 1 and void record 10 (default include_deleted=False prunes voided records)
+    upstream_records[1].record_data = {"SCORE": 999}
+    upstream_records[1].date_modified = datetime(2026, 6, 2, 12, 0, tzinfo=UTC)
+    upstream_records[10].deleted = True
+    upstream_records[10].date_modified = datetime(2026, 6, 2, 12, 1, tzinfo=UTC)
+
+    for label, out_path, extra_kw, dest_conn in specs:
+        dest_name = "json" if label == "json_hier" else label
+        op3 = ImednetExportOperator(
+            task_id=f"sync_{label}_3",
+            study_key="STUDY_AF_10",
+            destination=dest_name,
+            output_path=out_path,
+            destination_conn_id=dest_conn,
+            incremental=True,
+            stream_name=f"stream_{label}",
+            ledger_path=str(ledger_file),
+            quality_gate_enabled=False,
+            export_kwargs=extra_kw,
+        )
+        monkeypatch.setattr(op3, "_get_sdk", lambda: sdk)
+        op3.execute({"run_id": "run_3"})
+
+    ledger = FileStateProvider(str(ledger_file))
+    for label, *_ in specs:
+        assert ledger.get_last_timestamp("STUDY_AF_10", f"stream_{label}") == datetime(
+            2026, 6, 2, 12, 1, tzinfo=UTC
+        )
+
+    csv_df3 = pd.read_csv(csv_out)
+    assert sorted(csv_df3["recordId"].tolist()) == list(range(1, 10))
+    assert int(csv_df3.loc[csv_df3["recordId"] == 1, "SCORE"].iloc[0]) == 999
+    assert sorted(pd.read_parquet(pq_out)["recordId"].tolist()) == list(range(1, 10))
+    assert sorted(pd.read_excel(xl_out)["recordId"].tolist()) == list(range(1, 10))
+    assert sorted(r["recordId"] for r in json.loads(json_out.read_text(encoding="utf-8"))) == list(
+        range(1, 10)
+    )
+    hier_loaded3 = json.loads(hier_out.read_text(encoding="utf-8"))
+    hier_ids3 = sorted(
+        rec["recordId"]
+        for subj in hier_loaded3
+        for v in subj["visits"]
+        for f in v["forms"]
+        for rec in f["records"]
+    )
+    assert hier_ids3 == list(range(1, 10))

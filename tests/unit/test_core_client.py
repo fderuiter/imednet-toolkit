@@ -13,11 +13,12 @@ from imednet.core.retry import RetryConfig, RetryPolicy
 
 
 def test_initialization_sets_defaults() -> None:
-    """Test that initialization sets defaults."""
+    """Test that initialization sets defaults with origin-scoped auth."""
     client = Client(api_key="A", security_key="B")
     assert client.base_url == DEFAULT_BASE_URL
-    assert client._client.headers["x-api-key"] == "A"
-    assert client._client.headers["x-imn-security-key"] == "B"
+    assert client.auth.get_headers() == {"x-api-key": "A", "x-imn-security-key": "B"}
+    assert "x-api-key" not in client._client.headers
+    assert "x-imn-security-key" not in client._client.headers
 
 
 def test_retry_logic_retries_request_errors() -> None:

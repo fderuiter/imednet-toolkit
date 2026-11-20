@@ -40,6 +40,7 @@ CachedRecordsLoader = "imednet_workflows.cached_loader:CachedRecordsLoader"
 
 [project.entry-points."imednet.stores"]
 ConfigVersionStore = "imednet_workflows.config_version_control:ConfigVersionStore"
+TriageStore = "imednet_workflows.triage_store:TriageStore"
 
 [project.entry-points."imednet.state_providers"]
 default = "imednet_workflows.state_ledger:get_state_provider"

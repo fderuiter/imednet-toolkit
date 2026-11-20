@@ -41,7 +41,8 @@ imednet tui
 ## Navigation & Controls
 
 - **Arrow keys / Tab / Shift-Tab**: Move focus between panels, the Jobs batch input, and the Jobs table.
-- **Enter / Space**: Select study or site to inspect corresponding subjects and jobs; press **Enter** in the Jobs batch input to track one or more batch IDs for the active study.
+- **Enter / Space**: Select study or site to inspect corresponding subjects and jobs (re-selecting the active site clears the site filter); press **Enter** in the Jobs batch input to track one or more batch IDs for the active study.
+- **Escape**: Move focus from the Jobs batch input to the Jobs table, or clear the active site filter and reload all study subjects.
 - **q**: Quit application (suppressed while typing in the Jobs batch input).
 - **d**: Toggle dark mode (suppressed while typing in the Jobs batch input).
 - **h**: Toggle high contrast mode (suppressed while typing in the Jobs batch input).

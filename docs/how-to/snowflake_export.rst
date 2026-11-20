@@ -170,6 +170,68 @@ inserting unmatched voided records. Set ``idempotent = False`` (``--force-reload
 to bypass staging-table merges and append directly into the target table via
 ``COPY INTO ... FORCE = TRUE``.
 
+Incremental checkpoints with ``ExtractionStateLedger`` and ``AirflowStateProvider``
+-----------------------------------------------------------------------------------
+
+``SnowflakeSinkConfig`` inherits all eight streaming checkpoint options from
+:class:`~imednet.spi.sink_base.SinkConfig` (``incremental``, ``stream_name``,
+``ledger_path``, ``state_provider``, ``modified_since``, ``record_filter``,
+``record_data_filter``, and ``include_deleted``) while keeping ``mask_phi=True``
+enabled by default.
+
+* For local or VM-scheduled loads, pass ``ledger_path`` or an explicit
+  :class:`~imednet_workflows.ExtractionStateLedger` (:class:`~imednet_workflows.state_ledger.FileStateProvider`)
+  instance so :func:`~imednet_sinks.warehouse.export_to_snowflake` (via
+  :func:`~imednet.spi.sink_base.run_streaming_export`) commits the new ``Record``
+  watermark only after ``SnowflakeExportSink.flush()`` succeeds.
+* Inside Apache Airflow tasks, pass :class:`~imednet_workflows.state_ledger.AirflowStateProvider`
+  (or resolve ``get_state_provider(provider_name="airflow")``) so watermarks persist
+  in Airflow XCom metadata across scheduled DAG runs.
+* When ``incremental=True``, ``idempotent=True``, and ``include_deleted=False``,
+  ``Record`` items voided after the previous watermark are routed through
+  ``SnowflakeExportSink.reconcile_deleted`` so warehouse tables stay synchronized
+  without scanning unchanged history.
+
+.. testcode::
+
+   import os
+   import tempfile
+   from pathlib import Path
+   from imednet import ImednetSDK
+   from imednet_sinks.warehouse import SnowflakeSinkConfig, export_to_snowflake
+   from imednet_workflows import ExtractionStateLedger
+
+   with tempfile.TemporaryDirectory() as sf_tmp_dir:
+       sf_ledger_path = Path(sf_tmp_dir) / "snowflake_ledger.json"
+       sf_ledger = ExtractionStateLedger(str(sf_ledger_path))
+
+       snowflake_incremental_cfg = SnowflakeSinkConfig(
+           study_key="STUDY",
+           account="myorg-myaccount",
+           user="loader",
+           password=os.environ["SNOWFLAKE_PASSWORD"],
+           database="IMEDNET_DB",
+           schema="PUBLIC",
+           warehouse="COMPUTE_WH",
+           stage="MY_STAGE",
+           table="RECORDS",
+           mask_phi=True,
+           incremental=True,
+           stream_name="snowflake_vitals",
+           ledger_path=sf_ledger_path,
+           state_provider=sf_ledger,
+           modified_since="2026-01-01T00:00:00Z",
+           record_filter={"form_key": "F_VS"},
+           record_data_filter="V_WEIGHT>0",
+           include_deleted=False,
+       )
+       sf_rows = export_to_snowflake(
+           ImednetSDK(simulation_mode=True),
+           "STUDY",
+           config=snowflake_incremental_cfg,
+       )
+       assert sf_rows >= 0
+
 Error handling and retries
 --------------------------
 

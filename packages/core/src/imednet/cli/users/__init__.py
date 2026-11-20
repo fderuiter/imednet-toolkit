@@ -11,7 +11,7 @@ from ..utils import STUDY_KEY_ARG, display_list, fetching_status
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
-    collect_list_items,
+    collect_list_items_with_remainder,
     prepare_list_query,
 )
 
@@ -26,6 +26,49 @@ def _get_val(obj: Any, *keys: str, default: Any = None) -> Any:
             if val is not None:
                 return val
     return default
+
+
+def _user_view_model(u: Any) -> dict[str, Any]:
+    roles = _get_val(u, "roles", default=[])
+    if isinstance(roles, list):
+        role_names: list[str] = []
+        for r in roles:
+            r_name = getattr(r, "name", None)
+            if isinstance(r_name, str):
+                role_names.append(r_name)
+            elif isinstance(r, dict) and isinstance(r.get("name"), str):
+                role_names.append(r["name"])
+            elif isinstance(r, str):
+                role_names.append(r)
+            else:
+                role_names.append(str(r))
+        roles_str = ", ".join(role_names)
+    else:
+        roles_str = str(roles) if roles else ""
+
+    status_val = _get_val(u, "status")
+    if status_val is None:
+        active = _get_val(u, "user_active_in_study", "userActiveInStudy", "active", "is_active")
+        if active is not None:
+            status_val = "active" if active else "inactive"
+
+    first = _get_val(u, "first_name", "firstName")
+    last = _get_val(u, "last_name", "lastName")
+    name_val = _get_val(u, "name")
+    if not isinstance(name_val, str):
+        name_val = None
+    if not name_val and (first or last):
+        name_parts = [p for p in (first, last) if isinstance(p, str)]
+        name_val = " ".join(name_parts) if name_parts else None
+
+    return {
+        "user_id": _get_val(u, "user_id", "userId", "id"),
+        "name": name_val,
+        "login": _get_val(u, "login", "username"),
+        "email": _get_val(u, "email"),
+        "status": status_val,
+        "roles": roles_str or None,
+    }
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -64,7 +107,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
         with fetching_status("users", study_key):
-            users_list, truncated = collect_list_items(
+            users_list, truncated, load_remaining = collect_list_items_with_remainder(
                 sdk.users.list(study_key, include_inactive=include_inactive, **req_kwargs),
                 effective_limit,
             )
@@ -73,52 +116,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             display_list(users_list, "users", output_format="json")
             return
 
-        view_models = []
-        for u in users_list:
-            roles = _get_val(u, "roles", default=[])
-            if isinstance(roles, list):
-                role_names: list[str] = []
-                for r in roles:
-                    r_name = getattr(r, "name", None)
-                    if isinstance(r_name, str):
-                        role_names.append(r_name)
-                    elif isinstance(r, dict) and isinstance(r.get("name"), str):
-                        role_names.append(r["name"])
-                    elif isinstance(r, str):
-                        role_names.append(r)
-                    else:
-                        role_names.append(str(r))
-                roles_str = ", ".join(role_names)
-            else:
-                roles_str = str(roles) if roles else ""
+        view_models = [_user_view_model(u) for u in users_list]
 
-            status_val = _get_val(u, "status")
-            if status_val is None:
-                active = _get_val(
-                    u, "user_active_in_study", "userActiveInStudy", "active", "is_active"
-                )
-                if active is not None:
-                    status_val = "active" if active else "inactive"
-
-            first = _get_val(u, "first_name", "firstName")
-            last = _get_val(u, "last_name", "lastName")
-            name_val = _get_val(u, "name")
-            if not isinstance(name_val, str):
-                name_val = None
-            if not name_val and (first or last):
-                name_parts = [p for p in (first, last) if isinstance(p, str)]
-                name_val = " ".join(name_parts) if name_parts else None
-
-            view_models.append(
-                {
-                    "user_id": _get_val(u, "user_id", "userId", "id"),
-                    "name": name_val,
-                    "login": _get_val(u, "login", "username"),
-                    "email": _get_val(u, "email"),
-                    "status": status_val,
-                    "roles": roles_str or None,
-                }
-            )
+        def _load_more_users() -> tuple[list[dict[str, Any]], list[Any]]:
+            more = load_remaining() if load_remaining is not None else []
+            return [_user_view_model(u) for u in more], more
 
         display_list(
             view_models,
@@ -127,6 +129,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             details=users_list,
             truncated=truncated,
             interactive=False if no_interactive else None,
+            on_load_all=_load_more_users if load_remaining is not None else None,
         )
 
     list_parser.set_defaults(

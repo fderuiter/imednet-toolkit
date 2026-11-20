@@ -11,18 +11,40 @@ from scripts.typecheck_docs import (
     collect_snippets,
     extract_docstring_snippets,
     extract_markdown_python_blocks,
+    extract_rst_literalinclude_snippets,
     extract_rst_python_blocks,
+    extract_showcase_js_snippets,
     main,
     typecheck_documentation,
 )
 
 
-def test_collect_snippets_extracts_rst_markdown_and_docstrings(tmp_path: Path) -> None:
-    """Verify collect_snippets gathers RST testcode/code-block, Markdown, and docstring blocks."""
+def test_collect_snippets_extracts_rst_markdown_literalinclude_showcase_and_docstrings(
+    tmp_path: Path,
+) -> None:
+    """Verify collect_snippets gathers RST, literalinclude, showcase.js, Markdown, and docstring blocks."""
     docs_dir = tmp_path / "docs"
-    docs_dir.mkdir(parents=True)
+    static_dir = docs_dir / "_static"
+    examples_dir = tmp_path / "examples"
+    static_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    (examples_dir / "sliced_tutorial.py").write_text(
+        "# [start]\nx_slice = 10\n# [end]\n",
+        encoding="utf-8",
+    )
     (docs_dir / "guide.rst").write_text(
-        "Guide\n=====\n\n.. testcode::\n\n   x = 1\n\n.. code-block:: python\n\n   y = 2\n",
+        "Guide\n=====\n\n"
+        ".. testcode::\n\n   x = 1\n\n"
+        ".. code-block:: python\n\n   y = 2\n\n"
+        ".. literalinclude:: /../examples/sliced_tutorial.py\n"
+        "   :language: python\n"
+        "   :start-after: # [start]\n"
+        "   :end-before: # [end]\n",
+        encoding="utf-8",
+    )
+    (static_dir / "showcase.js").write_text(
+        "const SNIPPETS = {\n    sdk: {\n        studies: `s = 1`\n    },\n    rest: {}\n};\n",
         encoding="utf-8",
     )
     (tmp_path / "README.md").write_text(
@@ -37,16 +59,20 @@ def test_collect_snippets_extracts_rst_markdown_and_docstrings(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    tc_blocks, cb_blocks = extract_rst_python_blocks(
-        (docs_dir / "guide.rst").read_text(encoding="utf-8"), docs_dir / "guide.rst"
-    )
+    guide_text = (docs_dir / "guide.rst").read_text(encoding="utf-8")
+    tc_blocks, cb_blocks = extract_rst_python_blocks(guide_text, docs_dir / "guide.rst")
     assert len(tc_blocks) == 1
     assert len(cb_blocks) == 1
+    li_blocks = extract_rst_literalinclude_snippets(guide_text, docs_dir / "guide.rst", docs_dir, 0)
+    assert len(li_blocks) == 1
+    assert li_blocks[0].code == "x_slice = 10"
+    js_blocks = extract_showcase_js_snippets(static_dir / "showcase.js", 0)
+    assert len(js_blocks) == 1
     assert len(extract_markdown_python_blocks((tmp_path / "README.md").read_text(), py_file)) == 1
     assert len(extract_docstring_snippets(py_file, 0)) == 1
 
     snippets = collect_snippets(tmp_path)
-    assert len(snippets) == 4
+    assert len(snippets) == 6
 
 
 def test_typecheck_docs_reports_syntax_errors_and_maps_mypy_diagnostics(
@@ -70,7 +96,7 @@ def test_typecheck_docs_reports_syntax_errors_and_maps_mypy_diagnostics(
         snippet_files = sorted(snippet_dir.glob("*.py"))
         assert len(snippet_files) == 1
         fname = snippet_files[0].name
-        stdout = f'{snippet_dir / fname}:1: error: Incompatible types in assignment [assignment]\n'
+        stdout = f"{snippet_dir / fname}:1: error: Incompatible types in assignment [assignment]\n"
         return SimpleNamespace(returncode=1, stdout=stdout, stderr="")
 
     monkeypatch.setattr(typecheck_docs_mod.subprocess, "run", _fake_run)

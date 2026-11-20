@@ -19,7 +19,7 @@ Role-Based Pathways & Interactive Showcase
       .. rubric:: Clinical Data Managers
          :class: role-card-title
 
-      Curated workflows for clinical study configuration, subject registration, form building, and data verification.
+      Curated workflows for Study Data Dictionary management, Subject registration, UAT edit check verification, and Record validation.
 
       .. raw:: html
 
@@ -29,8 +29,9 @@ Role-Based Pathways & Interactive Showcase
             </button>
          </div>
 
+      * :doc:`how-to/data_dictionary`
+      * :doc:`how-to/workflows/uat_workflow`
       * :doc:`how-to/register_subjects`
-      * :doc:`how-to/form_builder`
       * :doc:`how-to/workflows/bulk_submission`
       * :doc:`how-to/verification`
 
@@ -200,8 +201,10 @@ Role-Based Pathways & Interactive Showcase
          </div>
 
          <div class="quick-start-callout">
-            <p>Design complex clinical studies with dynamic conditional logic and edit checks:</p>
-            <a href="how-to/form_builder.html">Visit Form Builder Guide &rarr;</a>
+            <p>Manage Study Data Dictionaries, CDISC ODM metadata, and automated UAT edit check verification:</p>
+            <a href="how-to/data_dictionary.html">Read Data Dictionary Guide &rarr;</a>
+            &nbsp;&middot;&nbsp;
+            <a href="how-to/workflows/uat_workflow.html">Run UAT Workflow Guide &rarr;</a>
          </div>
       </div>
 
@@ -271,6 +274,7 @@ This documentation is organized according to the Diátaxis framework into four m
    :caption: How-to Guides:
 
    how-to/cli
+   how-to/data_dictionary
    how-to/logging_and_tracing
    how-to/pagination
    how-to/form_builder
@@ -278,9 +282,19 @@ This documentation is organized according to the Diátaxis framework into four m
    how-to/caching
    how-to/retry_policy
    how-to/job_polling
+   how-to/domain_lifecycles
+   how-to/simulation_testing
    how-to/airflow
    how-to/workflows/uat_workflow
+   how-to/workflows/uat_inspector
    how-to/workflows/bulk_submission
+   how-to/workflows/data_extraction
+   how-to/workflows/record_update
+   how-to/workflows/subject_data
+   how-to/workflows/query_management
+   how-to/workflows/triage_store
+   how-to/workflows/schema_profiler
+   how-to/workflows/chunked_pipeline
    how-to/export_destinations
    how-to/duckdb_integration
    how-to/snowflake_export

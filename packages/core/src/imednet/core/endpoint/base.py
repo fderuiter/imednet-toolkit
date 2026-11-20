@@ -39,7 +39,7 @@ from imednet.utils.filters import (
     validate_record_filter,
 )
 from imednet.utils.typing import FilterValue, ItemId
-from imednet.utils.url import build_safe_path
+from imednet.utils.url import build_safe_path, validate_path_segment
 
 T = TypeVar("T", bound=ImednetBaseModel)
 
@@ -76,7 +76,7 @@ class GenericEndpoint(EndpointABC[T]):
         return filters
 
     def _build_path(self, *segments: Any) -> str:
-        """Return an API path joined with :data:`BASE_PATH`.
+        """Return an API path joining static :data:`BASE_PATH` with validated segments.
 
         Args:
             *segments: URL path segments to append.
@@ -84,7 +84,10 @@ class GenericEndpoint(EndpointABC[T]):
         Returns:
             The full API path string.
         """
-        return "/" + build_safe_path(self.BASE_PATH, *segments)
+        static_base = build_safe_path(self.BASE_PATH) if self.BASE_PATH else ""
+        dynamic_tail = build_safe_path("", *segments) if segments else ""
+        parts = [part for part in (static_base, dynamic_tail) if part]
+        return "/" + "/".join(parts)
 
     def _require_sync_client(self) -> RequesterProtocol:
         """Return the configured sync client or raise if missing."""
@@ -141,6 +144,8 @@ class _GetEndpointBase(GenericEndpoint[T]):
             The requested resource.
         """
         self._require_item_id(item_id)
+        self._validate_study_key(study_key)
+        validate_path_segment(item_id, name="item_id")
         path = self._get_endpoint_path(study_key, item_id)
         return PathGetOperation[T](
             path=path,
@@ -234,7 +239,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
                 extra_params = extra_params.copy()
             extra_params.update(special_params)
 
-        if study_key:
+        if study_key is not None:
             if not self.requires_study_key and "studyKey" in processed_filters:
                 processed_filters["study_key"] = study_key
             else:
@@ -378,6 +383,7 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
 
     def _validate_item_id(self, item_id: ItemId) -> ItemId:
         """Validate a single-item identifier before constructing the lookup filter."""
+        validate_path_segment(item_id, name="item_id")
         return item_id
 
     def _validate_get_result(self, items: list[T], study_key: str | None, item_id: ItemId) -> T:
@@ -410,6 +416,8 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
             The requested resource.
         """
         self._require_item_id(item_id)
+        if study_key is not None:
+            self._validate_study_key(study_key)
         validated_id = self._validate_item_id(item_id)
         filters: dict[str, Any] = {self._id_param: validated_id}
 

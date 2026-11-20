@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
 import inspect
 import logging
 import threading
@@ -21,8 +23,15 @@ from imednet.models.jobs import (
     validate_job_transition,
 )
 from imednet.utils.secrets import redact_sensitive_payload
+from imednet.utils.url import validate_path_segment
 
 logger = logging.getLogger(__name__)
+_ORIGINAL_TIME_SLEEP = time.sleep
+
+
+class _PollAbortedError(Exception):
+    """Internal cooperative stop signal for sibling synchronous pollers."""
+
 
 __all__ = [
     "AsyncJobPoller",
@@ -388,6 +397,22 @@ class JobPoller(BaseJobPoller):
         self._get_job = get_job
         self._fetch_result = fetch_result
 
+    @staticmethod
+    def _wait_or_abort(interval: float, stop_event: threading.Event | None) -> None:
+        """Sleep for interval seconds or wake immediately when stop_event is set."""
+        if stop_event is not None:
+            if stop_event.is_set():
+                raise _PollAbortedError
+            if time.sleep is not _ORIGINAL_TIME_SLEEP:
+                time.sleep(interval)
+                if stop_event.is_set():
+                    raise _PollAbortedError
+                return
+            if stop_event.wait(timeout=max(interval, 0.0)):
+                raise _PollAbortedError
+            return
+        time.sleep(interval)
+
     def run(
         self,
         study_key: str,
@@ -398,6 +423,30 @@ class JobPoller(BaseJobPoller):
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Synchronously poll a job until completion."""
+        validate_path_segment(study_key, name="study_key")
+        validate_path_segment(batch_id, name="batch_id")
+        return self._run_with_stop(
+            study_key,
+            batch_id,
+            interval=interval,
+            timeout=timeout,
+            on_progress=on_progress,
+            stop_event=None,
+        )
+
+    def _run_with_stop(
+        self,
+        study_key: str,
+        batch_id: str,
+        interval: float = 5.0,
+        timeout: float = 300.0,
+        *,
+        on_progress: JobProgressHandler | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> JobStatus:
+        """Synchronously poll a job until completion or cooperative stop_event signal."""
+        validate_path_segment(study_key, name="study_key")
+        validate_path_segment(batch_id, name="batch_id")
         start = time.monotonic()
         poll_number = 0
         last_status: JobStatus | None = None
@@ -405,6 +454,8 @@ class JobPoller(BaseJobPoller):
             terminal_status: JobStatus | None = self._terminal_states.get(batch_id)
 
         while True:
+            if stop_event is not None and stop_event.is_set():
+                raise _PollAbortedError
             poll_number += 1
             result = self._get_job(study_key, batch_id)
             status = self._check_complete(result, batch_id)
@@ -435,6 +486,8 @@ class JobPoller(BaseJobPoller):
             self._trigger_callback(on_progress, event)
 
             if is_terminal:
+                if stop_event is not None and stop_event.is_set():
+                    raise _PollAbortedError
                 if self._fetch_result and _is_fetchable_result_url(
                     getattr(status, "result_url", None)
                 ):
@@ -473,7 +526,7 @@ class JobPoller(BaseJobPoller):
                 evaluate_job_state(status)
                 return status
 
-            time.sleep(interval)
+            self._wait_or_abort(interval, stop_event)
 
     def poll_many(
         self,
@@ -498,7 +551,9 @@ class JobPoller(BaseJobPoller):
         timeout : float
             Seconds before a job is considered timed out.
         fail_fast : bool
-            If True, raise JobTimeoutError as soon as any single job times out.
+            If True, wake sibling worker threads cooperatively and raise the
+            triggering exception (such as JobFailedError or JobTimeoutError)
+            as soon as any single job fails or times out.
             If False (default), continue polling remaining jobs and collect all
             failures into JobPollSummary.failures.
         on_progress : Optional[JobProgressCallback]
@@ -507,17 +562,34 @@ class JobPoller(BaseJobPoller):
         """
         results: dict[str, JobStatus] = {}
         failures: dict[str, Exception] = {}
+        validate_path_segment(study_key, name="study_key")
+        for batch_id in batch_ids:
+            validate_path_segment(batch_id, name="batch_id")
         lock = threading.Lock()
+        stop_event = threading.Event()
+        first_failure: Exception | None = None
         start = time.monotonic()
 
+        if not batch_ids:
+            return JobPollSummary(
+                study_key=study_key,
+                results=results,
+                failures=failures,
+                elapsed_total=time.monotonic() - start,
+            )
+
         def _poll_one(batch_id: str) -> None:
+            nonlocal first_failure
+            if fail_fast and stop_event.is_set():
+                return
             try:
-                status = self.run(
+                status = self._run_with_stop(
                     study_key,
                     batch_id,
                     interval=interval,
                     timeout=timeout,
                     on_progress=on_progress,
+                    stop_event=stop_event if fail_fast else None,
                 )
                 with lock:
                     if (
@@ -528,19 +600,25 @@ class JobPoller(BaseJobPoller):
                         pass
                     else:
                         results[batch_id] = status
+            except _PollAbortedError:
+                return
             except Exception as exc:
                 with lock:
                     failures[batch_id] = exc
-                # If fail_fast is true, we still let the thread exit gracefully.
-                # The exception is raised in the main thread after joining.
-
-        import concurrent.futures
+                    if fail_fast and first_failure is None:
+                        first_failure = exc
+                        stop_event.set()
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            list(executor.map(_poll_one, batch_ids))
+            futures = [
+                executor.submit(contextvars.copy_context().run, _poll_one, batch_id)
+                for batch_id in batch_ids
+            ]
+            for future in futures:
+                future.result()
 
-        if fail_fast and failures:
-            raise next(iter(failures.values()))
+        if fail_fast and first_failure is not None:
+            raise first_failure
 
         return JobPollSummary(
             study_key=study_key,
@@ -578,6 +656,8 @@ class AsyncJobPoller(BaseJobPoller):
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Asynchronously poll a job until completion."""
+        validate_path_segment(study_key, name="study_key")
+        validate_path_segment(batch_id, name="batch_id")
         start = time.monotonic()
         poll_number = 0
         last_status: JobStatus | None = None
@@ -665,14 +745,26 @@ class AsyncJobPoller(BaseJobPoller):
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Asynchronously poll multiple jobs concurrently via asyncio.gather.
+        """Asynchronously poll multiple jobs concurrently with cooperative cancellation.
 
         All jobs are polled in parallel. Results are collected regardless of
-        individual failures unless fail_fast=True.
+        individual failures unless fail_fast=True, which cancels and awaits
+        pending sibling tasks before raising the triggering exception.
         """
         start = time.monotonic()
         results: dict[str, JobStatus] = {}
         failures: dict[str, Exception] = {}
+        validate_path_segment(study_key, name="study_key")
+        for batch_id in batch_ids:
+            validate_path_segment(batch_id, name="batch_id")
+
+        if not batch_ids:
+            return JobPollSummary(
+                study_key=study_key,
+                results=results,
+                failures=failures,
+                elapsed_total=time.monotonic() - start,
+            )
 
         async def _poll_one(batch_id: str) -> None:
             try:
@@ -696,10 +788,36 @@ class AsyncJobPoller(BaseJobPoller):
                 if fail_fast:
                     raise
 
-        # We use return_exceptions=not fail_fast so we can collect failures manually
-        await asyncio.gather(
-            *[_poll_one(bid) for bid in batch_ids], return_exceptions=not fail_fast
-        )
+        pending: set[asyncio.Task[None]] = {
+            asyncio.create_task(_poll_one(bid)) for bid in batch_ids
+        }
+        triggering_exc: Exception | None = None
+
+        try:
+            if fail_fast:
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_EXCEPTION)
+                    for finished in done:
+                        if finished.cancelled():
+                            continue
+                        exc = finished.exception()
+                        if isinstance(exc, Exception) and triggering_exc is None:
+                            triggering_exc = exc
+                    if triggering_exc is not None:
+                        for sibling in pending:
+                            sibling.cancel()
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
+                        pending.clear()
+                        raise triggering_exc
+            else:
+                await asyncio.gather(*pending, return_exceptions=True)
+                pending.clear()
+        finally:
+            if pending:
+                for sibling in pending:
+                    sibling.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
         return JobPollSummary(
             study_key=study_key,

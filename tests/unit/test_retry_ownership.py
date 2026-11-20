@@ -7,7 +7,7 @@ import pytest
 
 from imednet.core.async_client import AsyncClient
 from imednet.core.client import Client
-from imednet.core.operations.circuit_breaker import get_global_circuit_breaker
+from imednet.core.operations.circuit_breaker import CircuitState, get_global_circuit_breaker
 from imednet.core.paginator import (
     AsyncJsonListPaginator,
     AsyncPaginator,
@@ -22,8 +22,13 @@ BASE_URL = "https://synthetic.example"
 
 
 @pytest.mark.parametrize("paginator_type", [Paginator, JsonListPaginator])
-@pytest.mark.parametrize("status,attempts", [(500, 3), (429, 3), (400, 1), (0, 3)])
-def test_sync_pagination_has_one_retry_owner(respx_mock, paginator_type, status, attempts):
+@pytest.mark.parametrize(
+    "status,attempts,expected_failures",
+    [(500, 3, 1), (429, 3, 0), (400, 1, 0), (0, 3, 1)],
+)
+def test_sync_pagination_has_one_retry_owner(
+    respx_mock, paginator_type, status, attempts, expected_failures
+):
     route = respx_mock.get(BASE_URL + "/records")
     if status:
         route.respond(status)
@@ -39,14 +44,21 @@ def test_sync_pagination_has_one_retry_owner(respx_mock, paginator_type, status,
         pytest.raises((ApiError, RequestError)),
     ):
         list(paginator_type(client, "/records"))
+    expected_failures = 0 if status in (400, 429) else 1
     assert route.call_count == attempts
-    # The outer paginator must not double-count exhausted requests.
-    assert get_global_circuit_breaker()._consecutive_failures == 1
+    # The outer paginator must not double-count exhausted requests, and 4xx/429 do not count as outages.
+    assert client._circuit_breaker.consecutive_failures == expected_failures
+    assert get_global_circuit_breaker().consecutive_failures == 0
 
 
 @pytest.mark.parametrize("paginator_type", [AsyncPaginator, AsyncJsonListPaginator])
-@pytest.mark.parametrize("status,attempts", [(500, 3), (429, 3), (400, 1), (0, 3)])
-async def test_async_pagination_has_one_retry_owner(respx_mock, paginator_type, status, attempts):
+@pytest.mark.parametrize(
+    "status,attempts,expected_failures",
+    [(500, 3, 1), (429, 3, 0), (400, 1, 0), (0, 3, 1)],
+)
+async def test_async_pagination_has_one_retry_owner(
+    respx_mock, paginator_type, status, attempts, expected_failures
+):
     route = respx_mock.get(BASE_URL + "/records")
     if status:
         route.respond(status)
@@ -60,8 +72,10 @@ async def test_async_pagination_has_one_retry_owner(respx_mock, paginator_type, 
     ) as client:
         with pytest.raises((ApiError, RequestError)):
             _ = [item async for item in paginator_type(client, "/records")]
+    expected_failures = 0 if status in (400, 429) else 1
     assert route.call_count == attempts
-    assert get_global_circuit_breaker()._consecutive_failures == 1
+    assert client._circuit_breaker.consecutive_failures == expected_failures
+    assert get_global_circuit_breaker().consecutive_failures == 0
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -81,11 +95,13 @@ async def test_pagination_recovery_stops_after_success(respx_mock, asynchronous)
     if asynchronous:
         async with AsyncClient(**kwargs) as client:
             assert [item async for item in AsyncPaginator(client, "/records")] == [1, 2]
+            assert client._circuit_breaker.consecutive_failures == 0
     else:
         with Client(**kwargs) as client:
             assert list(Paginator(client, "/records")) == [1, 2]
+            assert client._circuit_breaker.consecutive_failures == 0
     assert route.call_count == 2
-    assert get_global_circuit_breaker()._consecutive_failures == 0
+    assert get_global_circuit_breaker().consecutive_failures == 0
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -158,6 +174,8 @@ def test_sink_permanent_failures_do_not_retry_or_expose_driver_message(
         sink._execute_with_retry("synthetic_write", "synthetic/0", destination)
     assert destination.call_count == 1
     assert sleeps == []
+    assert sink._circuit_breaker.consecutive_failures == 0
+    assert sink._circuit_breaker.state == CircuitState.CLOSED
     assert sentinel not in str(caught.value)
     assert sentinel not in caplog.text
     assert sentinel not in str(tracer.mock_calls)
@@ -170,20 +188,30 @@ def test_sink_transient_failures_are_redacted_before_tracing(monkeypatch, caplog
     destination = MagicMock(side_effect=RuntimeError("synthetic-private-driver-message"))
     with pytest.raises(ExportBatchError) as caught:
         sink._execute_with_retry("synthetic_write", "synthetic/0", destination)
+    assert sink._circuit_breaker.consecutive_failures == 1
     assert "synthetic-private-driver-message" not in str(caught.value)
     assert "synthetic-private-driver-message" not in caplog.text
     assert "synthetic-private-driver-message" not in str(tracer.mock_calls)
 
 
 def test_sink_reports_zero_attempts_when_breaker_prevents_execution():
-    breaker = get_global_circuit_breaker()
-    for _ in range(breaker.failure_threshold):
-        breaker.record_failure()
+    sink = SyntheticSink(SinkConfig(study_key="synthetic", max_retries=0))
+    other_sink = SyntheticSink(SinkConfig(study_key="synthetic", max_retries=0))
+    failing_destination = MagicMock(side_effect=RuntimeError("destination outage"))
+    for idx in range(sink._circuit_breaker.failure_threshold):
+        with pytest.raises(ExportBatchError, match="after 1 attempts"):
+            sink._execute_with_retry("synthetic_write", f"synthetic/{idx}", failing_destination)
+
+    assert sink._circuit_breaker.state == CircuitState.OPEN
+    assert other_sink._circuit_breaker.state == CircuitState.CLOSED
+    assert get_global_circuit_breaker().state == CircuitState.CLOSED
+
     destination = MagicMock(return_value=7)
-    sink = SyntheticSink(SinkConfig(study_key="synthetic"))
     with pytest.raises(ExportBatchError, match="after 0 attempts"):
-        sink._execute_with_retry("synthetic_write", "synthetic/0", destination)
+        sink._execute_with_retry("synthetic_write", "synthetic/blocked", destination)
     destination.assert_not_called()
+    assert other_sink._execute_with_retry("synthetic_write", "synthetic/ok", destination) == 7
+    assert destination.call_count == 1
 
 
 @pytest.mark.parametrize("value", [-1, 1.5, True])
@@ -196,3 +224,121 @@ def test_sink_rejects_invalid_retry_counts(value):
 def test_sink_rejects_invalid_retry_backoff(value):
     with pytest.raises(ValueError, match="retry_backoff"):
         SinkConfig(study_key="synthetic", retry_backoff=value)
+
+
+@pytest.mark.parametrize(
+    "root_exc,expected_type",
+    [
+        (OSError(28, "No space left on device"), OSError),
+        (ConnectionError("upstream reset"), ConnectionError),
+        (ValueError("bad column layout"), ValueError),
+        (TypeError("unsupported column type"), TypeError),
+        (ExportConfigurationError("invalid sink stage"), ExportConfigurationError),
+    ],
+)
+def test_sink_batch_error_chains_root_exception_type(monkeypatch, root_exc, expected_type):
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
+    sink = SyntheticSink(SinkConfig(study_key="synthetic", max_retries=1, retry_backoff=0.0))
+    destination = MagicMock(side_effect=root_exc)
+    with pytest.raises(ExportBatchError) as caught:
+        sink._execute_with_retry("synthetic_write", "synthetic/0", destination)
+
+    cause = caught.value.__cause__
+    assert cause is not None
+    assert type(cause) is expected_type
+    assert cause.__cause__ is None
+    assert cause.__context__ is None
+    if isinstance(root_exc, OSError) and root_exc.errno is not None:
+        assert cause.errno == root_exc.errno
+
+
+def test_sink_batch_error_chains_circuit_breaker_cause_when_open():
+    from imednet.core.operations.circuit_breaker import CircuitBreakerError
+
+    sink = SyntheticSink(SinkConfig(study_key="synthetic"))
+    breaker = sink._circuit_breaker
+    for _ in range(breaker.failure_threshold):
+        breaker.record_failure()
+    with pytest.raises(ExportBatchError, match="after 0 attempts") as caught:
+        sink._execute_with_retry("synthetic_write", "synthetic/0", MagicMock(return_value=1))
+
+    assert isinstance(caught.value.__cause__, CircuitBreakerError)
+
+
+def test_sink_batch_error_cause_scrubs_credentials_and_phi(monkeypatch, caplog):
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
+    tracer = MagicMock()
+    sink = SyntheticSink(SinkConfig(study_key="synthetic", max_retries=0, tracer=tracer))
+
+    raw_uri = "postgresql://" + "db_admin:s3cr3t_db_pw" + "@db.internal:5432/clinical?api_key=k99"
+    raw_msg = (
+        f"Write failed on {raw_uri} auth=Bearer tok_live_abc123 password='inline_pw_val' "  # pragma: allowlist secret
+        'payload={"patientName": "Jane Doe", "ssn": "123-45-6789", "subjectKey": "SUBJ-01"} '
+        "contact=jane.doe@hospital.org"
+    )
+    inner_secret = RuntimeError("raw_socket_password=inner_leak_val")  # pragma: allowlist secret
+
+    def _failing_dest():
+        try:
+            raise inner_secret
+        except RuntimeError as inner:
+            raise ConnectionError(raw_msg) from inner
+
+    with pytest.raises(ExportBatchError) as caught:
+        sink._execute_with_retry("synthetic_write", "synthetic/phi", _failing_dest)
+
+    cause = caught.value.__cause__
+    assert type(cause) is ConnectionError
+    cause_text = str(cause)
+
+    # Host and exempt identifiers remain diagnostic
+    assert "postgresql://***@db.internal:5432/clinical" in cause_text
+    assert "SUBJ-01" in cause_text
+    assert "***MASKED***" in cause_text
+
+    # Credentials, PHI, and inner unredacted chain are scrubbed
+    for secret_fragment in (
+        "s3cr3t_db_pw",
+        "k99",
+        "tok_live_abc123",
+        "inline_pw_val",
+        "Jane Doe",
+        "123-45-6789",
+        "jane.doe@hospital.org",
+        "inner_leak_val",
+    ):
+        assert secret_fragment not in cause_text
+        assert secret_fragment not in str(caught.value)
+        assert secret_fragment not in caplog.text
+        assert secret_fragment not in str(tracer.mock_calls)
+
+    assert cause.__cause__ is None
+    assert cause.__context__ is None
+
+
+def test_sink_batch_error_cause_scrubs_structured_dict_args_and_custom_exceptions(monkeypatch):
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
+    sink = SyntheticSink(SinkConfig(study_key="synthetic", max_retries=0))
+
+    class _DriverBulkError(Exception):
+        def __init__(self, code: int, details: dict):
+            super().__init__(code, details)
+            self.code = code
+            self.details = details
+
+    err_instance = _DriverBulkError(
+        65,
+        {"writeErrors": [{"patient_name": "Alice Smith", "dob": "1975-08-19", "record_id": 10}]},
+    )
+    with pytest.raises(ExportBatchError) as caught:
+        sink._execute_with_retry(
+            "synthetic_write", "synthetic/bulk", MagicMock(side_effect=err_instance)
+        )
+
+    cause = caught.value.__cause__
+    assert type(cause) is _DriverBulkError
+    assert not hasattr(cause, "details")
+    assert "Alice Smith" not in str(cause)
+    assert "1975-08-19" not in str(cause)
+    assert "***MASKED***" in str(cause)
+    assert "10" in str(cause)

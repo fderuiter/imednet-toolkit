@@ -185,6 +185,22 @@ try:
     _wf_cached_loader.get_sqlite_connection = _fast_wf_get_sqlite_connection  # type: ignore[assignment]
 except ImportError:
     pass
+try:
+    import sqlite3 as _sqlite3
+
+    from sqlalchemy import event as _sa_event
+    from sqlalchemy.engine import Engine as _SAEngine
+
+    @_sa_event.listens_for(_SAEngine, "connect")
+    def _fast_sqlalchemy_sqlite_connect(
+        dbapi_connection: object, _connection_record: object
+    ) -> None:
+        if isinstance(dbapi_connection, _sqlite3.Connection):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA synchronous=OFF;")
+            cursor.close()
+except ImportError:
+    pass
 
 
 def pytest_addoption(parser):

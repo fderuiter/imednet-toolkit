@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from imednet.cli.decorators import with_sdk
+from imednet.cli.decorators import validate_cli_path_segment, with_sdk
 from imednet.endpoints.registry import ENDPOINT_REGISTRY
 from imednet.sdk import ImednetSDK
 
@@ -14,7 +14,7 @@ from .args import (
     add_list_query_args,
     add_no_interactive,
     add_output_format,
-    collect_list_items,
+    collect_list_items_with_remainder,
     prepare_list_query,
 )
 from .context import fetching_status
@@ -89,7 +89,7 @@ def register_list_command(
                 )
             )
             with fetching_status(name, study_key):
-                items, truncated = collect_list_items(
+                items, truncated, load_remaining = collect_list_items_with_remainder(
                     getattr(sdk, attr).list(study_key, **req_kwargs),
                     effective_limit,
                 )
@@ -102,9 +102,11 @@ def register_list_command(
                 details=items,
                 truncated=truncated,
                 interactive=False if no_interactive else None,
+                on_load_all=load_remaining,
             )
 
         def _dispatch_study_list(args: argparse.Namespace) -> None:
+            validate_cli_path_segment(args.study_key, name="study_key")
             no_interactive = getattr(args, "no_interactive", False)
             prepared = prepare_list_query(
                 filter_args=args.filter_args,
@@ -159,7 +161,7 @@ def register_list_command(
                 )
             )
             with fetching_status(name):
-                items, truncated = collect_list_items(
+                items, truncated, load_remaining = collect_list_items_with_remainder(
                     getattr(sdk, attr).list(**req_kwargs),
                     effective_limit,
                 )
@@ -172,6 +174,7 @@ def register_list_command(
                 details=items,
                 truncated=truncated,
                 interactive=False if no_interactive else None,
+                on_load_all=load_remaining,
             )
 
         def _dispatch_no_study_list(args: argparse.Namespace) -> None:
