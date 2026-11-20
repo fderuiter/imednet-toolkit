@@ -9,9 +9,25 @@ from dataclasses import dataclass
 from enum import StrEnum
 from threading import Event
 
+from imednet.spi.errors import (
+    ApiError,
+    AuthenticationError,
+    AuthorizationError,
+    NotFoundError,
+)
+
 from .cached_loader import CachedRecordsLoader
 
 logger = logging.getLogger(__name__)
+
+_PERMANENT_STATUS_CODES: frozenset[int] = frozenset({401, 403, 404})
+
+
+def _is_permanent_api_error(exc: ApiError) -> bool:
+    """Return True when an API error represents a permanent client failure."""
+    if isinstance(exc, (AuthenticationError, AuthorizationError, NotFoundError)):
+        return True
+    return exc.status_code in _PERMANENT_STATUS_CODES
 
 
 class SyncWorkerState(StrEnum):
@@ -67,6 +83,8 @@ class SyncWorkerConfig:
 
     def __post_init__(self) -> None:
         """Validate worker configuration bounds."""
+        if isinstance(self.interval_seconds, bool) or self.interval_seconds <= 0:
+            raise ValueError("interval_seconds must be greater than 0")
         if self.max_consecutive_failures is not None and self.max_consecutive_failures < 1:
             raise ValueError("max_consecutive_failures must be at least 1")
 
@@ -147,7 +165,8 @@ class SyncWorker:
         except Exception as exc:
             self._consecutive_failures += 1
             self._last_error = exc
-            if (
+            is_permanent = isinstance(exc, ApiError) and _is_permanent_api_error(exc)
+            if is_permanent or (
                 self._max_consecutive_failures is not None
                 and self._consecutive_failures >= self._max_consecutive_failures
             ):
@@ -206,6 +225,10 @@ class SyncWorker:
                 if on_cycle:
                     on_cycle(cycle_count, record_count)
             except Exception as exc:
+                if isinstance(exc, ApiError) and _is_permanent_api_error(exc):
+                    if on_error is not None and on_error is not self._on_error:
+                        _invoke_error_callback(on_error, exc, self._consecutive_failures)
+                    raise
                 logger.exception(
                     "sync worker cycle failed",
                     extra={
