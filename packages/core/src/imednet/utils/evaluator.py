@@ -33,8 +33,6 @@ DEFAULT_SAFE_METHODS: set[str] = {
     "encode",
     "endswith",
     "find",
-    "format",
-    "format_map",
     "index",
     "isalnum",
     "isalpha",
@@ -387,11 +385,16 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
             logger.warning(f"Security warning: {msg}")
             raise RestrictedEvaluationError(msg)
         try:
-            return getattr(target, attr)
+            result = getattr(target, attr)
         except AttributeError as exc:
             raise EvaluationError(
                 f"'{type(target).__name__}' object has no attribute '{attr}'"
             ) from exc
+        if callable(result) and attr not in DEFAULT_SAFE_METHODS:
+            msg = f"Method '{attr}' is forbidden"
+            logger.warning(f"Security warning: {msg}")
+            raise RestrictedEvaluationError(msg)
+        return result
 
     if isinstance(node, ast.Subscript):
         target = _eval_node(node.value, env)
