@@ -50,7 +50,10 @@ class _EdcEndpointBase:
 
     .. code-block:: python
 
-        class RecordsEndpoint(EdcGenericListGetEndpoint[Record]):
+        from imednet.core.endpoint.edc_mixin import EdcSyncListGetEndpoint
+        from imednet.models.records import Record
+
+        class RecordsEndpoint(EdcSyncListGetEndpoint[Record]):
             PATH = "records"
             MODEL = Record
             _id_param = "recordId"

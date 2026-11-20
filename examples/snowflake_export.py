@@ -25,8 +25,16 @@ from imednet import ImednetSDK
 # ---------------------------------------------------------------------------
 # SDK initialisation — credentials are read from environment variables only.
 # ---------------------------------------------------------------------------
+_SIM_MODE = os.environ.get("IMEDNET_SIMULATION_MODE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 sdk = ImednetSDK(
-    api_key=os.environ["IMEDNET_API_KEY"],
+    api_key=os.environ.get("IMEDNET_API_KEY")
+    or ("sim-api-placeholder" if _SIM_MODE else os.environ["IMEDNET_API_KEY"]),
     security_key=os.environ.get("IMEDNET_SECURITY_KEY", ""),
 )
 
@@ -41,7 +49,8 @@ config = SnowflakeSinkConfig(
     study_key=STUDY_KEY,
     account=os.environ.get("SNOWFLAKE_ACCOUNT") or "myorg-myaccount",
     user=os.environ.get("SNOWFLAKE_USER") or "loader",
-    password=os.environ["SNOWFLAKE_PASSWORD"],
+    password=os.environ.get("SNOWFLAKE_PASSWORD")
+    or ("sim-sf-placeholder" if _SIM_MODE else os.environ["SNOWFLAKE_PASSWORD"]),
     database=os.environ.get("SNOWFLAKE_DATABASE") or "IMEDNET_DB",
     schema=os.environ.get("SNOWFLAKE_SCHEMA") or "PUBLIC",
     warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE") or "COMPUTE_WH",

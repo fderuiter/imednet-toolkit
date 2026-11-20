@@ -17,8 +17,8 @@ Any callable passed to ``execute_pipeline`` must accept at minimum::
 
     def my_pipeline(
         study_key: str,           # the study identifier for this worker
-        sdk: ImednetSDK,          # shared (read-only) SDK instance
-        study_logger: Any,        # StudyContextLogAdapter bound to study_key
+        sdk_client: ImednetSDK,   # shared (read-only) SDK instance
+        logger: Any,              # StudyContextLogAdapter bound to study_key
         *args: Any,
         **kwargs: Any,
     ) -> Any: ...
@@ -27,8 +27,8 @@ Example::
 
     from imednet.orchestration import StudyWorkerCallable
 
-    def count_subjects(study_key, sdk, study_logger, **kwargs):
-        subjects = sdk.subjects.list(study_key=study_key)
+    def count_subjects(study_key, sdk_client, logger, **kwargs):
+        subjects = sdk_client.subjects.list(study_key=study_key)
         return len(list(subjects))
 
     # Runtime check via @runtime_checkable:

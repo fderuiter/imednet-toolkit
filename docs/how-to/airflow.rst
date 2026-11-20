@@ -20,7 +20,7 @@ pip installation. Package versions remain managed by release-please.
 Production Reference DAG
 ------------------------
 
-Use ``examples/airflow/multi_study_pipeline.py`` as the recommended production
+Use ``examples/airflow/airflow_multi_study_pipeline.py`` as the recommended production
 pattern for dynamic task mapping deployments. It demonstrates lightweight
 TaskFlow discovery feeding mapped provider operators while keeping execution
 logic inside mapped tasks.
@@ -135,6 +135,8 @@ For warehouse or database sinks, bind ``destination_conn_id`` so credentials are
 resolved only inside ``execute()``:
 
 .. code-block:: python
+
+   from apache_airflow_providers_imednet import ImednetExportOperator
 
    ImednetExportOperator(
        task_id="export_snowflake",

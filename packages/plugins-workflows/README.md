@@ -28,10 +28,10 @@ The package provides CLI commands mapped to registered `imednet.cli_plugins` sub
 
 ```bash
 # Extract clinical records
-imednet workflows extract-records --study-key <STUDY_KEY>
+imednet workflows extract-records <STUDY_KEY>
 
 # Continuous synchronization loop
-imednet workflows sync-worker --study-key <STUDY_KEY> --interval 900
+imednet workflows sync-worker <STUDY_KEY> --interval 900
 
 # Administrative state checkpoint management
 imednet workflows state show --study-key <STUDY_KEY>
@@ -46,7 +46,7 @@ imednet subject-data <STUDY_KEY> --subject-key <SUBJECT_KEY>
 
 **Registered Entry Points:**
 The following components are exposed via Python entry points:
-- **Workflows (`imednet.workflows`)**: `data_extraction`, `query_management`, `record_mapper`, `record_update`, `subject_data`, `uat`, `uat_inspector`.
+- **Workflows (`imednet.workflows`)**: `data_extraction`, `duckdb_centralizer`, `query_management`, `record_mapper`, `record_update`, `register_subjects`, `subject_data`, `uat`, `uat_inspector`.
 - **CLI Plugins (`imednet.cli_plugins`)**: `workflows`, `subject_data`.
 - **Custom Pollers (`imednet.pollers`)**: `JobPoller`, `AsyncJobPoller`.
 - **Custom Mappers (`imednet.mappers`)**: `RecordMapper`.

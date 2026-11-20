@@ -1,8 +1,11 @@
+"""Demonstrate configuring BulkRecordSubmissionWorkflow and GeneratedRecordSet payloads."""
+
 from imednet import ImednetSDK, load_config
 from imednet_workflows.uat import BulkRecordSubmissionWorkflow, GeneratedRecordSet, RecordTestType
 
 
-def main():
+def main() -> None:
+    """Configure bulk registration and study data submission sets."""
     try:
         cfg = load_config()
     except ValueError as e:

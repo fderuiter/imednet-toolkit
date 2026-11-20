@@ -47,13 +47,18 @@ Usage
 .. code-block:: python
 
     import os
+    from imednet import ImednetSDK
+    from imednet.spi.sink_base import iter_batches
     from imednet_sinks import SnowflakeExportSink, SnowflakeSinkConfig
+
+    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+    records = list(sdk.records.list(study_key="MYSTUDY"))
 
     config = SnowflakeSinkConfig(
         study_key="MYSTUDY",
         account="myorg-myaccount",
         user="loader",
-        **{"password": os.environ["SF_PASS"]},  # keep credentials out of source code
+        password=os.environ["SNOWFLAKE_PASSWORD"],  # keep credentials out of source code
         database="IMEDNET_DB",
         schema="PUBLIC",
         warehouse="COMPUTE_WH",
@@ -63,7 +68,7 @@ Usage
         local_staging_dir="/tmp/imednet_stage",
     )
     with SnowflakeExportSink(config=config) as sink:
-        for i, batch in enumerate(batched(records, config.batch_size)):
+        for i, batch in enumerate(iter_batches(records, config.batch_size)):
             sink.write_batch(batch, batch_id=f"MYSTUDY/FORM1/{i}")
 """
 

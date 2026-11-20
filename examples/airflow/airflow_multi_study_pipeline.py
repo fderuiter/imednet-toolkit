@@ -1,17 +1,3 @@
-"""TODO: Add docstring."""
-
-from __future__ import annotations
-
-import os
-import re
-from datetime import datetime, timedelta
-from typing import Any
-
-from airflow import DAG
-from airflow.sdk import task
-
-from apache_airflow_providers_imednet import ImednetExportOperator, ImednetHook
-
 """Production reference DAG for multi-study exports with dynamic task mapping.
 
 Pattern:
@@ -24,6 +10,18 @@ Operational guardrails:
 - Exports run in an Airflow pool (``imednet_exports``) for shared resource control.
   Create this pool in Airflow with a slot count that matches your backend limits.
 """
+
+from __future__ import annotations
+
+import os
+import re
+from datetime import datetime, timedelta
+from typing import Any
+
+from airflow import DAG
+from airflow.sdk import task
+
+from apache_airflow_providers_imednet import ImednetExportOperator, ImednetHook
 
 IMEDNET_CONN_ID = "imednet_default"
 IMEDNET_EXPORT_POOL = "imednet_exports"
@@ -43,7 +41,7 @@ def _safe_study_path_fragment(study_key: str) -> str:
 
 with DAG(
     dag_id="imednet_multi_study_reference",
-    schedule_interval=None,
+    schedule=None,
     default_args=default_args,
     catchup=False,
     max_active_runs=1,

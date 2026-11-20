@@ -50,9 +50,12 @@ Usage
 .. code-block:: python
 
     import os
+    from imednet import ImednetSDK
+    from imednet.spi.sink_base import iter_batches
     from imednet_sinks import MongoDbExportSink, MongoDbSinkConfig
     from imednet_workflows.data_extraction import DataExtractionWorkflow
 
+    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
     records = DataExtractionWorkflow(sdk).extract_records_by_criteria(
         study_key="MYSTUDY",
     )
@@ -64,7 +67,7 @@ Usage
         collection="records",
     )
     with MongoDbExportSink(config=config) as sink:
-        for i, batch in enumerate(batched(records, config.batch_size)):
+        for i, batch in enumerate(iter_batches(records, config.batch_size)):
             sink.write_batch(batch, batch_id=f"MYSTUDY/all/{i}")
 """
 

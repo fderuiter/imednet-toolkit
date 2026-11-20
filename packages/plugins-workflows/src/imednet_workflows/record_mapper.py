@@ -453,7 +453,7 @@ def transform_records_to_sdtm(
     if pd is None:
         raise ImportError(
             "pandas is required for SDTM transformations. Install with "
-            "'pip install \"imednet[pandas]\"'."
+            "'pip install \"imednet[export]\"'."
         )
 
     domain_clean = domain.strip().upper()
@@ -1176,7 +1176,7 @@ class RecordMapper:
         if pd is None:
             raise ImportError(
                 "pandas is required for RecordMapper.dataframe. Install "
-                "with 'pip install \"imednet[pandas]\"'."
+                "with 'pip install \"imednet[export]\"'."
             )
         variable_keys, label_map = self._fetch_variable_metadata(
             study_key,
@@ -1426,7 +1426,7 @@ class RecordMapper:
         if pd is None:
             raise ImportError(
                 "pandas is required for RecordMapper.sdtm_dataframe. Install "
-                "with 'pip install \"imednet[pandas]\"'."
+                "with 'pip install \"imednet[export]\"'."
             )
         frames = list(
             self.iter_sdtm_dataframes(
@@ -1456,7 +1456,7 @@ class RecordMapper:
         if pd is None:
             raise ImportError(
                 "pandas is required for RecordMapper.iter_sdtm_dataframes. Install "
-                "with 'pip install \"imednet[pandas]\"'."
+                "with 'pip install \"imednet[export]\"'."
             )
         if variable_whitelist is not None and len(variable_whitelist) == 0:
             return
@@ -1530,7 +1530,7 @@ class RecordMapper:
         if pd is None:
             raise ImportError(
                 "pandas is required for RecordMapper.dataframe. Install "
-                "with 'pip install \"imednet[pandas]\"'."
+                "with 'pip install \"imednet[export]\"'."
             )
         frames = list(
             self.iter_dataframes(

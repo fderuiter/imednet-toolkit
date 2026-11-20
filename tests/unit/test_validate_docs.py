@@ -20,8 +20,11 @@ from scripts.validate_docs import (
     _verify_core_html,
     _verify_pagination_html,
     _verify_sdk_html,
+    check_cli_snippets,
+    check_documented_extras,
     check_no_duplicate_suppression,
     check_rendered_api_reference,
+    check_todos_in_init,
 )
 
 import imednet.core as core_pkg
@@ -216,6 +219,87 @@ def test_check_no_duplicate_suppression_detects_forbidden_patterns(tmp_path: Pat
 def test_check_rendered_api_reference_flags_builtins_and_broken_backlinks(tmp_path: Path) -> None:
     """check_rendered_api_reference fails when pages are missing or contain broken [docs] anchors."""
     assert check_rendered_api_reference(tmp_path) is True
+
+
+def test_check_todos_in_init_scans_module_class_and_function_docstrings(tmp_path: Path) -> None:
+    """check_todos_in_init catches TODO placeholders across examples and package sources."""
+    clean_dir = tmp_path / "clean"
+    clean_dir.mkdir(parents=True)
+    (clean_dir / "ok.py").write_text(
+        '"""Clean module docstring."""\n\n'
+        "def run() -> None:\n"
+        '    """Clean function docstring."""\n'
+        "    pass\n",
+        encoding="utf-8",
+    )
+    assert check_todos_in_init([clean_dir]) is False
+
+    bad_dir = tmp_path / "bad"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "bad.py").write_text(
+        '"""Module with TODO placeholder."""\n',
+        encoding="utf-8",
+    )
+    assert check_todos_in_init([bad_dir]) is True
+
+
+def test_check_documented_extras_validates_against_pyproject_toml(tmp_path: Path) -> None:
+    """check_documented_extras passes declared extras and rejects undeclared extras."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-workspace"\n[project.optional-dependencies]\ndocs = []\n',
+        encoding="utf-8",
+    )
+    core_dir = tmp_path / "packages" / "core"
+    core_dir.mkdir(parents=True)
+    (core_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet"\n[project.optional-dependencies]\nexport = []\nsnowflake = []\n',
+        encoding="utf-8",
+    )
+    airflow_dir = tmp_path / "packages" / "providers-airflow"
+    airflow_dir.mkdir(parents=True)
+    (airflow_dir / "pyproject.toml").write_text(
+        '[project]\nname = "apache-airflow-providers-imednet"\n',
+        encoding="utf-8",
+    )
+
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        'Install with `pip install "imednet[export,snowflake]"`.\n',
+        encoding="utf-8",
+    )
+    assert check_documented_extras(tmp_path) is False
+
+    readme.write_text(
+        'Install with `pip install "imednet[pandas]"` or `apache-airflow-providers-imednet[amazon]`.\n',
+        encoding="utf-8",
+    )
+    assert check_documented_extras(tmp_path) is True
+
+
+def test_check_cli_snippets_validates_flags_against_parser(tmp_path: Path) -> None:
+    """check_cli_snippets accepts valid imednet CLI commands and rejects invalid flags."""
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True)
+    cli_rst = docs_dir / "cli.rst"
+    cli_rst.write_text(
+        "CLI Guide\n"
+        "=========\n\n"
+        ".. code-block:: bash\n\n"
+        "   imednet workflows extract-records <STUDY_KEY> \\\n"
+        '       --record-filter "site_id=1" \\\n'
+        '       --subject-filter "status=Active"\n',
+        encoding="utf-8",
+    )
+    assert check_cli_snippets(tmp_path) is False
+
+    cli_rst.write_text(
+        "CLI Guide\n"
+        "=========\n\n"
+        ".. code-block:: bash\n\n"
+        "   imednet workflows extract-records <STUDY_KEY> --nonexistent-flag value\n",
+        encoding="utf-8",
+    )
+    assert check_cli_snippets(tmp_path) is True
 
 
 def test_sphinx_html_renders_curated_core_pagination_sdk_and_endpoints(tmp_path: Path) -> None:

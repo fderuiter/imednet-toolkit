@@ -123,6 +123,20 @@ def main() -> None:
             args.revision,
         )
     else:
+        sim_mode = os.getenv("IMEDNET_SIMULATION_MODE", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if sim_mode:
+            preset_name = "Demo Form" if "Demo Form" in PRESETS else next(iter(PRESETS))
+            builder = FormBuilder()
+            PRESETS[preset_name](builder)
+            layout = builder.build()
+            print(f"Built simulated form payload using preset '{preset_name}': {list(layout)}")
+            return
+
         print(
             "Provide Form Builder CLI arguments (for example --preset, --form-id, --comm-id, "
             "and --revision) to build and submit a form payload.\n"

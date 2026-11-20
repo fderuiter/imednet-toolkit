@@ -1,45 +1,40 @@
 """Plugin contracts for the iMednet SDK.
 
-This module defines the :class:`PluginProtocol` that any third-party plugin
-factory must satisfy in order to be discoverable via the ``imednet.plugins``
-entry-point group, together with the :class:`WorkflowsNamespaceProtocol` that
-the factory's return value must implement.
+This module defines the :class:`PluginProtocol` that namespace-level plugin
+factories satisfy when discovered via the ``imednet.plugins`` entry-point
+group (such as ``sinks = "imednet_sinks.plugin:create_sinks"``), together with
+:class:`WorkflowsNamespaceProtocol` and :class:`SinksNamespaceProtocol`.
+
+Individual workflows exposed on ``sdk.workflows`` are discovered lazily by
+:class:`~imednet.sdk.WorkflowRegistry` via the ``imednet.workflows``
+entry-point group, where each entry point maps a workflow attribute name to a
+callable accepting the SDK instance.
 
 Minimal plugin skeleton
 -----------------------
 
-A plugin package must:
+To register an individual workflow on ``sdk.workflows``:
 
-1. Expose a factory callable under the ``imednet.plugins`` entry-point group
-   with the name ``"workflows"`` (or another agreed name).
+1. Expose a class or factory callable under ``[project.entry-points."imednet.workflows"]``.
 2. The callable must accept a single argument — the :class:`~imednet.sdk.ImednetSDK`
-   (or :class:`~imednet.sdk.AsyncImednetSDK`) instance — and return an object
-   that satisfies :class:`WorkflowsNamespaceProtocol`.
+   (or :class:`~imednet.sdk.AsyncImednetSDK`) instance — and return the workflow helper.
 
 Example ``pyproject.toml`` snippet::
 
+    [project.entry-points."imednet.workflows"]
+    my_workflow = "myplugin.workflows:MyWorkflow"
+
     [project.entry-points."imednet.plugins"]
-    workflows = "myplugin.namespace:create_workflows"
+    sinks = "imednet_sinks.plugin:create_sinks"
 
-Example factory::
+Example workflow class::
 
-    # myplugin/namespace.py
+    # myplugin/workflows.py
     from imednet.sdk import ImednetSDK
 
-    class MyWorkflows:
+    class MyWorkflow:
         def __init__(self, sdk: ImednetSDK) -> None:
-            self.data_extraction = ...
-            self.duckdb_centralizer = ...
-            self.query_management = ...
-            self.record_mapper = ...
-            self.record_update = ...
-            self.register_subjects = ...
-            self.subject_data = ...
-            self.uat = ...
-            self.uat_inspector = ...
-
-    def create_workflows(sdk: ImednetSDK) -> MyWorkflows:
-        return MyWorkflows(sdk)
+            self._sdk = sdk
 """
 
 from __future__ import annotations
@@ -118,10 +113,14 @@ class PluginProtocol(Protocol):
         class MyWorkflows:
             def __init__(self, sdk: ImednetSDK) -> None:
                 self.data_extraction = ...
+                self.duckdb_centralizer = ...
                 self.query_management = ...
                 self.record_mapper = ...
                 self.record_update = ...
+                self.register_subjects = ...
                 self.subject_data = ...
+                self.uat = ...
+                self.uat_inspector = ...
 
         def create_workflows(sdk: ImednetSDK) -> MyWorkflows:
             return MyWorkflows(sdk)

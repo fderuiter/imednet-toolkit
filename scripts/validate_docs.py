@@ -2,8 +2,11 @@
 
 import argparse
 import ast
+import contextlib
 import importlib
+import io
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,35 +19,342 @@ from typing import Any
 from defusedxml import ElementTree as DefusedET
 
 
-def check_todos_in_init() -> bool:
-    """Ensure no TODO strings exist in operator __init__ docstrings."""
-    print("Checking for TODOs in __init__ docstrings...")
-    base_path = Path("packages/providers-airflow/src/apache_airflow_providers_imednet")
-    if not base_path.exists():
-        print(f"Warning: Path {base_path} not found.")
-        return False
+def check_todos_in_init(roots: Sequence[Path] | None = None) -> bool:
+    """Ensure no TODO strings exist in module, class, or function docstrings across examples/ and packages/*/src/."""
+    print("Checking for TODOs in docstrings across examples/ and packages/*/src/...")
+    if roots is None:
+        candidate_roots = [Path("examples"), *sorted(Path("packages").glob("*/src"))]
+    else:
+        candidate_roots = list(roots)
 
     has_todos = False
-    for py_file in base_path.rglob("*.py"):
-        content = py_file.read_text(encoding="utf-8")
-        try:
-            tree = ast.parse(content, filename=str(py_file))
-        except SyntaxError:
+    for base_path in candidate_roots:
+        if not base_path.exists():
+            continue
+        for py_file in sorted(base_path.rglob("*.py")):
+            content = py_file.read_text(encoding="utf-8")
+            try:
+                tree = ast.parse(content, filename=str(py_file))
+            except SyntaxError:
+                continue
+
+            for node in ast.walk(tree):
+                if isinstance(
+                    node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    docstring = ast.get_docstring(node, clean=False)
+                    if docstring and "TODO" in docstring:
+                        lineno = (
+                            node.body[0].lineno
+                            if getattr(node, "body", None)
+                            else getattr(node, "lineno", 1)
+                        )
+                        target = getattr(node, "name", "<module>")
+                        print(f"Error: TODO found in docstring of {target} at {py_file}:{lineno}")
+                        has_todos = True
+
+    if not has_todos:
+        print("No TODOs found in docstrings.")
+    return has_todos
+
+
+_DOC_EXCLUDED_PARTS = {"_build", "agents", "superpowers"}
+_DOCUMENTED_EXTRA_RE = re.compile(
+    r"\b(imednet(?:-[a-z0-9]+)*|apache-airflow-providers-imednet)\[([a-z0-9_,\s-]+)\]"
+)
+
+
+def _load_declared_package_extras(repo_root: Path) -> dict[str, set[str]]:
+    """Load declared [project.optional-dependencies] keys keyed by package name."""
+    pkg_extras: dict[str, set[str]] = {}
+    pyproject_files = [
+        repo_root / "pyproject.toml",
+        *sorted((repo_root / "packages").glob("*/pyproject.toml")),
+    ]
+    for pyproject_path in pyproject_files:
+        if not pyproject_path.is_file():
+            continue
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        project = data.get("project", {})
+        pkg_name = project.get("name")
+        if isinstance(pkg_name, str):
+            opt_deps = project.get("optional-dependencies", {})
+            pkg_extras[pkg_name] = set(opt_deps.keys()) if isinstance(opt_deps, dict) else set()
+    return pkg_extras
+
+
+def check_documented_extras(repo_root: Path = Path(".")) -> bool:
+    """Validate that every documented <package>[<extra>] reference matches a declared extra in pyproject.toml."""
+    print("Checking documented package extras against pyproject.toml declarations...")
+    pkg_extras = _load_declared_package_extras(repo_root)
+    if not pkg_extras:
+        print(f"Warning: No pyproject.toml package definitions found under {repo_root}.")
+        return False
+
+    scan_candidates: list[Path] = []
+    root_readme = repo_root / "README.md"
+    if root_readme.is_file():
+        scan_candidates.append(root_readme)
+    packages_dir = repo_root / "packages"
+    if packages_dir.exists():
+        scan_candidates.extend(sorted(packages_dir.glob("*/README.md")))
+        scan_candidates.extend(sorted(packages_dir.glob("*/src/**/*.py")))
+    docs_dir = repo_root / "docs"
+    if docs_dir.exists():
+        scan_candidates.extend(sorted(docs_dir.rglob("*.rst")))
+        scan_candidates.extend(sorted(docs_dir.rglob("*.md")))
+    examples_dir = repo_root / "examples"
+    if examples_dir.exists():
+        scan_candidates.extend(sorted(examples_dir.rglob("*.py")))
+        scan_candidates.extend(sorted(examples_dir.rglob("*.md")))
+
+    has_errors = False
+    seen: set[Path] = set()
+    for path in scan_candidates:
+        resolved = path.resolve()
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        rel_parts = path.relative_to(repo_root).parts
+        if any(part in _DOC_EXCLUDED_PARTS for part in rel_parts):
             continue
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                for child in node.body:
-                    if isinstance(child, ast.FunctionDef) and child.name == "__init__":
-                        docstring = ast.get_docstring(child)
-                        if docstring and "TODO" in docstring:
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for match in _DOCUMENTED_EXTRA_RE.finditer(line):
+                pkg_name = match.group(1)
+                extras_raw = match.group(2)
+                if pkg_name not in pkg_extras:
+                    print(
+                        f"Error: Unknown workspace package '{pkg_name}' in extra reference at {path}:{lineno}"
+                    )
+                    has_errors = True
+                    continue
+                declared = pkg_extras[pkg_name]
+                for extra in (item.strip() for item in extras_raw.split(",") if item.strip()):
+                    if extra not in declared:
+                        print(
+                            f"Error: Undeclared extra '{pkg_name}[{extra}]' at {path}:{lineno} "
+                            f"(declared extras for {pkg_name}: {sorted(declared)})"
+                        )
+                        has_errors = True
+
+    if not has_errors:
+        print("All documented package extras match pyproject.toml declarations.")
+    return has_errors
+
+
+class _CLIValidationError(Exception):
+    """Raised when an argparse parser rejects a documented CLI command."""
+
+
+def _patch_cli_parser_errors(parser: argparse.ArgumentParser) -> None:
+    """Patch parser.error recursively on parser and all subparsers to raise _CLIValidationError."""
+
+    def _raise_error(message: str) -> Any:
+        raise _CLIValidationError(message)
+
+    parser.error = _raise_error  # type: ignore[method-assign]
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for subparser in action.choices.values():
+                _patch_cli_parser_errors(subparser)
+
+
+def _extract_shell_code_blocks(path: Path) -> list[tuple[int, str]]:
+    """Extract (1-based start line, shell block text) from Markdown or RST files."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    blocks: list[tuple[int, str]] = []
+    n = len(lines)
+
+    if path.suffix == ".md":
+        i = 0
+        while i < n:
+            if re.match(r"^\s*```(?:bash|sh|shell|console|zsh)\s*$", lines[i]):
+                start_line = i + 2
+                i += 1
+                buf: list[str] = []
+                while i < n and not re.match(r"^\s*```\s*$", lines[i]):
+                    buf.append(lines[i])
+                    i += 1
+                blocks.append((start_line, "\n".join(buf)))
+            i += 1
+    elif path.suffix == ".rst":
+        i = 0
+        while i < n:
+            match = re.match(
+                r"^(\s*)\.\.\s+(?:code-block|sourcecode|prompt)::\s*(?:bash|sh|shell|console|zsh)\b",
+                lines[i],
+            )
+            if match:
+                base_indent = len(match.group(1))
+                i += 1
+                while i < n:
+                    stripped = lines[i].strip()
+                    if stripped == "":
+                        i += 1
+                        break
+                    if (len(lines[i]) - len(lines[i].lstrip())) > base_indent and re.match(
+                        r"^:[a-zA-Z0-9_-]+:", stripped
+                    ):
+                        i += 1
+                    else:
+                        break
+                while i < n and lines[i].strip() == "":
+                    i += 1
+                if i < n:
+                    indent = len(lines[i]) - len(lines[i].lstrip())
+                    if indent > base_indent:
+                        start_line = i + 1
+                        buf = []
+                        while i < n:
+                            if lines[i].strip() == "":
+                                buf.append("")
+                            elif (len(lines[i]) - len(lines[i].lstrip())) >= indent:
+                                buf.append(lines[i][indent:])
+                            else:
+                                break
+                            i += 1
+                        blocks.append((start_line, "\n".join(buf)))
+                        continue
+            i += 1
+
+    return blocks
+
+
+def _split_shell_pipeline(cmd: str) -> list[list[str]]:
+    """Split a shell command line into individual command token lists while preserving <PLACEHOLDER> args."""
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars="|&;")
+    lex.whitespace_split = True
+    tokens = list(lex)
+    segments: list[list[str]] = []
+    curr: list[str] = []
+    skip_next = False
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("|", "||", "&&", ";"):
+            if curr:
+                segments.append(curr)
+                curr = []
+        elif tok in (">", ">>", "2>", "2>&1", "&>"):
+            skip_next = tok != "2>&1"
+        else:
+            curr.append(tok)
+    if curr:
+        segments.append(curr)
+    return segments
+
+
+def check_cli_snippets(repo_root: Path = Path(".")) -> bool:
+    """Parse documented `imednet ...` CLI invocations against imednet.cli.get_parser()."""
+    print("Checking documented imednet CLI commands against CLI argument parser...")
+    default_root = Path(__file__).resolve().parent.parent
+    for root in (repo_root, default_root):
+        for pkg_sub in (
+            "packages/core/src",
+            "packages/plugins-workflows/src",
+            "packages/plugins-sinks/src",
+            "packages/plugins-tui/src",
+            "packages/providers-airflow/src",
+        ):
+            src_dir = (root / pkg_sub).resolve()
+            if src_dir.is_dir() and str(src_dir) not in sys.path:
+                sys.path.insert(0, str(src_dir))
+
+    from imednet.cli import get_parser
+
+    parser = get_parser()
+    _patch_cli_parser_errors(parser)
+
+    candidates: list[Path] = []
+    root_readme = repo_root / "README.md"
+    if root_readme.is_file():
+        candidates.append(root_readme)
+    packages_dir = repo_root / "packages"
+    if packages_dir.exists():
+        candidates.extend(sorted(packages_dir.glob("*/README.md")))
+    docs_dir = repo_root / "docs"
+    if docs_dir.exists():
+        candidates.extend(sorted(docs_dir.rglob("*.rst")))
+        candidates.extend(sorted(docs_dir.rglob("*.md")))
+    examples_dir = repo_root / "examples"
+    if examples_dir.exists():
+        candidates.extend(sorted(examples_dir.rglob("*.md")))
+
+    has_errors = False
+    checked_count = 0
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        rel_parts = path.relative_to(repo_root).parts
+        if any(part in _DOC_EXCLUDED_PARTS for part in rel_parts):
+            continue
+
+        for start_line, block in _extract_shell_code_blocks(path):
+            logical_lines: list[tuple[int, str]] = []
+            acc = ""
+            acc_line = start_line
+            for offset, raw_line in enumerate(block.splitlines()):
+                stripped = raw_line.strip()
+                if not acc:
+                    acc_line = start_line + offset
+                if stripped.endswith("\\") and not stripped.startswith("#"):
+                    acc += stripped[:-1] + " "
+                else:
+                    acc += stripped
+                    logical_lines.append((acc_line, acc.strip()))
+                    acc = ""
+            if acc:
+                logical_lines.append((acc_line, acc.strip()))
+
+            for lineno, cmd_line in logical_lines:
+                if not cmd_line or cmd_line.startswith("#"):
+                    continue
+                normalized_cmd = cmd_line[2:].strip() if cmd_line.startswith("$ ") else cmd_line
+
+                try:
+                    segments = _split_shell_pipeline(normalized_cmd)
+                except ValueError as exc:
+                    if "imednet" in normalized_cmd:
+                        print(f"Error: Malformed shell command at {path}:{lineno}: {exc}")
+                        has_errors = True
+                    continue
+
+                for seg in segments:
+                    cmd_tokens = list(seg)
+                    while cmd_tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", cmd_tokens[0]):
+                        cmd_tokens = cmd_tokens[1:]
+                    if cmd_tokens[:2] == ["uv", "run"]:
+                        cmd_tokens = cmd_tokens[2:]
+                    if cmd_tokens and cmd_tokens[0] == "imednet":
+                        checked_count += 1
+                        try:
+                            with (
+                                contextlib.redirect_stdout(io.StringIO()),
+                                contextlib.redirect_stderr(io.StringIO()),
+                            ):
+                                parser.parse_args(cmd_tokens[1:])
+                        except SystemExit as exc:
+                            if exc.code not in (0, None):
+                                print(
+                                    f"Error: Invalid CLI command '{' '.join(cmd_tokens)}' at {path}:{lineno} "
+                                    f"(exited with code {exc.code})"
+                                )
+                                has_errors = True
+                        except _CLIValidationError as exc:
                             print(
-                                f"Error: TODO found in __init__ docstring of class {node.name} in {py_file}"
+                                f"Error: Invalid CLI command '{' '.join(cmd_tokens)}' at {path}:{lineno}: {exc}"
                             )
-                            has_todos = True
-    if not has_todos:
-        print("No TODOs found in __init__ docstrings.")
-    return has_todos
+                            has_errors = True
+
+    if not has_errors:
+        print(f"CLI command validation passed ({checked_count} command(s) verified).")
+    return has_errors
 
 
 def check_packages_registered() -> bool:
@@ -1101,6 +1411,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Run validation scripts."""
     args = parse_args(argv)
     todos_failed = check_todos_in_init()
+    extras_failed = check_documented_extras()
+    cli_failed = check_cli_snippets()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
     adr_failed = check_adr_records()
@@ -1114,6 +1426,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if (
         todos_failed
+        or extras_failed
+        or cli_failed
         or packages_failed
         or docs_failed
         or adr_failed

@@ -1,26 +1,23 @@
-"""TODO: Add docstring."""
+"""Retrieve all data for a single subject via :class:`SubjectDataWorkflow`.
+
+Demonstrates:
+1. Initializing the :class:`ImednetSDK` client.
+2. Using :class:`SubjectDataWorkflow` to gather subject details, visits, records, and queries.
+3. Displaying a summary of the returned information.
+"""
+
+import os
 
 from imednet import ImednetSDK
 from imednet_workflows.subject_data import SubjectDataWorkflow
 
-"""Example retrieving all data for a single subject via ``SubjectDataWorkflow``.
+api_key = os.getenv("IMEDNET_API_KEY") or None
+security_key = os.getenv("IMEDNET_SECURITY_KEY") or None
+base_url = os.getenv("IMEDNET_BASE_URL") or None
+study_key = os.getenv("IMEDNET_STUDY_KEY") or "STUDY"
+subject_key = os.getenv("IMEDNET_SUBJECT_KEY") or "SUB1"
 
-This script demonstrates how to:
-1. Initialize the :class:`ImednetSDK` client.
-2. Use :class:`SubjectDataWorkflow` to gather subject details, visits, records, and queries.
-3. Display a summary of the returned information.
-
-Replace the ``XXXXXXXXXX`` placeholders with real values before running.
-"""
-
-api_key = "XXXXXXXXXX"
-security_key = "XXXXXXXXXX"
-base_url = None  # Or set to your custom base URL if needed
-study_key = "XXXXXXXXXX"
-subject_key = "XXXXXXXXXX"
-
-try:
-    sdk = ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url)
+with ImednetSDK(api_key=api_key, security_key=security_key, base_url=base_url) as sdk:
     workflow = SubjectDataWorkflow(sdk)
     data = workflow.get_all_subject_data(study_key=study_key, subject_key=subject_key)
 
@@ -38,5 +35,3 @@ try:
     print(f"Queries ({len(data.queries)}):")
     for query in data.queries[:5]:
         print(f" - Annotation ID: {query.annotation_id}, Type: {query.type}")
-except Exception as exc:
-    print(f"Error fetching subject data: {exc}")

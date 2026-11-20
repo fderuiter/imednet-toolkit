@@ -1,11 +1,3 @@
-"""TODO: Add docstring."""
-
-from datetime import datetime
-
-from airflow import DAG
-
-from apache_airflow_providers_imednet import ImednetJobSensor
-
 """Example DAG demonstrating :class:`ImednetJobSensor` to monitor an iMednet job.
 
 This sensor periodically polls iMednet until the specified job reaches a
@@ -15,16 +7,22 @@ terminal state. Configuration is similar to ``ImednetExportOperator``:
   Environment variables ``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY`` may be
   used as fallbacks.
 - ``base_url`` can be provided in ``extra`` or via ``IMEDNET_BASE_URL`` when
-  targeting a non‑default environment.
+  targeting a non-default environment.
 
 Update ``STUDY_KEY`` and ``BATCH_ID`` with real values before running.
 """
+
+from datetime import datetime
+
+from airflow import DAG
+
+from apache_airflow_providers_imednet import ImednetJobSensor
 
 default_args = {"start_date": datetime(2024, 1, 1)}
 
 with DAG(
     dag_id="imednet_job_sensor_example",
-    schedule_interval=None,
+    schedule=None,
     default_args=default_args,
     catchup=False,
 ) as dag:

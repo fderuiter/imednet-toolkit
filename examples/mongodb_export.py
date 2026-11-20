@@ -24,8 +24,16 @@ from imednet_sinks import MongoDbSinkConfig, export_to_mongodb
 
 from imednet import ImednetSDK
 
+_SIM_MODE = os.environ.get("IMEDNET_SIMULATION_MODE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 sdk = ImednetSDK(
-    api_key=os.environ["IMEDNET_API_KEY"],
+    api_key=os.environ.get("IMEDNET_API_KEY")
+    or ("sim-api-placeholder" if _SIM_MODE else os.environ["IMEDNET_API_KEY"]),
     security_key=os.environ.get("IMEDNET_SECURITY_KEY", ""),
 )
 

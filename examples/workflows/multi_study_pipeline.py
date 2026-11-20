@@ -55,7 +55,7 @@ def extract_study_data(
 
 
 def main() -> int:
-    """TODO: Add docstring."""
+    """Run the multi-study extraction pipeline and return a process exit code."""
     whitelist_raw = os.getenv("IMEDNET_WHITELIST", "")
     blacklist_raw = os.getenv("IMEDNET_BLACKLIST", "")
     max_workers = int(os.getenv("IMEDNET_MAX_WORKERS", "4"))
