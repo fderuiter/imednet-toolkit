@@ -360,6 +360,79 @@ def test_dataframe_raises_importerror_when_pandas_missing(monkeypatch) -> None:
         mapper.dataframe("STUDY")
 
 
+def test_iter_dataframes_streams_multiple_chunks_deterministically() -> None:
+    """Test RecordMapper.iter_dataframes yields multiple bounded chunks with deterministic inputs."""
+
+    class _DeterministicLoader:
+        """Deterministic cached loader double for multi-chunk streaming verification."""
+
+        def __init__(self) -> None:
+            """Initialize the test loader."""
+            self.sync_records = MagicMock()
+
+        def iter_cached_records(self, study_key: str, *, chunk_size: int = 2):
+            """Yield five deterministic records across multiple chunks."""
+            assert study_key == "STUDY"
+            assert chunk_size == 2
+            for idx in range(5):
+                yield Record(
+                    study_key="STUDY",
+                    record_id=idx + 1,
+                    subject_key=f"SUBJ-{idx + 1:03d}",
+                    visit_id=(idx % 2) + 1,
+                    form_id=10,
+                    form_key="LAB",
+                    record_status="Complete",
+                    date_created=datetime(2024, 1, idx + 1),
+                    record_data={
+                        "AGE": 30 + idx,
+                        "COMMENT": f"note-{idx}",
+                    },
+                )
+
+    sdk = MagicMock()
+    sdk.get_variables.return_value = [
+        Variable(variable_name="AGE", label="Age", form_id=10),
+        Variable(variable_name="COMMENT", label="Comment", form_id=10),
+    ]
+    loader = _DeterministicLoader()
+    mapper = RecordMapper(sdk, loader=loader, chunk_size=2)
+
+    frames = list(mapper.iter_dataframes("STUDY", use_labels_as_columns=False))
+
+    loader.sync_records.assert_called_once_with("STUDY")
+    assert [len(frame) for frame in frames] == [2, 2, 1]
+    assert list(frames[0].columns) == [
+        "recordId",
+        "subjectKey",
+        "visitId",
+        "formId",
+        "recordStatus",
+        "dateCreated",
+        "AGE",
+        "COMMENT",
+    ]
+    assert frames[0]["AGE"].tolist() == [30, 31]
+    assert frames[1]["AGE"].tolist() == [32, 33]
+    assert frames[2]["AGE"].tolist() == [34]
+    assert frames[2]["COMMENT"].tolist() == ["note-4"]
+
+
+def test_record_mapping_example_import_has_no_filesystem_side_effects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Verify importing examples.workflows.record_mapping does not write files."""
+    import importlib
+    import sys
+
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("examples.workflows.record_mapping", None)
+    mod = importlib.import_module("examples.workflows.record_mapping")
+    assert hasattr(mod, "main")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.performance
 def test_iter_dataframes_streams_large_study_with_bounded_memory() -> None:
     """Test that iter dataframes streams large study with bounded memory."""
     fake = Faker()

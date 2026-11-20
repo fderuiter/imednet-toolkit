@@ -58,14 +58,6 @@ from imednet.models.jobs import JobStatus
 
 
 @pytest.fixture(autouse=True)
-def reload_cli():
-    """Ensure cli module is fresh and has all original commands bound to app."""
-    importlib.reload(cli)
-    yield
-    importlib.reload(cli)
-
-
-@pytest.fixture(autouse=True)
 def env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set required environment variables for each test."""
     monkeypatch.setenv("IMEDNET_API_KEY", "key")

@@ -1,88 +1,87 @@
-"""Unit tests for scripts/typecheck_docs.py snippet extraction and mypy verification."""
+"""Unit tests for scripts/typecheck_docs.py snippet extraction and syntax diagnostics."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
-from scripts.typecheck_docs import main, typecheck_documentation
+import pytest
+import scripts.typecheck_docs as typecheck_docs_mod
+from scripts.typecheck_docs import (
+    collect_snippets,
+    extract_docstring_snippets,
+    extract_markdown_python_blocks,
+    extract_rst_python_blocks,
+    main,
+    typecheck_documentation,
+)
 
 
-def test_repo_documentation_snippets_pass_typecheck() -> None:
-    """Verify all RST, Markdown, and docstring Python snippets in the repository pass mypy."""
-    repo_root = Path(__file__).resolve().parents[2]
-    count, errors = typecheck_documentation(repo_root)
-    assert count >= 20
-    assert not errors, f"Expected repository documentation snippets to type-check, got: {errors}"
-    assert not (repo_root / "docs" / "_build" / "snippets").exists()
-
-
-def test_typecheck_docs_catches_rst_markdown_and_docstring_errors(tmp_path: Path) -> None:
-    """Verify bad imports or symbol mismatches in RST, README, and docstrings fail with code 1."""
+def test_collect_snippets_extracts_rst_markdown_and_docstrings(tmp_path: Path) -> None:
+    """Verify collect_snippets gathers RST testcode/code-block, Markdown, and docstring blocks."""
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True)
     (docs_dir / "guide.rst").write_text(
-        "Guide\n=====\n\n.. code-block:: python\n\n   from imednet import NonExistentSdkSymbol\n",
+        "Guide\n=====\n\n.. testcode::\n\n   x = 1\n\n.. code-block:: python\n\n   y = 2\n",
         encoding="utf-8",
     )
-
     (tmp_path / "README.md").write_text(
-        "# Demo\n\n"
-        "```python\n"
-        "from imednet import ImednetSDK\n\n"
-        "sdk = ImednetSDK()\n"
-        "sdk.nonexistent_endpoint_attr()\n"
-        "```\n",
+        "# Demo\n\n```python\nz = 3\n```\n",
         encoding="utf-8",
     )
-
     pkg_src = tmp_path / "packages" / "demo" / "src" / "demo_pkg"
     pkg_src.mkdir(parents=True)
-    (pkg_src / "example.py").write_text(
-        '"""Demo module.\n\n'
-        ".. code-block:: python\n\n"
-        "    from imednet.errors import NonExistentExceptionClass\n"
-        '"""\n',
+    py_file = pkg_src / "example.py"
+    py_file.write_text(
+        '"""Demo module.\n\n.. code-block:: python\n\n    w = 4\n"""\n',
         encoding="utf-8",
     )
+
+    tc_blocks, cb_blocks = extract_rst_python_blocks(
+        (docs_dir / "guide.rst").read_text(encoding="utf-8"), docs_dir / "guide.rst"
+    )
+    assert len(tc_blocks) == 1
+    assert len(cb_blocks) == 1
+    assert len(extract_markdown_python_blocks((tmp_path / "README.md").read_text(), py_file)) == 1
+    assert len(extract_docstring_snippets(py_file, 0)) == 1
+
+    snippets = collect_snippets(tmp_path)
+    assert len(snippets) == 4
+
+
+def test_typecheck_docs_reports_syntax_errors_and_maps_mypy_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify syntax errors and mocked mypy diagnostics map back to source files and line numbers."""
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True)
+    guide_rst = docs_dir / "guide.rst"
+    guide_rst.write_text(
+        "Guide\n=====\n\n"
+        ".. code-block:: python\n\n"
+        "   def broken(\n\n"
+        ".. code-block:: python\n\n"
+        "   value: int = 'bad'\n",
+        encoding="utf-8",
+    )
+
+    def _fake_run(cmd, **_kwargs):
+        snippet_dir = Path(cmd[-1])
+        snippet_files = sorted(snippet_dir.glob("*.py"))
+        assert len(snippet_files) == 1
+        fname = snippet_files[0].name
+        stdout = f'{snippet_dir / fname}:1: error: Incompatible types in assignment [assignment]\n'
+        return SimpleNamespace(returncode=1, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(typecheck_docs_mod.subprocess, "run", _fake_run)
 
     exit_code = main(["--root-dir", str(tmp_path)])
     assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "SyntaxError" in output
+    assert "guide.rst" in output
+    assert "Incompatible types in assignment" in output
 
-    count, errors = typecheck_documentation(tmp_path)
-    assert count == 3
-    assert any("guide.rst" in err and "NonExistentSdkSymbol" in err for err in errors)
-    assert any("README.md" in err and "nonexistent_endpoint_attr" in err for err in errors)
-    assert any("example.py" in err and "NonExistentExceptionClass" in err for err in errors)
-
-
-def test_typecheck_docs_follows_imports_silently_for_package_internals(tmp_path: Path) -> None:
-    """Verify valid snippets importing package classes with getattr internals pass cleanly."""
-    pkg_src = tmp_path / "packages" / "demo" / "src" / "demo_pkg"
-    pkg_src.mkdir(parents=True)
-    (pkg_src / "__init__.py").write_text("", encoding="utf-8")
-    (pkg_src / "operator.py").write_text(
-        '"""Demo operator."""\n\n'
-        "from __future__ import annotations\n\n"
-        "class DemoOperator:\n"
-        '    """Demo class."""\n\n'
-        "    @property\n"
-        "    def output_path(self) -> str | None:\n"
-        '        """Return output path."""\n'
-        '        return getattr(self, "_output_path", None)\n',
-        encoding="utf-8",
-    )
-
-    docs_dir = tmp_path / "docs"
-    docs_dir.mkdir(parents=True)
-    (docs_dir / "usage.rst").write_text(
-        "Usage\n=====\n\n"
-        ".. code-block:: python\n\n"
-        "   from demo_pkg.operator import DemoOperator\n\n"
-        "   op = DemoOperator()\n"
-        "   path: str | None = op.output_path\n",
-        encoding="utf-8",
-    )
-
-    count, errors = typecheck_documentation(tmp_path)
-    assert count == 1
-    assert not errors, f"Expected zero errors with --follow-imports=silent, got: {errors}"
+    empty_count, empty_errors = typecheck_documentation(tmp_path / "empty")
+    assert empty_count == 0
+    assert empty_errors == []

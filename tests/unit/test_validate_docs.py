@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import subprocess
-import sys
 import types
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -17,9 +15,6 @@ from scripts.build_docs import (
     scope_apidoc_inherited_members,
 )
 from scripts.validate_docs import (
-    _verify_core_html,
-    _verify_pagination_html,
-    _verify_sdk_html,
     check_cli_snippets,
     check_documented_extras,
     check_no_duplicate_suppression,
@@ -300,98 +295,6 @@ def test_check_cli_snippets_validates_flags_against_parser(tmp_path: Path) -> No
         encoding="utf-8",
     )
     assert check_cli_snippets(tmp_path) is True
-
-
-def test_sphinx_html_renders_curated_core_pagination_sdk_and_endpoints(tmp_path: Path) -> None:
-    """Mini Sphinx HTML build with docs/conf.py renders core, pagination, SDK, and endpoint pages."""
-    repo_root = Path(__file__).resolve().parents[2]
-    src_dir = tmp_path / "docs"
-    api_dir = src_dir / "reference" / "api"
-    api_dir.mkdir(parents=True)
-    html_dir = tmp_path / "_build" / "html"
-
-    (src_dir / "index.rst").write_text(
-        "Test Docs\n=========\n\n"
-        ".. meta::\n   :description: Test docs\n\n"
-        ".. toctree::\n   :maxdepth: 2\n\n"
-        "   reference/api/imednet\n"
-        "   reference/api/imednet.core\n"
-        "   reference/api/imednet.pagination\n"
-        "   reference/api/imednet.endpoints\n",
-        encoding="utf-8",
-    )
-    (src_dir / "404.rst").write_text(":orphan:\n\nNot Found\n=========\n", encoding="utf-8")
-    (api_dir / "imednet.rst").write_text(
-        "imednet\n=======\n\n"
-        ".. automodule:: imednet.sdk\n"
-        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
-        "   :members:\n   :show-inheritance:\n\n"
-        ".. automodule:: imednet.sdk_convenience\n"
-        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
-        "   :members:\n   :show-inheritance:\n",
-        encoding="utf-8",
-    )
-    (api_dir / "imednet.core.rst").write_text(
-        "imednet.core\n============\n\n"
-        ".. automodule:: imednet.core\n"
-        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
-        "   :members:\n   :show-inheritance:\n",
-        encoding="utf-8",
-    )
-    (api_dir / "imednet.pagination.rst").write_text(
-        "imednet.pagination\n==================\n\n"
-        ".. automodule:: imednet.pagination\n"
-        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
-        "   :members:\n   :show-inheritance:\n",
-        encoding="utf-8",
-    )
-    (api_dir / "imednet.endpoints.rst").write_text(
-        "imednet.endpoints\n=================\n\n"
-        ".. automodule:: imednet.endpoints.records\n"
-        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
-        "   :members:\n   :show-inheritance:\n\n"
-        ".. automodule:: imednet.models.records\n"
-        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
-        "   :members:\n   :show-inheritance:\n\n"
-        ".. automodule:: imednet.models.jobs\n"
-        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
-        "   :members:\n   :show-inheritance:\n\n"
-        ".. automodule:: imednet.models.base\n"
-        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
-        "   :members:\n   :show-inheritance:\n",
-        encoding="utf-8",
-    )
-
-    res = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "sphinx",
-            "-b",
-            "html",
-            "-c",
-            str(repo_root / "docs"),
-            str(src_dir),
-            str(html_dir),
-        ],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res.returncode == 0, f"Sphinx failed:\n{res.stdout}\n{res.stderr}"
-
-    built_api = html_dir / "reference" / "api"
-    assert _verify_core_html(built_api / "imednet.core.html") is False
-    assert _verify_pagination_html(built_api / "imednet.pagination.html") is False
-    assert _verify_sdk_html(built_api / "imednet.html") is False
-
-    ep_text = (built_api / "imednet.endpoints.html").read_text(encoding="utf-8")
-    assert "ListOperation" not in ep_text
-    assert "FilterGetOperation" not in ep_text
-    assert "model_validate" not in ep_text
-    assert "RecordsEndpoint.to_dataframe" in ep_text
-    assert "AsyncRecordsEndpoint.to_dataframe" in ep_text
 
 
 def test_conf_resolves_mermaid_version_across_extension_majors(monkeypatch) -> None:

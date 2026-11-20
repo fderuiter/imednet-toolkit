@@ -41,10 +41,24 @@ EXPECTED_14_MODELS = {
 }
 
 
+_CONTRACT_LOADER_TESTS = {
+    "test_bundled_resource_resolution",
+    "test_custom_postman_path_override",
+    "test_custom_openapi_path_override",
+    "test_missing_postman_path_raises_file_not_found",
+    "test_missing_openapi_path_raises_file_not_found",
+    "test_missing_contract_raises_file_not_found",
+    "test_empty_specification_raises_runtime_error",
+    "test_bundled_and_local_fallback_contract_resolution",
+}
+_DEFAULT_CONTRACT = get_contract()
+
+
 @pytest.fixture(autouse=True)
-def _reset_engine_cache(monkeypatch):
+def _reset_engine_cache(request, monkeypatch):
     """Ensure a clean contract and model cache for each test."""
-    monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+    initial_contract = None if request.node.name in _CONTRACT_LOADER_TESTS else _DEFAULT_CONTRACT
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", initial_contract)
     monkeypatch.setattr(ModelEngine, "_model_cache", {})
 
 
@@ -523,8 +537,18 @@ def test_stub_cli_check_detects_drift_and_missing_stubs(tmp_path):
     import shutil
 
     models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
-    for f in sorted(models_dir.glob("*.py*")):
-        shutil.copy2(f, tmp_path / f.name)
+    for name in (
+        "__init__.py",
+        "base.py",
+        "base.pyi",
+        "contract.py",
+        "engine.py",
+        "studies.py",
+        "studies.pyi",
+    ):
+        src = models_dir / name
+        if src.exists():
+            shutil.copy2(src, tmp_path / src.name)
 
     assert engine._run_cli(["--check", str(tmp_path)]) == 0
 

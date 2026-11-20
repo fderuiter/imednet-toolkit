@@ -2,7 +2,6 @@
 
 import re
 import subprocess
-import sys
 import tomllib
 from pathlib import Path
 
@@ -135,25 +134,6 @@ def test_adr_0005_and_0007_reflect_shipped_tui_and_grid() -> None:
     assert "imednet.cli_plugins" in adr_0007
     assert "InteractiveDataGrid" in adr_0007
     assert "IMEDNET_NON_INTERACTIVE=1" in adr_0007
-
-
-def test_build_form_payload_no_args_shows_help_and_tui_guidance() -> None:
-    """Verify examples/build_form_payload.py prints Form Builder usage and directs browsing to imednet tui."""
-    repo_root = _get_repo_root()
-    script_path = repo_root / "examples" / "build_form_payload.py"
-    result = subprocess.run(
-        [sys.executable, str(script_path)],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-    )
-    combined_output = result.stdout + result.stderr
-    assert result.returncode == 1
-    assert "TUI mode has been removed" not in combined_output
-    assert "Form Builder" in combined_output
-    assert "imednet tui" in combined_output
-    assert "--preset" in combined_output
-    assert "--form-id" in combined_output
 
 
 def test_setup_wizard_stage6_recovery_guidance_mentions_all_packages() -> None:

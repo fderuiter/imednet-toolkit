@@ -125,7 +125,7 @@ def test_save_form_retries_http_429_and_does_not_retry_403_or_network_error(
     endpoint = f"{base_url}/app/formdez/formdez_save.php"
 
     # Avoid sleeping during retry unit test
-    monkeypatch.setattr("tenacity.nap.sleep", lambda _s: None)
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _s: None)
 
     # 1. HTTP 429 twice -> HTTP 200 succeeds on attempt 3
     route = respx_mock.post(endpoint)

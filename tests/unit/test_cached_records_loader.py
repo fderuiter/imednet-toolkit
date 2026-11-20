@@ -76,8 +76,11 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
     }
 
 
-def test_cached_loader_retries_record_fetches(tmp_path: Path) -> None:
+def test_cached_loader_retries_record_fetches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test that cached loader retries record fetches."""
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _delay: None)
     sdk = MagicMock()
     record = _record(1, "2024-01-01 00:00:00+00:00")
     sdk.get_records.side_effect = [RuntimeError("temporary"), [record], [record]]

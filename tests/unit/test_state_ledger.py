@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
-import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -186,8 +184,8 @@ def test_state_ledger_flock_concurrency(tmp_path) -> None:
     t2 = threading.Thread(target=second_thread)
     t2.start()
 
-    # Main thread sleeps a bit, then releases the lock from the first thread
-    time.sleep(0.5)
+    # Main thread sleeps briefly, then releases the lock from the first thread
+    time.sleep(0.05)
     assert not lock_acquired_in_t2.is_set()
 
     release_lock.set()
@@ -573,15 +571,16 @@ def test_default_ledger_path_env_override(monkeypatch, tmp_path) -> None:
     assert isinstance(explicit_factory, FileStateProvider)
     assert explicit_factory.ledger_path == Path(explicit_path)
 
-    # Subprocess check to verify import-time DEFAULT_LEDGER_PATH resolution with env var set
-    code = (
-        "import os, sys; "
-        f"os.environ['IMEDNET_WORKFLOW_LEDGER_PATH'] = {custom_ledger!r}; "
-        "from imednet_workflows.state_ledger import DEFAULT_LEDGER_PATH; "
-        f"assert DEFAULT_LEDGER_PATH == {custom_ledger!r}"
-    )
-    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-    assert res.returncode == 0, f"Subprocess failed: {res.stderr}"
+    # Isolated module execution to verify import-time DEFAULT_LEDGER_PATH resolution with env var set
+    import importlib.util
+
+    import imednet_workflows.state_ledger as sl_mod
+
+    spec = importlib.util.spec_from_file_location("_isolated_state_ledger", sl_mod.__file__)
+    assert spec is not None and spec.loader is not None
+    isolated_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated_mod)
+    assert isolated_mod.DEFAULT_LEDGER_PATH == custom_ledger
 
 
 def test_cli_default_ledger_path_behavior() -> None:

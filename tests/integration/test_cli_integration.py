@@ -258,3 +258,38 @@ def test_codings_list_sends_filter_parameters(monkeypatch: pytest.MonkeyPatch) -
     sdk.codings.list.assert_called_once_with("STUDY_CLIN", dictionaryName="MedDRA")
     assert "COD_100" in result.stdout
     assert "MedDRA" in result.stdout
+
+
+def test_console_entrypoint_subprocess_with_offline_simulation() -> None:
+    """Verify console entrypoint subprocess outputs clean JSON in offline simulation mode."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = os.environ.copy()
+    env.update(
+        IMEDNET_API_KEY="offline",  # pragma: allowlist secret
+        IMEDNET_SECURITY_KEY="offline",  # pragma: allowlist secret
+        IMEDNET_OIDC_TOKEN="",
+        IMEDNET_SIMULATION_MODE="true",
+    )
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from imednet.cli import app; app()",
+            "studies",
+            "list",
+            "--format",
+            "json",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    response = json.loads(process.stdout)
+    assert response["schemaVersion"] == "1.0" and response["resource"] == "studies"
+    assert response["count"] == len(response["items"])
+    assert "Fetching" not in process.stdout

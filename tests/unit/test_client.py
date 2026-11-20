@@ -3,6 +3,7 @@
 import httpx
 import pytest
 
+from imednet.core.retry import RetryConfig
 from imednet.errors import (
     BadRequestError,
     ConflictError,
@@ -38,6 +39,7 @@ def test_get_success(http_client, respx_mock_client, sample_data):
 )
 def test_request_error_mapping(http_client, respx_mock_client, status, exc):
     """Test that request error mapping."""
+    http_client._executor.retry_config = RetryConfig(backoff_factor=0.0)
     respx_mock_client.get("/path").mock(return_value=httpx.Response(status, json={"err": "x"}))
 
     with pytest.raises(exc):

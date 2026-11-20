@@ -72,7 +72,7 @@ def test_default_retry_policy_retries_connection_error(respx_mock_external) -> N
         api_key="k",
         security_key="s",
         base_url="https://example.com",
-        retry_config=RetryConfig(retries=2),
+        retry_config=RetryConfig(retries=2, backoff_factor=0.0),
     )
     # Simulate a persistent connection error
     route = respx_mock_external.get("/test").mock(
@@ -86,7 +86,7 @@ def test_default_retry_policy_retries_connection_error(respx_mock_external) -> N
 
     assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
 
-    # Should attempt 3 times (default retry_config=RetryConfig(retries=2))
+    # Should attempt 3 times (retry_config=RetryConfig(retries=2, backoff_factor=0.0))
     assert route.call_count == 3
 
 
@@ -96,7 +96,7 @@ def test_default_retry_policy_retries_on_500(respx_mock_external) -> None:
         api_key="k",
         security_key="s",
         base_url="https://example.com",
-        retry_config=RetryConfig(retries=2),
+        retry_config=RetryConfig(retries=2, backoff_factor=0.0),
     )
     route = respx_mock_external.get("/test").mock(return_value=httpx.Response(500))
 
@@ -113,7 +113,7 @@ def test_default_retry_policy_retries_on_429(respx_mock_external) -> None:
         api_key="k",
         security_key="s",
         base_url="https://example.com",
-        retry_config=RetryConfig(retries=2),
+        retry_config=RetryConfig(retries=2, backoff_factor=0.0),
     )
     route = respx_mock_external.get("/test").mock(return_value=httpx.Response(429))
 
@@ -131,7 +131,7 @@ async def test_default_retry_policy_async_retries_on_500(respx_mock_external) ->
         api_key="k",
         security_key="s",
         base_url="https://example.com",
-        retry_config=RetryConfig(retries=2),
+        retry_config=RetryConfig(retries=2, backoff_factor=0.0),
     )
 
     route = respx_mock_external.get("/test").mock(return_value=httpx.Response(500))
@@ -149,7 +149,7 @@ def test_default_retry_policy_post_does_not_retry_on_server_error(respx_mock_ext
         api_key="k",
         security_key="s",
         base_url="https://example.com",
-        retry_config=RetryConfig(retries=2),
+        retry_config=RetryConfig(retries=2, backoff_factor=0.0),
     )
     route = respx_mock_external.post("/test").mock(return_value=httpx.Response(503))
 
@@ -166,7 +166,7 @@ def test_default_retry_policy_post_retries_on_rate_limit(respx_mock_external) ->
         api_key="k",
         security_key="s",
         base_url="https://example.com",
-        retry_config=RetryConfig(retries=2),
+        retry_config=RetryConfig(retries=2, backoff_factor=0.0),
     )
     route = respx_mock_external.post("/test").mock(return_value=httpx.Response(429))
 

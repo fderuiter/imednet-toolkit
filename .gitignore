@@ -81,8 +81,10 @@ logs/
 pip-wheel-metadata/
 
 study_structure_output/
+record_mapping_output/
 
 examples/variables_output
+examples/workflows/record_mapping_output/
 
 examples/register_subjects_input/*
 !examples/register_subjects_input/sample_subjects.json

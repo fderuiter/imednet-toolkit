@@ -26,7 +26,7 @@ def test_retry_logic_retries_request_errors() -> None:
         api_key="A",
         security_key="B",
         base_url="https://api.test",
-        retry_config=RetryConfig(retries=1),
+        retry_config=RetryConfig(retries=1, backoff_factor=0.0),
     )
     call_count = {"count": 0}
 
@@ -60,7 +60,12 @@ def test_retry_logic_retries_request_errors() -> None:
 )
 def test_request_error_mapping(status, exc) -> None:
     """Test that request error mapping."""
-    client = Client(api_key="A", security_key="B", base_url="https://api.test")
+    client = Client(
+        api_key="A",
+        security_key="B",
+        base_url="https://api.test",
+        retry_config=RetryConfig(backoff_factor=0.0),
+    )
 
     with respx.mock(assert_all_called=True, assert_all_mocked=True) as respx_mock:
         respx_mock.get("https://api.test/some").respond(status_code=status, json={"error": status})

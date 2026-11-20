@@ -14,6 +14,7 @@ import pytest_asyncio
 
 # Ensure a default security key is set for testing encryption/decryption
 os.environ.setdefault("IMEDNET_SECURITY_KEY", "test_sec_key")
+os.environ.setdefault("LC_MESSAGES", "C")
 
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_TESTS_DIR = (ROOT / "tests" / "live").resolve()
@@ -24,9 +25,166 @@ for source_root in (
 ):
     sys.path.insert(0, str(source_root))
 
+import importlib.metadata as _importlib_metadata
+import ssl as _ssl
+
+import respx
+import respx.mocks as _respx_mocks
+
+_orig_entry_points = _importlib_metadata.entry_points
+_entry_points_cache: dict[tuple[tuple[str, ...], tuple[tuple[str, object], ...]], object] = {}
+
+
+def _cached_entry_points(**params: object):  # type: ignore[no-untyped-def]
+    """Cache entry point lookups across tests when sys.path is unchanged."""
+    key = (tuple(sys.path), tuple(sorted(params.items())))
+    cached = _entry_points_cache.get(key)
+    if cached is None:
+        cached = _orig_entry_points(**params)
+        _entry_points_cache[key] = cached
+    return cached
+
+
+_importlib_metadata.entry_points = _cached_entry_points  # type: ignore[assignment]
+
+_orig_ssl_create_default_context = _ssl.create_default_context
+_ssl_context_cache: dict[tuple[_ssl.Purpose, str | None], _ssl.SSLContext] = {}
+
+
+def _cached_ssl_create_default_context(
+    purpose: _ssl.Purpose = _ssl.Purpose.SERVER_AUTH,
+    *,
+    cafile: str | None = None,
+    capath: str | None = None,
+    cadata: str | bytes | None = None,
+) -> _ssl.SSLContext:
+    """Reuse default SERVER_AUTH SSLContext instances across HTTP clients in tests."""
+    if purpose == _ssl.Purpose.SERVER_AUTH and capath is None and cadata is None:
+        cache_key = (purpose, cafile)
+        cached_ctx = _ssl_context_cache.get(cache_key)
+        if cached_ctx is None:
+            cached_ctx = _orig_ssl_create_default_context(purpose, cafile=cafile)
+            _ssl_context_cache[cache_key] = cached_ctx
+        return cached_ctx
+    return _orig_ssl_create_default_context(purpose, cafile=cafile, capath=capath, cadata=cadata)
+
+
+_ssl.create_default_context = _cached_ssl_create_default_context  # type: ignore[assignment]
+
+_orig_httpcore_mocker_stop = _respx_mocks.HTTPCoreMocker.stop
+_keep_respx_patches = False
+
+
+def _warm_httpcore_mocker_stop(force: bool = False) -> None:
+    """Keep httpcore transport patches warm between non-live tests."""
+    if _keep_respx_patches and not force:
+        return
+    _orig_httpcore_mocker_stop(force=force)
+
+
+_respx_mocks.HTTPCoreMocker.stop = _warm_httpcore_mocker_stop  # type: ignore[method-assign]
+
+_cli_parser_cache: dict[tuple[object, ...], object] = {}
+
+
+def _ensure_cli_parser_cached() -> None:
+    """Wrap imednet.cli.get_parser with an entry-point-aware cache during tests."""
+    cli_mod = sys.modules.get("imednet.cli")
+    if cli_mod is None:
+        return
+    current_get_parser = getattr(cli_mod, "get_parser", None)
+    if current_get_parser is None or getattr(current_get_parser, "_is_test_cached", False):
+        return
+
+    def _cached_get_parser():  # type: ignore[no-untyped-def]
+        app_fn = getattr(cli_mod, "app", None)
+        if app_fn is None or sys._getframe(1).f_code is not app_fn.__code__:
+            return current_get_parser()
+        if _importlib_metadata.entry_points is not _cached_entry_points:
+            return current_get_parser()
+        if any(type(f).__module__.startswith("tests.") for f in sys.meta_path):
+            return current_get_parser()
+        wf_mod = sys.modules.get("imednet_workflows")
+        wf_cli = sys.modules.get("imednet_workflows.cli")
+        tui_mod = sys.modules.get("imednet_tui")
+        tui_cli = sys.modules.get("imednet_tui.cli")
+        if "imednet_workflows" in sys.modules and wf_mod is None:
+            return current_get_parser()
+        if "imednet_tui" in sys.modules and tui_mod is None:
+            return current_get_parser()
+        ledger_default = str(getattr(wf_cli, "DEFAULT_LEDGER_PATH", ""))
+        prog_key = sys.argv[0] if sys.argv else ""
+        key = (
+            id(cli_mod),
+            id(wf_mod),
+            id(wf_cli),
+            id(getattr(wf_cli, "setup_parser", None)),
+            id(tui_mod),
+            id(tui_cli),
+            id(getattr(tui_cli, "setup_parser", None)),
+            prog_key,
+            ledger_default,
+        )
+        cached_parser = _cli_parser_cache.get(key)
+        if cached_parser is None:
+            built_parser = current_get_parser()
+            sub_actions = [a for a in built_parser._actions if hasattr(a, "choices") and a.choices]
+            choices = sub_actions[0].choices if sub_actions else {}
+            wf_func = choices["workflows"].get_default("func") if "workflows" in choices else None
+            tui_func = choices["tui"].get_default("func") if "tui" in choices else None
+            if getattr(wf_func, "__name__", "") == "workflows_stub" or (
+                getattr(tui_func, "__name__", "") == "tui_stub"
+            ):
+                return built_parser
+            _cli_parser_cache[key] = built_parser
+            cached_parser = built_parser
+        return cached_parser
+
+    _cached_get_parser._is_test_cached = True  # type: ignore[attr-defined]
+    cli_mod.get_parser = _cached_get_parser  # type: ignore[attr-defined]
+
+
 from imednet.core.async_client import AsyncClient
 from imednet.core.client import Client
 from imednet.core.context import clear_study_context
+from imednet.core.operations.circuit_breaker import get_global_circuit_breaker
+from imednet.core.retry import RetryConfig
+from imednet.utils import db as _imednet_db
+
+_GLOBAL_CIRCUIT_BREAKER = get_global_circuit_breaker()
+_DEFAULT_RESPX_BASES = dict(respx.mock._bases)
+_respx_session_guard_active = False
+
+_orig_core_get_sqlite_connection = _imednet_db.get_sqlite_connection
+
+
+def _fast_core_get_sqlite_connection(*args, **kwargs):  # type: ignore[no-untyped-def]
+    """Disable fsync on test SQLite connections while preserving WAL mode."""
+    conn = _orig_core_get_sqlite_connection(*args, **kwargs)
+    conn.execute("PRAGMA synchronous=OFF;")
+    return conn
+
+
+_imednet_db.get_sqlite_connection = _fast_core_get_sqlite_connection  # type: ignore[assignment]
+try:
+    import imednet.spi.utils as _imednet_spi_utils
+
+    _imednet_spi_utils.get_sqlite_connection = _fast_core_get_sqlite_connection  # type: ignore[assignment]
+except ImportError:
+    pass
+try:
+    import imednet_workflows.cached_loader as _wf_cached_loader
+
+    _orig_wf_get_sqlite_connection = _wf_cached_loader.get_sqlite_connection
+
+    def _fast_wf_get_sqlite_connection(*args, **kwargs):  # type: ignore[no-untyped-def]
+        conn = _orig_wf_get_sqlite_connection(*args, **kwargs)
+        conn.execute("PRAGMA synchronous=OFF;")
+        return conn
+
+    _wf_cached_loader.get_sqlite_connection = _fast_wf_get_sqlite_connection  # type: ignore[assignment]
+except ImportError:
+    pass
 
 
 def pytest_addoption(parser):
@@ -55,7 +213,25 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(skip_performance)
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(scope="session", autouse=True)
+def _warm_respx_transport_patches():
+    """Keep respx transport patches and strict mock router active across the session."""
+    global _keep_respx_patches, _respx_session_guard_active
+    _keep_respx_patches = True
+    _respx_mocks.HTTPCoreMocker.start()
+    respx.mock.start()
+    _respx_session_guard_active = True
+    try:
+        yield
+    finally:
+        if _respx_session_guard_active:
+            respx.mock.stop()
+            _respx_session_guard_active = False
+        _keep_respx_patches = False
+        _orig_httpcore_mocker_stop(force=True)
+
+
+@pytest.fixture
 def block_external_requests(request: pytest.FixtureRequest):
     """Block real network calls in all non-live tests.
 
@@ -89,25 +265,42 @@ def _is_live_test(node: object) -> bool:
     if node_path is None:
         return False
 
-    return Path(str(node_path)).resolve().is_relative_to(LIVE_TESTS_DIR)
+    path = node_path if isinstance(node_path, Path) else Path(str(node_path))
+    if path.is_absolute() and ".." not in path.parts and path.is_relative_to(ROOT):
+        return path.is_relative_to(LIVE_TESTS_DIR)
+    return path.resolve().is_relative_to(LIVE_TESTS_DIR)
 
 
-@pytest.fixture(autouse=True)
-def reset_study_context_between_tests():
-    """Reset the global study context before and after each test to ensure isolation."""
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Reset study context, circuit breaker, CLI parser cache, and network guard before each test."""
+    global _respx_session_guard_active
+    if _keep_respx_patches:
+        if _is_live_test(item):
+            if _respx_session_guard_active:
+                respx.mock.stop()
+                _orig_httpcore_mocker_stop(force=True)
+                _respx_session_guard_active = False
+        elif not _respx_session_guard_active:
+            _respx_mocks.HTTPCoreMocker.start()
+            respx.mock.start()
+            _respx_session_guard_active = True
+
+    _ensure_cli_parser_cached()
     clear_study_context()
-    yield
+    _GLOBAL_CIRCUIT_BREAKER.reset()
+
+
+def pytest_runtest_teardown(item: pytest.Item) -> None:
+    """Reset study context, circuit breaker, and dirty respx router state after each test."""
+    if _respx_session_guard_active and (
+        respx.mock.routes._routes or respx.mock.calls or respx.mock._bases != _DEFAULT_RESPX_BASES
+    ):
+        respx.mock.clear()
+        respx.mock.reset()
+        respx.mock._bases = dict(_DEFAULT_RESPX_BASES)
+
     clear_study_context()
-
-
-@pytest.fixture(autouse=True)
-def reset_circuit_breaker_between_tests():
-    """Reset the global circuit breaker before and after each test to ensure state isolation."""
-    from imednet.core.operations.circuit_breaker import get_global_circuit_breaker
-
-    get_global_circuit_breaker().reset()
-    yield
-    get_global_circuit_breaker().reset()
+    _GLOBAL_CIRCUIT_BREAKER.reset()
 
 
 class DummyResponse:
@@ -317,7 +510,12 @@ def patch_build_filter(monkeypatch):
 @pytest.fixture
 def http_client():
     """Provide a synchronous Client instance configured for testing."""
-    return Client("key", "secret", base_url="https://api.test")
+    return Client(
+        "key",
+        "secret",
+        base_url="https://api.test",
+        retry_config=RetryConfig(backoff_factor=0.0),
+    )
 
 
 @pytest_asyncio.fixture
@@ -326,7 +524,12 @@ async def async_http_client():
 
     This fixture ensures the client is properly closed after use.
     """
-    client = AsyncClient("key", "secret", base_url="https://api.test")
+    client = AsyncClient(
+        "key",
+        "secret",
+        base_url="https://api.test",
+        retry_config=RetryConfig(backoff_factor=0.0),
+    )
     try:
         yield client
     finally:

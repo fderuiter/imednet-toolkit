@@ -262,6 +262,7 @@ def test_airflow_read_state_no_imports(monkeypatch):
     provider = AirflowStateProvider()
     import sys
 
+    monkeypatch.setitem(sys.modules, "airflow", None)
     monkeypatch.setitem(sys.modules, "airflow.models.xcom", None)
 
     state = provider.read_state()

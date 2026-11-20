@@ -126,37 +126,17 @@ def test_usage_error_stays_exit_two_and_stderr(capsys):
     assert "invalid choice" in captured.err
 
 
-def test_console_entrypoint_with_offline_simulation():
-    import os
-    import subprocess
-    import sys
-
-    env = os.environ.copy()
-    env.update(
-        IMEDNET_API_KEY="offline",
-        IMEDNET_SECURITY_KEY="offline",
-        IMEDNET_OIDC_TOKEN="",
-        IMEDNET_SIMULATION_MODE="true",
-    )
-    process = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from imednet.cli import app; app()",
-            "studies",
-            "list",
-            "--format",
-            "json",
-        ],
-        env=env,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    response = json.loads(process.stdout)
+def test_console_entrypoint_with_offline_simulation(monkeypatch, capsys):
+    monkeypatch.setenv("IMEDNET_API_KEY", "offline")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "offline")
+    monkeypatch.setenv("IMEDNET_OIDC_TOKEN", "")
+    monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "true")
+    cli.app(["studies", "list", "--format", "json"])
+    captured = capsys.readouterr()
+    response = json.loads(captured.out)
     assert response["schemaVersion"] == "1.0" and response["resource"] == "studies"
     assert response["count"] == len(response["items"])
-    assert "Fetching" not in process.stdout
+    assert "Fetching" not in captured.out
 
 
 def test_users_and_codings_json_complete_aliases_and_no_contamination(sdk, capsys):

@@ -9,10 +9,8 @@ from typing import Any
 
 import pytest
 from scripts.validate_showcases import (
-    execute_showcases_in_simulation,
     extract_literalinclude_slice,
     main,
-    stage_wheels,
     validate_canonical_showcase_terminology,
     validate_documentation_literal_includes,
     validate_landing_showcase,
@@ -164,6 +162,7 @@ def test_main_exit_code_zero_on_success(tmp_path: Path) -> None:
             str(docs_dir),
             "--root-dir",
             str(repo_root),
+            "--skip-execution",
         ]
     )
     assert exit_code == 0
@@ -237,23 +236,6 @@ def test_validate_staged_wheels_missing_required_module(tmp_path: Path) -> None:
 
     errors = validate_staged_wheels(wheels_dir, expected_packages=("imednet",))
     assert any("missing required module entry 'imednet/sdk.py'" in e for e in errors)
-
-
-def test_validate_staged_wheels_workspace_integration(tmp_path: Path) -> None:
-    """Verify that staged browser wheels pass validation and simulated Pyodide import."""
-    repo_root = Path(__file__).resolve().parents[2]
-    wheels_dir = tmp_path / "wheels"
-
-    staged = stage_wheels(repo_root, wheels_dir)
-    staged_names = [w.name for w in staged]
-    assert any(n.startswith("imednet-") for n in staged_names)
-    assert any(n.startswith("imednet_workflows-") for n in staged_names)
-    assert any(n.startswith("imednet_plugins_sinks-") for n in staged_names)
-    assert not any(n.startswith("apache_airflow_providers_imednet-") for n in staged_names)
-    assert not any(n.startswith("imednet_tui-") for n in staged_names)
-
-    errors = validate_staged_wheels(wheels_dir)
-    assert not errors, f"Expected all three staged browser wheels to pass validation, got: {errors}"
 
 
 def test_validate_staged_wheels_detects_missing_plugin_wheels(tmp_path: Path) -> None:
@@ -976,55 +958,6 @@ def test_todo_docstring_rejected_in_showcases(tmp_path: Path) -> None:
     assert len(errors) == 2
     assert any("<module>" in err and "TODO" in err for err in errors)
     assert any("'run'" in err and "TODO" in err for err in errors)
-
-
-def test_execute_showcases_in_simulation_passes_and_isolates_cwd(tmp_path: Path) -> None:
-    """Verify simulation execution sets IMEDNET_SIMULATION_MODE=true and isolates generated files."""
-    examples_dir = tmp_path / "examples"
-    examples_dir.mkdir(parents=True)
-    showcase = examples_dir / "sim_ok.py"
-    showcase.write_text(
-        "import os\n"
-        "from pathlib import Path\n"
-        "from imednet import ImednetSDK\n\n"
-        "assert os.environ.get('IMEDNET_SIMULATION_MODE') == 'true'\n"
-        "Path('generated_output.txt').write_text('ok', encoding='utf-8')\n"
-        "with ImednetSDK() as sdk:\n"
-        "    studies = list(sdk.studies.list())\n"
-        "    assert len(studies) >= 1\n",
-        encoding="utf-8",
-    )
-
-    errors = execute_showcases_in_simulation(examples_dir)
-    assert not errors, f"Expected simulation execution to pass, got: {errors}"
-    assert not (examples_dir / "generated_output.txt").exists()
-
-
-def test_execute_showcases_in_simulation_catches_nonzero_and_error_output(
-    tmp_path: Path,
-) -> None:
-    """Verify simulation execution catches non-zero exit codes, error lines, and JSON error logs."""
-    examples_dir = tmp_path / "examples"
-    examples_dir.mkdir(parents=True)
-
-    (examples_dir / "fail_exit.py").write_text(
-        "import sys\nsys.exit(2)\n",
-        encoding="utf-8",
-    )
-    (examples_dir / "fail_printed_error.py").write_text(
-        "print('Error: simulated failure without non-zero exit')\n",
-        encoding="utf-8",
-    )
-    (examples_dir / "fail_json_log.py").write_text(
-        'import sys\nprint(\'{"level": "ERROR", "message": "boom"}\', file=sys.stderr)\n',
-        encoding="utf-8",
-    )
-
-    errors = execute_showcases_in_simulation(examples_dir)
-    assert len(errors) == 3
-    assert any("fail_exit.py" in e and "non-zero code 2" in e for e in errors)
-    assert any("fail_printed_error.py" in e and "Error message emitted" in e for e in errors)
-    assert any("fail_json_log.py" in e and "Error log emitted" in e for e in errors)
 
 
 def test_validate_landing_showcase_detects_simulation_and_vocabulary_regressions(

@@ -1,6 +1,7 @@
 """Unit tests for architecture."""
 
 import ast
+import functools
 import importlib.util
 from pathlib import Path
 
@@ -16,16 +17,18 @@ except ImportError:
     imednet_workflows = None
 
 
-def get_all_python_files(package_path: Path) -> list[Path]:
+@functools.lru_cache(maxsize=None)
+def get_all_python_files(package_path: Path) -> tuple[Path, ...]:
     """Helper function to get all python files."""
-    return list(package_path.rglob("*.py"))
+    return tuple(package_path.rglob("*.py"))
 
 
-def get_imports_from_file(file_path: Path) -> set[str]:
+@functools.lru_cache(maxsize=None)
+def get_imports_from_file(file_path: Path) -> frozenset[str]:
     """Helper function to get imports from file."""
-    with open(file_path, encoding="utf-8") as f:
-        # We want SyntaxError to be raised if a file cannot be parsed, rather than silently ignored.
-        tree = ast.parse(f.read(), filename=str(file_path))
+    from import_rules import parse_python_ast
+
+    tree = parse_python_ast(file_path)
 
     imports = set()
     for node in ast.walk(tree):
@@ -36,7 +39,7 @@ def get_imports_from_file(file_path: Path) -> set[str]:
             imports.add(node.module)
             for name in node.names:
                 imports.add(f"{node.module}.{name.name}")
-    return imports
+    return frozenset(imports)
 
 
 def test_core_does_not_import_cli():

@@ -143,11 +143,21 @@ PATH="{mock_bin}:$PATH" open_url "https://example.com/headless-test"
         )
 
 
+def _wait_for_log_file(log_file: Path, timeout: float = 1.0) -> None:
+    """Poll briefly until background mock browser script writes to log_file."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if log_file.exists() and log_file.stat().st_size > 0:
+            return
+        time.sleep(0.005)
+
+
 def test_wizard_open_url_graphical_dispatch() -> None:
     """Verify open_url launches browser when DISPLAY or WAYLAND_DISPLAY is active."""
     import subprocess
     import tempfile
-    import time
 
     repo_root = Path(__file__).resolve().parents[2]
     wizard_path = repo_root / "scripts" / "wizards" / "setup-pypi-oidc.sh"
@@ -177,7 +187,7 @@ PATH="{mock_bin}:$PATH" open_url "https://example.com/x11-test"
         )
         assert "↗ opening https://example.com/x11-test" in res_x11.stdout
 
-        time.sleep(0.1)
+        _wait_for_log_file(log_file)
         assert log_file.exists()
         assert "opened https://example.com/x11-test" in log_file.read_text(encoding="utf-8")
 
@@ -198,7 +208,7 @@ PATH="{mock_bin}:$PATH" open_url "https://example.com/wayland-test"
         )
         assert "↗ opening https://example.com/wayland-test" in res_wayland.stdout
 
-        time.sleep(0.1)
+        _wait_for_log_file(log_file)
         assert log_file.exists()
         assert "opened https://example.com/wayland-test" in log_file.read_text(encoding="utf-8")
 
@@ -249,7 +259,6 @@ def test_wizard_open_url_wsl_and_macos() -> None:
     """Verify WSL tools and macOS open are preserved even without DISPLAY."""
     import subprocess
     import tempfile
-    import time
 
     repo_root = Path(__file__).resolve().parents[2]
     wizard_path = repo_root / "scripts" / "wizards" / "setup-pypi-oidc.sh"
@@ -281,7 +290,7 @@ PATH="{mock_bin}:$PATH" open_url "https://example.com/wsl-test"
             ["bash", "-c", script_wsl], capture_output=True, text=True, check=True
         )
         assert "↗ opening https://example.com/wsl-test" in res_wsl.stdout
-        time.sleep(0.1)
+        _wait_for_log_file(log_file)
         assert "wslview: https://example.com/wsl-test" in log_file.read_text(encoding="utf-8")
 
         # 2. Test macOS open when Darwin and DISPLAY is unset
@@ -300,5 +309,5 @@ OSTYPE=darwin21 PATH="{mock_bin}:$PATH" open_url "https://example.com/mac-test"
             ["bash", "-c", script_mac], capture_output=True, text=True, check=True
         )
         assert "↗ opening https://example.com/mac-test" in res_mac.stdout
-        time.sleep(0.1)
+        _wait_for_log_file(log_file)
         assert "open: https://example.com/mac-test" in log_file.read_text(encoding="utf-8")

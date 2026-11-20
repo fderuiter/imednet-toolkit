@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 from importlib.util import resolve_name
 from pathlib import Path
 
@@ -41,9 +42,21 @@ def within(name: str, prefix: str) -> bool:
     return name == prefix or name.startswith(prefix + ".")
 
 
-def import_edges(path: Path, source_root: Path) -> set[str]:
+@functools.lru_cache(maxsize=None)
+def _cached_parse(resolved_path: Path, mtime_ns: int, size: int) -> ast.Module:
+    return ast.parse(resolved_path.read_text(encoding="utf-8"), filename=str(resolved_path))
+
+
+def parse_python_ast(path: Path) -> ast.Module:
+    resolved = path if path.is_absolute() else path.resolve()
+    stat = resolved.stat()
+    return _cached_parse(resolved, stat.st_mtime_ns, stat.st_size)
+
+
+@functools.lru_cache(maxsize=None)
+def import_edges(path: Path, source_root: Path) -> frozenset[str]:
     package = ".".join(path.relative_to(source_root).parts[:-1])
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parse_python_ast(path)
     edges: set[str] = set()
     # Type-only imports follow the same layering rules, but are never imported/executed.
     for node in ast.walk(tree):
@@ -56,7 +69,7 @@ def import_edges(path: Path, source_root: Path) -> set[str]:
             if module:
                 edges.add(module)
                 edges.update(f"{module}.{alias.name}" for alias in node.names)
-    return edges
+    return frozenset(edges)
 
 
 def violations(path: Path, source_root: Path) -> list[str]:
