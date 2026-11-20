@@ -59,19 +59,19 @@ class Query(ImednetBaseModel):
 
     query_comments: list[QueryComment] = Field(default_factory=list, alias="queryComments")
     status: QueryStatus = Field(default=QueryStatus.OPEN, alias="status")
-    study_key: str | None
-    subject_id: int | None
-    annotation_id: int | None
-    description: str | None
-    record_id: int | None
-    variable: str | None
-    subject_key: str | None
-    date_created: str | None
-    date_modified: str | None
-    annotation_type: str | None
-    subject_oid: str | None
-    type: str | None
-    last_updated: str | None
+    study_key: str | None = None
+    subject_id: int | None = None
+    annotation_id: int | None = None
+    description: str | None = None
+    record_id: int | None = None
+    variable: str | None = None
+    subject_key: str | None = None
+    date_created: str | None = None
+    date_modified: str | None = None
+    annotation_type: str | None = None
+    subject_oid: str | None = None
+    type: str | None = None
+    last_updated: str | None = None
 
     @model_validator(mode="before")
     @classmethod

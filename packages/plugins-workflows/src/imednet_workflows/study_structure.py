@@ -41,7 +41,7 @@ def _build_study_structure(
     interval_structures: list[IntervalStructure] = []
     for interval in intervals:
         form_structures: list[FormStructure] = []
-        for form_summary in getattr(interval, 'forms', []):
+        for form_summary in getattr(interval, 'forms', None) or []:
             if form_summary.form_id is not None:
                 full_form = forms_by_id.get(form_summary.form_id)
             if full_form and full_form.form_id is not None:

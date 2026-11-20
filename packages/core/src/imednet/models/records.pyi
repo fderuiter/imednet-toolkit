@@ -68,22 +68,22 @@ class Record(ImednetBaseModel):
     record_data: dict[str, Any] = Field(default_factory=dict, alias="recordData")
     record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
     deleted: bool | None = Field(default=None, alias="deleted")
-    study_key: str | None
-    interval_id: int | None
-    form_id: int | None
-    form_key: str | None
-    site_id: int | None
-    record_id: int | None
-    record_oid: str | None
-    record_type: str | None
-    date_created: str | None
-    date_modified: str | None
-    subject_id: int | None
-    subject_oid: str | None
-    subject_key: str | None
-    visit_id: int | None
-    parent_record_id: int | None
-    last_updated: str | None
+    study_key: str | None = None
+    interval_id: int | None = None
+    form_id: int | None = None
+    form_key: str | None = None
+    site_id: int | None = None
+    record_id: int | None = None
+    record_oid: str | None = None
+    record_type: str | None = None
+    date_created: str | None = None
+    date_modified: str | None = None
+    subject_id: int | None = None
+    subject_oid: str | None = None
+    subject_key: str | None = None
+    visit_id: int | None = None
+    parent_record_id: int | None = None
+    last_updated: str | None = None
 
     @field_validator("record_status", mode="before")
     @classmethod

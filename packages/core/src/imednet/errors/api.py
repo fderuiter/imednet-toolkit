@@ -144,7 +144,7 @@ class ApiError(ImednetError):
         details = []
         if self.status_code is not None:
             details.append(f"Status Code: {self.status_code}")
-        if self.response:
+        if self.response and not (isinstance(self.response, str) and self.response == base):
             details.append(f"Response: {self.response}")
         if isinstance(self.field, dict) and self.field:
             redacted_field = _redact_sensitive_value(self.field)

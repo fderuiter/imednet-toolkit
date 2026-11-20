@@ -828,3 +828,22 @@ def test_simulation_filters_sorting_and_subresources():
 
         bool_filtered = list(sdk.records.list(study_key="STUDY", deleted=False))
         assert len(bool_filtered) >= 2
+
+
+@pytest.mark.asyncio
+async def test_offline_transport_initializes_without_credentials_and_matches_case_insensitive_regex():
+    """ImednetSDK and AsyncImednetSDK accept transport without credentials and match =~ case-insensitively."""
+    from imednet import AsyncImednetSDK, SimulationTransport
+
+    with patch.dict(os.environ, {}, clear=True):
+        with ImednetSDK(transport=SimulationTransport()) as sdk:
+            matched = list(sdk.records.list("STUDY", record_data_filter="V_GENDER=~fem"))
+            assert len(matched) >= 1
+            assert any(r.record_data.get("V_GENDER") == "Female" for r in matched)
+
+        async with AsyncImednetSDK(transport=SimulationTransport()) as async_sdk:
+            async_matched = [
+                r async for r in async_sdk.records.list("STUDY", record_data_filter="V_GENDER=~fem")
+            ]
+            assert len(async_matched) >= 1
+            assert any(r.record_data.get("V_GENDER") == "Female" for r in async_matched)
