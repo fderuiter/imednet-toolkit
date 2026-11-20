@@ -31,9 +31,11 @@ def _cleanup_airflow_provider_modules():
     saved_handlers = list(root_logger.handlers)
     saved_level = root_logger.level
 
+    airflow_mod = sys.modules.get("airflow")
     if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        airflow_mod is None
+        or getattr(airflow_mod, "__path__", None) is None
+        or getattr(airflow_mod, "__file__", None) is None
     ):
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
@@ -318,3 +320,24 @@ def test_real_airflow_providers_manager_and_task_runtime_discover_imednet(real_a
     assert "imednet" in runtime_hooks
     assert runtime_hooks["imednet"] is not None
     assert runtime_hooks["imednet"].connection_type == "imednet"
+
+
+def test_real_airflow_provider_alias_stays_synced_across_reimports(real_airflow):
+    """Re-importing apache_airflow_providers_imednet refreshes stale airflow.providers.imednet aliases."""
+    import importlib
+    from types import ModuleType
+
+    # Simulate stale alias left behind after canonical package reload/eviction
+    stale_hooks = ModuleType("airflow.providers.imednet.hooks")
+    stale_hooks.ImednetHook = object  # type: ignore[attr-defined]
+    sys.modules["airflow.providers.imednet.hooks"] = stale_hooks
+    for mod in list(sys.modules):
+        if mod.startswith("apache_airflow_providers_imednet"):
+            sys.modules.pop(mod, None)
+
+    importlib.import_module("apache_airflow_providers_imednet")
+    from airflow.providers.imednet.hooks import ImednetHook as AliasedHook
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook as CanonicalHook
+
+    assert AliasedHook is CanonicalHook

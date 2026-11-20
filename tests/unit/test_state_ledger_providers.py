@@ -17,34 +17,27 @@ from imednet_workflows.state_ledger import (
 
 
 @pytest.fixture
-def mock_airflow():
+def mock_airflow(monkeypatch):
     """Mock airflow modules."""
     airflow_mock = MagicMock()
     xcom_mock = MagicMock()
     session_mock = MagicMock()
     python_mock = MagicMock()
 
-    sys.modules["airflow"] = airflow_mock
-    sys.modules["airflow.models"] = MagicMock()
-    sys.modules["airflow.models.xcom"] = xcom_mock
-    sys.modules["airflow.utils"] = MagicMock()
-    sys.modules["airflow.utils.session"] = session_mock
-    sys.modules["airflow.operators"] = MagicMock()
-    sys.modules["airflow.operators.python"] = python_mock
+    monkeypatch.setitem(sys.modules, "airflow", airflow_mock)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", None)
+    monkeypatch.setitem(sys.modules, "airflow.models", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.models.xcom", xcom_mock)
+    monkeypatch.setitem(sys.modules, "airflow.utils", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_mock)
+    monkeypatch.setitem(sys.modules, "airflow.operators", MagicMock())
+    monkeypatch.setitem(sys.modules, "airflow.operators.python", python_mock)
 
     yield {
         "xcom": xcom_mock,
         "session": session_mock,
         "python": python_mock,
     }
-
-    del sys.modules["airflow"]
-    del sys.modules["airflow.models"]
-    del sys.modules["airflow.models.xcom"]
-    del sys.modules["airflow.utils"]
-    del sys.modules["airflow.utils.session"]
-    del sys.modules["airflow.operators"]
-    del sys.modules["airflow.operators.python"]
 
 
 def test_get_state_provider(monkeypatch):
@@ -421,3 +414,59 @@ def test_airflow_recovers_stale_running_xcom_and_blocks_active_lease(mock_airflo
 
     assert pushed_statuses == ["failed", "running", "success"]
     assert provider.get_last_timestamp("ST1", "recs") == committed
+
+
+def test_airflow3_xcom_model_set_uses_run_id_without_execution_date(monkeypatch):
+    """Out-of-context set_last_timestamp uses Airflow 3 XComModel.set(..., run_id=..., session=...)."""
+    import contextlib
+    from types import ModuleType
+
+    provider = AirflowStateProvider()
+    monkeypatch.setattr(provider, "_ensure_manual_task_instance", lambda *_a, **_kw: None)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", None)
+    monkeypatch.setitem(sys.modules, "airflow.operators.python", None)
+
+    recorded_calls: list[dict[str, object]] = []
+
+    class FakeXComModel:
+        @classmethod
+        def set(cls, *, key, value, dag_id, task_id, run_id, map_index=-1, session=None):
+            recorded_calls.append(
+                {
+                    "key": key,
+                    "value": value,
+                    "dag_id": dag_id,
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "map_index": map_index,
+                    "session": session,
+                }
+            )
+
+    xcom_mod = ModuleType("airflow.models.xcom")
+    xcom_mod.XComModel = FakeXComModel  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.models.xcom", xcom_mod)
+
+    fake_session = object()
+
+    @contextlib.contextmanager
+    def fake_create_session():
+        yield fake_session
+
+    session_mod = ModuleType("airflow.utils.session")
+    session_mod.create_session = fake_create_session  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_mod)
+
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_af3")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "task_af3")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "manual__2026-06-01T00:00:00+00:00")
+
+    ts = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    provider.set_last_timestamp("ST_AF3", "csv", ts, records_processed=7)
+
+    assert len(recorded_calls) == 1
+    assert recorded_calls[0]["key"] == "state_ST_AF3_csv"
+    assert recorded_calls[0]["dag_id"] == "dag_af3"
+    assert recorded_calls[0]["task_id"] == "task_af3"
+    assert recorded_calls[0]["run_id"] == "manual__2026-06-01T00:00:00+00:00"
+    assert recorded_calls[0]["session"] is fake_session

@@ -18,6 +18,7 @@ from imednet_workflows.state_ledger import (
 def mock_airflow(monkeypatch):
     mock_airflow_mod = MagicMock()
     monkeypatch.setitem(sys.modules, "airflow", mock_airflow_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", None)
     monkeypatch.setitem(sys.modules, "airflow.operators.python", MagicMock())
     monkeypatch.setitem(sys.modules, "airflow.models.xcom", MagicMock())
     monkeypatch.setitem(sys.modules, "airflow.utils.session", MagicMock())
@@ -183,3 +184,150 @@ def test_airflow_state_provider_helpers_and_missing_airflow_graceful_fallbacks(m
     assert isinstance(get_state_provider(), AirflowStateProvider)
     with contextlib.suppress(KeyError):
         monkeypatch.delenv("USE_AIRFLOW_STATE_PROVIDER")
+
+
+def test_airflow_state_provider_xcom_list_tie_breaking_for_equal_or_none_timestamps(monkeypatch):
+    """Latest entry wins when prior-run XCom list contains equal or None last_timestamp values."""
+    provider = AirflowStateProvider()
+
+    class TieBreakTI:
+        task_id = "tie_break_export"
+        map_index = -1
+
+        def xcom_pull(self, **_kwargs):
+            return [
+                {"last_timestamp": None, "status": "running", "records_processed": 0},
+                {"last_timestamp": None, "status": "failed", "error_message": "boom"},
+                {"last_timestamp": None, "status": "success", "records_processed": 0},
+            ]
+
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.get_current_context = lambda: {"ti": TieBreakTI()}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+
+    assert provider.get_last_timestamp("STUDY_TIE", "csv") is None
+    assert provider.get_last_status("STUDY_TIE", "csv") == StreamExecutionStatus.SUCCESS
+
+
+@pytest.fixture
+def isolated_airflow_db(monkeypatch, tmp_path):
+    """Initialize an isolated real Airflow 3 SQLite DB and restore state on teardown."""
+    airflow_mod = sys.modules.get("airflow")
+    if (
+        airflow_mod is None
+        or getattr(airflow_mod, "__path__", None) is None
+        or getattr(airflow_mod, "__file__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+                sys.modules.pop(mod, None)
+
+    pytest.importorskip("airflow")
+    import logging
+
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
+    from airflow import settings
+    from airflow.configuration import conf
+    from airflow.utils.db import initdb
+
+    af_home = tmp_path / "af_state_home"
+    af_home.mkdir(parents=True, exist_ok=True)
+    db_uri = f"sqlite:///{af_home / 'airflow.db'}"
+
+    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_examples = conf.get("core", "load_examples", fallback=None)
+    monkeypatch.setenv("AIRFLOW_HOME", str(af_home))
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
+    monkeypatch.setenv("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
+    monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    conf.set("database", "sql_alchemy_conn", db_uri)
+    conf.set("core", "load_examples", "False")
+
+    settings.dispose_orm()
+    settings.configure_orm()
+    initdb()
+
+    try:
+        yield db_uri
+    finally:
+        settings.dispose_orm()
+        if prev_conn is not None:
+            conf.set("database", "sql_alchemy_conn", prev_conn)
+        if prev_examples is not None:
+            conf.set("core", "load_examples", prev_examples)
+        for mod in list(sys.modules):
+            if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+                sys.modules.pop(mod, None)
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
+
+
+def test_real_airflow_xcom_model_crud_and_crash_recovery(isolated_airflow_db, monkeypatch):
+    """Verify real Airflow 3 XComModel persistence, read_state, delete_entry, and stale RUNNING recovery."""
+    from datetime import timedelta
+
+    from airflow.models.xcom import XComModel
+    from airflow.utils.session import create_session
+
+    dag_id = "dag_state_crud"
+    task_id = "export_records_task"
+    run_id = "manual__2026-06-01T00:00:00+00:00"
+    logical_date = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", dag_id)
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", task_id)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", run_id)
+
+    provider = AirflowStateProvider()
+    assert provider.get_last_timestamp("STUDY_REAL", "csv") is None
+    assert provider.get_last_status("STUDY_REAL", "csv") is None
+
+    # Simulate stale crashed worker RUNNING state via XComModel.set
+    with create_session() as session:
+        provider._ensure_manual_task_instance(
+            session,
+            dag_id=dag_id,
+            task_id=task_id,
+            run_id=run_id,
+            logical_date=logical_date,
+        )
+        XComModel.set(
+            key="state_STUDY_REAL_csv",
+            value={
+                "last_timestamp": None,
+                "records_processed": 0,
+                "status": "running",
+                "owner_pid": 1,
+                "owner_host": "crashed-worker-pod",
+                "lease_expires_at": (
+                    datetime.now(timezone.utc) - timedelta(seconds=10)
+                ).isoformat(),
+            },
+            dag_id=dag_id,
+            task_id=task_id,
+            run_id=run_id,
+            session=session,
+        )
+
+    assert provider.get_last_status("STUDY_REAL", "csv") == StreamExecutionStatus.RUNNING
+
+    # Recover from expired RUNNING lease and commit watermark
+    committed_ts = datetime(2026, 6, 1, 10, 30, tzinfo=timezone.utc)
+    with provider.transaction("STUDY_REAL", "csv") as tx:
+        assert tx["last_timestamp"] is None
+        tx["new_timestamp"] = committed_ts
+        tx["records_processed"] = 12
+
+    assert provider.get_last_timestamp("STUDY_REAL", "csv") == committed_ts
+    assert provider.get_last_status("STUDY_REAL", "csv") == StreamExecutionStatus.SUCCESS
+
+    ledger = provider.read_state()
+    assert "STUDY_REAL" in ledger.studies
+    assert ledger.studies["STUDY_REAL"].streams["csv"].last_timestamp == committed_ts
+    assert ledger.studies["STUDY_REAL"].streams["csv"].records_processed == 12
+
+    assert provider.delete_entry("STUDY_REAL", "csv") is True
+    assert provider.get_last_timestamp("STUDY_REAL", "csv") is None

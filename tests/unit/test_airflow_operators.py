@@ -211,3 +211,12 @@ def test_provider_info_and_hook_metadata_contract():
     assert any(req.startswith("imednet-workflows") for req in requires)
     extras = set(dist.metadata.get_all("Provides-Extra") or [])
     assert {"duckdb", "export", "mongodb", "neo4j", "snowflake"}.issubset(extras)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mocked_airflow_provider_modules():
+    """Purge provider modules bound to mocked Airflow classes at module teardown."""
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)

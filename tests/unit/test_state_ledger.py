@@ -709,12 +709,14 @@ def test_airflow_state_provider_out_of_context_xcom_model_crud(tmp_path, monkeyp
     """Verify out-of-context set, get, read_state, and delete_entry against Airflow 3 XComModel."""
     import logging
 
+    airflow_mod = sys.modules.get("airflow")
     if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        airflow_mod is None
+        or getattr(airflow_mod, "__path__", None) is None
+        or getattr(airflow_mod, "__file__", None) is None
     ):
         for mod in list(sys.modules):
-            if mod == "airflow" or mod.startswith("airflow."):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
                 sys.modules.pop(mod, None)
 
     airflow = pytest.importorskip("airflow")
@@ -1018,3 +1020,27 @@ def test_active_concurrent_run_and_remote_lease_expiry_guards(tmp_path) -> None:
         tx["new_timestamp"] = recovered_ts
         tx["records_processed"] = 3
     assert ledger.get_last_timestamp("STUDY-REMOTE", "records") == recovered_ts
+
+
+def test_get_state_provider_accepts_path_and_cli_renders_none_watermark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """get_state_provider accepts pathlib.Path and CLI state show renders None watermarks cleanly."""
+    monkeypatch.delenv("AIRFLOW_CTX_TASK_ID", raising=False)
+    monkeypatch.delenv("USE_AIRFLOW_STATE_PROVIDER", raising=False)
+
+    ledger_file = tmp_path / "path_ledger.json"
+    provider = get_state_provider(ledger_file)
+    assert isinstance(provider, FileStateProvider)
+
+    with pytest.raises(RuntimeError, match="initial sync failed"):
+        with provider.transaction("STUDY-NONE", "records") as tx:
+            assert tx["last_timestamp"] is None
+            raise RuntimeError("initial sync failed")
+
+    assert provider.get_last_timestamp("STUDY-NONE", "records") is None
+    assert provider.get_last_status("STUDY-NONE", "records") == StreamExecutionStatus.FAILED
+
+    state_app(["show", "--ledger-path", str(ledger_file)])
+    captured = capsys.readouterr()
+    assert "STUDY-NONE" in captured.out

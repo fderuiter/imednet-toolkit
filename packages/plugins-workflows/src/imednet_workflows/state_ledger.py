@@ -680,13 +680,15 @@ class AirflowStateProvider(BaseStateProvider):
             dicts = [item for item in val if isinstance(item, dict)]
             if not dicts:
                 return None
-            return max(
-                dicts,
-                key=lambda item: (
-                    cls._parse_iso_utc(item.get("last_timestamp"))
-                    or datetime.min.replace(tzinfo=UTC)
+            _, latest = max(
+                enumerate(dicts),
+                key=lambda pair: (
+                    cls._parse_iso_utc(pair[1].get("last_timestamp"))
+                    or datetime.min.replace(tzinfo=UTC),
+                    pair[0],
                 ),
             )
+            return latest
         return None
 
     @staticmethod
@@ -1176,7 +1178,7 @@ class AirflowStateProvider(BaseStateProvider):
 
 
 def get_state_provider(
-    ledger_path: str = DEFAULT_LEDGER_PATH,
+    ledger_path: str | Path = DEFAULT_LEDGER_PATH,
 ) -> BaseStateProvider:
     """Factory to get the appropriate state provider based on environment."""
     if "AIRFLOW_CTX_TASK_ID" in os.environ or os.environ.get("USE_AIRFLOW_STATE_PROVIDER") == "1":

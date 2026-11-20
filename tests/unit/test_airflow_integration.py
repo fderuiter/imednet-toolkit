@@ -643,7 +643,7 @@ def test_export_operator_template_field_rendering_simulation(monkeypatch):
     picked up from the instance at execute time rather than captured at construction.
     """
     for mod in list(sys.modules):
-        if mod.startswith("apache_airflow_providers_imednet"):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
             del sys.modules[mod]
 
     _setup_airflow(monkeypatch)
@@ -730,8 +730,9 @@ def test_list_study_keys_skips_entries_without_recognized_key(monkeypatch):
 
 def test_export_operator_resolves_snowflake_sink(monkeypatch):
     """Test that export operator resolves snowflake sink."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            del sys.modules[mod]
 
     _setup_airflow(monkeypatch)
     conn = MagicMock()
@@ -989,3 +990,12 @@ def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monk
     with pytest.raises(Exception, match="Network request failed"):
         hook.list_studies_metadata()
     assert sdk_list_err._client._client.is_closed
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mocked_airflow_provider_modules():
+    """Purge provider modules bound to mocked Airflow classes at module teardown."""
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
