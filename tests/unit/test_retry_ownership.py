@@ -39,9 +39,11 @@ def test_sync_pagination_has_one_retry_owner(respx_mock, paginator_type, status,
         pytest.raises((ApiError, RequestError)),
     ):
         list(paginator_type(client, "/records"))
+    expected_failures = 0 if status in (400, 429) else 1
     assert route.call_count == attempts
-    # The outer paginator must not double-count exhausted requests.
-    assert get_global_circuit_breaker()._consecutive_failures == 1
+    # 5xx and network faults count once on the client's breaker; 4xx responses count zero.
+    assert client._circuit_breaker._consecutive_failures == expected_failures
+    assert get_global_circuit_breaker()._consecutive_failures == 0
 
 
 @pytest.mark.parametrize("paginator_type", [AsyncPaginator, AsyncJsonListPaginator])
@@ -60,8 +62,10 @@ async def test_async_pagination_has_one_retry_owner(respx_mock, paginator_type, 
     ) as client:
         with pytest.raises((ApiError, RequestError)):
             _ = [item async for item in paginator_type(client, "/records")]
+    expected_failures = 0 if status in (400, 429) else 1
     assert route.call_count == attempts
-    assert get_global_circuit_breaker()._consecutive_failures == 1
+    assert client._circuit_breaker._consecutive_failures == expected_failures
+    assert get_global_circuit_breaker()._consecutive_failures == 0
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -81,9 +85,11 @@ async def test_pagination_recovery_stops_after_success(respx_mock, asynchronous)
     if asynchronous:
         async with AsyncClient(**kwargs) as client:
             assert [item async for item in AsyncPaginator(client, "/records")] == [1, 2]
+            assert client._circuit_breaker._consecutive_failures == 0
     else:
         with Client(**kwargs) as client:
             assert list(Paginator(client, "/records")) == [1, 2]
+            assert client._circuit_breaker._consecutive_failures == 0
     assert route.call_count == 2
     assert get_global_circuit_breaker()._consecutive_failures == 0
 
@@ -176,14 +182,18 @@ def test_sink_transient_failures_are_redacted_before_tracing(monkeypatch, caplog
 
 
 def test_sink_reports_zero_attempts_when_breaker_prevents_execution():
-    breaker = get_global_circuit_breaker()
+    sink = SyntheticSink(SinkConfig(study_key="synthetic"))
+    breaker = sink._circuit_breaker
     for _ in range(breaker.failure_threshold):
         breaker.record_failure()
     destination = MagicMock(return_value=7)
-    sink = SyntheticSink(SinkConfig(study_key="synthetic"))
     with pytest.raises(ExportBatchError, match="after 0 attempts"):
         sink._execute_with_retry("synthetic_write", "synthetic/0", destination)
     destination.assert_not_called()
+
+    healthy_sink = SyntheticSink(SinkConfig(study_key="synthetic"))
+    assert healthy_sink._execute_with_retry("synthetic_write", "synthetic/1", destination) == 7
+    assert destination.call_count == 1
 
 
 @pytest.mark.parametrize("value", [-1, 1.5, True])

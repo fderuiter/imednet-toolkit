@@ -35,7 +35,9 @@ Typed endpoint interface
 methods on the async SDK. SDK convenience methods accept the same optional
 callback. A callback accepts either one ``JobStatusEvent`` or the legacy
 ``(batch_id, status, elapsed)`` arguments. Callback failures propagate once;
-batch polling collects them in ``JobPollSummary.failures`` by default.
+batch polling collects them in ``JobPollSummary.failures`` by default, while
+``fail_fast=True`` wakes or cancels sibling pollers and raises the triggering
+``JobFailedError`` or ``JobTimeoutError`` directly.
 
 Recognized successful terminal aliases are COMPLETED, COMPLETE and SUCCESS;
 FAILED, CANCELLED and TIMEOUT raise ``JobFailedError``. Missing states remain
