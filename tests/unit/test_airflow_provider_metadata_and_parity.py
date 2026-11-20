@@ -26,7 +26,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_airflow_provider_modules() -> Any:
-    """Unload provider/Airflow modules on teardown so mock-based test suites stay hermetic."""
+    """Purge stale mock-bound modules on setup and unload provider/Airflow modules on teardown."""
+    airflow_is_mock_or_absent = getattr(sys.modules.get("airflow"), "__file__", None) is None
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")) or (
+            airflow_is_mock_or_absent and (mod == "airflow" or mod.startswith("airflow."))
+        ):
+            sys.modules.pop(mod, None)
     yield
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow")):

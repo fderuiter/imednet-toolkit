@@ -139,6 +139,19 @@ def parse_record_data_filter(record_data_filter: str | None) -> str | None:
     return stripped
 
 
+def positive_int(value: str) -> int:
+    """Validate and return a strictly positive integer (> 0) for argparse options."""
+    if isinstance(value, bool):
+        raise argparse.ArgumentTypeError("value must be a positive integer (> 0)")
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer (> 0)")
+    return parsed
+
+
 def add_no_interactive(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
     """Add ``--no-interactive`` option to disable interactive UI, spinners, and prompts."""
     if "--no-interactive" in parser._option_string_actions:
