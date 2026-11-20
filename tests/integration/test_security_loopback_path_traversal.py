@@ -52,10 +52,15 @@ def test_loopback_server_records_zero_cross_study_requests(
         monkeypatch.setenv("IMEDNET_SECURITY_KEY", "test-secret")
         monkeypatch.setenv("IMEDNET_BASE_URL", base_url)
         monkeypatch.setenv(
-            "AIRFLOW_CONN_IMEDNET_DEFAULT", f"http://test-key:test-secret@127.0.0.1:{port}"
+            "AIRFLOW_CONN_IMEDNET_DEFAULT",
+            f"http://test-key:test-secret@127.0.0.1:{port}",  # pragma: allowlist secret
         )
 
-        sdk = ImednetSDK(api_key="test-key", security_key="test-secret", base_url=base_url)
+        sdk = ImednetSDK(
+            api_key="test-key",  # pragma: allowlist secret
+            security_key="test-secret",  # pragma: allowlist secret
+            base_url=base_url,
+        )
         try:
             sensor = ImednetJobSensor(
                 task_id="verify_job_sensor",
