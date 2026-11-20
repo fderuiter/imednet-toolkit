@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 class Workflows:
     """Namespace for accessing workflow classes."""
 
-    def __init__(self, sdk_instance: ImednetFacade):
+    def __init__(self, sdk_instance: ImednetFacade) -> None:
         """Initialize the workflows namespace.
 
         Args:
@@ -41,3 +41,6 @@ class Workflows:
     def duckdb_centralizer(self) -> DuckDBIngestionWorkflow:
         """Incremental record centralization pipeline using DuckDB."""
         return DuckDBIngestionWorkflow(self._sdk)
+
+
+__all__ = ["Workflows"]

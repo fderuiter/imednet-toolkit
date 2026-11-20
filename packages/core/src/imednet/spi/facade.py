@@ -4,8 +4,9 @@ These protocols define the expected interface for the iMednet SDK clients,
 allowing for easier mocking and decoupling in dependent packages.
 """
 
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
+from imednet.auth import AuthStrategy
 from imednet.models.codings import Coding
 from imednet.models.forms import Form
 from imednet.models.intervals import Interval
@@ -261,7 +262,7 @@ class ImednetFacade(Protocol):
         ...
 
     @property
-    def auth(self) -> Any:
+    def auth(self) -> AuthStrategy | None:
         """Access the authentication provider for the facade."""
         ...
 
@@ -500,3 +501,37 @@ class AsyncImednetFacade(Protocol):
     ) -> JobPollSummary:
         """Asynchronously wait for multiple background jobs and fetch resultUrl payloads."""
         ...
+
+    @property
+    def auth(self) -> AuthStrategy | None:
+        """Access the authentication provider for the asynchronous facade."""
+        ...
+
+
+from imednet.plugins import (
+    AsyncRecordUpdateWorkflowProtocol,
+    AsyncSinksNamespaceProtocol,
+    AsyncStudySchemaInspectorProtocol,
+    AsyncWorkflowsNamespaceProtocol,
+    SinksNamespaceProtocol,
+    SyncRecordUpdateWorkflowProtocol,
+    SyncSinksNamespaceProtocol,
+    SyncStudySchemaInspectorProtocol,
+    SyncWorkflowsNamespaceProtocol,
+    WorkflowsNamespaceProtocol,
+)
+
+__all__ = [
+    "AsyncImednetFacade",
+    "AsyncRecordUpdateWorkflowProtocol",
+    "AsyncSinksNamespaceProtocol",
+    "AsyncStudySchemaInspectorProtocol",
+    "AsyncWorkflowsNamespaceProtocol",
+    "ImednetFacade",
+    "SinksNamespaceProtocol",
+    "SyncRecordUpdateWorkflowProtocol",
+    "SyncSinksNamespaceProtocol",
+    "SyncStudySchemaInspectorProtocol",
+    "SyncWorkflowsNamespaceProtocol",
+    "WorkflowsNamespaceProtocol",
+]

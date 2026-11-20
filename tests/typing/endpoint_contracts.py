@@ -1,10 +1,22 @@
 from collections.abc import AsyncIterator, Iterator
+from contextlib import AbstractContextManager
 from typing import Literal, assert_type
 
-from imednet import AsyncImednetSDK, ImednetSDK
+from imednet_sinks.plugin import create_sinks
+
+from imednet import (
+    AsyncImednetSDK,
+    AsyncSinksNamespaceProtocol,
+    AsyncWorkflowsNamespaceProtocol,
+    ImednetSDK,
+    SinksNamespaceProtocol,
+    SyncWorkflowsNamespaceProtocol,
+)
+from imednet.auth import AuthStrategy
 from imednet.core.endpoint import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.dispatch import AsyncEndpointContext, SyncEndpointContext
 from imednet.endpoints.studies import AsyncStudiesEndpoint, StudiesEndpoint, StudiesOperationDef
+from imednet.integrations.sink_base import ExportSink
 from imednet.models.codings import Coding
 from imednet.models.forms import Form
 from imednet.models.intervals import Interval
@@ -18,9 +30,29 @@ from imednet.models.subjects import Subject, SubjectKeyword
 from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
+from imednet.plugins import (
+    AsyncRecordUpdateWorkflowProtocol,
+    AsyncStudySchemaInspectorProtocol,
+    DataExtractionWorkflowProtocol,
+    DuckDBIngestionWorkflowProtocol,
+    MongoDbSinkConfigProtocol,
+    Neo4jSinkConfigProtocol,
+    QueryManagementWorkflowProtocol,
+    RecordMapperProtocol,
+    RegisterSubjectsWorkflowProtocol,
+    SnowflakeSinkConfigProtocol,
+    StudySnapshotProtocol,
+    SubjectComprehensiveDataProtocol,
+    SubjectDataWorkflowProtocol,
+    SyncRecordUpdateWorkflowProtocol,
+    SyncStudySchemaInspectorProtocol,
+    UATRunResultProtocol,
+    UATWorkflowProtocol,
+)
 from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.utils.batch_coordinator import BatchSubmissionSummary
 from imednet.utils.job_poller import JobPollSummary
+from imednet_workflows import DataExtractionWorkflow, StudySchemaInspector, UATWorkflow, Workflows
 
 
 def sync_contract(sdk: ImednetSDK) -> None:
@@ -97,6 +129,64 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(JobState.COMPLETED, Literal[JobState.COMPLETED])
     assert_type(QueryStatus.OPEN, Literal[QueryStatus.OPEN])
 
+    # Narrowed SDK attributes and context contracts
+    assert_type(sdk.auth, AuthStrategy | None)
+    assert_type(facade.auth, AuthStrategy | None)
+    sync_ctx: AbstractContextManager[ImednetSDK] = sdk.study_context('S')
+    assert sync_ctx is not None
+    with sdk.study_context('S') as scoped_sdk:
+        assert_type(scoped_sdk, ImednetSDK)
+
+    # Concrete synchronous workflows contracts
+    assert_type(sdk.workflows, SyncWorkflowsNamespaceProtocol)
+    assert_type(sdk.workflows.data_extraction, DataExtractionWorkflowProtocol)
+    assert_type(sdk.workflows.duckdb_centralizer, DuckDBIngestionWorkflowProtocol)
+    assert_type(sdk.workflows.query_management, QueryManagementWorkflowProtocol)
+    assert_type(sdk.workflows.record_mapper, RecordMapperProtocol)
+    assert_type(sdk.workflows.record_update, SyncRecordUpdateWorkflowProtocol)
+    assert_type(sdk.workflows.register_subjects, RegisterSubjectsWorkflowProtocol)
+    assert_type(sdk.workflows.subject_data, SubjectDataWorkflowProtocol)
+    assert_type(sdk.workflows.uat, UATWorkflowProtocol)
+    assert_type(sdk.workflows.uat_inspector, SyncStudySchemaInspectorProtocol)
+    assert_type(
+        sdk.workflows.record_update.register_subject('S', 'DEMOG', 'SITE1', {'AGE': 40}),
+        Job,
+    )
+    assert_type(
+        sdk.workflows.record_update.update_scheduled_record(
+            'S', 'VITALS', 'SUBJ1', 'VISIT1', {'SYSBP': 120}
+        ),
+        Job,
+    )
+    assert_type(
+        sdk.workflows.record_update.create_new_record('S', 'AE', 'SUBJ1', {'AETERM': 'Headache'}),
+        Job,
+    )
+    assert_type(
+        sdk.workflows.subject_data.get_all_subject_data('S', 'SUBJ1'),
+        SubjectComprehensiveDataProtocol,
+    )
+    assert_type(sdk.workflows.uat.run('S'), UATRunResultProtocol)
+    assert_type(sdk.workflows.uat_inspector.inspect('S'), StudySnapshotProtocol)
+
+    # Concrete synchronous sinks contracts
+    assert_type(sdk.sinks, SinksNamespaceProtocol | None)
+    if sdk.sinks is not None:
+        mongo_cfg = sdk.sinks.MongoDbSinkConfig('S', uri='mongodb://localhost:27017')
+        assert_type(mongo_cfg, MongoDbSinkConfigProtocol)
+        assert_type(sdk.sinks.MongoDbExportSink(mongo_cfg), ExportSink)
+        assert_type(sdk.sinks.export_to_mongodb('S', config=mongo_cfg), int)
+
+        neo4j_cfg = sdk.sinks.Neo4jSinkConfig('S', uri='bolt://localhost:7687')
+        assert_type(neo4j_cfg, Neo4jSinkConfigProtocol)
+        assert_type(sdk.sinks.Neo4jExportSink(neo4j_cfg), ExportSink)
+        assert_type(sdk.sinks.export_to_neo4j('S', config=neo4j_cfg), int)
+
+        snow_cfg = sdk.sinks.SnowflakeSinkConfig('S', account='acct')
+        assert_type(snow_cfg, SnowflakeSinkConfigProtocol)
+        assert_type(sdk.sinks.SnowflakeExportSink(snow_cfg), ExportSink)
+        assert_type(sdk.sinks.export_to_snowflake('S', config=snow_cfg), int)
+
 
 async def async_contract(sdk: AsyncImednetSDK) -> None:
     facade: AsyncImednetFacade = sdk
@@ -161,6 +251,57 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.async_poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
     assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2']), JobPollSummary)
 
+    # Narrowed async SDK attributes and context contracts
+    assert_type(sdk.auth, AuthStrategy | None)
+    assert_type(facade.auth, AuthStrategy | None)
+    async_ctx: AbstractContextManager[AsyncImednetSDK] = sdk.study_context('S')
+    assert async_ctx is not None
+    with sdk.study_context('S') as scoped_async_sdk:
+        assert_type(scoped_async_sdk, AsyncImednetSDK)
+
+    # Concrete asynchronous workflows contracts
+    assert_type(sdk.workflows, AsyncWorkflowsNamespaceProtocol)
+    assert_type(sdk.workflows.record_update, AsyncRecordUpdateWorkflowProtocol)
+    assert_type(sdk.workflows.uat_inspector, AsyncStudySchemaInspectorProtocol)
+    assert_type(
+        await sdk.workflows.record_update.async_create_or_update_records_batch(
+            'S', [{'formKey': 'DEMOG', 'data': {}}]
+        ),
+        BatchSubmissionSummary,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_create_or_update_records(
+            'S', [{'formKey': 'DEMOG', 'data': {}}]
+        ),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_register_subject(
+            'S', 'DEMOG', 'SITE1', {'AGE': 40}
+        ),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_update_scheduled_record(
+            'S', 'VITALS', 'SUBJ1', 'VISIT1', {'SYSBP': 120}
+        ),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_create_new_record(
+            'S', 'AE', 'SUBJ1', {'AETERM': 'Headache'}
+        ),
+        Job,
+    )
+    assert_type(await sdk.workflows.uat_inspector.async_inspect('S'), StudySnapshotProtocol)
+
+    # Concrete asynchronous sinks contracts (config/sink classes accessible)
+    assert_type(sdk.sinks, AsyncSinksNamespaceProtocol | None)
+    if sdk.sinks is not None:
+        assert_type(sdk.sinks.MongoDbSinkConfig('S'), MongoDbSinkConfigProtocol)
+        assert_type(sdk.sinks.Neo4jSinkConfig('S'), Neo4jSinkConfigProtocol)
+        assert_type(sdk.sinks.SnowflakeSinkConfig('S'), SnowflakeSinkConfigProtocol)
+
 
 def sync_endpoint_contract(ep: StudiesEndpoint) -> None:
     assert_type(ep.get('S'), Study)
@@ -200,3 +341,32 @@ async def async_stub_contract(ep: _AsyncStub) -> None:
     assert_type((await ep.get('S')).study_key, str | None)
     assert_type(await ep.get(item_id='S'), Study)
     assert_type(await ep.get(None, 'S'), Study)
+
+
+class _CustomSyncSDK(ImednetSDK):
+    pass
+
+
+class _CustomAsyncSDK(AsyncImednetSDK):
+    pass
+
+
+def subclass_and_plugin_conformance_contract(
+    custom_sync: _CustomSyncSDK,
+    custom_async: _CustomAsyncSDK,
+) -> None:
+    custom_sync_ctx: AbstractContextManager[_CustomSyncSDK] = custom_sync.study_context('S')
+    custom_async_ctx: AbstractContextManager[_CustomAsyncSDK] = custom_async.study_context('S')
+    assert custom_sync_ctx is not None and custom_async_ctx is not None
+    with custom_sync.study_context('S') as scoped_custom_sync:
+        assert_type(scoped_custom_sync, _CustomSyncSDK)
+    with custom_async.study_context('S') as scoped_custom_async:
+        assert_type(scoped_custom_async, _CustomAsyncSDK)
+
+    workflows_ns: SyncWorkflowsNamespaceProtocol = Workflows(custom_sync)
+    sinks_ns: SinksNamespaceProtocol = create_sinks(custom_sync)
+    assert_type(workflows_ns, SyncWorkflowsNamespaceProtocol)
+    assert_type(sinks_ns, SinksNamespaceProtocol)
+    assert_type(DataExtractionWorkflow(custom_sync), DataExtractionWorkflow)
+    assert_type(StudySchemaInspector(custom_sync), StudySchemaInspector)
+    assert_type(UATWorkflow(custom_sync), UATWorkflow)

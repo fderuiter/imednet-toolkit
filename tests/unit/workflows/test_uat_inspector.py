@@ -165,7 +165,7 @@ def test_inspect_with_async_sdk_raises_type_error() -> None:
     sdk = AsyncImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
     inspector = StudySchemaInspector(sdk)
     try:
-        with pytest.raises(AttributeError):
+        with pytest.raises(TypeError, match=r"StudySchemaInspector\.inspect"):
             inspector.inspect("ST")
     finally:
         asyncio.run(sdk.aclose())

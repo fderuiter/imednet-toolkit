@@ -550,7 +550,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             **stream_kwargs,
         )
         with fetching_status("records for MongoDB export", study_key):
-            sdk.sinks.export_to_mongodb(sdk, study_key, config=cfg)
+            sdk.sinks.export_to_mongodb(study_key, config=cfg)
 
     m_parser.set_defaults(
         func=lambda args: export_mongodb(
@@ -611,7 +611,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             **stream_kwargs,
         )
         with fetching_status("records for Neo4j export", study_key):
-            sdk.sinks.export_to_neo4j(sdk, study_key, config=cfg)
+            sdk.sinks.export_to_neo4j(study_key, config=cfg)
 
     n_parser.set_defaults(
         func=lambda args: export_neo4j(
@@ -705,7 +705,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             **stream_kwargs,
         )
         with fetching_status("records for Snowflake export", study_key):
-            sdk.sinks.export_to_snowflake(sdk, study_key, config=cfg)
+            sdk.sinks.export_to_snowflake(study_key, config=cfg)
 
     s_parser.set_defaults(
         func=lambda args: export_snowflake(

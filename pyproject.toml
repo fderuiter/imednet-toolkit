@@ -72,7 +72,6 @@ python_version = "3.12"
 strict = true
 warn_unused_ignores = false
 warn_redundant_casts = false
-ignore_missing_imports = true
 plugins = []
 files = [
     "packages/core/src/imednet",
@@ -99,6 +98,8 @@ strict_optional = true
 [[tool.mypy.overrides]]
 module = [
     "pandas",
+    "pandas.*",
+    "pythonjsonlogger",
     "pythonjsonlogger.*",
     "opentelemetry",
     "opentelemetry.*",
@@ -118,6 +119,12 @@ module = [
     "openpyxl.*",
     "duckdb",
     "duckdb.*",
+    "defusedxml",
+    "defusedxml.*",
+    "jsonschema",
+    "jsonschema.*",
+    "pyarrow",
+    "pyarrow.*",
 ]
 ignore_missing_imports = true
 
@@ -191,6 +198,7 @@ verify-static = [
     "mypy packages/core/src/imednet",
     "mypy packages/plugins-workflows/src/imednet_workflows",
     "mypy packages/providers-airflow/src/apache_airflow_providers_imednet",
+    "mypy packages/plugins-sinks/src/imednet_sinks",
     "mypy packages/plugins-tui/src/imednet_tui",
     "mypy tests/typing/endpoint_contracts.py",
 ]

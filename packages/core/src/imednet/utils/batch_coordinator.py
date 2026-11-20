@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -152,7 +153,18 @@ class BatchCoordinator:
         """Validate once, submit in bounded chunks, and optionally poll to completion."""
         if not skip_validation:
             if validate_batch_fn is not None:
-                validate_batch_fn(study_key, records_data)
+                if inspect.iscoroutinefunction(validate_batch_fn):
+                    raise TypeError(
+                        "BatchCoordinator.submit() received an async validate_batch_fn; "
+                        "use AsyncBatchCoordinator.submit() instead."
+                    )
+                validation_result: Any = validate_batch_fn(study_key, records_data)
+                if inspect.iscoroutine(validation_result):
+                    validation_result.close()
+                    raise TypeError(
+                        "BatchCoordinator.submit() received a coroutine from validate_batch_fn; "
+                        "use AsyncBatchCoordinator.submit() instead."
+                    )
             elif schema is not None:
                 _validate_records_with_schema(schema, records_data, study_key=study_key)
 
