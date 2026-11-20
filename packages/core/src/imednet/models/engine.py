@@ -166,6 +166,44 @@ def _format_arg(arg: ast.arg, default: ast.expr | None = None, prefix: str = "")
     return part
 
 
+def _wrap_field_stub(
+    indent: str,
+    field_name: str,
+    ann_str: str,
+    default_str: str | None = None,
+) -> list[str]:
+    """Format a field stub declaration wrapped at 100 characters."""
+    suffix = f" = {default_str}" if default_str is not None else ""
+    single = f"{indent}{field_name}: {ann_str}{suffix}"
+    if len(single) <= 100:
+        return [single]
+    inner_ann = f"{indent}    {ann_str}"
+    if len(inner_ann) <= 100:
+        return [
+            f"{indent}{field_name}: (",
+            inner_ann,
+            f"{indent}){suffix}",
+        ]
+    union_parts = [part.strip() for part in ann_str.split(" | ")]
+    if len(union_parts) > 1:
+        wrapped = [f"{indent}{field_name}: ("]
+        for idx, part in enumerate(union_parts):
+            prefix = "" if idx == 0 else "| "
+            wrapped.append(f"{indent}    {prefix}{part}")
+        wrapped.append(f"{indent}){suffix}")
+        return wrapped
+    return [single]
+
+
+def _format_from_import(from_prefix: str, names: list[str]) -> str:
+    """Format a `from ... import ...` statement wrapped at 100 characters."""
+    single = f"{from_prefix} import {', '.join(names)}"
+    if len(single) <= 100 or len(names) <= 1:
+        return single
+    joined = "\n".join(f"    {name}," for name in names)
+    return f"{from_prefix} import (\n{joined}\n)"
+
+
 def _format_function_stub(
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
     indent: str = "",
@@ -333,11 +371,12 @@ def _build_pruned_imports(
                         a.name,
                     ),
                 )
-                names_str = ", ".join(
+                name_items = [
                     f"{a.name} as {a.asname}" if a.asname else a.name for a in sorted_kept
-                )
+                ]
+                names_str = ", ".join(name_items)
                 dots = "." * node.level
-                rendered = f"from {dots}{mod} import {names_str}"
+                rendered = _format_from_import(f"from {dots}{mod}", name_items)
                 grouped[grp].append(((1, f"{dots}{mod}", names_str), rendered))
 
     if "Any" in used_names and not any_imported:
@@ -356,10 +395,11 @@ def _build_pruned_imports(
                 a.name,
             ),
         )
-        names_str = ", ".join(
-            f"{a.name} as {a.asname}" if a.asname else a.name for a in sorted_typing
+        typing_items = [f"{a.name} as {a.asname}" if a.asname else a.name for a in sorted_typing]
+        names_str = ", ".join(typing_items)
+        grouped[1].append(
+            ((1, "typing", names_str), _format_from_import("from typing", typing_items))
         )
-        grouped[1].append(((1, "typing", names_str), f"from typing import {names_str}"))
 
     if has_future_annotations:
         grouped[0].append(((1, "__future__", "annotations"), "from __future__ import annotations"))
@@ -588,14 +628,19 @@ class ModelEngine:
             if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
                 field_name = stmt.target.id
                 declared_fields.add(field_name)
-                ann_part = f"    {field_name}: {_format_expr(stmt.annotation)}"
+                ann_expr_str = _format_expr(stmt.annotation)
+                ann_part = f"    {field_name}: {ann_expr_str}"
                 if stmt.value is None:
-                    field_lines.append(ann_part)
+                    field_lines.extend(_wrap_field_stub("    ", field_name, ann_expr_str))
                 else:
                     val_str = _format_expr(stmt.value)
                     single = f"{ann_part} = {val_str}"
-                    if len(single) <= 100 or not isinstance(stmt.value, ast.Call):
+                    if len(single) <= 100:
                         field_lines.append(single)
+                    elif not isinstance(stmt.value, ast.Call):
+                        field_lines.extend(
+                            _wrap_field_stub("    ", field_name, ann_expr_str, val_str)
+                        )
                     else:
                         func_str = _format_expr(stmt.value.func)
                         call_parts = [_format_expr(a) for a in stmt.value.args] + [
@@ -625,7 +670,10 @@ class ModelEngine:
                 if field_name in declared_fields:
                     continue
                 ann_str = _format_runtime_annotation(field_info.annotation)
-                field_lines.append(f"    {field_name}: {ann_str}")
+                default_str = (
+                    "None" if not field_info.is_required() and field_info.default is None else None
+                )
+                field_lines.extend(_wrap_field_stub("    ", field_name, ann_str, default_str))
 
         if not doc_lines and not field_lines and not method_lines:
             return ("class_single", [*header_lines, f"{header} ..."])

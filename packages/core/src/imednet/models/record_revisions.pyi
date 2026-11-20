@@ -20,22 +20,22 @@ class RecordRevision(ImednetBaseModel):
     record_revision: int | None = Field(default=None, alias="recordRevision")
     data_revision: int | None = Field(default=None, alias="dataRevision")
     record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
-    study_key: str | None
-    record_revision_id: int | None
-    record_id: int | None
-    subject_id: int | None
-    subject_key: str | None
-    site_id: int | None
-    form_key: str | None
-    interval_id: int | None
-    deleted: bool | None
-    date_created: str | None
-    reason_for_change: str | None
-    record_oid: str | None
-    role: str | None
-    subject_oid: str | None
-    user: str | None
-    last_updated: str | None
+    study_key: str | None = None
+    record_revision_id: int | None = None
+    record_id: int | None = None
+    subject_id: int | None = None
+    subject_key: str | None = None
+    site_id: int | None = None
+    form_key: str | None = None
+    interval_id: int | None = None
+    deleted: bool | None = None
+    date_created: str | None = None
+    reason_for_change: str | None = None
+    record_oid: str | None = None
+    role: str | None = None
+    subject_oid: str | None = None
+    user: str | None = None
+    last_updated: str | None = None
 
     @model_validator(mode="before")
     @classmethod

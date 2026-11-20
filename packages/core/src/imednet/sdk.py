@@ -148,12 +148,13 @@ class _BaseSDK:
         auth: AuthStrategy | None,
         credential_source: CredentialSource | None,
         has_injected_client: bool,
+        has_injected_transport: bool = False,
     ) -> Config:
         """Resolve SDK configuration once and initialize common SDK state."""
         if has_injected_client and auth is not None:
             raise ValueError("An injected client already owns authentication")
         effective_source = credential_source if auth is None else None
-        require_creds = auth is None and not has_injected_client
+        require_creds = auth is None and not has_injected_client and not has_injected_transport
         if config is not None:
             resolved = merge_config_overrides(
                 config,
@@ -166,6 +167,7 @@ class _BaseSDK:
                 simulation_mode=simulation_mode,
                 credential_source=effective_source,
                 require_credentials=require_creds,
+                has_transport=has_injected_transport,
             )
         else:
             resolved = load_config(
@@ -178,6 +180,7 @@ class _BaseSDK:
                 simulation_mode=simulation_mode,
                 credential_source=effective_source,
                 require_credentials=require_creds,
+                has_transport=has_injected_transport,
             )
         self.config = resolved
         self._api_key = resolved.api_key
@@ -365,6 +368,7 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
             auth=auth,
             credential_source=credential_source,
             has_injected_client=client is not None,
+            has_injected_transport=transport is not None,
         )
 
         if client is not None:
@@ -511,6 +515,7 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
             auth=auth,
             credential_source=credential_source,
             has_injected_client=async_client is not None,
+            has_injected_transport=transport is not None,
         )
 
         if async_client is not None:
