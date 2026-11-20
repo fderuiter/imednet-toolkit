@@ -184,6 +184,7 @@ def test_job_sensor_fetches_result_url_and_fails_on_record_errors(monkeypatch):
     import httpx
 
     from imednet import ImednetSDK
+    from imednet.core.retry import RetryConfig
 
     _setup_airflow(monkeypatch)
     import apache_airflow_providers_imednet.operators as ops
@@ -231,6 +232,7 @@ def test_job_sensor_fetches_result_url_and_fails_on_record_errors(monkeypatch):
             api_key="k",
             security_key="s",
             base_url="https://edc.trn.imednetapi.com",
+            retry_config=RetryConfig(backoff_factor=0.0),
             transport=httpx.MockTransport(handler),
         )
 

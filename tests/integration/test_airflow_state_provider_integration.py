@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import os
+import shutil
 import sys
 import textwrap
 from datetime import datetime, timezone
@@ -14,12 +15,76 @@ from typing import Any
 
 import pytest
 
-if "airflow" not in sys.modules or getattr(sys.modules.get("airflow"), "__path__", None) is None:
-    for _mod in list(sys.modules):
-        if _mod == "airflow" or _mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
-            sys.modules.pop(_mod, None)
 
+def _ensure_real_airflow_modules() -> None:
+    """Purge dummy Airflow or dummy-bound provider modules before real Airflow imports."""
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+                sys.modules.pop(mod, None)
+        return
+
+    compat_mod = sys.modules.get("apache_airflow_providers_imednet._airflow_compat")
+    base_hook = getattr(compat_mod, "BaseHook", None)
+    hook_mod = sys.modules.get(getattr(base_hook, "__module__", ""))
+    if compat_mod is not None and getattr(hook_mod, "__file__", None) is None:
+        for mod in list(sys.modules):
+            if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+                sys.modules.pop(mod, None)
+        providers_pkg = sys.modules.get("airflow.providers")
+        if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+            delattr(providers_pkg, "imednet")
+
+
+_ensure_real_airflow_modules()
 pytest.importorskip("airflow")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_airflow_state_provider_modules() -> Any:
+    """Unload Airflow and provider modules on teardown so subsequent unit tests stay hermetic."""
+    _ensure_real_airflow_modules()
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
+            sys.modules.pop(mod, None)
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
+
+
+@pytest.fixture(scope="module")
+def _airflow_template_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Create a clean Airflow 3 SQLite schema once per module and copy per test."""
+    _ensure_real_airflow_modules()
+    from airflow import settings
+    from airflow.configuration import conf
+    from airflow.utils import db
+
+    tpl_dir = tmp_path_factory.mktemp("airflow_tpl")
+    tpl_db = tpl_dir / "template.db"
+    tpl_uri = f"sqlite:///{tpl_db}"
+
+    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    conf.set("database", "sql_alchemy_conn", tpl_uri)
+    settings.SQL_ALCHEMY_CONN = tpl_uri
+    try:
+        settings.dispose_orm()
+        settings.configure_orm()
+        db.initdb()
+    finally:
+        settings.dispose_orm()
+        settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if prev_conn is not None:
+            conf.set("database", "sql_alchemy_conn", prev_conn)
+        settings.configure_orm()
+    return tpl_db
 
 
 def _load_dag_from_file(dag_file: Path, dag_id: str) -> Any:
@@ -33,15 +98,13 @@ def _load_dag_from_file(dag_file: Path, dag_id: str) -> Any:
 
 
 @pytest.fixture
-def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+def airflow_runtime_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _airflow_template_db: Path,
+) -> Any:
     """Initialize an isolated Apache Airflow 3 SQLite metadata DB and DAG bundle directory."""
-    if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
-    ):
-        for mod in list(sys.modules):
-            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
-                sys.modules.pop(mod, None)
+    _ensure_real_airflow_modules()
 
     root_logger = logging.getLogger()
     saved_handlers = list(root_logger.handlers)
@@ -50,12 +113,12 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     dags_dir = tmp_path / "dags"
     dags_dir.mkdir(parents=True, exist_ok=True)
     db_path = tmp_path / "airflow.db"
+    shutil.copy2(_airflow_template_db, db_path)
     db_uri = f"sqlite:///{db_path}"
 
     from airflow import settings
     from airflow.configuration import conf
     from airflow.dag_processing.bundles.manager import DagBundlesManager
-    from airflow.utils import db
 
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
     prev_dags = conf.get("core", "dags_folder", fallback=None)
@@ -89,7 +152,6 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
     settings.dispose_orm()
     settings.configure_orm()
-    db.initdb()
     DagBundlesManager().sync_bundles_to_db()
 
     yield dags_dir

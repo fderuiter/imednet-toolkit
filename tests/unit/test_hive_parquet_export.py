@@ -157,6 +157,7 @@ def test_export_to_hive_parquet_import_error(monkeypatch: pytest.MonkeyPatch) ->
         parquet_mod.export_to_hive_parquet(MagicMock(), "STUDY", "/tmp/lake")
 
 
+@pytest.mark.performance
 def test_export_to_hive_parquet_50_forms_5000_records_syncs_cache_once_and_masks_phi(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -304,6 +305,124 @@ def test_export_to_hive_parquet_50_forms_5000_records_syncs_cache_once_and_masks
         assert sync_calls == 2
         unmasked_df = _read_partition_dataframe(
             lake_unmasked / "study_key=HIVE50" / "form_key=FORM_01"
+        )
+        assert "Patient 1" in set(unmasked_df["Participant Name"])
+
+
+def test_export_to_hive_parquet_multi_form_single_pass_syncs_cache_once_and_masks_phi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify default export_to_hive_parquet syncs CachedRecordsLoader once across multiple forms."""
+    pytest.importorskip("pyarrow")
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+    from imednet_workflows import cached_loader as cached_loader_mod
+
+    monkeypatch.setattr(cached_loader_mod, "DEFAULT_CACHE_DIR", tmp_path / "cache")
+
+    forms_payload = [{"formId": i, "formKey": f"FORM_{i:02d}"} for i in range(1, 6)]
+    variables_payload = [
+        {
+            "variableName": "patientName",
+            "variableType": "text",
+            "label": "Participant Name",
+            "formId": i,
+            "formKey": f"FORM_{i:02d}",
+        }
+        for i in range(1, 6)
+    ]
+    all_records = [
+        {
+            "recordId": idx,
+            "studyKey": "HIVE5",
+            "subjectKey": f"SUBJ-{(idx % 5) + 1:03d}",
+            "visitId": 1,
+            "formId": ((idx - 1) % 3) + 1,
+            "formKey": f"FORM_{((idx - 1) % 3) + 1:02d}",
+            "recordStatus": "Complete",
+            "deleted": False,
+            "dateModified": "2026-06-01T00:00:00Z",
+            "recordData": {"patientName": f"Patient {idx}"},
+        }
+        for idx in range(1, 16)
+    ]
+
+    sync_calls = 0
+    orig_sync = cached_loader_mod.CachedRecordsLoader.sync_records
+
+    def _spy_sync(
+        self_loader: cached_loader_mod.CachedRecordsLoader,
+        study_key: str,
+        *,
+        reconcile: bool = True,
+    ) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        return orig_sync(self_loader, study_key, reconcile=reconcile)
+
+    monkeypatch.setattr(cached_loader_mod.CachedRecordsLoader, "sync_records", _spy_sync)
+    record_filters: list[str] = []
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get("https://api.test/api/v1/edc/studies/HIVE5/forms").mock(
+            return_value=httpx.Response(200, json={"data": forms_payload})
+        )
+        router.get("https://api.test/api/v1/edc/studies/HIVE5/variables").mock(
+            return_value=httpx.Response(200, json={"data": variables_payload})
+        )
+
+        def records_handler(req: httpx.Request) -> httpx.Response:
+            record_filters.append(req.url.params.get("filter", ""))
+            return httpx.Response(
+                200,
+                json={
+                    "data": all_records,
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 100,
+                        "totalPages": 1,
+                        "totalElements": len(all_records),
+                    },
+                },
+            )
+
+        router.get("https://api.test/api/v1/edc/studies/HIVE5/records").mock(
+            side_effect=records_handler
+        )
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+        lake_masked = tmp_path / "lake_masked"
+        parquet_mod.export_to_hive_parquet(
+            sdk,
+            "HIVE5",
+            str(lake_masked),
+            use_labels_as_columns=True,
+            chunk_size=5,
+            max_buffered_records=6,
+        )
+        assert sync_calls == 1
+        assert all("formId" not in flt for flt in record_filters)
+        study_dir = lake_masked / "study_key=HIVE5"
+        partition_dirs = sorted(p.name for p in study_dir.iterdir() if p.is_dir())
+        assert partition_dirs == ["form_key=FORM_01", "form_key=FORM_02", "form_key=FORM_03"]
+        for i in range(1, 4):
+            part_df = _read_partition_dataframe(study_dir / f"form_key=FORM_{i:02d}")
+            assert set(part_df["Participant Name"]) == {"***MASKED***"}
+
+        lake_unmasked = tmp_path / "lake_unmasked"
+        parquet_mod.export_to_hive_parquet(
+            sdk,
+            "HIVE5",
+            str(lake_unmasked),
+            use_labels_as_columns=True,
+            form_whitelist=[1],
+            mask_phi=False,
+        )
+        assert sync_calls == 2
+        unmasked_df = _read_partition_dataframe(
+            lake_unmasked / "study_key=HIVE5" / "form_key=FORM_01"
         )
         assert "Patient 1" in set(unmasked_df["Participant Name"])
 

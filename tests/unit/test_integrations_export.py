@@ -1555,6 +1555,7 @@ def test_custom_global_sensitivity_registry_key_redacts_across_all_outputs(tmp_p
         global_sensitivity_registry._sensitive_keys.update(snapshot)
 
 
+@pytest.mark.performance
 def test_by_form_exports_50_forms_5000_records_single_pass_http_counts(tmp_path: Path) -> None:
     """Verify 50-Form, 5,000-Record DuckDB and SQL per-Form exports issue 52 HTTP calls total."""
     import sqlite3
@@ -1701,6 +1702,117 @@ def test_by_form_exports_50_forms_5000_records_single_pass_http_counts(tmp_path:
                 assert sconn.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0] == 0
                 cols = {r[1] for r in sconn.execute(f"PRAGMA table_info('{tbl}')").fetchall()}
                 assert f"VAL_{empty_i:02d}" in cols
+
+
+def test_by_form_exports_multi_form_single_pass_http_counts(tmp_path: Path) -> None:
+    """Verify multi-Form DuckDB and SQL per-Form exports stream records once and create empty tables."""
+    import sqlite3
+
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    duckdb_mod = pytest.importorskip("duckdb")
+
+    forms_payload = [{"formId": i, "formKey": f"FORM_{i:02d}"} for i in range(1, 6)]
+    variables_payload = [
+        {
+            "variableName": f"VAL_{i:02d}",
+            "variableType": "int",
+            "label": f"Value {i:02d}",
+            "formId": i,
+            "formKey": f"FORM_{i:02d}",
+        }
+        for i in range(1, 6)
+    ]
+    all_records = [
+        {
+            "recordId": idx,
+            "studyKey": "BENCH5",
+            "subjectKey": f"SUBJ-{(idx % 5) + 1:03d}",
+            "visitId": 1,
+            "formId": ((idx - 1) % 3) + 1,
+            "formKey": f"FORM_{((idx - 1) % 3) + 1:02d}",
+            "recordStatus": "Complete",
+            "deleted": False,
+            "dateModified": "2026-06-01T00:00:00Z",
+            "recordData": {f"VAL_{((idx - 1) % 3) + 1:02d}": idx},
+        }
+        for idx in range(1, 16)
+    ]
+
+    counts = {"forms": 0, "variables": 0, "records": 0}
+    record_filters: list[str] = []
+
+    with respx.mock(assert_all_called=True) as router:
+
+        def forms_handler(_req: httpx.Request) -> httpx.Response:
+            counts["forms"] += 1
+            return httpx.Response(200, json={"data": forms_payload})
+
+        def vars_handler(_req: httpx.Request) -> httpx.Response:
+            counts["variables"] += 1
+            return httpx.Response(200, json={"data": variables_payload})
+
+        def records_handler(req: httpx.Request) -> httpx.Response:
+            counts["records"] += 1
+            record_filters.append(req.url.params.get("filter", ""))
+            return httpx.Response(
+                200,
+                json={
+                    "data": all_records,
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 100,
+                        "totalPages": 1,
+                        "totalElements": len(all_records),
+                    },
+                },
+            )
+
+        router.get("https://api.test/api/v1/edc/studies/BENCH5/forms").mock(
+            side_effect=forms_handler
+        )
+        router.get("https://api.test/api/v1/edc/studies/BENCH5/variables").mock(
+            side_effect=vars_handler
+        )
+        router.get("https://api.test/api/v1/edc/studies/BENCH5/records").mock(
+            side_effect=records_handler
+        )
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+        ddb_path = tmp_path / "bench5.duckdb"
+        export_mod.export_to_duckdb_by_form(sdk, "BENCH5", str(ddb_path), batch_size=5)
+        assert counts == {"forms": 1, "variables": 1, "records": 1}
+        assert all("formId" not in flt for flt in record_filters)
+
+        with duckdb_mod.connect(str(ddb_path)) as dconn:
+            ddb_tables = {r[0] for r in dconn.execute("SHOW TABLES").fetchall()}
+            assert len(ddb_tables) == 5
+            for empty_i in (4, 5):
+                tbl = f"FORM_{empty_i:02d}"
+                assert dconn.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0] == 0
+
+        counts.update({"forms": 0, "variables": 0, "records": 0})
+        record_filters.clear()
+        sql_path = tmp_path / "bench5.sqlite"
+        export_mod.export_to_sql_by_form(
+            sdk,
+            "BENCH5",
+            f"sqlite:///{sql_path}",
+            quality_gate_enabled=True,
+            batch_size=5,
+        )
+        assert counts == {"forms": 1, "variables": 1, "records": 1}
+        with sqlite3.connect(sql_path) as sconn:
+            sql_tables = {
+                r[0]
+                for r in sconn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            assert len(sql_tables) == 5
 
 
 def test_sql_by_form_quality_gate_drops_low_readiness_with_single_variables_fetch(
