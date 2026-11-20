@@ -37,8 +37,10 @@ Progress callbacks support either a JobStatusEvent argument or the original
 TypeError propagates exactly once. Ambiguous variadic and opaque callables use the
 original signature. Callbacks are synchronous even in async polling; batch sync
 callbacks must be thread safe. Partial batch results remain in JobPollSummary;
-fail_fast retains existing semantics (sync waits for workers, async raises on failure).
-This is not a promise that sibling operations are forcibly cancelled (#1686).
+on `fail_fast=True`, sync pollers copy `ContextVar` state per worker and wake sleeping
+siblings via a cooperative `threading.Event`, while async pollers cancel and await all
+pending sibling `asyncio.Task` pollers before raising the triggering `JobFailedError`
+or `JobTimeoutError` directly (without cancelling any server-side EDC Job).
 
 ## Verification
 
