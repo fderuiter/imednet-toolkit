@@ -8,6 +8,7 @@ from imednet.core.endpoint.operations.get import PathGetOperation
 from imednet.models.jobs import JobStatus
 from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
 from imednet.utils.typing import ItemId
+from imednet.utils.url import validate_path_segment
 
 
 class JobsOperationDef:
@@ -20,6 +21,8 @@ class JobsOperationDef:
     def get(self, study_key: str | None, item_id: ItemId) -> PathGetOperation[JobStatus]:
         """Get a single Job by ID."""
         self._require_item_id(item_id)  # type: ignore
+        self._validate_study_key(study_key)  # type: ignore
+        validate_path_segment(item_id, name="batch_id")
         path = self._get_endpoint_path(study_key, item_id)  # type: ignore
         return PathGetOperation[JobStatus](
             path=path,
@@ -53,6 +56,8 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
         """Wait for a terminal Job using the shared polling implementation."""
         from imednet.utils.job_poller import JobPoller
 
+        self._validate_study_key(study_key)
+        validate_path_segment(batch_id, name="batch_id")
         poller = JobPoller(self.get, fetch_result=self._fetch_result_url)
         if on_progress is None:
             return poller.run(study_key, batch_id, interval, timeout)
@@ -71,6 +76,9 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
         """Collect terminal statuses and per-job failures through the shared poller."""
         from imednet.utils.job_poller import JobPoller
 
+        self._validate_study_key(study_key)
+        for batch_id in batch_ids:
+            validate_path_segment(batch_id, name="batch_id")
         return JobPoller(self.get, fetch_result=self._fetch_result_url).poll_many(
             study_key, batch_ids, interval, timeout, on_progress=on_progress, fail_fast=fail_fast
         )
@@ -101,6 +109,8 @@ class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # ty
         """Wait asynchronously using the shared polling implementation."""
         from imednet.utils.job_poller import AsyncJobPoller
 
+        self._validate_study_key(study_key)
+        validate_path_segment(batch_id, name="batch_id")
         poller = AsyncJobPoller(self.get, fetch_result=self._fetch_result_url)
         if on_progress is None:
             return await poller.run(study_key, batch_id, interval, timeout)
@@ -119,6 +129,9 @@ class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # ty
         """Collect async terminal statuses and per-job failures through the shared poller."""
         from imednet.utils.job_poller import AsyncJobPoller
 
+        self._validate_study_key(study_key)
+        for batch_id in batch_ids:
+            validate_path_segment(batch_id, name="batch_id")
         return await AsyncJobPoller(self.get, fetch_result=self._fetch_result_url).async_poll_many(
             study_key, batch_ids, interval, timeout, on_progress=on_progress, fail_fast=fail_fast
         )

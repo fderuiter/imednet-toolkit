@@ -46,63 +46,206 @@
                 formId: 302,
                 formKey: "F_VS",
                 formName: "Vital Signs",
-                domain: "VS",
-                studyKey: "STUDY",
-                description: "Standard vital signs observations (blood pressure, pulse, weight, temperature).",
+                formType: "Subject",
                 variables: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
-                    { id: "VISIT", label: "Visit Name", type: "string", required: true, rule: "Values: Baseline, Follow-Up" },
-                    { id: "V_SYSBP", label: "Systolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "70 <= val <= 240" },
-                    { id: "V_DIABP", label: "Diastolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "40 <= val <= 140" },
-                    { id: "V_PULSE", label: "Pulse Rate (beats/min)", type: "integer", required: true, rule: "40 <= val <= 180" },
-                    { id: "V_WEIGHT", label: "Weight (kg)", type: "float", required: true, rule: "val > 0.0" },
-                    { id: "V_TEMP", label: "Oral Temperature (°C)", type: "float", required: false, rule: "35.0 <= val <= 41.0" }
+                    { variableName: "SUBJID", label: "Subject Identifier", variableType: "Text", sequence: 1, required: "Yes", format: "SUBX" },
+                    {
+                        variableName: "VISIT",
+                        label: "Visit Name",
+                        variableType: "Dropdown",
+                        sequence: 2,
+                        required: "Yes",
+                        choices: [
+                            { choiceText: "Baseline", choiceValue: "BASE", position: 1 },
+                            { choiceText: "Follow-Up", choiceValue: "FU1", position: 2 }
+                        ]
+                    },
+                    { variableName: "V_SYSBP", label: "Systolic Blood Pressure (mmHg)", variableType: "Integer", sequence: 3, required: "Yes", precision: "0" },
+                    { variableName: "V_DIABP", label: "Diastolic Blood Pressure (mmHg)", variableType: "Integer", sequence: 4, required: "Yes", precision: "0" },
+                    { variableName: "V_PULSE", label: "Pulse Rate (beats/min)", variableType: "Integer", sequence: 5, required: "Yes", precision: "0" },
+                    { variableName: "V_WEIGHT", label: "Weight (kg)", variableType: "Float", sequence: 6, required: "Yes", precision: "1" },
+                    { variableName: "V_TEMP", label: "Oral Temperature (°C)", variableType: "Float", sequence: 7, required: "No", precision: "1" }
+                ],
+                businessLogic: [
+                    {
+                        id: "BL-VS-001",
+                        name: "Systolic Range Query",
+                        type: "Query",
+                        status: "Active",
+                        form: "F_VS",
+                        sequence: 1,
+                        logic: {
+                            operator: "OR",
+                            conditions: [
+                                { variable: "V_SYSBP", operator: "<", value: 70 },
+                                { variable: "V_SYSBP", operator: ">", value: 240 }
+                            ]
+                        }
+                    },
+                    {
+                        id: "BL-VS-002",
+                        name: "Diastolic Exceeds Systolic",
+                        type: "Form",
+                        status: "Active",
+                        form: "F_VS",
+                        sequence: 2,
+                        logic: {
+                            conditions: [
+                                { variable: "V_DIABP", operator: ">=", compareVariable: "V_SYSBP" }
+                            ]
+                        }
+                    }
                 ]
             },
             DM: {
                 formId: 301,
                 formKey: "F_DM",
                 formName: "Demographics",
-                domain: "DM",
-                studyKey: "STUDY",
-                description: "Demographic background, biological sex, race category, and randomized arm.",
+                formType: "Subject",
                 variables: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
-                    { id: "V_AGE", label: "Age at Screening", type: "integer", required: true, rule: "val >= 18" },
-                    { id: "V_GENDER", label: "Biological Sex", type: "string", required: true, rule: "Values: Female, Male, Other" },
-                    { id: "V_RACE", label: "Race Category", type: "string", required: true, rule: "CDISC controlled terminology" },
-                    { id: "V_ARM", label: "Planned Arm", type: "string", required: true, rule: "Values: ARM-A, ARM-B, PLACEBO" }
+                    { variableName: "SUBJID", label: "Subject Identifier", variableType: "Text", sequence: 1, required: "Yes", format: "SUBX" },
+                    { variableName: "V_AGE", label: "Age at Screening", variableType: "Integer", sequence: 2, required: "Yes", precision: "0" },
+                    {
+                        variableName: "V_GENDER",
+                        label: "Biological Sex",
+                        variableType: "Radio",
+                        sequence: 3,
+                        required: "Yes",
+                        choices: [
+                            { choiceText: "Female", choiceValue: "Female", position: 1 },
+                            { choiceText: "Male", choiceValue: "Male", position: 2 },
+                            { choiceText: "Other", choiceValue: "Other", position: 3 }
+                        ]
+                    },
+                    {
+                        variableName: "V_RACE",
+                        label: "Race Category",
+                        variableType: "Dropdown",
+                        sequence: 4,
+                        required: "Yes",
+                        choices: [
+                            { choiceText: "White", choiceValue: "WHITE", position: 1 },
+                            { choiceText: "Asian", choiceValue: "ASIAN", position: 2 },
+                            { choiceText: "Black", choiceValue: "BLACK", position: 3 }
+                        ]
+                    },
+                    {
+                        variableName: "V_ARM",
+                        label: "Planned Arm",
+                        variableType: "Dropdown",
+                        sequence: 5,
+                        required: "Yes",
+                        choices: [
+                            { choiceText: "Arm A", choiceValue: "ARM-A", position: 1 },
+                            { choiceText: "Arm B", choiceValue: "ARM-B", position: 2 },
+                            { choiceText: "Placebo", choiceValue: "PLACEBO", position: 3 }
+                        ]
+                    }
+                ],
+                businessLogic: [
+                    {
+                        id: "BL-DM-001",
+                        name: "Adult Eligibility Check",
+                        type: "Form",
+                        status: "Active",
+                        form: "F_DM",
+                        sequence: 1,
+                        logic: {
+                            conditions: [
+                                { variable: "V_AGE", operator: "<", value: 18 }
+                            ]
+                        }
+                    }
                 ]
             },
             AE: {
                 formId: 303,
                 formKey: "F_AE",
                 formName: "Safety Observations",
-                domain: "AE",
-                studyKey: "STUDY",
-                description: "Clinical safety observation terms, severity grading, and relationship to study agent.",
+                formType: "Subject",
                 variables: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
-                    { id: "V_AETERM", label: "Reported Observation Term", type: "string", required: true, rule: "MedDRA LLT terminology" },
-                    { id: "V_AESTDTC", label: "Start Date", type: "date", required: true, rule: "ISO 8601 YYYY-MM-DD" },
-                    { id: "V_AESEV", label: "Severity Grade", type: "string", required: true, rule: "Values: MILD, MODERATE, SEVERE" },
-                    { id: "V_AESER", label: "Serious Safety Indicator", type: "boolean", required: true, rule: "true | false" },
-                    { id: "V_AEREL", label: "Causality Relationship", type: "string", required: true, rule: "Values: RELATED, POSSIBLE, UNRELATED" }
+                    { variableName: "SUBJID", label: "Subject Identifier", variableType: "Text", sequence: 1, required: "Yes", format: "SUBX" },
+                    { variableName: "V_AETERM", label: "Reported Observation Term", variableType: "Text", sequence: 2, required: "Yes" },
+                    { variableName: "V_AESTDTC", label: "Start Date", variableType: "Date/Time Precision", sequence: 3, required: "Yes", format: "YYYY-MM-DD" },
+                    {
+                        variableName: "V_AESEV",
+                        label: "Severity Grade",
+                        variableType: "Radio",
+                        sequence: 4,
+                        required: "Yes",
+                        choices: [
+                            { choiceText: "Mild", choiceValue: "MILD", position: 1 },
+                            { choiceText: "Moderate", choiceValue: "MODERATE", position: 2 },
+                            { choiceText: "Severe", choiceValue: "SEVERE", position: 3 }
+                        ]
+                    },
+                    { variableName: "V_AESER", label: "Serious Safety Indicator", variableType: "Checkbox", sequence: 5, required: "Yes" },
+                    {
+                        variableName: "V_AEREL",
+                        label: "Causality Relationship",
+                        variableType: "Dropdown",
+                        sequence: 6,
+                        required: "Yes",
+                        choices: [
+                            { choiceText: "Related", choiceValue: "RELATED", position: 1 },
+                            { choiceText: "Possible", choiceValue: "POSSIBLE", position: 2 },
+                            { choiceText: "Unrelated", choiceValue: "UNRELATED", position: 3 }
+                        ]
+                    }
+                ],
+                businessLogic: [
+                    {
+                        id: "BL-AE-001",
+                        name: "Severe Observation Review",
+                        type: "Query",
+                        status: "Active",
+                        form: "F_AE",
+                        sequence: 1,
+                        logic: {
+                            conditions: [
+                                { variable: "V_AESEV", operator: "==", value: "SEVERE" }
+                            ]
+                        }
+                    }
                 ]
             },
             LB: {
                 formId: 304,
                 formKey: "F_LB",
                 formName: "Laboratory Findings",
-                domain: "LB",
-                studyKey: "STUDY",
-                description: "Laboratory analytes, standard units, and reference range indicators.",
+                formType: "Subject",
                 variables: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
-                    { id: "V_LBTEST", label: "Analyte Test Name", type: "string", required: true, rule: "e.g. HEMOGLOBIN, POTASSIUM, ALT" },
-                    { id: "V_LBORRES", label: "Numeric Result", type: "float", required: true, rule: "val > 0.0" },
-                    { id: "V_LBORRESU", label: "Standard Unit", type: "string", required: true, rule: "SI units (g/dL, mmol/L, U/L)" },
-                    { id: "V_LBNRIND", label: "Normal Range Indicator", type: "string", required: true, rule: "Values: NORMAL, LOW, HIGH" }
+                    { variableName: "SUBJID", label: "Subject Identifier", variableType: "Text", sequence: 1, required: "Yes", format: "SUBX" },
+                    { variableName: "V_LBTEST", label: "Analyte Test Name", variableType: "Text", sequence: 2, required: "Yes" },
+                    { variableName: "V_LBORRES", label: "Numeric Result", variableType: "Float", sequence: 3, required: "Yes", precision: "2" },
+                    { variableName: "V_LBORRESU", label: "Standard Unit", variableType: "Text", sequence: 4, required: "Yes" },
+                    {
+                        variableName: "V_LBNRIND",
+                        label: "Normal Range Indicator",
+                        variableType: "Dropdown",
+                        sequence: 5,
+                        required: "Yes",
+                        choices: [
+                            { choiceText: "Normal", choiceValue: "NORMAL", position: 1 },
+                            { choiceText: "Low", choiceValue: "LOW", position: 2 },
+                            { choiceText: "High", choiceValue: "HIGH", position: 3 }
+                        ]
+                    }
+                ],
+                businessLogic: [
+                    {
+                        id: "BL-LB-001",
+                        name: "Non-Positive Result Check",
+                        type: "Form",
+                        status: "Active",
+                        form: "F_LB",
+                        sequence: 1,
+                        logic: {
+                            conditions: [
+                                { variable: "V_LBORRES", operator: "<=", value: 0 }
+                            ]
+                        }
+                    }
                 ]
             }
         },
@@ -175,37 +318,67 @@
         ],
         audits: [
             {
-                auditId: "AUD-8801",
-                timestamp: "2026-11-15T18:22:10Z",
-                user: "sim_admin",
+                recordRevisionId: 9001,
+                studyKey: "STUDY",
+                recordId: 601,
+                recordOid: "REC-601",
+                recordRevision: 1,
+                dataRevision: 1,
+                recordStatus: "Complete",
+                subjectId: 501,
+                subjectOid: "SUBJ-501",
+                subjectKey: "SUB1",
+                siteId: 201,
+                formKey: "F_VS",
+                intervalId: 401,
+                role: "Clinical Research Coordinator",
+                user: "sim_crc",
+                reasonForChange: "Initial Vital Signs Record capture",
+                deleted: false,
+                dateCreated: "2026-11-15 18:10:00",
+                lastUpdated: "2026-11-15 18:10:00"
+            },
+            {
+                recordRevisionId: 9002,
+                studyKey: "STUDY",
+                recordId: 601,
+                recordOid: "REC-601",
+                recordRevision: 2,
+                dataRevision: 2,
+                recordStatus: "Complete",
+                subjectId: 501,
+                subjectOid: "SUBJ-501",
+                subjectKey: "SUB1",
+                siteId: 201,
+                formKey: "F_VS",
+                intervalId: 401,
                 role: "Clinical Data Manager",
-                action: "RECORD_VERIFY",
-                target: "STUDY/F_VS/601",
-                hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                wcagCompliance: "PASS",
-                status: "VERIFIED"
+                user: "sim_cdm",
+                reasonForChange: "Updated systolic Variable measurement after Query review",
+                deleted: false,
+                dateCreated: "2026-11-15 18:22:10",
+                lastUpdated: "2026-11-15 18:22:10"
             },
             {
-                auditId: "AUD-8802",
-                timestamp: "2026-11-15T18:35:45Z",
-                user: "sim_user",
+                recordRevisionId: 9003,
+                studyKey: "STUDY",
+                recordId: 601,
+                recordOid: "REC-601",
+                recordRevision: 3,
+                dataRevision: 2,
+                recordStatus: "Verified",
+                subjectId: 501,
+                subjectOid: "SUBJ-501",
+                subjectKey: "SUB1",
+                siteId: 201,
+                formKey: "F_VS",
+                intervalId: 401,
                 role: "Principal Investigator",
-                action: "ELECTRONIC_SIGNATURE",
-                target: "STUDY/F_VS/601",
-                hash: "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
-                wcagCompliance: "PASS",
-                status: "VERIFIED"
-            },
-            {
-                auditId: "AUD-8803",
-                timestamp: "2026-11-15T19:01:12Z",
-                user: "sim_sync_job",
-                role: "Automated Pipeline",
-                action: "DATA_EXPORT_DUCKDB",
-                target: "STUDY/PARQUET",
-                hash: "7d793037a0760186574b0282f2f435e7b1e50774690f69799143a5544e131536",
-                wcagCompliance: "PASS",
-                status: "VERIFIED"
+                user: "sim_pi",
+                reasonForChange: "21 CFR Part 11 investigator verification sign-off",
+                deleted: false,
+                dateCreated: "2026-11-15 18:35:45",
+                lastUpdated: "2026-11-15 18:35:45"
             }
         ],
         vpat: [
@@ -381,18 +554,34 @@
     // -------------------------------------------------------------------------
     function renderCrfStructure(formDef) {
         if (!formDef) return "";
+        const rules = Array.isArray(formDef.businessLogic) ? formDef.businessLogic : [];
         let html = `<div class="crf-view-container">`;
         html += `<div class="crf-header">`;
-        html += `<h4><span class="crf-tag">${escapeHtml(formDef.domain)}</span> ${escapeHtml(formDef.formName)} <span class="crf-oid">(${escapeHtml(formDef.formKey || formDef.formId)})</span></h4>`;
-        html += `<p class="crf-desc">${escapeHtml(formDef.description)}</p>`;
+        html += `<h4><span class="crf-tag">${escapeHtml(formDef.formType || "Subject")}</span> ${escapeHtml(formDef.formName)} <span class="crf-oid">(${escapeHtml(formDef.formKey || formDef.formId)} &middot; ID ${escapeHtml(formDef.formId)})</span></h4>`;
+        html += `<p class="crf-desc">Canonical Data Dictionary Form schema (${formDef.variables.length} Variables, ${rules.length} BusinessLogicRules)</p>`;
         html += `</div>`;
 
         html += `<div class="form-variables-grid">`;
         formDef.variables.forEach(function (variable) {
+            const reqText = String(variable.required || "").toLowerCase();
+            const isRequired = variable.required === true || reqText === "yes" || reqText === "auto query";
+            let constraintLabel = "Sequence";
+            let constraintVal = String(variable.sequence || "");
+            if (Array.isArray(variable.choices) && variable.choices.length) {
+                constraintLabel = "Choices";
+                constraintVal = variable.choices.map(function (c) { return c.choiceValue; }).join(", ");
+            } else if (variable.format) {
+                constraintLabel = "Format";
+                constraintVal = variable.format;
+            } else if (variable.precision !== null && variable.precision !== undefined) {
+                constraintLabel = "Precision";
+                constraintVal = variable.precision;
+            }
+
             html += `<div class="form-variable-card">`;
             html += `<div class="form-variable-header">`;
-            html += `<span class="form-variable-id">${escapeHtml(variable.id)}</span>`;
-            if (variable.required) {
+            html += `<span class="form-variable-id">${escapeHtml(variable.variableName)}</span>`;
+            if (isRequired) {
                 html += `<span class="crf-badge-required">Required</span>`;
             } else {
                 html += `<span class="crf-badge-optional">Optional</span>`;
@@ -400,12 +589,34 @@
             html += `</div>`;
             html += `<div class="form-variable-label">${escapeHtml(variable.label)}</div>`;
             html += `<div class="form-variable-meta">`;
-            html += `<span class="crf-meta-item"><strong>Type:</strong> <code>${escapeHtml(variable.type)}</code></span>`;
-            html += `<span class="crf-meta-item"><strong>Rule:</strong> <code>${escapeHtml(variable.rule)}</code></span>`;
+            html += `<span class="crf-meta-item"><strong>Type:</strong> <code>${escapeHtml(variable.variableType)}</code></span>`;
+            html += `<span class="crf-meta-item"><strong>${constraintLabel}:</strong> <code>${escapeHtml(constraintVal)}</code></span>`;
             html += `</div>`;
             html += `</div>`;
         });
-        html += `</div></div>`;
+        html += `</div>`;
+
+        if (rules.length) {
+            html += `<div class="crf-rules-section">`;
+            html += `<h5 class="crf-rules-heading">BusinessLogicRule Definitions</h5>`;
+            html += `<div class="form-variables-grid">`;
+            rules.forEach(function (rule) {
+                html += `<div class="form-variable-card">`;
+                html += `<div class="form-variable-header">`;
+                html += `<span class="form-variable-id">${escapeHtml(rule.id)}</span>`;
+                html += `<span class="status-badge badge-success">${escapeHtml(rule.status || "Active")}</span>`;
+                html += `</div>`;
+                html += `<div class="form-variable-label">${escapeHtml(rule.name)}</div>`;
+                html += `<div class="form-variable-meta">`;
+                html += `<span class="crf-meta-item"><strong>Category:</strong> <code>${escapeHtml(rule.type)}</code></span>`;
+                html += `<span class="crf-meta-item"><strong>Form:</strong> <code>${escapeHtml(rule.form)}</code></span>`;
+                html += `</div>`;
+                html += `</div>`;
+            });
+            html += `</div></div>`;
+        }
+
+        html += `</div>`;
         return html;
     }
 
@@ -673,13 +884,14 @@
             } else if (datasetKey === "forms") {
                 data = Object.keys(MOCK_DATA.forms).map(function (k) {
                     const f = MOCK_DATA.forms[k];
+                    const rules = Array.isArray(f.businessLogic) ? f.businessLogic : [];
                     return {
                         formId: f.formId,
                         formKey: f.formKey,
                         formName: f.formName,
-                        studyKey: f.studyKey,
+                        formType: f.formType,
                         variableCount: f.variables.length,
-                        description: f.description
+                        ruleCount: rules.length
                     };
                 });
                 caption = "Study Forms Catalog (STUDY)";
@@ -785,9 +997,10 @@
         function executeCdmValidation() {
             const formKey = cdmSelectForm ? cdmSelectForm.value : "VS";
             const formDef = MOCK_DATA.forms[formKey] || MOCK_DATA.forms.VS;
+            const ruleCount = Array.isArray(formDef.businessLogic) ? formDef.businessLogic.length : 0;
 
             if (cdmMetricBadge) {
-                cdmMetricBadge.textContent = `Simulation Preview (Deterministic Fixture) — ${formDef.formName} (${formDef.variables.length} Variables) | CDISC ODM Compliant`;
+                cdmMetricBadge.textContent = `Simulation Preview (Deterministic Fixture) — ${formDef.formName} (${formDef.variables.length} Variables, ${ruleCount} BusinessLogicRules) | CDISC ODM Compliant`;
                 cdmMetricBadge.classList.add("active");
             }
 

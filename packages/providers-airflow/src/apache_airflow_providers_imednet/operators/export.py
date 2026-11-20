@@ -13,7 +13,11 @@ from urllib.parse import quote_plus, urlsplit
 from imednet import ImednetSDK
 from imednet.spi import sink_base
 from imednet.spi.sinks import redact_uri
-from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text
+from imednet.spi.utils import (
+    redact_sensitive_payload,
+    redact_sensitive_text,
+    validate_path_segment,
+)
 
 from .. import export
 from .._airflow_compat import AirflowException, Context
@@ -766,6 +770,7 @@ class ImednetExportOperator(BaseOperator):
         """Execute the export task."""
         _ = context
         # Validate templated fields at runtime prior to any export work.
+        validate_path_segment(self.study_key, name="study_key")
         self._validate_templated_attributes()
         runtime_kwargs = self._get_runtime_export_kwargs()
         # Resolve destination early to fail fast on invalid configs (like legacy _get_export_callable)

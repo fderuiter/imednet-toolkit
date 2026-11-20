@@ -8,13 +8,14 @@ from typing import Any
 from ...endpoints.codings import CodingsEndpoint
 from ...models.codings import Coding
 from ...sdk import ImednetSDK
-from ..decorators import with_sdk
+from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
     collect_list_items_with_remainder,
     prepare_list_query,
+    resolve_output_format,
 )
 
 
@@ -60,13 +61,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sdk: ImednetSDK,
         study_key: str,
         coding_filter: list[str] | None = None,
-        output_format: str = "table",
+        output_format: str | None = None,
         sort: str | None = None,
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,
         _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
+        resolved_format = resolve_output_format(output_format)
         req_kwargs, effective_limit = (
             _prepared_query
             if _prepared_query is not None
@@ -75,7 +77,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 sort=sort,
                 limit=limit,
                 fetch_all=fetch_all,
-                output_format=output_format,
+                output_format=resolved_format,
                 no_interactive=no_interactive,
                 model=Coding,
                 allowed_attributes=CodingsEndpoint.FILTER_ATTRIBUTES,
@@ -89,7 +91,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 effective_limit,
             )
 
-        if output_format == "json":
+        if resolved_format == "json":
             display_list(codings_list, "codings", output_format="json")
             return
 
@@ -106,17 +108,20 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             details=codings_list,
             truncated=truncated,
             interactive=False if no_interactive else None,
+            output_format=resolved_format,
             on_load_all=_load_more_codings if load_remaining is not None else None,
         )
 
     def _dispatch_list_codings(args: argparse.Namespace) -> None:
+        validate_cli_path_segment(args.study_key, name="study_key")
         no_interactive = getattr(args, "no_interactive", False)
+        resolved_format = resolve_output_format(args.output_format)
         prepared = prepare_list_query(
             filter_args=args.coding_filter,
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
-            output_format=args.output_format,
+            output_format=resolved_format,
             no_interactive=no_interactive,
             model=Coding,
             allowed_attributes=CodingsEndpoint.FILTER_ATTRIBUTES,
@@ -125,7 +130,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         list_codings(
             study_key=args.study_key,
             coding_filter=args.coding_filter,
-            output_format=args.output_format,
+            output_format=resolved_format,
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,

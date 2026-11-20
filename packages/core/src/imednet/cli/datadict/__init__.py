@@ -22,7 +22,8 @@ from ...datadict import (
     validate,
 )
 from ...datadict.models import DataDictionary
-from ..utils import get_sdk
+from ..decorators import validate_cli_path_segment
+from ..utils import get_sdk, resolve_output_format
 
 
 def _handle_to_odm(args: argparse.Namespace) -> None:
@@ -106,6 +107,7 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
 
 def _handle_from_api(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-api` command."""
+    validate_cli_path_segment(args.study_key, name="study_key")
     try:
         with closing(get_sdk()) as sdk:
             dd = load_from_api(sdk, args.study_key, no_raw_xml=args.no_raw_xml)
@@ -158,10 +160,11 @@ def _handle_diff(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     report = diff(old_dd, new_dd)
+    output_format = resolve_output_format(args.format, default="text")
 
-    if args.format == "json":
+    if output_format == "json":
         print(report.to_json(), end="")
-    elif args.format == "md":
+    elif output_format == "md":
         print(report.to_markdown(), end="")
     else:
         print(report.to_text(), end="")
@@ -344,7 +347,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     diff_parser.add_argument(
         "--format",
         choices=["text", "json", "md"],
-        default="text",
+        default=None,
         help="Output format: text, json, or md (default: text).",
     )
     diff_parser.set_defaults(func=_handle_diff)

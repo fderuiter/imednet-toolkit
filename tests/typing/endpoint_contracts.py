@@ -1,7 +1,14 @@
 from collections.abc import AsyncIterator, Iterator
 from typing import Literal, assert_type
 
-from imednet import AsyncImednetSDK, ImednetSDK
+from imednet import (
+    ApiError,
+    AsyncImednetSDK,
+    ImednetError,
+    ImednetSDK,
+    NotFoundError,
+    SimulationTransport,
+)
 from imednet.core.endpoint import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.dispatch import AsyncEndpointContext, SyncEndpointContext
 from imednet.endpoints.studies import AsyncStudiesEndpoint, StudiesEndpoint, StudiesOperationDef
@@ -96,6 +103,29 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(job_status.result_url, str | None)
     assert_type(JobState.COMPLETED, Literal[JobState.COMPLETED])
     assert_type(QueryStatus.OPEN, Literal[QueryStatus.OPEN])
+
+    # Partial constructors across all 14 contract models (zero [call-arg] errors under --strict)
+    assert_type(Coding(study_key='S'), Coding)
+    assert_type(Form(form_key='F_DM'), Form)
+    assert_type(Interval(forms=None), Interval)
+    assert_type(Job(batch_id='B1'), Job)
+    assert_type(JobStatus(progress=None), JobStatus)
+    assert_type(Query(description='Open query'), Query)
+    assert_type(Record(record_id=1), Record)
+    assert_type(RecordRevision(record_revision_id=1), RecordRevision)
+    assert_type(Site(site_id=1), Site)
+    assert_type(Study(study_key='S'), Study)
+    assert_type(Subject(subject_id=1), Subject)
+    assert_type(User(login='clinician'), User)
+    assert_type(Variable(variable_id=1), Variable)
+    assert_type(Visit(visit_id=1), Visit)
+
+    # Top-level exception exports and offline transport initialization
+    err_base: ImednetError = NotFoundError('missing')
+    err_api: ApiError = NotFoundError('missing')
+    assert err_base and err_api
+    assert_type(ImednetSDK(transport=SimulationTransport()), ImednetSDK)
+    assert_type(AsyncImednetSDK(transport=SimulationTransport()), AsyncImednetSDK)
 
 
 async def async_contract(sdk: AsyncImednetSDK) -> None:

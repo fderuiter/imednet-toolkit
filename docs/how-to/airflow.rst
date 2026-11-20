@@ -205,6 +205,56 @@ resolved only inside ``execute()``:
        },
    )
 
+Incremental Checkpoints with ``AirflowStateProvider`` and ``ExtractionStateLedger``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ImednetExportOperator`` forwards all eight streaming checkpoint and ``Record``
+filter parameters directly to :func:`~imednet.spi.sink_base.run_streaming_export`
+and tabular export helpers while maintaining ``mask_phi=True`` by default:
+
+- ``incremental``: Enable transactional high-water mark reads and commits.
+- ``stream_name``: Stream key used to isolate checkpoints per destination or ``Form``.
+- ``state_provider``: Explicit checkpoint provider such as
+  :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (persisting
+  watermarks in Airflow XCom metadata under ``state_<study_key>_<stream_name>``)
+  or :class:`~imednet_workflows.ExtractionStateLedger`
+  (:class:`~imednet_workflows.state_ledger.FileStateProvider`). When omitted on an
+  ``incremental=True`` run, ``ImednetExportOperator`` defaults to the ``airflow``
+  provider entry point automatically unless ``ledger_path`` is specified.
+- ``ledger_path``: Shared filesystem path used when persisting checkpoints with
+  ``ExtractionStateLedger`` instead of XCom metadata.
+- ``modified_since``: Initial UTC lower-bound watermark when no prior checkpoint exists.
+- ``record_filter``: ``Record`` metadata filter dictionary or expression string.
+- ``record_data_filter``: ``Variable`` payload filter expression (``recordDataFilter``).
+- ``include_deleted``: Include voided (``deleted=True``) ``Record`` items directly
+  in destination batches instead of reconciling deletes separately.
+
+.. testcode::
+
+   from apache_airflow_providers_imednet import ImednetExportOperator
+   from imednet_workflows.state_ledger import AirflowStateProvider, ExtractionStateLedger
+
+   airflow_state = AirflowStateProvider()
+   shared_file_ledger = ExtractionStateLedger("/tmp/airflow_shared_ledger.json")
+
+   incremental_export_task = ImednetExportOperator(
+       task_id="incremental_export_snowflake",
+       study_key="MY_STUDY",
+       destination="snowflake",
+       imednet_conn_id="imednet_default",
+       destination_conn_id="snowflake_warehouse",
+       mask_phi=True,
+       incremental=True,
+       stream_name="snowflake_vital_signs",
+       ledger_path=None,
+       state_provider=airflow_state,
+       modified_since="2026-01-01T00:00:00Z",
+       record_filter={"form_key": "F_VS"},
+       record_data_filter="V_WEIGHT>0",
+       include_deleted=False,
+       export_kwargs={"table": "VITAL_SIGNS_RECORDS"},
+   )
+
 Testing with Airflow
 --------------------
 

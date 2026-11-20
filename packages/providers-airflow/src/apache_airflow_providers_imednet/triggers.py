@@ -12,6 +12,7 @@ from imednet.spi.utils import (
     AsyncJobPoller,
     redact_sensitive_payload,
     redact_sensitive_text,
+    validate_path_segment,
 )
 
 from ._airflow_compat import AirflowException, BaseTrigger, TriggerEvent
@@ -105,6 +106,8 @@ class ImednetJobTrigger(BaseTrigger):
     async def run(self) -> AsyncIterator[TriggerEvent]:
         """Poll the iMednet job asynchronously via ``AsyncImednetSDK`` and ``AsyncJobPoller``."""
         try:
+            validate_path_segment(self.study_key, name="study_key")
+            validate_path_segment(self.batch_id, name="batch_id")
             hook = ImednetHook(imednet_conn_id=self.imednet_conn_id)
             sdk = await hook.get_async_conn()
             async with sdk:
