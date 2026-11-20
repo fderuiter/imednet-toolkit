@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 try:
-    from cryptography.exceptions import InvalidSignature
+    from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec, padding
     from cryptography.hazmat.primitives.asymmetric.ec import (
@@ -29,6 +29,29 @@ except ImportError:  # pragma: no cover
     _CRYPTOGRAPHY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+_ASYMMETRIC_ALGORITHMS: tuple[str, ...] = (
+    "RS256",
+    "RS384",
+    "RS512",
+    "ES256",
+    "ES384",
+    "ES512",
+    "EdDSA",
+)
+_SYMMETRIC_ALGORITHMS: tuple[str, ...] = (
+    "HS256",
+    "HS384",
+    "HS512",
+)
+_SSH_KEY_PREFIXES: tuple[bytes, ...] = (
+    b"ssh-rsa ",
+    b"ssh-ed25519 ",
+    b"ssh-dss ",
+    b"ecdsa-sha2-",
+    b"sk-ssh-",
+    b"sk-ecdsa-",
+)
 
 
 def _base64url_decode(data: str) -> bytes:
@@ -56,6 +79,22 @@ def _b64url_to_int(data: str) -> int:
     return int.from_bytes(_base64url_decode(data), byteorder="big")
 
 
+def _validate_jwk_constraints(jwk: dict[str, Any], alg: str | None = None) -> None:
+    """Validate JWK 'use' and 'alg' metadata fields.
+
+    Args:
+        jwk: The JSON Web Key dictionary.
+        alg: Optional JWS header algorithm to match when JWK specifies 'alg'.
+
+    Raises:
+        ValueError: If 'use' is set and not 'sig', or 'alg' is set and mismatches header 'alg'.
+    """
+    if "use" in jwk and jwk["use"] is not None and jwk["use"] != "sig":
+        raise ValueError(f"JWK 'use' must be 'sig' for signature verification, got {jwk['use']!r}.")
+    if alg is not None and "alg" in jwk and jwk["alg"] is not None and jwk["alg"] != alg:
+        raise ValueError(f"JWK 'alg' ({jwk['alg']!r}) does not match token header 'alg' ({alg!r}).")
+
+
 def _load_jwk_key(jwk: dict[str, Any]) -> Any:
     """Convert a JWK dictionary into a public key object or HMAC secret bytes.
 
@@ -68,35 +107,95 @@ def _load_jwk_key(jwk: dict[str, Any]) -> Any:
     Raises:
         ValueError: If key cannot be loaded or algorithm is unsupported.
     """
+    _validate_jwk_constraints(jwk)
     kty = jwk.get("kty")
-    if kty == "RSA":
-        if not _CRYPTOGRAPHY_AVAILABLE:
-            raise ValueError("Cryptography library is required to load RSA JWK.")
-        e = _b64url_to_int(str(jwk["e"]))
-        n = _b64url_to_int(str(jwk["n"]))
-        return RSAPublicNumbers(e=e, n=n).public_key()
-    if kty == "EC":
-        if not _CRYPTOGRAPHY_AVAILABLE:
-            raise ValueError("Cryptography library is required to load EC JWK.")
-        crv_map = {
-            "P-256": SECP256R1(),
-            "P-384": SECP384R1(),
-            "P-521": SECP521R1(),
-        }
-        crv = str(jwk.get("crv"))
-        if crv not in crv_map:
-            raise ValueError(f"Unsupported EC curve: {crv}")
-        x = _b64url_to_int(str(jwk["x"]))
-        y = _b64url_to_int(str(jwk["y"]))
-        return EllipticCurvePublicNumbers(x=x, y=y, curve=crv_map[crv]).public_key()
-    if kty == "OKP" and jwk.get("crv") == "Ed25519":
-        if not _CRYPTOGRAPHY_AVAILABLE:
-            raise ValueError("Cryptography library is required to load Ed25519 JWK.")
-        raw = _base64url_decode(str(jwk["x"]))
-        return Ed25519PublicKey.from_public_bytes(raw)
-    if kty == "oct":
-        return _base64url_decode(str(jwk["k"]))
+    try:
+        if kty == "RSA":
+            if not _CRYPTOGRAPHY_AVAILABLE:
+                raise ValueError("Cryptography library is required to load RSA JWK.")
+            e = _b64url_to_int(str(jwk["e"]))
+            n = _b64url_to_int(str(jwk["n"]))
+            return RSAPublicNumbers(e=e, n=n).public_key()
+        if kty == "EC":
+            if not _CRYPTOGRAPHY_AVAILABLE:
+                raise ValueError("Cryptography library is required to load EC JWK.")
+            crv_map = {
+                "P-256": SECP256R1(),
+                "P-384": SECP384R1(),
+                "P-521": SECP521R1(),
+            }
+            crv = str(jwk.get("crv"))
+            if crv not in crv_map:
+                raise ValueError(f"Unsupported EC curve: {crv}")
+            x = _b64url_to_int(str(jwk["x"]))
+            y = _b64url_to_int(str(jwk["y"]))
+            return EllipticCurvePublicNumbers(x=x, y=y, curve=crv_map[crv]).public_key()
+        if kty == "OKP" and jwk.get("crv") == "Ed25519":
+            if not _CRYPTOGRAPHY_AVAILABLE:
+                raise ValueError("Cryptography library is required to load Ed25519 JWK.")
+            raw = _base64url_decode(str(jwk["x"]))
+            return Ed25519PublicKey.from_public_bytes(raw)
+        if kty == "oct":
+            return _base64url_decode(str(jwk["k"]))
+    except KeyError as exc:
+        raise ValueError(f"Missing required JWK parameter: {exc.args[0]}") from exc
     raise ValueError(f"Unsupported JWK key type: {kty}")
+
+
+def _can_parse_as_asymmetric_key(data: bytes) -> bool:
+    """Return True if bytes can be parsed as a PEM public key, SSH key, or X.509 certificate."""
+    if not _CRYPTOGRAPHY_AVAILABLE:
+        return False
+    from cryptography import x509
+
+    for loader in (
+        serialization.load_pem_public_key,
+        serialization.load_ssh_public_key,
+        x509.load_pem_x509_certificate,
+    ):
+        try:
+            loader(data)
+            return True
+        except (ValueError, TypeError, UnsupportedAlgorithm):
+            continue
+    return False
+
+
+def _is_symmetric_key_input(key_data: Any) -> bool:
+    """Return True only when key_data represents a symmetric secret or 'oct' JWK."""
+    if _CRYPTOGRAPHY_AVAILABLE and isinstance(
+        key_data, (RSAPublicKey, EllipticCurvePublicKey, Ed25519PublicKey)
+    ):
+        return False
+    if isinstance(key_data, dict):
+        return key_data.get("kty") == "oct"
+    if not isinstance(key_data, (str, bytes)):
+        return False
+
+    raw_bytes = key_data.encode("utf-8") if isinstance(key_data, str) else key_data
+    stripped_bytes = raw_bytes.strip()
+    if not stripped_bytes:
+        return False
+    if (
+        b"-----BEGIN" in stripped_bytes
+        or stripped_bytes.startswith(_SSH_KEY_PREFIXES)
+        or _can_parse_as_asymmetric_key(stripped_bytes)
+    ):
+        return False
+
+    try:
+        stripped_text = stripped_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+
+    if stripped_text.startswith("{") and stripped_text.endswith("}"):
+        try:
+            parsed = json.loads(stripped_text)
+        except ValueError:
+            return False
+        return isinstance(parsed, dict) and parsed.get("kty") == "oct"
+
+    return True
 
 
 def _load_public_key_or_secret(key_data: Any, alg: str) -> Any:
@@ -108,14 +207,48 @@ def _load_public_key_or_secret(key_data: Any, alg: str) -> Any:
 
     Returns:
         The resolved key object or HMAC secret bytes.
+
+    Raises:
+        ValueError: If key_data is malformed or incompatible with alg.
     """
     if alg.startswith("HS"):
-        if isinstance(key_data, str):
-            return key_data.encode("utf-8")
-        if isinstance(key_data, bytes):
-            return key_data
+        if _CRYPTOGRAPHY_AVAILABLE and isinstance(
+            key_data, (RSAPublicKey, EllipticCurvePublicKey, Ed25519PublicKey)
+        ):
+            raise ValueError("Asymmetric public key object cannot be used as an HMAC secret.")
         if isinstance(key_data, dict):
-            return _load_jwk_key(key_data)
+            _validate_jwk_constraints(key_data, alg)
+            loaded_dict_key = _load_jwk_key(key_data)
+            if key_data.get("kty") != "oct":
+                raise ValueError("Only 'oct' JWK keys are permitted for HMAC verification.")
+            return loaded_dict_key
+        if isinstance(key_data, (str, bytes)):
+            raw_bytes = key_data.encode("utf-8") if isinstance(key_data, str) else key_data
+            stripped_bytes = raw_bytes.strip()
+            if not stripped_bytes:
+                raise ValueError("HMAC secret must not be empty.")
+            if (
+                b"-----BEGIN" in stripped_bytes
+                or stripped_bytes.startswith(_SSH_KEY_PREFIXES)
+                or _can_parse_as_asymmetric_key(stripped_bytes)
+            ):
+                raise ValueError("Asymmetric key material cannot be used as an HMAC secret.")
+            try:
+                stripped_text: str | None = stripped_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                stripped_text = None
+            if (
+                stripped_text is not None
+                and stripped_text.startswith("{")
+                and stripped_text.endswith("}")
+            ):
+                parsed_jwk: dict[str, Any] = json.loads(stripped_text)
+                _validate_jwk_constraints(parsed_jwk, alg)
+                loaded_str_key = _load_jwk_key(parsed_jwk)
+                if parsed_jwk.get("kty") != "oct":
+                    raise ValueError("Only 'oct' JWK keys are permitted for HMAC verification.")
+                return loaded_str_key
+            return raw_bytes
         raise ValueError("HMAC secret must be str, bytes, or oct JWK dict.")
 
     if not _CRYPTOGRAPHY_AVAILABLE:
@@ -125,19 +258,28 @@ def _load_public_key_or_secret(key_data: Any, alg: str) -> Any:
         return key_data
 
     if isinstance(key_data, dict):
+        if key_data.get("kty") == "oct":
+            raise ValueError("Symmetric 'oct' JWK cannot be used for asymmetric verification.")
+        _validate_jwk_constraints(key_data, alg)
         return _load_jwk_key(key_data)
 
     if isinstance(key_data, (str, bytes)):
         pem_str = key_data.decode("utf-8") if isinstance(key_data, bytes) else key_data
         pem_stripped = pem_str.strip()
         if pem_stripped.startswith("{") and pem_stripped.endswith("}"):
-            return _load_jwk_key(json.loads(pem_stripped))
-        pem_bytes = pem_str.encode("utf-8")
+            parsed_asym_jwk: dict[str, Any] = json.loads(pem_stripped)
+            if parsed_asym_jwk.get("kty") == "oct":
+                raise ValueError("Symmetric 'oct' JWK cannot be used for asymmetric verification.")
+            _validate_jwk_constraints(parsed_asym_jwk, alg)
+            return _load_jwk_key(parsed_asym_jwk)
+        pem_bytes = pem_stripped.encode("utf-8")
         if b"BEGIN CERTIFICATE" in pem_bytes:
             from cryptography import x509
 
             cert = x509.load_pem_x509_certificate(pem_bytes)
             return cert.public_key()
+        if pem_bytes.startswith(_SSH_KEY_PREFIXES):
+            return serialization.load_ssh_public_key(pem_bytes)
         return serialization.load_pem_public_key(pem_bytes)
 
     raise ValueError(f"Unsupported key format: {type(key_data)}")
@@ -286,6 +428,14 @@ class OIDCAuth:
         self.leeway = leeway
         self._decoded_claims = self._decode_token_claims(token)
 
+    def _default_allowed_algorithms(self) -> list[str]:
+        """Return default allowed JWS algorithms matched to the configured key type."""
+        if self.jwks is not None or self.jwks_url:
+            return list(_ASYMMETRIC_ALGORITHMS)
+        if self.public_key is not None and _is_symmetric_key_input(self.public_key):
+            return list(_SYMMETRIC_ALGORITHMS)
+        return list(_ASYMMETRIC_ALGORITHMS)
+
     def _decode_token_claims(self, token: str) -> dict[str, Any]:
         """Extract, cryptographically verify, and validate claims from the JWT token.
 
@@ -329,18 +479,9 @@ class OIDCAuth:
             logger.warning("OIDC token validation failed: Insecure 'none' algorithm is rejected.")
             return {}
 
-        allowed_algorithms = self.algorithms or [
-            "RS256",
-            "RS384",
-            "RS512",
-            "ES256",
-            "ES384",
-            "ES512",
-            "HS256",
-            "HS384",
-            "HS512",
-            "EdDSA",
-        ]
+        allowed_algorithms = (
+            self.algorithms if self.algorithms is not None else self._default_allowed_algorithms()
+        )
         if alg not in allowed_algorithms:
             logger.warning("OIDC token validation failed: Algorithm '%s' is not allowed.", alg)
             return {}
@@ -357,9 +498,11 @@ class OIDCAuth:
                 )
 
         jwks_data = self.jwks
-        if not jwks_data and self.jwks_url:
+        jwks_from_url = False
+        if jwks_data is None and self.jwks_url:
             try:
                 jwks_data = _fetch_jwks_from_url(self.jwks_url)
+                jwks_from_url = True
             except Exception as exc:
                 logger.warning("OIDC token validation failed: Could not fetch JWKS: %s", exc)
 
@@ -372,7 +515,23 @@ class OIDCAuth:
                 matching = [k for k in raw_keys if isinstance(k, dict)]
 
             for k in matching:
+                if jwks_from_url and k.get("kty") == "oct":
+                    logger.warning(
+                        "OIDC token validation failed: Symmetric 'oct' JWK from jwks_url is rejected."
+                    )
+                    continue
+                if alg.startswith("HS") and k.get("kty") != "oct":
+                    logger.warning(
+                        "OIDC token validation failed: Asymmetric JWK cannot verify HMAC algorithm."
+                    )
+                    continue
+                if not alg.startswith("HS") and k.get("kty") == "oct":
+                    logger.warning(
+                        "OIDC token validation failed: Symmetric 'oct' JWK cannot verify asymmetric algorithm."
+                    )
+                    continue
                 try:
+                    _validate_jwk_constraints(k, alg)
                     keys_to_try.append(_load_jwk_key(k))
                 except Exception as exc:
                     logger.warning("OIDC token validation failed: Could not load JWK: %s", exc)
