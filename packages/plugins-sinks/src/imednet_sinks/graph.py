@@ -19,7 +19,8 @@ Relationships
 ~~~~~~~~~~~~~
 * ``(:Study)-[:HAS_SUBJECT]->(:Subject)``
 * ``(:Subject)-[:HAS_VISIT]->(:Visit)``
-* ``(:Visit)-[:HAS_RECORD]->(:Record)``
+* ``(:Visit)-[:HAS_RECORD]->(:Record)`` (scheduled records with ``visit_id > 0``)
+* ``(:Subject)-[:HAS_RECORD]->(:Record)`` (unscheduled records with ``visit_id`` omitted or ``<= 0``)
 
 Optional dependency
 -------------------
@@ -61,25 +62,31 @@ Usage
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from imednet.spi.sinks import CentralizedMapper
+from typing import Any
+from unittest.mock import NonCallableMock
 
 from imednet.errors import ExportConfigurationError
 from imednet.sdk import ImednetSDK
 from imednet.spi.sink_base import (
-    ExportSink,
-    SinkConfig,
     _redact_uri,
     _require_optional_dep,
+)
+from imednet.spi.sinks import (
+    CentralizedMapper,
+    ExportSink,
+    SinkConfig,
     apply_quality_gate,
+    build_sink_mapper,
     extract_record_id,
+    normalize_sink_value,
     run_streaming_export,
 )
 
@@ -123,20 +130,30 @@ MERGE (r:Record   {record_id:  row.record_id,   study_key: row.study_key})
 SET r += row
 MERGE (s)-[:HAS_SUBJECT]->(su)
 FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
-    MERGE (v:Visit {visit_id: row.visit_id, study_key: row.study_key})
+    MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
     MERGE (su)-[:HAS_VISIT]->(v)
     MERGE (v)-[:HAS_RECORD]->(r)
+)
+FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
+    MERGE (su)-[:HAS_RECORD]->(r)
 )
 """
 
 _CREATE_RECORD_CYPHER = """\
 UNWIND $rows AS row
+MERGE (s:Study   {study_key:   row.study_key})
+MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
 CREATE (r:Record)
 SET r = row
-WITH r, row
-WHERE row.visit_id IS NOT NULL
-MATCH (v:Visit {visit_id: row.visit_id, study_key: row.study_key})
-MERGE (v)-[:HAS_RECORD]->(r)
+MERGE (s)-[:HAS_SUBJECT]->(su)
+FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
+    MERGE (su)-[:HAS_VISIT]->(v)
+    MERGE (v)-[:HAS_RECORD]->(r)
+)
+FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
+    MERGE (su)-[:HAS_RECORD]->(r)
+)
 """
 
 _DELETE_RECORD_CYPHER = """\
@@ -146,18 +163,54 @@ DETACH DELETE r
 """
 
 
-def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
-    import json
+def _graph_json_default(value: Any) -> Any:
+    """Encode ``date``/``datetime`` as ISO-8601 strings and ``Decimal`` as exact strings."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
-    row["record_data"] = json.dumps(row.get("record_data", {}))
+
+def _normalize_visit_id(visit_id: Any) -> Any:
+    """Normalize non-positive ``visit_id`` markers (``<= 0``) to ``None`` for unscheduled records."""
+    if visit_id is None or isinstance(visit_id, NonCallableMock):
+        return visit_id
+    if isinstance(visit_id, bool):
+        return None
+    if isinstance(visit_id, (int, float, Decimal)) and visit_id <= 0:
+        return None
+    if isinstance(visit_id, str):
+        stripped = visit_id.strip()
+        if not stripped:
+            return None
+        if stripped.lstrip("-").isdigit() and int(stripped) <= 0:
+            return None
+    return visit_id
+
+
+def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
+    row["visit_id"] = _normalize_visit_id(row.get("visit_id"))
+
+    for key, val in list(row.items()):
+        if key in ("record_data", "keywords") or val is None or isinstance(val, NonCallableMock):
+            continue
+        if isinstance(val, Enum):
+            row[key] = val.value
+        elif isinstance(val, (datetime, date)):
+            row[key] = val.isoformat()
+        elif isinstance(val, Decimal):
+            row[key] = str(val)
+
+    normalized_record_data = normalize_sink_value(row.get("record_data", {}))
+    row["record_data"] = json.dumps(normalized_record_data, default=_graph_json_default)
+
     keywords = row.get("keywords")
-    if isinstance(keywords, list):
-        row["keywords"] = json.dumps(
-            [
-                k.model_dump(mode="json", by_alias=True) if hasattr(k, "model_dump") else k
-                for k in keywords
-            ]
-        )
+    if keywords is not None and not isinstance(keywords, (str, NonCallableMock)):
+        normalized_keywords = normalize_sink_value(keywords, by_alias=True)
+        row["keywords"] = json.dumps(normalized_keywords, default=_graph_json_default)
     return row
 
 
@@ -170,8 +223,6 @@ def _record_to_row(
 ) -> dict[str, Any]:
     """Convert a typed ``Record`` model to a flat Cypher parameter dict."""
     if mapper is None:
-        from imednet.spi.sinks import CentralizedMapper
-
         mapper = CentralizedMapper(
             mode="document",
             post_processor=_post_process_graph,
@@ -228,29 +279,36 @@ class Neo4jExportSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
-        from imednet.spi.sinks import build_sink_mapper
+        if not records:
+            return 0
 
         mapper = build_sink_mapper(
             self.config,
             mode="document",
             post_processor=_post_process_graph,
         )
-        custom_pipeline = self.config.extra.get("enrichment_pipeline")
-        if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
-            mapper.register_pipeline(self._study_key, custom_pipeline)
-        rows = [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
-        if not rows:
-            return 0
-
         cypher = _MERGE_RECORD_CYPHER if self.config.idempotent else _CREATE_RECORD_CYPHER
-        cfg = self.config if isinstance(self.config, Neo4jSinkConfig) else Neo4jSinkConfig()
+        database = getattr(self.config, "database", "neo4j")
+        mapped_rows: list[dict[str, Any]] | None = None
 
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
-            with self._driver.session(database=cfg.database) as session:
-                session.run(cypher, rows=rows)
-            logger.debug("Wrote batch %s (%d records)", batch_id, len(rows))
-            return len(rows)
+            nonlocal mapped_rows
+            if mapped_rows is None:
+                try:
+                    mapped_rows = [
+                        _record_to_row(r, self._study_key, mapper=mapper) for r in records
+                    ]
+                except ExportConfigurationError:
+                    raise
+                except Exception:
+                    raise TypeError("Malformed Neo4j record batch payload.") from None
+            if not mapped_rows:
+                return 0
+            with self._driver.session(database=database) as session:
+                session.run(cypher, rows=mapped_rows)
+            logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))
+            return len(mapped_rows)
 
         return self._execute_with_retry("export_graph", batch_id, execute_export)
 
