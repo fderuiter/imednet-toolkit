@@ -317,3 +317,50 @@ def test_tui_root_high_contrast_and_finally_env_cleanup(monkeypatch: pytest.Monk
     ):
         cli_mod.app(["--high-contrast", "tui"])
     assert os.environ.get("IMEDNET_HIGH_CONTRAST") == "0"
+
+
+@pytest.mark.parametrize(
+    "cli_argv",
+    [
+        ["tui", "--study", "../admin"],
+        ["tui", "--study", "STUDY/../../etc"],
+        ["tui", "--study", "STUDY-1", "--batch", "../secret"],
+        ["tui", "--study", "STUDY-1", "--batch", "BATCH-1,BATCH?token=abc"],
+    ],
+)
+def test_tui_rejects_invalid_path_segments_before_sdk_init(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cli_argv: list[str],
+) -> None:
+    """Verify imednet tui validates --study and --batch path segments via SPI before SDK init."""
+    from imednet import cli as cli_mod
+    from imednet_tui.cli import setup_parser
+
+    class DummyEntryPoint:
+        name = "tui"
+
+        def load(self):
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: (
+            [DummyEntryPoint()] if kwargs.get("group") == "imednet.cli_plugins" else []
+        ),
+    )
+
+    with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+        patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        cli_mod.app(cli_argv)
+
+    assert exc_info.value.code == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "Error:" in err
+    mock_get_sdk.assert_not_called()
+    mock_run_tui.assert_not_called()

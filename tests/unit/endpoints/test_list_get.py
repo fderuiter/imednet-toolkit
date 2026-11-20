@@ -247,7 +247,7 @@ class _CountingAsyncRequester:
 def test_all_12_sync_endpoints_single_page_and_limit_http_execution(
     cls, _module, needs_study, _valid_attr
 ):
-    """Test sync collection endpoints send 1 HTTP call for page/size/sort and limit=10."""
+    """Test sync collection endpoints bound explicit page to 1 call and advance pages up to limit."""
     base_kwargs = {"study_key": "S1"} if needs_study else {}
 
     page_client = _CountingSyncRequester()
@@ -264,15 +264,16 @@ def test_all_12_sync_endpoints_single_page_and_limit_http_execution(
 
     limit_client = _CountingSyncRequester()
     ep_limit = cls(limit_client)
-    limit_items = list(ep_limit.list(**base_kwargs, limit=10))
-    assert len(limit_items) == 1
-    assert len(limit_client.calls) == 1
+    limit_items = list(ep_limit.list(**base_kwargs, limit=2))
+    assert len(limit_items) == 2
+    assert len(limit_client.calls) == 2
     limit_params = limit_client.calls[0]["params"]
     assert isinstance(limit_params, dict)
     assert limit_params["page"] == 0
-    assert limit_params["size"] == 10
+    assert limit_params["size"] == 2
     assert "limit" not in limit_params
     assert "filter" not in limit_params
+    assert limit_client.calls[1]["params"]["page"] == 1  # type: ignore[index]
 
 
 @pytest.mark.asyncio
@@ -280,7 +281,7 @@ def test_all_12_sync_endpoints_single_page_and_limit_http_execution(
 async def test_all_12_async_endpoints_single_page_and_limit_http_execution(
     cls, _module, needs_study, _valid_attr
 ):
-    """Test async collection endpoints send 1 HTTP call for page/size/sort and limit=10."""
+    """Test async collection endpoints bound explicit page to 1 call and advance pages up to limit."""
     base_kwargs = {"study_key": "S1"} if needs_study else {}
 
     page_client = _CountingAsyncRequester()
@@ -299,15 +300,16 @@ async def test_all_12_async_endpoints_single_page_and_limit_http_execution(
 
     limit_client = _CountingAsyncRequester()
     ep_limit = cls(limit_client)
-    limit_items = [item async for item in ep_limit.list(**base_kwargs, limit=10)]
-    assert len(limit_items) == 1
-    assert len(limit_client.calls) == 1
+    limit_items = [item async for item in ep_limit.list(**base_kwargs, limit=2)]
+    assert len(limit_items) == 2
+    assert len(limit_client.calls) == 2
     limit_params = limit_client.calls[0]["params"]
     assert isinstance(limit_params, dict)
     assert limit_params["page"] == 0
-    assert limit_params["size"] == 10
+    assert limit_params["size"] == 2
     assert "limit" not in limit_params
     assert "filter" not in limit_params
+    assert limit_client.calls[1]["params"]["page"] == 1  # type: ignore[index]
 
 
 @pytest.mark.asyncio
@@ -367,3 +369,44 @@ def test_study_subresource_or_list_filters_omit_study_key(
     capture = paginator_factory(module, [{}])
     list(ep.list(study_key="S1", **{attr: ["SUB1", "SUB2"]}))
     assert capture["params"] == {"filter": f"{attr}==SUB1,{attr}==SUB2"}
+
+
+INTEGER_GET_KEY_HINTS = [
+    (forms.FormsEndpoint, forms.AsyncFormsEndpoint, "formId", "formKey"),
+    (intervals.IntervalsEndpoint, intervals.AsyncIntervalsEndpoint, "intervalId", "intervalName"),
+    (records.RecordsEndpoint, records.AsyncRecordsEndpoint, "recordId", "recordOid"),
+    (
+        record_revisions.RecordRevisionsEndpoint,
+        record_revisions.AsyncRecordRevisionsEndpoint,
+        "recordRevisionId",
+        "recordOid",
+    ),
+    (sites.SitesEndpoint, sites.AsyncSitesEndpoint, "siteId", "siteName"),
+    (subjects.SubjectsEndpoint, subjects.AsyncSubjectsEndpoint, "subjectId", "subjectKey"),
+    (variables.VariablesEndpoint, variables.AsyncVariablesEndpoint, "variableId", "variableName"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sync_cls", "async_cls", "id_param", "hint_key"),
+    INTEGER_GET_KEY_HINTS,
+)
+@pytest.mark.parametrize("invalid_id", ["F_DM", True, False, -1, 1.5])
+async def test_all_7_integer_id_get_endpoints_reject_invalid_ids_with_key_hint(
+    dummy_client, sync_cls, async_cls, id_param, hint_key, invalid_id
+):
+    """All 7 integer-ID get() endpoints reject bools, negatives, floats, and strings with hint."""
+    sync_ep = sync_cls(dummy_client)
+    with pytest.raises(ValueError) as sync_exc:
+        sync_ep.get("S1", invalid_id)
+    msg = str(sync_exc.value)
+    assert id_param in msg
+    assert f"list(study_key, {hint_key}=...)" in msg
+
+    async_ep = async_cls(dummy_client)
+    with pytest.raises(ValueError) as async_exc:
+        await async_ep.get("S1", invalid_id)
+    async_msg = str(async_exc.value)
+    assert id_param in async_msg
+    assert f"list(study_key, {hint_key}=...)" in async_msg

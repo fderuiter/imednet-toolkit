@@ -13,6 +13,7 @@ from imednet.spi.cli import (
     add_no_interactive,
     is_non_interactive,
     print_error,
+    validate_cli_path_segment,
     with_sdk,
 )
 from imednet.spi.facade import ImednetFacade
@@ -114,6 +115,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             if not force and not is_interactive_terminal():
                 print_error("Error: Interactive terminal required to run the TUI interface.")
                 raise SystemExit(1)
+
+            if args is not None:
+                raw_study = getattr(args, "study_key", None) or getattr(args, "study", None)
+                if raw_study is not None and str(raw_study).strip():
+                    validate_cli_path_segment(str(raw_study).strip(), name="study_key")
+                raw_batches = getattr(args, "batch_ids", None) or getattr(args, "batch", None)
+                for batch_id in _parse_batch_args(raw_batches):
+                    validate_cli_path_segment(batch_id, name="batch_id")
 
             _launch(args)
         finally:

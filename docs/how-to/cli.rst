@@ -83,21 +83,25 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
    imednet records list STUDY --format json
    imednet jobs status STUDY BATCH --format json
    imednet jobs wait STUDY BATCH --timeout 60 --format json
+   imednet workflows extract-records STUDY --format json
+   imednet subject-data STUDY SUBJ-001 --format json
+   IMEDNET_CLI_OUTPUT_FORMAT=json imednet studies list
 
 Supported core list resources are studies, queries, variables, record-revisions,
-sites, records, subjects, intervals, visits, codings, and users. Core JSON reads emit exactly one envelope
+sites, forms, records, subjects, intervals, visits, codings, and users, alongside
+``workflows extract-records`` and ``subject-data``. JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
-``items``. Empty results use an empty items array. Item fields use the SDK models'
+``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
+and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it). Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
 JSON aliases; the JSON view includes model fields beyond the human summary table.
 Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
 Usage failures exit 2, SDK-command interruption exits 130, and success/help exits 0.
 
 ``records list --output json`` still writes ``records.json``; it is distinct from
-``--format json`` stdout and combining them is an error. Existing ``export``
-commands, ``datadict`` JSON/schema/diff outputs (see :doc:`/how-to/data_dictionary`)
-and optional workflow command formats retain their own contracts. This is not a
-global JSON wrapper for plugins.
+``--format json`` (or ``IMEDNET_CLI_OUTPUT_FORMAT=json``) stdout and combining them is an error. Existing ``export``
+commands (which also accept ``--no-interactive`` to suppress live spinners) and ``datadict`` JSON/schema/diff outputs
+(see :doc:`/how-to/data_dictionary`) retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
 
@@ -128,8 +132,8 @@ and ``stdout`` are connected to a capable TTY, while single-job commands
 (``imednet jobs status`` and ``imednet jobs wait``) always print a static summary
 table to ``stdout`` and exit immediately.
 
-Pass ``--no-interactive`` (at the root command or on ``imednet tui``, read, and workflow
-subcommands) or set ``IMEDNET_NON_INTERACTIVE=1`` to disable full-screen ``curses`` grids,
+Pass ``--no-interactive`` (at the root command or on ``imednet tui``, read, export, and
+workflow subcommands) or set ``IMEDNET_NON_INTERACTIVE=1`` to disable full-screen ``curses`` grids,
 live ``stderr`` spinners, and interactive ``stdin`` prompts. Passing
 ``imednet tui --no-interactive`` (or invoking ``imednet tui`` while
 ``IMEDNET_NON_INTERACTIVE`` is enabled) exits immediately with status code ``1``, even

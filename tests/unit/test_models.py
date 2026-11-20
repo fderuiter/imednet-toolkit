@@ -155,7 +155,35 @@ def test_job_status_progress_parsing() -> None:
     assert js_invalid.progress == 0
 
     js_none = JobStatus(batchId="1", state="PROCESSING", progress=None)
-    assert js_none.progress == 0
+    assert js_none.progress is None
+    assert JobStatus().progress is None
+
+
+def test_optional_vs_non_optional_container_normalizers() -> None:
+    """Optional list/dict fields preserve None while non-optional fields keep empty defaults."""
+    from imednet.models.intervals import Interval
+    from imednet.models.jobs import Job
+    from imednet.models.records import Record
+    from imednet_workflows.study_structure import _build_study_structure
+
+    assert Interval(forms=None).forms is None
+    assert Interval().forms is None
+    assert Interval.model_validate({"forms": None}).forms is None
+    assert Interval.model_validate({"forms": ""}).forms is None
+
+    assert Job(batchId="B1").batch_id == "B1"
+
+    rec_default = Record()
+    assert rec_default.keywords == []
+    assert rec_default.record_data == {}
+
+    rec_explicit_none = Record(keywords=None, record_data=None)  # type: ignore[arg-type]
+    assert rec_explicit_none.keywords == []
+    assert rec_explicit_none.record_data == {}
+
+    structure = _build_study_structure("S1", [Interval(intervalId=1, forms=None)], [], [])
+    assert len(structure.intervals) == 1
+    assert structure.intervals[0].forms == []
 
 
 def test_study_structure_methods() -> None:
