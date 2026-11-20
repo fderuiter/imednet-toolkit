@@ -25,13 +25,14 @@ dashboard for browsing studies, sites, subjects, and background jobs:
    IMEDNET_HIGH_CONTRAST=1 imednet --high-contrast tui
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
-``Enter`` to select a study or site (or to register batch IDs in the Jobs tab input),
-``q`` to quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to
-refresh active study data, and ``a`` to load all pages when a panel is truncated. Single-key
-shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input. Pass
-``--study`` and repeatable ``--batch`` flags at launch to open a study and monitor specific
-batch jobs immediately, and pass ``--force`` only when intentionally bypassing TTY stream
-checks.
+``Enter`` to select a study or site (re-selecting the active site clears the site filter)
+or to register batch IDs in the Jobs tab input, ``Esc`` to move focus from the Jobs batch
+input to the Jobs table or clear an active site filter, ``q`` to quit, ``d`` to toggle
+dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh active study data, and
+``a`` to load all pages when a panel is truncated. Single-key shortcuts are suppressed
+automatically while typing batch IDs in the Jobs tab input. Pass ``--study`` and
+repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
+immediately, and pass ``--force`` only when intentionally bypassing TTY stream checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
