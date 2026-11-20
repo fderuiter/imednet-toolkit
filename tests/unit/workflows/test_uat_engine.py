@@ -517,3 +517,171 @@ def test_uat_engine_explicit_or_group_xml_rule() -> None:
     assert (
         LogicTreeEvaluator().evaluate_rule(dnf_rule, dnf_payload, form_key="VS").triggered is True
     )
+
+
+def test_uat_engine_async_job_polling_classifications():
+    """UATExecutionEngine polls HTTP 202 Job batch_ids concurrently and classifies outcomes."""
+    from unittest.mock import patch
+
+    from imednet.errors import ApiError, ClientError, ServerError
+    from imednet.spi.models import Job, JobStatus
+    from imednet.spi.utils import JobPoller, JobTimeoutError
+
+    rules = [
+        {
+            "Name": "AsyncFailedState",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V1",
+            "Operator": ">=",
+            "Value": "18",
+        },
+        {
+            "Name": "AsyncFailedRecords",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V2",
+            "Operator": ">=",
+            "Value": "18",
+        },
+        {
+            "Name": "AsyncAccepted",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V3",
+            "Operator": ">=",
+            "Value": "18",
+        },
+        {
+            "Name": "AsyncTimeout",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V4",
+            "Operator": ">=",
+            "Value": "18",
+        },
+        {
+            "Name": "SyncClientReject",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V5",
+            "Operator": ">=",
+            "Value": "18",
+        },
+        {
+            "Name": "SyncServerErr",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V6",
+            "Operator": ">=",
+            "Value": "18",
+        },
+        {
+            "Name": "SyncApi500Err",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V7",
+            "Operator": ">=",
+            "Value": "18",
+        },
+    ]
+
+    sdk = Mock()
+
+    def create_record_side_effect(study_key, payloads):
+        data = payloads[0]["data"]
+        if "V1" in data:
+            return Job(batch_id="job-failed-state", state="PENDING")
+        if "V2" in data:
+            return Job(batch_id="job-failed-records", state="PENDING")
+        if "V3" in data:
+            return Job(batch_id="job-clean-completed", state="PENDING")
+        if "V4" in data:
+            return Job(batch_id="job-timed-out", state="PENDING")
+        if "V5" in data:
+            raise ClientError("HTTP 400 validation error", status_code=400)
+        if "V6" in data:
+            raise ServerError("HTTP 502 bad gateway", status_code=502)
+        raise ApiError("HTTP 500 internal error", status_code=500)
+
+    def get_job_side_effect(study_key, batch_id):
+        if batch_id == "job-failed-state":
+            return JobStatus(batch_id=batch_id, state="FAILED")
+        if batch_id == "job-failed-records":
+            return JobStatus(batch_id=batch_id, state="COMPLETED", failed_records=1)
+        if batch_id == "job-clean-completed":
+            return JobStatus(batch_id=batch_id, state="COMPLETED", failed_records=0)
+        raise JobTimeoutError("Polling timed out")
+
+    sdk.create_record.side_effect = create_record_side_effect
+    sdk.get_job.side_effect = get_job_side_effect
+
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+    engine = UATExecutionEngine(sdk, dd, poll_interval=0.01, poll_timeout=5.0)
+
+    with patch.object(JobPoller, "poll_many", autospec=True, wraps=JobPoller.poll_many) as spy_poll:
+        report = engine.run_verification("STUDY1")
+
+    spy_poll.assert_called_once()
+    polled_batch_ids = spy_poll.call_args.args[2]
+    assert polled_batch_ids == [
+        "job-failed-state",
+        "job-failed-records",
+        "job-clean-completed",
+        "job-timed-out",
+    ]
+    assert spy_poll.call_args.kwargs["fail_fast"] is False
+
+    status_by_rule = {entry["rule_name"]: entry["status"] for entry in report.results}
+    assert status_by_rule == {
+        "AsyncFailedState": EditCheckResultStatus.PASS,
+        "AsyncFailedRecords": EditCheckResultStatus.PASS,
+        "AsyncAccepted": EditCheckResultStatus.FAIL,
+        "AsyncTimeout": EditCheckResultStatus.ERROR,
+        "SyncClientReject": EditCheckResultStatus.PASS,
+        "SyncServerErr": EditCheckResultStatus.ERROR,
+        "SyncApi500Err": EditCheckResultStatus.ERROR,
+    }
+    assert report.total_rules == 7
+    assert report.passed_rules == 3
+    assert report.failed_rules == 4
+
+
+def test_uat_engine_async_job_polling_enforces_100_rule_cap():
+    """UATExecutionEngine caps submissions at 100 active rules before polling batch_ids."""
+    from unittest.mock import patch
+
+    from imednet.spi.models import Job, JobStatus
+    from imednet.spi.utils import JobPoller
+
+    rules = [
+        {
+            "Name": f"Rule{i}",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": f"V{i}",
+            "Operator": ">=",
+            "Value": "18",
+        }
+        for i in range(135)
+    ]
+    sdk = Mock()
+    sdk.create_record.side_effect = [
+        Job(batch_id=f"batch-{i}", state="PENDING") for i in range(135)
+    ]
+    sdk.get_job.side_effect = lambda _study, bid: JobStatus(
+        batch_id=bid, state="FAILED", failed_records=1
+    )
+
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+    engine = UATExecutionEngine(sdk, dd, poll_interval=0.01, poll_timeout=5.0)
+
+    with patch.object(JobPoller, "poll_many", autospec=True, wraps=JobPoller.poll_many) as spy_poll:
+        report = engine.run_verification("STUDY1")
+
+    assert sdk.create_record.call_count == 100
+    spy_poll.assert_called_once()
+    assert len(spy_poll.call_args.args[2]) == 100
+    assert report.total_rules == 100
+    assert report.passed_rules == 100
+    assert report.failed_rules == 0

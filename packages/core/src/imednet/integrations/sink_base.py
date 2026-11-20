@@ -100,7 +100,16 @@ from imednet.utils.dates import (
     normalize_utc_timestamp_bound,
     parse_iso_datetime,
 )
-from imednet.utils.filters import parse_filter_expressions, validate_connector_exclusivity
+from imednet.utils.filters import (
+    _parse_clause_operator,
+    _snake_to_camel,
+    _split_filter_clauses,
+    parse_filter_expressions,
+    validate_connector_exclusivity,
+    validate_filter_key,
+    validate_filter_operator,
+    validate_record_filter,
+)
 from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
 
 logger = logging.getLogger(__name__)
@@ -295,10 +304,16 @@ class SinkConfig:
             raise ValueError("mask_phi must be a boolean")
         if self.modified_since is not None:
             normalize_watermark_datetime(self.modified_since)
-        if isinstance(self.record_filter, str) and self.record_filter.strip():
-            validate_connector_exclusivity(self.record_filter)
-        if isinstance(self.record_data_filter, str) and self.record_data_filter.strip():
-            validate_connector_exclusivity(self.record_data_filter)
+        if self.record_data_filter is not None:
+            _validate_record_data_filter_input(self.record_data_filter)
+        if self.record_filter is not None:
+            if isinstance(self.record_filter, str) and not self.record_filter.strip():
+                raise ValueError("record_filter cannot be empty")
+            build_record_query_branches(
+                record_filter=self.record_filter,
+                watermark=self.modified_since,
+                exclude_deleted_upstream=not self.include_deleted,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -768,9 +783,27 @@ def extract_record_timestamp(record: Any) -> datetime | None:
     return None
 
 
+def _validate_record_data_filter_input(record_data_filter: str) -> str:
+    """Validate ``record_data_filter`` syntax, non-emptiness, operators, and unique AND keys."""
+    if not isinstance(record_data_filter, str):
+        raise ValueError(
+            f"record_data_filter must be a string, got {type(record_data_filter).__name__}"
+        )
+    stripped = record_data_filter.strip()
+    if not stripped:
+        raise ValueError("record_data_filter cannot be empty")
+    validate_record_filter(record_data_filter)
+    if stripped.lower() != "none":
+        clauses, _ = _split_filter_clauses(stripped)
+        for clause in clauses:
+            if _parse_clause_operator(clause) is None:
+                raise ValueError(f"Malformed filter clause '{clause}': missing comparison operator")
+    return stripped
+
+
 def _split_top_level(expr: str, sep: str) -> list[str]:
-    """Split a filter expression by ``sep`` outside double quotes."""
-    parts: list[str] = []
+    """Split a filter expression by ``sep`` outside double quotes, rejecting empty clauses."""
+    raw_parts: list[str] = []
     buf: list[str] = []
     in_quotes = False
     escape = False
@@ -788,38 +821,177 @@ def _split_top_level(expr: str, sep: str) -> list[str]:
             buf.append(ch)
             continue
         if ch == sep and not in_quotes:
-            part = "".join(buf).strip()
-            if part:
-                parts.append(part)
+            raw_parts.append("".join(buf).strip())
             buf = []
             continue
         buf.append(ch)
-    tail = "".join(buf).strip()
-    if tail:
-        parts.append(tail)
-    return parts
+    raw_parts.append("".join(buf).strip())
+    if len(raw_parts) == 1:
+        return [raw_parts[0]] if raw_parts[0] else []
+    if any(not part for part in raw_parts):
+        raise ValueError("Filter expression contains an empty clause")
+    return raw_parts
 
 
 def _merge_and_condition(target: dict[str, Any], key: str, condition: Any) -> None:
-    """Merge an AND filter condition onto ``target`` without losing prior bounds."""
-    from imednet.utils.filters import _snake_to_camel
-
+    """Merge an AND filter condition onto ``target``, rejecting duplicate AND attributes."""
     camel_key = _snake_to_camel(key)
-    existing_key = key if key in target else (camel_key if camel_key in target else key)
-    if existing_key not in target:
-        target[existing_key] = condition
-        return
+    for existing in target:
+        if _snake_to_camel(existing) == camel_key:
+            raise ValueError(f"Duplicate filter attribute '{camel_key}' in AND clause")
+    target[key] = condition
 
-    prev = target[existing_key]
-    if isinstance(prev, list):
-        combined = list(prev)
-    elif isinstance(prev, tuple):
-        combined = [prev]
+
+def _coerce_date_modified_clauses(raw_cond: Any) -> list[tuple[str, datetime]]:
+    """Normalize a branch's ``dateModified`` value into ``[(operator, utc_datetime), ...]``."""
+    raw_items: list[tuple[str, Any]]
+    if isinstance(raw_cond, list):
+        raw_items = []
+        for item in raw_cond:
+            if isinstance(item, tuple) and len(item) == 2:
+                raw_items.append((item[0], item[1]))
+            else:
+                raw_items.append(("==", item))
+    elif isinstance(raw_cond, tuple):
+        if len(raw_cond) != 2:
+            raise ValueError(
+                f"Filter tuple for 'dateModified' must have 2 elements, got {len(raw_cond)}"
+            )
+        raw_items = [(raw_cond[0], raw_cond[1])]
     else:
-        combined = [("==", prev)]
+        raw_items = [("==", raw_cond)]
 
-    combined.append(condition if isinstance(condition, tuple) else ("==", condition))
-    target[existing_key] = combined
+    parsed: list[tuple[str, datetime]] = []
+    for op, val in raw_items:
+        validate_filter_operator(op, allow_regex=False)
+        dt = normalize_watermark_datetime(val)
+        if dt is None:
+            raise ValueError(f"Invalid dateModified filter value: {val!r}")
+        parsed.append((op, dt))
+    return parsed
+
+
+def _combine_branch_with_watermark(
+    branch: dict[str, Any],
+    norm_wm: datetime | None,
+) -> tuple[dict[str, Any], Callable[[Any], bool] | None] | None:
+    """Combine a branch filter dict with ``norm_wm`` using at most one ``dateModified`` key.
+
+    Returns ``None`` when the combined ``dateModified`` bounds are unsatisfiable
+    so callers can skip issuing an upstream request for an empty intersection.
+    """
+    out = dict(branch)
+    dm_keys = [k for k in out if _snake_to_camel(k) == "dateModified"]
+    if len(dm_keys) > 1:
+        raise ValueError("Duplicate filter attribute 'dateModified' in AND clause")
+
+    clauses: list[tuple[str, datetime]] = []
+    if dm_keys:
+        raw_existing = out.pop(dm_keys[0])
+        # Preserve original non-list condition directly when watermark is absent
+        if norm_wm is None and not isinstance(raw_existing, list):
+            _coerce_date_modified_clauses(raw_existing)
+            out["dateModified"] = raw_existing
+            return out, None
+        clauses.extend(_coerce_date_modified_clauses(raw_existing))
+
+    if norm_wm is not None:
+        clauses.append((">=", norm_wm))
+
+    if not clauses:
+        return out, None
+
+    lower: tuple[datetime, bool] | None = None
+    upper: tuple[datetime, bool] | None = None
+    exact: datetime | None = None
+    excluded: set[datetime] = set()
+
+    for op, dt in clauses:
+        if op == "==":
+            if exact is not None and exact != dt:
+                return None
+            exact = dt
+        elif op in (">=", ">"):
+            strict = op == ">"
+            if lower is None or dt > lower[0] or (dt == lower[0] and strict and not lower[1]):
+                lower = (dt, strict)
+        elif op in ("<=", "<"):
+            strict = op == "<"
+            if upper is None or dt < upper[0] or (dt == upper[0] and strict and not upper[1]):
+                upper = (dt, strict)
+        elif op == "!=":
+            excluded.add(dt)
+
+    if lower is not None:
+        for ex in list(excluded):
+            if ex < lower[0] or (ex == lower[0] and lower[1]):
+                excluded.discard(ex)
+            elif ex == lower[0] and not lower[1]:
+                lower = (lower[0], True)
+                excluded.discard(ex)
+
+    if upper is not None:
+        for ex in list(excluded):
+            if ex > upper[0] or (ex == upper[0] and upper[1]):
+                excluded.discard(ex)
+            elif ex == upper[0] and not upper[1]:
+                upper = (upper[0], True)
+                excluded.discard(ex)
+
+    if exact is not None:
+        if exact in excluded:
+            return None
+        if lower is not None and (exact < lower[0] or (exact == lower[0] and lower[1])):
+            return None
+        if upper is not None and (exact > upper[0] or (exact == upper[0] and upper[1])):
+            return None
+        out["dateModified"] = ("==", format_iso_datetime(exact))
+        return out, None
+
+    if lower is not None and upper is not None:
+        if lower[0] > upper[0]:
+            return None
+        if lower[0] == upper[0]:
+            if lower[1] or upper[1] or lower[0] in excluded:
+                return None
+            out["dateModified"] = ("==", format_iso_datetime(lower[0]))
+            return out, None
+
+    residual_upper: tuple[datetime, bool] | None = None
+    if lower is not None:
+        out["dateModified"] = (
+            ">" if lower[1] else ">=",
+            format_iso_datetime(lower[0]),
+        )
+        residual_upper = upper
+    elif upper is not None:
+        out["dateModified"] = (
+            "<" if upper[1] else "<=",
+            format_iso_datetime(upper[0]),
+        )
+    elif excluded:
+        first_ex = min(excluded)
+        excluded.discard(first_ex)
+        out["dateModified"] = ("!=", format_iso_datetime(first_ex))
+
+    if residual_upper is None and not excluded:
+        return out, None
+
+    frozen_excluded = frozenset(excluded)
+
+    def _post_predicate(record: Any) -> bool:
+        rec_ts = extract_record_timestamp(record)
+        if rec_ts is None:
+            return False
+        if residual_upper is not None:
+            bound_dt, is_strict = residual_upper
+            if is_strict and not (rec_ts < bound_dt):
+                return False
+            if not is_strict and not (rec_ts <= bound_dt):
+                return False
+        return rec_ts not in frozen_excluded
+
+    return out, _post_predicate
 
 
 def _expand_scalar_list_branches(base: dict[str, Any]) -> list[dict[str, Any]]:
@@ -855,42 +1027,74 @@ def _expand_scalar_list_branches(base: dict[str, Any]) -> list[dict[str, Any]]:
     return branches
 
 
-def build_record_query_branches(
+def _resolve_record_query_branches(
     *,
     record_filter: dict[str, Any] | str | Sequence[str] | None = None,
     watermark: datetime | str | None = None,
     exclude_deleted_upstream: bool = True,
-) -> list[dict[str, Any]]:
-    """Build AND-only filter dictionaries for ``sdk.records.list``.
+) -> list[tuple[dict[str, Any], Callable[[Any], bool] | None]]:
+    """Resolve AND-safe query branches alongside optional timestamp post-predicates."""
+    from imednet.endpoints.records import RecordsEndpoint
+    from imednet.models.records import Record
 
-    Ensures OR filter clauses (comma-separated strings or scalar lists) are
-    split into separate query branches so ``;`` (AND) and ``,`` (OR) connectors
-    are never mixed in a single upstream ``filter`` parameter.
-    """
+    allowed_attrs = RecordsEndpoint.FILTER_ATTRIBUTES
     base_branches: list[dict[str, Any]] = [{}]
 
     if isinstance(record_filter, str):
         stripped = record_filter.strip()
-        if stripped and stripped.lower() != "none":
+        if not stripped:
+            raise ValueError("Filter expression cannot be empty")
+        if stripped.lower() != "none":
             validate_connector_exclusivity(stripped)
             or_parts = _split_top_level(stripped, ",")
             if len(or_parts) > 1:
-                base_branches = [parse_filter_expressions([part]) for part in or_parts]
+                base_branches = [
+                    parse_filter_expressions(
+                        [part],
+                        model=Record,
+                        allowed_attributes=allowed_attrs,
+                    )
+                    for part in or_parts
+                ]
             else:
                 and_parts = _split_top_level(stripped, ";")
-                base_branches = [parse_filter_expressions(and_parts)]
+                base_branches = [
+                    parse_filter_expressions(
+                        and_parts,
+                        model=Record,
+                        allowed_attributes=allowed_attrs,
+                    )
+                ]
     elif isinstance(record_filter, Mapping):
         raw_dict = dict(record_filter)
         inline_filter = raw_dict.pop("filter", None)
+        seen_dict_keys: set[str] = set()
+        for dict_key, dict_val in raw_dict.items():
+            validate_filter_key(dict_key, model=Record, allowed_attributes=allowed_attrs)
+            camel_dk = _snake_to_camel(dict_key)
+            if camel_dk in seen_dict_keys:
+                raise ValueError(f"Duplicate filter attribute '{camel_dk}' in AND clause")
+            seen_dict_keys.add(camel_dk)
+            if isinstance(dict_val, tuple):
+                if len(dict_val) != 2:
+                    raise ValueError(
+                        f"Filter tuple for '{dict_key}' must have 2 elements, got {len(dict_val)}"
+                    )
+                validate_filter_operator(dict_val[0], allow_regex=False)
         expanded = _expand_scalar_list_branches(raw_dict)
         if not expanded:
             return []
-        if isinstance(inline_filter, str) and inline_filter.strip():
-            inline_branches = build_record_query_branches(
-                record_filter=inline_filter,
-                watermark=None,
-                exclude_deleted_upstream=False,
-            )
+        if inline_filter is not None:
+            if not isinstance(inline_filter, str) or not inline_filter.strip():
+                raise ValueError("Inline 'filter' expression cannot be empty")
+            inline_branches = [
+                b
+                for b, _ in _resolve_record_query_branches(
+                    record_filter=inline_filter,
+                    watermark=None,
+                    exclude_deleted_upstream=False,
+                )
+            ]
             merged_branches: list[dict[str, Any]] = []
             for left in expanded:
                 for right in inline_branches:
@@ -902,13 +1106,24 @@ def build_record_query_branches(
         else:
             base_branches = expanded
     elif isinstance(record_filter, Sequence):
-        exprs = [str(item).strip() for item in record_filter if str(item).strip()]
-        if exprs:
-            for expr in exprs:
-                validate_connector_exclusivity(expr)
+        if not record_filter:
+            base_branches = [{}]
+        else:
+            exprs: list[str] = []
+            for item in record_filter:
+                text = str(item).strip()
+                if not text:
+                    raise ValueError("Filter expression cannot be empty")
+                validate_connector_exclusivity(text)
+                exprs.append(text)
             if len(exprs) == 1 and len(_split_top_level(exprs[0], ",")) > 1:
                 base_branches = [
-                    parse_filter_expressions([p]) for p in _split_top_level(exprs[0], ",")
+                    parse_filter_expressions(
+                        [p],
+                        model=Record,
+                        allowed_attributes=allowed_attrs,
+                    )
+                    for p in _split_top_level(exprs[0], ",")
                 ]
             else:
                 flat_and: list[str] = []
@@ -918,20 +1133,50 @@ def build_record_query_branches(
                             "Filter expression cannot combine both ';' (AND) and ',' (OR) connectors"
                         )
                     flat_and.extend(_split_top_level(expr, ";"))
-                base_branches = [parse_filter_expressions(flat_and)]
+                base_branches = [
+                    parse_filter_expressions(
+                        flat_and,
+                        model=Record,
+                        allowed_attributes=allowed_attrs,
+                    )
+                ]
 
     norm_wm = normalize_watermark_datetime(watermark)
-    wm_iso = format_iso_datetime(norm_wm) if norm_wm is not None else None
 
-    final_branches: list[dict[str, Any]] = []
+    final_branches: list[tuple[dict[str, Any], Callable[[Any], bool] | None]] = []
     for branch in base_branches:
-        b = dict(branch)
-        if wm_iso is not None:
-            _merge_and_condition(b, "dateModified", (">=", wm_iso))
-        if exclude_deleted_upstream and "deleted" not in b:
+        merged = _combine_branch_with_watermark(branch, norm_wm)
+        if merged is None:
+            continue
+        b, post_pred = merged
+        if exclude_deleted_upstream and not any(_snake_to_camel(k) == "deleted" for k in b):
             b["deleted"] = False
-        final_branches.append(b)
+        final_branches.append((b, post_pred))
     return final_branches
+
+
+def build_record_query_branches(
+    *,
+    record_filter: dict[str, Any] | str | Sequence[str] | None = None,
+    watermark: datetime | str | None = None,
+    exclude_deleted_upstream: bool = True,
+) -> list[dict[str, Any]]:
+    """Build AND-only filter dictionaries for ``sdk.records.list``.
+
+    Ensures OR filter clauses (comma-separated strings or scalar lists) are
+    split into separate query branches so ``;`` (AND) and ``,`` (OR) connectors
+    are never mixed in a single upstream ``filter`` parameter, and merges
+    ``watermark`` into ``dateModified`` without emitting duplicate
+    ``dateModified`` attributes in one request.
+    """
+    return [
+        branch
+        for branch, _ in _resolve_record_query_branches(
+            record_filter=record_filter,
+            watermark=watermark,
+            exclude_deleted_upstream=exclude_deleted_upstream,
+        )
+    ]
 
 
 def iter_filtered_sdk_records(
@@ -944,27 +1189,32 @@ def iter_filtered_sdk_records(
     exclude_deleted_upstream: bool = True,
 ) -> Iterator[Any]:
     """Lazily yield records from ``sdk.records.list`` across one or more AND-safe branches."""
-    if isinstance(record_data_filter, str) and record_data_filter.strip():
-        validate_connector_exclusivity(record_data_filter)
+    validated_rdf = (
+        _validate_record_data_filter_input(record_data_filter)
+        if record_data_filter is not None
+        else None
+    )
 
-    branches = build_record_query_branches(
+    resolved = _resolve_record_query_branches(
         record_filter=record_filter,
         watermark=watermark,
         exclude_deleted_upstream=exclude_deleted_upstream,
     )
-    if not branches:
+    if not resolved:
         return
 
-    deduplicate = len(branches) > 1
+    deduplicate = len(resolved) > 1
     seen_ids: set[Any] = set()
 
-    for branch in branches:
+    for branch, post_predicate in resolved:
         page_iter = sdk.records.list(
             study_key=study_key,
-            record_data_filter=record_data_filter,
+            record_data_filter=validated_rdf,
             **branch,
         )
         for record in page_iter:
+            if post_predicate is not None and not post_predicate(record):
+                continue
             if deduplicate:
                 rec_id = extract_record_id(record)
                 if rec_id is not None:

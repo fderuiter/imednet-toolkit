@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import Any
 
+from ...endpoints.records import RecordsEndpoint
 from ...models.records import Record
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
@@ -35,6 +37,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     add_output_format(list_parser)
 
+    def _validate_records_output(output: str | None, output_format: str) -> None:
+        if output and output_format == "json":
+            print_error("Choose --format json for stdout or --output for a file.")
+            sys.exit(1)
+        if output and output.lower() not in {"json", "csv"}:
+            print_error("Invalid output format. Use 'json' or 'csv'.")
+            sys.exit(1)
+
     @with_sdk
     def list_records(
         sdk: ImednetSDK,
@@ -47,26 +57,25 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,
+        _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
-        if output and output_format == "json":
-            print_error("Choose --format json for stdout or --output for a file.")
-            sys.exit(1)
-        if output and output.lower() not in {"json", "csv"}:
-            print_error("Invalid output format. Use 'json' or 'csv'.")
-            sys.exit(1)
-
-        req_kwargs, effective_limit = prepare_list_query(
-            filter_args=record_filter,
-            record_data_filter=record_data_filter,
-            sort=sort,
-            limit=limit,
-            fetch_all=fetch_all,
-            output_format=output_format,
-            has_output_file=bool(output),
-            no_interactive=no_interactive,
-            model=Record,
-            disallow_study_key=True,
-        )
+        if _prepared_query is None:
+            _validate_records_output(output, output_format)
+            req_kwargs, effective_limit = prepare_list_query(
+                filter_args=record_filter,
+                record_data_filter=record_data_filter,
+                sort=sort,
+                limit=limit,
+                fetch_all=fetch_all,
+                output_format=output_format,
+                has_output_file=bool(output),
+                no_interactive=no_interactive,
+                model=Record,
+                allowed_attributes=RecordsEndpoint.FILTER_ATTRIBUTES,
+                disallow_study_key=True,
+            )
+        else:
+            req_kwargs, effective_limit = _prepared_query
 
         with fetching_status("records", study_key):
             records, truncated = collect_list_items(
@@ -99,8 +108,23 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 interactive=False if no_interactive else None,
             )
 
-    list_parser.set_defaults(
-        func=lambda args: list_records(
+    def _dispatch_list_records(args: argparse.Namespace) -> None:
+        no_interactive = getattr(args, "no_interactive", False)
+        _validate_records_output(args.output, args.output_format)
+        prepared = prepare_list_query(
+            filter_args=args.record_filter,
+            record_data_filter=args.record_data_filter,
+            sort=args.sort,
+            limit=args.limit,
+            fetch_all=args.fetch_all,
+            output_format=args.output_format,
+            has_output_file=bool(args.output),
+            no_interactive=no_interactive,
+            model=Record,
+            allowed_attributes=RecordsEndpoint.FILTER_ATTRIBUTES,
+            disallow_study_key=True,
+        )
+        list_records(
             study_key=args.study_key,
             output=args.output,
             output_format=args.output_format,
@@ -109,6 +133,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
-            no_interactive=getattr(args, "no_interactive", False),
+            no_interactive=no_interactive,
+            _prepared_query=prepared,
         )
-    )
+
+    list_parser.set_defaults(func=_dispatch_list_records)

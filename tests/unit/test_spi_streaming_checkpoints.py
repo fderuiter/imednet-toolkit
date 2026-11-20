@@ -1616,3 +1616,169 @@ def test_parquet_and_duckdb_streaming_edge_case_schema_evolution(
     export_to_duckdb_by_form(sdk, "S-EDGE", str(ddb_untyped))
     with duckdb.connect(str(ddb_untyped)) as conn:
         assert conn.execute('SELECT COUNT(*) FROM "AE"').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "pos_args"),
+    [
+        ("parquet", ["STUDY1", "out.parquet"]),
+        ("csv", ["STUDY1", "out.csv"]),
+        ("excel", ["STUDY1", "out.xlsx"]),
+        ("json", ["STUDY1", "out.json"]),
+        ("duckdb", ["STUDY1", "records", "out.duckdb"]),
+        ("sql", ["STUDY1", "records", "sqlite:///out.db"]),
+        ("mongodb", ["STUDY1", "mongodb://localhost:27017", "db", "records"]),
+        ("neo4j", ["STUDY1", "bolt://localhost:7687", "neo4j", "secret"]),
+        (
+            "snowflake",
+            ["STUDY1", "acct", "usr", "pwd", "DB", "PUBLIC", "WH", "STG", "RECORDS"],
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("extra_flags", "expected_err"),
+    [
+        (["--record-data-filter", ""], "cannot be empty"),
+        (["--record-data-filter", "   "], "cannot be empty"),
+        (["--record-data-filter", "AGE>=18;AGE<=65"], "Duplicate filter attribute 'AGE'"),
+        (["--record-data-filter", "AGE==18,"], "empty clause"),
+        (["--filter", "subjectKey==SUBJ-01,"], "empty clause"),
+        (["--filter", "study_key=STUDY1"], "'study_key' and 'studyKey' cannot be used"),
+        (["--filter", "keywords=urgent"], "Valid attributes:"),
+        (["--filter", "form_key=~DEMO"], "Allowed operators: ['!=', '<', '<=', '==', '>', '>=']"),
+        (["--filter", "record_id>=1", "--filter", "recordId<=10"], "Duplicate filter attribute"),
+    ],
+)
+def test_all_nine_export_subcommands_reject_invalid_filters_before_http(
+    subcommand: str,
+    pos_args: list[str],
+    extra_flags: list[str],
+    expected_err: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 7 & AC 6: all 9 export subcommands reject blank/duplicate/trailing-comma/disallowed filters before HTTP."""
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    mock_get_sdk = MagicMock(side_effect=AssertionError("get_sdk must not be called in preflight"))
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", mock_get_sdk)
+
+    code, stdout, stderr = _invoke_cli(["export", subcommand, *pos_args, *extra_flags])
+    assert code == 1
+    assert stdout == ""
+    assert expected_err in stderr
+    mock_get_sdk.assert_not_called()
+
+
+def test_incremental_watermark_combines_date_modified_without_duplicate_attribute(
+    tmp_path: Path,
+) -> None:
+    """Req 8: incremental/--since watermarks combine with dateModified without duplicate attributes."""
+    # 1. Lower bound tighten: user >= 2026-06-05 > watermark 2026-06-01 -> keeps >= 2026-06-05
+    b_gt = build_record_query_branches(
+        record_filter={"date_modified": (">", "2026-06-05T00:00:00Z")},
+        watermark="2026-06-01T00:00:00Z",
+    )
+    assert len(b_gt) == 1
+    assert "date_modified" not in b_gt[0]
+    assert b_gt[0]["dateModified"] == (">", "2026-06-05T00:00:00Z")
+
+    # 2. Lower bound superseded by newer watermark: user >= 2026-05-01, watermark 2026-06-01
+    b_wm = build_record_query_branches(
+        record_filter="dateModified>=2026-05-01T00:00:00Z;formKey==AE",
+        watermark="2026-06-01T00:00:00Z",
+    )
+    assert len(b_wm) == 1
+    assert b_wm[0]["dateModified"] == (">=", "2026-06-01T00:00:00Z")
+
+    # 3. Unsatisfiable upper bound (< watermark) and equality (< watermark) prune branch completely
+    assert (
+        build_record_query_branches(
+            record_filter="dateModified<2026-05-01T00:00:00Z",
+            watermark="2026-06-01T00:00:00Z",
+        )
+        == []
+    )
+    assert (
+        build_record_query_branches(
+            record_filter="dateModified==2026-05-01T00:00:00Z",
+            watermark="2026-06-01T00:00:00Z",
+        )
+        == []
+    )
+
+    # 4. Equality >= watermark keeps exact equality without adding duplicate >= watermark
+    b_eq = build_record_query_branches(
+        record_filter="dateModified==2026-06-10T00:00:00Z",
+        watermark="2026-06-01T00:00:00Z",
+    )
+    assert b_eq == [{"dateModified": ("==", "2026-06-10T00:00:00Z"), "deleted": False}]
+
+    # 5. End-to-end HTTP check: upper bound `dateModified<=2026-06-10T00:00:00Z` + `--since 2026-06-01T00:00:00Z`
+    #    sends a SINGLE `dateModified>=2026-06-01T00:00:00Z` in HTTP filter and locally filters <= 2026-06-10!
+    seen_filters: list[str] = []
+    with respx.mock(assert_all_called=True) as router:
+
+        def _records_handler(request: httpx.Request) -> httpx.Response:
+            flt = request.url.params.get("filter", "")
+            seen_filters.append(flt)
+            assert flt.count("dateModified") == 1
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "recordId": 1,
+                            "subjectKey": "SUBJ-01",
+                            "visitId": 1,
+                            "formId": 10,
+                            "formKey": "AE",
+                            "deleted": False,
+                            "dateModified": "2026-06-05T12:00:00Z",
+                            "recordData": {"AGE": 40},
+                        },
+                        {
+                            "recordId": 2,
+                            "subjectKey": "SUBJ-02",
+                            "visitId": 1,
+                            "formId": 10,
+                            "formKey": "AE",
+                            "deleted": False,
+                            "dateModified": "2026-06-15T12:00:00Z",
+                            "recordData": {"AGE": 50},
+                        },
+                    ]
+                },
+            )
+
+        router.get("https://api.test/api/v1/edc/studies/S-WM/records").mock(
+            side_effect=_records_handler
+        )
+        router.get("https://api.test/api/v1/edc/studies/S-WM/variables").respond(
+            200,
+            json={
+                "data": [
+                    {
+                        "variableName": "AGE",
+                        "variableType": "int",
+                        "label": "Age",
+                        "formId": 10,
+                        "formKey": "AE",
+                    }
+                ]
+            },
+        )
+
+        with ImednetSDK(api_key="k", security_key="s", base_url="https://api.test") as real_sdk:
+            out_json = tmp_path / "wm_window.json"
+            export_to_json(
+                real_sdk,
+                "S-WM",
+                str(out_json),
+                record_filter="dateModified<=2026-06-10T00:00:00Z",
+                modified_since="2026-06-01T00:00:00Z",
+            )
+            exported_rows = json.loads(out_json.read_text(encoding="utf-8"))
+            assert [row["recordId"] for row in exported_rows] == [1]
+            assert len(seen_filters) == 1
+            assert seen_filters[0].count("dateModified") == 1
+            assert "dateModified>=2026-06-01T00:00:00Z" in seen_filters[0]

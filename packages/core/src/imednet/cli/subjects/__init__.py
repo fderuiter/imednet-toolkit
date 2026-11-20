@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
+from ...endpoints.subjects import SubjectsEndpoint
 from ...models.subjects import Subject
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
@@ -40,16 +42,22 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,
+        _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
-        req_kwargs, effective_limit = prepare_list_query(
-            filter_args=subject_filter,
-            sort=sort,
-            limit=limit,
-            fetch_all=fetch_all,
-            output_format=output_format,
-            no_interactive=no_interactive,
-            model=Subject,
-            disallow_study_key=True,
+        req_kwargs, effective_limit = (
+            _prepared_query
+            if _prepared_query is not None
+            else prepare_list_query(
+                filter_args=subject_filter,
+                sort=sort,
+                limit=limit,
+                fetch_all=fetch_all,
+                output_format=output_format,
+                no_interactive=no_interactive,
+                model=Subject,
+                allowed_attributes=SubjectsEndpoint.FILTER_ATTRIBUTES,
+                disallow_study_key=True,
+            )
         )
 
         with fetching_status("subjects", study_key):
@@ -83,14 +91,28 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             interactive=False if no_interactive else None,
         )
 
-    list_parser.set_defaults(
-        func=lambda args: list_subjects(
+    def _dispatch_list_subjects(args: argparse.Namespace) -> None:
+        no_interactive = getattr(args, "no_interactive", False)
+        prepared = prepare_list_query(
+            filter_args=args.subject_filter,
+            sort=args.sort,
+            limit=args.limit,
+            fetch_all=args.fetch_all,
+            output_format=args.output_format,
+            no_interactive=no_interactive,
+            model=Subject,
+            allowed_attributes=SubjectsEndpoint.FILTER_ATTRIBUTES,
+            disallow_study_key=True,
+        )
+        list_subjects(
             study_key=args.study_key,
             subject_filter=args.subject_filter,
             output_format=args.output_format,
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
-            no_interactive=getattr(args, "no_interactive", False),
+            no_interactive=no_interactive,
+            _prepared_query=prepared,
         )
-    )
+
+    list_parser.set_defaults(func=_dispatch_list_subjects)

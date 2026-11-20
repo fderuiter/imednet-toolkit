@@ -12,20 +12,24 @@ Overview
 
 The Snowflake export path uses a staged-loading and merge approach:
 
-1. **Stage** – Study records are mapped with top-level ``Record`` metadata columns
-   (``study_key``, ``record_id``, ``subject_id``, ``subject_key``, ``form_id``,
-   ``form_key``, ``visit_id``, ``record_status``, timestamps, etc.) and a JSON-encoded
-   ``record_data`` column after clinical PHI masking and enrichment. Encoding
-   ``record_data`` as JSON preserves heterogeneous Form schemas within the same batch
-   without Arrow type collisions.
-2. **PUT** – Each Parquet file is uploaded to a Snowflake *internal* stage via
-   ``PUT file://... AUTO_COMPRESS = FALSE OVERWRITE = TRUE``.
-3. **Load / Merge** – When ``idempotent=True`` (default), Snowflake bulk-loads the
-   staged Parquet file into a temporary staging table via
-   ``COPY INTO ... FILE_FORMAT = (TYPE = PARQUET) MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE FORCE = TRUE``
-   and executes ``MERGE INTO`` keyed on ``(study_key, record_id)``. When
-   ``idempotent=False``, Snowflake loads directly into the target table via
-   ``COPY INTO ... FORCE = TRUE``.
+1. **Stage** – Study records are flattened via ``CentralizedMapper`` into top-level
+   ``Record`` metadata columns (``study_key``, ``record_id``, ``subject_id``,
+   ``subject_key``, ``form_id``, ``form_key``, ``visit_id``, ``record_status``,
+   ``deleted``, timestamps, etc.), flattened clinical variable columns extracted from
+   ``record_data`` (with ``var_`` prefixing when a clinical variable collides with a
+   ``Record`` metadata name), and a JSON-encoded ``record_data`` payload column after
+   clinical PHI masking. Empty ``record_data`` dictionaries omit zero-field Arrow
+   structs so draft records serialize cleanly to Parquet.
+2. **PUT** – Each Parquet file is uploaded to a run-scoped path inside a Snowflake
+   *internal* stage via ``PUT file://... AUTO_COMPRESS = FALSE OVERWRITE = TRUE``.
+3. **Evolve & Merge** – The sink inspects ``INFORMATION_SCHEMA.COLUMNS`` and executes
+   ``CREATE TABLE IF NOT EXISTS`` when the target table is missing or ``ALTER TABLE ... ADD COLUMN``
+   when unseen form variables appear. When ``idempotent=True`` (default), Snowflake
+   bulk-loads the staged Parquet file into a temporary staging table via
+   ``COPY INTO ... FILE_FORMAT = (TYPE = PARQUET) MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE FORCE = TRUE``,
+   deduplicates ``(study_key, record_id)`` by ``date_modified``, and executes
+   ``MERGE INTO`` keyed on ``(study_key, record_id)``. When ``idempotent=False``,
+   Snowflake loads directly into the target table via ``COPY INTO ... FORCE = TRUE``.
 
 This is intentionally different from :func:`~imednet.integrations.export.export_to_sql`, which
 uses SQLAlchemy ``DataFrame.to_sql()`` and is appropriate for transactional SQL targets
@@ -147,16 +151,23 @@ Each entry contains:
        "loaded_at":  "2026-01-15T12:00:00+00:00"
    }
 
-Idempotency
------------
+Idempotency and delete semantics
+--------------------------------
 
 When ``SnowflakeSinkConfig.idempotent`` is ``True`` (default), each batch upload runs
 ``PUT ... AUTO_COMPRESS = FALSE OVERWRITE = TRUE`` so refreshed Parquet files replace stale
-staged artifacts, bulk-loads the batch into a session-scoped temporary staging table via
-``COPY INTO ... FORCE = TRUE``, and executes ``MERGE INTO`` keyed on
-``(study_key, record_id)``. Scheduled re-runs update modified records in place without
-inserting duplicate rows. Set ``idempotent = False`` (``--force-reload`` in the CLI) to
-bypass staging-table merges and append directly into the target table via
+staged artifacts, ensures target table DDL via ``INFORMATION_SCHEMA.COLUMNS``, bulk-loads
+the batch into a session-scoped temporary staging table via ``COPY INTO ... FORCE = TRUE``,
+deduplicates ``(study_key, record_id)`` rows by ``date_modified``, and executes
+``MERGE INTO`` keyed on ``(study_key, record_id)``. Scheduled re-runs update modified
+records in place without inserting duplicate rows.
+
+By default (``hard_delete=False``), records with ``deleted=True`` update the ``DELETED``
+metadata column on matched target rows. Set ``hard_delete=True`` on
+:class:`~imednet_sinks.warehouse.SnowflakeSinkConfig` (or ``export_kwargs={"hard_delete": True}``
+in ``ImednetExportOperator``) to delete matched target rows when ``deleted=True`` and skip
+inserting unmatched voided records. Set ``idempotent = False`` (``--force-reload`` in the CLI)
+to bypass staging-table merges and append directly into the target table via
 ``COPY INTO ... FORCE = TRUE``.
 
 Error handling and retries

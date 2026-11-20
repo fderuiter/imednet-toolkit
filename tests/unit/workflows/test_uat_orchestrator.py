@@ -354,7 +354,7 @@ def test_workflow_attempt_submitting_to_inspecting_raises_invalid_transition(moc
 
 
 def test_workflow_reset_and_rerun(mock_sdk, snapshot):
-    """Test reset restores state to PENDING and allows re-running workflow."""
+    """Test consecutive run() calls use isolated contexts and reset() restores PENDING."""
     from imednet_workflows.uat.models import InvalidUATStateTransitionError, UATWorkflowState
 
     workflow = UATWorkflow(mock_sdk)
@@ -368,16 +368,24 @@ def test_workflow_reset_and_rerun(mock_sdk, snapshot):
     assert result1.state == UATWorkflowState.COMPLETED
     assert workflow.state == UATWorkflowState.COMPLETED
 
-    # Running again without reset raises InvalidUATStateTransitionError
+    # Illegal manual transition from terminal COMPLETED still raises
     with pytest.raises(InvalidUATStateTransitionError):
-        workflow.run("TEST_STUDY")
+        workflow.transition_to(UATWorkflowState.INSPECTING)
 
-    # Reset allows rerun
+    # Running again without reset allocates an isolated execution context and succeeds
+    result2 = workflow.run("TEST_STUDY")
+    assert result2.state == UATWorkflowState.COMPLETED
+    assert result1.run_id != result2.run_id
+    assert result1.state_history is not result2.state_history
+    assert result1.state_history == result2.state_history
+
+    # Explicit reset restores state to PENDING and clears last_result
     workflow.reset()
     assert workflow.state == UATWorkflowState.PENDING
     assert workflow.state_history == [UATWorkflowState.PENDING]
-    result2 = workflow.run("TEST_STUDY")
-    assert result2.state == UATWorkflowState.COMPLETED
+    assert workflow.last_result is None
+    result3 = workflow.run("TEST_STUDY")
+    assert result3.state == UATWorkflowState.COMPLETED
 
 
 def test_builder_and_workflow_consume_data_dictionary(mock_sdk):
@@ -491,3 +499,111 @@ def test_builder_and_workflow_consume_data_dictionary(mock_sdk):
             },
         },
     )
+
+
+def test_sdk_singleton_consecutive_uat_runs_without_reset():
+    """Calling sdk.workflows.uat.run() twice succeeds without reset() and isolates run state."""
+    from imednet import ImednetSDK
+    from imednet_workflows.uat import BulkRecordSubmissionWorkflow
+    from imednet_workflows.uat.models import UATWorkflowState
+
+    sdk = ImednetSDK(simulation_mode=True)
+    singleton_uat = sdk.workflows.uat
+    assert sdk.workflows.uat is singleton_uat
+
+    created_submitters: list[BulkRecordSubmissionWorkflow] = []
+    orig_init = BulkRecordSubmissionWorkflow.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        created_submitters.append(self)
+
+    with patch.object(BulkRecordSubmissionWorkflow, "__init__", tracking_init):
+        res1 = sdk.workflows.uat.run("STUDY", subject_count=1)
+        res2 = sdk.workflows.uat.run("STUDY", subject_count=1)
+
+    assert res1.state == UATWorkflowState.COMPLETED
+    assert res2.state == UATWorkflowState.COMPLETED
+    assert res1.overall_success is True
+    assert res2.overall_success is True
+    assert res1.state_history is not res2.state_history
+    res1.state_history.append(UATWorkflowState.FAILED)
+    assert res2.state_history[-1] == UATWorkflowState.COMPLETED
+    assert len(created_submitters) == 2
+    assert created_submitters[0] is not created_submitters[1]
+    assert sdk.workflows.uat is singleton_uat
+
+
+def test_workflow_run_monitoring_poll_summary_any_failed_transitions_to_failed(mock_sdk, snapshot):
+    """When poll_summary.any_failed is True, workflow transitions MONITORING -> FAILED."""
+    from imednet.spi.models import JobStatus
+    from imednet.spi.utils import JobFailedError, JobPollSummary, JobTimeoutError
+    from imednet_workflows.uat.models import UATWorkflowState
+
+    observed_phases: list[UATWorkflowState] = []
+    workflow = UATWorkflow(mock_sdk, on_phase_change=observed_phases.append)
+    workflow.inspect = MagicMock(return_value=snapshot)
+    workflow.build_spec = MagicMock(return_value=MagicMock(spec=UATSpecification))
+    workflow.generate = MagicMock(return_value=[MagicMock(spec=GeneratedRecordSet)])
+    mock_sub = MagicMock(spec=SubmissionResult)
+    mock_sub.total_records_submitted = 4
+    mock_sub.all_batch_ids = ["batch-ok", "batch-fail-1", "batch-timeout-2"]
+    workflow.submit = MagicMock(return_value=mock_sub)
+
+    poll_summary = JobPollSummary(
+        study_key="TEST_STUDY",
+        results={"batch-ok": JobStatus(batch_id="batch-ok", state="COMPLETED")},
+        failures={
+            "batch-fail-1": JobFailedError(
+                "batch-fail-1", JobStatus(batch_id="batch-fail-1", state="FAILED")
+            ),
+            "batch-timeout-2": JobTimeoutError("Batch timed out"),
+        },
+        elapsed_total=1.5,
+    )
+    assert poll_summary.any_failed is True
+    workflow.monitor = MagicMock(return_value=poll_summary)
+
+    result = workflow.run("TEST_STUDY")
+
+    assert result.state == UATWorkflowState.FAILED
+    assert workflow.state == UATWorkflowState.FAILED
+    assert result.failure_phase == UATWorkflowState.MONITORING
+    assert result.overall_success is False
+    assert "batch-fail-1" in (result.error_message or "")
+    assert "batch-timeout-2" in (result.error_message or "")
+    assert result.state_history == [
+        UATWorkflowState.PENDING,
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.BUILDING_SPEC,
+        UATWorkflowState.GENERATING,
+        UATWorkflowState.SUBMITTING,
+        UATWorkflowState.MONITORING,
+        UATWorkflowState.FAILED,
+    ]
+    assert observed_phases[-1] == UATWorkflowState.FAILED
+    assert UATWorkflowState.COMPLETED not in observed_phases
+    summary_text = result.summary()
+    assert "Overall: FAIL" in summary_text
+    assert "Failed phase: MONITORING" in summary_text
+    assert "batch-fail-1" in summary_text
+
+    # Also verify nonzero failed_records on a COMPLETED job triggers MONITORING -> FAILED
+    rec_err_summary = JobPollSummary(
+        study_key="TEST_STUDY",
+        results={
+            "batch-rec-err": JobStatus(
+                batch_id="batch-rec-err", state="COMPLETED", failed_records=2
+            )
+        },
+        failures={},
+        elapsed_total=0.5,
+    )
+    assert rec_err_summary.any_failed is True
+    workflow.monitor = MagicMock(return_value=rec_err_summary)
+
+    result2 = workflow.run("TEST_STUDY")
+    assert result2.state == UATWorkflowState.FAILED
+    assert result2.failure_phase == UATWorkflowState.MONITORING
+    assert result2.overall_success is False
+    assert "batch-rec-err" in (result2.error_message or "")

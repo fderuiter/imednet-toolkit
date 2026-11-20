@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
+from ...endpoints.codings import CodingsEndpoint
 from ...models.codings import Coding
 from ...sdk import ImednetSDK
 from ..decorators import with_sdk
@@ -53,16 +54,22 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,
+        _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
-        req_kwargs, effective_limit = prepare_list_query(
-            filter_args=coding_filter,
-            sort=sort,
-            limit=limit,
-            fetch_all=fetch_all,
-            output_format=output_format,
-            no_interactive=no_interactive,
-            model=Coding,
-            disallow_study_key=True,
+        req_kwargs, effective_limit = (
+            _prepared_query
+            if _prepared_query is not None
+            else prepare_list_query(
+                filter_args=coding_filter,
+                sort=sort,
+                limit=limit,
+                fetch_all=fetch_all,
+                output_format=output_format,
+                no_interactive=no_interactive,
+                model=Coding,
+                allowed_attributes=CodingsEndpoint.FILTER_ATTRIBUTES,
+                disallow_study_key=True,
+            )
         )
 
         with fetching_status("codings", study_key):
@@ -101,14 +108,28 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             interactive=False if no_interactive else None,
         )
 
-    list_parser.set_defaults(
-        func=lambda args: list_codings(
+    def _dispatch_list_codings(args: argparse.Namespace) -> None:
+        no_interactive = getattr(args, "no_interactive", False)
+        prepared = prepare_list_query(
+            filter_args=args.coding_filter,
+            sort=args.sort,
+            limit=args.limit,
+            fetch_all=args.fetch_all,
+            output_format=args.output_format,
+            no_interactive=no_interactive,
+            model=Coding,
+            allowed_attributes=CodingsEndpoint.FILTER_ATTRIBUTES,
+            disallow_study_key=True,
+        )
+        list_codings(
             study_key=args.study_key,
             coding_filter=args.coding_filter,
             output_format=args.output_format,
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
-            no_interactive=getattr(args, "no_interactive", False),
+            no_interactive=no_interactive,
+            _prepared_query=prepared,
         )
-    )
+
+    list_parser.set_defaults(func=_dispatch_list_codings)

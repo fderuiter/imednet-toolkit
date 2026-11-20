@@ -23,15 +23,11 @@ def test_conf_sets_empty_templates_path_and_seo_hooks() -> None:
 
 
 @pytest.mark.unit
-def test_docs_mermaid_dependency_compatible_with_configured_mermaid_version() -> None:
-    """Verify pyproject.toml pins sphinxcontrib-mermaid <1.0.0 while mermaid_version is 10.2.0."""
-    import tomllib
-
-    pyproject_data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    docs_deps: list[str] = pyproject_data["project"]["optional-dependencies"]["docs"]
-    mermaid_specs = [dep for dep in docs_deps if dep.startswith("sphinxcontrib-mermaid")]
-    assert mermaid_specs == ["sphinxcontrib-mermaid>=0.9.2,<1.0.0"]
-    assert docs_conf.mermaid_version == "10.2.0"
+def test_conf_resolves_compatible_mermaid_version() -> None:
+    """Verify docs/conf.py selects Mermaid 10.2.0 for 0.x and >=10.3.0 for sphinxcontrib-mermaid >=1.0."""
+    assert docs_conf._resolve_mermaid_version("0.9.2") == "10.2.0"
+    assert docs_conf._resolve_mermaid_version("2.1.1") == "11.12.1"
+    assert docs_conf._resolve_mermaid_version("invalid") == "10.2.0"
 
 
 @pytest.mark.unit
