@@ -19,7 +19,7 @@ from .simulation import (
     SimulationTransport,
     create_simulation_transport,
 )
-from .utils.typing import FilterScalar, FilterValue, ItemId, JsonDict
+from .utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
 
 # Provide a backward-compatible alias
 ImednetClient = ImednetSDK
@@ -44,6 +44,7 @@ __all__ = [
     "OrchestratorResult",
     "PluginLoadError",
     "PluginProtocol",
+    "RecordsInput",
     "RetryPolicy",
     "RetryState",
     "SimulationState",

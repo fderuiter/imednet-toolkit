@@ -88,6 +88,98 @@ def test_sync_worker_init_leaves_loader_lock_unchanged_and_has_no_private_lock(
     assert lock_held_during_sync is False
 
 
+class _ImmediateEvent(Event):
+    """Threading Event whose wait() returns immediately when unset for fast unit tests."""
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.is_set()
+
+
+def test_sync_worker_config_rejects_non_positive_interval() -> None:
+    """SyncWorkerConfig rejects zero, negative, and boolean interval_seconds values."""
+    for invalid in (0, -1, -60, False):
+        with pytest.raises(ValueError, match="interval_seconds must be greater than 0"):
+            SyncWorkerConfig(study_key="PROT-01", interval_seconds=invalid)  # type: ignore[arg-type]
+
+
+def test_sync_worker_run_forever_reraises_permanent_api_errors(tmp_path: Path) -> None:
+    """SyncWorker.run_forever fails fast on 401, 403, and 404 ApiError exceptions."""
+    from imednet.spi.errors import (
+        ApiError,
+        AuthenticationError,
+        AuthorizationError,
+        ForbiddenError,
+        NotFoundError,
+        UnauthorizedError,
+    )
+
+    permanent_errors = [
+        AuthenticationError("bad key"),
+        UnauthorizedError("unauthorized"),
+        AuthorizationError("denied"),
+        ForbiddenError("forbidden"),
+        NotFoundError("unknown study"),
+        ApiError("raw 401", status_code=401),
+        ApiError("raw 403", status_code=403),
+        ApiError("raw 404", status_code=404),
+    ]
+
+    for err in permanent_errors:
+        loader = MagicMock()
+        loader.db_path = tmp_path / "records_cache.sqlite3"
+        loader.sync_records.side_effect = err
+        worker = SyncWorker(
+            loader,
+            config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=60),
+        )
+        with pytest.raises(type(err)):
+            worker.run_forever()
+        assert worker.state == SyncWorkerState.FAILED
+        loader.sync_records.assert_called_once()
+
+
+def test_sync_worker_run_forever_retries_transient_errors(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SyncWorker.run_forever logs and retries 429, 5xx, and network errors on subsequent cycles."""
+    from imednet.spi.errors import RateLimitError, RequestError, ServerError
+
+    for transient_err in (
+        RateLimitError("rate limited"),
+        ServerError("gateway timeout", status_code=503),
+        RequestError("connection reset"),
+        RuntimeError("transient glitch"),
+    ):
+        caplog.clear()
+        loader = MagicMock()
+        loader.db_path = tmp_path / "records_cache.sqlite3"
+        stop_event = _ImmediateEvent()
+        calls = 0
+
+        def _fail_then_succeed(
+            *_args: object, _err: Exception = transient_err, **_kwargs: object
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _err
+            stop_event.set()
+
+        loader.sync_records.side_effect = _fail_then_succeed
+        loader.count_cached_records.return_value = 7
+        worker = SyncWorker(
+            loader,
+            config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=1),
+            stop_event=stop_event,
+        )
+        cycles: list[tuple[int, int]] = []
+        worker.run_forever(on_cycle=lambda c, n: cycles.append((c, n)))
+
+        assert calls == 2
+        assert cycles == [(2, 7)]
+        assert "sync worker cycle failed" in caplog.text
+
+
 def test_sync_worker_degraded_recovery_and_error_callbacks(tmp_path: Path) -> None:
     """SyncWorker reports DEGRADED on first failure, invokes callbacks, and recovers to RUNNING."""
     loader = MagicMock()
@@ -96,20 +188,20 @@ def test_sync_worker_degraded_recovery_and_error_callbacks(tmp_path: Path) -> No
 
     err1 = RuntimeError("transient 503")
     err2 = RuntimeError("transient timeout")
-    stop_event = Event()
+    stop_event = _ImmediateEvent()
     states_observed: list[SyncWorkerState] = []
     callback_events: list[tuple[str, int]] = []
 
     worker = SyncWorker(
         loader,
-        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=0),
+        config=SyncWorkerConfig(study_key="PROT-01", interval_seconds=1),
         stop_event=stop_event,
         on_error=lambda exc, count: callback_events.append((str(exc), count)),
     )
 
     call_num = 0
 
-    def _sync_side_effect(*args, **kwargs) -> None:
+    def _sync_side_effect(*args: object, **kwargs: object) -> None:
         nonlocal call_num
         call_num += 1
         if call_num == 1:
@@ -157,9 +249,10 @@ def test_sync_worker_transitions_to_failed_at_max_consecutive_failures(tmp_path:
         loader,
         config=SyncWorkerConfig(
             study_key="PROT-01",
-            interval_seconds=0,
+            interval_seconds=1,
             max_consecutive_failures=3,
         ),
+        stop_event=_ImmediateEvent(),
         on_error=lambda _exc, failures: observed_states.append((failures, worker.state)),
     )
 
@@ -174,7 +267,8 @@ def test_sync_worker_transitions_to_failed_at_max_consecutive_failures(tmp_path:
     assert worker.consecutive_failures == 3
     assert isinstance(worker.last_error, RuntimeError)
     assert str(worker.last_error) == "401 invalid credentials"
-    assert sleep_ticks == []
+    # Cycles 1 and 2 sleep while DEGRADED; cycle 3 breaks immediately on FAILED without sleeping
+    assert sleep_ticks == [(1, 1), (2, 1)]
 
     # Calling stop() in a cleanup block preserves terminal FAILED state
     worker.stop()

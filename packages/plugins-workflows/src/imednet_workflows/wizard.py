@@ -148,28 +148,61 @@ def validate_filter_syntax(
     *,
     model: type[Any] | None = None,
 ) -> tuple[bool, str | None, Any | None, str | None]:
-    """Validate a single filter parameter string via the shared SPI parser.
+    """Validate a filter parameter string via the shared SPI parser.
 
     Args:
-        filter_str: Raw filter string.
+        filter_str: Raw filter string (single clause or compound ';' / ',' clauses).
         model: Optional endpoint resource model class used to validate filter keys.
 
     Returns:
         A tuple of (is_valid, key, parsed_value, error_message).
     """
     from imednet.spi.cli import resolve_endpoint_filter_attributes
-    from imednet.spi.utils import parse_filter_expression
+    from imednet.spi.utils import parse_filter_expressions
 
     allowed_attrs = resolve_endpoint_filter_attributes(model)
+    normalized = filter_str.strip() if isinstance(filter_str, str) else filter_str
     try:
-        key, parsed_val = parse_filter_expression(
-            filter_str,
+        parsed = parse_filter_expressions(
+            [normalized],
             model=model,
             allowed_attributes=allowed_attrs,
         )
     except ValueError as exc:
         return False, None, None, str(exc)
-    return True, key, parsed_val, None
+
+    if len(parsed) == 1:
+        key, parsed_val = next(iter(parsed.items()))
+        return True, key, parsed_val, None
+    return True, "filter", parsed, None
+
+
+def _validate_filter_with_context(
+    filter_str: str,
+    accepted_filters: list[str],
+    *,
+    model: type[Any] | None = None,
+) -> tuple[bool, str | None]:
+    """Validate a filter candidate both standalone and alongside accepted filters."""
+    is_valid, _, _, err = validate_filter_syntax(filter_str, model=model)
+    if not is_valid:
+        return False, err
+    if not accepted_filters:
+        return True, None
+
+    from imednet.spi.cli import resolve_endpoint_filter_attributes
+    from imednet.spi.utils import parse_filter_expressions
+
+    allowed_attrs = resolve_endpoint_filter_attributes(model)
+    try:
+        parse_filter_expressions(
+            [*accepted_filters, filter_str],
+            model=model,
+            allowed_attributes=allowed_attrs,
+        )
+    except ValueError as exc:
+        return False, str(exc)
+    return True, None
 
 
 def prompt_filters(
@@ -193,7 +226,7 @@ def prompt_filters(
     filters: list[str] = []
     if existing_filters:
         for f in existing_filters:
-            is_valid, _, _, err = validate_filter_syntax(f, model=model)
+            is_valid, err = _validate_filter_with_context(f, filters, model=model)
             if is_valid:
                 filters.append(f)
             else:
@@ -207,7 +240,7 @@ def prompt_filters(
                     )
                     sys.exit(1)
                 while True:
-                    c_valid, _, _, c_err = validate_filter_syntax(corrected, model=model)
+                    c_valid, c_err = _validate_filter_with_context(corrected, filters, model=model)
                     if c_valid:
                         filters.append(corrected)
                         break
@@ -232,7 +265,7 @@ def prompt_filters(
         entry = prompt_input(prompt_msg)
         if not entry:
             break
-        is_valid, _, _, err = validate_filter_syntax(entry, model=model)
+        is_valid, err = _validate_filter_with_context(entry, filters, model=model)
         if is_valid:
             filters.append(entry)
             prompt_msg = f"Enter additional {category_name} (or press Enter to finish)"
