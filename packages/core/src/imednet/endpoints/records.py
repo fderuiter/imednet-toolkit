@@ -79,6 +79,7 @@ class RecordsOperationDef:
         Returns:
             The background job for the creation operation.
         """
+        self._validate_study_key(study_key)  # type: ignore
         path = self._get_endpoint_path(study_key)  # type: ignore
         return RecordCreateOperation[Job](
             path=path,
@@ -104,6 +105,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         skip_validation: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
+        self._validate_study_key(study_key)
         coordinator = BatchCoordinator(chunk_size=chunk_size)
         return coordinator.submit(
             study_key,
@@ -162,6 +164,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         skip_validation: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once and asynchronously submit records in bounded chunks."""
+        self._validate_study_key(study_key)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
         return await coordinator.submit(
             study_key,

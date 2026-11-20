@@ -660,6 +660,187 @@ def test_initial_transaction_failure_keeps_last_timestamp_none(tmp_path, capsys)
     assert "STUDY-INIT | records | None |" in sub_out
 
 
+def test_airflow_state_provider_in_context_sdk_scoping_and_fallbacks(monkeypatch) -> None:
+    """Verify AirflowStateProvider uses airflow.sdk.get_current_context and scopes xcom_pull by task_id."""
+    import json as _json
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    provider = AirflowStateProvider()
+    pushed: list[tuple[str, dict[str, object]]] = []
+
+    class _MappedTI:
+        task_id = "export_records"
+        map_index = 2
+
+        def xcom_pull(self, *, task_ids=None, key=None, include_prior_dates=False):
+            assert task_ids == "export_records"
+            assert include_prior_dates is True
+            assert key == "state_STUDY_X_csv"
+            if not pushed:
+                return None
+            return [
+                {"last_timestamp": "2026-01-01T00:00:00", "status": "running"},
+                pushed[-1][1],
+            ]
+
+        def xcom_push(self, *, key: str, value: dict[str, object]) -> None:
+            pushed.append((key, value))
+
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.get_current_context = lambda: {"ti": _MappedTI()}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+
+    session_mod = ModuleType("airflow.utils.session")
+    create_session_spy = MagicMock()
+    session_mod.create_session = create_session_spy  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_mod)
+
+    # Initial run in active context returns None without querying XComModel DB
+    assert provider.get_last_timestamp("STUDY_X", "csv") is None
+    assert provider.get_last_status("STUDY_X", "csv") is None
+    create_session_spy.assert_not_called()
+
+    # Transaction commits via xcom_push and subsequent pull reads latest entry
+    with provider.transaction(
+        "STUDY_X", "csv", fallback_timestamp=datetime(2026, 2, 1, 8, 0)
+    ) as tx:
+        tx["new_timestamp"] = datetime(2026, 2, 2, 9, 30, tzinfo=timezone.utc)
+        tx["records_processed"] = 12
+
+    assert provider.get_last_timestamp("STUDY_X", "csv") == datetime(
+        2026, 2, 2, 9, 30, tzinfo=timezone.utc
+    )
+    assert provider.get_last_status("STUDY_X", "csv") == StreamExecutionStatus.SUCCESS
+
+    # Deserialization & parsing helpers
+    assert provider._deserialize_xcom_row(object, SimpleNamespace(value={"ok": 1})) == {"ok": 1}
+    assert provider._deserialize_xcom_row(
+        object, SimpleNamespace(value=_json.dumps({"ok": 2}).encode("utf-8"))
+    ) == {"ok": 2}
+    assert provider._deserialize_xcom_row(object, SimpleNamespace(value="{bad")) is None
+    assert provider._parse_status(StreamExecutionStatus.RUNNING) == StreamExecutionStatus.RUNNING
+    assert provider._parse_status("invalid_state") == StreamExecutionStatus.FAILED
+    assert provider._parse_status(99) == StreamExecutionStatus.FAILED
+    assert provider._parse_iso_utc(datetime(2026, 2, 1, 8, 0)) == datetime(
+        2026, 2, 1, 8, 0, tzinfo=timezone.utc
+    )
+    assert provider._parse_iso_utc("not-a-timestamp") is None
+    assert provider._parse_iso_utc(99) is None
+    assert provider._pull_ti_xcom_dict(
+        SimpleNamespace(xcom_pull=lambda **_kw: {"ok": 3}), "state_STUDY_X_csv"
+    ) == {"ok": 3}
+
+
+def test_airflow_state_provider_out_of_context_xcom_model_crud(tmp_path, monkeypatch) -> None:
+    """Verify out-of-context set, get, read_state, and delete_entry against Airflow 3 XComModel."""
+    import logging
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith("airflow."):
+                sys.modules.pop(mod, None)
+
+    airflow = pytest.importorskip("airflow")
+    _ = airflow
+    from airflow import settings
+    from airflow.configuration import conf
+    from airflow.models.xcom import XComModel
+    from airflow.utils.db import initdb
+    from airflow.utils.session import create_session
+
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
+    af_home = tmp_path / "af_unit_db"
+    af_home.mkdir(parents=True, exist_ok=True)
+    db_uri = f"sqlite:///{af_home / 'airflow.db'}"
+
+    prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    prev_conf_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    monkeypatch.setenv("AIRFLOW_HOME", str(af_home))
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
+    monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    conf.set("database", "sql_alchemy_conn", db_uri)
+
+    try:
+        settings.dispose_orm()
+        settings.configure_orm()
+        initdb()
+
+        provider = AirflowStateProvider()
+        assert provider.get_last_timestamp("STUDY_DB", "records") is None
+        assert provider.get_last_status("STUDY_DB", "records") is None
+        assert provider.read_state().studies == {}
+
+        t1 = datetime(2026, 3, 10, 14, 0, tzinfo=timezone.utc)
+        provider.set_last_timestamp(
+            "STUDY_DB",
+            "records",
+            t1,
+            records_processed=25,
+            status=StreamExecutionStatus.SUCCESS,
+            metadata={"source": "cli"},
+        )
+        provider.set_last_timestamp(
+            "STUDY_DB",
+            "queries",
+            t1,
+            records_processed=5,
+            status="success",
+        )
+
+        # Also insert a legacy-shaped XCom row without study_key/stream_name keys in payload
+        with create_session() as session:
+            provider._ensure_manual_task_instance(
+                session,
+                dag_id="manual_state_sync",
+                task_id="manual_state_sync",
+                run_id="manual__legacy",
+                logical_date=t1,
+            )
+            XComModel.set(
+                key="state_LEGACY_visits",
+                value={"last_timestamp": t1.isoformat(), "records_processed": 3},
+                dag_id="manual_state_sync",
+                task_id="manual_state_sync",
+                run_id="manual__legacy",
+                map_index=-1,
+                session=session,
+            )
+
+        assert provider.get_last_timestamp("STUDY_DB", "records") == t1
+        assert provider.get_last_status("STUDY_DB", "records") == StreamExecutionStatus.SUCCESS
+
+        ledger = provider.read_state()
+        assert "STUDY_DB" in ledger.studies
+        assert ledger.studies["STUDY_DB"].streams["records"].records_processed == 25
+        assert "LEGACY" in ledger.studies
+        assert ledger.studies["LEGACY"].streams["visits"].records_processed == 3
+
+        # Delete single stream, then whole study, then non-existent study
+        assert provider.delete_entry("STUDY_DB", "queries") is True
+        assert provider.delete_entry("STUDY_DB", "queries") is False
+        assert provider.delete_entry("STUDY_DB") is True
+        assert provider.delete_entry("STUDY_DB") is False
+    finally:
+        settings.dispose_orm()
+        settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if prev_conf_conn is not None:
+            conf.set("database", "sql_alchemy_conn", prev_conf_conn)
+        settings.configure_orm()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
+
+
 def test_initial_transaction_failure_keeps_watermark_none_for_retry(tmp_path) -> None:
     """Failed initial transaction keeps last_timestamp as None so retry reads historical data."""
     import socket

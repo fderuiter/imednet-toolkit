@@ -141,16 +141,26 @@ def test_airflow_set_last_timestamp_db(mock_airflow, monkeypatch):
     provider = AirflowStateProvider()
     mock_airflow["python"].get_current_context.side_effect = Exception("No context")
 
-    xcom_model = mock_airflow["xcom"].XComModel
-
+    # 1. Legacy XCom fallback when XComModel is not an ORM model class
+    legacy_xcom = mock_airflow["xcom"].XCom
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag1")
-    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "manual__2026-05-22T12:00:00+00:00")
+    monkeypatch.setenv("AIRFLOW_CTX_EXECUTION_DATE", "2026-05-22T12:00:00+00:00")
 
     ts = datetime(2026, 5, 22, 12, 0, 0)
     provider.set_last_timestamp("ST1", "recs", ts)
+    legacy_xcom.set.assert_called_once()
 
-    xcom_model.set.assert_called_once()
-    call_kwargs = xcom_model.set.call_args.kwargs
+    # 2. Airflow 3+ XComModel class path with run_id
+    class FakeXComModel:
+        set = MagicMock()
+
+    mock_airflow["xcom"].XComModel = FakeXComModel
+    monkeypatch.setattr(provider, "_ensure_manual_task_instance", MagicMock())
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "manual__2026-05-22T12:00:00+00:00")
+
+    provider.set_last_timestamp("ST1", "recs", ts)
+    FakeXComModel.set.assert_called_once()
+    call_kwargs = FakeXComModel.set.call_args.kwargs
     assert call_kwargs["dag_id"] == "dag1"
     assert call_kwargs["run_id"] == "manual__2026-05-22T12:00:00+00:00"
     assert "execution_date" not in call_kwargs
@@ -275,6 +285,28 @@ def test_airflow_read_state_no_imports(monkeypatch):
 
     # Set without imports
     provider.set_last_timestamp("ST1", "rec", datetime.now(timezone.utc))  # Shouldn't error
+
+
+def test_airflow_transaction_guard_running(mock_airflow):
+    """Airflow provider rejects transaction if stream is actively RUNNING."""
+    provider = AirflowStateProvider()
+
+    context_mock = MagicMock()
+    ti_mock = MagicMock()
+    context_mock.__getitem__.return_value = ti_mock
+    mock_airflow["python"].get_current_context.return_value = context_mock
+
+    ti_mock.xcom_pull.return_value = {
+        "last_timestamp": "2026-05-22T12:00:00+00:00",
+        "status": "running",
+    }
+
+    with pytest.raises(
+        InvalidStateTransitionError,
+        match="Cannot transition stream state from 'running' to 'running'",
+    ):
+        with provider.transaction("ST1", "recs"):
+            pass
 
 
 def test_airflow_transaction_recovers_running_and_initial_none(mock_airflow):

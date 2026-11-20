@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import sys
 from datetime import UTC, datetime, timezone
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -16,30 +19,22 @@ import pytest
 from imednet_workflows.state_ledger import (
     AirflowStateProvider,
     StreamExecutionStatus,
+    get_state_provider,
 )
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _cleanup_airflow_provider_modules():
-    """Unload provider modules upon module teardown so downstream test suites stay hermetic."""
-    yield
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
-            sys.modules.pop(mod, None)
 
 
 @pytest.fixture
 def mock_airflow(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Mock Airflow modules cleanly using monkeypatch so real Airflow tests stay uncorrupted."""
-    mock_af = MagicMock()
+    mock_airflow_mod = MagicMock()
     sdk_mock = MagicMock()
     sdk_mock.get_current_context.side_effect = RuntimeError("No SDK context")
-    monkeypatch.setitem(sys.modules, "airflow", mock_af)
+    monkeypatch.setitem(sys.modules, "airflow", mock_airflow_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mock)
     monkeypatch.setitem(sys.modules, "airflow.operators.python", MagicMock())
     monkeypatch.setitem(sys.modules, "airflow.models.xcom", MagicMock())
     monkeypatch.setitem(sys.modules, "airflow.utils.session", MagicMock())
-    return mock_af
+    return mock_airflow_mod
 
 
 def test_airflow_provider_fallback_transaction(mock_airflow: MagicMock) -> None:
@@ -61,30 +56,196 @@ def test_airflow_provider_fallback_transaction(mock_airflow: MagicMock) -> None:
     assert mock_ti.xcom_push.called
 
 
+def test_airflow_state_provider_sdk_context_scopes_task_id_and_skips_db_on_initial_run(
+    monkeypatch,
+):
+    provider = AirflowStateProvider()
+
+    sdk_mod = ModuleType("airflow.sdk")
+    mock_ti = MagicMock()
+    mock_ti.task_id = "export_study_task"
+    mock_ti.map_index = -1
+    mock_ti.xcom_pull.return_value = None
+    sdk_mod.get_current_context = lambda: {"ti": mock_ti}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+
+    session_mod = ModuleType("airflow.utils.session")
+    create_session_spy = MagicMock()
+    session_mod.create_session = create_session_spy  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_mod)
+
+    assert provider.get_last_timestamp("STUDY_A", "csv") is None
+    assert provider.get_last_status("STUDY_A", "csv") is None
+    create_session_spy.assert_not_called()
+
+    mock_ti.xcom_pull.assert_called_with(
+        task_ids="export_study_task",
+        key="state_STUDY_A_csv",
+        include_prior_dates=True,
+        map_indexes=-1,
+    )
+
+
+def test_airflow_state_provider_sdk_context_type_error_fallback_and_list_selection(monkeypatch):
+    provider = AirflowStateProvider()
+
+    calls: list[dict[str, object]] = []
+
+    class LegacyStubTI:
+        task_id = "mapped_export"
+        map_index = 0
+
+        def xcom_pull(self, *, task_ids=None, key=None, include_prior_dates=False):
+            calls.append(
+                {
+                    "task_ids": task_ids,
+                    "key": key,
+                    "include_prior_dates": include_prior_dates,
+                }
+            )
+            return [
+                {"last_timestamp": "2026-01-01T00:00:00", "status": "running"},
+                {"last_timestamp": "2026-01-05T12:30:00+00:00", "status": "SUCCESS"},
+            ]
+
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.get_current_context = lambda: {"ti": LegacyStubTI()}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+
+    ts = provider.get_last_timestamp("STUDY_B", "parquet")
+    assert ts == datetime(2026, 1, 5, 12, 30, tzinfo=timezone.utc)
+    assert provider.get_last_status("STUDY_B", "parquet") == StreamExecutionStatus.SUCCESS
+    assert calls[0] == {
+        "task_ids": "mapped_export",
+        "key": "state_STUDY_B_parquet",
+        "include_prior_dates": True,
+    }
+
+
+def test_airflow_state_provider_transaction_failure_records_failed_status(monkeypatch):
+    provider = AirflowStateProvider()
+    pushed: list[tuple[str, dict[str, object]]] = []
+
+    class RecordingTI:
+        task_id = "export_fail_task"
+        map_index = -1
+
+        def xcom_pull(self, **_kwargs):
+            return pushed[-1][1] if pushed else None
+
+        def xcom_push(self, *, key: str, value: dict[str, object]) -> None:
+            pushed.append((key, value))
+
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.get_current_context = lambda: {"ti": RecordingTI()}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+
+    with pytest.raises(RuntimeError, match="sink boom"):
+        with provider.transaction(
+            "STUDY_ERR",
+            "duckdb",
+            fallback_timestamp=datetime(2026, 2, 1),
+        ) as tx:
+            tx["records_processed"] = 3
+            raise RuntimeError("sink boom")
+
+    assert len(pushed) == 2
+    assert pushed[0][1]["status"] == "running"
+    assert pushed[1][1]["status"] == "failed"
+    assert pushed[1][1]["error_message"] == "sink boom"
+    assert pushed[1][1]["records_processed"] == 3
+
+
+def test_airflow_state_provider_helpers_and_missing_airflow_graceful_fallbacks(monkeypatch):
+    provider = AirflowStateProvider()
+
+    # Decode helper coverage across dict, deserialize_value, bytes, str, and invalid payloads
+    assert provider._deserialize_xcom_row(object, SimpleNamespace(value={"a": 1})) == {"a": 1}
+
+    class FakeXComModel:
+        @staticmethod
+        def deserialize_value(row):
+            return json.loads(row.raw)
+
+    assert provider._deserialize_xcom_row(
+        FakeXComModel, SimpleNamespace(value=None, raw='{"last_timestamp": "2026-01-01T00:00:00Z"}')
+    ) == {"last_timestamp": "2026-01-01T00:00:00Z"}
+    assert provider._deserialize_xcom_row(
+        object, SimpleNamespace(value=b'{"status": "success"}')
+    ) == {"status": "success"}
+    assert provider._deserialize_xcom_row(object, SimpleNamespace(value="not-json")) is None
+
+    assert provider._parse_status(StreamExecutionStatus.PENDING) == StreamExecutionStatus.PENDING
+    assert provider._parse_status("not_a_real_status") == StreamExecutionStatus.FAILED
+    assert provider._parse_status(123) == StreamExecutionStatus.FAILED
+    assert provider._parse_iso_utc(datetime(2026, 3, 1, 8, 0)) == datetime(
+        2026, 3, 1, 8, 0, tzinfo=timezone.utc
+    )
+    assert provider._parse_iso_utc(42) is None
+
+    # Simulate missing airflow imports for out-of-context calls
+    monkeypatch.setitem(sys.modules, "airflow", None)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", None)
+    monkeypatch.setitem(sys.modules, "airflow.operators.python", None)
+    monkeypatch.setitem(sys.modules, "airflow.models.xcom", None)
+
+    assert provider.get_last_timestamp("S1", "csv") is None
+    assert provider.get_last_status("S1", "csv") is None
+    provider.set_last_timestamp("S1", "csv", datetime(2026, 1, 1))
+    assert provider.delete_entry("S1") is False
+    assert provider.read_state().studies == {}
+
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+    assert isinstance(get_state_provider(), AirflowStateProvider)
+    with contextlib.suppress(KeyError):
+        monkeypatch.delenv("USE_AIRFLOW_STATE_PROVIDER")
+
+
 @pytest.fixture
-def isolated_airflow_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def isolated_airflow_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Initialize an isolated SQLite metadata DB on real Apache Airflow 3.2+."""
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith("airflow."):
+                sys.modules.pop(mod, None)
+
     pytest.importorskip("airflow")
-    airflow_home = tmp_path / "airflow_home"
-    airflow_home.mkdir()
-    db_path = airflow_home / "airflow.db"
-
-    monkeypatch.setenv("AIRFLOW_HOME", str(airflow_home))
-    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", f"sqlite:///{db_path}")
-
-    import airflow.settings
+    from airflow import settings
+    from airflow.configuration import conf
     from airflow.utils.db import initdb
 
-    if getattr(airflow.settings, "engine", None) is not None:
-        airflow.settings.engine.dispose()
-    airflow.settings.configure_vars()
-    airflow.settings.configure_orm()
-    initdb()
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
 
-    yield db_path
+    airflow_home = tmp_path / "airflow_home"
+    airflow_home.mkdir(parents=True, exist_ok=True)
+    db_path = airflow_home / "airflow.db"
+    db_uri = f"sqlite:///{db_path}"
 
-    if getattr(airflow.settings, "engine", None) is not None:
-        airflow.settings.engine.dispose()
+    prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    prev_conf_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    monkeypatch.setenv("AIRFLOW_HOME", str(airflow_home))
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
+    monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    conf.set("database", "sql_alchemy_conn", db_uri)
+
+    try:
+        settings.dispose_orm()
+        settings.configure_orm()
+        initdb()
+        yield db_path
+    finally:
+        settings.dispose_orm()
+        settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if prev_conf_conn is not None:
+            conf.set("database", "sql_alchemy_conn", prev_conf_conn)
+        settings.configure_orm()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
 
 
 def test_real_airflow_xcom_model_crud_and_crash_recovery(
@@ -124,7 +285,7 @@ def test_real_airflow_xcom_model_crud_and_crash_recovery(
     assert provider.get_last_status("STUDY", "records") == StreamExecutionStatus.RUNNING
     assert provider.get_last_timestamp("STUDY", "records") is None
 
-    # 3. Retry recovers cleanly (RUNNING -> RUNNING -> SUCCESS) without InvalidStateTransitionError
+    # 3. Retry recovers cleanly (RUNNING -> FAILED -> RUNNING -> SUCCESS)
     expected_ts = datetime(2026, 1, 10, 9, 35, tzinfo=UTC)
     with provider.transaction("STUDY", "records") as tx:
         assert tx["last_timestamp"] is None
@@ -150,6 +311,7 @@ def test_real_airflow_export_operator_incremental_and_quality_gate(
     _ = isolated_airflow_db
     import airflow.sdk as airflow_sdk
     from airflow.models.xcom import XComModel
+    from airflow.utils.session import create_session
 
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
     from imednet import ImednetSDK
@@ -171,15 +333,13 @@ def test_real_airflow_export_operator_incremental_and_quality_gate(
             self.map_index = -1
 
         def xcom_push(self, key: str, value: Any, **_kwargs: Any) -> None:
-            from airflow.utils.session import provide_session
-
-            @provide_session  # type: ignore[misc]
-            def _push(session: Any = None) -> None:
-                AirflowStateProvider._ensure_dag_run_for_xcom(
+            with create_session() as session:
+                AirflowStateProvider._ensure_manual_task_instance(
                     session,
                     dag_id=self.dag_id,
                     task_id=self.task_id,
                     run_id=self.run_id,
+                    logical_date=datetime.now(UTC),
                 )
                 XComModel.set(
                     key=key,
@@ -187,36 +347,32 @@ def test_real_airflow_export_operator_incremental_and_quality_gate(
                     task_id=self.task_id,
                     dag_id=self.dag_id,
                     run_id=self.run_id,
+                    map_index=self.map_index,
                     session=session,
                 )
-
-            _push()
 
         def xcom_pull(
             self, key: str = "return_value", include_prior_dates: bool = False, **_kwargs: Any
         ) -> Any:
-            from airflow.utils.session import provide_session
-
-            @provide_session  # type: ignore[misc]
-            def _pull(session: Any = None) -> Any:
-                AirflowStateProvider._ensure_dag_run_for_xcom(
+            with create_session() as session:
+                AirflowStateProvider._ensure_manual_task_instance(
                     session,
                     dag_id=self.dag_id,
                     task_id=self.task_id,
                     run_id=self.run_id,
+                    logical_date=datetime.now(UTC),
                 )
                 stmt = XComModel.get_many(
                     run_id=self.run_id,
                     key=key,
                     task_ids=self.task_id,
                     dag_ids=self.dag_id,
+                    map_indexes=self.map_index,
                     include_prior_dates=include_prior_dates,
                     limit=1,
                 )
                 row = session.scalars(stmt).first()
                 return XComModel.deserialize_value(row) if row is not None else None
-
-            return _pull()
 
     state = SimulationState()
     sim_transport = SimulationTransport(state)
