@@ -166,10 +166,12 @@ Typed Endpoint Interface and Terminal Semantics
 ``sdk.jobs.poll(study_key, batch_id, on_progress=callback)`` and
 ``sdk.jobs.poll_many(study_key, batch_ids)`` use the core pollers. Await these
 methods on ``AsyncImednetSDK``. SDK convenience methods accept the same optional
-callback, which receives either a single ``JobStatusEvent`` or the legacy
+callback, which accepts either a single ``JobStatusEvent`` or the legacy
 ``(batch_id, status, elapsed)`` positional arguments. Callback exceptions
-propagate immediately during single-Job polling; batch polling records per-Job
-errors in ``JobPollSummary.failures`` unless ``fail_fast=True`` is requested.
+propagate immediately during single-Job polling; batch polling collects per-Job
+failures in ``JobPollSummary.failures`` by default, while ``fail_fast=True``
+wakes or cancels sibling pollers and raises the triggering ``JobFailedError``
+or ``JobTimeoutError`` directly.
 
 Recognized successful terminal state aliases are ``COMPLETED``, ``COMPLETE``, and
 ``SUCCESS``; ``FAILED``, ``CANCELLED``, and ``TIMEOUT`` (as well as terminal

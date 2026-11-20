@@ -32,8 +32,10 @@ Destination decision matrix
        See :class:`~imednet_sinks.document.MongoDbExportSink` and :func:`~imednet_sinks.document.export_to_mongodb`.
    * - Neo4j
      - Relationship-heavy exploration and lineage queries
-     - Preserves the hierarchy ``Study → Subject → Visit → Record`` as nodes and
-       relationships, with ``record_data`` attached to ``Record`` nodes
+     - Preserves the hierarchy ``Study → Subject → Visit → Record`` for scheduled
+       visits and links unscheduled ``Record`` nodes directly via
+       ``(:Subject)-[:HAS_RECORD]->(:Record)``, with ``record_data`` attached to
+       ``Record`` nodes
      - Requires ``neo4j`` driver and Bolt/Neo4j endpoint credentials.
        Idempotent mode uses ``MERGE`` for safe re-runs.
        See :class:`~imednet_sinks.graph.Neo4jExportSink` and :func:`~imednet_sinks.graph.export_to_neo4j`.

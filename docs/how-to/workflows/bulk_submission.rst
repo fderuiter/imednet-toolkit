@@ -62,10 +62,10 @@ When ``Subject`` enrollment is already complete and you want schema-validated, c
    from imednet.simulation import reset_default_simulation_state
    from imednet_workflows.record_update import RecordUpdateWorkflow
 
-   sdk = ImednetSDK(simulation_mode=True)
-   updater = RecordUpdateWorkflow(cast(Any, sdk), batch_size=100)
+   chunk_sdk = ImednetSDK(simulation_mode=True)
+   chunk_updater = RecordUpdateWorkflow(cast(Any, chunk_sdk), batch_size=100)
 
-   summary = updater.create_or_update_records_batch(
+   chunk_summary = chunk_updater.create_or_update_records_batch(
        study_key="STUDY",
        records_data=[
            {
@@ -80,7 +80,94 @@ When ``Subject`` enrollment is already complete and you want schema-validated, c
        poll_interval=1,
        chunk_size=50,
    )
-   print(summary.batch_ids, summary.all_successful)
+   print(chunk_summary.batch_ids, chunk_summary.all_successful)
    reset_default_simulation_state()
 
 See :doc:`record_update` and :doc:`/how-to/job_polling` for ``BatchSubmissionSummary`` and partial ``JobStatus`` failure triage details.
+
+Pre-Submission Data Dictionary Validation
+-----------------------------------------
+
+Before uploading large ``Record`` batches, pass ``schema=data_dictionary`` to
+:class:`~imednet_workflows.record_update.RecordUpdateWorkflow` (or per call on
+``create_or_update_records_batch``, ``create_or_update_records``, and
+``sdk.records.create_batch``) to validate every chunk locally against ``Form``
+required policies, ``Choice`` codelists, numeric/length bounds, and conditional XML
+edit checks without extra ``/forms`` or ``/variables`` API round-trips:
+
+.. testcode::
+
+   from imednet import ImednetSDK
+   from imednet.datadict import DataDictionary, Form, Metadata, Variable
+   from imednet.errors import ValidationError
+   from imednet.simulation import SimulationState, SimulationTransport
+   from imednet_workflows.record_update import RecordUpdateWorkflow
+
+   vitals_dd = DataDictionary(
+       metadata=Metadata.create(study_key="STUDY"),
+       forms=[
+           Form(
+               formKey="F_VS",
+               formName="Vital Signs",
+               variables=[
+                   Variable(
+                       variableName="V_WEIGHT",
+                       variableType="Float",
+                       required="Yes",
+                       extraAttributes={"minValue": 35.0, "maxValue": 200.0},
+                   )
+               ],
+           )
+       ],
+   )
+
+   with ImednetSDK(
+       simulation_mode=True,
+       transport=SimulationTransport(SimulationState()),
+   ) as sdk:
+       updater = RecordUpdateWorkflow(sdk, batch_size=50, schema=vitals_dd)
+       batch_summary = updater.create_or_update_records_batch(
+           "STUDY",
+           [
+               {
+                   "formKey": "F_VS",
+                   "subjectKey": "SUB1",
+                   "intervalName": "Baseline",
+                   "data": {"V_WEIGHT": 71.4},
+               }
+           ],
+       )
+       assert batch_summary.total_records == 1
+
+       direct_summary = sdk.records.create_batch(
+           "STUDY",
+           [
+               {
+                   "formKey": "F_VS",
+                   "subjectKey": "SUB1",
+                   "intervalName": "Baseline",
+                   "data": {"V_WEIGHT": 72.0},
+               }
+           ],
+           chunk_size=50,
+           schema=vitals_dd,
+       )
+       assert direct_summary.total_records == 1
+
+       try:
+           updater.create_or_update_records_batch(
+               "STUDY",
+               [
+                   {
+                       "formKey": "F_VS",
+                       "subjectKey": "SUB1",
+                       "intervalName": "Baseline",
+                       "data": {"V_WEIGHT": 10.0},
+                   }
+               ],
+           )
+       except ValidationError as exc:
+           assert "V_WEIGHT" in str(exc)
+
+See :doc:`/how-to/data_dictionary` for loading a ``DataDictionary`` from CSV
+exports, CDISC ODM 1.3 XML, REDCap CSV, or the REST API.

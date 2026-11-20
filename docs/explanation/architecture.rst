@@ -46,7 +46,8 @@ Retry policy
   including endpoints returning a raw JSON list. Custom requesters must own
   their own retry policy; paginators do not replay their exceptions.
 * If a retriable response includes ``Retry-After``, that delay overrides the
-  backoff schedule.
+  backoff schedule and is bounded by ``RetryConfig.max_retry_after``
+  (default ``60.0`` seconds).
 
 Timeouts
 ~~~~~~~~

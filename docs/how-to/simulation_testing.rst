@@ -61,6 +61,6 @@ custom ``httpx.Client`` / ``httpx.AsyncClient`` transports directly:
    isolated_state = SimulationState()
    transport = SimulationTransport(state=isolated_state)
 
-   with ImednetSDK(api_key="sim", security_key="sim", transport=transport) as isolated_sdk:
+   with ImednetSDK(simulation_mode=True, transport=transport) as isolated_sdk:
        initial_records = list(isolated_sdk.records.list(study_key="STUDY"))
        assert len(initial_records) >= 1

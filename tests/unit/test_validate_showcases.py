@@ -1175,3 +1175,79 @@ def test_repo_workflow_bulk_submission_and_uat_execute_in_simulation(tmp_path: P
 
     exec_errors = execute_showcases_in_simulation(examples_dir, repo_root)
     assert not exec_errors, f"Expected zero simulation execution errors, got: {exec_errors}"
+
+
+def test_inline_rst_code_block_syntax_error_detected(tmp_path: Path) -> None:
+    """Verify .. code-block:: python and .. sourcecode:: python syntax errors fail validation."""
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True)
+    (docs_dir / "broken_guide.rst").write_text(
+        "Guide\n"
+        "=====\n\n"
+        ".. code-block:: python\n\n"
+        "   def broken_code_block(\n\n"
+        ".. sourcecode:: python\n\n"
+        "   if True\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir)
+    assert len(errors) == 2
+    assert all("broken_guide.rst:" in err and "syntax error" in err.lower() for err in errors)
+
+
+def test_markdown_syntax_and_workspace_import_errors_detected(tmp_path: Path) -> None:
+    """Verify fenced Python blocks in docs/*.md, README.md, packages/*/README.md, and examples/*.md fail on syntax or workspace import errors."""
+    repo_root = tmp_path / "repo"
+    docs_dir = repo_root / "docs"
+    pkg_dir = repo_root / "packages" / "demo"
+    examples_dir = repo_root / "examples"
+    docs_dir.mkdir(parents=True)
+    pkg_dir.mkdir(parents=True)
+    examples_dir.mkdir(parents=True)
+
+    (docs_dir / "notes.md").write_text(
+        "# Notes\n\n```python\ndef unclosed_func(\n```\n",
+        encoding="utf-8",
+    )
+    (repo_root / "README.md").write_text(
+        "# Root\n\n```python\nfrom imednet import MissingRootSymbol\n```\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "README.md").write_text(
+        "# Package\n\n```py\nfrom apache_airflow_providers_imednet import MissingOperator\n```\n",
+        encoding="utf-8",
+    )
+    (examples_dir / "README.md").write_text(
+        "# Examples\n\n```python\nfrom imednet_workflows import NonExistentWorkflow\n```\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_documentation_literal_includes(docs_dir, repo_root)
+    assert len(errors) == 4
+    assert any("notes.md:" in e and "syntax error" in e.lower() for e in errors)
+    assert any("README.md:" in e and "MissingRootSymbol" in e for e in errors)
+    assert any("MissingOperator" in e for e in errors)
+    assert any("NonExistentWorkflow" in e for e in errors)
+
+
+def test_showcase_js_syntax_and_workspace_import_errors_detected(tmp_path: Path) -> None:
+    """Verify validate_landing_showcase fails on syntax or workspace import errors in showcase.js."""
+    repo_root = Path(__file__).resolve().parents[2]
+    docs_dir = tmp_path / "docs"
+    static_dir = docs_dir / "_static"
+    static_dir.mkdir(parents=True)
+
+    valid_js = (repo_root / "docs" / "_static" / "showcase.js").read_text(encoding="utf-8")
+    broken_js = valid_js.replace(
+        'studies: `# List available clinical studies\\nfrom imednet import ImednetSDK',
+        'studies: `# List available clinical studies\\nfrom imednet import MissingShowcaseSymbol',
+    ).replace(
+        'forms: `# List study forms and metadata\\nfrom imednet import ImednetSDK',
+        'forms: `# List study forms and metadata\\ndef invalid_syntax(',
+    )
+    (static_dir / "showcase.js").write_text(broken_js, encoding="utf-8")
+
+    errors = validate_landing_showcase(docs_dir, repo_root)
+    assert any("SNIPPETS.sdk.studies" in e and "MissingShowcaseSymbol" in e for e in errors)
+    assert any("SNIPPETS.sdk.forms" in e and "Syntax error" in e for e in errors)
