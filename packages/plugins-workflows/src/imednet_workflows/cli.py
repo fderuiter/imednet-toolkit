@@ -35,7 +35,7 @@ from .sync_worker import SyncWorker, SyncWorkerConfig, SyncWorkerState
 
 
 def _execute_show_state(ledger_path: str, study_key: str | None = None) -> None:
-    """Display current high-water mark records and stream metadata."""
+    """Display high-water mark records and stream metadata from the ledger."""
     ledger = get_state_provider(ledger_path)
     try:
         state = ledger.read_state()
@@ -53,8 +53,13 @@ def _execute_show_state(ledger_path: str, study_key: str | None = None) -> None:
             continue
         for stream_name, stream_state in study_state.streams.items():
             has_data = True
+            ts_str = (
+                stream_state.last_timestamp.isoformat()
+                if stream_state.last_timestamp is not None
+                else "None"
+            )
             print(
-                f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
+                f"{s_key} | {stream_name} | {ts_str} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
             )
 
     if not has_data:
@@ -70,6 +75,7 @@ def _execute_set_state(
     interactive: bool = False,
     parser: argparse.ArgumentParser | None = None,
     no_interactive: bool = False,
+    force: bool = False,
 ) -> None:
     """Execute high-water mark timestamp update for a study/stream in the ledger."""
     if not interactive:
@@ -105,7 +111,7 @@ def _execute_set_state(
                 timestamp=dt,
                 records_processed=records_processed,
                 status="success",
-                force=True,
+                force=force,
             )
             print(
                 f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
@@ -485,6 +491,12 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         help="Path to the pipeline ledger JSON file.",
     )
     set_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force state transition override even when the current status disallows it.",
+    )
+    set_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
     add_no_interactive(set_parser)
@@ -499,6 +511,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             interactive=args.interactive,
             parser=set_parser,
             no_interactive=getattr(args, "no_interactive", False),
+            force=getattr(args, "force", False),
         )
     )
 
@@ -828,6 +841,12 @@ def state_app(args: list[str] | None = None) -> None:
     set_parser.add_argument("-r", "--records-processed", type=int, default=0)
     set_parser.add_argument("-l", "--ledger-path", default=DEFAULT_LEDGER_PATH)
     set_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force state transition override even when the current status disallows it.",
+    )
+    set_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
     add_no_interactive(set_parser)
@@ -842,6 +861,7 @@ def state_app(args: list[str] | None = None) -> None:
             interactive=args.interactive,
             parser=set_parser,
             no_interactive=getattr(args, "no_interactive", False),
+            force=getattr(args, "force", False),
         )
     )
 

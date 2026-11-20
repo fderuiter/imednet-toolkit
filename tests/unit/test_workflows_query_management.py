@@ -187,3 +187,194 @@ def test_get_queries_by_site_multi_subject_http_contract() -> None:
             queries_route.calls.last.request.url.params["filter"]
             == "subjectKey==SUB1,subjectKey==SUB2"
         )
+
+
+def test_get_open_queries_include_answered_and_get_unresolved_queries() -> None:
+    """Verify include_answered=True and get_unresolved_queries return OPEN and ANSWERED queries."""
+    sdk = MagicMock()
+    q_open = Query(annotation_id=1, status=QueryStatus.OPEN)
+    q_answered = Query(annotation_id=2, status=QueryStatus.ANSWERED)
+    q_closed = Query(annotation_id=3, status=QueryStatus.CLOSED)
+    q_cancelled = Query(annotation_id=4, status=QueryStatus.CANCELLED)
+    sdk.get_queries.return_value = [q_open, q_answered, q_closed, q_cancelled]
+
+    wf = QueryManagementWorkflow(sdk)
+    assert wf.get_open_queries("STUDY") == [q_open]
+    assert wf.get_open_queries("STUDY", include_answered=True) == [q_open, q_answered]
+    assert wf.get_unresolved_queries("STUDY", additional_filter={"variable": "V_AGE"}) == [
+        q_open,
+        q_answered,
+    ]
+    assert sdk.get_queries.call_args.kwargs == {"variable": "V_AGE"}
+
+
+def test_get_queries_by_site_excludes_deleted_and_unkeyed_subjects() -> None:
+    """Verify soft-deleted and unkeyed/blank subjects are excluded before querying."""
+    sdk = MagicMock()
+    sdk.get_subjects.return_value = [
+        Subject(subject_key="ACTIVE-1"),
+        Subject(subject_key="DELETED-FLAG", deleted=True),
+        Subject(subject_key="DELETED-STATUS", subject_status="Deleted"),
+        Subject(subject_key=None),
+        Subject(subject_key="   "),
+        Subject(subject_key=" ACTIVE-2 "),
+    ]
+    wf = QueryManagementWorkflow(sdk)
+    wf.get_queries_by_site("STUDY", "Site 1")
+
+    sdk.get_queries.assert_called_once_with("STUDY", subject_key=["ACTIVE-1", "ACTIVE-2"])
+
+
+def test_get_queries_by_site_returns_empty_when_only_deleted_or_unkeyed_subjects() -> None:
+    """Verify get_queries is not called if all subjects at the site are deleted or unkeyed."""
+    sdk = MagicMock()
+    sdk.get_subjects.return_value = [
+        Subject(subject_key="DEL-1", deleted=True),
+        Subject(subject_key=None),
+        Subject(subject_key=""),
+    ]
+    wf = QueryManagementWorkflow(sdk)
+
+    assert wf.get_queries_by_site("STUDY", "Site 1") == []
+    sdk.get_queries.assert_not_called()
+
+
+def test_sync_queries_to_triage_lifecycle_and_preservation(tmp_path: Any, monkeypatch: Any) -> None:
+    """Verify sync_queries_to_triage preserves reviewer state and tracks status transitions."""
+    from imednet.models.triage import TriageStatus
+    from imednet_workflows.triage_store import TriageStore
+
+    db_path = tmp_path / "sync_triage.sqlite3"
+    monkeypatch.setenv("IMEDNET_TRIAGE_DB_PATH", str(db_path))
+
+    sdk = MagicMock()
+    q1_open = Query(
+        annotation_id=701,
+        subject_key="SUBJ-001",
+        query_comments=[
+            QueryComment(
+                sequence=1,
+                closed=False,
+                user="dm-user",
+                comment="Verify age",
+                date="2026-01-11 08:00:00",
+            )
+        ],
+    )
+    q2_fallback = Query(
+        subject_key="SUBJ 002",
+        record_id=602,
+        variable="V_WEIGHT",
+        description="Missing weight check",
+        date_created="2026-01-12",
+    )
+    sdk.get_queries.return_value = [q1_open, q2_fallback]
+
+    wf = QueryManagementWorkflow(sdk)
+    # Sync via default store resolution (imednet.stores entry point + IMEDNET_TRIAGE_DB_PATH)
+    initial_queue = wf.sync_queries_to_triage("STUDY", default_severity="high")
+    assert len(initial_queue) == 2
+
+    store = TriageStore(db_path)
+    item1 = store.get_triage_item("STUDY:701")
+    item2 = store.get_triage_item("STUDY/SUBJ 002/602/V_WEIGHT")
+    assert item1 is not None and item1.status == TriageStatus.NEW and item1.severity == "high"
+    assert item2 is not None and item2.annotations[0].comment == "Missing weight check"
+
+    # Reviewer assigns and annotates item1
+    store.assign_item("STUDY:701", "lead-triager")
+    store.add_annotation("STUDY:701", "lead-triager", "Waiting for site response")
+
+    # Site answers q1; q2 closes
+    q1_answered = Query(
+        annotation_id=701,
+        subject_key="SUBJ-001",
+        query_comments=[
+            QueryComment(
+                sequence=1,
+                closed=False,
+                user="dm-user",
+                comment="Verify age",
+                date="2026-01-11 08:00:00",
+            ),
+            QueryComment(
+                sequence=2,
+                closed=False,
+                user="site-coord",
+                annotation_status="Site Answered",
+                comment="Confirmed 45",
+                date="2026-01-12 09:00:00",
+            ),
+        ],
+    )
+    q2_closed = Query(
+        subject_key="SUBJ 002",
+        record_id=602,
+        variable="V_WEIGHT",
+        status=QueryStatus.CLOSED,
+    )
+    sdk.get_queries.return_value = [q1_answered, q2_closed]
+
+    wf.sync_queries_to_triage("STUDY", store=store)
+    item1_ans = store.get_triage_item("STUDY:701")
+    item2_res = store.get_triage_item("STUDY/SUBJ 002/602/V_WEIGHT")
+    assert item1_ans is not None
+    assert item1_ans.status == TriageStatus.UNDER_REVIEW
+    assert item1_ans.assignee == "lead-triager"
+    assert {a.comment for a in item1_ans.annotations} == {
+        "Verify age",
+        "Waiting for site response",
+        "Confirmed 45",
+    }
+    assert any(
+        h.from_status == TriageStatus.NEW and h.to_status == TriageStatus.UNDER_REVIEW
+        for h in item1_ans.history
+    )
+    assert item2_res is not None and item2_res.status == TriageStatus.RESOLVED
+
+    # Close q1, then reopen q1 (RESOLVED -> UNDER_REVIEW)
+    q1_closed = Query(
+        annotation_id=701,
+        subject_key="SUBJ-001",
+        status=QueryStatus.CLOSED,
+        query_comments=q1_answered.query_comments
+        + [QueryComment(sequence=3, closed=True, user="dm-user", comment="Closed")],
+    )
+    sdk.get_queries.return_value = [q1_closed]
+    wf.sync_queries_to_triage("STUDY", store=store)
+    assert store.get_triage_item("STUDY:701").status == TriageStatus.RESOLVED  # type: ignore[union-attr]
+
+    q1_reopened = Query(
+        annotation_id=701,
+        subject_key="SUBJ-001",
+        status=QueryStatus.OPEN,
+        query_comments=q1_closed.query_comments
+        + [QueryComment(sequence=4, closed=False, user="dm-user", comment="Reopened")],
+    )
+    sdk.get_queries.return_value = [q1_reopened, q2_closed]
+    wf.sync_queries_to_triage("STUDY", store=store, unresolved_only=True)
+    reopened = store.get_triage_item("STUDY:701")
+    assert reopened is not None
+    assert reopened.status == TriageStatus.UNDER_REVIEW
+    assert any(
+        h.from_status == TriageStatus.RESOLVED and h.to_status == TriageStatus.UNDER_REVIEW
+        for h in reopened.history
+    )
+
+
+def test_sync_queries_to_triage_with_simulation_sdk(tmp_path: Any) -> None:
+    """Verify end-to-end sync_queries_to_triage against SimulationMode SDK."""
+    from imednet.models.triage import TriageStatus
+    from imednet.sdk import ImednetSDK
+
+    db_path = tmp_path / "sim_triage.sqlite3"
+    with ImednetSDK(simulation_mode=True) as sdk:
+        study_key = next(iter(sdk.studies.list())).study_key
+        assert study_key is not None
+        queue = sdk.workflows.query_management.sync_queries_to_triage(
+            study_key,
+            store=db_path,
+            unresolved_only=True,
+        )
+        assert len(queue) >= 1
+        assert all(item.status in (TriageStatus.NEW, TriageStatus.UNDER_REVIEW) for item in queue)

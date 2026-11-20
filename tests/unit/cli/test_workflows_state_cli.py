@@ -308,7 +308,7 @@ class TestHeadlessStateRecoveryAndContracts:
     def test_headless_state_set_recovers_failed_and_pending_streams(
         self, runner: CliRunner, tmp_path, initial_status: str
     ) -> None:
-        """Headless workflows state set recovers failed and pending streams to success."""
+        """Headless workflows state set --force recovers failed and pending streams to success."""
         from imednet.cli import app as main_app
         from imednet_workflows.state_ledger import FileStateProvider, InvalidStateTransitionError
 
@@ -337,7 +337,30 @@ class TestHeadlessStateRecoveryAndContracts:
                 force=False,
             )
 
-        # Headless CLI recovery via top-level workflows state set succeeds with exit code 0
+        # Non-forced CLI set routes diagnostic to stderr and exits 1
+        rejected = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY-REC",
+                "--stream",
+                "records",
+                "--timestamp",
+                ts_new,
+                "--records-processed",
+                "12",
+                "--ledger-path",
+                str(ledger_path),
+            ],
+        )
+        assert rejected.exit_code == 1
+        assert rejected.stdout == ""
+        assert "Failed to write ledger" in rejected.stderr
+
+        # Headless CLI recovery via top-level workflows state set --force succeeds with exit code 0
         result = runner.invoke(
             main_app,
             [
@@ -354,6 +377,7 @@ class TestHeadlessStateRecoveryAndContracts:
                 "12",
                 "--ledger-path",
                 str(ledger_path),
+                "--force",
             ],
         )
         assert result.exit_code == 0
@@ -415,3 +439,90 @@ class TestHeadlessStateRecoveryAndContracts:
             assert res.stdout == ""
             assert "Aborted by user." in res.stderr
             assert "Traceback" not in res.stderr
+
+
+def test_show_state_handles_none_timestamp(runner: CliRunner, tmp_path) -> None:
+    """state show renders None without AttributeError when last_timestamp is uncommitted."""
+    import argparse
+
+    from imednet_workflows.cli import setup_parser
+
+    ledger_path = str(tmp_path / "ledger.json")
+    state = LedgerState(
+        studies={
+            "STUDY-NULL": StudyState(
+                streams={
+                    "records": StreamState(
+                        last_timestamp=None,
+                        records_processed=0,
+                        last_run_status="failed",
+                        error_message="initial failure",
+                    )
+                }
+            )
+        }
+    )
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        mock_ledger.return_value.read_state.return_value = state
+        res_app = runner.invoke(state_app, ["show", "--ledger-path", ledger_path])
+
+        root = argparse.ArgumentParser()
+        setup_parser(root.add_subparsers(dest="sub"))
+        res_main = runner.invoke(
+            lambda argv: (parsed := root.parse_args(argv)).func(parsed),
+            ["workflows", "state", "show", "--ledger-path", ledger_path],
+        )
+
+    assert res_app.exit_code == 0
+    assert "STUDY-NULL | records | None | 0 | failed | initial failure" in res_app.stdout
+    assert res_main.exit_code == 0
+    assert "STUDY-NULL | records | None | 0 | failed | initial failure" in res_main.stdout
+
+
+def test_set_state_force_flag_overrides_stuck_stream(runner: CliRunner, tmp_path) -> None:
+    """workflows state set --force overrides invalid state transitions such as PENDING -> SUCCESS."""
+    from imednet_workflows.state_ledger import ExtractionStateLedger, StreamExecutionStatus
+
+    ledger_path = str(tmp_path / "ledger.json")
+    ledger = ExtractionStateLedger(ledger_path)
+    ledger.set_last_timestamp("STUDY-STUCK", "records", None, status=StreamExecutionStatus.PENDING)
+
+    # Without --force, PENDING -> SUCCESS is rejected
+    rejected = runner.invoke(
+        state_app,
+        [
+            "set",
+            "-s",
+            "STUDY-STUCK",
+            "-m",
+            "records",
+            "-t",
+            "2026-05-22T12:00:00Z",
+            "-l",
+            ledger_path,
+        ],
+    )
+    assert rejected.exit_code == 1
+    assert "Failed to write ledger" in rejected.output
+
+    # With --force, manual override succeeds
+    forced = runner.invoke(
+        state_app,
+        [
+            "set",
+            "-s",
+            "STUDY-STUCK",
+            "-m",
+            "records",
+            "-t",
+            "2026-05-22T12:00:00Z",
+            "-l",
+            ledger_path,
+            "--force",
+        ],
+    )
+    assert forced.exit_code == 0
+    assert ledger.get_last_timestamp("STUDY-STUCK", "records") == datetime(
+        2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc
+    )
+    assert ledger.get_last_status("STUDY-STUCK", "records") == StreamExecutionStatus.SUCCESS

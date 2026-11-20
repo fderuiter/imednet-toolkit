@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import os
 import sqlite3
 import time
 import uuid
@@ -21,8 +21,8 @@ from imednet.spi.models import (
 )
 from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text, sqlite_connection
 
-_SAFE_SQL_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]+$")
-_LATEST_SCHEMA_VERSION = 1
+DEFAULT_TRIAGE_DB_PATH = Path.home() / ".imednet" / "triage.sqlite3"
+_LATEST_SCHEMA_VERSION = 2
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _RETRY_BASE_DELAY_SECONDS = 0.05
 
@@ -32,7 +32,7 @@ class TriageStore:
 
     def __init__(
         self,
-        db_path: str | Path,
+        db_path: str | Path | None = None,
         *,
         timeout: float = 30.0,
         retry_attempts: int = 3,
@@ -40,11 +40,17 @@ class TriageStore:
         """Initialize the triage store.
 
         Args:
-            db_path: Path to the SQLite database file.
+            db_path: Path to the SQLite database file. Defaults to
+                ``IMEDNET_TRIAGE_DB_PATH`` or ``~/.imednet/triage.sqlite3``.
             timeout: Maximum time to wait for a database connection.
             retry_attempts: Number of write retry attempts.
         """
-        self.db_path = Path(db_path).expanduser()
+        raw_path = (
+            db_path
+            if db_path is not None
+            else os.environ.get("IMEDNET_TRIAGE_DB_PATH", DEFAULT_TRIAGE_DB_PATH)
+        )
+        self.db_path = Path(raw_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._timeout = timeout
         self._retry_attempts = retry_attempts
@@ -62,6 +68,8 @@ class TriageStore:
                 foreign_keys=True,
             ) as conn:
                 yield conn
+        except sqlite3.IntegrityError:
+            raise
         except sqlite3.Error as exc:
             raise sqlite3.OperationalError(
                 f"Unable to open triage store at {self._redact_sqlite_target(str(self.db_path))}: "
@@ -85,23 +93,25 @@ class TriageStore:
                 """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS triage_annotations (
-                    annotation_id TEXT PRIMARY KEY,
+                    annotation_id TEXT NOT NULL,
                     item_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     comment TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
+                    PRIMARY KEY (item_id, annotation_id),
                     FOREIGN KEY(item_id) REFERENCES triage_items(item_id) ON DELETE CASCADE
                 )
                 """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS triage_history (
-                    transition_id TEXT PRIMARY KEY,
+                    transition_id TEXT NOT NULL,
                     item_id TEXT NOT NULL,
                     from_status TEXT NOT NULL,
                     to_status TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     comment TEXT,
                     timestamp TEXT NOT NULL,
+                    PRIMARY KEY (item_id, transition_id),
                     FOREIGN KEY(item_id) REFERENCES triage_items(item_id) ON DELETE CASCADE
                 )
                 """)
@@ -148,24 +158,37 @@ class TriageStore:
             ) from last_error
 
     def upsert_item(self, item: TriageItem) -> None:
-        """Insert or update a triage item and its associated annotations and history."""
+        """Insert or update a triage item while preserving prior annotations and history."""
         now = datetime.now(UTC).isoformat()
 
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to write triage item data."""
             existing = conn.execute(
-                "SELECT status FROM triage_items WHERE item_id = ?",
+                "SELECT status, assignee FROM triage_items WHERE item_id = ?",
                 (item.item_id,),
             ).fetchone()
+            target_status = (
+                item.status
+                if isinstance(item.status, TriageStatus)
+                else TriageStatus(str(item.status))
+            )
+            status_changed = False
+            current_status: TriageStatus | None = None
             if existing is not None:
                 current_status = TriageStatus(str(existing["status"]))
-                target_status = (
-                    item.status
-                    if isinstance(item.status, TriageStatus)
-                    else TriageStatus(str(item.status))
-                )
                 if current_status != target_status:
                     validate_transition(current_status, target_status)
+                    status_changed = True
+
+            existing_transition_ids: set[str] = set()
+            if status_changed:
+                existing_transition_ids = {
+                    str(row["transition_id"])
+                    for row in conn.execute(
+                        "SELECT transition_id FROM triage_history WHERE item_id = ?",
+                        (item.item_id,),
+                    ).fetchall()
+                }
 
             conn.execute(
                 """
@@ -183,7 +206,7 @@ class TriageStore:
                 (
                     item.item_id,
                     item.study_key,
-                    item.status.value,
+                    target_status.value,
                     item.assignee,
                     item.severity,
                     now,
@@ -191,45 +214,92 @@ class TriageStore:
                 ),
             )
 
-            conn.execute("DELETE FROM triage_annotations WHERE item_id = ?", (item.item_id,))
-            conn.executemany(
-                """
-                INSERT INTO triage_annotations (annotation_id, item_id, user_id, comment, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        annotation.annotation_id,
-                        item.item_id,
-                        annotation.user_id,
-                        annotation.comment,
-                        annotation.timestamp.isoformat(),
+            if item.annotations:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO triage_annotations (
+                        annotation_id, item_id, user_id, comment, timestamp
                     )
-                    for annotation in item.annotations
-                ],
-            )
-
-            conn.execute("DELETE FROM triage_history WHERE item_id = ?", (item.item_id,))
-            conn.executemany(
-                """
-                INSERT INTO triage_history (
-                    transition_id, item_id, from_status, to_status, user_id, comment, timestamp
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            annotation.annotation_id,
+                            item.item_id,
+                            annotation.user_id,
+                            annotation.comment,
+                            annotation.timestamp.isoformat(),
+                        )
+                        for annotation in item.annotations
+                    ],
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        entry.transition_id,
-                        item.item_id,
-                        entry.from_status.value,
-                        entry.to_status.value,
-                        entry.user_id,
-                        entry.comment,
-                        entry.timestamp.isoformat(),
+
+            if item.history:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO triage_history (
+                        transition_id, item_id, from_status, to_status, user_id, comment, timestamp
                     )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            entry.transition_id,
+                            item.item_id,
+                            entry.from_status.value,
+                            entry.to_status.value,
+                            entry.user_id,
+                            entry.comment,
+                            entry.timestamp.isoformat(),
+                        )
+                        for entry in item.history
+                    ],
+                )
+
+            if status_changed and current_status is not None:
+                has_matching_new_entry = any(
+                    entry.transition_id not in existing_transition_ids
+                    and entry.from_status == current_status
+                    and entry.to_status == target_status
                     for entry in item.history
-                ],
-            )
+                )
+                if not has_matching_new_entry:
+                    actor = (
+                        item.assignee.strip()
+                        if item.assignee and item.assignee.strip()
+                        else (
+                            str(existing["assignee"]).strip()
+                            if existing is not None
+                            and existing["assignee"]
+                            and str(existing["assignee"]).strip()
+                            else "system"
+                        )
+                    )
+                    transition_entry = TriageHistoryEntry(
+                        transition_id=str(uuid.uuid4()),
+                        from_status=current_status,
+                        to_status=target_status,
+                        user_id=actor,
+                        comment=None,
+                        timestamp=datetime.fromisoformat(now),
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO triage_history (
+                            transition_id, item_id, from_status, to_status, user_id, comment, timestamp
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            transition_entry.transition_id,
+                            item.item_id,
+                            transition_entry.from_status.value,
+                            transition_entry.to_status.value,
+                            transition_entry.user_id,
+                            transition_entry.comment,
+                            transition_entry.timestamp.isoformat(),
+                        ),
+                    )
 
         self._execute_write(_write)
 
@@ -286,15 +356,6 @@ class TriageStore:
             item_ids = [str(row["item_id"]) for row in rows]
             if not item_ids:
                 return []
-            invalid_item_id = next(
-                (item_id for item_id in item_ids if not _SAFE_SQL_IDENTIFIER.fullmatch(item_id)),
-                None,
-            )
-            if invalid_item_id is not None:
-                raise ValueError(
-                    f"Invalid triage item identifier: {invalid_item_id}. "
-                    "Only alphanumeric characters and ._:- are allowed."
-                )
 
             conn.execute("DROP TABLE IF EXISTS temp_item_ids")
             conn.execute("CREATE TEMP TABLE temp_item_ids (item_id TEXT PRIMARY KEY)")
@@ -472,6 +533,29 @@ class TriageStore:
 
         self._execute_write(_write)
 
+    def delete_item(self, item_id: str) -> bool:
+        """Delete a triage item and its cascaded annotations and history.
+
+        Args:
+            item_id: Identifier of the triage item to delete.
+
+        Returns:
+            True if the item existed and was deleted, False otherwise.
+        """
+        deleted = False
+
+        def _write(conn: sqlite3.Connection) -> None:
+            """Internal helper to remove a triage item."""
+            nonlocal deleted
+            cursor = conn.execute(
+                "DELETE FROM triage_items WHERE item_id = ?",
+                (item_id,),
+            )
+            deleted = cursor.rowcount > 0
+
+        self._execute_write(_write)
+        return deleted
+
     def get_item_last_updated(self, item_id: str) -> datetime | None:
         """Get the last updated timestamp for a triage item."""
         with self._connection() as conn:
@@ -553,6 +637,74 @@ class TriageStore:
                 """,
                 (now,),
             )
+
+        annotation_pk_cols = sum(
+            1
+            for row in conn.execute("PRAGMA table_info(triage_annotations)").fetchall()
+            if int(row["pk"]) > 0
+        )
+        if annotation_pk_cols < 2:
+            conn.execute("DROP INDEX IF EXISTS idx_triage_annotations_item")
+            conn.execute("ALTER TABLE triage_annotations RENAME TO _triage_annotations_v1")
+            conn.execute("""
+                CREATE TABLE triage_annotations (
+                    annotation_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    comment TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    PRIMARY KEY (item_id, annotation_id),
+                    FOREIGN KEY(item_id) REFERENCES triage_items(item_id) ON DELETE CASCADE
+                )
+                """)
+            conn.execute("""
+                INSERT OR IGNORE INTO triage_annotations (
+                    annotation_id, item_id, user_id, comment, timestamp
+                )
+                SELECT annotation_id, item_id, user_id, comment, timestamp
+                FROM _triage_annotations_v1
+                WHERE item_id IN (SELECT item_id FROM triage_items)
+                """)
+            conn.execute("DROP TABLE _triage_annotations_v1")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_triage_annotations_item
+                ON triage_annotations(item_id, timestamp)
+                """)
+
+        history_pk_cols = sum(
+            1
+            for row in conn.execute("PRAGMA table_info(triage_history)").fetchall()
+            if int(row["pk"]) > 0
+        )
+        if history_pk_cols < 2:
+            conn.execute("DROP INDEX IF EXISTS idx_triage_history_item")
+            conn.execute("ALTER TABLE triage_history RENAME TO _triage_history_v1")
+            conn.execute("""
+                CREATE TABLE triage_history (
+                    transition_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    from_status TEXT NOT NULL,
+                    to_status TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    comment TEXT,
+                    timestamp TEXT NOT NULL,
+                    PRIMARY KEY (item_id, transition_id),
+                    FOREIGN KEY(item_id) REFERENCES triage_items(item_id) ON DELETE CASCADE
+                )
+                """)
+            conn.execute("""
+                INSERT OR IGNORE INTO triage_history (
+                    transition_id, item_id, from_status, to_status, user_id, comment, timestamp
+                )
+                SELECT transition_id, item_id, from_status, to_status, user_id, comment, timestamp
+                FROM _triage_history_v1
+                WHERE item_id IN (SELECT item_id FROM triage_items)
+                """)
+            conn.execute("DROP TABLE _triage_history_v1")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_triage_history_item
+                ON triage_history(item_id, timestamp)
+                """)
 
     def _redact_sqlite_target(self, target: str) -> str:
         """Redact sensitive information from a SQLite connection string."""

@@ -227,7 +227,6 @@ class SimulationState:
                     "recordId": 601,
                     "description": "Please verify demographic details.",
                     "variable": "V_AGE",
-                    "status": "OPEN",
                     "queryComments": [
                         {
                             "sequence": 1,
@@ -246,7 +245,6 @@ class SimulationState:
                     "recordId": 601,
                     "description": "Check vital sign measurement.",
                     "variable": "V_WEIGHT",
-                    "status": "OPEN",
                     "queryComments": [
                         {
                             "sequence": 1,
@@ -790,7 +788,6 @@ class SimulationState:
                     "recordId": 601,
                     "description": "Please verify demographic details.",
                     "variable": "V_AGE",
-                    "status": "OPEN",
                     "queryComments": [
                         {
                             "sequence": 1,
@@ -809,7 +806,6 @@ class SimulationState:
                     "recordId": 601,
                     "description": "Check vital sign measurement.",
                     "variable": "V_WEIGHT",
-                    "status": "OPEN",
                     "queryComments": [
                         {
                             "sequence": 1,
