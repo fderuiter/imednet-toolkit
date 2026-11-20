@@ -1,11 +1,9 @@
-==========================================
-Data Dictionary & Form Schema Verification
-==========================================
+Data Dictionary Workflows and Rule Validation
+=============================================
 
-Clinical Data Managers and Integration Engineers use the ``imednet.datadict``
-module and the ``imednet datadict`` CLI to compile, inspect, convert, diff, and
-validate canonical ``Study`` ``Data Dictionary`` definitions across CSV exports,
-CDISC ODM 1.3 XML, REDCap dictionaries, and the live iMednet REST API.
+A **Data Dictionary** is the canonical Study metadata specification in ``imednet``, defining Forms, Variables, Choices, numeric and text bounds, required-field policies, and XML ``BusinessLogicRule`` edit checks (see :doc:`/adr/0004-data-dictionary-standardization`).
+
+The :mod:`imednet.datadict` package and ``imednet datadict`` CLI subcommands let Clinical Data Managers and Integration Engineers load Study metadata from four sources, emit deterministic JSON or CDISC ODM 1.3 XML, structurally diff Study revisions, evaluate XML business logic offline, and enforce Form rules before submitting Record payloads to the EDC API.
 
 .. seealso::
    * :doc:`workflows/uat_workflow` — Execute pre-live User Acceptance Testing checks against a ``Study`` sandbox.
@@ -13,205 +11,286 @@ CDISC ODM 1.3 XML, REDCap dictionaries, and the live iMednet REST API.
    * :doc:`workflows/bulk_submission` — Validate and submit batch ``Record`` payloads with ``Job`` polling.
    * :doc:`form_builder` — Automate visual layout state dumps to the legacy ``formdez_save.php`` web endpoint using browser session cookies.
 
-CLI Reference (``imednet datadict``)
-------------------------------------
+Canonical Model Overview
+------------------------
 
-The ``imednet datadict`` command group provides 8 subcommands for compiling,
-converting, validating, and comparing ``Study`` schemas:
+Every loader compiles Study metadata into a typed Pydantic v2 hierarchy with deterministic camelCase JSON serialization:
 
-* ``from-csv`` — Compile a canonical JSON ``Data Dictionary`` from a 4-file iMednet CSV directory or ZIP archive.
-* ``from-odm`` — Import a CDISC ODM 1.3 XML metadata file into the canonical JSON ``Data Dictionary`` format.
-* ``to-odm`` — Export a canonical JSON ``Data Dictionary`` to CDISC ODM 1.3 XML.
-* ``from-redcap`` — Convert a REDCap data dictionary CSV file into the canonical JSON ``Data Dictionary`` format.
-* ``from-api`` — Extract live ``Study`` ``Form`` and ``Variable`` definitions from the iMednet REST API.
-* ``validate`` — Validate a ``Data Dictionary`` JSON file against Pydantic model invariants and JSON Schema rules.
-* ``diff`` — Compare two ``Data Dictionary`` JSON revisions structurally in ``text``, ``json``, or ``md`` format.
-* ``schema`` — Export the canonical Draft 2020-12 JSON Schema for downstream CI and IDE validation.
+* :class:`~imednet.datadict.DataDictionary`: Root container holding ``metadata``, ``forms``, and ``unassignedBusinessLogic``, while implementing :class:`~imednet.validation.cache.ValidationSchemaProtocol`.
+* :class:`~imednet.datadict.Form`: Represents a Study Form (``formKey``, ``formName``, ``formId``, ``formType``) with ordered ``variables`` and Form-scoped ``businessLogic`` rules.
+* :class:`~imednet.datadict.Variable`: Defines an individual clinical data point (``variableName``, ``label``, ``variableType``, ``sequence``, ``required``, ``format``, ``precision``, ``choices``).
+* :class:`~imednet.datadict.Choice`: Defines a coded categorical option (``choiceValue``, ``choiceText``, ``position``).
+* :class:`~imednet.datadict.BusinessLogicRule`: Captures an edit check or workflow rule with both a parsed AST dictionary (``logic``) and optional verbatim XML (``logicRawXml``). ``Form``-scoped rules attach to ``form.businessLogic``, while ``Workflow``, ``Query``, ``Approval``, and ``Required`` rules route to top-level ``unassignedBusinessLogic``.
+* :class:`~imednet.datadict.Metadata`: Tracks ``schemaVersion``, ``studyKey``, ``generatedAt``, ``source``, and ``validationWarnings``.
 
-Compiling & Converting Sources
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Source CSV or XML attributes without explicit typed properties are preserved losslessly under ``extraAttributes`` using deterministic lexical camelCase keys (via ``to_camel_case``).
 
-Compile a 4-file iMednet CSV export directory or ZIP archive (pass ``--strict``
-to fail fast on unknown columns or unreferenced ``Form`` keys, and
-``--no-raw-xml`` to omit verbatim XML strings from compiled rules):
+Loading a Data Dictionary
+-------------------------
 
-.. code-block:: bash
+From 4-File CSV Exports
+~~~~~~~~~~~~~~~~~~~~~~~
 
-   imednet datadict from-csv ./study_datadict_csv/ -o datadict.json --strict
-   imednet datadict from-csv study_datadict.zip -o datadict.json --no-raw-xml
-
-Round-trip metadata between CDISC ODM 1.3 XML, REDCap CSV exports, and the live
-REST API:
-
-.. code-block:: bash
-
-   # Import CDISC ODM 1.3 XML and override Study key
-   imednet datadict from-odm study_metadata.xml -o datadict.json --study-key STUDY --strict
-
-   # Export canonical JSON back to CDISC ODM 1.3 XML
-   imednet datadict to-odm datadict.json -o study_metadata.xml --file-oid OID.STUDY.V1
-
-   # Convert a REDCap data dictionary CSV
-   imednet datadict from-redcap redcap_dictionary.csv -o datadict.json --study-key STUDY
-
-   # Snapshot live Form and Variable metadata from the iMednet REST API
-   imednet datadict from-api --study-key STUDY -o datadict_live.json
-
-Validating, Diffing, and Exporting JSON Schema
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Validate a compiled dictionary, generate a Markdown structural diff between two
-``Study`` build revisions prior to UAT sign-off, or export the canonical JSON
-Schema:
-
-.. code-block:: bash
-
-   # Validate model and JSON Schema compliance
-   imednet datadict validate datadict.json
-
-   # Compare baseline and candidate Study builds in Markdown format
-   imednet datadict diff baseline_v1.json candidate_v2.json --format md
-
-   # Export canonical JSON Schema for CI pipelines or editor autocompletion
-   imednet datadict schema -o datadict.schema.json
-
-Canonical ``Data Dictionary`` Models
-------------------------------------
-
-Standardized in :doc:`/adr/0004-data-dictionary-standardization`, the
-``imednet.datadict`` package represents every ``Study`` build using deterministic
-Pydantic v2 models with camelCase JSON serialization:
-
-* :class:`~imednet.datadict.DataDictionary` — Root container holding ``metadata``, ``forms``, and ``unassignedBusinessLogic``.
-* :class:`~imednet.datadict.Metadata` — Envelope recording ``schemaVersion``, ``studyKey``, ``generatedAt``, ``source``, and ``validationWarnings``.
-* :class:`~imednet.datadict.Form` — Clinical ``Form`` definition (``formKey``, ``formName``, ``formId``, ``formType``, ``variables``, and form-scoped ``businessLogic``).
-* :class:`~imednet.datadict.Variable` — ``Form`` data capture ``Variable`` (``variableName``, ``label``, ``variableType``, ``sequence``, ``required``, ``format``, ``precision``, and categorical ``choices``).
-* :class:`~imednet.datadict.Choice` — Coded categorical option (``choiceText``, ``choiceValue``, ``position``).
-* :class:`~imednet.datadict.BusinessLogicRule` — Edit check, ``Query`` rule, or workflow trigger (``id``, ``name``, ``type``, ``status``, ``form``, ``sequence``, parsed ``logic`` AST, and optional ``logicRawXml``).
-
-Source CSV or XML attributes without explicit typed properties are preserved
-losslessly under ``extraAttributes`` using deterministic lexical camelCase keys
-(via ``to_camel_case``). Rules scoped to a single ``Form`` attach to
-``form.businessLogic``, while cross-form ``Workflow``, ``Query``, ``Approval``,
-or ``Required`` rules route to ``datadict.unassignedBusinessLogic``.
+iMednet Data Dictionary exports contain four CSV files: ``FORMS.csv``, ``QUESTIONS.csv``, ``CHOICES.csv``, and ``BUSINESS_LOGIC.csv``. Use :func:`~imednet.datadict.load_from_csv` for a directory or ``.zip`` archive, or :func:`~imednet.datadict.load_from_csv_files` for individual paths or text streams. Pass ``strict=True`` to fail fast on unknown columns or broken references, and ``no_raw_xml=True`` to omit verbatim XML strings after parsing the AST:
 
 .. testcode::
 
-   from imednet.datadict import (
-       BusinessLogicRule,
-       Choice,
-       DataDictionary,
-       Form,
-       Metadata,
-       Variable,
-       diff,
-       get_schema,
+   import io
+   import tempfile
+   from pathlib import Path
+   from imednet.datadict import load_from_csv, load_from_csv_files
+
+   forms_csv = "Form Key,Form Name,Form ID,Form Type\nF_VS,Vital Signs,302,Subject\n"
+   questions_csv = (
+       "Form Key,Variable Name,Label,Variable Type,Sequence,Required Field,Format\n"
+       "F_VS,V_WEIGHT,Weight (kg),Float,1,Yes,6\n"
+       "F_VS,V_POSITION,Body Position,Radio,2,Auto Query,\n"
+   )
+   choices_csv = (
+       "Form Key,Variable Name,Choice Value,Choice Text,Position\n"
+       "F_VS,V_POSITION,SIT,Sitting,1\n"
+       "F_VS,V_POSITION,SUP,Supine,2\n"
+   )
+   logic_csv = (
+       "ID,Name,Type,Status,Form,Sequence,Logic\n"
+       "101,Weight Positive,Form,Active,F_VS,1,"
+       '"<rule><conditions><condition variable=""V_WEIGHT"" operator=""&lt;="" value=""0""/></conditions>'
+       '<actions><action type=""error"" message=""Weight must exceed 0 kg.""/></actions></rule>"\n'
    )
 
-   baseline = DataDictionary(
-       metadata=Metadata(studyKey="STUDY", source="odm"),
-       forms=[
-           Form(
-               formKey="F_VS",
-               formName="Vital Signs",
-               formId=302,
-               formType="Subject",
-               variables=[
-                   Variable(
-                       variableName="V_SYSBP",
-                       label="Systolic Blood Pressure (mmHg)",
-                       variableType="Integer",
-                       sequence=1,
-                       required="Yes",
-                   ),
-                   Variable(
-                       variableName="V_POS",
-                       label="Measurement Position",
-                       variableType="Radio",
-                       sequence=2,
-                       required="No",
-                       choices=[
-                           Choice(choiceText="Sitting", choiceValue="SIT", position=1),
-                           Choice(choiceText="Standing", choiceValue="STAND", position=2),
-                       ],
-                   ),
-               ],
-               businessLogic=[
-                   BusinessLogicRule(
-                       id="BL-VS-001",
-                       name="Systolic Out of Range",
-                       type="Query",
-                       status="Active",
-                       form="F_VS",
-                       sequence=1,
-                       logic={
-                           "operator": "OR",
-                           "conditions": [
-                               {"variable": "V_SYSBP", "operator": "<", "value": 70},
-                               {"variable": "V_SYSBP", "operator": ">", "value": 240},
-                           ],
-                       },
-                   )
-               ],
-           )
-       ],
+   csv_dd = load_from_csv_files(
+       forms_file=io.StringIO(forms_csv),
+       questions_file=io.StringIO(questions_csv),
+       choices_file=io.StringIO(choices_csv),
+       business_logic_file=io.StringIO(logic_csv),
+       study_key="STUDY",
+       strict=True,
+   )
+   assert csv_dd.form_for_key("F_VS") is not None
+   assert len(csv_dd.variables_for_form("F_VS")["V_POSITION"].choices) == 2
+
+   with tempfile.TemporaryDirectory() as tmp_dir:
+       export_dir = Path(tmp_dir)
+       (export_dir / "FORMS.csv").write_text(forms_csv, encoding="utf-8")
+       (export_dir / "QUESTIONS.csv").write_text(questions_csv, encoding="utf-8")
+       (export_dir / "CHOICES.csv").write_text(choices_csv, encoding="utf-8")
+       (export_dir / "BUSINESS_LOGIC.csv").write_text(logic_csv, encoding="utf-8")
+
+       dir_dd = load_from_csv(export_dir, study_key="STUDY", strict=True, no_raw_xml=True)
+       assert dir_dd.forms[0].businessLogic[0].logicRawXml is None
+
+From CDISC ODM 1.3 XML
+~~~~~~~~~~~~~~~~~~~~~~
+
+Use :func:`~imednet.datadict.to_odm_xml` (or :func:`~imednet.datadict.to_odm_file`) to serialize a :class:`~imednet.datadict.DataDictionary` to CDISC ODM 1.3 XML, and :func:`~imednet.datadict.load_from_cdisc_odm` to parse ODM ``FormDef``, ``ItemGroupDef``, ``ItemDef``, ``CodeList``, ``RangeCheck``, ``ConditionDef``, and ``MethodDef`` definitions into the canonical model:
+
+.. testcode::
+
+   import io
+   from imednet.datadict import load_from_cdisc_odm, to_odm_xml
+
+   odm_xml = to_odm_xml(csv_dd, file_oid="ODM.STUDY.001")
+   odm_dd = load_from_cdisc_odm(
+       io.StringIO(odm_xml),
+       study_key="STUDY",
+       strict=True,
+   )
+   assert odm_dd.metadata.source == "cdisc_odm"
+   assert "V_WEIGHT" in odm_dd.variables_for_form("F_VS")
+
+From REDCap CSV Data Dictionaries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use :func:`~imednet.datadict.load_from_redcap` to convert REDCap instrument CSV files—mapping REDCap field types, ``Choices, Calculations, or Slider Labels``, ``Required Field?``, and ``Text Validation Min`` / ``Max`` bounds into canonical Forms, Variables, and Choices:
+
+.. testcode::
+
+   import io
+   from imednet.datadict import extract_variable_constraints, load_from_redcap
+
+   redcap_csv = (
+       "Variable / Field Name,Form Name,Field Type,Field Label,"
+       '"Choices, Calculations, or Slider Labels",Text Validation Type OR Show Slider Number,'
+       "Text Validation Min,Text Validation Max,Required Field?\n"
+       "v_age,demographics,text,Subject Age,,integer,18,99,y\n"
+       'v_arm,demographics,radio,Treatment Arm,"A, Arm A | B, Arm B",,,,y\n'
+   )
+   redcap_dd = load_from_redcap(io.StringIO(redcap_csv), study_key="STUDY", strict=True)
+   age_var = redcap_dd.variables_for_form("demographics")["v_age"]
+   age_constraints = extract_variable_constraints(age_var)
+   assert age_constraints.min_value == 18.0
+   assert age_constraints.max_value == 99.0
+   assert age_constraints.required_policy == "yes"
+
+From the EDC REST API
+~~~~~~~~~~~~~~~~~~~~~
+
+Use :func:`~imednet.datadict.load_from_api` with an initialized :class:`~imednet.ImednetSDK` client to extract Study Forms and Variables directly from the ``/forms`` and ``/variables`` REST endpoints:
+
+.. note::
+   The standard iMednet REST API exposes Forms and Variables, but does not expose Choice code lists or ``BusinessLogicRule`` XML definitions. ``load_from_api`` records this limitation in ``metadata.validationWarnings``; use a 4-file CSV or CDISC ODM export when enforcing Choice membership or edit check rules.
+
+.. testcode::
+
+   from imednet import ImednetSDK, SimulationState, SimulationTransport
+   from imednet.datadict import load_from_api
+
+   with ImednetSDK(
+       simulation_mode=True,
+       transport=SimulationTransport(SimulationState()),
+   ) as sdk:
+       api_dd = load_from_api(sdk, "STUDY", no_raw_xml=True)
+
+   assert api_dd.form_for_key("F_VS") is not None
+   assert len(api_dd.metadata.validationWarnings) == 1
+
+JSON Emission, Schema Export, and Validation
+--------------------------------------------
+
+:func:`~imednet.datadict.to_json` (and :func:`~imednet.datadict.to_file`) deterministically sorts Forms by ``formKey``, Variables by ``sequence`` then ``variableName``, Choices by ``position``, and rules by ``sequence`` then ``id``. Use :func:`~imednet.datadict.get_schema` to export the Draft 2020-12 JSON Schema, and :func:`~imednet.datadict.validate` to verify a dictionary, JSON string, file path, or :class:`~imednet.datadict.DataDictionary` instance:
+
+.. testcode::
+
+   from imednet.datadict import get_schema, to_json, validate
+
+   canonical_json = to_json(csv_dd, exclude_generated_at=True)
+   dd_schema = get_schema()
+   assert dd_schema["version"] == "1.0.0"
+
+   validation_errors = validate(canonical_json, schema=dd_schema)
+   assert validation_errors == []
+
+Comparing Study Revisions with ``diff``
+---------------------------------------
+
+Use :func:`~imednet.datadict.diff` to compare baseline and updated :class:`~imednet.datadict.DataDictionary` revisions while ignoring ``metadata.generatedAt`` timestamps. The returned :class:`~imednet.datadict.DiffReport` formats structural additions, removals, and modifications as plain text, Markdown tables, or JSON:
+
+.. testcode::
+
+   from imednet.datadict import DataDictionary, Variable, diff
+
+   updated_dd = csv_dd.model_copy(deep=True)
+   vs_form = updated_dd.form_for_key("F_VS")
+   assert vs_form is not None
+   vs_form.variables.append(
+       Variable(variableName="V_PULSE", label="Pulse (bpm)", variableType="Integer", sequence=3)
    )
 
-   candidate = baseline.model_copy(deep=True)
-   candidate.forms[0].variables[0].label = "Seated Systolic Blood Pressure (mmHg)"
+   diff_report = diff(csv_dd, updated_dd)
+   assert diff_report.has_changes is True
+   assert "V_PULSE" in diff_report.to_text()
+   assert "V_PULSE" in diff_report.to_markdown()
+   assert '"has_changes": true' in diff_report.to_json()
 
-   report = diff(baseline, candidate)
-   schema = get_schema()
-   assert schema["title"] == "iMednet Data Dictionary Schema"
-   assert len(report.items) == 1 and report.items[0].action == "modified"
-   print(f"Schema: {schema['title']}, Changes: {len(report.items)}, Modified: {report.items[0].action}")
+Evaluating XML Business Logic Rules
+-----------------------------------
 
-Evaluating Edit Checks with ``LogicTreeEvaluator``
---------------------------------------------------
+:func:`~imednet.datadict.parse_logic_xml` parses iMednet XML rule expressions into a safe, deterministic AST dictionary, and :class:`~imednet.datadict.LogicTreeEvaluator` evaluates single rules or Form rule sets against Record Variable mappings without ``eval()``:
 
-Before running live ``Record`` UAT or bulk imports, use
-:class:`~imednet.datadict.LogicTreeEvaluator` and ``parse_logic_xml`` to parse
-and evaluate ``BusinessLogicRule`` trees deterministically in memory against
-candidate ``Record`` dictionaries:
+* ``Form`` and ``Required`` rules classify as ``severity="error"`` (populating ``report.errors`` when triggered).
+* ``Query`` and ``Auto Query`` rules classify as ``severity="warning"`` (populating ``report.warnings`` when triggered).
+* Inactive rules, UI-only actions (such as ``hide`` or ``disable``), and cross-Form / cross-Visit rules are safely marked ``skipped=True`` with a descriptive ``skip_reason``.
 
 .. testcode::
 
    from imednet.datadict import BusinessLogicRule, LogicTreeEvaluator, parse_logic_xml
 
-   xml_rule = """
-   <rule>
-     <conditions operator="OR">
-       <condition><variable>V_SYSBP</variable><operator>&lt;</operator><value>70</value></condition>
-       <condition><variable>V_SYSBP</variable><operator>&gt;</operator><value>240</value></condition>
-     </conditions>
-     <action type="auto_query">
-       <message>Verify systolic blood pressure measurement.</message>
-     </action>
-   </rule>
-   """
-
-   rule = BusinessLogicRule(
-       id="BL-VS-001",
-       name="Systolic Range Check",
+   query_xml = (
+       "<rule>"
+       '<conditions><condition variable="V_WEIGHT" operator="&gt;" value="200"/></conditions>'
+       '<actions><action type="query" message="Confirm weight above 200 kg."/></actions>'
+       "</rule>"
+   )
+   query_rule = BusinessLogicRule(
+       id="102",
+       name="High Weight Query",
        type="Query",
        status="Active",
        form="F_VS",
-       logic=parse_logic_xml(xml_rule),
+       logic=parse_logic_xml(query_xml),
    )
 
    evaluator = LogicTreeEvaluator()
-   normal_report = evaluator.evaluate_rules([rule], {"V_SYSBP": 122}, form_key="F_VS")
-   alert_report = evaluator.evaluate_rules([rule], {"V_SYSBP": 255}, form_key="F_VS")
-   assert not normal_report.results[0].triggered
-   assert alert_report.results[0].triggered and alert_report.results[0].severity == "warning"
+   rules_to_check = [*csv_dd.rules_for_form("F_VS"), query_rule]
 
-   print(f"122 mmHg triggered: {normal_report.results[0].triggered}")
-   print(
-       f"255 mmHg triggered: {alert_report.results[0].triggered} "
-       f"({alert_report.results[0].severity}: {alert_report.results[0].message})"
-   )
+   bad_eval = evaluator.evaluate_rules(rules_to_check, {"V_WEIGHT": -5.0}, form_key="F_VS")
+   assert len(bad_eval.errors) == 1
+   assert bad_eval.errors[0].rule_name == "Weight Positive"
 
-Inactive rules (``status="Inactive"``), UI-only actions (such as ``hide``,
-``show``, or ``disable``), and cross-visit rules are automatically classified
-and marked ``skipped=True`` with a structured ``skip_reason`` so single-record
-validation pipelines remain deterministic.
+   warn_eval = evaluator.evaluate_rules(rules_to_check, {"V_WEIGHT": 225.0}, form_key="F_VS")
+   assert len(warn_eval.errors) == 0
+   assert len(warn_eval.warnings) == 1
+
+Validating Record Submissions with ``schema=data_dictionary``
+-------------------------------------------------------------
+
+Unlike :class:`~imednet.validation.cache.SchemaCache` (which only checks Form existence, unknown Variables, and basic scalar types), passing a :class:`~imednet.datadict.DataDictionary` via ``schema=data_dictionary`` enforces:
+
+1. **Required Variable policies** (``required="Yes"`` raises :class:`~imednet.errors.ValidationError`; ``required="Auto Query"`` logs a warning).
+2. **Choice membership** for categorical Variables (``Radio``, ``Single Select``, ``Multi Select``).
+3. **Numeric and string length bounds** (``minValue`` / ``maxValue`` and ``minLength`` / ``maxLength``).
+4. **Active XML edit checks** via :class:`~imednet.datadict.LogicTreeEvaluator` before any HTTP POST is sent.
+
+Pass ``schema=data_dictionary`` to :meth:`~imednet.endpoints.records.RecordsEndpoint.create`, :meth:`~imednet.endpoints.records.RecordsEndpoint.create_batch`, :class:`~imednet_workflows.record_update.RecordUpdateWorkflow`, or :class:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow` (see :doc:`/explanation/schema_validation`, :doc:`/how-to/register_subjects`, and :doc:`/how-to/workflows/bulk_submission`):
+
+.. testcode::
+
+   from imednet.errors import ValidationError
+   from imednet_workflows.record_update import RecordUpdateWorkflow
+
+   with ImednetSDK(
+       simulation_mode=True,
+       transport=SimulationTransport(SimulationState()),
+   ) as wf_sdk:
+       # Direct RecordsEndpoint validation
+       batch_summary = wf_sdk.records.create_batch(
+           "STUDY",
+           [{"formKey": "F_VS", "subjectKey": "SUB1", "data": {"V_WEIGHT": 72.5, "V_POSITION": "SIT"}}],
+           schema=csv_dd,
+       )
+       assert batch_summary.total_records == 1
+
+       # RecordUpdateWorkflow configured with an offline DataDictionary
+       update_wf = RecordUpdateWorkflow(wf_sdk, schema=csv_dd)
+       rejected = False
+       try:
+           update_wf.create_or_update_records(
+               "STUDY",
+               [{"formKey": "F_VS", "subjectKey": "SUB1", "data": {"V_WEIGHT": -1.0, "V_POSITION": "SIT"}}],
+           )
+       except ValidationError:
+           rejected = True
+       assert rejected is True
+
+For automated UAT synthetic Record generation and negative edit check verification against an EDC environment, pass ``data_dictionary`` to :class:`~imednet_workflows.uat.UATWorkflow` and :class:`~imednet_workflows.uat.UATExecutionEngine` as shown in :doc:`/how-to/workflows/uat_workflow`.
+
+CLI Reference and Recipes
+-------------------------
+
+The ``imednet datadict`` command group exposes eight subcommands for Study metadata conversion, schema validation, and revision comparison (see :doc:`/how-to/cli`):
+
+.. code-block:: bash
+
+   # 1. Compile canonical JSON from a 4-file CSV directory or ZIP archive
+   imednet datadict from-csv ./datadict_export.zip -o study_dd.json --strict --no-raw-xml
+
+   # 2. Import CDISC ODM 1.3 XML into canonical Data Dictionary JSON
+   imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
+
+   # 3. Export canonical Data Dictionary JSON to CDISC ODM 1.3 XML
+   imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
+
+   # 4. Convert a REDCap CSV Data Dictionary into canonical JSON
+   imednet datadict from-redcap ./redcap_dictionary.csv --study-key STUDY -o study_dd.json --strict
+
+   # 5. Extract Study Forms and Variables from the live iMednet REST API
+   imednet datadict from-api --study-key STUDY -o api_dd.json --no-raw-xml
+
+   # 6. Export the canonical Draft 2020-12 JSON Schema
+   imednet datadict schema -o data-dictionary.schema.json
+
+   # 7. Validate a Data Dictionary JSON file against model and JSON Schema rules
+   imednet datadict validate study_dd.json --schema data-dictionary.schema.json
+
+   # 8. Compare two Study Data Dictionary revisions in text, Markdown, or JSON format
+   imednet datadict diff baseline_dd.json study_dd.json --format md

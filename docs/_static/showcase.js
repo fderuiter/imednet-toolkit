@@ -445,26 +445,60 @@
     }
 
     // -------------------------------------------------------------------------
-    // Helper: Copy text safely with button status reset
+    // Helper: Copy text safely with button status reset and polite ARIA status
     // -------------------------------------------------------------------------
-    function bindCopyButton(btn, getText, defaultLabel) {
+    function bindCopyButton(btn, getText, defaultLabel, statusBadge) {
         if (!btn) return;
         let resetTimer = null;
+
+        function setTemporaryLabel(tempLabel) {
+            btn.textContent = tempLabel;
+            if (resetTimer) {
+                clearTimeout(resetTimer);
+            }
+            resetTimer = setTimeout(function () {
+                btn.textContent = defaultLabel;
+                resetTimer = null;
+            }, 1500);
+        }
+
+        function announceCopyStatus(message) {
+            if (statusBadge) {
+                statusBadge.textContent = message;
+            }
+        }
+
+        function handleCopySuccess() {
+            setTemporaryLabel("Copied!");
+            announceCopyStatus(defaultLabel + " succeeded — Copied to clipboard.");
+        }
+
+        function handleCopyFailure() {
+            setTemporaryLabel("Copy failed");
+            announceCopyStatus(
+                defaultLabel + " failed — Clipboard unavailable; select and copy text manually."
+            );
+        }
+
         btn.addEventListener("click", function () {
             const text = getText();
-            if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+            if (
+                typeof navigator === "undefined" ||
+                !navigator.clipboard ||
+                typeof navigator.clipboard.writeText !== "function"
+            ) {
+                handleCopyFailure();
                 return;
             }
-            navigator.clipboard.writeText(text).then(function () {
-                btn.textContent = "Copied!";
-                if (resetTimer) {
-                    clearTimeout(resetTimer);
-                }
-                resetTimer = setTimeout(function () {
-                    btn.textContent = defaultLabel;
-                    resetTimer = null;
-                }, 1500);
-            }).catch(function () {});
+            try {
+                Promise.resolve(navigator.clipboard.writeText(text))
+                    .then(handleCopySuccess)
+                    .catch(function () {
+                        handleCopyFailure();
+                    });
+            } catch (_err) {
+                handleCopyFailure();
+            }
         });
     }
 
@@ -788,8 +822,6 @@
             const currentHash = getHashTarget();
             if (isValidPanel(currentHash)) {
                 switchPersona(currentHash, false);
-            } else {
-                switchPersona("panel-integration", false);
             }
         });
 
@@ -913,7 +945,7 @@
 
         bindCopyButton(ieSnippetCopyBtn, function () {
             return ieCodeDisplay ? ieCodeDisplay.textContent : "";
-        }, "Copy Code");
+        }, "Copy Code", ieMetricBadge);
 
         // View toggle for IE
         function switchIeView(view) {
@@ -947,7 +979,7 @@
 
         bindCopyButton(ieCopyBtn, function () {
             return ieJsonPre ? ieJsonPre.textContent : "";
-        }, "Copy JSON");
+        }, "Copy JSON", ieMetricBadge);
 
         // ---------------------------------------------------------------------
         // 2. Clinical Data Manager Panel
@@ -1020,7 +1052,7 @@
 
         bindCopyButton(cdmCopyBtn, function () {
             return cdmJsonPre ? cdmJsonPre.textContent : "";
-        }, "Copy JSON");
+        }, "Copy JSON", cdmMetricBadge);
 
         // ---------------------------------------------------------------------
         // 3. Regulatory Compliance Auditor Panel
@@ -1109,7 +1141,7 @@
 
         bindCopyButton(audCopyBtn, function () {
             return audJsonPre ? audJsonPre.textContent : "";
-        }, "Copy JSON");
+        }, "Copy JSON", audMetricBadge);
 
         // Render default deterministic simulation previews immediately on load
         updateIeSnippet();

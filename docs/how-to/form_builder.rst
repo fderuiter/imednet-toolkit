@@ -4,10 +4,9 @@ Form Builder
 The Form Builder module allows maintainers to programmatically define visual ``Form`` layouts and submit them to the legacy iMedNet Form Designer. This bypasses manual drag-and-drop operations when automating legacy layout updates.
 
 .. warning::
-    **Legacy Browser Session Boundary:** This module targets the legacy web Form Designer endpoint (``formdez_save.php``), **not** the public iMednet REST API. It requires active browser session cookies (``PHPSESSID``) and anti-CSRF tokens (``CSRFKey``) scraped from an authenticated browser session—standard REST credentials (``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY``) are not accepted by ``formdez_save.php``.
+    **Legacy Browser Session Boundary:** ``imednet.form_designer`` targets only visual page layout submission to the legacy internal Form Designer endpoint (``formdez_save.php``) and requires scraped browser session cookies (``PHPSESSID`` and ``CSRFKey``)—standard REST credentials (``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY``) are not accepted. It is **not** part of the official iMednet REST API and does **not** load Study Data Dictionaries, convert CDISC ODM XML, or validate Record edit check rules.
 
-.. seealso::
-    For canonical ``Data Dictionary`` workflows—including inspecting ``Form`` and ``Variable`` definitions, converting CDISC ODM 1.3 XML or REDCap CSV files, structural version diffing, and evaluating ``BusinessLogicRule`` edit checks—use :doc:`data_dictionary` instead of ``FormBuilder``.
+    For canonical Study metadata conversion, CDISC ODM / REDCap / CSV loading, ``BusinessLogicRule`` evaluation, and UAT verification, see :doc:`/how-to/data_dictionary` and :doc:`/how-to/workflows/uat_workflow`.
 
 Core Concepts
 -------------
@@ -48,8 +47,7 @@ All 7 session and target flags are required when running in headless mode (``--b
 
 .. code-block:: console
 
-    uv run --with "imednet[cli]" python examples/build_form_payload.py \
-        --preset "Demo Form" \
+    uv run --with "imednet[cli]" python examples/build_form_payload.py --preset "Demo Form" \
         --base-url "https://your.imednet.com" \
         --phpsessid "YOUR_SESSION_ID" \
         --csrf "YOUR_CSRF_KEY" \
