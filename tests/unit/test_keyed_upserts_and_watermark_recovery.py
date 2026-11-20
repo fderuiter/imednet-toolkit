@@ -765,7 +765,7 @@ def test_initial_sync_failure_and_running_crash_recovery_end_to_end(tmp_path: Pa
         assert provider.get_last_timestamp("STUDY", "parquet") is None
         assert provider.get_last_status("STUDY", "parquet") == StreamExecutionStatus.FAILED
 
-        # 2. Simulate an abrupt process crash (e.g. OOM) leaving ledger stuck in RUNNING with None watermark
+        # 2. Simulate an abrupt process crash (e.g. OOM) leaving ledger stuck in RUNNING with expired lease and None watermark
         crashed = LedgerState(
             studies={
                 "STUDY": StudyState(
@@ -774,6 +774,7 @@ def test_initial_sync_failure_and_running_crash_recovery_end_to_end(tmp_path: Pa
                             last_timestamp=None,
                             records_processed=0,
                             last_run_status=StreamExecutionStatus.RUNNING,
+                            lease_expires_at=datetime(2020, 1, 1, tzinfo=UTC),
                         )
                     }
                 )

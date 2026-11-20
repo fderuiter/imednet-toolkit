@@ -112,13 +112,14 @@ def test_real_airflow_xcom_model_crud_and_crash_recovery(
     assert failed_stream.last_timestamp is None
     assert failed_stream.last_run_status == StreamExecutionStatus.FAILED
 
-    # 2. Simulate crashed task stuck in RUNNING status with None watermark
+    # 2. Simulate crashed task stuck in RUNNING status with expired lease and None watermark
     provider.set_last_timestamp(
         "STUDY",
         "records",
         None,
         records_processed=0,
         status=StreamExecutionStatus.RUNNING,
+        lease_expires_at=datetime(2020, 1, 1, tzinfo=UTC),
     )
     assert provider.get_last_status("STUDY", "records") == StreamExecutionStatus.RUNNING
     assert provider.get_last_timestamp("STUDY", "records") is None

@@ -17,6 +17,11 @@ def clean_auth_environment(monkeypatch):
         "IMEDNET_API_KEY",
         "IMEDNET_SECURITY_KEY",
         "IMEDNET_OIDC_TOKEN",
+        "IMEDNET_OIDC_PUBLIC_KEY",
+        "IMEDNET_OIDC_JWKS_URL",
+        "IMEDNET_OIDC_AUDIENCE",
+        "IMEDNET_OIDC_ALGORITHMS",
+        "IMEDNET_OIDC_ISSUER",
         "IMEDNET_SIMULATION_MODE",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -344,6 +349,402 @@ def test_oidc_valid_signed_tokens():
         auth_jwks_remote = OIDCAuth(jwt_jwk, jwks_url="https://auth.imednet.example/jwks.json")
         assert auth_jwks_remote.get_user_roles() == ["manager"]
         assert auth_jwks_remote.get_user_id() == "manager-1"
+
+
+def test_oidc_rejects_algorithm_confusion_and_blocks_commit_config(monkeypatch, tmp_path):
+    import base64
+    import datetime as dt
+    import hashlib
+    import hmac
+    import json
+    import time
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
+    from cryptography.x509.oid import NameOID
+
+    from imednet.auth.oidc import _load_public_key_or_secret
+    from imednet.models.study_config import MappingRule, StudyConfiguration, WidgetConfig
+    from imednet_workflows.config_version_control import ConfigVersionStore
+
+    def b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+    def _to_b64u(val: int) -> str:
+        return b64url(val.to_bytes((val.bit_length() + 7) // 8, byteorder="big"))
+
+    now = time.time()
+    hs_header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode("utf-8"))
+    hs_payload = b64url(
+        json.dumps({"sub": "attacker-canary", "roles": ["admin"], "exp": now + 600}).encode("utf-8")
+    )
+
+    # Generate RSA, EC, Ed25519 keys, X.509 certificate, OpenSSH keys, and JWK strings
+    rsa_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_pub = rsa_priv.public_key()
+    public_pem = rsa_pub.public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode("utf-8")
+    rsa_ssh = rsa_pub.public_bytes(
+        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
+    ).decode("utf-8")
+
+    ec_priv = ec.generate_private_key(ec.SECP256R1())
+    ec_pub = ec_priv.public_key()
+    ec_pem = ec_pub.public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode("utf-8")
+
+    ed_priv = ed25519.Ed25519PrivateKey.generate()
+    ed_pub = ed_priv.public_key()
+    ed_pem = ed_pub.public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode("utf-8")
+    ed_ssh = ed_pub.public_bytes(
+        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
+    ).decode("utf-8")
+
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "imednet-oidc.test")])
+    now_dt = dt.datetime.now(dt.UTC)
+    cert_pem = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(rsa_pub)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now_dt - dt.timedelta(minutes=5))
+        .not_valid_after(now_dt + dt.timedelta(hours=1))
+        .sign(rsa_priv, hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+        .decode("utf-8")
+    )
+
+    pub_numbers = rsa_pub.public_numbers()
+    rsa_jwk_dict = {
+        "kty": "RSA",
+        "n": _to_b64u(pub_numbers.n),
+        "e": _to_b64u(pub_numbers.e),
+    }
+    rsa_jwk_str = json.dumps(rsa_jwk_dict)
+
+    ec_numbers = ec_pub.public_numbers()
+    ec_jwk_str = json.dumps(
+        {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": _to_b64u(ec_numbers.x),
+            "y": _to_b64u(ec_numbers.y),
+        }
+    )
+    ed_jwk_str = json.dumps(
+        {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": b64url(
+                ed_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            ),
+        }
+    )
+
+    # 1. Direct _load_public_key_or_secret rejection across all asymmetric inputs for HS*
+    asymmetric_inputs = [
+        rsa_pub,
+        ec_pub,
+        ed_pub,
+        public_pem,
+        public_pem.encode("utf-8"),
+        f"  \n\t{public_pem}  ",
+        ec_pem,
+        ed_pem,
+        cert_pem,
+        cert_pem.encode("utf-8"),
+        f"\n  {cert_pem}",
+        rsa_ssh,
+        rsa_ssh.encode("utf-8"),
+        f"   {ed_ssh}\n",
+        rsa_jwk_dict,
+        rsa_jwk_str,
+        rsa_jwk_str.encode("utf-8"),
+        f"  \n {rsa_jwk_str} ",
+        ec_jwk_str,
+        ed_jwk_str,
+    ]
+    for asym_key in asymmetric_inputs:
+        for hs_alg in ("HS256", "HS384", "HS512"):
+            with pytest.raises(ValueError):
+                _load_public_key_or_secret(asym_key, hs_alg)
+
+    # 2. End-to-end canary check through IMEDNET_OIDC_PUBLIC_KEY, ImednetSDK, and ConfigVersionStore
+    store = ConfigVersionStore(db_path=tmp_path / "canary_versions.sqlite3")
+    canary_cfg = StudyConfiguration(
+        version="1.0.0",
+        studyKey="STUDY-CANARY",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                targetField="aeTerm",
+                sourceFormKey="AE_FORM",
+                sourceVariableName="ae_term",
+            )
+        ],
+        widgets=[
+            WidgetConfig(
+                widgetId="w-canary",
+                type="kpi_card",
+                title="AE Count",
+                domain="AE",
+                layoutCols=6,
+            )
+        ],
+    )
+
+    for env_key_material in (
+        public_pem,
+        f"  \n{public_pem}",
+        cert_pem,
+        f"  \n{cert_pem}",
+        rsa_jwk_str,
+        f"  \n{rsa_jwk_str}",
+        rsa_ssh,
+    ):
+        monkeypatch.setenv("IMEDNET_OIDC_PUBLIC_KEY", env_key_material)
+        hs_sig = b64url(
+            hmac.new(
+                env_key_material.encode("utf-8"),
+                f"{hs_header}.{hs_payload}".encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        )
+        confused_hs_jwt = f"{hs_header}.{hs_payload}.{hs_sig}"
+        with ImednetSDK(oidc_token=confused_hs_jwt) as test_sdk:
+            assert test_sdk.auth.get_user_roles() == []
+            with pytest.raises(PermissionError):
+                store.commit_config(
+                    "STUDY-CANARY", canary_cfg, desc="canary-confused-commit", sdk=test_sdk
+                )
+
+        # Even if caller explicitly opts into HS256 in algorithms, asymmetric key material is rejected
+        explicit_hs_auth = OIDCAuth(
+            confused_hs_jwt, public_key=env_key_material, algorithms=["HS256", "RS256"]
+        )
+        assert explicit_hs_auth.get_user_roles() == []
+        assert explicit_hs_auth.get_user_id() is None
+
+    # 3. Valid X.509 cert, OpenSSH, and whitespace-padded PEM/JWK still verify asymmetric tokens
+    rs_header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode("utf-8"))
+    rs_payload = b64url(
+        json.dumps({"sub": "valid-admin", "roles": ["admin"], "exp": now + 600}).encode("utf-8")
+    )
+    rs_sig = b64url(
+        rsa_priv.sign(
+            f"{rs_header}.{rs_payload}".encode("ascii"), padding.PKCS1v15(), hashes.SHA256()
+        )
+    )
+    valid_rs_jwt = f"{rs_header}.{rs_payload}.{rs_sig}"
+    for valid_asym_source in (
+        f"  \n{public_pem}",
+        f"  \n{cert_pem}",
+        f"  {rsa_ssh}",
+        f"  \n{rsa_jwk_str}",
+    ):
+        monkeypatch.setenv("IMEDNET_OIDC_PUBLIC_KEY", valid_asym_source)
+        with ImednetSDK(oidc_token=valid_rs_jwt) as valid_sdk:
+            assert valid_sdk.auth.get_user_roles() == ["admin"]
+            assert valid_sdk.auth.get_user_id() == "valid-admin"
+
+    # Valid EdDSA token with OpenSSH and OKP JWK
+    ed_header = b64url(json.dumps({"alg": "EdDSA", "typ": "JWT"}).encode("utf-8"))
+    ed_sig = b64url(ed_priv.sign(f"{ed_header}.{rs_payload}".encode("ascii")))
+    valid_ed_jwt = f"{ed_header}.{rs_payload}.{ed_sig}"
+    assert OIDCAuth(valid_ed_jwt, public_key=ed_ssh).get_user_roles() == ["admin"]
+    assert OIDCAuth(valid_ed_jwt, public_key=ed_jwk_str).get_user_roles() == ["admin"]
+
+    # 4. Explicit oct JWK dict and oct JWK JSON string work for HS256 by default
+    oct_raw = b"explicit-oct-hmac-secret-bytes"  # pragma: allowlist secret
+    oct_jwk = {"kty": "oct", "k": b64url(oct_raw)}
+    oct_sig = b64url(
+        hmac.new(oct_raw, f"{hs_header}.{hs_payload}".encode("ascii"), hashlib.sha256).digest()
+    )
+    valid_oct_jwt = f"{hs_header}.{hs_payload}.{oct_sig}"
+    assert OIDCAuth(valid_oct_jwt, public_key=oct_jwk).get_user_roles() == ["admin"]
+    assert OIDCAuth(valid_oct_jwt, public_key=f"  {json.dumps(oct_jwk)} ").get_user_roles() == [
+        "admin"
+    ]
+    with pytest.raises(ValueError):
+        _load_public_key_or_secret(oct_jwk, "RS256")
+
+
+def test_oidc_jwks_rejects_remote_oct_wrong_use_and_mismatched_alg():
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import time
+
+    import respx
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    def b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+    def _to_b64u(val: int) -> str:
+        return b64url(val.to_bytes((val.bit_length() + 7) // 8, byteorder="big"))
+
+    now = time.time()
+    payload = b64url(
+        json.dumps({"sub": "jwks-user", "roles": ["admin"], "exp": now + 600}).encode("utf-8")
+    )
+
+    # 1. Symmetric 'oct' JWK from jwks_url is rejected (default algorithms and explicit HS256)
+    oct_secret = b"publicly-exposed-jwks-oct-key"  # pragma: allowlist secret
+    hs_header = b64url(json.dumps({"alg": "HS256", "typ": "JWT", "kid": "oct-1"}).encode("utf-8"))
+    hs_sig = b64url(
+        hmac.new(oct_secret, f"{hs_header}.{payload}".encode("ascii"), hashlib.sha256).digest()
+    )
+    hs_jwt = f"{hs_header}.{payload}.{hs_sig}"
+    oct_jwks = {"keys": [{"kty": "oct", "kid": "oct-1", "use": "sig", "k": b64url(oct_secret)}]}
+
+    # Default algorithms on in-memory jwks also disallow HS256
+    assert OIDCAuth(hs_jwt, jwks=oct_jwks).get_user_roles() == []
+
+    with respx.mock:
+        respx.get("https://auth.imednet.example/oct-jwks.json").respond(200, json=oct_jwks)
+        assert (
+            OIDCAuth(hs_jwt, jwks_url="https://auth.imednet.example/oct-jwks.json").get_user_roles()
+            == []
+        )
+        assert (
+            OIDCAuth(
+                hs_jwt,
+                jwks_url="https://auth.imednet.example/oct-jwks.json",
+                algorithms=["HS256"],
+            ).get_user_roles()
+            == []
+        )
+
+    # 2. JWK 'use' != 'sig' and mismatched 'alg' are rejected
+    priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pub_numbers = priv_key.public_key().public_numbers()
+    rs_header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "rsa-1"}).encode("utf-8"))
+    rs_sig = b64url(
+        priv_key.sign(f"{rs_header}.{payload}".encode("ascii"), padding.PKCS1v15(), hashes.SHA256())
+    )
+    rs_jwt = f"{rs_header}.{payload}.{rs_sig}"
+
+    enc_jwks = {
+        "keys": [
+            {
+                "kty": "RSA",
+                "kid": "rsa-1",
+                "use": "enc",
+                "alg": "RS256",
+                "n": _to_b64u(pub_numbers.n),
+                "e": _to_b64u(pub_numbers.e),
+            }
+        ]
+    }
+    assert OIDCAuth(rs_jwt, jwks=enc_jwks).get_user_roles() == []
+
+    wrong_alg_jwks = {
+        "keys": [
+            {
+                "kty": "RSA",
+                "kid": "rsa-1",
+                "use": "sig",
+                "alg": "RS384",
+                "n": _to_b64u(pub_numbers.n),
+                "e": _to_b64u(pub_numbers.e),
+            }
+        ]
+    }
+    assert OIDCAuth(rs_jwt, jwks=wrong_alg_jwks).get_user_roles() == []
+
+    # Omitted 'use' and omitted 'alg' remain valid (including without kid in header)
+    minimal_jwks = {
+        "keys": [
+            {
+                "kty": "RSA",
+                "kid": "rsa-1",
+                "n": _to_b64u(pub_numbers.n),
+                "e": _to_b64u(pub_numbers.e),
+            }
+        ]
+    }
+    assert OIDCAuth(rs_jwt, jwks=minimal_jwks).get_user_roles() == ["admin"]
+
+    no_kid_header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode("utf-8"))
+    no_kid_sig = b64url(
+        priv_key.sign(
+            f"{no_kid_header}.{payload}".encode("ascii"), padding.PKCS1v15(), hashes.SHA256()
+        )
+    )
+    no_kid_jwt = f"{no_kid_header}.{payload}.{no_kid_sig}"
+    assert OIDCAuth(no_kid_jwt, jwks=minimal_jwks).get_user_roles() == ["admin"]
+    assert OIDCAuth(no_kid_jwt, public_key=minimal_jwks["keys"][0]).get_user_roles() == ["admin"]
+
+    # Family mismatches inside JWKS (asymmetric JWK with HS256, oct JWK with RS256) and failed fetch
+    matching_kid_rsa_jwk = {**minimal_jwks["keys"][0], "kid": "oct-1"}
+    assert (
+        OIDCAuth(
+            hs_jwt, jwks={"keys": [matching_kid_rsa_jwk]}, algorithms=["HS256"]
+        ).get_user_roles()
+        == []
+    )
+    assert OIDCAuth(no_kid_jwt, jwks=oct_jwks).get_user_roles() == []
+    with respx.mock:
+        respx.get("https://auth.imednet.example/broken-jwks.json").respond(500)
+        assert (
+            OIDCAuth(
+                rs_jwt, jwks_url="https://auth.imednet.example/broken-jwks.json"
+            ).get_user_roles()
+            == []
+        )
+
+    # Binary HMAC secret bytes, malformed JWK strings, and invalid key types
+    from cryptography.hazmat.primitives import serialization
+
+    from imednet.auth.oidc import (
+        _can_parse_as_asymmetric_key,
+        _load_jwk_key,
+        _load_public_key_or_secret,
+    )
+
+    pub_pem_bytes = priv_key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    assert _can_parse_as_asymmetric_key(pub_pem_bytes) is True
+    assert _can_parse_as_asymmetric_key(b"plain-secret") is False
+
+    raw_bin_secret = b"\xff\xfe\xfd-binary-hmac-secret"
+    bin_sig = b64url(
+        hmac.new(raw_bin_secret, f"{hs_header}.{payload}".encode("ascii"), hashlib.sha256).digest()
+    )
+    assert OIDCAuth(
+        f"{hs_header}.{payload}.{bin_sig}", public_key=raw_bin_secret
+    ).get_user_roles() == ["admin"]
+    assert OIDCAuth(f"{hs_header}.{payload}.{bin_sig}", public_key="   ").get_user_roles() == []
+    assert (
+        OIDCAuth(f"{hs_header}.{payload}.{bin_sig}", public_key="{not-json}").get_user_roles() == []
+    )
+    assert OIDCAuth(f"{hs_header}.{payload}.{bin_sig}", public_key=12345).get_user_roles() == []
+
+    for bad_jwk in (
+        {"kty": "RSA"},
+        {"kty": "EC", "crv": "P-999"},
+        {"kty": "unknown"},
+    ):
+        with pytest.raises(ValueError):
+            _load_jwk_key(bad_jwk)
+    for bad_key_arg, target_alg in (
+        ("   ", "HS256"),
+        (12345, "HS256"),
+        (12345, "RS256"),
+        (json.dumps(oct_jwks["keys"][0]), "RS256"),
+    ):
+        with pytest.raises(ValueError):
+            _load_public_key_or_secret(bad_key_arg, target_alg)
 
 
 def test_oidc_es256_and_issuer_and_env_configuration(monkeypatch):

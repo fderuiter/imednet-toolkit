@@ -2629,3 +2629,423 @@ async def test_dynamic_resize_across_compact_threshold_preserves_state_and_scrol
         assert "compact" in dashboard.classes
         assert dashboard.selected_study_key == "STUDY-RESIZE"
         assert dashboard.selected_site_id == "SITE-202"
+
+
+@pytest.mark.asyncio
+async def test_pilot_literal_bracketed_strings_and_error_notifications_across_all_panes() -> None:
+    """Render bracketed clinical strings literally across all 5 panes and notifications without MarkupError."""
+    from textual.widgets import Label, TabbedContent
+
+    from imednet_tui.app import JobTable, LogViewer
+
+    study_name = r"Oncology [Arm 1/2] [/] \[Cohort"
+    study_key = "ST-[1/2][/]"
+    site_name = r"Central [Unit A/B] [/] \[0]"
+    subj_status = r"Cohort [A/B] [/] \[open"
+    created_raw = r"2026-08-01 [UTC][/] \[t]"
+    good_batch = r"BATCH-[1/2][/]\[x]"
+    bad_batch = "BATCH-WARN-[/]"
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(
+        return_value=[MagicMock(study_key=study_key, study_name=study_name)]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[MagicMock(site_id=0, site_name=site_name)])
+    sdk.async_get_subjects = AsyncMock(
+        return_value=[
+            Subject(
+                subject_id=0,
+                site_id=0,
+                subject_status=subj_status,
+                date_created=created_raw,
+            )
+        ]
+    )
+
+    bogus_job = MagicMock()
+    bogus_job.batch_id = bad_batch
+    bogus_job.job_id = None
+    bogus_job.job_type = r"Export [/] [unclosed"
+    bogus_job.date_created = created_raw
+    bogus_job.state = r"BAD_WIRE_[/]_[unclosed"
+    bogus_job.is_terminal = False
+    bogus_job.is_failed = False
+
+    async def _get_job(_sk: str, bid: str) -> Any:
+        if bid == good_batch:
+            return JobStatus(
+                batch_id=good_batch,
+                state=JobState.COMPLETED,
+                progress=100,
+                total_records=5,
+                failed_records=0,
+                date_created=created_raw,
+            )
+        return bogus_job
+
+    sdk.async_get_job = AsyncMock(side_effect=_get_job)
+
+    app = ImednetTuiApp(sdk, study_key=study_key, batch_ids=[good_batch, bad_batch])
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _settle(pilot)
+        assert isinstance(app.screen, DashboardScreen)
+        dashboard = app.screen
+
+        # Pane 1: StudyList
+        study_list = dashboard.query_one(StudyList)
+        study_label = str(study_list.children[0].query_one(Label).render())
+        assert study_label == f"{study_name} ({study_key})"
+
+        # Pane 2: SiteList
+        site_list = dashboard.query_one(SiteList)
+        site_label = str(site_list.children[0].query_one(Label).render())
+        assert site_label == f"{site_name} (0)"
+
+        # Pane 3: SubjectTable
+        subject_table = dashboard.query_one(SubjectTable)
+        assert [str(c) for c in subject_table.get_row_at(0)] == [
+            "0",
+            "0",
+            subj_status,
+            created_raw,
+        ]
+
+        # Pane 4: JobMonitor summary, notice, and JobTable
+        job_monitor = dashboard.query_one(JobMonitor)
+        job_table = dashboard.query_one("#job_table", JobTable)
+        job_notice = dashboard.query_one("#job_monitor_notice", Static)
+        rendered_summary = str(job_monitor.render())
+        assert good_batch in rendered_summary
+        assert bad_batch in rendered_summary
+        assert r"BAD_WIRE_[/]_[unclosed" in rendered_summary
+        assert r"BAD_WIRE_[/]_[unclosed" in str(job_notice.render())
+        assert str(job_table.get_row_at(0)[0]) == good_batch
+
+        # Pane 5: LogViewer
+        bottom_pane = dashboard.query_one("#bottom-pane", TabbedContent)
+        bottom_pane.active = "logs-tab"
+        logging.getLogger("imednet").info(r"Audit log [/] [unclosed \[msg]")
+        await _settle(pilot)
+        log_viewer = dashboard.query_one(LogViewer)
+        assert any(r"Audit log [/] [unclosed \[msg]" in str(line) for line in log_viewer.lines)
+
+        # Error notify(markup=False) paths with malformed markup
+        err_payload = r"Failure [/] [unclosed \[detail]"
+        sdk.async_get_studies = AsyncMock(side_effect=RuntimeError(err_payload))
+        sdk.async_get_sites = AsyncMock(side_effect=RuntimeError(err_payload))
+        sdk.async_get_subjects = AsyncMock(side_effect=RuntimeError(err_payload))
+        app.action_refresh_data()
+        await _settle(pilot)
+
+
+@pytest.mark.asyncio
+async def test_pilot_site_zero_effective_status_and_none_fallbacks() -> None:
+    """Preserve site_id=0, Subject.effective_status, mock deleted=True, and clean None fallbacks."""
+    from textual.widgets import Label
+
+    from imednet.models.sites import Site
+    from imednet.models.studies import Study
+
+    study_zero = Study(study_key="ST-ZERO", study_name="Site Zero Trial")
+    study_empty = Study()
+    site_zero = Site(site_id=0, site_name="Central Coordinating")
+    site_empty = Site()
+
+    subj_deleted = Subject(
+        subject_id=101,
+        site_id=0,
+        subject_status="Enrolled",
+        deleted=True,
+        date_created="2026-08-02T00:00:00Z",
+    )
+    subj_empty = Subject()
+
+    mock_deleted = MagicMock(
+        subject_id="M-DEL",
+        site_id=0,
+        subject_status="Active",
+        deleted=True,
+        date_created="2026-08-03",
+    )
+    mock_unspec = MagicMock(
+        subject_id="M-PLAIN",
+        site_id=10,
+        subject_status="Screened",
+        date_created="2026-08-04",
+    )
+    mock_bare = MagicMock()
+
+    all_subjects: list[Any] = [subj_deleted, subj_empty, mock_deleted, mock_unspec, mock_bare]
+
+    async def _get_subjects(_sk: str, **filters: Any) -> list[Any]:
+        site_filter = filters.get("site_id")
+        if site_filter is not None:
+            return [
+                s
+                for s in all_subjects
+                if isinstance(getattr(s, "site_id", None), (int, str))
+                and str(s.site_id) == str(site_filter)
+            ]
+        return list(all_subjects)
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(return_value=[study_zero, study_empty])
+    sdk.async_get_sites = AsyncMock(return_value=[site_zero, site_empty])
+    sdk.async_get_subjects = AsyncMock(side_effect=_get_subjects)
+
+    app = ImednetTuiApp(sdk, study_key="ST-ZERO")
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _settle(pilot)
+        assert isinstance(app.screen, DashboardScreen)
+        dashboard = app.screen
+
+        study_list = dashboard.query_one(StudyList)
+        study_labels = [str(item.query_one(Label).render()) for item in study_list.children]
+        assert study_labels == ["Site Zero Trial (ST-ZERO)", "Unknown Study (no-key)"]
+
+        site_list = dashboard.query_one(SiteList)
+        site_labels = [str(item.query_one(Label).render()) for item in site_list.children]
+        assert site_labels == ["Central Coordinating (0)", "Unknown Site (no-id)"]
+
+        subject_table = dashboard.query_one(SubjectTable)
+        rows = [
+            [str(c) for c in subject_table.get_row_at(i)] for i in range(subject_table.row_count)
+        ]
+        assert rows == [
+            ["101", "0", "DELETED", "2026-08-02T00:00:00Z"],
+            ["-", "-", "-", "-"],
+            ["M-DEL", "0", "DELETED", "2026-08-03"],
+            ["M-PLAIN", "10", "Screened", "2026-08-04"],
+            ["-", "-", "-", "-"],
+        ]
+
+        # Selecting Site 0 filters subjects by site_id="0"
+        site_list.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await _settle(pilot)
+        assert dashboard.selected_site_id == "0"
+        assert sdk.async_get_subjects.await_args_list[-1].kwargs.get("site_id") == "0"
+        filtered_rows = [
+            [str(c) for c in subject_table.get_row_at(i)] for i in range(subject_table.row_count)
+        ]
+        assert filtered_rows == [
+            ["101", "0", "DELETED", "2026-08-02T00:00:00Z"],
+            ["M-DEL", "0", "DELETED", "2026-08-03"],
+        ]
+
+
+@pytest.mark.asyncio
+async def test_pilot_load_all_cancelled_and_discarded_on_study_switch() -> None:
+    """Cancel group='load-all' and discard stale to_thread/async results when switching studies."""
+    from textual.widgets import Label
+
+    load_all_entered = threading.Event()
+    release_stale_thread = threading.Event()
+
+    studies = [
+        MagicMock(study_key="ST-A", study_name="Study A"),
+        MagicMock(study_key="ST-B", study_name="Study B"),
+    ]
+
+    def _get_studies(**filters: Any) -> list[Any]:
+        limit = filters.get("limit")
+        return studies[:limit] if limit is not None else list(studies)
+
+    def _get_sites(study_key: str, **filters: Any) -> list[Any]:
+        limit = filters.get("limit")
+        if study_key == "ST-A":
+            if limit is None:
+                load_all_entered.set()
+                release_stale_thread.wait(timeout=2.0)
+                return [MagicMock(site_id=i, site_name=f"Site A-{i}") for i in range(1, 106)]
+            return [MagicMock(site_id=i, site_name=f"Site A-{i}") for i in range(1, 102)]
+        return [MagicMock(site_id=200, site_name="Site B-Only")]
+
+    def _get_subjects(study_key: str, **filters: Any) -> list[Any]:
+        limit = filters.get("limit")
+        if study_key == "ST-A":
+            if limit is None:
+                load_all_entered.set()
+                release_stale_thread.wait(timeout=2.0)
+                return [
+                    Subject(subject_id=i, site_id=1, subject_status="Active") for i in range(1, 106)
+                ]
+            return [
+                Subject(subject_id=i, site_id=1, subject_status="Active") for i in range(1, 102)
+            ]
+        return [Subject(subject_id=999, site_id=200, subject_status="Completed")]
+
+    sdk = MagicMock(spec=ImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.get_studies = MagicMock(side_effect=_get_studies)
+    sdk.get_sites = MagicMock(side_effect=_get_sites)
+    sdk.get_subjects = MagicMock(side_effect=_get_subjects)
+
+    app = ImednetTuiApp(sdk, study_key="ST-A")
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _settle(pilot)
+        assert isinstance(app.screen, DashboardScreen)
+        dashboard = app.screen
+        study_list = dashboard.query_one(StudyList)
+        site_list = dashboard.query_one(SiteList)
+        subject_table = dashboard.query_one(SubjectTable)
+
+        assert site_list.truncated is True
+        assert subject_table.truncated is True
+
+        # Start slow 'a' (load-all) on ST-A, then switch to ST-B while ST-A threads are blocked
+        await pilot.press("a")
+        for _ in range(50):
+            if load_all_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert load_all_entered.is_set()
+
+        study_list.post_message(StudyList.StudySelected("ST-B", "Study B"))
+        release_stale_thread.set()
+        await _settle(pilot)
+
+        # Also await direct stale coroutines against superseded widgets to verify request-id guards
+        stale_sites_task = asyncio.create_task(site_list.load_sites("ST-A"))
+        fresh_sites_task = asyncio.create_task(site_list.load_sites("ST-B"))
+        await asyncio.gather(stale_sites_task, fresh_sites_task)
+
+        assert dashboard.selected_study_key == "ST-B"
+        assert len(study_list.children) == 2
+        assert len(site_list.children) == 1
+        assert str(site_list.children[0].query_one(Label).render()) == "Site B-Only (200)"
+        assert subject_table.row_count == 1
+        assert [str(c) for c in subject_table.get_row_at(0)][:3] == ["999", "200", "Completed"]
+        assert site_list.loading is False
+        assert subject_table.loading is False
+
+
+@pytest.mark.asyncio
+async def test_pilot_study_option_past_100_and_absent_alignment() -> None:
+    """Align StudyList.index=None when --study is past 100 or absent, then highlight after load-all."""
+    many_studies = [
+        MagicMock(study_name=f"Trial {i}", study_key=f"ST-{i:03d}") for i in range(1, 136)
+    ]
+
+    async def _get_studies(**filters: Any) -> list[Any]:
+        limit = filters.get("limit")
+        return many_studies[:limit] if limit is not None else list(many_studies)
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(side_effect=_get_studies)
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    # Target study ST-125 is beyond the initial 100-study page
+    app = ImednetTuiApp(sdk, study_key="ST-125")
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settle(pilot)
+        assert isinstance(app.screen, DashboardScreen)
+        study_list = app.screen.query_one(StudyList)
+        assert app.screen.selected_study_key == "ST-125"
+        assert len(study_list.children) == 100
+        assert study_list.index is None
+
+        await pilot.press("a")
+        await _settle(pilot)
+        assert len(study_list.children) == 135
+        assert study_list.index == 124
+
+    # Absent study key keeps StudyList.index=None even after load-all
+    absent_app = ImednetTuiApp(sdk, study_key="ST-DOES-NOT-EXIST")
+    async with absent_app.run_test(size=(100, 30)) as pilot:
+        await _settle(pilot)
+        study_list = absent_app.screen.query_one(StudyList)
+        assert study_list.index is None
+        await pilot.press("a")
+        await _settle(pilot)
+        assert study_list.index is None
+
+
+@pytest.mark.asyncio
+async def test_pilot_escape_exits_batch_input_and_clears_site_filter_plus_reselect() -> None:
+    """Escape moves focus from #batch_id_input to #job_table, then clears site filter; reselect toggles."""
+    from textual.widgets import Input
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(
+        return_value=[MagicMock(study_key="ST-NAV", study_name="Navigation Study")]
+    )
+    sdk.async_get_sites = AsyncMock(
+        return_value=[
+            MagicMock(site_id=0, site_name="Central Site"),
+            MagicMock(site_id=101, site_name="Regional Site"),
+        ]
+    )
+    subjects = [
+        Subject(subject_id=1, site_id=0, subject_status="Enrolled"),
+        Subject(subject_id=2, site_id=101, subject_status="Screened"),
+    ]
+
+    async def _get_subjects(_sk: str, **filters: Any) -> list[Any]:
+        site_filter = filters.get("site_id")
+        if site_filter is not None:
+            return [s for s in subjects if str(s.site_id) == str(site_filter)]
+        return list(subjects)
+
+    sdk.async_get_subjects = AsyncMock(side_effect=_get_subjects)
+
+    app = ImednetTuiApp(sdk, study_key="ST-NAV")
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settle(pilot)
+        assert isinstance(app.screen, DashboardScreen)
+        dashboard = app.screen
+        site_list = dashboard.query_one(SiteList)
+        subject_table = dashboard.query_one(SubjectTable)
+        batch_input = dashboard.query_one("#batch_id_input", Input)
+        job_table = dashboard.query_one("#job_table", JobTable)
+
+        assert subject_table.row_count == 2
+
+        # Filter by Site 0
+        site_list.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await _settle(pilot)
+        assert dashboard.selected_site_id == "0"
+        assert subject_table.row_count == 1
+
+        # Focus #batch_id_input -> Escape moves focus to #job_table without clearing site filter yet
+        batch_input.focus()
+        await pilot.pause()
+        assert app.focused is batch_input
+        assert app.check_action("quit", ()) is False
+        assert app.check_action("handle_escape", ()) is True
+
+        await pilot.press("escape")
+        await _settle(pilot)
+        assert app.focused is job_table
+        assert app.check_action("quit", ()) is True
+        assert dashboard.selected_site_id == "0"
+        assert subject_table.row_count == 1
+
+        # Pressing Escape again clears selected_site_id and reloads all study subjects
+        await pilot.press("escape")
+        await _settle(pilot)
+        assert dashboard.selected_site_id is None
+        assert subject_table.row_count == 2
+
+        # Re-selecting the active site in SiteList also toggles off selected_site_id
+        site_list.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await _settle(pilot)
+        assert dashboard.selected_site_id == "0"
+        assert subject_table.row_count == 1
+
+        await pilot.press("enter")
+        await _settle(pilot)
+        assert dashboard.selected_site_id is None
+        assert subject_table.row_count == 2

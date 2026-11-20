@@ -330,3 +330,108 @@ def test_build_hierarchy_masks_phi_before_label_remapping_and_supports_opt_out(
     assert rec_unmasked["Participant Full Name"] == "Jane Doe"
     assert rec_unmasked["Government Identifier"] == "123-45-6789"
     assert rec_unmasked["Heart Rate"] == 68
+
+
+def test_build_hierarchy_includes_standalone_enrollment_f_dm_and_unscheduled_f_ae() -> None:
+    """Verify build_hierarchy parses Enrollment Form F_DM and standalone Unscheduled Form F_AE."""
+    from imednet.models.forms import Form
+    from imednet.models.intervals import FormSummary, Interval
+
+    sdk = MagicMock()
+    sdk.get_intervals.return_value = [
+        Interval(
+            interval_id=401,
+            interval_name="Visit 1",
+            interval_sequence=1,
+            interval_description="Visit 1",
+            interval_group_name="Main",
+            date_created="2025-01-01T00:00:00Z",
+            date_modified="2025-01-01T00:00:00Z",
+            forms=[FormSummary(form_id=302, form_key="F_VS", form_name="Vital Signs")],
+        )
+    ]
+    sdk.get_forms.return_value = [
+        Form(
+            form_id=301,
+            form_key="F_DM",
+            form_name="Demographics",
+            form_type="Enrollment",
+            date_created="2025-01-01T00:00:00Z",
+            date_modified="2025-01-01T00:00:00Z",
+        ),
+        Form(
+            form_id=302,
+            form_key="F_VS",
+            form_name="Vital Signs",
+            form_type="Standard",
+            date_created="2025-01-01T00:00:00Z",
+            date_modified="2025-01-01T00:00:00Z",
+        ),
+        Form(
+            form_id=303,
+            form_key="F_AE",
+            form_name="Adverse Events",
+            form_type="Standard",
+            date_created="2025-01-01T00:00:00Z",
+            date_modified="2025-01-01T00:00:00Z",
+        ),
+    ]
+    sdk.get_variables.return_value = [
+        Variable(variable_name="AGE", label="Age", variable_type="int", form_id=301),
+        Variable(variable_name="SYSBP", label="Systolic BP", variable_type="int", form_id=302),
+        Variable(variable_name="AETERM", label="AE Term", variable_type="text", form_id=303),
+    ]
+
+    records = [
+        Record(
+            record_id=601,
+            study_key="STUDY_DEMO",
+            subject_key="SUBJ-001",
+            visit_id=401,
+            form_id=301,
+            form_key="F_DM",
+            record_status="Complete",
+            date_created=datetime(2025, 1, 1),
+            record_data={"AGE": 47},
+        ),
+        Record(
+            record_id=602,
+            study_key="STUDY_DEMO",
+            subject_key="SUBJ-001",
+            visit_id=401,
+            form_id=302,
+            form_key="F_VS",
+            record_status="Complete",
+            date_created=datetime(2025, 1, 2),
+            record_data={"SYSBP": 122},
+        ),
+        Record(
+            record_id=603,
+            study_key="STUDY_DEMO",
+            subject_key="SUBJ-001",
+            visit_id=None,
+            form_id=303,
+            form_key="F_AE",
+            record_status="Complete",
+            date_created=datetime(2025, 1, 3),
+            record_data={"AETERM": "Headache"},
+        ),
+    ]
+
+    mapper = RecordMapper(sdk)
+    tree = mapper.build_hierarchy("STUDY_DEMO", records=records)
+    assert len(tree) == 1
+    subj = tree[0]
+    assert subj["subject_key"] == "SUBJ-001"
+
+    visit_forms = {f["form_id"]: f["records"] for f in subj["visits"][0]["forms"]}
+    assert set(visit_forms) == {301, 302}
+    assert visit_forms[301][0]["recordId"] == 601
+    assert visit_forms[301][0]["AGE"] == 47
+    assert visit_forms[302][0]["recordId"] == 602
+    assert visit_forms[302][0]["SYSBP"] == 122
+
+    unsched_forms = {f["form_id"]: f["records"] for f in subj["forms"]}
+    assert set(unsched_forms) == {303}
+    assert unsched_forms[303][0]["recordId"] == 603
+    assert unsched_forms[303][0]["AETERM"] == "Headache"
