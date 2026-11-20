@@ -1824,7 +1824,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 assert fc_copy_focus["outlineStyle"] == "solid"
                 assert fc_copy_focus["outlineWidth"] == "2px"
 
-                idx_page.locator("#panel-datamanager .quick-start-callout a").focus()
+                idx_page.locator("#panel-datamanager .quick-start-callout a").first.focus()
                 idx_page.keyboard.press("Shift")
                 fc_callout_focus = idx_page.evaluate(
                     """() => {
