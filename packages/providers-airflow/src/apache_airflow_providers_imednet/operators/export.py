@@ -76,6 +76,11 @@ _TABULAR_OPTION_DEFAULTS: dict[str, Any] = {
     "mask_phi": True,
     "quality_gate_enabled": False,
     "min_schema_readiness_score": 100.0,
+    "as_sdtm": False,
+    "sdtm_domain": None,
+    "standards_profile": None,
+    "min_standards_score": None,
+    "naming_convention": None,
 }
 
 
@@ -177,7 +182,7 @@ class ImednetExportOperator(BaseOperator):
         object.__setattr__(
             instance,
             "_explicit_tabular_options",
-            frozenset(key for key in _TABULAR_OPTION_DEFAULTS if key in kwargs),
+            frozenset(key for key in (*_TABULAR_OPTION_DEFAULTS, "domain") if key in kwargs),
         )
         return instance
 
@@ -197,6 +202,12 @@ class ImednetExportOperator(BaseOperator):
         mask_phi: bool = True,
         quality_gate_enabled: bool = False,
         min_schema_readiness_score: float = 100.0,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        sdtm_domain: str | None = None,
+        standards_profile: str | None = None,
+        min_standards_score: float | None = None,
+        naming_convention: str | None = None,
         modified_since: Any = None,
         record_filter: Any = None,
         record_data_filter: str | None = None,
@@ -240,6 +251,12 @@ class ImednetExportOperator(BaseOperator):
         self.mask_phi = mask_phi
         self.quality_gate_enabled = quality_gate_enabled
         self.min_schema_readiness_score = min_schema_readiness_score
+        self.domain = domain
+        self.sdtm_domain = sdtm_domain if sdtm_domain is not None else domain
+        self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
+        self.standards_profile = standards_profile
+        self.min_standards_score = min_standards_score
+        self.naming_convention = naming_convention
         self.modified_since = modified_since
         self.record_filter = record_filter
         self.record_data_filter = record_data_filter
@@ -317,11 +334,45 @@ class ImednetExportOperator(BaseOperator):
         explicit: frozenset[str] = getattr(self, "_explicit_tabular_options", frozenset())
         if not effective_mask_phi or "mask_phi" in runtime_kwargs or "mask_phi" in explicit:
             opts["mask_phi"] = effective_mask_phi
+
+        resolved_domain = (
+            runtime_kwargs.get("sdtm_domain")
+            or runtime_kwargs.get("domain")
+            or getattr(self, "sdtm_domain", None)
+            or getattr(self, "domain", None)
+        )
+        effective_as_sdtm = bool(
+            runtime_kwargs.get("as_sdtm", getattr(self, "as_sdtm", False))
+            or resolved_domain is not None
+        )
+        if effective_as_sdtm or "as_sdtm" in runtime_kwargs or "as_sdtm" in explicit:
+            opts["as_sdtm"] = effective_as_sdtm
+        if resolved_domain is not None:
+            opts["sdtm_domain"] = str(resolved_domain)
+        resolved_profile = runtime_kwargs.get(
+            "standards_profile", getattr(self, "standards_profile", None)
+        )
+        if resolved_profile is not None:
+            opts["standards_profile"] = str(resolved_profile)
+        raw_min_std = runtime_kwargs.get(
+            "min_standards_score", getattr(self, "min_standards_score", None)
+        )
+        if raw_min_std is not None:
+            opts["min_standards_score"] = float(raw_min_std)
+        resolved_convention = runtime_kwargs.get(
+            "naming_convention", getattr(self, "naming_convention", None)
+        )
+        if resolved_convention is not None:
+            opts["naming_convention"] = str(resolved_convention)
         return opts
 
     def _build_tabular_kwargs(self, runtime_kwargs: dict[str, Any]) -> dict[str, Any]:
         """Merge explicitly configured operational parameters into tabular export kwargs."""
         merged = dict(runtime_kwargs)
+        if "domain" in merged and "sdtm_domain" not in merged:
+            merged["sdtm_domain"] = merged.pop("domain")
+        else:
+            merged.pop("domain", None)
         explicit: frozenset[str] = getattr(self, "_explicit_tabular_options", frozenset())
         for key, default_val in _TABULAR_OPTION_DEFAULTS.items():
             current_val = getattr(self, key)
@@ -551,6 +602,7 @@ class ImednetExportOperator(BaseOperator):
                     stream_config,
                     stream_name=f"airflow_{dest}",
                     batch_id_prefix=f"{self.study_key}/batch/{run_token}",
+                    quality_gate_fn=sink_base.apply_quality_gate,
                     default_provider_name="airflow",
                 )
             else:

@@ -8,8 +8,12 @@ ledger management.
 from __future__ import annotations
 
 import argparse
+import builtins
+import contextlib
+import json
 import os
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,14 +24,130 @@ from imednet.spi.cli import (
     add_no_interactive,
     clear_line,
     console,
+    display_list,
+    is_json_output_mode,
     parse_filter_args,
+    print_error,
     with_sdk,
+)
+from imednet.spi.utils import (
+    mask_clinical_phi,
+    mask_custom_phi_recursive,
+    redact_sensitive_text,
+    resolve_study_configuration,
 )
 
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncWorker, SyncWorkerConfig
+
+
+def _emit_line(text: str = "", *, err: bool = False) -> None:
+    """Write a PHI/secret-redacted line safely via structured CLI output."""
+    sanitized = redact_sensitive_text(str(text))
+    if err:
+        print_error(sanitized)
+        return
+    with contextlib.suppress(BrokenPipeError, OSError):
+        builtins.print(sanitized, file=sys.stdout)
+
+
+def _to_serializable(value: Any) -> Any:
+    """Convert Pydantic models, mappings, and sequences into plain JSON-compatible objects."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_serializable(item) for item in value]
+    model_dump = getattr(type(value), "model_dump", None)
+    if callable(model_dump):
+        dumped = value.model_dump(mode="json")
+        if dumped is not value and isinstance(
+            dumped, (Mapping, list, tuple, str, int, float, bool)
+        ):
+            return _to_serializable(dumped)
+    instance_dump = getattr(value, "model_dump", None)
+    if callable(instance_dump):
+        dumped = instance_dump()
+        if dumped is not value and isinstance(
+            dumped, (Mapping, list, tuple, str, int, float, bool)
+        ):
+            return _to_serializable(dumped)
+    raw_vars = getattr(value, "__dict__", None)
+    if isinstance(raw_vars, Mapping):
+        public = {
+            str(k): _to_serializable(v)
+            for k, v in raw_vars.items()
+            if isinstance(k, str) and not k.startswith("_") and not callable(v)
+        }
+        if public:
+            return public
+    return str(value)
+
+
+def _sanitize_workflow_payload(
+    payload: Any,
+    *,
+    study_key: str | None = None,
+    mask_phi: bool = True,
+) -> Any:
+    """Serialize *payload* and apply default + study-configured PHI masking when enabled."""
+    serialized = _to_serializable(payload)
+    if not mask_phi:
+        return serialized
+    masked = mask_clinical_phi(serialized)
+    if study_key:
+        cfg = resolve_study_configuration(study_key)
+        if cfg is not None and cfg.phi_fields:
+            masked = mask_custom_phi_recursive(masked, set(cfg.phi_fields))
+    return masked
+
+
+def _format_records_table(records: list[Any]) -> str:
+    """Render a compact PHI-masked summary table for extracted records."""
+    lines = ["record_id | subject_key | form_key | record_status | record_data"]
+    lines.append("-" * len(lines[0]))
+    for item in records:
+        if isinstance(item, Mapping):
+            rec_id = item.get("record_id", item.get("recordId", ""))
+            subj_key = item.get("subject_key", item.get("subjectKey", ""))
+            form_key = item.get("form_key", item.get("formKey", ""))
+            status = item.get("record_status", item.get("recordStatus", ""))
+            rd = json.dumps(
+                item.get("record_data", item.get("recordData", {})),
+                default=str,
+                sort_keys=True,
+            )
+            lines.append(f"{rec_id} | {subj_key} | {form_key} | {status} | {rd}")
+        else:
+            lines.append(json.dumps(item, default=str))
+    return "\n".join(lines)
+
+
+def _emit_structured_payload(
+    payload: Any,
+    *,
+    study_key: str | None = None,
+    mask_phi: bool = True,
+    output_format: str = "json",
+) -> None:
+    """Format and emit a structured workflow payload with PHI masking."""
+    sanitized = _sanitize_workflow_payload(payload, study_key=study_key, mask_phi=mask_phi)
+    if output_format == "table" and isinstance(sanitized, list):
+        _emit_line(_format_records_table(sanitized))
+        return
+    if output_format == "table" and isinstance(sanitized, Mapping):
+        for key, val in sanitized.items():
+            rendered = (
+                json.dumps(val, default=str, sort_keys=True)
+                if isinstance(val, (Mapping, list))
+                else str(val)
+            )
+            _emit_line(f"{key}: {rendered}")
+        return
+    _emit_line(json.dumps(sanitized, indent=2, default=str))
 
 
 def _execute_set_state(
@@ -55,7 +175,7 @@ def _execute_set_state(
             msg = f"the following arguments are required: {', '.join(missing)}"
             if parser is not None:
                 parser.error(msg)
-            print(f"Error: {msg}", file=sys.stderr)
+            _emit_line(f"Error: {msg}", err=True)
             sys.exit(2)
 
         try:
@@ -63,7 +183,7 @@ def _execute_set_state(
             dt = datetime.fromisoformat(normalized)
             dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
         except ValueError as err:
-            print(f"Invalid ISO timestamp format: {err}")
+            _emit_line(f"Invalid ISO timestamp format: {err}")
             sys.exit(1)
 
         ledger = get_state_provider(ledger_path)
@@ -75,11 +195,11 @@ def _execute_set_state(
                 records_processed=records_processed,
                 status="success",
             )
-            print(
+            _emit_line(
                 f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
             )
         except Exception as err:
-            print(f"Failed to write ledger: {err}")
+            _emit_line(f"Failed to write ledger: {err}")
             sys.exit(1)
         return
 
@@ -154,11 +274,11 @@ def _execute_set_state(
             status="success",
             force=True,
         )
-        print(
+        _emit_line(
             f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
         )
     except Exception as err:
-        print(f"Failed to write ledger: {err}")
+        _emit_line(f"Failed to write ledger: {err}")
         sys.exit(1)
 
 
@@ -194,7 +314,7 @@ def _execute_reset_state(
         msg = "the following arguments are required: -s/--study-key"
         if parser is not None:
             parser.error(msg)
-        print(f"Error: {msg}", file=sys.stderr)
+        _emit_line(f"Error: {msg}", err=True)
         sys.exit(2)
 
     ledger = get_state_provider(ledger_path)
@@ -202,19 +322,19 @@ def _execute_reset_state(
         if stream:
             removed = ledger.delete_entry(study_key, stream)
             if removed:
-                print(f"Successfully reset stream '{stream}' for study '{study_key}'.")
+                _emit_line(f"Successfully reset stream '{stream}' for study '{study_key}'.")
             else:
-                print(f"No stream '{stream}' found for study '{study_key}'.")
+                _emit_line(f"No stream '{stream}' found for study '{study_key}'.")
                 return
         else:
             removed = ledger.delete_entry(study_key)
             if removed:
-                print(f"Successfully reset all streams for study '{study_key}'.")
+                _emit_line(f"Successfully reset all streams for study '{study_key}'.")
             else:
-                print(f"No state found for study '{study_key}'.")
+                _emit_line(f"No state found for study '{study_key}'.")
                 return
     except Exception as err:
-        print(f"Failed to reset ledger state: {err}")
+        _emit_line(f"Failed to reset ledger state: {err}")
         sys.exit(1)
 
 
@@ -248,6 +368,20 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         action="store_true",
         help="Run in interactive wizard mode with step-by-step prompts.",
     )
+    extract_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "table"),
+        default=None,
+        help="Structured output format (default: json, or table with summary header).",
+    )
+    extract_parser.add_argument(
+        "--mask-phi",
+        dest="mask_phi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mask clinical PHI fields with '***MASKED***' (default: enabled).",
+    )
     add_no_interactive(extract_parser)
 
     @with_sdk
@@ -259,6 +393,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         visit_filter: list[str] | None = None,
         interactive: bool = False,
         no_interactive: bool = False,
+        output_format: str | None = None,
+        mask_phi: bool = True,
     ) -> None:
         from imednet.spi.models import Record, Subject, Visit
 
@@ -313,11 +449,37 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 visit_filter=parsed_visit_filter,
             )
 
+        pure_json = output_format == "json" or (output_format is None and is_json_output_mode())
         if records:
-            print(f"Found {len(records)} matching records:")
-            print(records)
+            sanitized_records = _sanitize_workflow_payload(
+                records, study_key=study_key, mask_phi=mask_phi
+            )
+            if pure_json:
+                _emit_line(json.dumps(sanitized_records, indent=2, default=str))
+            elif output_format == "table" or (
+                isinstance(sanitized_records, list)
+                and sanitized_records
+                and all(isinstance(item, Mapping) for item in sanitized_records)
+            ):
+                display_list(
+                    sanitized_records,
+                    fields=[
+                        "record_id",
+                        "subject_key",
+                        "form_key",
+                        "record_status",
+                        "record_data",
+                    ],
+                    label="matching records",
+                    interactive=False,
+                )
+            else:
+                _emit_line(f"Found {len(records)} matching records:")
+                _emit_line(json.dumps(sanitized_records, indent=2, default=str))
+        elif pure_json:
+            _emit_structured_payload([], study_key=study_key, mask_phi=mask_phi)
         else:
-            print("No records found matching the criteria.")
+            _emit_line("No records found matching the criteria.")
 
     def _handle_extract_records(args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
@@ -340,6 +502,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             visit_filter=args.visit_filter,
             interactive=args.interactive,
             no_interactive=no_interactive,
+            output_format=getattr(args, "output_format", None),
+            mask_phi=getattr(args, "mask_phi", True),
         )
 
     extract_parser.set_defaults(func=_handle_extract_records)
@@ -372,10 +536,10 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         if once:
             count = worker.run_once()
-            print(f"Synced {count} cached records for study '{study_key}'.")
+            _emit_line(f"Synced {count} cached records for study '{study_key}'.")
             return
 
-        print(
+        _emit_line(
             f"Starting sync worker for study '{study_key}' "
             f"(interval={interval}s). Press Ctrl+C to stop."
         )
@@ -397,7 +561,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         except KeyboardInterrupt:
             clear_line()
             worker.stop()
-            print("Sync worker termination requested. Exiting cleanly.")
+            _emit_line("Sync worker termination requested. Exiting cleanly.")
 
     sync_parser.set_defaults(
         func=lambda args: sync_worker(
@@ -428,12 +592,12 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         try:
             state = ledger.read_state()
         except Exception as err:
-            print(f"Failed to read ledger from {ledger_path}: {err}")
+            _emit_line(f"Failed to read ledger from {ledger_path}: {err}")
             sys.exit(1)
 
         has_data = False
-        print(f"iMednet Extraction Ledger ({ledger_path})")
-        print(
+        _emit_line(f"iMednet Extraction Ledger ({ledger_path})")
+        _emit_line(
             "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
         )
         for s_key, study_state in state.studies.items():
@@ -441,12 +605,12 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 continue
             for stream_name, stream_state in study_state.streams.items():
                 has_data = True
-                print(
+                _emit_line(
                     f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
                 )
 
         if not has_data:
-            print("No ledger entries found matching filters.")
+            _emit_line("No ledger entries found matching filters.")
 
     show_parser.set_defaults(
         func=lambda args: show_state(ledger_path=args.ledger_path, study_key=args.study_key)
@@ -625,7 +789,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         else:
             print_progress("[Failed] UAT pipeline execution encountered an error.")
 
-        print(result.summary())
+        _emit_line(result.summary())
         if not is_success:
             sys.exit(1)
 
@@ -646,6 +810,215 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         )
 
     uat_run_parser.set_defaults(func=_handle_uat_run)
+
+    validate_std_parser = sub.add_parser(
+        "validate-standards",
+        help="Validate study records and schema against CDISC CDASH and SDTM readiness rules.",
+    )
+    validate_std_parser.add_argument("study_key", nargs="?", default=None, help=STUDY_KEY_ARG)
+    validate_std_parser.add_argument(
+        "-s",
+        "--study-key",
+        dest="study_key_flag",
+        default=None,
+        help=STUDY_KEY_ARG,
+    )
+    validate_std_parser.add_argument(
+        "--profile",
+        "--standards-profile",
+        dest="standards_profile",
+        choices=("general", "drug", "biologic", "vaccine", "device"),
+        default="general",
+        help="Regulatory CDISC standards profile (default: general).",
+    )
+    validate_std_parser.add_argument(
+        "--domain",
+        "--sdtm-domain",
+        dest="sdtm_domain",
+        default=None,
+        help="Optional target SDTM domain code (e.g. DM, AE, LB, VS, CM, EX, MH).",
+    )
+    validate_std_parser.add_argument(
+        "--min-score",
+        "--min-standards-score",
+        dest="min_standards_score",
+        type=float,
+        default=None,
+        help="Minimum standards readiness score (0-100) required for exit code 0.",
+    )
+    validate_std_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("table", "json"),
+        default=None,
+        help="Output format for readiness report (table or json).",
+    )
+    validate_std_parser.add_argument(
+        "--mask-phi",
+        dest="mask_phi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mask clinical PHI in reported diagnostics (default: enabled).",
+    )
+    add_no_interactive(validate_std_parser)
+
+    @with_sdk
+    def validate_standards(
+        sdk: ImednetSDK,
+        study_key: str,
+        standards_profile: str = "general",
+        sdtm_domain: str | None = None,
+        min_standards_score: float | None = None,
+        output_format: str | None = None,
+        mask_phi: bool = True,
+    ) -> None:
+        from imednet.spi.models import (
+            resolve_sdtm_domain,
+            validate_cdash_variable,
+        )
+        from imednet.spi.sink_base import evaluate_standards_readiness
+
+        if min_standards_score is not None and not 0.0 <= min_standards_score <= 100.0:
+            validate_std_parser.error("min-score must be between 0 and 100")
+
+        raw_forms = list(sdk.forms.list(study_key=study_key))
+        raw_variables = list(sdk.variables.list(study_key=study_key))
+        raw_records = [
+            rec
+            for rec in sdk.records.list(study_key=study_key)
+            if not bool(
+                rec.get("deleted") if isinstance(rec, Mapping) else getattr(rec, "deleted", False)
+            )
+        ]
+        sanitized_records = (
+            _sanitize_workflow_payload(raw_records, study_key=study_key, mask_phi=True)
+            if mask_phi
+            else raw_records
+        )
+
+        form_id_to_key: dict[Any, str] = {}
+        for f_obj in raw_forms:
+            fid = (
+                f_obj.get("form_id")
+                if isinstance(f_obj, Mapping)
+                else getattr(f_obj, "form_id", None)
+            )
+            fkey = (
+                f_obj.get("form_key")
+                if isinstance(f_obj, Mapping)
+                else getattr(f_obj, "form_key", None)
+            )
+            if fid is not None and fkey:
+                form_id_to_key[fid] = str(fkey)
+
+        cdash_warnings: list[str] = []
+        for var in raw_variables:
+            var_name = (
+                var.get("variable_name")
+                if isinstance(var, Mapping)
+                else getattr(var, "variable_name", None)
+            )
+            if not var_name:
+                continue
+            fkey = (
+                var.get("form_key") if isinstance(var, Mapping) else getattr(var, "form_key", None)
+            )
+            if not fkey:
+                fid = (
+                    var.get("form_id")
+                    if isinstance(var, Mapping)
+                    else getattr(var, "form_id", None)
+                )
+                fkey = form_id_to_key.get(fid)
+            inferred_dom = resolve_sdtm_domain(sdtm_domain or fkey, fallback="")
+            if inferred_dom:
+                valid_cdash, warning = validate_cdash_variable(str(var_name), inferred_dom)
+                if not valid_cdash and warning and warning not in cdash_warnings:
+                    cdash_warnings.append(warning)
+
+        report = evaluate_standards_readiness(
+            sanitized_records,
+            study_key=study_key,
+            standards_profile=standards_profile,
+            sdtm_domain=sdtm_domain,
+        )
+        all_warnings = list(dict.fromkeys([*report.warnings, *cdash_warnings]))
+        threshold = 100.0 if min_standards_score is None else float(min_standards_score)
+        passed = report.is_ready if min_standards_score is None else report.score >= threshold
+        serialized_violations = [
+            v.model_dump() if hasattr(v, "model_dump") else str(v) for v in report.violations
+        ]
+
+        resolved_fmt = output_format or ("json" if is_json_output_mode() else "table")
+        payload = {
+            "study_key": study_key,
+            "profile": report.profile,
+            "domain": resolve_sdtm_domain(sdtm_domain) if sdtm_domain else None,
+            "score": report.score,
+            "is_ready": report.is_ready,
+            "passed": passed,
+            "checked_records": report.checked_records,
+            "checked_fields": report.checked_fields,
+            "successfully_validated_fields": report.successfully_validated_fields,
+            "domain_scores": dict(report.domain_scores),
+            "warnings": all_warnings,
+            "violations": serialized_violations,
+        }
+        if resolved_fmt == "json":
+            _emit_structured_payload(
+                payload,
+                study_key=study_key,
+                mask_phi=mask_phi,
+                output_format="json",
+            )
+        else:
+            _emit_line(
+                f"Standards Readiness Report — Study: {study_key} (profile: {report.profile})"
+            )
+            _emit_line(
+                f"Score: {report.score:.2f}/100.00 | Ready: {report.is_ready} | "
+                f"Checked Records: {report.checked_records} | Checked Fields: {report.checked_fields}"
+            )
+            if report.domain_scores:
+                _emit_line("Domain Scores:")
+                for dom_code, dom_score in sorted(report.domain_scores.items()):
+                    _emit_line(f"  {dom_code}: {dom_score:.2f}")
+            if all_warnings:
+                _emit_line(f"Warnings ({len(all_warnings)}):")
+                for warn_msg in all_warnings:
+                    _emit_line(f"  - {warn_msg}")
+            if report.violations:
+                _emit_line(f"Violations ({len(report.violations)}):")
+                for violation in report.violations:
+                    v_msg = (
+                        f"[{violation.severity}] {violation.field}: {violation.message}"
+                        if hasattr(violation, "message")
+                        else str(violation)
+                    )
+                    _emit_line(f"  - {v_msg}")
+
+        if min_standards_score is not None and report.score < min_standards_score:
+            sys.exit(1)
+
+    def _handle_validate_standards(args: argparse.Namespace) -> None:
+        resolved_study = args.study_key_flag or args.study_key
+        if not resolved_study or not str(resolved_study).strip():
+            validate_std_parser.error("the following arguments are required: study_key")
+        if args.study_key_flag and args.study_key and args.study_key_flag != args.study_key:
+            validate_std_parser.error(
+                f"conflicting values provided for study_key: "
+                f"'{args.study_key_flag}' (flag) and '{args.study_key}' (positional)"
+            )
+        validate_standards(
+            study_key=str(resolved_study).strip(),
+            standards_profile=args.standards_profile,
+            sdtm_domain=args.sdtm_domain,
+            min_standards_score=args.min_standards_score,
+            output_format=args.output_format,
+            mask_phi=args.mask_phi,
+        )
+
+    validate_std_parser.set_defaults(func=_handle_validate_standards)
 
 
 class _UniqueStoreAction(argparse.Action):
@@ -700,13 +1073,38 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     subj_parser.add_argument(
         "subject_key", nargs="?", default=None, help="The key identifying the subject."
     )
+    subj_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "table"),
+        default="json",
+        help="Structured output format (default: json).",
+    )
+    subj_parser.add_argument(
+        "--mask-phi",
+        dest="mask_phi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mask clinical PHI fields with '***MASKED***' (default: enabled).",
+    )
     add_no_interactive(subj_parser)
 
     @with_sdk
-    def subject_data(sdk: ImednetSDK, study_key: str, subject_key: str) -> None:
+    def subject_data(
+        sdk: ImednetSDK,
+        study_key: str,
+        subject_key: str,
+        output_format: str = "json",
+        mask_phi: bool = True,
+    ) -> None:
         workflow = SubjectDataWorkflow(sdk)  # type: ignore[arg-type]
         data = workflow.get_all_subject_data(study_key, subject_key)
-        print(data.model_dump())
+        _emit_structured_payload(
+            data,
+            study_key=study_key,
+            mask_phi=mask_phi,
+            output_format=output_format,
+        )
 
     def handle_subject_data(args: argparse.Namespace) -> None:
         flag_study: str | None = args.study_key_flag
@@ -776,7 +1174,12 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         assert study_key is not None
         assert subject_key is not None
-        subject_data(study_key=study_key, subject_key=subject_key)
+        subject_data(
+            study_key=study_key,
+            subject_key=subject_key,
+            output_format=getattr(args, "output_format", "json"),
+            mask_phi=getattr(args, "mask_phi", True),
+        )
 
     subj_parser.set_defaults(func=handle_subject_data)
 
@@ -803,11 +1206,11 @@ def state_app(args: list[str] | None = None) -> None:
         try:
             state = ledger.read_state()
         except Exception as err:
-            print(f"Failed to read ledger from {ledger_path}: {err}")
+            _emit_line(f"Failed to read ledger from {ledger_path}: {err}")
             sys.exit(1)
         has_data = False
-        print(f"iMednet Extraction Ledger ({ledger_path})")
-        print(
+        _emit_line(f"iMednet Extraction Ledger ({ledger_path})")
+        _emit_line(
             "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
         )
         for s_key, study_state in state.studies.items():
@@ -815,11 +1218,11 @@ def state_app(args: list[str] | None = None) -> None:
                 continue
             for stream_name, stream_state in study_state.streams.items():
                 has_data = True
-                print(
+                _emit_line(
                     f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
                 )
         if not has_data:
-            print("No ledger entries found matching filters.")
+            _emit_line("No ledger entries found matching filters.")
 
     show_parser.set_defaults(
         func=lambda args: show_state(ledger_path=args.ledger_path, study_key=args.study_key)

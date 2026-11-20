@@ -94,7 +94,17 @@ from unittest.mock import NonCallableMock
 from tenacity import wait_exponential
 
 from imednet.core.operations.executor import OperationRetryPolicy
-from imednet.errors import ExportConfigurationError
+from imednet.errors import ExportConfigurationError, ExportError
+from imednet.models.standards import (
+    SDTM_DOMAIN_SPECS,
+    StandardsProfile,
+    StandardsReadinessReport,
+    StandardsReadinessValidator,
+    normalize_naming_convention,
+    resolve_sdtm_domain,
+    resolve_standards_profile,
+    validate_cdash_variable,
+)
 from imednet.utils.dates import (
     format_iso_datetime,
     normalize_utc_timestamp_bound,
@@ -262,6 +272,19 @@ class SinkConfig:
         Optional file path for file-backed checkpoint state providers.
     state_provider:
         Optional pre-configured checkpoint state provider instance.
+    as_sdtm:
+        When ``True``, transforms exported records into CDISC SDTM domain rows.
+    sdtm_domain:
+        Optional target 2-character CDISC SDTM domain code (e.g. ``"AE"``, ``"VS"``).
+    standards_profile:
+        Optional standards validation profile name (e.g. ``"drug"``,
+        ``"medical_device"``) or :class:`~imednet.models.standards.StandardsProfile`.
+    min_standards_score:
+        Optional minimum CDISC standards readiness score ``[0.0, 100.0]`` required
+        for exports to proceed.
+    naming_convention:
+        Optional raw variable/metadata naming convention (``"snake_case"``,
+        ``"camelCase"``, or ``"sdtm"``).
     """
 
     study_key: str
@@ -282,6 +305,11 @@ class SinkConfig:
     stream_name: str | None = None
     ledger_path: str | Path | None = None
     state_provider: Any | None = field(default=None, repr=False)
+    as_sdtm: bool = False
+    sdtm_domain: str | None = None
+    standards_profile: str | Any | None = None
+    min_standards_score: float | None = None
+    naming_convention: str | None = None
 
     def __post_init__(self) -> None:
         """Validate config properties after initialization."""
@@ -302,6 +330,35 @@ class SinkConfig:
             raise ValueError("retry_backoff must be a finite non-negative number")
         if not isinstance(self.mask_phi, bool):
             raise ValueError("mask_phi must be a boolean")
+        if not isinstance(self.as_sdtm, bool):
+            raise ValueError("as_sdtm must be a boolean")
+        if self.sdtm_domain is not None:
+            if not isinstance(self.sdtm_domain, str) or not self.sdtm_domain.strip():
+                raise ValueError("sdtm_domain must be a non-empty string when provided")
+            self.sdtm_domain = resolve_sdtm_domain(self.sdtm_domain)
+            self.as_sdtm = True
+        if self.standards_profile is not None:
+            try:
+                resolved_prof = resolve_standards_profile(self.standards_profile)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unknown standards_profile '{self.standards_profile}'. "
+                    "Expected 'general', 'drug', 'device', or a StandardsProfile instance."
+                ) from exc
+            if isinstance(self.standards_profile, str):
+                self.standards_profile = resolved_prof.profile_name
+        if self.min_standards_score is not None:
+            if (
+                isinstance(self.min_standards_score, bool)
+                or not isinstance(self.min_standards_score, (int, float))
+                or not math.isfinite(self.min_standards_score)
+                or self.min_standards_score < 0.0
+                or self.min_standards_score > 100.0
+            ):
+                raise ValueError("min_standards_score must be a finite number between 0 and 100")
+            self.min_standards_score = float(self.min_standards_score)
+        if self.naming_convention is not None:
+            self.naming_convention = normalize_naming_convention(self.naming_convention)
         if self.modified_since is not None:
             normalize_watermark_datetime(self.modified_since)
         if self.record_data_filter is not None:
@@ -662,12 +719,224 @@ def _require_optional_dep(package: str, extras_key: str) -> Any:
         raise
 
 
+_STANDARDS_ENVELOPE_KEYS: frozenset[str] = frozenset(
+    {
+        "record_id",
+        "recordId",
+        "form_id",
+        "formId",
+        "form_key",
+        "formKey",
+        "study_key",
+        "studyKey",
+        "visit_id",
+        "visitId",
+        "site_id",
+        "siteId",
+        "deleted",
+        "date_modified",
+        "dateModified",
+        "date_created",
+        "dateCreated",
+    }
+)
+
+
+def _extract_record_for_standards(
+    record: Any,
+    *,
+    configured_domain: str | None = None,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Return ``(domain, raw_data, canonical_data)`` without mutating ``record``."""
+    raw_domain: str | None = None
+    subject_val: Any = None
+    raw_data: dict[str, Any] = {}
+
+    if hasattr(record, "record_data") and getattr(record, "record_data", None) is not None:
+        rd = getattr(record, "record_data", None)
+        raw_data = dict(rd) if isinstance(rd, Mapping) else {}
+        raw_domain = getattr(record, "form_key", None)
+        subject_val = getattr(record, "subject_key", None)
+    elif isinstance(record, Mapping):
+        raw_domain = (
+            record.get("DOMAIN")
+            or record.get("domain")
+            or record.get("formKey")
+            or record.get("form_key")
+        )
+        subject_val = record.get("subjectKey") or record.get("subject_key") or record.get("USUBJID")
+        nested = record.get("record_data")
+        if nested is None:
+            nested = record.get("recordData")
+        if nested is None:
+            nested = record.get("data")
+        if isinstance(nested, Mapping):
+            raw_data = dict(nested)
+        else:
+            raw_data = {
+                str(k): v for k, v in record.items() if str(k) not in _STANDARDS_ENVELOPE_KEYS
+            }
+    elif hasattr(record, "model_dump"):
+        dumped = record.model_dump(by_alias=True)
+        if isinstance(dumped, Mapping):
+            raw_domain = (
+                dumped.get("DOMAIN")
+                or dumped.get("domain")
+                or dumped.get("formKey")
+                or dumped.get("form_key")
+            )
+            subject_val = (
+                dumped.get("subjectKey")
+                or dumped.get("subject_key")
+                or dumped.get("USUBJID")
+                or getattr(record, "subject_key", None)
+            )
+            nested = dumped.get("record_data") or dumped.get("recordData") or dumped.get("data")
+            if isinstance(nested, Mapping):
+                raw_data = dict(nested)
+            else:
+                raw_data = {
+                    str(k): v for k, v in dumped.items() if str(k) not in _STANDARDS_ENVELOPE_KEYS
+                }
+    elif hasattr(record, "__dict__"):
+        raw_domain = getattr(record, "form_key", None) or getattr(record, "domain", None)
+        subject_val = getattr(record, "subject_key", None) or getattr(record, "subjectKey", None)
+        rd = (
+            getattr(record, "record_data", None)
+            or getattr(record, "recordData", None)
+            or getattr(record, "data", None)
+        )
+        raw_data = dict(rd) if isinstance(rd, Mapping) else {}
+
+    domain = resolve_sdtm_domain(configured_domain or raw_domain, fallback="AE")
+    canonical: dict[str, Any] = dict(raw_data)
+
+    resolved_subject = (
+        canonical.get("subjectKey")
+        or canonical.get("subject_key")
+        or canonical.get("USUBJID")
+        or subject_val
+    )
+    if resolved_subject is not None:
+        canonical.setdefault("subjectKey", resolved_subject)
+
+    spec = SDTM_DOMAIN_SPECS.get(domain)
+    if spec is not None:
+        lower_raw = {str(k).lower(): v for k, v in raw_data.items()}
+        for sdtm_var, aliases in spec["aliases"].items():
+            if not aliases:
+                continue
+            primary_key = aliases[0]
+            found_val: Any = None
+            has_val = False
+            if primary_key in canonical and canonical[primary_key] is not None:
+                found_val = canonical[primary_key]
+                has_val = True
+            else:
+                for cand in [sdtm_var, *aliases]:
+                    if cand in raw_data:
+                        found_val = raw_data[cand]
+                        has_val = True
+                        break
+                    if cand.lower() in lower_raw:
+                        found_val = lower_raw[cand.lower()]
+                        has_val = True
+                        break
+            if has_val:
+                canonical.setdefault(primary_key, found_val)
+                if domain == "DM" and sdtm_var == "BRTHDTC":
+                    canonical.setdefault("birthDate", found_val)
+                elif domain == "DM" and sdtm_var == "ETHNIC":
+                    canonical.setdefault("ethnicity", found_val)
+
+    return domain, raw_data, canonical
+
+
+def evaluate_standards_readiness(
+    records: Iterable[Any],
+    *,
+    study_key: str,
+    config: SinkConfig | None = None,
+    standards_profile: str | StandardsProfile | None = None,
+    sdtm_domain: str | None = None,
+    terminology_lookups: dict[str, dict[str, str]] | None = None,
+) -> StandardsReadinessReport:
+    """Validate and score records against CDASH naming rules and a StandardsProfile."""
+    _ = study_key
+    raw_prof = (
+        standards_profile
+        if standards_profile is not None
+        else (getattr(config, "standards_profile", None) if config is not None else None)
+    )
+    cfg_domain = (
+        sdtm_domain
+        if sdtm_domain is not None
+        else (getattr(config, "sdtm_domain", None) if config is not None else None)
+    )
+    extra = getattr(config, "extra", None) if config is not None else None
+    lookups = terminology_lookups
+    if lookups is None and isinstance(extra, Mapping):
+        maybe_lookups = extra.get("terminology_lookups")
+        if isinstance(maybe_lookups, dict):
+            lookups = maybe_lookups
+
+    profile = resolve_standards_profile(raw_prof)
+    validator = StandardsReadinessValidator(profile=profile)
+
+    records_by_domain: dict[str, list[dict[str, Any]]] = {}
+    cdash_warnings: list[str] = []
+    seen_cdash: set[tuple[str, str]] = set()
+
+    for rec in records:
+        domain, raw_data, canonical = _extract_record_for_standards(
+            rec,
+            configured_domain=cfg_domain,
+        )
+        records_by_domain.setdefault(domain, []).append(canonical)
+        for field_key in raw_data:
+            pair = (domain, str(field_key))
+            if pair in seen_cdash:
+                continue
+            seen_cdash.add(pair)
+            valid_cdash, cdash_msg = validate_cdash_variable(str(field_key), domain)
+            if not valid_cdash and cdash_msg:
+                cdash_warnings.append(cdash_msg)
+
+    report = validator.score_records(
+        records_by_domain=records_by_domain,
+        terminology_lookups=lookups,
+    )
+    if cdash_warnings:
+        report.warnings = [*report.warnings, *cdash_warnings]
+    return report
+
+
 def apply_quality_gate(
     sdk: Any, study_key: str, records: Iterable[Any], config: SinkConfig
 ) -> Iterator[Any]:
-    """Filter records based on minimum schema readiness score if enabled."""
-    if not config.quality_gate_enabled:
+    """Filter records based on schema readiness and optional CDASH/SDTM readiness rules."""
+    cfg_profile = getattr(config, "standards_profile", None)
+    cfg_min_std = getattr(config, "min_standards_score", None)
+    cfg_domain = getattr(config, "sdtm_domain", None)
+
+    if not config.quality_gate_enabled and cfg_profile is None:
         yield from records
+        return
+
+    if not config.quality_gate_enabled:
+        seen_cdash: set[tuple[str, str]] = set()
+        for record in records:
+            domain, raw_data, _ = _extract_record_for_standards(
+                record, configured_domain=cfg_domain
+            )
+            for field_key in raw_data:
+                pair = (domain, str(field_key))
+                if pair not in seen_cdash:
+                    seen_cdash.add(pair)
+                    valid_cdash, cdash_msg = validate_cdash_variable(str(field_key), domain)
+                    if not valid_cdash and cdash_msg:
+                        logger.warning("CDASH naming warning (%s): %s", domain, cdash_msg)
+            yield record
         return
 
     from imednet.core.context import reset_study_context, set_study_context
@@ -675,6 +944,12 @@ def apply_quality_gate(
 
     validator = SchemaValidator(sdk)
     validator.refresh(study_key)
+    std_validator = (
+        StandardsReadinessValidator(resolve_standards_profile(cfg_profile))
+        if cfg_profile is not None
+        else None
+    )
+    seen_gate_cdash: set[tuple[str, str]] = set()
 
     dropped_count = 0
 
@@ -728,6 +1003,35 @@ def apply_quality_gate(
             )
             dropped_count += 1
             continue
+
+        if isinstance(data, Mapping):
+            domain_for_cdash = resolve_sdtm_domain(cfg_domain or str(fk), fallback="AE")
+            for field_key in data:
+                pair = (domain_for_cdash, str(field_key))
+                if pair not in seen_gate_cdash:
+                    seen_gate_cdash.add(pair)
+                    valid_cdash, cdash_msg = validate_cdash_variable(
+                        str(field_key), domain_for_cdash
+                    )
+                    if not valid_cdash and cdash_msg:
+                        logger.warning("CDASH naming warning (%s): %s", domain_for_cdash, cdash_msg)
+
+        if std_validator is not None and cfg_min_std is None:
+            dom, _, canonical = _extract_record_for_standards(
+                record, configured_domain=cfg_domain or str(fk)
+            )
+            rec_report = std_validator.score_records(records_by_domain={dom: [canonical]})
+            if rec_report.score < config.min_schema_readiness_score:
+                std_reasons = [v.message for v in rec_report.violations]
+                logger.info(
+                    "Dropped record %s (Standards Score: %.1f < %.1f). Reasons: %s",
+                    rec_dict.get("record_id", "Unknown"),
+                    rec_report.score,
+                    config.min_schema_readiness_score,
+                    "; ".join(std_reasons),
+                )
+                dropped_count += 1
+                continue
 
         yield record
 
@@ -1269,6 +1573,48 @@ def _extract_safe_config_options(config: Any) -> dict[str, Any]:
         )
     )
 
+    raw_as_sdtm = config.as_sdtm if is_real_cfg else getattr(config, "as_sdtm", False)
+    as_sdtm = raw_as_sdtm if isinstance(raw_as_sdtm, bool) else False
+
+    raw_sdtm_domain = config.sdtm_domain if is_real_cfg else getattr(config, "sdtm_domain", None)
+    sdtm_domain = (
+        resolve_sdtm_domain(raw_sdtm_domain)
+        if isinstance(raw_sdtm_domain, str) and raw_sdtm_domain.strip()
+        else None
+    )
+    if sdtm_domain is not None:
+        as_sdtm = True
+
+    raw_std_profile = (
+        config.standards_profile if is_real_cfg else getattr(config, "standards_profile", None)
+    )
+    standards_profile = (
+        raw_std_profile
+        if isinstance(raw_std_profile, StandardsProfile)
+        or (isinstance(raw_std_profile, str) and raw_std_profile.strip())
+        else None
+    )
+
+    raw_min_std = (
+        config.min_standards_score if is_real_cfg else getattr(config, "min_standards_score", None)
+    )
+    min_standards_score = (
+        float(raw_min_std)
+        if isinstance(raw_min_std, (int, float))
+        and not isinstance(raw_min_std, bool)
+        and math.isfinite(raw_min_std)
+        else None
+    )
+
+    raw_naming = (
+        config.naming_convention if is_real_cfg else getattr(config, "naming_convention", None)
+    )
+    naming_convention = (
+        normalize_naming_convention(raw_naming)
+        if isinstance(raw_naming, str) and raw_naming.strip()
+        else None
+    )
+
     return {
         "incremental": incremental,
         "include_deleted": include_deleted,
@@ -1280,6 +1626,11 @@ def _extract_safe_config_options(config: Any) -> dict[str, Any]:
         "stream_name": cfg_stream_name,
         "ledger_path": ledger_path,
         "state_provider": explicit_provider,
+        "as_sdtm": as_sdtm,
+        "sdtm_domain": sdtm_domain,
+        "standards_profile": standards_profile,
+        "min_standards_score": min_standards_score,
+        "naming_convention": naming_convention,
     }
 
 
@@ -1388,8 +1739,42 @@ def run_streaming_export(
                 yield rec
 
         filtered_records = gate_fn(sdk, study_key, _observe_and_route(), config)
+        check_standards = (
+            opts["standards_profile"] is not None or opts["min_standards_score"] is not None
+        )
         for index, batch in enumerate(batches_fn(filtered_records, opts["batch_size"])):
-            total_written += sink_obj.write_batch(batch, batch_id=f"{prefix}/{index}")
+            batch_id = f"{prefix}/{index}"
+            if check_standards and batch:
+                report = evaluate_standards_readiness(
+                    batch,
+                    study_key=study_key,
+                    config=config,
+                    standards_profile=opts["standards_profile"],
+                    sdtm_domain=opts["sdtm_domain"],
+                )
+                profile_obj = resolve_standards_profile(opts["standards_profile"])
+                for warning_msg in report.warnings:
+                    logger.warning(
+                        "Standards readiness warning in batch %s: %s",
+                        batch_id,
+                        mask_clinical_phi(warning_msg) if config.mask_phi else warning_msg,
+                    )
+                if (
+                    opts["min_standards_score"] is not None
+                    and report.score < opts["min_standards_score"]
+                ):
+                    error_fields = sorted(
+                        {v.field for v in report.violations if v.severity.upper() == "ERROR"}
+                    )
+                    detail = (
+                        f" (violating fields: {', '.join(error_fields)})" if error_fields else ""
+                    )
+                    raise ExportError(
+                        f"Standards readiness check failed for batch '{batch_id}' "
+                        f"(profile='{profile_obj.profile_name}', score={report.score:.1f} < "
+                        f"min_standards_score={opts['min_standards_score']:.1f}){detail}"
+                    )
+            total_written += sink_obj.write_batch(batch, batch_id=batch_id)
 
         if pending_voided:
             total_reconciled += sink_obj.reconcile_deleted(

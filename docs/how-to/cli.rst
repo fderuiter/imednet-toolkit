@@ -148,21 +148,30 @@ larger batches. Non-interactive runs (``--no-interactive``,
 file exports (``--output json|csv``) continue to fetch all matching pages unless
 ``--limit`` is explicitly specified.
 
-Export PHI masking and quality-gate controls
---------------------------------------------
+Export PHI masking, SDTM, and quality-gate controls
+---------------------------------------------------
 
 Every ``imednet export`` subcommand (``csv``, ``parquet``, ``excel``, ``json``,
 ``duckdb``, ``sql``, ``mongodb``, ``neo4j``, and ``snowflake``) masks sensitive
 ``Subject`` identifiers and committed ``StudyConfiguration`` ``phiFields`` to
-``***MASKED***`` by default (``--mask-phi``), even when ``--use-labels`` or
-``--hierarchical`` is active. Authorized compliance workflows operating inside
-a restricted enclave can opt out explicitly with ``--no-mask-phi``, and any
-export can enforce pre-write ``Record`` schema readiness filtering with
-``--quality-gate`` and ``--min-readiness-score``:
+``***MASKED***`` by default (``--mask-phi``) before building ``USUBJID`` or
+domain outputs, even when ``--use-labels`` or ``--hierarchical`` is active.
+Authorized compliance workflows operating inside a restricted enclave can opt
+out explicitly with ``--no-mask-phi``.
+
+Exports also support native CDISC SDTM transformation (``--as-sdtm`` and
+``--sdtm-domain``), batch-level CDISC standards readiness gating via
+``StandardsReadinessValidator`` (``--standards-profile`` and
+``--min-standards-score``), raw variable casing alignment
+(``--naming-convention snake_case|camelCase|sdtm``), and pre-write ``Record``
+schema readiness filtering (``--quality-gate`` and ``--min-readiness-score``):
 
 .. code-block:: bash
 
+   imednet export csv STUDY ./ae_sdtm.csv --sdtm-domain AE --standards-profile drug \
+       --min-standards-score 85
+   imednet export parquet STUDY ./aligned_study.parquet --naming-convention snake_case
    imednet export json STUDY ./study_tree.json --hierarchical --use-labels
    imednet export neo4j STUDY bolt://localhost:7687 neo4j "$NEO4J_PASSWORD" \
-       --quality-gate --min-readiness-score 90
+       --quality-gate --min-readiness-score 90 --standards-profile general
    imednet export parquet STUDY /secure/enclave/raw_study.parquet --no-mask-phi

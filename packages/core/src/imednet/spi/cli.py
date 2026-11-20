@@ -13,6 +13,7 @@ from imednet.cli.utils import (
     add_no_interactive,
     clear_line,
     console,
+    display_list,
     fetching_status,
     format_job_progress,
     is_dumb_terminal,
@@ -28,6 +29,7 @@ from imednet.cli.utils import (
     supports_interactive_stdin,
     supports_live_status,
 )
+from imednet.cli.utils.output import emit_json
 
 if TYPE_CHECKING:
     from imednet.cli.utils import is_interactive_terminal
@@ -42,6 +44,8 @@ __all__ = [
     "add_no_interactive",
     "clear_line",
     "console",
+    "display_list",
+    "emit_json",
     "fetching_status",
     "format_job_progress",
     "is_dumb_terminal",

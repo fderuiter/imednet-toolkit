@@ -1552,3 +1552,202 @@ def test_custom_global_sensitivity_registry_key_redacts_across_all_outputs(tmp_p
     finally:
         global_sensitivity_registry._sensitive_keys.clear()
         global_sensitivity_registry._sensitive_keys.update(snapshot)
+
+
+def test_export_to_csv_and_tabular_sinks_as_sdtm_domain_ae_without_batch_error(
+    tmp_path: Path,
+) -> None:
+    """export_to_csv(sdk, study_key, path, as_sdtm=True, domain='AE') succeeds without ExportBatchError and masks PHI."""
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [Form(form_id=10, form_key="AE", form_name="Adverse Events")]
+    sdk.variables.list.return_value = [
+        Variable(variable_id=1, form_id=10, form_key="AE", variable_name="aeTerm", label="AE Term"),
+        Variable(
+            variable_id=2,
+            form_id=10,
+            form_key="AE",
+            variable_name="aeStartDate",
+            label="Start Date",
+        ),
+        Variable(
+            variable_id=3,
+            form_id=10,
+            form_key="AE",
+            variable_name="aeSerious",
+            label="Serious",
+        ),
+        Variable(
+            variable_id=4,
+            form_id=10,
+            form_key="AE",
+            variable_name="patientName",
+            label="Patient Name",
+        ),
+    ]
+    ae_records = [
+        Record(
+            record_id=101,
+            study_key="TRIAL_AE",
+            form_id=10,
+            form_key="AE",
+            subject_key="SUBJ-01",
+            record_data={
+                "aeTerm": "Headache",
+                "aeDecod": "HEADACHE",
+                "aeStartDate": "2026-03-01 09:15:00",
+                "aeSerious": True,
+                "aeSeverity": "1",
+                "aeRelationship": "POSSIBLE",
+                "aeActionTaken": "NONE",
+                "aeOutcome": "RECOVERED",
+                "patientName": "John Secret",
+            },
+        ),
+        Record(
+            record_id=102,
+            study_key="TRIAL_AE",
+            form_id=10,
+            form_key="AE",
+            subject_key="SUBJ-01",
+            record_data={
+                "ae_term": "Dizziness",
+                "AEDECOD": "DIZZINESS",
+                "ae_start_date": "2026-03-02",
+                "ae_serious": "no",
+                "ae_severity": "2",
+                "ae_relationship": "PROBABLE",
+                "ae_action_taken": "NONE",
+                "ae_outcome": "RECOVERED",
+                "patientName": "John Secret",
+            },
+        ),
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(ae_records)
+    sdk.visits.list.return_value = []
+
+    csv_path = tmp_path / "ae_sdtm.csv"
+    export_mod.export_to_csv(
+        sdk,
+        "TRIAL_AE",
+        str(csv_path),
+        as_sdtm=True,
+        domain="AE",
+        batch_size=1,
+    )
+    df = pd.read_csv(csv_path)
+    assert list(df["STUDYID"]) == ["TRIAL_AE", "TRIAL_AE"]
+    assert list(df["DOMAIN"]) == ["AE", "AE"]
+    assert list(df["USUBJID"]) == ["SUBJ-01", "SUBJ-01"]
+    assert list(df["AESEQ"]) == [1, 2]
+    assert list(df["AETERM"]) == ["Headache", "Dizziness"]
+    assert list(df["AESTDTC"]) == ["2026-03-01T09:15:00", "2026-03-02"]
+    assert list(df["AESER"]) == ["Y", "N"]
+    assert list(df["patientName"]) == ["***MASKED***", "***MASKED***"]
+
+    # Parquet and JSON SDTM exports also succeed with identical domain semantics
+    pq_path = tmp_path / "ae_sdtm.parquet"
+    export_mod.export_to_parquet(
+        sdk,
+        "TRIAL_AE",
+        str(pq_path),
+        as_sdtm=True,
+        sdtm_domain="AE",
+        standards_profile="drug",
+        min_standards_score=95.0,
+    )
+    pq_df = pd.read_parquet(pq_path)
+    assert list(pq_df["AESEQ"]) == [1, 2]
+
+    import json
+
+    json_path = tmp_path / "ae_sdtm.json"
+    export_mod.export_to_json(sdk, "TRIAL_AE", str(json_path), as_sdtm=True, domain="AE")
+    json_rows = json.loads(json_path.read_text(encoding="utf-8"))
+    assert [r["AESEQ"] for r in json_rows] == [1, 2]
+
+
+def test_standards_profile_and_min_standards_score_gate_non_conforming_export(
+    tmp_path: Path,
+) -> None:
+    """standards_profile='drug' with min_standards_score gates non-conforming exports before writing."""
+    from imednet.errors import ExportError
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [Form(form_id=10, form_key="AE", form_name="Adverse Events")]
+    sdk.variables.list.return_value = []
+    # Missing aeDecod and aeRelationship, invalid non-CTCAE severity -> fails DrugSafetyProfile
+    bad_records = [
+        Record(
+            record_id=1,
+            study_key="BAD_DRUG_STUDY",
+            form_id=10,
+            form_key="AE",
+            subject_key="S01",
+            record_data={"aeTerm": "Rash", "aeSeverity": "SEVERE"},
+        )
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(bad_records)
+
+    out_csv = tmp_path / "gated_ae.csv"
+    with pytest.raises(ExportError, match="Standards readiness check failed"):
+        export_mod.export_to_csv(
+            sdk,
+            "BAD_DRUG_STUDY",
+            str(out_csv),
+            as_sdtm=True,
+            domain="AE",
+            standards_profile="drug",
+            min_standards_score=90.0,
+        )
+    assert not out_csv.exists()
+
+
+@pytest.mark.parametrize(
+    ("convention", "expected_cols"),
+    [
+        ("snake_case", {"study_key", "record_id", "subject_key", "ae_term", "sys_bp"}),
+        ("camelCase", {"studyKey", "recordId", "subjectKey", "aeTerm", "sysBp"}),
+        ("sdtm", {"STUDYID", "RECORD_ID", "USUBJID", "AETERM", "SYSBP"}),
+    ],
+)
+def test_export_to_parquet_naming_conventions(
+    tmp_path: Path, convention: str, expected_cols: set[str]
+) -> None:
+    """export_to_parquet honors naming_convention across snake_case, camelCase, and sdtm."""
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [Form(form_id=1, form_key="VITALS", form_name="Vitals")]
+    sdk.variables.list.return_value = [
+        Variable(variable_id=1, form_id=1, form_key="VITALS", variable_name="aeTerm"),
+        Variable(variable_id=2, form_id=1, form_key="VITALS", variable_name="sys_bp"),
+    ]
+    recs = [
+        Record(
+            record_id=7,
+            study_key="CONV_STUDY",
+            form_id=1,
+            form_key="VITALS",
+            subject_key="S7",
+            record_data={"aeTerm": "Mild", "sys_bp": 118},
+        )
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(recs)
+
+    pq_file = tmp_path / f"out_{convention}.parquet"
+    export_mod.export_to_parquet(
+        sdk,
+        "CONV_STUDY",
+        str(pq_file),
+        naming_convention=convention,
+    )
+    result_df = pd.read_parquet(pq_file)
+    assert expected_cols.issubset(set(result_df.columns))

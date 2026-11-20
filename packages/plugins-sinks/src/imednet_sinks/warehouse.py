@@ -97,6 +97,7 @@ from imednet.spi.sinks import (
     apply_quality_gate,
     build_sink_mapper,
     extract_record_id,
+    format_variable_name,
     run_streaming_export,
 )
 from imednet.spi.utils import flatten, global_sensitivity_registry, mask_clinical_phi
@@ -334,6 +335,41 @@ def _normalize_variable_column(raw_key: str, metadata_keys: frozenset[str]) -> s
     return col
 
 
+@functools.lru_cache(maxsize=2048)
+def _normalize_variable_column_for_convention(
+    raw_key: str,
+    metadata_keys: frozenset[str],
+    naming_convention: str | None = None,
+) -> str:
+    """Normalize a flattened variable key according to *naming_convention*."""
+    if naming_convention in (None, "snake_case"):
+        return _normalize_variable_column(raw_key, metadata_keys)
+    parsed = _validate_variable_key_segments(raw_key)
+    parts: list[str] = []
+    for idx, (base, indices) in enumerate(parsed):
+        conv_base = format_variable_name(base, naming_convention)
+        if naming_convention == "camelCase" and idx > 0 and conv_base:
+            conv_base = conv_base[0].upper() + conv_base[1:]
+        if indices:
+            idx_suffix = indices.replace("[", "_").replace("]", "")
+            parts.append(f"{conv_base}{idx_suffix}")
+        else:
+            parts.append(conv_base)
+    if naming_convention == "camelCase":
+        col = "".join(parts)
+        if col in metadata_keys:
+            col = f"var{col[0].upper()}{col[1:]}" if col else "var"
+    else:
+        col = "_".join(parts)
+        if col in metadata_keys:
+            col = f"VAR_{col}"
+    if not _IDENTIFIER_PATTERN.match(col):
+        raise ExportConfigurationError(
+            f"Warehouse column name contains invalid characters: {raw_key!r}"
+        )
+    return col
+
+
 def _omit_empty_structs(row: dict[str, Any]) -> dict[str, Any]:
     """Omit empty nested dictionaries so PyArrow never infers zero-field struct columns."""
     if not any(isinstance(v, dict) for v in row.values()):
@@ -358,21 +394,29 @@ def _post_process_warehouse(
     *,
     mask_phi: bool = True,
     _record_data_masked: bool = False,
+    naming_convention: str | None = None,
 ) -> dict[str, Any]:
     """Apply PHI masking, flatten ``record_data`` variables, and protect metadata columns."""
-    if any(v.__class__ not in _SCALAR_CLASSES for k, v in row.items() if k != "record_data"):
+    rd_key = (
+        "recordData"
+        if naming_convention == "camelCase"
+        else ("RECORD_DATA" if naming_convention == "sdtm" else "record_data")
+    )
+    kw_key = "KEYWORDS" if naming_convention == "sdtm" else "keywords"
+
+    if any(v.__class__ not in _SCALAR_CLASSES for k, v in row.items() if k != rd_key):
         normalized_row: dict[str, Any] = _normalize_warehouse_value(row)
     else:
-        rd_raw = row.get("record_data")
+        rd_raw = row.get(rd_key)
         if rd_raw is not None and rd_raw.__class__ not in _SCALAR_CLASSES:
-            row["record_data"] = _normalize_warehouse_value(rd_raw)
+            row[rd_key] = _normalize_warehouse_value(rd_raw)
         normalized_row = row
 
     if mask_phi:
         if not _record_data_masked or any(
             isinstance(k, str) and global_sensitivity_registry.is_sensitive(k)
             for k in normalized_row
-            if k != "record_data"
+            if k != rd_key
         ):
             masked_row: dict[str, Any] = mask_clinical_phi(normalized_row)
         else:
@@ -380,21 +424,24 @@ def _post_process_warehouse(
     else:
         masked_row = normalized_row
 
-    extra_meta = [
-        k
-        for k in masked_row
-        if k != "record_data" and isinstance(k, str) and k not in _RECORD_METADATA_KEYS
-    ]
-    metadata_keys = (
-        _RECORD_METADATA_KEYS | frozenset(extra_meta) if extra_meta else _RECORD_METADATA_KEYS
+    base_meta = (
+        _RECORD_METADATA_KEYS
+        if naming_convention in (None, "snake_case")
+        else frozenset(
+            format_variable_name(c, naming_convention) for c in _WAREHOUSE_RECORD_COLUMNS
+        )
     )
+    extra_meta = [
+        k for k in masked_row if k != rd_key and isinstance(k, str) and k not in base_meta
+    ]
+    metadata_keys = base_meta | frozenset(extra_meta) if extra_meta else base_meta
 
-    raw_payload = masked_row.get("record_data")
+    raw_payload = masked_row.get(rd_key)
     flat_vars: dict[str, Any] = {}
     if raw_payload is None:
-        masked_row["record_data"] = "{}"
+        masked_row[rd_key] = "{}"
     elif isinstance(raw_payload, str):
-        masked_row["record_data"] = raw_payload
+        masked_row[rd_key] = raw_payload
         try:
             parsed_payload = json.loads(raw_payload)
         except ValueError:
@@ -410,21 +457,25 @@ def _post_process_warehouse(
             raw_payload if isinstance(raw_payload, dict) else dict(raw_payload)
         )
         _validate_nested_variable_keys(payload_dict)
-        masked_row["record_data"] = json.dumps(payload_dict, default=str)
+        masked_row[rd_key] = json.dumps(payload_dict, default=str)
         if payload_dict:
             if any(isinstance(v, (Mapping, list, tuple)) for v in payload_dict.values()):
                 flat_vars = flatten(payload_dict)
             else:
                 flat_vars = payload_dict
     else:
-        masked_row["record_data"] = json.dumps(raw_payload, default=str)
+        masked_row[rd_key] = json.dumps(raw_payload, default=str)
 
-    keywords = masked_row.get("keywords")
+    keywords = masked_row.get(kw_key)
     if isinstance(keywords, (list, dict, tuple)):
-        masked_row["keywords"] = json.dumps(keywords, default=str)
+        masked_row[kw_key] = json.dumps(keywords, default=str)
 
     for var_key, var_val in flat_vars.items():
-        col_name = _normalize_variable_column(var_key, metadata_keys)
+        col_name = _normalize_variable_column_for_convention(
+            var_key,
+            metadata_keys,
+            naming_convention=naming_convention,
+        )
         if isinstance(var_val, dict) and not var_val:
             continue
         if isinstance(var_val, (dict, list, tuple)):
@@ -433,6 +484,31 @@ def _post_process_warehouse(
             masked_row[col_name] = var_val
 
     return _omit_empty_structs(masked_row)
+
+
+def _post_process_warehouse_sdtm(
+    row: dict[str, Any],
+    *,
+    mask_phi: bool = True,
+    _already_masked: bool = False,
+) -> dict[str, Any]:
+    """Normalize and validate an SDTM domain row for Snowflake Parquet staging."""
+    normalized = _normalize_warehouse_value(row)
+    if mask_phi and not _already_masked:
+        normalized = mask_clinical_phi(normalized)
+    cleaned: dict[str, Any] = {}
+    for col, val in normalized.items():
+        if not isinstance(col, str) or not _IDENTIFIER_PATTERN.match(col):
+            raise ExportConfigurationError(
+                f"Warehouse column name contains invalid characters: {col!r}"
+            )
+        if isinstance(val, dict) and not val:
+            continue
+        if isinstance(val, (dict, list, tuple)):
+            cleaned[col] = json.dumps(val, default=str)
+        else:
+            cleaned[col] = val
+    return _omit_empty_structs(cleaned)
 
 
 def _post_process_warehouse_mapped(row: dict[str, Any]) -> dict[str, Any]:
@@ -567,12 +643,42 @@ def _resolve_column_types(arrow_table: Any, columns: Sequence[str]) -> dict[str,
     return resolved
 
 
+def _resolve_merge_keys(
+    columns: Sequence[str],
+    *,
+    as_sdtm: bool = False,
+    naming_convention: str | None = None,
+) -> tuple[str, ...]:
+    """Resolve Snowflake ``MERGE INTO`` natural key columns for the active schema mode."""
+    col_set = set(columns)
+    if as_sdtm:
+        seq_col = next(
+            (c for c in columns if c.endswith("SEQ") and c not in ("STUDYID", "DOMAIN", "USUBJID")),
+            None,
+        )
+        candidates = (
+            ("STUDYID", "DOMAIN", "USUBJID", seq_col)
+            if seq_col is not None
+            else ("STUDYID", "DOMAIN", "USUBJID")
+        )
+        present = tuple(c for c in candidates if c in col_set)
+        return present if present else (columns[0],)
+    if naming_convention == "camelCase":
+        return ("studyKey", "recordId")
+    if naming_convention == "sdtm":
+        return ("STUDYID", "RECORD_ID")
+    return ("study_key", "record_id")
+
+
 def _records_to_arrow_table(
     records: Sequence[Any],
     *,
     mask_phi: bool = True,
     study_key: str | None = None,
     mapper: Any | None = None,
+    as_sdtm: bool = False,
+    sdtm_domain: str | None = None,
+    naming_convention: str | None = None,
 ) -> Any:
     """Convert *records* to a flattened tabular ``pyarrow.Table``."""
     pa = _require_optional_dep("pyarrow", "snowflake")
@@ -584,28 +690,81 @@ def _records_to_arrow_table(
         )
         if isinstance(raw_rd, Mapping):
             _validate_nested_variable_keys(raw_rd)
-    post_proc = _post_process_warehouse_mapped if mask_phi else _post_process_warehouse_unmasked
+    mapper_as_sdtm = bool(as_sdtm or getattr(mapper, "as_sdtm", False))
+    mapper_convention = getattr(mapper, "naming_convention", naming_convention)
     if mapper is None:
-        mapper = CentralizedMapper(
-            mode="tabular",
-            post_processor=post_proc,
-            mask_phi=mask_phi,
-        )
+        if mapper_as_sdtm:
+            sdtm_proc = functools.partial(
+                _post_process_warehouse_sdtm,
+                mask_phi=mask_phi,
+                _already_masked=mask_phi,
+            )
+            mapper = CentralizedMapper(
+                mode="tabular",
+                post_processor=sdtm_proc,
+                mask_phi=mask_phi,
+                as_sdtm=True,
+                sdtm_domain=sdtm_domain,
+            )
+        elif mapper_convention not in (None, "snake_case"):
+            conv_proc = functools.partial(
+                _post_process_warehouse,
+                mask_phi=mask_phi,
+                _record_data_masked=mask_phi,
+                naming_convention=mapper_convention,
+            )
+            mapper = CentralizedMapper(
+                mode="tabular",
+                post_processor=conv_proc,
+                mask_phi=mask_phi,
+                naming_convention=mapper_convention,
+            )
+        else:
+            post_proc = (
+                _post_process_warehouse_mapped if mask_phi else _post_process_warehouse_unmasked
+            )
+            mapper = CentralizedMapper(
+                mode="tabular",
+                post_processor=post_proc,
+                mask_phi=mask_phi,
+            )
         raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
     else:
         mapped_rows = [mapper.map_record(r, study_key=study_key) for r in records]
-        if getattr(mapper, "post_processor", None) in (
-            _post_process_warehouse,
-            _post_process_warehouse_mapped,
-            _post_process_warehouse_unmasked,
+        mapper_post = getattr(mapper, "post_processor", None)
+        if mapper_as_sdtm:
+            if getattr(mapper_post, "func", mapper_post) is _post_process_warehouse_sdtm:
+                raw_rows = mapped_rows
+            else:
+                effective_mask = getattr(mapper, "mask_phi", mask_phi) is not False
+                raw_rows = [
+                    _post_process_warehouse_sdtm(
+                        dict(row),
+                        mask_phi=effective_mask,
+                        _already_masked=effective_mask,
+                    )
+                    for row in mapped_rows
+                ]
+        elif (
+            mapper_post
+            in (
+                _post_process_warehouse,
+                _post_process_warehouse_mapped,
+                _post_process_warehouse_unmasked,
+            )
+            or getattr(mapper_post, "func", None) is _post_process_warehouse
         ):
             raw_rows = mapped_rows
         else:
             effective_mask = getattr(mapper, "mask_phi", mask_phi) is not False
-            fallback_proc = (
-                _post_process_warehouse if effective_mask else _post_process_warehouse_unmasked
-            )
-            raw_rows = [fallback_proc(dict(row)) for row in mapped_rows]
+            raw_rows = [
+                _post_process_warehouse(
+                    dict(row),
+                    mask_phi=effective_mask,
+                    naming_convention=mapper_convention,
+                )
+                for row in mapped_rows
+            ]
 
     rows = _harmonize_tabular_rows(raw_rows)
     return pa.Table.from_pylist(rows)
@@ -634,6 +793,7 @@ class SnowflakeExportSink(ExportSink):
         """
         super().__init__(config)
         self._cfg: SnowflakeSinkConfig = config
+        self._seq_counters: dict[str, int] = {}
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
@@ -753,18 +913,40 @@ class SnowflakeExportSink(ExportSink):
                 batch_id=batch_id,
             )
 
-        post_proc = (
-            _post_process_warehouse_mapped
-            if self.config.mask_phi
-            else _post_process_warehouse_unmasked
+        if cfg.as_sdtm:
+            post_proc: Any = functools.partial(
+                _post_process_warehouse_sdtm,
+                mask_phi=self.config.mask_phi,
+                _already_masked=self.config.mask_phi,
+            )
+        elif cfg.naming_convention not in (None, "snake_case"):
+            post_proc = functools.partial(
+                _post_process_warehouse,
+                mask_phi=self.config.mask_phi,
+                _record_data_masked=self.config.mask_phi,
+                naming_convention=cfg.naming_convention,
+            )
+        else:
+            post_proc = (
+                _post_process_warehouse_mapped
+                if self.config.mask_phi
+                else _post_process_warehouse_unmasked
+            )
+        mapper = build_sink_mapper(
+            cfg,
+            mode="tabular",
+            post_processor=post_proc,
+            seq_counters=self._seq_counters,
         )
-        mapper = build_sink_mapper(cfg, mode="tabular", post_processor=post_proc)
 
         arrow_table = _records_to_arrow_table(
             records,
             mask_phi=self.config.mask_phi,
             study_key=cfg.study_key,
             mapper=mapper,
+            as_sdtm=cfg.as_sdtm,
+            sdtm_domain=cfg.sdtm_domain,
+            naming_convention=cfg.naming_convention,
         )
         merge_columns = _resolve_merge_columns(arrow_table)
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
@@ -804,9 +986,12 @@ class SnowflakeExportSink(ExportSink):
                         f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
                         f"FORCE = TRUE"
                     )  # nosem
-                    non_key_cols = [
-                        col for col in merge_columns if col not in ("study_key", "record_id")
-                    ]
+                    merge_keys = _resolve_merge_keys(
+                        merge_columns,
+                        as_sdtm=cfg.as_sdtm,
+                        naming_convention=cfg.naming_convention,
+                    )
+                    non_key_cols = [col for col in merge_columns if col not in merge_keys]
                     if non_key_cols:
                         update_clause = ", ".join(
                             f"target.{_quote_identifier(col.upper())} = "
@@ -814,17 +999,48 @@ class SnowflakeExportSink(ExportSink):
                             for col in non_key_cols
                         )
                     else:
-                        update_clause = 'target."RECORD_ID" = source."RECORD_ID"'
+                        first_key = _quote_identifier(merge_keys[0].upper())
+                        update_clause = f"target.{first_key} = source.{first_key}"
                     insert_cols = ", ".join(_quote_identifier(col.upper()) for col in merge_columns)
                     insert_vals = ", ".join(
                         f"source.{_quote_identifier(col.upper())}" for col in merge_columns
                     )
-                    order_expr = (
-                        "ORDER BY date_modified DESC NULLS LAST"
-                        if "date_modified" in merge_columns
-                        else "ORDER BY record_id"
+                    deleted_col = next(
+                        (c for c in ("deleted", "DELETED") if c in merge_columns),
+                        None,
                     )
-                    if cfg.hard_delete and "deleted" in merge_columns:
+                    if not cfg.as_sdtm and cfg.naming_convention in (None, "snake_case"):
+                        partition_expr = "study_key, record_id"
+                        order_expr = (
+                            "ORDER BY date_modified DESC NULLS LAST"
+                            if "date_modified" in merge_columns
+                            else "ORDER BY record_id"
+                        )
+                        on_expr = (
+                            "target.study_key = source.study_key "
+                            "AND target.record_id = source.record_id"
+                        )
+                    else:
+                        partition_expr = ", ".join(_quote_identifier(k.upper()) for k in merge_keys)
+                        modified_col = next(
+                            (
+                                c
+                                for c in ("date_modified", "dateModified", "DATE_MODIFIED")
+                                if c in merge_columns
+                            ),
+                            None,
+                        )
+                        order_expr = (
+                            f"ORDER BY {_quote_identifier(modified_col.upper())} DESC NULLS LAST"
+                            if modified_col is not None
+                            else f"ORDER BY {_quote_identifier(merge_keys[-1].upper())}"
+                        )
+                        on_expr = " AND ".join(
+                            f"target.{_quote_identifier(k.upper())} = "
+                            f"source.{_quote_identifier(k.upper())}"
+                            for k in merge_keys
+                        )
+                    if cfg.hard_delete and deleted_col is not None:
                         matched_clause = (
                             'WHEN MATCHED AND COALESCE(source."DELETED", FALSE) = TRUE THEN DELETE '  # noqa: S608
                             f"WHEN MATCHED THEN UPDATE SET {update_clause} "
@@ -841,11 +1057,10 @@ class SnowflakeExportSink(ExportSink):
                         f"USING ("
                         f"SELECT * FROM {staging_table} "
                         f"QUALIFY ROW_NUMBER() OVER ("
-                        f"PARTITION BY study_key, record_id {order_expr}"
+                        f"PARTITION BY {partition_expr} {order_expr}"
                         f") = 1"
                         f") AS source "
-                        f"ON target.study_key = source.study_key "
-                        f"AND target.record_id = source.record_id "
+                        f"ON {on_expr} "
                         f"{matched_clause}"
                     )  # nosem
                 else:

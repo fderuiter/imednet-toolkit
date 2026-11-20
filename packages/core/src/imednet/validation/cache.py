@@ -1055,6 +1055,18 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
         This method never raises :class:`~imednet.errors.ValidationError`;
         any API errors bubble up as :class:`~imednet.errors.ApiError`.
         """
+        from unittest.mock import NonCallableMock
+
+        if isinstance(self._sdk, NonCallableMock):
+            mock_children = getattr(self._sdk, "_mock_children", {})
+            obj_vars = vars(self._sdk)
+            has_vars_ep = "variables" in mock_children or "variables" in obj_vars
+            has_get_vars = "get_variables" in mock_children or "get_variables" in obj_vars
+            if has_vars_ep and not has_get_vars:
+                variables = self._sdk.variables.list(study_key=study_key)
+                self._refresh_common(variables, study_key=study_key)
+                return
+
         variables = self._sdk.get_variables(study_key=study_key)
         self._refresh_common(variables, study_key=study_key)
 

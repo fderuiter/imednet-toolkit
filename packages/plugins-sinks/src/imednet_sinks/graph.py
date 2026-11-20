@@ -146,18 +146,109 @@ DETACH DELETE r
 """
 
 
+def _build_convention_cypher(
+    study_prop: str,
+    subject_prop: str,
+    record_prop: str,
+    visit_prop: str,
+) -> tuple[str, str]:
+    """Build MERGE and CREATE Cypher statements aligned to a naming convention."""
+    merge_cypher = (
+        "UNWIND $rows AS row\n"
+        f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
+        f"MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        f"MERGE (r:Record   {{{record_prop}: row.{record_prop}, {study_prop}: row.{study_prop}}})\n"
+        "SET r += row\n"
+        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {study_prop}: row.{study_prop}}})\n"
+        "    MERGE (su)-[:HAS_VISIT]->(v)\n"
+        "    MERGE (v)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+    )
+    create_cypher = (
+        "UNWIND $rows AS row\n"
+        "CREATE (r:Record)\n"
+        "SET r = row\n"
+        "WITH r, row\n"
+        f"WHERE row.{visit_prop} IS NOT NULL\n"
+        f"MATCH (v:Visit {{{visit_prop}: row.{visit_prop}, {study_prop}: row.{study_prop}}})\n"
+        "MERGE (v)-[:HAS_RECORD]->(r)\n"
+    )
+    return merge_cypher, create_cypher
+
+
+def _build_sdtm_cypher(seq_prop: str | None, has_visit: bool) -> tuple[str, str]:
+    """Build MERGE and CREATE Cypher statements for SDTM domain rows."""
+    record_key_props = (
+        f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, {seq_prop}: row.{seq_prop}"
+        if seq_prop
+        else "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID"
+    )
+    if has_visit:
+        visit_block = (
+            "FOREACH (_ IN CASE WHEN row.VISITNUM IS NOT NULL THEN [1] ELSE [] END |\n"
+            "    MERGE (v:Visit {VISITNUM: row.VISITNUM, STUDYID: row.STUDYID})\n"
+            "    MERGE (su)-[:HAS_VISIT]->(v)\n"
+            "    MERGE (v)-[:HAS_RECORD]->(r)\n"
+            ")\n"
+            "FOREACH (_ IN CASE WHEN row.VISITNUM IS NULL THEN [1] ELSE [] END |\n"
+            "    MERGE (su)-[:HAS_RECORD]->(r)\n"
+            ")\n"
+        )
+    else:
+        visit_block = "MERGE (su)-[:HAS_RECORD]->(r)\n"
+
+    merge_cypher = (
+        "UNWIND $rows AS row\n"
+        "MERGE (s:Study   {STUDYID: row.STUDYID})\n"
+        "MERGE (su:Subject {USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
+        f"MERGE (r:Record   {{{record_key_props}}})\n"
+        "SET r += row\n"
+        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"{visit_block}"
+    )
+    create_cypher = (
+        "UNWIND $rows AS row\n"
+        "MERGE (s:Study   {STUDYID: row.STUDYID})\n"
+        "MERGE (su:Subject {USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
+        "CREATE (r:Record)\n"
+        "SET r = row\n"
+        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        "MERGE (su)-[:HAS_RECORD]->(r)\n"
+    )
+    return merge_cypher, create_cypher
+
+
 def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
     import json
 
-    row["record_data"] = json.dumps(row.get("record_data", {}))
-    keywords = row.get("keywords")
-    if isinstance(keywords, list):
-        row["keywords"] = json.dumps(
-            [
-                k.model_dump(mode="json", by_alias=True) if hasattr(k, "model_dump") else k
-                for k in keywords
-            ]
-        )
+    for rd_key in ("record_data", "recordData", "RECORD_DATA"):
+        if rd_key in row:
+            row[rd_key] = json.dumps(row.get(rd_key, {}))
+            break
+    else:
+        row["record_data"] = json.dumps({})
+
+    for kw_key in ("keywords", "KEYWORDS"):
+        keywords = row.get(kw_key)
+        if isinstance(keywords, list):
+            row[kw_key] = json.dumps(
+                [
+                    k.model_dump(mode="json", by_alias=True) if hasattr(k, "model_dump") else k
+                    for k in keywords
+                ]
+            )
+    return row
+
+
+def _post_process_graph_sdtm(row: dict[str, Any]) -> dict[str, Any]:
+    """Serialize any non-primitive SDTM row values for Neo4j property compatibility."""
+    import json
+
+    for key, val in list(row.items()):
+        if isinstance(val, (dict, list, tuple)):
+            row[key] = json.dumps(val, default=str)
     return row
 
 
@@ -204,6 +295,7 @@ class Neo4jExportSink(ExportSink):
         self._uri = self.config.uri
         self._auth = self.config.auth
         self._study_key = self.config.study_key
+        self._seq_counters: dict[str, int] = {}
         self._driver: Any = None
         self._connect()
 
@@ -230,10 +322,12 @@ class Neo4jExportSink(ExportSink):
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
         from imednet.spi.sinks import build_sink_mapper
 
+        post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
         mapper = build_sink_mapper(
             self.config,
             mode="document",
-            post_processor=_post_process_graph,
+            post_processor=post_proc,
+            seq_counters=self._seq_counters,
         )
         custom_pipeline = self.config.extra.get("enrichment_pipeline")
         if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
@@ -242,7 +336,30 @@ class Neo4jExportSink(ExportSink):
         if not rows:
             return 0
 
-        cypher = _MERGE_RECORD_CYPHER if self.config.idempotent else _CREATE_RECORD_CYPHER
+        if self.config.as_sdtm:
+            sample_row = rows[0]
+            seq_prop = next(
+                (
+                    k
+                    for k in sample_row
+                    if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
+                ),
+                None,
+            )
+            has_visit = any("VISITNUM" in r for r in rows)
+            merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+        elif self.config.naming_convention == "camelCase":
+            merge_cypher, create_cypher = _build_convention_cypher(
+                "studyKey", "subjectKey", "recordId", "visitId"
+            )
+        elif self.config.naming_convention == "sdtm":
+            merge_cypher, create_cypher = _build_convention_cypher(
+                "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
+            )
+        else:
+            merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
+
+        cypher = merge_cypher if self.config.idempotent else create_cypher
         cfg = self.config if isinstance(self.config, Neo4jSinkConfig) else Neo4jSinkConfig()
 
         def execute_export() -> int:

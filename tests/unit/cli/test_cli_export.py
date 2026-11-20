@@ -1,6 +1,7 @@
 """Unit tests for cli export."""
 
 import importlib.util
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -562,3 +563,167 @@ def test_cli_export_no_mask_phi_and_quality_gate_passthrough(
             min_schema_readiness_score=88.0,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "subcmd",
+    [
+        "parquet",
+        "csv",
+        "excel",
+        "json",
+        "duckdb",
+        "sql",
+        "mongodb",
+        "neo4j",
+        "snowflake",
+    ],
+)
+def test_cli_export_subcommands_expose_sdtm_and_standards_flags(
+    runner: CliRunner, subcmd: str
+) -> None:
+    """All 9 export subcommands expose --as-sdtm, --sdtm-domain, --standards-profile, --min-standards-score, and --naming-convention."""
+    result = runner.invoke(cli.app, ["export", subcmd, "--help"])
+    assert result.exit_code == 0
+    for flag in (
+        "--as-sdtm",
+        "--sdtm-domain",
+        "--standards-profile",
+        "--min-standards-score",
+        "--naming-convention",
+    ):
+        assert flag in result.stdout
+
+
+def test_cli_export_sdtm_passthrough_and_non_conforming_study_gate(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CLI passes SDTM/standards flags to tabular and plugin sinks and exits 1 when standards score fails."""
+    from imednet.integrations import export as real_export
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+
+    saved_export_to_csv = real_export.export_to_csv
+    csv_mock = MagicMock()
+    monkeypatch.setattr(real_export, "export_to_csv", csv_mock)
+    monkeypatch.setattr(cli, "export_to_csv", csv_mock)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    res_csv = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "csv",
+            "STUDY_SDTM",
+            "ae.csv",
+            "--as-sdtm",
+            "--sdtm-domain",
+            "AE",
+            "--standards-profile",
+            "drug",
+            "--min-standards-score",
+            "95",
+            "--naming-convention",
+            "sdtm",
+        ],
+    )
+    assert res_csv.exit_code == 0
+    csv_mock.assert_called_once_with(
+        sdk,
+        "STUDY_SDTM",
+        "ae.csv",
+        use_labels_as_columns=False,
+        as_sdtm=True,
+        sdtm_domain="AE",
+        standards_profile="drug",
+        min_standards_score=95.0,
+        naming_convention="sdtm",
+    )
+
+    sdk.sinks = MagicMock()
+    sdk.sinks.SnowflakeSinkConfig = SnowflakeSinkConfig
+    res_sf = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "snowflake",
+            "STUDY_SDTM",
+            "acct",
+            "usr",
+            "pwd",
+            "DB",
+            "PUBLIC",
+            "WH",
+            "STG",
+            "AE_TBL",
+            "--domain",
+            "AE",
+            "--standards-profile",
+            "drug",
+            "--min-standards-score",
+            "90",
+            "--naming-convention",
+            "sdtm",
+        ],
+    )
+    assert res_sf.exit_code == 0
+    sdk.sinks.export_to_snowflake.assert_called_once_with(
+        sdk,
+        "STUDY_SDTM",
+        config=SnowflakeSinkConfig(
+            study_key="STUDY_SDTM",
+            account="acct",
+            user="usr",
+            password="pwd",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="AE_TBL",
+            as_sdtm=True,
+            sdtm_domain="AE",
+            standards_profile="drug",
+            min_standards_score=90.0,
+            naming_convention="sdtm",
+        ),
+    )
+
+    # Real end-to-end gating check via CLI (unpatched export_to_csv): exits 1 before writing
+    monkeypatch.setattr(real_export, "export_to_csv", saved_export_to_csv)
+    monkeypatch.setattr(cli, "export_to_csv", saved_export_to_csv)
+    sdk.forms.list.return_value = [Form(form_id=1, form_key="AE", form_name="AE")]
+    sdk.variables.list.return_value = []
+    sdk.records.list.side_effect = lambda **_kw: iter(
+        [
+            Record(
+                record_id=1,
+                study_key="NON_CONFORMING",
+                form_id=1,
+                form_key="AE",
+                subject_key="S1",
+                record_data={"aeTerm": "Nausea", "aeSeverity": "SEVERE"},
+            )
+        ]
+    )
+    gated_path = tmp_path / "blocked.csv"
+    res_blocked = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "csv",
+            "NON_CONFORMING",
+            str(gated_path),
+            "--as-sdtm",
+            "--sdtm-domain",
+            "AE",
+            "--standards-profile",
+            "drug",
+            "--min-standards-score",
+            "95",
+        ],
+    )
+    assert res_blocked.exit_code == 1
+    assert not gated_path.exists()

@@ -184,28 +184,35 @@ Export Path Decision Matrix
      - When to use
      - Key components
    * - **Tabular**
-     - Destination is a flat/columnar store (CSV, Excel, SQL, DuckDB,
-       Parquet).  All variables for a form can be represented as columns.
-     - :class:`~imednet_workflows.record_mapper.RecordMapper` →
-       ``pandas.DataFrame`` → sink function in
+     - Destination is a flat/columnar store (CSV, Excel, JSON, SQL, DuckDB,
+       Parquet).  All variables for a form or CDISC SDTM domain can be
+       represented as columns using ``snake_case``, ``camelCase``, or
+       uppercase ``sdtm`` naming conventions.
+     - ``imednet.spi.sink_base.SinkConfig`` +
+       ``imednet.spi.models.transform_records_to_sdtm_rows`` →
+       ``_TabularTransformSink`` / ``pandas.DataFrame`` → sink functions in
        :mod:`imednet.integrations.export`
    * - **Document**
      - Destination is a document store (for example MongoDB) and should keep
-       nested ``record_data`` payloads with metadata envelope fields.
-     - :class:`~imednet_workflows.data_extraction.DataExtractionWorkflow`
-       → typed :class:`~imednet.models.Record` list →
+       nested ``record_data`` payloads with metadata envelope fields (aligned
+       to ``naming_convention``) or emit flat CDISC SDTM domain documents
+       when ``as_sdtm=True``.
+     - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
        :class:`~imednet_sinks.document.MongoDbExportSink`
    * - **Graph**
      - Destination models relationships natively (for example Neo4j) and the
-       hierarchy *Study → Subject → Visit → Record* should be preserved.
-     - :class:`~imednet_workflows.data_extraction.DataExtractionWorkflow`
-       → typed :class:`~imednet.models.Record` list →
+       hierarchy *Study → Subject → Visit → Record* should be preserved
+       under either ``naming_convention`` properties or CDISC SDTM domain
+       node properties (``as_sdtm=True``).
+     - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
        :class:`~imednet_sinks.graph.Neo4jExportSink`
    * - **Warehouse**
      - Destination is a cloud data warehouse with a native bulk loader.
-       Records are staged as Parquet files and then COPY'd in a single
-       command for best throughput.
-     - :class:`~imednet_workflows.record_mapper.RecordMapper` →
+       Records are mapped via core SPI (supporting ``snake_case``,
+       ``camelCase``, ``sdtm`` naming conventions, and ``as_sdtm=True`` SDTM
+       domains), staged as Parquet files, and loaded via ``MERGE INTO`` /
+       ``COPY INTO`` for best throughput.
+     - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
        Parquet staging →
        :class:`~imednet_sinks.warehouse.SnowflakeExportSink`
 
