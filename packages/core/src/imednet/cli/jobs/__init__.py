@@ -65,6 +65,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         study_key = resolve_study_key(status_parser, args, required=True)
         assert study_key is not None
         validate_cli_path_segment(study_key, name="study_key")
+        validate_cli_path_segment(args.batch_id, name="batch_id")
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             job_status(
                 study_key=study_key,
@@ -126,6 +127,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         study_key = resolve_study_key(wait_parser, args, required=True)
         assert study_key is not None
         validate_cli_path_segment(study_key, name="study_key")
+        validate_cli_path_segment(args.batch_id, name="batch_id")
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             job_wait(
                 study_key=study_key,

@@ -406,7 +406,11 @@ def test_missing_and_partial_credentials_diagnostics_and_redaction(
     [
         ["users", "list", "../evil"],
         ["jobs", "status", "../evil", "BATCH-1"],
+        ["jobs", "status", "STUDY", "../evil"],
+        ["jobs", "status", "--study-key", "STUDY", "../evil"],
         ["jobs", "wait", "../evil", "BATCH-1"],
+        ["jobs", "wait", "STUDY", "../evil"],
+        ["jobs", "wait", "--study-key", "STUDY", "../evil"],
         ["records", "create", "../evil", "--form-key", "F_VS"],
         ["records", "import", "../evil", "nonexistent.csv"],
         ["subjects", "register", "../evil", "--form-key", "F_DM", "--site-name", "SITE"],

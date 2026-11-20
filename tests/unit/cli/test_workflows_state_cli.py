@@ -817,3 +817,38 @@ def test_show_state_rejects_interactive_json_and_conflicting_study_keys(
     assert conflict_study.exit_code == 2
     assert conflict_study.stdout == ""
     assert "conflicting values provided for study_key" in conflict_study.stderr
+
+
+def test_show_state_output_format_env_and_explicit_table_override(
+    runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IMEDNET_CLI_OUTPUT_FORMAT=json selects JSON unless --format table explicitly overrides it."""
+    import json
+    import os
+
+    from imednet.cli import app as main_app
+
+    ledger_path = str(tmp_path / "ledger.json")
+    state = _make_ledger_state("STUDY-01", "records")
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        mock_ledger.return_value.read_state.return_value = state
+        env_json_standalone = runner.invoke(state_app, ["show", "-l", ledger_path])
+        env_json_main = runner.invoke(main_app, ["workflows", "state", "show", "-l", ledger_path])
+        override_standalone = runner.invoke(
+            state_app, ["show", "-l", ledger_path, "--format", "table"]
+        )
+        override_main = runner.invoke(
+            main_app, ["workflows", "state", "show", "-l", ledger_path, "--format", "table"]
+        )
+
+    for res in (env_json_standalone, env_json_main):
+        assert res.exit_code == 0
+        payload = json.loads(res.stdout)
+        assert payload["resource"] == "ledger_state"
+
+    for res in (override_standalone, override_main):
+        assert res.exit_code == 0
+        assert "STUDY-01 | records" in res.stdout
+    assert os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"

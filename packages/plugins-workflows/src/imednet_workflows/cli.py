@@ -896,8 +896,11 @@ def state_app(args: list[str] | None = None) -> None:
     try:
         if getattr(parsed, "no_interactive", False):
             os.environ[NON_INTERACTIVE_ENV] = "1"
-        if getattr(parsed, "output_format", None) == "json":
+        explicit_format = getattr(parsed, "output_format", None)
+        if explicit_format == "json":
             os.environ[OUTPUT_FORMAT_ENV] = "json"
+        elif explicit_format == "table":
+            os.environ.pop(OUTPUT_FORMAT_ENV, None)
         with cli_execution_guard():
             if hasattr(parsed, "func"):
                 parsed.func(parsed)
