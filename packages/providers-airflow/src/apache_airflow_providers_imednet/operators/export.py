@@ -370,7 +370,20 @@ class ImednetExportOperator(BaseOperator):
             opts["naming_convention"] = str(resolved_convention)
         return opts
 
-    def _build_tabular_kwargs(self, runtime_kwargs: dict[str, Any]) -> dict[str, Any]:
+    def _default_airflow_stream_name(self, dest: str, *, sink_prefix: bool = False) -> str:
+        """Return a task-scoped default stream name invariant across mapped task indexes."""
+        base = f"airflow_{dest}" if sink_prefix else dest
+        task_id = getattr(self, "task_id", None)
+        if isinstance(task_id, str) and task_id.strip():
+            return f"{base}_{task_id.strip()}"
+        return base
+
+    def _build_tabular_kwargs(
+        self,
+        runtime_kwargs: dict[str, Any],
+        *,
+        dest: str = "records",
+    ) -> dict[str, Any]:
         """Merge explicitly configured operational parameters into tabular export kwargs."""
         merged = dict(runtime_kwargs)
         if "domain" in merged and "sdtm_domain" not in merged:
@@ -390,6 +403,8 @@ class ImednetExportOperator(BaseOperator):
             and "ledger_path" not in merged
         ):
             merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
+            if "stream_name" not in merged:
+                merged["stream_name"] = self._default_airflow_stream_name(dest)
         return merged
 
     def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
@@ -417,6 +432,8 @@ class ImednetExportOperator(BaseOperator):
         stream_opts = self._collect_streaming_options(runtime_kwargs)
         if not config.mask_phi and "mask_phi" not in stream_opts:
             stream_opts["mask_phi"] = False
+        if config.max_buffered_records is not None:
+            stream_opts["max_buffered_records"] = config.max_buffered_records
 
         if dest == "snowflake":
             sink_cls = getattr(sinks, "SnowflakeExportSink", None)
@@ -557,6 +574,7 @@ class ImednetExportOperator(BaseOperator):
         config = sink_base.SinkConfig(
             study_key=self.study_key,
             batch_size=int(runtime_kwargs.get("batch_size", self.batch_size)),
+            max_buffered_records=runtime_kwargs.get("max_buffered_records"),
             max_retries=int(runtime_kwargs.get("max_retries", self.max_retries)),
             retry_backoff=float(runtime_kwargs.get("retry_backoff", 1.0)),
             idempotent=bool(runtime_kwargs.get("idempotent", self.idempotent)),
@@ -600,12 +618,17 @@ class ImednetExportOperator(BaseOperator):
                     and config.state_provider is None
                 ):
                     stream_config = replace(config, include_deleted=True)
+                default_sink_stream = (
+                    self._default_airflow_stream_name(dest, sink_prefix=True)
+                    if stream_config.ledger_path is None and stream_config.state_provider is None
+                    else f"airflow_{dest}"
+                )
                 sink_base.run_streaming_export(
                     sdk,
                     self.study_key,
                     sink,
                     stream_config,
-                    stream_name=f"airflow_{dest}",
+                    stream_name=default_sink_stream,
                     batch_id_prefix=f"{self.study_key}/batch/{run_token}",
                     quality_gate_fn=sink_base.apply_quality_gate,
                     default_provider_name="airflow",
@@ -615,7 +638,7 @@ class ImednetExportOperator(BaseOperator):
                 if not export_callable:
                     raise AirflowException(f"Unsupported destination or export_func '{dest}'")
 
-                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs)
+                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs, dest=dest)
                 if dest == "duckdb":
                     conn_settings = self._resolve_destination_connection(dest)
                     db_path_arg = (

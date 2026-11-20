@@ -62,13 +62,15 @@ class ImednetJobSensor(BaseSensorOperator):
         return ImednetHook(self.imednet_conn_id).get_sdk_client()
 
     def poke(self, context: Context) -> bool:
-        """Check the status of the job."""
+        """Check the status of the Job and verify terminal ``resultUrl`` output."""
         from imednet.spi.models import JobStatus
         from imednet.spi.utils import (
             InvalidJobStateError,
             InvalidJobTransitionError,
             JobFailedError,
             evaluate_job_state,
+            fetch_terminal_job_result,
+            resolve_sdk_result_fetcher,
             validate_path_segment,
         )
 
@@ -78,25 +80,37 @@ class ImednetJobSensor(BaseSensorOperator):
         with closing(self._get_sdk()) as sdk:
             job: JobStatus = sdk.jobs.get(self.study_key, self.batch_id)
 
-        # In JobStatus instances, track state monotonically and guard against stale responses
-        if isinstance(job, JobStatus):
-            if self._terminal_reached and not getattr(job, "is_terminal", False):
-                return True
+            # In JobStatus instances, track state monotonically and guard against stale responses
+            if isinstance(job, JobStatus):
+                if self._terminal_reached and not getattr(job, "is_terminal", False):
+                    return True
+
+                try:
+                    if getattr(job, "is_terminal", False):
+                        fetch_terminal_job_result(
+                            job,
+                            resolve_sdk_result_fetcher(sdk),
+                            batch_id=self.batch_id,
+                        )
+                    is_done = evaluate_job_state(job, previous_state=self._last_state)
+                    self._last_state = getattr(job, "state", None)
+                    if is_done:
+                        self._terminal_reached = True
+                    return is_done
+                except (JobFailedError, InvalidJobTransitionError, InvalidJobStateError) as e:
+                    self._last_state = getattr(job, "state", None)
+                    raise AirflowException(str(e)) from e
 
             try:
-                is_done = evaluate_job_state(job, previous_state=self._last_state)
-                self._last_state = getattr(job, "state", None)
-                if is_done:
-                    self._terminal_reached = True
-                return is_done
+                if getattr(job, "is_terminal", False):
+                    fetch_terminal_job_result(
+                        job,
+                        resolve_sdk_result_fetcher(sdk),
+                        batch_id=self.batch_id,
+                    )
+                return evaluate_job_state(job)
             except (JobFailedError, InvalidJobTransitionError, InvalidJobStateError) as e:
-                self._last_state = getattr(job, "state", None)
                 raise AirflowException(str(e)) from e
-
-        try:
-            return evaluate_job_state(job)
-        except (JobFailedError, InvalidJobTransitionError, InvalidJobStateError) as e:
-            raise AirflowException(str(e)) from e
 
 
 __all__ = ["ImednetJobSensor"]

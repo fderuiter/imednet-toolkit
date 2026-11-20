@@ -5,6 +5,7 @@ from builtins import __import__ as builtin_import
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 from unittest.mock import MagicMock, call
 
 import pandas as pd
@@ -1552,6 +1553,884 @@ def test_custom_global_sensitivity_registry_key_redacts_across_all_outputs(tmp_p
     finally:
         global_sensitivity_registry._sensitive_keys.clear()
         global_sensitivity_registry._sensitive_keys.update(snapshot)
+
+
+def test_by_form_exports_50_forms_5000_records_single_pass_http_counts(tmp_path: Path) -> None:
+    """Verify 50-Form, 5,000-Record DuckDB and SQL per-Form exports issue 52 HTTP calls total."""
+    import sqlite3
+
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    duckdb_mod = pytest.importorskip("duckdb")
+
+    forms_payload = [{"formId": i, "formKey": f"FORM_{i:02d}"} for i in range(1, 51)]
+    variables_payload = [
+        {
+            "variableName": f"VAL_{i:02d}",
+            "variableType": "int",
+            "label": f"Value {i:02d}",
+            "formId": i,
+            "formKey": f"FORM_{i:02d}",
+        }
+        for i in range(1, 51)
+    ]
+
+    # Populate 30 forms across 5,000 records; leave FORM_31..FORM_50 empty (0 records)
+    all_records: list[dict[str, Any]] = []
+    for rec_idx in range(1, 5001):
+        fid = ((rec_idx - 1) % 30) + 1
+        all_records.append(
+            {
+                "recordId": rec_idx,
+                "studyKey": "BENCH50",
+                "subjectKey": f"SUBJ-{(rec_idx % 100) + 1:03d}",
+                "visitId": 1,
+                "formId": fid,
+                "formKey": f"FORM_{fid:02d}",
+                "recordStatus": "Complete",
+                "deleted": False,
+                "dateModified": "2026-06-01T00:00:00Z",
+                "recordData": {f"VAL_{fid:02d}": rec_idx},
+            }
+        )
+
+    counts = {"forms": 0, "variables": 0, "records": 0}
+    record_filters: list[str] = []
+
+    with respx.mock(assert_all_called=True) as router:
+
+        def forms_handler(_req: httpx.Request) -> httpx.Response:
+            counts["forms"] += 1
+            return httpx.Response(200, json={"data": forms_payload})
+
+        def vars_handler(_req: httpx.Request) -> httpx.Response:
+            counts["variables"] += 1
+            return httpx.Response(200, json={"data": variables_payload})
+
+        def records_handler(req: httpx.Request) -> httpx.Response:
+            counts["records"] += 1
+            flt = req.url.params.get("filter", "")
+            record_filters.append(flt)
+            page = int(req.url.params.get("page", "0"))
+            size = int(req.url.params.get("size", "100"))
+            start = page * size
+            page_slice = all_records[start : start + size]
+            total_pages = (len(all_records) + size - 1) // size
+            return httpx.Response(
+                200,
+                json={
+                    "data": page_slice,
+                    "pagination": {
+                        "currentPage": page,
+                        "size": size,
+                        "totalPages": total_pages,
+                        "totalElements": len(all_records),
+                    },
+                },
+            )
+
+        router.get("https://api.test/api/v1/edc/studies/BENCH50/forms").mock(
+            side_effect=forms_handler
+        )
+        router.get("https://api.test/api/v1/edc/studies/BENCH50/variables").mock(
+            side_effect=vars_handler
+        )
+        router.get("https://api.test/api/v1/edc/studies/BENCH50/records").mock(
+            side_effect=records_handler
+        )
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+
+        # 1. DuckDB by form: 1 /forms + 1 /variables + 50 /records pages = 52 HTTP calls
+        ddb_path = tmp_path / "bench50.duckdb"
+        export_mod.export_to_duckdb_by_form(sdk, "BENCH50", str(ddb_path), batch_size=200)
+        assert counts == {"forms": 1, "variables": 1, "records": 50}
+        assert sum(counts.values()) == 52
+        assert all("formId" not in flt for flt in record_filters)
+
+        with duckdb_mod.connect(str(ddb_path)) as dconn:
+            ddb_tables = {r[0] for r in dconn.execute("SHOW TABLES").fetchall()}
+            assert len(ddb_tables) == 50
+            populated_total = sum(
+                dconn.execute(f'SELECT COUNT(*) FROM "FORM_{i:02d}"').fetchone()[0]
+                for i in range(1, 31)
+            )
+            assert populated_total == 5000
+            for empty_i in range(31, 51):
+                tbl = f"FORM_{empty_i:02d}"
+                assert dconn.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0] == 0
+                col_types = {
+                    r[1]: r[2].upper()
+                    for r in dconn.execute(f"PRAGMA table_info('{tbl}')").fetchall()
+                }
+                assert col_types[f"VAL_{empty_i:02d}"] == "BIGINT"
+
+        # 2. SQL by form with quality_gate_enabled=True: still 52 HTTP calls (0 extra /variables calls!)
+        counts.update({"forms": 0, "variables": 0, "records": 0})
+        record_filters.clear()
+        sql_path = tmp_path / "bench50.sqlite"
+        export_mod.export_to_sql_by_form(
+            sdk,
+            "BENCH50",
+            f"sqlite:///{sql_path}",
+            quality_gate_enabled=True,
+            batch_size=200,
+        )
+        assert counts == {"forms": 1, "variables": 1, "records": 50}
+        assert sum(counts.values()) == 52
+        assert all("formId" not in flt for flt in record_filters)
+
+        with sqlite3.connect(sql_path) as sconn:
+            sql_tables = {
+                r[0]
+                for r in sconn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            assert len(sql_tables) == 50
+            sql_total = sum(
+                sconn.execute(f'SELECT COUNT(*) FROM "FORM_{i:02d}"').fetchone()[0]
+                for i in range(1, 31)
+            )
+            assert sql_total == 5000
+            for empty_i in range(31, 51):
+                tbl = f"FORM_{empty_i:02d}"
+                assert sconn.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0] == 0
+                cols = {r[1] for r in sconn.execute(f"PRAGMA table_info('{tbl}')").fetchall()}
+                assert f"VAL_{empty_i:02d}" in cols
+
+
+def test_sql_by_form_quality_gate_drops_low_readiness_with_single_variables_fetch(
+    tmp_path: Path,
+) -> None:
+    """Verify export_to_sql_by_form with quality_gate_enabled=True fetches /variables once and filters."""
+    import sqlite3
+
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    var_calls = 0
+    with respx.mock(assert_all_called=True) as router:
+        router.get("https://api.test/api/v1/edc/studies/QG_STUDY/forms").respond(
+            200,
+            json={
+                "data": [
+                    {"formId": 1, "formKey": "DEMO"},
+                    {"formId": 2, "formKey": "LABS"},
+                ]
+            },
+        )
+
+        def var_handler(_req: httpx.Request) -> httpx.Response:
+            nonlocal var_calls
+            var_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "variableName": "AGE",
+                            "variableType": "int",
+                            "label": "Age",
+                            "formId": 1,
+                            "formKey": "DEMO",
+                        },
+                        {
+                            "variableName": "GLUCOSE",
+                            "variableType": "float",
+                            "label": "Glucose",
+                            "formId": 2,
+                            "formKey": "LABS",
+                        },
+                    ]
+                },
+            )
+
+        router.get("https://api.test/api/v1/edc/studies/QG_STUDY/variables").mock(
+            side_effect=var_handler
+        )
+        router.get("https://api.test/api/v1/edc/studies/QG_STUDY/records").respond(
+            200,
+            json={
+                "data": [
+                    {
+                        "recordId": 10,
+                        "formId": 1,
+                        "formKey": "DEMO",
+                        "subjectKey": "S1",
+                        "recordData": {"AGE": 45},
+                    },
+                    {
+                        "recordId": 11,
+                        "formId": 1,
+                        "formKey": "DEMO",
+                        "subjectKey": "S2",
+                        "recordData": {},
+                    },
+                    {
+                        "recordId": 20,
+                        "formId": 2,
+                        "formKey": "LABS",
+                        "subjectKey": "S1",
+                        "recordData": {"GLUCOSE": 92.5},
+                    },
+                    {
+                        "recordId": 21,
+                        "formId": 2,
+                        "formKey": "LABS",
+                        "subjectKey": "S2",
+                        "recordData": {"GLUCOSE": "not-a-float"},
+                    },
+                ]
+            },
+        )
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+        sql_path = tmp_path / "qg_by_form.sqlite"
+        export_mod.export_to_sql_by_form(
+            sdk,
+            "QG_STUDY",
+            f"sqlite:///{sql_path}",
+            quality_gate_enabled=True,
+            min_schema_readiness_score=100.0,
+        )
+
+        assert var_calls == 1
+        with sqlite3.connect(sql_path) as conn:
+            demo_ids = [r[0] for r in conn.execute('SELECT "recordId" FROM "DEMO"').fetchall()]
+            labs_ids = [r[0] for r in conn.execute('SELECT "recordId" FROM "LABS"').fetchall()]
+        assert demo_ids == [10]
+        assert labs_ids == [20]
+
+
+def test_incremental_sql_by_form_watermarks_reconcile_deleted_and_post_flush_checkpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify per-Form watermarks, deleted reconciliation, and atomic post-flush checkpoints."""
+    import contextlib
+    import sqlite3
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [
+        SimpleNamespace(form_id=1, form_key="DEMO"),
+        SimpleNamespace(form_id=2, form_key="VITALS"),
+        SimpleNamespace(form_id=3, form_key="UNCHANGED"),
+    ]
+    vars_list = [
+        Variable(variable_name="AGE", label="Age", variable_type="int", form_id=1, form_key="DEMO"),
+        Variable(variable_name="HR", label="HR", variable_type="int", form_id=2, form_key="VITALS"),
+        Variable(
+            variable_name="NOTE",
+            label="Note",
+            variable_type="text",
+            form_id=3,
+            form_key="UNCHANGED",
+        ),
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.return_value = vars_list
+
+    initial_records = [
+        Record(
+            record_id=101,
+            subject_key="S1",
+            visit_id=1,
+            form_id=1,
+            form_key="DEMO",
+            date_modified="2026-06-01T00:00:00Z",
+            record_data={"AGE": 40},
+        ),
+        Record(
+            record_id=201,
+            subject_key="S1",
+            visit_id=1,
+            form_id=2,
+            form_key="VITALS",
+            date_modified="2026-06-01T00:00:00Z",
+            record_data={"HR": 70},
+        ),
+        Record(
+            record_id=202,
+            subject_key="S2",
+            visit_id=1,
+            form_id=2,
+            form_key="VITALS",
+            date_modified="2026-06-01T00:00:00Z",
+            record_data={"HR": 75},
+        ),
+        Record(
+            record_id=301,
+            subject_key="S1",
+            visit_id=1,
+            form_id=3,
+            form_key="UNCHANGED",
+            date_modified="2026-06-01T00:00:00Z",
+            record_data={"NOTE": "keep-me"},
+        ),
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(initial_records)
+
+    ledger_path = tmp_path / "ledger.json"
+    provider = FileStateProvider(str(ledger_path))
+    sql_path = tmp_path / "inc_by_form.sqlite"
+
+    # Seed initial full load
+    export_mod.export_to_sql_by_form(sdk, "INC_STUDY", f"sqlite:///{sql_path}")
+
+    # Seed uneven per-form watermarks: DEMO is at June 5, VITALS is at June 2, UNCHANGED is at June 5
+    ts_june_5 = datetime(2026, 6, 5, 0, 0, tzinfo=UTC)
+    ts_june_2 = datetime(2026, 6, 2, 0, 0, tzinfo=UTC)
+    provider.set_last_timestamp("INC_STUDY", "sql_DEMO", ts_june_5, records_processed=1)
+    provider.set_last_timestamp("INC_STUDY", "sql_VITALS", ts_june_2, records_processed=2)
+    provider.set_last_timestamp("INC_STUDY", "sql_UNCHANGED", ts_june_5, records_processed=1)
+
+    delta_stream = [
+        # Stale for DEMO (June 3 < June 5 watermark) -> must NOT overwrite DEMO record 101!
+        Record(
+            record_id=101,
+            subject_key="S1",
+            visit_id=1,
+            form_id=1,
+            form_key="DEMO",
+            date_modified="2026-06-03T00:00:00Z",
+            record_data={"AGE": 999},
+        ),
+        # Fresh update for DEMO (June 7 >= June 5)
+        Record(
+            record_id=102,
+            subject_key="S2",
+            visit_id=1,
+            form_id=1,
+            form_key="DEMO",
+            date_modified="2026-06-07T00:00:00Z",
+            record_data={"AGE": 51},
+        ),
+        # Newly voided VITALS record 201 (June 4 >= June 2) -> must be deleted from VITALS!
+        Record(
+            record_id=201,
+            subject_key="S1",
+            visit_id=1,
+            form_id=2,
+            form_key="VITALS",
+            deleted=True,
+            date_modified="2026-06-04T00:00:00Z",
+            record_data={},
+        ),
+    ]
+
+    # 1. Simulate a failure during the final Form sink's flush -> NO checkpoints may advance!
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_stream)
+    orig_flush = export_mod.TabularSQLSink.flush
+
+    def _failing_last_flush(self_sink: export_mod.TabularSQLSink) -> None:
+        if self_sink.table == "DEMO":
+            raise RuntimeError("disk full during final sink flush")
+        orig_flush(self_sink)
+
+    monkeypatch.setattr(export_mod.TabularSQLSink, "flush", _failing_last_flush)
+    with pytest.raises(RuntimeError, match="disk full during final sink flush"):
+        export_mod.export_to_sql_by_form(
+            sdk,
+            "INC_STUDY",
+            f"sqlite:///{sql_path}",
+            incremental=True,
+            state_provider=provider,
+        )
+
+    assert provider.get_last_timestamp("INC_STUDY", "sql_DEMO") == ts_june_5
+    assert provider.get_last_timestamp("INC_STUDY", "sql_VITALS") == ts_june_2
+    assert provider.get_last_timestamp("INC_STUDY", "sql_UNCHANGED") == ts_june_5
+    for s_name in ("sql_DEMO", "sql_VITALS", "sql_UNCHANGED"):
+        assert str(provider.get_last_status("INC_STUDY", s_name)).lower().endswith("failed")
+
+    # 2. Restore flush and re-run -> single /records call, deleted row reconciled, checkpoints committed post-flush
+    monkeypatch.setattr(export_mod.TabularSQLSink, "flush", orig_flush)
+    flush_order: list[str] = []
+    orig_tx = provider.transaction
+
+    def _spy_flush(self_sink: export_mod.TabularSQLSink) -> None:
+        flush_order.append(f"flush:{self_sink.table}")
+        orig_flush(self_sink)
+
+    @contextlib.contextmanager
+    def _spy_tx(study_key: str, stream_name: str, fallback_timestamp: Any = None):
+        flush_order.append(f"enter:{stream_name}")
+        with orig_tx(study_key, stream_name, fallback_timestamp=fallback_timestamp) as tx:
+            yield tx
+        flush_order.append(f"commit:{stream_name}")
+
+    monkeypatch.setattr(export_mod.TabularSQLSink, "flush", _spy_flush)
+    monkeypatch.setattr(provider, "transaction", _spy_tx)
+    sdk.records.list.reset_mock()
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_stream)
+
+    export_mod.export_to_sql_by_form(
+        sdk,
+        "INC_STUDY",
+        f"sqlite:///{sql_path}",
+        incremental=True,
+        state_provider=provider,
+    )
+
+    assert sdk.records.list.call_count == 1
+    assert flush_order[:3] == ["enter:sql_DEMO", "enter:sql_VITALS", "enter:sql_UNCHANGED"]
+    assert set(flush_order[3:6]) == {"flush:DEMO", "flush:VITALS", "flush:UNCHANGED"}
+    assert set(flush_order[6:]) == {"commit:sql_DEMO", "commit:sql_VITALS", "commit:sql_UNCHANGED"}
+
+    with sqlite3.connect(sql_path) as conn:
+        demo_rows = conn.execute(
+            'SELECT "recordId", "AGE" FROM "DEMO" ORDER BY "recordId"'
+        ).fetchall()
+        vitals_rows = conn.execute(
+            'SELECT "recordId", "HR" FROM "VITALS" ORDER BY "recordId"'
+        ).fetchall()
+        unchanged_rows = conn.execute('SELECT "recordId", "NOTE" FROM "UNCHANGED"').fetchall()
+
+    assert demo_rows == [(101, 40), (102, 51)]
+    assert vitals_rows == [(202, 75)]
+    assert unchanged_rows == [(301, "keep-me")]
+    assert provider.get_last_timestamp("INC_STUDY", "sql_DEMO") == datetime(
+        2026, 6, 7, 0, 0, tzinfo=UTC
+    )
+    assert provider.get_last_timestamp("INC_STUDY", "sql_VITALS") == datetime(
+        2026, 6, 4, 0, 0, tzinfo=UTC
+    )
+
+    # 3. Verify DuckDB incremental per-form watermarks, upserts, and voided delete reconciliation
+    duckdb_mod = pytest.importorskip("duckdb")
+    ddb_path = tmp_path / "inc_by_form.duckdb"
+    ddb_provider = FileStateProvider(str(tmp_path / "ddb_ledger.json"))
+    sdk.records.list.side_effect = lambda **_kw: iter(initial_records)
+    export_mod.export_to_duckdb_by_form(sdk, "INC_STUDY", str(ddb_path))
+
+    ddb_provider.set_last_timestamp("INC_STUDY", "duckdb_DEMO", ts_june_5, records_processed=1)
+    ddb_provider.set_last_timestamp("INC_STUDY", "duckdb_VITALS", ts_june_2, records_processed=2)
+    ddb_provider.set_last_timestamp("INC_STUDY", "duckdb_UNCHANGED", ts_june_5, records_processed=1)
+
+    sdk.records.list.reset_mock()
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_stream)
+    export_mod.export_to_duckdb_by_form(
+        sdk,
+        "INC_STUDY",
+        str(ddb_path),
+        incremental=True,
+        state_provider=ddb_provider,
+    )
+    assert sdk.records.list.call_count == 1
+
+    with duckdb_mod.connect(str(ddb_path)) as dconn:
+        ddb_demo = dconn.execute(
+            'SELECT "recordId", "AGE" FROM "DEMO" ORDER BY "recordId"'
+        ).fetchall()
+        ddb_vitals = dconn.execute(
+            'SELECT "recordId", "HR" FROM "VITALS" ORDER BY "recordId"'
+        ).fetchall()
+        ddb_unchanged = dconn.execute('SELECT "recordId", "NOTE" FROM "UNCHANGED"').fetchall()
+
+    assert ddb_demo == [(101, 40), (102, 51)]
+    assert ddb_vitals == [(202, 75)]
+    assert ddb_unchanged == [(301, "keep-me")]
+
+
+def test_by_form_exports_bound_memory_and_preserve_phi_masking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify max_buffered_records triggers mid-stream flushes and PHI masking/opt-out holds."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    duckdb_mod = pytest.importorskip("duckdb")
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [
+        SimpleNamespace(form_id=i, form_key=f"F{i}") for i in range(1, 6)
+    ]
+    vars_list = [
+        Variable(
+            variable_name="patientName",
+            label="Participant Alias",
+            variable_type="text",
+            form_id=i,
+            form_key=f"F{i}",
+        )
+        for i in range(1, 6)
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.return_value = vars_list
+
+    # 15 records interleaved across 5 forms (3 per form); batch_size=50, max_buffered_records=5
+    records = [
+        Record(
+            record_id=idx,
+            subject_key=f"S{idx}",
+            visit_id=1,
+            form_id=((idx - 1) % 5) + 1,
+            form_key=f"F{((idx - 1) % 5) + 1}",
+            record_data={"patientName": f"Alice {idx}"},
+        )
+        for idx in range(1, 16)
+    ]
+
+    events: list[str] = []
+
+    def _stream_with_events(**_kw: Any):
+        for r in records:
+            events.append("read")
+            yield r.model_copy(deep=True)
+
+    sdk.records.list.side_effect = _stream_with_events
+    orig_write_batch = export_mod.TabularSQLSink.write_batch
+
+    def _spy_write_batch(self_sink: export_mod.TabularSQLSink, recs: Any, *, batch_id: str) -> int:
+        events.append(f"write:{self_sink.table}")
+        return orig_write_batch(self_sink, recs, batch_id=batch_id)
+
+    monkeypatch.setattr(export_mod.TabularSQLSink, "write_batch", _spy_write_batch)
+
+    sql_masked = tmp_path / "ceil_masked.sqlite"
+    export_mod.export_to_sql_by_form(
+        sdk,
+        "PHI_CEIL",
+        f"sqlite:///{sql_masked}",
+        use_labels_as_columns=True,
+        batch_size=50,
+        max_buffered_records=5,
+    )
+
+    # First write MUST happen right after the 5th read (mid-stream ceiling eviction, well before 15th read!)
+    first_write_pos = next(i for i, e in enumerate(events) if e.startswith("write:"))
+    reads_before_first_write = sum(1 for e in events[:first_write_pos] if e == "read")
+    assert reads_before_first_write == 5
+
+    with sqlite3.connect(sql_masked) as sconn:
+        for i in range(1, 6):
+            vals = [
+                r[0] for r in sconn.execute(f'SELECT "Participant Alias" FROM "F{i}"').fetchall()
+            ]
+            assert vals == ["***MASKED***", "***MASKED***", "***MASKED***"]
+
+    # DuckDB masked vs mask_phi=False opt-out with labels
+    ddb_masked = tmp_path / "ddb_masked.duckdb"
+    ddb_unmasked = tmp_path / "ddb_unmasked.duckdb"
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+    export_mod.export_to_duckdb_by_form(
+        sdk,
+        "PHI_CEIL",
+        str(ddb_masked),
+        use_labels_as_columns=True,
+        batch_size=50,
+        max_buffered_records=5,
+    )
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+    export_mod.export_to_duckdb_by_form(
+        sdk,
+        "PHI_CEIL",
+        str(ddb_unmasked),
+        use_labels_as_columns=True,
+        mask_phi=False,
+        batch_size=50,
+        max_buffered_records=5,
+    )
+
+    with duckdb_mod.connect(str(ddb_masked)) as mconn:
+        masked_vals = [
+            r[0] for r in mconn.execute('SELECT "Participant Alias" FROM "F1"').fetchall()
+        ]
+    with duckdb_mod.connect(str(ddb_unmasked)) as uconn:
+        unmasked_vals = sorted(
+            r[0] for r in uconn.execute('SELECT "Participant Alias" FROM "F1"').fetchall()
+        )
+    assert masked_vals == ["***MASKED***", "***MASKED***", "***MASKED***"]
+    assert unmasked_vals == ["Alice 1", "Alice 11", "Alice 6"]
+
+
+def test_by_form_exports_recover_stale_running_lease_without_premature_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify stale RUNNING leases are recovered inside transaction without premature SUCCESS on failure."""
+    import json
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [SimpleNamespace(form_id=1, form_key="DEMO")]
+    vars_list = [
+        Variable(
+            variable_name="AGE", label="Age", variable_type="integer", form_id=1, form_key="DEMO"
+        )
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.return_value = vars_list
+
+    ledger_file = tmp_path / "stale_lease_ledger.json"
+    ledger_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "studies": {
+                    "STALE_STUDY": {
+                        "streams": {
+                            "sql_DEMO": {
+                                "last_timestamp": "2026-06-01T00:00:00+00:00",
+                                "status": "RUNNING",
+                                "updated_at": "2020-01-01T00:00:00+00:00",
+                                "records_processed": 5,
+                                "owner_pid": 99999999,
+                                "owner_host": "crashed-worker",
+                                "lease_expires_at": "2020-01-01T00:05:00+00:00",
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = FileStateProvider(str(ledger_file))
+
+    delta_records = [
+        Record(
+            record_id=10,
+            subject_key="S1",
+            visit_id=1,
+            form_id=1,
+            form_key="DEMO",
+            date_modified="2026-06-05T00:00:00Z",
+            record_data={"AGE": 33},
+        )
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_records)
+
+    orig_flush = export_mod.TabularSQLSink.flush
+
+    def _boom_flush(_self_sink: export_mod.TabularSQLSink) -> None:
+        raise RuntimeError("mid-flush failure after stale lease recovery")
+
+    monkeypatch.setattr(export_mod.TabularSQLSink, "flush", _boom_flush)
+    sql_path = tmp_path / "stale.sqlite"
+    with pytest.raises(RuntimeError, match="mid-flush failure after stale lease recovery"):
+        export_mod.export_to_sql_by_form(
+            sdk,
+            "STALE_STUDY",
+            f"sqlite:///{sql_path}",
+            incremental=True,
+            state_provider=provider,
+            mask_phi=False,
+        )
+
+    assert str(provider.get_last_status("STALE_STUDY", "sql_DEMO")).lower().endswith("failed")
+    assert provider.get_last_timestamp("STALE_STUDY", "sql_DEMO") == datetime(
+        2026, 6, 1, 0, 0, tzinfo=UTC
+    )
+
+    monkeypatch.setattr(export_mod.TabularSQLSink, "flush", orig_flush)
+    sdk.records.list.side_effect = lambda **_kw: iter(delta_records)
+    export_mod.export_to_sql_by_form(
+        sdk,
+        "STALE_STUDY",
+        f"sqlite:///{sql_path}",
+        incremental=True,
+        state_provider=provider,
+        mask_phi=False,
+    )
+    assert str(provider.get_last_status("STALE_STUDY", "sql_DEMO")).lower().endswith("success")
+    assert provider.get_last_timestamp("STALE_STUDY", "sql_DEMO") == datetime(
+        2026, 6, 5, 0, 0, tzinfo=UTC
+    )
+
+
+def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify by-form exports enforce Variable(required=True), #1979 CDISC/collapsed PHI keys, and dataframe_to_records."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    from imednet.errors import ValidationError
+    from imednet.integrations import enrichment as enrichment_mod
+    from imednet.models.records import Record
+    from imednet.models.study_config import StudyConfiguration
+    from imednet.models.variables import Variable
+    from imednet.utils.pandas import MASKED_SENTINEL, dataframe_to_records
+    from imednet.validation.cache import SchemaCache
+
+    duckdb_mod = pytest.importorskip("duckdb")
+
+    study_cfg = StudyConfiguration(
+        study_key="RT_STUDY",
+        phi_fields=["patient_chart_id"],
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: study_cfg if sk == "RT_STUDY" else None,
+    )
+
+    sdk = MagicMock()
+    forms = [
+        SimpleNamespace(form_id=10, form_key="DEMO"),
+        SimpleNamespace(form_id=20, form_key="VITALS"),
+    ]
+    sdk.forms.list.return_value = forms
+    vars_list = [
+        Variable(
+            variable_name="patientName",
+            label="Patient Name",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+            required=True,
+        ),
+        Variable(
+            variable_name="BRTHDTC",
+            label="Birth Date",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="PATIENTCHARTID",
+            label="Chart ID",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="SITE_CODE",
+            label="Site Code",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="HR",
+            label="Heart Rate",
+            variable_type="int",
+            form_id=20,
+            form_key="VITALS",
+            required=True,
+        ),
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.side_effect = AssertionError("must reuse prefetched variables")
+
+    records = [
+        Record(
+            record_id=101,
+            study_key="RT_STUDY",
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMO",
+            record_data={
+                "patientName": "Jane Doe",
+                "BRTHDTC": "1985-04-12",
+                "PATIENTCHARTID": "CH-900",
+                "SITE_CODE": "0042",
+            },
+        ),
+        Record(
+            record_id=102,
+            study_key="RT_STUDY",
+            subject_key="SUBJ-2",
+            visit_id=1,
+            form_id=10,
+            form_key="DEMO",
+            record_data={
+                "patientName": "",
+                "BRTHDTC": "1990-01-01",
+                "PATIENTCHARTID": "CH-901",
+                "SITE_CODE": "0099",
+            },
+        ),
+        Record(
+            record_id=201,
+            study_key="RT_STUDY",
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=20,
+            form_key="VITALS",
+            record_data={"HR": 72},
+        ),
+    ]
+
+    sql_masked = tmp_path / "rt_masked.sqlite"
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+    export_mod.export_to_sql_by_form(
+        sdk,
+        "RT_STUDY",
+        f"sqlite:///{sql_masked}",
+        quality_gate_enabled=True,
+        min_schema_readiness_score=100.0,
+    )
+    assert sdk.variables.list.call_count == 1
+
+    with sqlite3.connect(sql_masked) as sconn:
+        demo_masked_df = pd.read_sql_query('SELECT * FROM "DEMO"', sconn)
+    assert len(demo_masked_df) == 1
+    assert demo_masked_df["patientName"].iloc[0] == MASKED_SENTINEL
+    assert demo_masked_df["BRTHDTC"].iloc[0] == MASKED_SENTINEL
+    assert demo_masked_df["PATIENTCHARTID"].iloc[0] == MASKED_SENTINEL
+    assert demo_masked_df["SITE_CODE"].iloc[0] == "0042"
+    with pytest.raises(ValidationError, match="contains masked PHI sentinel"):
+        dataframe_to_records(demo_masked_df)
+
+    ddb_unmasked = tmp_path / "rt_unmasked.duckdb"
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+    export_mod.export_to_duckdb_by_form(
+        sdk,
+        "RT_STUDY",
+        str(ddb_unmasked),
+        quality_gate_enabled=True,
+        min_schema_readiness_score=100.0,
+        mask_phi=False,
+    )
+
+    schema = SchemaCache()
+    schema.populate(vars_list)
+    with duckdb_mod.connect(str(ddb_unmasked)) as uconn:
+        demo_unmasked_df = uconn.execute('SELECT * FROM "DEMO"').df()
+        vitals_unmasked_df = uconn.execute('SELECT * FROM "VITALS"').df()
+
+    demo_payloads = dataframe_to_records(demo_unmasked_df, schema=schema)
+    vitals_payloads = dataframe_to_records(vitals_unmasked_df, schema=schema)
+    assert demo_payloads == [
+        {
+            "formId": 10,
+            "subjectKey": "SUBJ-1",
+            "data": {
+                "patientName": "Jane Doe",
+                "BRTHDTC": "1985-04-12",
+                "PATIENTCHARTID": "CH-900",
+                "SITE_CODE": "0042",
+            },
+        }
+    ]
+    assert vitals_payloads == [
+        {
+            "formId": 20,
+            "subjectKey": "SUBJ-1",
+            "data": {"HR": 72},
+        }
+    ]
 
 
 def test_export_to_csv_and_tabular_sinks_as_sdtm_domain_ae_without_batch_error(

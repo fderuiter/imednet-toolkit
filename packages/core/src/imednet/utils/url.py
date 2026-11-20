@@ -47,9 +47,9 @@ def redact_sensitive_text(text: Any) -> str:
 
 
 def sanitize_base_url(url: str) -> str:
-    """Return base URL without trailing slashes or ``/api`` suffix."""
-    url = url.rstrip("/")
-    return str(re.sub(r"/api$", "", url))
+    """Return base URL without trailing slashes or ``/api``, ``/api/v1``, or ``/api/v1/edc`` suffix."""
+    cleaned = url.rstrip("/")
+    return str(re.sub(r"/api(?:/v1(?:/edc)?)?$", "", cleaned)).rstrip("/")
 
 
 def redact_url_query(url: str, sensitive_params: set[str] | None = None) -> str:

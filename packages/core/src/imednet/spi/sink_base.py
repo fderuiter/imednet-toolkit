@@ -6,7 +6,9 @@ decoupling them from internal integration components.
 """
 
 from imednet.integrations.sink_base import (
+    DEFAULT_MAX_BUFFERED_RECORDS,
     STATE_PROVIDER_ENTRY_POINT_GROUP,
+    BoundedFormBufferRouter,
     ExportSink,
     SinkConfig,
     StateProviderProtocol,
@@ -15,6 +17,7 @@ from imednet.integrations.sink_base import (
     apply_quality_gate,
     build_record_query_branches,
     evaluate_standards_readiness,
+    extract_record_form_ref,
     extract_record_id,
     extract_record_timestamp,
     get_state_provider,
@@ -24,11 +27,15 @@ from imednet.integrations.sink_base import (
     normalize_sink_value,
     normalize_watermark_datetime,
     redact_batch_records,
+    resolve_max_buffered_records,
     run_streaming_export,
+    validate_max_buffered_records,
 )
 
 __all__ = [
+    "DEFAULT_MAX_BUFFERED_RECORDS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
+    "BoundedFormBufferRouter",
     "ExportSink",
     "SinkConfig",
     "StateProviderProtocol",
@@ -37,6 +44,7 @@ __all__ = [
     "apply_quality_gate",
     "build_record_query_branches",
     "evaluate_standards_readiness",
+    "extract_record_form_ref",
     "extract_record_id",
     "extract_record_timestamp",
     "get_state_provider",
@@ -46,5 +54,7 @@ __all__ = [
     "normalize_sink_value",
     "normalize_watermark_datetime",
     "redact_batch_records",
+    "resolve_max_buffered_records",
     "run_streaming_export",
+    "validate_max_buffered_records",
 ]
