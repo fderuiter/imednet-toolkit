@@ -2518,3 +2518,237 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
                 sink.write_batch([rec], batch_id="STUDY_SEC/0")
 
         cursor.execute.assert_not_called()
+
+    def test_single_pass_record_status_keywords_and_deduplicated_checks(
+        self, monkeypatch, tmp_path
+    ):
+        """Standard Record batches normalize RecordStatus/keywords in place and deduplicate batch checks."""
+        import imednet_sinks.warehouse as wh_mod
+        import pyarrow.parquet as pq
+        from imednet_sinks.warehouse import (
+            SnowflakeExportSink,
+            SnowflakeSinkConfig,
+            _records_to_arrow_table,
+        )
+
+        from imednet.models.records import Record, RecordStatus
+        from imednet.spi.utils import global_sensitivity_registry
+
+        records = [
+            Record(
+                record_id=1,
+                study_key="STUDY_FAST",
+                subject_key="SUBJ-1",
+                subject_oid="OID-SECRET-1",
+                form_id=10,
+                form_key="VITALS",
+                visit_id=1,
+                record_status=RecordStatus.RECORD_COMPLETE,
+                deleted=False,
+                date_modified="2026-05-01T10:00:00Z",
+                record_data={"hr": 70, "patient_name": "Alice Doe"},
+            ),
+            Record(
+                record_id=2,
+                study_key="STUDY_FAST",
+                subject_key="SUBJ-2",
+                subject_oid="OID-SECRET-2",
+                form_id=20,
+                form_key="LABS",
+                visit_id=2,
+                record_status=RecordStatus.INCOMPLETE,
+                deleted=False,
+                date_modified="2026-05-01T10:05:00Z",
+                record_data={"glucose": 92.5},
+            ),
+        ]
+
+        counts = {
+            "normalize": 0,
+            "omit_empty": 0,
+            "scalar_family": 0,
+            "validate_keys": 0,
+            "is_sensitive": 0,
+        }
+        orig_norm = wh_mod._normalize_warehouse_value
+        orig_omit = wh_mod._omit_empty_structs
+        orig_fam = wh_mod._scalar_family
+        orig_val = wh_mod._validate_nested_variable_keys
+        orig_sens = global_sensitivity_registry.is_sensitive
+
+        def spy_norm(v):
+            counts["normalize"] += 1
+            return orig_norm(v)
+
+        def spy_omit(r):
+            counts["omit_empty"] += 1
+            return orig_omit(r)
+
+        def spy_fam(v):
+            counts["scalar_family"] += 1
+            return orig_fam(v)
+
+        def spy_val(v):
+            counts["validate_keys"] += 1
+            return orig_val(v)
+
+        def spy_sens(k):
+            counts["is_sensitive"] += 1
+            return orig_sens(k)
+
+        monkeypatch.setattr(wh_mod, "_normalize_warehouse_value", spy_norm)
+        monkeypatch.setattr(wh_mod, "_omit_empty_structs", spy_omit)
+        monkeypatch.setattr(wh_mod, "_scalar_family", spy_fam)
+        monkeypatch.setattr(wh_mod, "_validate_nested_variable_keys", spy_val)
+        monkeypatch.setattr(global_sensitivity_registry, "is_sensitive", spy_sens)
+
+        sf, _conn, cursor = _fake_snowflake_module()
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+        cursor.fetchall.return_value = []
+
+        cfg = SnowflakeSinkConfig(
+            study_key="STUDY_FAST",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="FAST_RECORDS",
+            local_staging_dir=str(tmp_path),
+        )
+        _records_to_arrow_table(records, study_key="STUDY_FAST")
+        assert counts["normalize"] == 0
+        assert counts["omit_empty"] == 0
+        assert counts["scalar_family"] == 0
+        assert counts["validate_keys"] == len(records)
+        # 19 canonical metadata keys checked once per batch + 3 total record_data keys across 2 records
+        assert counts["is_sensitive"] == (len(wh_mod._RECORD_METADATA_KEYS) - 1) + 3
+
+        for k in counts:
+            counts[k] = 0
+        with SnowflakeExportSink(config=cfg) as sink:
+            assert sink.write_batch(records, batch_id="STUDY_FAST/0") == 2
+
+        assert counts["normalize"] == 0
+        assert counts["omit_empty"] == 0
+        assert counts["scalar_family"] == 0
+        assert counts["validate_keys"] == len(records)
+
+        staged = pq.read_table(str(tmp_path / "STUDY_FAST_0.parquet")).to_pylist()
+        assert staged[0]["record_status"] == "Record Complete"
+        assert staged[0]["record_status"].__class__ is str
+        assert staged[0]["keywords"] == "[]"
+        assert staged[0]["patient_name"] == "***MASKED***"
+        assert staged[0]["hr"] == 70
+        assert staged[0]["glucose"] is None
+        assert staged[1]["record_status"] == "Incomplete"
+        assert staged[1]["keywords"] == "[]"
+        assert staged[1]["hr"] is None
+        assert staged[1]["glucose"] == 92.5
+
+        # Dynamically added sensitive metadata key is still picked up per batch
+        snapshot = set(global_sensitivity_registry._sensitive_keys)
+        global_sensitivity_registry.add_sensitive_key("subject_oid")
+        try:
+            sens_tbl = _records_to_arrow_table(records, study_key="STUDY_FAST")
+            sens_rows = sens_tbl.to_pylist()
+            assert sens_rows[0]["subject_oid"] == "***MASKED***"
+            assert sens_rows[1]["subject_oid"] == "***MASKED***"
+        finally:
+            global_sensitivity_registry._sensitive_keys.clear()
+            global_sensitivity_registry._sensitive_keys.update(snapshot)
+
+    def test_harmonize_tabular_rows_single_pass_selective_copy_and_other_family(self):
+        """_harmonize_tabular_rows aligns rows[0], copies later dicts only on coercion, and skips 'other' family."""
+        import pyarrow as pa
+        from imednet_sinks.warehouse import _harmonize_tabular_rows
+
+        from imednet.models.records import RecordStatus
+
+        class IntSub(int):
+            pass
+
+        # Non-conflicting mixed-form rows align missing keys on rows[0] without copying rows[1:]
+        r0 = {"record_id": 1, "hr": 72}
+        r1 = {"record_id": 2, "temp": 98.6}
+        aligned = _harmonize_tabular_rows([r0, r1])
+        assert aligned[0] == {"record_id": 1, "hr": 72, "temp": None}
+        assert aligned[0] is not r0
+        assert aligned[1] is r1
+        tbl = pa.Table.from_pylist(aligned)
+        assert tbl.column_names == ["record_id", "hr", "temp"]
+        assert tbl.to_pylist() == [
+            {"record_id": 1, "hr": 72, "temp": None},
+            {"record_id": 2, "hr": None, "temp": 98.6},
+        ]
+
+        # Conflicting types copy only rows whose values require conversion; 'other' (MagicMock) skips coercion
+        mock_marker = MagicMock()
+        c0 = {"record_id": 1, "mixed": IntSub(5), "status": RecordStatus.COMPLETE, "mock_col": 1}
+        c1 = {"record_id": 2, "mixed": "already_str", "status": "Incomplete", "mock_col": "txt"}
+        c2 = {"record_id": 3, "mixed": [1, 2], "mock_col": mock_marker}
+        coerced = _harmonize_tabular_rows([c0, c1, c2])
+        assert coerced[0]["mixed"] == "5"
+        assert coerced[0]["mock_col"] == 1
+        assert coerced[1] is c1  # 'already_str' needed no conversion and mock_col skipped coercion
+        assert coerced[2] is not c2
+        assert coerced[2]["mixed"] == "[1, 2]"
+        assert coerced[2]["mock_col"] is mock_marker
+
+    def test_standalone_post_process_omits_empty_structs_and_validates_string_payloads(self):
+        """Standalone _post_process_warehouse omits empty structs, masks PHI, and validates string record_data."""
+        import json
+
+        import pyarrow as pa
+        from imednet_sinks.warehouse import _post_process_warehouse
+
+        from imednet.errors import ExportConfigurationError
+        from imednet.models.records import RecordStatus
+
+        standalone = _post_process_warehouse(
+            {
+                "record_id": 77,
+                "record_status": RecordStatus.VERIFIED,
+                "keywords": [],
+                "patient_name": "Top Secret",
+                "empty_meta": {},
+                "nested_empty": {"leaf": {}},
+                "valid_meta": {"tag": "v1", "drop_empty": {}},
+                "tuple_meta": ("a", "b"),
+                "record_data": json.dumps(
+                    {"ssn": "999-00-1111", "bp": 118, "nested": {"pulse": 64}}
+                ),
+            }
+        )
+        assert standalone["record_status"] == "Verified"
+        assert standalone["record_status"].__class__ is str
+        assert standalone["keywords"] == "[]"
+        assert standalone["patient_name"] == "***MASKED***"
+        assert "empty_meta" not in standalone
+        assert "nested_empty" not in standalone
+        assert standalone["valid_meta"] == {"tag": "v1"}
+        assert standalone["tuple_meta"] == ["a", "b"]
+        assert standalone["ssn"] == "***MASKED***"
+        assert standalone["bp"] == 118
+        assert standalone["nested_pulse"] == 64
+
+        # PyArrow infers valid struct for valid_meta without failing on zero-field structs
+        arrow_tbl = pa.Table.from_pylist([standalone])
+        assert arrow_tbl.num_rows == 1
+        assert "empty_meta" not in arrow_tbl.column_names
+
+        # Unsafe keys in standalone Mapping and JSON-string record_data raise ExportConfigurationError
+        with pytest.raises(ExportConfigurationError, match="invalid characters"):
+            _post_process_warehouse({"record_id": 1, "record_data": {"empty_unsafe;sql": {}}})
+
+        with pytest.raises(ExportConfigurationError, match="invalid characters"):
+            _post_process_warehouse(
+                {"record_id": 1, "record_data": json.dumps({"empty_unsafe;sql": {}})}
+            )
