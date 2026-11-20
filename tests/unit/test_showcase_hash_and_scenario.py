@@ -937,6 +937,346 @@ def test_readonly_explorer_immediate_scenario_and_mode_updates_via_node() -> Non
     assert out["copiedText"] == out["queriesRestSnippet"]
 
 
+def _extract_showcase_mock_data() -> dict[str, object]:
+    """Parse ``const MOCK_DATA = {...};`` from ``docs/_static/showcase.js`` without requiring Node.js."""
+    repo_root = get_repo_root()
+    js_source = (repo_root / "docs" / "_static" / "showcase.js").read_text(encoding="utf-8")
+    start_marker = "const MOCK_DATA = "
+    start_idx = js_source.index(start_marker) + len(start_marker)
+    end_idx = js_source.index("const SNIPPETS =", start_idx)
+    raw_block = js_source[start_idx:end_idx].strip()
+    if raw_block.endswith(";"):
+        raw_block = raw_block[:-1].rstrip()
+
+    # Quote unquoted JS object keys outside string literals while ignoring // line comments
+    out_chars: list[str] = []
+    i = 0
+    n = len(raw_block)
+    in_string = False
+    escape = False
+
+    while i < n:
+        ch = raw_block[i]
+        if in_string:
+            out_chars.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out_chars.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and i + 1 < n and raw_block[i + 1] == "/":
+            newline_pos = raw_block.find("\n", i)
+            i = n if newline_pos == -1 else newline_pos
+            continue
+
+        key_match = re.match(r"([A-Za-z_]\w*)(\s*:)", raw_block[i:])
+        if key_match:
+            ident = key_match.group(1)
+            if ident not in {"true", "false", "null"}:
+                out_chars.append(f'"{ident}"{key_match.group(2)}')
+                i += len(key_match.group(0))
+                continue
+
+        out_chars.append(ch)
+        i += 1
+
+    cleaned = "".join(out_chars).strip()
+    if cleaned.endswith(";"):
+        cleaned = cleaned[:-1].rstrip()
+    parsed = json.loads(cleaned)
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def test_showcase_mock_forms_match_canonical_datadict_form_contract() -> None:
+    """Verify MOCK_DATA.forms matches imednet.datadict.models.Form with zero fabricated keys."""
+    from imednet.datadict import (
+        BusinessLogicRule,
+        Choice,
+        LogicTreeEvaluator,
+        Variable,
+    )
+    from imednet.datadict.models import Form as DatadictForm
+
+    mock_data = _extract_showcase_mock_data()
+    forms = mock_data.get("forms")
+    records_by_domain = mock_data.get("records")
+    assert isinstance(forms, dict)
+    assert isinstance(records_by_domain, dict)
+    assert set(forms.keys()) == {"VS", "DM", "AE", "LB"}
+
+    allowed_form_keys = set(DatadictForm.model_fields.keys())
+    allowed_var_keys = set(Variable.model_fields.keys())
+    allowed_choice_keys = set(Choice.model_fields.keys())
+    allowed_rule_keys = set(BusinessLogicRule.model_fields.keys())
+    evaluator = LogicTreeEvaluator()
+
+    for domain_key, raw_form in forms.items():
+        assert isinstance(raw_form, dict)
+        fabricated_form_keys = set(raw_form.keys()) - allowed_form_keys
+        assert not fabricated_form_keys, (
+            f"Form '{domain_key}' contains fabricated non-canonical keys: {sorted(fabricated_form_keys)}"
+        )
+
+        parsed_form = DatadictForm.model_validate(raw_form)
+        assert not parsed_form.model_extra
+        assert not parsed_form.extraAttributes
+        assert len(parsed_form.variables) > 0
+        assert len(parsed_form.businessLogic) > 0
+
+        raw_vars = raw_form.get("variables", [])
+        assert isinstance(raw_vars, list)
+        for raw_var, parsed_var in zip(raw_vars, parsed_form.variables, strict=True):
+            assert isinstance(raw_var, dict)
+            fabricated_var_keys = set(raw_var.keys()) - allowed_var_keys
+            assert not fabricated_var_keys, (
+                f"Variable in '{domain_key}' contains fabricated keys: {sorted(fabricated_var_keys)}"
+            )
+            assert not parsed_var.model_extra
+            assert not parsed_var.extraAttributes
+
+            raw_choices = raw_var.get("choices", [])
+            assert isinstance(raw_choices, list)
+            for raw_choice, parsed_choice in zip(raw_choices, parsed_var.choices, strict=True):
+                assert isinstance(raw_choice, dict)
+                fabricated_choice_keys = set(raw_choice.keys()) - allowed_choice_keys
+                assert not fabricated_choice_keys, (
+                    f"Choice in '{domain_key}.{parsed_var.variableName}' contains fabricated keys: "
+                    f"{sorted(fabricated_choice_keys)}"
+                )
+                assert not parsed_choice.model_extra
+                assert not parsed_choice.extraAttributes
+
+        raw_rules = raw_form.get("businessLogic", [])
+        assert isinstance(raw_rules, list)
+        for raw_rule, parsed_rule in zip(raw_rules, parsed_form.businessLogic, strict=True):
+            assert isinstance(raw_rule, dict)
+            fabricated_rule_keys = set(raw_rule.keys()) - allowed_rule_keys
+            assert not fabricated_rule_keys, (
+                f"BusinessLogicRule in '{domain_key}' contains fabricated keys: "
+                f"{sorted(fabricated_rule_keys)}"
+            )
+            assert not parsed_rule.model_extra
+            assert not parsed_rule.extraAttributes
+
+        domain_records = records_by_domain.get(domain_key)
+        assert isinstance(domain_records, list) and domain_records
+        sample_record = domain_records[0]
+        assert isinstance(sample_record, dict)
+        eval_report = evaluator.evaluate_rules(
+            parsed_form.businessLogic,
+            sample_record,
+            form_key=parsed_form.formKey,
+        )
+        assert len(eval_report.results) == len(parsed_form.businessLogic)
+        assert all(not r.skipped for r in eval_report.results)
+
+
+def test_showcase_mock_audits_match_record_revision_and_validate_chain() -> None:
+    """Verify MOCK_DATA.audits matches all 19 RecordRevision attributes and passes validate_chain."""
+    from imednet.models.record_revisions import RecordRevision
+
+    mock_data = _extract_showcase_mock_data()
+    audits = mock_data.get("audits")
+    assert isinstance(audits, list) and len(audits) >= 2
+
+    expected_aliases = {
+        field_info.alias or field_name
+        for field_name, field_info in RecordRevision.model_fields.items()
+    }
+    assert len(expected_aliases) == 19
+
+    for idx, raw_audit in enumerate(audits):
+        assert isinstance(raw_audit, dict)
+        actual_keys = set(raw_audit.keys())
+        missing_keys = expected_aliases - actual_keys
+        fabricated_keys = actual_keys - expected_aliases
+        assert not missing_keys, (
+            f"Audit revision [{idx}] missing canonical RecordRevision keys: {sorted(missing_keys)}"
+        )
+        assert not fabricated_keys, (
+            f"Audit revision [{idx}] contains fabricated keys: {sorted(fabricated_keys)}"
+        )
+        rev = RecordRevision.model_validate(raw_audit)
+        assert not getattr(rev, "model_extra", None)
+
+    validated_chain = RecordRevision.validate_chain(audits)
+    assert len(validated_chain) == len(audits)
+
+
+def test_persona_routing_and_datadict_subcommands_surfaced() -> None:
+    """Verify persona cards, panel callouts, and README route to canonical guides and surface all 8 datadict subcommands."""
+    from imednet.cli import get_parser
+
+    repo_root = get_repo_root()
+    index_rst = (repo_root / "docs" / "index.rst").read_text(encoding="utf-8")
+    readme_md = (repo_root / "README.md").read_text(encoding="utf-8")
+    datadict_rst = (repo_root / "docs" / "how-to" / "data_dictionary.rst").read_text(
+        encoding="utf-8"
+    )
+    audit_rst = (repo_root / "docs" / "how-to" / "audit_compliance.rst").read_text(encoding="utf-8")
+
+    parser = get_parser()
+    datadict_subcommands = (
+        "from-csv",
+        "from-odm",
+        "to-odm",
+        "from-redcap",
+        "from-api",
+        "validate",
+        "diff",
+        "schema",
+    )
+    import argparse
+
+    # Verify CLI parser still registers these exact 8 subcommands
+    subparsers_actions = [
+        act for act in parser._actions if isinstance(act, argparse._SubParsersAction)
+    ]
+    datadict_parser = subparsers_actions[0].choices["datadict"]
+    datadict_sub_actions = [
+        act for act in datadict_parser._actions if isinstance(act, argparse._SubParsersAction)
+    ]
+    registered_datadict_cmds = set(datadict_sub_actions[0].choices.keys())
+    assert registered_datadict_cmds == set(datadict_subcommands)
+
+    for cmd in datadict_subcommands:
+        assert cmd in datadict_rst, (
+            f"Subcommand '{cmd}' missing from docs/how-to/data_dictionary.rst"
+        )
+        assert cmd in index_rst, f"Subcommand '{cmd}' missing from docs/index.rst"
+        assert cmd in readme_md, f"Subcommand '{cmd}' missing from README.md"
+
+    assert "docs/how-to/data_dictionary.rst" in readme_md
+    assert "how-to/data_dictionary" in index_rst
+    assert "how-to/audit_compliance" in index_rst
+    assert "LogicTreeEvaluator" in datadict_rst
+    assert "RecordRevisionsEndpoint" in audit_rst
+    assert "extract_audit_trail" in audit_rst
+    assert "validate_chain" in audit_rst
+
+    # Isolate role cards in docs/index.rst
+    cards_section = index_rst[
+        index_rst.index(".. rubric:: Clinical Data Managers") : index_rst.index(
+            '<div id="interactive-showcase-root"'
+        )
+    ]
+    cdm_card = cards_section[: cards_section.index(".. rubric:: Integration Engineers")]
+    aud_card = cards_section[cards_section.index(".. rubric:: Regulatory Compliance Auditors") :]
+
+    for expected_cdm_doc in (
+        "how-to/data_dictionary",
+        "how-to/workflows/uat_workflow",
+        "how-to/register_subjects",
+        "how-to/workflows/bulk_submission",
+    ):
+        assert expected_cdm_doc in cdm_card
+    for forbidden_cdm_doc in ("how-to/verification", "how-to/form_builder"):
+        assert forbidden_cdm_doc not in cdm_card
+
+    for expected_aud_doc in (
+        "how-to/audit_compliance",
+        "how-to/duckdb_integration",
+        "how-to/export_destinations",
+        "reference/governance",
+        "reference/VPAT",
+    ):
+        assert expected_aud_doc in aud_card
+    for forbidden_aud_doc in (
+        "reference/project_standards",
+        "reference/security_exceptions",
+        "adr/index",
+    ):
+        assert forbidden_aud_doc not in aud_card
+
+    # Isolate #panel-datamanager and #panel-auditor callouts
+    panel_cdm = index_rst[
+        index_rst.index('id="panel-datamanager"') : index_rst.index('id="panel-auditor"')
+    ]
+    panel_aud = index_rst[
+        index_rst.index('id="panel-auditor"') : index_rst.index("Documentation Overview")
+    ]
+
+    for href in (
+        "how-to/data_dictionary.html",
+        "how-to/workflows/uat_workflow.html",
+        "how-to/register_subjects.html",
+        "how-to/workflows/bulk_submission.html",
+    ):
+        assert href in panel_cdm
+    assert "how-to/form_builder.html" not in panel_cdm
+
+    for href in (
+        "how-to/audit_compliance.html",
+        "how-to/duckdb_integration.html",
+        "how-to/export_destinations.html",
+        "reference/governance.html",
+        "reference/VPAT.html",
+    ):
+        assert href in panel_aud
+
+
+def test_form_builder_preset_snippet_executes_and_example_documents_cli_options() -> None:
+    """Verify form_builder.rst preset snippet runs without NameError and build_form_payload.py lists all CLI flags."""
+    import textwrap
+
+    repo_root = get_repo_root()
+    form_builder_rst = (repo_root / "docs" / "how-to" / "form_builder.rst").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        ":doc:`/how-to/data_dictionary`" in form_builder_rst
+        or ":doc:`data_dictionary`" in form_builder_rst
+    )
+    assert "formdez_save.php" in form_builder_rst
+    assert "PHPSESSID" in form_builder_rst
+    assert "CSRFKey" in form_builder_rst
+
+    match = re.search(
+        r"\.\.\s+(?:testcode|code-block::\s*python)::\n\n((?:[ ]{4,}.*\n|\n)+)",
+        form_builder_rst,
+    )
+    assert match, "Python preset snippet not found in docs/how-to/form_builder.rst"
+    snippet_code = textwrap.dedent(match.group(1))
+
+    namespace: dict[str, object] = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        exec(compile(snippet_code, "form_builder.rst", "exec"), namespace)  # noqa: S102
+
+    assert "FormBuilder" in namespace
+    assert callable(namespace.get("build_my_form"))
+    layout = namespace.get("layout")
+    assert hasattr(layout, "pages") and len(layout.pages) == 1  # type: ignore[union-attr]
+
+    example_py = (repo_root / "examples" / "build_form_payload.py").read_text(encoding="utf-8")
+    example_tree = ast.parse(example_py)
+    docstring = ast.get_docstring(example_tree) or ""
+    for required_flag in (
+        "--preset",
+        "--base-url",
+        "--phpsessid",
+        "--csrf",
+        "--form-id",
+        "--comm-id",
+        "--revision",
+    ):
+        assert required_flag in docstring, (
+            f"Required CLI option '{required_flag}' missing from examples/build_form_payload.py docstring"
+        )
+    assert "IMEDNET_API_KEY" not in docstring
+    assert "IMEDNET_SECURITY_KEY" not in docstring
+
+
 def test_showcase_hashchange_preserves_persona_and_clipboard_errors_announce_via_node() -> None:
     """Verify non-panel hashchange preserves active persona and rejected/missing clipboard announces fallback."""
     node_bin = shutil.which("node")

@@ -67,16 +67,16 @@ class Subject(ImednetBaseModel):
     keywords: list[SubjectKeyword] = Field(default_factory=list, alias="keywords")
     subject_status: SubjectStatus | str | None = Field(default=None, alias="subjectStatus")
     deleted: bool | None = Field(default=None, alias="deleted")
-    study_key: str | None
-    subject_id: int | None
-    subject_key: str | None
-    site_id: int | None
-    site_name: str | None
-    date_created: str | None
-    date_modified: str | None
-    enrollment_start_date: str | None
-    subject_oid: str | None
-    last_updated: str | None
+    study_key: str | None = None
+    subject_id: int | None = None
+    subject_key: str | None = None
+    site_id: int | None = None
+    site_name: str | None = None
+    date_created: str | None = None
+    date_modified: str | None = None
+    enrollment_start_date: str | None = None
+    subject_oid: str | None = None
+    last_updated: str | None = None
 
     @field_validator("subject_status", mode="before")
     @classmethod

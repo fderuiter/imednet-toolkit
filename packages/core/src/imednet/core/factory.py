@@ -17,10 +17,12 @@ from imednet.core.client import Client
 from imednet.core.retry import RetryConfig
 
 
-def _default_auth(config: Config) -> AuthStrategy:
+def _default_auth(config: Config, *, has_transport: bool = False) -> AuthStrategy:
     """Resolve the existing OIDC-before-key default policy once."""
     if config.oidc_token:
         return OIDCAuth(config.oidc_token)
+    if has_transport and (not config.api_key or not config.security_key):
+        return ApiKeyAuth(config.api_key or "", config.security_key or "")
     if not config.api_key and not config.security_key:
         raise ValueError("API key and security key are required")
     if not config.api_key:
@@ -54,7 +56,7 @@ class ClientFactory:
                 )
             )
         if auth is None:
-            auth = _default_auth(config)
+            auth = _default_auth(config, has_transport=transport is not None)
         effective_timeout = config.timeout if timeout is None else timeout
         client = Client(
             timeout=effective_timeout,
@@ -87,7 +89,7 @@ class ClientFactory:
                 )
             )
         if auth is None:
-            auth = _default_auth(config)
+            auth = _default_auth(config, has_transport=transport is not None)
         effective_timeout = config.timeout if timeout is None else timeout
         async_client = AsyncClient(
             timeout=effective_timeout,
