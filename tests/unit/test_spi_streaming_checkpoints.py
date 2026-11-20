@@ -330,14 +330,38 @@ def test_record_mapper_iter_dataframes_streams_lazily() -> None:
     assert [len(df) for df in remaining] == [2, 1]
     assert reads[0] == 5
 
-    # SDTM chunked streaming
+    # SDTM chunked streaming: single-subject group sorts & sequences continuously across chunks
     reads[0] = 0
     sdtm_frames = mapper.iter_sdtm_dataframes("STUDY-MAP", domain="AE")
     first_sdtm = next(sdtm_frames)
     assert len(first_sdtm) == 2
-    assert reads[0] == 2
+    assert list(first_sdtm["AESEQ"]) == [1, 2]
     rest_sdtm = list(sdtm_frames)
     assert sum(len(df) for df in rest_sdtm) == 3
+    assert [seq for df in rest_sdtm for seq in df["AESEQ"]] == [3, 4, 5]
+
+    # SDTM chunked streaming across ordered Subjects yields lazily with 1-record boundary lookahead
+    def _lazy_ordered_subjects(**kwargs: Any) -> Iterator[Record]:
+        assert kwargs.get("sort") == "subjectKey,asc;recordId,asc"
+        for idx in range(1, 6):
+            reads[0] += 1
+            yield _make_record(
+                idx,
+                subject_key=f"SUBJ-{idx:02d}",
+                form_key="AE",
+                record_data={"aeTerm": f"Headache {idx}", "aeSerious": "Yes"},
+            )
+
+    sdk.records.list.side_effect = _lazy_ordered_subjects
+    reads[0] = 0
+    ordered_sdtm_frames = mapper.iter_sdtm_dataframes("STUDY-MAP", domain="AE")
+    assert reads[0] == 0
+    first_ordered = next(ordered_sdtm_frames)
+    assert len(first_ordered) == 2
+    assert reads[0] == 3
+    rest_ordered = list(ordered_sdtm_frames)
+    assert [len(df) for df in rest_ordered] == [2, 1]
+    assert reads[0] == 5
 
 
 # ---------------------------------------------------------------------------

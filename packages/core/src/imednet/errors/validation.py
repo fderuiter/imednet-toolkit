@@ -9,11 +9,18 @@ from .client import ClientError
 class ValidationError(ApiError):
     """Raised when a request is malformed or validation fails (HTTP 400)."""
 
-    def __init__(self, response: dict[str, Any] | str | Any, status_code: int | None = 400) -> None:
+    def __init__(
+        self,
+        response: dict[str, Any] | str | Any,
+        status_code: int | None = 400,
+        *,
+        validation_report: Any | None = None,
+    ) -> None:
         """Initialize validation error, preserving upstream status when present."""
         super().__init__(response, status_code=status_code)
         if not self.status:
             self.status = "validation_error"
+        self.validation_report = validation_report
 
 
 class BadRequestError(ValidationError):
