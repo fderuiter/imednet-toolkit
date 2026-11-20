@@ -145,21 +145,81 @@ def test_legacy_payload_fallback_calculation() -> None:
     q_answered = Query.model_validate(answered_legacy)
     assert q_answered.status == QueryStatus.ANSWERED
 
-    cancelled_legacy = {
+    # Authoritative closed=False ignores closed/cancelled tokens
+    cancelled_open_legacy = {
         "queryComments": [
             {"sequence": 1, "closed": False, "annotationStatus": "Cancelled discrepancy"},
         ]
     }
-    q_cancelled = Query.model_validate(cancelled_legacy)
-    assert q_cancelled.status == QueryStatus.CANCELLED
+    q_cancelled_open = Query.model_validate(cancelled_open_legacy)
+    assert q_cancelled_open.status == QueryStatus.OPEN
 
-    closed_ann_legacy = {
+    closed_ann_open_legacy = {
         "queryComments": [
             {"sequence": 1, "closed": False, "annotationStatus": "Closed discrepancy"},
         ]
     }
-    q_closed_ann = Query.model_validate(closed_ann_legacy)
-    assert q_closed_ann.status == QueryStatus.CLOSED
+    q_closed_ann_open = Query.model_validate(closed_ann_open_legacy)
+    assert q_closed_ann_open.status == QueryStatus.OPEN
+
+    # Missing closed (None) falls back to annotation status tokens
+    cancelled_none_legacy = {
+        "queryComments": [
+            {"sequence": 1, "annotationStatus": "Cancelled discrepancy"},
+        ]
+    }
+    assert Query.model_validate(cancelled_none_legacy).status == QueryStatus.CANCELLED
+
+    closed_none_legacy = {
+        "queryComments": [
+            {"sequence": 1, "annotationStatus": "Closed discrepancy"},
+        ]
+    }
+    assert Query.model_validate(closed_none_legacy).status == QueryStatus.CLOSED
+
+
+def test_legacy_status_negated_annotations_and_authoritative_closed_flag() -> None:
+    """Verify negated tokens and authoritative boolean closed flag in calculate_legacy_status."""
+    for text in ("Uncancelled", "Not Closed", "Unanswered", "Not Answered", "Not Responded"):
+        payload = {"queryComments": [{"sequence": 1, "closed": False, "annotationStatus": text}]}
+        assert Query.model_validate(payload).status == QueryStatus.OPEN
+
+    for text in ("Uncancelled", "Not Cancelled", "Not Canceled", "Site Answered"):
+        payload = {"queryComments": [{"sequence": 1, "closed": True, "annotationStatus": text}]}
+        assert Query.model_validate(payload).status == QueryStatus.CLOSED
+
+    for text in ("Query Canceled", "Discrepancy Cancelled"):
+        payload = {"queryComments": [{"sequence": 1, "closed": True, "annotationStatus": text}]}
+        assert Query.model_validate(payload).status == QueryStatus.CANCELLED
+
+
+def test_legacy_status_missing_or_tied_sequence_uses_last_comment() -> None:
+    """Verify missing (None) or tied sequence integers select the newest (last) comment."""
+    no_seq_payload = {
+        "queryComments": [
+            {"closed": True, "annotationStatus": "Closed"},
+            {"closed": False, "annotationStatus": "Site Answered"},
+        ]
+    }
+    assert Query.model_validate(no_seq_payload).status == QueryStatus.ANSWERED
+
+    tied_seq_comments = [
+        QueryComment(sequence=2, closed=False, annotation_status="Answered"),
+        QueryComment(sequence=2, closed=True, annotation_status="Closed"),
+    ]
+    assert calculate_legacy_status(tied_seq_comments) == QueryStatus.CLOSED
+
+
+def test_query_model_validate_does_not_mutate_input_dict() -> None:
+    """Verify Query.model_validate leaves caller dictionary untouched."""
+    raw_comment = {"sequence": 1, "closed": False, "annotationStatus": "Site Answered"}
+    raw_payload = {"annotationId": 99, "queryComments": [raw_comment]}
+    snapshot = {"annotationId": 99, "queryComments": [dict(raw_comment)]}
+
+    query = Query.model_validate(raw_payload)
+    assert query.status == QueryStatus.ANSWERED
+    assert "status" not in raw_payload
+    assert raw_payload == snapshot
 
 
 def test_calculate_legacy_status_function() -> None:
