@@ -54,8 +54,10 @@ WORKSPACE_PACKAGES = {
 
 LITERALINCLUDE_PATTERN = re.compile(r"^\s*\.\.\s+literalinclude::\s+(\S+)")
 RST_PYTHON_BLOCK_PATTERN = re.compile(
-    r"^(\s*)\.\.\s+(?:testcode|code-block)::(?:\s+(python|py))?\s*$"
+    r"^(\s*)\.\.\s+(?:testcode|code-block|sourcecode)::(?:\s+(python|py))?\s*$"
 )
+MD_PYTHON_FENCE_OPEN_PATTERN = re.compile(r"^(\s*)```(?:python|py)\s*$")
+MD_PYTHON_FENCE_CLOSE_PATTERN = re.compile(r"^\s*```\s*$")
 
 
 def configure_sys_path(repo_root: Path) -> None:
@@ -746,18 +748,68 @@ def _validate_inline_rst_python_blocks(doc_file: Path, doc_lines: list[str]) -> 
         try:
             tree = ast.parse(textwrap.dedent(snippet), filename=str(doc_file))
         except SyntaxError as exc:
-            if is_testcode:
-                line_offset = (exc.lineno or 1) - 1
-                errors.append(
-                    f"{doc_file}:{block_start_idx + 1 + line_offset}: "
-                    f"Inline testcode syntax error: {exc.msg}"
-                )
+            line_offset = (exc.lineno or 1) - 1
+            label = (
+                "Inline testcode syntax error"
+                if is_testcode
+                else "Inline Python block syntax error"
+            )
+            errors.append(f"{doc_file}:{block_start_idx + 1 + line_offset}: {label}: {exc.msg}")
             continue
 
         for rel_lineno, reason in validate_ast_imports(tree, workspace_only=True):
             abs_lineno = block_start_idx + max(rel_lineno, 1)
             errors.append(
                 f"{doc_file}:{abs_lineno}: {reason} (in directive at line {directive_lineno})"
+            )
+
+    return errors
+
+
+def _validate_markdown_python_blocks(md_file: Path, md_lines: list[str]) -> list[str]:
+    """Validate syntax and workspace symbol imports inside fenced Markdown Python blocks."""
+    errors: list[str] = []
+    idx = 0
+    total = len(md_lines)
+
+    while idx < total:
+        match = MD_PYTHON_FENCE_OPEN_PATTERN.match(md_lines[idx])
+        if not match:
+            idx += 1
+            continue
+
+        fence_indent = len(match.group(1))
+        fence_lineno = idx + 1
+        idx += 1
+        block_start_idx = idx
+        buf: list[str] = []
+
+        while idx < total and not MD_PYTHON_FENCE_CLOSE_PATTERN.match(md_lines[idx]):
+            raw = md_lines[idx]
+            buf.append(raw[fence_indent:] if len(raw) >= fence_indent else raw)
+            idx += 1
+
+        if idx < total:
+            idx += 1
+
+        snippet = textwrap.dedent("\n".join(buf))
+        if not snippet.strip():
+            continue
+
+        try:
+            tree = ast.parse(snippet, filename=str(md_file))
+        except SyntaxError as exc:
+            line_offset = (exc.lineno or 1) - 1
+            errors.append(
+                f"{md_file}:{block_start_idx + 1 + line_offset}: "
+                f"Markdown Python block syntax error: {exc.msg}"
+            )
+            continue
+
+        for rel_lineno, reason in validate_ast_imports(tree, workspace_only=True):
+            abs_lineno = block_start_idx + max(rel_lineno, 1)
+            errors.append(
+                f"{md_file}:{abs_lineno}: {reason} (in fenced block at line {fence_lineno})"
             )
 
     return errors
@@ -885,6 +937,33 @@ def validate_documentation_literal_includes(
 
         if doc_file.suffix == ".rst":
             errors.extend(_validate_inline_rst_python_blocks(doc_file, doc_lines))
+        elif doc_file.suffix == ".md":
+            errors.extend(_validate_markdown_python_blocks(doc_file, doc_lines))
+
+    if repo_root is not None:
+        seen_md = {p.resolve() for p in doc_files if p.suffix == ".md"}
+        extra_md_candidates: list[Path] = []
+        root_readme = repo_root / "README.md"
+        if root_readme.is_file():
+            extra_md_candidates.append(root_readme)
+        packages_dir = repo_root / "packages"
+        if packages_dir.exists():
+            extra_md_candidates.extend(sorted(packages_dir.glob("*/README.md")))
+        examples_dir = repo_root / "examples"
+        if examples_dir.exists():
+            extra_md_candidates.extend(sorted(examples_dir.rglob("*.md")))
+
+        for md_file in extra_md_candidates:
+            resolved_md = md_file.resolve()
+            if resolved_md in seen_md or not md_file.is_file():
+                continue
+            seen_md.add(resolved_md)
+            try:
+                md_content = md_file.read_text(encoding="utf-8")
+            except Exception as exc:
+                errors.append(f"{md_file}: Failed to read file: {exc}")
+                continue
+            errors.extend(_validate_markdown_python_blocks(md_file, md_content.splitlines()))
 
     return errors
 

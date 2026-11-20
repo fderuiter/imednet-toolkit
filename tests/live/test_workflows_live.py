@@ -94,6 +94,22 @@ def test_query_management_state_counts(sdk: ImednetSDK, study_key: str) -> None:
     assert isinstance(counts, dict)
 
 
+def test_query_management_unresolved_queries(sdk: ImednetSDK, study_key: str) -> None:
+    """Test that query management unresolved queries."""
+    wf = sdk.workflows.query_management
+    assert isinstance(wf.get_unresolved_queries(study_key), list)
+
+
+def test_query_management_sync_queries_to_triage(sdk: ImednetSDK, study_key: str, tmp_path) -> None:
+    """Test syncing queries into a local TriageStore."""
+    from imednet_workflows.triage_store import TriageStore
+
+    store = TriageStore(tmp_path / "live_triage.sqlite3")
+    wf = sdk.workflows.query_management
+    queued = wf.sync_queries_to_triage(study_key, store)
+    assert isinstance(queued, list)
+
+
 def test_record_mapper_dataframe(sdk: ImednetSDK, study_key: str) -> None:
     """Test that record mapper dataframe."""
     df = sdk.workflows.record_mapper.dataframe(study_key)

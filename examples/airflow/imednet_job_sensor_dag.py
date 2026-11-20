@@ -14,7 +14,7 @@ Update ``STUDY_KEY`` and ``BATCH_ID`` with real values before running.
 
 from datetime import datetime
 
-from airflow import DAG
+from airflow.sdk import DAG
 
 from apache_airflow_providers_imednet import ImednetJobSensor
 

@@ -67,6 +67,7 @@ def test_get_provider_info_structure_and_airflow_discovery() -> None:
     """ProvidersManager discovers imednet provider, hook, widgets, and UI field behaviours."""
     from airflow.providers.imednet.hooks import ImednetHook as BridgeHook
     from airflow.providers.imednet.triggers import ImednetJobTrigger as BridgeTrigger
+
     from apache_airflow_providers_imednet import ImednetHook, ImednetJobTrigger, get_provider_info
 
     assert BridgeHook is ImednetHook

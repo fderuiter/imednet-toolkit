@@ -16,6 +16,10 @@ pip installation. Package versions remain managed by release-please.
 .. code-block:: bash
 
    pip install "apache-airflow>=3.2.0,<4.0.0" apache-airflow-providers-imednet
+   # Optional destination extras:
+   pip install "apache-airflow-providers-imednet[export]"
+   pip install "apache-airflow-providers-imednet[duckdb]"
+   pip install "apache-airflow-providers-imednet[snowflake,mongodb,neo4j]"
 
 Optional extras are available for OpenLineage dataset lineage, warehouse/graph/document
 sinks, incremental checkpoint ledgers, S3/AWS object-store targets, or all integrations:
@@ -53,21 +57,25 @@ Connections
 -----------
 
 Installing ``apache-airflow-providers-imednet`` registers the ``imednet``
-connection type in Airflow's ``ProvidersManager`` with labeled UI form fields
-(``API Key`` for ``login``, ``Security Key`` for ``password``, plus ``Base URL``,
-masked ``OIDC Token``, ``Request Timeout``, ``Strict Mode``, and
-``Simulation Mode``). Create an Airflow connection ``imednet_default`` or
-override ``imednet_conn_id``. ``ImednetHook.test_connection()`` validates
-connectivity against the lightweight study metadata endpoint while redacting
-secrets from error diagnostics. The hook merges connection settings with values
-from ``imednet.config.load_config`` so environment variables still apply.
+connection type in Airflow's ``ProvidersManager`` (via
+``apache_airflow_providers_imednet.get_provider_info:get_provider_info``) with
+labeled UI form fields (``API Key`` for ``login``, ``Security Key`` for
+``password``, plus ``Base URL``, masked ``OIDC Token``, ``Request Timeout``,
+``Strict Mode``, and ``Simulation Mode``). Create an Airflow connection
+``imednet_default`` or override ``imednet_conn_id``, providing ``api_key`` and
+``security_key`` via the login/password fields or in ``extra`` JSON.
+``ImednetHook.test_connection()`` validates connectivity against the lightweight
+study metadata endpoint while redacting secrets from error diagnostics. The hook
+merges connection settings with values from ``imednet.config.load_config`` so
+environment variables still apply.
 
-For warehouse, graph, document, and transactional SQL exports, configure a
+For warehouse, graph, document, DuckDB, and transactional SQL exports, configure a
 separate Airflow connection and pass ``destination_conn_id`` on
 ``ImednetExportOperator``. ``ImednetHook.resolve_destination_connection()``
 resolves destination credentials (Snowflake ``account``/``user``/``password``
 and coordinates, Neo4j ``uri``/``auth``/``database``, MongoDB ``uri`` and
-database settings, or SQLAlchemy connection URIs) at task execution time rather
+database settings, DuckDB ``db_path`` and ``table_name``, or SQLAlchemy
+connection URIs) at task execution time rather
 than embedding secrets in DAG definitions.
 
 To prevent credential leakage in Airflow rendered task metadata and XComs,
@@ -94,7 +102,7 @@ helper methods:
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
 - ``resolve_destination_connection()`` resolves runtime destination connection
-  settings for ``snowflake``, ``neo4j``, ``mongodb``, and ``sql`` targets.
+  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb``, and ``sql`` targets.
 
 Operators, Deferrable Sensors, and OpenLineage
 ----------------------------------------------
@@ -102,7 +110,8 @@ The Airflow integration organizes hooks, operators, sensors, and triggers in
 dedicated modules for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, Snowflake, Neo4j, etc.)
+records to any supported destination (CSV, Parquet, DuckDB, SQL, Snowflake,
+Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
@@ -122,15 +131,18 @@ sink destinations, replacing registered ``Subject`` identifiers and committed
 workflows can explicitly opt out by passing ``mask_phi=False`` (or
 ``export_kwargs={"mask_phi": False}``) without mutating
 ``global_sensitivity_registry``. Destination-specific non-secret options—such as
-Snowflake staging settings (``stage_prefix``, ``local_staging_dir``,
-``manifest_path``) and Neo4j ``database`` names—can be supplied via
-``export_kwargs`` or connection ``extra`` metadata.
+DuckDB ``table_name`` (or ``table``, defaulting to ``"records"``), Snowflake
+staging settings (``stage_prefix``, ``local_staging_dir``, ``manifest_path``),
+and Neo4j ``database`` names—can be supplied via ``export_kwargs`` or connection
+``extra`` metadata.
 
-``ImednetJobSensor`` waits for an asynchronous job to reach a terminal state.
-Passing ``deferrable=True`` (or enabling ``[operators] default_deferrable``)
-suspends the Airflow worker slot and delegates polling to ``ImednetJobTrigger``
-in the Airflow triggerer using ``AsyncImednetSDK`` and ``AsyncJobPoller``—storing
-only ``imednet_conn_id`` and job coordinates in serialized trigger state.
+``ImednetJobSensor(study_key=..., batch_id=...)`` polls an asynchronous iMednet
+job identified by ``study_key`` and ``batch_id`` until it reaches a terminal
+state (see :ref:`rest_resource_jobs`). Passing ``deferrable=True`` (or enabling
+``[operators] default_deferrable``) suspends the Airflow worker slot and
+delegates polling to ``ImednetJobTrigger`` in the Airflow triggerer using
+``AsyncImednetSDK`` and ``AsyncJobPoller``—storing only ``imednet_conn_id`` and
+job coordinates in serialized trigger state.
 All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` instance
 from an Airflow connection. The production reference DAG above shows the recommended
 dynamic-mapping pattern: keep static settings (for example ``destination``,
@@ -140,31 +152,33 @@ only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs`
 .. testcode::
 
    from typing import Any
-   from airflow.sdk import task
+   from airflow.sdk import DAG, task
    from apache_airflow_providers_imednet import ImednetExportOperator, ImednetHook
 
-   @task
-   def export_targets() -> list[dict[str, Any]]:
-       hook = ImednetHook("imednet_default")
-       return [
-           {
-               "study_key": study_key,
-               "output_path": f"/tmp/{study_key}.csv",
-               "export_kwargs": {"index": False},
-           }
-           for study_key in hook.list_study_keys()
-       ]
+   with DAG(dag_id="imednet_dynamic_export"):
 
-   ImednetExportOperator.partial(
-       task_id="export_records",
-       destination="csv",
-       batch_size=1000,
-       max_retries=5,
-       idempotent=True,
-       quality_gate_enabled=True,
-       min_schema_readiness_score=95.0,
-       imednet_conn_id="imednet_default",
-   ).expand_kwargs(export_targets())
+       @task
+       def export_targets() -> list[dict[str, Any]]:
+           hook = ImednetHook("imednet_default")
+           return [
+               {
+                   "study_key": study_key,
+                   "output_path": f"/tmp/{study_key}.csv",
+                   "export_kwargs": {"index": False},
+               }
+               for study_key in hook.list_study_keys()
+           ]
+
+       ImednetExportOperator.partial(
+           task_id="export_records",
+           destination="csv",
+           batch_size=1000,
+           max_retries=5,
+           idempotent=True,
+           quality_gate_enabled=True,
+           min_schema_readiness_score=95.0,
+           imednet_conn_id="imednet_default",
+       ).expand_kwargs(export_targets())
 
 For warehouse or database sinks, bind ``destination_conn_id`` so credentials are
 resolved only inside ``execute()``:

@@ -6,9 +6,11 @@ Provides an incremental record centralization pipeline using DuckDB.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
-from datetime import datetime
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
+from uuid import uuid4
 
 from .data_extraction import DataExtractionWorkflow
 
@@ -18,6 +20,25 @@ if TYPE_CHECKING:
 
 
 _SAFE_STUDY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+_BRONZE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
+    ("study_key", "object"),
+    ("record_revision_id", "Int64"),
+    ("record_id", "Int64"),
+    ("record_oid", "object"),
+    ("form_key", "object"),
+    ("subject_key", "object"),
+    ("site_id", "Int64"),
+    ("interval_id", "Int64"),
+    ("record_status", "object"),
+    ("record_revision", "Int32"),
+    ("data_revision", "Int32"),
+    ("user", "object"),
+    ("role", "object"),
+    ("reason_for_change", "object"),
+    ("deleted", "bool"),
+    ("date_created", "object"),
+    ("last_updated", "object"),
+)
 
 
 class DuckDBIngestionWorkflow:
@@ -64,9 +85,14 @@ class DuckDBIngestionWorkflow:
 
         self._ensure_bronze_table()
         rows = list(self._to_rows(study_key, revisions))
-        if rows:
-            self._connection.executemany(
-                """
+        if not rows:
+            return 0
+
+        staging_relation = self._build_staging_relation(rows)
+        view_name = f"_staging_bronze_revisions_{uuid4().hex}"
+        self._connection.register(view_name, staging_relation)
+        try:
+            insert_query = f"""
                 INSERT INTO bronze_revisions (
                     study_key,
                     record_revision_id,
@@ -85,10 +111,30 @@ class DuckDBIngestionWorkflow:
                     deleted,
                     date_created,
                     last_updated
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
+                )
+                SELECT
+                    CAST(study_key AS VARCHAR),
+                    CAST(record_revision_id AS BIGINT),
+                    CAST(record_id AS BIGINT),
+                    CAST(record_oid AS VARCHAR),
+                    CAST(form_key AS VARCHAR),
+                    CAST(subject_key AS VARCHAR),
+                    CAST(site_id AS BIGINT),
+                    CAST(interval_id AS BIGINT),
+                    CAST(record_status AS VARCHAR),
+                    CAST(record_revision AS INTEGER),
+                    CAST(data_revision AS INTEGER),
+                    CAST("user" AS VARCHAR),
+                    CAST(role AS VARCHAR),
+                    CAST(reason_for_change AS VARCHAR),
+                    CAST(deleted AS BOOLEAN),
+                    CAST(CAST(date_created AS VARCHAR) AS TIMESTAMP),
+                    CAST(CAST(last_updated AS VARCHAR) AS TIMESTAMP)
+                FROM "{view_name}"
+                """
+            self._connection.execute(insert_query)  # nosem
+        finally:
+            self._connection.unregister(view_name)
         return len(rows)
 
     def build_silver_view(self, study_key: str) -> None:
@@ -162,14 +208,27 @@ class DuckDBIngestionWorkflow:
         return None if value is None else int(value)
 
     @staticmethod
-    def _optional_timestamp(value: Any) -> datetime | str | None:
-        """Normalize empty timestamp strings to None for DuckDB TIMESTAMP columns."""
+    def _optional_str(value: Any) -> str | None:
+        """Convert optional string or enum fields to plain strings."""
         if value is None:
             return None
-        if isinstance(value, str) and not value.strip():
-            return None
-        if isinstance(value, (datetime, str)):
+        if isinstance(value, Enum):
+            return str(value.value)
+        if isinstance(value, str):
             return value
+        return str(value)
+
+    @staticmethod
+    def _optional_timestamp(value: Any) -> str | None:
+        """Normalize timestamps to naive UTC ISO strings and blank strings to None."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is not None and value.utcoffset() is not None:
+                value = value.astimezone(UTC).replace(tzinfo=None)
+            return value.isoformat()
+        if isinstance(value, str):
+            return value if value.strip() else None
         return str(value)
 
     def _to_rows(
@@ -183,18 +242,50 @@ class DuckDBIngestionWorkflow:
                 str(rev_study_key),
                 self._optional_int(getattr(revision, "record_revision_id", None)),
                 self._optional_int(getattr(revision, "record_id", None)),
-                getattr(revision, "record_oid", None),
-                getattr(revision, "form_key", None),
-                getattr(revision, "subject_key", None),
+                self._optional_str(getattr(revision, "record_oid", None)),
+                self._optional_str(getattr(revision, "form_key", None)),
+                self._optional_str(getattr(revision, "subject_key", None)),
                 self._optional_int(getattr(revision, "site_id", None)),
                 self._optional_int(getattr(revision, "interval_id", None)),
-                getattr(revision, "record_status", None),
+                self._optional_str(getattr(revision, "record_status", None)),
                 self._optional_int(getattr(revision, "record_revision", None)),
                 self._optional_int(getattr(revision, "data_revision", None)),
-                getattr(revision, "user", None),
-                getattr(revision, "role", None),
-                getattr(revision, "reason_for_change", None),
+                self._optional_str(getattr(revision, "user", None)),
+                self._optional_str(getattr(revision, "role", None)),
+                self._optional_str(getattr(revision, "reason_for_change", None)),
                 False if deleted_val is None else bool(deleted_val),
                 self._optional_timestamp(getattr(revision, "date_created", None)),
                 self._optional_timestamp(getattr(revision, "last_updated", None)),
             )
+
+    @staticmethod
+    def _build_staging_relation(rows: Sequence[tuple[Any, ...]]) -> Any:
+        """Build a typed columnar staging relation using PyArrow or Pandas fallback."""
+        columns: tuple[tuple[Any, ...], ...] = (
+            tuple(zip(*rows, strict=True)) if rows else tuple(() for _ in _BRONZE_COLUMN_SPECS)
+        )
+        try:
+            import pyarrow as pa
+        except ImportError:
+            import pandas as pd
+
+            return pd.DataFrame(
+                {
+                    name: pd.Series(list(col), dtype=dtype)
+                    for (name, dtype), col in zip(_BRONZE_COLUMN_SPECS, columns, strict=True)
+                }
+            )
+
+        arrow_types: dict[str, Any] = {
+            "object": pa.string(),
+            "Int64": pa.int64(),
+            "Int32": pa.int32(),
+            "bool": pa.bool_(),
+        }
+        return pa.Table.from_arrays(
+            [
+                pa.array(col, type=arrow_types[dtype])
+                for (_, dtype), col in zip(_BRONZE_COLUMN_SPECS, columns, strict=True)
+            ],
+            names=[name for name, _ in _BRONZE_COLUMN_SPECS],
+        )

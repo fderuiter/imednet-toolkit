@@ -631,101 +631,390 @@ def test_cli_default_ledger_path_behavior() -> None:
     assert reset_args.ledger_path == DEFAULT_LEDGER_PATH
 
 
-def test_airflow_state_provider_xcom_model_helpers_and_in_process_db(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify AirflowStateProvider XComModel helpers, run_id resolution, and state roundtrips."""
-    import sys
-    from types import SimpleNamespace
+def test_airflow_state_provider_in_context_sdk_scoping_and_fallbacks(monkeypatch) -> None:
+    """Verify AirflowStateProvider uses airflow.sdk.get_current_context and scopes xcom_pull by task_id."""
+    import json as _json
+    from types import ModuleType, SimpleNamespace
     from unittest.mock import MagicMock
 
     from imednet_workflows.state_ledger import AirflowStateProvider
 
     provider = AirflowStateProvider()
+    pushed: list[tuple[str, dict[str, object]]] = []
 
-    # 1. _resolve_out_of_task_run_id branches
-    monkeypatch.delenv("AIRFLOW_CTX_DAG_RUN_ID", raising=False)
-    monkeypatch.delenv("AIRFLOW_CTX_LOGICAL_DATE", raising=False)
-    monkeypatch.delenv("AIRFLOW_CTX_EXECUTION_DATE", raising=False)
-    assert provider._resolve_out_of_task_run_id() == "manual__state_sync"
+    class _MappedTI:
+        task_id = "export_records"
+        map_index = 2
 
-    monkeypatch.setenv("AIRFLOW_CTX_LOGICAL_DATE", "2026-06-01T09:00:00")
-    assert provider._resolve_out_of_task_run_id() == "manual__2026-06-01T09:00:00+00:00"
+        def xcom_pull(self, *, task_ids=None, key=None, include_prior_dates=False):
+            assert task_ids == "export_records"
+            assert include_prior_dates is True
+            assert key == "state_STUDY_X_csv"
+            if not pushed:
+                return None
+            return [
+                {"last_timestamp": "2026-01-01T00:00:00", "status": "running"},
+                pushed[-1][1],
+            ]
 
-    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled__2026-06-02")
-    assert provider._resolve_out_of_task_run_id() == "scheduled__2026-06-02"
+        def xcom_push(self, *, key: str, value: dict[str, object]) -> None:
+            pushed.append((key, value))
 
-    # 2. _deserialize_xcom_value branches
-    assert provider._deserialize_xcom_value(object, None) is None
-    assert provider._deserialize_xcom_value(object, SimpleNamespace(value={"a": 1})) == {"a": 1}
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.get_current_context = lambda: {"ti": _MappedTI()}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
 
-    cls_with_deser = SimpleNamespace(deserialize_value=lambda obj: {"decoded": obj.value})
-    assert provider._deserialize_xcom_value(cls_with_deser, SimpleNamespace(value="raw")) == {
-        "decoded": "raw"
-    }
+    session_mod = ModuleType("airflow.utils.session")
+    create_session_spy = MagicMock()
+    session_mod.create_session = create_session_spy  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_mod)
 
-    cls_broken_deser = SimpleNamespace(
-        deserialize_value=lambda _obj: (_ for _ in ()).throw(RuntimeError("bad"))
+    # Initial run in active context returns None without querying XComModel DB
+    assert provider.get_last_timestamp("STUDY_X", "csv") is None
+    assert provider.get_last_status("STUDY_X", "csv") is None
+    create_session_spy.assert_not_called()
+
+    # Transaction commits via xcom_push and subsequent pull reads latest entry
+    with provider.transaction(
+        "STUDY_X", "csv", fallback_timestamp=datetime(2026, 2, 1, 8, 0)
+    ) as tx:
+        tx["new_timestamp"] = datetime(2026, 2, 2, 9, 30, tzinfo=timezone.utc)
+        tx["records_processed"] = 12
+
+    assert provider.get_last_timestamp("STUDY_X", "csv") == datetime(
+        2026, 2, 2, 9, 30, tzinfo=timezone.utc
     )
-    assert provider._deserialize_xcom_value(
-        cls_broken_deser, SimpleNamespace(value='{"from_json": 2}')
-    ) == {"from_json": 2}
-    assert (
-        provider._deserialize_xcom_value(cls_broken_deser, SimpleNamespace(value="not-json"))
-        == "not-json"
+    assert provider.get_last_status("STUDY_X", "csv") == StreamExecutionStatus.SUCCESS
+
+    # Deserialization & parsing helpers
+    assert provider._deserialize_xcom_row(object, SimpleNamespace(value={"ok": 1})) == {"ok": 1}
+    assert provider._deserialize_xcom_row(
+        object, SimpleNamespace(value=_json.dumps({"ok": 2}).encode("utf-8"))
+    ) == {"ok": 2}
+    assert provider._deserialize_xcom_row(object, SimpleNamespace(value="{bad")) is None
+    assert provider._parse_status(StreamExecutionStatus.RUNNING) == StreamExecutionStatus.RUNNING
+    assert provider._parse_status("invalid_state") == StreamExecutionStatus.FAILED
+    assert provider._parse_status(99) == StreamExecutionStatus.FAILED
+    assert provider._parse_iso_utc(datetime(2026, 2, 1, 8, 0)) == datetime(
+        2026, 2, 1, 8, 0, tzinfo=timezone.utc
     )
+    assert provider._parse_iso_utc("not-a-timestamp") is None
+    assert provider._parse_iso_utc(99) is None
+    assert provider._pull_ti_xcom_dict(
+        SimpleNamespace(xcom_pull=lambda **_kw: {"ok": 3}), "state_STUDY_X_csv"
+    ) == {"ok": 3}
 
-    # 3. Real SQLite Airflow 3 DB roundtrip IN-PROCESS for full coverage of _ensure_standalone_xcom_parents
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
-            sys.modules.pop(mod, None)
-    airflow_db_mod = pytest.importorskip("airflow.utils.db")
 
-    import tempfile
+def test_airflow_state_provider_out_of_context_xcom_model_crud(tmp_path, monkeypatch) -> None:
+    """Verify out-of-context set, get, read_state, and delete_entry against Airflow 3 XComModel."""
+    import logging
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        monkeypatch.setenv("AIRFLOW_HOME", tmpdir)
-        monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", f"sqlite:///{tmpdir}/af_cov.db")
-        from airflow import settings
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith("airflow."):
+                sys.modules.pop(mod, None)
 
+    airflow = pytest.importorskip("airflow")
+    _ = airflow
+    from airflow import settings
+    from airflow.configuration import conf
+    from airflow.models.xcom import XComModel
+    from airflow.utils.db import initdb
+    from airflow.utils.session import create_session
+
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
+    af_home = tmp_path / "af_unit_db"
+    af_home.mkdir(parents=True, exist_ok=True)
+    db_uri = f"sqlite:///{af_home / 'airflow.db'}"
+
+    prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    prev_conf_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    monkeypatch.setenv("AIRFLOW_HOME", str(af_home))
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
+    monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    conf.set("database", "sql_alchemy_conn", db_uri)
+
+    try:
+        settings.dispose_orm()
         settings.configure_orm()
-        airflow_db_mod.initdb()
+        initdb()
 
-        ts = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
-        with provider.transaction("STUDY_UNDER_01", "records", fallback_timestamp=ts) as tx:
-            tx["new_timestamp"] = datetime(2026, 6, 2, 13, 0, tzinfo=timezone.utc)
-            tx["records_processed"] = 9
+        provider = AirflowStateProvider()
+        assert provider.get_last_timestamp("STUDY_DB", "records") is None
+        assert provider.get_last_status("STUDY_DB", "records") is None
+        assert provider.read_state().studies == {}
 
-        assert provider.get_last_timestamp("STUDY_UNDER_01", "records") == datetime(
-            2026, 6, 2, 13, 0, tzinfo=timezone.utc
+        t1 = datetime(2026, 3, 10, 14, 0, tzinfo=timezone.utc)
+        provider.set_last_timestamp(
+            "STUDY_DB",
+            "records",
+            t1,
+            records_processed=25,
+            status=StreamExecutionStatus.SUCCESS,
+            metadata={"source": "cli"},
         )
-        assert (
-            provider.get_last_status("STUDY_UNDER_01", "records") == StreamExecutionStatus.SUCCESS
+        provider.set_last_timestamp(
+            "STUDY_DB",
+            "queries",
+            t1,
+            records_processed=5,
+            status="success",
         )
-        ledger_state = provider.read_state()
-        assert "STUDY_UNDER_01" in ledger_state.studies
-        assert ledger_state.studies["STUDY_UNDER_01"].streams["records"].records_processed == 9
-        assert provider.delete_entry("STUDY_UNDER_01", "records") is True
-        assert provider.delete_entry("STUDY_UNDER_01") is False
 
-    # 4. Task-context TaskInstance branch via airflow.sdk.get_current_context
-    mock_ti = MagicMock()
-    mock_ti.xcom_pull.return_value = {
-        "last_timestamp": "2026-06-01T10:00:00+00:00",
-        "status": "success",
+        # Also insert a legacy-shaped XCom row without study_key/stream_name keys in payload
+        with create_session() as session:
+            provider._ensure_manual_task_instance(
+                session,
+                dag_id="manual_state_sync",
+                task_id="manual_state_sync",
+                run_id="manual__legacy",
+                logical_date=t1,
+            )
+            XComModel.set(
+                key="state_LEGACY_visits",
+                value={"last_timestamp": t1.isoformat(), "records_processed": 3},
+                dag_id="manual_state_sync",
+                task_id="manual_state_sync",
+                run_id="manual__legacy",
+                map_index=-1,
+                session=session,
+            )
+
+        assert provider.get_last_timestamp("STUDY_DB", "records") == t1
+        assert provider.get_last_status("STUDY_DB", "records") == StreamExecutionStatus.SUCCESS
+
+        ledger = provider.read_state()
+        assert "STUDY_DB" in ledger.studies
+        assert ledger.studies["STUDY_DB"].streams["records"].records_processed == 25
+        assert "LEGACY" in ledger.studies
+        assert ledger.studies["LEGACY"].streams["visits"].records_processed == 3
+
+        # Delete single stream, then whole study, then non-existent study
+        assert provider.delete_entry("STUDY_DB", "queries") is True
+        assert provider.delete_entry("STUDY_DB", "queries") is False
+        assert provider.delete_entry("STUDY_DB") is True
+        assert provider.delete_entry("STUDY_DB") is False
+    finally:
+        settings.dispose_orm()
+        settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if prev_conf_conn is not None:
+            conf.set("database", "sql_alchemy_conn", prev_conf_conn)
+        settings.configure_orm()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
+
+
+def test_initial_transaction_failure_keeps_watermark_none_for_retry(tmp_path) -> None:
+    """Failed initial transaction keeps last_timestamp as None so retry reads historical data."""
+    import socket
+
+    ledger_file = tmp_path / "ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+
+    with pytest.raises(RuntimeError, match="Initial API failure"):
+        with ledger.transaction("STUDY-INIT", "records") as tx:
+            assert tx["last_timestamp"] is None
+            running_stream = ledger.read_state().studies["STUDY-INIT"].streams["records"]
+            assert running_stream.last_run_status == StreamExecutionStatus.RUNNING
+            assert running_stream.last_timestamp is None
+            assert running_stream.owner_pid == os.getpid()
+            assert running_stream.owner_host == socket.gethostname()
+            assert running_stream.lease_expires_at is not None
+            raise RuntimeError("Initial API failure")
+
+    assert ledger.get_last_timestamp("STUDY-INIT", "records") is None
+    failed_stream = ledger.read_state().studies["STUDY-INIT"].streams["records"]
+    assert failed_stream.last_run_status == StreamExecutionStatus.FAILED
+    assert failed_stream.last_timestamp is None
+    assert failed_stream.owner_pid is None
+    assert failed_stream.owner_host is None
+    assert failed_stream.lease_expires_at is None
+
+    # Retry must still see last_timestamp=None and commit cleanly on success
+    committed_ts = datetime(2026, 2, 10, 8, 30, 0, tzinfo=timezone.utc)
+    with ledger.transaction("STUDY-INIT", "records") as retry_tx:
+        assert retry_tx["last_timestamp"] is None
+        retry_tx["new_timestamp"] = committed_ts
+        retry_tx["records_processed"] = 12
+
+    assert ledger.get_last_timestamp("STUDY-INIT", "records") == committed_ts
+
+
+def test_empty_initial_and_subsequent_transactions_preserve_committed_watermark(tmp_path) -> None:
+    """Zero-record initial sync keeps None; zero-record subsequent sync preserves prior watermark."""
+    ledger_file = tmp_path / "ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+
+    # Initial sync reading zero records must keep last_timestamp as None
+    with ledger.transaction("STUDY-EMPTY", "records") as tx:
+        assert tx["last_timestamp"] is None
+        tx["records_processed"] = 0
+
+    assert ledger.get_last_timestamp("STUDY-EMPTY", "records") is None
+    initial_stream = ledger.read_state().studies["STUDY-EMPTY"].streams["records"]
+    assert initial_stream.last_run_status == StreamExecutionStatus.SUCCESS
+    assert initial_stream.last_timestamp is None
+
+    # Set a committed watermark via a non-empty run
+    wm = datetime(2026, 3, 5, 14, 0, 0, tzinfo=timezone.utc)
+    with ledger.transaction("STUDY-EMPTY", "records") as tx2:
+        assert tx2["last_timestamp"] is None
+        tx2["new_timestamp"] = wm
+        tx2["records_processed"] = 5
+    assert ledger.get_last_timestamp("STUDY-EMPTY", "records") == wm
+
+    # Subsequent empty run must preserve wm
+    with ledger.transaction("STUDY-EMPTY", "records") as tx3:
+        assert tx3["last_timestamp"] == wm
+        tx3["records_processed"] = 0
+    assert ledger.get_last_timestamp("STUDY-EMPTY", "records") == wm
+
+
+def test_set_last_timestamp_accepts_none(tmp_path) -> None:
+    """set_last_timestamp accepts None for uncommitted stream checkpoints."""
+    ledger_file = tmp_path / "ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+
+    ledger.set_last_timestamp("STUDY-NONE", "records", None, status=StreamExecutionStatus.PENDING)
+    assert ledger.get_last_timestamp("STUDY-NONE", "records") is None
+    stream = ledger.read_state().studies["STUDY-NONE"].streams["records"]
+    assert stream.last_timestamp is None
+    assert stream.last_run_status == StreamExecutionStatus.PENDING
+
+
+def test_sigkill_crashed_worker_recovers_through_failed_to_running(tmp_path) -> None:
+    """Retry after SIGKILL crash recovers dead-PID RUNNING stream through FAILED to RUNNING."""
+    ledger_file = tmp_path / "ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+    prior_ts = datetime(2026, 4, 1, 9, 0, 0, tzinfo=timezone.utc)
+    ledger.set_last_timestamp("STUDY-CRASH", "records", prior_ts, records_processed=20)
+
+    worker_code = (
+        "import sys, time\n"
+        f"from imednet_workflows.state_ledger import ExtractionStateLedger\n"
+        f"ledger = ExtractionStateLedger({str(ledger_file)!r})\n"
+        "with ledger.transaction('STUDY-CRASH', 'records'):\n"
+        "    sys.stdout.write('READY\\n')\n"
+        "    sys.stdout.flush()\n"
+        "    time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", worker_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready_line = proc.stdout.readline().strip() if proc.stdout else ""
+        assert ready_line == "READY"
+        proc.kill()
+        proc.wait(timeout=5)
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        if proc.stderr:
+            proc.stderr.close()
+
+    crashed_stream = ledger.read_state().studies["STUDY-CRASH"].streams["records"]
+    assert crashed_stream.last_run_status == StreamExecutionStatus.RUNNING
+    assert crashed_stream.owner_pid == proc.pid
+    assert crashed_stream.last_timestamp == prior_ts
+
+    observed_statuses: list[StreamExecutionStatus] = []
+    orig_write = ledger.write_state
+
+    def tracking_write(state: LedgerState) -> None:
+        observed_statuses.append(state.studies["STUDY-CRASH"].streams["records"].last_run_status)
+        orig_write(state)
+
+    new_ts = datetime(2026, 4, 2, 10, 0, 0, tzinfo=timezone.utc)
+    with patch.object(ledger, "write_state", side_effect=tracking_write):
+        with ledger.transaction("STUDY-CRASH", "records") as retry_tx:
+            assert retry_tx["last_timestamp"] == prior_ts
+            retry_tx["new_timestamp"] = new_ts
+            retry_tx["records_processed"] = 8
+
+    assert observed_statuses == [
+        StreamExecutionStatus.FAILED,
+        StreamExecutionStatus.RUNNING,
+        StreamExecutionStatus.SUCCESS,
+    ]
+    assert ledger.get_last_timestamp("STUDY-CRASH", "records") == new_ts
+
+
+def test_active_concurrent_run_and_remote_lease_expiry_guards(tmp_path) -> None:
+    """Active local/remote leases raise InvalidStateTransitionError; expired leases recover."""
+    import json
+    from datetime import timedelta
+
+    ledger_file = tmp_path / "ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+
+    # 1. Active local transaction blocks re-entrant / concurrent transaction on same stream
+    with ledger.transaction("STUDY-GUARD", "records"):
+        with pytest.raises(
+            InvalidStateTransitionError,
+            match="Cannot transition stream state from 'running' to 'running'",
+        ):
+            with ledger.transaction("STUDY-GUARD", "records"):
+                pass
+
+    # 2. Remote container worker with unexpired lease blocks concurrent transaction
+    future_exp = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    remote_active = {
+        "studies": {
+            "STUDY-REMOTE": {
+                "streams": {
+                    "records": {
+                        "last_timestamp": None,
+                        "records_processed": 0,
+                        "last_run_status": "running",
+                        "owner_pid": 99999999,
+                        "owner_host": "remote-container-worker-a",
+                        "lease_expires_at": future_exp,
+                    }
+                }
+            }
+        }
     }
-    monkeypatch.setitem(
-        sys.modules, "airflow.sdk", SimpleNamespace(get_current_context=lambda: {"ti": mock_ti})
-    )
-    assert provider.get_last_timestamp("STUDY_CTX", "records") == datetime(
-        2026, 6, 1, 10, 0, tzinfo=timezone.utc
-    )
-    assert provider.get_last_status("STUDY_CTX", "records") == StreamExecutionStatus.SUCCESS
-    provider.set_last_timestamp(
-        "STUDY_CTX", "records", datetime(2026, 6, 1, 11, 0, tzinfo=timezone.utc)
-    )
-    mock_ti.xcom_push.assert_called_once()
+    ledger_file.write_text(json.dumps(remote_active), encoding="utf-8")
+    with pytest.raises(
+        InvalidStateTransitionError,
+        match="Cannot transition stream state from 'running' to 'running'",
+    ):
+        with ledger.transaction("STUDY-REMOTE", "records"):
+            pass
 
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
-            sys.modules.pop(mod, None)
+    # 3. Remote container worker (even with PID 1) recovers once lease expires
+    past_exp = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+    remote_expired = {
+        "studies": {
+            "STUDY-REMOTE": {
+                "streams": {
+                    "records": {
+                        "last_timestamp": None,
+                        "records_processed": 0,
+                        "last_run_status": "running",
+                        "owner_pid": 1,
+                        "owner_host": "remote-container-worker-a",
+                        "lease_expires_at": past_exp,
+                    }
+                }
+            }
+        }
+    }
+    ledger_file.write_text(json.dumps(remote_expired), encoding="utf-8")
+    recovered_ts = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    with ledger.transaction("STUDY-REMOTE", "records") as tx:
+        assert tx["last_timestamp"] is None
+        tx["new_timestamp"] = recovered_ts
+        tx["records_processed"] = 3
+    assert ledger.get_last_timestamp("STUDY-REMOTE", "records") == recovered_ts

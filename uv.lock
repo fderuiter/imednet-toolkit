@@ -486,23 +486,56 @@ source = { editable = "packages/providers-airflow" }
 dependencies = [
     { name = "apache-airflow" },
     { name = "imednet" },
+    { name = "imednet-workflows" },
 ]
 
 [package.optional-dependencies]
 all = [
     { name = "apache-airflow-providers-amazon" },
     { name = "apache-airflow-providers-openlineage" },
+    { name = "duckdb" },
     { name = "imednet-plugins-sinks" },
     { name = "imednet-workflows" },
+    { name = "neo4j" },
+    { name = "openpyxl" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "pymongo" },
+    { name = "snowflake-connector-python" },
+    { name = "sqlalchemy" },
 ]
 amazon = [
     { name = "apache-airflow-providers-amazon" },
+]
+duckdb = [
+    { name = "duckdb" },
+]
+export = [
+    { name = "duckdb" },
+    { name = "imednet-workflows" },
+    { name = "openpyxl" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "sqlalchemy" },
+]
+mongodb = [
+    { name = "imednet-plugins-sinks" },
+    { name = "pymongo" },
+]
+neo4j = [
+    { name = "imednet-plugins-sinks" },
+    { name = "neo4j" },
 ]
 openlineage = [
     { name = "apache-airflow-providers-openlineage" },
 ]
 sinks = [
     { name = "imednet-plugins-sinks" },
+]
+snowflake = [
+    { name = "imednet-plugins-sinks" },
+    { name = "pyarrow" },
+    { name = "snowflake-connector-python" },
 ]
 workflows = [
     { name = "imednet-workflows" },
@@ -515,13 +548,36 @@ requires-dist = [
     { name = "apache-airflow-providers-amazon", marker = "extra == 'amazon'", specifier = ">=9.0.0" },
     { name = "apache-airflow-providers-openlineage", marker = "extra == 'all'", specifier = ">=2.0.0" },
     { name = "apache-airflow-providers-openlineage", marker = "extra == 'openlineage'", specifier = ">=2.0.0" },
+    { name = "duckdb", marker = "extra == 'all'", specifier = ">=1.1.0,<2.0.0" },
+    { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.1.0,<2.0.0" },
+    { name = "duckdb", marker = "extra == 'export'", specifier = ">=1.1.0,<2.0.0" },
     { name = "imednet", editable = "packages/core" },
     { name = "imednet-plugins-sinks", marker = "extra == 'all'", editable = "packages/plugins-sinks" },
+    { name = "imednet-plugins-sinks", marker = "extra == 'mongodb'", editable = "packages/plugins-sinks" },
+    { name = "imednet-plugins-sinks", marker = "extra == 'neo4j'", editable = "packages/plugins-sinks" },
     { name = "imednet-plugins-sinks", marker = "extra == 'sinks'", editable = "packages/plugins-sinks" },
+    { name = "imednet-plugins-sinks", marker = "extra == 'snowflake'", editable = "packages/plugins-sinks" },
+    { name = "imednet-workflows", editable = "packages/plugins-workflows" },
     { name = "imednet-workflows", marker = "extra == 'all'", editable = "packages/plugins-workflows" },
+    { name = "imednet-workflows", marker = "extra == 'export'", editable = "packages/plugins-workflows" },
     { name = "imednet-workflows", marker = "extra == 'workflows'", editable = "packages/plugins-workflows" },
+    { name = "neo4j", marker = "extra == 'all'", specifier = ">=6.2.0,<7.0.0" },
+    { name = "neo4j", marker = "extra == 'neo4j'", specifier = ">=6.2.0,<7.0.0" },
+    { name = "openpyxl", marker = "extra == 'all'", specifier = ">=3.1,<4.0" },
+    { name = "openpyxl", marker = "extra == 'export'", specifier = ">=3.1,<4.0" },
+    { name = "pandas", marker = "extra == 'all'", specifier = ">=2.2.3,<3.0.0" },
+    { name = "pandas", marker = "extra == 'export'", specifier = ">=2.2.3,<3.0.0" },
+    { name = "pyarrow", marker = "extra == 'all'", specifier = ">=14.0.1" },
+    { name = "pyarrow", marker = "extra == 'export'", specifier = ">=14.0.1" },
+    { name = "pyarrow", marker = "extra == 'snowflake'", specifier = ">=14.0.1" },
+    { name = "pymongo", marker = "extra == 'all'", specifier = ">=4.0,<5.0" },
+    { name = "pymongo", marker = "extra == 'mongodb'", specifier = ">=4.0,<5.0" },
+    { name = "snowflake-connector-python", marker = "extra == 'all'", specifier = ">=3.0.0" },
+    { name = "snowflake-connector-python", marker = "extra == 'snowflake'", specifier = ">=3.0.0" },
+    { name = "sqlalchemy", marker = "extra == 'all'", specifier = ">=2.0,<3.0" },
+    { name = "sqlalchemy", marker = "extra == 'export'", specifier = ">=2.0,<3.0" },
 ]
-provides-extras = ["amazon", "openlineage", "sinks", "workflows", "all"]
+provides-extras = ["amazon", "duckdb", "export", "mongodb", "neo4j", "openlineage", "sinks", "snowflake", "workflows", "all"]
 
 [[package]]
 name = "apache-airflow-providers-openlineage"

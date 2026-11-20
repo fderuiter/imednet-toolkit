@@ -10,9 +10,12 @@ Install the package via standard pip using the public package distribution name:
 pip install apache-airflow-providers-imednet
 ```
 
-Optional extras can be installed for OpenLineage dataset facets, warehouse/graph/document sinks, incremental workflow checkpointing, S3/AWS object-store targets, or all integrations together:
+Install optional extras for destination sinks, tabular/DuckDB exports, OpenLineage dataset facets, S3/AWS object-store targets, or all integrations together:
 
 ```bash
+pip install "apache-airflow-providers-imednet[export]"
+pip install "apache-airflow-providers-imednet[duckdb]"
+pip install "apache-airflow-providers-imednet[snowflake,mongodb,neo4j]"
 pip install "apache-airflow-providers-imednet[openlineage]"
 pip install "apache-airflow-providers-imednet[sinks,workflows]"
 pip install "apache-airflow-providers-imednet[amazon]"
@@ -26,36 +29,49 @@ pip install ./packages/providers-airflow
 ```
 
 **Required Dependencies:**
-This package requires `imednet` and an `apache-airflow>=3.2.0,<4.0.0` core environment as parent dependencies.
+This package requires `imednet`, `imednet-workflows` (for incremental XCom checkpointing), and `apache-airflow>=3.2.0,<4.0.0`.
 
 **Build Targets (Hatchling):**
-This package uses Hatchling as its build backend, targeting the `src/apache_airflow_providers_imednet` package directory and registering the `apache_airflow_provider` entry point in `pyproject.toml`.
+This package uses Hatchling as its build backend, targeting `src/apache_airflow_providers_imednet` (with PEP 420 namespace bridge `src/airflow`) and registering the `apache_airflow_provider` discovery entry point in `pyproject.toml`.
 
 ## Usage Guide
 
-You can integrate iMednet hooks, operators, deferrable sensors, and triggers directly within your Airflow 3.x DAGs:
+You can integrate iMednet hooks, operators, deferrable sensors, and triggers directly within your Airflow 3.x DAGs (see `examples/airflow/airflow_multi_study_pipeline.py` for a full dynamic-mapping reference):
 
 ```python
-from apache_airflow_providers_imednet.hooks import ImednetHook
-from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-from apache_airflow_providers_imednet.sensors import ImednetJobSensor
+from datetime import datetime
 
-hook = ImednetHook(imednet_conn_id="my_imednet_conn")
-export_task = ImednetExportOperator(
-    task_id="export",
-    study_key="{{ params.study_key }}",
-    output_path="/tmp/records.csv",
-    export_func="export_to_csv",
-    modified_since="{{ data_interval_start.isoformat() }}",
-    record_filter="recordStatus==Record Complete",
-    stream_name="records_{{ params.study_key }}",
+from airflow.sdk import DAG
+from apache_airflow_providers_imednet import (
+    ImednetExportOperator,
+    ImednetHook,
+    ImednetJobSensor,
 )
-sensor_task = ImednetJobSensor(
-    task_id="wait_for_job",
-    study_key="{{ params.study_key }}",
-    batch_id="{{ ti.xcom_pull(task_ids='submit_job') }}",
-    deferrable=True,
-)
+
+with DAG(
+    dag_id="imednet_pipeline",
+    schedule=None,
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+):
+    hook = ImednetHook(imednet_conn_id="imednet_default")
+    export_task = ImednetExportOperator(
+        task_id="export_records",
+        study_key="{{ params.study_key }}",
+        destination="duckdb",
+        output_path="/tmp/study.duckdb",
+        export_kwargs={"table_name": "clinical_records"},
+        modified_since="{{ prev_data_interval_start_success or '' }}",
+        record_filter="recordStatus==Record Complete",
+        stream_name="records_{{ params.study_key }}",
+        incremental=True,
+    )
+    sensor_task = ImednetJobSensor(
+        task_id="wait_for_job",
+        study_key="{{ params.study_key }}",
+        batch_id="{{ params.batch_id }}",
+        deferrable=True,
+    )
 ```
 
 ## Using the ImednetHook
