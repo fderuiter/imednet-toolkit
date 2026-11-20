@@ -36,6 +36,7 @@ Advanced
    get_records_async
    post_register_subjects
    get_study_structure
+   data_dictionary
    custom_retry
    export_long_sql
    multi_study_pipeline
