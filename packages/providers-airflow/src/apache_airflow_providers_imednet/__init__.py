@@ -58,10 +58,30 @@ class _ImednetAirflowProviderFinder(MetaPathFinder, Loader):
         sys.modules[alias_name] = target_mod
 
 
+def _sync_airflow_provider_aliases() -> None:
+    """Keep ``airflow.providers.imednet`` aliases synchronized with loaded target modules."""
+    for alias_name in [
+        name
+        for name in list(sys.modules)
+        if name == _ALIAS_PREFIX or name.startswith(f"{_ALIAS_PREFIX}.")
+    ]:
+        target_name = alias_name.replace(_ALIAS_PREFIX, _TARGET_PREFIX, 1)
+        target_mod = sys.modules.get(target_name)
+        if target_mod is not None:
+            sys.modules[alias_name] = target_mod
+        else:
+            sys.modules.pop(alias_name, None)
+    providers_pkg = sys.modules.get("airflow.providers")
+    root_mod = sys.modules.get(_TARGET_PREFIX)
+    if providers_pkg is not None and hasattr(providers_pkg, "imednet") and root_mod is not None:
+        providers_pkg.imednet = root_mod  # type: ignore[attr-defined]
+
+
 def _ensure_airflow_provider_finder() -> None:
     """Ensure the ``airflow.providers.imednet`` import alias finder is registered."""
     if not any(isinstance(finder, _ImednetAirflowProviderFinder) for finder in sys.meta_path):
         sys.meta_path.insert(0, _ImednetAirflowProviderFinder())
+    _sync_airflow_provider_aliases()
 
 
 def get_provider_info() -> dict[str, Any]:
@@ -133,6 +153,8 @@ try:  # pragma: no cover - optional Airflow dependencies may be missing
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - sensor requires Airflow extras
     ImednetJobSensor = None
     sensors = None  # type: ignore
+
+_sync_airflow_provider_aliases()
 
 __all__ = [
     "ImednetExportOperator",

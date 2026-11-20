@@ -33,11 +33,18 @@ def _cleanup_airflow_provider_modules():
 
     if (
         "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
     ):
         for mod in list(sys.modules):
-            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+            if mod == "airflow" or mod.startswith("airflow."):
                 sys.modules.pop(mod, None)
+
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+        delattr(providers_pkg, "imednet")
 
     yield
     for mod in list(sys.modules):

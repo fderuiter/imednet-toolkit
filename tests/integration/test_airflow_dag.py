@@ -12,11 +12,23 @@ def _purge_partial_airflow_modules() -> None:
 
     if (
         "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
     ):
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
                 sys.modules.pop(mod, None)
+        return
+
+    compat_mod = sys.modules.get("apache_airflow_providers_imednet._airflow_compat")
+    base_hook = getattr(compat_mod, "BaseHook", None)
+    hook_mod = sys.modules.get(getattr(base_hook, "__module__", ""))
+    if compat_mod is not None and getattr(hook_mod, "__file__", None) is None:
+        for mod in list(sys.modules):
+            if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+                sys.modules.pop(mod, None)
+        providers_pkg = sys.modules.get("airflow.providers")
+        if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+            delattr(providers_pkg, "imednet")
 
 
 def test_dag_runs(monkeypatch, tmp_path):
