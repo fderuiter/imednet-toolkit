@@ -521,3 +521,60 @@ def test_cached_loader_incremental_sync_with_simulation_transport(tmp_path: Path
     assert by_id[601].record_data == {"V_AGE": 45, "V_GENDER": "Female"}
     assert by_id[602].record_data == {"V_WEIGHT": 71.0}
     assert by_id[1001].record_data == {"V_WEIGHT": 72.5}
+
+
+def test_iter_cached_records_order_by_subject_groups_subjects_cleanly(tmp_path: Path) -> None:
+    """Verify order_by_subject=True groups cached records by USUBJID/subjectKey then record_id."""
+    sdk = MagicMock()
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "subj-order-cache")
+
+    interleaved = [
+        Record(
+            study_key="STUDY",
+            record_id=10,
+            form_id=20,
+            form_key="AE",
+            subject_key="SUBJ-02",
+            record_data={"aeTerm": "Later subject first id"},
+        ),
+        Record(
+            study_key="STUDY",
+            record_id=20,
+            form_id=20,
+            form_key="AE",
+            subject_key="SUBJ-01",
+            record_data={"aeTerm": "Subj 1 first"},
+        ),
+        Record(
+            study_key="STUDY",
+            record_id=30,
+            form_id=20,
+            form_key="AE",
+            subject_key="SUBJ-02",
+            record_data={"aeTerm": "Later subject second id"},
+        ),
+        Record(
+            study_key="STUDY",
+            record_id=40,
+            form_id=20,
+            form_key="AE",
+            subject_key="SUBJ-99",
+            record_data={"USUBJID": "SUBJ-00", "aeTerm": "Explicit USUBJID override"},
+        ),
+        Record(
+            study_key="STUDY",
+            record_id=50,
+            form_id=20,
+            form_key="AE",
+            subject_key="SUBJ-01",
+            record_data={"aeTerm": "Subj 1 second"},
+        ),
+    ]
+    with get_sqlite_connection(loader.db_path) as conn:
+        loader._upsert_records(conn, interleaved)
+
+    default_order = list(loader.iter_cached_records("STUDY", chunk_size=2))
+    assert [r.record_id for r in default_order] == [10, 20, 30, 40, 50]
+
+    subject_grouped = list(loader.iter_cached_records("STUDY", chunk_size=2, order_by_subject=True))
+    assert [r.record_id for r in subject_grouped] == [40, 20, 50, 10, 30]

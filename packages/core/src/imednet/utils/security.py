@@ -53,7 +53,7 @@ class SensitivityRegistry:
 
     def __init__(self) -> None:
         """Initialize the registry with default sensitive and exempt keys."""
-        # Default clinical PHI fields
+        # Default clinical and CDISC PHI fields
         self._sensitive_keys = {
             "patient_name",
             "patient_initials",
@@ -64,41 +64,78 @@ class SensitivityRegistry:
             "email",
             "address",
             "birth_date",
+            "brthdtc",
+            "brthdat",
+            "brthyr",
+            "subjinit",
         }
         # Keys explicitly exempted from masking
-        self._exempt_keys = {"subject_key", "study_key", "record_id"}
+        self._exempt_keys = {
+            "subject_key",
+            "study_key",
+            "record_id",
+            "usubjid",
+            "subjid",
+            "studyid",
+        }
+        self._collapsed_sensitive = {k.replace("_", "") for k in self._sensitive_keys}
+        self._collapsed_exempt = {k.replace("_", "") for k in self._exempt_keys}
 
     def add_sensitive_key(self, key: Any) -> None:
         """Add a key to the sensitive list if it is not exempted."""
         norm_key = _normalize_key(key)
-        if norm_key and norm_key not in self._exempt_keys:
+        if not norm_key:
+            return
+        collapsed = norm_key.replace("_", "")
+        if norm_key not in self._exempt_keys and collapsed not in self._collapsed_exempt:
             self._sensitive_keys.add(norm_key)
+            self._collapsed_sensitive.add(collapsed)
 
     def remove_sensitive_key(self, key: Any) -> None:
         """Remove a key from the sensitive list."""
-        self._sensitive_keys.discard(_normalize_key(key))
+        norm_key = _normalize_key(key)
+        if not norm_key:
+            return
+        collapsed = norm_key.replace("_", "")
+        for existing in list(self._sensitive_keys):
+            if existing == norm_key or existing.replace("_", "") == collapsed:
+                self._sensitive_keys.discard(existing)
+        self._collapsed_sensitive.discard(collapsed)
 
     def add_exempt_key(self, key: Any) -> None:
         """Add a key to the exemption list."""
         norm_key = _normalize_key(key)
         if norm_key:
             self._exempt_keys.add(norm_key)
+            self._collapsed_exempt.add(norm_key.replace("_", ""))
 
     def remove_exempt_key(self, key: Any) -> None:
         """Remove a key from the exemption list."""
-        self._exempt_keys.discard(_normalize_key(key))
+        norm_key = _normalize_key(key)
+        if not norm_key:
+            return
+        collapsed = norm_key.replace("_", "")
+        for existing in list(self._exempt_keys):
+            if existing == norm_key or existing.replace("_", "") == collapsed:
+                self._exempt_keys.discard(existing)
+        self._collapsed_exempt.discard(collapsed)
 
     def is_exempt(self, key: Any) -> bool:
         """Check if a key is explicitly exempted from PHI masking."""
         norm_key = _normalize_key(key)
-        return bool(norm_key and norm_key in self._exempt_keys)
+        if not norm_key:
+            return False
+        return norm_key in self._exempt_keys or norm_key.replace("_", "") in self._collapsed_exempt
 
     def is_sensitive(self, key: Any) -> bool:
         """Check if a key is considered sensitive and not exempted."""
         norm_key = _normalize_key(key)
-        if not norm_key or norm_key in self._exempt_keys:
+        if not norm_key:
             return False
-        return norm_key in self._sensitive_keys
+        collapsed = norm_key.replace("_", "")
+        if norm_key in self._exempt_keys or collapsed in self._collapsed_exempt:
+            return False
+        return norm_key in self._sensitive_keys or collapsed in self._collapsed_sensitive
 
 
 global_sensitivity_registry = SensitivityRegistry()
