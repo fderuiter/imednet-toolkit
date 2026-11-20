@@ -247,6 +247,9 @@ class CentralizedMapper:
         self.post_processor = post_processor
         self.mask_phi = mask_phi
         self._pipeline_cache: dict[str, Any] = {}
+        self._sens_snapshot: frozenset[str] = frozenset()
+        self._exempt_snapshot: frozenset[str] = frozenset()
+        self._masked_meta_cache: dict[int, frozenset[str]] = {}
         if study_config is not None:
             custom_pipeline = EnrichmentPipeline(study_config)
             self._default_pipeline: Any = custom_pipeline
@@ -262,6 +265,35 @@ class CentralizedMapper:
     def register_pipeline(self, study_key: str, pipeline: Any) -> None:
         """Register an explicit enrichment pipeline for *study_key*."""
         self._pipeline_cache[study_key] = pipeline
+
+    def _resolve_masked_meta_fields(
+        self,
+        active_pipeline: Any,
+        fields: list[tuple[str, str]],
+        pipeline_phi_keys: set[str],
+    ) -> frozenset[str]:
+        """Return canonical metadata snake_keys that must be PHI-masked for *active_pipeline*."""
+        sens = global_sensitivity_registry._sensitive_keys
+        exempt = global_sensitivity_registry._exempt_keys
+        if sens != self._sens_snapshot or exempt != self._exempt_snapshot:
+            self._sens_snapshot = frozenset(sens)
+            self._exempt_snapshot = frozenset(exempt)
+            self._masked_meta_cache.clear()
+        cache_key = id(active_pipeline)
+        cached = self._masked_meta_cache.get(cache_key)
+        if cached is None:
+            masked: set[str] = set()
+            for f, snake_key in fields:
+                if f == "record_data":
+                    continue
+                if pipeline_phi_keys and _normalize_key(snake_key) in pipeline_phi_keys:
+                    if not global_sensitivity_registry.is_exempt(snake_key):
+                        masked.add(snake_key)
+                elif global_sensitivity_registry.is_sensitive(snake_key):
+                    masked.add(snake_key)
+            cached = frozenset(masked)
+            self._masked_meta_cache[cache_key] = cached
+        return cached
 
     def map_record(self, record: Any, study_key: str | None = None) -> dict[str, Any]:
         """Map a clinical record to the unified destination format."""
@@ -294,6 +326,11 @@ class CentralizedMapper:
                 )
         active_pipeline = self._pipeline_cache[sk]
         pipeline_phi_keys: set[str] = getattr(active_pipeline, "phi_keys", set())
+        masked_meta_fields: frozenset[str] | tuple[()] = (
+            self._resolve_masked_meta_fields(active_pipeline, fields, pipeline_phi_keys)
+            if self.mask_phi
+            else ()
+        )
 
         mapped: dict[str, Any] = {}
         for f, snake_key in fields:
@@ -325,15 +362,7 @@ class CentralizedMapper:
                 if self.mode == "tabular":
                     val = flatten(val)
                 val = {_to_snake_case(k): v for k, v in val.items()}
-            elif (
-                self.mask_phi
-                and val is not None
-                and not global_sensitivity_registry.is_exempt(snake_key)
-                and (
-                    (pipeline_phi_keys and _normalize_key(snake_key) in pipeline_phi_keys)
-                    or global_sensitivity_registry.is_sensitive(snake_key)
-                )
-            ):
+            elif masked_meta_fields and val is not None and snake_key in masked_meta_fields:
                 val = _MASKED_VALUE
 
             if val is not None or snake_key not in mapped:
