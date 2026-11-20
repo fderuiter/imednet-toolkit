@@ -41,12 +41,12 @@ class Site(ImednetBaseModel):
     site_enrollment_status: SiteEnrollmentStatus | str | None = Field(
         default=None, alias="siteEnrollmentStatus"
     )
-    study_key: str | None
-    site_id: int | None
-    site_name: str | None
-    date_created: str | None
-    date_modified: str | None
-    last_updated: str | None
+    study_key: str | None = None
+    site_id: int | None = None
+    site_name: str | None = None
+    date_created: str | None = None
+    date_modified: str | None = None
+    last_updated: str | None = None
 
     @field_validator("site_enrollment_status", mode="before")
     @classmethod

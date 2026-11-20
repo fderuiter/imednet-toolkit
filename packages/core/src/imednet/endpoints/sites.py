@@ -10,6 +10,7 @@ class SitesOperationDef:
     PATH = "sites"
     MODEL = Site
     _id_param = "siteId"
+    _lookup_key_hint = "siteName"
     FILTER_ATTRIBUTES = frozenset(
         {
             "siteId",

@@ -33,12 +33,12 @@ class User(ImednetBaseModel):
     """A user account in the system."""
 
     roles: list[Role] = Field(default_factory=list, alias="roles")
-    user_id: str | None
-    login: str | None
-    first_name: str | None
-    last_name: str | None
-    email: str | None
-    user_active_in_study: bool | None
+    user_id: str | None = None
+    login: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    email: str | None = None
+    user_active_in_study: bool | None = None
 
     @computed_field
     def name(self) -> str: ...

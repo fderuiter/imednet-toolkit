@@ -9,13 +9,14 @@ from typing import Any
 from ...endpoints.records import RecordsEndpoint
 from ...models.records import Record
 from ...sdk import ImednetSDK
-from ..decorators import with_sdk
+from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import STUDY_KEY_ARG, display_list, fetching_status, print_error
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
     collect_list_items_with_remainder,
     prepare_list_query,
+    resolve_output_format,
 )
 from ..utils.export import export_list_to_file
 
@@ -60,7 +61,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sdk: ImednetSDK,
         study_key: str,
         output: str | None = None,
-        output_format: str = "table",
+        output_format: str | None = None,
         record_filter: list[str] | None = None,
         record_data_filter: str | None = None,
         sort: str | None = None,
@@ -69,15 +70,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         no_interactive: bool = False,
         _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
+        resolved_format = resolve_output_format(output_format)
         if _prepared_query is None:
-            _validate_records_output(output, output_format)
+            _validate_records_output(output, resolved_format)
             req_kwargs, effective_limit = prepare_list_query(
                 filter_args=record_filter,
                 record_data_filter=record_data_filter,
                 sort=sort,
                 limit=limit,
                 fetch_all=fetch_all,
-                output_format=output_format,
+                output_format=resolved_format,
                 has_output_file=bool(output),
                 no_interactive=no_interactive,
                 model=Record,
@@ -93,7 +95,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 effective_limit,
             )
 
-        if output_format == "json":
+        if resolved_format == "json":
             display_list(records, "records", output_format="json")
         elif output:
             export_list_to_file(records, "records", output.lower())
@@ -111,19 +113,22 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 details=records,
                 truncated=truncated,
                 interactive=False if no_interactive else None,
+                output_format=resolved_format,
                 on_load_all=_load_more_records if load_remaining is not None else None,
             )
 
     def _dispatch_list_records(args: argparse.Namespace) -> None:
+        validate_cli_path_segment(args.study_key, name="study_key")
         no_interactive = getattr(args, "no_interactive", False)
-        _validate_records_output(args.output, args.output_format)
+        resolved_format = resolve_output_format(args.output_format)
+        _validate_records_output(args.output, resolved_format)
         prepared = prepare_list_query(
             filter_args=args.record_filter,
             record_data_filter=args.record_data_filter,
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
-            output_format=args.output_format,
+            output_format=resolved_format,
             has_output_file=bool(args.output),
             no_interactive=no_interactive,
             model=Record,
@@ -133,7 +138,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         list_records(
             study_key=args.study_key,
             output=args.output,
-            output_format=args.output_format,
+            output_format=resolved_format,
             record_filter=args.record_filter,
             record_data_filter=args.record_data_filter,
             sort=args.sort,
