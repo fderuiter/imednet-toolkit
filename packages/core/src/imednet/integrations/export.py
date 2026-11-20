@@ -23,6 +23,7 @@ from unittest.mock import NonCallableMock
 
 from imednet.integrations.enrichment import (
     EnrichmentPipeline,
+    _matches_custom_phi_key,
     mask_custom_phi_recursive,
     resolve_enrichment_pipeline,
     resolve_study_configuration,
@@ -51,7 +52,7 @@ except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 from imednet.constants import MAX_SQLITE_COLUMNS
 from imednet.utils import sanitize_csv_formula
-from imednet.utils.security import _normalize_key, global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
 from imednet.utils.tabular import MASKED_SENTINEL
 
 from .. import ImednetClient
@@ -109,9 +110,9 @@ def _create_record_mapper(sdk: Any, *, mask_phi: bool = True) -> Any:
 
 def _is_custom_phi_key(key: str, phi_keys: set[str] | None) -> bool:
     """Return True when *key* matches a custom StudyConfiguration PHI field."""
-    if not phi_keys or not key or global_sensitivity_registry.is_exempt(key):
+    if not phi_keys or not key:
         return False
-    return _normalize_key(key) in phi_keys
+    return _matches_custom_phi_key(key, phi_keys)
 
 
 def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFrame:

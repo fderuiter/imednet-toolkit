@@ -2258,19 +2258,31 @@ def test_by_form_exports_recover_stale_running_lease_without_premature_commit(
 
 
 def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify by-form exports enforce Variable(required=True) in one pass and integrate with dataframe_to_records."""
+    """Verify by-form exports enforce Variable(required=True), #1979 CDISC/collapsed PHI keys, and dataframe_to_records."""
     import sqlite3
     from types import SimpleNamespace
 
     from imednet.errors import ValidationError
+    from imednet.integrations import enrichment as enrichment_mod
     from imednet.models.records import Record
+    from imednet.models.study_config import StudyConfiguration
     from imednet.models.variables import Variable
     from imednet.utils.pandas import MASKED_SENTINEL, dataframe_to_records
     from imednet.validation.cache import SchemaCache
 
     duckdb_mod = pytest.importorskip("duckdb")
+
+    study_cfg = StudyConfiguration(
+        study_key="RT_STUDY",
+        phi_fields=["patient_chart_id"],
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: study_cfg if sk == "RT_STUDY" else None,
+    )
 
     sdk = MagicMock()
     forms = [
@@ -2286,6 +2298,20 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
             form_id=10,
             form_key="DEMO",
             required=True,
+        ),
+        Variable(
+            variable_name="BRTHDTC",
+            label="Birth Date",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_name="PATIENTCHARTID",
+            label="Chart ID",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
         ),
         Variable(
             variable_name="SITE_CODE",
@@ -2314,7 +2340,12 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
             visit_id=1,
             form_id=10,
             form_key="DEMO",
-            record_data={"patientName": "Jane Doe", "SITE_CODE": "0042"},
+            record_data={
+                "patientName": "Jane Doe",
+                "BRTHDTC": "1985-04-12",
+                "PATIENTCHARTID": "CH-900",
+                "SITE_CODE": "0042",
+            },
         ),
         Record(
             record_id=102,
@@ -2323,7 +2354,12 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
             visit_id=1,
             form_id=10,
             form_key="DEMO",
-            record_data={"patientName": "", "SITE_CODE": "0099"},
+            record_data={
+                "patientName": "",
+                "BRTHDTC": "1990-01-01",
+                "PATIENTCHARTID": "CH-901",
+                "SITE_CODE": "0099",
+            },
         ),
         Record(
             record_id=201,
@@ -2351,6 +2387,9 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
         demo_masked_df = pd.read_sql_query('SELECT * FROM "DEMO"', sconn)
     assert len(demo_masked_df) == 1
     assert demo_masked_df["patientName"].iloc[0] == MASKED_SENTINEL
+    assert demo_masked_df["BRTHDTC"].iloc[0] == MASKED_SENTINEL
+    assert demo_masked_df["PATIENTCHARTID"].iloc[0] == MASKED_SENTINEL
+    assert demo_masked_df["SITE_CODE"].iloc[0] == "0042"
     with pytest.raises(ValidationError, match="contains masked PHI sentinel"):
         dataframe_to_records(demo_masked_df)
 
@@ -2377,7 +2416,12 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
         {
             "formId": 10,
             "subjectKey": "SUBJ-1",
-            "data": {"patientName": "Jane Doe", "SITE_CODE": "0042"},
+            "data": {
+                "patientName": "Jane Doe",
+                "BRTHDTC": "1985-04-12",
+                "PATIENTCHARTID": "CH-900",
+                "SITE_CODE": "0042",
+            },
         }
     ]
     assert vitals_payloads == [
