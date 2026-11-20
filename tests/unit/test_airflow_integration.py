@@ -152,7 +152,7 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
         "output_path",
         "export_kwargs",
     )
-    assert ImednetExportOperator.template_fields == ImednetExportOperator.mapped_runtime_fields
+    assert "study_key" in ImednetExportOperator.template_fields
     assert ImednetExportOperator.template_fields_renderers == {"export_kwargs": "json"}
 
 
@@ -989,3 +989,22 @@ def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monk
     with pytest.raises(Exception, match="Network request failed"):
         hook.list_studies_metadata()
     assert sdk_list_err._client._client.is_closed
+
+
+def test_export_operator_full_template_fields_contract(monkeypatch):
+    """Verify full template_fields tuple includes mapped runtime, watermark, and filter fields."""
+    if "apache_airflow_providers_imednet" in sys.modules:
+        del sys.modules["apache_airflow_providers_imednet"]
+
+    _setup_airflow(monkeypatch)
+    from apache_airflow_providers_imednet import ImednetExportOperator
+
+    assert ImednetExportOperator.template_fields == (
+        "study_key",
+        "output_path",
+        "export_kwargs",
+        "modified_since",
+        "record_filter",
+        "record_data_filter",
+        "stream_name",
+    )

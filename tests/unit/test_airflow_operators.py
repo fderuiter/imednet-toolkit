@@ -194,12 +194,37 @@ def test_provider_info_and_hook_metadata_contract():
     info = provider_pkg.get_provider_info()
     assert info["package-name"] == "apache-airflow-providers-imednet"
     assert info["name"] == "iMednet"
-    assert info["connection-types"] == [
+    assert info["triggers"] == [
         {
-            "connection-type": "imednet",
-            "hook-class-name": "airflow.providers.imednet.hooks.ImednetHook",
+            "integration-name": "iMednet",
+            "python-modules": ["airflow.providers.imednet.triggers"],
         }
     ]
+    assert len(info["connection-types"]) == 1
+    conn_type_meta = info["connection-types"][0]
+    assert conn_type_meta["connection-type"] == "imednet"
+    assert conn_type_meta["hook-class-name"] == "airflow.providers.imednet.hooks.ImednetHook"
+    assert conn_type_meta["hook-name"] == "iMednet"
+    assert conn_type_meta["ui-field-behaviour"]["hidden-fields"] == [
+        "host",
+        "schema",
+        "port",
+        "extra",
+    ]
+    assert ImednetHook.get_ui_field_behaviour()["hidden_fields"] == [
+        "host",
+        "schema",
+        "port",
+        "extra",
+    ]
+    assert conn_type_meta["conn-fields"]["oidc_token"]["schema"]["format"] == "password"
+    assert set(conn_type_meta["conn-fields"]) == {
+        "base_url",
+        "oidc_token",
+        "timeout",
+        "strict_mode",
+        "simulation_mode",
+    }
 
     eps = entry_points(group="apache_airflow_provider")
     matched = [ep for ep in eps if ep.value == "apache_airflow_providers_imednet:get_provider_info"]
@@ -210,4 +235,15 @@ def test_provider_info_and_hook_metadata_contract():
     requires = dist.requires or []
     assert any(req.startswith("imednet-workflows") for req in requires)
     extras = set(dist.metadata.get_all("Provides-Extra") or [])
-    assert {"duckdb", "export", "mongodb", "neo4j", "snowflake"}.issubset(extras)
+    assert {
+        "all",
+        "amazon",
+        "duckdb",
+        "export",
+        "mongodb",
+        "neo4j",
+        "openlineage",
+        "sinks",
+        "snowflake",
+        "workflows",
+    }.issubset(extras)
