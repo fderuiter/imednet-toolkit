@@ -137,7 +137,7 @@ literal ``none`` bypass) to filter Form Variable values on the server. All twelv
 
    imednet records list STUDY --filter "formKey==AE;recordId>=100" \
        --record-data-filter "AESER==Serious;AGE>=18" --sort dateCreated,desc --limit 50
-   imednet queries list STUDY --filter "type==Open,type==Answered" --sort annotationId,desc
+   imednet queries list STUDY --filter "type==record,type==question" --sort annotationId,desc
    imednet users list STUDY --include-inactive --sort login,asc --limit 25
 
 Interactive TTY table sessions fetch one bounded page of 100 items by default and
