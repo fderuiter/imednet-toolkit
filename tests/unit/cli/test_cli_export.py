@@ -562,3 +562,89 @@ def test_cli_export_no_mask_phi_and_quality_gate_passthrough(
             min_schema_readiness_score=88.0,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "subcommand_args"),
+    [
+        ("parquet", ["STUDY", "out.parquet"]),
+        ("csv", ["STUDY", "out.csv"]),
+        ("excel", ["STUDY", "out.xlsx"]),
+        ("json", ["STUDY", "out.json"]),
+        ("duckdb", ["STUDY", "study_records", "out.duckdb"]),
+        ("sql", ["STUDY", "study_records", "sqlite:///out.db", "--single-table"]),
+        ("mongodb", ["STUDY", "mongodb://localhost:27017", "imednet", "records"]),
+        ("neo4j", ["STUDY", "bolt://localhost:7687", "neo4j", "password"]),
+        ("snowflake", ["STUDY", "acct", "user", "secret", "DB", "PUBLIC", "WH", "STAGE", "TBL"]),
+    ],
+)
+def test_cli_export_all_9_subcommands_accept_no_interactive_and_suppress_spinners(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    subcommand: str,
+    subcommand_args: list[str],
+) -> None:
+    """Verify all 9 export subcommands accept --no-interactive after subcommand and suppress spinners."""
+    import io
+    import os
+    import sys
+
+    from imednet.cli.utils.terminal import supports_live_status
+
+    class _FakeTTYErr(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    help_res = runner.invoke(cli.app, ["export", subcommand, "--help"])
+    assert help_res.exit_code == 0
+    assert "--no-interactive" in help_res.stdout
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+
+    sdk.sinks.MongoDbSinkConfig = MongoDbSinkConfig
+    sdk.sinks.Neo4jSinkConfig = Neo4jSinkConfig
+    sdk.sinks.SnowflakeSinkConfig = SnowflakeSinkConfig
+
+    observed_live_status: list[bool] = []
+
+    def _record_env(*_args: object, **_kwargs: object) -> None:
+        observed_live_status.append(supports_live_status(sys.stderr))
+
+    for export_fn_name in (
+        "export_to_parquet",
+        "export_to_csv",
+        "export_to_excel",
+        "export_to_json",
+        "export_to_duckdb",
+        "export_to_sql",
+        "export_to_sql_by_form",
+        "export_to_long_sql",
+    ):
+        spy = MagicMock(side_effect=_record_env)
+        monkeypatch.setattr(export_mod, export_fn_name, spy)
+        monkeypatch.setattr(cli, export_fn_name, spy)
+
+    sdk.sinks.export_to_mongodb = MagicMock(side_effect=_record_env)
+    sdk.sinks.export_to_neo4j = MagicMock(side_effect=_record_env)
+    sdk.sinks.export_to_snowflake = MagicMock(side_effect=_record_env)
+
+    tty_err = _FakeTTYErr()
+    old_err = sys.stderr
+    try:
+        sys.stderr = tty_err
+        out_buf = io.StringIO()
+        from contextlib import redirect_stdout
+
+        with redirect_stdout(out_buf):
+            cli.app(["export", subcommand, *subcommand_args, "--no-interactive"])
+    finally:
+        sys.stderr = old_err
+
+    err_text = tty_err.getvalue()
+    assert observed_live_status == [False]
+    assert "\x1b[?25l" not in err_text
+    assert "\x1b[?25h" not in err_text
+    assert "IMEDNET_NON_INTERACTIVE" not in os.environ

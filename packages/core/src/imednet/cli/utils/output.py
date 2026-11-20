@@ -595,17 +595,20 @@ def display_list(
     empty_msg: str | None = None,
     fields: list[str] | None = None,
     *,
-    output_format: str = "table",
+    output_format: str | None = None,
     details: Sequence[Any] | None = None,
     interactive: bool | None = None,
     truncated: bool = False,
     status_notice: str | None = None,
 ) -> None:
     """Display a human table or one versioned JSON response without progress text."""
-    if output_format == "json":
+    from .args import resolve_output_format
+
+    resolved_format = resolve_output_format(output_format)
+    if resolved_format == "json":
         emit_json(items, label.replace(" ", "_"))
         return
-    if output_format != "table":
+    if resolved_format != "table":
         raise ValueError("Unsupported output format")
     if not items:
         print(empty_msg or f"No {label} found.")

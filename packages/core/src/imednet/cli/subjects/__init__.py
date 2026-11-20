@@ -15,6 +15,7 @@ from ..utils.args import (
     add_output_format,
     collect_list_items,
     prepare_list_query,
+    resolve_output_format,
 )
 
 
@@ -37,13 +38,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sdk: ImednetSDK,
         study_key: str,
         subject_filter: list[str] | None = None,
-        output_format: str = "table",
+        output_format: str | None = None,
         sort: str | None = None,
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,
         _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
+        resolved_format = resolve_output_format(output_format)
         req_kwargs, effective_limit = (
             _prepared_query
             if _prepared_query is not None
@@ -52,7 +54,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 sort=sort,
                 limit=limit,
                 fetch_all=fetch_all,
-                output_format=output_format,
+                output_format=resolved_format,
                 no_interactive=no_interactive,
                 model=Subject,
                 allowed_attributes=SubjectsEndpoint.FILTER_ATTRIBUTES,
@@ -66,7 +68,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 effective_limit,
             )
 
-        if output_format == "json":
+        if resolved_format == "json":
             display_list(subjects_list, "subjects", output_format="json")
             return
         view_models = []
@@ -89,16 +91,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             details=subjects_list,
             truncated=truncated,
             interactive=False if no_interactive else None,
+            output_format=resolved_format,
         )
 
     def _dispatch_list_subjects(args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
+        resolved_format = resolve_output_format(args.output_format)
         prepared = prepare_list_query(
             filter_args=args.subject_filter,
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
-            output_format=args.output_format,
+            output_format=resolved_format,
             no_interactive=no_interactive,
             model=Subject,
             allowed_attributes=SubjectsEndpoint.FILTER_ATTRIBUTES,
@@ -107,7 +111,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         list_subjects(
             study_key=args.study_key,
             subject_filter=args.subject_filter,
-            output_format=args.output_format,
+            output_format=resolved_format,
             sort=args.sort,
             limit=args.limit,
             fetch_all=args.fetch_all,
