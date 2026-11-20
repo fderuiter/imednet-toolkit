@@ -1,5 +1,5 @@
 .. meta::
-   :description: Unofficial Python SDK, CLI, workflow plugins, TUI, and Apache Airflow provider for the iMednet clinical trials EDC API.
+   :description: Unofficial Python SDK, CLI, workflow plugins, TUI, and Apache Airflow provider for the iMednet clinical study EDC API.
 
 .. note::
    This SDK is unofficial and not affiliated with the vendor. Use at your own risk.
@@ -82,11 +82,11 @@ Role-Based Pathways & Interactive Showcase
       <div class="showcase-header">
          <div class="showcase-header-content">
             <div class="showcase-header-text">
-               <h3>Embedded Live Clinical Explorer</h3>
-               <p>Execute client-side Python SDK calls, REST queries, and form schema validations directly in the browser.</p>
+               <h3>Simulation Scenario Explorer</h3>
+               <p>Inspect verified Python SDK and REST snippets alongside instant simulation previews for Study, Form, Variable, Record, and Query resources.</p>
             </div>
             <div class="showcase-client-badge">
-               <span>⚡ 100% Client-Side (Sub-50ms)</span>
+               <span>Instant Simulation Preview (Offline Fixtures)</span>
             </div>
          </div>
          <div class="showcase-persona-tabs" role="tablist" aria-label="Live Explorer Persona Selection">
@@ -106,38 +106,33 @@ Role-Based Pathways & Interactive Showcase
       <div id="panel-integration" class="showcase-panel active" role="tabpanel" tabindex="0" aria-labelledby="tab-integration">
          <div class="explorer-toolbar">
             <div class="explorer-controls-left">
-               <div class="mode-segmented-toggle" role="group" aria-label="Execution Protocol">
+               <div class="mode-segmented-toggle" role="group" aria-label="Snippet Format">
                   <button type="button" id="ie-mode-sdk" class="mode-pill-btn active" aria-pressed="true">Python SDK</button>
                   <button type="button" id="ie-mode-rest" class="mode-pill-btn" aria-pressed="false">REST Request</button>
                </div>
                <div class="explorer-control-group">
-                  <label for="ie-dataset-select" class="explorer-control-label">Sample Query:</label>
-                  <select id="ie-dataset-select" class="explorer-select" aria-label="Sample Query: Select sample dataset query">
-                     <option value="records">Clinical Records (Vital Signs - VS)</option>
-                     <option value="studies">Active Clinical Trials Catalog</option>
-                     <option value="forms">Case Report Form Schemas</option>
-                     <option value="queries">Clinical Queries &amp; Discrepancies</option>
+                  <label for="ie-dataset-select" class="explorer-control-label">Study Scenario:</label>
+                  <select id="ie-dataset-select" class="explorer-select" aria-label="Study Scenario: Select simulation preview scenario">
+                     <option value="records">Study Records (Vital Signs — F_VS)</option>
+                     <option value="studies">Clinical Studies Catalog</option>
+                     <option value="forms">Study Form Schemas</option>
+                     <option value="queries">Open Study Queries</option>
                   </select>
                </div>
-            </div>
-            <div class="explorer-controls-right">
-               <button type="button" id="ie-run-btn" class="explorer-run-btn" aria-label="Execute query in browser">
-                  <span>▶ Execute Query</span>
-               </button>
             </div>
          </div>
 
          <div class="explorer-editor-box">
             <div class="explorer-editor-header">
-               <span>Client-Side Query Editor</span>
-               <span>In-memory sandbox</span>
+               <span>Read-Only Scenario Snippet (STUDY)</span>
+               <button type="button" id="ie-snippet-copy-btn" class="explorer-snippet-copy-btn" aria-label="Copy Code — Copy scenario snippet">Copy Code</button>
             </div>
-            <textarea id="ie-code-input" class="explorer-textarea" rows="6" aria-label="Code editor" spellcheck="false"></textarea>
+            <pre id="ie-code-viewer" class="explorer-code-pre"><code id="ie-code-display" class="language-python"></code></pre>
          </div>
 
          <div class="explorer-metric-bar">
             <div id="ie-metric-badge" class="explorer-metric-badge" role="status" aria-live="polite" aria-atomic="true">
-               ⚡ Executed in 1.8 ms (Mock Client Engine) | Status: 200 OK
+               Simulation Preview (Deterministic Fixture) — STUDY Records (4 items)
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Output View">
                <button type="button" id="ie-tab-table" class="explorer-output-tab active" role="tab" aria-selected="true" tabindex="0" aria-controls="ie-view-table">
@@ -157,8 +152,8 @@ Role-Based Pathways & Interactive Showcase
          </div>
 
          <div class="quick-start-callout">
-            <p>Ready to integrate with live clinical databases and pipeline orchestrators?</p>
-            <a href="tutorials/quick_start.html">Explore the Quick Start Tutorial &rarr;</a>
+            <p>Want to edit and execute custom Python <code>ImednetSDK</code> calls interactively in your browser?</p>
+            <a href="tutorials/quick_start.html">Launch the Interactive Runtime in Quick Start &rarr;</a>
          </div>
       </div>
 
@@ -168,11 +163,11 @@ Role-Based Pathways & Interactive Showcase
             <div class="explorer-controls-left">
                <div class="explorer-control-group">
                   <label for="cdm-form-select" class="explorer-control-label">Study Form:</label>
-                  <select id="cdm-form-select" class="explorer-select" aria-label="Select study form to inspect">
-                     <option value="VS">VS — Vital Signs (Blood pressure, pulse, temperature)</option>
-                     <option value="DM">DM — Demographics (Age, sex, race, treatment arm)</option>
-                     <option value="AE">AE — Adverse Events (Term, severity, causality)</option>
-                     <option value="LB">LB — Laboratory Findings (Analytes, units, ranges)</option>
+                  <select id="cdm-form-select" class="explorer-select" aria-label="Study Form: Select study form schema to inspect">
+                     <option value="VS">F_VS — Vital Signs (Blood pressure, pulse, weight, temperature)</option>
+                     <option value="DM">F_DM — Demographics (Age, sex, race, treatment arm)</option>
+                     <option value="AE">F_AE — Safety Observations (Term, severity, causality)</option>
+                     <option value="LB">F_LB — Laboratory Findings (Analytes, units, ranges)</option>
                   </select>
                </div>
             </div>
@@ -185,11 +180,11 @@ Role-Based Pathways & Interactive Showcase
 
          <div class="explorer-metric-bar">
             <div id="cdm-metric-badge" class="explorer-metric-badge" role="status" aria-live="polite" aria-atomic="true">
-               ✓ Schema Valid (CDISC ODM Compliant) — 0 Errors | Validated in 0.9 ms
+               Simulation Preview (Deterministic Fixture) — Form Schema Valid (CDISC ODM Compliant, 0 Errors)
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Form Schema View">
                <button type="button" id="cdm-tab-crf" class="explorer-output-tab active" role="tab" aria-selected="true" tabindex="0" aria-controls="cdm-view-crf">
-                  CRF Structure
+                  Form Variables
                </button>
                <button type="button" id="cdm-tab-json" class="explorer-output-tab" role="tab" aria-selected="false" tabindex="-1" aria-controls="cdm-view-json">
                   Form Schema JSON
@@ -205,7 +200,7 @@ Role-Based Pathways & Interactive Showcase
          </div>
 
          <div class="quick-start-callout">
-            <p>Design complex clinical trials with dynamic conditional logic and edit checks:</p>
+            <p>Design complex clinical studies with dynamic conditional logic and edit checks:</p>
             <a href="how-to/form_builder.html">Visit Form Builder Guide &rarr;</a>
          </div>
       </div>
@@ -231,14 +226,14 @@ Role-Based Pathways & Interactive Showcase
 
          <div class="explorer-metric-bar">
             <div id="aud-metric-badge" class="explorer-metric-badge" role="status" aria-live="polite" aria-atomic="true">
-               ✓ 21 CFR Part 11 Electronic Signature &amp; VPAT Check Verified | 1.1 ms
+               Simulation Preview (Deterministic Fixture) — 21 CFR Part 11 Electronic Signature &amp; VPAT Verified
             </div>
             <div class="explorer-output-tabs" role="tablist" aria-label="Auditor View">
                <button type="button" id="aud-tab-table" class="explorer-output-tab active" role="tab" aria-selected="true" tabindex="0" aria-controls="aud-view-table">
                   Audit Trail Records
                </button>
                <button type="button" id="aud-tab-json" class="explorer-output-tab" role="tab" aria-selected="false" tabindex="-1" aria-controls="aud-view-json">
-                  Signed Event JSON
+                  Signed Audit JSON
                </button>
             </div>
          </div>

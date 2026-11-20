@@ -104,7 +104,50 @@ def build_and_stage_wheels(
     return staged
 
 
-SCOPED_INHERITED_MEMBERS = "BaseModel, RootModel, Enum, str, int, Exception, BaseException, object"
+SCOPED_INHERITED_MEMBERS = (
+    "BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object"
+)
+
+
+def emit_curated_core_reference(api_dir: Path) -> None:
+    """Emit curated imednet.core.rst for imednet.core.__all__ and register it in imednet.rst."""
+    api_dir.mkdir(parents=True, exist_ok=True)
+    core_rst = api_dir / "imednet.core.rst"
+    core_rst.write_text(
+        "imednet.core package\n"
+        "====================\n\n"
+        ".. automodule:: imednet.core\n"
+        "   :inherited-members:\n"
+        "   :members:\n"
+        "   :show-inheritance:\n",
+        encoding="utf-8",
+    )
+
+    imednet_rst = api_dir / "imednet.rst"
+    if imednet_rst.exists():
+        lines = imednet_rst.read_text(encoding="utf-8").splitlines()
+        if "   imednet.core" not in lines:
+            updated_lines: list[str] = []
+            in_subpackages_toctree = False
+            inserted = False
+            for idx, line in enumerate(lines):
+                if line.strip() == "Subpackages" and idx + 1 < len(lines):
+                    in_subpackages_toctree = True
+                elif in_subpackages_toctree and line.strip() == "Submodules":
+                    if not inserted:
+                        updated_lines.append("   imednet.core")
+                        inserted = True
+                    in_subpackages_toctree = False
+                elif (
+                    in_subpackages_toctree
+                    and not inserted
+                    and line.startswith("   imednet.")
+                    and line.strip() > "imednet.core"
+                ):
+                    updated_lines.append("   imednet.core")
+                    inserted = True
+                updated_lines.append(line)
+            imednet_rst.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
 
 
 def scope_apidoc_inherited_members(api_dir: Path) -> None:
@@ -119,8 +162,10 @@ def scope_apidoc_inherited_members(api_dir: Path) -> None:
             rst_file.write_text(updated, encoding="utf-8")
 
 
-def main() -> None:
-    api_dir = Path("docs/reference/api")
+def generate_api_reference(api_dir: Path | None = None) -> None:
+    """Regenerate docs/reference/api RST files for all workspace packages."""
+    if api_dir is None:
+        api_dir = Path("docs/reference/api")
 
     print("Cleaning old API docs...")
     if api_dir.exists():
@@ -130,13 +175,14 @@ def main() -> None:
     env = os.environ.copy()
     env["SPHINX_APIDOC_OPTIONS"] = "inherited-members,members,show-inheritance"
 
-    # Core package
+    # Core package (exclude internal core submodules and legacy http shim)
     run_command(
         [
             "sphinx-apidoc",
             "-o",
             str(api_dir),
             "packages/core/src/imednet",
+            "packages/core/src/imednet/core",
             "packages/core/src/imednet/http",
             "-f",
             "-M",
@@ -145,6 +191,7 @@ def main() -> None:
         ],
         env=env,
     )
+    emit_curated_core_reference(api_dir)
 
     # Other packages
     packages_dir = Path("packages")
@@ -170,6 +217,10 @@ def main() -> None:
                     )
 
     scope_apidoc_inherited_members(api_dir)
+
+
+def main() -> None:
+    generate_api_reference()
 
     print("Generating ADR index...")
     generate_adr_index()

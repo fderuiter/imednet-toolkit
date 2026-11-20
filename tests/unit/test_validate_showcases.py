@@ -13,7 +13,9 @@ from scripts.validate_showcases import (
     extract_literalinclude_slice,
     main,
     stage_wheels,
+    validate_canonical_showcase_terminology,
     validate_documentation_literal_includes,
+    validate_landing_showcase,
     validate_python_slice,
     validate_python_syntax,
     validate_quick_start_ast_structure,
@@ -50,6 +52,9 @@ def test_repo_showcases_and_docs_pass() -> None:
 
     doc_errors = validate_documentation_literal_includes(docs_dir)
     assert not doc_errors, f"Expected no documentation literal include errors, got: {doc_errors}"
+
+    landing_errors = validate_landing_showcase(docs_dir, repo_root)
+    assert not landing_errors, f"Expected no landing showcase errors, got: {landing_errors}"
 
 
 def test_syntax_error_detection(tmp_path: Path) -> None:
@@ -1020,3 +1025,91 @@ def test_execute_showcases_in_simulation_catches_nonzero_and_error_output(
     assert any("fail_exit.py" in e and "non-zero code 2" in e for e in errors)
     assert any("fail_printed_error.py" in e and "Error message emitted" in e for e in errors)
     assert any("fail_json_log.py" in e and "Error log emitted" in e for e in errors)
+
+
+def test_validate_landing_showcase_detects_simulation_and_vocabulary_regressions(
+    tmp_path: Path,
+) -> None:
+    """Verify validate_landing_showcase catches broken SDK calls, unmaterialized iterators, Math.random, and synonyms."""
+    repo_root = Path(__file__).resolve().parents[2]
+    docs_dir = tmp_path / "docs"
+    static_dir = docs_dir / "_static"
+    static_dir.mkdir(parents=True)
+
+    # Copy valid showcase.js as baseline and inject targeted regressions
+    valid_js = (repo_root / "docs" / "_static" / "showcase.js").read_text(encoding="utf-8")
+    broken_js = (
+        valid_js.replace(
+            'studies = list(sdk.studies.list())',
+            'studies = sdk.studies.list(status="ACTIVE")',
+        ).replace(
+            'study_key="STUDY"',
+            'study_key="STUDY-101"',
+            1,
+        )
+        + "\n// Math.random()\n// patient discrepancy\n"
+    )
+    (static_dir / "showcase.js").write_text(broken_js, encoding="utf-8")
+
+    index_rst = docs_dir / "index.rst"
+    index_rst.write_text(
+        '<div id="interactive-showcase-root">\n'
+        '  <textarea id="ie-code-input"></textarea>\n'
+        '  <button id="ie-run-btn">Run</button>\n'
+        "  Study Variable Query trial eCRF\n"
+        "</div>\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_landing_showcase(docs_dir, repo_root)
+    assert any("Forbidden Math.random()" in e for e in errors)
+    assert any("Must target seeded 'STUDY' instead of 'STUDY-101'" in e for e in errors)
+    assert any("Offline simulation execution failed" in e for e in errors)
+    assert any("Legacy editable sandbox markup '<textarea'" in e for e in errors)
+    assert any("Missing required read-only showcase element" in e for e in errors)
+    assert any("Disallowed CONTEXT.md synonym 'patient'" in e for e in errors)
+    assert any("Disallowed CONTEXT.md synonym 'discrepancy'" in e for e in errors)
+    assert any("Disallowed CONTEXT.md synonym 'trial'" in e for e in errors)
+    assert any("Disallowed CONTEXT.md synonym 'eCRF'" in e for e in errors)
+
+
+def test_validate_landing_showcase_detects_unmaterialized_generator(tmp_path: Path) -> None:
+    """Verify validate_landing_showcase rejects snippets that leave lazy generators unmaterialized."""
+    repo_root = Path(__file__).resolve().parents[2]
+    docs_dir = tmp_path / "docs"
+    static_dir = docs_dir / "_static"
+    static_dir.mkdir(parents=True)
+
+    valid_js = (repo_root / "docs" / "_static" / "showcase.js").read_text(encoding="utf-8")
+    lazy_js = valid_js.replace(
+        "forms = list(sdk.forms.list(study_key=\"STUDY\"))\\n    for f in forms:\\n        print(f\"{f.form_name} ({f.form_key})\")",
+        "forms = sdk.forms.list(study_key=\"STUDY\")",
+    )
+    (static_dir / "showcase.js").write_text(lazy_js, encoding="utf-8")
+
+    errors = validate_landing_showcase(docs_dir, repo_root)
+    assert any("unmaterialized lazy iterator" in e for e in errors), f"Got errors: {errors}"
+
+
+def test_validate_canonical_showcase_terminology_allows_js_window_globals(tmp_path: Path) -> None:
+    """Verify window.location.hash and window.history do not false-positive while domain synonyms fail."""
+    js_file = tmp_path / "sample.js"
+    js_file.write_text(
+        "// Study Query Variable\n"
+        "const h = window.location.hash;\n"
+        "window.history.replaceState(null, '', '#panel-integration');\n"
+        "window.addEventListener('hashchange', () => {});\n",
+        encoding="utf-8",
+    )
+    assert not validate_canonical_showcase_terminology(js_file)
+
+    bad_js_file = tmp_path / "bad.js"
+    bad_js_file.write_text(
+        "// Study Query\nconst label = 'Clinic window and field count';\n",
+        encoding="utf-8",
+    )
+    errs = validate_canonical_showcase_terminology(bad_js_file)
+    assert any("Missing required canonical CONTEXT.md term 'Variable'" in e for e in errs)
+    assert any("Disallowed CONTEXT.md synonym 'Clinic'" in e for e in errs)
+    assert any("Disallowed CONTEXT.md synonym 'window'" in e for e in errs)
+    assert any("Disallowed CONTEXT.md synonym 'field'" in e for e in errs)

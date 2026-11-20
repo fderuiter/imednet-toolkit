@@ -735,6 +735,174 @@ def check_no_duplicate_suppression(conf_py_path: Path | None = None) -> bool:
     return has_errors
 
 
+def _verify_sdk_html(sdk_page: Path) -> bool:
+    """Verify ImednetSDK and AsyncImednetSDK convenience methods and study_context in imednet.html."""
+    from imednet.endpoints.registry import ENDPOINT_REGISTRY
+
+    has_errors = False
+    sdk_parsed = _parse_html_file(sdk_page)
+    list_resources = sorted(k for k, cls in ENDPOINT_REGISTRY.items() if hasattr(cls, "list"))
+
+    for sdk_qname, is_async in (
+        ("imednet.sdk.ImednetSDK", False),
+        ("imednet.sdk.AsyncImednetSDK", True),
+    ):
+        if sdk_qname not in sdk_parsed.ids:
+            print(f"Error: SDK class '{sdk_qname}' missing from imednet.html.")
+            has_errors = True
+            continue
+
+        sc_id = f"{sdk_qname}.study_context"
+        if sc_id not in sdk_parsed.ids:
+            print(f"Error: Inherited method '{sc_id}' missing from imednet.html.")
+            has_errors = True
+
+        for resource in list_resources:
+            method_name = f"async_get_{resource}" if is_async else f"get_{resource}"
+            mid = f"{sdk_qname}.{method_name}"
+            if mid not in sdk_parsed.ids:
+                print(f"Error: Convenience method '{mid}' missing from imednet.html.")
+                has_errors = True
+                continue
+            dt_str = sdk_parsed.dt_text.get(mid, "")
+            dl_str = sdk_parsed.dl_text_by_dt_id.get(mid, "")
+            if is_async and not dt_str.startswith("async "):
+                print(f"Error: Async convenience method '{mid}' missing 'async' prefix.")
+                has_errors = True
+            if not is_async and dt_str.startswith("async "):
+                print(f"Error: Sync convenience method '{mid}' unexpectedly marked 'async'.")
+                has_errors = True
+            if "sdk_self" in dl_str:
+                print(f"Error: Convenience method '{mid}' leaks internal 'sdk_self' parameter.")
+                has_errors = True
+
+    return has_errors
+
+
+def _verify_pagination_html(pagination_page: Path) -> bool:
+    """Verify Paginator, JsonListPaginator, AsyncPaginator, and AsyncJsonListPaginator HTML."""
+    has_errors = False
+    pag_parsed = _parse_html_file(pagination_page)
+    expected_paginators = (
+        ("Paginator", False),
+        ("JsonListPaginator", False),
+        ("AsyncPaginator", True),
+        ("AsyncJsonListPaginator", True),
+    )
+    for cls_name, is_async in expected_paginators:
+        qname = f"imednet.pagination.{cls_name}"
+        if qname not in pag_parsed.ids:
+            print(f"Error: Paginator '{qname}' missing from imednet.pagination.html.")
+            has_errors = True
+            continue
+
+        for attr_name in ("__init__", "cursor", "page_size"):
+            aid = f"{qname}.{attr_name}"
+            if aid not in pag_parsed.ids:
+                print(f"Error: Paginator member '{aid}' missing from imednet.pagination.html.")
+                has_errors = True
+
+        iter_name = "__aiter__" if is_async else "__iter__"
+        iter_id = f"{qname}.{iter_name}"
+        if iter_id not in pag_parsed.ids:
+            print(f"Error: Paginator iterator '{iter_id}' missing from imednet.pagination.html.")
+            has_errors = True
+        else:
+            dt_str = pag_parsed.dt_text.get(iter_id, "")
+            dl_str = pag_parsed.dl_text_by_dt_id.get(iter_id, "")
+            if is_async and not dt_str.startswith("async "):
+                print(f"Error: Async paginator '{iter_id}' missing 'async' coroutine prefix.")
+                has_errors = True
+            expected_ret = "AsyncIterator" if is_async else "Iterator"
+            if expected_ret not in dl_str:
+                print(f"Error: Paginator '{iter_id}' missing '{expected_ret}' return type.")
+                has_errors = True
+
+    return has_errors
+
+
+def _verify_core_html(core_page: Path) -> bool:
+    """Verify curated imednet.core exports, EDC endpoint bases, and clean inheritance."""
+    import imednet.core as core_pkg
+
+    has_errors = False
+    core_text = core_page.read_text(encoding="utf-8")
+    for forbidden_token in (
+        "ListOperation",
+        "FilterGetOperation",
+        "SyncRequestExecutor",
+        "AsyncRequestExecutor",
+    ):
+        if forbidden_token in core_text:
+            print(f"Error: Internal type '{forbidden_token}' leaked into imednet.core.html.")
+            has_errors = True
+
+    core_parsed = _parse_html_file(core_page)
+    expected_exports = {
+        "HTTPClientBase",
+        "BaseClient",
+        "Client",
+        "AsyncClient",
+        "RetryConfig",
+        "RetryPolicy",
+        "RetryState",
+        "DefaultRetryPolicy",
+        "BasePaginator",
+        "EdcSyncListEndpoint",
+        "EdcAsyncListEndpoint",
+        "EdcSyncGetEndpoint",
+        "EdcAsyncGetEndpoint",
+        "EdcSyncListGetEndpoint",
+        "EdcAsyncListGetEndpoint",
+    }
+    actual_exports = set(getattr(core_pkg, "__all__", ()))
+    if not expected_exports.issubset(actual_exports):
+        missing = sorted(expected_exports - actual_exports)
+        print(f"Error: imednet.core.__all__ is missing expected exports: {missing}.")
+        has_errors = True
+
+    for sym in sorted(expected_exports):
+        qname = f"imednet.core.{sym}"
+        if qname not in core_parsed.ids:
+            print(f"Error: Export '{qname}' missing from imednet.core.html.")
+            has_errors = True
+
+    edc_checks = (
+        ("EdcSyncListEndpoint", False, True, False),
+        ("EdcAsyncListEndpoint", True, True, False),
+        ("EdcSyncGetEndpoint", False, False, True),
+        ("EdcAsyncGetEndpoint", True, False, True),
+        ("EdcSyncListGetEndpoint", False, True, True),
+        ("EdcAsyncListGetEndpoint", True, True, True),
+    )
+    for cls_name, is_async, has_list, has_get in edc_checks:
+        qname = f"imednet.core.{cls_name}"
+        if has_list:
+            for mname in ("list", "to_dataframe"):
+                mid = f"{qname}.{mname}"
+                if mid not in core_parsed.ids:
+                    print(f"Error: Core endpoint method '{mid}' missing from imednet.core.html.")
+                    has_errors = True
+                elif mname == "list":
+                    expected_iter = "AsyncIterator" if is_async else "Iterator"
+                    if expected_iter not in core_parsed.dl_text_by_dt_id.get(mid, ""):
+                        print(f"Error: '{mid}' missing '{expected_iter}' return type.")
+                        has_errors = True
+                elif is_async and not core_parsed.dt_text.get(mid, "").startswith("async "):
+                    print(f"Error: Async method '{mid}' missing 'async' prefix.")
+                    has_errors = True
+        if has_get:
+            mid = f"{qname}.get"
+            if mid not in core_parsed.ids:
+                print(f"Error: Core endpoint method '{mid}' missing from imednet.core.html.")
+                has_errors = True
+            elif is_async and not core_parsed.dt_text.get(mid, "").startswith("async "):
+                print(f"Error: Async method '{mid}' missing 'async' prefix.")
+                has_errors = True
+
+    return has_errors
+
+
 def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
     """Verify rendered HTML model fields, endpoint methods, _modules/index.html, and [docs] backlinks."""
     print("Checking rendered Sphinx HTML API reference and viewcode backlinks...")
@@ -757,16 +925,45 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
                 print("Error: Strict sphinx-build failed while preparing HTML for validation.")
                 return True
 
-    models_page = html_dir / "reference" / "api" / "imednet.models.html"
-    endpoints_page = html_dir / "reference" / "api" / "imednet.endpoints.html"
+    api_html_dir = html_dir / "reference" / "api"
+    models_page = api_html_dir / "imednet.models.html"
+    endpoints_page = api_html_dir / "imednet.endpoints.html"
+    sdk_page = api_html_dir / "imednet.html"
+    pagination_page = api_html_dir / "imednet.pagination.html"
+    core_page = api_html_dir / "imednet.core.html"
     modules_index = html_dir / "_modules" / "index.html"
 
-    for required_page in (models_page, endpoints_page, modules_index):
+    for required_page in (
+        models_page,
+        endpoints_page,
+        sdk_page,
+        pagination_page,
+        core_page,
+        modules_index,
+    ):
         if not required_page.exists():
             print(f"Error: Expected rendered HTML page {required_page} does not exist.")
             return True
 
     has_errors = False
+
+    forbidden_internal_pages = (
+        "imednet.http.html",
+        "imednet.core.http.html",
+        "imednet.core.operations.html",
+        "imednet.core.endpoint.html",
+        "imednet.core.endpoint.operations.html",
+        "imednet.core.paginator.html",
+        "imednet.core.retry.html",
+        "imednet.core.client.html",
+        "imednet.core.async_client.html",
+        "imednet.core.base_client.html",
+        "imednet.core.http_client_base.html",
+    )
+    for forbidden_name in forbidden_internal_pages:
+        if (api_html_dir / forbidden_name).exists():
+            print(f"Error: Internal module page '{forbidden_name}' must not be generated.")
+            has_errors = True
 
     # 1. Verify 13 model submodules, 14 contract models (198+ fields), and 4 nested models
     from imednet.models.engine import get_contract
@@ -936,6 +1133,27 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
         elif expect_async and not endpoints_parsed.dt_text.get(mid, "").startswith("async "):
             print(f"Error: Async method '{mid}' missing 'async' coroutine prefix.")
             has_errors = True
+
+    endpoints_text = endpoints_page.read_text(encoding="utf-8")
+    for forbidden_ep_token in (
+        "ListOperation",
+        "FilterGetOperation",
+        "SyncRequestExecutor",
+        "AsyncRequestExecutor",
+        "model_validate",
+    ):
+        if forbidden_ep_token in endpoints_text:
+            print(
+                f"Error: Forbidden internal/inherited symbol '{forbidden_ep_token}' in imednet.endpoints.html."
+            )
+            has_errors = True
+
+    if _verify_sdk_html(sdk_page):
+        has_errors = True
+    if _verify_pagination_html(pagination_page):
+        has_errors = True
+    if _verify_core_html(core_page):
+        has_errors = True
 
     # 3. Verify _modules/index.html omits builtins.html and all [docs] backlinks resolve
     modules_index_text = modules_index.read_text(encoding="utf-8")
