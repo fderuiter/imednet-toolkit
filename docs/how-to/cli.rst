@@ -90,10 +90,30 @@ Usage failures exit 2, SDK-command interruption exits 130, and success/help exit
 
 ``records list --output json`` still writes ``records.json``; it is distinct from
 ``--format json`` stdout and combining them is an error. Existing ``export``
-commands, datadict JSON/schema/diff outputs and optional workflow command formats
-retain their own contracts. This is not a global JSON wrapper for plugins.
+commands, ``datadict`` JSON/schema/diff outputs (see :doc:`/how-to/data_dictionary`)
+and optional workflow command formats retain their own contracts. This is not a
+global JSON wrapper for plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
+
+Data Dictionary commands
+------------------------
+
+The ``imednet datadict`` subcommands convert Study metadata across 4-file CSV exports,
+CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate canonical JSON
+files, export the JSON Schema, and compute structural revision diffs (see
+:doc:`/how-to/data_dictionary` for Python equivalents and Record validation):
+
+.. code-block:: bash
+
+   imednet datadict from-csv ./datadict_export.zip -o study_dd.json --strict --no-raw-xml
+   imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
+   imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
+   imednet datadict from-redcap ./redcap_dictionary.csv --study-key STUDY -o study_dd.json
+   imednet datadict from-api --study-key STUDY -o api_dd.json --no-raw-xml
+   imednet datadict schema -o data-dictionary.schema.json
+   imednet datadict validate study_dd.json --schema data-dictionary.schema.json
+   imednet datadict diff baseline_dd.json study_dd.json --format md
 
 Terminal capabilities and non-interactive mode
 ----------------------------------------------
