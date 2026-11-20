@@ -54,25 +54,49 @@ class EndpointABC(ABC, ClientProvider, Generic[T]):
         Must be implemented by the base endpoint logic.
         """
 
-    def _validate_study_key(self, study_key: str | None) -> None:
-        """Validate that a study key is provided if required."""
-        if self.requires_study_key and not study_key:
-            from imednet.errors.validation import ConfigurationError
+    def _validate_study_key(self, study_key: Any) -> None:
+        """Validate that a study key is provided if required and safe for URL paths."""
+        from imednet.errors.validation import ConfigurationError
+        from imednet.utils.url import validate_path_segment
 
-            raise ConfigurationError(
-                "No study key provided. You must either pass 'study_key' explicitly "
-                "to the endpoint method or set it using ImednetSDK.study_context(...)."
-            )
+        if self.requires_study_key:
+            if study_key is None:
+                raise ConfigurationError(
+                    "No study key provided. You must either pass 'study_key' explicitly "
+                    "to the endpoint method or set it using ImednetSDK.study_context(...)."
+                )
+            validate_path_segment(study_key, name="study_key")
+            return
+
+        if study_key is not None:
+            if isinstance(study_key, (list, tuple, set, frozenset)):
+                if not study_key:
+                    validate_path_segment("", name="study_key")
+                for item in study_key:
+                    validate_path_segment(item, name="study_key")
+            else:
+                validate_path_segment(study_key, name="study_key")
+
+    @staticmethod
+    def _normalize_static_path(static_path: str) -> list[str]:
+        """Normalize static endpoint PATH segments, collapsing duplicate slashes."""
+        from imednet.utils.url import build_safe_path
+
+        normalized = build_safe_path(static_path)
+        return [part for part in normalized.split("/") if part]
 
     def _get_endpoint_path(self, study_key: str | None, *extra_segments: Any) -> str:
-        """Build the endpoint path with optional study key and extra segments."""
+        """Build the endpoint path separating static PATH prefixes from dynamic identifiers."""
+        from imednet.utils.url import validate_path_segment
+
         self._validate_study_key(study_key)
-        segments = []
+        segments: list[str] = []
         if self.requires_study_key:
-            segments.append(study_key)
+            segments.append(validate_path_segment(study_key, name="study_key"))
         if self.PATH:
-            segments.append(self.PATH)
-        segments.extend(extra_segments)
+            segments.extend(self._normalize_static_path(self.PATH))
+        for segment in extra_segments:
+            segments.append(validate_path_segment(segment, name="segment"))
         return self._build_path(*segments)
 
     def _raise_not_found(self, study_key: str | None, item_id: Any = None) -> None:

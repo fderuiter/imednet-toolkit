@@ -10,7 +10,13 @@ from typing import Any
 
 from imednet.spi.errors import ApiError, ClientError, ServerError
 from imednet.spi.facade import ImednetFacade
-from imednet.spi.utils import JobFailedError, JobPoller, JobTimeoutError
+from imednet.spi.utils import (
+    JobFailedError,
+    JobPoller,
+    JobTimeoutError,
+    PathTraversalValidationError,
+    validate_path_segment,
+)
 from imednet.spi.validation import (
     DataDictionary,
     ExtractedCondition,
@@ -380,8 +386,16 @@ class UATExecutionEngine:
             if isinstance(job, dict)
             else (getattr(job, "batch_id", None) or getattr(job, "batchId", None))
         )
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip()
+        if isinstance(raw, str):
+            if not raw:
+                return None
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+                validate_path_segment(raw, name="batch_id")
+            cleaned = raw.strip()
+            if not cleaned:
+                return None
+            validate_path_segment(cleaned, name="batch_id")
+            return cleaned
         return None
 
     def _build_job_poller(self) -> JobPoller:
@@ -488,6 +502,7 @@ class UATExecutionEngine:
     ) -> EditCheckVerificationReport:
         """Run the end-to-end UAT verification against the EDC API."""
         del site_name
+        validate_path_segment(study_key, name="study_key")
         report = EditCheckVerificationReport(study_key=study_key)
         pending_jobs: list[tuple[dict[str, Any], str]] = []
 
@@ -531,6 +546,8 @@ class UATExecutionEngine:
                         result["actual_response"] = "Accepted"
                         result["status"] = EditCheckResultStatus.FAIL
                         report.failed_rules += 1
+                except PathTraversalValidationError:
+                    raise
                 except (ApiError, ClientError) as e:
                     status_code = getattr(e, "status_code", None)
                     if isinstance(e, ServerError) or (
