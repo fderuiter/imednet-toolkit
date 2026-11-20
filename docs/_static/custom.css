@@ -608,7 +608,7 @@ body[data-theme="dark"] .role-card:hover {
     outline-offset: 2px;
 }
 
-/* Code editor console */
+/* Read-only code viewer */
 .explorer-editor-box {
     margin-bottom: 1.25rem;
 }
@@ -617,15 +617,52 @@ body[data-theme="dark"] .role-card:hover {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 0.75rem;
     background-color: var(--color-background-primary);
     border: 1px solid var(--color-background-border);
     border-bottom: none;
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;
-    padding: 0.4rem 0.85rem;
+    padding: 0.45rem 0.85rem;
     font-size: 0.775rem;
     font-weight: 600;
     color: var(--color-foreground-secondary);
+}
+
+.explorer-snippet-copy-btn {
+    background-color: var(--color-background-secondary);
+    border: 1px solid var(--color-background-border);
+    border-radius: 4px;
+    padding: 0.25rem 0.65rem;
+    font-size: 0.775rem;
+    font-weight: 600;
+    color: var(--color-foreground-primary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.explorer-snippet-copy-btn:hover {
+    color: var(--color-brand-primary);
+    border-color: var(--color-brand-primary);
+}
+
+.explorer-snippet-copy-btn:focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: 2px;
+}
+
+.explorer-code-pre {
+    margin: 0;
+    padding: 0.85rem 1rem;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    background-color: var(--color-background-primary);
+    color: var(--color-foreground-primary);
+    border: 1px solid var(--color-background-border);
+    border-bottom-left-radius: 6px;
+    border-bottom-right-radius: 6px;
 }
 
 .explorer-textarea {
@@ -750,7 +787,9 @@ body[data-theme="dark"] .role-card:hover {
 }
 
 .explorer-dataframe-table th.index-col,
-.explorer-dataframe-table td.index-col {
+.explorer-dataframe-table td.index-col,
+.explorer-dataframe-table th.index-cell,
+.explorer-dataframe-table td.index-cell {
     width: 48px;
     text-align: center;
     color: var(--color-foreground-secondary);
@@ -763,13 +802,17 @@ body[data-theme="dark"] .role-card:hover {
 }
 
 body[data-theme="dark"] .explorer-dataframe-table th.index-col,
-body[data-theme="dark"] .explorer-dataframe-table td.index-col {
+body[data-theme="dark"] .explorer-dataframe-table td.index-col,
+body[data-theme="dark"] .explorer-dataframe-table th.index-cell,
+body[data-theme="dark"] .explorer-dataframe-table td.index-cell {
     background-color: rgba(255, 255, 255, 0.04);
 }
 
 @media (prefers-color-scheme: dark) {
     body:not([data-theme="light"]) .explorer-dataframe-table th.index-col,
-    body:not([data-theme="light"]) .explorer-dataframe-table td.index-col {
+    body:not([data-theme="light"]) .explorer-dataframe-table td.index-col,
+    body:not([data-theme="light"]) .explorer-dataframe-table th.index-cell,
+    body:not([data-theme="light"]) .explorer-dataframe-table td.index-cell {
         background-color: rgba(255, 255, 255, 0.04);
     }
 }
@@ -840,6 +883,11 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     border-color: var(--color-brand-primary);
 }
 
+.explorer-copy-btn:focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: 2px;
+}
+
 .explorer-json-pre {
     margin: 0;
     padding: 1rem;
@@ -896,13 +944,15 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     color: var(--color-foreground-secondary);
 }
 
-.crf-fields-grid {
+.crf-fields-grid,
+.form-variables-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: 0.85rem;
 }
 
-.crf-field-card {
+.crf-field-card,
+.form-variable-card {
     background-color: var(--color-background-secondary);
     border: 1px solid var(--color-background-border);
     border-radius: 6px;
@@ -912,13 +962,15 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     gap: 0.35rem;
 }
 
-.crf-field-header {
+.crf-field-header,
+.form-variable-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
 }
 
-.crf-field-id {
+.crf-field-id,
+.form-variable-id {
     font-weight: 700;
     font-size: 0.9rem;
     color: var(--color-brand-primary);
@@ -945,13 +997,15 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     text-transform: uppercase;
 }
 
-.crf-field-label {
+.crf-field-label,
+.form-variable-label {
     font-size: 0.825rem;
     font-weight: 500;
     color: var(--color-foreground-primary);
 }
 
-.crf-field-meta {
+.crf-field-meta,
+.form-variable-meta {
     font-size: 0.775rem;
     color: var(--color-foreground-secondary);
     display: flex;
@@ -962,7 +1016,8 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     border-top: 1px dashed var(--color-background-border);
 }
 
-.crf-field-meta code {
+.crf-field-meta code,
+.form-variable-meta code {
     font-size: 0.75rem;
     padding: 0.1rem 0.3rem;
     border-radius: 3px;
@@ -1071,7 +1126,8 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
         align-items: flex-start;
     }
 
-    .crf-fields-grid {
+    .crf-fields-grid,
+    .form-variables-grid {
         grid-template-columns: 1fr;
     }
 }
@@ -1287,6 +1343,8 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     .thebelab-button,
     .explorer-run-btn,
     .explorer-secondary-btn,
+    .explorer-snippet-copy-btn,
+    .explorer-copy-btn,
     .role-card-launch-btn {
         border: 2px solid currentColor;
     }
@@ -1336,6 +1394,8 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     .thebelab-button.thebelab-run-button,
     .explorer-run-btn,
     .explorer-secondary-btn,
+    .explorer-snippet-copy-btn,
+    .explorer-copy-btn,
     .role-card-launch-btn,
     .persona-tab-btn,
     .output-subtab-btn,
@@ -1351,6 +1411,8 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     .thebelab-button.thebelab-run-button:hover:not(:disabled),
     .explorer-run-btn:hover:not(:disabled),
     .explorer-secondary-btn:hover:not(:disabled),
+    .explorer-snippet-copy-btn:hover:not(:disabled),
+    .explorer-copy-btn:hover:not(:disabled),
     .role-card-launch-btn:hover,
     .persona-tab-btn[aria-selected="true"],
     .output-subtab-btn[aria-selected="true"],
@@ -1371,6 +1433,7 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     .thebe-editor,
     .thebelab-cell,
     .role-card,
+    .explorer-code-pre,
     .explorer-select {
         forced-color-adjust: none;
         background-color: Canvas !important;
@@ -1383,6 +1446,8 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     .thebelab-button:focus-visible,
     .explorer-run-btn:focus-visible,
     .explorer-secondary-btn:focus-visible,
+    .explorer-snippet-copy-btn:focus-visible,
+    .explorer-copy-btn:focus-visible,
     .role-card-launch-btn:focus-visible,
     .persona-tab-btn:focus-visible,
     .output-subtab-btn:focus-visible,

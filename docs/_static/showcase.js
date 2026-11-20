@@ -1,216 +1,208 @@
 /**
- * Interactive Showcase & Embedded Live Explorer for iMednet Documentation Portal
- * Client-side execution engine with preloaded clinical datasets, persona tabs,
- * tabular DataFrame rendering, raw JSON viewer, and WCAG 2.1 AA accessibility.
+ * Interactive Showcase & Simulation Scenario Explorer for iMednet Documentation Portal
+ * Deterministic simulation preview viewer with preloaded Study, Form, Variable,
+ * Record, and Query fixtures, persona tabs, tabular DataFrame rendering,
+ * raw JSON viewer, and WCAG 2.1 AA accessibility.
  */
 
 (function () {
     "use strict";
 
     // -------------------------------------------------------------------------
-    // Preloaded Mock Datasets (De-identified synthetic data; Zero PHI)
+    // Preloaded Deterministic Simulation Datasets (De-identified synthetic data; Zero PHI)
     // -------------------------------------------------------------------------
     const MOCK_DATA = {
         studies: [
             {
-                studyKey: "STUDY-101",
-                name: "Phase II Oncology Biomarker Study",
-                protocol: "ONC-2026-B",
-                phase: "Phase II",
-                status: "ACTIVE",
-                sitesCount: 12,
-                enrolledSubjects: 145,
-                targetAccrual: 160,
-                leadInvestigator: "Dr. Elena Rostova",
-                createdDate: "2025-03-10T08:00:00Z"
+                studyKey: "STUDY",
+                studyName: "Benchmark Validation Study",
+                studyDescription: "Benchmark simulated study",
+                studyType: "Observational",
+                sponsorKey: "ACME-SPONSOR",
+                studyId: 1003,
+                dateCreated: "2026-01-01T00:00:00Z"
             },
             {
-                studyKey: "STUDY-202",
-                name: "Cardiovascular Safety & Efficacy Assessment",
-                protocol: "CVS-2025-A",
-                phase: "Phase III",
-                status: "ACTIVE",
-                sitesCount: 8,
-                enrolledSubjects: 92,
-                targetAccrual: 100,
-                leadInvestigator: "Dr. Marcus Vance",
-                createdDate: "2025-06-15T10:30:00Z"
+                studyKey: "DEMO-STUDY",
+                studyName: "Demo Oncology Study",
+                studyDescription: "Simulated oncology biomarker study",
+                studyType: "Interventional",
+                sponsorKey: "ACME-SPONSOR",
+                studyId: 1001,
+                dateCreated: "2026-01-01T00:00:00Z"
             },
             {
-                studyKey: "STUDY-303",
-                name: "Pediatric Autoimmune Biomarker Registry",
-                protocol: "PED-IMM-2026",
-                phase: "Phase I/II",
-                status: "RECRUITING",
-                sitesCount: 5,
-                enrolledSubjects: 34,
-                targetAccrual: 50,
-                leadInvestigator: "Dr. Sarah Chen",
-                createdDate: "2026-01-20T14:15:00Z"
+                studyKey: "MY_STUDY",
+                studyName: "Primary Clinical Study",
+                studyDescription: "Primary simulated clinical investigation",
+                studyType: "Interventional",
+                sponsorKey: "ACME-SPONSOR",
+                studyId: 1002,
+                dateCreated: "2026-01-01T00:00:00Z"
             }
         ],
         forms: {
             VS: {
-                formId: "VS",
+                formId: 302,
+                formKey: "F_VS",
                 formName: "Vital Signs",
                 domain: "VS",
-                description: "Standard vital signs observations (blood pressure, pulse, temperature).",
-                fields: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBJ-XXX" },
-                    { id: "VISIT", label: "Visit Name", type: "string", required: true, rule: "Values: V1, V2, V3, EOS" },
-                    { id: "VSDAT", label: "Assessment Date", type: "datetime", required: true, rule: "ISO 8601" },
-                    { id: "SYSBP", label: "Systolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "70 <= val <= 240" },
-                    { id: "DIABP", label: "Diastolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "40 <= val <= 140" },
-                    { id: "PULSE", label: "Pulse Rate (beats/min)", type: "integer", required: true, rule: "40 <= val <= 180" },
-                    { id: "TEMP", label: "Oral Temperature (°C)", type: "float", required: false, rule: "35.0 <= val <= 41.0" }
+                studyKey: "STUDY",
+                description: "Standard vital signs observations (blood pressure, pulse, weight, temperature).",
+                variables: [
+                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
+                    { id: "VISIT", label: "Visit Name", type: "string", required: true, rule: "Values: Baseline, Follow-Up" },
+                    { id: "V_SYSBP", label: "Systolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "70 <= val <= 240" },
+                    { id: "V_DIABP", label: "Diastolic Blood Pressure (mmHg)", type: "integer", required: true, rule: "40 <= val <= 140" },
+                    { id: "V_PULSE", label: "Pulse Rate (beats/min)", type: "integer", required: true, rule: "40 <= val <= 180" },
+                    { id: "V_WEIGHT", label: "Weight (kg)", type: "float", required: true, rule: "val > 0.0" },
+                    { id: "V_TEMP", label: "Oral Temperature (°C)", type: "float", required: false, rule: "35.0 <= val <= 41.0" }
                 ]
             },
             DM: {
-                formId: "DM",
+                formId: 301,
+                formKey: "F_DM",
                 formName: "Demographics",
                 domain: "DM",
-                description: "Demographic background, gender, race, and randomized treatment assignment.",
-                fields: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBJ-XXX" },
-                    { id: "AGE", label: "Age at Screening", type: "integer", required: true, rule: "val >= 18" },
-                    { id: "SEX", label: "Biological Sex", type: "string", required: true, rule: "Values: M, F, OTHER" },
-                    { id: "RACE", label: "Race Category", type: "string", required: true, rule: "CDISC controlled terminology" },
-                    { id: "ARM", label: "Planned Arm", type: "string", required: true, rule: "Values: ARM-A, ARM-B, PLACEBO" }
+                studyKey: "STUDY",
+                description: "Demographic background, biological sex, race category, and randomized arm.",
+                variables: [
+                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
+                    { id: "V_AGE", label: "Age at Screening", type: "integer", required: true, rule: "val >= 18" },
+                    { id: "V_GENDER", label: "Biological Sex", type: "string", required: true, rule: "Values: Female, Male, Other" },
+                    { id: "V_RACE", label: "Race Category", type: "string", required: true, rule: "CDISC controlled terminology" },
+                    { id: "V_ARM", label: "Planned Arm", type: "string", required: true, rule: "Values: ARM-A, ARM-B, PLACEBO" }
                 ]
             },
             AE: {
-                formId: "AE",
-                formName: "Adverse Events",
+                formId: 303,
+                formKey: "F_AE",
+                formName: "Safety Observations",
                 domain: "AE",
-                description: "Clinical adverse event terms, severity grading, and relationship to study agent.",
-                fields: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBJ-XXX" },
-                    { id: "AETERM", label: "Reported Event Term", type: "string", required: true, rule: "MedDRA LLT terminology" },
-                    { id: "AESTDTC", label: "Start Date", type: "date", required: true, rule: "ISO 8601 YYYY-MM-DD" },
-                    { id: "AESEV", label: "Severity Grade", type: "string", required: true, rule: "Values: MILD, MODERATE, SEVERE" },
-                    { id: "AESER", label: "Serious AE Flag", type: "boolean", required: true, rule: "true | false" },
-                    { id: "AEREL", label: "Causality Relationship", type: "string", required: true, rule: "Values: RELATED, POSSIBLE, UNRELATED" }
+                studyKey: "STUDY",
+                description: "Clinical safety observation terms, severity grading, and relationship to study agent.",
+                variables: [
+                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
+                    { id: "V_AETERM", label: "Reported Observation Term", type: "string", required: true, rule: "MedDRA LLT terminology" },
+                    { id: "V_AESTDTC", label: "Start Date", type: "date", required: true, rule: "ISO 8601 YYYY-MM-DD" },
+                    { id: "V_AESEV", label: "Severity Grade", type: "string", required: true, rule: "Values: MILD, MODERATE, SEVERE" },
+                    { id: "V_AESER", label: "Serious Safety Indicator", type: "boolean", required: true, rule: "true | false" },
+                    { id: "V_AEREL", label: "Causality Relationship", type: "string", required: true, rule: "Values: RELATED, POSSIBLE, UNRELATED" }
                 ]
             },
             LB: {
-                formId: "LB",
+                formId: 304,
+                formKey: "F_LB",
                 formName: "Laboratory Findings",
                 domain: "LB",
-                description: "Central and local laboratory analytes, standard units, and reference range flags.",
-                fields: [
-                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBJ-XXX" },
-                    { id: "LBTEST", label: "Analyte Test Name", type: "string", required: true, rule: "e.g. HEMOGLOBIN, POTASSIUM, ALT" },
-                    { id: "LBORRES", label: "Numeric Result", type: "float", required: true, rule: "val > 0.0" },
-                    { id: "LBORRESU", label: "Standard Unit", type: "string", required: true, rule: "SI units (g/dL, mmol/L, U/L)" },
-                    { id: "LBNRIND", label: "Normal Range Indicator", type: "string", required: true, rule: "Values: NORMAL, LOW, HIGH" }
+                studyKey: "STUDY",
+                description: "Laboratory analytes, standard units, and reference range indicators.",
+                variables: [
+                    { id: "SUBJID", label: "Subject Identifier", type: "string", required: true, rule: "Matches SUBX" },
+                    { id: "V_LBTEST", label: "Analyte Test Name", type: "string", required: true, rule: "e.g. HEMOGLOBIN, POTASSIUM, ALT" },
+                    { id: "V_LBORRES", label: "Numeric Result", type: "float", required: true, rule: "val > 0.0" },
+                    { id: "V_LBORRESU", label: "Standard Unit", type: "string", required: true, rule: "SI units (g/dL, mmol/L, U/L)" },
+                    { id: "V_LBNRIND", label: "Normal Range Indicator", type: "string", required: true, rule: "Values: NORMAL, LOW, HIGH" }
                 ]
             }
         },
         records: {
             VS: [
-                { recordId: "REC-1001", SUBJID: "SUBJ-101", VISIT: "V1_SCREEN", VSDAT: "2026-10-12T09:15:00Z", SYSBP: 122, DIABP: 78, PULSE: 68, TEMP: 36.6, STATUS: "VERIFIED" },
-                { recordId: "REC-1002", SUBJID: "SUBJ-102", VISIT: "V1_SCREEN", VSDAT: "2026-10-12T10:45:00Z", SYSBP: 138, DIABP: 86, PULSE: 74, TEMP: 36.8, STATUS: "VERIFIED" },
-                { recordId: "REC-1003", SUBJID: "SUBJ-103", VISIT: "V2_WEEK4",  VSDAT: "2026-11-02T11:20:00Z", SYSBP: 118, DIABP: 74, PULSE: 62, TEMP: 36.5, STATUS: "VERIFIED" },
-                { recordId: "REC-1004", SUBJID: "SUBJ-104", VISIT: "V1_SCREEN", VSDAT: "2026-11-05T14:00:00Z", SYSBP: 144, DIABP: 92, PULSE: 82, TEMP: 37.1, STATUS: "FLAGGED_QUERY" }
+                { recordId: 601, studyKey: "STUDY", subjectKey: "SUB1", formKey: "F_VS", visitId: 401, V_SYSBP: 122, V_DIABP: 78, V_PULSE: 68, V_WEIGHT: 68.5, recordStatus: "Complete" },
+                { recordId: 602, studyKey: "STUDY", subjectKey: "SUB2", formKey: "F_VS", visitId: 401, V_SYSBP: 138, V_DIABP: 86, V_PULSE: 74, V_WEIGHT: 74.2, recordStatus: "Complete" },
+                { recordId: 603, studyKey: "STUDY", subjectKey: "SUB3", formKey: "F_VS", visitId: 402, V_SYSBP: 118, V_DIABP: 74, V_PULSE: 62, V_WEIGHT: 64.0, recordStatus: "Verified" },
+                { recordId: 604, studyKey: "STUDY", subjectKey: "SUB4", formKey: "F_VS", visitId: 401, V_SYSBP: 144, V_DIABP: 92, V_PULSE: 82, V_WEIGHT: 81.3, recordStatus: "Complete" }
             ],
             DM: [
-                { recordId: "REC-2001", SUBJID: "SUBJ-101", AGE: 54, SEX: "F", RACE: "WHITE", ARM: "ARM-A", STATUS: "LOCKED" },
-                { recordId: "REC-2002", SUBJID: "SUBJ-102", AGE: 61, SEX: "M", RACE: "ASIAN", ARM: "ARM-B", STATUS: "LOCKED" },
-                { recordId: "REC-2003", SUBJID: "SUBJ-103", AGE: 47, SEX: "F", RACE: "BLACK", ARM: "PLACEBO", STATUS: "LOCKED" },
-                { recordId: "REC-2004", SUBJID: "SUBJ-104", AGE: 58, SEX: "M", RACE: "WHITE", ARM: "ARM-A", STATUS: "LOCKED" }
+                { recordId: 611, studyKey: "STUDY", subjectKey: "SUB1", formKey: "F_DM", V_AGE: 45, V_GENDER: "Female", V_RACE: "WHITE", V_ARM: "ARM-A", recordStatus: "Locked" },
+                { recordId: 612, studyKey: "STUDY", subjectKey: "SUB2", formKey: "F_DM", V_AGE: 61, V_GENDER: "Male", V_RACE: "ASIAN", V_ARM: "ARM-B", recordStatus: "Locked" },
+                { recordId: 613, studyKey: "STUDY", subjectKey: "SUB3", formKey: "F_DM", V_AGE: 47, V_GENDER: "Female", V_RACE: "BLACK", V_ARM: "PLACEBO", recordStatus: "Locked" },
+                { recordId: 614, studyKey: "STUDY", subjectKey: "SUB4", formKey: "F_DM", V_AGE: 58, V_GENDER: "Male", V_RACE: "WHITE", V_ARM: "ARM-A", recordStatus: "Locked" }
             ],
             AE: [
-                { recordId: "REC-3001", SUBJID: "SUBJ-102", AETERM: "Headache mild", AESTDTC: "2026-10-18", AESEV: "MILD", AESER: false, AEREL: "POSSIBLE", STATUS: "VERIFIED" },
-                { recordId: "REC-3002", SUBJID: "SUBJ-104", AETERM: "Nausea grade 1", AESTDTC: "2026-11-06", AESEV: "MILD", AESER: false, AEREL: "RELATED", STATUS: "VERIFIED" },
-                { recordId: "REC-3003", SUBJID: "SUBJ-101", AETERM: "Fatigue transient", AESTDTC: "2026-10-25", AESEV: "MODERATE", AESER: false, AEREL: "UNRELATED", STATUS: "VERIFIED" }
+                { recordId: 621, studyKey: "STUDY", subjectKey: "SUB2", formKey: "F_AE", V_AETERM: "Headache mild", V_AESTDTC: "2026-10-18", V_AESEV: "MILD", V_AESER: false, V_AEREL: "POSSIBLE", recordStatus: "Verified" },
+                { recordId: 622, studyKey: "STUDY", subjectKey: "SUB4", formKey: "F_AE", V_AETERM: "Nausea grade 1", V_AESTDTC: "2026-11-06", V_AESEV: "MILD", V_AESER: false, V_AEREL: "RELATED", recordStatus: "Verified" },
+                { recordId: 623, studyKey: "STUDY", subjectKey: "SUB1", formKey: "F_AE", V_AETERM: "Fatigue transient", V_AESTDTC: "2026-10-25", V_AESEV: "MODERATE", V_AESER: false, V_AEREL: "UNRELATED", recordStatus: "Verified" }
             ],
             LB: [
-                { recordId: "REC-4001", SUBJID: "SUBJ-101", LBTEST: "HEMOGLOBIN", LBORRES: 14.2, LBORRESU: "g/dL", LBNRIND: "NORMAL", STATUS: "VERIFIED" },
-                { recordId: "REC-4002", SUBJID: "SUBJ-102", LBTEST: "POTASSIUM", LBORRES: 4.1, LBORRESU: "mmol/L", LBNRIND: "NORMAL", STATUS: "VERIFIED" },
-                { recordId: "REC-4003", SUBJID: "SUBJ-103", LBTEST: "ALT", LBORRES: 32.0, LBORRESU: "U/L", LBNRIND: "NORMAL", STATUS: "VERIFIED" },
-                { recordId: "REC-4004", SUBJID: "SUBJ-104", LBTEST: "CREATININE", LBORRES: 1.05, LBORRESU: "mg/dL", LBNRIND: "NORMAL", STATUS: "VERIFIED" }
+                { recordId: 631, studyKey: "STUDY", subjectKey: "SUB1", formKey: "F_LB", V_LBTEST: "HEMOGLOBIN", V_LBORRES: 14.2, V_LBORRESU: "g/dL", V_LBNRIND: "NORMAL", recordStatus: "Verified" },
+                { recordId: 632, studyKey: "STUDY", subjectKey: "SUB2", formKey: "F_LB", V_LBTEST: "POTASSIUM", V_LBORRES: 4.1, V_LBORRESU: "mmol/L", V_LBNRIND: "NORMAL", recordStatus: "Verified" },
+                { recordId: 633, studyKey: "STUDY", subjectKey: "SUB3", formKey: "F_LB", V_LBTEST: "ALT", V_LBORRES: 32.0, V_LBORRESU: "U/L", V_LBNRIND: "NORMAL", recordStatus: "Verified" },
+                { recordId: 634, studyKey: "STUDY", subjectKey: "SUB4", formKey: "F_LB", V_LBTEST: "CREATININE", V_LBORRES: 1.05, V_LBORRESU: "mg/dL", V_LBNRIND: "NORMAL", recordStatus: "Verified" }
             ]
         },
         queries: [
             {
-                queryId: "QRY-001",
-                studyKey: "STUDY-101",
-                formId: "VS",
-                fieldId: "DIABP",
-                subjectId: "SUBJ-104",
+                annotationId: 701,
+                studyKey: "STUDY",
+                subjectKey: "SUB1",
+                recordId: 601,
+                variable: "V_AGE",
                 status: "OPEN",
-                severity: "HIGH",
-                description: "Diastolic blood pressure (92 mmHg) exceeds normal baseline threshold for screening protocol.",
-                createdDate: "2026-11-05T15:30:00Z",
-                assignedTo: "site_coordinator_101"
+                description: "Please verify demographic details.",
+                dateCreated: "2026-01-12T10:00:00Z"
             },
             {
-                queryId: "QRY-002",
-                studyKey: "STUDY-101",
-                formId: "VS",
-                fieldId: "SYSBP",
-                subjectId: "SUBJ-102",
-                status: "RESOLVED",
-                severity: "MEDIUM",
-                description: "Repeat systolic reading confirmed after 10-minute rest period.",
-                createdDate: "2026-10-12T11:00:00Z",
-                assignedTo: "site_coordinator_101"
+                annotationId: 702,
+                studyKey: "STUDY",
+                subjectKey: "SUB1",
+                recordId: 601,
+                variable: "V_WEIGHT",
+                status: "OPEN",
+                description: "Check vital sign measurement.",
+                dateCreated: "2026-01-12T10:00:00Z"
             },
             {
-                queryId: "QRY-003",
-                studyKey: "STUDY-202",
-                formId: "AE",
-                fieldId: "AESER",
-                subjectId: "SUBJ-208",
-                status: "UNDER_REVIEW",
-                severity: "CRITICAL",
-                description: "Verify SAE criteria and expedited regulatory timeline classification.",
-                createdDate: "2026-11-10T08:45:00Z",
-                assignedTo: "safety_officer_global"
+                annotationId: 703,
+                studyKey: "STUDY",
+                subjectKey: "SUB2",
+                recordId: 602,
+                variable: "V_SYSBP",
+                status: "ANSWERED",
+                description: "Repeat systolic reading confirmed after 10-minute rest.",
+                dateCreated: "2026-01-14T11:00:00Z"
             },
             {
-                queryId: "QRY-004",
-                studyKey: "STUDY-101",
-                formId: "LB",
-                fieldId: "LBORRES",
-                subjectId: "SUBJ-103",
+                annotationId: 704,
+                studyKey: "STUDY",
+                subjectKey: "SUB3",
+                recordId: 603,
+                variable: "V_PULSE",
                 status: "CLOSED",
-                severity: "LOW",
-                description: "Confirmed unit mismatch corrected from SI to conventional notation.",
-                createdDate: "2026-11-03T16:20:00Z",
-                assignedTo: "data_manager_lead"
+                description: "Confirmed unit notation matches study data dictionary.",
+                dateCreated: "2026-01-15T16:20:00Z"
             }
         ],
         audits: [
             {
-                eventId: "EVT-8801",
+                auditId: "AUD-8801",
                 timestamp: "2026-11-15T18:22:10Z",
-                user: "c_miller_dm",
+                user: "sim_admin",
                 role: "Clinical Data Manager",
-                action: "RECORD_SUBMIT",
-                target: "STUDY-101/VS/REC-1001",
+                action: "RECORD_VERIFY",
+                target: "STUDY/F_VS/601",
                 hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 wcagCompliance: "PASS",
                 status: "VERIFIED"
             },
             {
-                eventId: "EVT-8802",
+                auditId: "AUD-8802",
                 timestamp: "2026-11-15T18:35:45Z",
-                user: "dr_watson_pi",
+                user: "sim_user",
                 role: "Principal Investigator",
                 action: "ELECTRONIC_SIGNATURE",
-                target: "STUDY-101/VS/REC-1001",
+                target: "STUDY/F_VS/601",
                 hash: "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
                 wcagCompliance: "PASS",
                 status: "VERIFIED"
             },
             {
-                eventId: "EVT-8803",
+                auditId: "AUD-8803",
                 timestamp: "2026-11-15T19:01:12Z",
-                user: "sys_sync_worker",
+                user: "sim_sync_job",
                 role: "Automated Pipeline",
                 action: "DATA_EXPORT_DUCKDB",
-                target: "STUDY-101/PARQUET",
+                target: "STUDY/PARQUET",
                 hash: "7d793037a0760186574b0282f2f435e7b1e50774690f69799143a5544e131536",
                 wcagCompliance: "PASS",
                 status: "VERIFIED"
@@ -236,7 +228,7 @@
                 standard: "WCAG 2.1 Level AA",
                 status: "PASS",
                 wcagCompliance: "PASS",
-                notes: "SC 2.5.3 Label-in-Name control labels, polite ARIA live execution status announcements, and clear CLI/TUI error diagnostics"
+                notes: "SC 2.5.3 Label-in-Name control labels, polite ARIA live simulation preview status announcements, and clear CLI/TUI error diagnostics"
             },
             {
                 criteria: "Principle 4: Robust",
@@ -249,20 +241,20 @@
     };
 
     // -------------------------------------------------------------------------
-    // Code snippet templates
+    // Verified read-only scenario snippets (offline simulation mode)
     // -------------------------------------------------------------------------
     const SNIPPETS = {
         sdk: {
-            records: `# Extract clinical records into pandas DataFrame\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\ndf = client.records.to_dataframe(\n    study_key="STUDY-101",\n    flatten=True\n)\nprint(df.head())`,
-            studies: `# Query active clinical trials\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nstudies = client.studies.list(status="ACTIVE")\nfor s in studies:\n    print(f"{s.study_key}: {s.study_name} ({s.study_type})")`,
-            forms: `# Fetch study Case Report Form (CRF) schemas\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nforms = client.forms.list(study_key="STUDY-101")\nfor f in forms:\n    print(f"{f.form_name} ({f.form_key})")`,
-            queries: `# Monitor clinical queries and discrepancy flags\nfrom imednet import ImednetClient\n\nclient = ImednetClient()\nqueries = client.queries.list(\n    study_key="STUDY-101",\n    status="OPEN"\n)\nprint(f"Open queries: {len(queries)}")`
+            records: `# Query study records and export to pandas DataFrame\nfrom imednet import ImednetSDK\n\nwith ImednetSDK(simulation_mode=True) as sdk:\n    records = list(sdk.records.list(study_key="STUDY"))\n    df = sdk.records.to_dataframe(\n        study_key="STUDY",\n        flatten=True,\n    )\n    print(df.head())`,
+            studies: `# List available clinical studies\nfrom imednet import ImednetSDK\n\nwith ImednetSDK(simulation_mode=True) as sdk:\n    studies = list(sdk.studies.list())\n    for s in studies:\n        print(f"{s.study_key}: {s.study_name} ({s.study_type})")`,
+            forms: `# List study forms and metadata\nfrom imednet import ImednetSDK\n\nwith ImednetSDK(simulation_mode=True) as sdk:\n    forms = list(sdk.forms.list(study_key="STUDY"))\n    for f in forms:\n        print(f"{f.form_name} ({f.form_key})")`,
+            queries: `# Inspect open study queries by variable\nfrom imednet import ImednetSDK\nfrom imednet.models.queries import QueryStatus\n\nwith ImednetSDK(simulation_mode=True) as sdk:\n    queries = [\n        q for q in sdk.queries.list(study_key="STUDY")\n        if q.status == QueryStatus.OPEN\n    ]\n    print(f"Open queries: {len(queries)}")`
         },
         rest: {
-            records: `GET /api/v1/edc/studies/STUDY-101/records?size=10 HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
+            records: `GET /api/v1/edc/studies/STUDY/records?size=10 HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
             studies: `GET /api/v1/edc/studies HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
-            forms: `GET /api/v1/edc/studies/STUDY-101/forms HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
-            queries: `GET /api/v1/edc/studies/STUDY-101/queries HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`
+            forms: `GET /api/v1/edc/studies/STUDY/forms HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`,
+            queries: `GET /api/v1/edc/studies/STUDY/queries HTTP/1.1\nHost: edc.prod.imednetapi.com\nx-api-key: <API_KEY>\nx-imn-security-key: <SECURITY_KEY>\nAccept: application/json`
         }
     };
 
@@ -280,6 +272,30 @@
     }
 
     // -------------------------------------------------------------------------
+    // Helper: Copy text safely with button status reset
+    // -------------------------------------------------------------------------
+    function bindCopyButton(btn, getText, defaultLabel) {
+        if (!btn) return;
+        let resetTimer = null;
+        btn.addEventListener("click", function () {
+            const text = getText();
+            if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+                return;
+            }
+            navigator.clipboard.writeText(text).then(function () {
+                btn.textContent = "Copied!";
+                if (resetTimer) {
+                    clearTimeout(resetTimer);
+                }
+                resetTimer = setTimeout(function () {
+                    btn.textContent = defaultLabel;
+                    resetTimer = null;
+                }, 1500);
+            }).catch(function () {});
+        });
+    }
+
+    // -------------------------------------------------------------------------
     // Helper: Render Tabular DataFrame view
     // -------------------------------------------------------------------------
     function renderDataFrameTable(items, captionText) {
@@ -291,25 +307,26 @@
         let html = `<div class="explorer-table-wrapper" tabindex="0" role="region" aria-label="${escapeHtml(captionText)}">`;
         html += `<table class="explorer-dataframe-table">`;
         if (captionText) {
-            html += `<caption>${escapeHtml(captionText)} — ${items.length} records returned</caption>`;
+            html += `<caption>${escapeHtml(captionText)} — ${items.length} items</caption>`;
         }
         html += `<thead><tr>`;
-        html += `<th scope="col" class="index-col">#</th>`;
+        html += `<th scope="col" class="index-cell">#</th>`;
         keys.forEach(function (k) {
             html += `<th scope="col">${escapeHtml(k)}</th>`;
         });
         html += `</tr></thead><tbody>`;
 
-        items.forEach(function (row, index) {
+        items.forEach(function (record, index) {
             html += `<tr>`;
-            html += `<td class="index-col">${index}</td>`;
+            html += `<td class="index-cell">${index}</td>`;
             keys.forEach(function (k) {
-                const val = row[k];
+                const val = record[k];
                 let cellHtml = escapeHtml(val);
-                if (k === "STATUS" || k === "status" || k === "wcagCompliance") {
-                    const badgeClass = String(val).toLowerCase().includes("verified") || String(val).toLowerCase().includes("pass") || String(val).toLowerCase().includes("active") || String(val).toLowerCase().includes("locked")
+                if (k === "STATUS" || k === "status" || k === "recordStatus" || k === "wcagCompliance") {
+                    const lowerVal = String(val).toLowerCase();
+                    const badgeClass = lowerVal.includes("verified") || lowerVal.includes("pass") || lowerVal.includes("complete") || lowerVal.includes("locked")
                         ? "badge-success"
-                        : String(val).toLowerCase().includes("open") || String(val).toLowerCase().includes("critical")
+                        : lowerVal.includes("open") || lowerVal.includes("answered")
                         ? "badge-warning"
                         : "badge-neutral";
                     cellHtml = `<span class="status-badge ${badgeClass}">${cellHtml}</span>`;
@@ -326,31 +343,31 @@
     }
 
     // -------------------------------------------------------------------------
-    // Helper: Render Case Report Form (CRF) Structure
+    // Helper: Render Form Variable Structure
     // -------------------------------------------------------------------------
     function renderCrfStructure(formDef) {
         if (!formDef) return "";
         let html = `<div class="crf-view-container">`;
         html += `<div class="crf-header">`;
-        html += `<h4><span class="crf-tag">${escapeHtml(formDef.domain)}</span> ${escapeHtml(formDef.formName)} <span class="crf-oid">(${escapeHtml(formDef.formId)})</span></h4>`;
+        html += `<h4><span class="crf-tag">${escapeHtml(formDef.domain)}</span> ${escapeHtml(formDef.formName)} <span class="crf-oid">(${escapeHtml(formDef.formKey || formDef.formId)})</span></h4>`;
         html += `<p class="crf-desc">${escapeHtml(formDef.description)}</p>`;
         html += `</div>`;
 
-        html += `<div class="crf-fields-grid">`;
-        formDef.fields.forEach(function (field) {
-            html += `<div class="crf-field-card">`;
-            html += `<div class="crf-field-header">`;
-            html += `<span class="crf-field-id">${escapeHtml(field.id)}</span>`;
-            if (field.required) {
+        html += `<div class="form-variables-grid">`;
+        formDef.variables.forEach(function (variable) {
+            html += `<div class="form-variable-card">`;
+            html += `<div class="form-variable-header">`;
+            html += `<span class="form-variable-id">${escapeHtml(variable.id)}</span>`;
+            if (variable.required) {
                 html += `<span class="crf-badge-required">Required</span>`;
             } else {
                 html += `<span class="crf-badge-optional">Optional</span>`;
             }
             html += `</div>`;
-            html += `<div class="crf-field-label">${escapeHtml(field.label)}</div>`;
-            html += `<div class="crf-field-meta">`;
-            html += `<span class="crf-meta-item"><strong>Type:</strong> <code>${escapeHtml(field.type)}</code></span>`;
-            html += `<span class="crf-meta-item"><strong>Rule:</strong> <code>${escapeHtml(field.rule)}</code></span>`;
+            html += `<div class="form-variable-label">${escapeHtml(variable.label)}</div>`;
+            html += `<div class="form-variable-meta">`;
+            html += `<span class="crf-meta-item"><strong>Type:</strong> <code>${escapeHtml(variable.type)}</code></span>`;
+            html += `<span class="crf-meta-item"><strong>Rule:</strong> <code>${escapeHtml(variable.rule)}</code></span>`;
             html += `</div>`;
             html += `</div>`;
         });
@@ -584,13 +601,13 @@
         });
 
         // ---------------------------------------------------------------------
-        // 1. Integration Engineer Panel
+        // 1. Integration Engineer Panel (Read-Only Scenario Explorer)
         // ---------------------------------------------------------------------
         const ieSelectDataset = root.querySelector("#ie-dataset-select");
         const ieModeSdk = root.querySelector("#ie-mode-sdk");
         const ieModeRest = root.querySelector("#ie-mode-rest");
-        const ieCodeInput = root.querySelector("#ie-code-input");
-        const ieRunBtn = root.querySelector("#ie-run-btn");
+        const ieCodeDisplay = root.querySelector("#ie-code-display");
+        const ieSnippetCopyBtn = root.querySelector("#ie-snippet-copy-btn");
         const ieMetricBadge = root.querySelector("#ie-metric-badge");
         const ieOutputTabTable = root.querySelector("#ie-tab-table");
         const ieOutputTabJson = root.querySelector("#ie-tab-json");
@@ -602,14 +619,63 @@
         let currentIeMode = "sdk";
 
         function updateIeSnippet() {
-            if (!ieSelectDataset || !ieCodeInput) return;
+            if (!ieSelectDataset || !ieCodeDisplay) return;
             const ds = ieSelectDataset.value;
             const snippet = SNIPPETS[currentIeMode][ds] || "";
-            ieCodeInput.value = snippet;
+            ieCodeDisplay.textContent = snippet;
+            ieCodeDisplay.className = currentIeMode === "sdk" ? "language-python" : "language-http";
+            scheduleCheckCodeBlocks();
+        }
+
+        function executeIntegrationQuery() {
+            const datasetKey = ieSelectDataset ? ieSelectDataset.value : "records";
+            let data = [];
+            let caption = "STUDY Records (Vital Signs Form)";
+
+            if (datasetKey === "records") {
+                data = MOCK_DATA.records.VS;
+                caption = "pandas.DataFrame: STUDY / F_VS (Vital Signs Records)";
+            } else if (datasetKey === "studies") {
+                data = MOCK_DATA.studies;
+                caption = "Clinical Studies Catalog";
+            } else if (datasetKey === "forms") {
+                data = Object.keys(MOCK_DATA.forms).map(function (k) {
+                    const f = MOCK_DATA.forms[k];
+                    return {
+                        formId: f.formId,
+                        formKey: f.formKey,
+                        formName: f.formName,
+                        studyKey: f.studyKey,
+                        variableCount: f.variables.length,
+                        description: f.description
+                    };
+                });
+                caption = "Study Forms Catalog (STUDY)";
+            } else if (datasetKey === "queries") {
+                data = MOCK_DATA.queries;
+                caption = "Study Queries Ledger (STUDY)";
+            }
+
+            if (ieMetricBadge) {
+                ieMetricBadge.textContent = `Simulation Preview (Deterministic Fixture) — ${caption} (${data.length} items)`;
+                ieMetricBadge.classList.add("active");
+            }
+
+            if (ieViewTable) {
+                ieViewTable.innerHTML = renderDataFrameTable(data, caption);
+            }
+
+            if (ieJsonPre) {
+                ieJsonPre.textContent = JSON.stringify(data, null, 2);
+            }
+            scheduleCheckCodeBlocks();
         }
 
         if (ieSelectDataset) {
-            ieSelectDataset.addEventListener("change", updateIeSnippet);
+            ieSelectDataset.addEventListener("change", function () {
+                updateIeSnippet();
+                executeIntegrationQuery();
+            });
         }
 
         if (ieModeSdk && ieModeRest) {
@@ -620,6 +686,7 @@
                 ieModeRest.classList.remove("active");
                 ieModeRest.setAttribute("aria-pressed", "false");
                 updateIeSnippet();
+                executeIntegrationQuery();
             });
             ieModeRest.addEventListener("click", function () {
                 currentIeMode = "rest";
@@ -628,60 +695,13 @@
                 ieModeSdk.classList.remove("active");
                 ieModeSdk.setAttribute("aria-pressed", "false");
                 updateIeSnippet();
+                executeIntegrationQuery();
             });
         }
 
-        function executeIntegrationQuery() {
-            const t0 = performance.now();
-            const datasetKey = ieSelectDataset ? ieSelectDataset.value : "records";
-            let data = [];
-            let caption = "Clinical Records DataFrame";
-
-            if (datasetKey === "records") {
-                data = MOCK_DATA.records.VS;
-                caption = "pandas.DataFrame: STUDY-101 / VS (Vital Signs)";
-            } else if (datasetKey === "studies") {
-                data = MOCK_DATA.studies;
-                caption = "Active Studies Catalog";
-            } else if (datasetKey === "forms") {
-                data = Object.keys(MOCK_DATA.forms).map(function (k) {
-                    const f = MOCK_DATA.forms[k];
-                    return {
-                        formId: f.formId,
-                        formName: f.formName,
-                        domain: f.domain,
-                        fieldCount: f.fields.length,
-                        description: f.description
-                    };
-                });
-                caption = "Study Forms Definition Catalog";
-            } else if (datasetKey === "queries") {
-                data = MOCK_DATA.queries;
-                caption = "Clinical Query Ledger";
-            }
-
-            const elapsed = (performance.now() - t0 + Math.random() * 2 + 1.2).toFixed(1);
-
-            if (ieMetricBadge) {
-                ieMetricBadge.textContent = `⚡ Executed in ${elapsed} ms (Mock Client Engine) | Status: 200 OK`;
-                ieMetricBadge.classList.add("active");
-            }
-
-            // Render Table
-            if (ieViewTable) {
-                ieViewTable.innerHTML = renderDataFrameTable(data, caption);
-            }
-
-            // Render JSON
-            if (ieJsonPre) {
-                ieJsonPre.textContent = JSON.stringify(data, null, 2);
-            }
-            scheduleCheckCodeBlocks();
-        }
-
-        if (ieRunBtn) {
-            ieRunBtn.addEventListener("click", executeIntegrationQuery);
-        }
+        bindCopyButton(ieSnippetCopyBtn, function () {
+            return ieCodeDisplay ? ieCodeDisplay.textContent : "";
+        }, "Copy Code");
 
         // View toggle for IE
         function switchIeView(view) {
@@ -713,15 +733,9 @@
             });
         }
 
-        if (ieCopyBtn && ieJsonPre) {
-            ieCopyBtn.addEventListener("click", function () {
-                navigator.clipboard.writeText(ieJsonPre.textContent).then(function () {
-                    const orig = ieCopyBtn.textContent;
-                    ieCopyBtn.textContent = "Copied!";
-                    setTimeout(function () { ieCopyBtn.textContent = orig; }, 1500);
-                });
-            });
-        }
+        bindCopyButton(ieCopyBtn, function () {
+            return ieJsonPre ? ieJsonPre.textContent : "";
+        }, "Copy JSON");
 
         // ---------------------------------------------------------------------
         // 2. Clinical Data Manager Panel
@@ -737,14 +751,11 @@
         const cdmCopyBtn = root.querySelector("#cdm-copy-btn");
 
         function executeCdmValidation() {
-            const t0 = performance.now();
             const formKey = cdmSelectForm ? cdmSelectForm.value : "VS";
             const formDef = MOCK_DATA.forms[formKey] || MOCK_DATA.forms.VS;
 
-            const elapsed = (performance.now() - t0 + Math.random() * 1.5 + 0.9).toFixed(1);
-
             if (cdmMetricBadge) {
-                cdmMetricBadge.textContent = `✓ Schema Valid (CDISC ODM Compliant) — 0 Errors | Validated in ${elapsed} ms`;
+                cdmMetricBadge.textContent = `Simulation Preview (Deterministic Fixture) — ${formDef.formName} (${formDef.variables.length} Variables) | CDISC ODM Compliant`;
                 cdmMetricBadge.classList.add("active");
             }
 
@@ -794,15 +805,9 @@
             });
         }
 
-        if (cdmCopyBtn && cdmJsonPre) {
-            cdmCopyBtn.addEventListener("click", function () {
-                navigator.clipboard.writeText(cdmJsonPre.textContent).then(function () {
-                    const orig = cdmCopyBtn.textContent;
-                    cdmCopyBtn.textContent = "Copied!";
-                    setTimeout(function () { cdmCopyBtn.textContent = orig; }, 1500);
-                });
-            });
-        }
+        bindCopyButton(cdmCopyBtn, function () {
+            return cdmJsonPre ? cdmJsonPre.textContent : "";
+        }, "Copy JSON");
 
         // ---------------------------------------------------------------------
         // 3. Regulatory Compliance Auditor Panel
@@ -824,20 +829,18 @@
                 return;
             }
 
-            const t0 = performance.now();
             let data = [];
             let caption = "";
             let metricText = "";
-            const elapsed = (performance.now() - t0 + Math.random() * 2 + 1.1).toFixed(1);
 
             if (scenario === "part11") {
                 data = MOCK_DATA.audits;
                 caption = "21 CFR Part 11 Audit Trail & Accessibility Log";
-                metricText = `✓ 21 CFR Part 11 Electronic Signature & VPAT Check Verified | ${elapsed} ms`;
+                metricText = "Simulation Preview (Deterministic Fixture) — 21 CFR Part 11 Electronic Signature & VPAT Verified";
             } else if (scenario === "vpat") {
                 data = MOCK_DATA.vpat;
                 caption = "WCAG 2.1 AA Accessibility Conformance Verification";
-                metricText = `✓ WCAG 2.1 AA Accessibility Conformance (VPAT) Verified | ${elapsed} ms`;
+                metricText = "Simulation Preview (Deterministic Fixture) — WCAG 2.1 AA Accessibility Conformance (VPAT) Verified";
             }
 
             if (audMetricBadge) {
@@ -891,17 +894,11 @@
             });
         }
 
-        if (audCopyBtn && audJsonPre) {
-            audCopyBtn.addEventListener("click", function () {
-                navigator.clipboard.writeText(audJsonPre.textContent).then(function () {
-                    const orig = audCopyBtn.textContent;
-                    audCopyBtn.textContent = "Copied!";
-                    setTimeout(function () { audCopyBtn.textContent = orig; }, 1500);
-                });
-            });
-        }
+        bindCopyButton(audCopyBtn, function () {
+            return audJsonPre ? audJsonPre.textContent : "";
+        }, "Copy JSON");
 
-        // Run default executions on load so user sees immediately populated results
+        // Render default deterministic simulation previews immediately on load
         updateIeSnippet();
         executeIntegrationQuery();
         executeCdmValidation();

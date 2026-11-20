@@ -12,14 +12,16 @@ import ast
 import contextlib
 import importlib
 import importlib.util
+import io
 import os
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
+import types
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 
@@ -877,6 +879,253 @@ def stage_wheels(repo_root: Path, wheels_dir: Path | None = None) -> list[Path]:
     return sorted(wheels_dir.glob("*.whl"))
 
 
+SHOWCASE_EXPECTED_SDK_SCENARIOS: tuple[str, ...] = (
+    "records",
+    "studies",
+    "forms",
+    "queries",
+)
+
+CONTEXT_REQUIRED_CANONICAL_TERMS: tuple[str, ...] = (
+    "Study",
+    "Query",
+    "Variable",
+)
+
+CONTEXT_DISALLOWED_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "Study": ("trial", "trials", "project", "projects", "experiment", "experiments"),
+    "Subject": ("patient", "patients", "participant", "participants", "candidate", "candidates"),
+    "Site": ("center", "centers", "clinic", "clinics", "location", "locations"),
+    "Form": ("ecrf", "ecrfs", "questionnaire", "questionnaires", "survey", "surveys"),
+    "Record": ("submission", "submissions", "entry", "entries", "row", "rows"),
+    "Visit": ("appointment", "appointments", "event", "events", "milestone", "milestones"),
+    "Interval": ("phase", "phases", "window", "windows", "period", "periods"),
+    "Variable": (
+        "field",
+        "fields",
+        "fieldId",
+        "fieldCount",
+        "column",
+        "columns",
+        "parameter",
+        "parameters",
+        "question",
+        "questions",
+    ),
+    "Query": ("discrepancy", "discrepancies", "ticket", "tickets", "flag", "flags", "flagged"),
+}
+
+_JS_BROWSER_GLOBALS_PATTERN = re.compile(
+    r"\bwindow\.(?:location|history|addEventListener|dispatchEvent)\b"
+)
+
+
+def extract_showcase_sdk_snippets(showcase_js_path: Path) -> tuple[dict[str, str], list[str]]:
+    """Extract SNIPPETS.sdk Python snippets from docs/_static/showcase.js."""
+    if not showcase_js_path.exists():
+        return {}, [f"Showcase script not found: {showcase_js_path}"]
+
+    try:
+        content = showcase_js_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {}, [f"{showcase_js_path}: Failed to read file: {exc}"]
+
+    sdk_match = re.search(r"sdk:\s*\{(.*?)\n\s*\},?\s*rest:", content, re.DOTALL)
+    if not sdk_match:
+        return {}, [f"{showcase_js_path}: SNIPPETS.sdk dictionary not found"]
+
+    raw_snippets = dict(re.findall(r"(\w+):\s*`([^`]+)`", sdk_match.group(1)))
+    snippets = {name: raw.replace(r"\n", "\n") for name, raw in raw_snippets.items()}
+
+    expected = set(SHOWCASE_EXPECTED_SDK_SCENARIOS)
+    actual = set(snippets.keys())
+    errors: list[str] = []
+    if actual != expected:
+        errors.append(
+            f"{showcase_js_path}: Expected SNIPPETS.sdk keys {sorted(expected)}, "
+            f"found {sorted(actual)}"
+        )
+    return snippets, errors
+
+
+def validate_canonical_showcase_terminology(file_path: Path) -> list[str]:
+    """Validate that a showcase file uses canonical CONTEXT.md terminology and zero disallowed synonyms."""
+    if not file_path.exists():
+        return [f"Showcase file not found: {file_path}"]
+
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"{file_path}: Failed to read file: {exc}"]
+
+    errors: list[str] = []
+    for canonical_term in CONTEXT_REQUIRED_CANONICAL_TERMS:
+        if not re.search(rf"\b{re.escape(canonical_term)}\b", content):
+            errors.append(
+                f"{file_path}: Missing required canonical CONTEXT.md term '{canonical_term}'"
+            )
+
+    lines = content.splitlines()
+    for line_idx, raw_line in enumerate(lines, start=1):
+        scan_line = raw_line
+        if file_path.suffix == ".js":
+            scan_line = _JS_BROWSER_GLOBALS_PATTERN.sub("", scan_line)
+
+        for canonical_term, disallowed_forms in CONTEXT_DISALLOWED_SYNONYMS.items():
+            for synonym in disallowed_forms:
+                match = re.search(rf"\b{re.escape(synonym)}\b", scan_line, re.IGNORECASE)
+                if match:
+                    errors.append(
+                        f"{file_path}:{line_idx}: Disallowed CONTEXT.md synonym "
+                        f"'{match.group(0)}' (use canonical '{canonical_term}')"
+                    )
+    return errors
+
+
+def validate_landing_showcase(docs_dir: Path, repo_root: Path | None = None) -> list[str]:
+    """Verify landing-page read-only showcase markup, deterministic timing, vocabulary, and offline SDK execution."""
+    errors: list[str] = []
+    showcase_js = docs_dir / "_static" / "showcase.js"
+    if not showcase_js.exists():
+        return [f"Showcase script not found: {showcase_js}"]
+
+    configure_sys_path(Path(__file__).resolve().parent.parent)
+    if repo_root is not None:
+        configure_sys_path(repo_root)
+
+    try:
+        js_content = showcase_js.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"{showcase_js}: Failed to read file: {exc}"]
+
+    if "Math.random" in js_content:
+        errors.append(
+            f"{showcase_js}: Forbidden Math.random() latency simulation found in showcase.js"
+        )
+    for legacy_selector in ("#ie-code-input", "#ie-run-btn"):
+        if legacy_selector in js_content:
+            errors.append(
+                f"{showcase_js}: Legacy editable sandbox selector '{legacy_selector}' must be removed"
+            )
+
+    errors.extend(validate_canonical_showcase_terminology(showcase_js))
+
+    index_rst = docs_dir / "index.rst"
+    if index_rst.exists():
+        try:
+            index_content = index_rst.read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"{index_rst}: Failed to read file: {exc}")
+            index_content = ""
+
+        if "interactive-showcase-root" in index_content:
+            for forbidden_markup in ("<textarea", "ie-code-input", "ie-run-btn"):
+                if forbidden_markup in index_content:
+                    errors.append(
+                        f"{index_rst}: Legacy editable sandbox markup '{forbidden_markup}' "
+                        f"must not appear in landing showcase"
+                    )
+            for required_markup in (
+                'id="ie-code-display"',
+                'id="ie-snippet-copy-btn"',
+                "tutorials/quick_start.html",
+            ):
+                if required_markup not in index_content:
+                    errors.append(
+                        f"{index_rst}: Missing required read-only showcase element '{required_markup}'"
+                    )
+            errors.extend(validate_canonical_showcase_terminology(index_rst))
+
+    snippets, snippet_errors = extract_showcase_sdk_snippets(showcase_js)
+    errors.extend(snippet_errors)
+    if snippet_errors:
+        return errors
+
+    try:
+        from imednet.models.forms import Form
+        from imednet.models.queries import Query
+        from imednet.models.records import Record
+        from imednet.models.studies import Study
+        from imednet.simulation.state import get_default_simulation_state
+    except Exception as exc:
+        errors.append(f"{showcase_js}: Failed to import imednet simulation dependencies: {exc}")
+        return errors
+
+    expected_models: dict[str, type[object]] = {
+        "records": Record,
+        "studies": Study,
+        "forms": Form,
+        "queries": Query,
+    }
+
+    for scenario in SHOWCASE_EXPECTED_SDK_SCENARIOS:
+        code_py = snippets[scenario]
+        snippet_label = f"{showcase_js}:SNIPPETS.sdk.{scenario}"
+
+        if "ImednetClient" in code_py:
+            errors.append(
+                f"{snippet_label}: Must instantiate canonical ImednetSDK(simulation_mode=True) "
+                "instead of ImednetClient"
+            )
+        if "STUDY-101" in code_py:
+            errors.append(f"{snippet_label}: Must target seeded 'STUDY' instead of 'STUDY-101'")
+
+        try:
+            tree = ast.parse(code_py, filename=snippet_label)
+        except SyntaxError as exc:
+            errors.append(f"{snippet_label}:{exc.lineno}: Syntax error: {exc.msg}")
+            continue
+
+        for lineno, reason in validate_ast_imports(tree):
+            errors.append(f"{snippet_label}:{lineno}: {reason}")
+
+        get_default_simulation_state().reset()
+        namespace: dict[str, object] = {"__name__": "__showcase__"}
+        stdout_buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout_buf):
+                exec(compile(tree, filename=snippet_label, mode="exec"), namespace)  # noqa: S102
+        except Exception as exc:
+            errors.append(
+                f"{snippet_label}: Offline simulation execution failed: {type(exc).__name__}: {exc}"
+            )
+            continue
+
+        for var_name, var_val in namespace.items():
+            if isinstance(var_val, (types.GeneratorType, Iterator)):
+                errors.append(
+                    f"{snippet_label}: Variable '{var_name}' is an unmaterialized lazy iterator "
+                    f"({type(var_val).__name__}); materialize lazy iterators with list(...)"
+                )
+
+        expected_cls = expected_models[scenario]
+        result_items = namespace.get(scenario)
+        if not isinstance(result_items, (list, tuple)):
+            errors.append(
+                f"{snippet_label}: Expected materialized list variable '{scenario}', "
+                f"got {type(result_items).__name__}"
+            )
+            continue
+        if not result_items:
+            errors.append(
+                f"{snippet_label}: Simulation execution returned 0 {expected_cls.__name__} items"
+            )
+            continue
+        if not all(isinstance(item, expected_cls) for item in result_items):
+            errors.append(
+                f"{snippet_label}: Expected all items in '{scenario}' to be "
+                f"{expected_cls.__name__} instances"
+            )
+
+        if scenario == "records":
+            df_obj = namespace.get("df")
+            if df_obj is None or len(df_obj) == 0:  # type: ignore[arg-type]
+                errors.append(f"{snippet_label}: Expected non-empty DataFrame variable 'df'")
+
+    get_default_simulation_state().reset()
+    return errors
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -930,6 +1179,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Validating documentation literal includes in {docs_dir}...")
     doc_errors = validate_documentation_literal_includes(docs_dir, repo_root)
 
+    landing_errors: list[str] = []
+    if (docs_dir / "_static" / "showcase.js").exists():
+        print(f"Validating landing-page simulation showcase in {docs_dir}...")
+        landing_errors = validate_landing_showcase(docs_dir, repo_root)
+
     wheel_errors: list[str] = []
     should_check_wheels = not args.skip_wheels and (
         args.wheels_dir is not None
@@ -951,7 +1205,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if created_temp_wheels and args.wheels_dir is None:
                 shutil.rmtree(wheels_dir, ignore_errors=True)
 
-    all_errors = showcase_errors + doc_errors + wheel_errors
+    all_errors = showcase_errors + doc_errors + landing_errors + wheel_errors
 
     if all_errors:
         print(f"\nShowcase verification failed with {len(all_errors)} error(s):", file=sys.stderr)
