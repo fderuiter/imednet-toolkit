@@ -299,10 +299,11 @@ def test_simulation_filter_operators_quotes_and_connectors():
         state.queries[0]["description"] = 'Verify "age", urgent; check'
         q_resp = client.get(
             "/api/v1/edc/studies/STUDY/queries",
-            params={"filter": r'description=="Verify \"age\", urgent; check";status==OPEN'},
+            params={"filter": r'description=="Verify \"age\", urgent; check";variable==V_AGE'},
         )
         assert q_resp.status_code == 200
         assert [q["annotationId"] for q in q_resp.json()["data"]] == [701]
+        assert "status" not in q_resp.json()["data"][0]
 
         # Keyword 'or' connector via raw HTTP
         or_resp = client.get(
