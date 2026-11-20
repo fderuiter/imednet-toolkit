@@ -1,50 +1,71 @@
-"""Demonstrate configuring BulkRecordSubmissionWorkflow and GeneratedRecordSet payloads."""
+"""Demonstrate running BulkRecordSubmissionWorkflow with GeneratedRecordSet payloads."""
+
+import os
 
 from imednet import ImednetSDK, load_config
 from imednet_workflows.uat import BulkRecordSubmissionWorkflow, GeneratedRecordSet, RecordTestType
 
 
 def main() -> None:
-    """Configure bulk registration and study data submission sets."""
+    """Configure and submit bulk Subject registration and Study Record sets."""
     try:
         cfg = load_config()
-    except ValueError as e:
-        print(f"Skipping execution: {e}")
-        return
+    except ValueError:
+        cfg = load_config(simulation_mode=True)
 
-    # In a real environment, you'd execute against an active study.
-    try:
-        with ImednetSDK(
-            api_key=cfg.api_key,
-            security_key=cfg.security_key,
-            base_url=cfg.base_url,
-        ) as sdk:
-            BulkRecordSubmissionWorkflow(
-                sdk, batch_size=500, skip_existing_subjects=True, await_registration=True
-            )
+    study_key = os.environ.get("IMEDNET_STUDY_KEY", "STUDY")
 
-            # Example record sets (normally produced by a generator or mapped from source data)
-            GeneratedRecordSet(
-                form_key="REG",
-                form_name="Registration Form",
-                test_type=RecordTestType.REGISTER_SUBJECT,
-                payloads=[{"subject_id": "SUBJ_1", "age": 45}],
-                subject_keys=["SUBJ_1"],
-            )
+    with ImednetSDK(
+        api_key=cfg.api_key,
+        security_key=cfg.security_key,
+        base_url=cfg.base_url,
+        simulation_mode=cfg.simulation_mode,
+    ) as sdk:
+        workflow = BulkRecordSubmissionWorkflow(
+            sdk,
+            batch_size=500,
+            skip_existing_subjects=True,
+            await_registration=True,
+            registration_poll_interval=0.05,
+        )
 
-            GeneratedRecordSet(
-                form_key="VITALS",
-                form_name="Vitals Form",
-                test_type=RecordTestType.CREATE_NEW_RECORD,
-                payloads=[{"subject_id": "SUBJ_1", "hr": 72, "bp": "120/80"}],
-                subject_keys=["SUBJ_1"],
-            )
+        registration_set = GeneratedRecordSet(
+            form_key="F_DM",
+            form_name="Demographics",
+            test_type=RecordTestType.REGISTER_SUBJECT,
+            payloads=[
+                {
+                    "formKey": "F_DM",
+                    "siteName": "SITE",
+                    "subjectKey": "SUBJ-BULK-001",
+                    "data": {"V_AGE": 45, "V_GENDER": "M"},
+                }
+            ],
+            subject_keys=["SUBJ-BULK-001"],
+        )
 
-            # Submit in two phases: Registration first, then Data
-            # result = workflow.submit("MY_STUDY", [registration_set, data_set])
-            # print(f"Submitted {result.total_records_submitted} records across {len(result.all_batches)} batches.")
-    except Exception as e:
-        print(f"Failed: {e}")
+        data_set = GeneratedRecordSet(
+            form_key="F_VS",
+            form_name="Vital Signs",
+            test_type=RecordTestType.CREATE_NEW_RECORD,
+            payloads=[
+                {
+                    "formKey": "F_VS",
+                    "siteName": "SITE",
+                    "subjectKey": "SUBJ-BULK-001",
+                    "intervalName": "Baseline",
+                    "data": {"V_WEIGHT": 72.5},
+                }
+            ],
+            subject_keys=["SUBJ-BULK-001"],
+        )
+
+        # Submit in two phases: Subject registration first, then Study Form data
+        result = workflow.submit(study_key, [registration_set, data_set])
+        print(
+            f"Submitted {result.total_records_submitted} Records across "
+            f"{len(result.all_batches)} Job batches for Study {result.study_key}."
+        )
 
 
 if __name__ == "__main__":

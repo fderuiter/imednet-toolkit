@@ -32,8 +32,10 @@ from imednet.spi.cli import (
     print_error,
     resolve_hybrid_study_and_key,
     resolve_study_key,
+    validate_cli_path_segment,
     with_sdk,
 )
+from imednet.spi.utils import validate_path_segment
 
 from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
@@ -569,6 +571,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             extract_parser.error("the following arguments are required: study_key")
 
         assert study_key is not None
+        validate_path_segment(study_key, name="study_key")
         workflow = DataExtractionWorkflow(sdk)  # type: ignore[arg-type]
         parsed_record_filter = parse_filter_args(record_filter, model=Record)
         parsed_subject_filter = parse_filter_args(subject_filter, model=Subject)
@@ -602,6 +605,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             sys.exit(1)
 
         study_key = resolve_study_key(extract_parser, args, required=not args.interactive)
+        if study_key is not None:
+            validate_cli_path_segment(study_key, name="study_key")
         if args.interactive:
             from .wizard import ensure_interactive_stdin
 
@@ -769,6 +774,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 enabled_form_keys = None
         elif not study_key:
             uat_run_parser.error("the following arguments are required: study_key")
+
+        validate_path_segment(study_key, name="study_key")
 
         active_phase_descriptions = {
             UATWorkflowState.INSPECTING: "[Phase 1/5] Inspecting study schema and metadata...",

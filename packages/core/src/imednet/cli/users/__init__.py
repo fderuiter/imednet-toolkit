@@ -6,7 +6,7 @@ import argparse
 from typing import Any
 
 from ...sdk import ImednetSDK
-from ..decorators import with_sdk
+from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import display_list, fetching_status
 from ..utils.args import (
     add_list_query_args,
@@ -139,6 +139,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     def _dispatch_list_users(args: argparse.Namespace) -> None:
         study_key = resolve_study_key(list_parser, args, required=True)
         assert study_key is not None
+        validate_cli_path_segment(study_key, name="study_key")
         list_users(
             study_key=study_key,
             include_inactive=args.include_inactive,

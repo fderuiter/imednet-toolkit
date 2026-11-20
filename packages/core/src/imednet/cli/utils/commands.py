@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from imednet.cli.decorators import with_sdk
+from imednet.cli.decorators import validate_cli_path_segment, with_sdk
 from imednet.endpoints.registry import ENDPOINT_REGISTRY
 from imednet.sdk import ImednetSDK
 
@@ -111,6 +111,7 @@ def register_list_command(
         def _dispatch_study_list(args: argparse.Namespace) -> None:
             study_key = resolve_study_key(list_parser, args, required=True)
             assert study_key is not None
+            validate_cli_path_segment(study_key, name="study_key")
             no_interactive = getattr(args, "no_interactive", False)
             prepared = prepare_list_query(
                 filter_args=args.filter_args,

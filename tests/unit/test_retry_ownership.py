@@ -7,7 +7,7 @@ import pytest
 
 from imednet.core.async_client import AsyncClient
 from imednet.core.client import Client
-from imednet.core.operations.circuit_breaker import get_global_circuit_breaker
+from imednet.core.operations.circuit_breaker import CircuitState, get_global_circuit_breaker
 from imednet.core.paginator import (
     AsyncJsonListPaginator,
     AsyncPaginator,
@@ -22,8 +22,13 @@ BASE_URL = "https://synthetic.example"
 
 
 @pytest.mark.parametrize("paginator_type", [Paginator, JsonListPaginator])
-@pytest.mark.parametrize("status,attempts", [(500, 3), (429, 3), (400, 1), (0, 3)])
-def test_sync_pagination_has_one_retry_owner(respx_mock, paginator_type, status, attempts):
+@pytest.mark.parametrize(
+    "status,attempts,expected_failures",
+    [(500, 3, 1), (429, 3, 0), (400, 1, 0), (0, 3, 1)],
+)
+def test_sync_pagination_has_one_retry_owner(
+    respx_mock, paginator_type, status, attempts, expected_failures
+):
     route = respx_mock.get(BASE_URL + "/records")
     if status:
         route.respond(status)
@@ -41,14 +46,19 @@ def test_sync_pagination_has_one_retry_owner(respx_mock, paginator_type, status,
         list(paginator_type(client, "/records"))
     expected_failures = 0 if status in (400, 429) else 1
     assert route.call_count == attempts
-    # 5xx and network faults count once on the client's breaker; 4xx responses count zero.
-    assert client._circuit_breaker._consecutive_failures == expected_failures
-    assert get_global_circuit_breaker()._consecutive_failures == 0
+    # The outer paginator must not double-count exhausted requests, and 4xx/429 do not count as outages.
+    assert client._circuit_breaker.consecutive_failures == expected_failures
+    assert get_global_circuit_breaker().consecutive_failures == 0
 
 
 @pytest.mark.parametrize("paginator_type", [AsyncPaginator, AsyncJsonListPaginator])
-@pytest.mark.parametrize("status,attempts", [(500, 3), (429, 3), (400, 1), (0, 3)])
-async def test_async_pagination_has_one_retry_owner(respx_mock, paginator_type, status, attempts):
+@pytest.mark.parametrize(
+    "status,attempts,expected_failures",
+    [(500, 3, 1), (429, 3, 0), (400, 1, 0), (0, 3, 1)],
+)
+async def test_async_pagination_has_one_retry_owner(
+    respx_mock, paginator_type, status, attempts, expected_failures
+):
     route = respx_mock.get(BASE_URL + "/records")
     if status:
         route.respond(status)
@@ -64,8 +74,8 @@ async def test_async_pagination_has_one_retry_owner(respx_mock, paginator_type, 
             _ = [item async for item in paginator_type(client, "/records")]
     expected_failures = 0 if status in (400, 429) else 1
     assert route.call_count == attempts
-    assert client._circuit_breaker._consecutive_failures == expected_failures
-    assert get_global_circuit_breaker()._consecutive_failures == 0
+    assert client._circuit_breaker.consecutive_failures == expected_failures
+    assert get_global_circuit_breaker().consecutive_failures == 0
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -85,13 +95,13 @@ async def test_pagination_recovery_stops_after_success(respx_mock, asynchronous)
     if asynchronous:
         async with AsyncClient(**kwargs) as client:
             assert [item async for item in AsyncPaginator(client, "/records")] == [1, 2]
-            assert client._circuit_breaker._consecutive_failures == 0
+            assert client._circuit_breaker.consecutive_failures == 0
     else:
         with Client(**kwargs) as client:
             assert list(Paginator(client, "/records")) == [1, 2]
-            assert client._circuit_breaker._consecutive_failures == 0
+            assert client._circuit_breaker.consecutive_failures == 0
     assert route.call_count == 2
-    assert get_global_circuit_breaker()._consecutive_failures == 0
+    assert get_global_circuit_breaker().consecutive_failures == 0
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -164,6 +174,8 @@ def test_sink_permanent_failures_do_not_retry_or_expose_driver_message(
         sink._execute_with_retry("synthetic_write", "synthetic/0", destination)
     assert destination.call_count == 1
     assert sleeps == []
+    assert sink._circuit_breaker.consecutive_failures == 0
+    assert sink._circuit_breaker.state == CircuitState.CLOSED
     assert sentinel not in str(caught.value)
     assert sentinel not in caplog.text
     assert sentinel not in str(tracer.mock_calls)
@@ -176,23 +188,29 @@ def test_sink_transient_failures_are_redacted_before_tracing(monkeypatch, caplog
     destination = MagicMock(side_effect=RuntimeError("synthetic-private-driver-message"))
     with pytest.raises(ExportBatchError) as caught:
         sink._execute_with_retry("synthetic_write", "synthetic/0", destination)
+    assert sink._circuit_breaker.consecutive_failures == 1
     assert "synthetic-private-driver-message" not in str(caught.value)
     assert "synthetic-private-driver-message" not in caplog.text
     assert "synthetic-private-driver-message" not in str(tracer.mock_calls)
 
 
 def test_sink_reports_zero_attempts_when_breaker_prevents_execution():
-    sink = SyntheticSink(SinkConfig(study_key="synthetic"))
-    breaker = sink._circuit_breaker
-    for _ in range(breaker.failure_threshold):
-        breaker.record_failure()
+    sink = SyntheticSink(SinkConfig(study_key="synthetic", max_retries=0))
+    other_sink = SyntheticSink(SinkConfig(study_key="synthetic", max_retries=0))
+    failing_destination = MagicMock(side_effect=RuntimeError("destination outage"))
+    for idx in range(sink._circuit_breaker.failure_threshold):
+        with pytest.raises(ExportBatchError, match="after 1 attempts"):
+            sink._execute_with_retry("synthetic_write", f"synthetic/{idx}", failing_destination)
+
+    assert sink._circuit_breaker.state == CircuitState.OPEN
+    assert other_sink._circuit_breaker.state == CircuitState.CLOSED
+    assert get_global_circuit_breaker().state == CircuitState.CLOSED
+
     destination = MagicMock(return_value=7)
     with pytest.raises(ExportBatchError, match="after 0 attempts"):
-        sink._execute_with_retry("synthetic_write", "synthetic/0", destination)
+        sink._execute_with_retry("synthetic_write", "synthetic/blocked", destination)
     destination.assert_not_called()
-
-    healthy_sink = SyntheticSink(SinkConfig(study_key="synthetic"))
-    assert healthy_sink._execute_with_retry("synthetic_write", "synthetic/1", destination) == 7
+    assert other_sink._execute_with_retry("synthetic_write", "synthetic/ok", destination) == 7
     assert destination.call_count == 1
 
 

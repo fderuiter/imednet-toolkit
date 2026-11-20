@@ -48,6 +48,7 @@ def test_spi_cli_exports_shared_helpers() -> None:
         "resolve_hybrid_study_and_key",
         "resolve_study_key",
         "simulation_mode_context",
+        "validate_cli_path_segment",
     }
     assert expected_exports.issubset(set(spi_cli.__all__))
     for symbol in expected_exports:
@@ -361,3 +362,37 @@ def test_partial_credentials_surface_missing_key_and_simulation_hint_with_redact
     assert "API key is required" in err2
     assert "--simulation" in err2
     assert "super-secret-sec-key-value" not in err2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["codings", "list", "--study-key", "../CANARY_STUDY"],
+        ["subjects", "list", "--study-key", "../CANARY_STUDY"],
+        ["users", "list", "--study-key", "../CANARY_STUDY"],
+        ["records", "list", "--study-key", "../CANARY_STUDY"],
+        ["forms", "list", "--study-key", "../CANARY_STUDY"],
+        ["export", "json", "--study-key", "../CANARY_STUDY", "/tmp/unused.json"],
+        ["datadict", "from-api", "--study-key", "../CANARY_STUDY"],
+        ["workflows", "extract-records", "--study-key", "../CANARY_STUDY"],
+        ["tui", "--study-key", "../CANARY_STUDY", "--force"],
+        ["tui", "STUDY", "--batch", "../CANARY_BATCH", "--force"],
+    ],
+)
+def test_hybrid_study_key_and_tui_reject_unsafe_path_segments_before_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> None:
+    """Verify --study-key and tui flags reject path traversal via validate_cli_path_segment before SDK init."""
+
+    def _fail_get_sdk() -> Any:
+        raise AssertionError("get_sdk must not be called")
+
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _fail_get_sdk)
+    monkeypatch.setattr("imednet.cli.datadict.get_sdk", _fail_get_sdk)
+
+    code, out, err = _invoke_cli(capsys, argv)
+    assert code == 1
+    assert out == ""
+    assert "Error:" in err

@@ -22,6 +22,7 @@ from ...datadict import (
     validate,
 )
 from ...datadict.models import DataDictionary
+from ..decorators import validate_cli_path_segment
 from ..utils import (
     UniqueStoreAction,
     add_simulation_arg,
@@ -123,6 +124,7 @@ def _handle_from_api(args: argparse.Namespace) -> None:
         print("Error: the following arguments are required: study_key", file=sys.stderr)
         sys.exit(2)
 
+    validate_cli_path_segment(study_key, name="study_key")
     try:
         with (
             simulation_mode_context(bool(getattr(args, "simulation", False))),
