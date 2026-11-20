@@ -84,6 +84,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,7 @@ from imednet.spi.sinks import (
     apply_quality_gate,
     build_sink_mapper,
     extract_record_id,
+    normalize_sink_value,
     run_streaming_export,
 )
 from imednet.spi.utils import flatten, global_sensitivity_registry, mask_clinical_phi
@@ -284,33 +286,8 @@ def _needs_warehouse_normalization(value: Any) -> bool:
 
 
 def _normalize_warehouse_value(value: Any) -> Any:
-    """Recursively normalize Pydantic models, enums, and tuples into JSON-serializable primitives."""
-    if value.__class__ in _SCALAR_CLASSES:
-        return value
-    if isinstance(value, Enum):
-        return value.value if value.value.__class__ is str else str(value)
-    if value.__class__ is dict:
-        return {
-            (k if k.__class__ is str else str(k)): (
-                v if v.__class__ in _SCALAR_CLASSES else _normalize_warehouse_value(v)
-            )
-            for k, v in value.items()
-        }
-    if value.__class__ in (list, tuple):
-        return [
-            item if item.__class__ in _SCALAR_CLASSES else _normalize_warehouse_value(item)
-            for item in value
-        ]
-    model_dump = getattr(type(value), "model_dump", None)
-    if callable(model_dump):
-        dumped = value.model_dump(mode="json")
-        if dumped is not value and isinstance(dumped, (dict, list, tuple, str, int, float, bool)):
-            return _normalize_warehouse_value(dumped)
-    if isinstance(value, dict):
-        return {str(k): _normalize_warehouse_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_normalize_warehouse_value(item) for item in value]
-    return value
+    """Recursively normalize Pydantic models, enums, and tuples into plain containers."""
+    return normalize_sink_value(value)
 
 
 @functools.lru_cache(maxsize=2048)
@@ -586,6 +563,8 @@ def _scalar_family(value: Any) -> str:
     """Classify scalar values into Arrow-compatible type families."""
     if isinstance(value, bool):
         return "bool"
+    if isinstance(value, Decimal):
+        return "decimal"
     if isinstance(value, (int, float)):
         return "num"
     if isinstance(value, str):
@@ -604,6 +583,7 @@ _EXACT_SCALAR_FAMILIES: dict[type[Any], str] = {
     int: "num",
     float: "num",
     bool: "bool",
+    Decimal: "decimal",
     datetime: "datetime",
     date: "date",
     dict: "json",
@@ -757,7 +737,13 @@ def _resolve_column_types(arrow_table: Any, columns: Sequence[str]) -> dict[str,
                 sf_type = "BOOLEAN"
             elif type_name.startswith(("int", "uint")):
                 sf_type = "BIGINT"
-            elif type_name.startswith(("float", "double", "halffloat", "decimal")):
+            elif type_name.startswith("decimal"):
+                scale = getattr(raw_type, "scale", None)
+                if isinstance(scale, int) and 0 <= scale <= 37:
+                    sf_type = f"NUMBER(38, {scale})"
+                else:
+                    sf_type = "NUMBER(38, 9)"
+            elif type_name.startswith(("float", "double", "halffloat")):
                 sf_type = "FLOAT"
             elif type_name.startswith("timestamp"):
                 sf_type = "TIMESTAMP_TZ"
@@ -821,11 +807,7 @@ def _records_to_arrow_table(
         )
 
     if mapper is None:
-        post_proc = (
-            _make_mapped_post_proc(_has_sensitive_record_metadata())
-            if mask_phi
-            else _batch_post_proc_unmasked
-        )
+        post_proc = _make_mapped_post_proc(False) if mask_phi else _batch_post_proc_unmasked
         mapper = CentralizedMapper(
             mode="tabular",
             post_processor=post_proc,
@@ -839,7 +821,9 @@ def _records_to_arrow_table(
             _post_process_warehouse_unmasked,
         ):
             mapper.post_processor = (
-                _make_mapped_post_proc(_has_sensitive_record_metadata())
+                _make_mapped_post_proc(
+                    False if mapper.mask_phi else _has_sensitive_record_metadata()
+                )
                 if orig_post_proc is _post_process_warehouse_mapped
                 else _batch_post_proc_unmasked
             )
@@ -860,7 +844,14 @@ def _records_to_arrow_table(
                 is_tabular_centralized = (
                     isinstance(mapper, CentralizedMapper) and mapper.mode == "tabular"
                 )
-                batch_sensitive = _has_sensitive_record_metadata() if effective_mask else False
+                centralized_masked_meta = (
+                    isinstance(mapper, CentralizedMapper) and mapper.mask_phi is True
+                )
+                batch_sensitive = (
+                    False
+                    if (not effective_mask or centralized_masked_meta)
+                    else _has_sensitive_record_metadata()
+                )
                 raw_rows = [
                     _post_process_warehouse(
                         dict(row),

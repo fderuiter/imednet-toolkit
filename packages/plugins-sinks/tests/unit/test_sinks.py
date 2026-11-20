@@ -315,7 +315,11 @@ class TestNeo4jExportSink:
         run_args = driver.session.return_value.__enter__.return_value.run.call_args
         cypher = run_args.args[0]
         assert "CASE WHEN row.visit_id IS NOT NULL" in cypher
-        assert "WHERE row.visit_id IS NOT NULL" in graph_mod._CREATE_RECORD_CYPHER
+        assert "CASE WHEN row.visit_id IS NULL" in cypher
+        assert "MERGE (su)-[:HAS_RECORD]->(r)" in cypher
+        assert "CASE WHEN row.visit_id IS NOT NULL" in graph_mod._CREATE_RECORD_CYPHER
+        assert "CASE WHEN row.visit_id IS NULL" in graph_mod._CREATE_RECORD_CYPHER
+        assert "MERGE (su)-[:HAS_RECORD]->(r)" in graph_mod._CREATE_RECORD_CYPHER
         row = run_args.kwargs["rows"][0]
         assert row["visit_id"] is None
         assert row["parent_record_id"] is None
@@ -2752,3 +2756,586 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
             _post_process_warehouse(
                 {"record_id": 1, "record_data": json.dumps({"empty_unsafe;sql": {}})}
             )
+
+
+# ---------------------------------------------------------------------------
+# Centralized SPI governance, scalar serialization, and Neo4j Subject lineage
+# ---------------------------------------------------------------------------
+
+
+def _simulate_neo4j_cypher_execution(cypher: str, rows: list[dict]) -> dict[str, set]:
+    """Execute the node/relationship semantics of _MERGE_RECORD_CYPHER and _CREATE_RECORD_CYPHER in memory."""
+    is_merge_record = "MERGE (r:Record" in cypher
+    assert "MERGE (s:Study" in cypher
+    assert "MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})" in cypher
+    assert (
+        "MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})"
+        in cypher
+    )
+    assert "MERGE (su)-[:HAS_RECORD]->(r)" in cypher
+
+    studies: set[str] = set()
+    subjects: set[tuple[str, str]] = set()
+    visits: set[tuple[int, str, str]] = set()
+    records: list[tuple[object, dict]] = []
+    has_subject: set[tuple[str, tuple[str, str]]] = set()
+    has_visit: set[tuple[tuple[str, str], tuple[int, str, str]]] = set()
+    visit_has_record: set[tuple[tuple[int, str, str], object]] = set()
+    subject_has_record: set[tuple[tuple[str, str], object]] = set()
+
+    for idx, row in enumerate(rows):
+        sk = row["study_key"]
+        sub_key = (row["subject_key"], sk)
+        studies.add(sk)
+        subjects.add(sub_key)
+        has_subject.add((sk, sub_key))
+
+        rec_node_id: object = (
+            (row["record_id"], sk) if is_merge_record else ("created", idx, row["record_id"], sk)
+        )
+        records.append((rec_node_id, dict(row)))
+
+        if row["visit_id"] is not None:
+            v_key = (row["visit_id"], row["subject_key"], sk)
+            visits.add(v_key)
+            has_visit.add((sub_key, v_key))
+            visit_has_record.add((v_key, rec_node_id))
+        else:
+            subject_has_record.add((sub_key, rec_node_id))
+
+    return {
+        "studies": studies,
+        "subjects": subjects,
+        "visits": visits,
+        "records": set(r_id for r_id, _ in records),
+        "has_subject": has_subject,
+        "has_visit": has_visit,
+        "visit_has_record": visit_has_record,
+        "subject_has_record": subject_has_record,
+    }
+
+
+class TestCentralizedSpiGovernanceScalarsAndLineage:
+    """Verify governance rules, rich scalar serialization, and Neo4j Subject lineage across all sinks."""
+
+    def test_all_sinks_apply_uppercase_camelcase_and_lowercase_governance_rules(
+        self, monkeypatch, tmp_path
+    ):
+        """MongoDB, Neo4j, and Snowflake enforce uppercase, camelCase, and lowercase terminologyLookups and mappings."""
+        import json
+
+        import imednet_sinks.document as doc_mod
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+        import pyarrow.parquet as pq
+        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        from imednet.models.records import Record
+        from imednet.models.study_config import MappingRule, StudyConfiguration
+
+        study_cfg = StudyConfiguration(
+            studyKey="STUDY_GOV_ALL",
+            phiFields=["chartId", "subjectKey", "recordId", "studyKey"],
+            terminologyLookups={
+                "SEX": {"1": "Female", "2": "Male"},
+                "armCode": {"A": "Active", "B": "Placebo"},
+                "cohort": {"c1": "Cohort 1"},
+            },
+            mappings=[
+                MappingRule(
+                    domain="DM",
+                    targetField="DMSEX",
+                    sourceFormKey="DM",
+                    sourceVariableName="SEX",
+                ),
+                MappingRule(
+                    domain="DM",
+                    targetField="treatmentArm",
+                    sourceFormKey="DM",
+                    sourceVariableName="armCode",
+                    businessLogic="str(value).upper()",
+                ),
+                MappingRule(
+                    domain="DM",
+                    targetField="cohort_label",
+                    sourceFormKey="DM",
+                    sourceVariableName="cohort",
+                ),
+            ],
+        )
+
+        rec = Record(
+            record_id=701,
+            study_key="STUDY_GOV_ALL",
+            subject_key="SUBJ-701",
+            visit_id=1,
+            form_id=10,
+            form_key="DM",
+            record_data={
+                "SEX": "1",
+                "armCode": "A",
+                "cohort": "c1",
+                "chartId": "RAW-CHART-701",
+                "patientName": "Jane Governance",
+            },
+        )
+
+        # 1. MongoDB
+        pymongo, _client, _col = _fake_pymongo_module()
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+        with MongoDbExportSink(
+            MongoDbSinkConfig(
+                study_key="STUDY_GOV_ALL",
+                uri="mongodb://localhost:27017",
+                database="clinical",
+                collection="records",
+                extra={"study_config": study_cfg},
+            )
+        ) as mongo_sink:
+            assert mongo_sink.write_batch([rec], batch_id="STUDY_GOV_ALL/DM/0") == 1
+
+        mongo_doc = pymongo.UpdateOne.call_args.args[1]["$set"]
+        assert mongo_doc["study_key"] == "STUDY_GOV_ALL"
+        assert mongo_doc["subject_key"] == "SUBJ-701"
+        assert mongo_doc["record_id"] == 701
+        assert mongo_doc["record_data"] == {
+            "dmsex": "Female",
+            "treatment_arm": "ACTIVE",
+            "cohort_label": "Cohort 1",
+            "chart_id": "***MASKED***",
+            "patient_name": "***MASKED***",
+        }
+
+        # 2. Neo4j
+        neo4j_mod, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="STUDY_GOV_ALL",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "placeholder"),
+                extra={"study_config": study_cfg},
+            )
+        ) as neo_sink:
+            assert neo_sink.write_batch([rec], batch_id="STUDY_GOV_ALL/DM/0") == 1
+
+        neo_row = driver.session.return_value.__enter__.return_value.run.call_args.kwargs["rows"][0]
+        assert neo_row["study_key"] == "STUDY_GOV_ALL"
+        assert neo_row["subject_key"] == "SUBJ-701"
+        assert neo_row["record_id"] == 701
+        assert json.loads(neo_row["record_data"]) == {
+            "dmsex": "Female",
+            "treatment_arm": "ACTIVE",
+            "cohort_label": "Cohort 1",
+            "chart_id": "***MASKED***",
+            "patient_name": "***MASKED***",
+        }
+
+        # 3. Snowflake (with real PyArrow + Parquet)
+        sf, _conn, cursor = _fake_snowflake_module()
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+        cursor.fetchall.return_value = []
+        with SnowflakeExportSink(
+            SnowflakeSinkConfig(
+                study_key="STUDY_GOV_ALL",
+                account="acct",
+                user="loader",
+                password="placeholder",  # pragma: allowlist secret
+                database="DB",
+                schema="PUBLIC",
+                warehouse="WH",
+                stage="STG",
+                table="RECORDS",
+                local_staging_dir=str(tmp_path),
+                extra={"study_config": study_cfg},
+            )
+        ) as sf_sink:
+            assert sf_sink.write_batch([rec], batch_id="STUDY_GOV_ALL/DM/0") == 1
+
+        staged_parquet = tmp_path / "STUDY_GOV_ALL_DM_0.parquet"
+        sf_row = pq.read_table(str(staged_parquet)).to_pylist()[0]
+        assert sf_row["study_key"] == "STUDY_GOV_ALL"
+        assert sf_row["subject_key"] == "SUBJ-701"
+        assert sf_row["record_id"] == 701
+        assert sf_row["dmsex"] == "Female"
+        assert sf_row["treatment_arm"] == "ACTIVE"
+        assert sf_row["cohort_label"] == "Cohort 1"
+        assert sf_row["chart_id"] == "***MASKED***"
+        assert sf_row["patient_name"] == "***MASKED***"
+
+    def test_mongodb_bson_encode_succeeds_for_keywords_dates_and_exact_decimals(self, monkeypatch):
+        """bson.BSON.encode succeeds on _record_to_document output for Keyword, datetime.date, and Decimal values."""
+        from datetime import UTC, date
+        from decimal import Decimal
+
+        import bson
+        import imednet_sinks.document as doc_mod
+        from bson import Decimal128
+        from imednet_sinks.document import (
+            MongoDbExportSink,
+            MongoDbSinkConfig,
+            _record_to_document,
+        )
+
+        from imednet.models.records import Keyword, Record, RecordStatus
+
+        ts_sample = datetime(2026, 5, 1, 8, 30, tzinfo=UTC)
+        rec = Record(
+            record_id=801,
+            study_key="STUDY_BSON",
+            subject_key="SUBJ-801",
+            visit_id=2,
+            form_id=12,
+            form_key="LABS",
+            record_status=RecordStatus.COMPLETE,
+            date_created="2026-05-01T08:30:00Z",
+            date_modified="2026-05-02T09:45:00Z",
+            keywords=[
+                Keyword(
+                    keyword_name="Critical Lab",
+                    keyword_key="CRIT_LAB",
+                    keyword_id=11,
+                    date_added=datetime(2026, 5, 2, 10, 0, tzinfo=UTC),
+                )
+            ],
+            record_data={
+                "collectionDate": date(2026, 5, 1),
+                "collectionTimestamp": ts_sample,
+                "troponinNgMl": Decimal("0.00425"),
+                "highPrecisionRatio": Decimal("1234567890.0987654321"),
+                "nestedPanel": {
+                    "repeatDate": date(2026, 5, 2),
+                    "readings": (Decimal("1.10"), Decimal("1.20")),
+                },
+            },
+        )
+
+        doc = _record_to_document(rec, study_key="STUDY_BSON")
+        assert doc["record_status"] == "Complete"
+        assert doc["keywords"] == [
+            {
+                "keyword_name": "Critical Lab",
+                "keyword_key": "CRIT_LAB",
+                "keyword_id": 11,
+                "date_added": "2026-05-02T10:00:00Z",
+            }
+        ]
+        assert doc["date_created"] == "2026-05-01T08:30:00Z"
+        assert doc["record_data"]["collection_date"] == "2026-05-01"
+        assert doc["record_data"]["collection_timestamp"] == ts_sample
+        assert isinstance(doc["record_data"]["troponin_ng_ml"], Decimal128)
+        assert doc["record_data"]["troponin_ng_ml"].to_decimal() == Decimal("0.00425")
+        assert doc["record_data"]["high_precision_ratio"].to_decimal() == Decimal(
+            "1234567890.0987654321"
+        )
+        assert doc["record_data"]["nested_panel"] == {
+            "repeatDate": "2026-05-02",
+            "readings": [Decimal128("1.10"), Decimal128("1.20")],
+        }
+
+        raw_bson = bson.BSON.encode(doc)
+        decoded = bson.BSON(raw_bson).decode()
+        assert decoded["_id"] == "STUDY_BSON/801"
+        assert decoded["record_data"]["troponin_ng_ml"].to_decimal() == Decimal("0.00425")
+        assert decoded["record_data"]["collection_date"] == "2026-05-01"
+        assert decoded["keywords"][0]["keyword_id"] == 11
+
+        # Malformed payload in MongoDbExportSink.write_batch wraps in ExportBatchError
+        pymongo, _client, _col = _fake_pymongo_module()
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+        with MongoDbExportSink(
+            MongoDbSinkConfig(
+                study_key="STUDY_BSON",
+                uri="mongodb://localhost:27017",
+                database="db",
+                collection="col",
+            )
+        ) as sink:
+            with pytest.raises(ExportBatchError) as exc_info:
+                sink.write_batch([SimpleNamespace(record_data=12345)], batch_id="STUDY_BSON/bad/0")
+            assert exc_info.value.batch_id == "STUDY_BSON/bad/0"
+
+    def test_neo4j_serializes_dates_and_decimals_and_wraps_malformed_payloads(self, monkeypatch):
+        """Neo4jExportSink.write_batch serializes datetime.date and Decimal values and wraps malformed payloads in ExportBatchError."""
+        import json
+        from datetime import UTC, date
+        from decimal import Decimal
+
+        import imednet_sinks.graph as graph_mod
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
+
+        from imednet.models.records import Keyword, Record, RecordStatus
+
+        neo4j_mod, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+
+        rec = Record(
+            record_id=802,
+            study_key="STUDY_NEO_SCALAR",
+            subject_key="SUBJ-802",
+            visit_id=3,
+            form_id=14,
+            form_key="AE",
+            record_status=RecordStatus.VERIFIED,
+            date_created="2026-05-03T12:00:00Z",
+            keywords=[
+                Keyword(
+                    keyword_name="SAE",
+                    keyword_key="SAE_KEY",
+                    keyword_id=99,
+                    date_added=datetime(2026, 5, 3, 12, 5, tzinfo=UTC),
+                )
+            ],
+            record_data={
+                "onsetDate": date(2026, 5, 1),
+                "reportedAt": datetime(2026, 5, 3, 12, 0, tzinfo=UTC),
+                "doseMg": Decimal("0.00425"),
+                "measurements": (Decimal("12.340"), date(2026, 5, 2)),
+            },
+        )
+
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="STUDY_NEO_SCALAR",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "placeholder"),
+            )
+        ) as sink:
+            assert sink.write_batch([rec], batch_id="STUDY_NEO_SCALAR/AE/0") == 1
+
+            # Malformed payloads raise ExportBatchError without retrying or leaking payload secrets
+            for idx, bad_rec in enumerate(
+                [
+                    SimpleNamespace(
+                        record_id=1,
+                        subject_key="S1",
+                        visit_id=1,
+                        record_data={"unserializable": object()},
+                    ),
+                    SimpleNamespace(
+                        record_id=2,
+                        subject_key="S1",
+                        visit_id=1,
+                        record_data=99999,
+                    ),
+                    SimpleNamespace(
+                        record_id=3,
+                        subject_key="S1",
+                        visit_id=1,
+                        record_data={},
+                        keywords=[object()],
+                    ),
+                ]
+            ):
+                with pytest.raises(ExportBatchError) as caught:
+                    sink.write_batch([bad_rec], batch_id=f"STUDY_NEO_SCALAR/bad/{idx}")
+                assert caught.value.batch_id == f"STUDY_NEO_SCALAR/bad/{idx}"
+
+        session_mock = driver.session.return_value.__enter__.return_value
+        row = session_mock.run.call_args_list[0].kwargs["rows"][0]
+        assert row["record_status"] == "Verified"
+        assert row["date_created"] == "2026-05-03T12:00:00Z"
+        parsed_rd = json.loads(row["record_data"])
+        assert parsed_rd == {
+            "onset_date": "2026-05-01",
+            "reported_at": "2026-05-03T12:00:00+00:00",
+            "dose_mg": "0.00425",
+            "measurements": ["12.340", "2026-05-02"],
+        }
+        parsed_kw = json.loads(row["keywords"])
+        assert parsed_kw == [
+            {
+                "keywordName": "SAE",
+                "keywordKey": "SAE_KEY",
+                "keywordId": 99,
+                "dateAdded": "2026-05-03T12:05:00Z",
+            }
+        ]
+
+    @pytest.mark.parametrize("idempotent", [True, False])
+    def test_neo4j_scheduled_and_unscheduled_lineage_without_cross_subject_leakage(
+        self, monkeypatch, idempotent
+    ):
+        """Scheduled and unscheduled Records (visit_id=None or <=0) link to owning Subject without cross-Subject leakage."""
+        import imednet_sinks.graph as graph_mod
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
+
+        from imednet.models.records import Record
+
+        neo4j_mod, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+
+        batch = [
+            # Subject 1: scheduled visit_id=10 + unscheduled visit_id=None + unscheduled visit_id=0
+            Record(
+                record_id=1,
+                study_key="STUDY_LINEAGE",
+                subject_key="SUBJ-1",
+                visit_id=10,
+                form_id=1,
+                record_data={"note": "s1_sched"},
+            ),
+            Record(
+                record_id=2,
+                study_key="STUDY_LINEAGE",
+                subject_key="SUBJ-1",
+                visit_id=None,
+                form_id=2,
+                record_data={"note": "s1_unsched_none"},
+            ),
+            Record(
+                record_id=3,
+                study_key="STUDY_LINEAGE",
+                subject_key="SUBJ-1",
+                visit_id=0,
+                form_id=2,
+                record_data={"note": "s1_unsched_zero"},
+            ),
+            # Subject 2: SAME visit_id=10 + unscheduled visit_id=-1
+            Record(
+                record_id=4,
+                study_key="STUDY_LINEAGE",
+                subject_key="SUBJ-2",
+                visit_id=10,
+                form_id=1,
+                record_data={"note": "s2_sched"},
+            ),
+            {
+                "record_id": 5,
+                "study_key": "STUDY_LINEAGE",
+                "subject_key": "SUBJ-2",
+                "visit_id": -1,
+                "form_id": 2,
+                "record_data": {"note": "s2_unsched_neg"},
+            },
+        ]
+
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="STUDY_LINEAGE",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "placeholder"),
+                idempotent=idempotent,
+            )
+        ) as sink:
+            assert sink.write_batch(batch, batch_id="STUDY_LINEAGE/all/0") == 5
+
+        call = driver.session.return_value.__enter__.return_value.run.call_args
+        cypher = call.args[0]
+        rows = call.kwargs["rows"]
+        expected_cypher = (
+            graph_mod._MERGE_RECORD_CYPHER if idempotent else graph_mod._CREATE_RECORD_CYPHER
+        )
+        assert cypher == expected_cypher
+
+        # Non-positive visit_id values (0, -1) are normalized to None
+        by_id = {r["record_id"]: r for r in rows}
+        assert by_id[1]["visit_id"] == 10
+        assert by_id[2]["visit_id"] is None
+        assert by_id[3]["visit_id"] is None
+        assert by_id[4]["visit_id"] == 10
+        assert by_id[5]["visit_id"] is None
+
+        graph = _simulate_neo4j_cypher_execution(cypher, rows)
+        assert graph["studies"] == {"STUDY_LINEAGE"}
+        assert graph["subjects"] == {("SUBJ-1", "STUDY_LINEAGE"), ("SUBJ-2", "STUDY_LINEAGE")}
+        # Two distinct Visit nodes scoped by subject_key even though both use visit_id=10
+        assert graph["visits"] == {
+            (10, "SUBJ-1", "STUDY_LINEAGE"),
+            (10, "SUBJ-2", "STUDY_LINEAGE"),
+        }
+
+        # Collect reachable Record IDs per Subject via scheduled (Subject->Visit->Record) + unscheduled (Subject->Record)
+        def _subject_record_ids(subject_key: str) -> set[int]:
+            sub_node = (subject_key, "STUDY_LINEAGE")
+            direct = {
+                rec_node[-2] if rec_node[0] == "created" else rec_node[0]
+                for s_node, rec_node in graph["subject_has_record"]
+                if s_node == sub_node
+            }
+            sub_visits = {v for s_node, v in graph["has_visit"] if s_node == sub_node}
+            via_visit = {
+                rec_node[-2] if rec_node[0] == "created" else rec_node[0]
+                for v_node, rec_node in graph["visit_has_record"]
+                if v_node in sub_visits
+            }
+            return direct | via_visit
+
+        assert _subject_record_ids("SUBJ-1") == {1, 2, 3}
+        assert _subject_record_ids("SUBJ-2") == {4, 5}
+        assert _subject_record_ids("SUBJ-1").isdisjoint(_subject_record_ids("SUBJ-2"))
+
+    def test_snowflake_arrow_table_decimal_preserve_and_mixed_string_harmonization(self):
+        """_records_to_arrow_table preserves decimal128 on homogeneous Decimal batches and coerces mixed [Decimal, str] / [str, Decimal] to VARCHAR."""
+        from datetime import date
+        from decimal import Decimal
+
+        import pyarrow as pa
+        from imednet_sinks.warehouse import _records_to_arrow_table, _resolve_column_types
+
+        from imednet.models.records import Keyword, Record
+
+        # 1. Homogeneous Decimal + datetime.date + Keyword batch
+        homogeneous = [
+            Record(
+                record_id=1,
+                study_key="STUDY_DEC",
+                subject_key="S1",
+                keywords=[Keyword(keyword_name="Lab", keyword_key="LAB", keyword_id=1)],
+                record_data={
+                    "labResult": Decimal("0.050"),
+                    "sampleDate": date(2026, 5, 1),
+                },
+            ),
+            Record(
+                record_id=2,
+                study_key="STUDY_DEC",
+                subject_key="S2",
+                record_data={
+                    "labResult": Decimal("12.345"),
+                    "sampleDate": date(2026, 5, 2),
+                },
+            ),
+        ]
+        homo_tbl = _records_to_arrow_table(homogeneous, study_key="STUDY_DEC")
+        assert pa.types.is_decimal(homo_tbl.schema.field("lab_result").type)
+        assert pa.types.is_date(homo_tbl.schema.field("sample_date").type)
+        col_types = _resolve_column_types(homo_tbl, homo_tbl.column_names)
+        assert col_types["lab_result"] == "NUMBER(38, 3)"
+        assert col_types["sample_date"] == "DATE"
+        assert homo_tbl.column("lab_result").to_pylist() == [Decimal("0.050"), Decimal("12.345")]
+
+        # 2. Mixed [Decimal, str] batch (e.g. numeric lab result + "BLQ")
+        dec_then_str = [
+            Record(
+                record_id=3,
+                study_key="STUDY_DEC",
+                subject_key="S3",
+                record_data={"labResult": Decimal("0.00425")},
+            ),
+            Record(
+                record_id=4,
+                study_key="STUDY_DEC",
+                subject_key="S4",
+                record_data={"labResult": "BLQ"},
+            ),
+        ]
+        tbl_ds = _records_to_arrow_table(dec_then_str, study_key="STUDY_DEC")
+        assert pa.types.is_string(
+            tbl_ds.schema.field("lab_result").type
+        ) or pa.types.is_large_string(tbl_ds.schema.field("lab_result").type)
+        assert tbl_ds.column("lab_result").to_pylist() == ["0.00425", "BLQ"]
+
+        # 3. Mixed [str, Decimal] batch (reverse order)
+        tbl_sd = _records_to_arrow_table(list(reversed(dec_then_str)), study_key="STUDY_DEC")
+        assert pa.types.is_string(
+            tbl_sd.schema.field("lab_result").type
+        ) or pa.types.is_large_string(tbl_sd.schema.field("lab_result").type)
+        assert tbl_sd.column("lab_result").to_pylist() == ["BLQ", "0.00425"]
