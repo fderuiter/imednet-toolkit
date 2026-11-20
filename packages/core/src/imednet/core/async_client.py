@@ -31,6 +31,7 @@ class AsyncClient(HTTPClientBase[httpx.AsyncClient, AsyncRequestExecutor]):
             send=client.request,
             tracer=self._tracer,
             retry_config=retry_config,
+            circuit_breaker=self._circuit_breaker,
         )
 
     async def __aenter__(self) -> AsyncClient:

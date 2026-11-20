@@ -93,6 +93,7 @@ from unittest.mock import NonCallableMock
 
 from tenacity import wait_exponential
 
+from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError
 from imednet.utils.dates import (
@@ -449,6 +450,15 @@ class ExportSink(ABC):
     def __init__(self, config: SinkConfig) -> None:
         """Initialize the export sink with a configuration."""
         self.config: SinkConfig = config
+        self._circuit_breaker: CircuitBreaker = CircuitBreaker()
+
+    def _get_circuit_breaker(self) -> CircuitBreaker:
+        """Return this sink's isolated circuit breaker, initializing lazily if needed."""
+        breaker = getattr(self, "_circuit_breaker", None)
+        if breaker is None:
+            breaker = CircuitBreaker()
+            self._circuit_breaker = breaker
+        return breaker
 
     def redact_batch(self, records: Sequence[Any]) -> Any:
         """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
@@ -577,6 +587,7 @@ class ExportSink(ABC):
             wait_strategy=wait_exponential(multiplier=self.config.retry_backoff),
             tracer=self.config.tracer,
             operation_name=operation_name,
+            circuit_breaker=self._get_circuit_breaker(),
             batch_id=batch_id,
         )
         try:

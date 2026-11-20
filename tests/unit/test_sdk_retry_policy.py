@@ -216,12 +216,15 @@ def test_sync_sdk_retries_kwarg_preserves_default_policy_on_200_and_500(
     assert len(studies) == 1
     assert studies[0].study_key == "STUDY1"
     assert ok_route.call_count == 1
-    assert get_global_circuit_breaker()._consecutive_failures == 0
+    assert sdk._client._circuit_breaker.consecutive_failures == 0
+    assert get_global_circuit_breaker().consecutive_failures == 0
 
     err_route = respx_mock_external.get("/fail").mock(return_value=httpx.Response(500))
     with pytest.raises(errors.ServerError):
         sdk._client.get("/fail")
     assert err_route.call_count == 3
+    assert sdk._client._circuit_breaker.consecutive_failures == 1
+    assert get_global_circuit_breaker().consecutive_failures == 0
     sdk.close()
 
 
@@ -253,12 +256,15 @@ async def test_async_sdk_retries_kwarg_preserves_default_policy_on_200_and_500(
         assert len(studies) == 1
         assert studies[0].study_key == "STUDY1"
         assert ok_route.call_count == 1
-        assert get_global_circuit_breaker()._consecutive_failures == 0
+        assert sdk._async_client._circuit_breaker.consecutive_failures == 0
+        assert get_global_circuit_breaker().consecutive_failures == 0
 
         err_route = respx_mock_external.get("/fail").mock(return_value=httpx.Response(500))
         with pytest.raises(errors.ServerError):
             await sdk._async_client.get("/fail")
         assert err_route.call_count == 3
+        assert sdk._async_client._circuit_breaker.consecutive_failures == 1
+        assert get_global_circuit_breaker().consecutive_failures == 0
 
 
 def test_sync_sdk_zero_retries_executes_single_attempt(respx_mock_external) -> None:

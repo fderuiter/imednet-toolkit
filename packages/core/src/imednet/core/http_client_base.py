@@ -17,6 +17,7 @@ from imednet.constants import (
     HEADER_CONTENT_TYPE,
 )
 from imednet.core.http.executor import BaseRequestExecutor
+from imednet.core.operations.circuit_breaker import CircuitBreaker
 
 from .base_client import BaseClient, Tracer  # type: ignore[attr-defined]
 from .retry import RetryConfig, RetryPolicy
@@ -32,6 +33,7 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
 
     _client: ClientT
     _executor: ExecutorT
+    _circuit_breaker: CircuitBreaker
 
     @abstractmethod
     def _get_client_class(self) -> type[ClientT]:
@@ -77,7 +79,9 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
             credential_source=credential_source,
         )
 
+        self._circuit_breaker = CircuitBreaker()
         self._executor = self._create_executor(self._client, self.retry_config)
+        self._executor.circuit_breaker = self._circuit_breaker
 
     def _create_client(self, auth: AuthStrategy) -> ClientT:
         """Create the underlying httpx client with appropriate headers and configuration."""

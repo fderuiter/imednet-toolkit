@@ -46,6 +46,7 @@ class Client(HTTPClientBase[httpx.Client, SyncRequestExecutor]):
             send=client.request,
             tracer=self._tracer,
             retry_config=retry_config,
+            circuit_breaker=self._circuit_breaker,
         )
 
     def __enter__(self) -> Client:
