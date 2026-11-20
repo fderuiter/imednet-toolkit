@@ -57,6 +57,7 @@ src = ["packages/core/src", "packages/plugins-workflows/src", "packages/provider
 
 [tool.ruff.lint.isort]
 known-first-party = ["imednet", "imednet_workflows", "apache_airflow_providers_imednet", "imednet_sinks", "imednet_tui"]
+known-third-party = ["airflow"]
 
 [tool.ruff.lint]
 select = ["PL", "PIE", "FURB", "E", "F", "I", "N", "SLF", "D", "S", "B", "C4", "SIM", "UP", "PT", "RET", "RUF"]

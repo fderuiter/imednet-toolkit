@@ -117,6 +117,7 @@ from imednet.utils.security import (
     global_sensitivity_registry,
     mask_clinical_phi,
 )
+from imednet.utils.tabular import MASKED_SENTINEL
 from imednet.utils.url import redact_url_query
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BATCH_SIZE = 500
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_RETRY_BACKOFF = 1.0
+DEFAULT_MAX_BUFFERED_RECORDS = 5_000
 STATE_PROVIDER_ENTRY_POINT_GROUP = "imednet.state_providers"
 
 
@@ -232,6 +234,23 @@ class _SinkRetryPolicy(OperationRetryPolicy):
         return not isinstance(exception, (ExportConfigurationError, ValueError, TypeError))
 
 
+def validate_max_buffered_records(value: int | None) -> int | None:
+    """Validate an optional global buffered-record ceiling."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("max_buffered_records must be a positive integer")
+    return value
+
+
+def resolve_max_buffered_records(batch_size: int, max_buffered_records: int | None) -> int:
+    """Resolve the effective global buffered-record ceiling across per-form buffers."""
+    validated = validate_max_buffered_records(max_buffered_records)
+    if validated is not None:
+        return validated
+    return max(batch_size, DEFAULT_MAX_BUFFERED_RECORDS)
+
+
 @dataclass
 class SinkConfig:
     """Shared configuration for all export sinks.
@@ -269,6 +288,8 @@ class SinkConfig:
         Optional file path for file-backed checkpoint state providers.
     state_provider:
         Optional pre-configured checkpoint state provider instance.
+    max_buffered_records:
+        Optional global upper bound on records buffered across per-form streams.
     """
 
     study_key: str
@@ -289,6 +310,7 @@ class SinkConfig:
     stream_name: str | None = None
     ledger_path: str | Path | None = None
     state_provider: Any | None = field(default=None, repr=False)
+    max_buffered_records: int | None = None
 
     def __post_init__(self) -> None:
         """Validate config properties after initialization."""
@@ -309,6 +331,7 @@ class SinkConfig:
             raise ValueError("retry_backoff must be a finite non-negative number")
         if not isinstance(self.mask_phi, bool):
             raise ValueError("mask_phi must be a boolean")
+        validate_max_buffered_records(self.max_buffered_records)
         if self.modified_since is not None:
             normalize_watermark_datetime(self.modified_since)
         if self.record_data_filter is not None:
@@ -338,7 +361,7 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
     )
     for col in sensitive_cols:
         if len(masked) > 0:
-            masked[col] = "***MASKED***"
+            masked[col] = MASKED_SENTINEL
 
     if len(masked) == 0:
         return masked
@@ -380,8 +403,8 @@ def _redact_single_record(item: Any) -> Any:
                 continue
             if global_sensitivity_registry.is_sensitive(field_name):
                 val = getattr(item, field_name, None)
-                if val is not None and val != "***MASKED***":
-                    updates[field_name] = "***MASKED***"
+                if val is not None and val != MASKED_SENTINEL:
+                    updates[field_name] = MASKED_SENTINEL
         return item.model_copy(update=updates) if updates else item
 
     record_data = getattr(item, "record_data", None)
@@ -720,7 +743,7 @@ def _scrub_key_value_match(match: re.Match[str]) -> str:
     unquoted_key = key_token.strip("\"'")
 
     if global_sensitivity_registry.is_sensitive(unquoted_key):
-        replacement = "***MASKED***"
+        replacement = MASKED_SENTINEL
     elif _is_credential_key(unquoted_key):
         replacement = "***"
     else:
@@ -741,8 +764,8 @@ def _sanitize_text_content(text: str) -> str:
     sanitized = _AUTH_SCHEME_RE.sub(r"\1 ***", sanitized)
     sanitized = _JWT_RE.sub("***", sanitized)
     sanitized = _KEY_VALUE_PAIR_RE.sub(_scrub_key_value_match, sanitized)
-    sanitized = _SSN_RE.sub("***MASKED***", sanitized)
-    return _EMAIL_RE.sub("***MASKED***", sanitized)
+    sanitized = _SSN_RE.sub(MASKED_SENTINEL, sanitized)
+    return _EMAIL_RE.sub(MASKED_SENTINEL, sanitized)
 
 
 def _sanitize_exception_message(exc: BaseException) -> str:
@@ -870,7 +893,13 @@ def _require_optional_dep(package: str, extras_key: str) -> Any:
 
 
 def apply_quality_gate(
-    sdk: Any, study_key: str, records: Iterable[Any], config: SinkConfig
+    sdk: Any,
+    study_key: str,
+    records: Iterable[Any],
+    config: SinkConfig,
+    *,
+    variables: Iterable[Any] | None = None,
+    forms: Iterable[Any] | None = None,
 ) -> Iterator[Any]:
     """Filter records based on minimum schema readiness score if enabled."""
     if not config.quality_gate_enabled:
@@ -881,7 +910,40 @@ def apply_quality_gate(
     from imednet.validation.cache import SchemaValidator, calculate_readiness_score
 
     validator = SchemaValidator(sdk)
-    validator.refresh(study_key)
+    if variables is None:
+        validator.refresh(study_key)
+    else:
+        form_key_by_id: dict[int, str] = {}
+        for form in forms or ():
+            fid = getattr(form, "form_id", None)
+            fk_val = getattr(form, "form_key", None)
+            if (
+                isinstance(fid, int)
+                and not isinstance(fid, bool)
+                and isinstance(fk_val, str)
+                and fk_val
+            ):
+                form_key_by_id[fid] = fk_val
+
+        prepared_vars: list[Any] = []
+        for var in variables:
+            prepared_var = var
+            var_fk = getattr(var, "form_key", None)
+            var_fid = getattr(var, "form_id", None)
+            if not var_fk and isinstance(var_fid, int) and var_fid in form_key_by_id:
+                resolved_fk = form_key_by_id[var_fid]
+                model_copy = getattr(var, "model_copy", None)
+                if callable(model_copy):
+                    prepared_var = model_copy(update={"form_key": resolved_fk})
+                else:
+                    cloned = copy.copy(var)
+                    cloned.form_key = resolved_fk
+                    prepared_var = cloned
+            prepared_vars.append(prepared_var)
+
+        validator.schema.populate(prepared_vars, study_key=study_key)
+        for fid, fk_val in form_key_by_id.items():
+            validator.schema._form_id_to_key[(study_key, fid)] = fk_val
 
     dropped_count = 0
 
@@ -974,6 +1036,139 @@ def extract_record_id(record: Any) -> Any | None:
     if rec_id is None:
         rec_id = getattr(record, "recordId", None)
     return rec_id
+
+
+def extract_record_form_ref(record: Any) -> tuple[int | None, str | None]:
+    """Extract ``(form_id, form_key)`` from a record object or mapping."""
+    if isinstance(record, Mapping):
+        raw_id = record.get("form_id")
+        if raw_id is None:
+            raw_id = record.get("formId")
+        raw_key = record.get("form_key") or record.get("formKey")
+    else:
+        raw_id = getattr(record, "form_id", None)
+        if raw_id is None:
+            raw_id = getattr(record, "formId", None)
+        raw_key = getattr(record, "form_key", None) or getattr(record, "formKey", None)
+
+    form_id: int | None = None
+    if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+        form_id = raw_id
+    elif isinstance(raw_id, str):
+        stripped_id = raw_id.strip()
+        if stripped_id.lstrip("-").isdigit():
+            form_id = int(stripped_id)
+
+    form_key = raw_key.strip() if isinstance(raw_key, str) and raw_key.strip() else None
+    return form_id, form_key
+
+
+class BoundedFormBufferRouter:
+    """Buffer per-form records and flush on per-form batch size or global memory ceiling."""
+
+    def __init__(
+        self,
+        form_keys: Sequence[str],
+        *,
+        batch_size: int,
+        max_buffered_records: int | None = None,
+        on_flush_active: Callable[[str, list[Any], int], None],
+        on_flush_voided: Callable[[str, list[Any], int], None] | None = None,
+    ) -> None:
+        """Initialize per-form buffers and global ceiling tracking."""
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+        self._form_keys = list(dict.fromkeys(form_keys))
+        self.batch_size = batch_size
+        self.ceiling = resolve_max_buffered_records(batch_size, max_buffered_records)
+        self._on_flush_active = on_flush_active
+        self._on_flush_voided = on_flush_voided
+        self._active: dict[str, list[Any]] = {fk: [] for fk in self._form_keys}
+        self._voided: dict[str, list[Any]] = {fk: [] for fk in self._form_keys}
+        self._active_batch_idx: dict[str, int] = dict.fromkeys(self._form_keys, 0)
+        self._voided_batch_idx: dict[str, int] = dict.fromkeys(self._form_keys, 0)
+        self.total_buffered = 0
+        self.peak_buffered = 0
+
+    def add_active(self, form_key: str, record: Any) -> None:
+        """Append an active record to ``form_key`` and flush if thresholds are met."""
+        buf = self._active[form_key]
+        buf.append(record)
+        self.total_buffered += 1
+        self.peak_buffered = max(self.peak_buffered, self.total_buffered)
+        if len(buf) >= self.batch_size:
+            self._flush_active_form(form_key)
+        elif self.total_buffered >= self.ceiling:
+            self._evict_largest()
+
+    def add_voided(self, form_key: str, record: Any) -> None:
+        """Append a voided record to ``form_key`` and flush if thresholds are met."""
+        if self._on_flush_voided is None:
+            return
+        buf = self._voided[form_key]
+        buf.append(record)
+        self.total_buffered += 1
+        self.peak_buffered = max(self.peak_buffered, self.total_buffered)
+        if len(buf) >= self.batch_size:
+            self._flush_voided_form(form_key)
+        elif self.total_buffered >= self.ceiling:
+            self._evict_largest()
+
+    def _flush_active_form(self, form_key: str) -> None:
+        buf = self._active[form_key]
+        if not buf:
+            return
+        batch = list(buf)
+        buf.clear()
+        self.total_buffered -= len(batch)
+        idx = self._active_batch_idx[form_key]
+        self._active_batch_idx[form_key] = idx + 1
+        self._on_flush_active(form_key, batch, idx)
+
+    def _flush_voided_form(self, form_key: str) -> None:
+        if self._on_flush_voided is None:
+            return
+        buf = self._voided[form_key]
+        if not buf:
+            return
+        batch = list(buf)
+        buf.clear()
+        self.total_buffered -= len(batch)
+        idx = self._voided_batch_idx[form_key]
+        self._voided_batch_idx[form_key] = idx + 1
+        self._on_flush_voided(form_key, batch, idx)
+
+    def _evict_largest(self) -> None:
+        while self.total_buffered >= self.ceiling:
+            best_kind: str | None = None
+            best_key: str | None = None
+            best_len = 0
+            for fk in self._form_keys:
+                a_len = len(self._active[fk])
+                if a_len > best_len:
+                    best_len = a_len
+                    best_kind = "active"
+                    best_key = fk
+                if self._on_flush_voided is not None:
+                    v_len = len(self._voided[fk])
+                    if v_len > best_len:
+                        best_len = v_len
+                        best_kind = "voided"
+                        best_key = fk
+            if best_key is None or best_len == 0:
+                break
+            if best_kind == "voided":
+                self._flush_voided_form(best_key)
+            else:
+                self._flush_active_form(best_key)
+
+    def flush_all(self) -> None:
+        """Flush all remaining buffered active and voided records in form order."""
+        for fk in self._form_keys:
+            if self._active[fk]:
+                self._flush_active_form(fk)
+            if self._on_flush_voided is not None and self._voided[fk]:
+                self._flush_voided_form(fk)
 
 
 def extract_record_timestamp(record: Any) -> datetime | None:
@@ -1476,11 +1671,23 @@ def _extract_safe_config_options(config: Any) -> dict[str, Any]:
         )
     )
 
+    raw_max_buf = (
+        config.max_buffered_records
+        if is_real_cfg
+        else getattr(config, "max_buffered_records", None)
+    )
+    max_buffered_records = (
+        raw_max_buf
+        if isinstance(raw_max_buf, int) and not isinstance(raw_max_buf, bool) and raw_max_buf > 0
+        else None
+    )
+
     return {
         "incremental": incremental,
         "include_deleted": include_deleted,
         "idempotent": idempotent,
         "batch_size": batch_size,
+        "max_buffered_records": max_buffered_records,
         "modified_since": modified_since,
         "record_filter": record_filter,
         "record_data_filter": record_data_filter,
@@ -1614,7 +1821,9 @@ def run_streaming_export(
 
 
 __all__ = [
+    "DEFAULT_MAX_BUFFERED_RECORDS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
+    "BoundedFormBufferRouter",
     "ExportSink",
     "SinkConfig",
     "StateProviderProtocol",
@@ -1622,6 +1831,7 @@ __all__ = [
     "_require_optional_dep",
     "apply_quality_gate",
     "build_record_query_branches",
+    "extract_record_form_ref",
     "extract_record_id",
     "extract_record_timestamp",
     "get_state_provider",
@@ -1631,5 +1841,7 @@ __all__ = [
     "normalize_sink_value",
     "normalize_watermark_datetime",
     "redact_batch_records",
+    "resolve_max_buffered_records",
     "run_streaming_export",
+    "validate_max_buffered_records",
 ]

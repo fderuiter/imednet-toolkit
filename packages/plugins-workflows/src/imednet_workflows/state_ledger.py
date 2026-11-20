@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import abc
 import contextlib
-import importlib
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
-import uuid
-from collections.abc import Generator, Mapping
+from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -568,23 +567,215 @@ ExtractionStateLedger = FileStateProvider
 
 
 class AirflowStateProvider(BaseStateProvider):
-    """Manages transactional state using Airflow XCom metadata."""
+    """Manage transactional stream checkpoints using Airflow Variables."""
 
-    def __init__(self, *, lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS) -> None:
-        """Initialize the Airflow XCom state provider."""
+    DEFAULT_VARIABLE_PREFIX = "imednet_state"
+
+    def __init__(
+        self,
+        variable_prefix: str = DEFAULT_VARIABLE_PREFIX,
+        *,
+        lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS,
+    ) -> None:
+        """Initialize the Airflow Variable state provider.
+
+        Args:
+            variable_prefix: Prefix namespace for Airflow ``Variable`` checkpoint keys.
+            lease_ttl_seconds: Duration in seconds before an active ``RUNNING`` lease expires.
+        """
+        cleaned_prefix = variable_prefix.strip().rstrip(":")
+        self.variable_prefix = cleaned_prefix or self.DEFAULT_VARIABLE_PREFIX
         self.lease_ttl_seconds = lease_ttl_seconds
 
-    def _get_xcom_key(self, study_key: str, stream_name: str) -> str:
-        return f"state_{study_key}_{stream_name}"
+    @staticmethod
+    def _encode_key_part(value: str) -> str:
+        """Encode a key segment using RFC 3986 unreserved characters safe for FastAPI paths."""
+        return re.sub(
+            r"[^A-Za-z0-9_-]",
+            lambda m: "".join(f"~{b:02x}" for b in m.group(0).encode("utf-8")),
+            value,
+        )
 
     @staticmethod
-    def _parse_iso_utc(raw_value: Any) -> datetime | None:
+    def _decode_key_part(encoded: str) -> str:
+        """Decode a key segment previously encoded with :meth:`_encode_key_part`."""
+        return re.sub(
+            r"(?:~[0-9a-fA-F]{2})+",
+            lambda m: bytes.fromhex(m.group(0).replace("~", "")).decode("utf-8", errors="replace"),
+            encoded,
+        )
+
+    def _study_prefix(self, study_key: str) -> str:
+        """Return the Airflow Variable key prefix for a specific Study."""
+        return f"{self.variable_prefix}:{self._encode_key_part(study_key)}:"
+
+    def _get_variable_key(self, study_key: str, stream_name: str) -> str:
+        """Return the deterministic Airflow Variable key bound to Study and stream."""
+        return f"{self._study_prefix(study_key)}{self._encode_key_part(stream_name)}"
+
+    def _parse_variable_key(self, key: str) -> tuple[str, str] | None:
+        """Decode ``(study_key, stream_name)`` from a prefixed Airflow Variable key."""
+        root_prefix = f"{self.variable_prefix}:"
+        if not key.startswith(root_prefix):
+            return None
+        remainder = key[len(root_prefix) :]
+        encoded_study, sep, encoded_stream = remainder.partition(":")
+        if not sep or not encoded_study or not encoded_stream:
+            return None
+        return self._decode_key_part(encoded_study), self._decode_key_part(encoded_stream)
+
+    @staticmethod
+    def _airflow_available() -> bool:
+        """Return True when the ``airflow`` package is importable."""
+        if "airflow" in sys.modules and sys.modules["airflow"] is None:
+            return False
+        try:
+            import airflow  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @classmethod
+    def _has_active_task_sdk_comms(cls) -> bool:
+        """Return True when running inside an Airflow 3 Task SDK supervisor or SDK stub."""
+        if not cls._airflow_available():
+            return False
+        try:
+            from airflow.sdk import Variable as SdkVariable
+        except ImportError:
+            return False
+        if SdkVariable is None:
+            return False
+        try:
+            from airflow.sdk.execution_time import task_runner
+        except ImportError:
+            return True
+        return getattr(task_runner, "SUPERVISOR_COMMS", None) is not None
+
+    @staticmethod
+    def _ensure_orm_session() -> None:
+        """Ensure Airflow's SQLAlchemy Session factory is initialized for out-of-task calls."""
+        try:
+            from airflow import settings
+
+            if getattr(settings, "Session", None) is None:
+                configure_orm = getattr(settings, "configure_orm", None)
+                if callable(configure_orm):
+                    configure_orm()
+        except Exception:  # noqa: S110
+            pass
+
+    def _read_variable(self, key: str) -> dict[str, Any] | None:
+        """Read and deserialize a checkpoint JSON payload from Airflow Variables."""
+        if not self._airflow_available():
+            return None
+
+        raw_val: Any = None
+        if self._has_active_task_sdk_comms():
+            from airflow.sdk import Variable as SdkVariable
+
+            try:
+                raw_val = SdkVariable.get(key, default=None, deserialize_json=True)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        else:
+            try:
+                from airflow.models.variable import Variable as ModelVariable
+            except ImportError:
+                return None
+            self._ensure_orm_session()
+            try:
+                raw_val = ModelVariable.get(key, default_var=None, deserialize_json=True)
+            except (json.JSONDecodeError, ValueError):
+                return None
+
+        if isinstance(raw_val, str):
+            try:
+                raw_val = json.loads(raw_val)
+            except json.JSONDecodeError:
+                return None
+        return raw_val if isinstance(raw_val, dict) else None
+
+    def _write_variable(self, key: str, payload: dict[str, Any]) -> None:
+        """Persist a checkpoint JSON payload to Airflow Variables."""
+        if not self._airflow_available():
+            return
+
+        if self._has_active_task_sdk_comms():
+            from airflow.sdk import Variable as SdkVariable
+
+            SdkVariable.set(key, payload, serialize_json=True)
+            return
+
+        try:
+            from airflow.models.variable import Variable as ModelVariable
+        except ImportError:
+            return
+        self._ensure_orm_session()
+        ModelVariable.set(key, payload, serialize_json=True)
+
+    def _list_variable_keys(self, prefix: str) -> list[str]:
+        """List Airflow Variable keys matching ``prefix``."""
+        if not self._airflow_available():
+            return []
+
+        if self._has_active_task_sdk_comms():
+            from airflow.sdk import Variable as SdkVariable
+
+            return [str(k) for k in SdkVariable.keys(prefix=prefix)]
+
+        try:
+            from airflow.models.variable import Variable as ModelVariable
+            from airflow.utils.session import create_session
+            from sqlalchemy import select
+        except ImportError:
+            return []
+
+        self._ensure_orm_session()
+        with create_session() as session:
+            rows = session.scalars(
+                select(ModelVariable.key).where(ModelVariable.key.startswith(prefix))
+            ).all()
+            return [str(k) for k in rows]
+
+    def _delete_variable_key(self, key: str) -> bool:
+        """Delete a single Airflow Variable key, returning True when an entry existed."""
+        if not self._airflow_available():
+            return False
+
+        if self._has_active_task_sdk_comms():
+            from airflow.sdk import Variable as SdkVariable
+
+            if self._read_variable(key) is None:
+                return False
+            SdkVariable.delete(key)
+            return True
+
+        try:
+            from airflow.models.variable import Variable as ModelVariable
+        except ImportError:
+            return False
+        self._ensure_orm_session()
+        return bool(ModelVariable.delete(key))
+
+    @staticmethod
+    def _parse_timestamp(payload: dict[str, Any] | None) -> datetime | None:
+        """Extract a timezone-aware UTC timestamp from a checkpoint payload."""
+        if not payload or "last_timestamp" not in payload:
+            return None
+        raw_ts = payload["last_timestamp"]
+        if not isinstance(raw_ts, str):
+            return None
         with contextlib.suppress(ValueError):
-            return _parse_optional_timestamp(raw_value)
+            return _parse_optional_timestamp(raw_ts)
         return None
 
     @staticmethod
-    def _parse_status(raw_status: Any) -> StreamExecutionStatus:
+    def _parse_status(payload: dict[str, Any] | None) -> StreamExecutionStatus | None:
+        """Extract a validated StreamExecutionStatus from a checkpoint payload."""
+        if not payload or "status" not in payload:
+            return None
+        raw_status = payload["status"]
         if isinstance(raw_status, StreamExecutionStatus):
             return raw_status
         if isinstance(raw_status, str):
@@ -594,246 +785,15 @@ class AirflowStateProvider(BaseStateProvider):
                 return StreamExecutionStatus.FAILED
         return StreamExecutionStatus.FAILED
 
-    @staticmethod
-    def _extract_ti_from_context(context: Any) -> Any | None:
-        if isinstance(context, Mapping):
-            return context.get("ti")
-        if hasattr(context, "__getitem__"):
-            with contextlib.suppress(Exception):
-                return context["ti"]
-        return None
-
-    @classmethod
-    def _get_active_ti(cls) -> tuple[bool, Any | None]:
-        """Resolve the active Airflow TaskInstance when executing inside a task context."""
-        sdk_missing = False
-        try:
-            from airflow.sdk import get_current_context as sdk_get_current_context
-
-            try:
-                ti = cls._extract_ti_from_context(sdk_get_current_context())
-                if ti is not None:
-                    return True, ti
-            except Exception:  # noqa: S110
-                pass
-        except ImportError:
-            sdk_missing = True
-
-        legacy_mod = sys.modules.get("airflow.operators.python")
-        if legacy_mod is not None or sdk_missing:
-            try:
-                legacy_get_ctx: Any = None
-                if legacy_mod is not None:
-                    legacy_get_ctx = getattr(legacy_mod, "get_current_context", None)
-                else:
-                    from airflow.operators.python import (
-                        get_current_context as _legacy_get_ctx,
-                    )
-
-                    legacy_get_ctx = _legacy_get_ctx
-                if callable(legacy_get_ctx):
-                    ti = cls._extract_ti_from_context(legacy_get_ctx())
-                    if ti is not None:
-                        return True, ti
-            except Exception:  # noqa: S110
-                pass
-
-        return False, None
-
-    @classmethod
-    def _pull_ti_xcom_dict(cls, ti: Any, key: str) -> dict[str, Any] | None:
-        """Pull the most recent task-scoped XCom payload for ``ti``."""
-        task_id = getattr(ti, "task_id", None)
-        map_index = getattr(ti, "map_index", None)
-        if not isinstance(task_id, str) or not task_id:
-            val = ti.xcom_pull(key=key, include_prior_dates=True)
-        elif type(map_index) is int:
-            try:
-                val = ti.xcom_pull(
-                    task_ids=task_id,
-                    key=key,
-                    include_prior_dates=True,
-                    map_indexes=map_index,
-                )
-            except TypeError:
-                try:
-                    val = ti.xcom_pull(
-                        task_ids=task_id,
-                        key=key,
-                        include_prior_dates=True,
-                    )
-                except TypeError:
-                    val = ti.xcom_pull(key=key, include_prior_dates=True)
-        else:
-            try:
-                val = ti.xcom_pull(
-                    task_ids=task_id,
-                    key=key,
-                    include_prior_dates=True,
-                )
-            except TypeError:
-                val = ti.xcom_pull(key=key, include_prior_dates=True)
-
-        if isinstance(val, dict):
-            return val
-        if isinstance(val, (list, tuple)):
-            dicts = [item for item in val if isinstance(item, dict)]
-            if not dicts:
-                return None
-            return max(
-                dicts,
-                key=lambda item: (
-                    cls._parse_iso_utc(item.get("last_timestamp"))
-                    or datetime.min.replace(tzinfo=UTC)
-                ),
-            )
-        return None
-
-    @staticmethod
-    def _is_orm_model_class(candidate: object) -> TypeGuard[Any]:
-        return isinstance(candidate, type)
-
-    @staticmethod
-    def _deserialize_xcom_row(xcom_model_cls: Any, row: Any) -> dict[str, Any] | None:
-        """Decode an ``XComModel`` ORM row payload into a state dictionary."""
-        raw_val = getattr(row, "value", None)
-        if isinstance(raw_val, dict):
-            return raw_val
-        deserialize = getattr(xcom_model_cls, "deserialize_value", None)
-        if callable(deserialize):
-            try:
-                decoded = deserialize(row)
-                if isinstance(decoded, dict):
-                    return decoded
-            except Exception:  # noqa: S110
-                pass
-        if isinstance(raw_val, (bytes, bytearray)):
-            raw_val = raw_val.decode("utf-8", errors="ignore")
-        if isinstance(raw_val, str):
-            try:
-                parsed = json.loads(raw_val)
-                if isinstance(parsed, dict):
-                    return parsed
-            except ValueError:
-                pass
-        return None
-
-    def _query_latest_xcom_dict(self, study_key: str, stream_name: str) -> dict[str, Any] | None:
-        """Query the latest state payload from ``XComModel`` outside task execution."""
-        try:
-            xcom_mod = importlib.import_module("airflow.models.xcom")
-            session_mod = importlib.import_module("airflow.utils.session")
-            from sqlalchemy import select
-        except ImportError:
-            return None
-
-        key = self._get_xcom_key(study_key, stream_name)
-        xcom_model_cls = getattr(xcom_mod, "XComModel", None)
-        if self._is_orm_model_class(xcom_model_cls):
-            with session_mod.create_session() as session:
-                row = session.scalars(
-                    select(xcom_model_cls)
-                    .where(xcom_model_cls.key == key)
-                    .order_by(xcom_model_cls.timestamp.desc())
-                    .limit(1)
-                ).first()
-                if row is None:
-                    return None
-                return self._deserialize_xcom_row(xcom_model_cls, row)
-
-        with contextlib.suppress(Exception):
-            legacy_xcom = getattr(xcom_mod, "XCom", None)
-            provide_session = getattr(session_mod, "provide_session", None)
-            if legacy_xcom is not None and callable(provide_session):
-
-                @provide_session  # type: ignore[misc,untyped-decorator]
-                def _get_xcom(session: Any = None) -> Any:
-                    return (
-                        session.query(legacy_xcom)
-                        .filter(legacy_xcom.key == key)
-                        .order_by(legacy_xcom.timestamp.desc())
-                        .first()
-                    )
-
-                xcom_obj = _get_xcom()
-                if xcom_obj is not None:
-                    return self._deserialize_xcom_row(legacy_xcom, xcom_obj)
-        return None
-
-    def _pull_xcom_dict(self, study_key: str, stream_name: str) -> dict[str, Any] | None:
-        """Pull the latest XCom state dictionary from active task context or metadata DB."""
-        in_context, ti = self._get_active_ti()
-        if in_context:
-            return self._pull_ti_xcom_dict(ti, self._get_xcom_key(study_key, stream_name))
-        return self._query_latest_xcom_dict(study_key, stream_name)
-
-    @staticmethod
-    def _ensure_manual_task_instance(
-        session: Any,
-        *,
-        dag_id: str,
-        task_id: str,
-        run_id: str,
-        logical_date: datetime,
-    ) -> None:
-        """Ensure prerequisite ``DagRun`` and ``TaskInstance`` rows exist for manual XCom writes."""
-        from airflow.models.dagrun import DagRun
-        from airflow.models.taskinstance import TaskInstance
-        from airflow.utils.state import DagRunState, TaskInstanceState
-        from airflow.utils.types import DagRunType
-        from sqlalchemy import insert, select
-
-        existing_dr_id = session.scalar(
-            select(DagRun.id).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id)
-        )
-        if existing_dr_id is None:
-            session.add(
-                DagRun(
-                    dag_id=dag_id,
-                    run_id=run_id,
-                    run_type=DagRunType.MANUAL,
-                    logical_date=logical_date,
-                    run_after=logical_date,
-                    state=DagRunState.SUCCESS,
-                )
-            )
-            session.flush()
-
-        existing_ti = session.scalar(
-            select(TaskInstance.task_id).where(
-                TaskInstance.dag_id == dag_id,
-                TaskInstance.task_id == task_id,
-                TaskInstance.run_id == run_id,
-                TaskInstance.map_index == -1,
-            )
-        )
-        if existing_ti is None:
-            session.execute(
-                insert(TaskInstance).values(
-                    task_id=task_id,
-                    dag_id=dag_id,
-                    run_id=run_id,
-                    map_index=-1,
-                    pool="default_pool",
-                    pool_slots=1,
-                    state=TaskInstanceState.SUCCESS,
-                )
-            )
-            session.flush()
-
     def get_last_timestamp(self, study_key: str, stream_name: str) -> datetime | None:
-        """Returns the high-water mark timestamp from Airflow XCom."""
-        val = self._pull_xcom_dict(study_key, stream_name)
-        if val is not None:
-            return self._parse_iso_utc(val.get("last_timestamp"))
-        return None
+        """Return the high-water mark timestamp for a Study and stream from Airflow Variables."""
+        payload = self._read_variable(self._get_variable_key(study_key, stream_name))
+        return self._parse_timestamp(payload)
 
     def get_last_status(self, study_key: str, stream_name: str) -> StreamExecutionStatus | None:
-        """Returns the execution status from Airflow XCom."""
-        val = self._pull_xcom_dict(study_key, stream_name)
-        if val is not None and "status" in val:
-            return self._parse_status(val["status"])
-        return None
+        """Return the execution status for a Study and stream from Airflow Variables."""
+        payload = self._read_variable(self._get_variable_key(study_key, stream_name))
+        return self._parse_status(payload)
 
     def set_last_timestamp(
         self,
@@ -850,9 +810,13 @@ class AirflowStateProvider(BaseStateProvider):
         owner_host: str | None = None,
         lease_expires_at: datetime | None = None,
     ) -> None:
-        """Sets the high-water mark timestamp atomically using Airflow XCom."""
-        _ = force
+        """Persist the high-water mark checkpoint for a Study and stream in Airflow Variables."""
         validated_status = _coerce_and_validate_status(status)
+
+        if not force:
+            current_status = self.get_last_status(study_key, stream_name)
+            validate_transition(current_status, validated_status)
+
         normalized_ts = _normalize_optional_utc(timestamp)
         normalized_lease = _normalize_optional_utc(lease_expires_at)
 
@@ -870,59 +834,7 @@ class AirflowStateProvider(BaseStateProvider):
                 normalized_lease.isoformat() if normalized_lease is not None else None
             ),
         }
-
-        in_context, ti = self._get_active_ti()
-        if in_context and ti is not None:
-            ti.xcom_push(key=self._get_xcom_key(study_key, stream_name), value=val)
-            return
-
-        # Out-of-context persistence via Airflow 3 XComModel
-        try:
-            xcom_mod = importlib.import_module("airflow.models.xcom")
-            session_mod = importlib.import_module("airflow.utils.session")
-        except ImportError:
-            return
-
-        now = datetime.now(UTC)
-        dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID", "manual_state_sync")
-        task_id = os.environ.get("AIRFLOW_CTX_TASK_ID", "manual_state_sync")
-        run_id = (
-            os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
-            or f"manual__{now.isoformat()}_{uuid.uuid4().hex[:8]}"
-        )
-
-        xcom_model_cls = getattr(xcom_mod, "XComModel", None)
-        if self._is_orm_model_class(xcom_model_cls):
-            with session_mod.create_session() as session:
-                self._ensure_manual_task_instance(
-                    session,
-                    dag_id=dag_id,
-                    task_id=task_id,
-                    run_id=run_id,
-                    logical_date=now,
-                )
-                xcom_model_cls.set(
-                    key=self._get_xcom_key(study_key, stream_name),
-                    value=val,
-                    dag_id=dag_id,
-                    task_id=task_id,
-                    run_id=run_id,
-                    map_index=-1,
-                    session=session,
-                )
-            return
-
-        legacy_xcom = getattr(xcom_mod, "XCom", None)
-        if legacy_xcom is not None:
-            exec_date_str = os.environ.get("AIRFLOW_CTX_EXECUTION_DATE")
-            exec_date = datetime.fromisoformat(exec_date_str) if exec_date_str else now
-            legacy_xcom.set(
-                key=self._get_xcom_key(study_key, stream_name),
-                value=val,
-                task_id=task_id,
-                dag_id=dag_id,
-                execution_date=exec_date,
-            )
+        self._write_variable(self._get_variable_key(study_key, stream_name), val)
 
     @contextlib.contextmanager
     def transaction(
@@ -933,23 +845,26 @@ class AirflowStateProvider(BaseStateProvider):
         *,
         lease_ttl_seconds: float | None = None,
     ) -> Generator[dict[str, Any], None, None]:
-        """Context manager for transactional state tracking using Airflow XCom."""
-        prior_ts = _normalize_optional_utc(self.get_last_timestamp(study_key, stream_name))
+        """Context manager for transactional state tracking backed by Airflow Variables."""
+        raw_entry = self._read_variable(self._get_variable_key(study_key, stream_name))
+        prior_ts = _normalize_optional_utc(self._parse_timestamp(raw_entry))
         effective_ts = (
             prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
         )
 
-        current_status = self.get_last_status(study_key, stream_name)
+        current_status = self._parse_status(raw_entry)
         now = datetime.now(UTC)
-        if current_status == StreamExecutionStatus.RUNNING:
-            raw_entry = self._pull_xcom_dict(study_key, stream_name) or {}
+        if current_status == StreamExecutionStatus.RUNNING and raw_entry is not None:
             raw_pid = raw_entry.get("owner_pid")
             owner_pid_val = (
                 raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
             )
             raw_host = raw_entry.get("owner_host")
             owner_host_val = raw_host if isinstance(raw_host, str) else None
-            lease_exp_val = _parse_optional_timestamp(raw_entry.get("lease_expires_at"))
+            with contextlib.suppress(ValueError):
+                lease_exp_val = _parse_optional_timestamp(raw_entry.get("lease_expires_at"))
+            if "lease_exp_val" not in locals():
+                lease_exp_val = None
             stale_reason = _check_stale_running(
                 owner_pid_val,
                 owner_host_val,
@@ -972,6 +887,7 @@ class AirflowStateProvider(BaseStateProvider):
                     status=StreamExecutionStatus.FAILED,
                     error_message=f"Recovered stale running stream: {stale_reason}",
                     metadata=raw_meta if isinstance(raw_meta, dict) else None,
+                    force=True,
                 )
                 current_status = StreamExecutionStatus.FAILED
 
@@ -985,6 +901,7 @@ class AirflowStateProvider(BaseStateProvider):
             timestamp=prior_ts,
             records_processed=0,
             status=StreamExecutionStatus.RUNNING,
+            force=True,
             owner_pid=os.getpid(),
             owner_host=socket.gethostname(),
             lease_expires_at=now + timedelta(seconds=ttl),
@@ -1011,6 +928,7 @@ class AirflowStateProvider(BaseStateProvider):
                 status=StreamExecutionStatus.FAILED,
                 error_message=str(err),
                 metadata=tx_data.get("metadata"),
+                force=True,
             )
             raise
         else:
@@ -1024,154 +942,67 @@ class AirflowStateProvider(BaseStateProvider):
                 records_processed=tx_data.get("records_processed", 0),
                 status=StreamExecutionStatus.SUCCESS,
                 metadata=tx_data.get("metadata"),
+                force=True,
             )
 
     def delete_entry(self, study_key: str, stream_name: str | None = None) -> bool:
-        """Deletes a study or specific stream entry from XComModel."""
-        try:
-            xcom_mod = importlib.import_module("airflow.models.xcom")
-            session_mod = importlib.import_module("airflow.utils.session")
-            from sqlalchemy import delete, select
-        except ImportError:
-            return False
+        """Delete a Study or specific stream checkpoint from Airflow Variables."""
+        if stream_name is not None:
+            return self._delete_variable_key(self._get_variable_key(study_key, stream_name))
 
-        xcom_model_cls = getattr(xcom_mod, "XComModel", None)
-        if self._is_orm_model_class(xcom_model_cls):
-            with session_mod.create_session() as session:
-                if stream_name:
-                    result = session.execute(
-                        delete(xcom_model_cls).where(
-                            xcom_model_cls.key == self._get_xcom_key(study_key, stream_name)
-                        )
-                    )
-                    return int(getattr(result, "rowcount", 0) or 0) > 0
+        keys = self._list_variable_keys(self._study_prefix(study_key))
+        deleted_any = False
+        for key in keys:
+            if self._delete_variable_key(key):
+                deleted_any = True
+        return deleted_any
 
-                rows = session.scalars(
-                    select(xcom_model_cls).where(xcom_model_cls.key.like("state_%"))
-                ).all()
-                prefix = f"state_{study_key}_"
-                matching_keys = set()
-                for row in rows:
-                    payload = self._deserialize_xcom_row(xcom_model_cls, row)
-                    if isinstance(payload, dict) and "study_key" in payload:
-                        if payload["study_key"] == study_key:
-                            matching_keys.add(row.key)
-                    elif isinstance(row.key, str) and row.key.startswith(prefix):
-                        matching_keys.add(row.key)
-
-                if not matching_keys:
-                    return False
-
-                result = session.execute(
-                    delete(xcom_model_cls).where(xcom_model_cls.key.in_(matching_keys))
-                )
-                return int(getattr(result, "rowcount", 0) or 0) > 0
-
-        legacy_xcom = getattr(xcom_mod, "XCom", None)
-        provide_session = getattr(session_mod, "provide_session", None)
-        if legacy_xcom is None or not callable(provide_session):
-            return False
-
-        @provide_session  # type: ignore[misc,untyped-decorator]
-        def _delete_xcom(session: Any = None) -> bool:
-            query = session.query(legacy_xcom)
-            if stream_name:
-                query = query.filter(legacy_xcom.key == self._get_xcom_key(study_key, stream_name))
-            else:
-                query = query.filter(legacy_xcom.key.like(f"state_{study_key}_%"))
-            deleted = query.delete(synchronize_session=False)
-            return bool(deleted > 0)
-
-        return bool(_delete_xcom())
-
-    def _populate_ledger_from_rows(
-        self,
-        state: LedgerState,
-        xcom_cls: Any,
-        rows: Any,
-    ) -> None:
-        processed_keys: set[str] = set()
-        for row in rows:
-            row_key = getattr(row, "key", None)
-            if not isinstance(row_key, str) or row_key in processed_keys:
-                continue
-            processed_keys.add(row_key)
-
-            val = self._deserialize_xcom_row(xcom_cls, row)
-            if not isinstance(val, dict) or ("last_timestamp" not in val and "status" not in val):
+    def read_state(self) -> LedgerState:
+        """Read and validate the full ledger state across all Study checkpoints."""
+        state = LedgerState()
+        keys = self._list_variable_keys(f"{self.variable_prefix}:")
+        for key in sorted(keys):
+            payload = self._read_variable(key)
+            if not payload:
                 continue
 
-            s_key: str | None = str(val["study_key"]) if "study_key" in val else None
-            s_name: str | None = str(val["stream_name"]) if "stream_name" in val else None
-            if not s_key or not s_name:
-                parts = row_key.split("_", 2)
-                if len(parts) == 3 and parts[0] == "state":
-                    s_key = parts[1]
-                    s_name = parts[2]
-
-            if not s_key or not s_name:
+            parsed_key = self._parse_variable_key(key)
+            s_key = payload.get("study_key") or (parsed_key[0] if parsed_key else None)
+            s_name = payload.get("stream_name") or (parsed_key[1] if parsed_key else None)
+            ts = self._parse_timestamp(payload)
+            if not isinstance(s_key, str) or not isinstance(s_name, str):
+                continue
+            if ts is None and "status" not in payload:
                 continue
 
-            raw_ts = val.get("last_timestamp")
-            ts = self._parse_iso_utc(raw_ts)
-            if raw_ts is not None and ts is None and "status" not in val:
-                continue
-
-            raw_pid = val.get("owner_pid")
+            raw_pid = payload.get("owner_pid")
             owner_pid_val = (
                 raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
             )
-            raw_host = val.get("owner_host")
+            raw_host = payload.get("owner_host")
             owner_host_val = raw_host if isinstance(raw_host, str) else None
-            lease_exp_val = self._parse_iso_utc(val.get("lease_expires_at"))
+            lease_exp_val: datetime | None = None
+            with contextlib.suppress(ValueError):
+                lease_exp_val = _parse_optional_timestamp(payload.get("lease_expires_at"))
 
+            status = self._parse_status(payload) or StreamExecutionStatus.SUCCESS
+            raw_processed = payload.get("records_processed", 0)
+            records_processed = (
+                raw_processed
+                if isinstance(raw_processed, int) and not isinstance(raw_processed, bool)
+                else 0
+            )
             study = state.studies.setdefault(s_key, StudyState())
             study.streams[s_name] = StreamState(
                 last_timestamp=ts,
-                records_processed=int(val.get("records_processed", 0)),
-                last_run_status=self._parse_status(val.get("status", "success")),
-                error_message=val.get("error_message"),
-                metadata=val.get("metadata") or {},
+                records_processed=records_processed,
+                last_run_status=status,
+                error_message=payload.get("error_message"),
+                metadata=payload.get("metadata") or {},
                 owner_pid=owner_pid_val,
                 owner_host=owner_host_val,
                 lease_expires_at=lease_exp_val,
             )
-
-    def read_state(self) -> LedgerState:
-        """Reads and validates the current full state from XComModel for CLI display."""
-        state = LedgerState()
-        try:
-            xcom_mod = importlib.import_module("airflow.models.xcom")
-            session_mod = importlib.import_module("airflow.utils.session")
-            from sqlalchemy import select
-        except ImportError:
-            return state
-
-        xcom_model_cls = getattr(xcom_mod, "XComModel", None)
-        if self._is_orm_model_class(xcom_model_cls):
-            with session_mod.create_session() as session:
-                xcoms = session.scalars(
-                    select(xcom_model_cls)
-                    .where(xcom_model_cls.key.like("state_%"))
-                    .order_by(xcom_model_cls.timestamp.desc())
-                ).all()
-                self._populate_ledger_from_rows(state, xcom_model_cls, xcoms)
-            return state
-
-        legacy_xcom = getattr(xcom_mod, "XCom", None)
-        provide_session = getattr(session_mod, "provide_session", None)
-        if legacy_xcom is not None and callable(provide_session):
-
-            @provide_session  # type: ignore[misc,untyped-decorator]
-            def _get_all_xcoms(session: Any = None) -> Any:
-                return (
-                    session.query(legacy_xcom)
-                    .filter(legacy_xcom.key.like("state_%"))
-                    .order_by(legacy_xcom.timestamp.desc())
-                    .all()
-                )
-
-            self._populate_ledger_from_rows(state, legacy_xcom, _get_all_xcoms())
         return state
 
 
