@@ -9,6 +9,7 @@ from .args import (
     add_no_interactive,
     parse_filter_args,
     parse_record_data_filter,
+    positive_int,
     resolve_endpoint_filter_attributes,
 )
 from .commands import register_list_command
@@ -69,6 +70,7 @@ __all__ = [
     "is_tty",
     "parse_filter_args",
     "parse_record_data_filter",
+    "positive_int",
     "print_error",
     "register_list_command",
     "resolve_endpoint_filter_attributes",

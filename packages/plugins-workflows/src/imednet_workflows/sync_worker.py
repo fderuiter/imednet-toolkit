@@ -10,9 +10,25 @@ from threading import Event
 
 from filelock import FileLock
 
+from imednet.spi.errors import (
+    ApiError,
+    AuthenticationError,
+    AuthorizationError,
+    NotFoundError,
+)
+
 from .cached_loader import CachedRecordsLoader
 
 logger = logging.getLogger(__name__)
+
+_PERMANENT_STATUS_CODES: frozenset[int] = frozenset({401, 403, 404})
+
+
+def _is_permanent_api_error(exc: ApiError) -> bool:
+    """Return True when an API error represents a permanent client failure."""
+    if isinstance(exc, (AuthenticationError, AuthorizationError, NotFoundError)):
+        return True
+    return exc.status_code in _PERMANENT_STATUS_CODES
 
 
 @dataclass(slots=True)
@@ -23,6 +39,11 @@ class SyncWorkerConfig:
     interval_seconds: int = 900
     reconcile: bool = True
     lock_timeout_seconds: int = 30
+
+    def __post_init__(self) -> None:
+        """Validate worker configuration bounds."""
+        if isinstance(self.interval_seconds, bool) or self.interval_seconds <= 0:
+            raise ValueError("interval_seconds must be greater than 0")
 
 
 class SyncWorker:
@@ -88,6 +109,10 @@ class SyncWorker:
                 record_count = self.run_once()
                 if on_cycle:
                     on_cycle(cycle_count, record_count)
+            except ApiError as exc:
+                if _is_permanent_api_error(exc):
+                    raise
+                logger.exception("sync worker cycle failed")
             except Exception:  # pragma: no cover - defensive logging path
                 logger.exception("sync worker cycle failed")
             if on_sleep_tick:

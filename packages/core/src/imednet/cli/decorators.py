@@ -5,7 +5,8 @@ from __future__ import annotations
 import inspect
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from functools import wraps
 from typing import Concatenate, ParamSpec, TypeVar
 
@@ -18,6 +19,7 @@ from imednet.errors import (
     RateLimitError,
     UnauthorizedError,
 )
+from imednet.utils.secrets import redact_sensitive_payload
 
 from ..sdk import ImednetSDK
 
@@ -25,13 +27,36 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def _redact_secrets(msg: str) -> str:
-    """Redact secrets from error messages."""
-    for env_var in ["IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_OIDC_TOKEN"]:
+def redact_cli_secrets(msg: str) -> str:
+    """Redact environment secrets and sensitive tokens from CLI error messages."""
+    redacted = msg
+    for env_var in ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_OIDC_TOKEN"):
         val = os.environ.get(env_var)
-        if val and val in msg:
-            msg = msg.replace(val, "********")
-    return msg
+        if val:
+            if val in redacted:
+                redacted = redacted.replace(val, "********")
+            stripped = val.strip()
+            if stripped and stripped in redacted:
+                redacted = redacted.replace(stripped, "********")
+    return str(redact_sensitive_payload(redacted))
+
+
+_redact_secrets = redact_cli_secrets
+
+
+@contextmanager
+def cli_execution_guard() -> Iterator[None]:
+    """Guard top-level CLI execution so user interrupts exit cleanly with code 130."""
+    from .utils.output import clear_line, print_error
+
+    try:
+        yield
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        clear_line()
+        print_error("\nAborted by user.")
+        sys.exit(130)
 
 
 def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
@@ -42,10 +67,17 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
     @wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         """Initialize the SDK, execute the command, and handle common API errors."""
-        from .utils.context import get_sdk
-        from .utils.output import print_error
+        from .utils import context as _context_mod
+        from .utils.output import clear_line, print_error
 
-        sdk = get_sdk()
+        mod_get_sdk = func.__globals__.get("get_sdk")
+        if (
+            callable(mod_get_sdk)
+            and getattr(mod_get_sdk, "__module__", None) != "imednet.cli.utils.context"
+        ):
+            sdk = mod_get_sdk()
+        else:
+            sdk = _context_mod.get_sdk()
         try:
             return func(sdk, *args, **kwargs)
         except SystemExit:
@@ -71,6 +103,7 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
             print_error(f"API Error: {msg}")
             sys.exit(1)
         except KeyboardInterrupt:
+            clear_line()
             print_error("\nAborted by user.")
             sys.exit(130)
         except Exception as exc:  # pragma: no cover - defensive

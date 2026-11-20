@@ -19,8 +19,11 @@ from imednet.spi.cli import (
     STUDY_KEY_ARG,
     add_no_interactive,
     clear_line,
+    cli_execution_guard,
     console,
     parse_filter_args,
+    positive_int,
+    print_error,
     with_sdk,
 )
 
@@ -28,6 +31,33 @@ from .data_extraction import DataExtractionWorkflow
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncWorker, SyncWorkerConfig
+
+
+def _execute_show_state(ledger_path: str, study_key: str | None = None) -> None:
+    """Display current high-water mark records and stream metadata."""
+    ledger = get_state_provider(ledger_path)
+    try:
+        state = ledger.read_state()
+    except Exception as err:
+        print_error(f"Failed to read ledger from {ledger_path}: {err}")
+        sys.exit(1)
+
+    has_data = False
+    print(f"iMednet Extraction Ledger ({ledger_path})")
+    print(
+        "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
+    )
+    for s_key, study_state in state.studies.items():
+        if study_key and s_key != study_key:
+            continue
+        for stream_name, stream_state in study_state.streams.items():
+            has_data = True
+            print(
+                f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
+            )
+
+    if not has_data:
+        print("No ledger entries found matching filters.")
 
 
 def _execute_set_state(
@@ -55,7 +85,7 @@ def _execute_set_state(
             msg = f"the following arguments are required: {', '.join(missing)}"
             if parser is not None:
                 parser.error(msg)
-            print(f"Error: {msg}", file=sys.stderr)
+            print_error(f"Error: {msg}")
             sys.exit(2)
 
         try:
@@ -63,7 +93,7 @@ def _execute_set_state(
             dt = datetime.fromisoformat(normalized)
             dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
         except ValueError as err:
-            print(f"Invalid ISO timestamp format: {err}")
+            print_error(f"Invalid ISO timestamp format: {err}")
             sys.exit(1)
 
         ledger = get_state_provider(ledger_path)
@@ -74,12 +104,13 @@ def _execute_set_state(
                 timestamp=dt,
                 records_processed=records_processed,
                 status="success",
+                force=True,
             )
             print(
                 f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
             )
         except Exception as err:
-            print(f"Failed to write ledger: {err}")
+            print_error(f"Failed to write ledger: {err}")
             sys.exit(1)
         return
 
@@ -158,7 +189,7 @@ def _execute_set_state(
             f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
         )
     except Exception as err:
-        print(f"Failed to write ledger: {err}")
+        print_error(f"Failed to write ledger: {err}")
         sys.exit(1)
 
 
@@ -194,7 +225,7 @@ def _execute_reset_state(
         msg = "the following arguments are required: -s/--study-key"
         if parser is not None:
             parser.error(msg)
-        print(f"Error: {msg}", file=sys.stderr)
+        print_error(f"Error: {msg}")
         sys.exit(2)
 
     ledger = get_state_provider(ledger_path)
@@ -214,7 +245,7 @@ def _execute_reset_state(
                 print(f"No state found for study '{study_key}'.")
                 return
     except Exception as err:
-        print(f"Failed to reset ledger state: {err}")
+        print_error(f"Failed to reset ledger state: {err}")
         sys.exit(1)
 
 
@@ -349,7 +380,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
     sync_parser.add_argument("study_key", help=STUDY_KEY_ARG)
     sync_parser.add_argument(
-        "--interval", type=int, default=900, help="Polling interval in seconds."
+        "--interval", type=positive_int, default=900, help="Polling interval in seconds."
     )
     sync_parser.add_argument(
         "--once", action="store_true", help="Run a single sync cycle and exit."
@@ -375,15 +406,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             print(f"Synced {count} cached records for study '{study_key}'.")
             return
 
-        print(
-            f"Starting sync worker for study '{study_key}' "
-            f"(interval={interval}s). Press Ctrl+C to stop."
-        )
         try:
-            with console.status(f"Starting sync worker for study '{study_key}'...") as status:
+            with console.status(
+                f"Starting sync worker for study '{study_key}' (interval={interval}s). Press Ctrl+C to stop.",
+                announce_non_interactive=False,
+            ) as status:
 
                 def on_cycle(cycle: int, count: int) -> None:
-                    status.update(f"Study '{study_key}' - cycle {cycle}: synced {count} records.")
+                    status.step(f"Study '{study_key}' - cycle {cycle}: synced {count} records.")
 
                 def on_sleep_tick(cycle: int, remaining: int) -> None:
                     status.update(
@@ -423,33 +453,10 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
     add_no_interactive(show_parser)
 
-    def show_state(ledger_path: str, study_key: str | None = None) -> None:  # pragma: no cover
-        ledger = get_state_provider(ledger_path)
-        try:
-            state = ledger.read_state()
-        except Exception as err:
-            print(f"Failed to read ledger from {ledger_path}: {err}")
-            sys.exit(1)
-
-        has_data = False
-        print(f"iMednet Extraction Ledger ({ledger_path})")
-        print(
-            "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
-        )
-        for s_key, study_state in state.studies.items():
-            if study_key and s_key != study_key:
-                continue
-            for stream_name, stream_state in study_state.streams.items():
-                has_data = True
-                print(
-                    f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
-                )
-
-        if not has_data:
-            print("No ledger entries found matching filters.")
-
     show_parser.set_defaults(
-        func=lambda args: show_state(ledger_path=args.ledger_path, study_key=args.study_key)
+        func=lambda args: _execute_show_state(
+            ledger_path=args.ledger_path, study_key=args.study_key
+        )
     )
 
     set_parser = state_sub.add_parser(
@@ -798,31 +805,10 @@ def state_app(args: list[str] | None = None) -> None:
     )
     add_no_interactive(show_parser)
 
-    def show_state(ledger_path: str, study_key: str | None = None) -> None:
-        ledger = get_state_provider(ledger_path)
-        try:
-            state = ledger.read_state()
-        except Exception as err:
-            print(f"Failed to read ledger from {ledger_path}: {err}")
-            sys.exit(1)
-        has_data = False
-        print(f"iMednet Extraction Ledger ({ledger_path})")
-        print(
-            "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
-        )
-        for s_key, study_state in state.studies.items():
-            if study_key and s_key != study_key:
-                continue
-            for stream_name, stream_state in study_state.streams.items():
-                has_data = True
-                print(
-                    f"{s_key} | {stream_name} | {stream_state.last_timestamp.isoformat()} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
-                )
-        if not has_data:
-            print("No ledger entries found matching filters.")
-
     show_parser.set_defaults(
-        func=lambda args: show_state(ledger_path=args.ledger_path, study_key=args.study_key)
+        func=lambda args: _execute_show_state(
+            ledger_path=args.ledger_path, study_key=args.study_key
+        )
     )
 
     set_parser = state_sub.add_parser("set")
@@ -874,10 +860,11 @@ def state_app(args: list[str] | None = None) -> None:
     try:
         if getattr(parsed, "no_interactive", False):
             os.environ[NON_INTERACTIVE_ENV] = "1"
-        if hasattr(parsed, "func"):
-            parsed.func(parsed)
-        else:
-            parser.print_help()
+        with cli_execution_guard():
+            if hasattr(parsed, "func"):
+                parsed.func(parsed)
+            else:
+                parser.print_help()
     finally:
         if old_non_interactive is not None:
             os.environ[NON_INTERACTIVE_ENV] = old_non_interactive
