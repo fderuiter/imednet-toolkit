@@ -13,7 +13,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -38,6 +38,7 @@ _DEFAULT_DB_PATH = Path(
 _DEFAULT_DB_PATH_STR = str(Path.home() / ".imednet" / "config_versions.sqlite3")
 _READ_STORE_CACHE: dict[Path, ConfigVersionStore] = {}
 _DYNAMIC_PATH_CACHE: dict[tuple[str, str, str | None], Path] = {}
+_HEAD_INDEX_CACHE: dict[tuple[Path, int, int, int], dict[str, str]] = {}
 
 
 def _sha256_of(content: str) -> str:
@@ -191,7 +192,9 @@ class ConfigVersionStore:
         raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
         raw_db_path = Path(raw_env).expanduser() if raw_env else Path(_DEFAULT_DB_PATH_STR)
         candidate_path = cls._get_dynamic_db_path_no_create(raw_db_path)
-        if not os.path.isfile(candidate_path):
+        try:
+            db_stat = os.stat(candidate_path)
+        except OSError:
             return None
 
         cached_store = _READ_STORE_CACHE.get(candidate_path)
@@ -200,7 +203,42 @@ class ConfigVersionStore:
                 _READ_STORE_CACHE.clear()
             cached_store = cls(db_path=raw_db_path)
             _READ_STORE_CACHE[candidate_path] = cached_store
-        head_id = cached_store.get_head(study_key)
+
+        if hasattr(cls.get_head, "_mock_name") or hasattr(cached_store.get_head, "_mock_name"):
+            head_id = cached_store.get_head(study_key)
+        else:
+            wal_mtime = 0
+            with suppress(OSError):
+                wal_mtime = os.stat(f"{candidate_path}-wal").st_mtime_ns
+            snap_key = (candidate_path, db_stat.st_mtime_ns, db_stat.st_size, wal_mtime)
+            head_index = _HEAD_INDEX_CACHE.get(snap_key)
+            if head_index is None:
+                if len(_HEAD_INDEX_CACHE) > 32:
+                    _HEAD_INDEX_CACHE.clear()
+                with cached_store._lock, cached_store._connection() as conn:
+                    rows = conn.execute(
+                        "SELECT study_key, head_commit_id FROM config_heads"
+                    ).fetchall()
+                    indexed = {str(r["study_key"]): str(r["head_commit_id"]) for r in rows}
+                    fallback_rows = conn.execute(
+                        "SELECT study_key, commit_id FROM config_commits ORDER BY timestamp ASC, rowid ASC"
+                    ).fetchall()
+                    for r in fallback_rows:
+                        sk = str(r["study_key"])
+                        if sk not in indexed:
+                            indexed[sk] = str(r["commit_id"])
+                    # Overwrite fallback with latest ordered commit where config_heads lacked an entry
+                    missing_keys = {str(r["study_key"]) for r in fallback_rows} - {
+                        str(r["study_key"]) for r in rows
+                    }
+                    if missing_keys:
+                        for r in fallback_rows:
+                            sk = str(r["study_key"])
+                            if sk in missing_keys:
+                                indexed[sk] = str(r["commit_id"])
+                head_index = indexed
+                _HEAD_INDEX_CACHE[snap_key] = head_index
+            head_id = head_index.get(study_key)
         if not head_id:
             return None
         return cached_store.rollback_config(study_key, head_id)

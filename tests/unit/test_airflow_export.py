@@ -975,3 +975,263 @@ def test_operator_propagates_mask_phi_opt_out_to_tabular_and_plugin_sinks(
     op_mongo.execute({})
     assert mock_mongo_cfg.call_args.kwargs["mask_phi"] is False
     assert global_sensitivity_registry._sensitive_keys == registry_snapshot
+
+
+def test_operator_forwards_snowflake_prefix_and_hard_delete_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ImednetExportOperator._resolve_sink forwards stage_prefix, prefix, local_staging_dir, manifest_path, and hard_delete."""
+    from types import SimpleNamespace
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.spi import sink_base
+
+    mock_sink_cls = MagicMock()
+    mock_config_cls = MagicMock()
+    mock_sdk = MagicMock(
+        sinks=SimpleNamespace(
+            SnowflakeExportSink=mock_sink_cls,
+            SnowflakeSinkConfig=mock_config_cls,
+        )
+    )
+
+    fake_conn = SimpleNamespace(
+        host="conn_acct",
+        login="conn_usr",
+        password="conn_pwd",  # pragma: allowlist secret
+        schema="PUBLIC",
+        extra={
+            "database": "DB",
+            "warehouse": "WH",
+            "stage": "STG",
+            "table": "TBL",
+            "hard_delete": "true",
+        },
+    )
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, conn_id: fake_conn if conn_id == "sf_conn" else None),
+    )
+
+    # 1. Explicit export_kwargs forwarding for prefix, local_staging_dir, manifest_path, and hard_delete
+    op_kw = ImednetExportOperator(
+        task_id="sf_forward_kwargs",
+        study_key="STUDY-SF-FWD",
+        destination="snowflake",
+        destination_conn_id="sf_conn",
+        export_kwargs={
+            "prefix": "imednet/custom_prefix",
+            "local_staging_dir": "/tmp/custom_stage",
+            "manifest_path": "/tmp/custom_manifest.jsonl",
+            "hard_delete": False,
+        },
+    )
+    op_kw._resolve_sink(sink_base.SinkConfig(study_key="STUDY-SF-FWD"), sdk=mock_sdk)
+    kw_passed = mock_config_cls.call_args.kwargs
+    assert kw_passed["stage_prefix"] == "imednet/custom_prefix"
+    assert kw_passed["prefix"] == "imednet/custom_prefix"
+    assert kw_passed["local_staging_dir"] == "/tmp/custom_stage"
+    assert kw_passed["manifest_path"] == "/tmp/custom_manifest.jsonl"
+    assert kw_passed["hard_delete"] is False
+
+    # 2. Connection extra fallback for hard_delete=True and explicit stage_prefix
+    mock_config_cls.reset_mock()
+    op_conn = ImednetExportOperator(
+        task_id="sf_forward_conn",
+        study_key="STUDY-SF-FWD",
+        destination="snowflake",
+        destination_conn_id="sf_conn",
+        export_kwargs={"stage_prefix": "imednet/stage_pfx"},
+    )
+    op_conn._resolve_sink(sink_base.SinkConfig(study_key="STUDY-SF-FWD"), sdk=mock_sdk)
+    conn_passed = mock_config_cls.call_args.kwargs
+    assert conn_passed["stage_prefix"] == "imednet/stage_pfx"
+    assert conn_passed["prefix"] is None
+    assert conn_passed["hard_delete"] is True
+
+
+def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Repeated ImednetExportOperator.execute runs generate run-scoped batch IDs, evolve schema, and merge/delete without duplicates."""
+    import re
+    from types import SimpleNamespace
+
+    import imednet_sinks.warehouse as wh_mod
+    import pyarrow.parquet as pq
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.records import Record
+
+    sf_mod = MagicMock()
+    cursor = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    sf_mod.connect.return_value = conn
+
+    orig_require = wh_mod._require_optional_dep
+    monkeypatch.setattr(
+        wh_mod,
+        "_require_optional_dep",
+        lambda pkg, extras: sf_mod if pkg == "snowflake.connector" else orig_require(pkg, extras),
+    )
+
+    known_cols: list[str] = []
+    warehouse_rows: dict[tuple[str, int], dict[str, object]] = {}
+    staged_rows: list[dict[str, object]] = []
+    stage_paths: list[str] = []
+
+    def fake_execute(sql: str) -> None:
+        nonlocal staged_rows
+        if "INFORMATION_SCHEMA.COLUMNS" in sql:
+            cursor.fetchall.return_value = [(c,) for c in known_cols]
+        elif sql.startswith("CREATE TABLE IF NOT EXISTS"):
+            for col in re.findall(r'"([A-Z0-9_$]+)"\s+[A-Z_]+', sql.split("(", 1)[1]):
+                if col not in known_cols:
+                    known_cols.append(col)
+            cursor.fetchall.return_value = []
+        elif sql.startswith("ALTER TABLE"):
+            for col in re.findall(r'"([A-Z0-9_$]+)"\s+[A-Z_]+', sql.split("ADD COLUMN", 1)[1]):
+                if col not in known_cols:
+                    known_cols.append(col)
+            cursor.fetchall.return_value = []
+        elif sql.startswith("PUT file://"):
+            local_file = sql.split("PUT file://", 1)[1].split(" ", 1)[0]
+            staged_rows = pq.read_table(local_file).to_pylist()
+            cursor.fetchall.return_value = []
+        elif sql.startswith("COPY INTO") and "__imednet_stage" in sql:
+            stage_paths.append(sql.split("FROM '", 1)[1].split("'", 1)[0])
+            cursor.fetchall.return_value = []
+        elif sql.startswith("MERGE INTO"):
+            hard_del = "THEN DELETE" in sql
+            for row in staged_rows:
+                key = (str(row["study_key"]), int(row["record_id"]))
+                is_del = bool(row.get("deleted"))
+                if key in warehouse_rows:
+                    if hard_del and is_del:
+                        del warehouse_rows[key]
+                    else:
+                        warehouse_rows[key].update(row)
+                elif not (hard_del and is_del):
+                    warehouse_rows[key] = dict(row)
+            cursor.fetchall.return_value = []
+        else:
+            cursor.fetchall.return_value = []
+
+    cursor.execute.side_effect = fake_execute
+
+    fake_conn = SimpleNamespace(
+        host="acct",
+        login="loader",
+        password="secret",  # pragma: allowlist secret
+        schema="PUBLIC",
+        extra={
+            "database": "DB",
+            "warehouse": "WH",
+            "stage": "STG",
+            "table": "RECORDS",
+        },
+    )
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, conn_id: fake_conn if conn_id == "sf_dest" else None),
+    )
+
+    sdk = MagicMock(
+        sinks=SimpleNamespace(
+            SnowflakeExportSink=wh_mod.SnowflakeExportSink,
+            SnowflakeSinkConfig=wh_mod.SnowflakeSinkConfig,
+        )
+    )
+
+    run1 = [
+        Record(
+            record_id=1,
+            form_id=10,
+            form_key="F1",
+            subject_key="S1",
+            deleted=False,
+            date_modified="2026-04-01T08:00:00Z",
+            record_data={"score": 10},
+        ),
+        Record(
+            record_id=2,
+            form_id=10,
+            form_key="F1",
+            subject_key="S2",
+            deleted=False,
+            date_modified="2026-04-01T08:05:00Z",
+            record_data={"score": 20},
+        ),
+    ]
+    run2 = [
+        Record(
+            record_id=1,
+            form_id=10,
+            form_key="F1",
+            subject_key="S1",
+            deleted=False,
+            date_modified="2026-04-02T08:00:00Z",
+            record_data={"score": 15, "newBiomarker": "POS"},
+        ),
+        Record(
+            record_id=2,
+            form_id=10,
+            form_key="F1",
+            subject_key="S2",
+            deleted=True,
+            date_modified="2026-04-02T08:05:00Z",
+            record_data={"score": 20, "newBiomarker": "NEG"},
+        ),
+    ]
+
+    manifest_file = tmp_path / "manifest.jsonl"
+    op_soft = ImednetExportOperator(
+        task_id="daily_sf_sync",
+        study_key="STUDY_AF_SF",
+        destination="snowflake",
+        destination_conn_id="sf_dest",
+        export_kwargs={
+            "stage_prefix": "imednet/airflow",
+            "local_staging_dir": str(tmp_path / "stage_soft"),
+            "manifest_path": str(manifest_file),
+            "hard_delete": False,
+        },
+    )
+    monkeypatch.setattr(op_soft, "_get_sdk", lambda: sdk)
+
+    sdk.records.list.side_effect = lambda **_kw: iter(run1)
+    op_soft.execute({"run_id": "scheduled__2026-04-01T00:00:00+00:00"})
+
+    sdk.records.list.side_effect = lambda **_kw: iter(run2)
+    op_soft.execute({"run_id": "scheduled__2026-04-02T00:00:00+00:00"})
+
+    assert len(stage_paths) == 2
+    assert stage_paths[0] != stage_paths[1]
+    assert "NEW_BIOMARKER" in known_cols
+    assert len(warehouse_rows) == 2
+    assert warehouse_rows[("STUDY_AF_SF", 1)]["score"] == 15
+    assert warehouse_rows[("STUDY_AF_SF", 1)]["new_biomarker"] == "POS"
+    assert warehouse_rows[("STUDY_AF_SF", 2)]["deleted"] is True
+
+    # Run 3 with hard_delete=True removes matched deleted=True record 2
+    op_hard = ImednetExportOperator(
+        task_id="daily_sf_sync_hard",
+        study_key="STUDY_AF_SF",
+        destination="snowflake",
+        destination_conn_id="sf_dest",
+        export_kwargs={
+            "stage_prefix": "imednet/airflow",
+            "local_staging_dir": str(tmp_path / "stage_hard"),
+            "hard_delete": True,
+        },
+    )
+    monkeypatch.setattr(op_hard, "_get_sdk", lambda: sdk)
+    sdk.records.list.side_effect = lambda **_kw: iter(run2)
+    op_hard.execute({"run_id": "scheduled__2026-04-03T00:00:00+00:00"})
+
+    assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]

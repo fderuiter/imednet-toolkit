@@ -319,4 +319,4 @@ def test_conf_resolves_mermaid_version_across_extension_majors(monkeypatch) -> N
     assert conf._resolve_mermaid_version() == "10.2.0"
 
     monkeypatch.setattr(importlib.metadata, "version", lambda _pkg: "2.0.0")
-    assert conf._resolve_mermaid_version() == "10.9.1"
+    assert conf._resolve_mermaid_version() == "11.12.1"

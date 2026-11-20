@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -308,6 +310,58 @@ class UATSpecificationBuilder:
         return None
 
 
+@dataclass
+class _UATExecutionContext:
+    """Scoped per-run execution context for ``UATWorkflow``."""
+
+    state: UATWorkflowState = UATWorkflowState.PENDING
+    state_history: list[UATWorkflowState] = field(
+        default_factory=lambda: [UATWorkflowState.PENDING]
+    )
+    last_result: UATRunResult | None = None
+    submitter: Any | None = None
+    poller: Any | None = None
+
+
+def _poll_summary_failed(poll_summary: Any) -> bool:
+    """Return True if ``poll_summary`` indicates any failed jobs or records."""
+    if poll_summary is None:
+        return False
+    any_failed = getattr(poll_summary, "any_failed", None)
+    if isinstance(any_failed, bool):
+        return any_failed
+    failures = getattr(poll_summary, "failures", None)
+    if isinstance(failures, dict) and failures:
+        return True
+    all_successful = getattr(poll_summary, "all_successful", None)
+    if isinstance(all_successful, bool):
+        return not all_successful
+    return False
+
+
+def _collect_failed_batch_ids(poll_summary: Any) -> list[str]:
+    """Extract ordered failed batch IDs from ``JobPollSummary``."""
+    failed_ids: list[str] = []
+    failures = getattr(poll_summary, "failures", None)
+    if isinstance(failures, dict):
+        for batch_id in failures:
+            bid = str(batch_id)
+            if bid not in failed_ids:
+                failed_ids.append(bid)
+    results = getattr(poll_summary, "results", None)
+    if isinstance(results, dict):
+        for batch_id, status in results.items():
+            is_failed = getattr(status, "is_failed", None) is True
+            failed_records = getattr(status, "failed_records", 0)
+            has_failed_records = isinstance(failed_records, int) and failed_records > 0
+            result_error = getattr(status, "result_error", None)
+            has_result_error = isinstance(result_error, str) and bool(result_error)
+            bid = str(batch_id)
+            if (is_failed or has_failed_records or has_result_error) and bid not in failed_ids:
+                failed_ids.append(bid)
+    return failed_ids
+
+
 class UATWorkflow:
     """End-to-end UAT execution coordinator.
 
@@ -338,7 +392,7 @@ class UATWorkflow:
         self._builder = UATSpecificationBuilder(data_dictionary=data_dictionary)
         self._generator = SyntheticRecordGenerator(seed=seed, data_dictionary=data_dictionary)
 
-        # Config for lazy initialization of sync components
+        # Config for per-run initialization of sync components
         self._batch_size = batch_size
         self._poll_interval = poll_interval
         self._poll_timeout = poll_timeout
@@ -348,24 +402,31 @@ class UATWorkflow:
         self._submitter: Any | None = None
         self._poller: Any | None = None
 
-        self._state: UATWorkflowState = UATWorkflowState.PENDING
-        self._state_history: list[UATWorkflowState] = [UATWorkflowState.PENDING]
-        self._last_result: UATRunResult | None = None
+        self._latest_context = _UATExecutionContext()
+        self._active_context: ContextVar[_UATExecutionContext | None] = ContextVar(
+            f"uat_execution_context_{id(self)}",
+            default=None,
+        )
+
+    def _current_context(self) -> _UATExecutionContext:
+        """Return the active run context when executing ``run()``, else the latest context."""
+        active = self._active_context.get()
+        return active if active is not None else self._latest_context
 
     @property
     def state(self) -> UATWorkflowState:
         """Return the current lifecycle state of the workflow."""
-        return self._state
+        return self._current_context().state
 
     @property
     def state_history(self) -> list[UATWorkflowState]:
         """Return the recorded history of lifecycle states."""
-        return list(self._state_history)
+        return list(self._current_context().state_history)
 
     @property
     def last_result(self) -> UATRunResult | None:
         """Return the result of the last run execution."""
-        return self._last_result
+        return self._current_context().last_result
 
     def transition_to(self, target: UATWorkflowState | str) -> UATWorkflowState:
         """Transition workflow to a new state along an approved lifecycle path.
@@ -379,39 +440,33 @@ class UATWorkflow:
         Raises:
             InvalidUATStateTransitionError: If the transition is not permitted.
         """
+        ctx = self._current_context()
         target_state = normalize_uat_state(target)
-        validate_uat_transition(self._state, target_state)
-        self._state = target_state
-        self._state_history.append(target_state)
+        validate_uat_transition(ctx.state, target_state)
+        ctx.state = target_state
+        ctx.state_history.append(target_state)
         if self._on_phase_change is not None:
             self._on_phase_change(target_state)
-        return self._state
+        return ctx.state
 
     def reset(self) -> None:
         """Reset the workflow state machine back to PENDING."""
-        self._state = UATWorkflowState.PENDING
-        self._state_history = [UATWorkflowState.PENDING]
-        self._last_result = None
+        self._latest_context = _UATExecutionContext()
 
-    def _get_submitter(self) -> Any:
-        if self._submitter is None:
-            from .submission import BulkRecordSubmissionWorkflow
+    def _create_submitter(self) -> Any:
+        from .submission import BulkRecordSubmissionWorkflow
 
-            self._submitter = BulkRecordSubmissionWorkflow(
-                self._sdk,
-                batch_size=self._batch_size,
-                registration_timeout=self._poll_timeout,
-                registration_poll_interval=self._poll_interval,
-            )
-        return self._submitter
+        return BulkRecordSubmissionWorkflow(
+            self._sdk,
+            batch_size=self._batch_size,
+            registration_timeout=self._poll_timeout,
+            registration_poll_interval=self._poll_interval,
+        )
 
-    def _get_poller(self) -> Any:
-        if self._poller is None:
-            from imednet.spi.utils import JobPoller
+    def _create_poller(self) -> Any:
+        from imednet.spi.utils import JobPoller
 
-            self._poller = JobPoller(get_job=self._sdk.get_job)
-
-        return self._poller
+        return JobPoller(get_job=self._sdk.get_job)
 
     def run(
         self,
@@ -424,7 +479,7 @@ class UATWorkflow:
         email_notify: bool | str | None = None,
         data_dictionary: DataDictionary | None = None,
     ) -> UATRunResult:
-        """Execute the full UAT pipeline and return a UATRunResult."""
+        """Execute the full UAT pipeline in an isolated context and return a UATRunResult."""
         started_at = datetime.now(UTC)
         run_id = str(uuid.uuid4())
         phase_durations: dict[str, float] = {}
@@ -433,88 +488,125 @@ class UATWorkflow:
         poll_summary: Any = None
         active_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
 
+        ctx = _UATExecutionContext(
+            submitter=self._create_submitter(),
+            poller=self._create_poller(),
+        )
+        self._latest_context = ctx
+        token = self._active_context.set(ctx)
+
         try:
-            # 1. Inspect
-            self.transition_to(UATWorkflowState.INSPECTING)
-            t0 = time.monotonic()
-            snapshot = self.inspect(study_key)
-            phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
+            try:
+                # 1. Inspect
+                self.transition_to(UATWorkflowState.INSPECTING)
+                t0 = time.monotonic()
+                snapshot = self.inspect(study_key)
+                phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
 
-            # 2. Build Spec (if not provided)
-            self.transition_to(UATWorkflowState.BUILDING_SPEC)
-            t0 = time.monotonic()
-            if spec is None:
-                build_kwargs: dict[str, Any] = {
-                    "subject_count": subject_count,
-                    "site_name": site_name,
-                    "enabled_form_keys": enabled_form_keys,
-                }
+                # 2. Build Spec (if not provided)
+                self.transition_to(UATWorkflowState.BUILDING_SPEC)
+                t0 = time.monotonic()
+                if spec is None:
+                    build_kwargs: dict[str, Any] = {
+                        "subject_count": subject_count,
+                        "site_name": site_name,
+                        "enabled_form_keys": enabled_form_keys,
+                    }
+                    if active_dd is not None:
+                        build_kwargs["data_dictionary"] = active_dd
+                    spec = self.build_spec(snapshot, **build_kwargs)
+                phase_durations[UATRunPhase.BUILD_SPEC] = time.monotonic() - t0
+
+                # 3. Generate
+                self.transition_to(UATWorkflowState.GENERATING)
+                t0 = time.monotonic()
                 if active_dd is not None:
-                    build_kwargs["data_dictionary"] = active_dd
-                spec = self.build_spec(snapshot, **build_kwargs)
-            phase_durations[UATRunPhase.BUILD_SPEC] = time.monotonic() - t0
+                    record_sets = self.generate(spec, snapshot, data_dictionary=active_dd)
+                else:
+                    record_sets = self.generate(spec, snapshot)
+                phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
 
-            # 3. Generate
-            self.transition_to(UATWorkflowState.GENERATING)
-            t0 = time.monotonic()
-            if active_dd is not None:
-                record_sets = self.generate(spec, snapshot, data_dictionary=active_dd)
-            else:
-                record_sets = self.generate(spec, snapshot)
-            phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
+                # 4. Submit
+                self.transition_to(UATWorkflowState.SUBMITTING)
+                t0 = time.monotonic()
+                submission_result = self.submit(study_key, record_sets, email_notify=email_notify)
+                phase_durations[UATRunPhase.SUBMIT] = time.monotonic() - t0
 
-            # 4. Submit
-            self.transition_to(UATWorkflowState.SUBMITTING)
-            t0 = time.monotonic()
-            submission_result = self.submit(study_key, record_sets, email_notify=email_notify)
-            phase_durations[UATRunPhase.SUBMIT] = time.monotonic() - t0
+                # 5. Monitor
+                self.transition_to(UATWorkflowState.MONITORING)
+                t0 = time.monotonic()
+                poll_summary = self.monitor(study_key, submission_result)
+                phase_durations[UATRunPhase.MONITOR] = time.monotonic() - t0
 
-            # 5. Monitor
-            self.transition_to(UATWorkflowState.MONITORING)
-            t0 = time.monotonic()
-            poll_summary = self.monitor(study_key, submission_result)
-            phase_durations[UATRunPhase.MONITOR] = time.monotonic() - t0
+                if _poll_summary_failed(poll_summary):
+                    failed_batch_ids = _collect_failed_batch_ids(poll_summary)
+                    err_msg = (
+                        f"Monitored job batches failed: {', '.join(failed_batch_ids)}"
+                        if failed_batch_ids
+                        else "One or more monitored job batches failed."
+                    )
+                    self.transition_to(UATWorkflowState.FAILED)
+                    result = UATRunResult(
+                        study_key=study_key,
+                        run_id=run_id,
+                        started_at=started_at,
+                        completed_at=datetime.now(UTC),
+                        state=ctx.state,
+                        state_history=list(ctx.state_history),
+                        failure_phase=UATWorkflowState.MONITORING,
+                        error_message=err_msg,
+                        spec=spec,
+                        record_sets=record_sets,
+                        submission_result=submission_result,
+                        poll_summary=poll_summary,
+                        phase_durations=phase_durations,
+                    )
+                    ctx.last_result = result
+                    return result
 
-            # Complete
-            self.transition_to(UATWorkflowState.COMPLETED)
-            result = UATRunResult(
-                study_key=study_key,
-                run_id=run_id,
-                started_at=started_at,
-                completed_at=datetime.now(UTC),
-                state=self._state,
-                state_history=list(self._state_history),
-                spec=spec,
-                record_sets=record_sets,
-                submission_result=submission_result,
-                poll_summary=poll_summary,
-                phase_durations=phase_durations,
-            )
-            self._last_result = result
-            return result
+                # Complete
+                self.transition_to(UATWorkflowState.COMPLETED)
+                result = UATRunResult(
+                    study_key=study_key,
+                    run_id=run_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(UTC),
+                    state=ctx.state,
+                    state_history=list(ctx.state_history),
+                    spec=spec,
+                    record_sets=record_sets,
+                    submission_result=submission_result,
+                    poll_summary=poll_summary,
+                    phase_durations=phase_durations,
+                )
+                ctx.last_result = result
+                return result
 
-        except InvalidUATStateTransitionError:
-            raise
-        except Exception as exc:
-            failed_phase = self._state
-            self.transition_to(UATWorkflowState.FAILED)
-            result = UATRunResult(
-                study_key=study_key,
-                run_id=run_id,
-                started_at=started_at,
-                completed_at=datetime.now(UTC),
-                state=self._state,
-                state_history=list(self._state_history),
-                failure_phase=failed_phase,
-                error_message=str(exc),
-                spec=spec,
-                record_sets=record_sets,
-                submission_result=submission_result,
-                poll_summary=poll_summary,
-                phase_durations=phase_durations,
-            )
-            self._last_result = result
-            return result
+            except InvalidUATStateTransitionError:
+                raise
+            except Exception as exc:
+                failed_phase = ctx.state
+                if not ctx.state.is_terminal:
+                    self.transition_to(UATWorkflowState.FAILED)
+                result = UATRunResult(
+                    study_key=study_key,
+                    run_id=run_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(UTC),
+                    state=ctx.state,
+                    state_history=list(ctx.state_history),
+                    failure_phase=failed_phase,
+                    error_message=str(exc),
+                    spec=spec,
+                    record_sets=record_sets,
+                    submission_result=submission_result,
+                    poll_summary=poll_summary,
+                    phase_durations=phase_durations,
+                )
+                ctx.last_result = result
+                return result
+        finally:
+            self._active_context.reset(token)
 
     def inspect(self, study_key: str) -> Any:
         """Fetch study metadata via StudySchemaInspector."""
@@ -543,7 +635,17 @@ class UATWorkflow:
         email_notify: bool | str | None = None,
     ) -> SubmissionResult:
         """Execute the two-phase bulk submission."""
-        return self._get_submitter().submit(study_key, record_sets, email_notify=email_notify)  # type: ignore[no-any-return]
+        active = self._active_context.get()
+        submitter = (
+            self._submitter
+            if self._submitter is not None
+            else (
+                active.submitter
+                if active is not None and active.submitter is not None
+                else self._create_submitter()
+            )
+        )
+        return submitter.submit(study_key, record_sets, email_notify=email_notify)  # type: ignore[no-any-return]
 
     def monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:
         """Poll all resulting jobs to completion via facade poll_jobs (or JobPoller fallback)."""
@@ -570,7 +672,13 @@ class UATWorkflow:
             if isinstance(candidate, JobPollSummary):
                 return candidate
 
-        return self._get_poller().poll_many(
+        active = self._active_context.get()
+        poller = (
+            active.poller
+            if active is not None and active.poller is not None
+            else self._create_poller()
+        )
+        return poller.poll_many(
             study_key,
             submission_result.all_batch_ids,
             interval=self._poll_interval,

@@ -218,20 +218,21 @@ text.noteText > tspan {
 """
 
 
-def _resolve_mermaid_version() -> str:
-    """Return '10.2.0' for sphinxcontrib-mermaid <1.0 (UMD) and '10.9.1' for >=1.0 (ESM)."""
+def _resolve_mermaid_version(dist_version: str | None = None) -> str:
+    """Return a Mermaid JS version compatible with the installed sphinxcontrib-mermaid."""
     try:
-        raw_version = importlib.metadata.version("sphinxcontrib-mermaid")
-        major_str = raw_version.split(".", 1)[0]
-        if int(major_str) >= 1:
-            return "10.9.1"
-    except (importlib.metadata.PackageNotFoundError, ValueError):
-        return "10.2.0"
-    return "10.2.0"
+        raw_version = (
+            dist_version
+            if dist_version is not None
+            else importlib.metadata.version("sphinxcontrib-mermaid")
+        )
+        major = int(raw_version.split(".", 1)[0])
+    except Exception:
+        major = 0
+    return "10.2.0" if major < 1 else "11.12.1"
 
 
-mermaid_version = _resolve_mermaid_version()
-mermaid_init_config: dict[str, Any] = {
+_MERMAID_INIT_CONFIG: dict[str, Any] = {
     "startOnLoad": True,
     "theme": "base",
     "useMaxWidth": False,
@@ -269,7 +270,10 @@ mermaid_init_config: dict[str, Any] = {
     },
     "themeCSS": _MERMAID_THEME_CSS,
 }
-mermaid_init_js = "mermaid.initialize(" + json.dumps(mermaid_init_config) + ");"
+
+mermaid_version = _resolve_mermaid_version()
+mermaid_init_config = _MERMAID_INIT_CONFIG
+mermaid_init_js = "mermaid.initialize(" + json.dumps(_MERMAID_INIT_CONFIG) + ");"
 
 _PYODIDE_WHEEL_SPECS: tuple[tuple[str, str], ...] = (
     ("imednet", "core"),

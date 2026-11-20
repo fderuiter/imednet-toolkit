@@ -157,10 +157,16 @@ def validate_filter_syntax(
     Returns:
         A tuple of (is_valid, key, parsed_value, error_message).
     """
+    from imednet.spi.cli import resolve_endpoint_filter_attributes
     from imednet.spi.utils import parse_filter_expression
 
+    allowed_attrs = resolve_endpoint_filter_attributes(model)
     try:
-        key, parsed_val = parse_filter_expression(filter_str, model=model)
+        key, parsed_val = parse_filter_expression(
+            filter_str,
+            model=model,
+            allowed_attributes=allowed_attrs,
+        )
     except ValueError as exc:
         return False, None, None, str(exc)
     return True, key, parsed_val, None

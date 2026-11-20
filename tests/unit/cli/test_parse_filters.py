@@ -29,26 +29,34 @@ def test_parse_filter_args_comparison_operators():
             "dictionaryName==MedDRA",
             "revision>=2",
             "subjectStatus!=Enrolled",
-            "revision>1",
+            "count>1",
         ]
     )
     assert combined == {
         "dictionaryName": ("==", "MedDRA"),
-        "revision": [(">=", 2), (">", 1)],
+        "revision": (">=", 2),
         "subjectStatus": ("!=", "Enrolled"),
+        "count": (">", 1),
     }
 
 
-def test_parse_filter_args_rejects_unknown_visit_attribute(capfd: pytest.CaptureFixture[str]):
-    """Test that unknown filter keys for Visit fail deterministically."""
+def test_parse_filter_args_rejects_unknown_or_unallowlisted_visit_attribute(
+    capfd: pytest.CaptureFixture[str],
+):
+    """Unknown or non-allowlisted filter keys for Visit fail deterministically and list valid attributes."""
     assert parse_filter_args(["interval_name=Screening"], model=Visit) == {
         "interval_name": "Screening"
     }
-    with pytest.raises(SystemExit) as exc_info:
-        parse_filter_args(["visit_key=SCREENING"], model=Visit)
-    assert exc_info.value.code == 1
-    captured = capfd.readouterr()
-    assert "Unknown filter attribute 'visit_key' for Visit" in captured.err
+    for bad_expr, expected_msg in (
+        ("visit_key=SCREENING", "Unknown filter attribute 'visit_key' for Visit"),
+        ("visit_id=1", "Unknown filter attribute 'visit_id' for Visit"),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            parse_filter_args([bad_expr], model=Visit)
+        assert exc_info.value.code == 1
+        captured = capfd.readouterr()
+        assert expected_msg in captured.err
+        assert "Valid attributes:" in captured.err
 
 
 def test_parse_filter_args_invalid():
@@ -69,11 +77,22 @@ def test_parse_filter_args_invalid_escaped(capfd: pytest.CaptureFixture[str]):
     assert captured.out == ""
 
 
-@pytest.mark.parametrize("op", ["<", "<=", ">", ">=", "==", "!=", "=~"])
-def test_parse_filter_args_all_seven_comparison_operators(op: str) -> None:
-    """All seven iMednet comparison operators parse into (operator, value) tuples."""
+@pytest.mark.parametrize("op", ["<", "<=", ">", ">=", "==", "!="])
+def test_parse_filter_args_table2_comparison_operators(op: str) -> None:
+    """All six Table 2 comparison operators parse into (operator, value) tuples."""
     result = parse_filter_args([f"age{op}30"])
     assert result == {"age": (op, 30)}
+
+
+def test_parse_filter_args_rejects_regex_operator(capfd: pytest.CaptureFixture[str]) -> None:
+    """Standard --filter rejects =~ and lists allowed Table 2 operators."""
+    with pytest.raises(SystemExit) as exc_info:
+        parse_filter_args(["form_key=~DEMO"])
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Allowed operators: ['!=', '<', '<=', '==', '>', '>=']" in captured.err
+    assert "=~" not in captured.err.split("Allowed operators:")[-1]
 
 
 def test_parse_filter_args_semicolon_and_repeatable() -> None:
@@ -86,13 +105,24 @@ def test_parse_filter_args_semicolon_and_repeatable() -> None:
     }
 
 
-def test_parse_filter_args_duplicate_key_range_preserves_both_clauses() -> None:
-    """Range filters on the same attribute preserve both clauses as AND operator tuples."""
-    from imednet.utils.filters import build_filter_string
-
-    result = parse_filter_args(["age>=18;age<=65"])
-    assert result == {"age": [(">=", 18), ("<=", 65)]}
-    assert build_filter_string(result) == "age>=18;age<=65"
+@pytest.mark.parametrize(
+    "dup_args",
+    [
+        ["age>=18;age<=65"],
+        ["record_id>=1", "recordId<=10"],
+        ["recordId>=1;recordId<=10"],
+    ],
+)
+def test_parse_filter_args_rejects_duplicate_and_attributes(
+    dup_args: list[str], capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Duplicate AND attributes (including mixed snake_case and camelCase) exit with code 1."""
+    with pytest.raises(SystemExit) as exc_info:
+        parse_filter_args(dup_args)
+    assert exc_info.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Duplicate filter attribute" in captured.err
 
 
 def test_parse_filter_args_comma_or_connector() -> None:

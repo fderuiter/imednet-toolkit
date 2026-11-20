@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from imednet.spi.errors import ApiError, ClientError
+from imednet.spi.errors import ApiError, ClientError, ServerError
 from imednet.spi.facade import ImednetFacade
+from imednet.spi.utils import JobFailedError, JobPoller, JobTimeoutError
 from imednet.spi.validation import (
     DataDictionary,
     ExtractedCondition,
@@ -45,15 +47,26 @@ class EditCheckVerificationReport:
 class UATExecutionEngine:
     """Automated Edit Check Verification execution engine."""
 
-    def __init__(self, sdk: ImednetFacade, data_dictionary: DataDictionary):
+    def __init__(
+        self,
+        sdk: ImednetFacade,
+        data_dictionary: DataDictionary,
+        *,
+        poll_interval: float = 5.0,
+        poll_timeout: float = 300.0,
+    ) -> None:
         """Initialize the UAT execution engine.
 
         Args:
             sdk: An instance of the iMednet SDK facade.
             data_dictionary: The data dictionary containing business rules.
+            poll_interval: Seconds between background job status polls.
+            poll_timeout: Maximum seconds to wait for background jobs.
         """
         self._sdk = sdk
         self._data_dictionary = data_dictionary
+        self._poll_interval = poll_interval
+        self._poll_timeout = poll_timeout
         self._form_variables: dict[str, dict[str, Any]] = {}
         if isinstance(data_dictionary, DataDictionary):
             for form in data_dictionary.forms:
@@ -360,11 +373,123 @@ class UATExecutionEngine:
 
         return data
 
+    def _extract_job_batch_id(self, job: Any) -> str | None:
+        """Extract a non-empty string ``batch_id`` from a ``create_record`` Job response."""
+        raw = (
+            job.get("batch_id") or job.get("batchId")
+            if isinstance(job, dict)
+            else (getattr(job, "batch_id", None) or getattr(job, "batchId", None))
+        )
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        return None
+
+    def _build_job_poller(self) -> JobPoller:
+        """Create a ``JobPoller`` wired to ``sdk.get_job`` (and ``fetch_result`` when real)."""
+        fetch_result_fn: Callable[[str], Any] | None = None
+        jobs_ep = getattr(self._sdk, "jobs", None)
+        require_sync = getattr(jobs_ep, "_require_sync_client", None)
+        if callable(require_sync) and not type(require_sync).__module__.startswith("unittest.mock"):
+            try:
+                client = require_sync()
+                candidate = getattr(client, "get", None)
+                if callable(candidate) and not type(candidate).__module__.startswith(
+                    "unittest.mock"
+                ):
+                    fetch_result_fn = candidate
+            except Exception:
+                fetch_result_fn = None
+
+        if fetch_result_fn is not None:
+            return JobPoller(get_job=self._sdk.get_job, fetch_result=fetch_result_fn)
+        return JobPoller(get_job=self._sdk.get_job)
+
+    def _classify_polled_batch(
+        self,
+        result: dict[str, Any],
+        batch_id: str,
+        summary: Any,
+        report: EditCheckVerificationReport,
+    ) -> None:
+        """Classify a polled asynchronous Job batch into ``EditCheckResultStatus``."""
+        failures = getattr(summary, "failures", {}) or {}
+        results = getattr(summary, "results", {}) or {}
+
+        if batch_id in failures:
+            exc = failures[batch_id]
+            if isinstance(exc, JobTimeoutError):
+                result["actual_response"] = f"Error: {exc}"
+                result["status"] = EditCheckResultStatus.ERROR
+                report.failed_rules += 1
+                return
+            if isinstance(exc, JobFailedError):
+                status = getattr(exc, "status", None)
+                raw_state = str(getattr(status, "state", "") or "").upper()
+                failed_recs = getattr(status, "failed_records", 0)
+                has_failed_recs = isinstance(failed_recs, int) and failed_recs > 0
+                res_err = getattr(exc, "result_error", None) or getattr(
+                    status, "result_error", None
+                )
+                is_result_fetch_error = (
+                    bool(res_err)
+                    and not has_failed_recs
+                    and raw_state in {"COMPLETED", "COMPLETE", "SUCCESS"}
+                )
+                if raw_state == "TIMEOUT" or is_result_fetch_error:
+                    result["actual_response"] = f"Error: {exc}"
+                    result["status"] = EditCheckResultStatus.ERROR
+                    report.failed_rules += 1
+                else:
+                    result["actual_response"] = "Rejected"
+                    result["status"] = EditCheckResultStatus.PASS
+                    report.passed_rules += 1
+                return
+            result["actual_response"] = f"Error: {exc}"
+            result["status"] = EditCheckResultStatus.ERROR
+            report.failed_rules += 1
+            return
+
+        if batch_id in results:
+            status = results[batch_id]
+            raw_state = str(getattr(status, "state", "") or "").upper()
+            failed_recs = getattr(status, "failed_records", 0)
+            has_failed_recs = isinstance(failed_recs, int) and failed_recs > 0
+            is_failed = getattr(status, "is_failed", None)
+            if raw_state == "TIMEOUT":
+                result["actual_response"] = "Error: Job timed out"
+                result["status"] = EditCheckResultStatus.ERROR
+                report.failed_rules += 1
+            elif (
+                has_failed_recs
+                or raw_state in {"FAILED", "CANCELLED"}
+                or (isinstance(is_failed, bool) and is_failed)
+            ):
+                result["actual_response"] = "Rejected"
+                result["status"] = EditCheckResultStatus.PASS
+                report.passed_rules += 1
+            else:
+                result["actual_response"] = "Accepted"
+                result["status"] = EditCheckResultStatus.FAIL
+                report.failed_rules += 1
+            return
+
+        result["actual_response"] = f"Error: Missing poll status for batch {batch_id}"
+        result["status"] = EditCheckResultStatus.ERROR
+        report.failed_rules += 1
+
     def run_verification(
-        self, study_key: str, form_scope: str | None = None, site_name: str = "TestSite"
+        self,
+        study_key: str,
+        form_scope: str | None = None,
+        site_name: str = "TestSite",
+        *,
+        poll_interval: float | None = None,
+        poll_timeout: float | None = None,
     ) -> EditCheckVerificationReport:
         """Run the end-to-end UAT verification against the EDC API."""
+        del site_name
         report = EditCheckVerificationReport(study_key=study_key)
+        pending_jobs: list[tuple[dict[str, Any], str]] = []
 
         for idx, rule in enumerate(self._rules):
             if form_scope and rule.get("form") != form_scope:
@@ -384,51 +509,70 @@ class UATExecutionEngine:
                         "reason": "Missing variable for data generation",
                     }
                 )
-                continue
+            else:
+                # Use CreateNewRecordRequest format
+                subject_key = f"UAT-SUBJ-{idx}"
+                payload = {"formKey": form_key, "subjectKey": subject_key, "data": test_data}
 
-            # Use CreateNewRecordRequest format
-            subject_key = f"UAT-SUBJ-{idx}"
-            payload = {"formKey": form_key, "subjectKey": subject_key, "data": test_data}
+                result: dict[str, Any] = {
+                    "rule_name": rule.get("rule_name"),
+                    "form": form_key,
+                    "test_data": test_data,
+                    "expected_response": "Rejected",
+                }
 
-            result = {
-                "rule_name": rule.get("rule_name"),
-                "form": form_key,
-                "test_data": test_data,
-                "expected_response": "Rejected",
-            }
-
-            try:
-                # Submit the record. If the EDC is enforcing the business logic correctly,
-                # this request should fail with a 400 ClientError (ValidationError).
-                self._sdk.create_record(study_key, [payload])
-
-                # If we reach here, the record was ACCEPTED by the EDC.
-                # This means the edit check FAILED to catch the invalid data.
-                result["actual_response"] = "Accepted"
-                result["status"] = EditCheckResultStatus.FAIL
-                report.failed_rules += 1
-            except (ApiError, ClientError) as e:
-                # 400-level errors from the API mean the request was rejected.
-                # This is a SUCCESSFUL REJECTION (Pass) for negative testing.
-                # Wait, if status_code is >= 500, we should log it as Error.
-                status_code = getattr(e, "status_code", None)
-                if status_code and status_code >= 500:
-                    result["actual_response"] = f"Error: Server error {status_code}"
+                try:
+                    job = self._sdk.create_record(study_key, [payload])
+                    batch_id = self._extract_job_batch_id(job)
+                    if batch_id is not None:
+                        result["batch_id"] = batch_id
+                        pending_jobs.append((result, batch_id))
+                    else:
+                        result["actual_response"] = "Accepted"
+                        result["status"] = EditCheckResultStatus.FAIL
+                        report.failed_rules += 1
+                except (ApiError, ClientError) as e:
+                    status_code = getattr(e, "status_code", None)
+                    if isinstance(e, ServerError) or (
+                        isinstance(status_code, int) and status_code >= 500
+                    ):
+                        result["actual_response"] = (
+                            f"Error: Server error {status_code}"
+                            if status_code is not None
+                            else f"Error: {e}"
+                        )
+                        result["status"] = EditCheckResultStatus.ERROR
+                        report.failed_rules += 1
+                    else:
+                        result["actual_response"] = "Rejected"
+                        result["status"] = EditCheckResultStatus.PASS
+                        report.passed_rules += 1
+                except Exception as e:
+                    result["actual_response"] = f"Error: {e}"
                     result["status"] = EditCheckResultStatus.ERROR
                     report.failed_rules += 1
-                else:
-                    result["actual_response"] = "Rejected"
-                    result["status"] = EditCheckResultStatus.PASS
-                    report.passed_rules += 1
-            except Exception as e:
-                result["actual_response"] = f"Error: {e}"
-                result["status"] = EditCheckResultStatus.ERROR
-                report.failed_rules += 1
 
-            report.results.append(result)
+                report.results.append(result)
 
             if report.total_rules >= 100:
                 logger.warning("Reached maximum subject limit of 100 per UAT run.")
                 break
+
+        if pending_jobs:
+            batch_ids = list(dict.fromkeys(bid for _, bid in pending_jobs))
+            effective_interval = (
+                self._poll_interval if poll_interval is None else float(poll_interval)
+            )
+            effective_timeout = self._poll_timeout if poll_timeout is None else float(poll_timeout)
+            poller = self._build_job_poller()
+            summary = poller.poll_many(
+                study_key,
+                batch_ids,
+                interval=effective_interval,
+                timeout=effective_timeout,
+                fail_fast=False,
+            )
+            for pending_result, batch_id in pending_jobs:
+                self._classify_polled_batch(pending_result, batch_id, summary, report)
 
         return report

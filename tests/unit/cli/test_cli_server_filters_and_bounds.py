@@ -891,3 +891,194 @@ def test_records_list_record_data_filter_with_json_and_file_output(
     assert "filter" not in params_out
     assert params_out["recordDataFilter"] == "SYSBP>=130"
     assert (tmp_path / "records.json").exists()
+
+
+@pytest.mark.parametrize(
+    "subcommand",
+    [
+        "sites",
+        "forms",
+        "intervals",
+        "queries",
+        "record-revisions",
+        "variables",
+        "visits",
+        "records",
+        "subjects",
+        "codings",
+    ],
+)
+@pytest.mark.parametrize("study_filter", ["study_key=STUDY", "studyKey==STUDY"])
+def test_all_ten_study_scoped_list_commands_reject_study_key_in_preflight(
+    subcommand: str,
+    study_filter: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance Criterion 1: -f study_key=STUDY exits 1 in preflight on all 10 Study-scoped list commands."""
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    mock_get_sdk = MagicMock(side_effect=AssertionError("get_sdk must not be called in preflight"))
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", mock_get_sdk)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.app([subcommand, "list", "STUDY", "-f", study_filter])
+
+    assert exc_info.value.code == 1
+    mock_get_sdk.assert_not_called()
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "'study_key' and 'studyKey' cannot be used in --filter" in captured.err
+    assert "Unexpected error" not in captured.err
+
+
+@respx.mock
+def test_studies_list_preserves_study_key_and_study_key_camel_filters(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Guardrail: study_key and studyKey remain valid on `imednet studies list`."""
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _make_sdk)
+    route = respx.get("https://api.test/api/v1/edc/studies").mock(
+        return_value=httpx.Response(
+            200,
+            json=_paginated_payload([{"studyKey": "STUDY", "studyName": "Demo"}]),
+        )
+    )
+
+    for flt in ("study_key=STUDY", "studyKey==STUDY"):
+        route.reset()
+        cli.app(["studies", "list", "-f", flt, "--format", "json"])
+        capfd.readouterr()
+        assert route.call_count == 1
+        assert dict(route.calls[0].request.url.params)["filter"] == "studyKey==STUDY"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_attr"),
+    [
+        (["queries", "list", "STUDY", "-f", "status=Open"], "annotationType"),
+        (["visits", "list", "STUDY", "-f", "visit_id=1"], "intervalName"),
+        (["codings", "list", "STUDY", "-f", "coding_id=1"], "dictionaryName"),
+        (["intervals", "list", "STUDY", "-f", "forms=DEMO"], "intervalName"),
+        (["records", "list", "STUDY", "-f", "keywords=urgent"], "formKey"),
+        (["subjects", "list", "STUDY", "-f", "keywords=vip"], "subjectStatus"),
+    ],
+)
+def test_list_commands_reject_non_allowlisted_attributes_and_list_valid_attributes(
+    argv: list[str],
+    expected_attr: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance Criterion 2: non-allowlisted attributes exit 1 during preflight and list valid attributes."""
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    mock_get_sdk = MagicMock(side_effect=AssertionError("get_sdk must not be called in preflight"))
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", mock_get_sdk)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.app(argv)
+
+    assert exc_info.value.code == 1
+    mock_get_sdk.assert_not_called()
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Valid attributes:" in captured.err
+    assert expected_attr in captured.err
+    assert "Unexpected error" not in captured.err
+
+
+def test_help_text_and_preflight_enforce_table2_for_filter_and_table7_for_record_data_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance Criterion 3: --help omits =~ from --filter, includes =~ on --record-data-filter, and -f form_key=~DEMO exits 1."""
+    for help_argv in (
+        ["codings", "list", "--help"],
+        ["visits", "list", "--help"],
+    ):
+        with pytest.raises(SystemExit) as help_exc:
+            cli.app(help_argv)
+        assert help_exc.value.code == 0
+        help_out = capfd.readouterr().out
+        assert "=~" not in help_out
+
+    for rdf_help_argv in (
+        ["records", "list", "--help"],
+        ["export", "json", "--help"],
+    ):
+        with pytest.raises(SystemExit) as rdf_exc:
+            cli.app(rdf_help_argv)
+        assert rdf_exc.value.code == 0
+        rdf_out = capfd.readouterr().out
+        # Split at --record-data-filter to verify --filter section omits =~ while --record-data-filter includes =~
+        before_rdf, after_rdf = rdf_out.split("--record-data-filter", 1)
+        assert "=~" not in before_rdf
+        assert "=~" in after_rdf
+
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    with pytest.raises(SystemExit) as preflight_exc:
+        cli.app(["records", "list", "STUDY", "-f", "form_key=~DEMO"])
+    assert preflight_exc.value.code == 1
+    err = capfd.readouterr().err
+    assert "Allowed operators: ['!=', '<', '<=', '==', '>', '>=']" in err
+
+
+def test_simulation_mode_codings_list_preserves_empty_quoted_string_and_returns_200(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance Criterion 4: `codings list STUDY -f 'reason==\"\"'` sends `filter=reason==\"\"` and gets HTTP 200 in simulation mode."""
+    from imednet.simulation import SimulationTransport, reset_default_simulation_state
+
+    reset_default_simulation_state()
+    monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "true")
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    seen_requests: list[tuple[str, int]] = []
+    orig_handle = SimulationTransport.handle_request
+
+    def _spy_handle(self: SimulationTransport, request: httpx.Request) -> httpx.Response:
+        response = orig_handle(self, request)
+        seen_requests.append((request.url.params.get("filter", ""), response.status_code))
+        return response
+
+    with patch.object(SimulationTransport, "handle_request", _spy_handle):
+        cli.app(["codings", "list", "STUDY", "-f", 'reason==""', "--format", "json"])
+
+    captured = capfd.readouterr()
+    envelope = json.loads(captured.out)
+    assert envelope["schemaVersion"] == "1.0"
+    assert envelope["resource"] == "codings"
+    assert seen_requests == [('reason==""', 200)]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["records", "list", "STUDY", "-f", "record_id>=1", "-f", "recordId<=10"],
+        ["records", "list", "STUDY", "-f", "recordId>=1;recordId<=10"],
+    ],
+)
+def test_records_list_rejects_duplicate_and_attributes_in_preflight(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance Criterion 5: duplicate normalized AND attributes exit 1 during preflight."""
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    mock_get_sdk = MagicMock(side_effect=AssertionError("get_sdk must not be called in preflight"))
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", mock_get_sdk)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.app(argv)
+
+    assert exc_info.value.code == 1
+    mock_get_sdk.assert_not_called()
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Duplicate filter attribute 'recordId'" in captured.err
