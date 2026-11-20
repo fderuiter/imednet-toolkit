@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any
 
@@ -101,35 +102,79 @@ def validate_query_transition(
 validate_transition = validate_query_transition
 
 
+_CLAUSE_SPLIT_RE = re.compile(r"[,;|/()]|\bbut\b")
+_WORD_TOKEN_RE = re.compile(r"[a-z0-9']+")
+_NEGATION_RE = re.compile(r"^(?:not|no|non|un|never|without|neither|nor|cannot|.*n't)$")
+_ANSWER_TOKEN_RE = re.compile(r"^(?:re)?answer(?:s|ed|ing)?$")
+_CANCEL_TOKEN_RE = re.compile(r"^(?:re)?cancel(?:s|ed|led|ing|ling|lation)?$")
+_CLOSE_TOKEN_RE = re.compile(r"^(?:re)?clos(?:e|es|ed|ing|ure)$")
+
+
+def _has_non_negated_token(text: str, pattern: re.Pattern[str]) -> bool:
+    """Check whether any clause in text contains a non-negated token matching pattern."""
+    if not text:
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(text.lower()):
+        tokens = _WORD_TOKEN_RE.findall(clause)
+        for idx, token in enumerate(tokens):
+            if pattern.fullmatch(token):
+                window = tokens[max(0, idx - 3) : idx]
+                if not any(_NEGATION_RE.fullmatch(prev) for prev in window):
+                    return True
+    return False
+
+
 def calculate_legacy_status(query_comments: list[Any] | None) -> QueryStatus:
     """Calculate fallback QueryStatus for legacy payloads lacking explicit status."""
     if not query_comments:
         return QueryStatus.OPEN
 
-    def _extract_seq(item: Any) -> int:
+    def _comment_sort_key(indexed_item: tuple[int, Any]) -> tuple[int, int]:
+        idx, item = indexed_item
         val = item.get("sequence") if isinstance(item, dict) else getattr(item, "sequence", None)
-        return int(val) if val is not None else -1
+        try:
+            seq = int(val) if val is not None else -1
+        except (TypeError, ValueError):
+            seq = -1
+        return (seq, idx)
 
-    latest = max(query_comments, key=_extract_seq)
+    _, latest = max(enumerate(query_comments), key=_comment_sort_key)
     if isinstance(latest, dict):
-        is_closed = latest.get("closed")
-        ann_status = latest.get("annotation_status") or latest.get("annotationStatus")
+        raw_closed = latest.get("closed")
+        ann_status = latest.get("annotation_status")
+        if ann_status is None:
+            ann_status = latest.get("annotationStatus")
     else:
-        is_closed = getattr(latest, "closed", None)
+        raw_closed = getattr(latest, "closed", None)
         ann_status = getattr(latest, "annotation_status", None)
+        if ann_status is None:
+            ann_status = getattr(latest, "annotationStatus", None)
 
-    ann_str = str(ann_status).strip().lower() if ann_status else ""
-    if "cancel" in ann_str:
-        return QueryStatus.CANCELLED
+    if isinstance(raw_closed, bool):
+        is_closed: bool | None = raw_closed
+    elif isinstance(raw_closed, str) and raw_closed.strip().lower() in {"true", "false"}:
+        is_closed = raw_closed.strip().lower() == "true"
+    else:
+        is_closed = None
+
+    ann_str = str(ann_status).strip() if ann_status else ""
+
+    if is_closed is False:
+        if _has_non_negated_token(ann_str, _ANSWER_TOKEN_RE):
+            return QueryStatus.ANSWERED
+        return QueryStatus.OPEN
 
     if is_closed is True:
+        if _has_non_negated_token(ann_str, _CANCEL_TOKEN_RE):
+            return QueryStatus.CANCELLED
         return QueryStatus.CLOSED
 
-    if ann_str:
-        if "answer" in ann_str:
-            return QueryStatus.ANSWERED
-        if "close" in ann_str:
-            return QueryStatus.CLOSED
+    if _has_non_negated_token(ann_str, _CANCEL_TOKEN_RE):
+        return QueryStatus.CANCELLED
+    if _has_non_negated_token(ann_str, _ANSWER_TOKEN_RE):
+        return QueryStatus.ANSWERED
+    if _has_non_negated_token(ann_str, _CLOSE_TOKEN_RE):
+        return QueryStatus.CLOSED
 
     return QueryStatus.OPEN
 
@@ -159,14 +204,16 @@ class Query(ImednetBaseModel):
     def _resolve_legacy_status(cls, data: Any) -> Any:
         """Resolve query status using explicit value or fallback legacy calculation."""
         if isinstance(data, dict):
-            status_val = data.get("status")
+            resolved = dict(data)
+            status_val = resolved.get("status")
             if status_val is None:
-                comments = data.get("query_comments")
+                comments = resolved.get("query_comments")
                 if comments is None:
-                    comments = data.get("queryComments")
-                data["status"] = calculate_legacy_status(comments)
+                    comments = resolved.get("queryComments")
+                resolved["status"] = calculate_legacy_status(comments)
             elif not isinstance(status_val, QueryStatus):
-                data["status"] = QueryStatus(status_val)
+                resolved["status"] = QueryStatus(status_val)
+            return resolved
         return data
 
     def transition_to(self, target_status: QueryStatus | str) -> QueryStatus:
