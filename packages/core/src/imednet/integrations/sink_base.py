@@ -448,7 +448,10 @@ class ExportSink(ABC):
 
     def __init__(self, config: SinkConfig) -> None:
         """Initialize the export sink with a configuration."""
+        from imednet.core.operations.circuit_breaker import CircuitBreaker
+
         self.config: SinkConfig = config
+        self._circuit_breaker: CircuitBreaker = CircuitBreaker()
 
     def redact_batch(self, records: Sequence[Any]) -> Any:
         """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
@@ -548,9 +551,15 @@ class ExportSink(ABC):
         execute_fn:
             Callable that performs the export and returns the record count.
         """
+        from imednet.core.operations.circuit_breaker import CircuitBreaker
         from imednet.core.operations.executor import UniversalExecutor
         from imednet.core.retry import RetryConfig
         from imednet.errors import ExportBatchError
+
+        breaker = getattr(self, "_circuit_breaker", None)
+        if breaker is None:
+            breaker = CircuitBreaker()
+            self._circuit_breaker = breaker
 
         attempts = 0
 
@@ -577,6 +586,7 @@ class ExportSink(ABC):
             wait_strategy=wait_exponential(multiplier=self.config.retry_backoff),
             tracer=self.config.tracer,
             operation_name=operation_name,
+            circuit_breaker=breaker,
             batch_id=batch_id,
         )
         try:
