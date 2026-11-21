@@ -7,6 +7,7 @@ EDC data workflows into Apache Airflow pipelines.
 from __future__ import annotations
 
 import sys
+from contextlib import suppress
 from importlib import import_module
 from importlib.abc import Loader, MetaPathFinder
 from importlib.machinery import ModuleSpec
@@ -64,9 +65,31 @@ def _ensure_airflow_provider_finder() -> None:
         sys.meta_path.insert(0, _ImednetAirflowProviderFinder())
 
 
+def _sync_airflow_provider_aliases() -> None:
+    """Keep ``airflow.providers.imednet`` aliases bound to active target modules."""
+    _ensure_airflow_provider_finder()
+    for alias_name in list(sys.modules):
+        if alias_name != _ALIAS_PREFIX and not alias_name.startswith(f"{_ALIAS_PREFIX}."):
+            continue
+        target_name = alias_name.replace(_ALIAS_PREFIX, _TARGET_PREFIX, 1)
+        target_mod = sys.modules.get(target_name)
+        parent_name, _, attr = alias_name.rpartition(".")
+        parent_mod = sys.modules.get(parent_name) if parent_name else None
+        if target_mod is None:
+            old_mod = sys.modules.pop(alias_name, None)
+            if parent_mod is not None and attr and getattr(parent_mod, attr, None) is old_mod:
+                with suppress(AttributeError):
+                    delattr(parent_mod, attr)
+        else:
+            sys.modules[alias_name] = target_mod
+            if parent_mod is not None and attr:
+                with suppress(AttributeError):
+                    setattr(parent_mod, attr, target_mod)
+
+
 def get_provider_info() -> dict[str, Any]:
     """Return Apache Airflow provider metadata for discovery."""
-    _ensure_airflow_provider_finder()
+    _sync_airflow_provider_aliases()
     hook_name = "iMednet"
     conn_type = "imednet"
     return {
@@ -133,6 +156,8 @@ try:  # pragma: no cover - optional Airflow dependencies may be missing
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - sensor requires Airflow extras
     ImednetJobSensor = None
     sensors = None  # type: ignore
+
+_sync_airflow_provider_aliases()
 
 __all__ = [
     "ImednetExportOperator",

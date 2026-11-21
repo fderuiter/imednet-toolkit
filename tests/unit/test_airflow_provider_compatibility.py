@@ -318,3 +318,25 @@ def test_real_airflow_providers_manager_and_task_runtime_discover_imednet(real_a
     assert "imednet" in runtime_hooks
     assert runtime_hooks["imednet"] is not None
     assert runtime_hooks["imednet"].connection_type == "imednet"
+
+
+def test_real_airflow_provider_alias_resyncs_after_target_reload(real_airflow):
+    """Verify airflow.providers.imednet aliases stay synchronized when target modules reload."""
+    import importlib
+
+    from airflow.providers.imednet.hooks import ImednetHook as InitialAliasedHook
+
+    assert InitialAliasedHook is real_airflow["ImednetHook"]
+
+    for mod in list(sys.modules):
+        if mod.startswith("apache_airflow_providers_imednet"):
+            sys.modules.pop(mod, None)
+
+    reloaded_pkg = importlib.import_module("apache_airflow_providers_imednet")
+    reloaded_pkg.get_provider_info()
+    from airflow.providers.imednet.hooks import ImednetHook as ReloadedAliasedHook
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook as ReloadedTargetHook
+
+    assert ReloadedAliasedHook is ReloadedTargetHook
+    assert ReloadedAliasedHook is not InitialAliasedHook
