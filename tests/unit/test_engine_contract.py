@@ -494,12 +494,12 @@ def test_model_engine_tracer_none_and_unknown_or_any_fields(monkeypatch):
 
 
 def test_generate_stubs_matches_committed_pyi_files(tmp_path):
-    """Verify ModelEngine.generate_stubs reproduces all 13 committed .pyi stubs byte-for-byte."""
+    """Verify ModelEngine.generate_stubs reproduces all 17 committed .pyi stubs byte-for-byte."""
     import shutil
 
     models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
     committed_stubs = sorted(models_dir.glob("*.pyi"))
-    assert len(committed_stubs) == 13
+    assert len(committed_stubs) == 17
 
     for py_file in sorted(models_dir.glob("*.py")):
         shutil.copy2(py_file, tmp_path / py_file.name)
@@ -754,12 +754,12 @@ def test_dynamic_models_preserve_runtime_module_doc_all_and_field_descriptions()
 
 
 def test_generated_stubs_emit_none_defaults_and_wrap_lines_within_100_chars():
-    """Verify all 13 .pyi stubs emit = None defaults on optional fields and wrap <= 100 chars."""
+    """Verify all 17 .pyi stubs emit defaults on optional fields and wrap <= 100 chars."""
     import ast
 
     models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
     pyi_files = sorted(models_dir.glob("*.pyi"))
-    assert len(pyi_files) == 13
+    assert len(pyi_files) == 17
     assert engine._run_cli([str(models_dir), "--check"]) == 0
 
     found_classes: dict[str, ast.ClassDef] = {}
@@ -806,3 +806,282 @@ def test_generated_stubs_emit_none_defaults_and_wrap_lines_within_100_chars():
         ],
     )
     assert all(len(line) <= 100 for line in wrapped_import.splitlines())
+
+
+def test_non_aliased_model_modules_do_not_generate_stubs():
+    """Verify modules without aliased ImednetBaseModel classes skip .pyi generation."""
+    import ast
+
+    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
+    for skipped_stem in (
+        "triage",
+        "verification",
+        "standards",
+        "sdtm",
+        "__init__",
+        "engine",
+        "contract",
+    ):
+        assert not (models_dir / f"{skipped_stem}.pyi").exists(), (
+            f"Unexpected stub generated for non-aliased module {skipped_stem}.py"
+        )
+
+    base_tree = ast.parse((models_dir / "base.pyi").read_text(encoding="utf-8"))
+    base_classes = {node.name: node for node in base_tree.body if isinstance(node, ast.ClassDef)}
+    for non_aliased_cls in (
+        "ImednetBaseModel",
+        "SortField",
+        "ErrorField",
+        "Error",
+        "Metadata",
+        "ApiResponse",
+    ):
+        init_defs = [
+            stmt
+            for stmt in base_classes[non_aliased_cls].body
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == "__init__"
+        ]
+        assert init_defs == [], f"Unexpected __init__ stub on {non_aliased_cls}"
+
+
+def test_all_39_aliased_models_emit_dual_constructor_overloads_and_field_aliases():
+    """Verify all 39 aliased models emit snake_case and camelCase __init__ overloads and Field aliases."""
+    import ast
+
+    models_dir = ROOT_DIR / "packages" / "core" / "src" / "imednet" / "models"
+    expected_aliased_by_module = {
+        "base.pyi": {"Pagination"},
+        "codings.pyi": {"Coding"},
+        "forms.pyi": {"Form"},
+        "intervals.pyi": {"FormSummary", "Interval"},
+        "jobs.pyi": {"Job", "JobStatus"},
+        "queries.pyi": {"QueryComment", "Query"},
+        "record_revisions.pyi": {"RecordRevision"},
+        "records.pyi": {
+            "Keyword",
+            "Record",
+            "RecordJobResponse",
+            "BaseRecordRequest",
+            "RegisterSubjectRequest",
+            "UpdateScheduledRecordRequest",
+            "CreateNewRecordRequest",
+        },
+        "reporting.pyi": {
+            "AdverseEvent",
+            "ProtocolDeviation",
+            "DeviceDeficiency",
+            "SubjectLevelAnalysis",
+            "AnalysisAdverseEvent",
+            "AnalysisLabResult",
+            "Demographics",
+            "VitalSigns",
+        },
+        "sites.pyi": {"Site"},
+        "studies.pyi": {"Study"},
+        "study_config.pyi": {"MappingRule", "WidgetConfig", "StudyConfiguration"},
+        "study_structure.pyi": {"FormStructure", "IntervalStructure", "StudyStructure"},
+        "subjects.pyi": {"SubjectKeyword", "Subject"},
+        "users.pyi": {"Role", "User"},
+        "variables.pyi": {"Variable"},
+        "visits.pyi": {"Visit"},
+    }
+    assert sum(len(v) for v in expected_aliased_by_module.values()) == 39
+
+    class_nodes: dict[str, ast.ClassDef] = {}
+    for pyi_name, expected_classes in expected_aliased_by_module.items():
+        tree = ast.parse((models_dir / pyi_name).read_text(encoding="utf-8"))
+        mod_classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+        assert expected_classes.issubset(mod_classes.keys()), (
+            f"Missing expected classes in {pyi_name}: {expected_classes - mod_classes.keys()}"
+        )
+        for cls_name in expected_classes:
+            cls_node = mod_classes[cls_name]
+            class_nodes[cls_name] = cls_node
+            init_defs = [
+                stmt
+                for stmt in cls_node.body
+                if isinstance(stmt, ast.FunctionDef) and stmt.name == "__init__"
+            ]
+            assert len(init_defs) == 2, (
+                f"{pyi_name}:{cls_name} expected 2 @overload __init__ defs, got {len(init_defs)}"
+            )
+            for fn in init_defs:
+                assert any(
+                    isinstance(d, ast.Name) and d.id == "overload" for d in fn.decorator_list
+                ), f"{cls_name}.__init__ missing @overload"
+                assert [a.arg for a in fn.args.args] == ["self"]
+                assert len(fn.args.kwonlyargs) >= 1
+
+            snake_kw = {a.arg for a in init_defs[0].args.kwonlyargs}
+            camel_kw = {a.arg for a in init_defs[1].args.kwonlyargs}
+            assert snake_kw != camel_kw, (
+                f"{cls_name} snake_case and camelCase overloads are identical"
+            )
+
+    # Dynamic contract models preserve Field(..., alias="...") declarations
+    studies_raw = (models_dir / "studies.pyi").read_text(encoding="utf-8")
+    assert 'alias="studyKey"' in studies_raw
+    assert 'alias="sponsorKey"' in studies_raw
+    study_fields = {
+        stmt.target.id: ast.unparse(stmt.value)
+        for stmt in class_nodes["Study"].body
+        if isinstance(stmt, ast.AnnAssign)
+        and isinstance(stmt.target, ast.Name)
+        and stmt.value is not None
+    }
+    assert "alias='studyKey'" in study_fields["study_key"]
+    assert "alias='sponsorKey'" in study_fields["sponsor_key"]
+
+    # Subclass overloads include inherited parent fields
+    for req_cls_name, own_snake, own_camel in (
+        ("RegisterSubjectRequest", "site_name", "siteName"),
+        ("UpdateScheduledRecordRequest", "interval_name", "intervalName"),
+        ("CreateNewRecordRequest", "subject_key", "subjectKey"),
+    ):
+        inits = [
+            stmt
+            for stmt in class_nodes[req_cls_name].body
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == "__init__"
+        ]
+        assert {"form_key", "data", own_snake}.issubset({a.arg for a in inits[0].args.kwonlyargs})
+        assert {"formKey", "data", own_camel}.issubset({a.arg for a in inits[1].args.kwonlyargs})
+
+    # JobStatus accepts normalized record count kwargs while keeping int properties
+    job_status_inits = [
+        stmt
+        for stmt in class_nodes["JobStatus"].body
+        if isinstance(stmt, ast.FunctionDef) and stmt.name == "__init__"
+    ]
+    js_snake_kw = {a.arg for a in job_status_inits[0].args.kwonlyargs}
+    js_camel_kw = {a.arg for a in job_status_inits[1].args.kwonlyargs}
+    assert {
+        "batch_id",
+        "job_id",
+        "record_total_count",
+        "record_success_count",
+        "record_failure_count",
+        "total_records",
+        "successful_records",
+        "failed_records",
+    }.issubset(js_snake_kw)
+    assert {
+        "batchId",
+        "jobId",
+        "totalRecords",
+        "successfulRecords",
+        "failedRecords",
+    }.issubset(js_camel_kw)
+
+    job_status_props = {
+        stmt.name: ast.unparse(stmt.returns)
+        for stmt in class_nodes["JobStatus"].body
+        if isinstance(stmt, ast.FunctionDef)
+        and stmt.returns is not None
+        and any(isinstance(d, ast.Name) and d.id == "property" for d in stmt.decorator_list)
+    }
+    assert job_status_props["total_records"] == "int"
+    assert job_status_props["successful_records"] == "int"
+    assert job_status_props["failed_records"] == "int"
+
+
+def test_stub_formatting_helpers_cover_wrapping_and_defaults():
+    """Verify dynamic field wrapping, overload wrapping, and default formatting helpers."""
+    from pydantic import Field
+
+    from imednet.models.queries import QueryStatus
+
+    assert engine._format_runtime_default(None) == "None"
+    assert engine._format_runtime_default(True) == "True"
+    assert engine._format_runtime_default(12) == "12"
+    assert engine._format_runtime_default("general") == '"general"'
+    assert engine._format_runtime_default(QueryStatus.OPEN) == "QueryStatus.OPEN"
+    assert engine._format_runtime_default(object()) == "..."
+
+    medium_overload = engine._format_overload_init(
+        ["first_medium_param: str = ''", "second_medium_param: int = 0"]
+    )
+    assert all(len(line) <= 100 for line in medium_overload)
+    empty_overload = engine._format_overload_init([])
+    assert empty_overload == ["    @overload", "    def __init__(self) -> None: ..."]
+
+    long_finfo = Field(
+        default=None,
+        alias="extremelyLongDynamicAttributeAliasExceedingSingleLineThreshold",
+    )
+    wrapped_dyn = engine._wrap_dynamic_field_stub(
+        "    ",
+        "extremely_long_dynamic_attribute_name_exceeding_threshold",
+        "dict[str, list[str]] | int | None",
+        long_finfo,
+    )
+    assert len(wrapped_dyn) > 1
+    assert all(len(line) <= 100 for line in wrapped_dyn)
+
+    medium_finfo = Field(default=None, alias="mediumAttributeAliasName")
+    medium_dyn = engine._wrap_dynamic_field_stub(
+        "    ",
+        "medium_attribute_field_name_for_two_line_wrap",
+        "str | int | None",
+        medium_finfo,
+    )
+    assert len(medium_dyn) == 3
+    assert all(len(line) <= 100 for line in medium_dyn)
+
+    unaliased_finfo = Field(default=None)
+    unaliased_dyn = engine._wrap_dynamic_field_stub(
+        "    ", "plain_opt", "int | None", unaliased_finfo
+    )
+    assert unaliased_dyn == ["    plain_opt: int | None = None"]
+
+
+def test_mypy_strict_accepts_aliased_models_and_rejects_missing_required_fields(tmp_path):
+    """Verify mypy --strict with plugins = [] passes valid calls and rejects missing required args."""
+    from mypy import api as mypy_api
+
+    pyproject_path = str(ROOT_DIR / "pyproject.toml")
+    positive_targets = [
+        str(ROOT_DIR / "tests" / "unit" / "reporting" / "test_study_config.py"),
+        str(ROOT_DIR / "packages" / "core" / "src" / "imednet" / "integrations" / "enrichment.py"),
+    ]
+    stdout, stderr, exit_code = mypy_api.run(
+        ["--config-file", pyproject_path, "--strict", *positive_targets]
+    )
+    assert exit_code == 0, f"mypy --strict failed on positive targets:\n{stdout}\n{stderr}"
+
+    negative_probe = tmp_path / "negative_missing_required.py"
+    negative_probe.write_text(
+        """from imednet.models.reporting import (
+    AdverseEvent,
+    Demographics,
+    DeviceDeficiency,
+    ProtocolDeviation,
+    SubjectLevelAnalysis,
+    VitalSigns,
+)
+from imednet.models.study_config import MappingRule, StudyConfiguration, WidgetConfig
+from imednet.models.study_structure import FormStructure, IntervalStructure, StudyStructure
+
+StudyConfiguration()
+MappingRule(domain="AE")
+WidgetConfig(widget_id="w1")
+StudyStructure()
+FormStructure(form_id=1)
+IntervalStructure(interval_id=1)
+AdverseEvent(subject_key="S1")
+ProtocolDeviation(subject_key="S1")
+DeviceDeficiency(subject_key="S1")
+SubjectLevelAnalysis()
+Demographics(subject_key="S1")
+VitalSigns(subject_key="S1")
+""",
+        encoding="utf-8",
+    )
+    neg_out, neg_err, neg_code = mypy_api.run(
+        ["--config-file", pyproject_path, "--strict", str(negative_probe)]
+    )
+    assert neg_code != 0, f"Expected mypy --strict failure on missing required fields:\n{neg_out}"
+    call_overload_lines = [line for line in neg_out.splitlines() if "[call-overload]" in line]
+    assert len(call_overload_lines) == 12, (
+        f"Expected 12 [call-overload] errors (one per invalid call), got {len(call_overload_lines)}:\n"
+        f"{neg_out}\n{neg_err}"
+    )
