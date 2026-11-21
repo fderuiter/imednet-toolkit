@@ -14,13 +14,16 @@ from ...sdk import ImednetSDK
 from ...utils.pandas import import_records_csv
 from ...utils.tabular import ensure_no_masked_sentinel
 from ..decorators import validate_cli_path_segment, with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status, print_error
+from ..utils import display_list, fetching_status, print_error, simulation_mode_context
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
+    add_simulation_arg,
+    add_study_key_args,
     collect_list_items_with_remainder,
     prepare_list_query,
     resolve_output_format,
+    resolve_study_key,
 )
 from ..utils.export import export_list_to_file
 from ..utils.write_helpers import (
@@ -122,9 +125,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     # 1. records list
     list_parser = sub.add_parser("list", help="List records for a study.")
-    list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(list_parser)
     list_parser.add_argument(
-        "-o", "--output", help="Save records to the given format (json or csv)"
+        "-o",
+        "--output",
+        help="Deprecated: save records to a file (json or csv); prefer --format json or 'imednet export'.",
     )
     add_list_query_args(
         list_parser,
@@ -132,6 +137,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         include_record_data_filter=True,
     )
     add_output_format(list_parser)
+    add_simulation_arg(list_parser)
 
     def _validate_records_output(output: str | None, output_format: str) -> None:
         if output and output_format == "json":
@@ -140,6 +146,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if output and output.lower() not in {"json", "csv"}:
             print_error("Invalid output format. Use 'json' or 'csv'.")
             sys.exit(1)
+        if output:
+            print_error(
+                "Warning: '-o/--output' on 'records list' is deprecated; use "
+                "'--format json' for stdout or 'imednet export' for file exports."
+            )
 
     @with_sdk
     def list_records(
@@ -203,7 +214,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             )
 
     def _dispatch_list_records(args: argparse.Namespace) -> None:
-        validate_cli_path_segment(args.study_key, name="study_key")
+        study_key = resolve_study_key(list_parser, args, required=True)
+        assert study_key is not None
+        validate_cli_path_segment(study_key, name="study_key")
         no_interactive = getattr(args, "no_interactive", False)
         resolved_format = resolve_output_format(args.output_format)
         _validate_records_output(args.output, resolved_format)
@@ -220,18 +233,19 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             allowed_attributes=RecordsEndpoint.FILTER_ATTRIBUTES,
             disallow_study_key=True,
         )
-        list_records(
-            study_key=args.study_key,
-            output=args.output,
-            output_format=resolved_format,
-            record_filter=args.record_filter,
-            record_data_filter=args.record_data_filter,
-            sort=args.sort,
-            limit=args.limit,
-            fetch_all=args.fetch_all,
-            no_interactive=no_interactive,
-            _prepared_query=prepared,
-        )
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            list_records(
+                study_key=study_key,
+                output=args.output,
+                output_format=resolved_format,
+                record_filter=args.record_filter,
+                record_data_filter=args.record_data_filter,
+                sort=args.sort,
+                limit=args.limit,
+                fetch_all=args.fetch_all,
+                no_interactive=no_interactive,
+                _prepared_query=prepared,
+            )
 
     list_parser.set_defaults(func=_dispatch_list_records)
 
@@ -240,7 +254,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "create",
         help="Create or update one or more records in a study.",
     )
-    create_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(create_parser)
     create_parser.add_argument(
         "-f",
         "--file",
@@ -325,7 +339,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
     def _dispatch_create_records(args: argparse.Namespace) -> None:
-        validate_cli_path_segment(args.study_key, name="study_key")
+        study_key = resolve_study_key(create_parser, args, required=True)
+        assert study_key is not None
+        validate_cli_path_segment(study_key, name="study_key")
         validate_write_numeric_flags(
             chunk_size=args.chunk_size,
             timeout=args.timeout,
@@ -341,7 +357,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 "Error: Provide --file, --json, or at least --form-key / --form-id to create records."
             )
             sys.exit(1)
-        create_records_cmd(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            create_records_cmd(args)
 
     create_parser.set_defaults(func=_dispatch_create_records)
 
@@ -350,7 +367,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "import",
         help="Import study records from a CSV or JSON file.",
     )
-    import_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(import_parser)
     import_parser.add_argument("file", help="Path to CSV or JSON file to import.")
     add_write_common_args(import_parser)
 
@@ -415,7 +432,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
     def _dispatch_import_records(args: argparse.Namespace) -> None:
-        validate_cli_path_segment(args.study_key, name="study_key")
+        study_key = resolve_study_key(import_parser, args, required=True)
+        assert study_key is not None
+        validate_cli_path_segment(study_key, name="study_key")
         validate_write_numeric_flags(
             chunk_size=args.chunk_size,
             timeout=args.timeout,
@@ -424,6 +443,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if not Path(args.file).exists():
             print_error(f"Error: Input file not found: '{args.file}'")
             sys.exit(1)
-        import_records_cmd(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            import_records_cmd(args)
 
     import_parser.set_defaults(func=_dispatch_import_records)

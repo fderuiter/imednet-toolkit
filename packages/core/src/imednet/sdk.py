@@ -8,10 +8,11 @@ This module provides the ImednetSDK class which:
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.metadata import EntryPoint, entry_points
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Never, Self, cast
 
 from .auth import AuthStrategy, CredentialSource
 from .config import Config, load_config, merge_config_overrides
@@ -27,10 +28,12 @@ from .core.retry import DefaultRetryPolicy, RetryConfig, RetryPolicy
 from .endpoints.registry import ASYNC_ENDPOINT_REGISTRY, ENDPOINT_REGISTRY
 from .errors import PluginLoadError
 from .plugins import (
+    AsyncSinksNamespaceProtocol,
+    AsyncWorkflowsNamespaceProtocol,
     PluginProtocol,
     SinksNamespaceProtocol,
     SinksPluginProtocol,
-    WorkflowsNamespaceProtocol,
+    SyncWorkflowsNamespaceProtocol,
 )
 from .sdk_convenience import AsyncSDKConvenienceMixin, SyncSDKConvenienceMixin
 
@@ -56,6 +59,31 @@ class WorkflowPluginProtocol(PluginProtocol):
     """Alias kept for backwards compatibility; use :class:`~imednet.plugins.PluginProtocol` instead."""
 
 
+_SYNC_ONLY_WORKFLOW_NAMES: frozenset[str] = frozenset(
+    {
+        "data_extraction",
+        "duckdb_centralizer",
+        "query_management",
+        "record_mapper",
+        "subject_data",
+        "uat",
+    }
+)
+
+
+def _factory_supports_async(target: Any) -> bool:
+    """Return True if a workflow class, factory, or instance supports AsyncImednetSDK."""
+    explicit = getattr(target, "supports_async", None)
+    if isinstance(explicit, bool):
+        return explicit
+    cls = target if inspect.isclass(target) else type(target)
+    return any(
+        attr.startswith("async_") or inspect.iscoroutinefunction(val)
+        for attr, val in inspect.getmembers(cls)
+        if not attr.startswith("_")
+    )
+
+
 class WorkflowRegistry:
     """Dynamic registry for resolving and instantiating iMednet workflows.
 
@@ -75,6 +103,22 @@ class WorkflowRegistry:
                 )
             self._entry_points[ep.name] = ep
         self._loaded_workflows: dict[str, Any] = {}
+
+    def _is_async_sdk(self) -> bool:
+        """Return True when the bound SDK is asynchronous."""
+        if isinstance(self._sdk, AsyncImednetSDK):
+            return True
+        return hasattr(self._sdk, "async_create_record") and not callable(
+            getattr(self._sdk, "create_record", None)
+        )
+
+    def _raise_sync_only_error(self, name: str) -> Never:
+        """Raise TypeError with actionable guidance when a sync-only workflow is requested on AsyncImednetSDK."""
+        raise TypeError(
+            f"Workflow '{name}' is synchronous-only and cannot be used with AsyncImednetSDK. "
+            "Use synchronous ImednetSDK(...) for this workflow, or use an async-capable "
+            "workflow ('record_update', 'register_subjects', or 'uat_inspector')."
+        )
 
     def __getattr__(self, name: str) -> Any:
         """Dynamically resolve and instantiate a workflow by name."""
@@ -114,14 +158,28 @@ class WorkflowRegistry:
                 f"that accepts an SDK instance; got {type(workflow_factory).__name__}."
             )
 
+        is_async = self._is_async_sdk()
+        if is_async:
+            if (
+                name in _SYNC_ONLY_WORKFLOW_NAMES
+                or getattr(workflow_factory, "supports_async", None) is False
+            ):
+                self._raise_sync_only_error(name)
+            if inspect.isclass(workflow_factory) and not _factory_supports_async(workflow_factory):
+                self._raise_sync_only_error(name)
+
         try:
             workflow_instance = workflow_factory(self._sdk)
-            self._loaded_workflows[name] = workflow_instance
-            return workflow_instance
         except TypeError as error:
             raise PluginLoadError(
                 "Failed to instantiate workflows from the discovered plugin entry point."
             ) from error
+
+        if is_async and not _factory_supports_async(workflow_instance):
+            self._raise_sync_only_error(name)
+
+        self._loaded_workflows[name] = workflow_instance
+        return workflow_instance
 
 
 class _BaseSDK:
@@ -240,11 +298,11 @@ class _BaseSDK:
             )
         return plugin_entry_points[0]
 
-    def _init_workflows(self) -> Any:
+    def _init_workflows(self) -> WorkflowRegistry:
         """Initialize and return the dynamic workflow registry."""
         return WorkflowRegistry(self)
 
-    def _init_sinks(self) -> SinksNamespaceProtocol | None:
+    def _init_sinks(self) -> SinksNamespaceProtocol | AsyncSinksNamespaceProtocol | None:
         """Instantiate sinks namespace when optional sinks plugin is available."""
         sinks_entry_point = self._get_plugin_entry_point("sinks")
         if sinks_entry_point is None:
@@ -273,7 +331,7 @@ class _BaseSDK:
             ) from error
 
     @contextmanager
-    def study_context(self, study_key: str) -> Iterator[Any]:
+    def study_context(self, study_key: str) -> Iterator[Self]:
         """Set a temporary default study key for the current thread/task context."""
         from .core.context import reset_base_url_context, set_base_url_context
 
@@ -312,7 +370,7 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
     users: UsersEndpoint
     variables: VariablesEndpoint
     visits: VisitsEndpoint
-    workflows: WorkflowsNamespaceProtocol | None
+    workflows: SyncWorkflowsNamespaceProtocol
     sinks: SinksNamespaceProtocol | None
     config: Config
 
@@ -390,13 +448,13 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
             )
 
         self._init_endpoints()
-        self.workflows = self._init_workflows()
-        self.sinks = self._init_sinks()
+        self.workflows = cast(SyncWorkflowsNamespaceProtocol, self._init_workflows())
+        self.sinks = cast("SinksNamespaceProtocol | None", self._init_sinks())
 
     @property
-    def auth(self) -> Any:
+    def auth(self) -> AuthStrategy | None:
         """Return the authentication provider used by the client."""
-        return getattr(self._client, "auth", None)
+        return cast("AuthStrategy | None", getattr(self._client, "auth", None))
 
     @property
     def retry_policy(self) -> RetryPolicy:
@@ -479,8 +537,8 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
     users: AsyncUsersEndpoint
     variables: AsyncVariablesEndpoint
     visits: AsyncVisitsEndpoint
-    workflows: WorkflowsNamespaceProtocol | None
-    sinks: SinksNamespaceProtocol | None
+    workflows: AsyncWorkflowsNamespaceProtocol
+    sinks: AsyncSinksNamespaceProtocol | None
 
     def __init__(
         self,
@@ -537,13 +595,13 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
             )
 
         self._init_endpoints()
-        self.workflows = self._init_workflows()
-        self.sinks = self._init_sinks()
+        self.workflows = cast(AsyncWorkflowsNamespaceProtocol, self._init_workflows())
+        self.sinks = cast("AsyncSinksNamespaceProtocol | None", self._init_sinks())
 
     @property
-    def auth(self) -> Any:
+    def auth(self) -> AuthStrategy | None:
         """Return the authentication provider used by the async client."""
-        return getattr(self._async_client, "auth", None)
+        return cast("AuthStrategy | None", getattr(self._async_client, "auth", None))
 
     @property
     def retry_policy(self) -> RetryPolicy:

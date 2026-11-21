@@ -10,15 +10,19 @@ Typer/Rich would require replacing registration hooks, rechecking every command 
 adding dependencies without a concrete missing capability. The old contributor stack
 declaration did not justify that cost. Revisit only for a measured user-facing requirement.
 
-Add opt-in `--format json` to core list reads and job status/wait, using one versioned
-response envelope. Human defaults render through curses `InteractiveDataGrid` paging,
-live search and side-panel inspection on interactive TTYs, and fall back to plain
-tabular stdout when streams are non-interactive, `TERM=dumb`, or
-`IMEDNET_NON_INTERACTIVE=1` is set; existing file export flags remain. Datadict JSON
+Add opt-in `--format json` to core list reads, job status/wait, and workflow reads
+(`extract-records`, `subject-data`, `state show`), using one versioned response envelope.
+Human defaults render through curses `InteractiveDataGrid` paging, live search and
+side-panel inspection on interactive TTYs, and fall back to plain tabular stdout when
+streams are non-interactive, `TERM=dumb`, or `IMEDNET_NON_INTERACTIVE=1` is set; existing
+file export flags remain. Study-scoped commands across core, workflows, and TUI share
+`imednet.spi.cli` hybrid `study_key` parsing (accepting positional `STUDY` or
+`-s`/`--study-key` and rejecting conflicting values with exit code `2`) and offline
+`--simulation` mode (`SimulationTransport` via `IMEDNET_SIMULATION_MODE=1`). Datadict JSON
 uses its own versioned Data Dictionary/schema/diff contracts and is deliberately not
-wrapped in the list envelope. Workflow and TUI plugins own their own documented outputs
-and interactive sessions; this change does not claim a global machine-output mode for
-arbitrary third-party commands.
+wrapped in the list envelope. TUI and non-read workflow commands own their own documented
+outputs and interactive sessions; this change does not claim a global machine-output mode
+for arbitrary third-party commands.
 
 ## Output and exits
 
@@ -32,9 +36,10 @@ for bounded read results, not a streaming/full-study export replacement.
 
 Do not emit a successful partial list: consume the iterator before output, propagate
 fetch failures, leave stdout empty, and report a redacted diagnostic on stderr. Users
-requiring resumable bulk export should use the export APIs. `--output json/csv` still
-writes files and cannot be combined with `--format json` on records. No implicit file
-write occurs in machine mode.
+requiring resumable bulk export should use the export APIs. Legacy `records list -o/--output`
+still writes `records.json` / `records.csv` with a `stderr` deprecation warning (prefer
+`--format json` or `imednet export`), and cannot be combined with `--format json`. No
+implicit file write occurs in machine mode.
 
 Exit 0 means success/empty/help; 1 means command/auth/permission/API/serialization
 failure; 2 means argparse usage failure; 130 means an interrupted SDK command. Existing
