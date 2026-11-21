@@ -503,8 +503,5 @@ class ImednetHook(BaseHook):
 
 if "airflow.providers.imednet.hooks" in sys.modules:
     sys.modules["airflow.providers.imednet.hooks"] = sys.modules[__name__]
-    _alias_parent = sys.modules.get("airflow.providers.imednet")
-    if _alias_parent is not None:
-        _alias_parent.hooks = sys.modules[__name__]  # type: ignore[attr-defined]
 
 __all__ = ["ImednetHook"]
