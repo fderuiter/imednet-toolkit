@@ -408,7 +408,9 @@ def test_concurrent_registration_polling_skips_empty_batch_ids(mock_sdk):
 
     mock_sdk.get_job.return_value = JobStatus(batch_id="valid_job", state="COMPLETED")
 
-    workflow._await_registration_jobs("study1", [batch_none, batch_empty, batch_valid])
+    workflow._poll_and_validate_registration_batches(
+        "study1", [batch_none, batch_empty, batch_valid]
+    )
 
     mock_sdk.get_job.assert_called_once_with("study1", "valid_job")
     assert batch_valid.job.state == "COMPLETED"
@@ -512,7 +514,7 @@ def test_submission_poller_uses_job_transition_to_and_job_state(mock_sdk):
     with patch.object(
         Job, "transition_to", autospec=True, wraps=Job.transition_to
     ) as mock_transition:
-        workflow._await_registration_jobs("study1", [batch])
+        workflow._poll_and_validate_registration_batches("study1", [batch])
         mock_transition.assert_called_once_with(real_job, JobState.COMPLETED)
 
     assert batch.job.state == JobState.COMPLETED
@@ -534,7 +536,7 @@ def test_submission_poller_rejects_illegal_job_transition(mock_sdk):
     mock_sdk.get_job.return_value = JobStatus(batch_id="job_completed", state="FAILED")
 
     with pytest.raises(InvalidJobTransitionError):
-        workflow._await_registration_jobs("study1", [batch])
+        workflow._poll_and_validate_registration_batches("study1", [batch])
 
 
 def test_omitted_subject_keys_fails_closed_instead_of_taking_preexisting_subjects(mock_sdk):

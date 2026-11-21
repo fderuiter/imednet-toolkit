@@ -182,23 +182,6 @@ def _extract_batch_result_entries(results_payload: Any) -> list[Any]:
     return []
 
 
-def _extract_subject_keys_from_job_results(results_payload: Any) -> list[str]:
-    """Extract server-assigned subject keys from a polled JobStatus.results payload."""
-    keys: list[str] = []
-    seen: set[str] = set()
-
-    for entry in _extract_batch_result_entries(results_payload):
-        cand = (
-            _clean_str(entry)
-            if isinstance(entry, str)
-            else _clean_str(_get_attr_or_key(entry, "subjectKey", "subject_key"))
-        )
-        if cand and cand not in seen:
-            seen.add(cand)
-            keys.append(cand)
-    return keys
-
-
 class SubmissionPhase(StrEnum):
     """Phases of a two-phase bulk submission workflow."""
 
@@ -731,23 +714,6 @@ class BulkRecordSubmissionWorkflow:
             )
 
         return summary
-
-    def _await_registration_jobs(self, study_key: str, batches: list[BatchSubmission]) -> list[str]:
-        """Block until all Phase 1 jobs reach terminal state and return direct result Subject keys."""
-        summary = self._poll_and_validate_registration_batches(study_key, batches)
-        if summary is None:
-            return []
-        enrolled_keys: list[str] = []
-        seen_enrolled: set[str] = set()
-        for batch in batches:
-            batch_id = batch.job.batch_id
-            if batch_id and batch_id in summary.results:
-                status = summary.results[batch_id]
-                for key in _extract_subject_keys_from_job_results(getattr(status, "results", None)):
-                    if key not in seen_enrolled:
-                        seen_enrolled.add(key)
-                        enrolled_keys.append(key)
-        return enrolled_keys
 
     @staticmethod
     def _extract_snapshot_from_subjects(subjects: Any) -> _PreExistingSubjectsSnapshot:
