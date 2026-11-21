@@ -4,70 +4,16 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
+from tests.utils.airflow_mocks import setup_dummy_airflow
 
 
 # Setup dummy airflow modules to prevent import errors if airflow is not installed
 def _setup_airflow(monkeypatch):
-    """Helper function to  setup airflow."""
-    airflow_mod = ModuleType("airflow")
-    airflow_mod.__path__ = []
-    hooks_pkg = ModuleType("airflow.hooks")
-    hooks_pkg.__path__ = []
-    hooks_mod = ModuleType("airflow.sdk.bases.hook")
-    sdk_mod = ModuleType("airflow.sdk")
-    sdk_mod.__path__ = []
-    sdk_bases = ModuleType("airflow.sdk.bases")
-    sdk_bases.__path__ = []
-    sdk_defs = ModuleType("airflow.sdk.definitions")
-    sdk_defs.__path__ = []
-    sdk_ctx = ModuleType("airflow.sdk.definitions.context")
-    sdk_dag = ModuleType("airflow.sdk.definitions.dag")
-    models_mod = ModuleType("airflow.models")
-
-    class DummyBaseHook:
-        """Test suite for DummyBaseHook."""
-
-        @classmethod
-        def get_connection(cls, conn_id):
-            """Helper function to get connection."""
-            raise NotImplementedError
-
-    class DummyBaseOperator:
-        """Test suite for DummyBaseOperator."""
-
-        template_fields = ()
-
-        def __init__(self, **kwargs):
-            """Initialize the test object."""
-
-    hooks_mod.BaseHook = DummyBaseHook
-    models_mod.BaseOperator = DummyBaseOperator
-    models_mod.DAG = DummyBaseOperator
-    sdk_dag.DAG = DummyBaseOperator
-    sdk_dag.dag = DummyBaseOperator
-
-    sdk_bases.hook = hooks_mod
-    sdk_mod.bases = sdk_bases
-    sdk_defs.context = sdk_ctx
-    sdk_defs.dag = sdk_dag
-    sdk_mod.definitions = sdk_defs
-    airflow_mod.sdk = sdk_mod
-    airflow_mod.hooks = hooks_pkg
-    airflow_mod.models = models_mod
-
-    monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
-    monkeypatch.setitem(sys.modules, "airflow.hooks", hooks_pkg)
-    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
-    monkeypatch.setitem(sys.modules, "airflow.models", models_mod)
+    """Helper function to setup airflow."""
+    setup_dummy_airflow(monkeypatch)
 
 
 EXPORT_FUNCTIONS = [

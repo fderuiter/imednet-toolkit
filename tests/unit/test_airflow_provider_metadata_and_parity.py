@@ -717,8 +717,49 @@ def test_export_operator_openlineage_facets_across_destinations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify OpenLineage input/output facets across warehouse, DuckDB, SQL, NoSQL, and files."""
+    from dataclasses import dataclass, field
+    from types import ModuleType
+
     from apache_airflow_providers_imednet.hooks import ImednetHook
-    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from apache_airflow_providers_imednet.operators.export import (
+        ImednetExportOperator,
+        _load_openlineage_types,
+    )
+
+    if _load_openlineage_types() is None:
+
+        @dataclass(frozen=True)
+        class _StubDataset:
+            namespace: str
+            name: str
+            facets: dict[str, Any] = field(default_factory=dict)
+
+        @dataclass(frozen=True)
+        class _StubOperatorLineage:
+            inputs: list[Any] = field(default_factory=list)
+            outputs: list[Any] = field(default_factory=list)
+
+        import airflow.providers as airflow_providers_pkg
+
+        ol_pkg = sys.modules.get("airflow.providers.openlineage")
+        if ol_pkg is None:
+            ol_pkg = ModuleType("airflow.providers.openlineage")
+            ol_pkg.__path__ = []
+            monkeypatch.setitem(sys.modules, "airflow.providers.openlineage", ol_pkg)
+            monkeypatch.setattr(airflow_providers_pkg, "openlineage", ol_pkg, raising=False)
+
+        extractors_mod = ModuleType("airflow.providers.openlineage.extractors")
+        extractors_mod.OperatorLineage = _StubOperatorLineage  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "airflow.providers.openlineage.extractors", extractors_mod)
+        monkeypatch.setattr(ol_pkg, "extractors", extractors_mod, raising=False)
+
+        facet_mod = ModuleType("airflow.providers.common.compat.openlineage.facet")
+        facet_mod.Dataset = _StubDataset  # type: ignore[attr-defined]
+        monkeypatch.setitem(
+            sys.modules,
+            "airflow.providers.common.compat.openlineage.facet",
+            facet_mod,
+        )
 
     monkeypatch.setattr(
         ImednetHook,
