@@ -8,7 +8,7 @@ import inspect
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 from unittest.mock import NonCallableMock
 
 from ..sdk import ImednetSDK
@@ -52,6 +52,18 @@ def _ensure_pyarrow() -> ModuleType:
             "PyArrow is required for Hive Parquet export. Install with "
             "\"pip install 'imednet[export]'\"."
         ) from error
+
+
+def _ensure_pandas() -> ModuleType:
+    """Ensure pandas is installed and return the module.
+
+    Returns:
+        ModuleType: The pandas module.
+
+    Raises:
+        ImportError: If pandas is not installed.
+    """
+    return cast(ModuleType, _require_optional_dep("pandas", "export"))
 
 
 def _cached_records_loader() -> Any:
@@ -145,7 +157,7 @@ def _prune_hive_partition_record_ids(
     """Prune superseded or voided record IDs from pre-existing Hive partition Parquet files."""
     if not files or not excluded_ids:
         return
-    pandas_module = _require_optional_dep("pandas", "export")
+    pandas_module = _ensure_pandas()
     partition_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}"
     for pf in files:
         if not pf.exists():

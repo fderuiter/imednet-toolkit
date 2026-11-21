@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import runpy
 from collections.abc import Iterator
 from pathlib import Path
@@ -30,10 +31,15 @@ BASIC_EXAMPLE_SCRIPTS = sorted(BASIC_EXAMPLES_DIR.glob("*.py"))
 
 @pytest.fixture(autouse=True)
 def _reset_simulation_state() -> Iterator[None]:
-    """Reset shared default SimulationState before and after each test."""
+    """Reset shared default SimulationState and root logger state before and after each test."""
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
     get_default_simulation_state().reset()
     yield
     get_default_simulation_state().reset()
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
 
 
 def test_basic_examples_inventory() -> None:
@@ -81,7 +87,8 @@ def test_basic_tutorial_scripts_execute_under_simulation_transport(
             f"{script_path.name} failed under SimulationTransport: {type(exc).__name__}: {exc}"
         )
 
-    assert capsys.readouterr().out.strip(), f"Expected non-empty stdout from {script_path.name}"
+    captured = capsys.readouterr()
+    assert captured.out.strip(), f"Expected non-empty stdout from {script_path.name}"
 
 
 def test_custom_retry_script_executes_under_simulation_mode(
@@ -101,7 +108,8 @@ def test_custom_retry_script_executes_under_simulation_mode(
         except (TypeError, ConfigurationError, SystemExit) as exc:
             pytest.fail(f"custom_retry.py failed offline: {type(exc).__name__}: {exc}")
 
-        assert "Request succeeded" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert "Request succeeded" in captured.out
 
 
 @pytest.mark.parametrize("scenario", SHOWCASE_EXPECTED_SDK_SCENARIOS)
