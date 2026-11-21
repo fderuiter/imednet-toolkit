@@ -6,121 +6,12 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from tests.conftest import isolate_airflow_provider_modules
+from tests.utils.airflow_mocks import setup_dummy_airflow
 
 
 def _setup_airflow(monkeypatch):
-    """Helper function to  setup airflow."""
-    isolate_airflow_provider_modules(monkeypatch)
-    airflow = ModuleType("airflow")
-    airflow.__path__ = []
-    hooks_pkg = ModuleType("airflow.hooks")
-    hooks_pkg.__path__ = []
-    hooks_base = ModuleType("airflow.sdk.bases.hook")
-    operator_base = ModuleType("airflow.sdk.bases.operator")
-    sdk_mod = ModuleType("airflow.sdk")
-    sdk_mod.__path__ = []
-    sdk_bases = ModuleType("airflow.sdk.bases")
-    sdk_bases.__path__ = []
-    sdk_defs = ModuleType("airflow.sdk.definitions")
-    sdk_defs.__path__ = []
-    sdk_ctx = ModuleType("airflow.sdk.definitions.context")
-    sdk_dag = ModuleType("airflow.sdk.definitions.dag")
-    models_mod = ModuleType("airflow.models")
-    sensors_base = ModuleType("airflow.sensors.base")
-    sensors_sdk = ModuleType("airflow.sdk.bases.sensor")
-    exc_mod = ModuleType("airflow.exceptions")
-    sdk_exc = ModuleType("airflow.sdk.exceptions")
-    s3_mod = ModuleType("airflow.providers.amazon.aws.hooks.s3")
-
-    class DummyBaseHook:
-        """Test suite for DummyBaseHook."""
-
-        @classmethod
-        def get_connection(cls, conn_id):
-            """Helper function to get connection."""
-            raise NotImplementedError
-
-    class DummyBaseOperator:
-        """Test suite for DummyBaseOperator."""
-
-        template_fields = ()
-
-        def __init__(self, *a, **kw):
-            """Initialize the test object."""
-
-    class DummySensorOperator:
-        """Test suite for DummySensorOperator."""
-
-        template_fields = ()
-
-        def __init__(self, *a, **kw):
-            """Initialize the test object."""
-
-    hooks_base.BaseHook = DummyBaseHook
-    operator_base.BaseOperator = DummyBaseOperator
-    models_mod.BaseOperator = DummyBaseOperator
-    models_mod.DAG = DummyBaseOperator
-    sensors_base.BaseSensorOperator = DummySensorOperator
-    sensors_sdk.BaseSensorOperator = DummySensorOperator
-    sdk_dag.DAG = DummyBaseOperator
-    sdk_dag.dag = DummyBaseOperator
-
-    class DummyAirflowError(Exception):
-        """Test suite for DummyAirflowError."""
-
-    exc_mod.AirflowException = DummyAirflowError
-    sdk_exc.AirflowException = DummyAirflowError
-    s3_mod.S3Hook = MagicMock
-
-    sdk_bases.hook = hooks_base
-    sdk_bases.operator = operator_base
-    sdk_bases.sensor = sensors_sdk
-    sdk_mod.bases = sdk_bases
-    sdk_mod.exceptions = sdk_exc
-    sdk_defs.context = sdk_ctx
-    sdk_defs.dag = sdk_dag
-    sdk_mod.definitions = sdk_defs
-    airflow.sdk = sdk_mod
-    airflow.hooks = hooks_pkg
-    airflow.models = models_mod
-    airflow.sensors = ModuleType("airflow.sensors")
-    airflow.sensors.__path__ = []
-    airflow.sensors.base = sensors_base
-    airflow.providers = ModuleType("airflow.providers")
-    airflow.providers.__path__ = []
-    airflow.providers.amazon = ModuleType("airflow.providers.amazon")
-    airflow.providers.amazon.__path__ = []
-    airflow.providers.amazon.aws = ModuleType("airflow.providers.amazon.aws")
-    airflow.providers.amazon.aws.__path__ = []
-    airflow.providers.amazon.aws.hooks = ModuleType("airflow.providers.amazon.aws.hooks")
-    airflow.providers.amazon.aws.hooks.__path__ = []
-    airflow.providers.amazon.aws.hooks.s3 = s3_mod
-
-    modules = {
-        "airflow": airflow,
-        "airflow.hooks": hooks_pkg,
-        "airflow.sdk": sdk_mod,
-        "airflow.sdk.bases": sdk_bases,
-        "airflow.sdk.bases.hook": hooks_base,
-        "airflow.sdk.bases.operator": operator_base,
-        "airflow.sdk.bases.sensor": sensors_sdk,
-        "airflow.sdk.definitions": sdk_defs,
-        "airflow.sdk.definitions.context": sdk_ctx,
-        "airflow.sdk.definitions.dag": sdk_dag,
-        "airflow.models": models_mod,
-        "airflow.sensors": airflow.sensors,
-        "airflow.sensors.base": sensors_base,
-        "airflow.providers": airflow.providers,
-        "airflow.providers.amazon": airflow.providers.amazon,
-        "airflow.providers.amazon.aws": airflow.providers.amazon.aws,
-        "airflow.providers.amazon.aws.hooks": airflow.providers.amazon.aws.hooks,
-        "airflow.providers.amazon.aws.hooks.s3": s3_mod,
-        "airflow.exceptions": exc_mod,
-        "airflow.sdk.exceptions": sdk_exc,
-    }
-    for name, mod in modules.items():
-        monkeypatch.setitem(sys.modules, name, mod)
+    """Helper function to setup airflow."""
+    setup_dummy_airflow(monkeypatch, include_sensors_and_aws=True)
 
 
 def _import_operators(monkeypatch):
@@ -278,12 +169,37 @@ def test_provider_info_and_hook_metadata_contract():
     info = provider_pkg.get_provider_info()
     assert info["package-name"] == "apache-airflow-providers-imednet"
     assert info["name"] == "iMednet"
-    assert info["connection-types"] == [
+    assert info["triggers"] == [
         {
-            "connection-type": "imednet",
-            "hook-class-name": "airflow.providers.imednet.hooks.ImednetHook",
+            "integration-name": "iMednet",
+            "python-modules": ["airflow.providers.imednet.triggers"],
         }
     ]
+    assert len(info["connection-types"]) == 1
+    conn_type_meta = info["connection-types"][0]
+    assert conn_type_meta["connection-type"] == "imednet"
+    assert conn_type_meta["hook-class-name"] == "airflow.providers.imednet.hooks.ImednetHook"
+    assert conn_type_meta["hook-name"] == "iMednet"
+    assert conn_type_meta["ui-field-behaviour"]["hidden-fields"] == [
+        "host",
+        "schema",
+        "port",
+        "extra",
+    ]
+    assert ImednetHook.get_ui_field_behaviour()["hidden_fields"] == [
+        "host",
+        "schema",
+        "port",
+        "extra",
+    ]
+    assert conn_type_meta["conn-fields"]["oidc_token"]["schema"]["format"] == "password"
+    assert set(conn_type_meta["conn-fields"]) == {
+        "base_url",
+        "oidc_token",
+        "timeout",
+        "strict_mode",
+        "simulation_mode",
+    }
 
     eps = entry_points(group="apache_airflow_provider")
     matched = [ep for ep in eps if ep.value == "apache_airflow_providers_imednet:get_provider_info"]
@@ -294,7 +210,18 @@ def test_provider_info_and_hook_metadata_contract():
     requires = dist.requires or []
     assert any(req.startswith("imednet-workflows") for req in requires)
     extras = set(dist.metadata.get_all("Provides-Extra") or [])
-    assert {"duckdb", "export", "mongodb", "neo4j", "snowflake"}.issubset(extras)
+    assert {
+        "all",
+        "amazon",
+        "duckdb",
+        "export",
+        "mongodb",
+        "neo4j",
+        "openlineage",
+        "sinks",
+        "snowflake",
+        "workflows",
+    }.issubset(extras)
 
 
 def test_provider_alias_sync_and_finder_deduplication(monkeypatch):

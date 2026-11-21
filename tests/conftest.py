@@ -357,17 +357,21 @@ _AIRFLOW_PROVIDER_MODULES = (
     "apache_airflow_providers_imednet",
     "apache_airflow_providers_imednet._airflow_compat",
     "apache_airflow_providers_imednet.export",
+    "apache_airflow_providers_imednet.get_provider_info",
     "apache_airflow_providers_imednet.hooks",
     "apache_airflow_providers_imednet.operators",
     "apache_airflow_providers_imednet.operators.export",
     "apache_airflow_providers_imednet.sensors",
+    "apache_airflow_providers_imednet.triggers",
     "airflow.providers.imednet",
     "airflow.providers.imednet._airflow_compat",
     "airflow.providers.imednet.export",
+    "airflow.providers.imednet.get_provider_info",
     "airflow.providers.imednet.hooks",
     "airflow.providers.imednet.operators",
     "airflow.providers.imednet.operators.export",
     "airflow.providers.imednet.sensors",
+    "airflow.providers.imednet.triggers",
 )
 
 

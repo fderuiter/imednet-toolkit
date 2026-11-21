@@ -106,58 +106,10 @@ def _ensure_airflow_provider_finder() -> None:
     _sync_airflow_provider_aliases()
 
 
-def get_provider_info() -> dict[str, Any]:
-    """Return Apache Airflow provider metadata for discovery."""
-    _ensure_airflow_provider_finder()
-    hook_name = "iMednet"
-    conn_type = "imednet"
-    return {
-        "package-name": "apache-airflow-providers-imednet",
-        "name": hook_name,
-        "description": "Apache Airflow provider for iMednet EDC clinical data workflows.",
-        "integrations": [
-            {
-                "integration-name": hook_name,
-                "external-doc-url": "https://fderuiter.github.io/imednet-toolkit/",
-                "tags": ["clinical", "edc", "imednet"],
-            }
-        ],
-        "hooks": [
-            {
-                "integration-name": hook_name,
-                "python-modules": [
-                    "airflow.providers.imednet.hooks",
-                ],
-            }
-        ],
-        "operators": [
-            {
-                "integration-name": hook_name,
-                "python-modules": [
-                    "apache_airflow_providers_imednet.operators.export",
-                ],
-            }
-        ],
-        "sensors": [
-            {
-                "integration-name": hook_name,
-                "python-modules": [
-                    "apache_airflow_providers_imednet.sensors",
-                ],
-            }
-        ],
-        "connection-types": [
-            {
-                "connection-type": conn_type,
-                "hook-class-name": "airflow.providers.imednet.hooks.ImednetHook",
-            }
-        ],
-    }
-
-
 _ensure_airflow_provider_finder()
 
 from . import export
+from .get_provider_info import get_provider_info
 
 try:  # pragma: no cover - optional Airflow dependencies may be missing
     from .hooks import ImednetHook
@@ -176,12 +128,20 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover - sensor requires
     ImednetJobSensor = None
     sensors = None  # type: ignore
 
+try:  # pragma: no cover - optional Airflow dependencies may be missing
+    triggers = import_module("apache_airflow_providers_imednet.triggers")
+    ImednetJobTrigger = triggers.ImednetJobTrigger
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - trigger requires Airflow extras
+    ImednetJobTrigger = None
+    triggers = None  # type: ignore
+
 _sync_airflow_provider_aliases()
 
 __all__ = [
     "ImednetExportOperator",
     "ImednetHook",
     "ImednetJobSensor",
+    "ImednetJobTrigger",
     "export",
     "get_provider_info",
 ]
