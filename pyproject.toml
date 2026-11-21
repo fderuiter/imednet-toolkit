@@ -109,6 +109,8 @@ module = [
     "pythonjsonlogger.*",
     "opentelemetry",
     "opentelemetry.*",
+    "openlineage",
+    "openlineage.*",
     "airflow",
     "airflow.*",
     "typer",
