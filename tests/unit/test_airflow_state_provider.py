@@ -545,3 +545,35 @@ def test_imednet_export_operator_incremental_idempotent_in_real_airflow_dag(
     assert provider.get_last_timestamp("STUDY_EXPORT", "json_export_records") == datetime(
         2026, 9, 10, 15, 0, 0, tzinfo=timezone.utc
     )
+
+
+def test_airflow_state_provider_redacts_sensitive_error_and_metadata(
+    airflow_runtime_env: Path,
+) -> None:
+    """AirflowStateProvider redacts URI credentials and secret tokens before writing Variables."""
+    _ = airflow_runtime_env
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    provider = AirflowStateProvider()
+    provider.set_last_timestamp(
+        study_key="STUDY_REDACT",
+        stream_name="records",
+        timestamp=datetime(2026, 9, 12, 10, 0, 0, tzinfo=timezone.utc),
+        status=StreamExecutionStatus.FAILED,
+        error_message=(
+            "Export failed for postgresql://loader:RAW_DB_PASS@db.internal:5432/edc "  # pragma: allowlist secret
+            "with api_key=RAW_API_SECRET"  # pragma: allowlist secret
+        ),
+        metadata={
+            "target": "edc",
+            "password": "RAW_META_SECRET",  # pragma: allowlist secret
+        },
+        force=True,
+    )
+
+    stream_state = provider.read_state().studies["STUDY_REDACT"].streams["records"]
+    assert stream_state.error_message is not None
+    assert "RAW_DB_PASS" not in stream_state.error_message
+    assert "RAW_API_SECRET" not in stream_state.error_message
+    assert "RAW_META_SECRET" not in json.dumps(stream_state.metadata)
+    assert stream_state.metadata["target"] == "edc"

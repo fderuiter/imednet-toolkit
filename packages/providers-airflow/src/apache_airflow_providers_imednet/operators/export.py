@@ -48,6 +48,8 @@ _TABULAR_EXPORTS = {
     "excel": export.export_to_excel,
     "json": export.export_to_json,
     "sql": export.export_to_sql,
+    "sql_by_form": export.export_to_sql_by_form,
+    "long_sql": export.export_to_long_sql,
     "duckdb": export.export_to_duckdb,
 }
 
@@ -975,18 +977,16 @@ class ImednetExportOperator(BaseOperator):
                 if dest in ("sql", "sql_by_form", "long_sql"):
                     conn_settings = self._resolve_destination_connection(dest)
                     if dest == "sql_by_form":
+                        kw_conn_str = tabular_kwargs.pop("conn_str", None)
                         conn_str_arg = (
-                            self.output_path
-                            or tabular_kwargs.pop("conn_str", None)
-                            or conn_settings.get("conn_str")
+                            self.output_path or kw_conn_str or conn_settings.get("conn_str")
                         )
                         export_callable(sdk, self.study_key, conn_str_arg, **tabular_kwargs)
                         return redact_uri(str(conn_str_arg)) if conn_str_arg is not None else None
+                    kw_table = tabular_kwargs.pop("table", None)
+                    kw_table_name = tabular_kwargs.pop("table_name", None)
                     table_arg = (
-                        self.output_path
-                        or tabular_kwargs.pop("table", None)
-                        or tabular_kwargs.pop("table_name", None)
-                        or conn_settings.get("table")
+                        self.output_path or kw_table or kw_table_name or conn_settings.get("table")
                     )
                     if "conn_str" not in tabular_kwargs and conn_settings.get("conn_str"):
                         tabular_kwargs["conn_str"] = conn_settings["conn_str"]

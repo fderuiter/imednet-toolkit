@@ -102,7 +102,8 @@ For task-mapping discovery, health checks, and async trigger execution,
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
 - ``resolve_destination_connection()`` resolves runtime destination connection
-  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb``, and ``sql`` targets.
+  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb``, and ``sql``
+  (including ``sql_by_form`` and ``long_sql``) targets.
 
 Operators and Sensors
 ---------------------
@@ -110,8 +111,8 @@ The Airflow integration organizes hooks, operators, and sensors in dedicated
 subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, DuckDB, SQL, Snowflake,
-Neo4j, MongoDB, etc.)
+records to any supported destination (CSV, Parquet, DuckDB, SQL / ``sql_by_form``
+/ ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
@@ -298,8 +299,8 @@ is installed (available via ``apache-airflow-providers-imednet[openlineage]``),
 - **Output dataset**: sanitized destination coordinates with userinfo, passwords,
   and query strings stripped across ``snowflake`` (``snowflake://<account>`` /
   ``<database>.<schema>.<table>``), ``duckdb`` (``duckdb`` /
-  ``<db_path>.<table_name>``), ``sql`` / ``sql_by_form`` (``postgres://host:port`` or
-  ``sqlite``), ``mongodb`` (``mongodb://<host>`` / ``<database>.<collection>``),
+  ``<db_path>.<table_name>``), ``sql`` / ``sql_by_form`` / ``long_sql``
+  (``postgres://host:port`` or ``sqlite``), ``mongodb`` (``mongodb://<host>`` / ``<database>.<collection>``),
   ``neo4j`` (``neo4j://<host>`` / ``<database>.<label>``), object storage URIs
   (``s3://``, ``gs://``, ``abfss://``), and local ``file`` paths.
 

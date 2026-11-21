@@ -830,3 +830,225 @@ def test_job_sensor_fails_in_dag_when_result_url_has_failed_records(monkeypatch)
     sensor = ImednetJobSensor(task_id="wait_bad_batch", study_key="STUDY_A", batch_id="BATCH_BAD")
     with pytest.raises(AirflowException, match="Form locked"):
         sensor.poke(context={})
+
+
+def _build_integration_sdk(records: list) -> tuple[MagicMock, list[dict]]:
+    """Build a lightweight mock ImednetSDK for Airflow 3 operator integration tests."""
+    from imednet.models.forms import Form
+    from imednet.models.variables import Variable as EdcVariable
+
+    seen_calls: list[dict] = []
+    sdk = MagicMock()
+    forms = [
+        Form(form_id=10, form_key="demographics", form_name="Demographics"),
+        Form(form_id=20, form_key="vitals", form_name="Vitals"),
+    ]
+    sdk.forms.list.return_value = forms
+    sdk.get_forms.return_value = forms
+    variables = [
+        EdcVariable(
+            variable_id=1,
+            form_id=10,
+            form_key="demographics",
+            variable_name="age",
+            label="Age",
+            variable_type="integer",
+        ),
+        EdcVariable(
+            variable_id=2,
+            form_id=10,
+            form_key="demographics",
+            variable_name="cohort",
+            label="Cohort",
+            variable_type="text",
+        ),
+        EdcVariable(
+            variable_id=3,
+            form_id=20,
+            form_key="vitals",
+            variable_name="hr",
+            label="Heart Rate",
+            variable_type="integer",
+        ),
+    ]
+    sdk.variables.list.return_value = variables
+    sdk.get_variables.return_value = variables
+
+    def _list_records(**kwargs):
+        seen_calls.append(dict(kwargs))
+        result = list(records)
+        form_id_filter = kwargs.get("formId")
+        if form_id_filter is not None:
+            allowed = {form_id_filter} if isinstance(form_id_filter, int) else set(form_id_filter)
+            result = [r for r in result if r.form_id in allowed]
+        subject_filter = kwargs.get("subjectKey")
+        if isinstance(subject_filter, str):
+            result = [r for r in result if r.subject_key == subject_filter]
+        return result
+
+    sdk.records.list.side_effect = _list_records
+    return sdk, seen_calls
+
+
+def test_export_operator_renders_jinja_watermark_and_filter_fields(
+    airflow3_sqlite_env,
+    monkeypatch,
+    tmp_path,
+):
+    """Airflow 3 Jinja rendering populates modified_since, record_filter, record_data_filter, stream_name."""
+    _ = airflow3_sqlite_env
+    import pandas as pd
+    from airflow.sdk import DAG
+
+    from apache_airflow_providers_imednet import ImednetExportOperator
+    from imednet.models.records import Record
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    out_csv = tmp_path / "templated.csv"
+    records = [
+        Record(
+            record_id=1,
+            form_id=10,
+            form_key="demographics",
+            subject_key="SUBJ-01",
+            deleted=False,
+            date_modified="2026-04-06T10:00:00Z",
+            record_data={"age": 52, "cohort": "A"},
+        ),
+        Record(
+            record_id=2,
+            form_id=10,
+            form_key="demographics",
+            subject_key="SUBJ-02",
+            deleted=False,
+            date_modified="2026-04-06T10:05:00Z",
+            record_data={"age": 29, "cohort": "B"},
+        ),
+    ]
+    sdk, seen_calls = _build_integration_sdk(records)
+    monkeypatch.setattr(ImednetExportOperator, "_get_sdk", lambda self: sdk)
+
+    with DAG("templated_export_dag", start_date=datetime(2026, 4, 1), schedule=None):
+        op = ImednetExportOperator(
+            task_id="templated_export",
+            study_key="STUDY_{{ params.env }}",
+            destination="csv",
+            output_path=str(out_csv),
+            incremental=True,
+            modified_since="{{ ds }}T00:00:00Z",
+            record_filter={"subjectKey": "{{ params.subject }}"},
+            record_data_filter="age>={{ params.min_age }}",
+            stream_name="csv_{{ ds_nodash }}",
+        )
+
+    render_ctx = {
+        "ds": "2026-04-05",
+        "ds_nodash": "20260405",
+        "params": {"env": "PROD", "subject": "SUBJ-01", "min_age": 40},
+    }
+    op.render_template_fields(render_ctx)
+
+    assert op.study_key == "STUDY_PROD"
+    assert op.modified_since == "2026-04-05T00:00:00Z"
+    assert op.record_filter == {"subjectKey": "SUBJ-01"}
+    assert op.record_data_filter == "age>=40"
+    assert op.stream_name == "csv_20260405"
+
+    op.execute(context=render_ctx)  # type: ignore[arg-type]
+
+    assert seen_calls[0]["dateModified"] == (">=", "2026-04-05T00:00:00Z")
+    assert seen_calls[0]["subjectKey"] == "SUBJ-01"
+    assert seen_calls[0]["record_data_filter"] == "age>=40"
+    exported = pd.read_csv(out_csv)
+    assert len(exported) == 1
+    assert int(exported.iloc[0]["age"]) == 52
+
+    provider = AirflowStateProvider()
+    assert provider.get_last_timestamp("STUDY_PROD", "csv_20260405") is not None
+
+
+def test_export_operator_executes_sql_by_form_and_long_sql_destinations(
+    airflow3_sqlite_env,
+    monkeypatch,
+    tmp_path,
+):
+    """Executing ImednetExportOperator with sql_by_form and long_sql writes expected SQL tables."""
+    _ = airflow3_sqlite_env
+    import sqlite3
+
+    from airflow.models.connection import Connection
+
+    from apache_airflow_providers_imednet import ImednetExportOperator
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from imednet.models.records import Record
+
+    sqlite_db = tmp_path / "clinical_exports.sqlite"
+    dest_conn = Connection(
+        conn_id="sqlite_export_dest",
+        conn_type="sqlite",
+        host=str(sqlite_db),
+    )
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, conn_id: dest_conn if conn_id == "sqlite_export_dest" else None),
+    )
+
+    records = [
+        Record(
+            record_id=101,
+            form_id=10,
+            form_key="demographics",
+            subject_key="SUBJ-01",
+            deleted=False,
+            date_modified="2026-04-01T10:00:00Z",
+            record_data={"age": 48, "cohort": "ARM1"},
+        ),
+        Record(
+            record_id=201,
+            form_id=20,
+            form_key="vitals",
+            subject_key="SUBJ-01",
+            deleted=False,
+            date_modified="2026-04-01T10:00:00Z",
+            record_data={"hr": 72},
+        ),
+    ]
+    sdk, _ = _build_integration_sdk(records)
+    monkeypatch.setattr(ImednetExportOperator, "_get_sdk", lambda self: sdk)
+
+    op_by_form = ImednetExportOperator(
+        task_id="export_sql_by_form",
+        study_key="STUDY_SQL_INT",
+        destination="sql_by_form",
+        destination_conn_id="sqlite_export_dest",
+    )
+    op_by_form.execute(context={})
+
+    op_long_sql = ImednetExportOperator(
+        task_id="export_long_sql",
+        study_key="STUDY_SQL_INT",
+        destination="long_sql",
+        output_path="long_clinical_eav",
+        destination_conn_id="sqlite_export_dest",
+    )
+    op_long_sql.execute(context={})
+
+    with sqlite3.connect(sqlite_db) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        assert {"demographics", "vitals", "long_clinical_eav"}.issubset(tables)
+
+        demo_rows = conn.execute("SELECT age, cohort FROM demographics").fetchall()
+        assert demo_rows == [(48, "ARM1")]
+
+        vitals_rows = conn.execute("SELECT hr FROM vitals").fetchall()
+        assert vitals_rows == [(72,)]
+
+        long_rows = conn.execute(
+            "SELECT record_id, variable_name, value FROM long_clinical_eav ORDER BY record_id, variable_name"
+        ).fetchall()
+        assert (101, "age", "48") in [(r[0], r[1], str(r[2])) for r in long_rows]
+        assert (201, "hr", "72") in [(r[0], r[1], str(r[2])) for r in long_rows]

@@ -852,3 +852,129 @@ def test_show_state_output_format_env_and_explicit_table_override(
         assert res.exit_code == 0
         assert "STUDY-01 | records" in res.stdout
     assert os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+
+
+@pytest.mark.parametrize("initial_status", ["failed", "pending"])
+def test_headless_state_set_recovers_airflow_variable_streams(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_status: str,
+) -> None:
+    """Headless workflows state set --force recovers failed/pending Airflow 3 Variable checkpoints."""
+    import logging
+    import sys
+
+    if (
+        "airflow" not in sys.modules
+        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+    ):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith("airflow."):
+                sys.modules.pop(mod, None)
+
+    pytest.importorskip("airflow")
+    import airflow.settings
+    from airflow.configuration import conf
+    from airflow.utils.db import initdb
+
+    from imednet.cli import app as main_app
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+
+    db_file = tmp_path / f"airflow_cli_{initial_status}.db"
+    db_url = f"sqlite:///{db_file}"
+    async_db_url = f"sqlite+aiosqlite:///{db_file}"
+    prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_async_conn = conf.get("database", "sql_alchemy_conn_async", fallback=None)
+    prev_pool_enabled = conf.get("database", "sql_alchemy_pool_enabled", fallback=None)
+    prev_settings_conn = airflow.settings.SQL_ALCHEMY_CONN
+    has_async_conn_attr = hasattr(airflow.settings, "SQL_ALCHEMY_CONN_ASYNC")
+    prev_settings_async_conn = getattr(airflow.settings, "SQL_ALCHEMY_CONN_ASYNC", None)
+    conf.set("database", "sql_alchemy_conn", db_url)
+    conf.set("database", "sql_alchemy_conn_async", async_db_url)
+    conf.set("database", "sql_alchemy_pool_enabled", "False")
+    airflow.settings.SQL_ALCHEMY_CONN = db_url
+    if has_async_conn_attr:
+        airflow.settings.SQL_ALCHEMY_CONN_ASYNC = async_db_url
+    airflow.settings.dispose_orm()
+    airflow.settings.configure_orm()
+    initdb()
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+    monkeypatch.delenv("AIRFLOW_CTX_TASK_ID", raising=False)
+
+    try:
+        provider = AirflowStateProvider()
+        provider.set_last_timestamp(
+            study_key="STUDY-AF-CLI",
+            stream_name="records",
+            timestamp=datetime(2026, 5, 20, 8, 0, 0, tzinfo=timezone.utc),
+            records_processed=5,
+            status=initial_status,  # type: ignore[arg-type]
+            error_message="worker crash" if initial_status == "failed" else None,
+            force=True,
+        )
+
+        # Non-forced CLI set rejects invalid transition on stderr with exit code 1
+        rejected = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY-AF-CLI",
+                "--stream",
+                "records",
+                "--timestamp",
+                "2026-05-22T12:00:00Z",
+                "--records-processed",
+                "12",
+            ],
+        )
+        assert rejected.exit_code == 1
+        assert rejected.stdout == ""
+        assert "Failed to write ledger" in rejected.stderr
+
+        # Forced CLI set recovers Airflow Variable state to success and clears error_message
+        recovered = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY-AF-CLI",
+                "--stream",
+                "records",
+                "--timestamp",
+                "2026-05-22T12:00:00Z",
+                "--records-processed",
+                "12",
+                "--force",
+            ],
+        )
+        assert recovered.exit_code == 0
+        assert "Successfully set high-water mark" in recovered.stdout
+        assert recovered.stderr == ""
+        assert provider.get_last_status("STUDY-AF-CLI", "records") == StreamExecutionStatus.SUCCESS
+        updated = provider.read_state().studies["STUDY-AF-CLI"].streams["records"]
+        assert updated.records_processed == 12
+        assert updated.error_message is None
+    finally:
+        airflow.settings.dispose_orm()
+        airflow.settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if has_async_conn_attr:
+            airflow.settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_async_conn
+        if prev_conn is not None:
+            conf.set("database", "sql_alchemy_conn", prev_conn)
+        if prev_async_conn is not None:
+            conf.set("database", "sql_alchemy_conn_async", prev_async_conn)
+        if prev_pool_enabled is not None:
+            conf.set("database", "sql_alchemy_pool_enabled", prev_pool_enabled)
+        airflow.settings.configure_orm()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
