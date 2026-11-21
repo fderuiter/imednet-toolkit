@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator, Iterator
 from contextlib import AbstractContextManager
+from datetime import UTC, datetime
 from typing import Literal, assert_type
 
 import pandas as pd
@@ -20,18 +21,41 @@ from imednet.auth.strategy import AuthStrategy
 from imednet.core.endpoint import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.dispatch import AsyncEndpointContext, SyncEndpointContext
 from imednet.endpoints.studies import AsyncStudiesEndpoint, StudiesEndpoint, StudiesOperationDef
+from imednet.models.base import Pagination
 from imednet.models.codings import Coding
 from imednet.models.forms import Form
-from imednet.models.intervals import Interval
+from imednet.models.intervals import FormSummary, Interval
 from imednet.models.jobs import Job, JobState, JobStatus
-from imednet.models.queries import Query, QueryStatus
+from imednet.models.queries import Query, QueryComment, QueryStatus
 from imednet.models.record_revisions import RecordRevision
-from imednet.models.records import Record
+from imednet.models.records import (
+    BaseRecordRequest,
+    CreateNewRecordRequest,
+    Keyword,
+    Record,
+    RecordData,
+    RecordJobResponse,
+    RegisterSubjectRequest,
+    UpdateScheduledRecordRequest,
+)
+from imednet.models.reporting import (
+    AdverseEvent,
+    AnalysisAdverseEvent,
+    AnalysisLabResult,
+    Demographics,
+    DeviceDeficiency,
+    ProtocolDeviation,
+    SubjectLevelAnalysis,
+    VitalSign,
+    VitalSigns,
+)
 from imednet.models.sites import Site
 from imednet.models.studies import Study
+from imednet.models.study_config import MappingRule, StudyConfiguration, WidgetConfig
+from imednet.models.study_structure import FormStructure, IntervalStructure, StudyStructure
 from imednet.models.subjects import Subject, SubjectKeyword
 from imednet.models.triage import TriageItem
-from imednet.models.users import User
+from imednet.models.users import Role, User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 from imednet.plugins import (
@@ -132,21 +156,64 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(JobState.COMPLETED, Literal[JobState.COMPLETED])
     assert_type(QueryStatus.OPEN, Literal[QueryStatus.OPEN])
 
-    # Partial constructors across all 14 contract models (zero [call-arg] errors under --strict)
+    # Partial constructors across all 14 contract models (snake_case & camelCase, zero [call-arg])
     assert_type(Coding(study_key='S'), Coding)
+    assert_type(Coding(studyKey='S'), Coding)
     assert_type(Form(form_key='F_DM'), Form)
-    assert_type(Interval(forms=None), Interval)
+    assert_type(Form(formKey='F_DM'), Form)
+    assert_type(Interval(interval_name='Baseline'), Interval)
+    assert_type(Interval(intervalName='Baseline', forms=None), Interval)
     assert_type(Job(batch_id='B1'), Job)
-    assert_type(JobStatus(progress=None), JobStatus)
-    assert_type(Query(description='Open query'), Query)
+    assert_type(Job(batchId='B1'), Job)
+    assert_type(
+        JobStatus(
+            batch_id='B1',
+            progress=50,
+            record_total_count=10,
+            record_success_count=9,
+            record_failure_count=1,
+        ),
+        JobStatus,
+    )
+    assert_type(
+        JobStatus(
+            batch_id='B1',
+            total_records=10,
+            successful_records=9,
+            failed_records=1,
+        ),
+        JobStatus,
+    )
+    assert_type(
+        JobStatus(
+            batchId='B1',
+            totalRecords=10,
+            successfulRecords=9,
+            failedRecords=1,
+        ),
+        JobStatus,
+    )
+    assert_type(job_status.total_records, int)
+    assert_type(job_status.successful_records, int)
+    assert_type(job_status.failed_records, int)
+    assert_type(Query(study_key='S', description='Open query'), Query)
+    assert_type(Query(studyKey='S', description='Open query'), Query)
     assert_type(Record(record_id=1), Record)
+    assert_type(Record(recordId=1), Record)
     assert_type(RecordRevision(record_revision_id=1), RecordRevision)
+    assert_type(RecordRevision(recordRevisionId=1), RecordRevision)
     assert_type(Site(site_id=1), Site)
+    assert_type(Site(siteId=1), Site)
     assert_type(Study(study_key='S'), Study)
+    assert_type(Study(studyKey='S'), Study)
     assert_type(Subject(subject_id=1), Subject)
-    assert_type(User(login='clinician'), User)
+    assert_type(Subject(subjectId=1), Subject)
+    assert_type(User(user_id='u-1', login='clinician'), User)
+    assert_type(User(userId='u-1', login='clinician'), User)
     assert_type(Variable(variable_id=1), Variable)
+    assert_type(Variable(variableId=1), Variable)
     assert_type(Visit(visit_id=1), Visit)
+    assert_type(Visit(visitId=1), Visit)
 
     # Top-level exception exports and offline transport initialization
     err_base: ImednetError = NotFoundError('missing')
@@ -451,3 +518,306 @@ def plugin_implementation_contracts(
     assert_type(sf_cfg.naming_convention, str | None)
     assert_type(workflows_ns.record_mapper.sdtm_dataframe('S', 'AE', mask_phi=True), pd.DataFrame)
     assert workflows_ns and sinks_ns and sinks_factory and workflows_factory
+
+
+def aliased_model_constructor_contracts() -> None:
+    now = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+
+    # Pagination (base.py)
+    assert_type(Pagination(current_page=1, total_pages=3, total_elements=60), Pagination)
+    assert_type(Pagination(currentPage=1, totalPages=3, totalElements=60), Pagination)
+
+    # Nested aliased models across intervals, queries, records, subjects, and users
+    assert_type(FormSummary(form_id=1, form_key='DM', form_name='Demographics'), FormSummary)
+    assert_type(FormSummary(formId=1, formKey='DM', formName='Demographics'), FormSummary)
+    assert_type(QueryComment(annotation_status='Monitor Open', sequence=1), QueryComment)
+    assert_type(QueryComment(annotationStatus='Monitor Open', sequence=1), QueryComment)
+    assert_type(Keyword(keyword_name='Safety', keyword_key='SAFE', keyword_id=1), Keyword)
+    assert_type(Keyword(keywordName='Safety', keywordKey='SAFE', keywordId=1), Keyword)
+    assert_type(RecordJobResponse(job_id='J1', batch_id='B1', state='OPEN'), RecordJobResponse)
+    assert_type(RecordJobResponse(jobId='J1', batchId='B1', state='OPEN'), RecordJobResponse)
+    assert_type(
+        SubjectKeyword(keyword_name='Enrolled', keyword_key='ENR', keyword_id=2),
+        SubjectKeyword,
+    )
+    assert_type(
+        SubjectKeyword(keywordName='Enrolled', keywordKey='ENR', keywordId=2),
+        SubjectKeyword,
+    )
+    assert_type(Role(role_id='R1', community_id=10), Role)
+    assert_type(Role(roleId='R1', communityId=10), Role)
+
+    # Record request hierarchy with inherited BaseRecordRequest fields (records.py)
+    payload = RecordData({'AGE': 42})
+    assert_type(BaseRecordRequest(form_key='DM', data=payload), BaseRecordRequest)
+    assert_type(BaseRecordRequest(formKey='DM', data=payload), BaseRecordRequest)
+    assert_type(
+        RegisterSubjectRequest(form_key='DM', site_name='SITE-01', data=payload),
+        RegisterSubjectRequest,
+    )
+    assert_type(
+        RegisterSubjectRequest(formKey='DM', siteName='SITE-01', data=payload),
+        RegisterSubjectRequest,
+    )
+    assert_type(
+        UpdateScheduledRecordRequest(
+            form_key='VS',
+            subject_key='SUBJ-01',
+            interval_name='Visit 1',
+            data=payload,
+        ),
+        UpdateScheduledRecordRequest,
+    )
+    assert_type(
+        UpdateScheduledRecordRequest(
+            formKey='VS',
+            subjectKey='SUBJ-01',
+            intervalName='Visit 1',
+            data=payload,
+        ),
+        UpdateScheduledRecordRequest,
+    )
+    assert_type(
+        CreateNewRecordRequest(form_key='AE', subject_key='SUBJ-01', data=payload),
+        CreateNewRecordRequest,
+    )
+    assert_type(
+        CreateNewRecordRequest(formKey='AE', subjectKey='SUBJ-01', data=payload),
+        CreateNewRecordRequest,
+    )
+
+    # Study configuration models (study_config.py)
+    rule_snake = MappingRule(
+        domain='AE',
+        target_field='aeTerm',
+        source_form_key='AE_FORM',
+        source_variable_name='AETERM',
+        is_baseline=True,
+    )
+    rule_camel = MappingRule(
+        domain='AE',
+        targetField='aeTerm',
+        sourceFormKey='AE_FORM',
+        sourceVariableName='AETERM',
+        isBaseline=True,
+    )
+    assert_type(rule_snake, MappingRule)
+    assert_type(rule_camel, MappingRule)
+
+    widget_snake = WidgetConfig(
+        widget_id='w-1',
+        type='bar',
+        title='AE Count',
+        domain='AE',
+        x_axis='aeSeverity',
+        layout_cols=6,
+    )
+    widget_camel = WidgetConfig(
+        widgetId='w-1',
+        type='bar',
+        title='AE Count',
+        domain='AE',
+        xAxis='aeSeverity',
+        layoutCols=6,
+    )
+    assert_type(widget_snake, WidgetConfig)
+    assert_type(widget_camel, WidgetConfig)
+
+    assert_type(
+        StudyConfiguration(
+            study_key='STUDY-1',
+            reporting_profile='drug',
+            mappings=[rule_snake],
+            widgets=[widget_snake],
+            phi_fields=['BRTHDTC'],
+        ),
+        StudyConfiguration,
+    )
+    assert_type(
+        StudyConfiguration(
+            studyKey='STUDY-1',
+            reportingProfile='drug',
+            mappings=[rule_camel],
+            widgets=[widget_camel],
+            phiFields=['BRTHDTC'],
+        ),
+        StudyConfiguration,
+    )
+
+    # Study structure models (study_structure.py)
+    form_struct_snake = FormStructure(
+        form_id=1,
+        form_key='DM',
+        form_name='Demographics',
+        form_type='CRF',
+        revision=1,
+        epro_form=False,
+        allow_copy=False,
+        date_created=now,
+        date_modified=now,
+    )
+    form_struct_camel = FormStructure(
+        formId=1,
+        formKey='DM',
+        formName='Demographics',
+        formType='CRF',
+        revision=1,
+        eproForm=False,
+        allowCopy=False,
+        dateCreated=now,
+        dateModified=now,
+    )
+    assert_type(form_struct_snake, FormStructure)
+    assert_type(form_struct_camel, FormStructure)
+
+    interval_struct_snake = IntervalStructure(
+        interval_id=10,
+        interval_name='Baseline',
+        interval_sequence=1,
+        interval_description='Baseline Visit',
+        interval_group_name='Core',
+        date_created=now,
+        date_modified=now,
+        forms=[form_struct_snake],
+    )
+    interval_struct_camel = IntervalStructure(
+        intervalId=10,
+        intervalName='Baseline',
+        intervalSequence=1,
+        intervalDescription='Baseline Visit',
+        intervalGroupName='Core',
+        dateCreated=now,
+        dateModified=now,
+        forms=[form_struct_camel],
+    )
+    assert_type(interval_struct_snake, IntervalStructure)
+    assert_type(interval_struct_camel, IntervalStructure)
+
+    assert_type(
+        StudyStructure(
+            study_key='STUDY-1',
+            intervals=[interval_struct_snake],
+            forms=[form_struct_snake],
+        ),
+        StudyStructure,
+    )
+    assert_type(
+        StudyStructure(
+            studyKey='STUDY-1',
+            intervals=[interval_struct_camel],
+            forms=[form_struct_camel],
+        ),
+        StudyStructure,
+    )
+
+    # Reporting & CDISC analysis models (reporting.py)
+    assert_type(
+        AdverseEvent(
+            subject_key='SUBJ-01',
+            ae_term='Headache',
+            ae_severity='MILD',
+            ae_serious=False,
+        ),
+        AdverseEvent,
+    )
+    assert_type(
+        AdverseEvent(
+            subjectKey='SUBJ-01',
+            aeTerm='Headache',
+            aeSeverity='MILD',
+            aeSerious=False,
+        ),
+        AdverseEvent,
+    )
+    assert_type(
+        ProtocolDeviation(
+            subject_key='SUBJ-01',
+            dv_term='Late visit',
+            dv_category='VISIT_WINDOW',
+            dv_severity='MINOR',
+            dv_date=now,
+        ),
+        ProtocolDeviation,
+    )
+    assert_type(
+        ProtocolDeviation(
+            subjectKey='SUBJ-01',
+            dvTerm='Late visit',
+            dvCategory='VISIT_WINDOW',
+            dvSeverity='MINOR',
+            dvDate=now,
+        ),
+        ProtocolDeviation,
+    )
+    assert_type(
+        DeviceDeficiency(
+            subject_key='SUBJ-01',
+            dd_term='Sensor calibration drift',
+            dd_category='MALFUNCTION',
+            dd_date=now,
+        ),
+        DeviceDeficiency,
+    )
+    assert_type(
+        DeviceDeficiency(
+            subjectKey='SUBJ-01',
+            ddTerm='Sensor calibration drift',
+            ddCategory='MALFUNCTION',
+            ddDate=now,
+        ),
+        DeviceDeficiency,
+    )
+    assert_type(
+        SubjectLevelAnalysis(subject_key='SUBJ-01', arm='Treatment A'),
+        SubjectLevelAnalysis,
+    )
+    assert_type(
+        SubjectLevelAnalysis(subjectKey='SUBJ-01', arm='Treatment A'),
+        SubjectLevelAnalysis,
+    )
+    assert_type(
+        AnalysisAdverseEvent(subject_key='SUBJ-01', trtemfl='Y'),
+        AnalysisAdverseEvent,
+    )
+    assert_type(
+        AnalysisAdverseEvent(subjectKey='SUBJ-01', trtemfl='Y'),
+        AnalysisAdverseEvent,
+    )
+    assert_type(
+        AnalysisLabResult(subject_key='SUBJ-01', paramcd='ALT'),
+        AnalysisLabResult,
+    )
+    assert_type(
+        AnalysisLabResult(subjectKey='SUBJ-01', paramcd='ALT'),
+        AnalysisLabResult,
+    )
+    assert_type(
+        Demographics(subject_key='SUBJ-01', sex='F', birth_date=now, age=34),
+        Demographics,
+    )
+    assert_type(
+        Demographics(subjectKey='SUBJ-01', sex='F', birthDate=now, age=34),
+        Demographics,
+    )
+    assert_type(
+        VitalSigns(
+            subject_key='SUBJ-01',
+            vs_test='Systolic Blood Pressure',
+            vs_test_cd='SYSBP',
+            vs_result=120.0,
+            vs_unit='mmHg',
+            vs_date=now,
+        ),
+        VitalSigns,
+    )
+    assert_type(
+        VitalSign(
+            subjectKey='SUBJ-01',
+            vsTest='Systolic Blood Pressure',
+            vsTestCd='SYSBP',
+            vsResult=120.0,
+            vsUnit='mmHg',
+            vsDate=now,
+        ),
+        VitalSigns,
+    )

@@ -11,9 +11,10 @@ import os
 import re
 import sys
 import types
-from typing import Any, ClassVar, Union, get_args, get_origin
+from enum import Enum
+from typing import Any, ClassVar, TypeVar, Union, get_args, get_origin
 
-from pydantic import Field, create_model
+from pydantic import BaseModel, Field, create_model
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.contract import APIContract, ContractBuilder
@@ -22,7 +23,13 @@ _CONTRACT_CACHE: APIContract | None = None
 _SKIP_STUB_FILES = frozenset({"__init__.py", "engine.py", "contract.py"})
 _STDLIB_MODULES = frozenset(sys.stdlib_module_names)
 _FIRST_PARTY_ROOTS = frozenset(
-    {"imednet", "imednet_workflows", "apache_airflow_providers_imednet", "imednet_tui"}
+    {
+        "imednet",
+        "imednet_workflows",
+        "apache_airflow_providers_imednet",
+        "imednet_sinks",
+        "imednet_tui",
+    }
 )
 
 
@@ -32,6 +39,8 @@ def _format_runtime_annotation(annotation: Any) -> str:
         return "Any"
     if annotation is None or annotation is type(None):
         return "None"
+    if isinstance(annotation, TypeVar):
+        return annotation.__name__
 
     origin = get_origin(annotation)
     if origin is Union or origin is types.UnionType:
@@ -53,6 +62,45 @@ def _format_runtime_annotation(annotation: Any) -> str:
         return annotation.__name__
 
     return str(annotation).replace("typing.", "").replace("NoneType", "None")
+
+
+def _format_runtime_default(value: Any) -> str:
+    """Format a runtime default value into `.pyi` literal syntax."""
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, Enum):
+        return f"{type(value).__name__}.{value.name}"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    return "..."
+
+
+def _is_aliased_imednet_model(cls_obj: Any) -> bool:
+    """Return True if *cls_obj* is an ImednetBaseModel subclass with distinct field aliases."""
+    if not isinstance(cls_obj, type) or not issubclass(cls_obj, BaseModel):
+        return False
+    if cls_obj.__name__ == "ImednetBaseModel":
+        return False
+    if not any(base.__name__ == "ImednetBaseModel" for base in cls_obj.__mro__):
+        return False
+    return any(
+        bool(field_info.alias and field_info.alias != field_name)
+        for field_name, field_info in cls_obj.model_fields.items()
+    )
+
+
+def _ast_references_imednet_base_model(tree: ast.Module) -> bool:
+    """Return True if *tree* defines or references ImednetBaseModel."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "ImednetBaseModel":
+            return True
+        if isinstance(node, ast.ClassDef) and node.name == "ImednetBaseModel":
+            return True
+    return False
 
 
 class _AnnotationNormalizer(ast.NodeTransformer):
@@ -259,22 +307,202 @@ def _format_function_stub(
     return lines
 
 
+def _extract_validator_key_aliases(cls_node: ast.ClassDef) -> list[tuple[str, str]]:
+    """Extract `(alt_snake_key, target_alias)` pairs normalized in `@model_validator` methods."""
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for stmt in cls_node.body:
+        if not isinstance(stmt, ast.FunctionDef):
+            continue
+        is_model_validator = any(
+            (isinstance(dec, ast.Name) and dec.id == "model_validator")
+            or (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Name)
+                and dec.func.id == "model_validator"
+            )
+            for dec in stmt.decorator_list
+        )
+        if not is_model_validator:
+            continue
+        for sub in ast.walk(stmt):
+            if not isinstance(sub, ast.Assign) or len(sub.targets) != 1:
+                continue
+            target = sub.targets[0]
+            if not (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.slice, ast.Constant)
+                and isinstance(target.slice.value, str)
+            ):
+                continue
+            val = sub.value
+            if not (
+                isinstance(val, ast.Call)
+                and isinstance(val.func, ast.Attribute)
+                and val.func.attr in {"pop", "get"}
+                and val.args
+                and isinstance(val.args[0], ast.Constant)
+                and isinstance(val.args[0].value, str)
+            ):
+                continue
+            alt_key = val.args[0].value
+            alias_key = target.slice.value
+            if alt_key not in seen:
+                seen.add(alt_key)
+                pairs.append((alt_key, alias_key))
+    return pairs
+
+
+def _format_overload_init(params: list[str], indent: str = "    ") -> list[str]:
+    """Format a keyword-only `@overload def __init__` stub wrapped at <= 100 characters."""
+    lines = [f"{indent}@overload"]
+    all_params = ["self", "*", *params] if params else ["self"]
+    joined = ", ".join(all_params)
+    single = f"{indent}def __init__({joined}) -> None: ..."
+    if len(single) <= 100:
+        lines.append(single)
+        return lines
+    indented = f"{indent}    {joined}"
+    if len(indented) <= 100:
+        lines.append(f"{indent}def __init__(")
+        lines.append(indented)
+        lines.append(f"{indent}) -> None: ...")
+        return lines
+    lines.append(f"{indent}def __init__(")
+    for param in all_params:
+        lines.append(f"{indent}    {param},")
+    lines.append(f"{indent}) -> None: ...")
+    return lines
+
+
+def _build_init_overloads(
+    cls_node: ast.ClassDef,
+    runtime_cls: type[Any],
+    declared_annotations: dict[str, str],
+    indent: str = "    ",
+) -> list[str]:
+    """Build `snake_case` and `camelCase` `@overload def __init__` stubs for an aliased model."""
+    snake_params: list[str] = []
+    alias_params: list[str] = []
+    alias_meta: dict[str, tuple[str, str]] = {}
+    existing_snake_names: set[str] = set()
+
+    for field_name, field_info in runtime_cls.model_fields.items():
+        ann_str = declared_annotations.get(field_name) or _format_runtime_annotation(
+            field_info.annotation
+        )
+        if field_info.is_required():
+            default_suffix = ""
+        elif field_info.default_factory is not None:
+            default_suffix = " = ..."
+        else:
+            default_suffix = f" = {_format_runtime_default(field_info.default)}"
+
+        snake_params.append(f"{field_name}: {ann_str}{default_suffix}")
+        existing_snake_names.add(field_name)
+
+        alias_name = field_info.alias or field_name
+        alias_params.append(f"{alias_name}: {ann_str}{default_suffix}")
+        alias_meta[alias_name] = (ann_str, default_suffix)
+
+    for alt_key, target_alias in _extract_validator_key_aliases(cls_node):
+        if alt_key not in existing_snake_names and target_alias in alias_meta:
+            ann_str, default_suffix = alias_meta[target_alias]
+            snake_params.append(f"{alt_key}: {ann_str}{default_suffix}")
+            existing_snake_names.add(alt_key)
+
+    if runtime_cls.model_config.get("extra") == "allow":
+        snake_params.append("**extra_data: Any")
+        alias_params.append("**extra_data: Any")
+
+    return [
+        *_format_overload_init(snake_params, indent=indent),
+        *_format_overload_init(alias_params, indent=indent),
+    ]
+
+
+def _wrap_dynamic_field_stub(
+    indent: str,
+    field_name: str,
+    ann_str: str,
+    field_info: Any,
+) -> list[str]:
+    """Render a dynamic or inherited model field preserving its `Field(alias=...)` declaration."""
+    if not field_info.alias:
+        default_str = (
+            "None" if not field_info.is_required() and field_info.default is None else None
+        )
+        return _wrap_field_stub(indent, field_name, ann_str, default_str)
+
+    if field_info.is_required():
+        default_part = "..."
+    elif field_info.default_factory is not None:
+        factory_name = getattr(field_info.default_factory, "__name__", "")
+        default_part = (
+            f"default_factory={factory_name}"
+            if factory_name in {"list", "dict", "set"}
+            else "default=..."
+        )
+    else:
+        default_part = f"default={_format_runtime_default(field_info.default)}"
+
+    call_args = f"{default_part}, alias={json.dumps(field_info.alias)}"
+    ann_part = f"{indent}{field_name}: {ann_str}"
+    single = f"{ann_part} = Field({call_args})"
+    if len(single) <= 100:
+        return [single]
+
+    header_lines = (
+        [f"{ann_part} = Field("]
+        if len(f"{ann_part} = Field(") <= 100
+        else _wrap_field_stub(indent, field_name, ann_str, "Field(")
+    )
+    joined_call = f"{indent}    {call_args}"
+    if len(joined_call) <= 100:
+        return [
+            *header_lines,
+            joined_call,
+            f"{indent})",
+        ]
+
+    return [
+        *header_lines,
+        f"{indent}    {default_part},",
+        f"{indent}    alias={json.dumps(field_info.alias)},",
+        f"{indent})",
+    ]
+
+
 def _load_module_models(
     py_file: str,
     model_targets: list[tuple[str, str, str | None]],
+    class_names: set[str],
 ) -> dict[str, type[Any]]:
-    """Execute a model module in isolation to resolve base_cls and dynamic models."""
+    """Execute a model module in isolation to resolve static and dynamic models."""
     stem = os.path.splitext(os.path.basename(py_file))[0]
-    temp_mod_name = f"_stubgen_isolated_{stem}"
+    pkg_name = "_stubgen_isolated_pkg"
+    temp_mod_name = f"{pkg_name}.{stem}"
     saved_cache = ModelEngine._model_cache.copy()
+    models_pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    target_dir = os.path.dirname(os.path.abspath(py_file))
+    search_dirs = [target_dir] if target_dir == models_pkg_dir else [target_dir, models_pkg_dir]
+
     spec = importlib.util.spec_from_file_location(temp_mod_name, py_file)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load module spec for {py_file}")
+
+    pkg_mod = types.ModuleType(pkg_name)
+    pkg_mod.__path__ = search_dirs
     module = importlib.util.module_from_spec(spec)
+    sys.modules[pkg_name] = pkg_mod
     sys.modules[temp_mod_name] = module
     try:
         spec.loader.exec_module(module)
         resolved: dict[str, type[Any]] = {}
+        for cls_name in sorted(class_names):
+            attr = getattr(module, cls_name, None)
+            if isinstance(attr, type):
+                resolved[cls_name] = attr
         for target_name, model_name, base_name in model_targets:
             attr = getattr(module, target_name, None)
             if isinstance(attr, type):
@@ -286,7 +514,8 @@ def _load_module_models(
                 resolved[target_name] = ModelEngine.get_model(model_name, base_cls)
         return resolved
     finally:
-        sys.modules.pop(temp_mod_name, None)
+        for mod_key in [k for k in sys.modules if k == pkg_name or k.startswith(f"{pkg_name}.")]:
+            sys.modules.pop(mod_key, None)
         ModelEngine._model_cache = saved_cache
 
 
@@ -318,10 +547,19 @@ def _build_pruned_imports(
 ) -> list[str]:
     """Prune unused imports (including ModelEngine, Optional, Any) and emit sorted lines."""
     pruned_forbidden = {"ModelEngine", "Optional"}
-    grouped: dict[int, list[tuple[tuple[int, str, str], str]]] = {0: [], 1: [], 2: [], 3: []}
+    grouped: dict[int, list[tuple[tuple[int, str, str], str]]] = {
+        0: [],
+        1: [],
+        2: [],
+        3: [],
+        4: [],
+    }
     typing_aliases: list[ast.alias] = []
+    pydantic_aliases: list[ast.alias] = []
     has_future_annotations = False
     any_imported = False
+    overload_imported = False
+    field_imported = False
 
     for node in import_nodes:
         if isinstance(node, ast.ImportFrom) and node.module == "__future__":
@@ -338,6 +576,19 @@ def _build_pruned_imports(
                     typing_aliases.append(alias)
                     if bound == "Any":
                         any_imported = True
+                    if bound == "overload":
+                        overload_imported = True
+            continue
+
+        if isinstance(node, ast.ImportFrom) and node.module == "pydantic" and node.level == 0:
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if bound in pruned_forbidden:
+                    continue
+                if bound in used_names:
+                    pydantic_aliases.append(alias)
+                    if bound == "Field":
+                        field_imported = True
             continue
 
         if isinstance(node, ast.Import):
@@ -361,7 +612,7 @@ def _build_pruned_imports(
                 and (alias.asname or alias.name) not in pruned_forbidden
             ]
             if kept:
-                grp = 3 if node.level > 0 else _classify_import_group(mod)
+                grp = 4 if node.level > 0 else _classify_import_group(mod)
                 sorted_kept = sorted(
                     kept,
                     key=lambda a: (
@@ -381,6 +632,10 @@ def _build_pruned_imports(
 
     if "Any" in used_names and not any_imported:
         typing_aliases.append(ast.alias(name="Any"))
+    if "overload" in used_names and not overload_imported:
+        typing_aliases.append(ast.alias(name="overload"))
+    if "Field" in used_names and not field_imported:
+        pydantic_aliases.append(ast.alias(name="Field"))
 
     if typing_aliases:
         dedup: dict[tuple[str, str | None], ast.alias] = {}
@@ -401,11 +656,35 @@ def _build_pruned_imports(
             ((1, "typing", names_str), _format_from_import("from typing", typing_items))
         )
 
+    if pydantic_aliases:
+        dedup_pydantic: dict[tuple[str, str | None], ast.alias] = {}
+        for alias in pydantic_aliases:
+            dedup_pydantic[(alias.name, alias.asname)] = alias
+        sorted_pydantic = sorted(
+            dedup_pydantic.values(),
+            key=lambda a: (
+                not a.name.isupper(),
+                not a.name[:1].isupper(),
+                a.name.lower(),
+                a.name,
+            ),
+        )
+        pydantic_items = [
+            f"{a.name} as {a.asname}" if a.asname else a.name for a in sorted_pydantic
+        ]
+        pydantic_names_str = ", ".join(pydantic_items)
+        grouped[2].append(
+            (
+                (1, "pydantic", pydantic_names_str),
+                _format_from_import("from pydantic", pydantic_items),
+            )
+        )
+
     if has_future_annotations:
         grouped[0].append(((1, "__future__", "annotations"), "from __future__ import annotations"))
 
     blocks: list[str] = []
-    for grp in (0, 1, 2, 3):
+    for grp in (0, 1, 2, 3, 4):
         if grouped[grp]:
             items = [line for _, line in sorted(grouped[grp], key=lambda item: item[0])]
             blocks.append("\n".join(items))
@@ -594,6 +873,7 @@ class ModelEngine:
         cls_node: ast.ClassDef,
         dynamic_model: type[Any] | None = None,
         override_base_name: str | None = None,
+        runtime_cls: type[Any] | None = None,
     ) -> tuple[str, list[str]]:
         """Render a ClassDef AST node and optional dynamic model fields as `.pyi` lines."""
         bases_list = (
@@ -616,6 +896,8 @@ class ModelEngine:
         field_lines: list[str] = []
         method_lines: list[str] = []
         declared_fields: set[str] = set()
+        declared_annotations: dict[str, str] = {}
+        has_explicit_init = False
 
         body_stmts = list(cls_node.body)
         if body_stmts:
@@ -629,6 +911,7 @@ class ModelEngine:
                 field_name = stmt.target.id
                 declared_fields.add(field_name)
                 ann_expr_str = _format_expr(stmt.annotation)
+                declared_annotations[field_name] = ann_expr_str
                 ann_part = f"    {field_name}: {ann_expr_str}"
                 if stmt.value is None:
                     field_lines.extend(_wrap_field_stub("    ", field_name, ann_expr_str))
@@ -663,6 +946,8 @@ class ModelEngine:
                         declared_fields.add(target.id)
                         field_lines.append(f"    {target.id} = {_format_expr(stmt.value)}")
             elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if stmt.name == "__init__":
+                    has_explicit_init = True
                 method_lines.extend(_format_function_stub(stmt, indent="    "))
 
         if dynamic_model is not None:
@@ -670,10 +955,23 @@ class ModelEngine:
                 if field_name in declared_fields:
                     continue
                 ann_str = _format_runtime_annotation(field_info.annotation)
-                default_str = (
-                    "None" if not field_info.is_required() and field_info.default is None else None
+                field_lines.extend(
+                    _wrap_dynamic_field_stub("    ", field_name, ann_str, field_info)
                 )
-                field_lines.extend(_wrap_field_stub("    ", field_name, ann_str, default_str))
+
+        effective_cls = dynamic_model or runtime_cls
+        if (
+            effective_cls is not None
+            and not has_explicit_init
+            and _is_aliased_imednet_model(effective_cls)
+        ):
+            init_lines = _build_init_overloads(
+                cls_node,
+                effective_cls,
+                declared_annotations,
+                indent="    ",
+            )
+            method_lines = [*init_lines, *method_lines]
 
         if not doc_lines and not field_lines and not method_lines:
             return ("class_single", [*header_lines, f"{header} ..."])
@@ -688,7 +986,7 @@ class ModelEngine:
 
     @classmethod
     def _render_module_stub(cls, py_file: str, source: str) -> str | None:
-        """Parse a model `.py` file into a `.pyi` stub string, or None if not a dynamic model."""
+        """Parse a model `.py` file into a `.pyi` stub string, or None if no aliased models."""
         tree = ast.parse(source, filename=py_file)
         model_targets: list[tuple[str, str, str | None]] = []
         for stmt in tree.body:
@@ -696,15 +994,23 @@ class ModelEngine:
             if extracted is not None:
                 model_targets.append(extracted)
 
-        if not model_targets:
+        class_names_in_ast = {stmt.name for stmt in tree.body if isinstance(stmt, ast.ClassDef)}
+        if not model_targets and (
+            not class_names_in_ast or not _ast_references_imednet_base_model(tree)
+        ):
             return None
 
-        resolved_models = _load_module_models(py_file, model_targets)
+        resolved_models = _load_module_models(py_file, model_targets, class_names_in_ast)
+        has_aliased_model = any(
+            _is_aliased_imednet_model(model_cls) for model_cls in resolved_models.values()
+        )
+        if not model_targets and not has_aliased_model:
+            return None
+
         target_map: dict[str, tuple[str, str | None]] = {
             target_name: (model_name, base_name)
             for target_name, model_name, base_name in model_targets
         }
-        class_names_in_ast = {stmt.name for stmt in tree.body if isinstance(stmt, ast.ClassDef)}
 
         leading_comments: list[str] = []
         for raw_line in source.splitlines():
@@ -747,9 +1053,12 @@ class ModelEngine:
                 continue
 
             if isinstance(stmt, ast.ClassDef):
-                dyn_model = resolved_models.get(stmt.name)
+                dyn_model = resolved_models.get(stmt.name) if stmt.name in target_map else None
+                runtime_cls = resolved_models.get(stmt.name)
                 override_base = target_map[stmt.name][1] if stmt.name in target_map else None
-                body_blocks.append(cls._emit_class_stub(stmt, dyn_model, override_base))
+                body_blocks.append(
+                    cls._emit_class_stub(stmt, dyn_model, override_base, runtime_cls)
+                )
             elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 body_blocks.append(("func", _format_function_stub(stmt)))
             elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):

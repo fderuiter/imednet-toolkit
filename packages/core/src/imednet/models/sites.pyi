@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, overload
 
 from pydantic import Field, field_validator
 
@@ -41,13 +41,37 @@ class Site(ImednetBaseModel):
     site_enrollment_status: SiteEnrollmentStatus | str | None = Field(
         default=None, alias="siteEnrollmentStatus"
     )
-    study_key: str | None = None
-    site_id: int | None = None
-    site_name: str | None = None
-    date_created: str | None = None
-    date_modified: str | None = None
-    last_updated: str | None = None
+    study_key: str | None = Field(default=None, alias="studyKey")
+    site_id: int | None = Field(default=None, alias="siteId")
+    site_name: str | None = Field(default=None, alias="siteName")
+    date_created: str | None = Field(default=None, alias="dateCreated")
+    date_modified: str | None = Field(default=None, alias="dateModified")
+    last_updated: str | None = Field(default=None, alias="lastUpdated")
 
+    @overload
+    def __init__(
+        self,
+        *,
+        site_enrollment_status: SiteEnrollmentStatus | str | None = None,
+        study_key: str | None = None,
+        site_id: int | None = None,
+        site_name: str | None = None,
+        date_created: str | None = None,
+        date_modified: str | None = None,
+        last_updated: str | None = None,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self,
+        *,
+        siteEnrollmentStatus: SiteEnrollmentStatus | str | None = None,
+        studyKey: str | None = None,
+        siteId: int | None = None,
+        siteName: str | None = None,
+        dateCreated: str | None = None,
+        dateModified: str | None = None,
+        lastUpdated: str | None = None,
+    ) -> None: ...
     @field_validator("site_enrollment_status", mode="before")
     @classmethod
     def _validate_site_enrollment_status(cls, value: Any) -> SiteEnrollmentStatus | str | None: ...
