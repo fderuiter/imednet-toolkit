@@ -7,9 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ...endpoints.subjects import SubjectsEndpoint
 from ...errors import ValidationError
-from ...models.subjects import Subject
 from ...sdk import ImednetSDK
 from ...utils.enrollment import (
     filter_existing_subject_registrations,
@@ -17,15 +15,9 @@ from ...utils.enrollment import (
     validate_subject_registration_sites,
 )
 from ..decorators import validate_cli_path_segment, with_sdk
-from ..utils import display_list, fetching_status, print_error, simulation_mode_context
+from ..utils import print_error, register_list_command, simulation_mode_context
 from ..utils.args import (
-    add_list_query_args,
-    add_output_format,
-    add_simulation_arg,
     add_study_key_args,
-    collect_list_items_with_remainder,
-    prepare_list_query,
-    resolve_output_format,
     resolve_study_key,
 )
 from ..utils.write_helpers import (
@@ -90,101 +82,20 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     sub = parser.add_subparsers(dest="command")
 
     # 1. subjects list
-    list_parser = sub.add_parser("list", help="List subjects for a specific study.")
-    add_study_key_args(list_parser)
-    add_list_query_args(
-        list_parser,
+    register_list_command(
+        parser,
+        "subjects",
+        "subjects",
+        requires_study_key=True,
+        list_help="List subjects for a specific study.",
+        empty_msg="No subjects found matching the criteria.",
+        row_mapper=_subject_view_model,
         filter_dest="subject_filter",
-        filter_help="Filter criteria (e.g., 'subject_status=Screened' or 'subjectStatus==Screened'). Repeat for multiple filters.",
+        filter_help=(
+            "Filter criteria (e.g., 'subject_status=Screened' or 'subjectStatus==Screened'). "
+            "Repeat for multiple filters."
+        ),
     )
-    add_output_format(list_parser)
-    add_simulation_arg(list_parser)
-
-    @with_sdk
-    def list_subjects(
-        sdk: ImednetSDK,
-        study_key: str,
-        subject_filter: list[str] | None = None,
-        output_format: str | None = None,
-        sort: str | None = None,
-        limit: int | None = None,
-        fetch_all: bool = False,
-        no_interactive: bool = False,
-        _prepared_query: tuple[dict[str, Any], int | None] | None = None,
-    ) -> None:
-        resolved_format = resolve_output_format(output_format)
-        req_kwargs, effective_limit = (
-            _prepared_query
-            if _prepared_query is not None
-            else prepare_list_query(
-                filter_args=subject_filter,
-                sort=sort,
-                limit=limit,
-                fetch_all=fetch_all,
-                output_format=resolved_format,
-                no_interactive=no_interactive,
-                model=Subject,
-                allowed_attributes=SubjectsEndpoint.FILTER_ATTRIBUTES,
-                disallow_study_key=True,
-            )
-        )
-
-        with fetching_status("subjects", study_key):
-            subjects_list, truncated, load_remaining = collect_list_items_with_remainder(
-                sdk.subjects.list(study_key, **req_kwargs),
-                effective_limit,
-            )
-
-        if resolved_format == "json":
-            display_list(subjects_list, "subjects", output_format="json")
-            return
-        view_models = [_subject_view_model(s) for s in subjects_list]
-
-        def _load_more_subjects() -> tuple[list[dict[str, Any]], list[Any]]:
-            more = load_remaining() if load_remaining is not None else []
-            return [_subject_view_model(s) for s in more], more
-
-        display_list(
-            view_models,
-            "subjects",
-            "No subjects found matching the criteria.",
-            details=subjects_list,
-            truncated=truncated,
-            interactive=False if no_interactive else None,
-            output_format=resolved_format,
-            on_load_all=_load_more_subjects if load_remaining is not None else None,
-        )
-
-    def _dispatch_list_subjects(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(list_parser, args, required=True)
-        assert study_key is not None
-        validate_cli_path_segment(study_key, name="study_key")
-        no_interactive = getattr(args, "no_interactive", False)
-        resolved_format = resolve_output_format(args.output_format)
-        prepared = prepare_list_query(
-            filter_args=args.subject_filter,
-            sort=args.sort,
-            limit=args.limit,
-            fetch_all=args.fetch_all,
-            output_format=resolved_format,
-            no_interactive=no_interactive,
-            model=Subject,
-            allowed_attributes=SubjectsEndpoint.FILTER_ATTRIBUTES,
-            disallow_study_key=True,
-        )
-        with simulation_mode_context(bool(getattr(args, "simulation", False))):
-            list_subjects(
-                study_key=study_key,
-                subject_filter=args.subject_filter,
-                output_format=resolved_format,
-                sort=args.sort,
-                limit=args.limit,
-                fetch_all=args.fetch_all,
-                no_interactive=no_interactive,
-                _prepared_query=prepared,
-            )
-
-    list_parser.set_defaults(func=_dispatch_list_subjects)
 
     # 2. subjects register
     register_parser = sub.add_parser(

@@ -2107,3 +2107,178 @@ def test_study_scoped_list_commands_reject_study_key_in_filter(
     assert "'study_key' and 'studyKey' cannot be used in --filter" in result.stderr
     assert "TypeError" not in result.stderr
     getattr(sdk, attr).list.assert_not_called()
+
+
+def test_get_model_value_and_cli_utils_export() -> None:
+    """get_model_value resolves first non-None dict or attribute value and stays internal to cli.utils."""
+    from types import SimpleNamespace
+
+    from imednet.cli import utils as cli_utils
+    from imednet.cli.utils.commands import get_model_value
+    from imednet.spi import cli as spi_cli
+
+    assert cli_utils.get_model_value is get_model_value
+    assert "get_model_value" in cli_utils.__all__
+    assert "get_model_value" not in spi_cli.__all__
+    assert "register_list_command" not in spi_cli.__all__
+    assert not hasattr(spi_cli, "get_model_value")
+    assert not hasattr(spi_cli, "register_list_command")
+
+    mapping = {"primary": None, "secondary": "meddra", "zero": 0, "flag": False}
+    assert get_model_value(mapping, "missing", "primary", "secondary") == "meddra"
+    assert get_model_value(mapping, "zero") == 0
+    assert get_model_value(mapping, "flag") is False
+    assert get_model_value(mapping, "missing", "primary", default="fallback") == "fallback"
+
+    obj = SimpleNamespace(primary=None, secondary="whodrug")
+    assert get_model_value(obj, "missing", "primary", "secondary") == "whodrug"
+    assert get_model_value(obj, "missing", "primary", default="none") == "none"
+
+
+def test_codings_subjects_users_delegate_to_register_list_command() -> None:
+    """codings, subjects, and users have no inline list handlers and preserve parser contracts."""
+    import argparse
+    import ast
+    import inspect
+
+    import imednet.cli.codings as codings_mod
+    import imednet.cli.subjects as subjects_mod
+    import imednet.cli.users as users_mod
+    from imednet.cli import get_parser
+
+    forbidden = {
+        "_get_val",
+        "list_codings",
+        "list_subjects",
+        "list_users",
+        "_dispatch_list_codings",
+        "_dispatch_list_subjects",
+        "_dispatch_list_users",
+    }
+    for mod in (codings_mod, subjects_mod, users_mod):
+        tree = ast.parse(inspect.getsource(mod))
+        defined_funcs = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assert forbidden.isdisjoint(defined_funcs), (
+            f"{mod.__name__} still defines {forbidden & defined_funcs}"
+        )
+
+    parser = get_parser()
+    root_sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+
+    subjects_parser = root_sub.choices["subjects"]
+    subjects_sub = next(
+        a for a in subjects_parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    assert set(subjects_sub.choices) == {"list", "register"}
+
+    ns_codings = parser.parse_args(["codings", "list", "STUDY", "-f", "dictionaryName=MedDRA"])
+    assert ns_codings.coding_filter == ["dictionaryName=MedDRA"]
+
+    ns_subjects = parser.parse_args(["subjects", "list", "STUDY", "-f", "subject_status=Screened"])
+    assert ns_subjects.subject_filter == ["subject_status=Screened"]
+
+    for group_name, expected_help in (
+        ("codings", "List codings for a specific study."),
+        ("subjects", "List subjects for a specific study."),
+        ("users", "List users for a specific study."),
+    ):
+        group_parser = root_sub.choices[group_name]
+        group_sub = next(
+            a for a in group_parser._actions if isinstance(a, argparse._SubParsersAction)
+        )
+        help_map = {act.dest: act.help for act in group_sub._choices_actions}
+        assert help_map["list"] == expected_help
+
+
+def test_preflight_query_order_across_codings_subjects_and_users(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codings and subjects validate queries before get_sdk, while users initializes get_sdk first."""
+    from imednet import cli
+
+    for preflight_subcmd in ("codings", "subjects"):
+        not_called = MagicMock(side_effect=AssertionError("get_sdk called during preflight"))
+        monkeypatch.setattr("imednet.cli.utils.context.get_sdk", not_called)
+        res = runner.invoke(cli.app, [preflight_subcmd, "list", "STUDY", "--limit", "0"])
+        assert res.exit_code == 1
+        assert "--limit must be a positive integer" in res.stderr
+        not_called.assert_not_called()
+
+    events: list[str] = []
+    mock_sdk = MagicMock()
+    mock_sdk.close.side_effect = lambda: events.append("sdk_close")
+
+    def _recording_get_sdk() -> MagicMock:
+        events.append("get_sdk")
+        return mock_sdk
+
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _recording_get_sdk)
+    users_res = runner.invoke(cli.app, ["users", "list", "STUDY", "--limit", "0"])
+    assert users_res.exit_code == 1
+    assert "--limit must be a positive integer" in users_res.stderr
+    assert events == ["get_sdk", "sdk_close"]
+    mock_sdk.users.list.assert_not_called()
+
+
+def test_register_list_command_hooks_no_study_and_subparser_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """register_list_command reuses existing subparsers and supports custom hooks without study_key."""
+    import argparse
+
+    from imednet.cli.utils.commands import register_list_command
+    from imednet.models.studies import Study
+
+    parser = argparse.ArgumentParser(prog="custom")
+    existing_sub = parser.add_subparsers(dest="command")
+    other_parser = existing_sub.add_parser("ping", help="Ping command.")
+    other_parser.set_defaults(func=lambda _args: None)
+
+    register_list_command(
+        parser,
+        "studies",
+        "studies",
+        requires_study_key=False,
+        list_help="Custom studies list help.",
+        empty_msg="No custom studies.",
+        row_mapper=lambda s: {"key": s.study_key, "upper_name": (s.study_name or "").upper()},
+        include_filter=False,
+        extra_args_fn=lambda p: p.add_argument("--archived", action="store_true", default=False),
+        extra_kwargs_fn=lambda a: {"archived": a.archived},
+        preflight_query=False,
+    )
+
+    sub_actions = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    assert sub_actions == [existing_sub]
+    assert set(existing_sub.choices) == {"ping", "list"}
+
+    study = Study(studyKey="ST-1", studyName="Alpha")
+    mock_sdk = MagicMock()
+    mock_sdk.studies.list.return_value = [study]
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: mock_sdk)
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: False)
+
+    # Table mode maps rows via row_mapper and emits human progress on stderr
+    ns_table = parser.parse_args(["list", "--archived"])
+    ns_table.func(ns_table)
+    out_table, err_table = capsys.readouterr()
+    assert "Fetching studies..." in err_table
+    assert "ALPHA" in out_table
+    mock_sdk.studies.list.assert_called_once_with(archived=True)
+
+    # IMEDNET_CLI_OUTPUT_FORMAT=json bypasses row_mapper and emits raw alias-serialized model
+    mock_sdk.studies.list.reset_mock()
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    ns_json = parser.parse_args(["list"])
+    ns_json.func(ns_json)
+    out_json, err_json = capsys.readouterr()
+    assert err_json == ""
+    payload = json.loads(out_json)
+    assert payload["items"] == [study.model_dump(mode="json", by_alias=True)]
+    mock_sdk.studies.list.assert_called_once_with(archived=False)
