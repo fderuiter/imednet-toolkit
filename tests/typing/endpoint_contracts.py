@@ -416,15 +416,38 @@ def plugin_implementation_contracts(
         database='db',
         collection='col',
         max_buffered_records=1000,
+        as_sdtm=True,
+        sdtm_domain='AE',
+        standards_profile='drug',
+        min_standards_score=90.0,
+        naming_convention='sdtm',
     )
     neo4j_cfg = sinks_ns.Neo4jSinkConfig(
         'S',
         uri='bolt://localhost:7687',
         auth=('neo4j', 'pw'),
         max_buffered_records=1000,
+        as_sdtm=True,
+        sdtm_domain='AE',
+        standards_profile='drug',
+        min_standards_score=90.0,
+        naming_convention='sdtm',
     )
-    sf_cfg = sinks_ns.SnowflakeSinkConfig('S', max_buffered_records=1000)
+    sf_cfg = sinks_ns.SnowflakeSinkConfig(
+        'S',
+        max_buffered_records=1000,
+        as_sdtm=True,
+        sdtm_domain='AE',
+        standards_profile='drug',
+        min_standards_score=90.0,
+        naming_convention='sdtm',
+    )
     assert_type(mongo_cfg.max_buffered_records, int | None)
+    assert_type(mongo_cfg.as_sdtm, bool)
+    assert_type(mongo_cfg.sdtm_domain, str | None)
     assert_type(neo4j_cfg.max_buffered_records, int | None)
+    assert_type(neo4j_cfg.min_standards_score, float | None)
     assert_type(sf_cfg.max_buffered_records, int | None)
+    assert_type(sf_cfg.naming_convention, str | None)
+    assert_type(workflows_ns.record_mapper.sdtm_dataframe('S', 'AE', mask_phi=True), pd.DataFrame)
     assert workflows_ns and sinks_ns and sinks_factory and workflows_factory

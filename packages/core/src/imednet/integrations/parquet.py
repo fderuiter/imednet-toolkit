@@ -260,6 +260,9 @@ def export_to_hive_parquet(
             stream_prefix="hive_parquet",
             custom_stream_prefix=config.stream_name,
             validate_form_key_fn=validate_partition_key,
+            as_sdtm=config.as_sdtm,
+            sdtm_domain=config.sdtm_domain,
+            naming_convention=config.naming_convention,
         )
         if not contexts:
             return

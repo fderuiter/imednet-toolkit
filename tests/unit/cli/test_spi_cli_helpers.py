@@ -334,6 +334,7 @@ def test_simulation_mode_datadict_export_and_write_commands(
         ["workflows", "extract-records", "STUDY-A", "--study-key", "STUDY-B"],
         ["workflows", "sync-worker", "STUDY-A", "--study-key", "STUDY-B", "--once"],
         ["workflows", "uat", "run", "STUDY-A", "--study-key", "STUDY-B"],
+        ["workflows", "validate-standards", "STUDY-A", "--study-key", "STUDY-B"],
     ],
 )
 def test_conflicting_study_keys_exit_two_on_stderr(
@@ -416,6 +417,7 @@ def test_missing_and_partial_credentials_diagnostics_and_redaction(
         ["subjects", "register", "../evil", "--form-key", "F_DM", "--site-name", "SITE"],
         ["workflows", "sync-worker", "../evil", "--once"],
         ["workflows", "uat", "run", "../evil"],
+        ["workflows", "validate-standards", "../evil"],
         ["subject-data", "../evil", "SUBJ-001"],
         ["subject-data", "STUDY", "../evil"],
     ],
@@ -445,3 +447,26 @@ def test_extract_records_rejects_interactive_with_json_format(
     out, err = capsys.readouterr()
     assert out == ""
     assert "Cannot combine --interactive with --format json" in err
+
+
+def test_validate_standards_supports_simulation_and_study_key_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify workflows validate-standards supports --study-key and --simulation offline."""
+    cli_mod.app(
+        [
+            "workflows",
+            "validate-standards",
+            "--study-key",
+            "STUDY",
+            "--simulation",
+            "--format",
+            "json",
+        ]
+    )
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert spi_cli.SIMULATION_MODE_ENV not in os.environ
+    payload = json.loads(out)
+    assert payload["study_key"] == "STUDY"
+    assert "score" in payload

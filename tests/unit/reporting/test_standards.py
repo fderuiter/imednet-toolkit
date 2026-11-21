@@ -289,3 +289,109 @@ def test_standards_profile_canonical_alias_resolution_for_cm() -> None:
         {"subjectKey": "S001", "cmTrt": "Aspirin", "cmDose": 100, "cmDosU": "mg"},
     )
     assert no_violations == []
+
+
+def test_core_sdtm_transform_enforces_pre_usubjid_phi_masking_and_cross_batch_seq() -> None:
+    """Core SDTM transformation masks sensitive USUBJID/PHI before output and increments --SEQ across batches."""
+    from imednet.models.records import Record
+    from imednet.models.standards import (
+        SDTM_DOMAIN_SPECS,
+        CategoricalNormalizer,
+        StandardsReadinessValidator,
+        transform_records_to_sdtm_rows,
+    )
+    from imednet.utils.security import SensitivityRegistry
+
+    assert {"DM", "AE", "LB", "VS", "CM", "EX", "MH"}.issubset(SDTM_DOMAIN_SPECS.keys())
+    norm = CategoricalNormalizer(cdisc_ct={"sex": {"F", "M"}}).normalize_record(
+        {"sex": "female"},
+        terminology_lookups={"sex": {"FEMALE": "F"}},
+    )
+    assert norm.normalized_record["sex"] == "F"
+    assert norm.warnings == []
+
+    # Upstream Record instances must never be mutated in place
+    rec1 = Record(
+        record_id=1,
+        study_key="ONCO1",
+        form_key="AE",
+        subject_key="SUBJ-101",
+        record_data={
+            "aeTerm": "Nausea",
+            "aeDecod": "NAUSEA",
+            "aeStartDate": "2026-01-10 08:30:00",
+            "aeSerious": "yes",
+            "aeSeverity": "Grade 2",
+            "aeRelationship": "POSSIBLE",
+            "patientName": "Alice Secret",
+        },
+    )
+    rec2 = Record(
+        record_id=2,
+        study_key="ONCO1",
+        form_key="AE",
+        subject_key="SUBJ-101",
+        record_data={
+            "ae_term": "Fatigue",
+            "AEDECOD": "FATIGUE",
+            "AESTDTC": "2026-01-12",
+            "AESER": False,
+            "AESEV": "Grade 1",
+            "AEREL": "UNLIKELY",
+        },
+    )
+    original_dump_1 = rec1.model_dump()
+
+    seq_counters: dict[str, int] = {}
+    batch1 = transform_records_to_sdtm_rows(
+        [rec1], domain="AE", study_key="ONCO1", mask_phi=True, seq_counters=seq_counters
+    )
+    batch2 = transform_records_to_sdtm_rows(
+        [rec2], domain="AE", study_key="ONCO1", mask_phi=True, seq_counters=seq_counters
+    )
+    assert rec1.model_dump() == original_dump_1
+    assert batch1[0]["STUDYID"] == "ONCO1"
+    assert batch1[0]["DOMAIN"] == "AE"
+    assert batch1[0]["USUBJID"] == "SUBJ-101"
+    assert batch1[0]["AESEQ"] == 1
+    assert batch1[0]["AESTDTC"] == "2026-01-10T08:30:00"
+    assert batch1[0]["AESER"] == "Y"
+    assert batch1[0]["patientName"] == "***MASKED***"
+
+    assert batch2[0]["AESEQ"] == 2
+    assert batch2[0]["AETERM"] == "Fatigue"
+    assert batch2[0]["AEDECOD"] == "FATIGUE"
+    assert batch2[0]["AESER"] == "N"
+
+    # When subject_key is registered as sensitive in SensitivityRegistry or custom phi_keys,
+    # USUBJID itself is masked BEFORE SDTM rows are emitted.
+    custom_reg = SensitivityRegistry()
+    custom_reg.remove_exempt_key("subject_key")
+    custom_reg.add_sensitive_key("subject_key")
+    masked_usubjid_rows = transform_records_to_sdtm_rows(
+        [rec1],
+        domain="AE",
+        study_key="ONCO1",
+        mask_phi=True,
+        registry=custom_reg,
+    )
+    assert masked_usubjid_rows[0]["USUBJID"] == "***MASKED***"
+
+    validator = StandardsReadinessValidator(profile="drug")
+    ready_report = validator.score_records(
+        records_by_domain={
+            "AE": [
+                {
+                    "subjectKey": "SUBJ-101",
+                    "aeTerm": "Nausea",
+                    "aeDecod": "NAUSEA",
+                    "aeSeverity": "2",
+                    "aeRelationship": "POSSIBLE",
+                    "aeActionTaken": "NONE",
+                    "aeOutcome": "RECOVERED",
+                }
+            ]
+        }
+    )
+    assert ready_report.score == 100.0
+    assert ready_report.is_ready is True

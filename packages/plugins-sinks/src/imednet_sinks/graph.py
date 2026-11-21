@@ -191,11 +191,104 @@ def _normalize_visit_id(visit_id: Any) -> Any:
     return visit_id
 
 
+def _build_convention_cypher(
+    study_prop: str,
+    subject_prop: str,
+    record_prop: str,
+    visit_prop: str,
+) -> tuple[str, str]:
+    """Build MERGE and CREATE Cypher statements aligned to a naming convention."""
+    merge_cypher = (
+        "UNWIND $rows AS row\n"
+        f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
+        f"MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        f"MERGE (r:Record   {{{record_prop}: row.{record_prop}, {study_prop}: row.{study_prop}}})\n"
+        "SET r += row\n"
+        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        "    MERGE (su)-[:HAS_VISIT]->(v)\n"
+        "    MERGE (v)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
+        "    MERGE (su)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+    )
+    create_cypher = (
+        "UNWIND $rows AS row\n"
+        f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
+        f"MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        "CREATE (r:Record)\n"
+        "SET r = row\n"
+        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        "    MERGE (su)-[:HAS_VISIT]->(v)\n"
+        "    MERGE (v)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
+        "    MERGE (su)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+    )
+    return merge_cypher, create_cypher
+
+
+def _build_sdtm_cypher(seq_prop: str | None, has_visit: bool) -> tuple[str, str]:
+    """Build MERGE and CREATE Cypher statements for SDTM domain rows."""
+    record_key_props = (
+        f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, {seq_prop}: row.{seq_prop}"
+        if seq_prop
+        else "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID"
+    )
+    if has_visit:
+        visit_block = (
+            "FOREACH (_ IN CASE WHEN row.VISITNUM IS NOT NULL THEN [1] ELSE [] END |\n"
+            "    MERGE (v:Visit {VISITNUM: row.VISITNUM, USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
+            "    MERGE (su)-[:HAS_VISIT]->(v)\n"
+            "    MERGE (v)-[:HAS_RECORD]->(r)\n"
+            ")\n"
+            "FOREACH (_ IN CASE WHEN row.VISITNUM IS NULL THEN [1] ELSE [] END |\n"
+            "    MERGE (su)-[:HAS_RECORD]->(r)\n"
+            ")\n"
+        )
+    else:
+        visit_block = "MERGE (su)-[:HAS_RECORD]->(r)\n"
+
+    merge_cypher = (
+        "UNWIND $rows AS row\n"
+        "MERGE (s:Study   {STUDYID: row.STUDYID})\n"
+        "MERGE (su:Subject {USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
+        f"MERGE (r:Record   {{{record_key_props}}})\n"
+        "SET r += row\n"
+        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"{visit_block}"
+    )
+    create_cypher = (
+        "UNWIND $rows AS row\n"
+        "MERGE (s:Study   {STUDYID: row.STUDYID})\n"
+        "MERGE (su:Subject {USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
+        "CREATE (r:Record)\n"
+        "SET r = row\n"
+        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"{visit_block}"
+    )
+    return merge_cypher, create_cypher
+
+
 def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
-    row["visit_id"] = _normalize_visit_id(row.get("visit_id"))
+    for visit_key in ("visit_id", "visitId", "VISIT_ID"):
+        if visit_key in row:
+            row[visit_key] = _normalize_visit_id(row.get(visit_key))
+            break
+    else:
+        row["visit_id"] = _normalize_visit_id(row.get("visit_id"))
 
     for key, val in list(row.items()):
-        if key in ("record_data", "keywords") or val is None or isinstance(val, NonCallableMock):
+        if (
+            key in ("record_data", "recordData", "RECORD_DATA", "keywords", "KEYWORDS")
+            or val is None
+            or isinstance(val, NonCallableMock)
+        ):
             continue
         if isinstance(val, Enum):
             row[key] = val.value
@@ -204,13 +297,36 @@ def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(val, Decimal):
             row[key] = str(val)
 
-    normalized_record_data = normalize_sink_value(row.get("record_data", {}))
-    row["record_data"] = json.dumps(normalized_record_data, default=_graph_json_default)
+    for rd_key in ("record_data", "recordData", "RECORD_DATA"):
+        if rd_key in row:
+            normalized_record_data = normalize_sink_value(row.get(rd_key, {}))
+            row[rd_key] = json.dumps(normalized_record_data, default=_graph_json_default)
+            break
+    else:
+        row["record_data"] = json.dumps({}, default=_graph_json_default)
 
-    keywords = row.get("keywords")
-    if keywords is not None and not isinstance(keywords, (str, NonCallableMock)):
-        normalized_keywords = normalize_sink_value(keywords, by_alias=True)
-        row["keywords"] = json.dumps(normalized_keywords, default=_graph_json_default)
+    for kw_key in ("keywords", "KEYWORDS"):
+        keywords = row.get(kw_key)
+        if keywords is not None and not isinstance(keywords, (str, NonCallableMock)):
+            normalized_keywords = normalize_sink_value(keywords, by_alias=True)
+            row[kw_key] = json.dumps(normalized_keywords, default=_graph_json_default)
+    return row
+
+
+def _post_process_graph_sdtm(row: dict[str, Any]) -> dict[str, Any]:
+    """Serialize any non-primitive SDTM row values for Neo4j property compatibility."""
+    for key, val in list(row.items()):
+        if val is None or isinstance(val, NonCallableMock):
+            continue
+        if isinstance(val, Enum):
+            row[key] = val.value
+        elif isinstance(val, (datetime, date)):
+            row[key] = val.isoformat()
+        elif isinstance(val, Decimal):
+            row[key] = str(val)
+        elif isinstance(val, (dict, list, tuple)):
+            normalized_val = normalize_sink_value(val)
+            row[key] = json.dumps(normalized_val, default=_graph_json_default)
     return row
 
 
@@ -255,6 +371,7 @@ class Neo4jExportSink(ExportSink):
         self._uri = self.config.uri
         self._auth = self.config.auth
         self._study_key = self.config.study_key
+        self._seq_counters: dict[str, int] = {}
         self._driver: Any = None
         self._connect()
 
@@ -282,18 +399,20 @@ class Neo4jExportSink(ExportSink):
         if not records:
             return 0
 
+        post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
         mapper = build_sink_mapper(
             self.config,
             mode="document",
-            post_processor=_post_process_graph,
+            post_processor=post_proc,
+            seq_counters=self._seq_counters,
         )
-        cypher = _MERGE_RECORD_CYPHER if self.config.idempotent else _CREATE_RECORD_CYPHER
         database = getattr(self.config, "database", "neo4j")
         mapped_rows: list[dict[str, Any]] | None = None
+        cypher: str | None = None
 
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
-            nonlocal mapped_rows
+            nonlocal mapped_rows, cypher
             if mapped_rows is None:
                 try:
                     mapped_rows = [
@@ -305,6 +424,30 @@ class Neo4jExportSink(ExportSink):
                     raise TypeError("Malformed Neo4j record batch payload.") from None
             if not mapped_rows:
                 return 0
+            if cypher is None:
+                if self.config.as_sdtm:
+                    sample_row = mapped_rows[0]
+                    seq_prop = next(
+                        (
+                            k
+                            for k in sample_row
+                            if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
+                        ),
+                        None,
+                    )
+                    has_visit = any("VISITNUM" in r for r in mapped_rows)
+                    merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+                elif self.config.naming_convention == "camelCase":
+                    merge_cypher, create_cypher = _build_convention_cypher(
+                        "studyKey", "subjectKey", "recordId", "visitId"
+                    )
+                elif self.config.naming_convention == "sdtm":
+                    merge_cypher, create_cypher = _build_convention_cypher(
+                        "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
+                    )
+                else:
+                    merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
+                cypher = merge_cypher if self.config.idempotent else create_cypher
             with self._driver.session(database=database) as session:
                 session.run(cypher, rows=mapped_rows)
             logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))
@@ -329,10 +472,24 @@ class Neo4jExportSink(ExportSink):
             else Neo4jSinkConfig(study_key=self._study_key, uri=self._uri, auth=self._auth)
         )
 
+        delete_cypher = _DELETE_RECORD_CYPHER
+        if cfg.naming_convention == "camelCase":
+            delete_cypher = (
+                "UNWIND $record_ids AS rid\n"
+                "MATCH (r:Record {recordId: rid, studyKey: $study_key})\n"
+                "DETACH DELETE r\n"
+            )
+        elif cfg.naming_convention == "sdtm":
+            delete_cypher = (
+                "UNWIND $record_ids AS rid\n"
+                "MATCH (r:Record {RECORD_ID: rid, STUDYID: $study_key})\n"
+                "DETACH DELETE r\n"
+            )
+
         def execute_reconcile() -> int:
             with self._driver.session(database=cfg.database) as session:
                 session.run(
-                    _DELETE_RECORD_CYPHER,
+                    delete_cypher,
                     record_ids=record_ids,
                     study_key=self._study_key,
                 )

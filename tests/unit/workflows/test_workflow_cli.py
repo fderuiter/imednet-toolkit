@@ -723,3 +723,179 @@ def test_extract_records_interactive_grid_and_piped_table_and_env_override(
     assert tty_res.exit_code == 0
     grid_spy.assert_called_once()
     assert grid_spy.call_args.kwargs["details"] == [rec]
+
+
+def test_workflow_cli_masks_phi_in_subject_data_and_extract_records(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """subject-data and workflows extract-records mask PHI by default across JSON envelopes and tables."""
+    import json
+
+    from imednet.models.records import Record
+    from imednet.models.subjects import Subject
+    from imednet_workflows.subject_data import SubjectComprehensiveData
+
+    subj = Subject(
+        study_key="STUDY1",
+        subject_key="SUBJ-001",
+        subject_status="Screened",
+    )
+    rec_subj = Record(
+        record_id=11,
+        study_key="STUDY1",
+        form_key="AE",
+        subject_key="SUBJ-001",
+        record_data={
+            "birthDate": "1980-05-12",
+            "patientName": "Alice Example",
+            "SSN": "999-00-1111",
+            "aeTerm": "Mild rash",
+            "email": "alice@example.com",
+        },
+    )
+    workflow_subj = MagicMock()
+    workflow_subj.get_all_subject_data.return_value = SubjectComprehensiveData(
+        subject_details=subj,
+        visits=[],
+        records=[rec_subj],
+        queries=[],
+    )
+    monkeypatch.setattr(
+        "imednet_workflows.cli.SubjectDataWorkflow", MagicMock(return_value=workflow_subj)
+    )
+
+    res_subj = runner.invoke(cli.app, ["subject-data", "STUDY1", "SUBJ-001", "--format", "json"])
+    assert res_subj.exit_code == 0
+    parsed_subj = json.loads(res_subj.stdout)
+    assert parsed_subj["schemaVersion"] == "1.0"
+    assert parsed_subj["resource"] == "subject_data"
+    subj_rec_data = parsed_subj["items"][0]["records"][0]["recordData"]
+    assert subj_rec_data["birthDate"] == "***MASKED***"
+    assert subj_rec_data["patientName"] == "***MASKED***"
+    assert subj_rec_data["SSN"] == "***MASKED***"
+    assert subj_rec_data["email"] == "***MASKED***"
+    assert subj_rec_data["aeTerm"] == "Mild rash"
+    assert "1980-05-12" not in res_subj.stdout
+    assert "Alice Example" not in res_subj.stdout
+
+    # Opt-out --no-mask-phi preserves enclave values
+    res_unmasked = runner.invoke(
+        cli.app, ["subject-data", "STUDY1", "SUBJ-001", "--format", "json", "--no-mask-phi"]
+    )
+    assert res_unmasked.exit_code == 0
+    unmasked_rec_data = json.loads(res_unmasked.stdout)["items"][0]["records"][0]["recordData"]
+    assert unmasked_rec_data["birthDate"] == "1980-05-12"
+    assert unmasked_rec_data["email"] == "alice@example.com"
+
+    workflow_ext = MagicMock()
+    workflow_ext.extract_records_by_criteria.return_value = [
+        Record(
+            record_id=10,
+            study_key="STUDY1",
+            form_key="DM",
+            subject_key="SUBJ-001",
+            record_status="Complete",
+            record_data={"DOB": "1980-05-12", "patientName": "Alice Example", "age": 45},
+        )
+    ]
+    monkeypatch.setattr(
+        "imednet_workflows.cli.DataExtractionWorkflow", MagicMock(return_value=workflow_ext)
+    )
+
+    res_ext = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY1", "--format", "json"])
+    assert res_ext.exit_code == 0
+    parsed_ext = json.loads(res_ext.stdout)
+    assert parsed_ext["schemaVersion"] == "1.0"
+    assert parsed_ext["resource"] == "records"
+    ext_item = parsed_ext["items"][0]
+    assert ext_item["recordData"]["DOB"] == "***MASKED***"
+    assert ext_item["recordData"]["patientName"] == "***MASKED***"
+    assert ext_item["recordData"]["age"] == 45
+    assert "1980-05-12" not in res_ext.stdout
+
+
+def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """imednet workflows validate-standards reports domain readiness scores and exits 1 below --min-score."""
+    import json
+
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    sdk.forms.list.return_value = [Form(form_id=1, form_key="AE", form_name="Adverse Events")]
+    sdk.variables.list.return_value = [
+        Variable(variable_id=1, form_id=1, form_key="AE", variable_name="aeTerm"),
+        Variable(variable_id=2, form_id=1, form_key="AE", variable_name="unprefixedVar"),
+    ]
+    sdk.records.list.return_value = [
+        Record(
+            record_id=1,
+            study_key="STUDY_STD",
+            form_id=1,
+            form_key="AE",
+            subject_key="S01",
+            record_data={
+                "aeTerm": "Nausea",
+                "aeSeverity": "SEVERE",
+                "patientName": "Secret Patient",
+            },
+        )
+    ]
+
+    res_json = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_STD",
+            "--profile",
+            "drug",
+            "--domain",
+            "AE",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_json.exit_code == 0
+    report_payload = json.loads(res_json.stdout)
+    assert report_payload["study_key"] == "STUDY_STD"
+    assert report_payload["profile"] == "drug"
+    assert report_payload["domain"] == "AE"
+    assert report_payload["score"] < 100.0
+    assert report_payload["is_ready"] is False
+    assert any("unprefixedVar" in w for w in report_payload["warnings"])
+    assert "Secret Patient" not in res_json.stdout
+
+    # Also honors IMEDNET_CLI_OUTPUT_FORMAT=json
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    res_env_json = runner.invoke(
+        cli.app,
+        ["workflows", "validate-standards", "STUDY_STD", "--profile", "drug", "--domain", "AE"],
+    )
+    assert res_env_json.exit_code == 0
+    assert json.loads(res_env_json.stdout)["study_key"] == "STUDY_STD"
+    monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
+
+    res_gated = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_STD",
+            "--profile",
+            "drug",
+            "--domain",
+            "AE",
+            "--min-score",
+            "95",
+        ],
+    )
+    assert res_gated.exit_code == 1
+    assert "Standards Readiness Report" in res_gated.stdout
+    assert "Violations" in res_gated.stdout

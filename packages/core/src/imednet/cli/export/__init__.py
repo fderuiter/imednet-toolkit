@@ -125,6 +125,41 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Minimum record schema readiness score (0-100) when quality gate is enabled.",
     )
+    parser.add_argument(
+        "--as-sdtm",
+        dest="as_sdtm",
+        action="store_true",
+        default=False,
+        help="Transform exported study records into CDISC SDTM domain format.",
+    )
+    parser.add_argument(
+        "--sdtm-domain",
+        "--domain",
+        dest="sdtm_domain",
+        default=None,
+        help="Target CDISC SDTM domain code (e.g. AE, DM, VS, CM, DV, DD); implies --as-sdtm.",
+    )
+    parser.add_argument(
+        "--standards-profile",
+        dest="standards_profile",
+        choices=["general", "drug", "device"],
+        default=None,
+        help="CDISC standards readiness profile used to validate study batches.",
+    )
+    parser.add_argument(
+        "--min-standards-score",
+        dest="min_standards_score",
+        type=float,
+        default=None,
+        help="Minimum CDISC StandardsReadinessValidator score (0-100) required per batch.",
+    )
+    parser.add_argument(
+        "--naming-convention",
+        dest="naming_convention",
+        choices=["snake_case", "camelCase", "sdtm"],
+        default=None,
+        help="Variable and metadata key naming convention when --as-sdtm is off.",
+    )
     add_no_interactive(parser)
 
 
@@ -190,6 +225,23 @@ def _extract_streaming_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     min_readiness = getattr(args, "min_schema_readiness_score", None)
     if min_readiness is not None:
         opts["min_schema_readiness_score"] = min_readiness
+    if getattr(args, "as_sdtm", False):
+        opts["as_sdtm"] = True
+    sdtm_domain = getattr(args, "sdtm_domain", None)
+    if sdtm_domain is not None:
+        opts["sdtm_domain"] = sdtm_domain
+    standards_profile = getattr(args, "standards_profile", None)
+    if standards_profile is not None:
+        opts["standards_profile"] = standards_profile
+    min_standards_score = getattr(args, "min_standards_score", None)
+    if min_standards_score is not None:
+        if min_standards_score < 0.0 or min_standards_score > 100.0:
+            print_error("Error: --min-standards-score must be between 0 and 100.")
+            sys.exit(1)
+        opts["min_standards_score"] = min_standards_score
+    naming_convention = getattr(args, "naming_convention", None)
+    if naming_convention is not None:
+        opts["naming_convention"] = naming_convention
     return opts
 
 

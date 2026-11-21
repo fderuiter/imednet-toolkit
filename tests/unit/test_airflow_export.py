@@ -1195,6 +1195,91 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]
 
 
+def test_airflow_export_operator_sdtm_standards_gating_and_naming_convention(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ImednetExportOperator exposes SDTM, standards_profile/min_standards_score gating, and naming_convention."""
+    import pandas as pd
+
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.errors import ExportError
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [Form(form_id=1, form_key="AE", form_name="Adverse Events")]
+    sdk.variables.list.return_value = []
+
+    # 1. Non-conforming study gated before write when standards_profile='drug' and min_standards_score=95
+    bad_records = [
+        Record(
+            record_id=1,
+            study_key="AF_GATED",
+            form_id=1,
+            form_key="AE",
+            subject_key="S01",
+            record_data={"aeTerm": "Headache", "aeSeverity": "SEVERE"},
+        )
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(bad_records)
+
+    blocked_csv = tmp_path / "af_blocked.csv"
+    op_blocked = ImednetExportOperator(
+        task_id="blocked_sdtm_ae",
+        study_key="AF_GATED",
+        destination="csv",
+        output_path=str(blocked_csv),
+        as_sdtm=True,
+        domain="AE",
+        standards_profile="drug",
+        min_standards_score=95.0,
+    )
+    monkeypatch.setattr(op_blocked, "_get_sdk", lambda: sdk)
+    with pytest.raises(ExportError, match="Standards readiness check failed"):
+        op_blocked.execute({})
+    assert not blocked_csv.exists()
+
+    # 2. Conforming study succeeds with SDTM AE output
+    good_records = [
+        Record(
+            record_id=1,
+            study_key="AF_READY",
+            form_id=1,
+            form_key="AE",
+            subject_key="S01",
+            record_data={
+                "aeTerm": "Headache",
+                "aeDecod": "HEADACHE",
+                "aeStartDate": "2026-04-01",
+                "aeSeverity": "1",
+                "aeRelationship": "POSSIBLE",
+                "aeActionTaken": "NONE",
+                "aeOutcome": "RECOVERED",
+            },
+        )
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(good_records)
+    ready_pq = tmp_path / "af_ready_ae.parquet"
+    op_ready = ImednetExportOperator(
+        task_id="ready_sdtm_ae",
+        study_key="AF_READY",
+        destination="parquet",
+        output_path=str(ready_pq),
+        as_sdtm=True,
+        domain="AE",
+        standards_profile="drug",
+        min_standards_score=95.0,
+        naming_convention="sdtm",
+    )
+    monkeypatch.setattr(op_ready, "_get_sdk", lambda: sdk)
+    op_ready.execute({})
+    out_df = pd.read_parquet(ready_pq)
+    assert list(out_df["DOMAIN"]) == ["AE"]
+    assert list(out_df["AESEQ"]) == [1]
+    assert list(out_df["AETERM"]) == ["Headache"]
+
+
 def test_export_operator_duckdb_default_table_custom_table_and_conn_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -33,6 +33,7 @@ from imednet.integrations.sink_base import (
     ExportSink,
     SinkConfig,
     StateProviderProtocol,
+    _enforce_batch_standards_readiness,
     _extract_safe_config_options,
     apply_quality_gate,
     extract_record_form_ref,
@@ -44,6 +45,13 @@ from imednet.integrations.sink_base import (
     iter_filtered_sdk_records,
     normalize_watermark_datetime,
     run_streaming_export,
+)
+from imednet.models.standards import (
+    format_variable_name,
+    get_sdtm_domain_variables,
+    normalize_naming_convention,
+    resolve_sdtm_domain,
+    transform_records_to_sdtm,
 )
 
 try:
@@ -438,8 +446,8 @@ def _canonical_record_id(value: Any) -> str | None:
 
 
 def _extract_row_canonical_id(row: Mapping[str, Any]) -> str | None:
-    """Extract canonical record ID from a row mapping under ``recordId`` or ``record_id``."""
-    for key in ("recordId", "record_id"):
+    """Extract canonical record ID from a row mapping under ``recordId``, ``record_id``, or ``RECORD_ID``."""
+    for key in ("recordId", "record_id", "RECORD_ID"):
         if key in row:
             cid = _canonical_record_id(row[key])
             if cid is not None:
@@ -449,7 +457,7 @@ def _extract_row_canonical_id(row: Mapping[str, Any]) -> str | None:
 
 def _find_df_record_id_col(df: pd.DataFrame) -> str | None:
     """Return the record ID column name in ``df``, if present."""
-    for candidate in ("recordId", "record_id"):
+    for candidate in ("recordId", "record_id", "RECORD_ID"):
         if candidate in df.columns:
             return candidate
     return None
@@ -875,6 +883,69 @@ def _unify_logical_types(left: str | None, right: str | None) -> str | None:
     return "string"
 
 
+def _build_sdtm_contract_types(
+    domain: str | None,
+    *,
+    variable_whitelist: Sequence[str] | None = None,
+) -> dict[str, str | None]:
+    """Derive expected uppercase SDTM column names and logical types for ``domain``."""
+    dom = resolve_sdtm_domain(domain, fallback="AE")
+    std_vars = get_sdtm_domain_variables(dom)
+    seq_col = f"{dom}SEQ"
+    contract: dict[str, str | None] = {}
+    for col in std_vars:
+        if col in {seq_col, "AGE"}:
+            contract[col] = "int64"
+        else:
+            contract[col] = "string"
+    if variable_whitelist is not None:
+        for extra_var in variable_whitelist:
+            if extra_var not in contract:
+                contract[extra_var] = "string"
+    return contract
+
+
+def _apply_naming_convention_to_df(
+    df: pd.DataFrame,
+    convention: str | None,
+    *,
+    domain: str | None = None,
+    meta_cols: set[str] | None = None,
+    study_key: str | None = None,
+) -> pd.DataFrame:
+    """Rename DataFrame metadata and variable columns according to ``convention``."""
+    canonical_conv = normalize_naming_convention(convention)
+    if canonical_conv is None or (df.empty and len(df.columns) == 0):
+        return df
+    meta_lookup = {
+        m.lower() for m in (meta_cols or {k for k, _ in _RECORD_META_CONTRACT_TYPES})
+    } | {"studykey", "study_key", "studyid"}
+    renamed_cols = [
+        format_variable_name(
+            str(col),
+            canonical_conv,
+            domain=domain,
+            is_metadata=(str(col).lower() in meta_lookup),
+        )
+        for col in df.columns
+    ]
+    out = df.copy()
+    out.columns = pd.Index(renamed_cols)
+    if study_key:
+        study_col = format_variable_name(
+            "study_key",
+            canonical_conv,
+            domain=domain,
+            is_metadata=True,
+        )
+        if study_col.lower() not in {str(c).lower() for c in out.columns}:
+            out.insert(0, study_col, study_key)
+    dup_mask = out.columns.astype(str).str.lower().duplicated()
+    if bool(dup_mask.any()):
+        out = out.loc[:, ~dup_mask]
+    return out
+
+
 def _build_tabular_contract_types(
     variable_keys: Sequence[str],
     label_map: Mapping[str, Any],
@@ -884,10 +955,23 @@ def _build_tabular_contract_types(
     mask_phi: bool = True,
     phi_keys: set[str] | None = None,
     pipeline: EnrichmentPipeline | None = None,
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
 ) -> dict[str, str | None]:
     """Derive expected column names and logical types from the Record + Variable contract."""
-    contract: dict[str, str | None] = dict(_RECORD_META_CONTRACT_TYPES)
-    seen_lower: set[str] = {name.lower() for name, _ in _RECORD_META_CONTRACT_TYPES}
+    canonical_conv = (
+        None if use_labels_as_columns else normalize_naming_convention(naming_convention)
+    )
+    if canonical_conv is None:
+        contract: dict[str, str | None] = dict(_RECORD_META_CONTRACT_TYPES)
+    else:
+        contract = {}
+        for meta_name, meta_type in [("studyKey", "string"), *_RECORD_META_CONTRACT_TYPES]:
+            formatted_meta = format_variable_name(
+                meta_name, canonical_conv, domain=sdtm_domain, is_metadata=True
+            )
+            contract.setdefault(formatted_meta, meta_type)
+    seen_lower: set[str] = {name.lower() for name in contract}
     active_phi_keys = (
         phi_keys
         if phi_keys is not None
@@ -915,15 +999,22 @@ def _build_tabular_contract_types(
         effective_keys = [k for k in variable_keys if k not in replaced_sources] + mapped_targets
 
     for key in effective_keys:
-        col_name = str(label_map.get(key, key) if use_labels_as_columns else key)
+        raw_col_name = str(label_map.get(key, key) if use_labels_as_columns else key)
+        col_name = (
+            format_variable_name(raw_col_name, canonical_conv, domain=sdtm_domain)
+            if canonical_conv is not None
+            else raw_col_name
+        )
         col_lower = col_name.lower()
         if col_lower in seen_lower:
             continue
         seen_lower.add(col_lower)
         if mask_phi and (
             global_sensitivity_registry.is_sensitive(key)
+            or global_sensitivity_registry.is_sensitive(raw_col_name)
             or global_sensitivity_registry.is_sensitive(col_name)
             or _is_custom_phi_key(key, active_phi_keys)
+            or _is_custom_phi_key(raw_col_name, active_phi_keys)
             or _is_custom_phi_key(col_name, active_phi_keys)
         ):
             contract[col_name] = "string"
@@ -1304,10 +1395,9 @@ def _filter_arrow_table_excluding_ids(pa: Any, tbl: Any, exclude_ids: set[str]) 
     """Filter out rows from ``tbl`` whose canonical record ID is in ``exclude_ids``."""
     if tbl.num_rows == 0 or not exclude_ids:
         return tbl
-    id_col = (
-        "recordId"
-        if "recordId" in tbl.column_names
-        else ("record_id" if "record_id" in tbl.column_names else None)
+    id_col = next(
+        (c for c in ("recordId", "record_id", "RECORD_ID") if c in tbl.column_names),
+        None,
     )
     if id_col is None:
         return tbl
@@ -1530,10 +1620,9 @@ class TabularParquetSink(ExportSink):
         remaining = dict(self._delta_id_counts)
         for record_batch in delta_pf.iter_batches(batch_size=max(1, self._cfg.batch_size)):
             tbl = pa.Table.from_batches([record_batch])
-            id_col = (
-                "recordId"
-                if "recordId" in tbl.column_names
-                else ("record_id" if "record_id" in tbl.column_names else None)
+            id_col = next(
+                (c for c in ("recordId", "record_id", "RECORD_ID") if c in tbl.column_names),
+                None,
             )
             if id_col is not None and tbl.num_rows > 0:
                 mask: list[bool] = []
@@ -1729,7 +1818,7 @@ class TabularSQLSink(ExportSink):
         return _execute_chunked_sql_id_delete(
             self.engine,
             self.table,
-            ("recordId", "record_id"),
+            ("recordId", "record_id", "RECORD_ID"),
             record_ids,
         )
 
@@ -1751,7 +1840,7 @@ class TabularSQLSink(ExportSink):
                 and if_exists == "append"
                 and not isinstance(self.engine, NonCallableMock)
             ):
-                for candidate_col in ("recordId", "record_id"):
+                for candidate_col in ("recordId", "record_id", "RECORD_ID"):
                     if candidate_col in df.columns:
                         ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
                         self._delete_existing_record_ids(ids)
@@ -1856,8 +1945,9 @@ class TabularDuckDBSink(ExportSink):
             row[1]
             for row in self._conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
         }
-        id_col = (
-            "recordId" if "recordId" in cols else ("record_id" if "record_id" in cols else None)
+        id_col = next(
+            (c for c in ("recordId", "record_id", "RECORD_ID") if c in cols),
+            None,
         )
         if id_col is None:
             return 0
@@ -1910,7 +2000,7 @@ class TabularDuckDBSink(ExportSink):
                     self._conn.execute(f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
                 else:
                     if self._is_incremental_sync and self._cfg.idempotent:
-                        for candidate_col in ("recordId", "record_id"):
+                        for candidate_col in ("recordId", "record_id", "RECORD_ID"):
                             if candidate_col in df.columns:
                                 ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
                                 self._delete_record_ids(ids)
@@ -2044,8 +2134,67 @@ class _TabularTransformSink(ExportSink):
         self._pipeline = pipeline
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
+        self._seq_counters: dict[str, int] = {}
+        self._meta_cols = {name for name, _ in _RECORD_META_CONTRACT_TYPES}
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        if self._cfg.as_sdtm:
+            if not records:
+                return 0
+            raw_domain = self._cfg.sdtm_domain
+            if not raw_domain:
+                first_rec = records[0]
+                raw_domain = (
+                    first_rec.get("DOMAIN")
+                    or first_rec.get("domain")
+                    or first_rec.get("form_key")
+                    or first_rec.get("formKey")
+                    if isinstance(first_rec, Mapping)
+                    else getattr(first_rec, "form_key", None)
+                )
+            target_domain = resolve_sdtm_domain(raw_domain, fallback="AE")
+            batch_records: Sequence[Any] = records
+            if self._cfg.variable_whitelist is not None:
+                allowed = set(self._cfg.variable_whitelist)
+                projected: list[Any] = []
+                for rec in records:
+                    rec_data = getattr(rec, "record_data", None)
+                    if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
+                        projected.append(
+                            rec.model_copy(
+                                update={
+                                    "record_data": {
+                                        k: v for k, v in rec_data.items() if k in allowed
+                                    }
+                                }
+                            )
+                        )
+                    elif isinstance(rec, Mapping) and isinstance(rec.get("record_data"), Mapping):
+                        cloned = dict(rec)
+                        cloned["record_data"] = {
+                            k: v for k, v in rec["record_data"].items() if k in allowed
+                        }
+                        projected.append(cloned)
+                    else:
+                        projected.append(rec)
+                batch_records = projected
+
+            df = transform_records_to_sdtm(
+                batch_records,
+                domain=target_domain,
+                study_key=self._cfg.study_key,
+                include_deleted=self._cfg.include_deleted,
+                mask_phi=self._cfg.mask_phi,
+                seq_counters=self._seq_counters,
+                phi_keys=self._phi_keys,
+                pipeline=self._pipeline,
+            )
+            if df.empty:
+                return 0
+            if self._sanitize:
+                df = _sanitize_df(df)
+            return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
+
         rows, _ = self._mapper._parse_records(records, self._record_model)
         if self._pipeline is not None and not self._has_native_enrichment:
             rows = [self._pipeline.process(r, mask_phi=self._cfg.mask_phi) for r in rows]
@@ -2063,6 +2212,14 @@ class _TabularTransformSink(ExportSink):
 
         if self._cfg.mask_phi:
             df = _mask_df(df, phi_keys=self._phi_keys)
+        if not self._cfg.use_labels_as_columns and self._cfg.naming_convention is not None:
+            df = _apply_naming_convention_to_df(
+                df,
+                self._cfg.naming_convention,
+                domain=self._cfg.sdtm_domain,
+                meta_cols=self._meta_cols,
+                study_key=self._cfg.study_key,
+            )
         if self._sanitize:
             df = _sanitize_df(df)
 
@@ -2148,30 +2305,50 @@ def _tabular_export(
     stream_name: str | None = None,
 ) -> None:
     mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-    variable_keys, label_map = mapper._fetch_variable_metadata(
-        study_key,
-        variable_whitelist=config.variable_whitelist,
-        form_whitelist=config.form_whitelist,
-    )
-    if not variable_keys:
-        with sink:
-            pass
-        return
+    empty_whitelist = (
+        config.variable_whitelist is not None and len(config.variable_whitelist) == 0
+    ) or (config.form_whitelist is not None and len(config.form_whitelist) == 0)
+    if config.as_sdtm:
+        if empty_whitelist:
+            with sink:
+                pass
+            return
+        variable_keys: list[str] = []
+        label_map: dict[str, str] = {}
+        contract_types = _build_sdtm_contract_types(
+            config.sdtm_domain,
+            variable_whitelist=config.variable_whitelist,
+        )
+        pipeline = resolve_enrichment_pipeline(study_key)
+        record_model: Any = None
+    else:
+        variable_keys, label_map = mapper._fetch_variable_metadata(
+            study_key,
+            variable_whitelist=config.variable_whitelist,
+            form_whitelist=config.form_whitelist,
+        )
+        if not variable_keys:
+            with sink:
+                pass
+            return
 
-    raw_variables = mapper._last_variables if hasattr(mapper, "_last_variables") else None
-    pipeline = resolve_enrichment_pipeline(study_key)
-    contract_types = _build_tabular_contract_types(
-        variable_keys,
-        label_map,
-        raw_variables if isinstance(raw_variables, list) else (),
-        use_labels_as_columns=config.use_labels_as_columns,
-        mask_phi=config.mask_phi,
-        pipeline=pipeline,
-    )
+        raw_variables = mapper._last_variables if hasattr(mapper, "_last_variables") else None
+        pipeline = resolve_enrichment_pipeline(study_key)
+        contract_types = _build_tabular_contract_types(
+            variable_keys,
+            label_map,
+            raw_variables if isinstance(raw_variables, list) else (),
+            use_labels_as_columns=config.use_labels_as_columns,
+            mask_phi=config.mask_phi,
+            pipeline=pipeline,
+            naming_convention=config.naming_convention,
+            sdtm_domain=config.sdtm_domain,
+        )
+        record_model = mapper._build_record_model(variable_keys, label_map)
+
     if isinstance(sink, (TabularParquetSink, TabularDuckDBSink)):
         sink.set_contract_types(contract_types)
 
-    record_model = mapper._build_record_model(variable_keys, label_map)
     records_source = _make_mapper_records_source(sdk, study_key, mapper, config)
 
     transform_sink = _TabularTransformSink(
@@ -2184,7 +2361,7 @@ def _tabular_export(
         sanitize=sanitize,
         pipeline=pipeline,
     )
-    run_streaming_export(
+    written = run_streaming_export(
         sdk,
         study_key,
         transform_sink,
@@ -2195,6 +2372,14 @@ def _tabular_export(
         quality_gate_fn=apply_quality_gate,
         iter_batches_fn=iter_batches,
     )
+    if (
+        config.as_sdtm
+        and written == 0
+        and isinstance(sink, TabularCSVSink)
+        and not Path(sink.path).exists()
+    ):
+        empty_sdtm_df = _build_empty_contract_df(contract_types)
+        empty_sdtm_df.to_csv(sink.path, index=False, **config.pandas_kwargs)
 
 
 class _TabularCallableSink(ExportSink):
@@ -2279,12 +2464,21 @@ def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         "stream_name",
         "ledger_path",
         "state_provider",
+        "as_sdtm",
+        "sdtm_domain",
+        "standards_profile",
+        "min_standards_score",
+        "naming_convention",
     )
-    return {k: kwargs.pop(k) for k in sink_keys if k in kwargs}
+    domain_alias = kwargs.pop("domain", None)
+    extracted = {k: kwargs.pop(k) for k in sink_keys if k in kwargs}
+    if domain_alias is not None and extracted.get("sdtm_domain") is None:
+        extracted["sdtm_domain"] = domain_alias
+    return extracted
 
 
 def _config_has_streaming_options(config: TabularSinkConfig) -> bool:
-    """Return True when ``config`` activates incremental, watermark, or filter streaming options."""
+    """Return True when ``config`` activates incremental, watermark, filter, or SDTM options."""
     return bool(
         config.modified_since is not None
         or config.record_filter is not None
@@ -2294,6 +2488,11 @@ def _config_has_streaming_options(config: TabularSinkConfig) -> bool:
         or config.stream_name is not None
         or config.ledger_path is not None
         or config.state_provider is not None
+        or config.as_sdtm
+        or config.sdtm_domain is not None
+        or config.standards_profile is not None
+        or config.min_standards_score is not None
+        or config.naming_convention is not None
     )
 
 
@@ -2436,7 +2635,21 @@ def export_to_csv(
         When ``True`` (default), sensitive PHI values are replaced with
         ``***MASKED***``.
     """
-    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
+    has_sdtm_or_standards_opts = bool(
+        kwargs.get("as_sdtm")
+        or kwargs.get("sdtm_domain") is not None
+        or kwargs.get("domain") is not None
+        or kwargs.get("standards_profile") is not None
+        or kwargs.get("min_standards_score") is not None
+    )
+    effective_default_gate = (
+        False
+        if has_sdtm_or_standards_opts
+        and "quality_gate_enabled" not in kwargs
+        and quality_gate_enabled is True
+        else quality_gate_enabled
+    )
+    kwargs.setdefault("quality_gate_enabled", effective_default_gate)
     kwargs.setdefault("sanitize", True)
     config = _build_tabular_sink_config(
         study_key,
@@ -2445,7 +2658,7 @@ def export_to_csv(
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
-        default_quality_gate=quality_gate_enabled,
+        default_quality_gate=effective_default_gate,
         mask_phi=mask_phi,
     )
 
@@ -2534,20 +2747,33 @@ def export_to_excel(
             return
 
     excel_kwargs = dict(config.pandas_kwargs)
+    sdtm_contract = (
+        _build_sdtm_contract_types(config.sdtm_domain, variable_whitelist=config.variable_whitelist)
+        if config.as_sdtm
+        else None
+    )
     is_incremental_excel = _is_incremental_config(config)
 
     def _write_or_reconcile_excel(combined: pd.DataFrame, voided_ids: set[str]) -> None:
         if not (is_incremental_excel and config.idempotent):
-            combined.to_excel(path, index=False, **excel_kwargs)
+            target = (
+                _build_empty_contract_df(sdtm_contract)
+                if combined.empty and sdtm_contract is not None
+                else combined
+            )
+            target.to_excel(path, index=False, **excel_kwargs)
             return
 
         dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
         if combined.empty and not voided_ids:
             if dest_exists:
                 return
+            empty_target = (
+                _build_empty_contract_df(sdtm_contract) if sdtm_contract is not None else combined
+            )
             _atomic_replace_file(
                 path,
-                lambda tmp: combined.to_excel(tmp, index=False, **excel_kwargs),
+                lambda tmp: empty_target.to_excel(tmp, index=False, **excel_kwargs),
                 suffix=".xlsx",
             )
             return
@@ -2929,7 +3155,7 @@ def export_to_json(
         mask_phi=mask_phi,
     )
 
-    if hierarchical:
+    if hierarchical and not config.as_sdtm:
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
         is_mock_hier_mapper = _is_mock_mapper(mapper) or not callable(
             getattr(mapper, "_get_enrichment_pipeline", None)
@@ -3274,6 +3500,7 @@ class _FormExportContext:
     record_model: Any
     contract_types: dict[str, str | None]
     stream_name: str
+    sdtm_domain: str | None = None
     watermark: datetime | None = None
     wrote_any: bool = False
     total_written: int = 0
@@ -3298,6 +3525,9 @@ def _build_form_export_contexts(
     stream_prefix: str,
     custom_stream_prefix: str | None,
     validate_form_key_fn: Callable[[str], None] | None = None,
+    as_sdtm: bool = False,
+    sdtm_domain: str | None = None,
+    naming_convention: str | None = None,
 ) -> tuple[list[_FormExportContext], list[Any]]:
     """Fetch study forms and variables once and build per-form export contexts."""
     forms = list(sdk.forms.list(study_key=study_key))
@@ -3331,14 +3561,25 @@ def _build_form_export_contexts(
         label_map = {
             v.variable_name: v.label for v in variables if v.variable_name in variable_keys
         }
-        record_model = mapper._build_record_model(variable_keys, label_map)
-        contract_types = _build_tabular_contract_types(
-            variable_keys,
-            label_map,
-            variables,
-            use_labels_as_columns=use_labels_as_columns,
-            mask_phi=mask_phi,
-            pipeline=pipeline,
+        form_domain = (
+            resolve_sdtm_domain(sdtm_domain or form.form_key, fallback="AE")
+            if as_sdtm
+            else sdtm_domain
+        )
+        record_model = None if as_sdtm else mapper._build_record_model(variable_keys, label_map)
+        contract_types = (
+            _build_sdtm_contract_types(form_domain, variable_whitelist=variable_whitelist)
+            if as_sdtm
+            else _build_tabular_contract_types(
+                variable_keys,
+                label_map,
+                variables,
+                use_labels_as_columns=use_labels_as_columns,
+                mask_phi=mask_phi,
+                pipeline=pipeline,
+                naming_convention=naming_convention,
+                sdtm_domain=sdtm_domain,
+            )
         )
         resolved_stream = (
             f"{custom_stream_prefix}_{form.form_key}"
@@ -3356,6 +3597,7 @@ def _build_form_export_contexts(
                 record_model=record_model,
                 contract_types=contract_types,
                 stream_name=resolved_stream,
+                sdtm_domain=form_domain,
             )
         )
     return contexts, all_variables
@@ -3448,8 +3690,22 @@ def _stream_records_across_forms(
             exclude_deleted_upstream=exclude_deleted_upstream,
         )
 
+        check_standards = (
+            opts["standards_profile"] is not None or opts["min_standards_score"] is not None
+        )
+
         def _handle_active_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
             ctx = by_form_key[fk]
+            if check_standards and batch:
+                _enforce_batch_standards_readiness(
+                    batch,
+                    batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}",
+                    study_key=study_key,
+                    config=config,
+                    standards_profile=opts["standards_profile"],
+                    min_standards_score=opts["min_standards_score"],
+                    sdtm_domain=ctx.sdtm_domain or opts["sdtm_domain"],
+                )
             written = on_active_batch(ctx, batch, batch_idx)
             ctx.total_written += written
             if written > 0:
@@ -3577,7 +3833,7 @@ def _make_form_sink_config(
         manifest_path=config.manifest_path,
         pandas_kwargs=dict(config.pandas_kwargs) if pandas_kwargs is None else pandas_kwargs,
         use_labels_as_columns=use_labels_as_columns,
-        variable_whitelist=ctx.variable_keys,
+        variable_whitelist=config.variable_whitelist if config.as_sdtm else ctx.variable_keys,
         form_whitelist=[ctx.form_id],
         batch_size=config.batch_size,
         max_buffered_records=config.max_buffered_records,
@@ -3597,6 +3853,11 @@ def _make_form_sink_config(
         stream_name=ctx.stream_name,
         ledger_path=config.ledger_path,
         state_provider=config.state_provider,
+        as_sdtm=config.as_sdtm,
+        sdtm_domain=ctx.sdtm_domain,
+        standards_profile=config.standards_profile,
+        min_standards_score=config.min_standards_score,
+        naming_convention=config.naming_convention,
     )
 
 
@@ -3676,6 +3937,9 @@ def export_to_duckdb_by_form(
         stream_prefix="duckdb",
         custom_stream_prefix=config.stream_name,
         validate_form_key_fn=_validate_duckdb_identifier,
+        as_sdtm=config.as_sdtm,
+        sdtm_domain=config.sdtm_domain,
+        naming_convention=config.naming_convention,
     )
 
     resolved_db_path = _coerce_path_str(db_path)
@@ -3827,6 +4091,9 @@ def export_to_sql_by_form(
         pipeline=pipeline,
         stream_prefix="sql",
         custom_stream_prefix=config.stream_name,
+        as_sdtm=config.as_sdtm,
+        sdtm_domain=config.sdtm_domain,
+        naming_convention=config.naming_convention,
     )
 
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
@@ -3965,6 +4232,8 @@ def _unpack_long_sql_rows(
     mask_phi: bool,
     pipeline: EnrichmentPipeline | None,
     phi_keys: set[str] | None,
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
 ) -> list[dict[str, Any]]:
     """Unpack ``Record`` envelopes into normalized long-format variable rows with PHI masking."""
     long_rows: list[dict[str, Any]] = []
@@ -3994,11 +4263,16 @@ def _unpack_long_sql_rows(
                 masked_value = mask_clinical_phi(value)
                 if phi_keys:
                     masked_value = mask_custom_phi_recursive(masked_value, phi_keys)
+            formatted_var_name = (
+                format_variable_name(name, naming_convention, domain=sdtm_domain)
+                if naming_convention is not None
+                else name
+            )
             long_rows.append(
                 {
                     "record_id": rec_id,
                     "form_id": form_id,
-                    "variable_name": name,
+                    "variable_name": formatted_var_name,
                     "value": masked_value,
                     "timestamp": timestamp,
                 }
@@ -4064,6 +4338,8 @@ class _LongSQLSink(ExportSink):
             mask_phi=self._cfg.mask_phi,
             pipeline=self._pipeline,
             phi_keys=self._phi_keys,
+            naming_convention=self._cfg.naming_convention,
+            sdtm_domain=self._cfg.sdtm_domain,
         )
 
         def execute_export() -> int:
@@ -4179,6 +4455,32 @@ def export_to_long_sql(
                 engine.dispose()
         return
 
+    records_source = _make_mapper_records_source(sdk, study_key, mapper, config)
+    if config.as_sdtm:
+        sdtm_sql_sink = TabularSQLSink(table_name, engine, config)
+        sdtm_transform_sink = _TabularTransformSink(
+            sdtm_sql_sink,
+            mapper,
+            None,
+            [],
+            {},
+            config,
+            sanitize=False,
+            pipeline=pipeline,
+        )
+        run_streaming_export(
+            sdk,
+            study_key,
+            sdtm_transform_sink,
+            config,
+            stream_name=f"long_sql_{table_name}",
+            batch_id_prefix=f"{study_key}/long_sql/{table_name}",
+            records_source=records_source,
+            quality_gate_fn=apply_quality_gate,
+            iter_batches_fn=iter_batches,
+        )
+        return
+
     long_sink = _LongSQLSink(
         table_name,
         engine,
@@ -4186,7 +4488,6 @@ def export_to_long_sql(
         chunk_size=chunk_size,
         pipeline=pipeline,
     )
-    records_source = _make_mapper_records_source(sdk, study_key, mapper, config)
     run_streaming_export(
         sdk,
         study_key,
