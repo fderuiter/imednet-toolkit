@@ -2166,16 +2166,18 @@ def run_streaming_export(
 
         pending_voided: list[Any] = []
         voided_batch_idx = 0
+        pending_gate: dict[int, list[tuple[Any, datetime | None]]] = {}
+        exported_timestamps: list[datetime] = []
 
         def _observe_and_route() -> Iterator[Any]:
-            nonlocal max_ts, total_reconciled, voided_batch_idx
+            nonlocal total_reconciled, voided_batch_idx
             for rec in raw_records:
                 rec_ts = extract_record_timestamp(rec)
-                if rec_ts is not None and (max_ts is None or rec_ts > max_ts):
-                    max_ts = rec_ts
 
                 if not opts["include_deleted"] and is_record_deleted(rec):
                     if reconcile_voided:
+                        if rec_ts is not None:
+                            exported_timestamps.append(rec_ts)
                         pending_voided.append(rec)
                         if len(pending_voided) >= opts["batch_size"]:
                             total_reconciled += sink_obj.reconcile_deleted(
@@ -2186,9 +2188,36 @@ def run_streaming_export(
                             voided_batch_idx += 1
                     continue
 
+                pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
                 yield rec
 
-        filtered_records = gate_fn(sdk, study_key, _observe_and_route(), config)
+        def _pop_accepted_candidate(rec: Any) -> None:
+            bucket = pending_gate.get(id(rec))
+            if bucket:
+                bucket.pop(0)
+                if not bucket:
+                    del pending_gate[id(rec)]
+                return
+            rec_id = extract_record_id(rec)
+            if rec_id is None:
+                return
+            for obj_id, candidate_bucket in list(pending_gate.items()):
+                for idx, (cand_rec, _) in enumerate(candidate_bucket):
+                    if extract_record_id(cand_rec) == rec_id:
+                        candidate_bucket.pop(idx)
+                        if not candidate_bucket:
+                            del pending_gate[obj_id]
+                        return
+
+        def _track_accepted(records_iter: Iterable[Any]) -> Iterator[Any]:
+            for rec in records_iter:
+                _pop_accepted_candidate(rec)
+                rec_ts = extract_record_timestamp(rec)
+                if rec_ts is not None:
+                    exported_timestamps.append(rec_ts)
+                yield rec
+
+        filtered_records = _track_accepted(gate_fn(sdk, study_key, _observe_and_route(), config))
         check_standards = (
             opts["standards_profile"] is not None or opts["min_standards_score"] is not None
         )
@@ -2212,6 +2241,19 @@ def run_streaming_export(
                 batch_id=f"{prefix}/voided/{voided_batch_idx}",
             )
             pending_voided.clear()
+
+        rejected_timestamps = [rec_ts for bucket in pending_gate.values() for _, rec_ts in bucket]
+        pending_gate.clear()
+
+        if rejected_timestamps:
+            if any(rec_ts is None for rec_ts in rejected_timestamps):
+                max_ts = None
+            else:
+                min_rejected_ts = min(ts for ts in rejected_timestamps if ts is not None)
+                eligible_ts = [ts for ts in exported_timestamps if ts <= min_rejected_ts]
+                max_ts = max(eligible_ts) if eligible_ts else None
+        elif exported_timestamps:
+            max_ts = max(exported_timestamps)
 
         if tx is not None:
             tx["records_processed"] = total_written + total_reconciled

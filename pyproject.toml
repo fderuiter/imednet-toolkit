@@ -73,7 +73,6 @@ python_version = "3.12"
 strict = true
 warn_unused_ignores = false
 warn_redundant_casts = false
-ignore_missing_imports = true
 plugins = []
 files = [
     "packages/core/src/imednet",
@@ -101,6 +100,8 @@ strict_optional = true
 [[tool.mypy.overrides]]
 module = [
     "pandas",
+    "pandas.*",
+    "pythonjsonlogger",
     "pythonjsonlogger.*",
     "opentelemetry",
     "opentelemetry.*",
@@ -120,6 +121,12 @@ module = [
     "openpyxl.*",
     "duckdb",
     "duckdb.*",
+    "defusedxml",
+    "defusedxml.*",
+    "jsonschema",
+    "jsonschema.*",
+    "pyarrow",
+    "pyarrow.*",
 ]
 ignore_missing_imports = true
 

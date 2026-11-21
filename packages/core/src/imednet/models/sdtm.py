@@ -142,10 +142,14 @@ def format_iso8601_dtc(
     should_redact = mask_phi or redact_to_year
     if val is None:
         return None
-    if isinstance(val, float) and math.isnan(val):
-        return None
-    if not isinstance(val, (list, tuple, dict, set)) and pd is not None and bool(pd.isna(val)):
-        return None
+    if isinstance(val, str):
+        val_str = val.strip()
+        if not val_str or val_str == _MASKED_SENTINEL:
+            return None
+        formatted, parsed_year = _parse_dtc_string(val_str)
+        if should_redact:
+            return f"{parsed_year:04d}" if parsed_year is not None else None
+        return formatted
     if isinstance(val, bool):
         return None if should_redact else str(val)
     if isinstance(val, datetime):
@@ -156,20 +160,16 @@ def format_iso8601_dtc(
         if should_redact:
             return f"{val:04d}" if 1000 <= val <= 9999 else None
         return str(val)
-    if isinstance(val, str):
-        val_str = val.strip()
-        if not val_str or val_str == _MASKED_SENTINEL:
-            return None
-        formatted, parsed_year = _parse_dtc_string(val_str)
-        if should_redact:
-            return f"{parsed_year:04d}" if parsed_year is not None else None
-        return formatted
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    if not isinstance(val, (list, tuple, dict, set)) and pd is not None and bool(pd.isna(val)):
+        return None
     return None if should_redact else str(val)
 
 
 def _format_sdtm_flag(val: Any) -> str | None:
     """Format boolean flag values into CDISC standard 'Y' or 'N'."""
-    if val is None or (pd is not None and pd.isna(val)):
+    if val is None:
         return None
     if isinstance(val, bool):
         return "Y" if val else "N"
@@ -180,6 +180,8 @@ def _format_sdtm_flag(val: Any) -> str | None:
         if v in ("N", "NO", "FALSE", "0"):
             return "N"
         return val
+    if pd is not None and pd.isna(val):
+        return None
     return "Y" if bool(val) else "N"
 
 
@@ -998,6 +1000,10 @@ class _SdtmNormalizer:
         self.sensitive_mapped_targets = frozenset(sensitive_targets)
         self._sens_cache.clear()
         self.remaps_usubjid = remaps_usubjid
+        self._usubjid_is_sensitive = self._is_sensitive_key("USUBJID")
+        self._subject_key_is_sensitive = self._is_sensitive_key(
+            "subject_key"
+        ) or self._is_sensitive_key("subjectKey")
         self._topic_set = frozenset(self.topic_vars)
         self._compiled_std_vars: tuple[
             tuple[
@@ -1141,14 +1147,8 @@ class _SdtmNormalizer:
             self.mask_phi
             and usubjid
             and (
-                self._is_sensitive_key("USUBJID")
-                or (
-                    not explicit_usubjid
-                    and (
-                        self._is_sensitive_key("subject_key")
-                        or self._is_sensitive_key("subjectKey")
-                    )
-                )
+                self._usubjid_is_sensitive
+                or (not explicit_usubjid and self._subject_key_is_sensitive)
             )
         ):
             usubjid = _MASKED_SENTINEL

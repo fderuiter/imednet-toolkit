@@ -9,13 +9,16 @@ from ...endpoints.codings import CodingsEndpoint
 from ...models.codings import Coding
 from ...sdk import ImednetSDK
 from ..decorators import validate_cli_path_segment, with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status
+from ..utils import display_list, fetching_status, simulation_mode_context
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
+    add_simulation_arg,
+    add_study_key_args,
     collect_list_items_with_remainder,
     prepare_list_query,
     resolve_output_format,
+    resolve_study_key,
 )
 
 
@@ -47,7 +50,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     parser = subparsers.add_parser("codings", help="Manage medical codings within a study.")
     sub = parser.add_subparsers(dest="command")
     list_parser = sub.add_parser("list", help="List codings for a specific study.")
-    list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(list_parser)
     add_list_query_args(
         list_parser,
         filter_dest="coding_filter",
@@ -55,6 +58,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
 
     add_output_format(list_parser)
+    add_simulation_arg(list_parser)
 
     @with_sdk
     def list_codings(
@@ -113,7 +117,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
     def _dispatch_list_codings(args: argparse.Namespace) -> None:
-        validate_cli_path_segment(args.study_key, name="study_key")
+        study_key = resolve_study_key(list_parser, args, required=True)
+        assert study_key is not None
+        validate_cli_path_segment(study_key, name="study_key")
         no_interactive = getattr(args, "no_interactive", False)
         resolved_format = resolve_output_format(args.output_format)
         prepared = prepare_list_query(
@@ -127,15 +133,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             allowed_attributes=CodingsEndpoint.FILTER_ATTRIBUTES,
             disallow_study_key=True,
         )
-        list_codings(
-            study_key=args.study_key,
-            coding_filter=args.coding_filter,
-            output_format=resolved_format,
-            sort=args.sort,
-            limit=args.limit,
-            fetch_all=args.fetch_all,
-            no_interactive=no_interactive,
-            _prepared_query=prepared,
-        )
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            list_codings(
+                study_key=study_key,
+                coding_filter=args.coding_filter,
+                output_format=resolved_format,
+                sort=args.sort,
+                limit=args.limit,
+                fetch_all=args.fetch_all,
+                no_interactive=no_interactive,
+                _prepared_query=prepared,
+            )
 
     list_parser.set_defaults(func=_dispatch_list_codings)

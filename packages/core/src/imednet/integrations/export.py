@@ -504,20 +504,26 @@ def _filter_df_excluding_record_ids(df: pd.DataFrame, exclude_ids: set[str]) -> 
     return df.loc[mask].reset_index(drop=True)
 
 
+def _coerce_path_str(path: Any) -> Any:
+    """Normalize ``os.PathLike`` paths to ``str`` while preserving mock objects."""
+    return os.fspath(path) if isinstance(path, os.PathLike) else path
+
+
 def _atomic_replace_file(
-    dest_path: str,
+    dest_path: str | os.PathLike[str],
     write_fn: Callable[[str], Any],
     *,
     suffix: str = ".tmp",
 ) -> None:
     """Write via a sibling temporary file and atomically replace ``dest_path``."""
-    dest = Path(dest_path)
+    dest_str = _coerce_path_str(dest_path)
+    dest = Path(dest_str)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = str(dest.parent / f".{dest.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}{suffix}")
     try:
         write_fn(tmp_path)
         if Path(tmp_path).exists():
-            os.replace(tmp_path, dest_path)
+            os.replace(tmp_path, dest_str)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -613,10 +619,10 @@ def _dataframe_to_json_records(df: Any) -> list[dict[str, Any]]:
 class TabularCSVSink(ExportSink):
     """Sink for exporting data to CSV format."""
 
-    def __init__(self, path: str, config: TabularSinkConfig):
+    def __init__(self, path: str | os.PathLike[str], config: TabularSinkConfig):
         """Initialize the CSV sink."""
         super().__init__(config)
-        self.path = path
+        self.path: str = _coerce_path_str(path)
         self._is_first_batch = True
         self._cfg = config
         self._is_incremental_sync = _is_incremental_config(config)
@@ -790,9 +796,8 @@ class TabularCSVSink(ExportSink):
         if not should_reconcile:
             return
 
-        batch_id = f"{self._cfg.study_key or 'study'}/csv/flush"
         try:
-            self._execute_with_retry("reconcile_csv", batch_id, self._reconcile_csv_to_disk)
+            self._reconcile_csv_to_disk()
         finally:
             self._staged_frames.clear()
             self._voided_ids.clear()
@@ -1407,14 +1412,14 @@ class TabularParquetSink(ExportSink):
 
     def __init__(
         self,
-        path: str,
+        path: str | os.PathLike[str],
         config: TabularSinkConfig,
         *,
         contract_types: Mapping[str, str | None] | None = None,
     ) -> None:
         """Initialize the Parquet sink."""
         super().__init__(config)
-        self.path = path
+        self.path: str = _coerce_path_str(path)
         self._cfg = config
         self._writer: Any = None
         self._schema: Any = None
@@ -1724,13 +1729,8 @@ class TabularParquetSink(ExportSink):
             self._writer = None
 
         if self._use_staged_delta() or (self._cfg.idempotent and self._voided_ids):
-            batch_id = f"{self._cfg.study_key or 'study'}/parquet/flush"
             try:
-                self._execute_with_retry(
-                    "reconcile_parquet",
-                    batch_id,
-                    self._reconcile_parquet_to_disk,
-                )
+                self._reconcile_parquet_to_disk()
             finally:
                 if self._delta_path is not None:
                     Path(self._delta_path).unlink(missing_ok=True)
@@ -1755,6 +1755,39 @@ class TabularParquetSink(ExportSink):
         self._delta_id_counts.clear()
         self._voided_ids.clear()
         self._schema = None
+
+
+def _execute_chunked_sql_id_delete(
+    engine: Any,
+    table_name: str,
+    candidate_cols: Sequence[str],
+    record_ids: Sequence[Any],
+) -> int:
+    """Delete rows matching ``record_ids`` in chunks of 500 when ``table_name`` exists."""
+    if not record_ids or isinstance(engine, NonCallableMock):
+        return 0
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text as sa_text
+
+    inspector = sa_inspect(engine)
+    if not inspector.has_table(table_name):
+        return 0
+    existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
+    id_col = next((col for col in candidate_cols if col in existing_cols), None)
+    if id_col is None:
+        return 0
+
+    preparer = engine.dialect.identifier_preparer
+    quoted_table = preparer.quote(table_name)
+    quoted_col = preparer.quote(id_col)
+    with engine.begin() as conn:
+        for start in range(0, len(record_ids), 500):
+            chunk = record_ids[start : start + 500]
+            params = {f"id_{idx}": rid for idx, rid in enumerate(chunk)}
+            placeholders = ", ".join(f":{k}" for k in params)
+            stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
+            conn.execute(stmt, params)
+    return len(record_ids)
 
 
 class TabularSQLSink(ExportSink):
@@ -1782,31 +1815,12 @@ class TabularSQLSink(ExportSink):
 
     def _delete_existing_record_ids(self, record_ids: Sequence[Any]) -> int:
         """Delete existing rows matching ``recordId`` when the destination table exists."""
-        if not record_ids:
-            return 0
-        from sqlalchemy import inspect as sa_inspect
-        from sqlalchemy import text as sa_text
-
-        inspector = sa_inspect(self.engine)
-        if not inspector.has_table(self.table):
-            return 0
-        existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
-        id_col = next(
-            (c for c in ("recordId", "record_id", "RECORD_ID") if c in existing_cols),
-            None,
+        return _execute_chunked_sql_id_delete(
+            self.engine,
+            self.table,
+            ("recordId", "record_id", "RECORD_ID"),
+            record_ids,
         )
-        if id_col is None:
-            return 0
-
-        preparer = self.engine.dialect.identifier_preparer
-        quoted_table = preparer.quote(self.table)
-        quoted_col = preparer.quote(id_col)
-        params = {f"id_{idx}": rid for idx, rid in enumerate(record_ids)}
-        placeholders = ", ".join(f":{k}" for k in params)
-        stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
-        with self.engine.begin() as conn:
-            conn.execute(stmt, params)
-        return len(record_ids)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -1889,7 +1903,7 @@ class TabularDuckDBSink(ExportSink):
 
     def __init__(
         self,
-        db_path: str,
+        db_path: str | os.PathLike[str],
         table_name: str,
         config: TabularSinkConfig,
         *,
@@ -1899,7 +1913,8 @@ class TabularDuckDBSink(ExportSink):
         """Initialize the DuckDB sink."""
         super().__init__(config)
         _validate_duckdb_identifier(table_name)
-        self.db_path = db_path
+        resolved_db_path: str = _coerce_path_str(db_path)
+        self.db_path = resolved_db_path
         self.table_name = table_name
         self._cfg = config
         self._contract_types: dict[str, str | None] = dict(contract_types) if contract_types else {}
@@ -1912,7 +1927,7 @@ class TabularDuckDBSink(ExportSink):
         else:
             import duckdb
 
-            self._conn = duckdb.connect(db_path, config={"threads": "1"})
+            self._conn = duckdb.connect(resolved_db_path, config={"threads": "1"})
 
     def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
         """Configure contract-derived column types prior to streaming batches."""
@@ -2516,7 +2531,7 @@ def _build_tabular_sink_config(
 def export_to_parquet(
     sdk: ImednetSDK,
     study_key: str,
-    path: str,
+    path: str | os.PathLike[str],
     *,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -2597,7 +2612,7 @@ def export_to_parquet(
 def export_to_csv(
     sdk: ImednetSDK,
     study_key: str,
-    path: str,
+    path: str | os.PathLike[str],
     *,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -2654,7 +2669,7 @@ def export_to_csv(
 def export_to_excel(
     sdk: ImednetSDK,
     study_key: str,
-    path: str,
+    path: str | os.PathLike[str],
     *,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -2813,13 +2828,14 @@ def _apply_json_enrichment(study_key: str, data: Any, *, mask_phi: bool = True) 
     return data
 
 
-def _dump_json_payload(path: str, data: Any, config: TabularSinkConfig) -> int:
+def _dump_json_payload(path: str | os.PathLike[str], data: Any, config: TabularSinkConfig) -> int:
     """Persist strict RFC 8259 JSON export payload atomically, appending when ``idempotent=False``."""
+    resolved_path: str = _coerce_path_str(path)
     sanitized_data = _sanitize_json_value(data)
     payload = sanitized_data
-    if not config.idempotent and isinstance(sanitized_data, list) and Path(path).exists():
+    if not config.idempotent and isinstance(sanitized_data, list) and Path(resolved_path).exists():
         try:
-            with open(path, encoding="utf-8") as existing_file:
+            with open(resolved_path, encoding="utf-8") as existing_file:
                 existing_data = json.load(existing_file)
             if isinstance(existing_data, list):
                 payload = _sanitize_json_value(existing_data) + sanitized_data
@@ -2833,7 +2849,7 @@ def _dump_json_payload(path: str, data: Any, config: TabularSinkConfig) -> int:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, **dump_kwargs)
 
-    _atomic_replace_file(path, _write_tmp_json, suffix=".json.tmp")
+    _atomic_replace_file(resolved_path, _write_tmp_json, suffix=".json.tmp")
     return len(sanitized_data) if isinstance(sanitized_data, list) else 1
 
 
@@ -2978,7 +2994,7 @@ class _HierarchicalJSONSink(ExportSink):
 
     def __init__(
         self,
-        path: str,
+        path: str | os.PathLike[str],
         study_key: str,
         mapper: Any,
         hier_kwargs: dict[str, Any],
@@ -2987,7 +3003,7 @@ class _HierarchicalJSONSink(ExportSink):
         is_mock_hier_mapper: bool,
     ) -> None:
         super().__init__(config)
-        self.path = path
+        self.path: str = _coerce_path_str(path)
         self._study_key = study_key
         self._mapper = mapper
         self._hier_kwargs = dict(hier_kwargs)
@@ -3100,7 +3116,7 @@ class _HierarchicalJSONSink(ExportSink):
 def export_to_json(
     sdk: ImednetSDK,
     study_key: str,
-    path: str,
+    path: str | os.PathLike[str],
     *,
     use_labels_as_columns: bool = False,
     hierarchical: bool = False,
@@ -3332,7 +3348,7 @@ def export_to_sql(
 def export_to_duckdb(
     sdk: ImednetSDK,
     study_key: str,
-    db_path: str,
+    db_path: str | os.PathLike[str],
     table_name: str,
     *,
     use_labels_as_columns: bool = False,
@@ -3427,7 +3443,7 @@ def export_to_duckdb(
         if df_legacy is not None:
 
             def _write_duckdb() -> int:
-                conn: Any = duckdb.connect(db_path)
+                conn: Any = duckdb.connect(_coerce_path_str(db_path))
                 try:
                     quoted_tbl = _quote_duckdb_identifier(table_name)
                     quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
@@ -3490,6 +3506,8 @@ class _FormExportContext:
     total_written: int = 0
     total_reconciled: int = 0
     max_ts: datetime | None = None
+    pending_gate: dict[int, list[tuple[Any, datetime | None]]] = field(default_factory=dict)
+    exported_timestamps: list[datetime] = field(default_factory=list)
     sink: Any = None
     tx: dict[str, Any] | None = None
 
@@ -3707,6 +3725,24 @@ def _stream_records_across_forms(
             on_flush_voided=_handle_voided_flush if any_reconcile_voided else None,
         )
 
+        def _pop_form_accepted_candidate(ctx: _FormExportContext, rec: Any) -> None:
+            bucket = ctx.pending_gate.get(id(rec))
+            if bucket:
+                bucket.pop(0)
+                if not bucket:
+                    del ctx.pending_gate[id(rec)]
+                return
+            rec_id = extract_record_id(rec)
+            if rec_id is None:
+                return
+            for obj_id, candidate_bucket in list(ctx.pending_gate.items()):
+                for idx, (cand_rec, _) in enumerate(candidate_bucket):
+                    if extract_record_id(cand_rec) == rec_id:
+                        candidate_bucket.pop(idx)
+                        if not candidate_bucket:
+                            del ctx.pending_gate[obj_id]
+                        return
+
         def _observe_and_route() -> Iterator[Any]:
             for rec in raw_records:
                 ctx = _resolve_ctx(rec)
@@ -3720,14 +3756,14 @@ def _stream_records_across_forms(
                     elif study_watermark is None or study_watermark < ctx.watermark:
                         continue
 
-                if rec_ts is not None and (ctx.max_ts is None or rec_ts > ctx.max_ts):
-                    ctx.max_ts = rec_ts
-
                 if not opts["include_deleted"] and is_record_deleted(rec):
                     if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
+                        if rec_ts is not None:
+                            ctx.exported_timestamps.append(rec_ts)
                         router.add_voided(ctx.form_key, rec)
                     continue
 
+                ctx.pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
                 yield rec
 
         if apply_quality_gate is _DEFAULT_APPLY_QUALITY_GATE:
@@ -3750,8 +3786,28 @@ def _stream_records_across_forms(
         for rec in gated_records:
             matched_ctx = _resolve_ctx(rec)
             if matched_ctx is not None:
+                _pop_form_accepted_candidate(matched_ctx, rec)
+                rec_ts = extract_record_timestamp(rec)
+                if rec_ts is not None:
+                    matched_ctx.exported_timestamps.append(rec_ts)
                 router.add_active(matched_ctx.form_key, rec)
         router.flush_all()
+
+        for ctx in contexts:
+            rejected_timestamps = [
+                rec_ts for bucket in ctx.pending_gate.values() for _, rec_ts in bucket
+            ]
+            ctx.pending_gate.clear()
+            if rejected_timestamps:
+                if any(rec_ts is None for rec_ts in rejected_timestamps):
+                    ctx.max_ts = None
+                else:
+                    min_rejected_ts = min(ts for ts in rejected_timestamps if ts is not None)
+                    eligible_ts = [ts for ts in ctx.exported_timestamps if ts <= min_rejected_ts]
+                    ctx.max_ts = max(eligible_ts) if eligible_ts else None
+            elif ctx.exported_timestamps:
+                ctx.max_ts = max(ctx.exported_timestamps)
+            ctx.exported_timestamps.clear()
 
         if on_before_checkpoints is not None:
             on_before_checkpoints()
@@ -3808,7 +3864,7 @@ def _make_form_sink_config(
 def export_to_duckdb_by_form(
     sdk: ImednetSDK,
     study_key: str,
-    db_path: str,
+    db_path: str | os.PathLike[str],
     *,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -3886,7 +3942,8 @@ def export_to_duckdb_by_form(
         naming_convention=config.naming_convention,
     )
 
-    conn: Any = duckdb.connect(db_path, config={"threads": "1"})
+    resolved_db_path = _coerce_path_str(db_path)
+    conn: Any = duckdb.connect(resolved_db_path, config={"threads": "1"})
     try:
         if use_mock_fetch:
             for ctx in contexts:
@@ -4182,17 +4239,16 @@ def _unpack_long_sql_rows(
     long_rows: list[dict[str, Any]] = []
     for rec in records:
         rec_id = extract_record_id(rec)
-        form_id = rec.get("form_id") if isinstance(rec, Mapping) else getattr(rec, "form_id", None)
-        timestamp = (
-            rec.get("date_modified")
-            if isinstance(rec, Mapping)
-            else getattr(rec, "date_modified", None)
-        )
-        raw_payload = (
-            rec.get("record_data") or rec.get("recordData")
-            if isinstance(rec, Mapping)
-            else getattr(rec, "record_data", None)
-        )
+        if isinstance(rec, Mapping):
+            form_id = rec.get("form_id") if "form_id" in rec else rec.get("formId")
+            timestamp = (
+                rec.get("date_modified") if "date_modified" in rec else rec.get("dateModified")
+            )
+            raw_payload = rec.get("record_data") if "record_data" in rec else rec.get("recordData")
+        else:
+            form_id = getattr(rec, "form_id", getattr(rec, "formId", None))
+            timestamp = getattr(rec, "date_modified", getattr(rec, "dateModified", None))
+            raw_payload = getattr(rec, "record_data", getattr(rec, "recordData", None))
         rec_payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
         if pipeline is not None and rec_payload:
             rec_payload = pipeline.process(rec_payload, mask_phi=mask_phi)
@@ -4252,26 +4308,12 @@ class _LongSQLSink(ExportSink):
         )
 
     def _delete_record_ids(self, record_ids: Sequence[Any]) -> int:
-        if not record_ids or isinstance(self.engine, NonCallableMock):
-            return 0
-        from sqlalchemy import inspect as sa_inspect
-        from sqlalchemy import text as sa_text
-
-        inspector = sa_inspect(self.engine)
-        if not inspector.has_table(self.table):
-            return 0
-        existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
-        if "record_id" not in existing_cols:
-            return 0
-        preparer = self.engine.dialect.identifier_preparer
-        quoted_table = preparer.quote(self.table)
-        quoted_col = preparer.quote("record_id")
-        params = {f"id_{idx}": rid for idx, rid in enumerate(record_ids)}
-        placeholders = ", ".join(f":{k}" for k in params)
-        stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
-        with self.engine.begin() as conn:
-            conn.execute(stmt, params)
-        return len(record_ids)
+        return _execute_chunked_sql_id_delete(
+            self.engine,
+            self.table,
+            ("record_id",),
+            record_ids,
+        )
 
     def _write_long_chunks(self, long_rows: list[dict[str, Any]]) -> None:
         for start in range(0, len(long_rows), self._chunk_size):
@@ -4340,7 +4382,14 @@ class _LongSQLSink(ExportSink):
             self._is_first_write = False
 
     def close(self) -> None:
-        """Close the sink."""
+        """Close the sink and dispose any non-in-memory SQLAlchemy engine."""
+        db_name = getattr(getattr(self.engine, "url", None), "database", None)
+        if (
+            not isinstance(self.engine, NonCallableMock)
+            and db_name not in (None, ":memory:")
+            and callable(getattr(self.engine, "dispose", None))
+        ):
+            self.engine.dispose()
 
 
 def export_to_long_sql(
@@ -4374,27 +4423,36 @@ def export_to_long_sql(
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
 
     if _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config):
-        legacy_records = (
-            rec
-            for rec in mapper._fetch_records(study_key)
-            if config.include_deleted or not is_record_deleted(rec)
-        )
-        long_rows = _unpack_long_sql_rows(
-            legacy_records,
-            mask_phi=config.mask_phi,
-            pipeline=pipeline,
-            phi_keys=phi_keys,
-        )
-        first = True
-        for start in range(0, len(long_rows), max(1, chunk_size)):
-            df = pd.DataFrame(long_rows[start : start + max(1, chunk_size)])
-            df.to_sql(
-                table_name,
-                engine,
-                if_exists="replace" if first else "append",
-                index=False,
+        try:
+            legacy_records = (
+                rec
+                for rec in mapper._fetch_records(study_key)
+                if config.include_deleted or not is_record_deleted(rec)
             )
-            first = False
+            long_rows = _unpack_long_sql_rows(
+                legacy_records,
+                mask_phi=config.mask_phi,
+                pipeline=pipeline,
+                phi_keys=phi_keys,
+            )
+            first = True
+            for start in range(0, len(long_rows), max(1, chunk_size)):
+                df = pd.DataFrame(long_rows[start : start + max(1, chunk_size)])
+                df.to_sql(
+                    table_name,
+                    engine,
+                    if_exists="replace" if first else "append",
+                    index=False,
+                )
+                first = False
+        finally:
+            db_name = getattr(getattr(engine, "url", None), "database", None)
+            if (
+                not isinstance(engine, NonCallableMock)
+                and db_name not in (None, ":memory:")
+                and callable(getattr(engine, "dispose", None))
+            ):
+                engine.dispose()
         return
 
     records_source = _make_mapper_records_source(sdk, study_key, mapper, config)

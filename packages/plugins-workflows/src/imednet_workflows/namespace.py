@@ -41,3 +41,6 @@ class Workflows:
     def duckdb_centralizer(self) -> DuckDBIngestionWorkflow:
         """Incremental record centralization pipeline using DuckDB."""
         return DuckDBIngestionWorkflow(self._sdk)
+
+
+__all__ = ["Workflows"]

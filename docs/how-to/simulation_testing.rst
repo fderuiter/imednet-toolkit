@@ -42,6 +42,22 @@ entries, and ``Query`` items):
 
    reset_default_simulation_state()
 
+Running the CLI in Simulation Mode
+----------------------------------
+
+Pass ``--simulation`` on the root ``imednet`` command or any API-backed subcommand
+(or set ``IMEDNET_SIMULATION_MODE=true``) to exercise CLI tables, JSON envelopes,
+exports, write commands, workflows, and the Textual TUI offline without API keys:
+
+.. code-block:: bash
+
+   imednet studies list --simulation --no-interactive
+   imednet forms list STUDY --simulation --format json
+   imednet datadict from-api STUDY --simulation -o sim_datadict.json
+   imednet export json STUDY ./sim_records.json --simulation --no-interactive
+   imednet subject-data STUDY SUB1 --simulation --format json
+   imednet tui STUDY --simulation
+
 Isolated Per-Test ``SimulationState`` Injection
 -----------------------------------------------
 

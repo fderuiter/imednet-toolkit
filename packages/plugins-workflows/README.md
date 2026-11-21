@@ -27,17 +27,19 @@ environments before upgrading. UAT commands are included; there is no separate
 The package provides CLI commands mapped to registered `imednet.cli_plugins` subcommands.
 
 ```bash
-# Extract clinical records
+# Extract clinical records (positional STUDY_KEY or -s/--study-key; supports --simulation)
 imednet workflows extract-records <STUDY_KEY>
+imednet workflows extract-records --study-key <STUDY_KEY> --simulation --format json
 
 # Continuous synchronization loop
 imednet workflows sync-worker <STUDY_KEY> --interval 900
 
-# Administrative state checkpoint management
+# Administrative state checkpoint management (human table or v1 JSON envelope)
 imednet workflows state show --study-key <STUDY_KEY>
+imednet workflows state show <STUDY_KEY> --format json
 imednet workflows state set --study-key <STUDY_KEY> --stream records --timestamp "2023-10-27T12:00:00Z"
 
-# Single subject profile data (supports flags, positionals, or hybrids)
+# Single subject profile data (supports flags, positionals, hybrids, and --simulation)
 imednet subject-data --study-key <STUDY_KEY> --subject-key <SUBJECT_KEY>
 imednet subject-data <STUDY_KEY> <SUBJECT_KEY>
 imednet subject-data --study-key <STUDY_KEY> <SUBJECT_KEY>
