@@ -1,5 +1,66 @@
 # Changelog
 
+## [1.2.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-workflows-v1.1.0...imednet-workflows-v1.2.0) (2026-11-21)
+
+
+### Features
+
+* add tabular record import and CLI write commands ([#1978](https://github.com/fderuiter/imednet-toolkit/issues/1978)) ([358fbb9](https://github.com/fderuiter/imednet-toolkit/commit/358fbb9191035135056cd9513bdeaa281cb4ffe0))
+* **airflow:** align Airflow 3 provider UI metadata, template fields, and SQL exports ([#1999](https://github.com/fderuiter/imednet-toolkit/issues/1999)) ([fb5b4c0](https://github.com/fderuiter/imednet-toolkit/commit/fb5b4c0dcf68200855f79f00e0bf75ef07e3eb65))
+* centralize batch coordination and job error diagnostics ([#1909](https://github.com/fderuiter/imednet-toolkit/issues/1909)) ([20232c6](https://github.com/fderuiter/imednet-toolkit/commit/20232c6729f185cf7941cf9585ba1bd9ec089dcb))
+* centralize default PHI masking across enrichment and exports ([#1936](https://github.com/fderuiter/imednet-toolkit/issues/1936)) ([99a0bc0](https://github.com/fderuiter/imednet-toolkit/commit/99a0bc0aef9d389c48a53d1841ddb10f23516d33))
+* **cli:** expose shared CLI helpers in SPI ([#1998](https://github.com/fderuiter/imednet-toolkit/issues/1998)) ([b52e79b](https://github.com/fderuiter/imednet-toolkit/commit/b52e79ba6ac80e8562b5b77c930eda9be372cb6f))
+* **cli:** implement live ANSI terminal progress rendering with poller integration ([#1852](https://github.com/fderuiter/imednet-toolkit/issues/1852)) ([9ea62ef](https://github.com/fderuiter/imednet-toolkit/commit/9ea62ef13339f034e983d8af5b7ba1e1b2048408))
+* embed CDISC SDTM transformation and standards readiness in core SPI ([#2002](https://github.com/fderuiter/imednet-toolkit/issues/2002)) ([1d7ca31](https://github.com/fderuiter/imednet-toolkit/commit/1d7ca3164a958194be9aae5e3e5746912de78112))
+* embed lifecycle invariants in domain models and stores ([#1915](https://github.com/fderuiter/imednet-toolkit/issues/1915)) ([2154ff4](https://github.com/fderuiter/imednet-toolkit/commit/2154ff4479fcee63d70d55407694af3e1d7e3ab9))
+* enforce mode-safe plugin protocols and static types ([#2000](https://github.com/fderuiter/imednet-toolkit/issues/2000)) ([5c46bfa](https://github.com/fderuiter/imednet-toolkit/commit/5c46bfaf7f321e7026f5d6fbabfcec5acee2e954))
+* merge tabular records with Snowflake schema evolution ([a596cc1](https://github.com/fderuiter/imednet-toolkit/commit/a596cc154cc426f5c3c51139139b281e0951c1ca))
+* unify DataDictionary validation with XML rule evaluator ([#1913](https://github.com/fderuiter/imednet-toolkit/issues/1913)) ([2595f8e](https://github.com/fderuiter/imednet-toolkit/commit/2595f8e43ccf70f03dbe94ae3200143cdbfefb19))
+* unify streaming batches and ledger checkpoints via SPI ([#1912](https://github.com/fderuiter/imednet-toolkit/issues/1912)) ([820d2b6](https://github.com/fderuiter/imednet-toolkit/commit/820d2b621ec78ff2f7b10d6ea9a62174a578d94e))
+* **workflows:** add interactive console wizards and parameter validation ([#1843](https://github.com/fderuiter/imednet-toolkit/issues/1843)) ([c78001a](https://github.com/fderuiter/imednet-toolkit/commit/c78001afa5bd8f120fbe8605fab2d01c7f60f915))
+* **workflows:** add SQLite sync epoch state machine and SyncWorker lifecycle ([#1959](https://github.com/fderuiter/imednet-toolkit/issues/1959)) ([f1b42b8](https://github.com/fderuiter/imednet-toolkit/commit/f1b42b8f6e6b8dc374fe7e9d5057e803b65e2b6a))
+* **workflows:** add vital signs (VS) SDTM domain specification ([#1796](https://github.com/fderuiter/imednet-toolkit/issues/1796)) ([8e5389c](https://github.com/fderuiter/imednet-toolkit/commit/8e5389c8758ba7378e2446abaf8bf2333d2a8192))
+* **workflows:** bridge QueryManagementWorkflow to TriageStore with schema v2 ([#1977](https://github.com/fderuiter/imednet-toolkit/issues/1977)) ([62e5694](https://github.com/fderuiter/imednet-toolkit/commit/62e56947ab9a78b04d0c4381479a957543b9de88))
+* **workflows:** register missing workflow entrypoints and add contract parity test ([#1775](https://github.com/fderuiter/imednet-toolkit/issues/1775)) ([562ca4f](https://github.com/fderuiter/imednet-toolkit/commit/562ca4f5462e18635e0438526246e71fb9c8f5dd))
+* **workflows:** support optional flags in subject-data CLI ([#1820](https://github.com/fderuiter/imednet-toolkit/issues/1820)) ([62cc9c3](https://github.com/fderuiter/imednet-toolkit/commit/62cc9c39995b71e85ca3c09ba5638b24d4b4a4f4))
+
+
+### Bug Fixes
+
+* **airflow:** repair Airflow 3 provider discovery, XCom checkpoints, and DuckDB dispatch ([#1970](https://github.com/fderuiter/imednet-toolkit/issues/1970)) ([e778b17](https://github.com/fderuiter/imednet-toolkit/commit/e778b17e91025a11e0aeb11d8eee8d558cb09700))
+* **airflow:** use Airflow Variable checkpoints and verify Job resultUrl ([#1995](https://github.com/fderuiter/imednet-toolkit/issues/1995)) ([ce2e65c](https://github.com/fderuiter/imednet-toolkit/commit/ce2e65c14ce46ad999d80498d4f78d9d0fcbc7d2))
+* align filters, exports, and DuckDB revision schemas ([478f0fb](https://github.com/fderuiter/imednet-toolkit/commit/478f0fb44d34ffba811cfe816bc2865848106582))
+* **cli:** thread endpoint filter allowlists through CLI preflight ([bee7d00](https://github.com/fderuiter/imednet-toolkit/commit/bee7d00fcc205c4acfdcdd256a3d0eb2a391d859))
+* **cli:** unify CLI contracts in core SPI ([#1960](https://github.com/fderuiter/imednet-toolkit/issues/1960)) ([7f0c9fa](https://github.com/fderuiter/imednet-toolkit/commit/7f0c9fa742facb4c72c5beeae2ef9adc90434d82))
+* **cli:** unify CLI output and format contracts via SPI ([#1987](https://github.com/fderuiter/imednet-toolkit/issues/1987)) ([2caa9c6](https://github.com/fderuiter/imednet-toolkit/commit/2caa9c6c14a61b73739bba133fdb222e1b217b97))
+* **cli:** unify terminal policy with opt-out interactive mode ([#1888](https://github.com/fderuiter/imednet-toolkit/issues/1888)) ([066801e](https://github.com/fderuiter/imednet-toolkit/commit/066801e349af5b96b543b7e261aad7b06c9d879e))
+* **core:** align dynamic stubs and endpoint contracts ([#1967](https://github.com/fderuiter/imednet-toolkit/issues/1967)) ([429b69c](https://github.com/fderuiter/imednet-toolkit/commit/429b69c68b23896e18962b83cea88c9d649aa56a))
+* **core:** restrict evaluator method calls to safe allowlist ([#1806](https://github.com/fderuiter/imednet-toolkit/issues/1806)) ([980cb31](https://github.com/fderuiter/imednet-toolkit/commit/980cb315882a9c5df17429beb09e8524f3e339fd))
+* **docs:** fix examples and expand docs verification scripts ([#1945](https://github.com/fderuiter/imednet-toolkit/issues/1945)) ([78b3ad8](https://github.com/fderuiter/imednet-toolkit/commit/78b3ad859e67b930bbb396c12622914cca1d0892))
+* enforce endpoint filter registries and list-only contracts ([#1893](https://github.com/fderuiter/imednet-toolkit/issues/1893)) ([ed927c0](https://github.com/fderuiter/imednet-toolkit/commit/ed927c0f67f9983cc1ba38fb0b0b5df95358ea87))
+* **export:** reconcile incremental exports directly in destination files ([#1964](https://github.com/fderuiter/imednet-toolkit/issues/1964)) ([f8a7758](https://github.com/fderuiter/imednet-toolkit/commit/f8a775886c2c94910ac9853afc0f1266b318ac18))
+* **models:** infer contract types and synchronize Postman schemas ([#1889](https://github.com/fderuiter/imednet-toolkit/issues/1889)) ([64efe0f](https://github.com/fderuiter/imednet-toolkit/commit/64efe0f3bd62a19a86e99b56fabf7b6ead7a33a1))
+* normalize pagination bounds and filters in endpoint strategies ([#1918](https://github.com/fderuiter/imednet-toolkit/issues/1918)) ([add6048](https://github.com/fderuiter/imednet-toolkit/commit/add6048a46fb53011dc1b97c23328d961765d851))
+* preserve uncommitted watermarks, recover stale leases, and chain sanitized batch causes ([#1955](https://github.com/fderuiter/imednet-toolkit/issues/1955)) ([cc69622](https://github.com/fderuiter/imednet-toolkit/commit/cc696223e5e0e3e4196f4c76f7ee0ce8f967c523))
+* scope HTTP auth, isolate circuit breakers, and make job pollers cooperative ([#1947](https://github.com/fderuiter/imednet-toolkit/issues/1947)) ([e15e872](https://github.com/fderuiter/imednet-toolkit/commit/e15e8724825bae66d8a03bc0f2522e3bf1e9ffde))
+* **security:** mask PHI at mapper ingress via SPI ([#1911](https://github.com/fderuiter/imednet-toolkit/issues/1911)) ([432d8a5](https://github.com/fderuiter/imednet-toolkit/commit/432d8a5e3e7fe784f6143d7eae55206d770a7bd2))
+* **security:** standardize PHI redaction on SensitivityRegistry ([#1923](https://github.com/fderuiter/imednet-toolkit/issues/1923)) ([cb52acc](https://github.com/fderuiter/imednet-toolkit/commit/cb52accc22789ee6f805bc8f8d6cc1f2c9379dad))
+* **security:** validate and encode API path segments strictly ([#1968](https://github.com/fderuiter/imednet-toolkit/issues/1968)) ([78e605b](https://github.com/fderuiter/imednet-toolkit/commit/78e605bea40845d6a3130aafe432091b58357b49))
+* **workflows:** deduplicate model aliases and normalize consumed keys in SDTM transformation ([#1821](https://github.com/fderuiter/imednet-toolkit/issues/1821)) ([ca73a42](https://github.com/fderuiter/imednet-toolkit/commit/ca73a42b7a55152394d8ed6e7e821a35675f522b))
+* **workflows:** enforce server-side role validation in commit_config ([#1802](https://github.com/fderuiter/imednet-toolkit/issues/1802)) ([71257d0](https://github.com/fderuiter/imednet-toolkit/commit/71257d057b6f4fbb5ef4a01a942931a65b071dfa))
+* **workflows:** isolate UAT run state and poll verification jobs concurrently ([#1942](https://github.com/fderuiter/imednet-toolkit/issues/1942)) ([804aae4](https://github.com/fderuiter/imednet-toolkit/commit/804aae4293bd396f02c6a8970f5693a7038f5b8b))
+* **workflows:** set default state ledger path to user home directory ([#1814](https://github.com/fderuiter/imednet-toolkit/issues/1814)) ([71c090f](https://github.com/fderuiter/imednet-toolkit/commit/71c090f2f972582a11271ad8b2e588b612eb3a0b))
+* **workflows:** stream sorted SDTM batches with ISO PHI redaction ([#1979](https://github.com/fderuiter/imednet-toolkit/issues/1979)) ([c52d849](https://github.com/fderuiter/imednet-toolkit/commit/c52d849e3ea1b0e9193457e8ed69f95ad2c7a05f))
+* **workflows:** validate study context with validate_partition_key in ConfigVersionStore ([#1789](https://github.com/fderuiter/imednet-toolkit/issues/1789)) ([3b9009d](https://github.com/fderuiter/imednet-toolkit/commit/3b9009d46ef05ab3418c1dea656342563256e12e))
+
+
+### Performance Improvements
+
+* **workflows:** bulk insert revisions via columnar DuckDB staging ([#1948](https://github.com/fderuiter/imednet-toolkit/issues/1948)) ([ef1e7ee](https://github.com/fderuiter/imednet-toolkit/commit/ef1e7eeb1333d18d56340a46cc236b27bf0d902a))
+* **workflows:** deduplicate form model synthesis in hierarchy mapping ([#1785](https://github.com/fderuiter/imednet-toolkit/issues/1785)) ([b848c85](https://github.com/fderuiter/imednet-toolkit/commit/b848c85d2d037f41422cbefe3c17c8137cfbae08))
+* **workflows:** narrow SQLite lock scope to write transactions ([#1875](https://github.com/fderuiter/imednet-toolkit/issues/1875)) ([3a9833f](https://github.com/fderuiter/imednet-toolkit/commit/3a9833fa454a3e498d3864c9f312e40e145bc6d2))
+* **workflows:** precompute model aliases and dispatch date parsing ([#1876](https://github.com/fderuiter/imednet-toolkit/issues/1876)) ([6f7ffba](https://github.com/fderuiter/imednet-toolkit/commit/6f7ffba3053b0012c29345190ff1c7db55ae0a5e))
+
 ## [1.1.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-workflows-v1.0.0...imednet-workflows-v1.1.0) (2026-11-16)
 
 
