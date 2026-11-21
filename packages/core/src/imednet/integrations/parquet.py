@@ -8,7 +8,7 @@ import inspect
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import Any
 from unittest.mock import NonCallableMock
 
 from ..sdk import ImednetSDK
@@ -29,7 +29,6 @@ from .export import (
 from .parquet_engine import PyArrowDatasetPartitionedStorageEngine
 from .sink_base import (
     BoundedFormBufferRouter,
-    _require_optional_dep,
     extract_record_form_ref,
     extract_record_id,
     validate_max_buffered_records,
@@ -63,7 +62,13 @@ def _ensure_pandas() -> ModuleType:
     Raises:
         ImportError: If pandas is not installed.
     """
-    return cast(ModuleType, _require_optional_dep("pandas", "export"))
+    try:
+        return import_module("pandas")
+    except ImportError as error:
+        raise ImportError(
+            "pandas is required for Hive Parquet export. Install with "
+            "\"pip install 'imednet[export]'\"."
+        ) from error
 
 
 def _cached_records_loader() -> Any:
