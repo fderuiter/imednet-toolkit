@@ -869,7 +869,9 @@ def test_airflow_state_provider_out_of_context_model_variable_crud(tmp_path, mon
         if prev_conf_conn is not None:
             conf.set("database", "sql_alchemy_conn", prev_conf_conn)
         settings.configure_orm()
-        root_logger.handlers = saved_handlers
+        root_logger.handlers = [
+            h for h in saved_handlers if not getattr(getattr(h, "stream", None), "closed", False)
+        ]
         root_logger.setLevel(saved_level)
 
 

@@ -26,10 +26,77 @@ for source_root in (
     sys.path.insert(0, str(source_root))
 
 import importlib.metadata as _importlib_metadata
+import logging as _logging
 import ssl as _ssl
 
 import respx
 import respx.mocks as _respx_mocks
+
+
+def _is_closed_handler(handler: _logging.Handler) -> bool:
+    """Return True if a logging handler wraps a closed I/O stream."""
+    stream = getattr(handler, "stream", None)
+    if stream is not None and getattr(stream, "closed", False):
+        return True
+    console = getattr(handler, "console", None)
+    console_file = getattr(console, "_file", None) if console is not None else None
+    return bool(console_file is not None and getattr(console_file, "closed", False))
+
+
+_INITIAL_ROOT_HANDLERS: list[_logging.Handler] = [
+    h for h in _logging.getLogger().handlers if not _is_closed_handler(h)
+]
+_INITIAL_NAMED_LOGGERS: dict[str, tuple[list[_logging.Handler], int, bool, bool]] = {
+    name: (
+        [h for h in lg.handlers if not _is_closed_handler(h)],
+        lg.level,
+        lg.propagate,
+        lg.disabled,
+    )
+    for name, lg in _logging.Logger.manager.loggerDict.items()
+    if isinstance(lg, _logging.Logger)
+}
+_post_collection_logging_sanitized = False
+
+
+def _sanitize_post_collection_loggers() -> None:
+    """Strip non-pytest handlers attached as import side effects during test collection."""
+    global _post_collection_logging_sanitized
+    if _post_collection_logging_sanitized:
+        return
+    _post_collection_logging_sanitized = True
+
+    root_logger = _logging.getLogger()
+    root_logger.handlers[:] = [
+        h
+        for h in root_logger.handlers
+        if not _is_closed_handler(h)
+        and (h in _INITIAL_ROOT_HANDLERS or type(h).__module__.startswith("_pytest"))
+    ]
+    for name, lg in list(_logging.Logger.manager.loggerDict.items()):
+        if not isinstance(lg, _logging.Logger):
+            continue
+        if name in _INITIAL_NAMED_LOGGERS:
+            init_handlers, init_level, init_prop, init_dis = _INITIAL_NAMED_LOGGERS[name]
+            target_handlers = [h for h in init_handlers if not _is_closed_handler(h)]
+            if lg.handlers != target_handlers:
+                lg.handlers[:] = target_handlers
+            if lg.level != init_level:
+                lg.setLevel(init_level)
+            if lg.propagate != init_prop:
+                lg.propagate = init_prop
+            if lg.disabled != init_dis:
+                lg.disabled = init_dis
+        else:
+            if any(not isinstance(h, _logging.NullHandler) for h in lg.handlers):
+                lg.handlers[:] = [h for h in lg.handlers if isinstance(h, _logging.NullHandler)]
+            if lg.level != _logging.NOTSET:
+                lg.setLevel(_logging.NOTSET)
+            if not lg.propagate:
+                lg.propagate = True
+            if lg.disabled:
+                lg.disabled = False
+
 
 _orig_entry_points = _importlib_metadata.entry_points
 _entry_points_cache: dict[tuple[tuple[str, ...], tuple[tuple[str, object], ...]], object] = {}
@@ -300,6 +367,57 @@ def _is_live_test(node: object) -> bool:
     if path.is_absolute() and ".." not in path.parts and path.is_relative_to(ROOT):
         return path.is_relative_to(LIVE_TESTS_DIR)
     return path.resolve().is_relative_to(LIVE_TESTS_DIR)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):  # type: ignore[no-untyped-def]
+    """Snapshot and restore logging handlers and levels across each full test lifecycle."""
+    del item, nextitem
+    _sanitize_post_collection_loggers()
+    root_logger = _logging.getLogger()
+    saved_root_handlers = tuple(root_logger.handlers)
+    saved_root_level = root_logger.level
+    saved_root_disabled = root_logger.disabled
+    saved_named_loggers: dict[str, tuple[tuple[_logging.Handler, ...], int, bool, bool]] = {
+        name: (tuple(lg.handlers), lg.level, lg.propagate, lg.disabled)
+        for name, lg in _logging.Logger.manager.loggerDict.items()
+        if isinstance(lg, _logging.Logger)
+    }
+    try:
+        yield
+    finally:
+        target_root_handlers = [h for h in saved_root_handlers if not _is_closed_handler(h)]
+        if root_logger.handlers != target_root_handlers:
+            root_logger.handlers[:] = target_root_handlers
+        if root_logger.level != saved_root_level:
+            root_logger.setLevel(saved_root_level)
+        if root_logger.disabled != saved_root_disabled:
+            root_logger.disabled = saved_root_disabled
+        for name, lg in list(_logging.Logger.manager.loggerDict.items()):
+            if not isinstance(lg, _logging.Logger):
+                continue
+            saved = saved_named_loggers.get(name)
+            if saved is not None:
+                h_tuple, lvl, prop, dis = saved
+                if not lg.handlers and not h_tuple:
+                    pass
+                elif tuple(lg.handlers) != h_tuple or any(_is_closed_handler(h) for h in h_tuple):
+                    lg.handlers[:] = [h for h in h_tuple if not _is_closed_handler(h)]
+                if lg.level != lvl:
+                    lg.setLevel(lvl)
+                if lg.propagate != prop:
+                    lg.propagate = prop
+                if lg.disabled != dis:
+                    lg.disabled = dis
+            else:
+                if any(not isinstance(h, _logging.NullHandler) for h in lg.handlers):
+                    lg.handlers[:] = [h for h in lg.handlers if isinstance(h, _logging.NullHandler)]
+                if lg.level != _logging.NOTSET:
+                    lg.setLevel(_logging.NOTSET)
+                if not lg.propagate:
+                    lg.propagate = True
+                if lg.disabled:
+                    lg.disabled = False
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:

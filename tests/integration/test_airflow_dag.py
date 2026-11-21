@@ -169,7 +169,9 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
         conf.set("dag_processor", "dag_bundle_config_list", prev_bundles)
     settings.configure_orm()
 
-    root_logger.handlers = saved_handlers
+    root_logger.handlers = [
+        h for h in saved_handlers if not getattr(getattr(h, "stream", None), "closed", False)
+    ]
     root_logger.setLevel(saved_level)
 
 

@@ -45,16 +45,21 @@ pytest.importorskip("airflow")
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_airflow_state_provider_modules() -> Any:
-    """Unload Airflow and provider modules on teardown so subsequent unit tests stay hermetic."""
+    """Unload provider modules on teardown so subsequent unit tests stay hermetic."""
     _ensure_real_airflow_modules()
     root_logger = logging.getLogger()
     saved_handlers = list(root_logger.handlers)
     saved_level = root_logger.level
     yield
     for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
             sys.modules.pop(mod, None)
-    root_logger.handlers = saved_handlers
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+        delattr(providers_pkg, "imednet")
+    root_logger.handlers = [
+        h for h in saved_handlers if not getattr(getattr(h, "stream", None), "closed", False)
+    ]
     root_logger.setLevel(saved_level)
 
 
@@ -173,7 +178,9 @@ def airflow_runtime_env(
         conf.set("dag_processor", "dag_bundle_config_list", prev_bundles)
     settings.configure_orm()
 
-    root_logger.handlers = saved_handlers
+    root_logger.handlers = [
+        h for h in saved_handlers if not getattr(getattr(h, "stream", None), "closed", False)
+    ]
     root_logger.setLevel(saved_level)
 
 

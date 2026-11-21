@@ -48,9 +48,14 @@ def _cleanup_airflow_provider_modules():
 
     yield
     for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow")):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
             sys.modules.pop(mod, None)
-    root_logger.handlers = saved_handlers
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+        delattr(providers_pkg, "imednet")
+    root_logger.handlers = [
+        h for h in saved_handlers if not getattr(getattr(h, "stream", None), "closed", False)
+    ]
     root_logger.setLevel(saved_level)
 
 

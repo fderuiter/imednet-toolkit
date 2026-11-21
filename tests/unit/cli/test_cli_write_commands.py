@@ -425,3 +425,62 @@ def test_cli_subjects_register_skip_existing_and_json_output(
     assert item["totalRecords"] == 1
     assert item["skippedCount"] == 1
     assert len(state.get_subjects("STUDY")) == before_subjects + 1
+
+
+def test_capfd_stream_handler_mutation_is_isolated_step1(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Attach StreamHandlers while capfd is active so teardown closes their underlying stream."""
+    import logging
+    import sys
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(logging.StreamHandler(sys.stdout))
+
+    named_logger = logging.getLogger("imednet.test.capfd_leak_probe")
+    named_logger.setLevel(logging.INFO)
+    named_logger.addHandler(logging.StreamHandler(sys.stderr))
+    named_logger.info("probe message")
+
+    captured = capfd.readouterr()
+    assert "probe message" in captured.err
+
+
+def test_capfd_stream_handler_mutation_is_isolated_step2(
+    capsys: pytest.CaptureFixture[str],
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """Subsequent CLI commands emit zero closed-stream logging errors after capfd teardown."""
+    import logging
+
+    _ = sim_sdk_and_requests
+    for lg in [logging.getLogger(), logging.getLogger("imednet.test.capfd_leak_probe")]:
+        assert not any(getattr(getattr(h, "stream", None), "closed", False) for h in lg.handlers)
+
+    res = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--subject-key",
+            "SUB1",
+            "--site-name",
+            "SITE",
+            "-d",
+            "V_AGE=48",
+            "--wait",
+            "--timeout",
+            "5",
+            "--interval",
+            "0",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res.exit_code == 0, res.stderr
+    assert res.stderr == ""
