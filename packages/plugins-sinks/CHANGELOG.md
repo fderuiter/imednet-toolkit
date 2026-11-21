@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.1.0](https://github.com/fderuiter/imednet-toolkit/compare/imednet-plugins-sinks-v1.0.1...imednet-plugins-sinks-v1.1.0) (2026-11-21)
+
+
+### Features
+
+* centralize default PHI masking across enrichment and exports ([#1936](https://github.com/fderuiter/imednet-toolkit/issues/1936)) ([99a0bc0](https://github.com/fderuiter/imednet-toolkit/commit/99a0bc0aef9d389c48a53d1841ddb10f23516d33))
+* embed CDISC SDTM transformation and standards readiness in core SPI ([#2002](https://github.com/fderuiter/imednet-toolkit/issues/2002)) ([1d7ca31](https://github.com/fderuiter/imednet-toolkit/commit/1d7ca3164a958194be9aae5e3e5746912de78112))
+* enforce mode-safe plugin protocols and static types ([#2000](https://github.com/fderuiter/imednet-toolkit/issues/2000)) ([5c46bfa](https://github.com/fderuiter/imednet-toolkit/commit/5c46bfaf7f321e7026f5d6fbabfcec5acee2e954))
+* merge tabular records with Snowflake schema evolution ([a596cc1](https://github.com/fderuiter/imednet-toolkit/commit/a596cc154cc426f5c3c51139139b281e0951c1ca))
+* **spi:** introduce formal SPI sink_base and dynamic entry point discovery ([#1773](https://github.com/fderuiter/imednet-toolkit/issues/1773)) ([f5817de](https://github.com/fderuiter/imednet-toolkit/commit/f5817de89f43a6f0916cfb8604e1f55c7c2afca7))
+* unify streaming batches and ledger checkpoints via SPI ([#1912](https://github.com/fderuiter/imednet-toolkit/issues/1912)) ([820d2b6](https://github.com/fderuiter/imednet-toolkit/commit/820d2b621ec78ff2f7b10d6ea9a62174a578d94e))
+
+
+### Bug Fixes
+
+* **airflow:** sync provider aliases and isolate dummy-Airflow test modules ([#2007](https://github.com/fderuiter/imednet-toolkit/issues/2007)) ([c4236be](https://github.com/fderuiter/imednet-toolkit/commit/c4236be941cb2d1281b7d3870378debee74e1b73))
+* align sink showcases and enforce symbol-level showcase validation ([#1920](https://github.com/fderuiter/imednet-toolkit/issues/1920)) ([0536005](https://github.com/fderuiter/imednet-toolkit/commit/053600566fd550f3379edd35a3ce4d04125e2994))
+* **docs:** fix examples and expand docs verification scripts ([#1945](https://github.com/fderuiter/imednet-toolkit/issues/1945)) ([78b3ad8](https://github.com/fderuiter/imednet-toolkit/commit/78b3ad859e67b930bbb396c12622914cca1d0892))
+* **models:** infer contract types and synchronize Postman schemas ([#1889](https://github.com/fderuiter/imednet-toolkit/issues/1889)) ([64efe0f](https://github.com/fderuiter/imednet-toolkit/commit/64efe0f3bd62a19a86e99b56fabf7b6ead7a33a1))
+* resolve Airflow destination connections and merge Snowflake batches ([c2a1b79](https://github.com/fderuiter/imednet-toolkit/commit/c2a1b7955b86c5c58e9339a80ffd90f3ddf94c07))
+* **security:** mask PHI at mapper ingress via SPI ([#1911](https://github.com/fderuiter/imednet-toolkit/issues/1911)) ([432d8a5](https://github.com/fderuiter/imednet-toolkit/commit/432d8a5e3e7fe784f6143d7eae55206d770a7bd2))
+* **security:** standardize PHI redaction on SensitivityRegistry ([#1923](https://github.com/fderuiter/imednet-toolkit/issues/1923)) ([cb52acc](https://github.com/fderuiter/imednet-toolkit/commit/cb52accc22789ee6f805bc8f8d6cc1f2c9379dad))
+* **sinks:** centralize SPI mapping and add direct Neo4j subject-record edges ([#1949](https://github.com/fderuiter/imednet-toolkit/issues/1949)) ([2342129](https://github.com/fderuiter/imednet-toolkit/commit/234212996a823c21c47e35adb9c5bf239de32648))
+
+
+### Performance Improvements
+
+* **sinks:** streamline warehouse Arrow conversion to single-pass checks ([#1952](https://github.com/fderuiter/imednet-toolkit/issues/1952)) ([40197f6](https://github.com/fderuiter/imednet-toolkit/commit/40197f6daf6e7723d2430671bff3e85ae9259cc3))
+
 ## [1.0.1](https://github.com/fderuiter/imednet-toolkit/compare/imednet-plugins-sinks-v1.0.0...imednet-plugins-sinks-v1.0.1) (2026-11-16)
 
 
