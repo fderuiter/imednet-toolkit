@@ -1218,6 +1218,8 @@ def test_jobs_status_colors_on_tty(
     """Test that job states display correct ANSI colors when stdout is interactive (TTY)."""
     job = JobStatus(batchId="BATCH_C", jobId="JOB_C", state=state, progress=50)
     sdk.get_job.return_value = job
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
     result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH_C"], tty=True)
     assert result.exit_code == 0
@@ -1245,6 +1247,7 @@ def test_jobs_status_colors_high_contrast(
     sdk.get_job.return_value = job
     monkeypatch.setenv("IMEDNET_HIGH_CONTRAST", "1")
     monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
     result = runner.invoke(cli.app, ["jobs", "status", "STUDY", "BATCH_HC"], tty=True)
     assert result.exit_code == 0
     assert expected_code in result.stdout

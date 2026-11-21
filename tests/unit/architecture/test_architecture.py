@@ -125,6 +125,39 @@ def test_extensions_use_spi():
         packages_dir / "providers-airflow" / "src",
     ]
 
+    allowed_prefixes = (
+        "imednet.spi",
+        "imednet.sdk",
+        "imednet.config",
+        "imednet.errors",
+        "imednet.ImednetSDK",
+        "imednet.AsyncImednetSDK",
+        "imednet.Config",
+        "imednet.PluginLoadError",
+        "imednet.FilterConflictError",
+        "imednet.OrchestratorError",
+        "imednet.MultiStudyOrchestrator",
+        "imednet.OrchestratorResult",
+        "imednet.StudyWorkerCallable",
+        "imednet.PluginProtocol",
+        "imednet.AsyncSinksNamespaceProtocol",
+        "imednet.AsyncWorkflowsNamespaceProtocol",
+        "imednet.SinksNamespaceProtocol",
+        "imednet.SyncWorkflowsNamespaceProtocol",
+        "imednet.WorkflowsNamespaceProtocol",
+        "imednet.BaseClient",
+        "imednet.DefaultRetryPolicy",
+        "imednet.FilterScalar",
+        "imednet.FilterValue",
+        "imednet.ImednetClient",
+        "imednet.ItemId",
+        "imednet.JsonDict",
+        "imednet.RecordsInput",
+        "imednet.RetryPolicy",
+        "imednet.RetryState",
+        "imednet.load_config",
+    )
+
     for ext_dir in extension_dirs:
         if not ext_dir.exists():
             continue
@@ -134,34 +167,6 @@ def test_extensions_use_spi():
             for imp in imports:
                 # If they import imednet, it must be the top level (e.g. `imednet` itself)
                 # or through the SPI `imednet.spi`
-                allowed_prefixes = (
-                    "imednet.spi",
-                    "imednet.sdk",
-                    "imednet.config",
-                    "imednet.errors",
-                    "imednet.ImednetSDK",
-                    "imednet.AsyncImednetSDK",
-                    "imednet.Config",
-                    "imednet.PluginLoadError",
-                    "imednet.FilterConflictError",
-                    "imednet.OrchestratorError",
-                    "imednet.MultiStudyOrchestrator",
-                    "imednet.OrchestratorResult",
-                    "imednet.StudyWorkerCallable",
-                    "imednet.PluginProtocol",
-                    "imednet.WorkflowsNamespaceProtocol",
-                    "imednet.BaseClient",
-                    "imednet.DefaultRetryPolicy",
-                    "imednet.FilterScalar",
-                    "imednet.FilterValue",
-                    "imednet.ImednetClient",
-                    "imednet.ItemId",
-                    "imednet.JsonDict",
-                    "imednet.RecordsInput",
-                    "imednet.RetryPolicy",
-                    "imednet.RetryState",
-                    "imednet.load_config",
-                )
                 if imp.startswith("imednet.") and not imp.startswith(allowed_prefixes):
                     # The only allowed exceptions are imednet.sdk, imednet.config or something imported via top-level.
                     # Usually, they should just `from imednet import ImednetSDK` which is `imp == "imednet"`

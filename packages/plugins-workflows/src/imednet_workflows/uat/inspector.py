@@ -90,6 +90,8 @@ class StudySchemaInspector:
     use external synchronization or separate inspector instances for that access pattern.
     """
 
+    supports_async = True
+
     def __init__(self, sdk: ImednetFacade | AsyncImednetFacade) -> None:
         """Initialize the study schema inspector.
 
@@ -101,6 +103,14 @@ class StudySchemaInspector:
 
     def inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
         """Synchronously fetch and return a study snapshot."""
+        if hasattr(self._sdk, "async_get_forms") and not callable(
+            getattr(self._sdk, "get_forms", None)
+        ):
+            raise TypeError(
+                "StudySchemaInspector.inspect() requires a synchronous ImednetSDK "
+                "(ImednetFacade). With AsyncImednetSDK, await "
+                "inspector.async_inspect(...) instead."
+            )
         if not force_refresh and study_key in self._cache:
             return self._cache[study_key]
 

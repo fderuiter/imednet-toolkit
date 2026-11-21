@@ -426,7 +426,7 @@ class ConfigVersionStore:
             raise PermissionError(f"Server-side authorization failure: {exc}") from exc
 
         # Legacy fallback: if using static keys, validate server-side by making an API call
-        if not roles and hasattr(sdk.auth, "api_key") and sdk.auth.api_key:
+        if not roles and getattr(sdk.auth, "api_key", None):
             try:
                 # Validate the key has access by requesting study data
                 sdk.get_sites(study_key, limit=1)

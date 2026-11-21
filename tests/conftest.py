@@ -57,6 +57,7 @@ _INITIAL_NAMED_LOGGERS: dict[str, tuple[list[_logging.Handler], int, bool, bool]
     if isinstance(lg, _logging.Logger)
 }
 _post_collection_logging_sanitized = False
+_BASELINE_NAMED_LOGGERS: dict[str, tuple[tuple[_logging.Handler, ...], int, bool, bool]] = {}
 
 
 def _sanitize_post_collection_loggers() -> None:
@@ -96,6 +97,12 @@ def _sanitize_post_collection_loggers() -> None:
                 lg.propagate = True
             if lg.disabled:
                 lg.disabled = False
+        _BASELINE_NAMED_LOGGERS[name] = (
+            tuple(lg.handlers),
+            lg.level,
+            lg.propagate,
+            lg.disabled,
+        )
 
 
 _orig_entry_points = _importlib_metadata.entry_points
@@ -378,11 +385,6 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):  #
     saved_root_handlers = tuple(root_logger.handlers)
     saved_root_level = root_logger.level
     saved_root_disabled = root_logger.disabled
-    saved_named_loggers: dict[str, tuple[tuple[_logging.Handler, ...], int, bool, bool]] = {
-        name: (tuple(lg.handlers), lg.level, lg.propagate, lg.disabled)
-        for name, lg in _logging.Logger.manager.loggerDict.items()
-        if isinstance(lg, _logging.Logger)
-    }
     try:
         yield
     finally:
@@ -396,7 +398,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):  #
         for name, lg in list(_logging.Logger.manager.loggerDict.items()):
             if not isinstance(lg, _logging.Logger):
                 continue
-            saved = saved_named_loggers.get(name)
+            saved = _BASELINE_NAMED_LOGGERS.get(name)
             if saved is not None:
                 h_tuple, lvl, prop, dis = saved
                 if not lg.handlers and not h_tuple:

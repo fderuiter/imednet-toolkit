@@ -23,7 +23,16 @@ from ...datadict import (
 from ...datadict.models import DataDictionary
 from ...sdk import ImednetSDK
 from ..decorators import redact_cli_secrets, validate_cli_path_segment, with_sdk
-from ..utils import get_sdk, print_error, resolve_output_format
+from ..utils import (
+    UniqueStoreAction,
+    add_simulation_arg,
+    add_study_key_args,
+    get_sdk,
+    print_error,
+    resolve_output_format,
+    resolve_study_key,
+    simulation_mode_context,
+)
 
 __all__ = ["get_sdk", "setup_parser"]
 
@@ -125,12 +134,19 @@ def _from_api(
 
 def _handle_from_api(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-api` command."""
-    validate_cli_path_segment(args.study_key, name="study_key")
-    _from_api(
-        study_key=args.study_key,
-        output=args.output,
-        no_raw_xml=args.no_raw_xml,
-    )
+    parser: argparse.ArgumentParser | None = getattr(args, "_api_parser", None)
+    if parser is not None:
+        study_key = resolve_study_key(parser, args, required=True)
+    else:
+        study_key = getattr(args, "study_key", None)
+    assert study_key is not None
+    validate_cli_path_segment(study_key, name="study_key")
+    with simulation_mode_context(bool(getattr(args, "simulation", False))):
+        _from_api(
+            study_key=study_key,
+            output=args.output,
+            no_raw_xml=args.no_raw_xml,
+        )
 
 
 def _handle_validate(args: argparse.Namespace) -> None:
@@ -249,6 +265,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
     odm_parser.add_argument(
         "--study-key",
+        action=UniqueStoreAction,
         help="Optional study key identifier override.",
     )
     odm_parser.add_argument(
@@ -299,6 +316,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
     redcap_parser.add_argument(
         "--study-key",
+        action=UniqueStoreAction,
         help="Optional study key identifier override.",
     )
     redcap_parser.add_argument(
@@ -318,10 +336,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "from-api",
         help="Extract study forms and variables from live iMednet REST API.",
     )
-    api_parser.add_argument(
-        "--study-key",
-        required=True,
-        help="Study key identifier to query.",
+    add_study_key_args(
+        api_parser,
+        flag_help="Study key identifier to query.",
     )
     api_parser.add_argument(
         "-o",
@@ -333,7 +350,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         action="store_true",
         help="Omit verbatim XML strings.",
     )
-    api_parser.set_defaults(func=_handle_from_api)
+    add_simulation_arg(api_parser)
+    api_parser.set_defaults(func=_handle_from_api, _api_parser=api_parser)
 
     # 3. validate
     val_parser = cmd_subparsers.add_parser(

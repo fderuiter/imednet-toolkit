@@ -18,13 +18,11 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
 
 .. testcode::
 
-   from typing import Any, cast
    from imednet import AsyncImednetSDK, ImednetSDK
    from imednet.simulation import reset_default_simulation_state
-   from imednet_workflows.record_update import RecordUpdateWorkflow
 
    sdk = ImednetSDK(simulation_mode=True)
-   workflow = RecordUpdateWorkflow(cast(Any, sdk), batch_size=100)
+   workflow = sdk.workflows.record_update
 
    summary = workflow.create_or_update_records_batch(
        study_key="STUDY",
@@ -53,8 +51,7 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
 
    async def run_async_batch() -> None:
        async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
-           async_workflow = RecordUpdateWorkflow(cast(Any, async_sdk))
-           await async_workflow.async_create_or_update_records_batch(
+           await async_sdk.workflows.record_update.async_create_or_update_records_batch(
                "STUDY",
                [
                    {
@@ -76,25 +73,26 @@ Single-Record Convenience Helpers
 
 For targeted operational scripts, ``RecordUpdateWorkflow`` also provides typed
 builders that construct properly aliased ``Record`` dictionaries and return the
-submitted ``Job``:
+submitted ``Job`` (along with ``async_*`` counterparts for ``AsyncImednetSDK``):
 
-* :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.register_subject`:
+* :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.register_subject` /
+  :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.async_register_subject`:
   Submits an enrollment ``Form`` ``Record`` at an open ``Site``.
-* :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.update_scheduled_record`:
+* :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.update_scheduled_record` /
+  :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.async_update_scheduled_record`:
   Updates a ``Form`` ``Record`` bound to a scheduled ``Interval`` for an enrolled
   ``Subject``.
-* :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_new_record`:
+* :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_new_record` /
+  :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.async_create_new_record`:
   Creates an unscheduled ``Form`` ``Record`` for an enrolled ``Subject``.
 
 .. testcode::
 
-   from typing import Any, cast
-   from imednet import ImednetSDK
+   from imednet import AsyncImednetSDK, ImednetSDK
    from imednet.simulation import reset_default_simulation_state
-   from imednet_workflows.record_update import RecordUpdateWorkflow
 
    helper_sdk = ImednetSDK(simulation_mode=True)
-   helper_workflow = RecordUpdateWorkflow(cast(Any, helper_sdk))
+   helper_workflow = helper_sdk.workflows.record_update
 
    reg_job = helper_workflow.register_subject(
        study_key="STUDY",
@@ -121,5 +119,17 @@ submitted ``Job``:
        wait_for_completion=True,
        poll_interval=1,
    )
+
+   async def run_async_helpers() -> None:
+       async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
+           await async_sdk.workflows.record_update.async_register_subject(
+               study_key="STUDY",
+               form_identifier="F_DM",
+               site_identifier="SITE",
+               data={"V_AGE": 41, "V_GENDER": "M"},
+               wait_for_completion=True,
+               poll_interval=1,
+           )
+
    print(reg_job.batch_id, sched_job.batch_id, unsched_job.batch_id)
    reset_default_simulation_state()

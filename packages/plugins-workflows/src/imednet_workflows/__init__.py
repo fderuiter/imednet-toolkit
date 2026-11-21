@@ -17,8 +17,10 @@ from imednet.spi.utils import (
 from .cached_loader import CachedRecordsLoader, StudySyncState, StudySyncStatus
 from .chunked_pipeline import ChunkedRecordPipeline, iter_chunks
 from .config_version_control import ConfigVersionStore
+from .data_extraction import DataExtractionWorkflow
 from .duckdb_centralizer import DuckDBIngestionWorkflow
 from .extraction_engine import ExtractionResult, extract_canonical_records
+from .namespace import Workflows
 from .query_management import QueryManagementWorkflow
 from .record_mapper import RecordMapper, format_iso8601_dtc, transform_records_to_sdtm
 from .record_update import RecordUpdateWorkflow
@@ -42,7 +44,7 @@ from .study_structure import async_get_study_structure, get_study_structure
 from .subject_data import SubjectDataWorkflow
 from .sync_worker import SyncErrorCallback, SyncWorker, SyncWorkerConfig, SyncWorkerState
 from .triage_store import TriageStore
-from .uat import UATSpecification
+from .uat import StudySchemaInspector, UATSpecification, UATWorkflow
 
 __all__ = [
     "DEFAULT_LEDGER_PATH",
@@ -54,6 +56,7 @@ __all__ = [
     "CategoricalNormalizer",
     "ChunkedRecordPipeline",
     "ConfigVersionStore",
+    "DataExtractionWorkflow",
     "DuckDBIngestionWorkflow",
     "ExtractionResult",
     "ExtractionStateLedger",
@@ -77,6 +80,7 @@ __all__ = [
     "StandardsReadinessValidator",
     "StreamExecutionStatus",
     "StreamState",
+    "StudySchemaInspector",
     "StudySyncState",
     "StudySyncStatus",
     "SubjectDataWorkflow",
@@ -86,6 +90,8 @@ __all__ = [
     "SyncWorkerState",
     "TriageStore",
     "UATSpecification",
+    "UATWorkflow",
+    "Workflows",
     "async_get_study_structure",
     "extract_canonical_records",
     "format_iso8601_dtc",
