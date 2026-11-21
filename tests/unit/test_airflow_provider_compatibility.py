@@ -31,9 +31,11 @@ def _cleanup_airflow_provider_modules():
     saved_handlers = list(root_logger.handlers)
     saved_level = root_logger.level
 
+    airflow_mod = sys.modules.get("airflow")
     if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        airflow_mod is None
+        or getattr(airflow_mod, "__path__", None) is None
+        or getattr(airflow_mod, "__file__", None) is None
     ):
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
@@ -42,6 +44,9 @@ def _cleanup_airflow_provider_modules():
         for mod in list(sys.modules):
             if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
                 sys.modules.pop(mod, None)
+        providers_pkg = sys.modules.get("airflow.providers")
+        if providers_pkg is not None:
+            providers_pkg.__dict__.pop("imednet", None)
 
     yield
     for mod in list(sys.modules):
@@ -492,6 +497,41 @@ def test_real_airflow_hook_test_connection_and_provider_discovery(monkeypatch, r
     assert ok_fail is False
     assert "SUPER_SECRET_API_KEY" not in err_msg
     assert "SUPER_SECRET_SEC_KEY" not in err_msg
+
+
+def test_real_airflow_provider_alias_stays_synced_across_reimports(real_airflow):
+    """Ensure airflow.providers.imednet.hooks stays synced after eviction or reload."""
+    import importlib
+
+    from airflow.providers.imednet.hooks import ImednetHook as InitialAliasedHook
+
+    assert InitialAliasedHook is real_airflow["ImednetHook"]
+
+    # 1. Evict canonical modules while airflow.providers.imednet.hooks stays cached in sys.modules
+    for mod in list(sys.modules):
+        if mod.startswith("apache_airflow_providers_imednet"):
+            sys.modules.pop(mod, None)
+
+    reimported_pkg = importlib.import_module("apache_airflow_providers_imednet")
+    reimported_pkg.get_provider_info()
+
+    from airflow.providers.imednet.hooks import ImednetHook as ReimportedAliasedHook
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook as ReimportedCanonicalHook
+
+    assert ReimportedAliasedHook is ReimportedCanonicalHook
+    assert issubclass(ReimportedCanonicalHook, real_airflow["BaseHook"])
+
+    # 2. Direct importlib.reload on canonical hooks updates alias module and avoids finder leaks
+    hooks_mod = importlib.import_module("apache_airflow_providers_imednet.hooks")
+    reloaded_hooks = importlib.reload(hooks_mod)
+    from airflow.providers.imednet.hooks import ImednetHook as ReloadedAliasedHook
+
+    assert ReloadedAliasedHook is reloaded_hooks.ImednetHook
+    finder_count = sum(
+        1 for finder in sys.meta_path if getattr(finder, "_imednet_airflow_provider_finder", False)
+    )
+    assert finder_count == 1
 
 
 def test_real_airflow_providers_manager_validates_schema_and_masks_ui_secrets(

@@ -33,18 +33,15 @@ BASIC_EXAMPLE_SCRIPTS = sorted(BASIC_EXAMPLES_DIR.glob("*.py"))
 
 @pytest.fixture(autouse=True)
 def _reset_simulation_state() -> Iterator[None]:
-    """Reset shared default SimulationState and isolate root logger handlers around each test."""
+    """Reset shared default SimulationState and root logger state before and after each test."""
     root_logger = logging.getLogger()
     saved_handlers = list(root_logger.handlers)
     saved_level = root_logger.level
-    root_logger.handlers = []
     get_default_simulation_state().reset()
-    try:
-        yield
-    finally:
-        get_default_simulation_state().reset()
-        root_logger.handlers = saved_handlers
-        root_logger.setLevel(saved_level)
+    yield
+    get_default_simulation_state().reset()
+    root_logger.handlers = saved_handlers
+    root_logger.setLevel(saved_level)
 
 
 def test_basic_examples_inventory() -> None:
@@ -61,6 +58,7 @@ def test_basic_tutorial_scripts_execute_under_simulation_transport(
     script_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Run each examples/basic/*.py script offline via SimulationTransport without TypeError or ConfigurationError."""
     monkeypatch.chdir(tmp_path)
@@ -83,20 +81,21 @@ def test_basic_tutorial_scripts_execute_under_simulation_transport(
 
     monkeypatch.setattr(ImednetSDK, "__init__", _patched_init)
 
-    stdout_buf = io.StringIO()
+    capsys.readouterr()
     try:
-        with contextlib.redirect_stdout(stdout_buf):
-            runpy.run_path(str(script_path), run_name="__main__")
+        runpy.run_path(str(script_path), run_name="__main__")
     except (TypeError, ConfigurationError, SystemExit) as exc:
         pytest.fail(
             f"{script_path.name} failed under SimulationTransport: {type(exc).__name__}: {exc}"
         )
 
-    assert stdout_buf.getvalue().strip(), f"Expected non-empty stdout from {script_path.name}"
+    captured = capsys.readouterr()
+    assert captured.out.strip(), f"Expected non-empty stdout from {script_path.name}"
 
 
 def test_custom_retry_script_executes_under_simulation_mode(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify examples/custom_retry.py passes RetryConfig and succeeds offline across repeated runs."""
     custom_retry_path = REPO_ROOT / "examples" / "custom_retry.py"
@@ -105,14 +104,14 @@ def test_custom_retry_script_executes_under_simulation_mode(
     monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "true")
 
     for _ in range(2):
-        stdout_buf = io.StringIO()
+        capsys.readouterr()
         try:
-            with contextlib.redirect_stdout(stdout_buf):
-                runpy.run_path(str(custom_retry_path), run_name="__main__")
+            runpy.run_path(str(custom_retry_path), run_name="__main__")
         except (TypeError, ConfigurationError, SystemExit) as exc:
             pytest.fail(f"custom_retry.py failed offline: {type(exc).__name__}: {exc}")
 
-        assert "Request succeeded" in stdout_buf.getvalue()
+        captured = capsys.readouterr()
+        assert "Request succeeded" in captured.out
 
 
 @pytest.mark.parametrize("scenario", SHOWCASE_EXPECTED_SDK_SCENARIOS)

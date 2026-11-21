@@ -27,6 +27,8 @@ _PACKAGE_ALIASES = frozenset(
 class _ImednetAirflowProviderFinder(MetaPathFinder, Loader):
     """Map ``airflow.providers.imednet`` imports to ``apache_airflow_providers_imednet``."""
 
+    _imednet_airflow_provider_finder = True
+
     def find_spec(
         self,
         fullname: str,
@@ -56,12 +58,48 @@ class _ImednetAirflowProviderFinder(MetaPathFinder, Loader):
         if hasattr(target_mod, "__path__"):
             module.__path__ = list(target_mod.__path__)
         sys.modules[alias_name] = target_mod
+        if alias_name == _ALIAS_PREFIX:
+            providers_pkg = sys.modules.get("airflow.providers")
+            if providers_pkg is not None:
+                providers_pkg.__dict__["imednet"] = target_mod
+
+
+def _sync_airflow_provider_aliases() -> None:
+    """Synchronize cached ``airflow.providers.imednet`` module aliases in ``sys.modules``."""
+    for alias_name in list(sys.modules):
+        if alias_name == _ALIAS_PREFIX or alias_name.startswith(f"{_ALIAS_PREFIX}."):
+            target_name = alias_name.replace(_ALIAS_PREFIX, _TARGET_PREFIX, 1)
+            target_mod = sys.modules.get(target_name)
+            if target_mod is not None:
+                sys.modules[alias_name] = target_mod
+            else:
+                sys.modules.pop(alias_name, None)
+
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None:
+        target_root = sys.modules.get(_TARGET_PREFIX)
+        if target_root is not None:
+            providers_pkg.__dict__["imednet"] = target_root
+        else:
+            providers_pkg.__dict__.pop("imednet", None)
 
 
 def _ensure_airflow_provider_finder() -> None:
     """Ensure the ``airflow.providers.imednet`` import alias finder is registered."""
-    if not any(isinstance(finder, _ImednetAirflowProviderFinder) for finder in sys.meta_path):
+    existing = [
+        idx
+        for idx, finder in enumerate(sys.meta_path)
+        if getattr(finder, "_imednet_airflow_provider_finder", False)
+    ]
+    if not existing:
         sys.meta_path.insert(0, _ImednetAirflowProviderFinder())
+    else:
+        first_idx = existing[0]
+        if not isinstance(sys.meta_path[first_idx], _ImednetAirflowProviderFinder):
+            sys.meta_path[first_idx] = _ImednetAirflowProviderFinder()
+        for stale_idx in reversed(existing[1:]):
+            del sys.meta_path[stale_idx]
+    _sync_airflow_provider_aliases()
 
 
 def get_provider_info() -> dict[str, Any]:
@@ -170,6 +208,8 @@ try:  # pragma: no cover - optional Airflow dependencies may be missing
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - sensor requires Airflow extras
     ImednetJobSensor = None
     sensors = None  # type: ignore
+
+_sync_airflow_provider_aliases()
 
 __all__ = [
     "ImednetExportOperator",

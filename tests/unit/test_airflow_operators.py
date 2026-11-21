@@ -15,6 +15,7 @@ def _setup_airflow(monkeypatch):
     hooks_pkg = ModuleType("airflow.hooks")
     hooks_pkg.__path__ = []
     hooks_base = ModuleType("airflow.sdk.bases.hook")
+    operator_base = ModuleType("airflow.sdk.bases.operator")
     sdk_mod = ModuleType("airflow.sdk")
     sdk_mod.__path__ = []
     sdk_bases = ModuleType("airflow.sdk.bases")
@@ -26,7 +27,6 @@ def _setup_airflow(monkeypatch):
     models_mod = ModuleType("airflow.models")
     sensors_base = ModuleType("airflow.sensors.base")
     sensors_sdk = ModuleType("airflow.sdk.bases.sensor")
-    operators_sdk = ModuleType("airflow.sdk.bases.operator")
     exc_mod = ModuleType("airflow.exceptions")
     sdk_exc = ModuleType("airflow.sdk.exceptions")
     s3_mod = ModuleType("airflow.providers.amazon.aws.hooks.s3")
@@ -56,7 +56,7 @@ def _setup_airflow(monkeypatch):
             """Initialize the test object."""
 
     hooks_base.BaseHook = DummyBaseHook
-    operators_sdk.BaseOperator = DummyBaseOperator
+    operator_base.BaseOperator = DummyBaseOperator
     models_mod.BaseOperator = DummyBaseOperator
     models_mod.DAG = DummyBaseOperator
     sensors_base.BaseSensorOperator = DummySensorOperator
@@ -72,7 +72,7 @@ def _setup_airflow(monkeypatch):
     s3_mod.S3Hook = MagicMock
 
     sdk_bases.hook = hooks_base
-    sdk_bases.operator = operators_sdk
+    sdk_bases.operator = operator_base
     sdk_bases.sensor = sensors_sdk
     sdk_mod.bases = sdk_bases
     sdk_mod.exceptions = sdk_exc
@@ -95,13 +95,19 @@ def _setup_airflow(monkeypatch):
     airflow.providers.amazon.aws.hooks.__path__ = []
     airflow.providers.amazon.aws.hooks.s3 = s3_mod
 
+    for mod_name in list(sys.modules):
+        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
+            "apache_airflow_providers_imednet."
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
     modules = {
         "airflow": airflow,
         "airflow.hooks": hooks_pkg,
         "airflow.sdk": sdk_mod,
         "airflow.sdk.bases": sdk_bases,
         "airflow.sdk.bases.hook": hooks_base,
-        "airflow.sdk.bases.operator": operators_sdk,
+        "airflow.sdk.bases.operator": operator_base,
         "airflow.sdk.bases.sensor": sensors_sdk,
         "airflow.sdk.definitions": sdk_defs,
         "airflow.sdk.definitions.context": sdk_ctx,
@@ -119,12 +125,6 @@ def _setup_airflow(monkeypatch):
     }
     for name, mod in modules.items():
         monkeypatch.setitem(sys.modules, name, mod)
-
-    for mod_name in list(sys.modules):
-        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
-            ("apache_airflow_providers_imednet.", "airflow.providers.imednet")
-        ):
-            monkeypatch.delitem(sys.modules, mod_name, raising=False)
 
 
 def _import_operators(monkeypatch):
@@ -300,3 +300,52 @@ def test_provider_info_and_hook_metadata_contract():
     assert any(req.startswith("imednet-workflows") for req in requires)
     extras = set(dist.metadata.get_all("Provides-Extra") or [])
     assert {"duckdb", "export", "mongodb", "neo4j", "snowflake"}.issubset(extras)
+
+
+def test_provider_alias_sync_and_finder_deduplication(monkeypatch):
+    """Verify _sync_airflow_provider_aliases and finder deduplication across reloads."""
+    _setup_airflow(monkeypatch)
+    import apache_airflow_providers_imednet as provider_pkg
+
+    importlib.reload(provider_pkg)
+    alias_pkg = importlib.import_module("airflow.providers.imednet")
+    alias_hooks = importlib.import_module("airflow.providers.imednet.hooks")
+    alias_ops = importlib.import_module("airflow.providers.imednet.operators")
+
+    assert alias_pkg is sys.modules["apache_airflow_providers_imednet"]
+    assert alias_hooks is sys.modules["apache_airflow_providers_imednet.hooks"]
+    assert alias_ops is sys.modules["apache_airflow_providers_imednet.operators"]
+    assert sys.modules["airflow.providers"].__dict__["imednet"] is alias_pkg
+
+    reloaded_ops = importlib.reload(sys.modules["apache_airflow_providers_imednet.operators"])
+    assert sys.modules["airflow.providers.imednet.operators"] is reloaded_ops
+
+    # Simulate duplicate stale finder & unloaded target module
+    stale_finder = type("StaleFinder", (), {"_imednet_airflow_provider_finder": True})()
+    sys.meta_path.insert(0, stale_finder)
+    sys.meta_path.append(stale_finder)
+    monkeypatch.setitem(sys.modules, "airflow.providers.imednet.ghost", ModuleType("ghost"))
+    saved_root = sys.modules.pop("apache_airflow_providers_imednet")
+    try:
+        provider_pkg._ensure_airflow_provider_finder()
+        assert "imednet" not in sys.modules["airflow.providers"].__dict__
+    finally:
+        sys.modules["apache_airflow_providers_imednet"] = saved_root
+        provider_pkg._sync_airflow_provider_aliases()
+
+    assert "airflow.providers.imednet.ghost" not in sys.modules
+    finders = [f for f in sys.meta_path if getattr(f, "_imednet_airflow_provider_finder", False)]
+    assert len(finders) == 1
+    assert isinstance(finders[0], provider_pkg._ImednetAirflowProviderFinder)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mocked_airflow_provider_modules():
+    """Evict provider modules reloaded against dummy Airflow stubs on module teardown."""
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None:
+        providers_pkg.__dict__.pop("imednet", None)

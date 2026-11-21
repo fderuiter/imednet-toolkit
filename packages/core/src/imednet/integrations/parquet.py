@@ -11,8 +11,6 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import NonCallableMock
 
-import pandas as pd
-
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
 from .enrichment import resolve_enrichment_pipeline
@@ -51,6 +49,24 @@ def _ensure_pyarrow() -> ModuleType:
     except ImportError as error:
         raise ImportError(
             "PyArrow is required for Hive Parquet export. Install with "
+            "\"pip install 'imednet[export]'\"."
+        ) from error
+
+
+def _ensure_pandas() -> ModuleType:
+    """Ensure pandas is installed and return the module.
+
+    Returns:
+        ModuleType: The pandas module.
+
+    Raises:
+        ImportError: If pandas is not installed.
+    """
+    try:
+        return import_module("pandas")
+    except ImportError as error:
+        raise ImportError(
+            "pandas is required for Hive Parquet export. Install with "
             "\"pip install 'imednet[export]'\"."
         ) from error
 
@@ -146,11 +162,12 @@ def _prune_hive_partition_record_ids(
     """Prune superseded or voided record IDs from pre-existing Hive partition Parquet files."""
     if not files or not excluded_ids:
         return
+    pandas_module = _ensure_pandas()
     partition_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}"
     for pf in files:
         if not pf.exists():
             continue
-        existing_df = pd.read_parquet(pf, engine="pyarrow")
+        existing_df = pandas_module.read_parquet(pf, engine="pyarrow")
         filtered_df = _filter_df_excluding_record_ids(existing_df, excluded_ids)
         if len(filtered_df) == len(existing_df):
             continue

@@ -776,11 +776,21 @@ def test_headless_state_set_recovers_airflow_variable_streams(
     saved_handlers = list(root_logger.handlers)
     saved_level = root_logger.level
 
-    db_url = f"sqlite:///{tmp_path / f'airflow_cli_{initial_status}.db'}"
+    db_file = tmp_path / f"airflow_cli_{initial_status}.db"
+    db_url = f"sqlite:///{db_file}"
+    async_db_url = f"sqlite+aiosqlite:///{db_file}"
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_async_conn = conf.get("database", "sql_alchemy_conn_async", fallback=None)
+    prev_pool_enabled = conf.get("database", "sql_alchemy_pool_enabled", fallback=None)
     prev_settings_conn = airflow.settings.SQL_ALCHEMY_CONN
+    has_async_conn_attr = hasattr(airflow.settings, "SQL_ALCHEMY_CONN_ASYNC")
+    prev_settings_async_conn = getattr(airflow.settings, "SQL_ALCHEMY_CONN_ASYNC", None)
     conf.set("database", "sql_alchemy_conn", db_url)
+    conf.set("database", "sql_alchemy_conn_async", async_db_url)
+    conf.set("database", "sql_alchemy_pool_enabled", "False")
     airflow.settings.SQL_ALCHEMY_CONN = db_url
+    if has_async_conn_attr:
+        airflow.settings.SQL_ALCHEMY_CONN_ASYNC = async_db_url
     airflow.settings.dispose_orm()
     airflow.settings.configure_orm()
     initdb()
@@ -848,8 +858,14 @@ def test_headless_state_set_recovers_airflow_variable_streams(
     finally:
         airflow.settings.dispose_orm()
         airflow.settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if has_async_conn_attr:
+            airflow.settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_async_conn
         if prev_conn is not None:
             conf.set("database", "sql_alchemy_conn", prev_conn)
+        if prev_async_conn is not None:
+            conf.set("database", "sql_alchemy_conn_async", prev_async_conn)
+        if prev_pool_enabled is not None:
+            conf.set("database", "sql_alchemy_pool_enabled", prev_pool_enabled)
         airflow.settings.configure_orm()
         root_logger.handlers = saved_handlers
         root_logger.setLevel(saved_level)
