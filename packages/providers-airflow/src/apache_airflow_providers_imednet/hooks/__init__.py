@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Mapping, MutableMapping
 from contextlib import closing
 from datetime import date, datetime
@@ -499,5 +500,8 @@ class ImednetHook(BaseHook):
                 keys.append(study_key)
         return keys
 
+
+if "airflow.providers.imednet.hooks" in sys.modules:
+    sys.modules["airflow.providers.imednet.hooks"] = sys.modules[__name__]
 
 __all__ = ["ImednetHook"]
