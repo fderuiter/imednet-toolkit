@@ -5,6 +5,8 @@ workflows, including record extraction, cache synchronization, standards
 readiness validation, and state ledger management.
 """
 
+# pylint: disable=duplicate-code
+
 from __future__ import annotations
 
 import argparse
@@ -15,9 +17,10 @@ import os
 import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
+from importlib import import_module
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from imednet.sdk import ImednetSDK
 from imednet.spi.cli import (
     NON_INTERACTIVE_ENV,
     OUTPUT_FORMAT_ENV,
@@ -53,10 +56,47 @@ from imednet.spi.utils import (
     validate_path_segment,
 )
 
-from .data_extraction import DataExtractionWorkflow
-from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
-from .subject_data import SubjectDataWorkflow
-from .sync_worker import SyncWorker, SyncWorkerConfig, SyncWorkerState
+if TYPE_CHECKING:
+    from imednet.sdk import ImednetSDK
+
+DEFAULT_LEDGER_PATH: str = os.environ.get(
+    "IMEDNET_WORKFLOW_LEDGER_PATH",
+    str(Path.home() / ".imednet" / "pipeline_ledger.json"),
+)
+
+_LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    "DataExtractionWorkflow": ("imednet_workflows.data_extraction", "DataExtractionWorkflow"),
+    "SubjectDataWorkflow": ("imednet_workflows.subject_data", "SubjectDataWorkflow"),
+    "SyncWorker": ("imednet_workflows.sync_worker", "SyncWorker"),
+    "SyncWorkerConfig": ("imednet_workflows.sync_worker", "SyncWorkerConfig"),
+    "SyncWorkerState": ("imednet_workflows.sync_worker", "SyncWorkerState"),
+    "get_state_provider": ("imednet_workflows.state_ledger", "get_state_provider"),
+}
+
+
+def _load_lazy_attr(name: str) -> Any:
+    """Import and cache a lazy workflow attribute on first access."""
+    if name in _LAZY_ATTRS:
+        mod_name, attr_name = _LAZY_ATTRS[name]
+        mod = import_module(mod_name)  # nosem
+        val = getattr(mod, attr_name)
+        globals()[name] = val
+        return val
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> Any:
+        """Lazily load workflow execution classes and state providers on demand (PEP 562)."""
+        return _load_lazy_attr(name)
+
+
+def _resolve_attr(name: str) -> Any:
+    """Resolve a lazy workflow symbol while preserving module-level monkeypatches."""
+    if name in globals():
+        return globals()[name]
+    return _load_lazy_attr(name)
 
 
 def _emit_line(text: str = "", *, err: bool = False) -> None:
@@ -268,7 +308,7 @@ def _execute_set_state(
             _emit_line(f"Invalid ISO timestamp format: {err}", err=True)
             sys.exit(1)
 
-        ledger = get_state_provider(ledger_path)
+        ledger = _resolve_attr("get_state_provider")(ledger_path)
         try:
             ledger.set_last_timestamp(
                 study_key=study_key,  # type: ignore[arg-type]
@@ -321,7 +361,7 @@ def _execute_set_state(
         "Enter number of records processed", default=records_processed
     )
 
-    ledger = get_state_provider(ledger_path)
+    ledger = _resolve_attr("get_state_provider")(ledger_path)
     current_status = "None"
     current_ts_str = "None"
     try:
@@ -400,7 +440,7 @@ def _execute_reset_state(
         _emit_line(f"Error: {msg}", err=True)
         sys.exit(2)
 
-    ledger = get_state_provider(ledger_path)
+    ledger = _resolve_attr("get_state_provider")(ledger_path)
     try:
         if stream:
             removed = ledger.delete_entry(study_key, stream)
@@ -445,7 +485,7 @@ def _execute_show_state(
         )
         study_key = study_input if study_input else None
 
-    ledger = get_state_provider(ledger_path)
+    ledger = _resolve_attr("get_state_provider")(ledger_path)
     try:
         state = ledger.read_state()
     except Exception as err:
@@ -685,7 +725,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         assert study_key is not None
         validate_path_segment(study_key, name="study_key")
-        workflow = DataExtractionWorkflow(sdk)  # type: ignore[arg-type]
+        workflow = _resolve_attr("DataExtractionWorkflow")(sdk)
         parsed_record_filter = parse_filter_args(record_filter, model=Record)
         parsed_subject_filter = parse_filter_args(subject_filter, model=Subject)
         parsed_visit_filter = parse_filter_args(visit_filter, model=Visit)
@@ -804,9 +844,12 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     ) -> None:
         from .cached_loader import CachedRecordsLoader
 
-        worker = SyncWorker(
+        sync_worker_cls = _resolve_attr("SyncWorker")
+        sync_worker_cfg_cls = _resolve_attr("SyncWorkerConfig")
+        sync_worker_state_cls = _resolve_attr("SyncWorkerState")
+        worker = sync_worker_cls(
             CachedRecordsLoader(sdk),  # type: ignore[arg-type]
-            config=SyncWorkerConfig(study_key=study_key, interval_seconds=interval),
+            config=sync_worker_cfg_cls(study_key=study_key, interval_seconds=interval),
         )
 
         if once:
@@ -832,7 +875,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     worker.run_forever(on_cycle=on_cycle, on_sleep_tick=on_sleep_tick)
                 except TypeError:
                     worker.run_forever()
-            if worker.state == SyncWorkerState.FAILED:
+            if worker.state == sync_worker_state_cls.FAILED:
                 err_detail = f": {worker.last_error}" if worker.last_error is not None else ""
                 print_error(
                     redact_cli_secrets(
@@ -1252,7 +1295,7 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         mask_phi: bool = True,
     ) -> None:
         resolved_format = resolve_output_format(output_format)
-        workflow = SubjectDataWorkflow(sdk)  # type: ignore[arg-type]
+        workflow = _resolve_attr("SubjectDataWorkflow")(sdk)
         if resolved_format == "json" or is_json_output_mode():
             data = workflow.get_all_subject_data(study_key, subject_key)
         else:

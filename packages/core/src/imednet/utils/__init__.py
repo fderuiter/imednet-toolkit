@@ -104,6 +104,11 @@ def __getattr__(name: str) -> Any:
     return obj
 
 
+def __dir__() -> list[str]:
+    """Return module attributes including lazy exports."""
+    return sorted(set(globals()) | set(__all__))
+
+
 __all__ = [
     "ALLOWED_OPERATORS",
     "DEFAULT_BATCH_CHUNK_SIZE",

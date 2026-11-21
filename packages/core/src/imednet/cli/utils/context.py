@@ -6,13 +6,33 @@ import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
 
 from imednet.config import load_config
-from imednet.sdk import ImednetSDK
 from imednet.utils.validators import parse_bool
 
 from .output import Status, console, print_error
 from .terminal import SIMULATION_MODE_ENV
+
+if TYPE_CHECKING:
+    from imednet.sdk import ImednetSDK
+
+
+def _load_sdk_cls() -> type[ImednetSDK]:
+    """Import and cache ImednetSDK in module globals on first access."""
+    from imednet.sdk import ImednetSDK
+
+    globals()["ImednetSDK"] = ImednetSDK
+    return ImednetSDK
+
+
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> Any:
+        """Lazily load ImednetSDK on demand while supporting module-level mock patching."""
+        if name == "ImednetSDK":
+            return _load_sdk_cls()
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @contextmanager
@@ -73,7 +93,10 @@ def get_sdk() -> ImednetSDK:
         sys.exit(1)
 
     try:
-        return ImednetSDK(config=config)
+        sdk_cls: type[ImednetSDK] = (
+            globals()["ImednetSDK"] if "ImednetSDK" in globals() else _load_sdk_cls()
+        )
+        return sdk_cls(config=config)
     except Exception as exc:  # pragma: no cover - defensive
         from ..decorators import redact_cli_secrets
 

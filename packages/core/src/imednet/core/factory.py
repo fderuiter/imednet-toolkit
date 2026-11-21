@@ -6,20 +6,23 @@ handling authentication, configuration, and retry policies.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from imednet.auth.api_key import ApiKeyAuth
-from imednet.auth.oidc import OIDCAuth
 from imednet.auth.strategy import AuthStrategy
 from imednet.config import Config
-from imednet.core.async_client import AsyncClient
-from imednet.core.client import Client
 from imednet.core.retry import RetryConfig
+
+if TYPE_CHECKING:
+    from imednet.core.async_client import AsyncClient
+    from imednet.core.client import Client
 
 
 def _default_auth(config: Config, *, has_transport: bool = False) -> AuthStrategy:
     """Resolve the existing OIDC-before-key default policy once."""
     if config.oidc_token:
+        from imednet.auth.oidc import OIDCAuth
+
         return OIDCAuth(config.oidc_token)
     if has_transport and (not config.api_key or not config.security_key):
         return ApiKeyAuth(config.api_key or "", config.security_key or "")
@@ -44,6 +47,8 @@ class ClientFactory:
         auth: AuthStrategy | None = None,
     ) -> Client:
         """Create a synchronous client."""
+        from imednet.core.client import Client
+
         if transport is None and config.simulation_mode:
             from imednet.simulation import create_simulation_transport
 
@@ -77,6 +82,8 @@ class ClientFactory:
         auth: AuthStrategy | None = None,
     ) -> AsyncClient:
         """Create an asynchronous client."""
+        from imednet.core.async_client import AsyncClient
+
         if transport is None and config.simulation_mode:
             from imednet.simulation import create_simulation_transport
 

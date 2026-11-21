@@ -24,10 +24,6 @@ for source_root in (
 ):
     sys.path.insert(0, str(source_root))
 
-from imednet.core.async_client import AsyncClient
-from imednet.core.client import Client
-from imednet.core.context import clear_study_context
-
 
 def pytest_addoption(parser):
     """Add custom command-line options for running specific test tracks."""
@@ -95,6 +91,8 @@ def _is_live_test(node: object) -> bool:
 @pytest.fixture(autouse=True)
 def reset_study_context_between_tests():
     """Reset the global study context before and after each test to ensure isolation."""
+    from imednet.core.context import clear_study_context
+
     clear_study_context()
     yield
     clear_study_context()
@@ -317,6 +315,8 @@ def patch_build_filter(monkeypatch):
 @pytest.fixture
 def http_client():
     """Provide a synchronous Client instance configured for testing."""
+    from imednet.core.client import Client
+
     return Client("key", "secret", base_url="https://api.test")
 
 
@@ -326,6 +326,8 @@ async def async_http_client():
 
     This fixture ensures the client is properly closed after use.
     """
+    from imednet.core.async_client import AsyncClient
+
     client = AsyncClient("key", "secret", base_url="https://api.test")
     try:
         yield client

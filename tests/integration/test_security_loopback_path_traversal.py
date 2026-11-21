@@ -9,16 +9,16 @@ from typing import Any
 
 import pytest
 
-from apache_airflow_providers_imednet.sensors import ImednetJobSensor
-from imednet import ImednetSDK, cli
-from imednet.errors import ClientError, PathTraversalValidationError
-
 
 def test_loopback_server_records_zero_cross_study_requests(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Verify traversal/truncation proof vectors never reach a loopback HTTP server."""
+    from apache_airflow_providers_imednet.sensors import ImednetJobSensor
+    from imednet import ImednetSDK, cli
+    from imednet.errors import ClientError, PathTraversalValidationError
+
     captured_requests: list[dict[str, Any]] = []
 
     class RecordingHandler(BaseHTTPRequestHandler):

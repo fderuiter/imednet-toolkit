@@ -1,10 +1,23 @@
 """Type definitions for imednet SDK utilities."""
 
 import os
-from typing import TYPE_CHECKING, Any, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, Union, runtime_checkable
 
 #: Generic JSON object type (mapping of string keys to arbitrary values).
 JsonDict = dict[str, Any]
+
+
+@runtime_checkable
+class _TabularDataFrameLike(Protocol):
+    """Runtime structural protocol for tabular DataFrame inputs without importing pandas."""
+
+    @property
+    def columns(self) -> Any:
+        """Return tabular column labels."""
+
+    def to_dict(self, *args: Any, **kwargs: Any) -> Any:
+        """Convert tabular rows into Python dictionaries."""
+
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -12,14 +25,22 @@ if TYPE_CHECKING:
     DataFrame: TypeAlias = pd.DataFrame
     RecordsInput: TypeAlias = list[JsonDict] | pd.DataFrame | str | os.PathLike[str]
 else:
-    try:
-        import pandas as _runtime_pd
+    RecordsInput = list[JsonDict] | _TabularDataFrameLike | str | os.PathLike[str]
+    globals().pop("DataFrame", None)
 
-        DataFrame = _runtime_pd.DataFrame
-        RecordsInput = list[JsonDict] | _runtime_pd.DataFrame | str | os.PathLike[str]
-    except ImportError:
-        DataFrame = Any
-        RecordsInput = list[JsonDict] | str | os.PathLike[str]
+    def __getattr__(name: str) -> Any:
+        """Lazily resolve the runtime DataFrame alias only when explicitly requested."""
+        if name == "DataFrame":
+            try:
+                import pandas as _runtime_pd
+
+                df_type: Any = _runtime_pd.DataFrame
+            except ImportError:
+                df_type = Any
+            globals()["DataFrame"] = df_type
+            return df_type
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 #: Accepted types for an endpoint item-ID parameter (path segment or filter value).
 ItemId = Union[str, int]  # noqa: UP007

@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import wraps
-from typing import Any, Concatenate, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar
 
 from imednet.errors import (
     ApiError,
@@ -23,7 +23,8 @@ from imednet.errors import (
 from imednet.utils.secrets import redact_sensitive_payload
 from imednet.utils.url import validate_path_segment
 
-from ..sdk import ImednetSDK
+if TYPE_CHECKING:
+    from ..sdk import ImednetSDK
 
 P = ParamSpec("P")
 R = TypeVar("R")
