@@ -1,4 +1,4 @@
-"""Compatibility shim for different Airflow versions.
+"""Compatibility shim for Airflow 3 Task SDK and offline test environments.
 
 This module provides fallbacks for Airflow-specific classes and exceptions
 to allow the package to be imported even when Airflow is not installed.
@@ -6,27 +6,66 @@ to allow the package to be imported even when Airflow is not installed.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     try:
         from airflow.sdk.bases.hook import BaseHook
     except ImportError:
-        try:
-            from airflow.hooks.base import BaseHook  # type: ignore[attr-defined,no-redef]
-        except ImportError:
 
-            class BaseHook:  # type: ignore[no-redef]
-                """Fallback BaseHook typing stub."""
+        class BaseHook:  # type: ignore[no-redef]
+            """Fallback BaseHook typing stub."""
+
+    try:
+        from airflow.sdk.bases.operator import BaseOperator
+    except ImportError:
+
+        class BaseOperator:  # type: ignore[no-redef]
+            """Fallback BaseOperator typing stub."""
+
+            template_fields: Sequence[str] = ()
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                """Initialize fallback BaseOperator."""
+
+    try:
+        from airflow.sdk.bases.sensor import BaseSensorOperator
+    except ImportError:
+
+        class BaseSensorOperator:  # type: ignore[no-redef]
+            """Fallback BaseSensorOperator typing stub."""
+
+            template_fields: Sequence[str] = ()
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                """Initialize fallback BaseSensorOperator."""
 
     try:
         from airflow.sdk.exceptions import AirflowException
     except ImportError:
-        from airflow.exceptions import AirflowException  # type: ignore[attr-defined]
+
+        class AirflowException(Exception):  # type: ignore[no-redef]  # noqa: N818
+            """Fallback AirflowException typing stub."""
+
     try:
         from airflow.sdk.exceptions import TaskDeferred
     except ImportError:
-        from airflow.exceptions import TaskDeferred  # type: ignore[attr-defined,no-redef]
+
+        class TaskDeferred(Exception):  # type: ignore[no-redef]  # noqa: N818
+            """Fallback TaskDeferred typing stub."""
+
+            def __init__(
+                self,
+                *,
+                trigger: Any,
+                method_name: str,
+                kwargs: dict[str, Any] | None = None,
+                timeout: Any = None,
+            ) -> None:
+                """Initialize fallback deferred task signal."""
+                _ = (trigger, method_name, kwargs, timeout)
+
     try:
         from airflow.triggers.base import BaseTrigger, TriggerEvent
     except ImportError:
@@ -50,41 +89,35 @@ else:  # pragma: no cover - typing fallback for optional Airflow dependency
     try:
         from airflow.sdk.exceptions import AirflowException
     except (ImportError, ModuleNotFoundError):
-        try:
-            from airflow.exceptions import AirflowException
-        except (ImportError, ModuleNotFoundError):
 
-            class _FallbackAirflowError(Exception):
-                """Fallback exception used when ``AirflowException`` is unavailable."""
+        class _FallbackAirflowError(Exception):
+            """Fallback exception used when ``AirflowException`` is unavailable."""
 
-            AirflowException = _FallbackAirflowError
+        AirflowException = _FallbackAirflowError
 
     try:
         from airflow.sdk.exceptions import TaskDeferred
     except (ImportError, ModuleNotFoundError):
-        try:
-            from airflow.exceptions import TaskDeferred
-        except (ImportError, ModuleNotFoundError):
 
-            class _FallbackTaskDeferredError(Exception):
-                """Fallback exception used when ``TaskDeferred`` is unavailable."""
+        class _FallbackTaskDeferredError(Exception):
+            """Fallback exception used when ``TaskDeferred`` is unavailable."""
 
-                def __init__(
-                    self,
-                    *,
-                    trigger: Any,
-                    method_name: str,
-                    kwargs: dict[str, Any] | None = None,
-                    timeout: Any = None,
-                ) -> None:
-                    """Initialize fallback deferred task signal."""
-                    super().__init__(f"Task deferred to {method_name}")
-                    self.trigger = trigger
-                    self.method_name = method_name
-                    self.kwargs = kwargs or {}
-                    self.timeout = timeout
+            def __init__(
+                self,
+                *,
+                trigger: Any,
+                method_name: str,
+                kwargs: dict[str, Any] | None = None,
+                timeout: Any = None,
+            ) -> None:
+                """Initialize fallback deferred task signal."""
+                super().__init__(f"Task deferred to {method_name}")
+                self.trigger = trigger
+                self.method_name = method_name
+                self.kwargs = kwargs or {}
+                self.timeout = timeout
 
-            TaskDeferred = _FallbackTaskDeferredError
+        TaskDeferred = _FallbackTaskDeferredError
 
     try:
         from airflow.triggers.base import BaseTrigger, TriggerEvent
@@ -120,28 +153,55 @@ else:  # pragma: no cover - typing fallback for optional Airflow dependency
     try:
         from airflow.sdk.bases.hook import BaseHook
     except (ImportError, ModuleNotFoundError):
-        try:
-            from airflow.hooks.base import BaseHook
-        except (ImportError, ModuleNotFoundError):
 
-            class _FallbackBaseHook:
-                """Fallback base hook used when Airflow is unavailable."""
+        class _FallbackBaseHook:
+            """Fallback base hook used when Airflow is unavailable."""
 
-                def __init__(self, *args: Any, **kwargs: Any) -> None:
-                    """Initialize fallback hook."""
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                """Initialize fallback hook."""
 
-                @classmethod
-                def get_connection(cls, conn_id: str) -> Any:
-                    """Stub for retrieving Airflow connections offline."""
-                    raise AirflowException(
-                        f"Cannot retrieve connection '{conn_id}': Apache Airflow is not installed."
-                    )
+            @classmethod
+            def get_connection(cls, conn_id: str) -> Any:
+                """Stub for retrieving Airflow connections offline."""
+                raise AirflowException(
+                    f"Cannot retrieve connection '{conn_id}': Apache Airflow is not installed."
+                )
 
-            BaseHook = _FallbackBaseHook
+        BaseHook = _FallbackBaseHook
+
+    try:
+        from airflow.sdk.bases.operator import BaseOperator
+    except (ImportError, ModuleNotFoundError):
+
+        class _FallbackBaseOperator:
+            """Fallback base operator used when Airflow is unavailable."""
+
+            template_fields: Sequence[str] = ()
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                """Initialize fallback base operator."""
+
+        BaseOperator = _FallbackBaseOperator
+
+    try:
+        from airflow.sdk.bases.sensor import BaseSensorOperator
+    except (ImportError, ModuleNotFoundError):
+
+        class _FallbackBaseSensorOperator:
+            """Fallback base sensor operator used when Airflow is unavailable."""
+
+            template_fields: Sequence[str] = ()
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                """Initialize fallback base sensor operator."""
+
+        BaseSensorOperator = _FallbackBaseSensorOperator
 
 __all__ = [
     "AirflowException",
     "BaseHook",
+    "BaseOperator",
+    "BaseSensorOperator",
     "BaseTrigger",
     "Context",
     "TaskDeferred",

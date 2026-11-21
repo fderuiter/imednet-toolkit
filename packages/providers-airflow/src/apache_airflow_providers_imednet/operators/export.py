@@ -20,24 +20,8 @@ from imednet.spi.utils import (
 )
 
 from .. import export
-from .._airflow_compat import AirflowException, Context
+from .._airflow_compat import AirflowException, BaseOperator, Context
 from ..hooks import ImednetHook
-
-try:  # pragma: no cover - optional Airflow dependency
-    try:
-        from airflow.sdk.bases.operator import BaseOperator
-    except (ImportError, ModuleNotFoundError):
-        from airflow.models import BaseOperator  # type: ignore[no-redef]
-except (ImportError, ModuleNotFoundError):  # pragma: no cover - placeholder fallback
-
-    class BaseOperator:  # type: ignore
-        """Fallback BaseOperator for offline tests."""
-
-        template_fields: Sequence[str] = ()
-
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            """Initialize fallback BaseOperator."""
-
 
 logger = logging.getLogger(__name__)
 
