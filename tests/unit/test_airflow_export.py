@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ EXPORT_FUNCTIONS = [
     "export_to_json",
     "export_to_sql",
     "export_to_sql_by_form",
+    "export_to_long_sql",
 ]
 
 
@@ -1640,3 +1642,75 @@ def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and
         for rec in f["records"]
     )
     assert hier_ids3 == list(range(1, 10))
+
+
+def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify ImednetExportOperator dispatches sql_by_form and long_sql with connection resolution and URI redaction."""
+    from apache_airflow_providers_imednet import export
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import (
+        _TABULAR_EXPORTS,
+        ImednetExportOperator,
+    )
+
+    assert _TABULAR_EXPORTS["sql_by_form"] is export.export_to_sql_by_form
+    assert _TABULAR_EXPORTS["long_sql"] is export.export_to_long_sql
+
+    sql_uri = "postgresql://sql_user:sql_secret_password@db.synthetic.example:5432/clinical"  # pragma: allowlist secret
+    fake_sql_conn = SimpleNamespace(
+        conn_type="postgres",
+        host="db.synthetic.example",
+        port=5432,
+        login="sql_user",
+        password="sql_secret_password",  # pragma: allowlist secret
+        schema="clinical",
+        extra={"table": "long_records"},
+        get_uri=lambda: sql_uri,
+    )
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, conn_id: fake_sql_conn if conn_id == "sql_dest" else None),
+    )
+
+    mock_sdk = MagicMock()
+    mock_by_form = MagicMock()
+    mock_long_sql = MagicMock()
+    monkeypatch.setattr(export, "export_to_sql_by_form", mock_by_form)
+    monkeypatch.setattr(export, "export_to_long_sql", mock_long_sql)
+
+    op_by_form = ImednetExportOperator(
+        task_id="export_by_form",
+        study_key="STUDY-SQL",
+        destination="sql_by_form",
+        destination_conn_id="sql_dest",
+    )
+    monkeypatch.setattr(op_by_form, "_get_sdk", lambda: mock_sdk)
+    res_by_form = op_by_form.execute({})
+    mock_by_form.assert_called_once_with(
+        mock_sdk,
+        "STUDY-SQL",
+        sql_uri,
+    )
+    assert res_by_form is not None
+    assert "sql_secret_password" not in res_by_form
+    assert "***" in res_by_form
+
+    op_long = ImednetExportOperator(
+        task_id="export_long",
+        study_key="STUDY-SQL",
+        destination="long_sql",
+        output_path="override_long_records",
+        destination_conn_id="sql_dest",
+        export_kwargs={"table_name": "ignored_duplicate", "if_exists": "append"},
+    )
+    monkeypatch.setattr(op_long, "_get_sdk", lambda: mock_sdk)
+    res_long = op_long.execute({})
+    mock_long_sql.assert_called_once_with(
+        mock_sdk,
+        "STUDY-SQL",
+        "override_long_records",
+        conn_str=sql_uri,
+        if_exists="append",
+    )
+    assert res_long == "override_long_records"

@@ -342,7 +342,7 @@ Incremental exports decouple destination sinks from checkpoint persistence throu
 
   - ``default`` → :func:`imednet_workflows.state_ledger.get_state_provider` (auto-detects Airflow task context vs file ledger).
   - ``file`` → :class:`imednet_workflows.state_ledger.FileStateProvider` (also exported as the backward-compatible alias :class:`imednet_workflows.ExtractionStateLedger`).
-  - ``airflow`` → :class:`imednet_workflows.state_ledger.AirflowStateProvider` (persists stream watermarks in Airflow XCom metadata).
+  - ``airflow`` → :class:`imednet_workflows.state_ledger.AirflowStateProvider` (persists stream watermarks in Airflow ``Variable`` checkpoints).
 
 * :func:`~imednet.spi.sink_base.run_streaming_export` orchestrates end-to-end streaming
   writes across every ``ExportSink``:

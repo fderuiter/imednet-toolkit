@@ -539,3 +539,75 @@ def test_real_airflow_provider_alias_stays_synced_across_reimports(real_airflow)
         1 for finder in sys.meta_path if getattr(finder, "_imednet_airflow_provider_finder", False)
     )
     assert finder_count == 1
+
+
+def test_real_airflow_providers_manager_validates_schema_and_masks_ui_secrets(
+    monkeypatch,
+    real_airflow,
+    managed_sdk,
+):
+    """Verify provider_info.schema.json validation, UI password widgets, and extra__imednet__* resolution."""
+    import warnings
+    from pathlib import Path
+
+    import airflow
+    import jsonschema
+    from airflow.providers_manager import ProvidersManager
+    from airflow.sdk.bases.operator import BaseOperator as SdkBaseOperator
+    from airflow.sdk.definitions.connection import Connection as SdkConnection
+
+    import apache_airflow_providers_imednet as provider_pkg
+
+    hook_cls = real_airflow["ImednetHook"]
+    operator_cls = real_airflow["ImednetExportOperator"]
+    base_hook_cls = real_airflow["BaseHook"]
+
+    info = provider_pkg.get_provider_info()
+    schema_path = Path(airflow.__file__).resolve().parent / "provider_info.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    jsonschema.validate(instance=info, schema=schema)
+
+    ui_behaviour = hook_cls.get_ui_field_behaviour()
+    assert "schema" in ui_behaviour["hidden_fields"]
+    assert ui_behaviour["relabeling"]["login"] == "API Key"
+    assert ui_behaviour["relabeling"]["password"] == "Security Key"  # pragma: allowlist secret
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pm = ProvidersManager()
+        pm._cleanup()
+        widgets = pm.connection_form_widgets
+        assert widgets["extra__imednet__oidc_token"].is_sensitive is True
+        assert widgets["extra__imednet__base_url"].is_sensitive is False
+        assert widgets["extra__imednet__timeout"].is_sensitive is False
+        assert pm.field_behaviours["imednet"]["hidden_fields"] == [
+            "host",
+            "schema",
+            "port",
+            "extra",
+        ]
+        provider_warnings = [
+            w for w in caught if "imednet" in str(w.message).lower() or "imednet" in str(w.filename)
+        ]
+        assert provider_warnings == []
+
+    ui_conn = SdkConnection(
+        conn_id="imednet_ui_conn",
+        conn_type="imednet",
+        host="https://ui.synthetic.example",
+        extra=json.dumps(
+            {
+                "extra__imednet__api_key": "ui-api-key",  # pragma: allowlist secret
+                "extra__imednet__security_key": "ui-sec-key",  # pragma: allowlist secret
+                "extra__imednet__base_url": "https://edc.trn.imednetapi.com/api/v1/edc",
+            }
+        ),
+    )
+    monkeypatch.setattr(base_hook_cls, "get_connection", classmethod(lambda cls, cid: ui_conn))
+    resolved_hook = ui_conn.get_hook()
+    assert isinstance(resolved_hook, hook_cls)
+    sdk_client = managed_sdk(resolved_hook.get_conn())
+    assert sdk_client.config.api_key == "ui-api-key"  # pragma: allowlist secret
+    assert sdk_client.config.security_key == "ui-sec-key"  # pragma: allowlist secret
+    assert str(sdk_client.config.base_url).rstrip("/") == "https://edc.trn.imednetapi.com"
+    assert issubclass(operator_cls, SdkBaseOperator)

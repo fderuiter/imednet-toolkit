@@ -18,6 +18,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from imednet.spi.sinks import redact_uri
+from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text
+
 # Graceful fallback if fcntl is not available (e.g. non-UNIX environments)
 try:
     import fcntl
@@ -819,6 +822,13 @@ class AirflowStateProvider(BaseStateProvider):
 
         normalized_ts = _normalize_optional_utc(timestamp)
         normalized_lease = _normalize_optional_utc(lease_expires_at)
+        redacted_error = (
+            redact_sensitive_text(str(redact_sensitive_payload(redact_uri(error_message))))
+            if error_message is not None
+            else None
+        )
+        raw_redacted_meta = redact_sensitive_payload(metadata) if metadata else {}
+        redacted_meta = raw_redacted_meta if isinstance(raw_redacted_meta, dict) else {}
 
         val: dict[str, Any] = {
             "study_key": study_key,
@@ -826,8 +836,8 @@ class AirflowStateProvider(BaseStateProvider):
             "last_timestamp": normalized_ts.isoformat() if normalized_ts is not None else None,
             "records_processed": records_processed,
             "status": validated_status.value,
-            "error_message": error_message,
-            "metadata": metadata or {},
+            "error_message": redacted_error,
+            "metadata": redacted_meta,
             "owner_pid": owner_pid,
             "owner_host": owner_host,
             "lease_expires_at": (

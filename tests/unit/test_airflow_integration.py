@@ -951,3 +951,24 @@ def test_export_operator_full_template_fields_contract(monkeypatch):
         "record_data_filter",
         "stream_name",
     )
+
+
+def test_export_operator_rejects_secrets_in_templated_filter_fields(monkeypatch):
+    """Templated filter and stream fields reject secret keys and credentialed URIs."""
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
+
+    _setup_airflow(monkeypatch)
+    from apache_airflow_providers_imednet import ImednetExportOperator
+    from apache_airflow_providers_imednet._airflow_compat import AirflowException
+
+    with pytest.raises(AirflowException, match="record_filter"):
+        ImednetExportOperator(
+            task_id="bad_filter",
+            study_key="STUDY-1",
+            record_filter={"password": "leaked"},  # pragma: allowlist secret
+        )
+
+    op = ImednetExportOperator(task_id="ok", study_key="STUDY-1")
+    with pytest.raises(AirflowException, match="stream_name"):
+        op.stream_name = "postgresql://user:pass@db.example/prod"  # pragma: allowlist secret

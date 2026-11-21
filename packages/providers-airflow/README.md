@@ -28,7 +28,7 @@ pip install ./packages/providers-airflow
 ```
 
 **Required Dependencies:**
-This package requires `imednet`, `imednet-workflows` (for incremental XCom checkpointing), and `apache-airflow>=3.2.0,<4.0.0`.
+This package requires `imednet`, `imednet-workflows` (for incremental Airflow `Variable` checkpointing), and `apache-airflow>=3.2.0,<4.0.0`.
 
 **Build Targets & Namespace Compatibility (Hatchling):**
 This package uses Hatchling as its build backend, targeting `src/apache_airflow_providers_imednet`, registering the `apache_airflow_provider` discovery entry point (`apache_airflow_providers_imednet:get_provider_info`), and dynamically aliasing `airflow.providers.imednet.*` to the public provider modules.
@@ -101,8 +101,8 @@ def my_task_logic() -> None:
 - **Connection Hook Management**: Resolves sync (`get_conn()`) and async (`get_async_conn()`) SDK clients via `ImednetHook`, masking sensitive values (`api_key`, `security_key`, `oidc_token`, `token`) as `***`.
 - **Dynamic Task Mapping & Watermark Templating**: Supports Jinja-templated runtime fields (`study_key`, `output_path`, `export_kwargs`, `modified_since`, `record_filter`, `record_data_filter`, `stream_name`) while rejecting inline credentials.
 - **Deferrable Job Polling**: `ImednetJobSensor(deferrable=True)` yields worker slots to `ImednetJobTrigger`, polling asynchronously via `AsyncImednetSDK` and `AsyncJobPoller` without persisting secrets in trigger serialization.
-- **OpenLineage Dataset Facets**: Emits `OperatorLineage` inputs and outputs across `snowflake`, `duckdb`, `sql`, `mongodb`, `neo4j`, cloud object URIs (`s3://`, `gs://`, `abfss://`), and local files.
-- **Lazy Database Ingestion & Tabular Exporters**: Lazily resolves database sinks (`imednet_sinks`) and tabular serialization adapters for CSV, Parquet, JSON, DuckDB, and SQL formats.
+- **OpenLineage Dataset Facets**: Emits `OperatorLineage` inputs and outputs across `snowflake`, `duckdb`, `sql` / `sql_by_form` / `long_sql`, `mongodb`, `neo4j`, cloud object URIs (`s3://`, `gs://`, `abfss://`), and local files.
+- **Lazy Database Ingestion & Tabular Exporters**: Lazily resolves database sinks (`imednet_sinks`) and tabular serialization adapters for CSV, Parquet, JSON, DuckDB, and SQL (`sql`, `sql_by_form`, `long_sql`) formats.
 
 ## Component Description Table
 
