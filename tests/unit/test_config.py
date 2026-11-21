@@ -155,3 +155,36 @@ def test_merge_config_overrides_preserves_and_overrides_without_env(monkeypatch)
 
     with pytest.raises(ValueError, match="Either OIDC token or both API key and security key"):
         merge_config_overrides(Config())
+
+
+def test_load_config_and_merge_raise_configuration_error(monkeypatch):
+    """load_config and merge_config_overrides raise ConfigurationError (ClientError & ValueError)."""
+    from imednet.config import merge_config_overrides
+    from imednet.errors import ClientError, ConfigurationError, ImednetError
+
+    assert issubclass(ConfigurationError, ClientError)
+    assert issubclass(ConfigurationError, ImednetError)
+    assert issubclass(ConfigurationError, ValueError)
+
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
+
+    with pytest.raises(
+        ConfigurationError, match="API key and security key are required"
+    ) as exc_info:
+        load_config()
+    assert isinstance(exc_info.value, ImednetError)
+    assert isinstance(exc_info.value, ValueError)
+
+    with pytest.raises(ConfigurationError, match="Either OIDC token or both API key"):
+        merge_config_overrides(Config())
+
+    class BrokenCredentialSource:
+        def get_credentials(self):
+            raise KeyError("missing_vault_secret")
+
+    with pytest.raises(ConfigurationError, match="Credential source lookup failed") as source_exc:
+        load_config(credential_source=BrokenCredentialSource())
+    assert source_exc.value.__suppress_context__ is True
+    assert source_exc.value.cause_type == "KeyError"

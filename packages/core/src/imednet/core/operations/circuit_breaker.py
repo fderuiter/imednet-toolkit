@@ -9,6 +9,8 @@ from enum import Enum
 from types import TracebackType
 from typing import TypeVar
 
+from imednet.errors.network import CircuitBreakerError
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -44,10 +46,6 @@ ALLOWED_CIRCUIT_TRANSITIONS: dict[CircuitState, set[CircuitState]] = {
         CircuitState.OPEN,
     },
 }
-
-
-class CircuitBreakerError(Exception):
-    """Raised when the circuit breaker is open and a request is blocked."""
 
 
 class InvalidCircuitStateError(ValueError):

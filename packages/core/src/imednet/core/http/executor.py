@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
+from urllib.parse import urlencode
 
 import httpx
 from tenacity import (
@@ -17,14 +16,17 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from imednet.core.http.handlers import handle_response
+from imednet.core.http.handlers import handle_response, parse_retry_after_seconds
 from imednet.core.http.monitor import RequestMonitor
 from imednet.core.operations.circuit_breaker import (
     CircuitBreaker,
+    CircuitBreakerError,
     ProbeLease,
     get_global_circuit_breaker,
 )
 from imednet.core.retry import RetryConfig, RetryState
+from imednet.errors import DiagnosticContext
+from imednet.utils.url import redact_url_query
 
 _SUPPRESSED_LOG_LEVEL = logging.CRITICAL + 1
 
@@ -126,11 +128,23 @@ class BaseRequestExecutor(ABC):
         else:
             lease.record_success()
 
+    @staticmethod
+    def _build_monitor_url(url: str, kwargs: Mapping[str, Any]) -> str:
+        """Include query params in the monitored URL when present and sanitize sensitive values."""
+        params = kwargs.get("params")
+        if isinstance(params, Mapping) and params and "?" not in url:
+            query = urlencode(list(params.items()), doseq=True)
+            if query:
+                return redact_url_query(f"{url}?{query}")
+        return url
+
     def _finalize_response(
         self,
         response: httpx.Response | None,
         lease: ProbeLease,
         monitor: RequestMonitor,
+        *,
+        attempt_count: int | None = None,
     ) -> httpx.Response:
         """Classify breaker outcome once, record telemetry, and map HTTP error responses."""
         if response is None:
@@ -138,50 +152,44 @@ class BaseRequestExecutor(ABC):
             raise RuntimeError("Request failed without response or exception")
         self._record_response_outcome(response, lease)
         monitor.on_success(response)
-        return handle_response(response)
+        return handle_response(
+            response,
+            method=monitor.method,
+            url=monitor.safe_url,
+            attempt_count=attempt_count,
+        )
 
     def _extract_or_fail_retry_error(
         self,
         error: RetryError,
         lease: ProbeLease,
         monitor: RequestMonitor,
+        *,
+        attempt_count: int | None = None,
     ) -> httpx.Response:
         """Extract response from exhausted retries or record one transport failure and escalate."""
         if error.last_attempt and not error.last_attempt.failed:
             response: httpx.Response = error.last_attempt.result()
             return response
         lease.record_failure()
-        monitor.on_retry_error(error)
-        raise error
+        return monitor.on_retry_error(error, attempt_count=attempt_count)
+
+    @staticmethod
+    def _handle_request_error(
+        error: httpx.RequestError,
+        lease: ProbeLease,
+        monitor: RequestMonitor,
+        *,
+        attempt_count: int | None = None,
+    ) -> NoReturn:
+        """Record one breaker failure and wrap an unretried transport error in RequestError."""
+        lease.record_failure()
+        monitor.on_request_error(error, attempt_count=attempt_count)
 
     @staticmethod
     def _parse_retry_after_seconds(response: httpx.Response) -> float | None:
-        """Parse the 'Retry-After' header from an HTTP response.
-
-        Args:
-            response: The HTTP response containing the header.
-
-        Returns:
-            Optional[float]: The number of seconds to wait, or None if not present or invalid.
-        """
-        value = response.headers.get("Retry-After")
-        if not value:
-            return None
-
-        try:
-            delay = float(value)
-            return max(delay, 0.0)
-        except ValueError:
-            pass
-
-        try:
-            retry_time = parsedate_to_datetime(value)
-            if retry_time.tzinfo is None:
-                retry_time = retry_time.replace(tzinfo=UTC)
-            delay = (retry_time - datetime.now(UTC)).total_seconds()
-            return max(delay, 0.0)
-        except (TypeError, ValueError, OverflowError):
-            return None
+        """Parse the 'Retry-After' header from an HTTP response."""
+        return parse_retry_after_seconds(response)
 
     def _wait_strategy(self, retry_state: RetryCallState) -> float:
         """Calculate the wait time before the next retry attempt.
@@ -207,9 +215,29 @@ class BaseRequestExecutor(ABC):
             "retry_predicate": self._get_retry_predicate(method),
         }
 
-    def _prepare_request(self) -> ProbeLease:
+    def _prepare_request(
+        self,
+        method: str | None = None,
+        url: str | None = None,
+    ) -> ProbeLease:
         """Admit a new request through the circuit breaker and return its lease."""
-        return self.circuit_breaker.acquire()
+        try:
+            return self.circuit_breaker.acquire()
+        except CircuitBreakerError as err:
+            if method is not None or url is not None:
+                ctx = DiagnosticContext(
+                    method=method,
+                    url=url,
+                    attempt_count=0,
+                )
+                raise CircuitBreakerError(
+                    err.message,
+                    status_code=err.status_code,
+                    code=err.code,
+                    status=err.status,
+                    diagnostic_context=ctx,
+                ) from err.__cause__
+            raise
 
     @abstractmethod
     def __call__(self, method: str, url: str, **kwargs: Any) -> Any:
@@ -249,29 +277,36 @@ class SyncRequestExecutor(BaseRequestExecutor):
 
         Raises:
             CircuitBreakerError: If the circuit is open.
-            Exception: Re-raises exceptions from the send function or retryer.
+            RequestError: If an HTTP transport error occurs.
         """
+        attempts = 0
 
         def send_fn() -> httpx.Response:
-            """Wrapper to send the request with suppressed logging.
-
-            Returns:
-                httpx.Response: The HTTP response.
-            """
+            """Wrapper to send the request with suppressed logging."""
+            nonlocal attempts
+            attempts += 1
             with self._suppress_httpx_request_logging():
                 return self.send(method, url, **kwargs)  # type: ignore[no-any-return]
 
         retryer = self.retry_config.create_retryer(**self._get_retryer_kwargs(method))
+        monitor_url = self._build_monitor_url(url, kwargs)
 
-        with self._prepare_request() as lease, RequestMonitor(self.tracer, method, url) as monitor:
+        with (
+            self._prepare_request(method, monitor_url) as lease,
+            RequestMonitor(self.tracer, method, monitor_url) as monitor,
+        ):
             try:
                 response: httpx.Response | None = retryer(send_fn)
             except RetryError as err:
-                response = self._extract_or_fail_retry_error(err, lease, monitor)
+                response = self._extract_or_fail_retry_error(
+                    err, lease, monitor, attempt_count=attempts or None
+                )
+            except httpx.RequestError as err:
+                self._handle_request_error(err, lease, monitor, attempt_count=attempts or None)
             except Exception:
                 lease.record_failure()
                 raise
-            return self._finalize_response(response, lease, monitor)
+            return self._finalize_response(response, lease, monitor, attempt_count=attempts or None)
 
 
 class AsyncRequestExecutor(BaseRequestExecutor):
@@ -307,29 +342,33 @@ class AsyncRequestExecutor(BaseRequestExecutor):
 
         Raises:
             CircuitBreakerError: If the circuit is open.
-            Exception: Re-raises exceptions from the send function or retryer.
+            RequestError: If an HTTP transport error occurs.
         """
+        attempts = 0
 
         async def send_fn() -> httpx.Response:
-            """Wrapper to send the request with suppressed logging.
-
-            Returns:
-                httpx.Response: The HTTP response.
-            """
+            """Wrapper to send the request with suppressed logging."""
+            nonlocal attempts
+            attempts += 1
             with self._suppress_httpx_request_logging():
                 return await self.send(method, url, **kwargs)  # type: ignore[no-any-return]
 
         retryer = self.retry_config.create_async_retryer(**self._get_retryer_kwargs(method))
+        monitor_url = self._build_monitor_url(url, kwargs)
 
         async with (
-            self._prepare_request() as lease,
-            RequestMonitor(self.tracer, method, url) as monitor,
+            self._prepare_request(method, monitor_url) as lease,
+            RequestMonitor(self.tracer, method, monitor_url) as monitor,
         ):
             try:
                 response: httpx.Response | None = await retryer(send_fn)
             except RetryError as err:
-                response = self._extract_or_fail_retry_error(err, lease, monitor)
+                response = self._extract_or_fail_retry_error(
+                    err, lease, monitor, attempt_count=attempts or None
+                )
+            except httpx.RequestError as err:
+                self._handle_request_error(err, lease, monitor, attempt_count=attempts or None)
             except Exception:
                 lease.record_failure()
                 raise
-            return self._finalize_response(response, lease, monitor)
+            return self._finalize_response(response, lease, monitor, attempt_count=attempts or None)

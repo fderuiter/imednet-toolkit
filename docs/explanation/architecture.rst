@@ -86,12 +86,16 @@ Response errors are mapped via :func:`imednet.errors.get_error_class`:
 Credential redaction
 ~~~~~~~~~~~~~~~~~~~~
 
-* Transport logs never include raw credential headers.
-* URLs logged by request monitoring are sanitized through
-  :func:`imednet.utils.url.redact_url_query`, redacting sensitive query params
-  such as ``api_key``, ``security_key``, ``token``, ``secret``, and ``password``.
-* Retry exhaustion raises :class:`imednet.errors.RequestError` with a generic
-  message that does not expose credentials.
+* Transport logs and formatted errors never include raw credential headers.
+* URLs logged by request monitoring or attached to :class:`imednet.errors.DiagnosticContext`
+  are sanitized through :func:`imednet.utils.url.redact_url_query`, redacting
+  sensitive query params such as ``api_key``, ``security_key``, ``token``,
+  ``secret``, and ``password``.
+* Both retried and unretried transport failures raise :class:`imednet.errors.RequestError`
+  with structured :class:`imednet.errors.DiagnosticContext` and chained causes,
+  open circuit breakers raise :class:`imednet.errors.CircuitBreakerError`, and
+  credential configuration errors raise :class:`imednet.errors.ConfigurationError`
+  so callers can catch all SDK failures via :class:`imednet.errors.ImednetError`.
 
 Async Client
 ------------

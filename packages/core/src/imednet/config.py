@@ -9,6 +9,8 @@ import os
 from dataclasses import dataclass, replace
 
 from imednet.auth.credentials import Credentials, CredentialSource
+from imednet.errors.base import DiagnosticContext
+from imednet.errors.validation import ConfigurationError
 from imednet.utils.validators import parse_bool
 
 __all__ = ["Config", "load_config"]
@@ -55,10 +57,13 @@ def _read_credential_source(credential_source: CredentialSource | None) -> Crede
             snapshot = credential_source.get_credentials()
             if snapshot is not None:
                 credentials = snapshot
-        except Exception:
-            raise ValueError("Credential source lookup failed") from None
+        except Exception as exc:
+            raise ConfigurationError(
+                "Credential source lookup failed",
+                diagnostic_context=DiagnosticContext(cause_type=type(exc).__name__),
+            ) from None
         if not isinstance(credentials, Credentials):
-            raise ValueError("Credential source returned an invalid snapshot")
+            raise ConfigurationError("Credential source returned an invalid snapshot")
     return credentials
 
 
@@ -83,11 +88,13 @@ def _finalize_credentials(
         security_key = security_key or "simulated_security_key"
     elif require_credentials and not has_transport and not oidc_token:
         if not api_key and not security_key:
-            raise ValueError("Either OIDC token or both API key and security key are required")
+            raise ConfigurationError(
+                "Either OIDC token or both API key and security key are required"
+            )
         if not api_key:
-            raise ValueError("API key is required when not using OIDC")
+            raise ConfigurationError("API key is required when not using OIDC")
         if not security_key:
-            raise ValueError("Security key is required when not using OIDC")
+            raise ConfigurationError("Security key is required when not using OIDC")
     return api_key, security_key, base_url, oidc_token
 
 
@@ -190,7 +197,7 @@ def load_config(
         The loaded SDK configuration.
 
     Raises:
-        ValueError: If required authentication parameters are missing.
+        ConfigurationError: If required authentication parameters are missing or credential loading fails.
     """
     credentials = _read_credential_source(credential_source)
     api_key = api_key if api_key is not None else credentials.api_key
