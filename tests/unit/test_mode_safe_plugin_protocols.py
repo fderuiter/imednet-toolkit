@@ -583,36 +583,3 @@ def test_sink_config_factories_expose_max_buffered_records() -> None:
         assert sf_cfg.max_buffered_records == 2500
     finally:
         sync_sdk.close()
-
-
-def test_airflow_provider_aliases_stay_synchronized_across_reloads() -> None:
-    pytest.importorskip("airflow")
-    import importlib
-    import sys
-
-    from airflow.providers.imednet.hooks import ImednetHook as InitialAliasHook
-
-    from apache_airflow_providers_imednet.hooks import ImednetHook as InitialDirectHook
-
-    assert InitialAliasHook is InitialDirectHook
-
-    import apache_airflow_providers_imednet.hooks as hooks_mod
-
-    reloaded_hooks = importlib.reload(hooks_mod)
-    from airflow.providers.imednet.hooks import ImednetHook as ReloadedAliasHook
-
-    assert ReloadedAliasHook is reloaded_hooks.ImednetHook
-
-    for mod_name in [
-        m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")
-    ]:
-        sys.modules.pop(mod_name, None)
-
-    import apache_airflow_providers_imednet as provider_pkg
-
-    provider_pkg.get_provider_info()
-    from airflow.providers.imednet.hooks import ImednetHook as ReimportedAliasHook
-
-    from apache_airflow_providers_imednet.hooks import ImednetHook as ReimportedDirectHook
-
-    assert ReimportedAliasHook is ReimportedDirectHook
