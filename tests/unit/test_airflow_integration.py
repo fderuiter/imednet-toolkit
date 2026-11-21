@@ -48,8 +48,8 @@ def test_imednet_hook_returns_sdk(monkeypatch):
 
 def test_export_operator_calls_helper(monkeypatch):
     """Test that export operator calls helper."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -87,8 +87,8 @@ def test_export_operator_calls_helper(monkeypatch):
 
 def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
     """Test that export operator exposes mapped runtime fields."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -105,8 +105,8 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
 
 def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monkeypatch):
     """Test that export operator copies runtime kwargs and resolves sdk at execute."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -150,8 +150,8 @@ def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monke
 
 def test_export_operator_rejects_unknown_export_callable(monkeypatch):
     """Test that export operator rejects unknown export callable."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -590,8 +590,8 @@ def test_export_operator_template_field_rendering_simulation(monkeypatch):
     picked up from the instance at execute time rather than captured at construction.
     """
     for mod in list(sys.modules):
-        if mod.startswith("apache_airflow_providers_imednet"):
-            del sys.modules[mod]
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -677,8 +677,8 @@ def test_list_study_keys_skips_entries_without_recognized_key(monkeypatch):
 
 def test_export_operator_resolves_snowflake_sink(monkeypatch):
     """Test that export operator resolves snowflake sink."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
     conn = MagicMock()
@@ -939,17 +939,21 @@ def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monk
 
 
 @pytest.fixture(autouse=True, scope="module")
-def _cleanup_dummy_provider_modules():
-    """Unload dummy-patched provider modules after module tests finish."""
+def _cleanup_mocked_airflow_provider_modules():
+    """Evict provider modules bound to dummy Airflow stubs on module teardown."""
     yield
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
             sys.modules.pop(mod, None)
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None:
+        providers_pkg.__dict__.pop("imednet", None)
 
 
 def test_export_operator_full_template_fields_contract(monkeypatch):
     """Verify full template_fields tuple includes mapped runtime, watermark, and filter fields."""
     monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
     from apache_airflow_providers_imednet import ImednetExportOperator

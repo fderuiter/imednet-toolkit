@@ -19,6 +19,8 @@ def setup_dummy_airflow(
     hooks_pkg = ModuleType("airflow.hooks")
     hooks_pkg.__path__ = []
     hooks_mod = ModuleType("airflow.sdk.bases.hook")
+    operator_mod = ModuleType("airflow.sdk.bases.operator")
+    sensor_mod = ModuleType("airflow.sdk.bases.sensor")
     sdk_mod = ModuleType("airflow.sdk")
     sdk_mod.__path__ = []
     sdk_bases = ModuleType("airflow.sdk.bases")
@@ -59,6 +61,8 @@ def setup_dummy_airflow(
             """No-op upstream XCom relationship registration."""
 
     hooks_mod.BaseHook = DummyBaseHook  # type: ignore[attr-defined]
+    operator_mod.BaseOperator = DummyBaseOperator  # type: ignore[attr-defined]
+    sensor_mod.BaseSensorOperator = DummyBaseOperator  # type: ignore[attr-defined]
     models_mod.BaseOperator = DummyBaseOperator  # type: ignore[attr-defined]
     models_mod.DAG = DummyBaseOperator  # type: ignore[attr-defined]
     sdk_dag.DAG = DummyBaseOperator  # type: ignore[attr-defined]
@@ -67,6 +71,8 @@ def setup_dummy_airflow(
     sdk_xcom_arg.XComArg = DummyXComArg  # type: ignore[attr-defined]
 
     sdk_bases.hook = hooks_mod  # type: ignore[attr-defined]
+    sdk_bases.operator = operator_mod  # type: ignore[attr-defined]
+    sdk_bases.sensor = sensor_mod  # type: ignore[attr-defined]
     sdk_mod.bases = sdk_bases  # type: ignore[attr-defined]
     sdk_defs.context = sdk_ctx  # type: ignore[attr-defined]
     sdk_defs.dag = sdk_dag  # type: ignore[attr-defined]
@@ -77,12 +83,23 @@ def setup_dummy_airflow(
     airflow_mod.hooks = hooks_pkg  # type: ignore[attr-defined]
     airflow_mod.models = models_mod  # type: ignore[attr-defined]
 
+    for mod_name in list(sys.modules):
+        if mod_name in {
+            "apache_airflow_providers_imednet",
+            "airflow.providers.imednet",
+        } or mod_name.startswith(
+            ("apache_airflow_providers_imednet.", "airflow.providers.imednet.")
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
     modules: dict[str, ModuleType] = {
         "airflow": airflow_mod,
         "airflow.hooks": hooks_pkg,
         "airflow.sdk": sdk_mod,
         "airflow.sdk.bases": sdk_bases,
         "airflow.sdk.bases.hook": hooks_mod,
+        "airflow.sdk.bases.operator": operator_mod,
+        "airflow.sdk.bases.sensor": sensor_mod,
         "airflow.sdk.definitions": sdk_defs,
         "airflow.sdk.definitions.context": sdk_ctx,
         "airflow.sdk.definitions.dag": sdk_dag,

@@ -19,22 +19,37 @@ import pytest
 from imednet.errors.validation import PathTraversalValidationError
 from imednet.sdk import AsyncImednetSDK
 
+if (
+    "airflow" not in sys.modules
+    or getattr(sys.modules.get("airflow"), "__path__", None) is None
+    or getattr(sys.modules.get("airflow"), "__file__", None) is None
+):
+    for _mod in list(sys.modules):
+        if _mod == "airflow" or _mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+            sys.modules.pop(_mod, None)
+
 pytest.importorskip("airflow")
 
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_airflow_provider_modules() -> Any:
     """Unload stale dummy-patched provider modules before and after real-Airflow parity tests."""
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
-            sys.modules.pop(mod, None)
+    airflow_mod = sys.modules.get("airflow")
     if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        airflow_mod is None
+        or getattr(airflow_mod, "__path__", None) is None
+        or getattr(airflow_mod, "__file__", None) is None
     ):
         for mod in list(sys.modules):
-            if mod == "airflow" or mod.startswith("airflow."):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
                 sys.modules.pop(mod, None)
+    else:
+        for mod in list(sys.modules):
+            if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+                sys.modules.pop(mod, None)
+        providers_pkg = sys.modules.get("airflow.providers")
+        if providers_pkg is not None:
+            providers_pkg.__dict__.pop("imednet", None)
 
     yield
 
