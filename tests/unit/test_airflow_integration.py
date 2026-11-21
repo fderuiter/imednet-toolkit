@@ -8,12 +8,14 @@ from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
+from tests.conftest import isolate_airflow_provider_modules
 
 import imednet.sdk as sdk_mod
 
 
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
+    isolate_airflow_provider_modules(monkeypatch)
     airflow_mod = ModuleType("airflow")
     airflow_mod.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")
@@ -101,9 +103,6 @@ def test_imednet_hook_returns_sdk(monkeypatch):
 
 def test_export_operator_calls_helper(monkeypatch):
     """Test that export operator calls helper."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
-
     _setup_airflow(monkeypatch)
 
     conn = MagicMock()
@@ -140,9 +139,6 @@ def test_export_operator_calls_helper(monkeypatch):
 
 def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
     """Test that export operator exposes mapped runtime fields."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
-
     _setup_airflow(monkeypatch)
 
     from apache_airflow_providers_imednet import ImednetExportOperator
@@ -158,9 +154,6 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
 
 def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monkeypatch):
     """Test that export operator copies runtime kwargs and resolves sdk at execute."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
-
     _setup_airflow(monkeypatch)
 
     conn = MagicMock()
@@ -203,9 +196,6 @@ def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monke
 
 def test_export_operator_rejects_unknown_export_callable(monkeypatch):
     """Test that export operator rejects unknown export callable."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
-
     _setup_airflow(monkeypatch)
 
     conn = MagicMock()
@@ -642,10 +632,6 @@ def test_export_operator_template_field_rendering_simulation(monkeypatch):
     mapped runtime fields (``study_key``, ``output_path``, ``export_kwargs``) are
     picked up from the instance at execute time rather than captured at construction.
     """
-    for mod in list(sys.modules):
-        if mod.startswith("apache_airflow_providers_imednet"):
-            del sys.modules[mod]
-
     _setup_airflow(monkeypatch)
 
     import apache_airflow_providers_imednet as airflow_mod
@@ -730,9 +716,6 @@ def test_list_study_keys_skips_entries_without_recognized_key(monkeypatch):
 
 def test_export_operator_resolves_snowflake_sink(monkeypatch):
     """Test that export operator resolves snowflake sink."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
-
     _setup_airflow(monkeypatch)
     conn = MagicMock()
     import airflow.sdk.bases.hook as hooks_base

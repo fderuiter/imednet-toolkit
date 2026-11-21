@@ -6,10 +6,12 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from tests.conftest import isolate_airflow_provider_modules
 
 
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
+    isolate_airflow_provider_modules(monkeypatch)
     airflow = ModuleType("airflow")
     airflow.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")

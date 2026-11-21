@@ -38,6 +38,13 @@ def _cleanup_airflow_provider_modules():
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
                 sys.modules.pop(mod, None)
+    else:
+        for mod in list(sys.modules):
+            if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+                sys.modules.pop(mod, None)
+        providers_pkg = sys.modules.get("airflow.providers")
+        if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+            delattr(providers_pkg, "imednet")
 
     yield
     for mod in list(sys.modules):
@@ -488,3 +495,30 @@ def test_real_airflow_hook_test_connection_and_provider_discovery(monkeypatch, r
     assert ok_fail is False
     assert "SUPER_SECRET_API_KEY" not in err_msg
     assert "SUPER_SECRET_SEC_KEY" not in err_msg
+
+
+def test_provider_alias_resyncs_after_provider_reimport(real_airflow):
+    """Re-importing apache_airflow_providers_imednet keeps airflow.providers.imednet aliases identical."""
+    _ = real_airflow
+    from airflow.providers.imednet.hooks import ImednetHook as InitialAliasedHook
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook as InitialCanonicalHook
+
+    assert InitialAliasedHook is InitialCanonicalHook
+
+    # Simulate another test evicting canonical modules while leaving alias entries cached.
+    for mod_name in list(sys.modules):
+        if mod_name.startswith("apache_airflow_providers_imednet"):
+            sys.modules.pop(mod_name, None)
+
+    import apache_airflow_providers_imednet as provider_pkg
+    from apache_airflow_providers_imednet.hooks import ImednetHook as ReimportedCanonicalHook
+
+    provider_pkg.get_provider_info()
+    from airflow.providers.imednet.hooks import ImednetHook as ResyncedAliasedHook
+
+    assert ResyncedAliasedHook is ReimportedCanonicalHook
+    finder_count = sum(
+        1 for finder in sys.meta_path if type(finder).__name__ == "_ImednetAirflowProviderFinder"
+    )
+    assert finder_count == 1

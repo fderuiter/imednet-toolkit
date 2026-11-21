@@ -3,9 +3,12 @@
 import sys
 from types import ModuleType
 
+from tests.conftest import isolate_airflow_provider_modules
+
 
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
+    isolate_airflow_provider_modules(monkeypatch)
     airflow_mod = ModuleType("airflow")
     airflow_mod.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")
