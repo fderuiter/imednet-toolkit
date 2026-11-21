@@ -65,6 +65,12 @@ def _setup_airflow(monkeypatch):
     airflow_mod.hooks = hooks_pkg
     airflow_mod.models = models_mod
 
+    for mod_name in list(sys.modules):
+        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
+            "apache_airflow_providers_imednet."
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
     monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
     monkeypatch.setitem(sys.modules, "airflow.hooks", hooks_pkg)
     monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)

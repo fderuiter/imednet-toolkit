@@ -27,6 +27,8 @@ _PACKAGE_ALIASES = frozenset(
 class _ImednetAirflowProviderFinder(MetaPathFinder, Loader):
     """Map ``airflow.providers.imednet`` imports to ``apache_airflow_providers_imednet``."""
 
+    _imednet_airflow_provider_finder = True
+
     def find_spec(
         self,
         fullname: str,
@@ -56,43 +58,54 @@ class _ImednetAirflowProviderFinder(MetaPathFinder, Loader):
         if hasattr(target_mod, "__path__"):
             module.__path__ = list(target_mod.__path__)
         sys.modules[alias_name] = target_mod
-
-
-def _ensure_airflow_provider_finder() -> None:
-    """Ensure a single ``airflow.providers.imednet`` import alias finder is registered."""
-    if sys.meta_path and isinstance(sys.meta_path[0], _ImednetAirflowProviderFinder):
-        return
-    sys.meta_path[:] = [
-        finder
-        for finder in sys.meta_path
-        if type(finder).__name__ != "_ImednetAirflowProviderFinder"
-    ]
-    sys.meta_path.insert(0, _ImednetAirflowProviderFinder())
+        if alias_name == _ALIAS_PREFIX:
+            providers_pkg = sys.modules.get("airflow.providers")
+            if providers_pkg is not None:
+                providers_pkg.__dict__["imednet"] = target_mod
 
 
 def _sync_airflow_provider_aliases() -> None:
-    """Keep ``airflow.providers.imednet`` module aliases aligned with active submodules."""
-    for mod_name in list(sys.modules):
-        if mod_name == _ALIAS_PREFIX or mod_name.startswith(f"{_ALIAS_PREFIX}."):
-            target_name = mod_name.replace(_ALIAS_PREFIX, _TARGET_PREFIX, 1)
+    """Synchronize cached ``airflow.providers.imednet`` module aliases in ``sys.modules``."""
+    for alias_name in list(sys.modules):
+        if alias_name == _ALIAS_PREFIX or alias_name.startswith(f"{_ALIAS_PREFIX}."):
+            target_name = alias_name.replace(_ALIAS_PREFIX, _TARGET_PREFIX, 1)
             target_mod = sys.modules.get(target_name)
             if target_mod is not None:
-                sys.modules[mod_name] = target_mod
+                sys.modules[alias_name] = target_mod
             else:
-                sys.modules.pop(mod_name, None)
+                sys.modules.pop(alias_name, None)
+
     providers_pkg = sys.modules.get("airflow.providers")
-    target_root = sys.modules.get(_TARGET_PREFIX)
-    if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+    if providers_pkg is not None:
+        target_root = sys.modules.get(_TARGET_PREFIX)
         if target_root is not None:
-            providers_pkg.imednet = target_root  # type: ignore[attr-defined]
+            providers_pkg.__dict__["imednet"] = target_root
         else:
-            delattr(providers_pkg, "imednet")
+            providers_pkg.__dict__.pop("imednet", None)
+
+
+def _ensure_airflow_provider_finder() -> None:
+    """Ensure the ``airflow.providers.imednet`` import alias finder is registered."""
+    existing = [
+        idx
+        for idx, finder in enumerate(sys.meta_path)
+        if getattr(finder, "_imednet_airflow_provider_finder", False)
+        or type(finder).__name__ == "_ImednetAirflowProviderFinder"
+    ]
+    if not existing:
+        sys.meta_path.insert(0, _ImednetAirflowProviderFinder())
+    else:
+        first_idx = existing[0]
+        if not isinstance(sys.meta_path[first_idx], _ImednetAirflowProviderFinder):
+            sys.meta_path[first_idx] = _ImednetAirflowProviderFinder()
+        for stale_idx in reversed(existing[1:]):
+            del sys.meta_path[stale_idx]
+    _sync_airflow_provider_aliases()
 
 
 def get_provider_info() -> dict[str, Any]:
     """Return Apache Airflow provider metadata for discovery."""
     _ensure_airflow_provider_finder()
-    _sync_airflow_provider_aliases()
     hook_name = "iMednet"
     conn_type = "imednet"
     return {

@@ -114,10 +114,14 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
     async_db_uri = f"sqlite+aiosqlite:///{db_file}"
 
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_async_conn = conf.get("database", "sql_alchemy_conn_async", fallback=None)
     prev_pool_enabled = conf.get("database", "sql_alchemy_pool_enabled", fallback=None)
     prev_dags = conf.get("core", "dags_folder", fallback=None)
     prev_examples = conf.get("core", "load_examples", fallback=None)
     prev_bundles = conf.get("dag_processor", "dag_bundle_config_list", fallback=None)
+    has_async_conn_attr = hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC")
+    prev_settings_async_conn = getattr(settings, "SQL_ALCHEMY_CONN_ASYNC", None)
+    snapshot_cache = getattr(bundle_manager_mod, "_load_bundle_config_snapshot", None)
 
     bundle_cfg = json.dumps(
         [
@@ -131,25 +135,26 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
 
     monkeypatch.setenv("AIRFLOW_HOME", str(af_home))
     monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
     monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED", "False")
     monkeypatch.setenv("AIRFLOW__CORE__DAGS_FOLDER", str(dags_dir))
     monkeypatch.setenv("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
     monkeypatch.setenv("AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST", bundle_cfg)
 
     prev_settings_conn = settings.SQL_ALCHEMY_CONN
-    prev_settings_async_conn = getattr(settings, "SQL_ALCHEMY_CONN_ASYNC", None)
     monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
-    if hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+    if has_async_conn_attr:
         monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
 
     conf.set("database", "sql_alchemy_conn", db_uri)
+    conf.set("database", "sql_alchemy_conn_async", async_db_uri)
     conf.set("database", "sql_alchemy_pool_enabled", "False")
     conf.set("core", "dags_folder", str(dags_dir))
     conf.set("core", "load_examples", "False")
     conf.set("dag_processor", "dag_bundle_config_list", bundle_cfg)
-    if hasattr(bundle_manager_mod, "_load_bundle_config_snapshot"):
-        bundle_manager_mod._load_bundle_config_snapshot.cache_clear()
 
+    if snapshot_cache is not None and hasattr(snapshot_cache, "cache_clear"):
+        snapshot_cache.cache_clear()
     settings.dispose_orm()
     settings.configure_orm()
     initdb()
@@ -163,6 +168,7 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
             **{k: v for k, v in os.environ.items() if not k.startswith("AIRFLOW_CTX_")},
             "AIRFLOW_HOME": str(af_home),
             "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": db_uri,
+            "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC": async_db_uri,
             "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED": "False",
             "AIRFLOW__CORE__DAGS_FOLDER": str(dags_dir),
             "AIRFLOW__CORE__LOAD_EXAMPLES": "False",
@@ -177,10 +183,12 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
 
     settings.dispose_orm()
     settings.SQL_ALCHEMY_CONN = prev_settings_conn
-    if hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+    if has_async_conn_attr:
         settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_async_conn
     if prev_conn is not None:
         conf.set("database", "sql_alchemy_conn", prev_conn)
+    if prev_async_conn is not None:
+        conf.set("database", "sql_alchemy_conn_async", prev_async_conn)
     if prev_pool_enabled is not None:
         conf.set("database", "sql_alchemy_pool_enabled", prev_pool_enabled)
     if prev_dags is not None:
@@ -189,8 +197,8 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
         conf.set("core", "load_examples", prev_examples)
     if prev_bundles is not None:
         conf.set("dag_processor", "dag_bundle_config_list", prev_bundles)
-    if hasattr(bundle_manager_mod, "_load_bundle_config_snapshot"):
-        bundle_manager_mod._load_bundle_config_snapshot.cache_clear()
+    if snapshot_cache is not None and hasattr(snapshot_cache, "cache_clear"):
+        snapshot_cache.cache_clear()
     settings.configure_orm()
 
     root_logger.handlers = saved_handlers

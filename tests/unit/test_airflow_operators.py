@@ -8,18 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 
 
-@pytest.fixture(autouse=True, scope="module")
-def _isolate_provider_modules():
-    """Prevent dummy Airflow subclasses from leaking into or out of this module."""
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
-            sys.modules.pop(mod, None)
-    yield
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
-            sys.modules.pop(mod, None)
-
-
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
     airflow = ModuleType("airflow")
@@ -106,6 +94,12 @@ def _setup_airflow(monkeypatch):
     airflow.providers.amazon.aws.hooks = ModuleType("airflow.providers.amazon.aws.hooks")
     airflow.providers.amazon.aws.hooks.__path__ = []
     airflow.providers.amazon.aws.hooks.s3 = s3_mod
+
+    for mod_name in list(sys.modules):
+        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
+            "apache_airflow_providers_imednet."
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
 
     modules = {
         "airflow": airflow,
@@ -305,3 +299,55 @@ def test_provider_info_and_hook_metadata_contract():
     assert any(req.startswith("imednet-workflows") for req in requires)
     extras = set(dist.metadata.get_all("Provides-Extra") or [])
     assert {"duckdb", "export", "mongodb", "neo4j", "snowflake"}.issubset(extras)
+
+
+def test_provider_alias_sync_and_finder_deduplication(monkeypatch):
+    """Verify _sync_airflow_provider_aliases and finder deduplication across reloads."""
+    _setup_airflow(monkeypatch)
+    import apache_airflow_providers_imednet as provider_pkg
+
+    importlib.reload(provider_pkg)
+    alias_pkg = importlib.import_module("airflow.providers.imednet")
+    alias_hooks = importlib.import_module("airflow.providers.imednet.hooks")
+    alias_ops = importlib.import_module("airflow.providers.imednet.operators")
+
+    assert alias_pkg is sys.modules["apache_airflow_providers_imednet"]
+    assert alias_hooks is sys.modules["apache_airflow_providers_imednet.hooks"]
+    assert alias_ops is sys.modules["apache_airflow_providers_imednet.operators"]
+    assert sys.modules["airflow.providers"].__dict__["imednet"] is alias_pkg
+
+    reloaded_ops = importlib.reload(sys.modules["apache_airflow_providers_imednet.operators"])
+    assert sys.modules["airflow.providers.imednet.operators"] is reloaded_ops
+
+    # Simulate duplicate stale finder & unloaded target module
+    stale_finder = type("StaleFinder", (), {"_imednet_airflow_provider_finder": True})()
+    sys.meta_path.insert(0, stale_finder)
+    sys.meta_path.append(stale_finder)
+    monkeypatch.setitem(sys.modules, "airflow.providers.imednet.ghost", ModuleType("ghost"))
+    saved_root = sys.modules.pop("apache_airflow_providers_imednet")
+    try:
+        provider_pkg._ensure_airflow_provider_finder()
+        assert "imednet" not in sys.modules["airflow.providers"].__dict__
+    finally:
+        sys.modules["apache_airflow_providers_imednet"] = saved_root
+        provider_pkg._sync_airflow_provider_aliases()
+
+    assert "airflow.providers.imednet.ghost" not in sys.modules
+    finders = [f for f in sys.meta_path if getattr(f, "_imednet_airflow_provider_finder", False)]
+    assert len(finders) == 1
+    assert isinstance(finders[0], provider_pkg._ImednetAirflowProviderFinder)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mocked_airflow_provider_modules():
+    """Evict provider modules reloaded against dummy Airflow stubs on module setup and teardown."""
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None:
+        providers_pkg.__dict__.pop("imednet", None)
