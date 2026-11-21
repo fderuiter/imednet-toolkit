@@ -4,84 +4,17 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from tests.utils.airflow_mocks import setup_dummy_airflow
 
 
 # Setup dummy airflow modules to prevent import errors if airflow is not installed
 def _setup_airflow(monkeypatch):
-    """Helper function to  setup airflow."""
-    airflow_mod = ModuleType("airflow")
-    airflow_mod.__path__ = []
-    hooks_pkg = ModuleType("airflow.hooks")
-    hooks_pkg.__path__ = []
-    hooks_mod = ModuleType("airflow.sdk.bases.hook")
-    operator_mod = ModuleType("airflow.sdk.bases.operator")
-    sensor_mod = ModuleType("airflow.sdk.bases.sensor")
-    sdk_mod = ModuleType("airflow.sdk")
-    sdk_mod.__path__ = []
-    sdk_bases = ModuleType("airflow.sdk.bases")
-    sdk_bases.__path__ = []
-    sdk_defs = ModuleType("airflow.sdk.definitions")
-    sdk_defs.__path__ = []
-    sdk_ctx = ModuleType("airflow.sdk.definitions.context")
-    sdk_dag = ModuleType("airflow.sdk.definitions.dag")
-    models_mod = ModuleType("airflow.models")
-
-    class DummyBaseHook:
-        """Test suite for DummyBaseHook."""
-
-        @classmethod
-        def get_connection(cls, conn_id):
-            """Helper function to get connection."""
-            raise NotImplementedError
-
-    class DummyBaseOperator:
-        """Test suite for DummyBaseOperator."""
-
-        template_fields = ()
-
-        def __init__(self, **kwargs):
-            """Initialize the test object."""
-
-    hooks_mod.BaseHook = DummyBaseHook
-    operator_mod.BaseOperator = DummyBaseOperator
-    sensor_mod.BaseSensorOperator = DummyBaseOperator
-    models_mod.BaseOperator = DummyBaseOperator
-    models_mod.DAG = DummyBaseOperator
-    sdk_dag.DAG = DummyBaseOperator
-    sdk_dag.dag = DummyBaseOperator
-
-    sdk_bases.hook = hooks_mod
-    sdk_bases.operator = operator_mod
-    sdk_bases.sensor = sensor_mod
-    sdk_mod.bases = sdk_bases
-    sdk_defs.context = sdk_ctx
-    sdk_defs.dag = sdk_dag
-    sdk_mod.definitions = sdk_defs
-    airflow_mod.sdk = sdk_mod
-    airflow_mod.hooks = hooks_pkg
-    airflow_mod.models = models_mod
-
-    for mod_name in list(sys.modules):
-        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
-            "apache_airflow_providers_imednet."
-        ):
-            monkeypatch.delitem(sys.modules, mod_name, raising=False)
-
-    monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
-    monkeypatch.setitem(sys.modules, "airflow.hooks", hooks_pkg)
-    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", operator_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.sensor", sensor_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
-    monkeypatch.setitem(sys.modules, "airflow.models", models_mod)
+    """Helper function to setup airflow."""
+    setup_dummy_airflow(monkeypatch)
 
 
 EXPORT_FUNCTIONS = [
@@ -1252,77 +1185,12 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]
 
 
-def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ImednetExportOperator dispatches sql_by_form and long_sql destinations via export wrappers."""
-    from apache_airflow_providers_imednet import export
-    from apache_airflow_providers_imednet.hooks import ImednetHook
-    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-
-    fake_conn = SimpleNamespace(
-        conn_type="postgresql",
-        host="db.internal",
-        login="loader",
-        password="secret",  # pragma: allowlist secret
-        schema="edc",
-        port=5432,
-        extra={},
-    )
-    monkeypatch.setattr(
-        ImednetHook,
-        "_get_airflow_connection",
-        classmethod(lambda cls, conn_id: fake_conn if conn_id == "pg_dest" else None),
-    )
-
-    sdk = MagicMock()
-    by_form_mock = MagicMock()
-    long_sql_mock = MagicMock()
-    monkeypatch.setattr(export, "export_to_sql_by_form", by_form_mock)
-    monkeypatch.setattr(export, "export_to_long_sql", long_sql_mock)
-
-    op_by_form = ImednetExportOperator(
-        task_id="exp_sql_by_form",
-        study_key="STUDY_SQL",
-        destination="sql_by_form",
-        destination_conn_id="pg_dest",
-        export_kwargs={"if_exists": "replace"},
-    )
-    monkeypatch.setattr(op_by_form, "_get_sdk", lambda: sdk)
-    ret_by_form = op_by_form.execute({})
-
-    by_form_mock.assert_called_once_with(
-        sdk,
-        "STUDY_SQL",
-        "postgresql://loader:secret@db.internal:5432/edc",  # pragma: allowlist secret
-        if_exists="replace",
-    )
-    assert ret_by_form is not None
-    assert "secret" not in ret_by_form
-
-    op_long = ImednetExportOperator(
-        task_id="exp_long_sql",
-        study_key="STUDY_SQL",
-        destination="long_sql",
-        output_path="long_records",
-        destination_conn_id="pg_dest",
-        export_kwargs={"table_name": "ignored_when_output_path_set", "chunk_size": 250},
-    )
-    monkeypatch.setattr(op_long, "_get_sdk", lambda: sdk)
-    ret_long = op_long.execute({})
-
-    long_sql_mock.assert_called_once_with(
-        sdk,
-        "STUDY_SQL",
-        "long_records",
-        conn_str="postgresql://loader:secret@db.internal:5432/edc",  # pragma: allowlist secret
-        chunk_size=250,
-    )
-    assert ret_long == "long_records"
-
-
 def test_export_operator_duckdb_default_table_custom_table_and_conn_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Verify DuckDB operator/hook resolution across default table, custom table, and destination_conn_id."""
+    from types import SimpleNamespace
+
     import duckdb
 
     from apache_airflow_providers_imednet.hooks import ImednetHook
@@ -1677,3 +1545,75 @@ def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and
         for rec in f["records"]
     )
     assert hier_ids3 == list(range(1, 10))
+
+
+def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify ImednetExportOperator dispatches sql_by_form and long_sql with connection resolution and URI redaction."""
+    from apache_airflow_providers_imednet import export
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import (
+        _TABULAR_EXPORTS,
+        ImednetExportOperator,
+    )
+
+    assert _TABULAR_EXPORTS["sql_by_form"] is export.export_to_sql_by_form
+    assert _TABULAR_EXPORTS["long_sql"] is export.export_to_long_sql
+
+    sql_uri = "postgresql://sql_user:sql_secret_password@db.synthetic.example:5432/clinical"  # pragma: allowlist secret
+    fake_sql_conn = SimpleNamespace(
+        conn_type="postgres",
+        host="db.synthetic.example",
+        port=5432,
+        login="sql_user",
+        password="sql_secret_password",  # pragma: allowlist secret
+        schema="clinical",
+        extra={"table": "long_records"},
+        get_uri=lambda: sql_uri,
+    )
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, conn_id: fake_sql_conn if conn_id == "sql_dest" else None),
+    )
+
+    mock_sdk = MagicMock()
+    mock_by_form = MagicMock()
+    mock_long_sql = MagicMock()
+    monkeypatch.setattr(export, "export_to_sql_by_form", mock_by_form)
+    monkeypatch.setattr(export, "export_to_long_sql", mock_long_sql)
+
+    op_by_form = ImednetExportOperator(
+        task_id="export_by_form",
+        study_key="STUDY-SQL",
+        destination="sql_by_form",
+        destination_conn_id="sql_dest",
+    )
+    monkeypatch.setattr(op_by_form, "_get_sdk", lambda: mock_sdk)
+    res_by_form = op_by_form.execute({})
+    mock_by_form.assert_called_once_with(
+        mock_sdk,
+        "STUDY-SQL",
+        sql_uri,
+    )
+    assert res_by_form is not None
+    assert "sql_secret_password" not in res_by_form
+    assert "***" in res_by_form
+
+    op_long = ImednetExportOperator(
+        task_id="export_long",
+        study_key="STUDY-SQL",
+        destination="long_sql",
+        output_path="override_long_records",
+        destination_conn_id="sql_dest",
+        export_kwargs={"table_name": "ignored_duplicate", "if_exists": "append"},
+    )
+    monkeypatch.setattr(op_long, "_get_sdk", lambda: mock_sdk)
+    res_long = op_long.execute({})
+    mock_long_sql.assert_called_once_with(
+        mock_sdk,
+        "STUDY-SQL",
+        "override_long_records",
+        conn_str=sql_uri,
+        if_exists="append",
+    )
+    assert res_long == "override_long_records"

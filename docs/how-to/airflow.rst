@@ -16,10 +16,13 @@ pip installation. Package versions remain managed by release-please.
 .. code-block:: bash
 
    pip install "apache-airflow>=3.2.0,<4.0.0" apache-airflow-providers-imednet
-   # Optional destination extras:
+   # Optional destination, lineage, and cloud extras:
    pip install "apache-airflow-providers-imednet[export]"
    pip install "apache-airflow-providers-imednet[duckdb]"
+   pip install "apache-airflow-providers-imednet[sinks]"
    pip install "apache-airflow-providers-imednet[snowflake,mongodb,neo4j]"
+   pip install "apache-airflow-providers-imednet[openlineage,amazon]"
+   pip install "apache-airflow-providers-imednet[all]"
 
 Production Reference DAG
 ------------------------
@@ -49,13 +52,16 @@ Connections
 Create an Airflow connection ``imednet_default`` (connection type ``imednet``,
 registered via ``apache_airflow_providers_imednet:get_provider_info``) or override
 ``imednet_conn_id``.
-Provide ``api_key`` and ``security_key`` via the login/password fields, the
-password-masked Airflow UI custom fields (``extra__imednet__api_key``,
-``extra__imednet__security_key``, ``extra__imednet__oidc_token``), or in the
-``extra`` JSON. Base URL resolution honors an explicit ``base_url`` in ``extra``
-first, then resolves ``Connection.host`` (with optional ``scheme`` and ``port``)
-while stripping ``/api/v1/edc``, ``/api/v1``, and ``/api`` suffixes before
-falling back to ``imednet.config.load_config`` environment defaults.
+Provide ``api_key`` and ``security_key`` via the login/password fields (which the
+Airflow UI relabels as **API Key** and **Security Key** via
+``get_ui_field_behaviour()``), via custom connection form widgets
+(``extra__imednet__*``), or in the ``extra`` JSON. ``base_url``,
+password-masked ``oidc_token``, ``timeout``, ``strict_mode``, and
+``simulation_mode`` are exposed directly as typed connection form fields. Base URL
+resolution honors an explicit ``base_url`` first, then resolves ``Connection.host``
+(with optional ``scheme`` and ``port``) while stripping ``/api/v1/edc``,
+``/api/v1``, and ``/api`` suffixes before falling back to
+``imednet.config.load_config`` environment defaults.
 ``ImednetHook.test_connection()`` validates credentials against the ``Study``
 endpoint and redacts sensitive tokens on error.
 
@@ -70,27 +76,34 @@ connection URIs including SQLite ``sqlite:////abs/path.db``,
 rather than embedding secrets in DAG definitions.
 
 To prevent credential leakage in Airflow rendered task metadata and XComs,
-templated fields (``export_kwargs``, ``output_path``, ``modified_since``,
-``record_filter``, ``record_data_filter``, and ``stream_name``) reject raw secret
-keys (such as ``password``, ``auth``, ``api_key``, ``security_key``, ``token``, or
-``conn_str`` containing credentials) as well as URIs with embedded userinfo.
+templated fields (``study_key``, ``output_path``, ``export_kwargs``,
+``modified_since``, ``record_filter``, ``record_data_filter``, and
+``stream_name``) reject raw secret keys (such as ``password``, ``auth``,
+``api_key``, ``security_key``, ``token``, or ``conn_str`` containing
+credentials) as well as URIs with embedded userinfo.
 
-For task-mapping discovery steps, ``ImednetHook`` provides explicit helper methods:
+For task-mapping discovery, health checks, and async trigger execution,
+``ImednetHook`` provides explicit helper methods:
 
 - ``get_conn()`` returns the live :class:`~imednet.ImednetSDK` adhering to the
   standard Airflow BaseHook contract.
 - ``get_sdk_client()`` is a direct alias for ``get_conn()`` for use inside task
   execution context.
+- ``get_async_conn()`` returns an :class:`~imednet.AsyncImednetSDK` resolved via
+  ``BaseHook.aget_connection()`` (falling back to ``asyncio.to_thread()``) for
+  deferrable triggers.
+- ``get_base_url()`` returns the normalized non-secret API base URL for lineage
+  namespaces and diagnostics.
+- ``test_connection()`` validates connection credentials from the Airflow UI or
+  CLI and scrubs sensitive tokens and URI credentials from error messages.
 - ``list_studies_metadata()`` returns JSON-serializable primitive dictionaries
   (with sensitive keys redacted) for safe mapped task expansion.
 - ``list_study_keys()`` returns primitive study keys only.
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
-- ``test_connection()`` probes ``sdk.studies.list()`` for Airflow UI/CLI connection
-  testing while redacting credentials from error messages.
 - ``resolve_destination_connection()`` resolves runtime destination connection
-  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb``, ``sql``,
-  ``sql_by_form``, and ``long_sql`` targets.
+  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb``, and ``sql``
+  (including ``sql_by_form`` and ``long_sql``) targets.
 
 Operators and Sensors
 ---------------------
@@ -98,8 +111,8 @@ The Airflow integration organizes hooks, operators, and sensors in dedicated
 subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, DuckDB, SQL, Snowflake,
-Neo4j, MongoDB, etc.)
+records to any supported destination (CSV, Parquet, DuckDB, SQL / ``sql_by_form``
+/ ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
@@ -239,6 +252,57 @@ and tabular export helpers while maintaining ``mask_phi=True`` by default:
        include_deleted=False,
        export_kwargs={"table": "VITAL_SIGNS_RECORDS"},
    )
+
+Deferrable Job Polling with ``ImednetJobTrigger``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ImednetJobSensor`` supports Airflow 3 deferrable execution via ``deferrable=True``
+(defaulting to ``airflow.configuration.conf.getboolean("operators", "default_deferrable", fallback=False)``
+when ``deferrable=None``). In deferrable mode, ``execute()`` validates path-safe
+``study_key`` and ``batch_id`` segments and yields the worker slot to
+:class:`~apache_airflow_providers_imednet.ImednetJobTrigger`, which polls
+iMednet asynchronously inside the Airflow triggerer using
+:meth:`~apache_airflow_providers_imednet.hooks.ImednetHook.get_async_conn` and
+:class:`~imednet.utils.job_poller.AsyncJobPoller` (including terminal
+``resultUrl`` verification for per-``Record`` failures).
+
+``ImednetJobTrigger.serialize()`` persists only non-secret identifiers
+(``study_key``, ``batch_id``, ``imednet_conn_id``, ``poke_interval``, and
+``timeout``) to the Airflow metadata database and scrubs any error messages
+before emitting a ``TriggerEvent``.
+
+.. testcode::
+
+   from apache_airflow_providers_imednet import ImednetJobSensor
+
+   wait_for_batch = ImednetJobSensor(
+       task_id="wait_for_batch",
+       study_key="MY_STUDY",
+       batch_id="BATCH_001",
+       imednet_conn_id="imednet_default",
+       poke_interval=30,
+       timeout=3600,
+       deferrable=True,
+   )
+
+OpenLineage Dataset Facets
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When ``apache-airflow-providers-common-compat`` or ``apache-airflow-providers-openlineage``
+is installed (available via ``apache-airflow-providers-imednet[openlineage]``),
+``ImednetExportOperator`` implements ``get_openlineage_facets_on_start()`` and
+``get_openlineage_facets_on_complete()`` lazily:
+
+- **Input dataset**: ``namespace`` normalized from ``ImednetHook.get_base_url()``
+  (for example ``https://edc.prod.imednetapi.com``) and ``name``
+  ``study.<study_key>.records``.
+- **Output dataset**: sanitized destination coordinates with userinfo, passwords,
+  and query strings stripped across ``snowflake`` (``snowflake://<account>`` /
+  ``<database>.<schema>.<table>``), ``duckdb`` (``duckdb`` /
+  ``<db_path>.<table_name>``), ``sql`` / ``sql_by_form`` / ``long_sql``
+  (``postgres://host:port`` or ``sqlite``), ``mongodb`` (``mongodb://<host>`` / ``<database>.<collection>``),
+  ``neo4j`` (``neo4j://<host>`` / ``<database>.<label>``), object storage URIs
+  (``s3://``, ``gs://``, ``abfss://``), and local ``file`` paths.
 
 Testing with Airflow
 --------------------

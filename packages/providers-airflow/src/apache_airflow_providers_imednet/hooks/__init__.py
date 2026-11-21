@@ -11,7 +11,7 @@ from datetime import date, datetime
 from typing import Any, TypeAlias, Union, cast
 from urllib.parse import quote_plus, urlsplit
 
-from imednet import Config, ImednetSDK, load_config
+from imednet import AsyncImednetSDK, Config, ImednetSDK, load_config
 from imednet.spi.utils import (
     is_boolean_token,
     parse_bool,
@@ -63,28 +63,20 @@ class ImednetHook(BaseHook):
 
     @classmethod
     def get_ui_field_behaviour(cls) -> dict[str, Any]:
-        """Return Airflow UI connection form field customizations for iMednet."""
+        """Return Airflow UI connection form customizations for ``imednet``."""
         return {
-            "hidden_fields": ["schema", "extra"],
+            "hidden_fields": ["host", "schema", "port", "extra"],
             "relabeling": {
-                "host": "Base URL",
                 "login": "API Key",
                 "password": "Security Key",  # pragma: allowlist secret
             },
             "placeholders": {
-                "host": "https://edc.prod.imednetapi.com",
-                "login": "iMednet API key",
-                "password": "iMednet security key",  # pragma: allowlist secret
+                "login": "iMednet API Key",
+                "password": "iMednet Security Key",  # pragma: allowlist secret
+                "extra__imednet__base_url": "https://edc.prod.imednetapi.com",
+                "extra__imednet__timeout": "30.0",
             },
         }
-
-    @classmethod
-    def _extra_value(cls, extras: Mapping[str, object], key: str) -> object:
-        """Look up an extra value supporting both unprefixed and Airflow 3 UI-prefixed keys."""
-        if key in extras and extras[key] is not None:
-            return extras[key]
-        prefixed = f"extra__{cls.conn_type}__{key}"
-        return extras.get(prefixed)
 
     @staticmethod
     def _string_or_none(value: object) -> str | None:
@@ -174,6 +166,45 @@ class ImednetHook(BaseHook):
         except (ImportError, ModuleNotFoundError):
             hook_cls = BaseHook
         return hook_cls.get_connection(conn_id)
+
+    @classmethod
+    async def _aget_airflow_connection(cls, conn_id: str) -> Any:
+        """Retrieve an Airflow connection asynchronously in triggerer/async contexts."""
+        import asyncio
+
+        if "aget_connection" in cls.__dict__:
+            custom_aget = cls.__dict__["aget_connection"]
+            fn = getattr(custom_aget, "__func__", custom_aget)
+            try:
+                return (
+                    await fn(cls, conn_id)
+                    if hasattr(custom_aget, "__func__")
+                    else await fn(conn_id)
+                )
+            except RuntimeError:
+                return await asyncio.to_thread(cls._get_airflow_connection, conn_id)
+
+        if "_get_airflow_connection" in cls.__dict__ and cls is not ImednetHook:
+            return await asyncio.to_thread(cls._get_airflow_connection, conn_id)
+
+        hook_cls: Any
+        try:
+            from airflow.sdk.bases.hook import BaseHook as SdkBaseHook
+
+            hook_cls = SdkBaseHook
+        except (ImportError, ModuleNotFoundError):
+            hook_cls = BaseHook
+
+        get_conn_attr = hook_cls.__dict__.get("get_connection")
+        aget_conn = getattr(hook_cls, "aget_connection", None)
+        # Preserve synchronous monkeypatches on BaseHook.get_connection in unit tests
+        sync_patched = getattr(getattr(get_conn_attr, "__func__", get_conn_attr), "__module__", "")
+        if callable(aget_conn) and (not sync_patched or sync_patched.startswith("airflow.")):
+            try:
+                return await aget_conn(conn_id)
+            except RuntimeError:
+                return await asyncio.to_thread(hook_cls.get_connection, conn_id)
+        return await asyncio.to_thread(hook_cls.get_connection, conn_id)
 
     @classmethod
     def resolve_destination_connection(cls, conn_id: str, destination: str) -> dict[str, Any]:
@@ -384,13 +415,21 @@ class ImednetHook(BaseHook):
         return {}
 
     @classmethod
+    def _extra_field(cls, extras_dict: Mapping[str, object], field_name: str) -> object:
+        """Read connection extra by unprefixed or Airflow UI-prefixed key."""
+        direct = extras_dict.get(field_name)
+        if direct is not None and (not isinstance(direct, str) or direct.strip()):
+            return direct
+        return extras_dict.get(f"extra__imednet__{field_name}")
+
+    @classmethod
     def _resolve_connection_base_url(
         cls,
         conn: object,
         extras: Mapping[str, object],
     ) -> str | None:
         """Resolve an iMednet base URL from explicit extras first, then Connection host/scheme/port."""
-        explicit_base_url = cls._string_or_none(cls._extra_value(extras, "base_url"))
+        explicit_base_url = cls._string_or_none(cls._extra_field(extras, "base_url"))
         if explicit_base_url is not None:
             cleaned_explicit = explicit_base_url.rstrip("/")
             return re.sub(r"/api/v1(?:/edc)?$", "", cleaned_explicit).rstrip("/")
@@ -408,7 +447,7 @@ class ImednetHook(BaseHook):
                 netloc = f"{netloc}:{port}"
             path = parsed.path
         else:
-            extra_scheme = (cls._string_or_none(cls._extra_value(extras, "scheme")) or "").lower()
+            extra_scheme = (cls._string_or_none(cls._extra_field(extras, "scheme")) or "").lower()
             conn_scheme = (cls._string_or_none(getattr(conn, "conn_type", None)) or "").lower()
             if extra_scheme in {"http", "https"}:
                 scheme = extra_scheme
@@ -425,22 +464,43 @@ class ImednetHook(BaseHook):
 
         return sanitize_base_url(f"{scheme}://{netloc}{path}")
 
+    def _config_from_connection(self, conn: object) -> Config:
+        """Build SDK ``Config`` from a resolved Airflow connection and env fallbacks."""
+        extras_dict = self._connection_extras(conn)
+        return load_config(
+            api_key=self._string_or_none(self._extra_field(extras_dict, "api_key"))
+            or self._string_or_none(getattr(conn, "login", None)),
+            security_key=self._string_or_none(self._extra_field(extras_dict, "security_key"))
+            or self._string_or_none(getattr(conn, "password", None)),
+            base_url=self._resolve_connection_base_url(conn, extras_dict),
+            oidc_token=self._string_or_none(self._extra_field(extras_dict, "oidc_token")),
+            timeout=self._float_or_none(self._extra_field(extras_dict, "timeout")),
+            strict_mode=self._bool_or_none(self._extra_field(extras_dict, "strict_mode")),
+            simulation_mode=self._bool_or_none(self._extra_field(extras_dict, "simulation_mode")),
+        )
+
     def _resolved_config(self) -> Config:
         """Resolve hook configuration from Airflow connection fields and env fallback."""
         conn = self._get_airflow_connection(self.imednet_conn_id)
-        extras_dict = self._connection_extras(conn)
+        return self._config_from_connection(conn)
 
-        return load_config(
-            api_key=self._string_or_none(self._extra_value(extras_dict, "api_key"))
-            or self._string_or_none(getattr(conn, "login", None)),
-            security_key=self._string_or_none(self._extra_value(extras_dict, "security_key"))
-            or self._string_or_none(getattr(conn, "password", None)),
-            base_url=self._resolve_connection_base_url(conn, extras_dict),
-            oidc_token=self._string_or_none(self._extra_value(extras_dict, "oidc_token")),
-            timeout=self._float_or_none(self._extra_value(extras_dict, "timeout")),
-            strict_mode=self._bool_or_none(self._extra_value(extras_dict, "strict_mode")),
-            simulation_mode=self._bool_or_none(self._extra_value(extras_dict, "simulation_mode")),
-        )
+    def get_base_url(self) -> str:
+        """Return redacted iMednet API base URL for lineage/inspection without requiring secrets."""
+        import os
+
+        from imednet.spi.sinks import redact_uri
+
+        default_url = "https://edc.prod.imednetapi.com"
+        try:
+            conn = self._get_airflow_connection(self.imednet_conn_id)
+            extras_dict = self._connection_extras(conn)
+            raw_url = self._resolve_connection_base_url(conn, extras_dict)
+        except Exception:
+            raw_url = None
+
+        env_url = self._string_or_none(os.environ.get("IMEDNET_BASE_URL"))
+        resolved = raw_url or (sanitize_base_url(env_url) if env_url else None) or default_url
+        return redact_uri(redact_sensitive_text(resolved)).rstrip("/")
 
     @classmethod
     def _to_primitive(cls, value: Any) -> PrimitiveContainer:
@@ -475,6 +535,27 @@ class ImednetHook(BaseHook):
         config = self._resolved_config()
         return ImednetSDK(config=config)
 
+    async def get_async_conn(self) -> AsyncImednetSDK:
+        """Return an authenticated :class:`AsyncImednetSDK` for async triggers and tasks."""
+        conn = await self._aget_airflow_connection(self.imednet_conn_id)
+        config = self._config_from_connection(conn)
+        return AsyncImednetSDK(config=config)
+
+    async def redact_error_message(self, raw_message: str) -> str:
+        """Redact sensitive patterns, URI credentials, and resolved connection secrets."""
+        import contextlib
+
+        from imednet.spi.sinks import redact_uri
+
+        message = str(redact_sensitive_payload(redact_uri(redact_sensitive_text(raw_message))))
+        with contextlib.suppress(Exception):
+            conn = await self._aget_airflow_connection(self.imednet_conn_id)
+            config = self._config_from_connection(conn)
+            for secret in (config.api_key, config.security_key, config.oidc_token):
+                if isinstance(secret, str) and secret:
+                    message = message.replace(secret, "***")
+        return message
+
     def get_sdk_client(self) -> ImednetSDK:
         """Return an SDK client for use within task execution context.
 
@@ -484,13 +565,24 @@ class ImednetHook(BaseHook):
 
     def test_connection(self) -> tuple[bool, str]:
         """Validate connectivity and credentials against the configured iMednet Study endpoint."""
+        config: Config | None = None
         try:
+            try:
+                config = self._resolved_config()
+            except Exception:
+                config = None
             with closing(self.get_sdk_client()) as sdk:
                 next(iter(sdk.studies.list()), None)
+            return True, "Connection successfully tested"
         except Exception as exc:
-            redacted = redact_sensitive_text(str(redact_sensitive_payload(str(exc))))
-            return False, redacted or "Connection test failed."
-        return True, "Connection successfully tested."
+            from imednet.spi.sinks import redact_uri
+
+            message = str(redact_sensitive_payload(redact_uri(redact_sensitive_text(str(exc)))))
+            if config is not None:
+                for secret in (config.api_key, config.security_key, config.oidc_token):
+                    if isinstance(secret, str) and secret:
+                        message = message.replace(secret, "***")
+            return False, message or exc.__class__.__name__
 
     def describe_connection(self) -> dict[str, PrimitiveContainer]:
         """Return redacted primitive metadata about resolved hook configuration."""

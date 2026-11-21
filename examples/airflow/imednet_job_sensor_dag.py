@@ -1,7 +1,11 @@
 """Example DAG demonstrating :class:`ImednetJobSensor` to monitor an iMednet job.
 
-This sensor periodically polls iMednet until the specified job reaches a
-terminal state. Configuration is similar to ``ImednetExportOperator``:
+This sensor polls iMednet until the specified job reaches a terminal state.
+When ``deferrable=True``, the task yields its worker slot to the Airflow
+triggerer (:class:`ImednetJobTrigger`) and polls asynchronously via
+:class:`~imednet.utils.job_poller.AsyncJobPoller`.
+
+Configuration is similar to ``ImednetExportOperator``:
 - Credentials are read from the Airflow connection ``imednet_default`` (or a
   custom ``imednet_conn_id``) using the login/password or ``extra`` fields.
   Environment variables ``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY`` may be
@@ -31,4 +35,5 @@ with DAG(
         study_key="STUDY_KEY",
         batch_id="BATCH_ID",
         poke_interval=60,
+        deferrable=True,
     )

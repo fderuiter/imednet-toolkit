@@ -570,11 +570,15 @@ def test_real_airflow_providers_manager_validates_schema_and_masks_ui_secrets(
         pm = ProvidersManager()
         pm._cleanup()
         widgets = pm.connection_form_widgets
-        assert widgets["extra__imednet__api_key"].is_sensitive is True
-        assert widgets["extra__imednet__security_key"].is_sensitive is True
         assert widgets["extra__imednet__oidc_token"].is_sensitive is True
         assert widgets["extra__imednet__base_url"].is_sensitive is False
-        assert "imednet" in pm.field_behaviours
+        assert widgets["extra__imednet__timeout"].is_sensitive is False
+        assert pm.field_behaviours["imednet"]["hidden_fields"] == [
+            "host",
+            "schema",
+            "port",
+            "extra",
+        ]
         provider_warnings = [
             w for w in caught if "imednet" in str(w.message).lower() or "imednet" in str(w.filename)
         ]

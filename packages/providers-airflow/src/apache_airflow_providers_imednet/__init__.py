@@ -102,95 +102,10 @@ def _ensure_airflow_provider_finder() -> None:
     _sync_airflow_provider_aliases()
 
 
-def get_provider_info() -> dict[str, Any]:
-    """Return Apache Airflow provider metadata for discovery."""
-    _ensure_airflow_provider_finder()
-    hook_name = "iMednet"
-    conn_type = "imednet"
-    ui_field_behaviour: dict[str, Any] = {
-        "hidden_fields": ["schema", "extra"],
-        "relabeling": {
-            "host": "Base URL",
-            "login": "API Key",
-            "password": "Security Key",  # pragma: allowlist secret
-        },
-        "placeholders": {
-            "host": "https://edc.prod.imednetapi.com",
-            "login": "iMednet API key",
-            "password": "iMednet security key",  # pragma: allowlist secret
-        },
-    }
-    hook_cls = globals().get("ImednetHook")
-    if hook_cls is not None and hasattr(hook_cls, "get_ui_field_behaviour"):
-        ui_field_behaviour = hook_cls.get_ui_field_behaviour()
-
-    return {
-        "package-name": "apache-airflow-providers-imednet",
-        "name": hook_name,
-        "description": "Apache Airflow provider for iMednet EDC clinical data workflows.",
-        "integrations": [
-            {
-                "integration-name": hook_name,
-                "external-doc-url": "https://fderuiter.github.io/imednet-toolkit/",
-                "tags": ["clinical", "edc", "imednet"],
-            }
-        ],
-        "hooks": [
-            {
-                "integration-name": hook_name,
-                "python-modules": [
-                    "airflow.providers.imednet.hooks",
-                ],
-            }
-        ],
-        "operators": [
-            {
-                "integration-name": hook_name,
-                "python-modules": [
-                    "apache_airflow_providers_imednet.operators.export",
-                ],
-            }
-        ],
-        "sensors": [
-            {
-                "integration-name": hook_name,
-                "python-modules": [
-                    "apache_airflow_providers_imednet.sensors",
-                ],
-            }
-        ],
-        "connection-types": [
-            {
-                "connection-type": conn_type,
-                "hook-class-name": "airflow.providers.imednet.hooks.ImednetHook",
-                "hook-name": hook_name,
-                "ui-field-behaviour": ui_field_behaviour,
-                "conn-fields": {
-                    "api_key": {
-                        "label": "API Key (Extra Override)",
-                        "schema": {"type": ["string", "null"], "format": "password"},
-                    },
-                    "security_key": {
-                        "label": "Security Key (Extra Override)",
-                        "schema": {"type": ["string", "null"], "format": "password"},
-                    },
-                    "oidc_token": {
-                        "label": "OIDC Token",
-                        "schema": {"type": ["string", "null"], "format": "password"},
-                    },
-                    "base_url": {
-                        "label": "Base URL Override",
-                        "schema": {"type": ["string", "null"]},
-                    },
-                },
-            }
-        ],
-    }
-
-
 _ensure_airflow_provider_finder()
 
 from . import export
+from .get_provider_info import get_provider_info
 
 try:  # pragma: no cover - optional Airflow dependencies may be missing
     from .hooks import ImednetHook
@@ -209,12 +124,20 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover - sensor requires
     ImednetJobSensor = None
     sensors = None  # type: ignore
 
+try:  # pragma: no cover - optional Airflow dependencies may be missing
+    triggers = import_module("apache_airflow_providers_imednet.triggers")
+    ImednetJobTrigger = triggers.ImednetJobTrigger
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - trigger requires Airflow extras
+    ImednetJobTrigger = None
+    triggers = None  # type: ignore
+
 _sync_airflow_provider_aliases()
 
 __all__ = [
     "ImednetExportOperator",
     "ImednetHook",
     "ImednetJobSensor",
+    "ImednetJobTrigger",
     "export",
     "get_provider_info",
 ]
