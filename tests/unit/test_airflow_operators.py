@@ -10,6 +10,10 @@ import pytest
 
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+
     airflow = ModuleType("airflow")
     airflow.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")
@@ -54,6 +58,8 @@ def _setup_airflow(monkeypatch):
         def __init__(self, *a, **kw):
             """Initialize the test object."""
 
+    ops_sdk = ModuleType("airflow.sdk.bases.operator")
+    ops_sdk.BaseOperator = DummyBaseOperator
     hooks_base.BaseHook = DummyBaseHook
     models_mod.BaseOperator = DummyBaseOperator
     models_mod.DAG = DummyBaseOperator
@@ -70,6 +76,7 @@ def _setup_airflow(monkeypatch):
     s3_mod.S3Hook = MagicMock
 
     sdk_bases.hook = hooks_base
+    sdk_bases.operator = ops_sdk
     sdk_bases.sensor = sensors_sdk
     sdk_mod.bases = sdk_bases
     sdk_mod.exceptions = sdk_exc
@@ -98,6 +105,7 @@ def _setup_airflow(monkeypatch):
         "airflow.sdk": sdk_mod,
         "airflow.sdk.bases": sdk_bases,
         "airflow.sdk.bases.hook": hooks_base,
+        "airflow.sdk.bases.operator": ops_sdk,
         "airflow.sdk.bases.sensor": sensors_sdk,
         "airflow.sdk.definitions": sdk_defs,
         "airflow.sdk.definitions.context": sdk_ctx,

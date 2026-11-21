@@ -13,6 +13,10 @@ import pytest
 # Setup dummy airflow modules to prevent import errors if airflow is not installed
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+
     airflow_mod = ModuleType("airflow")
     airflow_mod.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")
@@ -45,12 +49,18 @@ def _setup_airflow(monkeypatch):
             """Initialize the test object."""
 
     hooks_mod.BaseHook = DummyBaseHook
+    ops_mod = ModuleType("airflow.sdk.bases.operator")
+    ops_mod.BaseOperator = DummyBaseOperator
+    sensors_mod = ModuleType("airflow.sdk.bases.sensor")
+    sensors_mod.BaseSensorOperator = DummyBaseOperator
     models_mod.BaseOperator = DummyBaseOperator
     models_mod.DAG = DummyBaseOperator
     sdk_dag.DAG = DummyBaseOperator
     sdk_dag.dag = DummyBaseOperator
 
     sdk_bases.hook = hooks_mod
+    sdk_bases.operator = ops_mod
+    sdk_bases.sensor = sensors_mod
     sdk_mod.bases = sdk_bases
     sdk_defs.context = sdk_ctx
     sdk_defs.dag = sdk_dag
@@ -64,6 +74,8 @@ def _setup_airflow(monkeypatch):
     monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", ops_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.sensor", sensors_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
