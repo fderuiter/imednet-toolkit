@@ -477,22 +477,27 @@ def test_export_to_hive_parquet_deduplicates_case_insensitive_variables_and_mask
 
 def test_parquet_and_cli_import_without_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
     """Minimal installs without pandas must still import imednet.integrations.parquet and CLI."""
-    import importlib
+    import subprocess
     import sys
 
-    for mod_name in (
-        "imednet.cli",
-        "imednet.integrations",
-        "imednet.integrations.parquet",
-    ):
-        monkeypatch.delitem(sys.modules, mod_name, raising=False)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; sys.modules['pandas'] = None; "
+                "import imednet.integrations.parquet as parquet_mod; "
+                "import imednet.cli as cli_mod; "
+                "assert callable(parquet_mod.hive_parquet_query); "
+                "assert cli_mod.app is not None"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
     monkeypatch.setitem(sys.modules, "pandas", None)
-
-    reloaded_parquet = importlib.import_module("imednet.integrations.parquet")
-    reloaded_cli = importlib.import_module("imednet.cli")
-
-    assert callable(reloaded_parquet.hive_parquet_query)
-    assert reloaded_cli.app is not None
-
     with pytest.raises(ImportError, match=r"pip install 'imednet\[export\]'"):
-        reloaded_parquet._ensure_pandas()
+        parquet_mod._ensure_pandas()
