@@ -556,3 +556,63 @@ def test_all_five_packages_ship_pep561_py_typed_and_typed_classifier() -> None:
         pyproject_data = tomllib.loads((pkg_root / "pyproject.toml").read_text(encoding="utf-8"))
         classifiers = pyproject_data["project"].get("classifiers", [])
         assert "Typing :: Typed" in classifiers, f"Missing Typing :: Typed in {dist_dir}"
+
+
+def test_sink_config_factories_expose_max_buffered_records() -> None:
+    sync_sdk = ImednetSDK(simulation_mode=True)
+    try:
+        mongo_cfg = sync_sdk.sinks.MongoDbSinkConfig(
+            "STUDY_1",
+            uri="mongodb://localhost:27017",
+            database="imednet",
+            collection="records",
+            max_buffered_records=2500,
+        )
+        neo4j_cfg = sync_sdk.sinks.Neo4jSinkConfig(
+            "STUDY_1",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "secret"),  # pragma: allowlist secret
+            max_buffered_records=2500,
+        )
+        sf_cfg = sync_sdk.sinks.SnowflakeSinkConfig(
+            "STUDY_1",
+            max_buffered_records=2500,
+        )
+        assert mongo_cfg.max_buffered_records == 2500
+        assert neo4j_cfg.max_buffered_records == 2500
+        assert sf_cfg.max_buffered_records == 2500
+    finally:
+        sync_sdk.close()
+
+
+def test_airflow_provider_aliases_stay_synchronized_across_reloads() -> None:
+    pytest.importorskip("airflow")
+    import importlib
+    import sys
+
+    from airflow.providers.imednet.hooks import ImednetHook as InitialAliasHook
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook as InitialDirectHook
+
+    assert InitialAliasHook is InitialDirectHook
+
+    import apache_airflow_providers_imednet.hooks as hooks_mod
+
+    reloaded_hooks = importlib.reload(hooks_mod)
+    from airflow.providers.imednet.hooks import ImednetHook as ReloadedAliasHook
+
+    assert ReloadedAliasHook is reloaded_hooks.ImednetHook
+
+    for mod_name in [
+        m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")
+    ]:
+        sys.modules.pop(mod_name, None)
+
+    import apache_airflow_providers_imednet as provider_pkg
+
+    provider_pkg.get_provider_info()
+    from airflow.providers.imednet.hooks import ImednetHook as ReimportedAliasHook
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook as ReimportedDirectHook
+
+    assert ReimportedAliasHook is ReimportedDirectHook

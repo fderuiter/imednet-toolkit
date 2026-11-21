@@ -1144,6 +1144,7 @@ class MongoDbSinkConfigProtocol(Protocol):
     database: str
     collection: str
     batch_size: int
+    max_buffered_records: int | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1175,6 +1176,7 @@ class MongoDbSinkConfigFactoryProtocol(Protocol):
         stream_name: str | None = None,
         ledger_path: str | Path | None = None,
         state_provider: Any | None = None,
+        max_buffered_records: int | None = None,
         uri: str = "",
         database: str = "",
         collection: str = "",
@@ -1238,6 +1240,7 @@ class Neo4jSinkConfigProtocol(Protocol):
     auth: tuple[str, str]
     database: str
     batch_size: int
+    max_buffered_records: int | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1269,6 +1272,7 @@ class Neo4jSinkConfigFactoryProtocol(Protocol):
         stream_name: str | None = None,
         ledger_path: str | Path | None = None,
         state_provider: Any | None = None,
+        max_buffered_records: int | None = None,
         uri: str = "",
         auth: tuple[str, str] = ("", ""),
         database: str = "neo4j",
@@ -1335,6 +1339,7 @@ class SnowflakeSinkConfigProtocol(Protocol):
     table: str
     stage_prefix: str
     batch_size: int
+    max_buffered_records: int | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1366,6 +1371,7 @@ class SnowflakeSinkConfigFactoryProtocol(Protocol):
         stream_name: str | None = None,
         ledger_path: str | Path | None = None,
         state_provider: Any | None = None,
+        max_buffered_records: int | None = None,
         account: str = "",
         user: str = "",
         password: str = "",

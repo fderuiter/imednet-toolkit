@@ -410,4 +410,21 @@ def plugin_implementation_contracts(
     sinks_ns: SinksNamespaceProtocol = SinksNamespace(sync_sdk)
     sinks_factory: SinksPluginProtocol = create_sinks
     workflows_factory: PluginProtocol = Workflows
+    mongo_cfg = sinks_ns.MongoDbSinkConfig(
+        'S',
+        uri='mongodb://localhost:27017',
+        database='db',
+        collection='col',
+        max_buffered_records=1000,
+    )
+    neo4j_cfg = sinks_ns.Neo4jSinkConfig(
+        'S',
+        uri='bolt://localhost:7687',
+        auth=('neo4j', 'pw'),
+        max_buffered_records=1000,
+    )
+    sf_cfg = sinks_ns.SnowflakeSinkConfig('S', max_buffered_records=1000)
+    assert_type(mongo_cfg.max_buffered_records, int | None)
+    assert_type(neo4j_cfg.max_buffered_records, int | None)
+    assert_type(sf_cfg.max_buffered_records, int | None)
     assert workflows_ns and sinks_ns and sinks_factory and workflows_factory
