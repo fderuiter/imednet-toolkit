@@ -289,3 +289,33 @@ def test_provider_info_and_hook_metadata_contract():
     assert any(req.startswith("imednet-workflows") for req in requires)
     extras = set(dist.metadata.get_all("Provides-Extra") or [])
     assert {"duckdb", "export", "mongodb", "neo4j", "snowflake"}.issubset(extras)
+
+
+def test_provider_alias_resyncs_on_package_reimport(monkeypatch):
+    """Cached airflow.providers.imednet aliases stay identical across target re-imports."""
+    _setup_airflow(monkeypatch)
+    providers_pkg = importlib.import_module("airflow.providers")
+    initial_pkg = importlib.import_module("apache_airflow_providers_imednet")
+    initial_alias_hooks = importlib.import_module("airflow.providers.imednet.hooks")
+
+    providers_pkg.imednet = initial_pkg  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        sys.modules,
+        "airflow.providers.imednet.stale_submod",
+        ModuleType("airflow.providers.imednet.stale_submod"),
+    )
+
+    for mod_name in [
+        name for name in list(sys.modules) if name.startswith("apache_airflow_providers_imednet")
+    ]:
+        monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
+    reloaded_pkg = importlib.import_module("apache_airflow_providers_imednet")
+    reloaded_alias_hooks = importlib.import_module("airflow.providers.imednet.hooks")
+    reloaded_target_hooks = importlib.import_module("apache_airflow_providers_imednet.hooks")
+
+    assert reloaded_pkg is not initial_pkg
+    assert reloaded_alias_hooks is not initial_alias_hooks
+    assert reloaded_alias_hooks.ImednetHook is reloaded_target_hooks.ImednetHook
+    assert providers_pkg.imednet is reloaded_pkg
+    assert "airflow.providers.imednet.stale_submod" not in sys.modules
