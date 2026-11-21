@@ -20,6 +20,15 @@ from imednet.models.jobs import JobState, JobStatus
 from imednet.utils.job_poller import JobStatusEvent
 
 
+@pytest.fixture(autouse=True)
+def _isolate_terminal_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure mock-TTY output tests do not inherit TERM=dumb or NO_COLOR from CI runners."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
+
+
 def test_fetching_status_records() -> None:
     """fetching_status shows status spinner with message."""
     with patch("imednet.cli.utils.context.console") as mock_console:

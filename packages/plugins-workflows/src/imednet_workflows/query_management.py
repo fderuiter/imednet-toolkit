@@ -20,7 +20,7 @@ from imednet.spi.utils import normalize_iso_date, parse_iso_datetime
 from .triage_store import TriageStore
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import ImednetFacade, TriageStoreProtocol
 
 
 class QueryStateCounts(dict[str, int]):
@@ -222,9 +222,11 @@ class QueryManagementWorkflow:
         return state_counts
 
     @staticmethod
-    def _resolve_triage_store(store: TriageStore | str | Path | None) -> TriageStore:
+    def _resolve_triage_store(
+        store: TriageStoreProtocol | str | Path | None,
+    ) -> TriageStoreProtocol:
         """Resolve a TriageStore instance from argument or imednet.stores entry point."""
-        if isinstance(store, TriageStore):
+        if store is not None and not isinstance(store, (str, Path)):
             return store
         eps = list(entry_points(group="imednet.stores", name="TriageStore"))
         store_cls: Any = eps[0].load() if eps else TriageStore
@@ -369,7 +371,7 @@ class QueryManagementWorkflow:
     def sync_queries_to_triage(
         self,
         study_key: str,
-        store: TriageStore | str | Path | None = None,
+        store: TriageStoreProtocol | str | Path | None = None,
         *,
         additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
         unresolved_only: bool = False,

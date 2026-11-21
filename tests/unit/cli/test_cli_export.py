@@ -207,7 +207,6 @@ def test_cli_export_mongodb_happy_path(
 
     assert result.exit_code == 0
     sdk.sinks.export_to_mongodb.assert_called_once_with(
-        sdk,
         "STUDY",
         config=MongoDbSinkConfig(
             study_key="STUDY",
@@ -269,7 +268,6 @@ def test_cli_export_neo4j_happy_path(
 
     assert result.exit_code == 0
     sdk.sinks.export_to_neo4j.assert_called_once_with(
-        sdk,
         "STUDY",
         config=Neo4jSinkConfig(
             study_key="STUDY",
@@ -336,7 +334,6 @@ def test_cli_export_snowflake_happy_path(
 
     assert result.exit_code == 0
     sdk.sinks.export_to_snowflake.assert_called_once_with(
-        sdk,
         "STUDY",
         config=SnowflakeSinkConfig(
             study_key="STUDY",
@@ -553,7 +550,6 @@ def test_cli_export_no_mask_phi_and_quality_gate_passthrough(
     )
     assert res_neo.exit_code == 0
     sdk.sinks.export_to_neo4j.assert_called_once_with(
-        sdk,
         "STUDY",
         config=Neo4jSinkConfig(
             study_key="STUDY",

@@ -127,6 +127,8 @@ def test_plan_ci_impact_maps_top_level_tests_without_building_wheels():
         [
             "tests/unit/cli/test_cli_forms.py",
             "tests/unit/test_batch_validation_and_polling.py",
+            "tests/unit/test_keyed_upserts_and_watermark_recovery.py",
+            "tests/unit/test_mode_safe_plugin_protocols.py",
             "tests/unit/test_tabular_import.py",
         ],
         packages,

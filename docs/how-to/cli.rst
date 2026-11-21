@@ -2,8 +2,13 @@ Command Line Interface (CLI)
 ============================
 
 The package installs an ``imednet`` command that wraps common SDK features. The CLI
-reads authentication details from environment variables. See :doc:`/reference/configuration`
-for the full list and details on using an ``.env`` file.
+reads authentication details from environment variables (or runs completely offline
+against synthetic ``SimulationTransport`` fixtures when ``--simulation`` or
+``IMEDNET_SIMULATION_MODE=true`` is passed). Every Study-scoped command across core,
+``datadict from-api``, ``export``, ``workflows``, and ``tui`` accepts either a
+positional ``STUDY`` argument or ``-s`` / ``--study-key STUDY`` (passing conflicting
+values exits with status code ``2``). See :doc:`/reference/configuration` for the full
+list of environment variables and details on using an ``.env`` file.
 
 .. argparse::
    :module: imednet.cli
@@ -21,6 +26,7 @@ dashboard for browsing studies, sites, subjects, and background jobs:
    pip install "imednet[tui]"
    imednet tui
    imednet tui --study DEMO-STUDY --batch BATCH-001 --batch BATCH-002
+   imednet tui DEMO-STUDY --simulation
    imednet tui --high-contrast
    IMEDNET_HIGH_CONTRAST=1 imednet --high-contrast tui
 
@@ -76,20 +82,24 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
 
 .. code-block:: bash
 
-   imednet studies list --format json
+   imednet studies list --simulation --format json
    imednet subjects list STUDY --filter subject_status=Screened --format json
+   imednet subjects list --study-key STUDY --format json
    imednet users list STUDY --include-inactive --format json
    imednet codings list STUDY -f dictionaryName=MedDRA --format json
    imednet records list STUDY --format json
    imednet jobs status STUDY BATCH --format json
    imednet jobs wait STUDY BATCH --timeout 60 --format json
    imednet workflows extract-records STUDY --format json
+   imednet workflows state show --study-key STUDY --format json
    imednet subject-data STUDY SUBJ-001 --format json
    IMEDNET_CLI_OUTPUT_FORMAT=json imednet studies list
 
 Supported core list resources are studies, queries, variables, record-revisions,
 sites, forms, records, subjects, intervals, visits, codings, and users, alongside
-``workflows extract-records`` and ``subject-data``. JSON reads emit one envelope
+``workflows extract-records``, ``workflows state show`` (resource ``ledger_state``),
+and ``subject-data`` (plus write batch summaries for ``records create``, ``records import``,
+and ``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
 and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it). Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
@@ -98,8 +108,9 @@ Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
 Usage failures exit 2, SDK-command interruption exits 130, and success/help exits 0.
 
-``records list --output json`` still writes ``records.json``; it is distinct from
-``--format json`` (or ``IMEDNET_CLI_OUTPUT_FORMAT=json``) stdout and combining them is an error. Existing ``export``
+Legacy ``records list -o/--output json|csv`` still writes ``records.json`` or ``records.csv``
+and emits a ``stderr`` deprecation warning (prefer ``--format json`` for stdout or
+``imednet export`` for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
 commands (which also accept ``--no-interactive`` to suppress live spinners) and ``datadict`` JSON/schema/diff outputs
 (see :doc:`/how-to/data_dictionary`) retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
@@ -120,6 +131,7 @@ files, export the JSON Schema, and compute structural revision diffs (see
    imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
    imednet datadict from-redcap ./redcap_dictionary.csv --study-key STUDY -o study_dd.json
    imednet datadict from-api --study-key STUDY -o api_dd.json --no-raw-xml
+   imednet datadict from-api STUDY --simulation -o sim_dd.json
    imednet datadict schema -o data-dictionary.schema.json
    imednet datadict validate study_dd.json --schema data-dictionary.schema.json
    imednet datadict diff baseline_dd.json study_dd.json --format md

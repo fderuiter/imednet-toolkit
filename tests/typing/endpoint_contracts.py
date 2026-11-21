@@ -1,14 +1,22 @@
 from collections.abc import AsyncIterator, Iterator
+from contextlib import AbstractContextManager
 from typing import Literal, assert_type
+
+import pandas as pd
 
 from imednet import (
     ApiError,
     AsyncImednetSDK,
+    AsyncSinksNamespaceProtocol,
+    AsyncWorkflowsNamespaceProtocol,
     ImednetError,
     ImednetSDK,
     NotFoundError,
     SimulationTransport,
+    SinksNamespaceProtocol,
+    SyncWorkflowsNamespaceProtocol,
 )
+from imednet.auth.strategy import AuthStrategy
 from imednet.core.endpoint import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.dispatch import AsyncEndpointContext, SyncEndpointContext
 from imednet.endpoints.studies import AsyncStudiesEndpoint, StudiesEndpoint, StudiesOperationDef
@@ -22,12 +30,32 @@ from imednet.models.records import Record
 from imednet.models.sites import Site
 from imednet.models.studies import Study
 from imednet.models.subjects import Subject, SubjectKeyword
+from imednet.models.triage import TriageItem
 from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
+from imednet.plugins import (
+    AsyncRecordUpdateWorkflowProtocol,
+    AsyncRegisterSubjectsWorkflowProtocol,
+    AsyncStudySchemaInspectorProtocol,
+    MongoDbSinkConfigProtocol,
+    Neo4jSinkConfigProtocol,
+    PluginProtocol,
+    SinksPluginProtocol,
+    SnowflakeSinkConfigProtocol,
+    StudySnapshotProtocol,
+    SubjectComprehensiveDataProtocol,
+    SyncRecordUpdateWorkflowProtocol,
+    SyncRegisterSubjectsWorkflowProtocol,
+    SyncStudySchemaInspectorProtocol,
+    UATRunResultProtocol,
+)
 from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+from imednet.spi.sinks import ExportSink
 from imednet.utils.batch_coordinator import BatchSubmissionSummary
 from imednet.utils.job_poller import JobPollSummary
+from imednet_sinks.plugin import SinksNamespace, create_sinks
+from imednet_workflows import Workflows
 
 
 def sync_contract(sdk: ImednetSDK) -> None:
@@ -127,6 +155,82 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(ImednetSDK(transport=SimulationTransport()), ImednetSDK)
     assert_type(AsyncImednetSDK(transport=SimulationTransport()), AsyncImednetSDK)
 
+    # Narrowed auth, study_context Self preservation, and sync plugin protocols
+    assert_type(sdk.auth, AuthStrategy | None)
+    assert_type(facade.auth, AuthStrategy | None)
+    _sync_cm: AbstractContextManager[ImednetSDK] = sdk.study_context('S')
+    assert _sync_cm
+    with sdk.study_context('S') as scoped_sdk:
+        assert_type(scoped_sdk, ImednetSDK)
+
+    assert_type(sdk.workflows, SyncWorkflowsNamespaceProtocol)
+    assert_type(sdk.workflows.data_extraction.extract_records_by_criteria('S'), list[Record])
+    assert_type(sdk.workflows.duckdb_centralizer.ingest_revisions('S'), int)
+    assert_type(sdk.workflows.query_management.get_open_queries('S'), list[Query])
+    assert_type(sdk.workflows.query_management.sync_queries_to_triage('S'), list[TriageItem])
+    assert_type(sdk.workflows.record_mapper.dataframe('S'), pd.DataFrame)
+    assert_type(sdk.workflows.record_update, SyncRecordUpdateWorkflowProtocol)
+    assert_type(sdk.workflows.record_update.create_or_update_records('S', []), Job)
+    assert_type(
+        sdk.workflows.record_update.create_or_update_records_batch('S', []),
+        BatchSubmissionSummary,
+    )
+    assert_type(sdk.workflows.record_update.register_subject('S', 'F_DM', 'SITE', {}), Job)
+    assert_type(
+        sdk.workflows.record_update.update_scheduled_record('S', 'F_VS', 'SUBJ', 'V1', {}),
+        Job,
+    )
+    assert_type(sdk.workflows.record_update.create_new_record('S', 'F_VS', 'SUBJ', {}), Job)
+    assert_type(sdk.workflows.register_subjects, SyncRegisterSubjectsWorkflowProtocol)
+    assert_type(sdk.workflows.register_subjects.register_subjects('S', []), Job)
+    assert_type(
+        sdk.workflows.register_subjects.register_subjects_batch('S', []),
+        BatchSubmissionSummary,
+    )
+    assert_type(
+        sdk.workflows.subject_data.get_all_subject_data('S', 'SUBJ'),
+        SubjectComprehensiveDataProtocol,
+    )
+    assert_type(sdk.workflows.uat_inspector, SyncStudySchemaInspectorProtocol)
+    assert_type(sdk.workflows.uat_inspector.inspect('S'), StudySnapshotProtocol)
+    assert_type(sdk.workflows.uat.run('S'), UATRunResultProtocol)
+
+    assert_type(sdk.sinks, SinksNamespaceProtocol | None)
+    if sdk.sinks is not None:
+        mongo_cfg = sdk.sinks.MongoDbSinkConfig(
+            study_key='S',
+            uri='mongodb://localhost:27017',
+            database='db',
+            collection='records',
+        )
+        assert_type(mongo_cfg, MongoDbSinkConfigProtocol)
+        assert_type(sdk.sinks.MongoDbExportSink(mongo_cfg), ExportSink)
+        assert_type(sdk.sinks.export_to_mongodb('S', config=mongo_cfg), int)
+
+        neo_cfg = sdk.sinks.Neo4jSinkConfig(
+            study_key='S',
+            uri='bolt://localhost:7687',
+            auth=('neo4j', 'pass'),
+        )
+        assert_type(neo_cfg, Neo4jSinkConfigProtocol)
+        assert_type(sdk.sinks.Neo4jExportSink(neo_cfg), ExportSink)
+        assert_type(sdk.sinks.export_to_neo4j('S', config=neo_cfg), int)
+
+        sf_cfg = sdk.sinks.SnowflakeSinkConfig(
+            study_key='S',
+            account='acct',
+            user='u',
+            password='p',
+            database='DB',
+            schema='PUBLIC',
+            warehouse='WH',
+            stage='STG',
+            table='TBL',
+        )
+        assert_type(sf_cfg, SnowflakeSinkConfigProtocol)
+        assert_type(sdk.sinks.SnowflakeExportSink(sf_cfg), ExportSink)
+        assert_type(sdk.sinks.export_to_snowflake('S', config=sf_cfg), int)
+
 
 async def async_contract(sdk: AsyncImednetSDK) -> None:
     facade: AsyncImednetFacade = sdk
@@ -191,6 +295,59 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.async_poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
     assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2']), JobPollSummary)
 
+    # Narrowed auth, study_context Self preservation, and async plugin protocols
+    assert_type(sdk.auth, AuthStrategy | None)
+    assert_type(facade.auth, AuthStrategy | None)
+    _async_cm: AbstractContextManager[AsyncImednetSDK] = sdk.study_context('S')
+    assert _async_cm
+    with sdk.study_context('S') as scoped_async_sdk:
+        assert_type(scoped_async_sdk, AsyncImednetSDK)
+
+    assert_type(sdk.workflows, AsyncWorkflowsNamespaceProtocol)
+    assert_type(sdk.workflows.record_update, AsyncRecordUpdateWorkflowProtocol)
+    assert_type(
+        await sdk.workflows.record_update.async_create_or_update_records('S', []),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_create_or_update_records_batch('S', []),
+        BatchSubmissionSummary,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_register_subject('S', 'F_DM', 'SITE', {}),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_update_scheduled_record(
+            'S', 'F_VS', 'SUBJ', 'V1', {}
+        ),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_create_new_record('S', 'F_VS', 'SUBJ', {}),
+        Job,
+    )
+    assert_type(sdk.workflows.register_subjects, AsyncRegisterSubjectsWorkflowProtocol)
+    assert_type(await sdk.workflows.register_subjects.async_register_subjects('S', []), Job)
+    assert_type(
+        await sdk.workflows.register_subjects.async_register_subjects_batch('S', []),
+        BatchSubmissionSummary,
+    )
+    assert_type(sdk.workflows.uat_inspector, AsyncStudySchemaInspectorProtocol)
+    assert_type(await sdk.workflows.uat_inspector.async_inspect('S'), StudySnapshotProtocol)
+
+    assert_type(sdk.sinks, AsyncSinksNamespaceProtocol | None)
+    if sdk.sinks is not None:
+        assert_type(
+            sdk.sinks.MongoDbSinkConfig(
+                study_key='S',
+                uri='mongodb://localhost:27017',
+                database='db',
+                collection='records',
+            ),
+            MongoDbSinkConfigProtocol,
+        )
+
 
 def sync_endpoint_contract(ep: StudiesEndpoint) -> None:
     assert_type(ep.get('S'), Study)
@@ -230,3 +387,44 @@ async def async_stub_contract(ep: _AsyncStub) -> None:
     assert_type((await ep.get('S')).study_key, str | None)
     assert_type(await ep.get(item_id='S'), Study)
     assert_type(await ep.get(None, 'S'), Study)
+
+
+class _CustomSyncSDK(ImednetSDK):
+    pass
+
+
+class _CustomAsyncSDK(AsyncImednetSDK):
+    pass
+
+
+def plugin_implementation_contracts(
+    sync_sdk: _CustomSyncSDK,
+    async_sdk: _CustomAsyncSDK,
+) -> None:
+    with sync_sdk.study_context('S') as scoped_sync:
+        assert_type(scoped_sync, _CustomSyncSDK)
+    with async_sdk.study_context('S') as scoped_async:
+        assert_type(scoped_async, _CustomAsyncSDK)
+
+    workflows_ns: SyncWorkflowsNamespaceProtocol = Workflows(sync_sdk)
+    sinks_ns: SinksNamespaceProtocol = SinksNamespace(sync_sdk)
+    sinks_factory: SinksPluginProtocol = create_sinks
+    workflows_factory: PluginProtocol = Workflows
+    mongo_cfg = sinks_ns.MongoDbSinkConfig(
+        'S',
+        uri='mongodb://localhost:27017',
+        database='db',
+        collection='col',
+        max_buffered_records=1000,
+    )
+    neo4j_cfg = sinks_ns.Neo4jSinkConfig(
+        'S',
+        uri='bolt://localhost:7687',
+        auth=('neo4j', 'pw'),
+        max_buffered_records=1000,
+    )
+    sf_cfg = sinks_ns.SnowflakeSinkConfig('S', max_buffered_records=1000)
+    assert_type(mongo_cfg.max_buffered_records, int | None)
+    assert_type(neo4j_cfg.max_buffered_records, int | None)
+    assert_type(sf_cfg.max_buffered_records, int | None)
+    assert workflows_ns and sinks_ns and sinks_factory and workflows_factory
