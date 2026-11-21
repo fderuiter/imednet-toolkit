@@ -1,801 +1,919 @@
-"""End-to-end tests for keyed file/DB upserts and transactional watermark recovery."""
+"""End-to-end simulation and regression tests for keyed file/SQL upserts and watermark recovery.
+
+Covers:
+- Keyed incremental (`incremental=True`) and `modified_since=...` upserts + hard-delete
+  reconciliation across all 6 streaming exporters (`csv`, `parquet`, `excel`, `json`,
+  `duckdb_by_form`, `long_sql`) while preserving non-incremental `idempotent=True`
+  snapshot overwrite semantics.
+- Parquet schema widening across incremental batches without PyArrow schema errors.
+- Atomic single-file swap failure (`os.replace` raising `OSError`) leaving prior files intact.
+- Real `apply_quality_gate` watermark holdback and recovery across runs, plus CPython GC
+  `id(rec)` address-reuse immunity, custom `gate_fn` shallow copies (`model_copy()`), and
+  rejected records with `date_modified=None`.
+- Chunked SQL ID deletes (>500 IDs) and `camelCase`/`snake_case` unpacking in `_unpack_long_sql_rows`.
+- Native `os.PathLike` (`pathlib.Path`) destination paths across file and DuckDB exporters.
+"""
 
 from __future__ import annotations
 
-import copy
+import gc
 import json
-from datetime import UTC, datetime
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import duckdb
-import httpx
 import pandas as pd
-import pyarrow.parquet as pq
 import pytest
-import sqlalchemy as sa
+from sqlalchemy import create_engine, inspect, text
 
-from imednet import ImednetSDK
-from imednet.integrations import enrichment as enrichment_mod
 from imednet.integrations.export import (
-    TabularParquetSink,
     TabularSinkConfig,
+    _unpack_long_sql_rows,
     export_to_csv,
     export_to_duckdb_by_form,
     export_to_excel,
     export_to_json,
     export_to_long_sql,
     export_to_parquet,
+    export_to_sql,
 )
-from imednet.models.study_config import StudyConfiguration
-from imednet.simulation.state import SimulationState
-from imednet.simulation.transport import SimulationTransport
-from imednet_workflows.state_ledger import (
-    FileStateProvider,
-    LedgerState,
-    StreamExecutionStatus,
-    StreamState,
-    StudyState,
-)
+from imednet.integrations.sink_base import run_streaming_export
+from imednet.models.records import Record
+from imednet.models.variables import Variable
+from imednet_workflows.state_ledger import ExtractionStateLedger
 
 
-def _make_study_state() -> SimulationState:
-    """Create an isolated SimulationState with custom PHI variable and initial Study Records."""
-    state = SimulationState()
-    state.variables.extend(
+def _make_record(
+    record_id: int,
+    *,
+    date_modified: str | datetime | None,
+    data: dict[str, Any],
+    deleted: bool = False,
+    form_id: int = 10,
+    form_key: str = "DEMOG",
+) -> Record:
+    payload: dict[str, Any] = {
+        "recordId": record_id,
+        "subjectId": record_id * 10,
+        "subjectKey": f"SUBJ-{record_id:04d}",
+        "formId": form_id,
+        "formKey": form_key,
+        "deleted": deleted,
+        "recordData": data,
+    }
+    if date_modified is not None:
+        payload["dateModified"] = (
+            date_modified.isoformat() if isinstance(date_modified, datetime) else date_modified
+        )
+    return Record.model_validate(payload)
+
+
+def _make_variable(
+    name: str,
+    form_id: int = 10,
+    form_key: str = "DEMOG",
+    variable_type: str = "text",
+) -> Variable:
+    return Variable.model_validate(
+        {
+            "variableId": abs(hash((form_id, name))) % 100_000 + 1,
+            "variableName": name,
+            "label": name,
+            "variableType": variable_type,
+            "formId": form_id,
+            "formKey": form_key,
+        }
+    )
+
+
+class _SimulatedSDK:
+    """Deterministic in-memory SDK stub supporting filter-aware `records.list` and `get_variables`."""
+
+    def __init__(
+        self,
+        records: list[Record],
+        variables: list[Variable],
+        *,
+        fail_records: Exception | None = None,
+    ) -> None:
+        self._records = list(records)
+        self._variables = list(variables)
+        self._fail_records = fail_records
+        self.seen_filters: list[Any] = []
+        default_forms = [SimpleNamespace(form_id=10, form_key="DEMOG")]
+        self.records = SimpleNamespace(list=self._list_records)
+        self.variables = SimpleNamespace(list=self._list_variables)
+        self.intervals = SimpleNamespace(list=lambda *_a, **_kw: [])
+        self.forms = SimpleNamespace(list=lambda *_a, **_kw: list(default_forms))
+        self.subjects = SimpleNamespace(list=lambda *_a, **_kw: [])
+        self.visits = SimpleNamespace(list=lambda *_a, **_kw: [])
+        self.get_records = self._list_records
+        self.get_variables = self._list_variables
+        self.get_intervals = lambda *_a, **_kw: []
+        self.get_forms = lambda *_a, **_kw: list(default_forms)
+        self.get_subjects = lambda *_a, **_kw: []
+        self.get_visits = lambda *_a, **_kw: []
+
+    def set_records(self, records: list[Record]) -> None:
+        self._records = list(records)
+
+    def set_variables(self, variables: list[Variable]) -> None:
+        self._variables = list(variables)
+
+    def _list_variables(self, study_key: str | None = None, **_kwargs: Any) -> list[Variable]:
+        return list(self._variables)
+
+    def _list_records(
+        self,
+        study_key: str | None = None,
+        *,
+        record_data_filter: str | None = None,
+        **kwargs: Any,
+    ) -> list[Record]:
+        dm_cond = kwargs.get("dateModified")
+        self.seen_filters.append(dm_cond if dm_cond is not None else record_data_filter)
+        if self._fail_records is not None:
+            raise self._fail_records
+        cutoff: datetime | None = None
+        if isinstance(dm_cond, tuple) and len(dm_cond) == 2 and dm_cond[0] == ">":
+            raw_val = dm_cond[1]
+            parsed = (
+                raw_val if isinstance(raw_val, datetime) else datetime.fromisoformat(str(raw_val))
+            )
+            cutoff = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        elif record_data_filter and "dateModified>" in record_data_filter:
+            ts_raw = record_data_filter.split("dateModified>", 1)[1].strip().strip("'\"")
+            parsed = datetime.fromisoformat(ts_raw)
+            cutoff = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+        deleted_filter = kwargs.get("deleted")
+        form_id_filter = kwargs.get("formId")
+        out: list[Record] = []
+        for rec in self._records:
+            if deleted_filter is False and rec.deleted:
+                continue
+            if form_id_filter is not None and rec.form_id != form_id_filter:
+                continue
+            if cutoff is not None and rec.date_modified is not None:
+                rec_dt = (
+                    rec.date_modified
+                    if rec.date_modified.tzinfo
+                    else rec.date_modified.replace(tzinfo=timezone.utc)
+                )
+                if rec_dt <= cutoff:
+                    continue
+            out.append(rec)
+        return out
+
+
+def _df_id_col(df: pd.DataFrame) -> str:
+    return "recordId" if "recordId" in df.columns else "record_id"
+
+
+def _read_exporter_records(exporter: str, dest: Path) -> dict[int, dict[str, Any]]:
+    """Read exported destination back as `{record_id: row_dict}` and assert zero duplicate IDs."""
+    if exporter == "csv":
+        df = pd.read_csv(dest)
+        id_col = _df_id_col(df)
+        ids = [int(v) for v in df[id_col].tolist()]
+        assert len(ids) == len(set(ids)), f"Duplicate record_ids in CSV: {ids}"
+        return {int(row[id_col]): dict(row) for _, row in df.iterrows()}
+
+    if exporter == "parquet":
+        df = pd.read_parquet(dest)
+        id_col = _df_id_col(df)
+        ids = [int(v) for v in df[id_col].tolist()]
+        assert len(ids) == len(set(ids)), f"Duplicate record_ids in Parquet: {ids}"
+        return {int(row[id_col]): dict(row) for _, row in df.iterrows()}
+
+    if exporter == "excel":
+        df = pd.read_excel(dest)
+        id_col = _df_id_col(df)
+        ids = [int(v) for v in df[id_col].tolist()]
+        assert len(ids) == len(set(ids)), f"Duplicate record_ids in Excel: {ids}"
+        return {int(row[id_col]): dict(row) for _, row in df.iterrows()}
+
+    if exporter == "json":
+        rows = json.loads(dest.read_text(encoding="utf-8"))
+        ids = [int(r.get("record_id") or r.get("recordId")) for r in rows]
+        assert len(ids) == len(set(ids)), f"Duplicate record_ids in JSON: {ids}"
+        out: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            rid = int(r.get("record_id") or r.get("recordId"))
+            merged = dict(r)
+            if isinstance(r.get("record_data"), dict):
+                merged.update(r["record_data"])
+            if isinstance(r.get("recordData"), dict):
+                merged.update(r["recordData"])
+            out[rid] = merged
+        return out
+
+    if exporter == "duckdb_by_form":
+        with duckdb.connect(str(dest)) as conn:
+            df = conn.execute("SELECT * FROM DEMOG").df()
+        id_col = _df_id_col(df)
+        ids = [int(v) for v in df[id_col].tolist()]
+        assert len(ids) == len(set(ids)), f"Duplicate record_ids in DuckDB: {ids}"
+        return {int(row[id_col]): dict(row) for _, row in df.iterrows()}
+
+    if exporter == "long_sql":
+        engine = create_engine(f"sqlite:///{dest}")
+        try:
+            df = pd.read_sql_table("clinical_long", engine)
+        finally:
+            engine.dispose()
+        grouped: dict[int, dict[str, Any]] = {}
+        seen_pairs: set[tuple[int, str]] = set()
+        for _, row in df.iterrows():
+            rid = int(row["record_id"])
+            var_name = str(row["variable_name"])
+            assert (rid, var_name) not in seen_pairs, (
+                f"Duplicate (record_id, variable_name) in long_sql: {(rid, var_name)}"
+            )
+            seen_pairs.add((rid, var_name))
+            grouped.setdefault(rid, {})[var_name] = row["value"]
+        return grouped
+
+    raise ValueError(f"Unknown exporter: {exporter}")
+
+
+def _run_exporter(
+    exporter: str,
+    sdk: Any,
+    study_key: str,
+    dest: Path,
+    **kwargs: Any,
+) -> None:
+    if exporter == "csv":
+        export_to_csv(sdk, study_key, dest, batch_size=1, **kwargs)
+    elif exporter == "parquet":
+        export_to_parquet(sdk, study_key, dest, batch_size=1, **kwargs)
+    elif exporter == "excel":
+        export_to_excel(sdk, study_key, dest, batch_size=1, **kwargs)
+    elif exporter == "json":
+        export_to_json(sdk, study_key, dest, batch_size=1, **kwargs)
+    elif exporter == "duckdb_by_form":
+        export_to_duckdb_by_form(sdk, study_key, dest, batch_size=1, **kwargs)
+    elif exporter == "long_sql":
+        export_to_long_sql(
+            sdk,
+            study_key,
+            "clinical_long",
+            f"sqlite:///{dest}",
+            chunk_size=1,
+            batch_size=1,
+            **kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown exporter: {exporter}")
+
+
+@pytest.mark.parametrize(
+    ("exporter", "suffix"),
+    [
+        ("csv", ".csv"),
+        ("parquet", ".parquet"),
+        ("excel", ".xlsx"),
+        ("json", ".json"),
+        ("duckdb_by_form", ".duckdb"),
+        ("long_sql", ".sqlite"),
+    ],
+)
+@pytest.mark.parametrize("sync_mode", ["incremental", "modified_since"])
+def test_all_exporters_keyed_upserts_and_deletes_preserve_prior_records(
+    tmp_path: Path,
+    exporter: str,
+    suffix: str,
+    sync_mode: str,
+) -> None:
+    """All 6 exporters upsert modified records, remove deleted IDs, and keep untouched history."""
+    ledger = ExtractionStateLedger(str(tmp_path / "ledger.json"))
+    dest = tmp_path / f"out_{exporter}_{sync_mode}{suffix}"
+    variables = [_make_variable("AGE"), _make_variable("STATUS")]
+
+    # Run 1: initial baseline with records 1, 2, 3 across multiple chunks (batch_size=1)
+    run1_records = [
+        _make_record(1, date_modified="2026-01-01T10:00:00Z", data={"AGE": "41", "STATUS": "OK"}),
+        _make_record(2, date_modified="2026-01-01T10:05:00Z", data={"AGE": "52", "STATUS": "OK"}),
+        _make_record(3, date_modified="2026-01-01T10:10:00Z", data={"AGE": "63", "STATUS": "OK"}),
+    ]
+    sdk = _SimulatedSDK(run1_records, variables)
+
+    if sync_mode == "incremental":
+        _run_exporter(
+            exporter,
+            sdk,
+            "STUDY_UPSERT",
+            dest,
+            incremental=True,
+            state_provider=ledger,
+            mask_phi=False,
+        )
+    else:
+        _run_exporter(exporter, sdk, "STUDY_UPSERT", dest, mask_phi=False)
+
+    after_run1 = _read_exporter_records(exporter, dest)
+    assert set(after_run1) == {1, 2, 3}
+    assert str(after_run1[2]["AGE"]) == "52"
+
+    # Run 2: record 1 untouched (filtered out by watermark / modified_since), record 2 modified,
+    # record 3 hard-deleted, record 4 newly created.
+    delta_records = [
+        _make_record(1, date_modified="2026-01-01T10:00:00Z", data={"AGE": "41", "STATUS": "OK"}),
+        _make_record(
+            2, date_modified="2026-01-02T08:00:00Z", data={"AGE": "53", "STATUS": "UPDATED"}
+        ),
+        _make_record(
+            3,
+            date_modified="2026-01-02T08:05:00Z",
+            data={"AGE": "63", "STATUS": "DEL"},
+            deleted=True,
+        ),
+        _make_record(4, date_modified="2026-01-02T08:10:00Z", data={"AGE": "29", "STATUS": "NEW"}),
+    ]
+    sdk.set_records(delta_records)
+
+    if sync_mode == "incremental":
+        _run_exporter(
+            exporter,
+            sdk,
+            "STUDY_UPSERT",
+            dest,
+            incremental=True,
+            state_provider=ledger,
+            mask_phi=False,
+        )
+    else:
+        _run_exporter(
+            exporter,
+            sdk,
+            "STUDY_UPSERT",
+            dest,
+            modified_since="2026-01-01T10:10:00Z",
+            mask_phi=False,
+        )
+
+    after_run2 = _read_exporter_records(exporter, dest)
+    assert set(after_run2) == {1, 2, 4}
+    assert str(after_run2[1]["AGE"]) == "41"
+    assert str(after_run2[2]["AGE"]) == "53"
+    assert str(after_run2[2]["STATUS"]) == "UPDATED"
+    assert str(after_run2[4]["STATUS"]) == "NEW"
+
+
+@pytest.mark.parametrize(
+    ("exporter", "suffix"),
+    [
+        ("csv", ".csv"),
+        ("parquet", ".parquet"),
+        ("excel", ".xlsx"),
+        ("json", ".json"),
+        ("duckdb_by_form", ".duckdb"),
+        ("long_sql", ".sqlite"),
+    ],
+)
+def test_non_incremental_snapshot_export_still_replaces_stale_destination_rows(
+    tmp_path: Path,
+    exporter: str,
+    suffix: str,
+) -> None:
+    """Default `idempotent=True` non-incremental exports still overwrite prior snapshot data."""
+    dest = tmp_path / f"snapshot_{exporter}{suffix}"
+    variables = [_make_variable("AGE")]
+
+    sdk = _SimulatedSDK(
         [
-            {
-                "variableId": 804,
-                "variableName": "V_CUSTOM_MRN",
-                "variableKey": "V_CUSTOM_MRN",
-                "variableType": "Text",
-                "formId": 301,
-                "formKey": "F_DM",
-                "studyKey": "STUDY",
-                "label": "Subject Custom PHI",
-            },
-            {
-                "variableId": 805,
-                "variableName": "V_NOTES",
-                "variableKey": "V_NOTES",
-                "variableType": "Text",
-                "formId": 302,
-                "formKey": "F_VS",
-                "studyKey": "STUDY",
-                "label": "Clinical Notes",
-            },
-            {
-                "variableId": 807,
-                "variableName": "PATIENT_INITIALS",
-                "variableKey": "PATIENT_INITIALS",
-                "variableType": "Text",
-                "formId": 301,
-                "formKey": "F_DM",
-                "studyKey": "STUDY",
-                "label": "Subject Initials",
-            },
+            _make_record(1, date_modified="2026-01-01T10:00:00Z", data={"AGE": "40"}),
+            _make_record(2, date_modified="2026-01-01T10:05:00Z", data={"AGE": "50"}),
+        ],
+        variables,
+    )
+    _run_exporter(exporter, sdk, "STUDY_SNAP", dest, mask_phi=False)
+    assert set(_read_exporter_records(exporter, dest)) == {1, 2}
+
+    # Full snapshot now only returns record 99 -> records 1 & 2 must be replaced
+    sdk.set_records([_make_record(99, date_modified="2026-01-02T10:00:00Z", data={"AGE": "77"})])
+    _run_exporter(exporter, sdk, "STUDY_SNAP", dest, mask_phi=False)
+    assert set(_read_exporter_records(exporter, dest)) == {99}
+
+
+def test_parquet_incremental_schema_widening_backfills_nulls(tmp_path: Path) -> None:
+    """Parquet incremental sync widens schema cleanly when new form variables appear later."""
+    dest = tmp_path / "widening.parquet"
+    sdk = _SimulatedSDK(
+        [_make_record(1, date_modified="2026-01-01T10:00:00Z", data={"AGE": "44"})],
+        [_make_variable("AGE")],
+    )
+    export_to_parquet(sdk, "STUDY_WIDE", dest, mask_phi=False)
+
+    sdk.set_variables([_make_variable("AGE"), _make_variable("SITE_CODE")])
+    sdk.set_records(
+        [
+            _make_record(1, date_modified="2026-01-01T10:00:00Z", data={"AGE": "44"}),
+            _make_record(
+                2,
+                date_modified="2026-01-02T10:00:00Z",
+                data={"AGE": "51", "SITE_CODE": "EU-01"},
+            ),
         ]
     )
-    state.records = [
-        {
-            "recordId": 601,
-            "studyKey": "STUDY",
-            "subjectKey": "SUB-PHI-001",
-            "subjectId": 201,
-            "formId": 301,
-            "formKey": "F_DM",
-            "visitId": 401,
-            "intervalId": 501,
-            "siteId": 101,
-            "recordType": "Standard",
-            "recordStatus": "Complete",
-            "recordData": {
-                "V_AGE": 45,
-                "V_GENDER": "Female",
-                "V_CUSTOM_MRN": "MRN-12345",
-                "PATIENT_INITIALS": "J.D.",
-            },
-            "deleted": False,
-            "dateCreated": "2026-01-10T09:30:00Z",
-            "dateModified": "2026-01-10T09:30:00Z",
-            "lastUpdated": "2026-01-10T09:30:00Z",
-        },
-        {
-            "recordId": 602,
-            "studyKey": "STUDY",
-            "subjectKey": "SUB-PHI-001",
-            "subjectId": 201,
-            "formId": 302,
-            "formKey": "F_VS",
-            "visitId": 401,
-            "intervalId": 501,
-            "siteId": 101,
-            "recordType": "Standard",
-            "recordStatus": "Complete",
-            "recordData": {
-                "V_WEIGHT": 68.5,
-                "V_NOTES": "Initial note",
-            },
-            "deleted": False,
-            "dateCreated": "2026-01-10T09:35:00Z",
-            "dateModified": "2026-01-10T09:35:00Z",
-            "lastUpdated": "2026-01-10T09:35:00Z",
-        },
-        {
-            "recordId": 603,
-            "studyKey": "STUDY",
-            "subjectKey": "SUB-PHI-002",
-            "subjectId": 202,
-            "formId": 301,
-            "formKey": "F_DM",
-            "visitId": 401,
-            "intervalId": 501,
-            "siteId": 101,
-            "recordType": "Standard",
-            "recordStatus": "Complete",
-            "recordData": {
-                "V_AGE": 39,
-                "V_GENDER": "Male",
-                "V_CUSTOM_MRN": "MRN-55555",
-                "PATIENT_INITIALS": "A.S.",
-            },
-            "deleted": False,
-            "dateCreated": "2026-01-10T09:40:00Z",
-            "dateModified": "2026-01-10T09:40:00Z",
-            "lastUpdated": "2026-01-10T09:40:00Z",
-        },
-    ]
-    return state
-
-
-def _make_sdk(
-    state: SimulationState,
-    *,
-    transport: httpx.BaseTransport | None = None,
-    monkeypatch: pytest.MonkeyPatch | None = None,
-    phi_fields: list[str] | None = None,
-) -> ImednetSDK:
-    """Create an offline ImednetSDK wired to SimulationTransport and optional StudyConfiguration."""
-    if monkeypatch is not None and phi_fields is not None:
-        study_cfg = StudyConfiguration(studyKey="STUDY", phiFields=phi_fields)
-        fake_store = SimpleNamespace(
-            resolve_committed_config=lambda sk: study_cfg if sk == "STUDY" else None
-        )
-        monkeypatch.setattr(enrichment_mod, "_get_config_store_cls", lambda: fake_store)
-    return ImednetSDK(
-        api_key="sim-key",  # pragma: allowlist secret
-        security_key="sim-sec",  # pragma: allowlist secret
-        base_url="https://sim.example",
-        transport=transport or SimulationTransport(state),
-        retries=0,
+    export_to_parquet(
+        sdk,
+        "STUDY_WIDE",
+        dest,
+        modified_since="2026-01-01T10:00:00Z",
+        mask_phi=False,
     )
 
-
-def _assert_no_temp_artifacts(directory: Path) -> None:
-    """Verify no leftover temporary files or sidecar directories exist."""
-    leftover = [
-        p.name
-        for p in directory.iterdir()
-        if p.name.endswith(".tmp") or ".tmp." in p.name or p.name.startswith(".")
-    ]
-    assert leftover == [], f"Unexpected leftover temp artifacts: {leftover}"
+    df = pd.read_parquet(dest)
+    id_col = _df_id_col(df)
+    df = df.sort_values(id_col).reset_index(drop=True)
+    assert [int(v) for v in df[id_col].tolist()] == [1, 2]
+    assert pd.isna(df.loc[0, "SITE_CODE"])
+    assert df.loc[1, "SITE_CODE"] == "EU-01"
 
 
-def _run_all_six_exporters(
-    sdk: ImednetSDK,
-    paths: dict[str, Any],
-    *,
-    mode: str,
-    since_ts: str | None = None,
-    ledger_dir: Path | None = None,
-    idempotent: bool = True,
-    include_deleted: bool = False,
+@pytest.mark.parametrize(
+    ("exporter", "suffix"),
+    [
+        ("csv", ".csv"),
+        ("parquet", ".parquet"),
+        ("excel", ".xlsx"),
+        ("json", ".json"),
+    ],
+)
+def test_atomic_file_swap_failure_leaves_existing_destination_intact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exporter: str,
+    suffix: str,
 ) -> None:
-    """Invoke all six target exporters under either --incremental, --since, or snapshot mode."""
-    common: dict[str, Any] = {
-        "idempotent": idempotent,
-        "include_deleted": include_deleted,
-        "quality_gate_enabled": False,
-        "batch_size": 2,
-    }
+    """If `os.replace` raises OSError during flush, existing destination file is uncorrupted."""
+    dest = tmp_path / f"atomic_{exporter}{suffix}"
+    variables = [_make_variable("AGE")]
+    sdk = _SimulatedSDK(
+        [_make_record(1, date_modified="2026-01-01T10:00:00Z", data={"AGE": "40"})],
+        variables,
+    )
+    _run_exporter(exporter, sdk, "STUDY_ATOMIC", dest, mask_phi=False)
+    baseline_bytes = dest.read_bytes()
 
-    def _opts(name: str) -> dict[str, Any]:
-        opts = dict(common)
-        if mode == "incremental":
-            assert ledger_dir is not None
-            opts["incremental"] = True
-            opts["ledger_path"] = ledger_dir / f"{name}_ledger.json"
-        elif mode == "since":
-            if since_ts is not None:
-                opts["modified_since"] = since_ts
-        return opts
+    sdk.set_records(
+        [
+            _make_record(1, date_modified="2026-01-01T10:00:00Z", data={"AGE": "40"}),
+            _make_record(2, date_modified="2026-01-02T10:00:00Z", data={"AGE": "99"}),
+        ]
+    )
 
-    export_to_csv(sdk, "STUDY", paths["csv"], **_opts("csv"))
-    export_to_parquet(sdk, "STUDY", paths["parquet"], **_opts("parquet"))
-    export_to_excel(sdk, "STUDY", paths["excel"], **_opts("excel"))
-    export_to_json(sdk, "STUDY", paths["json"], **_opts("json"))
-    export_to_duckdb_by_form(sdk, "STUDY", paths["duckdb"], **_opts("duckdb"))
+    real_replace = os.replace
+
+    def _failing_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if os.fspath(dst) == str(dest):
+            raise OSError("simulated disk full during atomic swap")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _failing_replace)
+    with pytest.raises(OSError, match="simulated disk full during atomic swap"):
+        _run_exporter(
+            exporter,
+            sdk,
+            "STUDY_ATOMIC",
+            dest,
+            modified_since="2026-01-01T10:00:00Z",
+            mask_phi=False,
+        )
+
+    assert dest.read_bytes() == baseline_bytes
+    leftover_tmp = [p for p in tmp_path.iterdir() if ".tmp" in p.name]
+    assert leftover_tmp == []
+
+
+def test_quality_gate_caps_watermark_below_rejected_draft_and_recovers_once_fixed(
+    tmp_path: Path,
+) -> None:
+    """Watermark never advances past an earlier rejected draft even when later records pass."""
+    ledger = ExtractionStateLedger(str(tmp_path / "qg_ledger.json"))
+    dest = tmp_path / "qg.csv"
+    # Integer variable AGE so real SchemaValidator + calculate_readiness_score drops AGE='DRAFT'
+    variables = [_make_variable("AGE", variable_type="integer")]
+
+    # Run 1: baseline record at 08:00Z passes quality gate -> watermark = 08:00Z
+    r1 = _make_record(1, date_modified="2026-01-01T08:00:00Z", data={"AGE": 30})
+    sdk = _SimulatedSDK([r1], variables)
+
+    export_to_csv(
+        sdk,
+        "STUDY_QG",
+        dest,
+        incremental=True,
+        state_provider=ledger,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=100.0,
+        mask_phi=False,
+    )
+    assert ledger.get_last_timestamp("STUDY_QG", "csv") == datetime(
+        2026, 1, 1, 8, 0, tzinfo=timezone.utc
+    )
+
+    # Run 2: record 2 (08:30Z) passes, record 3 (09:00Z) is rejected DRAFT, record 4 (10:00Z) passes.
+    # Watermark MUST cap at 08:30Z (< 09:00Z), NOT advance to 10:00Z!
+    r2 = _make_record(2, date_modified="2026-01-01T08:30:00Z", data={"AGE": 35})
+    r3_draft = _make_record(3, date_modified="2026-01-01T09:00:00Z", data={"AGE": "DRAFT"})
+    r4 = _make_record(4, date_modified="2026-01-01T10:00:00Z", data={"AGE": 45})
+    sdk.set_records([r1, r2, r3_draft, r4])
+
+    export_to_csv(
+        sdk,
+        "STUDY_QG",
+        dest,
+        incremental=True,
+        state_provider=ledger,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=100.0,
+        batch_size=1,
+        mask_phi=False,
+    )
+    assert ledger.get_last_timestamp("STUDY_QG", "csv") == datetime(
+        2026, 1, 1, 8, 30, tzinfo=timezone.utc
+    )
+    rows_after_run2 = _read_exporter_records("csv", dest)
+    assert set(rows_after_run2) == {1, 2, 4}
+
+    # Run 3: record 3 is corrected in source EDC while keeping its 09:00Z timestamp.
+    # Because watermark was held at 08:30Z, record 3 is re-fetched and exported, and watermark
+    # advances to 10:00Z without duplicating record 4!
+    r3_fixed = _make_record(3, date_modified="2026-01-01T09:00:00Z", data={"AGE": 39})
+    sdk.set_records([r1, r2, r3_fixed, r4])
+
+    export_to_csv(
+        sdk,
+        "STUDY_QG",
+        dest,
+        incremental=True,
+        state_provider=ledger,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=100.0,
+        batch_size=1,
+        mask_phi=False,
+    )
+    assert ledger.get_last_timestamp("STUDY_QG", "csv") == datetime(
+        2026, 1, 1, 10, 0, tzinfo=timezone.utc
+    )
+    rows_after_run3 = _read_exporter_records("csv", dest)
+    assert set(rows_after_run3) == {1, 2, 3, 4}
+    assert int(rows_after_run3[3]["AGE"]) == 39
+
+
+def test_quality_gate_watermark_resists_gc_id_reuse_shallow_copies_and_none_timestamps(
+    tmp_path: Path,
+) -> None:
+    """Watermark cap cannot be bypassed by CPython `id()` reuse, `model_copy()`, or None timestamps."""
+    ledger = ExtractionStateLedger(str(tmp_path / "gc_ledger.json"))
+
+    class _CountingSink:
+        def __init__(self) -> None:
+            self.written_ids: list[int] = []
+
+        def write_batch(self, records: list[Record], *, batch_id: str) -> int:
+            self.written_ids.extend(r.record_id for r in records if r.record_id is not None)
+            return len(records)
+
+        def reconcile_deleted(self, records: list[Record], *, batch_id: str) -> int:
+            return 0
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def __enter__(self) -> _CountingSink:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self.close()
+
+    # Case 1: Stream 250 transient Record instances from a generator where record 1 (09:00Z)
+    # is dropped and records 2..250 (10:00Z) pass; force GC on each step so freed addresses
+    # would be reused if rejected objects were not retained.
+    def _transient_record_stream(_since: datetime | None, _inc_del: bool):
+        yield _make_record(1, date_modified="2026-02-01T09:00:00Z", data={"STATUS": "DROP"})
+        gc.collect()
+        for rid in range(2, 252):
+            yield _make_record(rid, date_modified="2026-02-01T10:00:00Z", data={"STATUS": "OK"})
+
+    def _drop_if_marked(_sdk: Any, _study_key: str, records: Any, _cfg: Any):
+        for rec in records:
+            if (rec.record_data or {}).get("STATUS") == "DROP":
+                gc.collect()
+                continue
+            # Also yield a shallow copy to verify fallback record_id candidate matching
+            yield rec.model_copy()
+
+    cfg = TabularSinkConfig(
+        "STUDY_GC",
+        incremental=True,
+        quality_gate_enabled=True,
+        state_provider=ledger,
+    )
+    sink1 = _CountingSink()
+    run_streaming_export(
+        SimpleNamespace(),
+        "STUDY_GC",
+        sink1,
+        cfg,
+        stream_name="gc_stream",
+        batch_id_prefix="STUDY_GC/gc",
+        records_source=_transient_record_stream,
+        quality_gate_fn=_drop_if_marked,
+        iter_batches_fn=lambda it, _sz: ([r] for r in it),
+    )
+    assert len(sink1.written_ids) == 250
+    # Rejected record 1 at 09:00Z has no accepted record strictly < 09:00Z -> watermark stays None!
+    assert ledger.get_last_timestamp("STUDY_GC", "gc_stream") is None
+
+    # Case 2: Rejected record with `date_modified=None` alongside accepted timestamped record
+    # must hold watermark at None because its temporal ordering is unknown.
+    def _none_ts_rejected_stream(_since: datetime | None, _inc_del: bool):
+        yield _make_record(10, date_modified=None, data={"STATUS": "DROP"})
+        yield _make_record(11, date_modified="2026-02-01T11:00:00Z", data={"STATUS": "OK"})
+
+    sink2 = _CountingSink()
+    run_streaming_export(
+        SimpleNamespace(),
+        "STUDY_GC",
+        sink2,
+        cfg,
+        stream_name="none_ts_stream",
+        batch_id_prefix="STUDY_GC/none_ts",
+        records_source=_none_ts_rejected_stream,
+        quality_gate_fn=_drop_if_marked,
+        iter_batches_fn=lambda it, _sz: ([r] for r in it),
+    )
+    assert sink2.written_ids == [11]
+    assert ledger.get_last_timestamp("STUDY_GC", "none_ts_stream") is None
+
+
+def test_chunked_sql_delete_over_500_ids_and_camelcase_long_sql_unpacking(
+    tmp_path: Path,
+) -> None:
+    """SQLite keyed upserts/deletes handle >500 IDs in chunks and `_unpack_long_sql_rows` reads camelCase."""
+    wide_db = tmp_path / "wide_550.sqlite"
+    long_db = tmp_path / "long_550.sqlite"
+    conn_wide = f"sqlite:///{wide_db}"
+    conn_long = f"sqlite:///{long_db}"
+
+    variables = [_make_variable("SCORE")]
+    initial_records = [
+        _make_record(i, date_modified="2026-03-01T00:00:00Z", data={"SCORE": str(i)})
+        for i in range(1, 561)
+    ]
+    sdk = _SimulatedSDK(initial_records, variables)
+
+    export_to_sql(sdk, "STUDY_550", "wide_tbl", conn_wide, batch_size=600, mask_phi=False)
     export_to_long_sql(
         sdk,
-        "STUDY",
-        "long_records",
-        paths["sqlite_uri"],
-        **_opts("long_sql"),
+        "STUDY_550",
+        "long_tbl",
+        conn_long,
+        chunk_size=600,
+        batch_size=600,
+        mask_phi=False,
     )
 
-
-@pytest.mark.parametrize("mode", ["incremental", "since"])
-def test_simulation_incremental_and_since_across_all_six_exporters(
-    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verify sequential --incremental and --since runs preserve, upsert, mask PHI, and purge deletes."""
-    out_dir = tmp_path / f"out_{mode}"
-    out_dir.mkdir()
-    ledger_dir = tmp_path / f"ledgers_{mode}"
-    ledger_dir.mkdir()
-
-    paths = {
-        "csv": out_dir / "records.csv",
-        "parquet": out_dir / "records.parquet",
-        "excel": out_dir / "records.xlsx",
-        "json": out_dir / "records.json",
-        "duckdb": out_dir / "forms.duckdb",
-        "sqlite_uri": f"sqlite:///{out_dir / 'long.db'}",
-    }
-
-    state = _make_study_state()
-    with _make_sdk(state, monkeypatch=monkeypatch, phi_fields=["V_CUSTOM_MRN"]) as sdk:
-        # 1. Initial sync (3 records: 601, 602, 603)
-        _run_all_six_exporters(sdk, paths, mode=mode, since_ts=None, ledger_dir=ledger_dir)
-        _assert_no_temp_artifacts(out_dir)
-
-        csv_df = pd.read_csv(paths["csv"])
-        assert set(csv_df["recordId"]) == {601, 602, 603}
-        assert set(csv_df["subjectKey"]) == {"SUB-PHI-001", "SUB-PHI-002"}
-        assert set(csv_df.loc[csv_df["recordId"].isin([601, 603]), "PATIENT_INITIALS"]) == {
-            "***MASKED***"
-        }
-        assert set(csv_df.loc[csv_df["recordId"].isin([601, 603]), "V_CUSTOM_MRN"]) == {
-            "***MASKED***"
-        }
-
-        # 2. Mutate simulation state:
-        # - 601 stays untouched at 09:30Z (omitted by >= 2026-01-12 filter!)
-        # - 602 is updated at 2026-01-15T10:00:00Z with updated V_WEIGHT, cleared V_NOTES, and new variable V_BMI
-        # - 604 is newly created at 2026-01-15T10:05:00Z on F_DM with PHI field
-        state.variables.append(
-            {
-                "variableId": 806,
-                "variableName": "V_BMI",
-                "variableKey": "V_BMI",
-                "variableType": "Float",
-                "formId": 302,
-                "formKey": "F_VS",
-                "studyKey": "STUDY",
-                "label": "BMI",
-            }
+    # Incremental update: modify 520 records and delete 30 records (>500 IDs in single batch)
+    delta_records = [
+        _make_record(i, date_modified="2026-03-02T00:00:00Z", data={"SCORE": str(i + 1000)})
+        for i in range(1, 521)
+    ] + [
+        _make_record(
+            i,
+            date_modified="2026-03-02T00:00:00Z",
+            data={"SCORE": "0"},
+            deleted=True,
         )
-        for rec in state.records:
-            if rec["recordId"] == 602:
-                rec["recordData"] = {"V_WEIGHT": 71.2, "V_BMI": 23.4}
-                rec["dateModified"] = "2026-01-15T10:00:00Z"
-                rec["lastUpdated"] = "2026-01-15T10:00:00Z"
-        state.records.append(
-            {
-                "recordId": 604,
-                "studyKey": "STUDY",
-                "subjectKey": "SUB-PHI-003",
-                "subjectId": 201,
-                "formId": 301,
-                "formKey": "F_DM",
-                "visitId": 402,
-                "intervalId": 502,
-                "siteId": 101,
-                "recordType": "Standard",
-                "recordStatus": "Complete",
-                "recordData": {
-                    "V_AGE": 52,
-                    "V_GENDER": "Male",
-                    "V_CUSTOM_MRN": "MRN-99999",
-                    "PATIENT_INITIALS": "R.K.",
-                },
-                "deleted": False,
-                "dateCreated": "2026-01-15T10:05:00Z",
-                "dateModified": "2026-01-15T10:05:00Z",
-                "lastUpdated": "2026-01-15T10:05:00Z",
-            }
-        )
+        for i in range(521, 551)
+    ]
+    sdk.set_records(delta_records + initial_records[550:])
 
-        _run_all_six_exporters(
-            sdk,
-            paths,
-            mode=mode,
-            since_ts="2026-01-12T00:00:00Z",
-            ledger_dir=ledger_dir,
-        )
-        _assert_no_temp_artifacts(out_dir)
-
-        # Verify CSV
-        csv_df = pd.read_csv(paths["csv"]).sort_values("recordId").reset_index(drop=True)
-        assert list(csv_df["recordId"]) == [601, 602, 603, 604]
-        assert float(csv_df.loc[csv_df["recordId"] == 602, "V_WEIGHT"].iloc[0]) == 71.2
-        assert float(csv_df.loc[csv_df["recordId"] == 602, "V_BMI"].iloc[0]) == 23.4
-        assert pd.isna(csv_df.loc[csv_df["recordId"] == 602, "V_NOTES"].iloc[0])
-        assert set(csv_df["subjectKey"]) == {"SUB-PHI-001", "SUB-PHI-002", "SUB-PHI-003"}
-        assert set(csv_df.loc[csv_df["recordId"].isin([601, 603, 604]), "PATIENT_INITIALS"]) == {
-            "***MASKED***"
-        }
-        assert set(csv_df.loc[csv_df["recordId"].isin([601, 603, 604]), "V_CUSTOM_MRN"]) == {
-            "***MASKED***"
-        }
-
-        # Verify Parquet
-        pq_df = pq.read_table(paths["parquet"]).to_pandas().sort_values("recordId")
-        assert list(pq_df["recordId"]) == [601, 602, 603, 604]
-        assert float(pq_df.loc[pq_df["recordId"] == 602, "V_WEIGHT"].iloc[0]) == 71.2
-        assert float(pq_df.loc[pq_df["recordId"] == 602, "V_BMI"].iloc[0]) == 23.4
-        assert set(pq_df.loc[pq_df["recordId"].isin([601, 603, 604]), "PATIENT_INITIALS"]) == {
-            "***MASKED***"
-        }
-        assert set(pq_df.loc[pq_df["recordId"].isin([601, 603, 604]), "V_CUSTOM_MRN"]) == {
-            "***MASKED***"
-        }
-
-        # Verify Excel (flat Study Records sheet)
-        excel_df = pd.read_excel(paths["excel"]).sort_values("recordId").reset_index(drop=True)
-        assert list(excel_df["recordId"]) == [601, 602, 603, 604]
-        assert float(excel_df.loc[excel_df["recordId"] == 602, "V_WEIGHT"].iloc[0]) == 71.2
-        assert float(excel_df.loc[excel_df["recordId"] == 602, "V_BMI"].iloc[0]) == 23.4
-        assert pd.isna(excel_df.loc[excel_df["recordId"] == 602, "V_NOTES"].iloc[0])
-        assert set(
-            excel_df.loc[excel_df["recordId"].isin([601, 603, 604]), "PATIENT_INITIALS"]
-        ) == {"***MASKED***"}
-        assert set(excel_df.loc[excel_df["recordId"].isin([601, 603, 604]), "V_CUSTOM_MRN"]) == {
-            "***MASKED***"
-        }
-
-        # Verify JSON
-        json_rows = json.loads(paths["json"].read_text(encoding="utf-8"))
-        by_id = {int(r["recordId"]): r for r in json_rows}
-        assert set(by_id) == {601, 602, 603, 604}
-        assert by_id[602]["V_WEIGHT"] == 71.2
-        assert by_id[602]["V_BMI"] == 23.4
-        assert by_id[602].get("V_NOTES") is None
-        for rid in (601, 603, 604):
-            assert by_id[rid]["V_CUSTOM_MRN"] == "***MASKED***"
-            assert by_id[rid]["PATIENT_INITIALS"] == "***MASKED***"
-
-        # Verify DuckDB by Form
-        with duckdb.connect(str(paths["duckdb"]), read_only=True) as con:
-            dm_duck = con.execute('SELECT * FROM F_DM ORDER BY "recordId"').df()
-            vs_duck = con.execute('SELECT * FROM F_VS ORDER BY "recordId"').df()
-        assert list(dm_duck["recordId"]) == [601, 603, 604]
-        assert list(vs_duck["recordId"]) == [602]
-        assert float(vs_duck.iloc[0]["V_WEIGHT"]) == 71.2
-        assert float(vs_duck.iloc[0]["V_BMI"]) == 23.4
-        assert set(dm_duck["V_CUSTOM_MRN"]) == {"***MASKED***"}
-        assert set(dm_duck["PATIENT_INITIALS"]) == {"***MASKED***"}
-
-        # Verify Long SQL (cleared variable V_NOTES for 602 must be removed!)
-        engine = sa.create_engine(paths["sqlite_uri"])
-        try:
-            with engine.connect() as conn:
-                long_df = pd.read_sql_table("long_records", conn)
-        finally:
-            engine.dispose()
-        assert set(long_df["record_id"]) == {601, 602, 603, 604}
-        rec602_vars = dict(
-            zip(
-                long_df.loc[long_df["record_id"] == 602, "variable_name"],
-                long_df.loc[long_df["record_id"] == 602, "value"],
-                strict=True,
-            )
-        )
-        assert float(rec602_vars["V_WEIGHT"]) == 71.2
-        assert float(rec602_vars["V_BMI"]) == 23.4
-        assert "V_NOTES" not in rec602_vars
-        mrn_vals = set(long_df.loc[long_df["variable_name"] == "V_CUSTOM_MRN", "value"])
-        assert mrn_vals == {"***MASKED***"}
-        init_vals = set(long_df.loc[long_df["variable_name"] == "PATIENT_INITIALS", "value"])
-        assert init_vals == {"***MASKED***"}
-
-        # 3. Empty incremental sync (no records modified at or after 2026-01-16T00:00:00Z)
-        # Note: for incremental mode, advance watermark past 10:05Z by setting 2026-01-16 on ledger
-        # OR verify that even when API returns 0 records (--since="2026-01-16T00:00:00Z" / ledger at 2026-01-16),
-        # existing outputs remain completely intact!
-        if mode == "incremental":
-            for ledger_file in ledger_dir.glob("*_ledger.json"):
-                provider = FileStateProvider(ledger_file)
-                for study_state in provider.read_state().studies.values():
-                    for stream_key in study_state.streams:
-                        provider.set_last_timestamp(
-                            "STUDY",
-                            stream_key,
-                            datetime(2026, 1, 16, 0, 0, tzinfo=UTC),
-                            records_processed=0,
-                        )
-
-        _run_all_six_exporters(
-            sdk,
-            paths,
-            mode=mode,
-            since_ts="2026-01-16T00:00:00Z",
-            ledger_dir=ledger_dir,
-        )
-        _assert_no_temp_artifacts(out_dir)
-
-        assert list(pd.read_csv(paths["csv"]).sort_values("recordId")["recordId"]) == [
-            601,
-            602,
-            603,
-            604,
-        ]
-        assert list(
-            pq.read_table(paths["parquet"]).to_pandas().sort_values("recordId")["recordId"]
-        ) == [601, 602, 603, 604]
-        assert sorted(pd.read_excel(paths["excel"])["recordId"].tolist()) == [
-            601,
-            602,
-            603,
-            604,
-        ]
-        assert len(json.loads(paths["json"].read_text(encoding="utf-8"))) == 4
-        with duckdb.connect(str(paths["duckdb"]), read_only=True) as con:
-            assert con.execute("SELECT COUNT(*) FROM F_DM").fetchone()[0] == 3
-            assert con.execute("SELECT COUNT(*) FROM F_VS").fetchone()[0] == 1
-        engine = sa.create_engine(paths["sqlite_uri"])
-        try:
-            with engine.connect() as conn:
-                assert set(pd.read_sql_table("long_records", conn)["record_id"]) == {
-                    601,
-                    602,
-                    603,
-                    604,
-                }
-        finally:
-            engine.dispose()
-
-        # 4. Voided Study Records reconciliation (603 on F_DM and 602 on F_VS become deleted=True)
-        for rec in state.records:
-            if rec["recordId"] in (602, 603):
-                rec["deleted"] = True
-                rec["dateModified"] = "2026-01-20T12:00:00Z"
-                rec["lastUpdated"] = "2026-01-20T12:00:00Z"
-
-        _run_all_six_exporters(
-            sdk,
-            paths,
-            mode=mode,
-            since_ts="2026-01-19T00:00:00Z",
-            ledger_dir=ledger_dir,
-            include_deleted=False,
-            idempotent=True,
-        )
-        _assert_no_temp_artifacts(out_dir)
-
-        assert sorted(pd.read_csv(paths["csv"])["recordId"].tolist()) == [601, 604]
-        assert sorted(pq.read_table(paths["parquet"]).to_pandas()["recordId"].tolist()) == [
-            601,
-            604,
-        ]
-        assert sorted(pd.read_excel(paths["excel"])["recordId"].tolist()) == [601, 604]
-        json_after_delete = json.loads(paths["json"].read_text(encoding="utf-8"))
-        assert sorted(int(r["recordId"]) for r in json_after_delete) == [
-            601,
-            604,
-        ]
-        with duckdb.connect(str(paths["duckdb"]), read_only=True) as con:
-            assert sorted(con.execute('SELECT "recordId" FROM F_DM').df()["recordId"].tolist()) == [
-                601,
-                604,
-            ]
-            assert con.execute("SELECT COUNT(*) FROM F_VS").fetchone()[0] == 0
-        engine = sa.create_engine(paths["sqlite_uri"])
-        try:
-            with engine.connect() as conn:
-                assert sorted(
-                    pd.read_sql_table("long_records", conn)["record_id"].unique().tolist()
-                ) == [601, 604]
-        finally:
-            engine.dispose()
-
-
-def test_full_snapshot_idempotent_overwrites_when_not_incremental(tmp_path: Path) -> None:
-    """Verify full snapshot overwrite behavior is preserved when no incremental/--since/state_provider is active."""
-    paths = {
-        "csv": tmp_path / "snap.csv",
-        "parquet": tmp_path / "snap.parquet",
-        "excel": tmp_path / "snap.xlsx",
-        "json": tmp_path / "snap.json",
-        "duckdb": tmp_path / "snap.duckdb",
-        "sqlite_uri": f"sqlite:///{tmp_path / 'snap.db'}",
-    }
-    state = _make_study_state()
-    with _make_sdk(state) as sdk:
-        _run_all_six_exporters(sdk, paths, mode="snapshot")
-        assert len(pd.read_csv(paths["csv"])) == 3
-
-        # Remove 601 and 603 completely from the Study snapshot (only 602 remains)
-        state.records = [r for r in state.records if r["recordId"] == 602]
-        _run_all_six_exporters(sdk, paths, mode="snapshot")
-
-        assert list(pd.read_csv(paths["csv"])["recordId"]) == [602]
-        assert list(pq.read_table(paths["parquet"]).to_pandas()["recordId"]) == [602]
-        assert list(pd.read_excel(paths["excel"])["recordId"]) == [602]
-        json_rows = json.loads(paths["json"].read_text(encoding="utf-8"))
-        assert [int(r["recordId"]) for r in json_rows] == [602]
-        engine = sa.create_engine(paths["sqlite_uri"])
-        try:
-            with engine.connect() as conn:
-                assert set(pd.read_sql_table("long_records", conn)["record_id"]) == {602}
-        finally:
-            engine.dispose()
-
-
-def test_parquet_schema_widening_type_promotion_and_cleanup(tmp_path: Path) -> None:
-    """Verify TabularParquetSink merges existing int64 column with float/string delta batches."""
-    pq_path = tmp_path / "widening.parquet"
-    sink_init = TabularParquetSink(
-        str(pq_path), TabularSinkConfig(study_key="STUDY", idempotent=True, incremental=False)
+    export_to_sql(
+        sdk,
+        "STUDY_550",
+        "wide_tbl",
+        conn_wide,
+        modified_since="2026-03-01T00:00:00Z",
+        batch_size=600,
+        mask_phi=False,
     )
-    sink_init.write_batch(
+    export_to_long_sql(
+        sdk,
+        "STUDY_550",
+        "long_tbl",
+        conn_long,
+        modified_since="2026-03-01T00:00:00Z",
+        chunk_size=600,
+        batch_size=600,
+        mask_phi=False,
+    )
+
+    eng_w = create_engine(conn_wide)
+    eng_l = create_engine(conn_long)
+    try:
+        wide_cols = {col["name"] for col in inspect(eng_w).get_columns("wide_tbl")}
+        wide_id_col = "recordId" if "recordId" in wide_cols else "record_id"
+        with eng_w.connect() as c:
+            wide_count = c.execute(text("SELECT COUNT(*) FROM wide_tbl")).scalar_one()
+            wide_distinct = c.execute(
+                text(f"SELECT COUNT(DISTINCT {wide_id_col}) FROM wide_tbl")
+            ).scalar_one()
+            score_1 = c.execute(
+                text(f"SELECT SCORE FROM wide_tbl WHERE {wide_id_col} = 1")
+            ).scalar_one()
+        with eng_l.connect() as c:
+            long_count = c.execute(text("SELECT COUNT(*) FROM long_tbl")).scalar_one()
+            long_distinct = c.execute(
+                text("SELECT COUNT(DISTINCT record_id) FROM long_tbl")
+            ).scalar_one()
+            long_score_1 = c.execute(
+                text("SELECT value FROM long_tbl WHERE record_id = 1 AND variable_name = 'SCORE'")
+            ).scalar_one()
+    finally:
+        eng_w.dispose()
+        eng_l.dispose()
+
+    # 560 initial - 30 deleted = 530 unique records remaining (520 updated + 10 untouched 551..560)
+    assert wide_count == 530
+    assert wide_distinct == 530
+    assert str(score_1) == "1001"
+    assert long_count == 530
+    assert long_distinct == 530
+    assert str(long_score_1) == "1001"
+
+    # Direct camelCase dict & object verification for _unpack_long_sql_rows
+    camel_rows = _unpack_long_sql_rows(
         [
-            {"record_id": 1, "score": 10, "status": "ok"},
-            {"record_id": 2, "score": 20, "status": "ok"},
+            {
+                "recordId": 77,
+                "formId": 12,
+                "dateModified": "2026-03-05T12:00:00Z",
+                "recordData": {"BP": 120},
+            },
+            SimpleNamespace(
+                recordId=78,
+                formId=13,
+                dateModified="2026-03-05T12:05:00Z",
+                recordData={"BP": 118},
+            ),
         ],
-        batch_id="b0",
+        mask_phi=False,
+        pipeline=None,
+        phi_keys=None,
     )
-    sink_init.flush()
-    sink_init.close()
-
-    sink_inc = TabularParquetSink(
-        str(pq_path), TabularSinkConfig(study_key="STUDY", idempotent=True, incremental=True)
-    )
-    sink_inc.write_batch([{"record_id": 2, "score": 25.75, "extra_col": "added"}], batch_id="b1")
-    sink_inc.write_batch([{"record_id": 3, "score": 30.5, "status": "new"}], batch_id="b2")
-    sink_inc.reconcile_deleted([{"record_id": 1}], batch_id="b_del")
-    sink_inc.flush()
-    sink_inc.close()
-
-    _assert_no_temp_artifacts(tmp_path)
-    merged = pq.read_table(pq_path).to_pandas().sort_values("record_id").reset_index(drop=True)
-    assert list(merged["record_id"]) == [2, 3]
-    assert list(merged["score"]) == [25.75, 30.5]
-    assert merged.loc[merged["record_id"] == 2, "extra_col"].iloc[0] == "added"
-
-
-def test_atomic_swap_preserves_existing_files_on_failure(tmp_path: Path) -> None:
-    """Simulated write error during incremental run leaves prior files untouched and cleans up .tmp."""
-    state = _make_study_state()
-    csv_path = tmp_path / "atomic.csv"
-    pq_path = tmp_path / "atomic.parquet"
-    xlsx_path = tmp_path / "atomic.xlsx"
-    json_path = tmp_path / "atomic.json"
-
-    with _make_sdk(state) as sdk:
-        export_to_csv(sdk, "STUDY", csv_path)
-        export_to_parquet(sdk, "STUDY", pq_path)
-        export_to_excel(sdk, "STUDY", xlsx_path)
-        export_to_json(sdk, "STUDY", json_path)
-
-        orig_csv = csv_path.read_bytes()
-        orig_pq = pq_path.read_bytes()
-        orig_xlsx = xlsx_path.read_bytes()
-        orig_json = json_path.read_bytes()
-
-        state.records[0]["recordData"]["V_AGE"] = 99
-        state.records[0]["dateModified"] = "2026-02-01T00:00:00Z"
-
-        with patch("os.replace", side_effect=OSError("Simulated disk full during atomic swap")):
-            for fn, target in (
-                (export_to_csv, csv_path),
-                (export_to_parquet, pq_path),
-                (export_to_excel, xlsx_path),
-                (export_to_json, json_path),
-            ):
-                with pytest.raises(OSError, match="Simulated disk full"):
-                    fn(sdk, "STUDY", target, modified_since="2026-01-20T00:00:00Z")
-
-    assert csv_path.read_bytes() == orig_csv
-    assert pq_path.read_bytes() == orig_pq
-    assert xlsx_path.read_bytes() == orig_xlsx
-    assert json_path.read_bytes() == orig_json
-    _assert_no_temp_artifacts(tmp_path)
-
-
-def test_quality_gate_watermark_capping_and_recovery(tmp_path: Path) -> None:
-    """Verify apply_quality_gate never advances new_timestamp at or past rejected Study Records."""
-    state = SimulationState()
-    # F_DM requires V_AGE (Number) and V_GENDER (Coded) for 100% readiness score.
-    # Step 1: Earliest record 701 (09:00Z) is an incomplete draft (missing V_GENDER -> 50% < 100%),
-    # while later record 702 (10:00Z) is complete (100%).
-    state.records = [
+    assert camel_rows == [
         {
-            "recordId": 701,
-            "studyKey": "STUDY",
-            "subjectKey": "SUB1",
-            "subjectId": 201,
-            "formId": 301,
-            "formKey": "F_DM",
-            "visitId": 401,
-            "intervalId": 501,
-            "siteId": 101,
-            "recordType": "Standard",
-            "recordStatus": "Draft",
-            "recordData": {"V_AGE": 41},  # Missing V_GENDER -> rejected!
-            "deleted": False,
-            "dateCreated": "2026-01-10T09:00:00Z",
-            "dateModified": "2026-01-10T09:00:00Z",
-            "lastUpdated": "2026-01-10T09:00:00Z",
+            "record_id": 77,
+            "form_id": 12,
+            "variable_name": "BP",
+            "value": 120,
+            "timestamp": "2026-03-05T12:00:00Z",
         },
         {
-            "recordId": 702,
-            "studyKey": "STUDY",
-            "subjectKey": "SUB1",
-            "subjectId": 201,
-            "formId": 301,
-            "formKey": "F_DM",
-            "visitId": 401,
-            "intervalId": 501,
-            "siteId": 101,
-            "recordType": "Standard",
-            "recordStatus": "Complete",
-            "recordData": {"V_AGE": 50, "V_GENDER": "Female"},
-            "deleted": False,
-            "dateCreated": "2026-01-10T10:00:00Z",
-            "dateModified": "2026-01-10T10:00:00Z",
-            "lastUpdated": "2026-01-10T10:00:00Z",
+            "record_id": 78,
+            "form_id": 13,
+            "variable_name": "BP",
+            "value": 118,
+            "timestamp": "2026-03-05T12:05:00Z",
         },
     ]
 
-    csv_path = tmp_path / "gated.csv"
-    ledger_path = tmp_path / "gated_ledger.json"
-    provider = FileStateProvider(ledger_path)
 
-    with _make_sdk(state) as sdk:
+def test_initial_sync_failure_and_stale_running_lease_recovery_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """Initial export failure leaves watermark None; expired RUNNING lease recovers cleanly."""
+    ledger_file = tmp_path / "recovery_ledger.json"
+    ledger = ExtractionStateLedger(str(ledger_file))
+
+    dest = tmp_path / "recovered.csv"
+    variables = [_make_variable("AGE")]
+    failing_sdk = _SimulatedSDK([], variables, fail_records=RuntimeError("503 upstream down"))
+
+    with pytest.raises(RuntimeError, match="503 upstream down"):
         export_to_csv(
-            sdk,
-            "STUDY",
-            csv_path,
+            failing_sdk,
+            "STUDY_REC",
+            dest,
             incremental=True,
-            state_provider=provider,
-            quality_gate_enabled=True,
-            min_schema_readiness_score=100.0,
-        )
-        # 702 exported, 701 dropped, and watermark MUST remain None (< 09:00Z)!
-        assert list(pd.read_csv(csv_path)["recordId"]) == [702]
-        assert provider.get_last_timestamp("STUDY", "csv") is None
-
-        # Step 2: Fix 701 (09:00Z), add same-timestamp accepted 703 (10:30Z) + rejected 704 (10:30Z),
-        # and add newer accepted 705 (11:00Z).
-        state.records[0]["recordData"] = {"V_AGE": 41, "V_GENDER": "Male"}
-        state.records.extend(
-            [
-                {
-                    **copy.deepcopy(state.records[1]),
-                    "recordId": 703,
-                    "recordData": {"V_AGE": 60, "V_GENDER": "Female"},
-                    "dateModified": "2026-01-10T10:30:00Z",
-                    "lastUpdated": "2026-01-10T10:30:00Z",
-                },
-                {
-                    **copy.deepcopy(state.records[1]),
-                    "recordId": 704,
-                    "recordData": {"V_AGE": 61},  # Rejected at 10:30Z!
-                    "dateModified": "2026-01-10T10:30:00Z",
-                    "lastUpdated": "2026-01-10T10:30:00Z",
-                },
-                {
-                    **copy.deepcopy(state.records[1]),
-                    "recordId": 705,
-                    "recordData": {"V_AGE": 62, "V_GENDER": "Male"},
-                    "dateModified": "2026-01-10T11:00:00Z",
-                    "lastUpdated": "2026-01-10T11:00:00Z",
-                },
-            ]
+            state_provider=ledger,
+            mask_phi=False,
         )
 
-        export_to_csv(
-            sdk,
-            "STUDY",
-            csv_path,
-            incremental=True,
-            state_provider=provider,
-            quality_gate_enabled=True,
-            min_schema_readiness_score=100.0,
-        )
-        # Accepted records 701, 702, 703, 705 are exported without duplicates;
-        # Watermark MUST cap at 10:00Z (strictly < 10:30Z where 704 was rejected)!
-        assert sorted(pd.read_csv(csv_path)["recordId"].tolist()) == [701, 702, 703, 705]
-        assert provider.get_last_timestamp("STUDY", "csv") == datetime(
-            2026, 1, 10, 10, 0, tzinfo=UTC
-        )
+    stream_key = "csv"
+    assert ledger.get_last_timestamp("STUDY_REC", stream_key) is None
 
-        # Step 3: Fix 704 (still at 10:30Z). Next incremental run fetches >= 10:00Z,
-        # upserts 702/703/704/705 cleanly while preserving 701, and advances watermark to 11:00Z!
-        for rec in state.records:
-            if rec["recordId"] == 704:
-                rec["recordData"] = {"V_AGE": 61, "V_GENDER": "Female"}
-
-        export_to_csv(
-            sdk,
-            "STUDY",
-            csv_path,
-            incremental=True,
-            state_provider=provider,
-            quality_gate_enabled=True,
-            min_schema_readiness_score=100.0,
-        )
-        assert sorted(pd.read_csv(csv_path)["recordId"].tolist()) == [701, 702, 703, 704, 705]
-        assert provider.get_last_timestamp("STUDY", "csv") == datetime(
-            2026, 1, 10, 11, 0, tzinfo=UTC
-        )
-
-
-def test_initial_sync_failure_and_running_crash_recovery_end_to_end(tmp_path: Path) -> None:
-    """Initial failure keeps last_timestamp None, and crashed RUNNING stream recovers on retry."""
-    state = _make_study_state()
-    sim_transport = SimulationTransport(state)
-    should_fail = {"active": True}
-
-    class _FlakyRecordsTransport(httpx.BaseTransport):
-        def handle_request(self, request: httpx.Request) -> httpx.Response:
-            if should_fail["active"] and "/records" in request.url.path:
-                raise httpx.ConnectError("Simulated API outage on initial sync", request=request)
-            return sim_transport.handle_request(request)
-
-    ledger_path = tmp_path / "recovery_ledger.json"
-    provider = FileStateProvider(ledger_path)
-    pq_path = tmp_path / "recovery.parquet"
-
-    with _make_sdk(state, transport=_FlakyRecordsTransport()) as sdk:
-        # 1. Initial sync fails due to API outage -> last_timestamp MUST remain None
-        with pytest.raises(Exception):
-            export_to_parquet(
-                sdk,
-                "STUDY",
-                pq_path,
-                incremental=True,
-                state_provider=provider,
-                max_retries=1,
-            )
-
-        assert provider.get_last_timestamp("STUDY", "parquet") is None
-        assert provider.get_last_status("STUDY", "parquet") == StreamExecutionStatus.FAILED
-
-        # 2. Simulate an abrupt process crash (e.g. OOM) leaving ledger stuck in RUNNING with expired lease and None watermark
-        crashed = LedgerState(
-            studies={
-                "STUDY": StudyState(
-                    streams={
-                        "parquet": StreamState(
-                            last_timestamp=None,
-                            records_processed=0,
-                            last_run_status=StreamExecutionStatus.RUNNING,
-                            lease_expires_at=datetime(2020, 1, 1, tzinfo=UTC),
-                        )
+    # Simulate crashed container worker (PID 1 on remote host) with expired lease
+    expired_payload = {
+        "studies": {
+            "STUDY_REC": {
+                "streams": {
+                    stream_key: {
+                        "last_timestamp": None,
+                        "records_processed": 0,
+                        "last_run_status": "running",
+                        "owner_pid": 1,
+                        "owner_host": "crashed-pod-xyz",
+                        "lease_expires_at": (
+                            datetime.now(timezone.utc) - timedelta(seconds=30)
+                        ).isoformat(),
                     }
-                )
+                }
             }
-        )
-        ledger_path.write_text(crashed.model_dump_json(indent=2), encoding="utf-8")
-        assert provider.get_last_status("STUDY", "parquet") == StreamExecutionStatus.RUNNING
+        }
+    }
+    ledger_file.write_text(json.dumps(expired_payload), encoding="utf-8")
 
-        # 3. Restore API and retry -> transitions RUNNING -> RUNNING -> SUCCESS and exports all historical records!
-        should_fail["active"] = False
-        export_to_parquet(
-            sdk,
-            "STUDY",
-            pq_path,
-            incremental=True,
-            state_provider=provider,
-        )
+    # Retry succeeds with historical 2024 record -> must fetch all history (no dateModified filter!)
+    historical_rec = _make_record(1, date_modified="2024-05-10T09:00:00Z", data={"AGE": "61"})
+    healthy_sdk = _SimulatedSDK([historical_rec], variables)
+    export_to_csv(
+        healthy_sdk,
+        "STUDY_REC",
+        dest,
+        incremental=True,
+        state_provider=ledger,
+        mask_phi=False,
+    )
 
-        assert provider.get_last_status("STUDY", "parquet") == StreamExecutionStatus.SUCCESS
-        assert provider.get_last_timestamp("STUDY", "parquet") == datetime(
-            2026, 1, 10, 9, 40, tzinfo=UTC
-        )
-        exported_ids = sorted(pq.read_table(pq_path).to_pandas()["recordId"].tolist())
-        assert exported_ids == [601, 602, 603]
+    assert healthy_sdk.seen_filters == [None]
+    assert ledger.get_last_timestamp("STUDY_REC", stream_key) == datetime(
+        2024, 5, 10, 9, 0, tzinfo=timezone.utc
+    )
+    rows = _read_exporter_records("csv", dest)
+    assert set(rows) == {1}
+    assert str(rows[1]["AGE"]) == "61"
+
+
+def test_by_form_streaming_quality_gate_caps_watermark_below_rejected_record(
+    tmp_path: Path,
+) -> None:
+    """Single-pass per-form streaming caps per-form watermarks strictly below rejected records."""
+    ledger = ExtractionStateLedger(str(tmp_path / "by_form_ledger.json"))
+    ddb_path = tmp_path / "by_form_gate.duckdb"
+    variables = [_make_variable("AGE"), _make_variable("WT")]
+
+    # Run 1: rec 1 (10:00) valid, rec 2 (11:00) rejected (only unmapped drift keys), rec 3 (12:00) valid
+    run1_records = [
+        _make_record(1, date_modified="2026-06-01T10:00:00Z", data={"AGE": "40", "WT": "70"}),
+        _make_record(
+            2,
+            date_modified="2026-06-01T11:00:00Z",
+            data={"D1": "x", "D2": "x", "D3": "x", "D4": "x"},
+        ),
+        _make_record(3, date_modified="2026-06-01T12:00:00Z", data={"AGE": "55", "WT": "82"}),
+    ]
+    sdk1 = _SimulatedSDK(run1_records, variables)
+    export_to_duckdb_by_form(
+        sdk1,
+        "STUDY_BY_FORM_GATE",
+        ddb_path,
+        incremental=True,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=75.0,
+        state_provider=ledger,
+        mask_phi=False,
+    )
+
+    # Watermark for duckdb_DEMOG must be held at 10:00 (strictly < 11:00 rejected rec 2), not 12:00
+    assert ledger.get_last_timestamp("STUDY_BY_FORM_GATE", "duckdb_DEMOG") == datetime(
+        2026, 6, 1, 10, 0, tzinfo=timezone.utc
+    )
+    rows1 = _read_exporter_records("duckdb_by_form", ddb_path)
+    assert set(rows1) == {1, 3}
+
+    # Run 2: rec 2 is fixed at 11:05 -> re-fetched because watermark was capped at 10:00!
+    run2_records = [
+        _make_record(1, date_modified="2026-06-01T10:00:00Z", data={"AGE": "40", "WT": "70"}),
+        _make_record(2, date_modified="2026-06-01T11:05:00Z", data={"AGE": "48", "WT": "76"}),
+        _make_record(3, date_modified="2026-06-01T12:00:00Z", data={"AGE": "55", "WT": "82"}),
+    ]
+    sdk2 = _SimulatedSDK(run2_records, variables)
+    export_to_duckdb_by_form(
+        sdk2,
+        "STUDY_BY_FORM_GATE",
+        ddb_path,
+        incremental=True,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=75.0,
+        state_provider=ledger,
+        mask_phi=False,
+    )
+
+    assert ledger.get_last_timestamp("STUDY_BY_FORM_GATE", "duckdb_DEMOG") == datetime(
+        2026, 6, 1, 12, 0, tzinfo=timezone.utc
+    )
+    rows2 = _read_exporter_records("duckdb_by_form", ddb_path)
+    assert set(rows2) == {1, 2, 3}
+    assert str(rows2[2]["AGE"]) == "48"

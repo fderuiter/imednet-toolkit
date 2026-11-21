@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
 import inspect
@@ -13,7 +14,7 @@ import numbers
 import os
 import re
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,18 +23,26 @@ from unittest.mock import NonCallableMock
 
 from imednet.integrations.enrichment import (
     EnrichmentPipeline,
+    _matches_custom_phi_key,
     mask_custom_phi_recursive,
     resolve_enrichment_pipeline,
     resolve_study_configuration,
 )
 from imednet.integrations.sink_base import (
+    BoundedFormBufferRouter,
     ExportSink,
     SinkConfig,
+    StateProviderProtocol,
+    _extract_safe_config_options,
     apply_quality_gate,
+    extract_record_form_ref,
     extract_record_id,
+    extract_record_timestamp,
+    get_state_provider,
     is_record_deleted,
     iter_batches,
     iter_filtered_sdk_records,
+    normalize_watermark_datetime,
     run_streaming_export,
 )
 
@@ -43,7 +52,8 @@ except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 from imednet.constants import MAX_SQLITE_COLUMNS
 from imednet.utils import sanitize_csv_formula
-from imednet.utils.security import _normalize_key, global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.tabular import MASKED_SENTINEL
 
 from .. import ImednetClient
 from ..sdk import ImednetSDK
@@ -100,9 +110,9 @@ def _create_record_mapper(sdk: Any, *, mask_phi: bool = True) -> Any:
 
 def _is_custom_phi_key(key: str, phi_keys: set[str] | None) -> bool:
     """Return True when *key* matches a custom StudyConfiguration PHI field."""
-    if not phi_keys or not key or global_sensitivity_registry.is_exempt(key):
+    if not phi_keys or not key:
         return False
-    return _normalize_key(key) in phi_keys
+    return _matches_custom_phi_key(key, phi_keys)
 
 
 def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFrame:
@@ -117,7 +127,7 @@ def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFr
     )
     for col in sensitive_cols:
         if len(df) > 0:
-            df[col] = "***MASKED***"
+            df[col] = MASKED_SENTINEL
 
     if len(df) == 0:
         return df
@@ -230,6 +240,7 @@ def _prepare_export_df(
 
 
 _DEFAULT_PREPARE_EXPORT_DF = _prepare_export_df
+_DEFAULT_APPLY_QUALITY_GATE = apply_quality_gate
 
 
 def _merge_form_whitelist_into_filter(
@@ -1808,6 +1819,7 @@ class TabularDuckDBSink(ExportSink):
         config: TabularSinkConfig,
         *,
         contract_types: Mapping[str, str | None] | None = None,
+        conn: Any | None = None,
     ) -> None:
         """Initialize the DuckDB sink."""
         super().__init__(config)
@@ -1819,21 +1831,23 @@ class TabularDuckDBSink(ExportSink):
         self._contract_types: dict[str, str | None] = dict(contract_types) if contract_types else {}
         self._untyped_null_cols: set[str] = set()
         self._is_first_batch = True
-        self._is_incremental_sync = bool(
-            config.incremental
-            or config.modified_since is not None
-            or config.state_provider is not None
-        )
-        import duckdb
+        self._is_incremental_sync = _is_incremental_config(config)
+        self._owns_conn = conn is None
+        if conn is not None:
+            self._conn: Any = conn
+        else:
+            import duckdb
 
-        self._conn: Any = duckdb.connect(resolved_db_path, config={"threads": "1"})
+            self._conn = duckdb.connect(resolved_db_path, config={"threads": "1"})
 
     def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
         """Configure contract-derived column types prior to streaming batches."""
         self._contract_types = dict(contract_types)
 
     def _table_exists(self) -> bool:
-        return _duckdb_table_exists(self._conn, self.table_name)
+        return not isinstance(self._conn, NonCallableMock) and _duckdb_table_exists(
+            self._conn, self.table_name
+        )
 
     def _delete_record_ids(self, record_ids: Sequence[Any]) -> int:
         if not record_ids or not self._table_exists():
@@ -1937,10 +1951,11 @@ class TabularDuckDBSink(ExportSink):
             _replace_duckdb_with_empty_table(self._conn, self.table_name, self._contract_types)
 
     def close(self) -> None:
-        """Close the DuckDB connection."""
+        """Close the DuckDB connection when owned by this sink."""
         if self._conn is not None:
             try:
-                self._conn.close()
+                if self._owns_conn:
+                    self._conn.close()
             finally:
                 self._conn = None
 
@@ -2247,6 +2262,7 @@ def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Extract SinkConfig keyword arguments so they do not leak into pandas kwargs."""
     sink_keys = (
         "batch_size",
+        "max_buffered_records",
         "max_retries",
         "retry_backoff",
         "idempotent",
@@ -3245,6 +3261,345 @@ def export_to_duckdb(
     )
 
 
+@dataclass
+class _FormExportContext:
+    """Per-form metadata and mutable state during a single-pass multi-form export."""
+
+    form: Any
+    form_id: int
+    form_key: str
+    variables: list[Any]
+    variable_keys: list[str]
+    label_map: dict[str, Any]
+    record_model: Any
+    contract_types: dict[str, str | None]
+    stream_name: str
+    watermark: datetime | None = None
+    wrote_any: bool = False
+    total_written: int = 0
+    total_reconciled: int = 0
+    max_ts: datetime | None = None
+    pending_gate: dict[int, list[tuple[Any, datetime | None]]] = field(default_factory=dict)
+    exported_timestamps: list[datetime] = field(default_factory=list)
+    sink: Any = None
+    tx: dict[str, Any] | None = None
+
+
+def _build_form_export_contexts(
+    sdk: Any,
+    study_key: str,
+    mapper: Any,
+    *,
+    use_labels_as_columns: bool,
+    variable_whitelist: list[str] | None,
+    form_whitelist: list[int] | None,
+    mask_phi: bool,
+    pipeline: EnrichmentPipeline | None,
+    stream_prefix: str,
+    custom_stream_prefix: str | None,
+    validate_form_key_fn: Callable[[str], None] | None = None,
+) -> tuple[list[_FormExportContext], list[Any]]:
+    """Fetch study forms and variables once and build per-form export contexts."""
+    forms = list(sdk.forms.list(study_key=study_key))
+    form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
+    all_variables = (
+        []
+        if form_whitelist is not None and len(form_whitelist) == 0
+        else list(sdk.variables.list(study_key=study_key, **form_filter))
+    )
+    variables_by_form: dict[int, list[Any]] = {}
+    for var in all_variables:
+        if var.form_id is not None:
+            variables_by_form.setdefault(var.form_id, []).append(var)
+
+    contexts: list[_FormExportContext] = []
+    for form in forms:
+        if form.form_id is None or form.form_key is None:
+            continue
+        if form_whitelist is not None and form.form_id not in form_whitelist:
+            continue
+        if validate_form_key_fn is not None:
+            validate_form_key_fn(form.form_key)
+
+        variables = variables_by_form.get(form.form_id, [])
+        variable_keys = [
+            v.variable_name
+            for v in variables
+            if v.variable_name
+            and (variable_whitelist is None or v.variable_name in variable_whitelist)
+        ]
+        label_map = {
+            v.variable_name: v.label for v in variables if v.variable_name in variable_keys
+        }
+        record_model = mapper._build_record_model(variable_keys, label_map)
+        contract_types = _build_tabular_contract_types(
+            variable_keys,
+            label_map,
+            variables,
+            use_labels_as_columns=use_labels_as_columns,
+            mask_phi=mask_phi,
+            pipeline=pipeline,
+        )
+        resolved_stream = (
+            f"{custom_stream_prefix}_{form.form_key}"
+            if custom_stream_prefix is not None
+            else f"{stream_prefix}_{form.form_key}"
+        )
+        contexts.append(
+            _FormExportContext(
+                form=form,
+                form_id=form.form_id,
+                form_key=form.form_key,
+                variables=variables,
+                variable_keys=variable_keys,
+                label_map=label_map,
+                record_model=record_model,
+                contract_types=contract_types,
+                stream_name=resolved_stream,
+            )
+        )
+    return contexts, all_variables
+
+
+def _stream_records_across_forms(
+    sdk: Any,
+    study_key: str,
+    config: TabularSinkConfig,
+    contexts: list[_FormExportContext],
+    all_variables: list[Any],
+    *,
+    on_active_batch: Callable[[_FormExportContext, list[Any], int], int],
+    on_voided_batch: Callable[[_FormExportContext, list[Any], int], int] | None = None,
+    on_before_checkpoints: Callable[[], None] | None = None,
+) -> None:
+    """Stream study records once, route batches per form, and commit checkpoints post-flush."""
+    if not contexts:
+        if on_before_checkpoints is not None:
+            on_before_checkpoints()
+        return
+
+    opts = _extract_safe_config_options(config)
+    use_checkpoint = opts["incremental"] or opts["state_provider"] is not None
+    provider: StateProviderProtocol | None = None
+    if use_checkpoint:
+        provider = (
+            cast(StateProviderProtocol, opts["state_provider"])
+            if opts["state_provider"] is not None
+            else get_state_provider(ledger_path=opts["ledger_path"])
+        )
+
+    with contextlib.ExitStack() as tx_stack:
+        for ctx in contexts:
+            if provider is not None:
+                ctx.tx = tx_stack.enter_context(
+                    provider.transaction(
+                        study_key,
+                        ctx.stream_name,
+                        fallback_timestamp=opts["modified_since"],
+                    )
+                )
+                raw_last = ctx.tx.get("last_timestamp")
+                ctx.watermark = (
+                    normalize_watermark_datetime(raw_last)
+                    if isinstance(raw_last, (datetime, str))
+                    else None
+                ) or opts["modified_since"]
+            else:
+                ctx.watermark = opts["modified_since"]
+
+        if all(ctx.watermark is not None for ctx in contexts):
+            study_watermark: datetime | None = min(
+                cast(datetime, ctx.watermark) for ctx in contexts
+            )
+        else:
+            study_watermark = None
+
+        any_reconcile_voided = any(
+            (not opts["include_deleted"])
+            and opts["idempotent"]
+            and (use_checkpoint or ctx.watermark is not None)
+            for ctx in contexts
+        )
+        exclude_deleted_upstream = (not opts["include_deleted"]) and (not any_reconcile_voided)
+
+        by_form_id = {ctx.form_id: ctx for ctx in contexts}
+        by_form_key = {ctx.form_key: ctx for ctx in contexts}
+
+        def _resolve_ctx(record: Any) -> _FormExportContext | None:
+            fid, fk = extract_record_form_ref(record)
+            if fid is not None and fid in by_form_id:
+                return by_form_id[fid]
+            if fk is not None and fk in by_form_key:
+                return by_form_key[fk]
+            return None
+
+        effective_form_whitelist = (
+            [ctx.form_id for ctx in contexts] if config.form_whitelist is not None else None
+        )
+        merged_filter = _merge_form_whitelist_into_filter(
+            opts["record_filter"], effective_form_whitelist
+        )
+        raw_records = iter_filtered_sdk_records(
+            sdk,
+            study_key,
+            watermark=study_watermark,
+            record_filter=merged_filter,
+            record_data_filter=opts["record_data_filter"],
+            exclude_deleted_upstream=exclude_deleted_upstream,
+        )
+
+        def _handle_active_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
+            ctx = by_form_key[fk]
+            written = on_active_batch(ctx, batch, batch_idx)
+            ctx.total_written += written
+            if written > 0:
+                ctx.wrote_any = True
+
+        def _handle_voided_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
+            if on_voided_batch is None:
+                return
+            ctx = by_form_key[fk]
+            ctx.total_reconciled += on_voided_batch(ctx, batch, batch_idx)
+
+        router = BoundedFormBufferRouter(
+            [ctx.form_key for ctx in contexts],
+            batch_size=opts["batch_size"],
+            max_buffered_records=opts["max_buffered_records"],
+            on_flush_active=_handle_active_flush,
+            on_flush_voided=_handle_voided_flush if any_reconcile_voided else None,
+        )
+
+        def _pop_form_accepted_candidate(ctx: _FormExportContext, rec: Any) -> None:
+            bucket = ctx.pending_gate.get(id(rec))
+            if bucket:
+                bucket.pop(0)
+                if not bucket:
+                    del ctx.pending_gate[id(rec)]
+                return
+            rec_id = extract_record_id(rec)
+            if rec_id is None:
+                return
+            for obj_id, candidate_bucket in list(ctx.pending_gate.items()):
+                for idx, (cand_rec, _) in enumerate(candidate_bucket):
+                    if extract_record_id(cand_rec) == rec_id:
+                        candidate_bucket.pop(idx)
+                        if not candidate_bucket:
+                            del ctx.pending_gate[obj_id]
+                        return
+
+        def _observe_and_route() -> Iterator[Any]:
+            for rec in raw_records:
+                ctx = _resolve_ctx(rec)
+                if ctx is None:
+                    continue
+                rec_ts = extract_record_timestamp(rec)
+                if ctx.watermark is not None:
+                    if rec_ts is not None:
+                        if rec_ts < ctx.watermark:
+                            continue
+                    elif study_watermark is None or study_watermark < ctx.watermark:
+                        continue
+
+                if not opts["include_deleted"] and is_record_deleted(rec):
+                    if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
+                        if rec_ts is not None:
+                            ctx.exported_timestamps.append(rec_ts)
+                        router.add_voided(ctx.form_key, rec)
+                    continue
+
+                ctx.pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
+                yield rec
+
+        if apply_quality_gate is _DEFAULT_APPLY_QUALITY_GATE:
+            gated_records: Iterable[Any] = apply_quality_gate(
+                sdk,
+                study_key,
+                _observe_and_route(),
+                config,
+                variables=all_variables,
+                forms=[ctx.form for ctx in contexts],
+            )
+        else:
+            gated_records = apply_quality_gate(
+                sdk,
+                study_key,
+                _observe_and_route(),
+                config,
+            )
+
+        for rec in gated_records:
+            matched_ctx = _resolve_ctx(rec)
+            if matched_ctx is not None:
+                _pop_form_accepted_candidate(matched_ctx, rec)
+                rec_ts = extract_record_timestamp(rec)
+                if rec_ts is not None:
+                    matched_ctx.exported_timestamps.append(rec_ts)
+                router.add_active(matched_ctx.form_key, rec)
+        router.flush_all()
+
+        for ctx in contexts:
+            rejected_timestamps = [
+                rec_ts for bucket in ctx.pending_gate.values() for _, rec_ts in bucket
+            ]
+            ctx.pending_gate.clear()
+            if rejected_timestamps:
+                if any(rec_ts is None for rec_ts in rejected_timestamps):
+                    ctx.max_ts = None
+                else:
+                    min_rejected_ts = min(ts for ts in rejected_timestamps if ts is not None)
+                    eligible_ts = [ts for ts in ctx.exported_timestamps if ts <= min_rejected_ts]
+                    ctx.max_ts = max(eligible_ts) if eligible_ts else None
+            elif ctx.exported_timestamps:
+                ctx.max_ts = max(ctx.exported_timestamps)
+            ctx.exported_timestamps.clear()
+
+        if on_before_checkpoints is not None:
+            on_before_checkpoints()
+
+        for ctx in contexts:
+            if ctx.tx is not None:
+                ctx.tx["records_processed"] = ctx.total_written + ctx.total_reconciled
+                if ctx.max_ts is not None:
+                    ctx.tx["new_timestamp"] = ctx.max_ts
+
+
+def _make_form_sink_config(
+    study_key: str,
+    config: TabularSinkConfig,
+    ctx: _FormExportContext,
+    *,
+    use_labels_as_columns: bool,
+    pandas_kwargs: dict[str, Any] | None = None,
+) -> TabularSinkConfig:
+    """Create a per-form :class:`TabularSinkConfig` inheriting study-level streaming options."""
+    return TabularSinkConfig(
+        study_key=study_key,
+        manifest_path=config.manifest_path,
+        pandas_kwargs=dict(config.pandas_kwargs) if pandas_kwargs is None else pandas_kwargs,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=ctx.variable_keys,
+        form_whitelist=[ctx.form_id],
+        batch_size=config.batch_size,
+        max_buffered_records=config.max_buffered_records,
+        max_retries=config.max_retries,
+        retry_backoff=config.retry_backoff,
+        idempotent=config.idempotent,
+        mask_phi=config.mask_phi,
+        extra=dict(config.extra),
+        quality_gate_enabled=config.quality_gate_enabled,
+        min_schema_readiness_score=config.min_schema_readiness_score,
+        tracer=config.tracer,
+        modified_since=config.modified_since,
+        record_filter=config.record_filter,
+        record_data_filter=config.record_data_filter,
+        include_deleted=config.include_deleted,
+        incremental=config.incremental,
+        stream_name=ctx.stream_name,
+        ledger_path=config.ledger_path,
+        state_provider=config.state_provider,
+    )
+
+
 def export_to_duckdb_by_form(
     sdk: ImednetSDK,
     study_key: str,
@@ -3307,53 +3662,38 @@ def export_to_duckdb_by_form(
     pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
-    forms = sdk.forms.list(study_key=study_key)
-
-    # Fetch all variables for the study once to avoid N+1 queries
-    _form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
-    all_variables = (
-        []
-        if form_whitelist is not None and len(form_whitelist) == 0
-        else sdk.variables.list(study_key=study_key, **_form_filter)
-    )
-    variables_by_form: dict[int, list[Any]] = {}
-    for v in all_variables:
-        if v.form_id is not None:
-            variables_by_form.setdefault(v.form_id, []).append(v)
-
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
-    if use_mock_fetch:
-        conn: Any = duckdb.connect(_coerce_path_str(db_path), config={"threads": "1"})
-        try:
-            for form in forms:
-                if form.form_id is None or form.form_key is None:
-                    continue
-                if form_whitelist is not None and form.form_id not in form_whitelist:
-                    continue
 
-                _validate_duckdb_identifier(form.form_key)
+    contexts, all_variables = _build_form_export_contexts(
+        sdk,
+        study_key,
+        mapper,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        mask_phi=config.mask_phi,
+        pipeline=pipeline,
+        stream_prefix="duckdb",
+        custom_stream_prefix=config.stream_name,
+        validate_form_key_fn=_validate_duckdb_identifier,
+    )
 
-                variables = variables_by_form.get(form.form_id, [])
-                variable_keys = [
-                    v.variable_name
-                    for v in variables
-                    if variable_whitelist is None or v.variable_name in variable_whitelist
-                ]
-                label_map = {
-                    v.variable_name: v.label for v in variables if v.variable_name in variable_keys
-                }
-                record_model = mapper._build_record_model(variable_keys, label_map)
+    resolved_db_path = _coerce_path_str(db_path)
+    conn: Any = duckdb.connect(resolved_db_path, config={"threads": "1"})
+    try:
+        if use_mock_fetch:
+            for ctx in contexts:
                 records = mapper._fetch_records(
                     study_key,
-                    extra_filters={"formId": form.form_id},
+                    extra_filters={"formId": ctx.form_id},
                 )
-                rows, _ = mapper._parse_records(records, record_model)
+                rows, _ = mapper._parse_records(records, ctx.record_model)
                 if pipeline is not None and not has_native_enrichment:
                     rows = [pipeline.process(r, mask_phi=config.mask_phi) for r in rows]
                 df = mapper._build_dataframe(
                     rows,
-                    variable_keys,
-                    label_map,
+                    ctx.variable_keys,
+                    ctx.label_map,
                     use_labels_as_columns,
                 )
                 if isinstance(df, pd.DataFrame):
@@ -3368,119 +3708,75 @@ def export_to_duckdb_by_form(
                     and len(df.columns) == 0
                     and not isinstance(conn, NonCallableMock)
                 ):
-                    _replace_duckdb_with_empty_table(conn, form.form_key, None)
+                    _replace_duckdb_with_empty_table(conn, ctx.form_key, None)
                     continue
 
                 conn.register(_DUCKDB_DF_ALIAS, df)
                 try:
                     conn.execute(
-                        f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(form.form_key)} "
+                        f"CREATE OR REPLACE TABLE {_quote_duckdb_identifier(ctx.form_key)} "
                         f"AS SELECT * FROM {_quote_duckdb_identifier(_DUCKDB_DF_ALIAS)}"
                     )
                 finally:
                     conn.unregister(_DUCKDB_DF_ALIAS)
-        finally:
-            conn.close()
-        return
+            return
 
-    for form in forms:
-        if form.form_id is None or form.form_key is None:
-            continue
-        if form_whitelist is not None and form.form_id not in form_whitelist:
-            continue
+        with contextlib.ExitStack() as sink_stack:
+            for ctx in contexts:
+                form_config = _make_form_sink_config(
+                    study_key,
+                    config,
+                    ctx,
+                    use_labels_as_columns=use_labels_as_columns,
+                )
+                inner_ddb_sink = TabularDuckDBSink(
+                    db_path,
+                    ctx.form_key,
+                    form_config,
+                    contract_types=ctx.contract_types,
+                    conn=conn,
+                )
+                transform_sink = _TabularTransformSink(
+                    inner_ddb_sink,
+                    mapper,
+                    ctx.record_model,
+                    ctx.variable_keys,
+                    ctx.label_map,
+                    form_config,
+                    sanitize=False,
+                    pipeline=pipeline,
+                )
+                ctx.sink = sink_stack.enter_context(transform_sink)
 
-        _validate_duckdb_identifier(form.form_key)
+            def _write_duckdb_batch(
+                ctx: _FormExportContext, batch: list[Any], batch_idx: int
+            ) -> int:
+                return int(
+                    ctx.sink.write_batch(batch, batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}")
+                )
 
-        variables = variables_by_form.get(form.form_id, [])
-        variable_keys = [
-            v.variable_name
-            for v in variables
-            if variable_whitelist is None or v.variable_name in variable_whitelist
-        ]
-        label_map = {
-            v.variable_name: v.label for v in variables if v.variable_name in variable_keys
-        }
-        record_model = mapper._build_record_model(variable_keys, label_map)
-        form_contract_types = _build_tabular_contract_types(
-            variable_keys,
-            label_map,
-            variables,
-            use_labels_as_columns=use_labels_as_columns,
-            mask_phi=config.mask_phi,
-            pipeline=pipeline,
-        )
-        form_stream_name = (
-            f"{config.stream_name}_{form.form_key}" if config.stream_name is not None else None
-        )
-        form_config = TabularSinkConfig(
-            study_key=study_key,
-            manifest_path=config.manifest_path,
-            pandas_kwargs=dict(config.pandas_kwargs),
-            use_labels_as_columns=use_labels_as_columns,
-            variable_whitelist=variable_keys,
-            form_whitelist=[form.form_id],
-            batch_size=config.batch_size,
-            max_retries=config.max_retries,
-            retry_backoff=config.retry_backoff,
-            idempotent=config.idempotent,
-            mask_phi=config.mask_phi,
-            extra=dict(config.extra),
-            quality_gate_enabled=config.quality_gate_enabled,
-            min_schema_readiness_score=config.min_schema_readiness_score,
-            tracer=config.tracer,
-            modified_since=config.modified_since,
-            record_filter=config.record_filter,
-            record_data_filter=config.record_data_filter,
-            include_deleted=config.include_deleted,
-            incremental=config.incremental,
-            stream_name=form_stream_name,
-            ledger_path=config.ledger_path,
-            state_provider=config.state_provider,
-        )
-        form_sink = TabularDuckDBSink(
-            db_path,
-            form.form_key,
-            form_config,
-            contract_types=form_contract_types,
-        )
-        form_filter = _merge_form_whitelist_into_filter(form_config.record_filter, [form.form_id])
+            def _reconcile_duckdb_voided(
+                ctx: _FormExportContext, voided_batch: list[Any], batch_idx: int
+            ) -> int:
+                return int(
+                    ctx.sink.reconcile_deleted(
+                        voided_batch,
+                        batch_id=f"{study_key}/{ctx.form_key}/voided/{batch_idx}",
+                    )
+                )
 
-        def _duckdb_form_records_source(
-            watermark: datetime | None,
-            exclude_deleted_upstream: bool,
-            _flt: Any = form_filter,
-            _rdf: str | None = form_config.record_data_filter,
-        ) -> Iterable[Any]:
-            return iter_filtered_sdk_records(
+            _stream_records_across_forms(
                 sdk,
                 study_key,
-                watermark=watermark,
-                record_filter=_flt,
-                record_data_filter=_rdf,
-                exclude_deleted_upstream=exclude_deleted_upstream,
+                config,
+                contexts,
+                all_variables,
+                on_active_batch=_write_duckdb_batch,
+                on_voided_batch=_reconcile_duckdb_voided,
+                on_before_checkpoints=sink_stack.close,
             )
-
-        transform_sink = _TabularTransformSink(
-            form_sink,
-            mapper,
-            record_model,
-            variable_keys,
-            label_map,
-            form_config,
-            sanitize=False,
-            pipeline=pipeline,
-        )
-        run_streaming_export(
-            sdk,
-            study_key,
-            transform_sink,
-            form_config,
-            stream_name=f"duckdb_{form.form_key}",
-            batch_id_prefix=f"{study_key}/{form.form_key}",
-            records_source=_duckdb_form_records_source,
-            quality_gate_fn=apply_quality_gate,
-            iter_batches_fn=iter_batches,
-        )
+    finally:
+        conn.close()
 
 
 def export_to_sql_by_form(
@@ -3519,49 +3815,34 @@ def export_to_sql_by_form(
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     engine = create_engine(conn_str)
-    forms = sdk.forms.list(study_key=study_key)
 
-    # Fetch all variables for the study once to avoid N+1 queries
-    _form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
-    all_variables = (
-        []
-        if form_whitelist is not None and len(form_whitelist) == 0
-        else sdk.variables.list(study_key=study_key, **_form_filter)
+    contexts, all_variables = _build_form_export_contexts(
+        sdk,
+        study_key,
+        mapper,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        mask_phi=config.mask_phi,
+        pipeline=pipeline,
+        stream_prefix="sql",
+        custom_stream_prefix=config.stream_name,
     )
-    variables_by_form: dict[int, list[Any]] = {}
-    for v in all_variables:
-        if v.form_id is not None:
-            variables_by_form.setdefault(v.form_id, []).append(v)
 
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
-
-    for form in forms:
-        if form.form_id is None or form.form_key is None:
-            continue
-        if form_whitelist is not None and form.form_id not in form_whitelist:
-            continue
-        variables = variables_by_form.get(form.form_id, [])
-        variable_keys = [
-            v.variable_name
-            for v in variables
-            if variable_whitelist is None or v.variable_name in variable_whitelist
-        ]
-        label_map = {
-            v.variable_name: v.label for v in variables if v.variable_name in variable_keys
-        }
-        record_model = mapper._build_record_model(variable_keys, label_map)
-        if use_mock_fetch:
+    if use_mock_fetch:
+        for ctx in contexts:
             records = mapper._fetch_records(
                 study_key,
-                extra_filters={"formId": form.form_id},
+                extra_filters={"formId": ctx.form_id},
             )
-            rows, _ = mapper._parse_records(records, record_model)
+            rows, _ = mapper._parse_records(records, ctx.record_model)
             if pipeline is not None and not has_native_enrichment:
                 rows = [pipeline.process(r, mask_phi=config.mask_phi) for r in rows]
             df = mapper._build_dataframe(
                 rows,
-                variable_keys,
-                label_map,
+                ctx.variable_keys,
+                ctx.label_map,
                 use_labels_as_columns,
             )
             if isinstance(df, pd.DataFrame):
@@ -3570,7 +3851,7 @@ def export_to_sql_by_form(
                 if config.mask_phi:
                     df = _mask_df(df, phi_keys=phi_keys)
 
-            form_table = form.form_key or ""
+            form_table = ctx.form_key
 
             def _write_form_sql(
                 target_df: pd.DataFrame = df,
@@ -3587,77 +3868,94 @@ def export_to_sql_by_form(
 
             with _TabularCallableSink(config, "export_sql_by_form", _write_form_sql) as legacy_sink:
                 legacy_sink.write_batch([1], batch_id=f"{study_key}/{form_table}/0")
-            continue
+        return
 
-        form_stream_name = (
-            f"{config.stream_name}_{form.form_key}" if config.stream_name is not None else None
-        )
-        form_pandas_kwargs = dict(config.pandas_kwargs)
-        if if_exists is not None and not (config.incremental or config.modified_since is not None):
-            form_pandas_kwargs["if_exists"] = if_exists
-        form_config = TabularSinkConfig(
-            study_key=study_key,
-            manifest_path=config.manifest_path,
-            pandas_kwargs=form_pandas_kwargs,
-            use_labels_as_columns=use_labels_as_columns,
-            variable_whitelist=variable_keys,
-            form_whitelist=[form.form_id],
-            batch_size=config.batch_size,
-            max_retries=config.max_retries,
-            retry_backoff=config.retry_backoff,
-            idempotent=config.idempotent,
-            mask_phi=config.mask_phi,
-            extra=dict(config.extra),
-            quality_gate_enabled=config.quality_gate_enabled,
-            min_schema_readiness_score=config.min_schema_readiness_score,
-            tracer=config.tracer,
-            modified_since=config.modified_since,
-            record_filter=config.record_filter,
-            record_data_filter=config.record_data_filter,
-            include_deleted=config.include_deleted,
-            incremental=config.incremental,
-            stream_name=form_stream_name,
-            ledger_path=config.ledger_path,
-            state_provider=config.state_provider,
-        )
-        form_sink = TabularSQLSink(form.form_key, engine, form_config)
-        form_filter = _merge_form_whitelist_into_filter(form_config.record_filter, [form.form_id])
+    is_incremental = _is_incremental_config(config)
 
-        def _form_records_source(
-            watermark: datetime | None,
-            exclude_deleted_upstream: bool,
-            _flt: Any = form_filter,
-            _rdf: str | None = form_config.record_data_filter,
-        ) -> Iterable[Any]:
-            return iter_filtered_sdk_records(
-                sdk,
+    with contextlib.ExitStack() as sink_stack:
+        for ctx in contexts:
+            form_pandas_kwargs = dict(config.pandas_kwargs)
+            if if_exists is not None and not (
+                config.incremental or config.modified_since is not None
+            ):
+                form_pandas_kwargs["if_exists"] = if_exists
+            form_config = _make_form_sink_config(
                 study_key,
-                watermark=watermark,
-                record_filter=_flt,
-                record_data_filter=_rdf,
-                exclude_deleted_upstream=exclude_deleted_upstream,
+                config,
+                ctx,
+                use_labels_as_columns=use_labels_as_columns,
+                pandas_kwargs=form_pandas_kwargs,
+            )
+            inner_sql_sink = TabularSQLSink(ctx.form_key, engine, form_config)
+            transform_sink = _TabularTransformSink(
+                inner_sql_sink,
+                mapper,
+                ctx.record_model,
+                ctx.variable_keys,
+                ctx.label_map,
+                form_config,
+                sanitize=False,
+                pipeline=pipeline,
+            )
+            ctx.sink = sink_stack.enter_context(transform_sink)
+
+        def _write_sql_batch(ctx: _FormExportContext, batch: list[Any], batch_idx: int) -> int:
+            return int(
+                ctx.sink.write_batch(batch, batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}")
             )
 
-        transform_sink = _TabularTransformSink(
-            form_sink,
-            mapper,
-            record_model,
-            variable_keys,
-            label_map,
-            form_config,
-            sanitize=False,
-            pipeline=pipeline,
-        )
-        run_streaming_export(
+        def _reconcile_sql_voided(
+            ctx: _FormExportContext, voided_batch: list[Any], batch_idx: int
+        ) -> int:
+            return int(
+                ctx.sink.reconcile_deleted(
+                    voided_batch,
+                    batch_id=f"{study_key}/{ctx.form_key}/voided/{batch_idx}",
+                )
+            )
+
+        def _finalize_and_flush_sql_sinks() -> None:
+            if (
+                not is_incremental
+                and config.idempotent
+                and resolved_if_exists != "fail"
+                and not isinstance(engine, NonCallableMock)
+            ):
+                for ctx in contexts:
+                    if not ctx.wrote_any:
+                        empty_df = _build_empty_contract_df(ctx.contract_types)
+                        sql_sink = cast(TabularSQLSink, ctx.sink._inner)
+
+                        def _write_empty(
+                            target_df: pd.DataFrame = empty_df,
+                            target_table: str = ctx.form_key,
+                            target_kwargs: Mapping[str, Any] = sql_sink._cfg.pandas_kwargs,
+                        ) -> int:
+                            _to_sql_with_chunking(
+                                target_df,
+                                target_table,
+                                engine,
+                                if_exists=resolved_if_exists,
+                                **target_kwargs,
+                            )
+                            return 0
+
+                        sql_sink._execute_with_retry(
+                            "export_sql_empty",
+                            f"{study_key}/{ctx.form_key}/empty",
+                            _write_empty,
+                        )
+            sink_stack.close()
+
+        _stream_records_across_forms(
             sdk,
             study_key,
-            transform_sink,
-            form_config,
-            stream_name=f"sql_{form.form_key}",
-            batch_id_prefix=f"{study_key}/{form.form_key}",
-            records_source=_form_records_source,
-            quality_gate_fn=apply_quality_gate,
-            iter_batches_fn=iter_batches,
+            config,
+            contexts,
+            all_variables,
+            on_active_batch=_write_sql_batch,
+            on_voided_batch=_reconcile_sql_voided,
+            on_before_checkpoints=_finalize_and_flush_sql_sinks,
         )
 
 
@@ -3691,7 +3989,7 @@ def _unpack_long_sql_rows(
             elif global_sensitivity_registry.is_sensitive(name) or _is_custom_phi_key(
                 name, phi_keys
             ):
-                masked_value = "***MASKED***"
+                masked_value = MASKED_SENTINEL
             else:
                 masked_value = mask_clinical_phi(value)
                 if phi_keys:
@@ -3808,9 +4106,12 @@ class _LongSQLSink(ExportSink):
             self._is_first_write = False
 
     def close(self) -> None:
-        """Close the sink and release pooled SQLite/SQLAlchemy connections."""
-        if not isinstance(self.engine, NonCallableMock) and callable(
-            getattr(self.engine, "dispose", None)
+        """Close the sink and dispose any non-in-memory SQLAlchemy engine."""
+        db_name = getattr(getattr(self.engine, "url", None), "database", None)
+        if (
+            not isinstance(self.engine, NonCallableMock)
+            and db_name not in (None, ":memory:")
+            and callable(getattr(self.engine, "dispose", None))
         ):
             self.engine.dispose()
 
@@ -3846,27 +4147,36 @@ def export_to_long_sql(
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
 
     if _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config):
-        legacy_records = (
-            rec
-            for rec in mapper._fetch_records(study_key)
-            if config.include_deleted or not is_record_deleted(rec)
-        )
-        long_rows = _unpack_long_sql_rows(
-            legacy_records,
-            mask_phi=config.mask_phi,
-            pipeline=pipeline,
-            phi_keys=phi_keys,
-        )
-        first = True
-        for start in range(0, len(long_rows), max(1, chunk_size)):
-            df = pd.DataFrame(long_rows[start : start + max(1, chunk_size)])
-            df.to_sql(
-                table_name,
-                engine,
-                if_exists="replace" if first else "append",
-                index=False,
+        try:
+            legacy_records = (
+                rec
+                for rec in mapper._fetch_records(study_key)
+                if config.include_deleted or not is_record_deleted(rec)
             )
-            first = False
+            long_rows = _unpack_long_sql_rows(
+                legacy_records,
+                mask_phi=config.mask_phi,
+                pipeline=pipeline,
+                phi_keys=phi_keys,
+            )
+            first = True
+            for start in range(0, len(long_rows), max(1, chunk_size)):
+                df = pd.DataFrame(long_rows[start : start + max(1, chunk_size)])
+                df.to_sql(
+                    table_name,
+                    engine,
+                    if_exists="replace" if first else "append",
+                    index=False,
+                )
+                first = False
+        finally:
+            db_name = getattr(getattr(engine, "url", None), "database", None)
+            if (
+                not isinstance(engine, NonCallableMock)
+                and db_name not in (None, ":memory:")
+                and callable(getattr(engine, "dispose", None))
+            ):
+                engine.dispose()
         return
 
     long_sink = _LongSQLSink(

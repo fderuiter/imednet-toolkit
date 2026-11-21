@@ -86,6 +86,7 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
 
     from airflow import settings
     from airflow.configuration import conf
+    from airflow.dag_processing.bundles import manager as bundles_manager
     from airflow.utils.db import initdb
 
     af_home = tmp_path / "airflow_home"
@@ -95,6 +96,7 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
     db_uri = f"sqlite:///{db_file}"
 
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_pool = conf.get("database", "sql_alchemy_pool_enabled", fallback=None)
     prev_dags = conf.get("core", "dags_folder", fallback=None)
     prev_examples = conf.get("core", "load_examples", fallback=None)
     prev_bundles = conf.get("dag_processor", "dag_bundle_config_list", fallback=None)
@@ -111,19 +113,26 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
 
     monkeypatch.setenv("AIRFLOW_HOME", str(af_home))
     monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED", "False")
     monkeypatch.setenv("AIRFLOW__CORE__DAGS_FOLDER", str(dags_dir))
     monkeypatch.setenv("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
     monkeypatch.setenv("AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST", bundle_cfg)
 
     prev_settings_conn = settings.SQL_ALCHEMY_CONN
-    monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    prev_settings_conn_async = getattr(settings, "SQL_ALCHEMY_CONN_ASYNC", None)
 
     conf.set("database", "sql_alchemy_conn", db_uri)
+    conf.set("database", "sql_alchemy_pool_enabled", "False")
     conf.set("core", "dags_folder", str(dags_dir))
     conf.set("core", "load_examples", "False")
     conf.set("dag_processor", "dag_bundle_config_list", bundle_cfg)
+    if hasattr(bundles_manager, "_load_bundle_config_snapshot"):
+        bundles_manager._load_bundle_config_snapshot.cache_clear()
 
     settings.dispose_orm()
+    if hasattr(settings, "configure_vars"):
+        settings.configure_vars()
+    monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
     settings.configure_orm()
     initdb()
 
@@ -136,6 +145,7 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
             **{k: v for k, v in os.environ.items() if not k.startswith("AIRFLOW_CTX_")},
             "AIRFLOW_HOME": str(af_home),
             "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": db_uri,
+            "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED": "False",
             "AIRFLOW__CORE__DAGS_FOLDER": str(dags_dir),
             "AIRFLOW__CORE__LOAD_EXAMPLES": "False",
             "AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST": bundle_cfg,
@@ -149,14 +159,22 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
 
     settings.dispose_orm()
     settings.SQL_ALCHEMY_CONN = prev_settings_conn
+    if hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+        settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_conn_async
     if prev_conn is not None:
         conf.set("database", "sql_alchemy_conn", prev_conn)
+    if prev_pool is not None:
+        conf.set("database", "sql_alchemy_pool_enabled", prev_pool)
     if prev_dags is not None:
         conf.set("core", "dags_folder", prev_dags)
     if prev_examples is not None:
         conf.set("core", "load_examples", prev_examples)
     if prev_bundles is not None:
         conf.set("dag_processor", "dag_bundle_config_list", prev_bundles)
+    if hasattr(bundles_manager, "_load_bundle_config_snapshot"):
+        bundles_manager._load_bundle_config_snapshot.cache_clear()
+    if hasattr(settings, "configure_vars"):
+        settings.configure_vars()
     settings.configure_orm()
 
     root_logger.handlers = saved_handlers
@@ -750,3 +768,41 @@ def test_airflow3_dagbag_loads_examples_airflow_with_zero_import_errors(airflow3
     assert expected_dags.issubset(set(dagbag.dags.keys()))
     for dag_id in expected_dags:
         assert dagbag.dags[dag_id].schedule is None
+
+
+def test_job_sensor_fails_in_dag_when_result_url_has_failed_records(monkeypatch):
+    """ImednetJobSensor fails inside a real Airflow DAG when terminal resultUrl reports Record errors."""
+    _purge_partial_airflow_modules()
+    pytest.importorskip("airflow")
+    import httpx
+
+    from apache_airflow_providers_imednet import ImednetJobSensor
+    from apache_airflow_providers_imednet.operators import AirflowException
+    from imednet import ImednetSDK
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/jobs/BATCH_BAD"):
+            return httpx.Response(
+                200,
+                json={
+                    "batchId": "BATCH_BAD",
+                    "state": "COMPLETED",
+                    "resultUrl": "https://edc.trn.imednetapi.com/results/BATCH_BAD.json",
+                },
+            )
+        return httpx.Response(
+            200,
+            json=[{"recordKey": "SUBJ-001-1", "status": "FAILED", "error": "Form locked"}],
+        )
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://edc.trn.imednetapi.com",
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr(ImednetJobSensor, "_get_sdk", lambda self: sdk)
+
+    sensor = ImednetJobSensor(task_id="wait_bad_batch", study_key="STUDY_A", batch_id="BATCH_BAD")
+    with pytest.raises(AirflowException, match="Form locked"):
+        sensor.poke(context={})
