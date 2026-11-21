@@ -22,6 +22,23 @@ if TYPE_CHECKING:
     from imednet import ImednetSDK
 
 
+def _has_dummy_provider_bindings() -> bool:
+    """Return True when cached provider modules are bound to non-Airflow dummy base classes."""
+    checks = (
+        ("apache_airflow_providers_imednet.hooks", "BaseHook"),
+        ("apache_airflow_providers_imednet.operators.export", "BaseOperator"),
+        ("apache_airflow_providers_imednet.sensors", "BaseSensorOperator"),
+    )
+    for mod_name, attr_name in checks:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        base_cls = getattr(mod, attr_name, None)
+        if not getattr(base_cls, "__module__", "").startswith("airflow"):
+            return True
+    return False
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_airflow_provider_modules():
     """Unload provider modules upon module teardown to ensure other test suites stay hermetic."""
@@ -31,12 +48,18 @@ def _cleanup_airflow_provider_modules():
     saved_handlers = list(root_logger.handlers)
     saved_level = root_logger.level
 
+    airflow_mod = sys.modules.get("airflow")
     if (
-        "airflow" not in sys.modules
-        or getattr(sys.modules.get("airflow"), "__path__", None) is None
+        airflow_mod is None
+        or getattr(airflow_mod, "__path__", None) is None
+        or not getattr(airflow_mod, "__file__", None)
     ):
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+                sys.modules.pop(mod, None)
+    elif _has_dummy_provider_bindings():
+        for mod in list(sys.modules):
+            if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
                 sys.modules.pop(mod, None)
 
     yield
@@ -488,3 +511,36 @@ def test_real_airflow_hook_test_connection_and_provider_discovery(monkeypatch, r
     assert ok_fail is False
     assert "SUPER_SECRET_API_KEY" not in err_msg
     assert "SUPER_SECRET_SEC_KEY" not in err_msg
+
+
+def test_provider_alias_stays_synced_after_module_eviction_and_reimport(real_airflow):
+    """Evicting and re-importing apache_airflow_providers_imednet resyncs airflow.providers.imednet aliases."""
+    import importlib
+
+    from airflow.providers.imednet.hooks import ImednetHook as InitialAliasedHook
+    from airflow.providers_manager import ProvidersManager
+
+    connection_cls = real_airflow["Connection"]
+    assert InitialAliasedHook is real_airflow["ImednetHook"]
+
+    # Simulate another test evicting apache_airflow_providers_imednet* while leaving
+    # airflow.providers.imednet* cached in sys.modules.
+    for mod in list(sys.modules):
+        if mod.startswith("apache_airflow_providers_imednet"):
+            sys.modules.pop(mod, None)
+
+    provider_pkg = importlib.import_module("apache_airflow_providers_imednet")
+    fresh_hooks = importlib.import_module("apache_airflow_providers_imednet.hooks")
+    resynced_hooks = importlib.import_module("airflow.providers.imednet.hooks")
+
+    provider_pkg.get_provider_info()
+    finder_count = sum(
+        1 for finder in sys.meta_path if type(finder).__name__ == "_ImednetAirflowProviderFinder"
+    )
+    assert finder_count == 1
+    assert resynced_hooks.ImednetHook is fresh_hooks.ImednetHook
+
+    pm = ProvidersManager()
+    pm._cleanup()
+    conn = connection_cls(conn_id="imednet_alias_resync", conn_type="imednet")
+    assert isinstance(conn.get_hook(), fresh_hooks.ImednetHook)

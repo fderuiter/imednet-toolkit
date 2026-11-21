@@ -59,14 +59,40 @@ class _ImednetAirflowProviderFinder(MetaPathFinder, Loader):
 
 
 def _ensure_airflow_provider_finder() -> None:
-    """Ensure the ``airflow.providers.imednet`` import alias finder is registered."""
-    if not any(isinstance(finder, _ImednetAirflowProviderFinder) for finder in sys.meta_path):
-        sys.meta_path.insert(0, _ImednetAirflowProviderFinder())
+    """Ensure a single ``airflow.providers.imednet`` import alias finder is registered."""
+    if sys.meta_path and isinstance(sys.meta_path[0], _ImednetAirflowProviderFinder):
+        return
+    sys.meta_path[:] = [
+        finder
+        for finder in sys.meta_path
+        if type(finder).__name__ != "_ImednetAirflowProviderFinder"
+    ]
+    sys.meta_path.insert(0, _ImednetAirflowProviderFinder())
+
+
+def _sync_airflow_provider_aliases() -> None:
+    """Keep ``airflow.providers.imednet`` module aliases aligned with active submodules."""
+    for mod_name in list(sys.modules):
+        if mod_name == _ALIAS_PREFIX or mod_name.startswith(f"{_ALIAS_PREFIX}."):
+            target_name = mod_name.replace(_ALIAS_PREFIX, _TARGET_PREFIX, 1)
+            target_mod = sys.modules.get(target_name)
+            if target_mod is not None:
+                sys.modules[mod_name] = target_mod
+            else:
+                sys.modules.pop(mod_name, None)
+    providers_pkg = sys.modules.get("airflow.providers")
+    target_root = sys.modules.get(_TARGET_PREFIX)
+    if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+        if target_root is not None:
+            providers_pkg.imednet = target_root  # type: ignore[attr-defined]
+        else:
+            delattr(providers_pkg, "imednet")
 
 
 def get_provider_info() -> dict[str, Any]:
     """Return Apache Airflow provider metadata for discovery."""
     _ensure_airflow_provider_finder()
+    _sync_airflow_provider_aliases()
     hook_name = "iMednet"
     conn_type = "imednet"
     return {
@@ -133,6 +159,8 @@ try:  # pragma: no cover - optional Airflow dependencies may be missing
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - sensor requires Airflow extras
     ImednetJobSensor = None
     sensors = None  # type: ignore
+
+_sync_airflow_provider_aliases()
 
 __all__ = [
     "ImednetExportOperator",

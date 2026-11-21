@@ -18,6 +18,8 @@ def _setup_airflow(monkeypatch):
     hooks_pkg = ModuleType("airflow.hooks")
     hooks_pkg.__path__ = []
     hooks_mod = ModuleType("airflow.sdk.bases.hook")
+    operator_mod = ModuleType("airflow.sdk.bases.operator")
+    sensor_mod = ModuleType("airflow.sdk.bases.sensor")
     sdk_mod = ModuleType("airflow.sdk")
     sdk_mod.__path__ = []
     sdk_bases = ModuleType("airflow.sdk.bases")
@@ -41,16 +43,20 @@ def _setup_airflow(monkeypatch):
 
         template_fields = ()
 
-        def __init__(self, **kwargs):
+        def __init__(self, *args, **kwargs):
             """Initialize the test object."""
 
     hooks_mod.BaseHook = DummyBaseHook
+    operator_mod.BaseOperator = DummyBaseOperator
+    sensor_mod.BaseSensorOperator = DummyBaseOperator
     models_mod.BaseOperator = DummyBaseOperator
     models_mod.DAG = DummyBaseOperator
     sdk_dag.DAG = DummyBaseOperator
     sdk_dag.dag = DummyBaseOperator
 
     sdk_bases.hook = hooks_mod
+    sdk_bases.operator = operator_mod
+    sdk_bases.sensor = sensor_mod
     sdk_mod.bases = sdk_bases
     sdk_defs.context = sdk_ctx
     sdk_defs.dag = sdk_dag
@@ -64,6 +70,8 @@ def _setup_airflow(monkeypatch):
     monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", operator_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.sensor", sensor_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
@@ -79,6 +87,18 @@ EXPORT_FUNCTIONS = [
     "export_to_sql",
     "export_to_sql_by_form",
 ]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _isolate_provider_modules():
+    """Prevent dummy Airflow subclasses from leaking into or out of this module."""
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
 
 
 @pytest.fixture(autouse=True)
