@@ -157,6 +157,41 @@ def test_export_to_hive_parquet_import_error(monkeypatch: pytest.MonkeyPatch) ->
         parquet_mod.export_to_hive_parquet(MagicMock(), "STUDY", "/tmp/lake")
 
 
+def test_parquet_module_import_and_pruning_handle_missing_pandas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify importing imednet.integrations.parquet works without pandas and pruning raises clear ImportError."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "imednet.integrations._parquet_no_pandas_check",
+        parquet_mod.__file__,
+    )
+    assert spec is not None and spec.loader is not None
+    isolated_mod = importlib.util.module_from_spec(spec)
+    isolated_mod.__package__ = "imednet.integrations"
+    with monkeypatch.context() as mp:
+        mp.setitem(__import__("sys").modules, "pandas", None)
+        spec.loader.exec_module(isolated_mod)
+
+    def _raise_pandas_import_error(module_name: str) -> Any:
+        if module_name == "pandas":
+            raise ImportError("missing pandas")
+        return __import__(module_name)
+
+    monkeypatch.setattr(parquet_mod, "import_module", _raise_pandas_import_error)
+    with pytest.raises(ImportError, match=r"pandas is required.*pip install 'imednet\[export\]'"):
+        parquet_mod._prune_hive_partition_record_ids(
+            [tmp_path / "part-0.parquet"],
+            {"101"},
+            pyarrow_module=MagicMock(),
+            storage_engine=MagicMock(),
+            base_dir=str(tmp_path),
+            study_key="STUDY",
+            form_key="DEMO",
+        )
+
+
 @pytest.mark.performance
 def test_export_to_hive_parquet_50_forms_5000_records_syncs_cache_once_and_masks_phi(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
