@@ -47,8 +47,10 @@ def test_job_sensor(monkeypatch):
     """Test that job sensor."""
     _setup_airflow(monkeypatch)
     import apache_airflow_providers_imednet.operators as ops
-    from apache_airflow_providers_imednet import sensors
+    from apache_airflow_providers_imednet import _airflow_compat, sensors
 
+    importlib.reload(_airflow_compat)
+    importlib.reload(ops)
     importlib.reload(sensors)
     _patch_basehook(monkeypatch)
     sdk = MagicMock()
@@ -84,8 +86,10 @@ def test_job_sensor_fetches_result_url_and_fails_on_record_errors(monkeypatch):
 
     _setup_airflow(monkeypatch)
     import apache_airflow_providers_imednet.operators as ops
-    from apache_airflow_providers_imednet import sensors
+    from apache_airflow_providers_imednet import _airflow_compat, sensors
 
+    importlib.reload(_airflow_compat)
+    importlib.reload(ops)
     importlib.reload(sensors)
     _patch_basehook(monkeypatch)
 
@@ -289,6 +293,53 @@ def test_provider_alias_sync_and_finder_deduplication(monkeypatch):
     finders = [f for f in sys.meta_path if getattr(f, "_imednet_airflow_provider_finder", False)]
     assert len(finders) == 1
     assert isinstance(finders[0], provider_pkg._ImednetAirflowProviderFinder)
+
+
+def test_airflow_compat_centralizes_sdk_exports_and_offline_fallbacks(monkeypatch):
+    """_airflow_compat exports all SDK symbols and resolves _Fallback* stubs without Airflow 2.x."""
+    import builtins
+
+    from tests.conftest import isolate_airflow_provider_modules
+
+    isolate_airflow_provider_modules(monkeypatch)
+
+    real_import = builtins.__import__
+    blocked_v2_imports: list[str] = []
+
+    def _offline_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "airflow" or name.startswith("airflow."):
+            if name.startswith(
+                ("airflow.hooks", "airflow.models", "airflow.sensors", "airflow.exceptions")
+            ):
+                blocked_v2_imports.append(name)
+            raise ModuleNotFoundError(f"No module named '{name}'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _offline_import)
+
+    compat = importlib.import_module("apache_airflow_providers_imednet._airflow_compat")
+    export_mod = importlib.import_module("apache_airflow_providers_imednet.operators.export")
+    sensors_mod = importlib.import_module("apache_airflow_providers_imednet.sensors")
+
+    assert compat.__all__ == [
+        "AirflowException",
+        "BaseHook",
+        "BaseOperator",
+        "BaseSensorOperator",
+        "BaseTrigger",
+        "Context",
+        "TaskDeferred",
+        "TriggerEvent",
+    ]
+    assert blocked_v2_imports == []
+    assert export_mod.BaseOperator is compat.BaseOperator
+    assert sensors_mod.BaseSensorOperator is compat.BaseSensorOperator
+    assert issubclass(export_mod.ImednetExportOperator, compat.BaseOperator)
+    assert issubclass(sensors_mod.ImednetJobSensor, compat.BaseSensorOperator)
+    assert compat.BaseOperator.__module__ == "apache_airflow_providers_imednet._airflow_compat"
+    assert (
+        compat.BaseSensorOperator.__module__ == "apache_airflow_providers_imednet._airflow_compat"
+    )
 
 
 @pytest.fixture(autouse=True, scope="module")

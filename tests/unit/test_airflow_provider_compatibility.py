@@ -78,12 +78,8 @@ def managed_sdk():
 def real_airflow():
     """Import and return real Airflow and provider components dynamically."""
     import airflow
-    from airflow.models.connection import Connection
-
-    try:
-        from airflow.sdk.bases.hook import BaseHook
-    except (ImportError, ModuleNotFoundError):  # pragma: no cover - Airflow 2.x fallback
-        from airflow.hooks.base import BaseHook
+    from airflow.sdk import Connection
+    from airflow.sdk.bases.hook import BaseHook
 
     from apache_airflow_providers_imednet.hooks import ImednetHook
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
@@ -310,23 +306,18 @@ def test_real_airflow_providers_manager_and_task_runtime_discover_imednet(real_a
     assert "apache-airflow-providers-imednet" in providers
     assert providers["apache-airflow-providers-imednet"].data["name"] == "iMednet"
 
-    hooks = pm.hooks
-    assert "imednet" in hooks
-    assert hooks["imednet"] is not None
-    assert hooks["imednet"].connection_type == "imednet"
-    assert hooks["imednet"].hook_name == "iMednet"
-    assert hooks["imednet"].hook_class_name == "airflow.providers.imednet.hooks.ImednetHook"
-
-    from airflow.providers.imednet.hooks import ImednetHook as AliasedImednetHook
-
-    assert AliasedImednetHook is hook_cls
-
     runtime_pm = ProvidersManagerTaskRuntime()
     runtime_pm._cleanup()
     runtime_hooks = runtime_pm.hooks
     assert "imednet" in runtime_hooks
     assert runtime_hooks["imednet"] is not None
     assert runtime_hooks["imednet"].connection_type == "imednet"
+    assert runtime_hooks["imednet"].hook_name == "iMednet"
+    assert runtime_hooks["imednet"].hook_class_name == "airflow.providers.imednet.hooks.ImednetHook"
+
+    from airflow.providers.imednet.hooks import ImednetHook as AliasedImednetHook
+
+    assert AliasedImednetHook is hook_cls
 
 
 def test_real_airflow_hook_resolves_connection_host_scheme_port_and_precedence(
@@ -505,6 +496,7 @@ def test_real_airflow_provider_alias_stays_synced_across_reimports(real_airflow)
 
     from airflow.providers.imednet.hooks import ImednetHook as InitialAliasedHook
     from airflow.providers_manager import ProvidersManager
+    from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
 
     connection_cls = real_airflow["Connection"]
     assert InitialAliasedHook is real_airflow["ImednetHook"]
@@ -526,6 +518,7 @@ def test_real_airflow_provider_alias_stays_synced_across_reimports(real_airflow)
 
     pm = ProvidersManager()
     pm._cleanup()
+    ProvidersManagerTaskRuntime()._cleanup()
     conn = connection_cls(conn_id="imednet_alias_resync", conn_type="imednet")
     assert isinstance(conn.get_hook(), ReimportedCanonicalHook)
 
@@ -554,9 +547,11 @@ def test_real_airflow_providers_manager_validates_schema_and_masks_ui_secrets(
     import jsonschema
     from airflow.providers_manager import ProvidersManager
     from airflow.sdk.bases.operator import BaseOperator as SdkBaseOperator
+    from airflow.sdk.bases.sensor import BaseSensorOperator as SdkBaseSensorOperator
     from airflow.sdk.definitions.connection import Connection as SdkConnection
 
     import apache_airflow_providers_imednet as provider_pkg
+    from apache_airflow_providers_imednet.sensors import ImednetJobSensor
 
     hook_cls = real_airflow["ImednetHook"]
     operator_cls = real_airflow["ImednetExportOperator"]
@@ -611,3 +606,4 @@ def test_real_airflow_providers_manager_validates_schema_and_masks_ui_secrets(
     assert sdk_client.config.security_key == "ui-sec-key"  # pragma: allowlist secret
     assert str(sdk_client.config.base_url).rstrip("/") == "https://edc.trn.imednetapi.com"
     assert issubclass(operator_cls, SdkBaseOperator)
+    assert issubclass(ImednetJobSensor, SdkBaseSensorOperator)

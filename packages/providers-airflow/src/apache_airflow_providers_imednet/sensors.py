@@ -7,22 +7,6 @@ from contextlib import closing
 from datetime import timedelta
 from typing import Any
 
-try:  # pragma: no cover - optional Airflow dependency
-    try:
-        from airflow.sdk.bases.sensor import BaseSensorOperator
-    except ImportError:
-        from airflow.sensors.base import BaseSensorOperator  # type: ignore[no-redef]
-except (ImportError, ModuleNotFoundError):  # pragma: no cover - placeholder fallback
-
-    class BaseSensorOperator:  # type: ignore
-        """Fallback BaseSensorOperator."""
-
-        template_fields: Sequence[str] = ()
-
-        def __init__(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
-            """Initialize fallback BaseSensorOperator."""
-
-
 from imednet import ImednetSDK
 from imednet.spi.utils import (
     redact_sensitive_payload,
@@ -30,7 +14,7 @@ from imednet.spi.utils import (
     validate_path_segment,
 )
 
-from ._airflow_compat import AirflowException, Context, TaskDeferred
+from ._airflow_compat import AirflowException, BaseSensorOperator, Context, TaskDeferred
 from .hooks import ImednetHook
 from .triggers import ImednetJobTrigger
 

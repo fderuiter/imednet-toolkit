@@ -43,9 +43,9 @@ def test_dag_runs(monkeypatch, tmp_path):
     _purge_partial_airflow_modules()
     pytest.importorskip("airflow")
     out_csv = tmp_path / "out.csv"
-    from airflow.models import DAG  # noqa: I001
+    from airflow.sdk import DAG
 
-    from apache_airflow_providers_imednet import ImednetJobSensor, ImednetExportOperator
+    from apache_airflow_providers_imednet import ImednetExportOperator, ImednetJobSensor
 
     sdk = MagicMock()
 
@@ -982,7 +982,7 @@ def test_export_operator_executes_sql_by_form_and_long_sql_destinations(
     _ = airflow3_sqlite_env
     import sqlite3
 
-    from airflow.models.connection import Connection
+    from airflow.sdk import Connection
 
     from apache_airflow_providers_imednet import ImednetExportOperator
     from apache_airflow_providers_imednet.hooks import ImednetHook

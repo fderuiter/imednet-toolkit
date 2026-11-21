@@ -19,8 +19,6 @@ def setup_dummy_airflow(
     isolate_airflow_provider_modules(monkeypatch)
     airflow_mod = ModuleType("airflow")
     airflow_mod.__path__ = []
-    hooks_pkg = ModuleType("airflow.hooks")
-    hooks_pkg.__path__ = []
     hooks_mod = ModuleType("airflow.sdk.bases.hook")
     operator_mod = ModuleType("airflow.sdk.bases.operator")
     sensor_mod = ModuleType("airflow.sdk.bases.sensor")
@@ -34,7 +32,6 @@ def setup_dummy_airflow(
     sdk_dag = ModuleType("airflow.sdk.definitions.dag")
     sdk_taskgroup = ModuleType("airflow.sdk.definitions.taskgroup")
     sdk_xcom_arg = ModuleType("airflow.sdk.definitions.xcom_arg")
-    models_mod = ModuleType("airflow.models")
 
     class DummyBaseHook:
         """Minimal BaseHook stub."""
@@ -66,8 +63,6 @@ def setup_dummy_airflow(
     hooks_mod.BaseHook = DummyBaseHook  # type: ignore[attr-defined]
     operator_mod.BaseOperator = DummyBaseOperator  # type: ignore[attr-defined]
     sensor_mod.BaseSensorOperator = DummyBaseOperator  # type: ignore[attr-defined]
-    models_mod.BaseOperator = DummyBaseOperator  # type: ignore[attr-defined]
-    models_mod.DAG = DummyBaseOperator  # type: ignore[attr-defined]
     sdk_dag.DAG = DummyBaseOperator  # type: ignore[attr-defined]
     sdk_dag.dag = DummyBaseOperator  # type: ignore[attr-defined]
     sdk_taskgroup.TaskGroup = DummyBaseOperator  # type: ignore[attr-defined]
@@ -83,12 +78,9 @@ def setup_dummy_airflow(
     sdk_defs.xcom_arg = sdk_xcom_arg  # type: ignore[attr-defined]
     sdk_mod.definitions = sdk_defs  # type: ignore[attr-defined]
     airflow_mod.sdk = sdk_mod  # type: ignore[attr-defined]
-    airflow_mod.hooks = hooks_pkg  # type: ignore[attr-defined]
-    airflow_mod.models = models_mod  # type: ignore[attr-defined]
 
     modules: dict[str, ModuleType] = {
         "airflow": airflow_mod,
-        "airflow.hooks": hooks_pkg,
         "airflow.sdk": sdk_mod,
         "airflow.sdk.bases": sdk_bases,
         "airflow.sdk.bases.hook": hooks_mod,
@@ -99,15 +91,10 @@ def setup_dummy_airflow(
         "airflow.sdk.definitions.dag": sdk_dag,
         "airflow.sdk.definitions.taskgroup": sdk_taskgroup,
         "airflow.sdk.definitions.xcom_arg": sdk_xcom_arg,
-        "airflow.models": models_mod,
     }
 
     if include_sensors_and_aws:
-        sensors_pkg = ModuleType("airflow.sensors")
-        sensors_pkg.__path__ = []
-        sensors_base = ModuleType("airflow.sensors.base")
         sensors_sdk = ModuleType("airflow.sdk.bases.sensor")
-        exc_mod = ModuleType("airflow.exceptions")
         sdk_exc = ModuleType("airflow.sdk.exceptions")
         providers_pkg = ModuleType("airflow.providers")
         providers_pkg.__path__ = []
@@ -130,16 +117,12 @@ def setup_dummy_airflow(
         class DummyAirflowError(Exception):
             """Minimal AirflowException stub."""
 
-        sensors_base.BaseSensorOperator = DummySensorOperator  # type: ignore[attr-defined]
         sensors_sdk.BaseSensorOperator = DummySensorOperator  # type: ignore[attr-defined]
-        exc_mod.AirflowException = DummyAirflowError  # type: ignore[attr-defined]
         sdk_exc.AirflowException = DummyAirflowError  # type: ignore[attr-defined]
         s3_mod.S3Hook = MagicMock  # type: ignore[attr-defined]
 
         sdk_bases.sensor = sensors_sdk  # type: ignore[attr-defined]
         sdk_mod.exceptions = sdk_exc  # type: ignore[attr-defined]
-        sensors_pkg.base = sensors_base  # type: ignore[attr-defined]
-        airflow_mod.sensors = sensors_pkg  # type: ignore[attr-defined]
         aws_hooks_pkg.s3 = s3_mod  # type: ignore[attr-defined]
         aws_pkg.hooks = aws_hooks_pkg  # type: ignore[attr-defined]
         amazon_pkg.aws = aws_pkg  # type: ignore[attr-defined]
@@ -149,14 +132,11 @@ def setup_dummy_airflow(
         modules.update(
             {
                 "airflow.sdk.bases.sensor": sensors_sdk,
-                "airflow.sensors": sensors_pkg,
-                "airflow.sensors.base": sensors_base,
                 "airflow.providers": providers_pkg,
                 "airflow.providers.amazon": amazon_pkg,
                 "airflow.providers.amazon.aws": aws_pkg,
                 "airflow.providers.amazon.aws.hooks": aws_hooks_pkg,
                 "airflow.providers.amazon.aws.hooks.s3": s3_mod,
-                "airflow.exceptions": exc_mod,
                 "airflow.sdk.exceptions": sdk_exc,
             }
         )
