@@ -423,3 +423,26 @@ def test_pytest_collect_only_security_tests_avoids_airflow_and_sqlalchemy() -> N
         if mod in {"airflow", "sqlalchemy"} or mod.startswith(("airflow.", "sqlalchemy."))
     )
     assert leaked == [], f"Unexpected Airflow/SQLAlchemy modules loaded during collection: {leaked}"
+
+
+def test_deferred_airflow_import_under_capfd_does_not_leak_closed_stream_handlers() -> None:
+    """Verify first-time Airflow import inside capfd does not poison subsequent capsys CLI runs."""
+    if (
+        importlib.util.find_spec("airflow") is None
+        or importlib.util.find_spec("apache_airflow_providers_imednet") is None
+    ):
+        pytest.skip("airflow provider not installed")
+
+    probe = (
+        "import pytest\n"
+        "rc = pytest.main([\n"
+        "    '-q',\n"
+        "    '-o', 'addopts=-ra',\n"
+        "    'tests/integration/test_security_loopback_path_traversal.py',\n"
+        "    'tests/unit/cli/test_spi_cli_helpers.py::'\n"
+        "    'test_simulation_mode_offline_json_reads_and_env_restoration[argv0-studies]',\n"
+        "])\n"
+        "raise SystemExit(rc)\n"
+    )
+    proc = _run_python_probe(probe)
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
