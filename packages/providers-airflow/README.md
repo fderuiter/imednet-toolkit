@@ -10,12 +10,15 @@ Install the package via standard pip using the public package distribution name:
 pip install apache-airflow-providers-imednet
 ```
 
-Install optional destination extras for tabular/DuckDB exports or database sinks:
+Install optional destination, lineage, or cloud extras as needed:
 
 ```bash
 pip install "apache-airflow-providers-imednet[export]"
 pip install "apache-airflow-providers-imednet[duckdb]"
+pip install "apache-airflow-providers-imednet[sinks]"
 pip install "apache-airflow-providers-imednet[snowflake,mongodb,neo4j]"
+pip install "apache-airflow-providers-imednet[openlineage,amazon]"
+pip install "apache-airflow-providers-imednet[all]"
 ```
 
 Or using the workspace-relative path install command:
@@ -27,12 +30,12 @@ pip install ./packages/providers-airflow
 **Required Dependencies:**
 This package requires `imednet`, `imednet-workflows` (for incremental XCom checkpointing), and `apache-airflow>=3.2.0,<4.0.0`.
 
-**Build Targets (Hatchling):**
-This package uses Hatchling as its build backend, targeting the `src/apache_airflow_providers_imednet` package directory and registering the `apache_airflow_provider` discovery entry point in `pyproject.toml`.
+**Build Targets & Namespace Compatibility (Hatchling):**
+This package uses Hatchling as its build backend, targeting `src/apache_airflow_providers_imednet`, registering the `apache_airflow_provider` discovery entry point (`apache_airflow_providers_imednet:get_provider_info`), and dynamically aliasing `airflow.providers.imednet.*` to the public provider modules.
 
 ## Usage Guide
 
-You can integrate iMednet hooks, operators, and sensors directly within your Airflow 3 DAGs (see `examples/airflow/airflow_multi_study_pipeline.py` for a full dynamic-mapping reference):
+You can integrate iMednet hooks, operators, deferrable sensors, and triggers directly within your Airflow 3 DAGs (see `examples/airflow/airflow_multi_study_pipeline.py` for a full dynamic-mapping reference):
 
 ```python
 from datetime import datetime
@@ -58,21 +61,23 @@ with DAG(
         output_path="/tmp/study.duckdb",
         export_kwargs={"table_name": "clinical_records"},
         incremental=True,
+        modified_since="{{ data_interval_start.isoformat() }}",
     )
     sensor_task = ImednetJobSensor(
         task_id="wait_for_job",
         study_key="{{ params.study_key }}",
         batch_id="{{ params.batch_id }}",
+        deferrable=True,
     )
 ```
 
 ## Using the ImednetHook
 
-The `ImednetHook` allows you to interact with the iMednet system securely by resolving configurations from Airflow connections. It provides access to the underlying `ImednetSDK` client.
+The `ImednetHook` resolves credentials from Airflow connections (`imednet` connection type, including custom Airflow UI form widgets and `extra__imednet__*` fields), provides `test_connection()` with automatic secret scrubbing, and exposes both synchronous (`ImednetSDK`) and asynchronous (`AsyncImednetSDK`) clients.
 
 ### Getting the SDK Client
 
-To retrieve a configured SDK client to use in your custom operators or tasks, use `get_conn()` (adhering to the standard Airflow `BaseHook` interface) or its alias `get_sdk_client()`:
+To retrieve a configured SDK client to use in your custom operators, tasks, or triggers, use `get_conn()` (or `get_sdk_client()`) for synchronous tasks and `await get_async_conn()` for async triggers:
 
 ```python
 from apache_airflow_providers_imednet.hooks import ImednetHook
@@ -92,17 +97,19 @@ def my_task_logic() -> None:
 
 ## Features
 
-- **Connection Hook Management**: Secures connection variables via `ImednetHook`, resolving authorization keys/secrets and auto-masking sensitive values (`api_key`, `security_key`, `token`) as `***` during serialization.
-- **Dynamic Task Mapping & Templating**: Supports Airflow standard task mapping via Jinja-templated fields (`study_key`, `output_path`, `export_kwargs`).
-- **Lazy Database Ingestion**: Uses dynamic resolution to lazily import database drivers (such as `imednet_sinks`) during execution.
-- **State Polling Sensor**: `ImednetJobSensor` monitors asynchronous platform processes with robust exception handling and state polling.
-- **Flexible Tabular Exporters**: Exposes tabular serialization adapters for CSV, Parquet, JSON, and SQL formats.
+- **Airflow 3 Provider Metadata & UI Form**: Registers the `imednet` connection type with typed UI form widgets (`base_url`, password-masked `oidc_token`, `timeout`, `strict_mode`, `simulation_mode`), `get_ui_field_behaviour()`, and redacted `test_connection()`.
+- **Connection Hook Management**: Resolves sync (`get_conn()`) and async (`get_async_conn()`) SDK clients via `ImednetHook`, masking sensitive values (`api_key`, `security_key`, `oidc_token`, `token`) as `***`.
+- **Dynamic Task Mapping & Watermark Templating**: Supports Jinja-templated runtime fields (`study_key`, `output_path`, `export_kwargs`, `modified_since`, `record_filter`, `record_data_filter`, `stream_name`) while rejecting inline credentials.
+- **Deferrable Job Polling**: `ImednetJobSensor(deferrable=True)` yields worker slots to `ImednetJobTrigger`, polling asynchronously via `AsyncImednetSDK` and `AsyncJobPoller` without persisting secrets in trigger serialization.
+- **OpenLineage Dataset Facets**: Emits `OperatorLineage` inputs and outputs across `snowflake`, `duckdb`, `sql`, `mongodb`, `neo4j`, cloud object URIs (`s3://`, `gs://`, `abfss://`), and local files.
+- **Lazy Database Ingestion & Tabular Exporters**: Lazily resolves database sinks (`imednet_sinks`) and tabular serialization adapters for CSV, Parquet, JSON, DuckDB, and SQL formats.
 
 ## Component Description Table
 
 | Component | Description |
 |-----------|-------------|
-| `ImednetHook` | Secures connection variables and handles auto-masking of sensitive values. |
-| `ImednetExportOperator` | Airflow operator for executing data export tasks via the iMedNet API. |
-| `ImednetJobSensor` | Monitors asynchronous platform processes, handling state polling and exception management. |
-| `_airflow_compat` | Compatibility layer for different versions of standard Airflow environments. |
+| `ImednetHook` | Resolves sync/async SDK clients, UI form behaviour, connection testing, and credential redaction. |
+| `ImednetExportOperator` | Airflow operator for streaming/tabular data exports with Jinja templating and OpenLineage facets. |
+| `ImednetJobSensor` | Monitors asynchronous iMednet jobs in synchronous poke/reschedule or deferrable triggerer mode. |
+| `ImednetJobTrigger` | Async Airflow trigger polling iMednet jobs via `AsyncImednetSDK` and `AsyncJobPoller`. |
+| `_airflow_compat` | Compatibility layer for Airflow 3 Task SDK and offline unit testing environments. |

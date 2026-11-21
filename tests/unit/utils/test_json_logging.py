@@ -72,3 +72,28 @@ def test_configure_json_logging_uses_jsonlogger_import(monkeypatch, caplog):
     json_logging = importlib.import_module(MODULE_PATH)
     handler = _configure_and_log(json_logging, caplog)
     assert isinstance(handler.formatter, formatter_cls)
+
+
+def test_configure_json_logging_falls_back_when_dependency_missing(monkeypatch, capsys):
+    """Test fallback StreamHandler configuration when python-json-logger is absent."""
+    for name in (
+        "pythonjsonlogger",
+        "pythonjsonlogger.json",
+        "pythonjsonlogger.jsonlogger",
+    ):
+        monkeypatch.setitem(sys.modules, name, None)
+    monkeypatch.delitem(sys.modules, MODULE_PATH, raising=False)
+    json_logging = importlib.import_module(MODULE_PATH)
+
+    root = logging.getLogger()
+    old_handlers, old_level = root.handlers[:], root.level
+    try:
+        json_logging.configure_json_logging(level=logging.WARNING)
+        captured = capsys.readouterr()
+        assert "python-json-logger not installed" in captured.err
+        assert root.level == logging.WARNING
+        assert len(root.handlers) == 1
+        assert isinstance(root.handlers[0], logging.StreamHandler)
+    finally:
+        root.handlers = old_handlers
+        root.setLevel(old_level)
