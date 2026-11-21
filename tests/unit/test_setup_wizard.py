@@ -57,7 +57,7 @@ def test_setup_wizard_stage3_commands_and_messages() -> None:
     content = wizard_path.read_text(encoding="utf-8")
     stage3_content = _extract_stage_content(content, 3)
 
-    expected_cmd = "uv sync --all-packages --extra dev --extra docs"
+    expected_cmd = "uv sync --locked --all-packages --all-extras"
 
     assert f'confirm "Run \'{expected_cmd}\' now?"' in stage3_content
     assert f'say "Running \'{expected_cmd}\'..."' in stage3_content
@@ -93,6 +93,7 @@ def test_workspace_manifest_and_readme_include_tui() -> None:
 
     root_deps = pyproject_data["project"]["dependencies"]
     uv_sources = pyproject_data["tool"]["uv"]["sources"]
+    assert "apache-airflow-providers-imednet" in root_deps
     assert "imednet-tui" in root_deps
     assert "imednet-tui" in uv_sources
 
@@ -102,12 +103,14 @@ def test_workspace_manifest_and_readme_include_tui() -> None:
     ]
     assert len(workspace_pkgs) == 1
     locked_dep_names = {dep["name"] for dep in workspace_pkgs[0].get("dependencies", [])}
+    assert "apache-airflow-providers-imednet" in locked_dep_names
     assert "imednet-tui" in locked_dep_names
 
     readme_content = (repo_root / "README.md").read_text(encoding="utf-8")
     assert 'pip install "imednet[tui]"' in readme_content
-    assert readme_content.count("uv sync --all-packages --extra dev --extra docs") >= 2
+    assert readme_content.count("uv sync --locked --all-packages --all-extras") >= 2
     assert "uv sync --extra dev --extra docs" not in readme_content
+    assert "uv sync --all-packages --extra dev --extra docs" not in readme_content
 
 
 def test_validate_docs_packages_registered_parity(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -142,8 +145,8 @@ def test_setup_wizard_stage6_recovery_guidance_mentions_all_packages() -> None:
     content = wizard_path.read_text(encoding="utf-8")
     stage6_content = _extract_stage_content(content, 6)
 
-    # In Stage 6, when python check via uv fails, uv sync recovery instruction must include --all-packages
-    assert "uv sync --all-packages" in stage6_content
+    # In Stage 6, when python check via uv fails, uv sync recovery instruction must include canonical flags
+    assert "uv sync --locked --all-packages --all-extras" in stage6_content
 
 
 def test_setup_wizard_bash_syntax() -> None:

@@ -300,20 +300,24 @@ def test_parquet_and_cli_subprocess_import_without_pandas() -> None:
     import subprocess
     import sys
 
+    probe = (
+        "import builtins\n"
+        "real_import = builtins.__import__\n"
+        "def block_pandas(name, *args, **kwargs):\n"
+        "    if name == 'pandas' or name.startswith('pandas.'):\n"
+        "        raise ModuleNotFoundError(\"No module named 'pandas'\")\n"
+        "    return real_import(name, *args, **kwargs)\n"
+        "builtins.__import__ = block_pandas\n"
+        "import imednet.integrations.parquet as pm\n"
+        "import imednet.cli as cli_mod\n"
+        "assert 'pip install' in cli_mod.get_parser().format_help()\n"
+        "assert 'read_parquet' in pm.hive_parquet_query('/tmp/lake')\n"
+        "assert cli_mod.app is not None\n"
+    )
     proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; sys.modules['pandas'] = None; "
-                "import imednet.integrations.parquet as parquet_mod; "
-                "import imednet.cli as cli_mod; "
-                "assert callable(parquet_mod.hive_parquet_query); "
-                "assert cli_mod.app is not None"
-            ),
-        ],
+        [sys.executable, "-c", probe],
         check=False,
         capture_output=True,
         text=True,
     )
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 0, f"Unexpected import failure without pandas:\n{proc.stderr}"

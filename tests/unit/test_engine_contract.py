@@ -52,14 +52,21 @@ _CONTRACT_LOADER_TESTS = {
     "test_bundled_and_local_fallback_contract_resolution",
 }
 _DEFAULT_CONTRACT = get_contract()
+_DEFAULT_MODEL_CACHE = {name: ModelEngine.get_model(name) for name in EXPECTED_14_MODELS}
 
 
 @pytest.fixture(autouse=True)
 def _reset_engine_cache(request, monkeypatch):
     """Ensure a clean contract and model cache for each test."""
     initial_contract = None if request.node.name in _CONTRACT_LOADER_TESTS else _DEFAULT_CONTRACT
+    initial_models = (
+        {}
+        if request.node.name in _CONTRACT_LOADER_TESTS
+        or request.node.name == "test_all_14_core_models_have_fields"
+        else dict(_DEFAULT_MODEL_CACHE)
+    )
     monkeypatch.setattr(engine, "_CONTRACT_CACHE", initial_contract)
-    monkeypatch.setattr(ModelEngine, "_model_cache", {})
+    monkeypatch.setattr(ModelEngine, "_model_cache", initial_models)
 
 
 def test_bundled_resource_resolution():

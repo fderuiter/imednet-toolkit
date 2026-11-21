@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
 from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
 from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
 from imednet_sinks.plugin import SinksNamespace, create_sinks

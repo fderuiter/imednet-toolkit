@@ -30,7 +30,9 @@ for source_root in (
 import importlib.metadata as _importlib_metadata
 import logging as _logging
 import ssl as _ssl
+from contextlib import contextmanager as _contextmanager
 
+import _pytest.logging as _pytest_logging
 import respx
 import respx.mocks as _respx_mocks
 
@@ -179,6 +181,23 @@ def _warm_httpcore_mocker_stop(force: bool = False) -> None:
 
 _respx_mocks.HTTPCoreMocker.stop = _warm_httpcore_mocker_stop  # type: ignore[method-assign]
 
+_orig_logging_runtest_for = _pytest_logging.LoggingPlugin._runtest_for
+
+
+@_contextmanager
+def _fast_logging_runtest_for(self: _pytest_logging.LoggingPlugin, item: pytest.Item, when: str):  # type: ignore[no-untyped-def]
+    """Skip O(N_loggers) loggerDict walks on setup/call/teardown when caplog is unused."""
+    if self.log_level is not None or "caplog" in getattr(item, "fixturenames", ()):
+        with _orig_logging_runtest_for(self, item, when):
+            yield
+        return
+    if when == "setup":
+        item.stash[_pytest_logging.caplog_handler_key] = self.caplog_handler
+    yield
+
+
+_pytest_logging.LoggingPlugin._runtest_for = _fast_logging_runtest_for  # type: ignore[method-assign]
+
 _cli_parser_cache: dict[tuple[object, ...], object] = {}
 
 
@@ -250,6 +269,23 @@ from imednet.utils import db as _imednet_db
 _GLOBAL_CIRCUIT_BREAKER = get_global_circuit_breaker()
 _DEFAULT_RESPX_BASES = dict(respx.mock._bases)
 _respx_session_guard_active = False
+
+import sqlite3 as _sqlite3
+
+_orig_sqlite3_connect = _sqlite3.connect
+
+
+def _fast_sqlite3_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+    """Set synchronous=OFF immediately on new SQLite connections to skip WAL fsyncs in tests."""
+    conn = _orig_sqlite3_connect(*args, **kwargs)
+    try:
+        conn.execute("PRAGMA synchronous=OFF;")
+    except _sqlite3.Error:
+        pass
+    return conn
+
+
+_sqlite3.connect = _fast_sqlite3_connect  # type: ignore[assignment]
 
 _orig_core_get_sqlite_connection = _imednet_db.get_sqlite_connection
 
@@ -471,7 +507,13 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 def pytest_runtest_teardown(item: pytest.Item) -> None:
     """Reset study context, circuit breaker, and dirty respx router state after each test."""
     if _respx_session_guard_active and (
-        respx.mock.routes._routes or respx.mock.calls or respx.mock._bases != _DEFAULT_RESPX_BASES
+        respx.mock.routes._routes
+        or respx.mock.calls
+        or (
+            bool(respx.mock._bases)
+            if not _DEFAULT_RESPX_BASES
+            else respx.mock._bases != _DEFAULT_RESPX_BASES
+        )
     ):
         respx.mock.clear()
         respx.mock.reset()

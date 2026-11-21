@@ -803,8 +803,9 @@ def test_airflow_state_provider_out_of_context_model_variable_crud(tmp_path, mon
     _ = airflow
     from airflow import settings
     from airflow.configuration import conf
-    from airflow.models import import_all_models
     from airflow.models.base import Base
+    from airflow.models.team import Team
+    from airflow.models.variable import Variable
 
     from imednet_workflows.state_ledger import AirflowStateProvider
 
@@ -824,11 +825,10 @@ def test_airflow_state_provider_out_of_context_model_variable_crud(tmp_path, mon
     conf.set("database", "sql_alchemy_conn", db_uri)
 
     try:
-        import_all_models()
         settings.dispose_orm()
         settings.configure_orm()
         assert settings.engine is not None
-        Base.metadata.create_all(settings.engine)
+        Base.metadata.create_all(settings.engine, tables=[Team.__table__, Variable.__table__])
 
         provider = AirflowStateProvider()
         assert provider.get_last_timestamp("STUDY_DB", "records") is None

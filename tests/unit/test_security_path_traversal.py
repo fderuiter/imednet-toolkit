@@ -7,8 +7,6 @@ from unittest.mock import MagicMock
 import pytest
 import respx
 
-from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-from apache_airflow_providers_imednet.sensors import ImednetJobSensor
 from imednet import AsyncImednetSDK, ImednetSDK, cli
 from imednet.core.client import Client
 from imednet.core.endpoint.base import GenericEndpoint
@@ -284,6 +282,17 @@ def test_airflow_sensor_and_export_operator_reject_unsafe_segments_before_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ImednetJobSensor.poke and ImednetExportOperator.execute fail preflight before _get_sdk."""
+    import sys
+
+    airflow_mod = sys.modules.get("airflow")
+    if airflow_mod is not None and not getattr(airflow_mod, "__file__", None):
+        for mod in list(sys.modules):
+            if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+                sys.modules.pop(mod, None)
+
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from apache_airflow_providers_imednet.sensors import ImednetJobSensor
+
     fail_get_sdk = MagicMock(side_effect=AssertionError("_get_sdk must not be called"))
     monkeypatch.setattr(ImednetJobSensor, "_get_sdk", fail_get_sdk)
     monkeypatch.setattr(ImednetExportOperator, "_get_sdk", fail_get_sdk)

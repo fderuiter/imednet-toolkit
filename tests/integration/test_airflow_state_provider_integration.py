@@ -22,7 +22,7 @@ def _ensure_real_airflow_modules() -> None:
     if (
         airflow_mod is None
         or getattr(airflow_mod, "__path__", None) is None
-        or getattr(airflow_mod, "__file__", None) is None
+        or not getattr(airflow_mod, "__file__", None)
     ):
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):

@@ -8,14 +8,14 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
+import imednet
 import imednet_sinks.document as doc_mod
 import imednet_sinks.graph as graph_mod
 import imednet_sinks.warehouse as wh_mod
-import pytest
-from imednet_sinks import MongoDbSinkConfig, Neo4jSinkConfig, SnowflakeSinkConfig
-
-import imednet
 from imednet.models.records import Record
+from imednet_sinks import MongoDbSinkConfig, Neo4jSinkConfig, SnowflakeSinkConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES_DIR = REPO_ROOT / "examples"

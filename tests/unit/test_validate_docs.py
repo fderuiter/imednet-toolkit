@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import types
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TypeVar
 
+import pytest
 from scripts.build_docs import (
     SCOPED_INHERITED_MEMBERS,
     emit_curated_core_reference,
+    generate_api_reference,
+    require_sphinx_tools,
     scope_apidoc_inherited_members,
 )
 from scripts.validate_docs import (
@@ -307,3 +311,58 @@ def test_conf_resolves_mermaid_version_across_extension_majors(monkeypatch) -> N
 
     monkeypatch.setattr(importlib.metadata, "version", lambda _pkg: "2.0.0")
     assert conf._resolve_mermaid_version() == "11.12.1"
+
+
+def test_generate_api_reference_fails_fast_without_sphinx_apidoc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing sphinx-apidoc fails fast and keeps all existing .rst files in api_dir."""
+    import shutil
+
+    api_dir = tmp_path / "docs" / "reference" / "api"
+    api_dir.mkdir(parents=True)
+    tracked_files = {}
+    for idx in range(51):
+        rst = api_dir / f"module_{idx:02d}.rst"
+        content = f"Module {idx}\n=========\n"
+        rst.write_text(content, encoding="utf-8")
+        tracked_files[rst.name] = content
+
+    monkeypatch.setattr(shutil, "which", lambda _tool: None)
+
+    with pytest.raises(FileNotFoundError, match="sphinx-apidoc"):
+        generate_api_reference(api_dir)
+
+    remaining = {p.name: p.read_text(encoding="utf-8") for p in sorted(api_dir.glob("*.rst"))}
+    assert len(remaining) == 51
+    assert remaining == tracked_files
+
+
+def test_generate_api_reference_preserves_existing_docs_on_staging_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Subprocess failure during apidoc staging leaves existing api_dir intact with no staging leftovers."""
+    import scripts.build_docs as build_docs_mod
+
+    api_dir = tmp_path / "docs" / "reference" / "api"
+    api_dir.mkdir(parents=True)
+    original = api_dir / "imednet.rst"
+    original.write_text("Original\n========\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        build_docs_mod, "require_sphinx_tools", lambda *tools: {t: f"/bin/{t}" for t in tools}
+    )
+
+    def _fail_run_command(cmd, env=None, check=True):
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(build_docs_mod, "run_command", _fail_run_command)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        generate_api_reference(api_dir)
+
+    assert original.read_text(encoding="utf-8") == "Original\n========\n"
+    assert list(api_dir.parent.glob(".api_staging_*")) == []
+    with pytest.raises(FileNotFoundError):
+        monkeypatch.setattr(build_docs_mod.shutil, "which", lambda _t: None)
+        require_sphinx_tools("sphinx-apidoc", "sphinx-build")

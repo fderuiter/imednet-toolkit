@@ -696,7 +696,9 @@ class SimulationState:
         study_sites = [s for s in self.sites if s.get("studyKey") == study_key]
         other_sites = [s for s in self.sites if s.get("studyKey") != study_key]
         all_sites = study_sites + other_sites
-        default_site = study_sites[0] if study_sites else {"siteId": 101, "siteName": "SITE"}
+        default_site: dict[str, Any] = (
+            study_sites[0] if study_sites else {"siteId": 101, "siteName": "SITE"}
+        )
 
         requested_name = str(item.get("siteName") or item.get("site_name") or "").strip()
         requested_id = item.get("siteId") if item.get("siteId") is not None else item.get("site_id")

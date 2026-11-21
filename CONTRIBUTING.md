@@ -1,11 +1,13 @@
 # Contributing
 
 ## Project scope
-The SDK targets Python 3.11–3.13 and includes:
+The SDK targets Python 3.11–3.13 (development and documentation workspace checkouts require Python 3.11.5+) and includes:
 
 - Core SDK package under `packages/core/src/imednet/`
 - Workflow orchestration package under `packages/plugins-workflows/src/imednet_workflows/`
 - Airflow provider package under `packages/providers-airflow/src/apache_airflow_providers_imednet/`
+- Database sinks plugin package under `packages/plugins-sinks/src/imednet_sinks/`
+- Terminal user interface plugin package under `packages/plugins-tui/src/imednet_tui/`
 - Docs, tests, examples, and tooling in their directories
 
 `AGENTS.md` is the authoritative contributor contract for architecture boundaries,
@@ -14,20 +16,28 @@ quality gates, and release expectations.
 ## Workspace package boundaries
 - `packages/core/src/imednet/`: SDK transport, endpoints, models, CLI surface.
 - `packages/plugins-workflows/src/imednet_workflows/`: higher-level workflows built on the SDK.
-- `packages/providers-airflow/src/apache_airflow_providers_imednet/`: Airflow hooks/operators.
+- `packages/providers-airflow/src/apache_airflow_providers_imednet/`: Airflow hooks, operators, and sensors.
+- `packages/plugins-sinks/src/imednet_sinks/`: database export sinks (MongoDB, Neo4j, Snowflake).
+- `packages/plugins-tui/src/imednet_tui/`: Textual terminal user interface and CLI plugin.
 
 For the architecture view, see `docs/explanation/architecture.rst`.
 
 ## Prerequisites
-- Python 3.11 or newer; recreate existing Python 3.10 virtual environments.
+- Python 3.11.5 or newer for workspace checkouts (published packages support Python 3.11+); recreate existing Python 3.10 virtual environments.
 - [Make](https://www.gnu.org/software/make/) (optional, for building docs)
 
 ## Setup
-**Hatch** and **uv** are the mandatory tools for repository environment setup.
+**uv** and **Hatch** are the mandatory tools for repository environment setup.
 
-Hatch uses `uv` as a backend installer. Ensure both are installed globally, or configure Hatch to use uv via `hatch config set installer uv`.
+Hatch uses `uv` as a backend installer. Ensure `uv` is installed (`hatch` can also be invoked via `uvx hatch`).
 
-To initialize the default development workspace environment and install all package dependencies:
+To initialize the locked development workspace `.venv` with all five packages, member extras, and default `dev` and `docs` dependency groups:
+
+```bash
+uv sync --locked --all-packages --all-extras
+```
+
+You can also initialize the Hatch environment directly with:
 
 ```bash
 hatch env create
@@ -39,13 +49,19 @@ To interactively configure your `.env` credentials, endpoints, and test flags, r
 bash scripts/wizards/setup-imednet-env.sh
 ```
 
-To run the unified quality and linter suite (Ruff, MyPy, etc.):
+To run the canonical static and coverage verification gate across all five packages:
+
+```bash
+hatch run verify
+```
+
+To run the unified quality and security scanner suite (Ruff, MyPy, Vulture, Semgrep, Pylint, etc.):
 
 ```bash
 hatch run lint:all
 ```
 
-To run the testing suite with strict coverage gates:
+To run the testing suite:
 
 ```bash
 hatch run test
@@ -76,39 +92,40 @@ Issue titles should use the format `<type>(<area>): <concise outcome>`, for exam
 Run before committing:
 
 ```bash
+uvx pre-commit run --all-files
+hatch run verify
 hatch run lint:all
-hatch run test
 hatch run docs
 ```
-Coverage must stay ≥ 90%.
+Coverage must stay ≥ 90% across all five workspace packages (`imednet`, `imednet_workflows`, `apache_airflow_providers_imednet`, `imednet_sinks`, and `imednet_tui`).
 
 ### Containerized Integration Tests
 
 To run the containerized integration tests for the MongoDB and Neo4j sinks locally using ephemeral Docker containers, run the following single command:
 
 ```bash
-docker compose up -d && pytest packages/plugins-sinks/tests/integration
+(docker compose up -d && trap 'docker compose down -v' EXIT && sleep 15 && IMEDNET_TEST_CONTAINERS=1 uv run pytest -o addopts="" packages/plugins-sinks/tests/integration/test_containerized_sinks.py -v)
 ```
 
-This will automatically spin up the required database containers, run the verification tests, and tear the containers down afterwards.
+This spins up the required database containers, waits for service initialization, enables the `IMEDNET_TEST_CONTAINERS=1` gate for `packages/plugins-sinks/tests/integration/test_containerized_sinks.py`, and tears the containers and volumes down afterwards (even if a test fails).
 
-## Incremental typing ratchet
-Typing rigor is increased incrementally across workspace packages instead of one
-strict-mode migration.
+## Strict typing enforcement
+Strict static typing (`strict = true` in `[tool.mypy]`) is enforced across all five workspace packages, examples, and endpoint typing contracts.
 
-### Current baseline (captured 2026-05-20)
+### Current baseline
 - `packages/core/src/imednet`: **0** mypy errors
-- `packages/plugins-workflows/src/imednet_workflows`: **5** mypy errors
+- `packages/plugins-workflows/src/imednet_workflows`: **0** mypy errors
 - `packages/providers-airflow/src/apache_airflow_providers_imednet`: **0** mypy errors
+- `packages/plugins-sinks/src/imednet_sinks`: **0** mypy errors
+- `packages/plugins-tui/src/imednet_tui`: **0** mypy errors
+- `examples`: **0** mypy errors
+- `tests/typing/endpoint_contracts.py`: **0** mypy errors
 
-### Ratchet rules
-- Keep global mypy at non-strict while tightening module by module.
-- `imednet.models.*` and `imednet.errors.*` are strict targets and must remain
-  clean under `mypy --strict`.
-- `ignore_missing_imports` must stay scoped only to third-party modules that do
-  not currently ship complete typing information (`pandas`, `pythonjsonlogger`,
-  `opentelemetry`, `airflow`).
-- CI enforces the strict subset so previously clean strict modules cannot regress.
+### Typing rules
+- Keep `[tool.mypy]` `strict = true` across all five workspace packages, examples, and endpoint contracts (`uv run mypy packages examples tests/typing/endpoint_contracts.py`).
+- `imednet.models.*` and `imednet.errors.*` additionally retain explicit strict overrides and generated `.pyi` stub parity (`uv run python -m imednet.models.engine --check`).
+- `ignore_missing_imports` must stay scoped only to third-party modules that do not ship complete typing information, and `disallow_subclassing_any = false` is scoped solely to `apache_airflow_providers_imednet.*` for untyped Airflow base classes.
+- CI enforces strict `mypy` across all five packages so typing regressions cannot land.
 
 ### Top `Any` / dynamic typing hotspots (tracked TODOs)
 - TODO (#938): reduce `Any` leakage in dynamic endpoint interfaces used by core
@@ -147,8 +164,9 @@ Releases are fully automated and driven by merged PR titles:
    `Semantic PR Title` check enforces this.
 2. Ensure your branch is up to date and all validation checks pass:
    ```bash
+   uvx pre-commit run --all-files
+   hatch run verify
    hatch run lint:all
-   hatch run test
    hatch run docs
    ```
 3. Merge to `main` using **Squash and merge** so the PR title becomes the merged commit message.
@@ -170,15 +188,17 @@ has an independent version and changelog:
 | `imednet-workflows` | `packages/plugins-workflows/` | `packages/plugins-workflows` |
 | `apache-airflow-providers-imednet` | `packages/providers-airflow/` | `packages/providers-airflow` |
 | `imednet-plugins-sinks` | `packages/plugins-sinks/` | `packages/plugins-sinks` |
+| `imednet-tui` | `packages/plugins-tui/` | `packages/plugins-tui` |
 
 **Tag format** — release-please creates package-specific Git tags when a Release PR is merged:
 
 | Package | Tag format | Example |
 |---|---|---|
-| `imednet` | `imednet-v<version>` | `imednet-v0.7.0` |
-| `imednet-workflows` | `imednet-workflows-v<version>` | `imednet-workflows-v0.5.3` |
-| `apache-airflow-providers-imednet` | `apache-airflow-providers-imednet-v<version>` | `apache-airflow-providers-imednet-v0.5.2` |
-| `imednet-plugins-sinks` | `imednet-plugins-sinks-v<version>` | `imednet-plugins-sinks-v0.2.0` |
+| `imednet` | `imednet-v<version>` | `imednet-v1.1.0` |
+| `imednet-workflows` | `imednet-workflows-v<version>` | `imednet-workflows-v1.1.0` |
+| `apache-airflow-providers-imednet` | `apache-airflow-providers-imednet-v<version>` | `apache-airflow-providers-imednet-v1.1.0` |
+| `imednet-plugins-sinks` | `imednet-plugins-sinks-v<version>` | `imednet-plugins-sinks-v1.0.1` |
+| `imednet-tui` | `imednet-tui-v<version>` | `imednet-tui-v1.0.0` |
 
 **PyPI publishing** — the `Release` workflow in `.github/workflows/release.yml` contains publish jobs
 (`publish`).
@@ -186,10 +206,11 @@ Publishing is triggered either by package tags or by the release commit pushed t
 (`chore: release main`). Jobs use `skip-existing` so repeated runs are idempotent.
 
 ```
-imednet-v* tag or release commit         → publish-core       → uploads imednet to PyPI
-imednet-workflows-v* or release commit   → publish-workflows  → uploads imednet-workflows to PyPI
-apache-airflow-*-v* or release commit    → publish-providers  → uploads apache-airflow-providers-imednet to PyPI
-imednet-plugins-sinks-v* or release comm → publish-sinks      → uploads imednet-plugins-sinks to PyPI
+imednet-v* tag or release commit                  → publish (core)              → uploads imednet to PyPI
+imednet-workflows-v* tag or release commit        → publish (plugins-workflows) → uploads imednet-workflows to PyPI
+apache-airflow-*-v* tag or release commit         → publish (providers-airflow) → uploads apache-airflow-providers-imednet to PyPI
+imednet-plugins-sinks-v* tag or release commit    → publish (plugins-sinks)     → uploads imednet-plugins-sinks to PyPI
+imednet-tui-v* tag or release commit              → publish (plugins-tui)       → uploads imednet-tui to PyPI
 ```
 
 Publishing uses PyPI Trusted Publishers (OIDC) via `pypa/gh-action-pypi-publish`. No API token
@@ -201,13 +222,15 @@ Release-please writes per-package changelogs automatically.
 **Version pinning** — to pin a specific release of each package:
 
 ```bash
-pip install "imednet==0.7.0"
-pip install "imednet-workflows==0.5.3"
-pip install "apache-airflow-providers-imednet==0.5.2"
+pip install "imednet==1.1.0"
+pip install "imednet-workflows==1.1.0"
+pip install "apache-airflow-providers-imednet==1.1.0"
+pip install "imednet-plugins-sinks==1.0.1"
+pip install "imednet-tui==1.0.0"
 ```
 
 Changelogs and release notes per package are available on
-[GitHub Releases](https://github.com/fderuiter/imednet-python-sdk/releases).
+[GitHub Releases](https://github.com/fderuiter/imednet-toolkit/releases).
 
 Configuration requirements:
 - Publishing requires PyPI Trusted Publishers (OIDC) configured for each package on PyPI, **or**
@@ -244,8 +267,9 @@ Key rules:
    actual Python type annotations; broken or missing annotations will render incorrectly.
 4. **Static `.rst` files are reserved for architectural overviews and tutorials only.**
    Do not create manually maintained `.rst` files for individual modules, classes, or CLI commands.
-   API reference documentation is generated automatically by `sphinx-apidoc` into `docs/api/`
-   (excluded from version control via `.gitignore`).
+   API reference documentation is generated automatically by `scripts/build_docs.py` (`sphinx-apidoc`
+   plus curated core reference helpers) into `docs/reference/api/`, which is tracked in version
+   control and staged atomically before replacing existing files.
 
 ### Docstring example
 
@@ -269,12 +293,19 @@ def fetch_records(study_key: str, page: int = 0) -> list[Record]:
 
 Before opening a pull request that adds or modifies public APIs:
 
-1. Run `mypy packages/core/src/imednet` and confirm zero errors.
-2. Run `mypy packages/plugins-workflows/src/imednet_workflows`.
-3. Run `mypy packages/providers-airflow/src/apache_airflow_providers_imednet`.
-4. Run `hatch run docs` locally. This command regenerates `docs/api/` via `sphinx-apidoc` and then
-   compiles the HTML with `-W --keep-going`, treating every Sphinx warning as an error.
-5. Open `docs/_build/html/index.html` and verify that type hints appear in the parameter
+1. Run strict `mypy` across all five workspace packages, examples, and endpoint contracts (`uv run mypy packages examples tests/typing/endpoint_contracts.py` or individually):
+   - `mypy packages/core/src/imednet`
+   - `mypy packages/plugins-workflows/src/imednet_workflows`
+   - `mypy packages/providers-airflow/src/apache_airflow_providers_imednet`
+   - `mypy packages/plugins-sinks/src/imednet_sinks`
+   - `mypy packages/plugins-tui/src/imednet_tui`
+   - `mypy examples`
+   - `mypy tests/typing/endpoint_contracts.py`
+2. Run `hatch run docs` (or `uv run python scripts/build_docs.py`) locally. This command stages and
+   updates `docs/reference/api/` via `sphinx-apidoc` and compiles the HTML with `-W --keep-going`,
+   treating every Sphinx warning as an error.
+3. Commit any intentional `docs/reference/api/` updates when adding or renaming public modules.
+4. Open `docs/_build/html/index.html` and verify that type hints appear in the parameter
    descriptions with no raw reStructuredText syntax leaking into the rendered page.
 
 
@@ -282,7 +313,7 @@ Before opening a pull request that adds or modifies public APIs:
 1. Fork the repository and create a feature branch.
 2. Include validation output in the PR description.
 3. Keep PRs scoped; one change per PR.
-4. Please follow the [Code of Conduct](https://github.com/fderuiter/imednet-python-sdk/blob/main/CODE_OF_CONDUCT.md).
+4. Please follow the [Code of Conduct](https://github.com/fderuiter/imednet-toolkit/blob/main/CODE_OF_CONDUCT.md).
 
 ## Dependency-Aware CI Pipeline
 Our CI pipeline is optimized to run quality gates and test suites only for packages affected by your changes.

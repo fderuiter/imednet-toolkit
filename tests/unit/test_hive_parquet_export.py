@@ -647,3 +647,58 @@ def test_export_to_hive_parquet_streaming_checkpoints_incremental_upsert_and_voi
         ("DEMO", 101, 41, None),
         ("VITALS", 202, None, 82),
     ]
+
+
+def test_parquet_and_cli_import_without_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify core parquet integration and CLI parser import cleanly when pandas is absent."""
+    import builtins
+    import importlib.util
+    from pathlib import Path
+
+    import imednet.cli as existing_cli_mod
+
+    real_import = builtins.__import__
+
+    def block_pandas(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "pandas" or name.startswith("pandas."):
+            raise ModuleNotFoundError("No module named 'pandas'")
+        return real_import(name, *args, **kwargs)
+
+    def _exec_fresh_module(
+        qualname: str,
+        file_path: Path,
+        *,
+        submodule_search_locations: list[str] | None = None,
+    ) -> Any:
+        spec = importlib.util.spec_from_file_location(
+            qualname,
+            file_path,
+            submodule_search_locations=submodule_search_locations,
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    cli_init_path = Path(existing_cli_mod.__file__).resolve()
+    parquet_path = Path(parquet_mod.__file__).resolve()
+
+    with monkeypatch.context() as mp:
+        mp.setattr(builtins, "__import__", block_pandas)
+        fresh_parquet = _exec_fresh_module("imednet.integrations._parquet_no_pandas", parquet_path)
+        fresh_cli = _exec_fresh_module(
+            "imednet.cli",
+            cli_init_path,
+            submodule_search_locations=[str(cli_init_path.parent)],
+        )
+        assert "pip install" in fresh_cli.get_parser().format_help()
+        assert "read_parquet" in fresh_parquet.hive_parquet_query("/tmp/lake")
+
+    def _raise_pandas_import_error(module_name: str) -> Any:
+        if module_name == "pandas":
+            raise ImportError("missing pandas")
+        return __import__(module_name)
+
+    monkeypatch.setattr(parquet_mod, "import_module", _raise_pandas_import_error)
+    with pytest.raises(ImportError, match=r"pip install 'imednet\[export\]'"):
+        parquet_mod._ensure_pandas()

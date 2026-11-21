@@ -43,5 +43,5 @@ if (Test-Path $venvActivate) {
     & $venvActivate
     Write-Host "✓ Activated .venv" -ForegroundColor Green
 } else {
-    Write-Host "i Monorepo venv not yet created. Run: uv sync --extra dev --extra docs" -ForegroundColor Cyan
+    Write-Host "i Monorepo venv not yet created. Run: uv sync --locked --all-packages --all-extras" -ForegroundColor Cyan
 }

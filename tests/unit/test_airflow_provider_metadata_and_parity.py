@@ -966,8 +966,9 @@ def test_airflow_state_provider_and_example_dags_airflow3_compat(
     from airflow import settings
     from airflow.configuration import conf
     from airflow.dag_processing.dagbag import DagBag
-    from airflow.models import import_all_models
     from airflow.models.base import Base
+    from airflow.models.team import Team
+    from airflow.models.variable import Variable
 
     from imednet_workflows.state_ledger import AirflowStateProvider
 
@@ -1000,11 +1001,10 @@ def test_airflow_state_provider_and_example_dags_airflow3_compat(
         monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
 
     try:
-        import_all_models()
         settings.dispose_orm()
         settings.configure_orm()
         assert settings.engine is not None
-        Base.metadata.create_all(settings.engine)
+        Base.metadata.create_all(settings.engine, tables=[Team.__table__, Variable.__table__])
 
         provider = AirflowStateProvider()
         with provider.transaction("STUDY_A_1", "records_v1") as tx:

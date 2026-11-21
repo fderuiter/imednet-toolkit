@@ -56,9 +56,13 @@ SDK examples
    ``SnowflakeSinkConfig``) enables PHI masking by default (``mask_phi=True``),
    resolves committed ``StudyConfiguration`` governance rules automatically via
    ``ConfigVersionStore`` (failing closed to ``global_sensitivity_registry``
-   redaction when no configuration history or encryption key is present), and
+   redaction when no configuration history or encryption key is present),
    supports pre-write ``Record`` readiness filtering via
-   ``quality_gate_enabled=True`` and ``min_schema_readiness_score``.
+   ``quality_gate_enabled=True`` and ``min_schema_readiness_score``, and shares
+   CDISC SDTM transformation and standards readiness controls (``as_sdtm``,
+   ``sdtm_domain``, ``standards_profile``, ``min_standards_score``, and
+   ``naming_convention``; see :doc:`/how-to/record_mapping` and
+   :doc:`/how-to/cli`).
 
 MongoDB (document export):
 

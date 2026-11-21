@@ -81,10 +81,10 @@ def test_workflow_dependency_and_lockfile_exclude_vulnerable_filelock() -> None:
 
 def test_duckdb_dependencies_and_lockfile_exclude_unstable_v2_major() -> None:
     """Unlocked Hatch/pip and locked uv resolutions must exclude duckdb 2.x crashes."""
-    root_project = _load_toml(ROOT / "pyproject.toml")["project"]
+    root_pyproject = _load_toml(ROOT / "pyproject.toml")
     core_project = _load_toml(ROOT / "packages/core/pyproject.toml")["project"]
 
-    dev_reqs = [Requirement(v) for v in root_project["optional-dependencies"]["dev"]]
+    dev_reqs = [Requirement(v) for v in root_pyproject["dependency-groups"]["dev"]]
     duckdb_extra_reqs = [Requirement(v) for v in core_project["optional-dependencies"]["duckdb"]]
     export_extra_reqs = [Requirement(v) for v in core_project["optional-dependencies"]["export"]]
 

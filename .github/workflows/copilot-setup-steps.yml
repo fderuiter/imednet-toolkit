@@ -48,5 +48,5 @@ jobs:
       - name: Install Workspace Dependencies
         run: |
           python -m pip install uv hatch
-          uv sync --locked --all-extras
+          uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH

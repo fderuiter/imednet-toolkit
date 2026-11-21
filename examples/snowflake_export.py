@@ -18,9 +18,8 @@ from __future__ import annotations
 
 import os
 
-from imednet_sinks import SnowflakeSinkConfig, export_to_snowflake
-
 from imednet import ImednetSDK
+from imednet_sinks import SnowflakeSinkConfig, export_to_snowflake
 
 # ---------------------------------------------------------------------------
 # SDK initialisation — credentials are read from environment variables only.

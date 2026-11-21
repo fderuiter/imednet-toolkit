@@ -5,11 +5,11 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, MagicMock
 
 import pytest
+
+from imednet.errors import ExportBatchError, ExportConfigurationError
 from imednet_sinks import (
     Neo4jSinkConfig,
 )
-
-from imednet.errors import ExportBatchError, ExportConfigurationError
 
 
 def _fake_neo4j_module(fail_connect: bool = False) -> ModuleType:
@@ -226,7 +226,6 @@ class TestNeo4jExportSink:
     def test_write_batch_reuses_mapper_instance(self, monkeypatch):
         """Verify CentralizedMapper is instantiated once per write_batch execution."""
         import imednet_sinks.graph as graph_mod
-
         from imednet.integrations.enrichment import CentralizedMapper
 
         neo4j, driver = _fake_neo4j_module()
@@ -258,9 +257,8 @@ class TestNeo4jExportSink:
 
     def test_record_to_row_accepts_and_uses_injected_mapper(self):
         """Verify _record_to_row uses injected mapper and maintains backward compatibility."""
-        from imednet_sinks.graph import _post_process_graph, _record_to_row
-
         from imednet.integrations.enrichment import CentralizedMapper
+        from imednet_sinks.graph import _post_process_graph, _record_to_row
 
         record = MagicMock(record_id=10, form_id=1, visit_id=1, subject_key="S1", record_data={})
 
@@ -279,9 +277,8 @@ class TestNeo4jExportSink:
         import json
 
         import imednet_sinks.graph as graph_mod
-        from imednet_sinks.graph import Neo4jExportSink
-
         from imednet.models.records import Record
+        from imednet_sinks.graph import Neo4jExportSink
 
         neo4j, driver = _fake_neo4j_module()
         monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
@@ -534,7 +531,6 @@ class TestMongoDbExportSink:
     def test_write_batch_reuses_mapper_instance(self, monkeypatch):
         """Verify CentralizedMapper is instantiated once per write_batch execution."""
         import imednet_sinks.document as doc_mod
-
         from imednet.integrations.enrichment import CentralizedMapper
 
         pymongo, client, collection = _fake_pymongo_module()
@@ -568,9 +564,8 @@ class TestMongoDbExportSink:
 
     def test_record_to_document_accepts_and_uses_injected_mapper(self):
         """Verify _record_to_document uses injected mapper and maintains backward compatibility."""
-        from imednet_sinks.document import _post_process_document, _record_to_document
-
         from imednet.integrations.enrichment import CentralizedMapper
+        from imednet_sinks.document import _post_process_document, _record_to_document
 
         record = MagicMock(record_id=10, form_id=1, visit_id=1, subject_key="S1", record_data={})
 
@@ -1082,11 +1077,11 @@ class TestSnowflakeExportSink:
 
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from imednet_sinks.warehouse import _post_process_warehouse, _records_to_arrow_table
 
         from imednet.integrations.enrichment import CentralizedMapper, EnrichmentPipeline
         from imednet.models.records import Keyword, Record
         from imednet.models.study_config import MappingRule, StudyConfiguration
+        from imednet_sinks.warehouse import _post_process_warehouse, _records_to_arrow_table
 
         records = [
             Record(
@@ -1225,11 +1220,11 @@ class TestSnowflakeExportSink:
         """Verify idempotent write_batch overwrites staged Parquet and merges by (study_key, record_id) without duplicating rows."""
         import json
 
-        import imednet_sinks.warehouse as wh_mod
         import pyarrow.parquet as pq
-        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
+        import imednet_sinks.warehouse as wh_mod
         from imednet.models.records import Record
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
         sf, conn, cursor = _fake_snowflake_module()
         orig_require = wh_mod._require_optional_dep
@@ -1475,10 +1470,9 @@ class TestBatchScopedMapperPerformance:
 
     def test_pipeline_cache_reuse_across_1000_records(self):
         """Verify pipeline cache is populated once and reused across 1,000 records."""
+        from imednet.integrations.enrichment import CentralizedMapper
         from imednet_sinks.document import _post_process_document, _record_to_document
         from imednet_sinks.graph import _post_process_graph, _record_to_row
-
-        from imednet.integrations.enrichment import CentralizedMapper
 
         records = [
             SimpleNamespace(
@@ -1543,9 +1537,8 @@ class TestSinkPhiMaskingControls:
     def test_mongodb_sink_masks_phi_by_default_and_honors_opt_out(self, monkeypatch):
         """MongoDbExportSink replaces patientName, DOB, SSN, and email with ***MASKED*** unless mask_phi=False."""
         import imednet_sinks.document as doc_mod
-        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
-
         from imednet.utils.security import global_sensitivity_registry
+        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
 
         registry_before = set(global_sensitivity_registry._sensitive_keys)
         pymongo, _client, _collection = _fake_pymongo_module()
@@ -1716,10 +1709,9 @@ class TestSinkPhiMaskingControls:
         import json
 
         import imednet_sinks.graph as graph_mod
-        from imednet_sinks.graph import Neo4jSinkConfig, export_to_neo4j
-
         from imednet.models.records import Record
         from imednet.models.variables import Variable
+        from imednet_sinks.graph import Neo4jSinkConfig, export_to_neo4j
 
         neo4j, driver = _fake_neo4j_module()
         monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
@@ -1774,7 +1766,6 @@ class TestSinkPhiMaskingControls:
         import imednet_sinks.document as doc_mod
         import imednet_sinks.graph as graph_mod
         import imednet_sinks.warehouse as wh_mod
-
         from imednet.integrations import enrichment as enrichment_mod
         from imednet.models.records import Record
         from imednet.models.study_config import StudyConfiguration
@@ -1883,13 +1874,12 @@ class TestSinkPhiMaskingControls:
         import imednet_sinks.document as doc_mod
         import imednet_sinks.graph as graph_mod
         import imednet_sinks.warehouse as wh_mod
-        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
-        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
-        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
-
         from imednet.models.records import Record
         from imednet.models.study_config import StudyConfiguration
         from imednet.spi.utils import global_sensitivity_registry
+        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
         snapshot = set(global_sensitivity_registry._sensitive_keys)
         global_sensitivity_registry.add_sensitive_key("customGeneticMarker")
@@ -2010,10 +2000,10 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
     ):
         """Flatten record_data via CentralizedMapper, prefix metadata collisions with var_, and mask PHI."""
         import pyarrow.parquet as pq
-        from imednet_sinks.warehouse import _records_to_arrow_table
 
         from imednet.models.records import Record
         from imednet.spi.sinks import CentralizedMapper
+        from imednet_sinks.warehouse import _records_to_arrow_table
 
         rec = Record(
             record_id=42,
@@ -2074,16 +2064,16 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
         self, monkeypatch, tmp_path
     ):
         """Batches where every record has record_data={} serialize to Parquet without ArrowNotImplementedError."""
-        import imednet_sinks.warehouse as wh_mod
         import pyarrow.parquet as pq
+
+        import imednet_sinks.warehouse as wh_mod
+        from imednet.models.records import Record
+        from imednet.spi.sinks import CentralizedMapper
         from imednet_sinks.warehouse import (
             SnowflakeExportSink,
             SnowflakeSinkConfig,
             _records_to_arrow_table,
         )
-
-        from imednet.models.records import Record
-        from imednet.spi.sinks import CentralizedMapper
 
         draft_records = [
             Record(
@@ -2154,11 +2144,11 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
         """write_batch creates missing table, runs ALTER TABLE for unseen variables, and deduplicates by date_modified."""
         import re
 
-        import imednet_sinks.warehouse as wh_mod
         import pyarrow.parquet as pq
-        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
+        import imednet_sinks.warehouse as wh_mod
         from imednet.models.records import Record
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
         sf, _conn, cursor = _fake_snowflake_module()
         orig_require = wh_mod._require_optional_dep
@@ -2295,11 +2285,11 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
         self, monkeypatch, tmp_path
     ):
         """export_to_snowflake generates run-scoped batch IDs and handles soft vs hard deletes without duplicates."""
-        import imednet_sinks.warehouse as wh_mod
         import pyarrow.parquet as pq
-        from imednet_sinks.warehouse import SnowflakeSinkConfig, export_to_snowflake
 
+        import imednet_sinks.warehouse as wh_mod
         from imednet.models.records import Record
+        from imednet_sinks.warehouse import SnowflakeSinkConfig, export_to_snowflake
 
         sf, _conn, cursor = _fake_snowflake_module()
         orig_require = wh_mod._require_optional_dep
@@ -2482,10 +2472,9 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
     ):
         """Unsafe clinical variable names and non-boolean hard_delete raise ExportConfigurationError before SQL execution."""
         import imednet_sinks.warehouse as wh_mod
-        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
-
         from imednet.errors import ExportConfigurationError
         from imednet.models.records import Record
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
         with pytest.raises(ExportConfigurationError, match="hard_delete"):
             SnowflakeSinkConfig(study_key="S", hard_delete="yes")  # type: ignore[arg-type]
@@ -2527,16 +2516,16 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
         self, monkeypatch, tmp_path
     ):
         """Standard Record batches normalize RecordStatus/keywords in place and deduplicate batch checks."""
-        import imednet_sinks.warehouse as wh_mod
         import pyarrow.parquet as pq
+
+        import imednet_sinks.warehouse as wh_mod
+        from imednet.models.records import Record, RecordStatus
+        from imednet.spi.utils import global_sensitivity_registry
         from imednet_sinks.warehouse import (
             SnowflakeExportSink,
             SnowflakeSinkConfig,
             _records_to_arrow_table,
         )
-
-        from imednet.models.records import Record, RecordStatus
-        from imednet.spi.utils import global_sensitivity_registry
 
         records = [
             Record(
@@ -2672,9 +2661,9 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
     def test_harmonize_tabular_rows_single_pass_selective_copy_and_other_family(self):
         """_harmonize_tabular_rows aligns rows[0], copies later dicts only on coercion, and skips 'other' family."""
         import pyarrow as pa
-        from imednet_sinks.warehouse import _harmonize_tabular_rows
 
         from imednet.models.records import RecordStatus
+        from imednet_sinks.warehouse import _harmonize_tabular_rows
 
         class IntSub(int):
             pass
@@ -2711,10 +2700,10 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
         import json
 
         import pyarrow as pa
-        from imednet_sinks.warehouse import _post_process_warehouse
 
         from imednet.errors import ExportConfigurationError
         from imednet.models.records import RecordStatus
+        from imednet_sinks.warehouse import _post_process_warehouse
 
         standalone = _post_process_warehouse(
             {
@@ -2824,16 +2813,16 @@ class TestCentralizedSpiGovernanceScalarsAndLineage:
         """MongoDB, Neo4j, and Snowflake enforce uppercase, camelCase, and lowercase terminologyLookups and mappings."""
         import json
 
+        import pyarrow.parquet as pq
+
         import imednet_sinks.document as doc_mod
         import imednet_sinks.graph as graph_mod
         import imednet_sinks.warehouse as wh_mod
-        import pyarrow.parquet as pq
+        from imednet.models.records import Record
+        from imednet.models.study_config import MappingRule, StudyConfiguration
         from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
         from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
         from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
-
-        from imednet.models.records import Record
-        from imednet.models.study_config import MappingRule, StudyConfiguration
 
         study_cfg = StudyConfiguration(
             studyKey="STUDY_GOV_ALL",
@@ -2976,15 +2965,15 @@ class TestCentralizedSpiGovernanceScalarsAndLineage:
         from decimal import Decimal
 
         import bson
-        import imednet_sinks.document as doc_mod
         from bson import Decimal128
+
+        import imednet_sinks.document as doc_mod
+        from imednet.models.records import Keyword, Record, RecordStatus
         from imednet_sinks.document import (
             MongoDbExportSink,
             MongoDbSinkConfig,
             _record_to_document,
         )
-
-        from imednet.models.records import Keyword, Record, RecordStatus
 
         ts_sample = datetime(2026, 5, 1, 8, 30, tzinfo=UTC)
         rec = Record(
@@ -3069,9 +3058,8 @@ class TestCentralizedSpiGovernanceScalarsAndLineage:
         from decimal import Decimal
 
         import imednet_sinks.graph as graph_mod
-        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
-
         from imednet.models.records import Keyword, Record, RecordStatus
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
 
         neo4j_mod, driver = _fake_neo4j_module()
         monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
@@ -3165,9 +3153,8 @@ class TestCentralizedSpiGovernanceScalarsAndLineage:
     ):
         """Scheduled and unscheduled Records (visit_id=None or <=0) link to owning Subject without cross-Subject leakage."""
         import imednet_sinks.graph as graph_mod
-        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
-
         from imednet.models.records import Record
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
 
         neo4j_mod, driver = _fake_neo4j_module()
         monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
@@ -3278,9 +3265,9 @@ class TestCentralizedSpiGovernanceScalarsAndLineage:
         from decimal import Decimal
 
         import pyarrow as pa
-        from imednet_sinks.warehouse import _records_to_arrow_table, _resolve_column_types
 
         from imednet.models.records import Keyword, Record
+        from imednet_sinks.warehouse import _records_to_arrow_table, _resolve_column_types
 
         # 1. Homogeneous Decimal + datetime.date + Keyword batch
         homogeneous = [
@@ -3339,3 +3326,335 @@ class TestCentralizedSpiGovernanceScalarsAndLineage:
             tbl_sd.schema.field("lab_result").type
         ) or pa.types.is_large_string(tbl_sd.schema.field("lab_result").type)
         assert tbl_sd.column("lab_result").to_pylist() == ["BLQ", "0.00425"]
+
+
+class TestPluginSinksSdtmAndNamingConventionParity:
+    """Verify Snowflake, MongoDB, and Neo4j sinks support as_sdtm and naming_convention parity."""
+
+    def test_all_three_plugin_sinks_emit_sdtm_with_cross_batch_seq_and_phi_masking(
+        self, monkeypatch, tmp_path
+    ):
+        """Snowflake, MongoDB, and Neo4j emit uppercase SDTM schemas with monotonic --SEQ per USUBJID."""
+        import pyarrow.parquet as pq
+
+        import imednet_sinks.document as doc_mod
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+        from imednet.models.records import Record
+        from imednet_sinks import (
+            MongoDbExportSink,
+            MongoDbSinkConfig,
+            Neo4jExportSink,
+            Neo4jSinkConfig,
+            SnowflakeExportSink,
+            SnowflakeSinkConfig,
+        )
+
+        batch_1 = [
+            Record(
+                record_id=1,
+                study_key="SDTM_STUDY",
+                form_key="AE",
+                subject_key="SUBJ-9",
+                record_data={
+                    "aeTerm": "Headache",
+                    "aeStartDate": "2026-02-01 10:00:00",
+                    "aeSerious": "yes",
+                    "patientName": "Hidden Name",
+                },
+            )
+        ]
+        batch_2 = [
+            Record(
+                record_id=2,
+                study_key="SDTM_STUDY",
+                form_key="AE",
+                subject_key="SUBJ-9",
+                record_data={
+                    "ae_term": "Nausea",
+                    "ae_start_date": "2026-02-02",
+                    "ae_serious": False,
+                },
+            )
+        ]
+
+        # 1. SnowflakeExportSink
+        sf, _conn, cursor = _fake_snowflake_module()
+        cursor.fetchall.return_value = []
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+        sf_stage_dir = tmp_path / "sf_sdtm"
+        sf_cfg = SnowflakeSinkConfig(
+            study_key="SDTM_STUDY",
+            account="acct",
+            user="usr",
+            password="pwd",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="AE",
+            local_staging_dir=str(sf_stage_dir),
+            as_sdtm=True,
+            sdtm_domain="AE",
+        )
+        with SnowflakeExportSink(config=sf_cfg) as sf_sink:
+            sf_sink.write_batch(batch_1, batch_id="b1")
+            sf_sink.write_batch(batch_2, batch_id="b2")
+
+        t1 = pq.read_table(sf_stage_dir / "b1.parquet").to_pylist()
+        t2 = pq.read_table(sf_stage_dir / "b2.parquet").to_pylist()
+        assert t1[0]["STUDYID"] == "SDTM_STUDY"
+        assert t1[0]["DOMAIN"] == "AE"
+        assert t1[0]["USUBJID"] == "SUBJ-9"
+        assert t1[0]["AESEQ"] == 1
+        assert t1[0]["AESTDTC"] == "2026-02-01T10:00:00"
+        assert t1[0]["AESER"] == "Y"
+        assert t1[0]["patientName"] == "***MASKED***"
+        assert "record_data" not in t1[0]
+        assert t2[0]["AESEQ"] == 2
+        executed_sql = "\n".join(c.args[0] for c in cursor.execute.call_args_list)
+        assert 'PARTITION BY "STUDYID", "DOMAIN", "USUBJID", "AESEQ"' in executed_sql
+
+        # 2. MongoDbExportSink
+        pymongo_mod, _client, collection = _fake_pymongo_module()
+        pymongo_mod.UpdateOne = MagicMock(side_effect=lambda flt, upd, upsert: (flt, upd, upsert))
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo_mod)
+        mongo_cfg = MongoDbSinkConfig(
+            study_key="SDTM_STUDY",
+            uri="mongodb://localhost:27017",
+            database="clin",
+            collection="ae",
+            as_sdtm=True,
+            sdtm_domain="AE",
+        )
+        with MongoDbExportSink(config=mongo_cfg) as mongo_sink:
+            mongo_sink.write_batch(batch_1, batch_id="b1")
+            mongo_sink.write_batch(batch_2, batch_id="b2")
+        ops_1 = collection.bulk_write.call_args_list[0].args[0]
+        ops_2 = collection.bulk_write.call_args_list[1].args[0]
+        doc_1 = ops_1[0][1]["$set"]
+        doc_2 = ops_2[0][1]["$set"]
+        assert doc_1["_id"] == "SDTM_STUDY/1"
+        assert doc_1["AESEQ"] == 1
+        assert doc_1["patientName"] == "***MASKED***"
+        assert doc_2["_id"] == "SDTM_STUDY/2"
+        assert doc_2["AESEQ"] == 2
+
+        # 3. Neo4jExportSink
+        neo4j_mod, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+        neo_cfg = Neo4jSinkConfig(
+            study_key="SDTM_STUDY",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "pass"),
+            as_sdtm=True,
+            sdtm_domain="AE",
+        )
+        with Neo4jExportSink(config=neo_cfg) as neo_sink:
+            neo_sink.write_batch(batch_1, batch_id="b1")
+            neo_sink.write_batch(batch_2, batch_id="b2")
+        neo_calls = driver.session.return_value.__enter__.return_value.run.call_args_list
+        assert "MERGE (s:Study   {STUDYID: row.STUDYID})" in neo_calls[0].args[0]
+        assert neo_calls[0].kwargs["rows"][0]["AESEQ"] == 1
+        assert neo_calls[1].kwargs["rows"][0]["AESEQ"] == 2
+
+    @pytest.mark.parametrize("convention", ["snake_case", "camelCase", "sdtm"])
+    def test_naming_convention_parity_across_parquet_snowflake_mongodb_and_neo4j(
+        self, monkeypatch, tmp_path, convention
+    ):
+        """naming_convention produces aligned clinical variable and identifier keys across Parquet and plugin sinks."""
+        import pandas as pd
+        import pyarrow.parquet as pq
+
+        import imednet_sinks.document as doc_mod
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+        from imednet.integrations import export as export_mod
+        from imednet.models.forms import Form
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
+        from imednet_sinks import (
+            MongoDbExportSink,
+            MongoDbSinkConfig,
+            Neo4jExportSink,
+            Neo4jSinkConfig,
+            SnowflakeExportSink,
+            SnowflakeSinkConfig,
+        )
+
+        rec = Record(
+            record_id=55,
+            study_key="PARITY_STUDY",
+            form_id=1,
+            form_key="VS",
+            subject_key="SUBJ-55",
+            visit_id=3,
+            record_data={"heartRate": 72, "sys_bp": 120},
+        )
+
+        sdk = MagicMock()
+        sdk.forms.list.return_value = [Form(form_id=1, form_key="VS", form_name="Vitals")]
+        sdk.variables.list.return_value = [
+            Variable(variable_id=1, form_id=1, form_key="VS", variable_name="heartRate"),
+            Variable(variable_id=2, form_id=1, form_key="VS", variable_name="sys_bp"),
+        ]
+        sdk.records.list.side_effect = lambda **_kw: iter([rec])
+
+        pq_file = tmp_path / f"parity_{convention}.parquet"
+        export_mod.export_to_parquet(
+            sdk, "PARITY_STUDY", str(pq_file), naming_convention=convention
+        )
+        pq_cols = set(pd.read_parquet(pq_file).columns)
+
+        sf, _conn, cursor = _fake_snowflake_module()
+        cursor.fetchall.return_value = []
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+        sf_dir = tmp_path / f"sf_{convention}"
+        sf_cfg = SnowflakeSinkConfig(
+            study_key="PARITY_STUDY",
+            account="acct",
+            user="usr",
+            password="pwd",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="RECORDS",
+            local_staging_dir=str(sf_dir),
+            naming_convention=convention,
+        )
+        with SnowflakeExportSink(config=sf_cfg) as sf_sink:
+            sf_sink.write_batch([rec], batch_id="b0")
+        sf_cols = set(pq.read_table(sf_dir / "b0.parquet").column_names)
+
+        expected_vars = {
+            "snake_case": {"study_key", "subject_key", "record_id", "heart_rate", "sys_bp"},
+            "camelCase": {"studyKey", "subjectKey", "recordId", "heartRate", "sysBp"},
+            "sdtm": {"STUDYID", "USUBJID", "RECORD_ID", "HEARTRATE", "SYSBP"},
+        }[convention]
+        assert expected_vars.issubset(pq_cols)
+        assert expected_vars.issubset(sf_cols)
+
+        pymongo_mod, _client, collection = _fake_pymongo_module()
+        pymongo_mod.UpdateOne = MagicMock(side_effect=lambda flt, upd, upsert: (flt, upd, upsert))
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo_mod)
+        with MongoDbExportSink(
+            MongoDbSinkConfig(
+                study_key="PARITY_STUDY",
+                uri="mongodb://localhost:27017",
+                database="db",
+                collection="col",
+                naming_convention=convention,
+            )
+        ) as mongo_sink:
+            mongo_sink.write_batch([rec], batch_id="b0")
+        mongo_doc = collection.bulk_write.call_args.args[0][0][1]["$set"]
+        rd_key = {"snake_case": "record_data", "camelCase": "recordData", "sdtm": "RECORD_DATA"}[
+            convention
+        ]
+        expected_var_only = {
+            "snake_case": {"heart_rate", "sys_bp"},
+            "camelCase": {"heartRate", "sysBp"},
+            "sdtm": {"HEARTRATE", "SYSBP"},
+        }[convention]
+        assert set(mongo_doc[rd_key].keys()) == expected_var_only
+
+        neo4j_mod, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="PARITY_STUDY",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "pass"),
+                naming_convention=convention,
+            )
+        ) as neo_sink:
+            neo_sink.write_batch([rec], batch_id="b0")
+        neo_row = driver.session.return_value.__enter__.return_value.run.call_args.kwargs["rows"][0]
+        assert (expected_vars - expected_var_only).issubset(set(neo_row.keys()))
+
+    @pytest.mark.parametrize(
+        ("convention", "expected_neo_fragment", "expected_sf_where"),
+        [
+            (
+                "snake_case",
+                "MATCH (r:Record {record_id: rid, study_key: $study_key})",
+                "WHERE STUDY_KEY = %s AND RECORD_ID IN (%s)",
+            ),
+            (
+                "camelCase",
+                "MATCH (r:Record {recordId: rid, studyKey: $study_key})",
+                'WHERE "STUDYKEY" = %s AND "RECORDID" IN (%s)',
+            ),
+            (
+                "sdtm",
+                "MATCH (r:Record {RECORD_ID: rid, STUDYID: $study_key})",
+                'WHERE "STUDYID" = %s AND "RECORD_ID" IN (%s)',
+            ),
+        ],
+    )
+    def test_reconcile_deleted_respects_naming_convention_in_neo4j_and_snowflake(
+        self,
+        monkeypatch,
+        tmp_path,
+        convention: str,
+        expected_neo_fragment: str,
+        expected_sf_where: str,
+    ):
+        """Neo4j and Snowflake reconcile_deleted match identifiers formatted by naming_convention."""
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+        from imednet.models.records import Record
+        from imednet_sinks import (
+            Neo4jExportSink,
+            Neo4jSinkConfig,
+            SnowflakeExportSink,
+            SnowflakeSinkConfig,
+        )
+
+        voided = Record(record_id=88, study_key="DEL_STUDY", deleted=True, record_data={})
+
+        neo4j_mod, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="DEL_STUDY",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "pass"),
+                naming_convention=convention,
+            )
+        ) as neo_sink:
+            assert neo_sink.reconcile_deleted([voided], batch_id="del/0") == 1
+        neo_cypher = driver.session.return_value.__enter__.return_value.run.call_args.args[0]
+        assert expected_neo_fragment in neo_cypher
+
+        sf, _conn, cursor = _fake_snowflake_module()
+        monkeypatch.setattr(wh_mod, "_require_optional_dep", lambda *_: sf)
+        with SnowflakeExportSink(
+            SnowflakeSinkConfig(
+                study_key="DEL_STUDY",
+                account="acct",
+                user="usr",
+                password="pwd",  # pragma: allowlist secret
+                database="DB",
+                schema="PUBLIC",
+                warehouse="WH",
+                stage="STG",
+                table="RECORDS",
+                local_staging_dir=str(tmp_path / f"sf_del_{convention}"),
+                naming_convention=convention,
+            )
+        ) as sf_sink:
+            assert sf_sink.reconcile_deleted([voided], batch_id="del/0") == 1
+        sf_sql = cursor.execute.call_args.args[0]
+        assert expected_sf_where in sf_sql

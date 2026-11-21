@@ -20,9 +20,8 @@ from __future__ import annotations
 
 import os
 
-from imednet_sinks import MongoDbSinkConfig, export_to_mongodb
-
 from imednet import ImednetSDK
+from imednet_sinks import MongoDbSinkConfig, export_to_mongodb
 
 _SIM_MODE = os.environ.get("IMEDNET_SIMULATION_MODE", "").strip().lower() in {
     "1",

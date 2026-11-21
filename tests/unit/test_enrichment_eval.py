@@ -8,12 +8,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from imednet_sinks.warehouse import _records_to_arrow_table
 
 from imednet.integrations.enrichment import EnrichmentPipeline, _to_snake_case
 from imednet.models.records import Record
 from imednet.models.study_config import MappingRule, StudyConfiguration
 from imednet.testing.fake_data import fake_record
+from imednet_sinks.warehouse import _records_to_arrow_table
 
 
 def test_enrichment_pipeline_valid_business_logic() -> None:

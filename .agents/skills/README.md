@@ -29,7 +29,7 @@ Unified, Python-tailored skill portfolio merging [obra/superpowers](https://gith
 - **`/improve-codebase-architecture`** & **`codebase-design`**: Deep-module architecture scans aligned with `docs/explanation/architecture.rst` and `tests/unit/architecture/import_rules.py`.
 
 ### Workspaces, Execution, Testing & Debugging
-- **`using-git-worktrees`**: Isolated branch/worktree setup with `uv sync --locked --extra dev --extra docs` and `pytest` baseline.
+- **`using-git-worktrees`**: Isolated branch/worktree setup with `uv sync --locked --all-packages --all-extras` and `pytest` baseline.
 - **`subagent-driven-development`**: Per-task fresh implementer + two-stage spec & quality review.
 - **`executing-plans`**: Single-session inline plan execution sharing `.superpowers/sdd/` ledgers.
 - **`dispatching-parallel-agents`**: Concurrent dispatch for independent streams (`Agent` / `spawn_agent` / `invoke_subagent` / `swarm`).

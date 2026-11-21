@@ -13,13 +13,13 @@ ROOT = Path(__file__).resolve().parents[2]
 RELEASE_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release.yml"
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def release_workflow() -> dict:
     source = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
     return yaml.load(source, Loader=yaml.BaseLoader)
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def determine_packages_script(release_workflow: dict) -> str:
     steps = release_workflow["jobs"]["plan"]["steps"]
     step = next(s for s in steps if s.get("id") == "determine-packages")
