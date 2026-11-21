@@ -21,7 +21,6 @@ from ..hooks import ImednetHook
 
 try:  # pragma: no cover - optional Airflow dependency
     try:
-        import airflow.sdk.definitions._internal.contextmanager  # noqa: F401
         from airflow.sdk.bases.operator import BaseOperator
     except (ImportError, ModuleNotFoundError):
         from airflow.models import BaseOperator  # type: ignore[no-redef]

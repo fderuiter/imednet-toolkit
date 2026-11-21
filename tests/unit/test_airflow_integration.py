@@ -14,15 +14,13 @@ import imednet.sdk as sdk_mod
 
 def _setup_airflow(monkeypatch):
     """Helper function to  setup airflow."""
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
-            monkeypatch.delitem(sys.modules, mod, raising=False)
-
     airflow_mod = ModuleType("airflow")
     airflow_mod.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")
     hooks_pkg.__path__ = []
     hooks_mod = ModuleType("airflow.sdk.bases.hook")
+    operator_mod = ModuleType("airflow.sdk.bases.operator")
+    sensor_mod = ModuleType("airflow.sdk.bases.sensor")
     sdk_mod = ModuleType("airflow.sdk")
     sdk_mod.__path__ = []
     sdk_bases = ModuleType("airflow.sdk.bases")
@@ -50,18 +48,16 @@ def _setup_airflow(monkeypatch):
             """Initialize the test object."""
 
     hooks_mod.BaseHook = DummyBaseHook
-    ops_mod = ModuleType("airflow.sdk.bases.operator")
-    ops_mod.BaseOperator = DummyBaseOperator
-    sensors_mod = ModuleType("airflow.sdk.bases.sensor")
-    sensors_mod.BaseSensorOperator = DummyBaseOperator
+    operator_mod.BaseOperator = DummyBaseOperator
+    sensor_mod.BaseSensorOperator = DummyBaseOperator
     models_mod.BaseOperator = DummyBaseOperator
     models_mod.DAG = DummyBaseOperator
     sdk_dag.DAG = DummyBaseOperator
     sdk_dag.dag = DummyBaseOperator
 
     sdk_bases.hook = hooks_mod
-    sdk_bases.operator = ops_mod
-    sdk_bases.sensor = sensors_mod
+    sdk_bases.operator = operator_mod
+    sdk_bases.sensor = sensor_mod
     sdk_mod.bases = sdk_bases
     sdk_defs.context = sdk_ctx
     sdk_defs.dag = sdk_dag
@@ -70,13 +66,19 @@ def _setup_airflow(monkeypatch):
     airflow_mod.hooks = hooks_pkg
     airflow_mod.models = models_mod
 
+    for mod_name in list(sys.modules):
+        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
+            "apache_airflow_providers_imednet."
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
     monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
     monkeypatch.setitem(sys.modules, "airflow.hooks", hooks_pkg)
     monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", ops_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.sensor", sensors_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", operator_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.sensor", sensor_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
@@ -113,8 +115,8 @@ def test_imednet_hook_returns_sdk(monkeypatch):
 
 def test_export_operator_calls_helper(monkeypatch):
     """Test that export operator calls helper."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -152,8 +154,8 @@ def test_export_operator_calls_helper(monkeypatch):
 
 def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
     """Test that export operator exposes mapped runtime fields."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -170,8 +172,8 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
 
 def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monkeypatch):
     """Test that export operator copies runtime kwargs and resolves sdk at execute."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -215,8 +217,8 @@ def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monke
 
 def test_export_operator_rejects_unknown_export_callable(monkeypatch):
     """Test that export operator rejects unknown export callable."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -656,7 +658,7 @@ def test_export_operator_template_field_rendering_simulation(monkeypatch):
     """
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
-            del sys.modules[mod]
+            monkeypatch.delitem(sys.modules, mod, raising=False)
 
     _setup_airflow(monkeypatch)
 
@@ -742,9 +744,8 @@ def test_list_study_keys_skips_entries_without_recognized_key(monkeypatch):
 
 def test_export_operator_resolves_snowflake_sink(monkeypatch):
     """Test that export operator resolves snowflake sink."""
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
-            del sys.modules[mod]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
 
     _setup_airflow(monkeypatch)
     conn = MagicMock()
@@ -1006,8 +1007,11 @@ def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monk
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mocked_airflow_provider_modules():
-    """Purge provider modules bound to mocked Airflow classes at module teardown."""
+    """Evict provider modules bound to dummy Airflow stubs on module teardown."""
     yield
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
             sys.modules.pop(mod, None)
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None:
+        providers_pkg.__dict__.pop("imednet", None)

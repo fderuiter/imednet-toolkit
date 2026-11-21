@@ -8,13 +8,8 @@ import inspect
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import Any
 from unittest.mock import NonCallableMock
-
-try:
-    import pandas as pd
-except ImportError:  # pragma: no cover - optional export dependency
-    pd = None  # type: ignore[assignment, unused-ignore]
 
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
@@ -67,8 +62,6 @@ def _ensure_pandas() -> ModuleType:
     Raises:
         ImportError: If pandas is not installed.
     """
-    if pd is not None:
-        return cast(ModuleType, pd)
     try:
         return import_module("pandas")
     except ImportError as error:
@@ -220,7 +213,6 @@ def export_to_hive_parquet(
 ) -> None:
     """Export study records to a Hive-partitioned Parquet directory layout."""
     pyarrow_module = _ensure_pyarrow()
-    _ensure_pandas()
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
     validate_max_buffered_records(max_buffered_records)

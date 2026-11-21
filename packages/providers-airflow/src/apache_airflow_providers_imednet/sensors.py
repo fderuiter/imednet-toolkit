@@ -8,7 +8,6 @@ from typing import Any
 
 try:  # pragma: no cover - optional Airflow dependency
     try:
-        import airflow.sdk.definitions._internal.contextmanager  # noqa: F401
         from airflow.sdk.bases.sensor import BaseSensorOperator
     except ImportError:
         from airflow.sensors.base import BaseSensorOperator  # type: ignore[no-redef]

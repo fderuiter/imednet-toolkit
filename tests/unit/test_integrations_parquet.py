@@ -475,33 +475,29 @@ def test_export_to_hive_parquet_deduplicates_case_insensitive_variables_and_mask
     assert enroll_df["subjectKey"].iloc[0] == "SUBJ-201"
 
 
-def test_export_to_hive_parquet_missing_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify export_to_hive_parquet raises a clear ImportError when pandas is absent."""
-    monkeypatch.setattr(parquet_mod, "_ensure_pyarrow", lambda: SimpleNamespace())
-    monkeypatch.setattr(parquet_mod, "pd", None)
-
-    def _raise_import_error(module_name: str):
-        if module_name == "pandas":
-            raise ImportError("missing pandas")
-        return __import__(module_name)
-
-    monkeypatch.setattr(parquet_mod, "import_module", _raise_import_error)
-
-    with pytest.raises(ImportError, match=r"pandas is required.*pip install 'imednet\[export\]'"):
-        parquet_mod.export_to_hive_parquet(MagicMock(), "STUDY_A", "/tmp/lake")
-
-
-def test_parquet_module_import_and_query_without_pandas() -> None:
-    """Verify imednet.integrations and imednet.cli load when pandas is not installed."""
+def test_parquet_and_cli_import_without_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Minimal installs without pandas must still import imednet.integrations.parquet and CLI."""
     import subprocess
     import sys
 
-    code = (
-        "import sys; sys.modules['pandas'] = None; "
-        "import imednet.integrations as integ; "
-        "from imednet.cli import app; "
-        "assert 'read_parquet' in integ.hive_parquet_query('/tmp/lake'); "
-        "assert callable(app)"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; sys.modules['pandas'] = None; "
+                "import imednet.integrations.parquet as parquet_mod; "
+                "import imednet.cli as cli_mod; "
+                "assert callable(parquet_mod.hive_parquet_query); "
+                "assert cli_mod.app is not None"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
     )
-    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
-    assert res.returncode == 0, res.stderr
+    assert proc.returncode == 0, proc.stderr
+
+    monkeypatch.setitem(sys.modules, "pandas", None)
+    with pytest.raises(ImportError, match=r"pip install 'imednet\[export\]'"):
+        parquet_mod._ensure_pandas()

@@ -33,7 +33,7 @@ BASIC_EXAMPLE_SCRIPTS = sorted(BASIC_EXAMPLES_DIR.glob("*.py"))
 
 @pytest.fixture(autouse=True)
 def _reset_simulation_state() -> Iterator[None]:
-    """Reset shared default SimulationState and root logger handlers around each test."""
+    """Reset shared default SimulationState and root logger state before and after each test."""
     root_logger = logging.getLogger()
     saved_handlers = list(root_logger.handlers)
     saved_level = root_logger.level
