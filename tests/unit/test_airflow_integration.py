@@ -991,10 +991,18 @@ def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monk
     assert sdk_list_err._client._client.is_closed
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_dummy_provider_modules():
+    """Unload dummy-patched provider modules after module tests finish."""
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+
+
 def test_export_operator_full_template_fields_contract(monkeypatch):
     """Verify full template_fields tuple includes mapped runtime, watermark, and filter fields."""
-    if "apache_airflow_providers_imednet" in sys.modules:
-        del sys.modules["apache_airflow_providers_imednet"]
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
 
     _setup_airflow(monkeypatch)
     from apache_airflow_providers_imednet import ImednetExportOperator

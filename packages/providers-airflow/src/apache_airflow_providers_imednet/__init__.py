@@ -58,10 +58,31 @@ class _ImednetAirflowProviderFinder(MetaPathFinder, Loader):
         sys.modules[alias_name] = target_mod
 
 
+def _sync_airflow_provider_aliases() -> None:
+    """Synchronize or evict stale ``airflow.providers.imednet`` aliases in ``sys.modules``."""
+    for mod_name in list(sys.modules):
+        if mod_name == _ALIAS_PREFIX or mod_name.startswith(f"{_ALIAS_PREFIX}."):
+            target_name = mod_name.replace(_ALIAS_PREFIX, _TARGET_PREFIX, 1)
+            target_mod = sys.modules.get(target_name)
+            if target_mod is None:
+                sys.modules.pop(mod_name, None)
+            elif sys.modules.get(mod_name) is not target_mod:
+                sys.modules[mod_name] = target_mod
+
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+        root_target = sys.modules.get(_TARGET_PREFIX)
+        if root_target is None:
+            delattr(providers_pkg, "imednet")
+        elif getattr(providers_pkg, "imednet", None) is not root_target:
+            providers_pkg.imednet = root_target  # type: ignore[attr-defined]
+
+
 def _ensure_airflow_provider_finder() -> None:
     """Ensure the ``airflow.providers.imednet`` import alias finder is registered."""
     if not any(isinstance(finder, _ImednetAirflowProviderFinder) for finder in sys.meta_path):
         sys.meta_path.insert(0, _ImednetAirflowProviderFinder())
+    _sync_airflow_provider_aliases()
 
 
 _ensure_airflow_provider_finder()
@@ -92,6 +113,8 @@ try:  # pragma: no cover - optional Airflow dependencies may be missing
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - trigger requires Airflow extras
     ImednetJobTrigger = None
     triggers = None  # type: ignore
+
+_sync_airflow_provider_aliases()
 
 __all__ = [
     "ImednetExportOperator",

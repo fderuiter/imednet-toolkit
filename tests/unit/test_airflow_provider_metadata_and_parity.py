@@ -123,6 +123,42 @@ def test_ensure_airflow_provider_finder_reinserts_when_missing(
     assert provider_pkg.get_provider_info() == get_provider_info()
 
 
+def test_sync_airflow_provider_aliases_handles_provider_reload_and_eviction() -> None:
+    """Verify airflow.providers.imednet aliases stay identical across provider unloads/reloads."""
+    import airflow.providers
+    import airflow.providers.imednet.hooks as initial_alias_hooks
+
+    from apache_airflow_providers_imednet import _ensure_airflow_provider_finder
+
+    assert initial_alias_hooks.ImednetHook is not None
+
+    # Simulate partial unload of apache_airflow_providers_imednet* while alias entries remain cached
+    for mod in list(sys.modules):
+        if mod == "apache_airflow_providers_imednet" or mod.startswith(
+            "apache_airflow_providers_imednet."
+        ):
+            sys.modules.pop(mod, None)
+
+    _ensure_airflow_provider_finder()
+    assert "airflow.providers.imednet.hooks" not in sys.modules
+    assert not hasattr(airflow.providers, "imednet")
+
+    # Re-import canonical package while pre-seeding stale alias entries to verify rebinding
+    stale_pkg = SimpleNamespace()
+    stale_hooks = SimpleNamespace()
+    sys.modules["airflow.providers.imednet"] = stale_pkg  # type: ignore[assignment]
+    sys.modules["airflow.providers.imednet.hooks"] = stale_hooks  # type: ignore[assignment]
+    airflow.providers.imednet = stale_pkg  # type: ignore[attr-defined]
+
+    reloaded_pkg = importlib.import_module("apache_airflow_providers_imednet")
+    from airflow.providers.imednet.hooks import ImednetHook as ReloadedAliasHook
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook as ReloadedCanonicalHook
+
+    assert ReloadedAliasHook is ReloadedCanonicalHook
+    assert getattr(airflow.providers, "imednet") is reloaded_pkg
+
+
 def test_hook_extra_prefix_base_url_and_test_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

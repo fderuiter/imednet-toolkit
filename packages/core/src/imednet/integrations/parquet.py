@@ -11,7 +11,10 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import NonCallableMock
 
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover - optional export dependency
+    pd = None  # type: ignore[assignment, unused-ignore]
 
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
@@ -146,6 +149,11 @@ def _prune_hive_partition_record_ids(
     """Prune superseded or voided record IDs from pre-existing Hive partition Parquet files."""
     if not files or not excluded_ids:
         return
+    if pd is None:  # pragma: no cover - optional export dependency
+        raise ImportError(
+            "pandas is required for Hive Parquet export. Install with "
+            "\"pip install 'imednet[export]'\"."
+        )
     partition_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}"
     for pf in files:
         if not pf.exists():
