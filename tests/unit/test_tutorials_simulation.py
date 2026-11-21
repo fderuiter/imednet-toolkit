@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import runpy
 from collections.abc import Iterator
 from pathlib import Path
@@ -32,10 +33,18 @@ BASIC_EXAMPLE_SCRIPTS = sorted(BASIC_EXAMPLES_DIR.glob("*.py"))
 
 @pytest.fixture(autouse=True)
 def _reset_simulation_state() -> Iterator[None]:
-    """Reset shared default SimulationState before and after each test."""
+    """Reset shared default SimulationState and isolate root logger handlers around each test."""
+    root_logger = logging.getLogger()
+    saved_handlers = list(root_logger.handlers)
+    saved_level = root_logger.level
+    root_logger.handlers = []
     get_default_simulation_state().reset()
-    yield
-    get_default_simulation_state().reset()
+    try:
+        yield
+    finally:
+        get_default_simulation_state().reset()
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
 
 
 def test_basic_examples_inventory() -> None:

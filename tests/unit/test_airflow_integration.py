@@ -68,7 +68,7 @@ def _setup_airflow(monkeypatch):
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
-    monkeypatch.setitem(sys.modules, "airflow.models", models_mod)
+    _bind_sdk_operator_stubs(monkeypatch, sdk_bases, models_mod, DummyBaseOperator)
 
 
 def test_imednet_hook_returns_sdk(monkeypatch):
@@ -1019,3 +1019,21 @@ def test_export_operator_rejects_secrets_in_templated_filter_fields(monkeypatch)
     op = ImednetExportOperator(task_id="t_secret_stream", study_key="S")
     with pytest.raises(AirflowException, match="stream_name"):
         op.stream_name = "postgresql://user:pass@db.example/prod"  # pragma: allowlist secret
+
+
+def _bind_sdk_operator_stubs(monkeypatch, sdk_bases, models_mod, dummy_operator_cls):
+    """Register Task SDK operator/sensor base stubs and evict cached provider submodules."""
+    sdk_op = ModuleType("airflow.sdk.bases.operator")
+    sdk_sensor = ModuleType("airflow.sdk.bases.sensor")
+    sdk_op.BaseOperator = dummy_operator_cls
+    sdk_sensor.BaseSensorOperator = dummy_operator_cls
+    sdk_bases.operator = sdk_op
+    sdk_bases.sensor = sdk_sensor
+    monkeypatch.setitem(sys.modules, "airflow.models", models_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", sdk_op)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.sensor", sdk_sensor)
+    for mod_name in list(sys.modules):
+        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
+            ("apache_airflow_providers_imednet.", "airflow.providers.imednet")
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)

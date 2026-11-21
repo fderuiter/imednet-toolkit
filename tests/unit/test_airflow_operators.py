@@ -26,6 +26,7 @@ def _setup_airflow(monkeypatch):
     models_mod = ModuleType("airflow.models")
     sensors_base = ModuleType("airflow.sensors.base")
     sensors_sdk = ModuleType("airflow.sdk.bases.sensor")
+    operators_sdk = ModuleType("airflow.sdk.bases.operator")
     exc_mod = ModuleType("airflow.exceptions")
     sdk_exc = ModuleType("airflow.sdk.exceptions")
     s3_mod = ModuleType("airflow.providers.amazon.aws.hooks.s3")
@@ -55,6 +56,7 @@ def _setup_airflow(monkeypatch):
             """Initialize the test object."""
 
     hooks_base.BaseHook = DummyBaseHook
+    operators_sdk.BaseOperator = DummyBaseOperator
     models_mod.BaseOperator = DummyBaseOperator
     models_mod.DAG = DummyBaseOperator
     sensors_base.BaseSensorOperator = DummySensorOperator
@@ -70,6 +72,7 @@ def _setup_airflow(monkeypatch):
     s3_mod.S3Hook = MagicMock
 
     sdk_bases.hook = hooks_base
+    sdk_bases.operator = operators_sdk
     sdk_bases.sensor = sensors_sdk
     sdk_mod.bases = sdk_bases
     sdk_mod.exceptions = sdk_exc
@@ -98,6 +101,7 @@ def _setup_airflow(monkeypatch):
         "airflow.sdk": sdk_mod,
         "airflow.sdk.bases": sdk_bases,
         "airflow.sdk.bases.hook": hooks_base,
+        "airflow.sdk.bases.operator": operators_sdk,
         "airflow.sdk.bases.sensor": sensors_sdk,
         "airflow.sdk.definitions": sdk_defs,
         "airflow.sdk.definitions.context": sdk_ctx,
@@ -115,6 +119,12 @@ def _setup_airflow(monkeypatch):
     }
     for name, mod in modules.items():
         monkeypatch.setitem(sys.modules, name, mod)
+
+    for mod_name in list(sys.modules):
+        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
+            ("apache_airflow_providers_imednet.", "airflow.providers.imednet")
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
 
 
 def _import_operators(monkeypatch):
