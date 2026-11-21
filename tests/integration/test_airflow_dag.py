@@ -126,7 +126,12 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
     monkeypatch.setenv("AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST", bundle_cfg)
 
     prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    prev_settings_async_conn = getattr(settings, "SQL_ALCHEMY_CONN_ASYNC", None)
+    async_db_uri = f"sqlite+aiosqlite:///{db_file}"
     monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    if hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+        monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
+        monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
 
     conf.set("database", "sql_alchemy_conn", db_uri)
     conf.set("core", "dags_folder", str(dags_dir))
@@ -159,6 +164,8 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
 
     settings.dispose_orm()
     settings.SQL_ALCHEMY_CONN = prev_settings_conn
+    if prev_settings_async_conn is not None and hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+        settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_async_conn
     if prev_conn is not None:
         conf.set("database", "sql_alchemy_conn", prev_conn)
     if prev_dags is not None:

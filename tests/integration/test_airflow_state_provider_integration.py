@@ -77,8 +77,11 @@ def _airflow_template_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
     prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    prev_settings_async_conn = getattr(settings, "SQL_ALCHEMY_CONN_ASYNC", None)
     conf.set("database", "sql_alchemy_conn", tpl_uri)
     settings.SQL_ALCHEMY_CONN = tpl_uri
+    if hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+        settings.SQL_ALCHEMY_CONN_ASYNC = f"sqlite+aiosqlite:///{tpl_db}"
     try:
         settings.dispose_orm()
         settings.configure_orm()
@@ -86,6 +89,8 @@ def _airflow_template_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
     finally:
         settings.dispose_orm()
         settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if prev_settings_async_conn is not None and hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+            settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_async_conn
         if prev_conn is not None:
             conf.set("database", "sql_alchemy_conn", prev_conn)
         settings.configure_orm()
@@ -93,13 +98,25 @@ def _airflow_template_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _load_dag_from_file(dag_file: Path, dag_id: str) -> Any:
-    """Load a DAG from a file inside ``AIRFLOW__CORE__DAGS_FOLDER``."""
+    """Load and register a DAG from a file inside ``AIRFLOW__CORE__DAGS_FOLDER``."""
+    from airflow.dag_processing.dagbag import BundleDagBag, sync_bag_to_db
+
     spec = importlib.util.spec_from_file_location(dag_file.stem, dag_file)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[dag_file.stem] = module
     spec.loader.exec_module(module)
-    return getattr(module, dag_id)
+    dag = getattr(module, dag_id)
+    bag = BundleDagBag(
+        dag_folder=str(dag_file.parent),
+        bundle_path=dag_file.parent,
+        bundle_name="dags-folder",
+        safe_mode=True,
+        collect_dags=False,
+    )
+    bag.bag_dag(dag=dag)
+    sync_bag_to_db(bag, "dags-folder", None)
+    return dag
 
 
 @pytest.fixture
@@ -130,7 +147,9 @@ def airflow_runtime_env(
     prev_examples = conf.get("core", "load_examples", fallback=None)
     prev_bundles = conf.get("dag_processor", "dag_bundle_config_list", fallback=None)
     prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    prev_settings_async_conn = getattr(settings, "SQL_ALCHEMY_CONN_ASYNC", None)
     prev_settings_dags = settings.DAGS_FOLDER
+    async_db_uri = f"sqlite+aiosqlite:///{db_path}"
 
     bundle_cfg = json.dumps(
         [
@@ -155,6 +174,9 @@ def airflow_runtime_env(
     conf.set("dag_processor", "dag_bundle_config_list", bundle_cfg)
     monkeypatch.setattr(settings, "DAGS_FOLDER", str(dags_dir))
     monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    if hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+        monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
+        monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
     settings.dispose_orm()
     settings.configure_orm()
     DagBundlesManager().sync_bundles_to_db()
@@ -167,6 +189,8 @@ def airflow_runtime_env(
 
     settings.dispose_orm()
     settings.SQL_ALCHEMY_CONN = prev_settings_conn
+    if prev_settings_async_conn is not None and hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+        settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_async_conn
     settings.DAGS_FOLDER = prev_settings_dags
     if prev_conn is not None:
         conf.set("database", "sql_alchemy_conn", prev_conn)

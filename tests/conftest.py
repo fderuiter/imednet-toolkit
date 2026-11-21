@@ -418,6 +418,23 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):  #
                     lg.propagate = True
                 if lg.disabled:
                     lg.disabled = False
+        compat_mod = sys.modules.get("apache_airflow_providers_imednet._airflow_compat")
+        if compat_mod is not None:
+            base_hook = getattr(compat_mod, "BaseHook", None)
+            hook_mod_name = getattr(base_hook, "__module__", "")
+            hook_mod = sys.modules.get(hook_mod_name)
+            if (
+                not hook_mod_name.startswith("airflow.")
+                or getattr(hook_mod, "__file__", None) is None
+            ):
+                for mod_name in list(sys.modules):
+                    if mod_name.startswith(
+                        ("apache_airflow_providers_imednet", "airflow.providers.imednet")
+                    ):
+                        sys.modules.pop(mod_name, None)
+                providers_pkg = sys.modules.get("airflow.providers")
+                if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+                    delattr(providers_pkg, "imednet")
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:

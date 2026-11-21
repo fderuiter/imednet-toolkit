@@ -38,16 +38,19 @@ def _setup_airflow(monkeypatch):
 
         template_fields = ()
 
-        def __init__(self, **kwargs):  # pragma: no cover
+        def __init__(self, *args, **kwargs):  # pragma: no cover
             """Initialize the test object."""
 
+    operator_mod = ModuleType("airflow.sdk.bases.operator")
     hooks_mod.BaseHook = DummyBaseHook
+    operator_mod.BaseOperator = DummyBaseOperator
     models_mod.BaseOperator = DummyBaseOperator
     models_mod.DAG = DummyBaseOperator
     sdk_dag.DAG = DummyBaseOperator
     sdk_dag.dag = DummyBaseOperator
 
     sdk_bases.hook = hooks_mod
+    sdk_bases.operator = operator_mod
     sdk_mod.bases = sdk_bases
     sdk_defs.context = sdk_ctx
     sdk_defs.dag = sdk_dag
@@ -56,11 +59,18 @@ def _setup_airflow(monkeypatch):
     airflow_mod.hooks = hooks_pkg
     airflow_mod.models = models_mod
 
+    for mod_name in list(sys.modules):
+        if mod_name == "airflow" or mod_name.startswith(
+            ("airflow.", "apache_airflow_providers_imednet")
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
     monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
     monkeypatch.setitem(sys.modules, "airflow.hooks", hooks_pkg)
     monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
     monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", operator_mod)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
     monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
