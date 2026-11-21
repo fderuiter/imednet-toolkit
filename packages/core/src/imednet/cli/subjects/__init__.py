@@ -17,13 +17,16 @@ from ...utils.enrollment import (
     validate_subject_registration_sites,
 )
 from ..decorators import validate_cli_path_segment, with_sdk
-from ..utils import STUDY_KEY_ARG, display_list, fetching_status, print_error
+from ..utils import display_list, fetching_status, print_error, simulation_mode_context
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
+    add_simulation_arg,
+    add_study_key_args,
     collect_list_items_with_remainder,
     prepare_list_query,
     resolve_output_format,
+    resolve_study_key,
 )
 from ..utils.write_helpers import (
     add_write_common_args,
@@ -88,13 +91,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     # 1. subjects list
     list_parser = sub.add_parser("list", help="List subjects for a specific study.")
-    list_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(list_parser)
     add_list_query_args(
         list_parser,
         filter_dest="subject_filter",
         filter_help="Filter criteria (e.g., 'subject_status=Screened' or 'subjectStatus==Screened'). Repeat for multiple filters.",
     )
     add_output_format(list_parser)
+    add_simulation_arg(list_parser)
 
     @with_sdk
     def list_subjects(
@@ -152,7 +156,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
     def _dispatch_list_subjects(args: argparse.Namespace) -> None:
-        validate_cli_path_segment(args.study_key, name="study_key")
+        study_key = resolve_study_key(list_parser, args, required=True)
+        assert study_key is not None
+        validate_cli_path_segment(study_key, name="study_key")
         no_interactive = getattr(args, "no_interactive", False)
         resolved_format = resolve_output_format(args.output_format)
         prepared = prepare_list_query(
@@ -166,16 +172,17 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             allowed_attributes=SubjectsEndpoint.FILTER_ATTRIBUTES,
             disallow_study_key=True,
         )
-        list_subjects(
-            study_key=args.study_key,
-            subject_filter=args.subject_filter,
-            output_format=resolved_format,
-            sort=args.sort,
-            limit=args.limit,
-            fetch_all=args.fetch_all,
-            no_interactive=no_interactive,
-            _prepared_query=prepared,
-        )
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            list_subjects(
+                study_key=study_key,
+                subject_filter=args.subject_filter,
+                output_format=resolved_format,
+                sort=args.sort,
+                limit=args.limit,
+                fetch_all=args.fetch_all,
+                no_interactive=no_interactive,
+                _prepared_query=prepared,
+            )
 
     list_parser.set_defaults(func=_dispatch_list_subjects)
 
@@ -184,7 +191,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "register",
         help="Register one or more subjects in a study.",
     )
-    register_parser.add_argument("study_key", help=STUDY_KEY_ARG)
+    add_study_key_args(register_parser)
     register_parser.add_argument(
         "-f",
         "--file",
@@ -299,7 +306,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
     def _dispatch_register_subjects(args: argparse.Namespace) -> None:
-        validate_cli_path_segment(args.study_key, name="study_key")
+        study_key = resolve_study_key(register_parser, args, required=True)
+        assert study_key is not None
+        validate_cli_path_segment(study_key, name="study_key")
         validate_write_numeric_flags(
             chunk_size=args.chunk_size,
             timeout=args.timeout,
@@ -317,6 +326,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 "Error: Provide --file, --json, or both --form-key and --site-name to register subjects."
             )
             sys.exit(1)
-        register_subjects_cmd(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            register_subjects_cmd(args)
 
     register_parser.set_defaults(func=_dispatch_register_subjects)

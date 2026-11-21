@@ -26,7 +26,7 @@ from imednet.utils.tabular import (
 from imednet.validation.cache import SchemaCache, ValidationSchemaProtocol
 
 from ..decorators import _redact_secrets
-from .args import add_output_format, resolve_output_format
+from .args import add_output_format, add_simulation_arg, resolve_output_format
 from .context import fetching_status
 from .output import display_list, emit_json, format_job_progress, print_error
 from .terminal import is_json_output_mode, is_non_interactive, supports_live_status
@@ -83,6 +83,7 @@ def add_write_common_args(
         help="Optional email address or boolean flag for job completion notifications.",
     )
     add_output_format(parser)
+    add_simulation_arg(parser)
 
 
 def validate_write_numeric_flags(

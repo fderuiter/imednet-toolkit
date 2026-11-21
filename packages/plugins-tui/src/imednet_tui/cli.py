@@ -9,10 +9,13 @@ from collections.abc import Sequence
 from typing import Any
 
 from imednet.spi.cli import (
-    STUDY_KEY_ARG,
     add_no_interactive,
+    add_simulation_arg,
+    add_study_key_args,
     is_non_interactive,
     print_error,
+    resolve_study_key,
+    simulation_mode_context,
     validate_cli_path_segment,
     with_sdk,
 )
@@ -46,14 +49,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         help="Launch interactive terminal interface.",
         description="Interactive terminal interface for browsing clinical studies, sites, subjects, and jobs.",
     )
-    tui_parser.add_argument(
-        "-s",
-        "--study",
-        "--study-key",
-        dest="study_key",
-        default=None,
-        help=STUDY_KEY_ARG,
-    )
+    add_study_key_args(tui_parser, flag_names=("-s", "--study", "--study-key"))
     tui_parser.add_argument(
         "-b",
         "--batch",
@@ -75,6 +71,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         help="Force launch even if terminal streams appear non-interactive.",
     )
     add_no_interactive(tui_parser)
+    add_simulation_arg(tui_parser)
 
     @with_sdk
     def _launch(sdk: ImednetFacade, args: argparse.Namespace | None = None) -> None:
@@ -104,6 +101,15 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     def run_tui_command(args: argparse.Namespace | None = None) -> None:
         old_high_contrast = os.environ.get("IMEDNET_HIGH_CONTRAST")
         try:
+            resolved_study: str | None = None
+            if args is not None:
+                resolved_study = resolve_study_key(tui_parser, args, required=False)
+                if resolved_study is None:
+                    legacy_study = getattr(args, "study", None)
+                    if legacy_study and str(legacy_study).strip():
+                        resolved_study = str(legacy_study).strip()
+                        args.study_key = resolved_study
+
             no_interactive = bool(args and getattr(args, "no_interactive", False))
             if no_interactive or is_non_interactive():
                 print_error(
@@ -117,14 +123,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 raise SystemExit(1)
 
             if args is not None:
-                raw_study = getattr(args, "study_key", None) or getattr(args, "study", None)
-                if raw_study is not None and str(raw_study).strip():
-                    validate_cli_path_segment(str(raw_study).strip(), name="study_key")
+                if resolved_study is not None:
+                    validate_cli_path_segment(resolved_study, name="study_key")
                 raw_batches = getattr(args, "batch_ids", None) or getattr(args, "batch", None)
                 for batch_id in _parse_batch_args(raw_batches):
                     validate_cli_path_segment(batch_id, name="batch_id")
 
-            _launch(args)
+            with simulation_mode_context(bool(args and getattr(args, "simulation", False))):
+                _launch(args)
         finally:
             if old_high_contrast is not None:
                 os.environ["IMEDNET_HIGH_CONTRAST"] = old_high_contrast
