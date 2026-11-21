@@ -7,6 +7,7 @@ They are architecturally linked to the core execution engine.
 from __future__ import annotations
 
 from collections.abc import Callable, Coroutine
+from importlib import import_module
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -18,28 +19,9 @@ from typing import (
     overload,
 )
 
-from imednet.models.codings import Coding
-from imednet.models.forms import Form
-from imednet.models.intervals import Interval
-from imednet.models.jobs import Job, JobStatus
-from imednet.models.queries import Query
-from imednet.models.record_revisions import RecordRevision
-from imednet.models.records import Record
-from imednet.models.sites import Site
-from imednet.models.studies import Study
-from imednet.models.subjects import Subject
-from imednet.models.users import User
-from imednet.models.variables import Variable
-from imednet.models.visits import Visit
-from imednet.utils.batch_coordinator import (
-    DEFAULT_BATCH_CHUNK_SIZE,
-    AsyncBatchCoordinator,
-    BatchCoordinator,
-    BatchSubmissionSummary,
-)
-from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
-from imednet.utils.tabular import normalize_records_input
 from imednet.utils.typing import FilterValue, RecordsInput
+
+DEFAULT_BATCH_CHUNK_SIZE = 100
 
 try:
     from opentelemetry import trace as _trace
@@ -88,6 +70,21 @@ def _async_trace_method(
 if TYPE_CHECKING:
     from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
     from imednet.endpoints.records import AsyncRecordsEndpoint, RecordsEndpoint
+    from imednet.models.codings import Coding
+    from imednet.models.forms import Form
+    from imednet.models.intervals import Interval
+    from imednet.models.jobs import Job, JobStatus
+    from imednet.models.queries import Query
+    from imednet.models.record_revisions import RecordRevision
+    from imednet.models.records import Record
+    from imednet.models.sites import Site
+    from imednet.models.studies import Study
+    from imednet.models.subjects import Subject
+    from imednet.models.users import User
+    from imednet.models.variables import Variable
+    from imednet.models.visits import Visit
+    from imednet.utils.batch_coordinator import BatchSubmissionSummary
+    from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
     from imednet.validation.cache import ValidationSchemaProtocol
 
 
@@ -115,19 +112,19 @@ class _AsyncListMethod(Protocol[T]):
     async def __call__(self, **filters: FilterValue) -> list[T]: ...
 
 
-_ENDPOINT_MODELS: dict[str, type[Any]] = {
-    "codings": Coding,
-    "forms": Form,
-    "intervals": Interval,
-    "queries": Query,
-    "record_revisions": RecordRevision,
-    "records": Record,
-    "sites": Site,
-    "studies": Study,
-    "subjects": Subject,
-    "users": User,
-    "variables": Variable,
-    "visits": Visit,
+_ENDPOINT_MODEL_SPECS: dict[str, tuple[str, str]] = {
+    "codings": ("imednet.models.codings", "Coding"),
+    "forms": ("imednet.models.forms", "Form"),
+    "intervals": ("imednet.models.intervals", "Interval"),
+    "queries": ("imednet.models.queries", "Query"),
+    "record_revisions": ("imednet.models.record_revisions", "RecordRevision"),
+    "records": ("imednet.models.records", "Record"),
+    "sites": ("imednet.models.sites", "Site"),
+    "studies": ("imednet.models.studies", "Study"),
+    "subjects": ("imednet.models.subjects", "Subject"),
+    "users": ("imednet.models.users", "User"),
+    "variables": ("imednet.models.variables", "Variable"),
+    "visits": ("imednet.models.visits", "Visit"),
 }
 
 
@@ -181,19 +178,39 @@ class _ListOperation(Generic[T, R_co]):
     """Descriptor that provides convenience list methods on the SDK."""
 
     def __init__(self, endpoint_name: str, name: str, is_async: bool = False) -> None:
-        """Initialize the list operation descriptor."""
-        import functools
-        from typing import cast
-
+        """Initialize the list operation descriptor without importing model classes eagerly."""
         self.endpoint_name = endpoint_name
         self.name = name
         self.is_async = is_async
-        self._model_cls: Any = _ENDPOINT_MODELS.get(endpoint_name, Any)
+        self._model_cls_cache: Any = None
+        self._unbound_cache: Callable[..., Any] | None = None
         doc = f"Asynchronously list {endpoint_name}." if is_async else f"List {endpoint_name}."
         owner_name = "AsyncSDKConvenienceMixin" if is_async else "SyncSDKConvenienceMixin"
+        self.__module__ = __name__
+        self.__name__ = name
+        self.__qualname__ = f"{owner_name}.{name}"
+        self.__doc__ = doc
+
+    def _resolve_model_cls(self) -> Any:
+        """Import and cache the endpoint model class on first signature or call access."""
+        if self._model_cls_cache is not None:
+            return self._model_cls_cache
+        spec = _ENDPOINT_MODEL_SPECS.get(self.endpoint_name)
+        if spec is None:
+            self._model_cls_cache = Any
+            return Any
+        mod = import_module(spec[0])  # nosem
+        cls = getattr(mod, spec[1])
+        self._model_cls_cache = cls
+        return cls
+
+    def _get_unbound(self) -> Callable[..., Any]:
+        """Construct and cache the unbound convenience callable with resolved annotations."""
+        if self._unbound_cache is not None:
+            return self._unbound_cache
 
         op = self
-        if is_async:
+        if self.is_async:
 
             async def _template_async(
                 self: Any, study_key: str | None = None, **filters: FilterValue
@@ -210,16 +227,31 @@ class _ListOperation(Generic[T, R_co]):
 
             template_fn = _template_sync
 
-        self._unbound = _configure_list_convenience_callable(
+        self._unbound_cache = _configure_list_convenience_callable(
             template_fn,
             template_fn,
-            name=name,
-            qualname=f"{owner_name}.{name}",
-            doc=doc,
-            model_cls=self._model_cls,
+            name=self.name,
+            qualname=self.__qualname__,
+            doc=self.__doc__ or "",
+            model_cls=self._resolve_model_cls(),
             bound=False,
         )
-        functools.update_wrapper(cast(Any, self), self._unbound)
+        return self._unbound_cache
+
+    @property
+    def __signature__(self) -> Any:
+        """Expose resolved callable signature on the raw descriptor."""
+        return self._get_unbound().__signature__  # type: ignore[attr-defined]
+
+    @property
+    def __annotations__(self) -> dict[str, Any]:
+        """Expose resolved type annotations on the raw descriptor."""
+        return dict(self._get_unbound().__annotations__)
+
+    @__annotations__.setter
+    def __annotations__(self, value: dict[str, Any]) -> None:
+        """Update type annotations on the underlying unbound callable."""
+        self._get_unbound().__annotations__ = value
 
     def _invoke_sync(
         self, instance: Any, study_key: str | None, filters: dict[str, Any]
@@ -277,10 +309,12 @@ class _ListOperation(Generic[T, R_co]):
         if instance is None:
             if owner is None:
                 return self
-            return self._unbound
+            return self._get_unbound()
 
+        unbound = self._get_unbound()
+        model_cls = self._resolve_model_cls()
         owner_cls_name = type(instance).__name__
-        doc = self._unbound.__doc__ or ""
+        doc = unbound.__doc__ or ""
         if self.is_async:
 
             @_async_trace_method
@@ -292,11 +326,11 @@ class _ListOperation(Generic[T, R_co]):
 
             return _configure_list_convenience_callable(
                 async_wrapper,
-                self._unbound,
+                unbound,
                 name=self.name,
                 qualname=f"{owner_cls_name}.{self.name}",
                 doc=doc,
-                model_cls=self._model_cls,
+                model_cls=model_cls,
                 bound=True,
             )
 
@@ -307,11 +341,11 @@ class _ListOperation(Generic[T, R_co]):
 
         return _configure_list_convenience_callable(
             sync_wrapper,
-            self._unbound,
+            unbound,
             name=self.name,
             qualname=f"{owner_cls_name}.{self.name}",
             doc=doc,
-            model_cls=self._model_cls,
+            model_cls=model_cls,
             bound=True,
         )
 
@@ -324,20 +358,26 @@ class SyncSDKConvenienceMixin:
         jobs: JobsEndpoint
         _client: Any
 
-    get_codings = _ListOperation[Coding, list[Coding]]("codings", "get_codings")
-    get_forms = _ListOperation[Form, list[Form]]("forms", "get_forms")
-    get_intervals = _ListOperation[Interval, list[Interval]]("intervals", "get_intervals")
-    get_queries = _ListOperation[Query, list[Query]]("queries", "get_queries")
-    get_record_revisions = _ListOperation[RecordRevision, list[RecordRevision]](
+    get_codings: _ListOperation[Coding, list[Coding]] = _ListOperation("codings", "get_codings")
+    get_forms: _ListOperation[Form, list[Form]] = _ListOperation("forms", "get_forms")
+    get_intervals: _ListOperation[Interval, list[Interval]] = _ListOperation(
+        "intervals", "get_intervals"
+    )
+    get_queries: _ListOperation[Query, list[Query]] = _ListOperation("queries", "get_queries")
+    get_record_revisions: _ListOperation[RecordRevision, list[RecordRevision]] = _ListOperation(
         "record_revisions", "get_record_revisions"
     )
-    get_records = _ListOperation[Record, list[Record]]("records", "get_records")
-    get_sites = _ListOperation[Site, list[Site]]("sites", "get_sites")
-    get_studies = _ListOperation[Study, list[Study]]("studies", "get_studies")
-    get_subjects = _ListOperation[Subject, list[Subject]]("subjects", "get_subjects")
-    get_users = _ListOperation[User, list[User]]("users", "get_users")
-    get_variables = _ListOperation[Variable, list[Variable]]("variables", "get_variables")
-    get_visits = _ListOperation[Visit, list[Visit]]("visits", "get_visits")
+    get_records: _ListOperation[Record, list[Record]] = _ListOperation("records", "get_records")
+    get_sites: _ListOperation[Site, list[Site]] = _ListOperation("sites", "get_sites")
+    get_studies: _ListOperation[Study, list[Study]] = _ListOperation("studies", "get_studies")
+    get_subjects: _ListOperation[Subject, list[Subject]] = _ListOperation(
+        "subjects", "get_subjects"
+    )
+    get_users: _ListOperation[User, list[User]] = _ListOperation("users", "get_users")
+    get_variables: _ListOperation[Variable, list[Variable]] = _ListOperation(
+        "variables", "get_variables"
+    )
+    get_visits: _ListOperation[Visit, list[Visit]] = _ListOperation("visits", "get_visits")
 
     @_trace_method
     def get_job(self, study_key: str, batch_id: str) -> JobStatus:
@@ -355,6 +395,8 @@ class SyncSDKConvenienceMixin:
         skip_validation: bool = False,
     ) -> Job:
         """Create records in the specified study."""
+        from imednet.utils.tabular import normalize_records_input
+
         normalized = normalize_records_input(records_data, schema=schema)
         if skip_validation:
             return self.records.create(
@@ -389,6 +431,9 @@ class SyncSDKConvenienceMixin:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
+        from imednet.utils.batch_coordinator import BatchCoordinator
+        from imednet.utils.tabular import normalize_records_input
+
         normalized = normalize_records_input(records_data, schema=schema)
         coordinator = BatchCoordinator(chunk_size=chunk_size)
         return coordinator.submit(
@@ -462,40 +507,40 @@ class AsyncSDKConvenienceMixin:
         jobs: AsyncJobsEndpoint
         _async_client: Any
 
-    async_get_codings = _ListOperation[Coding, Coroutine[Any, Any, list[Coding]]](
+    async_get_codings: _ListOperation[Coding, Coroutine[Any, Any, list[Coding]]] = _ListOperation(
         "codings", "async_get_codings", is_async=True
     )
-    async_get_forms = _ListOperation[Form, Coroutine[Any, Any, list[Form]]](
+    async_get_forms: _ListOperation[Form, Coroutine[Any, Any, list[Form]]] = _ListOperation(
         "forms", "async_get_forms", is_async=True
     )
-    async_get_intervals = _ListOperation[Interval, Coroutine[Any, Any, list[Interval]]](
-        "intervals", "async_get_intervals", is_async=True
+    async_get_intervals: _ListOperation[Interval, Coroutine[Any, Any, list[Interval]]] = (
+        _ListOperation("intervals", "async_get_intervals", is_async=True)
     )
-    async_get_queries = _ListOperation[Query, Coroutine[Any, Any, list[Query]]](
+    async_get_queries: _ListOperation[Query, Coroutine[Any, Any, list[Query]]] = _ListOperation(
         "queries", "async_get_queries", is_async=True
     )
-    async_get_record_revisions = _ListOperation[
+    async_get_record_revisions: _ListOperation[
         RecordRevision, Coroutine[Any, Any, list[RecordRevision]]
-    ]("record_revisions", "async_get_record_revisions", is_async=True)
-    async_get_records = _ListOperation[Record, Coroutine[Any, Any, list[Record]]](
+    ] = _ListOperation("record_revisions", "async_get_record_revisions", is_async=True)
+    async_get_records: _ListOperation[Record, Coroutine[Any, Any, list[Record]]] = _ListOperation(
         "records", "async_get_records", is_async=True
     )
-    async_get_sites = _ListOperation[Site, Coroutine[Any, Any, list[Site]]](
+    async_get_sites: _ListOperation[Site, Coroutine[Any, Any, list[Site]]] = _ListOperation(
         "sites", "async_get_sites", is_async=True
     )
-    async_get_studies = _ListOperation[Study, Coroutine[Any, Any, list[Study]]](
+    async_get_studies: _ListOperation[Study, Coroutine[Any, Any, list[Study]]] = _ListOperation(
         "studies", "async_get_studies", is_async=True
     )
-    async_get_subjects = _ListOperation[Subject, Coroutine[Any, Any, list[Subject]]](
-        "subjects", "async_get_subjects", is_async=True
+    async_get_subjects: _ListOperation[Subject, Coroutine[Any, Any, list[Subject]]] = (
+        _ListOperation("subjects", "async_get_subjects", is_async=True)
     )
-    async_get_users = _ListOperation[User, Coroutine[Any, Any, list[User]]](
+    async_get_users: _ListOperation[User, Coroutine[Any, Any, list[User]]] = _ListOperation(
         "users", "async_get_users", is_async=True
     )
-    async_get_variables = _ListOperation[Variable, Coroutine[Any, Any, list[Variable]]](
-        "variables", "async_get_variables", is_async=True
+    async_get_variables: _ListOperation[Variable, Coroutine[Any, Any, list[Variable]]] = (
+        _ListOperation("variables", "async_get_variables", is_async=True)
     )
-    async_get_visits = _ListOperation[Visit, Coroutine[Any, Any, list[Visit]]](
+    async_get_visits: _ListOperation[Visit, Coroutine[Any, Any, list[Visit]]] = _ListOperation(
         "visits", "async_get_visits", is_async=True
     )
 
@@ -515,6 +560,8 @@ class AsyncSDKConvenienceMixin:
         skip_validation: bool = False,
     ) -> Job:
         """Asynchronously create records in the specified study."""
+        from imednet.utils.tabular import normalize_records_input
+
         normalized = normalize_records_input(records_data, schema=schema)
         if skip_validation:
             return await self.records.create(
@@ -549,6 +596,9 @@ class AsyncSDKConvenienceMixin:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once and submit records in bounded chunks."""
+        from imednet.utils.batch_coordinator import AsyncBatchCoordinator
+        from imednet.utils.tabular import normalize_records_input
+
         normalized = normalize_records_input(records_data, schema=schema)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
         return await coordinator.submit(

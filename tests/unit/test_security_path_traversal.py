@@ -7,14 +7,9 @@ from unittest.mock import MagicMock
 import pytest
 import respx
 
-from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
-from apache_airflow_providers_imednet.sensors import ImednetJobSensor
-from imednet import AsyncImednetSDK, ImednetSDK, cli
-from imednet.core.client import Client
 from imednet.core.endpoint.base import GenericEndpoint
 from imednet.errors import ClientError, PathTraversalValidationError
 from imednet.models.base import ImednetBaseModel
-from imednet_workflows.uat.engine import UATExecutionEngine
 
 
 class MockModel(ImednetBaseModel):
@@ -91,6 +86,8 @@ SYNC_GET_ENDPOINTS = (
 )
 def test_build_path_security(unsafe_segment: str) -> None:
     """GenericEndpoint._build_path rejects dot-segments, encoded slashes, ?, #, and \\."""
+    from imednet.core.client import Client
+
     client = MagicMock(spec=Client)
     endpoint = MockEndpoint(client)
     endpoint.BASE_PATH = "api/v1/edc/studies"
@@ -101,6 +98,8 @@ def test_build_path_security(unsafe_segment: str) -> None:
 
 def test_endpoint_abc_separates_static_prefixes_from_dynamic_segments() -> None:
     """Static BASE_PATH/PATH collapse slashes while dynamic segments reject any slash."""
+    from imednet.core.client import Client
+
     client = MagicMock(spec=Client)
     endpoint = MockEndpoint(client)
     endpoint.BASE_PATH = "//api//v1/edc//studies//"
@@ -121,6 +120,8 @@ def test_endpoint_abc_separates_static_prefixes_from_dynamic_segments() -> None:
 @respx.mock
 def test_acceptance_criteria_vectors_send_zero_http_requests() -> None:
     """Verify exact acceptance criteria traversal/truncation vectors fail preflight."""
+    from imednet import ImednetSDK
+
     sdk = ImednetSDK(
         api_key="test-key",  # pragma: allowlist secret
         security_key="test-secret",  # pragma: allowlist secret
@@ -150,6 +151,8 @@ def test_acceptance_criteria_vectors_send_zero_http_requests() -> None:
 @pytest.mark.parametrize("ep_attr", SYNC_LIST_ENDPOINTS)
 def test_all_sync_list_endpoints_reject_unsafe_study_key(ep_attr: str) -> None:
     """All 12 sync list endpoints reject unsafe study_key values before HTTP dispatch."""
+    from imednet import ImednetSDK
+
     sdk = ImednetSDK(
         api_key="test-key",  # pragma: allowlist secret
         security_key="test-secret",  # pragma: allowlist secret
@@ -170,6 +173,8 @@ def test_all_sync_list_endpoints_reject_unsafe_study_key(ep_attr: str) -> None:
 @pytest.mark.parametrize("ep_attr", SYNC_LIST_ENDPOINTS)
 async def test_all_async_list_endpoints_reject_unsafe_study_key(ep_attr: str) -> None:
     """All 12 async list endpoints reject unsafe study_key values before HTTP dispatch."""
+    from imednet import AsyncImednetSDK
+
     async with AsyncImednetSDK(
         api_key="test-key",  # pragma: allowlist secret
         security_key="test-secret",  # pragma: allowlist secret
@@ -186,6 +191,8 @@ async def test_all_async_list_endpoints_reject_unsafe_study_key(ep_attr: str) ->
 @pytest.mark.parametrize("ep_attr", SYNC_GET_ENDPOINTS)
 def test_all_sync_get_endpoints_reject_unsafe_identifiers(ep_attr: str) -> None:
     """All sync get endpoints (including jobs and studies) reject unsafe study_key and item_id."""
+    from imednet import ImednetSDK
+
     sdk = ImednetSDK(
         api_key="test-key",  # pragma: allowlist secret
         security_key="test-secret",  # pragma: allowlist secret
@@ -215,6 +222,8 @@ def test_all_sync_get_endpoints_reject_unsafe_identifiers(ep_attr: str) -> None:
 @pytest.mark.parametrize("ep_attr", SYNC_GET_ENDPOINTS)
 async def test_all_async_get_endpoints_reject_unsafe_identifiers(ep_attr: str) -> None:
     """All async get endpoints (including jobs and studies) reject unsafe inputs."""
+    from imednet import AsyncImednetSDK
+
     async with AsyncImednetSDK(
         api_key="test-key",  # pragma: allowlist secret
         security_key="test-secret",  # pragma: allowlist secret
@@ -240,6 +249,8 @@ async def test_all_async_get_endpoints_reject_unsafe_identifiers(ep_attr: str) -
 @pytest.mark.asyncio
 async def test_records_create_and_jobs_poll_reject_unsafe_segments() -> None:
     """Sync and async record creation and job polling reject unsafe study_key and batch_id."""
+    from imednet import AsyncImednetSDK, ImednetSDK
+
     sdk = ImednetSDK(
         api_key="test-key",  # pragma: allowlist secret
         security_key="test-secret",  # pragma: allowlist secret
@@ -284,6 +295,9 @@ def test_airflow_sensor_and_export_operator_reject_unsafe_segments_before_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ImednetJobSensor.poke and ImednetExportOperator.execute fail preflight before _get_sdk."""
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from apache_airflow_providers_imednet.sensors import ImednetJobSensor
+
     fail_get_sdk = MagicMock(side_effect=AssertionError("_get_sdk must not be called"))
     monkeypatch.setattr(ImednetJobSensor, "_get_sdk", fail_get_sdk)
     monkeypatch.setattr(ImednetExportOperator, "_get_sdk", fail_get_sdk)
@@ -348,6 +362,8 @@ def test_cli_commands_reject_unsafe_segments_before_sdk_dispatch(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     """CLI commands reject unsafe study_key and batch_id before creating SDK or HTTP traffic."""
+    from imednet import cli
+
     fail_get_sdk = MagicMock(side_effect=AssertionError("get_sdk must not be called"))
     monkeypatch.setattr("imednet.cli.utils.context.get_sdk", fail_get_sdk)
     monkeypatch.setattr("imednet.cli.datadict.get_sdk", fail_get_sdk)
@@ -364,6 +380,8 @@ def test_cli_commands_reject_unsafe_segments_before_sdk_dispatch(
 
 def test_uat_execution_engine_rejects_unsafe_study_key_and_batch_id() -> None:
     """UATExecutionEngine raises PathTraversalValidationError instead of classifying as PASS."""
+    from imednet_workflows.uat.engine import UATExecutionEngine
+
     sdk = MagicMock()
     mock_dd = MagicMock()
     mock_dd.business_logic = []

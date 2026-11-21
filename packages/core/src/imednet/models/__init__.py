@@ -1,158 +1,342 @@
+# pylint: disable=duplicate-code
 """Models package for the iMedNet SDK.
 
 This package contains all data models used by the SDK to represent iMedNet resources.
 """
 
-from imednet.models.base import (
-    ApiResponse,
-    Error,
-    ErrorField,
-    ImednetBaseModel,
-    Metadata,
-    Pagination,
-    SortField,
-)
-from imednet.models.codings import Coding
-from imednet.models.engine import ResourceRegistry
-from imednet.models.forms import Form
-from imednet.models.intervals import FormSummary, Interval
-from imednet.models.jobs import (
-    ACTIVE_JOB_STATES,
-    ALLOWED_JOB_TRANSITIONS,
-    FAILED_JOB_STATES,
-    SUCCESSFUL_JOB_STATES,
-    TERMINAL_JOB_STATES,
-    InvalidJobStateError,
-    InvalidJobTransitionError,
-    InvalidStateTransitionError,
-    Job,
-    JobState,
-    JobStatus,
-    is_valid_job_transition,
-    normalize_job_state,
-    validate_job_transition,
-)
-from imednet.models.queries import (
-    ALLOWED_QUERY_TRANSITIONS,
-    Query,
-    QueryComment,
-    QueryStatus,
-    calculate_legacy_status,
-    is_valid_query_transition,
-    validate_query_transition,
-)
-from imednet.models.record_revisions import (
-    RecordRevision,
-    is_valid_record_revision_chain,
-    validate_record_revision_chain,
-)
-from imednet.models.records import (
-    ALLOWED_RECORD_TRANSITIONS,
-    BaseRecordRequest,
-    CreateNewRecordRequest,
-    Keyword,
-    Record,
-    RecordData,
-    RecordJobResponse,
-    RecordStatus,
-    RegisterSubjectRequest,
-    UpdateScheduledRecordRequest,
-    is_valid_record_transition,
-    normalize_record_status,
-    validate_record_transition,
-)
-from imednet.models.reporting import (
-    AdverseEvent,
-    AnalysisAdverseEvent,
-    AnalysisLabResult,
-    Demographics,
-    DeviceDeficiency,
-    ProtocolDeviation,
-    SubjectLevelAnalysis,
-    VitalSign,
-    VitalSigns,
-)
-from imednet.models.sites import (
-    ELIGIBLE_SITE_ENROLLMENT_STATUSES,
-    Site,
-    SiteEnrollmentStatus,
-    is_site_enrollment_eligible,
-    normalize_site_enrollment_status,
-)
-from imednet.models.standards import (
-    _SDTM_RECORDS_SORT,
-    _UNSET_PIPELINE,
-    CDISC_CONTROLLED_TERMINOLOGY,
-    NORMALIZATION_TERMINOLOGY,
-    PROFILE_REGISTRY,
-    SDTM_DOMAIN_SPECS,
-    VALID_NAMING_CONVENTIONS,
-    CategoricalNormalizer,
-    DeviceSafetyProfile,
-    DrugSafetyProfile,
-    GeneralClinicalProfile,
-    NormalizationResult,
-    StandardsProfile,
-    StandardsProfileRegistry,
-    StandardsReadinessReport,
-    StandardsReadinessValidator,
-    ValidationViolation,
-    _collapse_alnum_key,
-    _extract_stream_usubjid_and_id,
-    _format_sdtm_flag,
-    _get_model_consumed_keys,
-    _get_model_field_aliases,
-    _iter_sorted_sdtm_frames,
-    _normalize_key,
-    _PreparedSdtmRow,
-    _SdtmNormalizer,
-    format_iso8601_dtc,
-    format_variable_name,
-    get_sdtm_domain_variables,
-    is_valid_cdash_variable,
-    normalize_naming_convention,
-    resolve_sdtm_domain,
-    resolve_standards_profile,
-    transform_records_to_sdtm,
-    transform_records_to_sdtm_rows,
-    validate_cdash_variable,
-)
-from imednet.models.studies import Study
-from imednet.models.study_config import MappingRule, StudyConfiguration, WidgetConfig
-from imednet.models.study_structure import FormStructure, IntervalStructure, StudyStructure
-from imednet.models.subjects import (
-    ALLOWED_SUBJECT_TRANSITIONS,
-    Subject,
-    SubjectKeyword,
-    SubjectStatus,
-    is_valid_subject_transition,
-    normalize_subject_status,
-    validate_subject_transition,
-)
-from imednet.models.triage import (
-    ALLOWED_STATUS_TRANSITIONS,
-    ALLOWED_TRANSITIONS,
-    TriageAnnotation,
-    TriageHistoryEntry,
-    TriageItem,
-    TriageStatus,
-    can_transition,
-    is_valid_status_transition,
-    is_valid_transition,
-    validate_status_transition,
-    validate_transition,
-)
-from imednet.models.users import Role, User
-from imednet.models.variables import Variable
-from imednet.models.visits import Visit
-from imednet.utils.validators import (
-    parse_bool,
-    parse_datetime,
-    parse_dict_or_default,
-    parse_int_or_default,
-    parse_list_or_default,
-    parse_str_or_default,
-)
+from __future__ import annotations
+
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from imednet.models.base import (
+        ApiResponse,
+        Error,
+        ErrorField,
+        ImednetBaseModel,
+        Metadata,
+        Pagination,
+        SortField,
+    )
+    from imednet.models.codings import Coding
+    from imednet.models.engine import ResourceRegistry
+    from imednet.models.forms import Form
+    from imednet.models.intervals import FormSummary, Interval
+    from imednet.models.jobs import (
+        ACTIVE_JOB_STATES,
+        ALLOWED_JOB_TRANSITIONS,
+        FAILED_JOB_STATES,
+        SUCCESSFUL_JOB_STATES,
+        TERMINAL_JOB_STATES,
+        InvalidJobStateError,
+        InvalidJobTransitionError,
+        InvalidStateTransitionError,
+        Job,
+        JobState,
+        JobStatus,
+        is_valid_job_transition,
+        normalize_job_state,
+        validate_job_transition,
+    )
+    from imednet.models.queries import (
+        ALLOWED_QUERY_TRANSITIONS,
+        Query,
+        QueryComment,
+        QueryStatus,
+        calculate_legacy_status,
+        is_valid_query_transition,
+        validate_query_transition,
+    )
+    from imednet.models.record_revisions import (
+        RecordRevision,
+        is_valid_record_revision_chain,
+        validate_record_revision_chain,
+    )
+    from imednet.models.records import (
+        ALLOWED_RECORD_TRANSITIONS,
+        BaseRecordRequest,
+        CreateNewRecordRequest,
+        Keyword,
+        Record,
+        RecordData,
+        RecordJobResponse,
+        RecordStatus,
+        RegisterSubjectRequest,
+        UpdateScheduledRecordRequest,
+        is_valid_record_transition,
+        normalize_record_status,
+        validate_record_transition,
+    )
+    from imednet.models.reporting import (
+        AdverseEvent,
+        AnalysisAdverseEvent,
+        AnalysisLabResult,
+        Demographics,
+        DeviceDeficiency,
+        ProtocolDeviation,
+        SubjectLevelAnalysis,
+        VitalSign,
+        VitalSigns,
+    )
+    from imednet.models.sites import (
+        ELIGIBLE_SITE_ENROLLMENT_STATUSES,
+        Site,
+        SiteEnrollmentStatus,
+        is_site_enrollment_eligible,
+        normalize_site_enrollment_status,
+    )
+    from imednet.models.standards import (
+        _SDTM_RECORDS_SORT,
+        _UNSET_PIPELINE,
+        CDISC_CONTROLLED_TERMINOLOGY,
+        NORMALIZATION_TERMINOLOGY,
+        PROFILE_REGISTRY,
+        SDTM_DOMAIN_SPECS,
+        VALID_NAMING_CONVENTIONS,
+        CategoricalNormalizer,
+        DeviceSafetyProfile,
+        DrugSafetyProfile,
+        GeneralClinicalProfile,
+        NormalizationResult,
+        StandardsProfile,
+        StandardsProfileRegistry,
+        StandardsReadinessReport,
+        StandardsReadinessValidator,
+        ValidationViolation,
+        _collapse_alnum_key,
+        _extract_stream_usubjid_and_id,
+        _format_sdtm_flag,
+        _get_model_consumed_keys,
+        _get_model_field_aliases,
+        _iter_sorted_sdtm_frames,
+        _normalize_key,
+        _PreparedSdtmRow,
+        _SdtmNormalizer,
+        format_iso8601_dtc,
+        format_variable_name,
+        get_sdtm_domain_variables,
+        is_valid_cdash_variable,
+        normalize_naming_convention,
+        resolve_sdtm_domain,
+        resolve_standards_profile,
+        transform_records_to_sdtm,
+        transform_records_to_sdtm_rows,
+        validate_cdash_variable,
+    )
+    from imednet.models.studies import Study
+    from imednet.models.study_config import MappingRule, StudyConfiguration, WidgetConfig
+    from imednet.models.study_structure import FormStructure, IntervalStructure, StudyStructure
+    from imednet.models.subjects import (
+        ALLOWED_SUBJECT_TRANSITIONS,
+        Subject,
+        SubjectKeyword,
+        SubjectStatus,
+        is_valid_subject_transition,
+        normalize_subject_status,
+        validate_subject_transition,
+    )
+    from imednet.models.triage import (
+        ALLOWED_STATUS_TRANSITIONS,
+        ALLOWED_TRANSITIONS,
+        TriageAnnotation,
+        TriageHistoryEntry,
+        TriageItem,
+        TriageStatus,
+        can_transition,
+        is_valid_status_transition,
+        is_valid_transition,
+        validate_status_transition,
+        validate_transition,
+    )
+    from imednet.models.users import Role, User
+    from imednet.models.variables import Variable
+    from imednet.models.visits import Visit
+    from imednet.utils.validators import (
+        parse_bool,
+        parse_datetime,
+        parse_dict_or_default,
+        parse_int_or_default,
+        parse_list_or_default,
+        parse_str_or_default,
+    )
+
+_MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
+    "imednet.models.base": (
+        "ApiResponse",
+        "Error",
+        "ErrorField",
+        "ImednetBaseModel",
+        "Metadata",
+        "Pagination",
+        "SortField",
+    ),
+    "imednet.models.codings": ("Coding",),
+    "imednet.models.engine": ("ResourceRegistry",),
+    "imednet.models.forms": ("Form",),
+    "imednet.models.intervals": ("FormSummary", "Interval"),
+    "imednet.models.jobs": (
+        "ACTIVE_JOB_STATES",
+        "ALLOWED_JOB_TRANSITIONS",
+        "FAILED_JOB_STATES",
+        "SUCCESSFUL_JOB_STATES",
+        "TERMINAL_JOB_STATES",
+        "InvalidJobStateError",
+        "InvalidJobTransitionError",
+        "InvalidStateTransitionError",
+        "Job",
+        "JobState",
+        "JobStatus",
+        "is_valid_job_transition",
+        "normalize_job_state",
+        "validate_job_transition",
+    ),
+    "imednet.models.queries": (
+        "ALLOWED_QUERY_TRANSITIONS",
+        "Query",
+        "QueryComment",
+        "QueryStatus",
+        "calculate_legacy_status",
+        "is_valid_query_transition",
+        "validate_query_transition",
+    ),
+    "imednet.models.record_revisions": (
+        "RecordRevision",
+        "is_valid_record_revision_chain",
+        "validate_record_revision_chain",
+    ),
+    "imednet.models.records": (
+        "ALLOWED_RECORD_TRANSITIONS",
+        "BaseRecordRequest",
+        "CreateNewRecordRequest",
+        "Keyword",
+        "Record",
+        "RecordData",
+        "RecordJobResponse",
+        "RecordStatus",
+        "RegisterSubjectRequest",
+        "UpdateScheduledRecordRequest",
+        "is_valid_record_transition",
+        "normalize_record_status",
+        "validate_record_transition",
+    ),
+    "imednet.models.reporting": (
+        "AdverseEvent",
+        "AnalysisAdverseEvent",
+        "AnalysisLabResult",
+        "Demographics",
+        "DeviceDeficiency",
+        "ProtocolDeviation",
+        "SubjectLevelAnalysis",
+        "VitalSign",
+        "VitalSigns",
+    ),
+    "imednet.models.sites": (
+        "ELIGIBLE_SITE_ENROLLMENT_STATUSES",
+        "Site",
+        "SiteEnrollmentStatus",
+        "is_site_enrollment_eligible",
+        "normalize_site_enrollment_status",
+    ),
+    "imednet.models.standards": (
+        "_SDTM_RECORDS_SORT",
+        "_UNSET_PIPELINE",
+        "CDISC_CONTROLLED_TERMINOLOGY",
+        "NORMALIZATION_TERMINOLOGY",
+        "PROFILE_REGISTRY",
+        "SDTM_DOMAIN_SPECS",
+        "VALID_NAMING_CONVENTIONS",
+        "CategoricalNormalizer",
+        "DeviceSafetyProfile",
+        "DrugSafetyProfile",
+        "GeneralClinicalProfile",
+        "NormalizationResult",
+        "StandardsProfile",
+        "StandardsProfileRegistry",
+        "StandardsReadinessReport",
+        "StandardsReadinessValidator",
+        "ValidationViolation",
+        "_collapse_alnum_key",
+        "_extract_stream_usubjid_and_id",
+        "_format_sdtm_flag",
+        "_get_model_consumed_keys",
+        "_get_model_field_aliases",
+        "_iter_sorted_sdtm_frames",
+        "_normalize_key",
+        "_PreparedSdtmRow",
+        "_SdtmNormalizer",
+        "format_iso8601_dtc",
+        "format_variable_name",
+        "get_sdtm_domain_variables",
+        "is_valid_cdash_variable",
+        "normalize_naming_convention",
+        "resolve_sdtm_domain",
+        "resolve_standards_profile",
+        "transform_records_to_sdtm",
+        "transform_records_to_sdtm_rows",
+        "validate_cdash_variable",
+    ),
+    "imednet.models.studies": ("Study",),
+    "imednet.models.study_config": ("MappingRule", "StudyConfiguration", "WidgetConfig"),
+    "imednet.models.study_structure": ("FormStructure", "IntervalStructure", "StudyStructure"),
+    "imednet.models.subjects": (
+        "ALLOWED_SUBJECT_TRANSITIONS",
+        "Subject",
+        "SubjectKeyword",
+        "SubjectStatus",
+        "is_valid_subject_transition",
+        "normalize_subject_status",
+        "validate_subject_transition",
+    ),
+    "imednet.models.triage": (
+        "ALLOWED_STATUS_TRANSITIONS",
+        "ALLOWED_TRANSITIONS",
+        "TriageAnnotation",
+        "TriageHistoryEntry",
+        "TriageItem",
+        "TriageStatus",
+        "can_transition",
+        "is_valid_status_transition",
+        "is_valid_transition",
+        "validate_status_transition",
+        "validate_transition",
+    ),
+    "imednet.models.users": ("Role", "User"),
+    "imednet.models.variables": ("Variable",),
+    "imednet.models.visits": ("Visit",),
+    "imednet.utils.validators": (
+        "parse_bool",
+        "parse_datetime",
+        "parse_dict_or_default",
+        "parse_int_or_default",
+        "parse_list_or_default",
+        "parse_str_or_default",
+    ),
+}
+
+_LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    sym: (mod_path, sym) for mod_path, symbols in _MODULE_EXPORTS.items() for sym in symbols
+}
+
+
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> Any:
+        """Lazily resolve model classes and validators on demand."""
+        try:
+            module_path, obj_name = _LAZY_ATTRS[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        mod = import_module(module_path)  # nosem
+        obj = getattr(mod, obj_name)
+        globals()[name] = obj
+        return obj
+
+
+def __dir__() -> list[str]:
+    """Return module attributes including lazy exports."""
+    return sorted(set(globals()) | set(__all__))
+
 
 __all__: list[str] = [
     "ACTIVE_JOB_STATES",

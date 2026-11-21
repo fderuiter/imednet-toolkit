@@ -14,7 +14,8 @@ from contextlib import contextmanager
 from importlib.metadata import EntryPoint, entry_points
 from typing import TYPE_CHECKING, Any, Never, Self, cast
 
-from .auth import AuthStrategy, CredentialSource
+from .auth.credentials import CredentialSource
+from .auth.strategy import AuthStrategy
 from .config import Config, load_config, merge_config_overrides
 from .constants import DEFAULT_BACKOFF_FACTOR, DEFAULT_RETRIES
 from .core.context import (
@@ -467,13 +468,32 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
         self._client.retry_policy = policy
 
     def _init_endpoints(self) -> None:
-        """Instantiate endpoint clients."""
+        """Prepare lazy endpoint instantiation state for this SDK instance."""
         strict_val = getattr(self.config, "strict_mode", None)
-        strict_mode = strict_val if isinstance(strict_val, bool) else None
-        for attr, endpoint_cls in ENDPOINT_REGISTRY.items():
+        self._endpoint_strict_mode: bool | None = (
+            strict_val if isinstance(strict_val, bool) else None
+        )
+        for attr in ENDPOINT_REGISTRY:
+            self.__dict__.pop(attr, None)
+
+    if not TYPE_CHECKING:
+
+        def __getattr__(self, name: str) -> Any:
+            """Lazily instantiate synchronous endpoint clients on first access."""
+            try:
+                endpoint_cls = ENDPOINT_REGISTRY[name]
+            except KeyError:
+                raise AttributeError(
+                    f"'{type(self).__name__}' object has no attribute {name!r}"
+                ) from None
             endpoint = endpoint_cls(self._client)
-            endpoint._strict_mode = strict_mode
-            setattr(self, attr, endpoint)
+            endpoint._strict_mode = getattr(self, "_endpoint_strict_mode", None)
+            setattr(self, name, endpoint)
+            return endpoint
+
+        def __dir__(self) -> list[str]:
+            """Include lazy endpoint attributes in dir()."""
+            return sorted(set(super().__dir__()) | set(ENDPOINT_REGISTRY))
 
     def __enter__(self) -> ImednetSDK:
         """Support for context manager protocol."""
@@ -616,13 +636,32 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
         self._async_client.retry_policy = policy
 
     def _init_endpoints(self) -> None:
-        """Initialize all asynchronous endpoint instances."""
+        """Prepare lazy asynchronous endpoint instantiation state for this SDK instance."""
         strict_val = getattr(self.config, "strict_mode", None)
-        strict_mode = strict_val if isinstance(strict_val, bool) else None
-        for attr, endpoint_cls in ASYNC_ENDPOINT_REGISTRY.items():
+        self._endpoint_strict_mode: bool | None = (
+            strict_val if isinstance(strict_val, bool) else None
+        )
+        for attr in ASYNC_ENDPOINT_REGISTRY:
+            self.__dict__.pop(attr, None)
+
+    if not TYPE_CHECKING:
+
+        def __getattr__(self, name: str) -> Any:
+            """Lazily instantiate asynchronous endpoint clients on first access."""
+            try:
+                endpoint_cls = ASYNC_ENDPOINT_REGISTRY[name]
+            except KeyError:
+                raise AttributeError(
+                    f"'{type(self).__name__}' object has no attribute {name!r}"
+                ) from None
             endpoint = endpoint_cls(self._async_client)
-            endpoint._strict_mode = strict_mode
-            setattr(self, attr, endpoint)
+            endpoint._strict_mode = getattr(self, "_endpoint_strict_mode", None)
+            setattr(self, name, endpoint)
+            return endpoint
+
+        def __dir__(self) -> list[str]:
+            """Include lazy asynchronous endpoint attributes in dir()."""
+            return sorted(set(super().__dir__()) | set(ASYNC_ENDPOINT_REGISTRY))
 
     def close(self) -> None:
         """Raise TypeError as sync close is not supported."""
