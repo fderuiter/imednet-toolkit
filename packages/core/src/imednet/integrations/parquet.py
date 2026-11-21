@@ -8,10 +8,13 @@ import inspect
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 from unittest.mock import NonCallableMock
 
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover - optional export dependency
+    pd = None  # type: ignore[assignment, unused-ignore]
 
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
@@ -51,6 +54,26 @@ def _ensure_pyarrow() -> ModuleType:
     except ImportError as error:
         raise ImportError(
             "PyArrow is required for Hive Parquet export. Install with "
+            "\"pip install 'imednet[export]'\"."
+        ) from error
+
+
+def _ensure_pandas() -> ModuleType:
+    """Ensure pandas is installed and return the module.
+
+    Returns:
+        ModuleType: The pandas module.
+
+    Raises:
+        ImportError: If pandas is not installed.
+    """
+    if pd is not None:
+        return cast(ModuleType, pd)
+    try:
+        return import_module("pandas")
+    except ImportError as error:
+        raise ImportError(
+            "pandas is required for Hive Parquet export. Install with "
             "\"pip install 'imednet[export]'\"."
         ) from error
 
@@ -146,11 +169,12 @@ def _prune_hive_partition_record_ids(
     """Prune superseded or voided record IDs from pre-existing Hive partition Parquet files."""
     if not files or not excluded_ids:
         return
+    pandas_module = _ensure_pandas()
     partition_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}"
     for pf in files:
         if not pf.exists():
             continue
-        existing_df = pd.read_parquet(pf, engine="pyarrow")
+        existing_df = pandas_module.read_parquet(pf, engine="pyarrow")
         filtered_df = _filter_df_excluding_record_ids(existing_df, excluded_ids)
         if len(filtered_df) == len(existing_df):
             continue
@@ -196,6 +220,7 @@ def export_to_hive_parquet(
 ) -> None:
     """Export study records to a Hive-partitioned Parquet directory layout."""
     pyarrow_module = _ensure_pyarrow()
+    _ensure_pandas()
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
     validate_max_buffered_records(max_buffered_records)
