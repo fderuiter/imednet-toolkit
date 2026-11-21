@@ -19,7 +19,7 @@ from .args import (
     resolve_output_format,
     resolve_study_key,
 )
-from .commands import register_list_command
+from .commands import get_model_value, register_list_command
 from .context import fetching_status, get_sdk, simulation_mode_context
 from .output import (
     _HC_STATUS_COLOR_MAP,
@@ -77,6 +77,7 @@ __all__ = [
     "emit_json",
     "fetching_status",
     "format_job_progress",
+    "get_model_value",
     "get_sdk",
     "is_dumb_terminal",
     "is_interactive_terminal",
