@@ -8,12 +8,16 @@ from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import replace
 from typing import Any, cast
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 from imednet import ImednetSDK
 from imednet.spi import sink_base
 from imednet.spi.sinks import redact_uri
-from imednet.spi.utils import validate_path_segment
+from imednet.spi.utils import (
+    redact_sensitive_payload,
+    redact_sensitive_text,
+    validate_path_segment,
+)
 
 from .. import export
 from .._airflow_compat import AirflowException, Context
@@ -95,13 +99,26 @@ def _has_embedded_uri_credentials(value: str) -> bool:
     return redact_uri(value) != value
 
 
+def _has_inline_secret_tokens(value: str) -> bool:
+    """Return True if *value* embeds sensitive query params, headers, or credential pairs."""
+    existing_masks = value.count("***")
+    if redact_sensitive_text(value).count("***") > existing_masks:
+        return True
+    return str(redact_sensitive_payload(value)).count("***") > existing_masks
+
+
 def _validate_no_secrets_in_value(value: Any, *, field_name: str = "export_kwargs") -> None:
-    """Reject secret keys or embedded URI credentials in templated operator fields."""
+    """Reject secret keys or embedded credentials in templated operator fields."""
     if isinstance(value, str):
         if _has_embedded_uri_credentials(value):
             raise AirflowException(
                 f"Plaintext URI credentials are not allowed in '{field_name}'. "
                 "Configure an Airflow Connection and pass 'destination_conn_id' instead."
+            )
+        if _has_inline_secret_tokens(value):
+            raise AirflowException(
+                f"Embedded credentials or secret tokens are not allowed in '{field_name}'. "
+                "Configure an Airflow Connection instead."
             )
         return
     if isinstance(value, Mapping):
@@ -117,6 +134,48 @@ def _validate_no_secrets_in_value(value: Any, *, field_name: str = "export_kwarg
     if isinstance(value, (list, tuple, set)):
         for item in value:
             _validate_no_secrets_in_value(item, field_name=field_name)
+
+
+def _load_openlineage_types() -> tuple[Any, Any] | None:
+    """Lazily import OpenLineage ``OperatorLineage`` and ``Dataset`` when available."""
+    try:
+        from airflow.providers.openlineage.extractors import OperatorLineage
+    except (ImportError, ModuleNotFoundError):
+        return None
+    try:
+        from airflow.providers.common.compat.openlineage.facet import Dataset
+    except (ImportError, ModuleNotFoundError):
+        try:
+            from openlineage.client.event_v2 import Dataset  # type: ignore[no-redef]
+        except (ImportError, ModuleNotFoundError):
+            return None
+    if OperatorLineage is None or Dataset is None:
+        return None
+    return OperatorLineage, Dataset
+
+
+def _sanitize_lineage_text(value: str) -> str:
+    """Redact credentials and sensitive query parameters from OpenLineage identifiers."""
+    return redact_sensitive_text(redact_uri(value))
+
+
+def _lineage_authority(uri: str, *, normalize_sql_scheme: bool = False) -> str:
+    """Extract canonical ``scheme://host[:port]`` namespace with zero userinfo or query params."""
+    parsed = urlsplit(uri.strip())
+    if not parsed.scheme or not parsed.hostname:
+        return _sanitize_lineage_text(uri.strip())
+    scheme = parsed.scheme.lower()
+    if normalize_sql_scheme:
+        scheme = scheme.split("+", 1)[0]
+        if scheme == "postgresql":
+            scheme = "postgres"
+    host = parsed.hostname.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    authority = f"{host}:{port}" if port is not None else host
+    return f"{scheme}://{authority}"
 
 
 def _inject_uri_credentials(uri: str, user: str | None, password: str | None) -> str:
@@ -176,7 +235,13 @@ class ImednetExportOperator(BaseOperator):
 
     # Fields intended for Airflow `.partial().expand()` runtime mapping.
     mapped_runtime_fields: Sequence[str] = ("study_key", "output_path", "export_kwargs")
-    template_fields: Sequence[str] = mapped_runtime_fields
+    template_fields: Sequence[str] = (
+        *mapped_runtime_fields,
+        "modified_since",
+        "record_filter",
+        "record_data_filter",
+        "stream_name",
+    )
     template_fields_renderers = {"export_kwargs": "json"}  # noqa: RUF012
     _explicit_tabular_options: frozenset[str] = frozenset()
 
@@ -271,6 +336,18 @@ class ImednetExportOperator(BaseOperator):
         self.state_provider = state_provider
 
     @property
+    def study_key(self) -> str:
+        """Return the configured study key."""
+        return getattr(self, "_study_key", "")
+
+    @study_key.setter
+    def study_key(self, value: str) -> None:
+        """Validate and set study_key, rejecting embedded credentials."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="study_key")
+        self._study_key = value
+
+    @property
     def output_path(self) -> str | None:
         """Return the configured output path."""
         return getattr(self, "_output_path", None)
@@ -281,6 +358,54 @@ class ImednetExportOperator(BaseOperator):
         if value is not None:
             _validate_no_secrets_in_value(value, field_name="output_path")
         self._output_path = value
+
+    @property
+    def modified_since(self) -> Any:
+        """Return the configured modified_since watermark."""
+        return getattr(self, "_modified_since", None)
+
+    @modified_since.setter
+    def modified_since(self, value: Any) -> None:
+        """Validate and set modified_since, rejecting embedded credentials."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="modified_since")
+        self._modified_since = value
+
+    @property
+    def record_filter(self) -> Any:
+        """Return the configured record_filter."""
+        return getattr(self, "_record_filter", None)
+
+    @record_filter.setter
+    def record_filter(self, value: Any) -> None:
+        """Validate and set record_filter, rejecting embedded credentials."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="record_filter")
+        self._record_filter = value
+
+    @property
+    def record_data_filter(self) -> str | None:
+        """Return the configured record_data_filter."""
+        return getattr(self, "_record_data_filter", None)
+
+    @record_data_filter.setter
+    def record_data_filter(self, value: str | None) -> None:
+        """Validate and set record_data_filter, rejecting embedded credentials."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="record_data_filter")
+        self._record_data_filter = value
+
+    @property
+    def stream_name(self) -> str | None:
+        """Return the configured stream_name."""
+        return getattr(self, "_stream_name", None)
+
+    @stream_name.setter
+    def stream_name(self, value: str | None) -> None:
+        """Validate and set stream_name, rejecting embedded credentials."""
+        if value is not None:
+            _validate_no_secrets_in_value(value, field_name="stream_name")
+        self._stream_name = value
 
     @property
     def export_kwargs(self) -> dict[str, Any]:
@@ -295,6 +420,30 @@ class ImednetExportOperator(BaseOperator):
     def export_kwargs(self, value: Mapping[str, Any] | None) -> None:
         """Validate and store export_kwargs without persisting raw credentials."""
         self._export_kwargs = _ValidatedExportKwargs(value)
+
+    def _validate_templated_attributes(self) -> None:
+        """Validate all templated operator attributes prior to execution or lineage emission."""
+        for field_name in (
+            "study_key",
+            "output_path",
+            "modified_since",
+            "record_filter",
+            "record_data_filter",
+            "stream_name",
+        ):
+            val = getattr(self, field_name, None)
+            if val is not None:
+                _validate_no_secrets_in_value(val, field_name=field_name)
+        _validate_no_secrets_in_value(self.export_kwargs, field_name="export_kwargs")
+
+    def _effective_destination(self) -> str:
+        """Return normalized destination identifier from ``destination`` or ``export_func``."""
+        dest = self.destination
+        if not dest and self.export_func:
+            dest = self.export_func.replace("export_to_", "")
+        elif not dest:
+            dest = "csv"
+        return dest.lower().strip()
 
     def _get_sdk(self) -> ImednetSDK:
         """Resolve the SDK client from the configured Airflow connection at execute time."""
@@ -326,10 +475,24 @@ class ImednetExportOperator(BaseOperator):
         }
         for key, default_val in defaults.items():
             attr_val = getattr(self, key, default_val)
+            if (
+                key in ("modified_since", "stream_name")
+                and isinstance(attr_val, str)
+                and not attr_val.strip()
+            ):
+                attr_val = None
             if attr_val != default_val:
                 opts[key] = attr_val
             elif key in runtime_kwargs and runtime_kwargs[key] != default_val:
-                opts[key] = runtime_kwargs[key]
+                kw_val = runtime_kwargs[key]
+                if (
+                    key in ("modified_since", "stream_name")
+                    and isinstance(kw_val, str)
+                    and not kw_val.strip()
+                ):
+                    kw_val = None
+                if kw_val != default_val:
+                    opts[key] = kw_val
         effective_mask_phi = (
             bool(runtime_kwargs["mask_phi"])
             if "mask_phi" in runtime_kwargs
@@ -542,13 +705,159 @@ class ImednetExportOperator(BaseOperator):
 
         return None
 
+    def _build_openlineage_datasets(self, dataset_cls: Any) -> tuple[list[Any], list[Any]]:
+        """Construct redacted OpenLineage source and destination datasets."""
+        source_namespace = _lineage_authority(ImednetHook(self.imednet_conn_id).get_base_url())
+        source_study = _sanitize_lineage_text(str(self.study_key or "unknown"))
+        inputs = [dataset_cls(namespace=source_namespace, name=f"study.{source_study}.records")]
+
+        dest = self._effective_destination()
+        runtime_kwargs = dict(self.export_kwargs)
+        try:
+            conn_settings = self._resolve_destination_connection(dest)
+        except Exception:
+            conn_settings = {}
+
+        outputs: list[Any] = []
+        if dest == "snowflake":
+            account = str(
+                runtime_kwargs.get("account") or conn_settings.get("account") or "unknown"
+            ).strip()
+            raw_ns = account if "://" in account else f"snowflake://{account}"
+            namespace = _lineage_authority(raw_ns)
+            db = str(runtime_kwargs.get("database") or conn_settings.get("database") or "").strip()
+            schema = str(
+                runtime_kwargs.get("schema") or conn_settings.get("schema") or "PUBLIC"
+            ).strip()
+            table = str(
+                runtime_kwargs.get("table")
+                or conn_settings.get("table")
+                or self.output_path
+                or source_study
+            ).strip()
+            name = _sanitize_lineage_text(".".join(part for part in (db, schema, table) if part))
+            outputs.append(dataset_cls(namespace=namespace, name=name))
+        elif dest == "neo4j":
+            raw_uri = str(
+                runtime_kwargs.get("uri") or conn_settings.get("uri") or "neo4j://localhost"
+            ).strip()
+            namespace = _lineage_authority(raw_uri)
+            database = str(
+                runtime_kwargs.get("database") or conn_settings.get("database") or "neo4j"
+            ).strip()
+            label = str(
+                runtime_kwargs.get("label") or conn_settings.get("label") or source_study
+            ).strip()
+            name = _sanitize_lineage_text(f"{database}.{label}")
+            outputs.append(dataset_cls(namespace=namespace, name=name))
+        elif dest == "mongodb":
+            raw_uri = str(
+                runtime_kwargs.get("uri") or conn_settings.get("uri") or "mongodb://localhost"
+            ).strip()
+            namespace = _lineage_authority(raw_uri)
+            database = str(
+                runtime_kwargs.get("database") or conn_settings.get("database") or ""
+            ).strip()
+            collection = str(
+                runtime_kwargs.get("collection") or conn_settings.get("collection") or source_study
+            ).strip()
+            raw_name = f"{database}.{collection}" if database else collection
+            outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(raw_name)))
+        elif dest == "duckdb":
+            raw_db_path = str(
+                self.output_path
+                or runtime_kwargs.get("db_path")
+                or runtime_kwargs.get("path")
+                or conn_settings.get("db_path")
+                or ":memory:"
+            ).strip()
+            safe_db_path = _sanitize_lineage_text(raw_db_path)
+            table_target = str(
+                runtime_kwargs.get("table_name")
+                or runtime_kwargs.get("table")
+                or conn_settings.get("table_name")
+                or "records"
+            ).strip()
+            raw_name = f"{safe_db_path}.{table_target}" if safe_db_path else table_target
+            outputs.append(dataset_cls(namespace="duckdb", name=_sanitize_lineage_text(raw_name)))
+        elif dest in {"sql", "sql_by_form", "long_sql"}:
+            raw_conn = str(
+                conn_settings.get("conn_str")
+                or runtime_kwargs.get("conn_str")
+                or (
+                    self.output_path
+                    if isinstance(self.output_path, str) and "://" in self.output_path
+                    else ""
+                )
+                or "sql://database"
+            ).strip()
+            safe_conn = _sanitize_lineage_text(raw_conn)
+            table_target = str(
+                (
+                    self.output_path
+                    if isinstance(self.output_path, str) and "://" not in self.output_path
+                    else None
+                )
+                or runtime_kwargs.get("table")
+                or runtime_kwargs.get("table_name")
+                or conn_settings.get("table")
+                or ("records" if dest == "sql_by_form" else source_study)
+            ).strip()
+            if safe_conn.startswith("sqlite:"):
+                sqlite_path = safe_conn.split(":///", 1)[-1] if ":///" in safe_conn else ":memory:"
+                namespace = "sqlite"
+                raw_name = f"{sqlite_path}.{table_target}" if sqlite_path else table_target
+            elif "://" in raw_conn:
+                parsed_sql = urlsplit(raw_conn)
+                namespace = _lineage_authority(raw_conn, normalize_sql_scheme=True)
+                db_path = parsed_sql.path.lstrip("/")
+                raw_name = (
+                    f"{db_path}.{table_target}"
+                    if db_path and not table_target.startswith(f"{db_path}.")
+                    else table_target
+                )
+            else:
+                namespace = "sql"
+                raw_name = table_target
+            outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(raw_name)))
+        elif self.output_path:
+            raw_target = str(self.output_path)
+            if "://" in raw_target:
+                parsed_out = urlsplit(raw_target)
+                namespace = _lineage_authority(raw_target)
+                name = parsed_out.path.lstrip("/") or _sanitize_lineage_text(raw_target)
+            else:
+                namespace = "file"
+                name = _sanitize_lineage_text(raw_target)
+            outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(name)))
+
+        return inputs, outputs
+
+    def get_openlineage_facets_on_start(self) -> Any:
+        """Return OpenLineage source and destination datasets prior to execution."""
+        lineage_types = _load_openlineage_types()
+        if lineage_types is None:
+            return None
+        operator_lineage_cls, dataset_cls = lineage_types
+        inputs, outputs = self._build_openlineage_datasets(dataset_cls)
+        return operator_lineage_cls(inputs=inputs, outputs=outputs)
+
+    def get_openlineage_facets_on_complete(self, task_instance: Any = None) -> Any:
+        """Return OpenLineage source and destination datasets after execution completes."""
+        _ = task_instance
+        lineage_types = _load_openlineage_types()
+        if lineage_types is None:
+            return None
+        operator_lineage_cls, dataset_cls = lineage_types
+        inputs, outputs = self._build_openlineage_datasets(dataset_cls)
+        return operator_lineage_cls(inputs=inputs, outputs=outputs)
+
     def execute(self, context: Context) -> str | None:
         """Execute the export task."""
         _ = context
         # Validate templated fields at runtime prior to any export work.
+        self._validate_templated_attributes()
         validate_path_segment(self.study_key, name="study_key")
-        if self.output_path is not None:
-            _validate_no_secrets_in_value(self.output_path, field_name="output_path")
         runtime_kwargs = self._get_runtime_export_kwargs()
         # Resolve destination early to fail fast on invalid configs (like legacy _get_export_callable)
         dest = self.destination

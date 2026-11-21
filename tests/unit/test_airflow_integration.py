@@ -8,81 +8,14 @@ from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
+from tests.utils.airflow_mocks import setup_dummy_airflow
 
 import imednet.sdk as sdk_mod
 
 
 def _setup_airflow(monkeypatch):
-    """Helper function to  setup airflow."""
-    airflow_mod = ModuleType("airflow")
-    airflow_mod.__path__ = []
-    hooks_pkg = ModuleType("airflow.hooks")
-    hooks_pkg.__path__ = []
-    hooks_mod = ModuleType("airflow.sdk.bases.hook")
-    operator_mod = ModuleType("airflow.sdk.bases.operator")
-    sensor_mod = ModuleType("airflow.sdk.bases.sensor")
-    sdk_mod = ModuleType("airflow.sdk")
-    sdk_mod.__path__ = []
-    sdk_bases = ModuleType("airflow.sdk.bases")
-    sdk_bases.__path__ = []
-    sdk_defs = ModuleType("airflow.sdk.definitions")
-    sdk_defs.__path__ = []
-    sdk_ctx = ModuleType("airflow.sdk.definitions.context")
-    sdk_dag = ModuleType("airflow.sdk.definitions.dag")
-    models_mod = ModuleType("airflow.models")
-
-    class DummyBaseHook:
-        """Test suite for DummyBaseHook."""
-
-        @classmethod
-        def get_connection(cls, conn_id):
-            """Helper function to get connection."""
-            raise NotImplementedError
-
-    class DummyBaseOperator:
-        """Test suite for DummyBaseOperator."""
-
-        template_fields = ()
-
-        def __init__(self, **kwargs):
-            """Initialize the test object."""
-
-    hooks_mod.BaseHook = DummyBaseHook
-    operator_mod.BaseOperator = DummyBaseOperator
-    sensor_mod.BaseSensorOperator = DummyBaseOperator
-    models_mod.BaseOperator = DummyBaseOperator
-    models_mod.DAG = DummyBaseOperator
-    sdk_dag.DAG = DummyBaseOperator
-    sdk_dag.dag = DummyBaseOperator
-
-    sdk_bases.hook = hooks_mod
-    sdk_bases.operator = operator_mod
-    sdk_bases.sensor = sensor_mod
-    sdk_mod.bases = sdk_bases
-    sdk_defs.context = sdk_ctx
-    sdk_defs.dag = sdk_dag
-    sdk_mod.definitions = sdk_defs
-    airflow_mod.sdk = sdk_mod
-    airflow_mod.hooks = hooks_pkg
-    airflow_mod.models = models_mod
-
-    for mod_name in list(sys.modules):
-        if mod_name == "apache_airflow_providers_imednet" or mod_name.startswith(
-            "apache_airflow_providers_imednet."
-        ):
-            monkeypatch.delitem(sys.modules, mod_name, raising=False)
-
-    monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
-    monkeypatch.setitem(sys.modules, "airflow.hooks", hooks_pkg)
-    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", operator_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.sensor", sensor_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
-    monkeypatch.setitem(sys.modules, "airflow.models", models_mod)
+    """Helper function to setup airflow."""
+    setup_dummy_airflow(monkeypatch)
 
 
 def test_imednet_hook_returns_sdk(monkeypatch):
@@ -166,7 +99,7 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
         "output_path",
         "export_kwargs",
     )
-    assert ImednetExportOperator.template_fields == ImednetExportOperator.mapped_runtime_fields
+    assert "study_key" in ImednetExportOperator.template_fields
     assert ImednetExportOperator.template_fields_renderers == {"export_kwargs": "json"}
 
 
@@ -1015,3 +948,22 @@ def _cleanup_mocked_airflow_provider_modules():
     providers_pkg = sys.modules.get("airflow.providers")
     if providers_pkg is not None:
         providers_pkg.__dict__.pop("imednet", None)
+
+
+def test_export_operator_full_template_fields_contract(monkeypatch):
+    """Verify full template_fields tuple includes mapped runtime, watermark, and filter fields."""
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
+
+    _setup_airflow(monkeypatch)
+    from apache_airflow_providers_imednet import ImednetExportOperator
+
+    assert ImednetExportOperator.template_fields == (
+        "study_key",
+        "output_path",
+        "export_kwargs",
+        "modified_since",
+        "record_filter",
+        "record_data_filter",
+        "stream_name",
+    )
