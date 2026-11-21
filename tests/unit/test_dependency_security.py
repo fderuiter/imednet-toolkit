@@ -1,7 +1,9 @@
 """Exercise interpreter compatibility and vulnerable dependency exclusion."""
 
+import functools
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -12,10 +14,15 @@ from packaging.version import Version
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@functools.lru_cache(maxsize=None)
+def _load_toml(path: Path) -> dict[str, Any]:
+    return tomllib.loads(path.read_text())
+
+
 def test_published_packages_keep_supported_python_lines() -> None:
     """Workspace tooling must not retire a published package's Python support."""
     for path in ROOT.glob("packages/*/pyproject.toml"):
-        project = tomllib.loads(path.read_text())["project"]
+        project = _load_toml(path)["project"]
         supported = SpecifierSet(project["requires-python"])
         assert "3.10.99" not in supported, path
         for version in ("3.11", "3.12", "3.13"):
@@ -23,7 +30,7 @@ def test_published_packages_keep_supported_python_lines() -> None:
 
 
 def test_workspace_rejects_python_without_patched_selector_support() -> None:
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    project = _load_toml(ROOT / "pyproject.toml")["project"]
     supported = SpecifierSet(project["requires-python"])
     assert "3.11.4" not in supported
     for version in ("3.11.5", "3.12", "3.13"):
@@ -42,11 +49,11 @@ def test_workspace_resolution_excludes_reported_vulnerabilities(
     name, affected, patched, later_patch
 ) -> None:
     """All locked copies and fresh uv resolutions must exclude vulnerable releases."""
-    locked = tomllib.loads((ROOT / "uv.lock").read_text())
+    locked = _load_toml(ROOT / "uv.lock")
     versions = [p["version"] for p in locked["package"] if p["name"] == name]
     assert versions
     assert all(Version(version) >= Version(patched) for version in versions)
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    project = _load_toml(ROOT / "pyproject.toml")
     constraints = [
         Requirement(value) for value in project["tool"]["uv"].get("constraint-dependencies", [])
     ]
@@ -58,13 +65,13 @@ def test_workspace_resolution_excludes_reported_vulnerabilities(
 
 def test_workflow_dependency_and_lockfile_exclude_vulnerable_filelock() -> None:
     """Fresh installs and locked installs must both reject affected releases."""
-    project = tomllib.loads((ROOT / "packages/plugins-workflows/pyproject.toml").read_text())
+    project = _load_toml(ROOT / "packages/plugins-workflows/pyproject.toml")
     requirements = [Requirement(value) for value in project["project"]["dependencies"]]
     filelock = next(requirement for requirement in requirements if requirement.name == "filelock")
     for version in ("3.20.3", "4.1.0", "4.2.0"):
         assert version not in filelock.specifier
     assert "4.2.1" in filelock.specifier
-    locked = tomllib.loads((ROOT / "uv.lock").read_text())
+    locked = _load_toml(ROOT / "uv.lock")
     versions = [
         package["version"] for package in locked["package"] if package["name"] == "filelock"
     ]
@@ -74,8 +81,8 @@ def test_workflow_dependency_and_lockfile_exclude_vulnerable_filelock() -> None:
 
 def test_duckdb_dependencies_and_lockfile_exclude_unstable_v2_major() -> None:
     """Unlocked Hatch/pip and locked uv resolutions must exclude duckdb 2.x crashes."""
-    root_project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    core_project = tomllib.loads((ROOT / "packages/core/pyproject.toml").read_text())["project"]
+    root_project = _load_toml(ROOT / "pyproject.toml")["project"]
+    core_project = _load_toml(ROOT / "packages/core/pyproject.toml")["project"]
 
     dev_reqs = [Requirement(v) for v in root_project["optional-dependencies"]["dev"]]
     duckdb_extra_reqs = [Requirement(v) for v in core_project["optional-dependencies"]["duckdb"]]
@@ -86,7 +93,7 @@ def test_duckdb_dependencies_and_lockfile_exclude_unstable_v2_major() -> None:
         assert "1.5.4" in duckdb_req.specifier
         assert "2.0.0" not in duckdb_req.specifier
 
-    locked = tomllib.loads((ROOT / "uv.lock").read_text())
+    locked = _load_toml(ROOT / "uv.lock")
     versions = [p["version"] for p in locked["package"] if p["name"] == "duckdb"]
     assert versions
     assert all(Version("1.1.0") <= Version(v) < Version("2.0.0") for v in versions)

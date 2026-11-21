@@ -640,3 +640,44 @@ def test_imednet_export_operator_incremental_idempotent_in_real_airflow_dag(
     assert provider.get_last_timestamp("STUDY_EXPORT", "json_export_records") == datetime(
         2026, 9, 10, 15, 0, 0, tzinfo=timezone.utc
     )
+
+
+def test_airflow_state_provider_subprocess_initdb_roundtrip(tmp_path: Path) -> None:
+    """Verify AirflowStateProvider SQLite round-trip (with underscores) in an isolated initdb subprocess."""
+    import subprocess
+
+    db_file = tmp_path / "airflow_state_parity.db"
+    script = textwrap.dedent(
+        """
+        from datetime import datetime, timezone
+        import airflow.utils.db as db
+        from imednet_workflows.state_ledger import AirflowStateProvider
+
+        db.initdb()
+        provider = AirflowStateProvider()
+        with provider.transaction("STUDY_A_1", "records_v1") as tx:
+            tx["new_timestamp"] = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+            tx["records_processed"] = 12
+
+        committed = provider.get_last_timestamp("STUDY_A_1", "records_v1")
+        assert committed is not None
+        assert committed.isoformat() == "2026-04-01T00:00:00+00:00"
+        state = provider.read_state()
+        assert "STUDY_A_1" in state.studies
+        assert "records_v1" in state.studies["STUDY_A_1"].streams
+        assert provider.delete_entry("STUDY_A_1", "records_v1") is True
+        """
+    )
+    env = {
+        **dict(os.environ),
+        "AIRFLOW_HOME": str(tmp_path),
+        "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": f"sqlite:///{db_file}",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"

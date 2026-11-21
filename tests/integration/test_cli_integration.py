@@ -293,3 +293,27 @@ def test_console_entrypoint_subprocess_with_offline_simulation() -> None:
     assert response["schemaVersion"] == "1.0" and response["resource"] == "studies"
     assert response["count"] == len(response["items"])
     assert "Fetching" not in process.stdout
+
+
+def test_parquet_and_cli_subprocess_import_without_pandas() -> None:
+    """Verify clean interpreter subprocess imports imednet.integrations.parquet and CLI without pandas."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; sys.modules['pandas'] = None; "
+                "import imednet.integrations.parquet as parquet_mod; "
+                "import imednet.cli as cli_mod; "
+                "assert callable(parquet_mod.hive_parquet_query); "
+                "assert cli_mod.app is not None"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr

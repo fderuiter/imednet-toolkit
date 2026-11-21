@@ -8,6 +8,7 @@ verifies delegation and subclass override contracts, and cleans up created SDK i
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 from typing import TYPE_CHECKING, Any
@@ -15,8 +16,13 @@ from unittest.mock import patch
 
 import pytest
 
-# Guard to isolate optional provider dependencies so core-only installs remain usable.
-pytest.importorskip("airflow")
+# Guard to isolate optional provider dependencies without importing Airflow during collection.
+if "airflow" in sys.modules and getattr(sys.modules.get("airflow"), "__file__", None) is None:
+    for _mod in list(sys.modules):
+        if _mod == "airflow" or _mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
+            sys.modules.pop(_mod, None)
+if importlib.util.find_spec("airflow") is None:
+    pytest.skip("could not import 'airflow': No module named 'airflow'", allow_module_level=True)
 
 if TYPE_CHECKING:
     from imednet import ImednetSDK
@@ -47,6 +53,8 @@ def _cleanup_airflow_provider_modules():
         providers_pkg = sys.modules.get("airflow.providers")
         if providers_pkg is not None:
             providers_pkg.__dict__.pop("imednet", None)
+
+    pytest.importorskip("airflow")
 
     yield
     for mod in list(sys.modules):

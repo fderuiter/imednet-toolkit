@@ -1,87 +1,17 @@
 """Unit tests for airflow export."""
 
-import os
-import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
+from tests.utils.airflow_mocks import setup_dummy_airflow
 
 
 # Setup dummy airflow modules to prevent import errors if airflow is not installed
 def _setup_airflow(monkeypatch):
-    """Helper function to  setup airflow."""
-    airflow_mod = ModuleType("airflow")
-    airflow_mod.__path__ = []
-    hooks_pkg = ModuleType("airflow.hooks")
-    hooks_pkg.__path__ = []
-    hooks_mod = ModuleType("airflow.sdk.bases.hook")
-    operator_mod = ModuleType("airflow.sdk.bases.operator")
-    sensor_mod = ModuleType("airflow.sdk.bases.sensor")
-    sdk_mod = ModuleType("airflow.sdk")
-    sdk_mod.__path__ = []
-    sdk_bases = ModuleType("airflow.sdk.bases")
-    sdk_bases.__path__ = []
-    sdk_defs = ModuleType("airflow.sdk.definitions")
-    sdk_defs.__path__ = []
-    sdk_ctx = ModuleType("airflow.sdk.definitions.context")
-    sdk_dag = ModuleType("airflow.sdk.definitions.dag")
-    models_mod = ModuleType("airflow.models")
-
-    class DummyBaseHook:
-        """Test suite for DummyBaseHook."""
-
-        @classmethod
-        def get_connection(cls, conn_id):
-            """Helper function to get connection."""
-            raise NotImplementedError
-
-    class DummyBaseOperator:
-        """Test suite for DummyBaseOperator."""
-
-        template_fields = ()
-
-        def __init__(self, *args, **kwargs):
-            """Initialize the test object."""
-
-    hooks_mod.BaseHook = DummyBaseHook
-    operator_mod.BaseOperator = DummyBaseOperator
-    sensor_mod.BaseSensorOperator = DummyBaseOperator
-    models_mod.BaseOperator = DummyBaseOperator
-    models_mod.DAG = DummyBaseOperator
-    sdk_dag.DAG = DummyBaseOperator
-    sdk_dag.dag = DummyBaseOperator
-
-    sdk_bases.hook = hooks_mod
-    sdk_bases.operator = operator_mod
-    sdk_bases.sensor = sensor_mod
-    sdk_mod.bases = sdk_bases
-    sdk_defs.context = sdk_ctx
-    sdk_defs.dag = sdk_dag
-    sdk_mod.definitions = sdk_defs
-    airflow_mod.sdk = sdk_mod
-    airflow_mod.hooks = hooks_pkg
-    airflow_mod.models = models_mod
-
-    for mod_name in list(sys.modules):
-        if mod_name == "airflow" or mod_name.startswith(
-            ("airflow.", "apache_airflow_providers_imednet")
-        ):
-            monkeypatch.delitem(sys.modules, mod_name, raising=False)
-
-    monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
-    monkeypatch.setitem(sys.modules, "airflow.hooks", hooks_pkg)
-    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases", sdk_bases)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.hook", hooks_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.operator", operator_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.bases.sensor", sensor_mod)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions", sdk_defs)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.context", sdk_ctx)
-    monkeypatch.setitem(sys.modules, "airflow.sdk.definitions.dag", sdk_dag)
-    monkeypatch.setitem(sys.modules, "airflow.models", models_mod)
+    """Helper function to setup airflow."""
+    setup_dummy_airflow(monkeypatch)
 
 
 EXPORT_FUNCTIONS = [
@@ -120,61 +50,48 @@ def test_airflow_export_forwards_arguments(func_name: str) -> None:
         mock_base_func.assert_called_once_with(*args, **kwargs)
 
 
-def test_spi_export_delegation_with_dispatcher_binding() -> None:
+def test_spi_export_delegation_with_dispatcher_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Resolve real SPI bindings independently of package attribute import order."""
-    script = '''
-import importlib
-import sys
-from unittest.mock import patch
+    import importlib
 
-sys.modules["airflow"] = None
-import imednet.integrations as integrations
+    for mod_name in list(sys.modules):
+        if mod_name == "airflow" or mod_name.startswith(
+            ("airflow.", "apache_airflow_providers_imednet")
+        ):
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
+    monkeypatch.setitem(sys.modules, "airflow", None)
 
-# A cached submodule import must not decide whether `export` is callable or a module.
-importlib.reload(integrations)
-assert callable(integrations.export)
-import imednet.spi as spi
-importlib.reload(spi)
-assert spi.export is integrations.export
-from apache_airflow_providers_imednet import export
+    from imednet import integrations, spi
 
-for func_name in EXPORT_FUNCTIONS:
-    with patch("imednet.integrations.export." + func_name, return_value=None) as destination:
-        getattr(export, func_name)("synthetic-study", path="synthetic-output")
-        destination.assert_called_once_with("synthetic-study", path="synthetic-output")
-    with patch(
-        "imednet.integrations.export." + func_name,
-        side_effect=ImportError("optional-driver"),
-    ):
-        try:
-            getattr(export, func_name)("synthetic-study")
-        except ImportError as error:
-            assert str(error) == "optional-driver"
-        else:
-            raise AssertionError(f"dependency error was swallowed for {func_name}")
-'''
-    repo_root = Path(__file__).resolve().parents[2]
-    package_paths = [
-        str(repo_root / "packages" / "providers-airflow" / "src"),
-        str(repo_root / "packages" / "core" / "src"),
-    ]
-    env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH")
-    if existing_pythonpath:
-        env["PYTHONPATH"] = os.pathsep.join(package_paths + [existing_pythonpath])
-    else:
-        env["PYTHONPATH"] = os.pathsep.join(package_paths)
+    saved_integrations_dict = dict(integrations.__dict__)
+    saved_spi_dict = dict(spi.__dict__)
+    try:
+        # A cached submodule import must not decide whether `export` is callable or a module.
+        importlib.reload(integrations)
+        assert callable(integrations.export)
+        importlib.reload(spi)
+        assert spi.export is integrations.export
+        from apache_airflow_providers_imednet import export
 
-    result = subprocess.run(
-        [sys.executable, "-c", "EXPORT_FUNCTIONS = " + repr(EXPORT_FUNCTIONS) + "\n" + script],
-        cwd=repo_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+        for func_name in EXPORT_FUNCTIONS:
+            with patch(
+                "imednet.integrations.export." + func_name, return_value=None
+            ) as destination:
+                getattr(export, func_name)("synthetic-study", path="synthetic-output")
+                destination.assert_called_once_with("synthetic-study", path="synthetic-output")
+            with patch(
+                "imednet.integrations.export." + func_name,
+                side_effect=ImportError("optional-driver"),
+            ):
+                with pytest.raises(ImportError, match="^optional-driver$"):
+                    getattr(export, func_name)("synthetic-study")
+    finally:
+        integrations.__dict__.clear()
+        integrations.__dict__.update(saved_integrations_dict)
+        spi.__dict__.clear()
+        spi.__dict__.update(saved_spi_dict)
 
 
 def test_export_operator_dispatches_duckdb(monkeypatch: pytest.MonkeyPatch) -> None:

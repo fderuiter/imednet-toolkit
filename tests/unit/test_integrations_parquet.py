@@ -477,27 +477,36 @@ def test_export_to_hive_parquet_deduplicates_case_insensitive_variables_and_mask
 
 def test_parquet_and_cli_import_without_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
     """Minimal installs without pandas must still import imednet.integrations.parquet and CLI."""
-    import subprocess
+    import importlib
     import sys
 
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; sys.modules['pandas'] = None; "
-                "import imednet.integrations.parquet as parquet_mod; "
-                "import imednet.cli as cli_mod; "
-                "assert callable(parquet_mod.hive_parquet_query); "
-                "assert cli_mod.app is not None"
-            ),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, proc.stderr
+    import imednet
+    import imednet.integrations as integrations_pkg
 
+    saved_imednet_dict = dict(imednet.__dict__)
+    saved_integrations_dict = dict(integrations_pkg.__dict__)
+    target_exact = {"imednet.integrations.parquet", "imednet.cli"}
+    saved_modules = {
+        k: v for k, v in sys.modules.items() if k in target_exact or k.startswith("imednet.cli.")
+    }
     monkeypatch.setitem(sys.modules, "pandas", None)
-    with pytest.raises(ImportError, match=r"pip install 'imednet\[export\]'"):
-        parquet_mod._ensure_pandas()
+    try:
+        for mod_name in list(saved_modules):
+            sys.modules.pop(mod_name, None)
+
+        reloaded_parquet = importlib.import_module("imednet.integrations.parquet")
+        reloaded_cli = importlib.import_module("imednet.cli")
+        assert callable(reloaded_parquet.hive_parquet_query)
+        assert reloaded_cli.app is not None
+
+        with pytest.raises(ImportError, match=r"pip install 'imednet\[export\]'"):
+            reloaded_parquet._ensure_pandas()
+    finally:
+        for mod_name in list(sys.modules):
+            if mod_name in target_exact or mod_name.startswith("imednet.cli."):
+                sys.modules.pop(mod_name, None)
+        sys.modules.update(saved_modules)
+        imednet.__dict__.clear()
+        imednet.__dict__.update(saved_imednet_dict)
+        integrations_pkg.__dict__.clear()
+        integrations_pkg.__dict__.update(saved_integrations_dict)

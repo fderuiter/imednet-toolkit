@@ -827,3 +827,73 @@ def test_job_sensor_fails_in_dag_when_result_url_has_failed_records(monkeypatch)
     sensor = ImednetJobSensor(task_id="wait_bad_batch", study_key="STUDY_A", batch_id="BATCH_BAD")
     with pytest.raises(AirflowException, match="Form locked"):
         sensor.poke(context={})
+
+
+def test_spi_export_delegation_subprocess_with_dispatcher_binding() -> None:
+    """Verify clean interpreter subprocess resolves SPI export bindings independently of import order."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    export_functions = [
+        "export_to_csv",
+        "export_to_duckdb",
+        "export_to_parquet",
+        "export_to_excel",
+        "export_to_json",
+        "export_to_sql",
+        "export_to_sql_by_form",
+    ]
+    script = """
+import importlib
+import sys
+from unittest.mock import patch
+
+sys.modules["airflow"] = None
+import imednet.integrations as integrations
+
+importlib.reload(integrations)
+assert callable(integrations.export)
+import imednet.spi as spi
+importlib.reload(spi)
+assert spi.export is integrations.export
+from apache_airflow_providers_imednet import export
+
+for func_name in EXPORT_FUNCTIONS:
+    with patch("imednet.integrations.export." + func_name, return_value=None) as destination:
+        getattr(export, func_name)("synthetic-study", path="synthetic-output")
+        destination.assert_called_once_with("synthetic-study", path="synthetic-output")
+    with patch(
+        "imednet.integrations.export." + func_name,
+        side_effect=ImportError("optional-driver"),
+    ):
+        try:
+            getattr(export, func_name)("synthetic-study")
+        except ImportError as error:
+            assert str(error) == "optional-driver"
+        else:
+            raise AssertionError(f"dependency error was swallowed for {func_name}")
+"""
+    repo_root = Path(__file__).resolve().parents[2]
+    package_paths = [
+        str(repo_root / "packages" / "providers-airflow" / "src"),
+        str(repo_root / "packages" / "core" / "src"),
+    ]
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    if existing_pythonpath:
+        env["PYTHONPATH"] = os.pathsep.join(package_paths + [existing_pythonpath])
+    else:
+        env["PYTHONPATH"] = os.pathsep.join(package_paths)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "EXPORT_FUNCTIONS = " + repr(export_functions) + "\n" + script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr

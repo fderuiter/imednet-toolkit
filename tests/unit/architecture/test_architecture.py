@@ -26,12 +26,10 @@ def get_all_python_files(package_path: Path) -> tuple[Path, ...]:
 @functools.lru_cache(maxsize=None)
 def get_imports_from_file(file_path: Path) -> frozenset[str]:
     """Helper function to get imports from file."""
-    from import_rules import parse_python_ast
-
-    tree = parse_python_ast(file_path)
+    from import_rules import parse_import_nodes
 
     imports = set()
-    for node in ast.walk(tree):
+    for node in parse_import_nodes(file_path):
         if isinstance(node, ast.Import):
             for name in node.names:
                 imports.add(name.name)

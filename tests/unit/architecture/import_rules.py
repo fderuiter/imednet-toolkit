@@ -58,13 +58,47 @@ def parse_python_ast(path: Path) -> ast.Module:
     return _cached_parse(resolved, stat.st_mtime_ns, stat.st_size)
 
 
+_STMT_CONTAINER_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
+
+
+def _iter_import_nodes(node: ast.AST) -> list[ast.Import | ast.ImportFrom]:
+    found: list[ast.Import | ast.ImportFrom] = []
+    stack: list[ast.AST] = [node]
+    while stack:
+        current = stack.pop()
+        for field in _STMT_CONTAINER_FIELDS:
+            children = getattr(current, field, None)
+            if not isinstance(children, list):
+                continue
+            for child in children:
+                if isinstance(child, (ast.Import, ast.ImportFrom)):
+                    found.append(child)
+                elif isinstance(child, (ast.stmt, ast.excepthandler, ast.match_case)):
+                    stack.append(child)
+    return found
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_import_nodes(
+    resolved_path: Path, mtime_ns: int, size: int
+) -> tuple[ast.Import | ast.ImportFrom, ...]:
+    del mtime_ns, size
+    tree = ast.parse(resolved_path.read_text(encoding="utf-8"), filename=str(resolved_path))
+    return tuple(_iter_import_nodes(tree))
+
+
+def parse_import_nodes(path: Path) -> tuple[ast.Import | ast.ImportFrom, ...]:
+    resolved = path if path.is_absolute() else path.resolve()
+    stat = resolved.stat()
+    return _cached_import_nodes(resolved, stat.st_mtime_ns, stat.st_size)
+
+
 @functools.lru_cache(maxsize=None)
 def import_edges(path: Path, source_root: Path) -> frozenset[str]:
     package = ".".join(path.relative_to(source_root).parts[:-1])
-    tree = parse_python_ast(path)
     edges: set[str] = set()
     # Type-only imports follow the same layering rules, but are never imported/executed.
-    for node in ast.walk(tree):
+    for node in parse_import_nodes(path):
         if isinstance(node, ast.Import):
             edges.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):

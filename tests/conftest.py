@@ -18,6 +18,8 @@ os.environ.setdefault("LC_MESSAGES", "C")
 
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_TESTS_DIR = (ROOT / "tests" / "live").resolve()
+_LIVE_TESTS_PREFIX = str(LIVE_TESTS_DIR) + os.sep
+_ROOT_PREFIX = str(ROOT) + os.sep
 for source_root in (
     ROOT / "packages" / "core" / "src",
     ROOT / "packages" / "plugins-workflows" / "src",
@@ -56,8 +58,55 @@ _INITIAL_NAMED_LOGGERS: dict[str, tuple[list[_logging.Handler], int, bool, bool]
     for name, lg in _logging.Logger.manager.loggerDict.items()
     if isinstance(lg, _logging.Logger)
 }
+_ALL_CREATED_LOGGERS: list[_logging.Logger] = [
+    lg for lg in _logging.Logger.manager.loggerDict.values() if isinstance(lg, _logging.Logger)
+]
+_orig_logger_init = _logging.Logger.__init__
+
+
+def _tracking_logger_init(self: _logging.Logger, name: str, level: int = _logging.NOTSET) -> None:
+    _orig_logger_init(self, name, level)
+    _ALL_CREATED_LOGGERS.append(self)
+
+
+_logging.Logger.__init__ = _tracking_logger_init  # type: ignore[method-assign]
+
 _post_collection_logging_sanitized = False
-_BASELINE_NAMED_LOGGERS: dict[str, tuple[tuple[_logging.Handler, ...], int, bool, bool]] = {}
+_TRACKED_LOGGERS: list[tuple[_logging.Logger, list[_logging.Handler], bool, int, bool, bool]] = []
+_SEEN_LOGGER_IDS: set[int] = set()
+_last_synced_logger_count: int = -1
+
+
+def _sync_tracked_loggers() -> None:
+    """Register and sanitize newly created loggers incrementally."""
+    global _last_synced_logger_count
+    current_count = len(_ALL_CREATED_LOGGERS)
+    if current_count == _last_synced_logger_count:
+        return
+    logger_dict = _logging.Logger.manager.loggerDict
+    for lg in _ALL_CREATED_LOGGERS[max(0, _last_synced_logger_count) :]:
+        if id(lg) in _SEEN_LOGGER_IDS or logger_dict.get(lg.name) is not lg:
+            continue
+        _SEEN_LOGGER_IDS.add(id(lg))
+        name = lg.name
+        if name in _INITIAL_NAMED_LOGGERS:
+            init_handlers, init_level, init_prop, init_dis = _INITIAL_NAMED_LOGGERS[name]
+            h_list = [h for h in init_handlers if not _is_closed_handler(h)]
+            lvl, prop, dis = init_level, init_prop, init_dis
+        else:
+            h_list = [h for h in lg.handlers if isinstance(h, _logging.NullHandler)]
+            lvl, prop, dis = _logging.NOTSET, True, False
+        if lg.handlers != h_list:
+            lg.handlers[:] = h_list
+        if lg.level != lvl:
+            lg.setLevel(lvl)
+        if lg.propagate is not prop:
+            lg.propagate = prop
+        if lg.disabled is not dis:
+            lg.disabled = dis
+        has_stream = any(not isinstance(h, _logging.NullHandler) for h in h_list)
+        _TRACKED_LOGGERS.append((lg, h_list, has_stream, lvl, prop, dis))
+    _last_synced_logger_count = len(_ALL_CREATED_LOGGERS)
 
 
 def _sanitize_post_collection_loggers() -> None:
@@ -74,35 +123,7 @@ def _sanitize_post_collection_loggers() -> None:
         if not _is_closed_handler(h)
         and (h in _INITIAL_ROOT_HANDLERS or type(h).__module__.startswith("_pytest"))
     ]
-    for name, lg in list(_logging.Logger.manager.loggerDict.items()):
-        if not isinstance(lg, _logging.Logger):
-            continue
-        if name in _INITIAL_NAMED_LOGGERS:
-            init_handlers, init_level, init_prop, init_dis = _INITIAL_NAMED_LOGGERS[name]
-            target_handlers = [h for h in init_handlers if not _is_closed_handler(h)]
-            if lg.handlers != target_handlers:
-                lg.handlers[:] = target_handlers
-            if lg.level != init_level:
-                lg.setLevel(init_level)
-            if lg.propagate != init_prop:
-                lg.propagate = init_prop
-            if lg.disabled != init_dis:
-                lg.disabled = init_dis
-        else:
-            if any(not isinstance(h, _logging.NullHandler) for h in lg.handlers):
-                lg.handlers[:] = [h for h in lg.handlers if isinstance(h, _logging.NullHandler)]
-            if lg.level != _logging.NOTSET:
-                lg.setLevel(_logging.NOTSET)
-            if not lg.propagate:
-                lg.propagate = True
-            if lg.disabled:
-                lg.disabled = False
-        _BASELINE_NAMED_LOGGERS[name] = (
-            tuple(lg.handlers),
-            lg.level,
-            lg.propagate,
-            lg.disabled,
-        )
+    _sync_tracked_loggers()
 
 
 _orig_entry_points = _importlib_metadata.entry_points
@@ -370,73 +391,62 @@ def _is_live_test(node: object) -> bool:
     if node_path is None:
         return False
 
-    path = node_path if isinstance(node_path, Path) else Path(str(node_path))
-    if path.is_absolute() and ".." not in path.parts and path.is_relative_to(ROOT):
-        return path.is_relative_to(LIVE_TESTS_DIR)
+    path_str = str(node_path)
+    if path_str.startswith(_ROOT_PREFIX) and ".." not in path_str:
+        return path_str.startswith(_LIVE_TESTS_PREFIX)
+    path = node_path if isinstance(node_path, Path) else Path(path_str)
     return path.resolve().is_relative_to(LIVE_TESTS_DIR)
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):  # type: ignore[no-untyped-def]
     """Snapshot and restore logging handlers and levels across each full test lifecycle."""
-    del item, nextitem
     _sanitize_post_collection_loggers()
     root_logger = _logging.getLogger()
-    saved_root_handlers = tuple(root_logger.handlers)
+    saved_root_handlers = list(root_logger.handlers)
     saved_root_level = root_logger.level
     saved_root_disabled = root_logger.disabled
     try:
         yield
     finally:
-        target_root_handlers = [h for h in saved_root_handlers if not _is_closed_handler(h)]
-        if root_logger.handlers != target_root_handlers:
-            root_logger.handlers[:] = target_root_handlers
+        if root_logger.handlers != saved_root_handlers or any(
+            _is_closed_handler(h) for h in saved_root_handlers
+        ):
+            root_logger.handlers[:] = [h for h in saved_root_handlers if not _is_closed_handler(h)]
         if root_logger.level != saved_root_level:
             root_logger.setLevel(saved_root_level)
-        if root_logger.disabled != saved_root_disabled:
+        if root_logger.disabled is not saved_root_disabled:
             root_logger.disabled = saved_root_disabled
-        for name, lg in list(_logging.Logger.manager.loggerDict.items()):
-            if not isinstance(lg, _logging.Logger):
-                continue
-            saved = _BASELINE_NAMED_LOGGERS.get(name)
-            if saved is not None:
-                h_tuple, lvl, prop, dis = saved
-                if not lg.handlers and not h_tuple:
-                    pass
-                elif tuple(lg.handlers) != h_tuple or any(_is_closed_handler(h) for h in h_tuple):
-                    lg.handlers[:] = [h for h in h_tuple if not _is_closed_handler(h)]
-                if lg.level != lvl:
-                    lg.setLevel(lvl)
-                if lg.propagate != prop:
-                    lg.propagate = prop
-                if lg.disabled != dis:
-                    lg.disabled = dis
-            else:
-                if any(not isinstance(h, _logging.NullHandler) for h in lg.handlers):
-                    lg.handlers[:] = [h for h in lg.handlers if isinstance(h, _logging.NullHandler)]
-                if lg.level != _logging.NOTSET:
-                    lg.setLevel(_logging.NOTSET)
-                if not lg.propagate:
-                    lg.propagate = True
-                if lg.disabled:
-                    lg.disabled = False
-        compat_mod = sys.modules.get("apache_airflow_providers_imednet._airflow_compat")
-        if compat_mod is not None:
-            base_hook = getattr(compat_mod, "BaseHook", None)
-            hook_mod_name = getattr(base_hook, "__module__", "")
-            hook_mod = sys.modules.get(hook_mod_name)
-            if (
-                not hook_mod_name.startswith("airflow.")
-                or getattr(hook_mod, "__file__", None) is None
-            ):
-                for mod_name in list(sys.modules):
-                    if mod_name.startswith(
-                        ("apache_airflow_providers_imednet", "airflow.providers.imednet")
-                    ):
-                        sys.modules.pop(mod_name, None)
-                providers_pkg = sys.modules.get("airflow.providers")
-                if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
-                    delattr(providers_pkg, "imednet")
+        for lg, h_list, has_stream, lvl, prop, dis in _TRACKED_LOGGERS:
+            if lg.handlers != h_list or (has_stream and any(_is_closed_handler(h) for h in h_list)):
+                if has_stream:
+                    h_list[:] = [h for h in h_list if not _is_closed_handler(h)]
+                lg.handlers[:] = h_list
+            if lg.level != lvl:
+                lg.setLevel(lvl)
+            if lg.propagate is not prop:
+                lg.propagate = prop
+            if lg.disabled is not dis:
+                lg.disabled = dis
+        _sync_tracked_loggers()
+        if nextitem is None or getattr(nextitem, "path", None) != getattr(item, "path", None):
+            compat_mod = sys.modules.get("apache_airflow_providers_imednet._airflow_compat")
+            if compat_mod is not None:
+                base_hook = getattr(compat_mod, "BaseHook", None)
+                hook_mod_name = getattr(base_hook, "__module__", "")
+                hook_mod = sys.modules.get(hook_mod_name)
+                if (
+                    not hook_mod_name.startswith("airflow.")
+                    or getattr(hook_mod, "__file__", None) is None
+                ):
+                    for mod_name in list(sys.modules):
+                        if mod_name.startswith(
+                            ("apache_airflow_providers_imednet", "airflow.providers.imednet")
+                        ):
+                            sys.modules.pop(mod_name, None)
+                    providers_pkg = sys.modules.get("airflow.providers")
+                    if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+                        delattr(providers_pkg, "imednet")
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
