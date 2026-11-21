@@ -13,6 +13,12 @@ from importlib.metadata import entry_points
 from typing import Any
 
 from imednet.models.engine import ResourceRegistry
+from imednet.models.sdtm import (
+    format_variable_name,
+    normalize_naming_convention,
+    resolve_sdtm_domain,
+    transform_records_to_sdtm_rows,
+)
 from imednet.models.study_config import StudyConfiguration
 from imednet.utils.evaluator import evaluate_expression
 from imednet.utils.security import (
@@ -240,6 +246,10 @@ class CentralizedMapper:
         *,
         mask_phi: bool = True,
         study_config: StudyConfiguration | None = None,
+        naming_convention: str | None = None,
+        as_sdtm: bool = False,
+        sdtm_domain: str | None = None,
+        seq_counters: dict[str, int] | None = None,
     ):
         """Initialize the mapper.
 
@@ -248,10 +258,22 @@ class CentralizedMapper:
             post_processor: Optional function to apply destination-specific formatting.
             mask_phi: Whether to mask sensitive PHI fields by default.
             study_config: Optional study configuration containing custom enrichment rules.
+            naming_convention: Optional key convention ('snake_case', 'camelCase', 'sdtm').
+            as_sdtm: When True, transform records directly into CDISC SDTM domain rows.
+            sdtm_domain: Optional SDTM domain code (e.g. 'AE', 'VS', 'DM').
+            seq_counters: Optional per-USUBJID sequence counter map shared across batches.
         """
         self.mode = mode
         self.post_processor = post_processor
         self.mask_phi = mask_phi
+        self.naming_convention = normalize_naming_convention(naming_convention)
+        self.sdtm_domain = (
+            resolve_sdtm_domain(sdtm_domain)
+            if isinstance(sdtm_domain, str) and sdtm_domain.strip()
+            else None
+        )
+        self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
+        self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
         self._pipeline_cache: dict[str, Any] = {}
         self._sens_snapshot: frozenset[str] = frozenset()
         self._exempt_snapshot: frozenset[str] = frozenset()
@@ -331,18 +353,64 @@ class CentralizedMapper:
                 )
         active_pipeline = self._pipeline_cache[sk]
         pipeline_phi_keys: set[str] = getattr(active_pipeline, "phi_keys", set())
+        has_active_rules = bool(
+            active_pipeline is not None
+            and not (
+                active_pipeline.__class__ is EnrichmentPipeline and not active_pipeline._has_rules
+            )
+        )
         masked_meta_fields: frozenset[str] | tuple[()] = (
             self._resolve_masked_meta_fields(active_pipeline, fields, pipeline_phi_keys)
             if self.mask_phi
             else ()
         )
 
+        if self.as_sdtm:
+            raw_dom = self.sdtm_domain
+            if not raw_dom:
+                raw_dom = (
+                    record.get("DOMAIN")
+                    or record.get("domain")
+                    or record.get("form_key")
+                    or record.get("formKey")
+                    if is_mapping
+                    else getattr(record, "form_key", None)
+                )
+            target_domain = resolve_sdtm_domain(raw_dom, fallback="AE")
+            sdtm_rows = transform_records_to_sdtm_rows(
+                [record],
+                domain=target_domain,
+                study_key=sk,
+                include_deleted=True,
+                mask_phi=self.mask_phi,
+                seq_counters=self._seq_counters,
+                phi_keys=pipeline_phi_keys or None,
+                pipeline=active_pipeline if has_active_rules else None,
+            )
+            mapped_sdtm = (
+                sdtm_rows[0]
+                if sdtm_rows
+                else {
+                    "STUDYID": sk,
+                    "DOMAIN": target_domain,
+                    "USUBJID": "",
+                }
+            )
+            if self.post_processor:
+                mapped_sdtm = self.post_processor(mapped_sdtm)
+            return mapped_sdtm
+
+        active_conv = self.naming_convention
         mapped: dict[str, Any] = {}
         for f, snake_key in fields:
             if is_mapping:
                 val = record.get(f)
                 if val is None and snake_key != f:
                     val = record.get(snake_key)
+                if val is None:
+                    camel_f = format_variable_name(snake_key, "camelCase")
+                    if camel_f not in {f, snake_key}:
+                        val = record.get(camel_f)
             else:
                 val = getattr(record, f, None)
 
@@ -350,10 +418,7 @@ class CentralizedMapper:
                 val = dict(val or {})
                 if self.mask_phi and val:
                     val = mask_clinical_phi(val)
-                if active_pipeline is not None and not (
-                    active_pipeline.__class__ is EnrichmentPipeline
-                    and not active_pipeline._has_rules
-                ):
+                if has_active_rules:
                     if self.mask_phi:
                         try:
                             val = active_pipeline.process(val, _skip_default_phi=False)
@@ -366,7 +431,13 @@ class CentralizedMapper:
                             val = active_pipeline.process(val)
                 if self.mode == "tabular":
                     val = flatten(val)
-                val = {_to_snake_case(k): v for k, v in val.items()}
+                if active_conv is None or active_conv == "snake_case":
+                    val = {_to_snake_case(k): v for k, v in val.items()}
+                else:
+                    val = {
+                        format_variable_name(k, active_conv, domain=self.sdtm_domain): v
+                        for k, v in val.items()
+                    }
             elif masked_meta_fields and val is not None and snake_key in masked_meta_fields:
                 val = _MASKED_VALUE
 
@@ -393,6 +464,18 @@ class CentralizedMapper:
             mapped['study_key'] = study_key
         elif 'study_key' not in mapped or not mapped['study_key']:
             mapped['study_key'] = resolved_study_key
+
+        if active_conv is not None and active_conv != "snake_case":
+            converted: dict[str, Any] = {}
+            for mk, mv in mapped.items():
+                target_mk = format_variable_name(
+                    mk,
+                    active_conv,
+                    domain=self.sdtm_domain,
+                    is_metadata=True,
+                )
+                converted[target_mk] = mv
+            mapped = converted
 
         if self.post_processor:
             mapped = self.post_processor(mapped)

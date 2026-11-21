@@ -427,20 +427,27 @@ def check_packages_registered() -> bool:
     if pyproject_path.exists():
         pyproject_data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
         root_deps = set(pyproject_data.get("project", {}).get("dependencies", []))
-        if "imednet-tui" not in root_deps:
-            print(
-                "Error: 'imednet-tui' is missing from root pyproject.toml [project].dependencies."
-            )
-            has_errors = True
+        for required_dep in (
+            "imednet",
+            "imednet-workflows",
+            "apache-airflow-providers-imednet",
+            "imednet-plugins-sinks",
+            "imednet-tui",
+        ):
+            if required_dep not in root_deps:
+                print(
+                    f"Error: '{required_dep}' is missing from root pyproject.toml [project].dependencies."
+                )
+                has_errors = True
 
     if readme_path.exists():
         readme_content = readme_path.read_text(encoding="utf-8")
         if "imednet[tui]" not in readme_content:
             print("Error: 'imednet[tui]' is missing from README.md installation instructions.")
             has_errors = True
-        if "uv sync --all-packages --extra dev --extra docs" not in readme_content:
+        if "uv sync --locked --all-packages --all-extras" not in readme_content:
             print(
-                "Error: 'uv sync --all-packages --extra dev --extra docs' is missing from README.md."
+                "Error: 'uv sync --locked --all-packages --all-extras' is missing from README.md."
             )
             has_errors = True
 

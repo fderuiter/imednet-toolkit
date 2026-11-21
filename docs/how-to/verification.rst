@@ -22,10 +22,16 @@ Before proposing any code change, execute and pass all CI quality gates locally.
       hatch run mypy packages/core/src/imednet
       hatch run mypy packages/plugins-workflows/src/imednet_workflows
       hatch run mypy packages/providers-airflow/src/apache_airflow_providers_imednet
+      hatch run mypy packages/plugins-sinks/src/imednet_sinks
+      hatch run mypy packages/plugins-tui/src/imednet_tui
+      hatch run mypy examples
+      hatch run mypy tests/typing/endpoint_contracts.py
       hatch run pytest -q \
         --cov=imednet \
         --cov=imednet_workflows \
         --cov=apache_airflow_providers_imednet \
+        --cov=imednet_sinks \
+        --cov=imednet_tui \
         --cov-fail-under=90
 
 3. Fix every reported error before marking a task complete. Re-run until the entire sequence exits 0.
@@ -54,7 +60,8 @@ similarity execution is removed; the canonical ``lint:pylint-sim`` and
 ``duplication:check`` tasks retain their documented scopes and thresholds.
 
 Fuzzing/performance tracks require their pytest flags; container integration
-requires ``IMEDNET_TEST_CONTAINERS=1``. Live tests remain outside the default
+requires ``IMEDNET_TEST_CONTAINERS=1`` with ``docker compose up -d`` and
+``docker compose down -v`` teardown (see ``CONTRIBUTING.md``). Live tests remain outside the default
 suite and require explicit authorization and the live-test charter. Security
 exception ownership and review dates are in :doc:`/reference/security_exceptions`.
 

@@ -148,10 +148,36 @@ def _encode_bson_scalars(value: Any) -> Any:
 
 
 def _post_process_document(doc: dict[str, Any]) -> dict[str, Any]:
-    study_key = doc.get("study_key")
-    record_id = doc.get("record_id")
+    study_key = doc.get("study_key") or doc.get("studyKey") or doc.get("STUDYID")
+    if "record_id" in doc:
+        record_id = doc.get("record_id")
+    elif "recordId" in doc:
+        record_id = doc.get("recordId")
+    else:
+        record_id = doc.get("RECORD_ID")
     doc["_id"] = _make_document_id(str(study_key), record_id)
-    doc["exported_at"] = datetime.now(tz=UTC).isoformat()
+    exported_ts = datetime.now(tz=UTC).isoformat()
+    if "studyKey" in doc and "study_key" not in doc:
+        doc["exportedAt"] = exported_ts
+    elif "STUDYID" in doc and "study_key" not in doc:
+        doc["EXPORTED_AT"] = exported_ts
+    else:
+        doc["exported_at"] = exported_ts
+    normalized: dict[str, Any] = normalize_sink_value(doc)
+    return _encode_bson_scalars(normalized)  # type: ignore[no-any-return]
+
+
+def _attach_sdtm_document_id(doc: dict[str, Any], record: Any, study_key: str) -> dict[str, Any]:
+    """Attach a deterministic MongoDB ``_id`` to a flat SDTM domain document."""
+    rid = extract_record_id(record)
+    resolved_study = str(doc.get("STUDYID") or study_key)
+    if rid is not None:
+        doc["_id"] = _make_document_id(resolved_study, rid)
+    else:
+        domain = str(doc.get("DOMAIN") or "DM")
+        usubjid = str(doc.get("USUBJID") or "")
+        seq_val = next((doc[k] for k in doc if k.endswith("SEQ")), 1)
+        doc["_id"] = f"{resolved_study}/{domain}/{usubjid}/{seq_val}"
     normalized: dict[str, Any] = normalize_sink_value(doc)
     return _encode_bson_scalars(normalized)  # type: ignore[no-any-return]
 
@@ -170,7 +196,10 @@ def _record_to_document(
             post_processor=_post_process_document,
             mask_phi=mask_phi,
         )
-    return mapper.map_record(record, study_key=study_key)
+    mapped = mapper.map_record(record, study_key=study_key)
+    if getattr(mapper, "as_sdtm", False) and "_id" not in mapped:
+        return _attach_sdtm_document_id(mapped, record, study_key)
+    return mapped
 
 
 class MongoDbExportSink(ExportSink):
@@ -198,6 +227,7 @@ class MongoDbExportSink(ExportSink):
         self._database = self.config.database
         self._collection_name = self.config.collection
         self._study_key = self.config.study_key
+        self._seq_counters: dict[str, int] = {}
         self._client: Any = None
         self._collection: Any = None
         self._connect()
@@ -231,10 +261,12 @@ class MongoDbExportSink(ExportSink):
         if not records:
             return 0
 
+        post_proc = None if self.config.as_sdtm else _post_process_document
         mapper = build_sink_mapper(
             self.config,
             mode="document",
-            post_processor=_post_process_document,
+            post_processor=post_proc,
+            seq_counters=self._seq_counters,
         )
         mapped_docs: list[dict[str, Any]] | None = None
 

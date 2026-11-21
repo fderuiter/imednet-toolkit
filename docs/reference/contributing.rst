@@ -22,7 +22,7 @@ We recommend using our interactive setup wizard to configure your environment, c
 
    bash scripts/wizards/setup-imednet-env.sh
 
-The wizard configures UTF-8 encoding (preventing Windows console errors), validates your ``uv`` installation, synchronizes all 4 packages in editable mode (``uv sync --extra dev --extra docs``), and configures ``.env`` with EDC credentials and safety flags.
+The wizard configures UTF-8 encoding (preventing Windows console errors), validates your ``uv`` installation, synchronizes all 5 packages in editable mode (``uv sync --locked --all-packages --all-extras``), and configures ``.env`` with EDC credentials and safety flags.
 
 For manual setup:
 
@@ -32,7 +32,7 @@ For manual setup:
    export PYTHONUTF8=1   # in PowerShell: $env:PYTHONUTF8 = "1"
 
    # Synchronize workspace dependencies
-   uv sync --extra dev --extra docs
+   uv sync --locked --all-packages --all-extras
 
 Public API stability
 --------------------

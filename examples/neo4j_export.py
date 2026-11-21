@@ -21,9 +21,8 @@ from __future__ import annotations
 
 import os
 
-from imednet_sinks import Neo4jSinkConfig, export_to_neo4j
-
 from imednet import ImednetSDK
+from imednet_sinks import Neo4jSinkConfig, export_to_neo4j
 
 _SIM_MODE = os.environ.get("IMEDNET_SIMULATION_MODE", "").strip().lower() in {
     "1",

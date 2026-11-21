@@ -90,10 +90,7 @@ def _ensure_airflow_provider_finder() -> None:
         idx
         for idx, finder in enumerate(sys.meta_path)
         if getattr(finder, "_imednet_airflow_provider_finder", False)
-        or (
-            type(finder).__name__ == "_ImednetAirflowProviderFinder"
-            and type(finder).__module__ == __name__
-        )
+        or type(finder).__name__ == "_ImednetAirflowProviderFinder"
     ]
     if not existing:
         sys.meta_path.insert(0, _ImednetAirflowProviderFinder())

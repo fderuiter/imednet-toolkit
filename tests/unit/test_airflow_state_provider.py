@@ -17,7 +17,7 @@ import pytest
 if (
     "airflow" not in sys.modules
     or getattr(sys.modules.get("airflow"), "__path__", None) is None
-    or getattr(sys.modules.get("airflow"), "__file__", None) is None
+    or not getattr(sys.modules.get("airflow"), "__file__", None)
 ):
     for _mod in list(sys.modules):
         if _mod == "airflow" or _mod.startswith(("airflow.", "apache_airflow_providers_imednet")):
@@ -42,7 +42,7 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     if (
         "airflow" not in sys.modules
         or getattr(sys.modules.get("airflow"), "__path__", None) is None
-        or getattr(sys.modules.get("airflow"), "__file__", None) is None
+        or not getattr(sys.modules.get("airflow"), "__file__", None)
     ):
         for mod in list(sys.modules):
             if mod == "airflow" or mod.startswith(("airflow.", "apache_airflow_providers_imednet")):

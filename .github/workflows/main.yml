@@ -222,7 +222,7 @@ jobs:
           uv run ruff format --check .
           uv run ruff check .
           uv run mypy packages examples tests/typing/endpoint_contracts.py
-          uv run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_tui --cov-fail-under=90
+          uv run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_sinks --cov=imednet_tui --cov-fail-under=90
 
       - name: Verify Model Type Stubs
         run: |
@@ -363,6 +363,7 @@ jobs:
             uv-venv-${{ runner.os }}-${{ matrix.python-version }}-
 
       - name: Download Built Artifacts
+        if: needs.plan.outputs.build_matrix != '[]'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*
@@ -390,12 +391,10 @@ jobs:
             TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*sinks* --ignore-glob=*tui/* tests/"
             COV_ARGS="--cov=imednet"
           elif [ "$PACKAGE" = "plugins-workflows" ]; then
-
-
-            TEST_ARGS="tests/unit/test_workflows*.py tests/unit/workflows/ tests/workflows/ tests/unit/test_chunked_pipeline.py tests/unit/cli/ tests/unit/test_config_version_control.py tests/unit/test_duckdb_ingestion_workflow.py tests/unit/test_job_poller.py tests/unit/test_record_mapper.py tests/unit/test_record_mapper_hierarchy.py tests/unit/test_state_ledger.py tests/unit/test_study_structure.py tests/unit/test_sync_worker.py tests/unit/test_cached_records_loader.py"
+            TEST_ARGS="tests/unit/test_workflows*.py tests/integration/test_workflows*.py tests/integration/test_sync_worker_integration.py tests/unit/workflows/ tests/workflows/ tests/unit/test_chunked_pipeline.py tests/unit/cli/ tests/unit/test_config_version_control.py tests/unit/test_duckdb_ingestion_workflow.py tests/unit/test_job_poller.py tests/unit/test_record_mapper.py tests/unit/test_record_mapper_hierarchy.py tests/unit/test_state_ledger.py tests/unit/test_state_ledger_providers.py tests/unit/test_study_structure.py tests/unit/test_sync_worker.py tests/unit/test_cached_records_loader.py tests/unit/test_batch_validation_and_polling.py tests/unit/test_keyed_upserts_and_watermark_recovery.py tests/unit/test_mode_safe_plugin_protocols.py tests/unit/test_tabular_import.py"
             COV_ARGS="--cov=imednet_workflows"
           elif [ "$PACKAGE" = "providers-airflow" ]; then
-            TEST_ARGS="tests/unit/test_airflow*.py"
+            TEST_ARGS="tests/unit/test_airflow*.py tests/integration/test_airflow*.py"
             COV_ARGS="--cov=apache_airflow_providers_imednet"
           elif [ "$PACKAGE" = "plugins-sinks" ]; then
             TEST_ARGS="packages/plugins-sinks/tests/"
@@ -603,8 +602,15 @@ jobs:
           restore-keys: |
             uv-venv-${{ runner.os }}-"3.11"-
 
-      - name: Install build tool
-        run: python -m pip install build
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: "false"
+
+      - name: Install Dependencies
+        run: |
+          uv sync --locked --all-packages --all-extras
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Tighten Internal Dependencies
         run: python scripts/tighten_dependencies.py --rewrite

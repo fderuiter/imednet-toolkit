@@ -1,7 +1,7 @@
 Package compatibility and release policy
 ========================================
 
-The four distributions ship independently. Release-please owns their versions,
+The five distributions ship independently. Release-please owns their versions,
 package tags and release notes. A workspace checkout is a development environment,
 not an installable substitute for any published extension. Current 1.x contracts
 use semantic versioning even while the core classifier remains Beta.
@@ -24,6 +24,9 @@ use semantic versioning even while the core classifier remains Beta.
    * - ``apache-airflow-providers-imednet``
      - 3.11, 3.12, 3.13 / >=1.0,<2
      - Airflow >=3.2,<4; additionally obey Airflow's Python constraints
+   * - ``imednet-tui``
+     - 3.11, 3.12, 3.13 / >=1.0,<2
+     - Textual >=0.86 per manifest
 
 Newer Python versions allowed by metadata are not claimed tested until added to
 the CI matrix. Supported combinations are the intersection of this table and all
@@ -36,15 +39,16 @@ release, with a documented migration and security exception approved by the main
 
 Development and documentation checkouts require Python >=3.11.5 so patched
 Soup Sieve releases can install. Recreate older workspace virtual environments
-with a supported interpreter, then run ``uv sync --locked --extra dev --extra docs``.
-This patch minimum belongs to the workspace's tooling; the four published
+with a supported interpreter, then run ``uv sync --locked --all-packages --all-extras``.
+This patch minimum belongs to the workspace's tooling; the five published
 distributions retain their Python >=3.11 metadata. Workspace security constraints
 and the independent lockfile audit are documented in
 :doc:`security_exceptions`.
 
 Install core with ``pip install imednet``. Use ``imednet[cli]`` for optional dotenv
-and logging helpers, ``imednet[export]`` for tabular workflows, or
-``imednet[mongodb]``, ``imednet[neo4j]``, ``imednet[snowflake]`` for sinks.
+and logging helpers, ``imednet[export]`` for tabular workflows, ``imednet[tui]``
+for the interactive terminal UI, or ``imednet[mongodb]``, ``imednet[neo4j]``,
+``imednet[snowflake]`` for sinks.
 Install the Airflow distribution separately. Extras are dependency bundles, not
 separate versions or guarantees that external services are configured.
 

@@ -224,9 +224,10 @@ class DuckDBIngestionWorkflow:
         if value is None:
             return None
         if isinstance(value, datetime):
-            if value.tzinfo is not None and value.utcoffset() is not None:
-                value = value.astimezone(UTC).replace(tzinfo=None)
-            return value.isoformat()
+            dt = value
+            if dt.tzinfo is not None and dt.utcoffset() is not None:
+                dt = dt.astimezone(UTC).replace(tzinfo=None)
+            return dt.isoformat()
         if isinstance(value, str):
             return value if value.strip() else None
         return str(value)

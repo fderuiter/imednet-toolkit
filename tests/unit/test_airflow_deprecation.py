@@ -2,7 +2,20 @@
 
 import sys
 
+import pytest
 from tests.utils.airflow_mocks import setup_dummy_airflow
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _isolate_provider_modules():
+    """Prevent dummy Airflow subclasses from leaking into or out of this module."""
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
 
 
 def _setup_airflow(monkeypatch):

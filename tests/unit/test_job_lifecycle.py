@@ -270,36 +270,46 @@ def test_evaluate_job_state_rejects_unvalidated_state_strings() -> None:
 def test_airflow_job_sensor_stale_response_protection(monkeypatch: pytest.MonkeyPatch) -> None:
     """Criterion 5: ImednetJobSensor.poke succeeds deterministically when terminal states occur."""
     import importlib
+    import sys
 
     from tests.unit.test_airflow_operators import _patch_basehook, _setup_airflow
 
-    _setup_airflow(monkeypatch)
-    _patch_basehook(monkeypatch)
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
 
-    from apache_airflow_providers_imednet import sensors
+    try:
+        _setup_airflow(monkeypatch)
+        _patch_basehook(monkeypatch)
 
-    importlib.reload(sensors)
+        from apache_airflow_providers_imednet import sensors
 
-    sdk = MagicMock()
-    hook_inst = MagicMock(get_sdk_client=MagicMock(return_value=sdk))
-    monkeypatch.setattr(sensors, "ImednetHook", MagicMock(return_value=hook_inst))
+        importlib.reload(sensors)
 
-    sensor = sensors.ImednetJobSensor(task_id="t", study_key="S", batch_id="B")
+        sdk = MagicMock()
+        hook_inst = MagicMock(get_sdk_client=MagicMock(return_value=sdk))
+        monkeypatch.setattr(sensors, "ImednetHook", MagicMock(return_value=hook_inst))
 
-    # 1. Active poke -> returns False
-    running_job = JobStatus(batchId="B", state="RUNNING")
-    sdk.jobs.get.return_value = running_job
-    assert sensor.poke({}) is False
+        sensor = sensors.ImednetJobSensor(task_id="t", study_key="S", batch_id="B")
 
-    # 2. Terminal completion poke -> returns True
-    completed_job = JobStatus(batchId="B", state="COMPLETED")
-    sdk.jobs.get.return_value = completed_job
-    assert sensor.poke({}) is True
+        # 1. Active poke -> returns False
+        running_job = JobStatus(batchId="B", state="RUNNING")
+        sdk.jobs.get.return_value = running_job
+        assert sensor.poke({}) is False
 
-    # 3. Subsequent stale non-terminal poke -> succeeds deterministically (returns True)
-    stale_job = JobStatus(batchId="B", state="RUNNING")
-    sdk.jobs.get.return_value = stale_job
-    assert sensor.poke({}) is True
+        # 2. Terminal completion poke -> returns True
+        completed_job = JobStatus(batchId="B", state="COMPLETED")
+        sdk.jobs.get.return_value = completed_job
+        assert sensor.poke({}) is True
+
+        # 3. Subsequent stale non-terminal poke -> succeeds deterministically (returns True)
+        stale_job = JobStatus(batchId="B", state="RUNNING")
+        sdk.jobs.get.return_value = stale_job
+        assert sensor.poke({}) is True
+    finally:
+        for mod in list(sys.modules):
+            if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+                sys.modules.pop(mod, None)
 
 
 # ==============================================================================

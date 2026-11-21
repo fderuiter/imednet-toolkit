@@ -7,7 +7,7 @@ Stack Identification
 
 Before executing any task, audit the active dependency stack. Do not assume the presence of any library.
 
-1. Parse ``pyproject.toml`` (``[project.dependencies]`` and ``[project.optional-dependencies]``) and ``uv.lock`` to identify the exact versions in use.
+1. Parse ``pyproject.toml`` (``[project.dependencies]``, ``[project.optional-dependencies]``, and ``[dependency-groups]``) and ``uv.lock`` to identify the exact versions in use.
 2. Use only libraries already declared in those files. Never introduce a conflicting or unlisted package without an explicit instruction to update dependencies.
 3. Apply the following decision matrix when selecting implementation patterns:
 

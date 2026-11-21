@@ -11,11 +11,11 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from imednet_sinks.plugin import SinksNamespace
 
 from imednet.integrations.sink_base import SinkConfig
 from imednet.plugins import WorkflowsNamespaceProtocol
 from imednet.sdk import ImednetSDK
+from imednet_sinks.plugin import SinksNamespace
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
 from imednet_workflows.register_subjects import RegisterSubjectsWorkflow

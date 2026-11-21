@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -162,64 +163,99 @@ def scope_apidoc_inherited_members(api_dir: Path) -> None:
             rst_file.write_text(updated, encoding="utf-8")
 
 
+def require_sphinx_tools(*tools: str) -> dict[str, str]:
+    """Verify required Sphinx CLI tools exist on PATH before mutating tracked files."""
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for tool in tools:
+        found = shutil.which(tool)
+        if found is None:
+            missing.append(tool)
+        else:
+            resolved[tool] = found
+    if missing:
+        joined = ", ".join(missing)
+        raise FileNotFoundError(
+            f"Required Sphinx tool(s) not found on PATH: {joined}. "
+            "Run via 'uv run python scripts/build_docs.py' after syncing the workspace."
+        )
+    return resolved
+
+
 def generate_api_reference(api_dir: Path | None = None) -> None:
-    """Regenerate docs/reference/api RST files for all workspace packages."""
+    """Regenerate docs/reference/api RST files for all workspace packages via atomic staging."""
     if api_dir is None:
         api_dir = Path("docs/reference/api")
 
-    print("Cleaning old API docs...")
-    if api_dir.exists():
-        shutil.rmtree(api_dir)
+    require_sphinx_tools("sphinx-apidoc")
+    api_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    print("Generating new API docs...")
+    print("Generating new API docs in staging directory...")
     env = os.environ.copy()
     env["SPHINX_APIDOC_OPTIONS"] = "inherited-members,members,show-inheritance"
 
-    # Core package (exclude internal core submodules and legacy http shim)
-    run_command(
-        [
-            "sphinx-apidoc",
-            "-o",
-            str(api_dir),
-            "packages/core/src/imednet",
-            "packages/core/src/imednet/core",
-            "packages/core/src/imednet/http",
-            "-f",
-            "-M",
-            "--tocfile",
-            "core",
-        ],
-        env=env,
-    )
-    emit_curated_core_reference(api_dir)
+    with tempfile.TemporaryDirectory(dir=api_dir.parent, prefix=".api_staging_") as tmp_root:
+        tmp_root_path = Path(tmp_root)
+        staging_dir = tmp_root_path / "api"
+        staging_dir.mkdir(parents=True, exist_ok=True)
 
-    # Other packages
-    packages_dir = Path("packages")
-    for pkg in sorted(packages_dir.iterdir()):
-        if pkg.is_dir() and pkg.name != "core":
-            src_dir = pkg / "src"
-            if src_dir.exists():
-                subdirs = sorted(d for d in src_dir.iterdir() if d.is_dir())
-                if subdirs:
-                    target_dir = subdirs[0]
-                    run_command(
-                        [
-                            "sphinx-apidoc",
-                            "-o",
-                            str(api_dir),
-                            str(target_dir),
-                            "-f",
-                            "-M",
-                            "--tocfile",
-                            pkg.name,
-                        ],
-                        env=env,
-                    )
+        # Core package (exclude internal core submodules and legacy http shim)
+        run_command(
+            [
+                "sphinx-apidoc",
+                "-o",
+                str(staging_dir),
+                "packages/core/src/imednet",
+                "packages/core/src/imednet/core",
+                "packages/core/src/imednet/http",
+                "-f",
+                "-M",
+                "--tocfile",
+                "core",
+            ],
+            env=env,
+        )
+        emit_curated_core_reference(staging_dir)
 
-    scope_apidoc_inherited_members(api_dir)
+        # Other packages
+        packages_dir = Path("packages")
+        for pkg in sorted(packages_dir.iterdir()):
+            if pkg.is_dir() and pkg.name != "core":
+                src_dir = pkg / "src"
+                if src_dir.exists():
+                    subdirs = sorted(d for d in src_dir.iterdir() if d.is_dir())
+                    if subdirs:
+                        target_dir = subdirs[0]
+                        run_command(
+                            [
+                                "sphinx-apidoc",
+                                "-o",
+                                str(staging_dir),
+                                str(target_dir),
+                                "-f",
+                                "-M",
+                                "--tocfile",
+                                pkg.name,
+                            ],
+                            env=env,
+                        )
+
+        scope_apidoc_inherited_members(staging_dir)
+
+        print("Replacing API docs with staged output...")
+        backup_dir = tmp_root_path / "backup"
+        if api_dir.exists():
+            shutil.move(str(api_dir), str(backup_dir))
+        try:
+            shutil.move(str(staging_dir), str(api_dir))
+        except Exception:
+            if backup_dir.exists() and not api_dir.exists():
+                shutil.move(str(backup_dir), str(api_dir))
+            raise
 
 
 def main() -> None:
+    require_sphinx_tools("sphinx-apidoc", "sphinx-build")
     generate_api_reference()
 
     print("Generating ADR index...")

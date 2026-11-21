@@ -11,10 +11,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
-from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
-from imednet_sinks.plugin import SinksNamespace, create_sinks
-from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
 import imednet
 import imednet_workflows
@@ -33,6 +29,10 @@ from imednet.plugins import PluginProtocol, SinksPluginProtocol
 from imednet.simulation import reset_default_simulation_state
 from imednet.spi.validation import DataDictionary
 from imednet.utils.batch_coordinator import BatchCoordinator
+from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
+from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
+from imednet_sinks.plugin import SinksNamespace, create_sinks
+from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 from imednet_workflows import (
     DataExtractionWorkflow,
     RecordUpdateWorkflow,

@@ -921,7 +921,10 @@ def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monk
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mocked_airflow_provider_modules():
-    """Evict provider modules bound to dummy Airflow stubs on module teardown."""
+    """Evict provider modules bound to dummy Airflow stubs on module setup and teardown."""
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
     yield
     for mod in list(sys.modules):
         if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):

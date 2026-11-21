@@ -295,7 +295,9 @@ class RecordMapperProtocol(Protocol):
         domain: str,
         study_key: str,
         *,
+        mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        seq_counters: dict[str, int] | None = None,
     ) -> pd.DataFrame:
         """Transform records into a normalized SDTM domain DataFrame."""
         ...
@@ -308,6 +310,7 @@ class RecordMapperProtocol(Protocol):
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> pd.DataFrame:
         """Return study records mapped to a CDISC SDTM domain DataFrame."""
@@ -321,6 +324,7 @@ class RecordMapperProtocol(Protocol):
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked DataFrames mapped to a CDISC SDTM domain."""
@@ -1145,6 +1149,11 @@ class MongoDbSinkConfigProtocol(Protocol):
     collection: str
     batch_size: int
     max_buffered_records: int | None
+    as_sdtm: bool
+    sdtm_domain: str | None
+    standards_profile: str | Any | None
+    min_standards_score: float | None
+    naming_convention: str | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1177,6 +1186,11 @@ class MongoDbSinkConfigFactoryProtocol(Protocol):
         ledger_path: str | Path | None = None,
         state_provider: Any | None = None,
         max_buffered_records: int | None = None,
+        as_sdtm: bool = False,
+        sdtm_domain: str | None = None,
+        standards_profile: str | Any | None = None,
+        min_standards_score: float | None = None,
+        naming_convention: str | None = None,
         uri: str = "",
         database: str = "",
         collection: str = "",
@@ -1241,6 +1255,11 @@ class Neo4jSinkConfigProtocol(Protocol):
     database: str
     batch_size: int
     max_buffered_records: int | None
+    as_sdtm: bool
+    sdtm_domain: str | None
+    standards_profile: str | Any | None
+    min_standards_score: float | None
+    naming_convention: str | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1273,6 +1292,11 @@ class Neo4jSinkConfigFactoryProtocol(Protocol):
         ledger_path: str | Path | None = None,
         state_provider: Any | None = None,
         max_buffered_records: int | None = None,
+        as_sdtm: bool = False,
+        sdtm_domain: str | None = None,
+        standards_profile: str | Any | None = None,
+        min_standards_score: float | None = None,
+        naming_convention: str | None = None,
         uri: str = "",
         auth: tuple[str, str] = ("", ""),
         database: str = "neo4j",
@@ -1340,6 +1364,11 @@ class SnowflakeSinkConfigProtocol(Protocol):
     stage_prefix: str
     batch_size: int
     max_buffered_records: int | None
+    as_sdtm: bool
+    sdtm_domain: str | None
+    standards_profile: str | Any | None
+    min_standards_score: float | None
+    naming_convention: str | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1372,6 +1401,11 @@ class SnowflakeSinkConfigFactoryProtocol(Protocol):
         ledger_path: str | Path | None = None,
         state_provider: Any | None = None,
         max_buffered_records: int | None = None,
+        as_sdtm: bool = False,
+        sdtm_domain: str | None = None,
+        standards_profile: str | Any | None = None,
+        min_standards_score: float | None = None,
+        naming_convention: str | None = None,
         account: str = "",
         user: str = "",
         password: str = "",
