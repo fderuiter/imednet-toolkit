@@ -105,7 +105,7 @@ Auto-detect and run the repository environment setup (`imednet-toolkit` uses `uv
 
 ```bash
 # Python monorepo (canonical for imednet-toolkit)
-if [ -f uv.lock ] || [ -f pyproject.toml ]; then uv sync --locked --extra dev --extra docs; fi
+if [ -f uv.lock ] || [ -f pyproject.toml ]; then uv sync --locked --all-packages --all-extras; fi
 ```
 
 On Windows PowerShell, load `scripts/env.ps1` (under `pwsh`) or ensure `uv` and `.venv` are resolved before running tests.

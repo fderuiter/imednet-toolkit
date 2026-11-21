@@ -493,3 +493,34 @@ def test_export_to_hive_parquet_streaming_checkpoints_incremental_upsert_and_voi
         ("DEMO", 101, 41, None),
         ("VITALS", 202, None, 82),
     ]
+
+
+def test_parquet_and_cli_import_without_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify core parquet integration and CLI parser import cleanly when pandas is absent."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import builtins\n"
+        "real_import = builtins.__import__\n"
+        "def block_pandas(name, *args, **kwargs):\n"
+        "    if name == 'pandas' or name.startswith('pandas.'):\n"
+        "        raise ModuleNotFoundError(\"No module named 'pandas'\")\n"
+        "    return real_import(name, *args, **kwargs)\n"
+        "builtins.__import__ = block_pandas\n"
+        "import imednet.integrations.parquet as pm\n"
+        "from imednet.cli import get_parser\n"
+        "assert 'pip install' in get_parser().format_help()\n"
+        "assert 'read_parquet' in pm.hive_parquet_query('/tmp/lake')\n"
+    )
+    res = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=False)
+    assert res.returncode == 0, f"Unexpected import failure without pandas:\n{res.stderr}"
+
+    def _raise_pandas_import_error(module_name: str) -> Any:
+        if module_name == "pandas":
+            raise ImportError("missing pandas")
+        return __import__(module_name)
+
+    monkeypatch.setattr(parquet_mod, "import_module", _raise_pandas_import_error)
+    with pytest.raises(ImportError, match=r"pip install 'imednet\[export\]'"):
+        parquet_mod._ensure_pandas()

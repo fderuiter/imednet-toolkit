@@ -3,7 +3,6 @@ from contextlib import AbstractContextManager
 from typing import Literal, assert_type
 
 import pandas as pd
-from imednet_sinks.plugin import SinksNamespace, create_sinks
 
 from imednet import (
     ApiError,
@@ -55,6 +54,7 @@ from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.sinks import ExportSink
 from imednet.utils.batch_coordinator import BatchSubmissionSummary
 from imednet.utils.job_poller import JobPollSummary
+from imednet_sinks.plugin import SinksNamespace, create_sinks
 from imednet_workflows import Workflows
 
 

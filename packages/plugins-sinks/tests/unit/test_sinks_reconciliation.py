@@ -7,17 +7,17 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
-import imednet_sinks.document as doc_mod
-import imednet_sinks.graph as graph_mod
-import imednet_sinks.warehouse as wh_mod
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+
+import imednet_sinks.document as doc_mod
+import imednet_sinks.graph as graph_mod
+import imednet_sinks.warehouse as wh_mod
+from imednet.models.records import Record
 from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig, export_to_mongodb
 from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig, export_to_neo4j
 from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig, export_to_snowflake
-
-from imednet.models.records import Record
 from imednet_workflows.state_ledger import ExtractionStateLedger
 
 

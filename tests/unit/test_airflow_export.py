@@ -27,6 +27,18 @@ EXPORT_FUNCTIONS = [
 ]
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _isolate_provider_modules():
+    """Prevent dummy Airflow subclasses from leaking into or out of this module."""
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+    yield
+    for mod in list(sys.modules):
+        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+            sys.modules.pop(mod, None)
+
+
 @pytest.fixture(autouse=True)
 def setup_airflow_mock(monkeypatch):
     """Helper function to setup airflow mock."""
@@ -1005,9 +1017,9 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     import re
     from types import SimpleNamespace
 
-    import imednet_sinks.warehouse as wh_mod
     import pyarrow.parquet as pq
 
+    import imednet_sinks.warehouse as wh_mod
     from apache_airflow_providers_imednet.hooks import ImednetHook
     from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
     from imednet.models.records import Record

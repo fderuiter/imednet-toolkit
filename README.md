@@ -92,7 +92,7 @@ bash scripts/wizards/setup-imednet-env.sh
 The wizard guides you through:
 1. **Tooling Verification**: Ensuring Python (>= 3.11.5) and `uv` are available in your `PATH`.
 2. **UTF-8 Encoding**: Configuring `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` to prevent Windows console `charmap` encoding errors.
-3. **Workspace Synchronization**: Running `uv sync --all-packages --extra dev --extra docs` to link workspace packages in editable mode.
+3. **Workspace Synchronization**: Running `uv sync --locked --all-packages --all-extras` to link all five workspace packages in editable mode along with member extras and default `dev` and `docs` groups.
 4. **EDC Credentials**: Safely entering EDC API credentials into `.env` (with optional GitHub Actions secrets sync via `gh`).
 5. **Self-Test**: Validating that the SDK and CLI (`imednet --help`) are fully operational.
 
@@ -102,8 +102,8 @@ To set up manually:
 # PowerShell: $env:PYTHONUTF8 = "1"
 # bash: export PYTHONUTF8=1
 
-# Synchronize monorepo packages with dev and docs tooling
-uv sync --all-packages --extra dev --extra docs
+# Synchronize monorepo packages, extras, and default dev/docs dependency groups
+uv sync --locked --all-packages --all-extras
 ```
 
 ## Contributing
