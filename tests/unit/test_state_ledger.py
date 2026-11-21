@@ -815,14 +815,19 @@ def test_airflow_state_provider_out_of_context_model_variable_crud(tmp_path, mon
     db_uri = f"sqlite:///{af_home / 'airflow.db'}"
 
     prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    prev_settings_conn_async = getattr(settings, "SQL_ALCHEMY_CONN_ASYNC", None)
     prev_conf_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
+    prev_pool_enabled = conf.get("database", "sql_alchemy_pool_enabled", fallback=None)
     monkeypatch.setenv("AIRFLOW_HOME", str(af_home))
     monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
-    monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED", "False")
     conf.set("database", "sql_alchemy_conn", db_uri)
+    conf.set("database", "sql_alchemy_pool_enabled", "False")
 
     try:
         settings.dispose_orm()
+        settings.configure_vars()
+        monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
         settings.configure_orm()
         initdb()
 
@@ -863,9 +868,14 @@ def test_airflow_state_provider_out_of_context_model_variable_crud(tmp_path, mon
         assert provider.delete_entry("STUDY_DB") is False
     finally:
         settings.dispose_orm()
-        settings.SQL_ALCHEMY_CONN = prev_settings_conn
         if prev_conf_conn is not None:
             conf.set("database", "sql_alchemy_conn", prev_conf_conn)
+        if prev_pool_enabled is not None:
+            conf.set("database", "sql_alchemy_pool_enabled", prev_pool_enabled)
+        settings.configure_vars()
+        settings.SQL_ALCHEMY_CONN = prev_settings_conn
+        if prev_settings_conn_async is not None and hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC"):
+            settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_conn_async
         settings.configure_orm()
         root_logger.handlers = saved_handlers
         root_logger.setLevel(saved_level)

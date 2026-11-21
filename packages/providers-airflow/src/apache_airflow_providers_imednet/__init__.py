@@ -85,7 +85,7 @@ def _sync_airflow_provider_aliases() -> None:
 
 
 def _ensure_airflow_provider_finder() -> None:
-    """Ensure the ``airflow.providers.imednet`` import alias finder is registered."""
+    """Ensure a single active ``airflow.providers.imednet`` import alias finder is registered."""
     existing = [
         idx
         for idx, finder in enumerate(sys.meta_path)

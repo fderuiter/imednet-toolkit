@@ -48,9 +48,6 @@ def test_imednet_hook_returns_sdk(monkeypatch):
 
 def test_export_operator_calls_helper(monkeypatch):
     """Test that export operator calls helper."""
-    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
-    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
-
     _setup_airflow(monkeypatch)
 
     conn = MagicMock()
@@ -87,9 +84,6 @@ def test_export_operator_calls_helper(monkeypatch):
 
 def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
     """Test that export operator exposes mapped runtime fields."""
-    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
-    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
-
     _setup_airflow(monkeypatch)
 
     from apache_airflow_providers_imednet import ImednetExportOperator
@@ -105,9 +99,6 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
 
 def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monkeypatch):
     """Test that export operator copies runtime kwargs and resolves sdk at execute."""
-    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
-    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
-
     _setup_airflow(monkeypatch)
 
     conn = MagicMock()
@@ -150,9 +141,6 @@ def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monke
 
 def test_export_operator_rejects_unknown_export_callable(monkeypatch):
     """Test that export operator rejects unknown export callable."""
-    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
-    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
-
     _setup_airflow(monkeypatch)
 
     conn = MagicMock()
@@ -589,10 +577,6 @@ def test_export_operator_template_field_rendering_simulation(monkeypatch):
     mapped runtime fields (``study_key``, ``output_path``, ``export_kwargs``) are
     picked up from the instance at execute time rather than captured at construction.
     """
-    for mod in list(sys.modules):
-        if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
-            monkeypatch.delitem(sys.modules, mod, raising=False)
-
     _setup_airflow(monkeypatch)
 
     import apache_airflow_providers_imednet as airflow_mod
@@ -677,9 +661,6 @@ def test_list_study_keys_skips_entries_without_recognized_key(monkeypatch):
 
 def test_export_operator_resolves_snowflake_sink(monkeypatch):
     """Test that export operator resolves snowflake sink."""
-    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
-    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
-
     _setup_airflow(monkeypatch)
     conn = MagicMock()
     import airflow.sdk.bases.hook as hooks_base

@@ -7,6 +7,8 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import MagicMock
 
+from tests.conftest import isolate_airflow_provider_modules
+
 
 def setup_dummy_airflow(
     monkeypatch: Any,
@@ -14,6 +16,7 @@ def setup_dummy_airflow(
     include_sensors_and_aws: bool = False,
 ) -> None:
     """Populate ``sys.modules`` with lightweight Airflow 3.x SDK stubs."""
+    isolate_airflow_provider_modules(monkeypatch)
     airflow_mod = ModuleType("airflow")
     airflow_mod.__path__ = []
     hooks_pkg = ModuleType("airflow.hooks")
@@ -82,15 +85,6 @@ def setup_dummy_airflow(
     airflow_mod.sdk = sdk_mod  # type: ignore[attr-defined]
     airflow_mod.hooks = hooks_pkg  # type: ignore[attr-defined]
     airflow_mod.models = models_mod  # type: ignore[attr-defined]
-
-    for mod_name in list(sys.modules):
-        if mod_name in {
-            "apache_airflow_providers_imednet",
-            "airflow.providers.imednet",
-        } or mod_name.startswith(
-            ("apache_airflow_providers_imednet.", "airflow.providers.imednet.")
-        ):
-            monkeypatch.delitem(sys.modules, mod_name, raising=False)
 
     modules: dict[str, ModuleType] = {
         "airflow": airflow_mod,

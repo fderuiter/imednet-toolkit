@@ -3335,10 +3335,12 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         self, monkeypatch, tmp_path
     ):
         """Snowflake, MongoDB, and Neo4j emit uppercase SDTM schemas with monotonic --SEQ per USUBJID."""
+        import pyarrow.parquet as pq
+
         import imednet_sinks.document as doc_mod
         import imednet_sinks.graph as graph_mod
         import imednet_sinks.warehouse as wh_mod
-        import pyarrow.parquet as pq
+        from imednet.models.records import Record
         from imednet_sinks import (
             MongoDbExportSink,
             MongoDbSinkConfig,
@@ -3347,8 +3349,6 @@ class TestPluginSinksSdtmAndNamingConventionParity:
             SnowflakeExportSink,
             SnowflakeSinkConfig,
         )
-
-        from imednet.models.records import Record
 
         batch_1 = [
             Record(
@@ -3468,11 +3468,16 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         self, monkeypatch, tmp_path, convention
     ):
         """naming_convention produces aligned clinical variable and identifier keys across Parquet and plugin sinks."""
+        import pandas as pd
+        import pyarrow.parquet as pq
+
         import imednet_sinks.document as doc_mod
         import imednet_sinks.graph as graph_mod
         import imednet_sinks.warehouse as wh_mod
-        import pandas as pd
-        import pyarrow.parquet as pq
+        from imednet.integrations import export as export_mod
+        from imednet.models.forms import Form
+        from imednet.models.records import Record
+        from imednet.models.variables import Variable
         from imednet_sinks import (
             MongoDbExportSink,
             MongoDbSinkConfig,
@@ -3481,11 +3486,6 @@ class TestPluginSinksSdtmAndNamingConventionParity:
             SnowflakeExportSink,
             SnowflakeSinkConfig,
         )
-
-        from imednet.integrations import export as export_mod
-        from imednet.models.forms import Form
-        from imednet.models.records import Record
-        from imednet.models.variables import Variable
 
         rec = Record(
             record_id=55,
@@ -3614,14 +3614,13 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         """Neo4j and Snowflake reconcile_deleted match identifiers formatted by naming_convention."""
         import imednet_sinks.graph as graph_mod
         import imednet_sinks.warehouse as wh_mod
+        from imednet.models.records import Record
         from imednet_sinks import (
             Neo4jExportSink,
             Neo4jSinkConfig,
             SnowflakeExportSink,
             SnowflakeSinkConfig,
         )
-
-        from imednet.models.records import Record
 
         voided = Record(record_id=88, study_key="DEL_STUDY", deleted=True, record_data={})
 

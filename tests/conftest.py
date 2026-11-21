@@ -351,3 +351,52 @@ async def respx_mock_async_client(async_http_client, respx_mock):
 def sample_data():
     """Provide a simple dictionary for testing data handling."""
     return {"data": [1]}
+
+
+_AIRFLOW_PROVIDER_MODULES = (
+    "apache_airflow_providers_imednet",
+    "apache_airflow_providers_imednet._airflow_compat",
+    "apache_airflow_providers_imednet.export",
+    "apache_airflow_providers_imednet.get_provider_info",
+    "apache_airflow_providers_imednet.hooks",
+    "apache_airflow_providers_imednet.operators",
+    "apache_airflow_providers_imednet.operators.export",
+    "apache_airflow_providers_imednet.sensors",
+    "apache_airflow_providers_imednet.triggers",
+    "airflow.providers.imednet",
+    "airflow.providers.imednet._airflow_compat",
+    "airflow.providers.imednet.export",
+    "airflow.providers.imednet.get_provider_info",
+    "airflow.providers.imednet.hooks",
+    "airflow.providers.imednet.operators",
+    "airflow.providers.imednet.operators.export",
+    "airflow.providers.imednet.sensors",
+    "airflow.providers.imednet.triggers",
+)
+
+
+def isolate_airflow_provider_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate Airflow provider imports during dummy-Airflow monkeypatched tests.
+
+    Unloads cached ``airflow*`` and ``apache_airflow_providers_imednet*``
+    modules before installing dummy ``airflow`` modules and restores exact
+    pre-test ``sys.modules`` and ``sys.meta_path`` state on teardown.
+    """
+    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
+    providers_pkg = sys.modules.get("airflow.providers")
+    if providers_pkg is not None and hasattr(providers_pkg, "imednet"):
+        monkeypatch.delattr(providers_pkg, "imednet", raising=False)
+
+    candidate_names = set(_AIRFLOW_PROVIDER_MODULES)
+    for mod_name in list(sys.modules):
+        if mod_name == "airflow" or mod_name.startswith(
+            ("airflow.", "apache_airflow_providers_imednet")
+        ):
+            candidate_names.add(mod_name)
+
+    for mod_name in sorted(candidate_names):
+        if mod_name in sys.modules:
+            monkeypatch.delitem(sys.modules, mod_name, raising=False)
+        else:
+            monkeypatch.setitem(sys.modules, mod_name, None)  # type: ignore[arg-type]
+            del sys.modules[mod_name]

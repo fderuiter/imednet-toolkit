@@ -62,11 +62,14 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     db_uri = f"sqlite:///{db_path}"
     async_db_uri = f"sqlite+aiosqlite:///{db_path}"
 
-    import airflow.dag_processing.bundles.manager as bundle_manager_mod
     from airflow import settings
     from airflow.configuration import conf
+    from airflow.dag_processing import bundles
     from airflow.dag_processing.bundles.manager import DagBundlesManager
     from airflow.utils import db
+
+    bundle_manager_mod = getattr(bundles, "manager", None)
+    snapshot_cache = getattr(bundle_manager_mod, "_load_bundle_config_snapshot", None)
 
     prev_conn = conf.get("database", "sql_alchemy_conn", fallback=None)
     prev_async_conn = conf.get("database", "sql_alchemy_conn_async", fallback=None)
@@ -75,10 +78,9 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     prev_examples = conf.get("core", "load_examples", fallback=None)
     prev_bundles = conf.get("dag_processor", "dag_bundle_config_list", fallback=None)
     prev_settings_conn = settings.SQL_ALCHEMY_CONN
+    has_async_conn_attr = hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC")
     prev_settings_async_conn = getattr(settings, "SQL_ALCHEMY_CONN_ASYNC", None)
     prev_settings_dags = settings.DAGS_FOLDER
-    has_async_conn_attr = hasattr(settings, "SQL_ALCHEMY_CONN_ASYNC")
-    snapshot_cache = getattr(bundle_manager_mod, "_load_bundle_config_snapshot", None)
 
     bundle_cfg = json.dumps(
         [
@@ -105,13 +107,15 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     conf.set("database", "sql_alchemy_conn_async", async_db_uri)
     conf.set("database", "sql_alchemy_pool_enabled", "False")
     conf.set("dag_processor", "dag_bundle_config_list", bundle_cfg)
+    if callable(getattr(snapshot_cache, "cache_clear", None)):
+        snapshot_cache.cache_clear()
+
+    settings.dispose_orm()
+    settings.configure_vars()
     monkeypatch.setattr(settings, "DAGS_FOLDER", str(dags_dir))
     monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", db_uri)
     if has_async_conn_attr:
         monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
-    if snapshot_cache is not None and hasattr(snapshot_cache, "cache_clear"):
-        snapshot_cache.cache_clear()
-    settings.dispose_orm()
     settings.configure_orm()
     db.initdb()
     DagBundlesManager().sync_bundles_to_db()
@@ -123,10 +127,6 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
             os.environ.pop(env_key, None)
 
     settings.dispose_orm()
-    settings.SQL_ALCHEMY_CONN = prev_settings_conn
-    if has_async_conn_attr:
-        settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_async_conn
-    settings.DAGS_FOLDER = prev_settings_dags
     if prev_conn is not None:
         conf.set("database", "sql_alchemy_conn", prev_conn)
     if prev_async_conn is not None:
@@ -139,8 +139,13 @@ def airflow_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         conf.set("core", "load_examples", prev_examples)
     if prev_bundles is not None:
         conf.set("dag_processor", "dag_bundle_config_list", prev_bundles)
-    if snapshot_cache is not None and hasattr(snapshot_cache, "cache_clear"):
+    if callable(getattr(snapshot_cache, "cache_clear", None)):
         snapshot_cache.cache_clear()
+    settings.configure_vars()
+    settings.SQL_ALCHEMY_CONN = prev_settings_conn
+    if has_async_conn_attr:
+        settings.SQL_ALCHEMY_CONN_ASYNC = prev_settings_async_conn
+    settings.DAGS_FOLDER = prev_settings_dags
     settings.configure_orm()
 
     root_logger.handlers = saved_handlers

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
 import logging
 import runpy
 from collections.abc import Iterator
@@ -118,6 +116,7 @@ def test_custom_retry_script_executes_under_simulation_mode(
 def test_showcase_js_sdk_snippets_execute_under_simulation_transport(
     scenario: str,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Execute each SNIPPETS.sdk template from docs/_static/showcase.js with SimulationTransport."""
     for env_key in ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_BASE_URL"):
@@ -137,9 +136,9 @@ def test_showcase_js_sdk_snippets_execute_under_simulation_transport(
     monkeypatch.setattr(ImednetSDK, "__init__", _patched_init)
 
     namespace: dict[str, Any] = {"__name__": "__showcase_test__"}
-    stdout_buf = io.StringIO()
-    with contextlib.redirect_stdout(stdout_buf):
-        exec(compile(snippets[scenario], f"showcase.js:{scenario}", "exec"), namespace)
+    capsys.readouterr()
+    exec(compile(snippets[scenario], f"showcase.js:{scenario}", "exec"), namespace)
+    capsys.readouterr()
 
     expected_models: dict[str, type[object]] = {
         "records": Record,
@@ -157,20 +156,21 @@ def test_showcase_js_sdk_snippets_execute_under_simulation_transport(
 
 def test_documented_cli_query_scope_filter_succeeds_in_simulation(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify the documented Query target-scope CLI filter in docs/how-to/cli.rst executes cleanly."""
     monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "true")
     monkeypatch.setenv("IMEDNET_NON_INTERACTIVE", "1")
-    stdout_buf = io.StringIO()
-    with contextlib.redirect_stdout(stdout_buf):
-        app(
-            [
-                "queries",
-                "list",
-                "STUDY",
-                "--filter",
-                "type==record,type==question",
-                "--sort",
-                "annotationId,desc",
-            ]
-        )
+    capsys.readouterr()
+    app(
+        [
+            "queries",
+            "list",
+            "STUDY",
+            "--filter",
+            "type==record,type==question",
+            "--sort",
+            "annotationId,desc",
+        ]
+    )
+    capsys.readouterr()
