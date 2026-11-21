@@ -374,10 +374,9 @@ _AIRFLOW_PROVIDER_MODULES = (
 def isolate_airflow_provider_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate Airflow provider imports during dummy-Airflow monkeypatched tests.
 
-    Unloads cached ``apache_airflow_providers_imednet*`` and
-    ``airflow.providers.imednet*`` modules before installing dummy ``airflow``
-    modules and restores exact pre-test ``sys.modules`` and ``sys.meta_path``
-    state on teardown.
+    Unloads cached ``airflow*`` and ``apache_airflow_providers_imednet*``
+    modules before installing dummy ``airflow`` modules and restores exact
+    pre-test ``sys.modules`` and ``sys.meta_path`` state on teardown.
     """
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     providers_pkg = sys.modules.get("airflow.providers")
@@ -386,7 +385,9 @@ def isolate_airflow_provider_modules(monkeypatch: pytest.MonkeyPatch) -> None:
 
     candidate_names = set(_AIRFLOW_PROVIDER_MODULES)
     for mod_name in list(sys.modules):
-        if mod_name.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):
+        if mod_name == "airflow" or mod_name.startswith(
+            ("airflow.", "apache_airflow_providers_imednet")
+        ):
             candidate_names.add(mod_name)
 
     for mod_name in sorted(candidate_names):

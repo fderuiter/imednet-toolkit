@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
 import runpy
 from collections.abc import Iterator
 from pathlib import Path
@@ -52,6 +50,7 @@ def test_basic_tutorial_scripts_execute_under_simulation_transport(
     script_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Run each examples/basic/*.py script offline via SimulationTransport without TypeError or ConfigurationError."""
     monkeypatch.chdir(tmp_path)
@@ -74,20 +73,20 @@ def test_basic_tutorial_scripts_execute_under_simulation_transport(
 
     monkeypatch.setattr(ImednetSDK, "__init__", _patched_init)
 
-    stdout_buf = io.StringIO()
+    capsys.readouterr()
     try:
-        with contextlib.redirect_stdout(stdout_buf):
-            runpy.run_path(str(script_path), run_name="__main__")
+        runpy.run_path(str(script_path), run_name="__main__")
     except (TypeError, ConfigurationError, SystemExit) as exc:
         pytest.fail(
             f"{script_path.name} failed under SimulationTransport: {type(exc).__name__}: {exc}"
         )
 
-    assert stdout_buf.getvalue().strip(), f"Expected non-empty stdout from {script_path.name}"
+    assert capsys.readouterr().out.strip(), f"Expected non-empty stdout from {script_path.name}"
 
 
 def test_custom_retry_script_executes_under_simulation_mode(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify examples/custom_retry.py passes RetryConfig and succeeds offline across repeated runs."""
     custom_retry_path = REPO_ROOT / "examples" / "custom_retry.py"
@@ -96,20 +95,20 @@ def test_custom_retry_script_executes_under_simulation_mode(
     monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "true")
 
     for _ in range(2):
-        stdout_buf = io.StringIO()
+        capsys.readouterr()
         try:
-            with contextlib.redirect_stdout(stdout_buf):
-                runpy.run_path(str(custom_retry_path), run_name="__main__")
+            runpy.run_path(str(custom_retry_path), run_name="__main__")
         except (TypeError, ConfigurationError, SystemExit) as exc:
             pytest.fail(f"custom_retry.py failed offline: {type(exc).__name__}: {exc}")
 
-        assert "Request succeeded" in stdout_buf.getvalue()
+        assert "Request succeeded" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("scenario", SHOWCASE_EXPECTED_SDK_SCENARIOS)
 def test_showcase_js_sdk_snippets_execute_under_simulation_transport(
     scenario: str,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Execute each SNIPPETS.sdk template from docs/_static/showcase.js with SimulationTransport."""
     for env_key in ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_BASE_URL"):
@@ -129,9 +128,9 @@ def test_showcase_js_sdk_snippets_execute_under_simulation_transport(
     monkeypatch.setattr(ImednetSDK, "__init__", _patched_init)
 
     namespace: dict[str, Any] = {"__name__": "__showcase_test__"}
-    stdout_buf = io.StringIO()
-    with contextlib.redirect_stdout(stdout_buf):
-        exec(compile(snippets[scenario], f"showcase.js:{scenario}", "exec"), namespace)
+    capsys.readouterr()
+    exec(compile(snippets[scenario], f"showcase.js:{scenario}", "exec"), namespace)
+    capsys.readouterr()
 
     expected_models: dict[str, type[object]] = {
         "records": Record,
@@ -149,20 +148,21 @@ def test_showcase_js_sdk_snippets_execute_under_simulation_transport(
 
 def test_documented_cli_query_scope_filter_succeeds_in_simulation(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify the documented Query target-scope CLI filter in docs/how-to/cli.rst executes cleanly."""
     monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "true")
     monkeypatch.setenv("IMEDNET_NON_INTERACTIVE", "1")
-    stdout_buf = io.StringIO()
-    with contextlib.redirect_stdout(stdout_buf):
-        app(
-            [
-                "queries",
-                "list",
-                "STUDY",
-                "--filter",
-                "type==record,type==question",
-                "--sort",
-                "annotationId,desc",
-            ]
-        )
+    capsys.readouterr()
+    app(
+        [
+            "queries",
+            "list",
+            "STUDY",
+            "--filter",
+            "type==record,type==question",
+            "--sort",
+            "annotationId,desc",
+        ]
+    )
+    capsys.readouterr()
