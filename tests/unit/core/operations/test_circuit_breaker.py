@@ -295,8 +295,12 @@ async def test_non_retried_post_500_and_connect_error_increment_failure_once(
                     await client.post("/records", json={"recordData": {}})
                 assert breaker.consecutive_failures == expected
 
-            with pytest.raises(httpx.ConnectError):
+            with pytest.raises(RequestError) as net_exc:
                 await client.post("/records-net", json={"recordData": {}})
+            assert isinstance(net_exc.value.__cause__, httpx.ConnectError)
+            assert net_exc.value.method == "POST"
+            assert net_exc.value.url == f"{BASE_URL}/records-net"
+            assert net_exc.value.attempt_count == 1
             assert breaker.consecutive_failures == 3
             assert breaker.state is CircuitState.CLOSED
     else:
@@ -312,8 +316,12 @@ async def test_non_retried_post_500_and_connect_error_increment_failure_once(
                     client.post("/records", json={"recordData": {}})
                 assert breaker.consecutive_failures == expected
 
-            with pytest.raises(httpx.ConnectError):
+            with pytest.raises(RequestError) as net_exc:
                 client.post("/records-net", json={"recordData": {}})
+            assert isinstance(net_exc.value.__cause__, httpx.ConnectError)
+            assert net_exc.value.method == "POST"
+            assert net_exc.value.url == f"{BASE_URL}/records-net"
+            assert net_exc.value.attempt_count == 1
             assert breaker.consecutive_failures == 3
             assert breaker.state is CircuitState.CLOSED
 
@@ -581,3 +589,37 @@ async def test_direct_executor_fallback_uses_global_circuit_breaker_and_skips_ca
         await async_exec("GET", f"{BASE_URL}/ping")
     assert calls == 1
     assert global_breaker.consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_error_subclasses_imednet_error_and_attaches_context(
+    respx_mock,
+) -> None:
+    """CircuitBreakerError subclasses ImednetError in errors & spi.errors and carries DiagnosticContext."""
+    from imednet.errors import CircuitBreakerError as PublicCircuitBreakerError
+    from imednet.errors import ImednetError
+    from imednet.spi.errors import CircuitBreakerError as SpiCircuitBreakerError
+
+    assert PublicCircuitBreakerError is CircuitBreakerError
+    assert SpiCircuitBreakerError is CircuitBreakerError
+    assert issubclass(CircuitBreakerError, ImednetError)
+
+    respx_mock.get(f"{BASE_URL}/down").respond(500)
+
+    with Client(
+        api_key="k",
+        security_key="s",
+        base_url=BASE_URL,
+        retry_config=RetryConfig(retries=0, backoff_factor=0),
+    ) as client:
+        client._circuit_breaker.failure_threshold = 1
+        with pytest.raises(ServerError):
+            client.get("/down")
+
+        with pytest.raises(ImednetError) as cb_exc:
+            client.get("/down?api_key=raw-cb-secret")
+
+    assert isinstance(cb_exc.value, CircuitBreakerError)
+    assert cb_exc.value.method == "GET"
+    assert cb_exc.value.url == "/down?api_key=***"
+    assert cb_exc.value.attempt_count == 0

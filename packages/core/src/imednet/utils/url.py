@@ -54,15 +54,21 @@ def sanitize_base_url(url: str) -> str:
 
 def redact_url_query(url: str, sensitive_params: set[str] | None = None) -> str:
     """Return URL with sensitive query parameters redacted."""
-    if sensitive_params is None:
-        sensitive_params = {"api_key", "security_key", "token", "secret", "password"}
+    from imednet.utils.secrets import is_sensitive_key
+
+    default_params = {"api_key", "security_key", "token", "secret", "password"}
 
     parsed = urlparse(url)
     query_params = parse_qsl(parsed.query, keep_blank_values=True)
 
     new_query_params = []
     for key, value in query_params:
-        if key in sensitive_params:
+        is_secret = (
+            key in sensitive_params
+            if sensitive_params is not None
+            else (key.lower() in default_params or is_sensitive_key(key))
+        )
+        if is_secret:
             new_query_params.append((key, "***"))
         else:
             new_query_params.append((key, value))

@@ -111,6 +111,24 @@ def test_request_error_mapping(status, exc) -> None:
             None,
         ),
         (
+            401,
+            {
+                "metadata": {
+                    "status": "UNAUTHORIZED",
+                    "path": "/api/v1/edc/studies",
+                    "timestamp": "2018-10-18 05:46:29",
+                    "error": {
+                        "code": "9001",
+                        "description": "Unauthorized error. Insufficient permission to retrieve data.",
+                    },
+                }
+            },
+            errors.AuthenticationError,
+            9001,
+            "Unauthorized error. Insufficient permission to retrieve data.",
+            None,
+        ),
+        (
             403,
             {
                 "metadata": {
@@ -123,7 +141,7 @@ def test_request_error_mapping(status, exc) -> None:
                     },
                 }
             },
-            errors.AuthenticationError,
+            errors.ForbiddenError,
             9001,
             "Unauthorized error. Insufficient permission to retrieve data.",
             None,
@@ -154,6 +172,9 @@ def test_nested_metadata_error_http_dispatch(
     assert err.description == expected_msg
     assert err.field == expected_field
     assert err.status == payload["metadata"]["status"]
+    assert err.method == "GET"
+    assert err.url == "https://api.test/nested"
+    assert err.attempt_count == 1
 
 
 def test_non_json_error_fallback() -> None:
