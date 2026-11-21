@@ -143,6 +143,51 @@ def test_export_to_hive_parquet_missing_pyarrow(monkeypatch) -> None:
         parquet_mod.export_to_hive_parquet(MagicMock(), "STUDY_A", "/tmp/lake")
 
 
+def test_parquet_and_cli_import_without_optional_pandas_or_pyarrow() -> None:
+    """Verify imednet.integrations.parquet and imednet.cli load in a fresh process without pandas or pyarrow."""
+    import subprocess
+    import sys
+
+    script = (
+        "import importlib.abc, sys\n"
+        "class _BlockOptional(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, fullname, path, target=None):\n"
+        "        if fullname.split('.')[0] in {'pandas', 'pyarrow'}:\n"
+        "            raise ModuleNotFoundError(f'No module named {fullname!r}', name=fullname)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _BlockOptional())\n"
+        "import imednet.integrations.parquet as parquet_mod\n"
+        "assert 'read_parquet' in parquet_mod.hive_parquet_query('/tmp/lake')\n"
+        "from imednet.cli import get_parser\n"
+        "assert \"pip install 'imednet[cli]'\" in get_parser().format_help()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_prune_hive_partition_record_ids_missing_pandas(monkeypatch, tmp_path: Path) -> None:
+    """Verify _prune_hive_partition_record_ids raises a clear ImportError when pandas is missing."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pandas", None)
+    part_file = tmp_path / "study_key=STUDY_A" / "form_key=DEMO" / "part-0.parquet"
+    part_file.parent.mkdir(parents=True)
+    part_file.write_bytes(b"placeholder")
+
+    with pytest.raises(ImportError, match=r"pip install 'imednet\[export\]'"):
+        parquet_mod._prune_hive_partition_record_ids(
+            [part_file],
+            {"101"},
+            pyarrow_module=MagicMock(),
+            storage_engine=MagicMock(),
+            base_dir=str(tmp_path),
+            study_key="STUDY_A",
+            form_key="DEMO",
+        )
+
+
 def test_export_to_hive_parquet_rejects_malicious_study_key(monkeypatch) -> None:
     """Test that export to hive parquet rejects malicious study key."""
     monkeypatch.setattr(parquet_mod, "_ensure_pyarrow", lambda: None)

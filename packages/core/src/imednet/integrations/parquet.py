@@ -11,8 +11,6 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import NonCallableMock
 
-import pandas as pd
-
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
 from .enrichment import resolve_enrichment_pipeline
@@ -31,6 +29,7 @@ from .export import (
 from .parquet_engine import PyArrowDatasetPartitionedStorageEngine
 from .sink_base import (
     BoundedFormBufferRouter,
+    _require_optional_dep,
     extract_record_form_ref,
     extract_record_id,
     validate_max_buffered_records,
@@ -146,11 +145,12 @@ def _prune_hive_partition_record_ids(
     """Prune superseded or voided record IDs from pre-existing Hive partition Parquet files."""
     if not files or not excluded_ids:
         return
+    pandas_module = _require_optional_dep("pandas", "export")
     partition_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}"
     for pf in files:
         if not pf.exists():
             continue
-        existing_df = pd.read_parquet(pf, engine="pyarrow")
+        existing_df = pandas_module.read_parquet(pf, engine="pyarrow")
         filtered_df = _filter_df_excluding_record_ids(existing_df, excluded_ids)
         if len(filtered_df) == len(existing_df):
             continue
