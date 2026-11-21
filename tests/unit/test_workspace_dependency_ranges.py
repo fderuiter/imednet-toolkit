@@ -63,6 +63,9 @@ def test_snowflake_extras_declare_connector_and_pyarrow():
         *core_project_deps(sinks_pyproject),
     ]
     assert "snowflake-connector-python" not in _pkg_names(default_env_entries)
+    dev_group_names = _pkg_names(root_pyproject["dependency-groups"]["dev"])
+    cli_extra_names = _pkg_names(core_pyproject["optional-dependencies"]["cli"])
+    assert cli_extra_names <= dev_group_names
 
     core_sf_reqs = {
         canonicalize_name(req.name): req

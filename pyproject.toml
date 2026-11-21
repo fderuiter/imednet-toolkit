@@ -34,6 +34,9 @@ dev = [
     "atheris>=3.0.0,<4.0.0; python_version>='3.12' and sys_platform != 'win32'",
     "click>=8.3.3",
     "jsonschema>=4.20.0",
+    "python-dotenv>=1.2.2",
+    "python-json-logger>=2.0.7,<3.0.0",
+    "pygments>=2.19.2,<3.0.0",
 ]
 docs = [
     "furo<2026.0.0",
