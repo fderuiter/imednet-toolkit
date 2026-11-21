@@ -364,3 +364,38 @@ def test_tui_rejects_invalid_path_segments_before_sdk_init(
     assert "Error:" in err
     mock_get_sdk.assert_not_called()
     mock_run_tui.assert_not_called()
+
+
+def test_tui_positional_study_and_flag_conflict_exits_two(monkeypatch, capsys):
+    """Verify tui accepts positional STUDY and exits 2 on conflicting --study-key."""
+    from imednet import cli as cli_mod
+    from imednet_tui.cli import setup_parser
+
+    class DummyEntryPoint:
+        name = "tui"
+
+        def load(self):
+            return setup_parser
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: (
+            [DummyEntryPoint()] if kwargs.get("group") == "imednet.cli_plugins" else []
+        ),
+    )
+
+    with (
+        patch("imednet_tui.cli.is_interactive_terminal", return_value=True),
+        patch("imednet_tui.app.run_tui") as mock_run_tui,
+    ):
+        cli_mod.app(["tui", "STUDY", "--simulation"])
+        assert mock_run_tui.call_count == 1
+        assert mock_run_tui.call_args.kwargs["study_key"] == "STUDY"
+        assert "IMEDNET_SIMULATION_MODE" not in os.environ
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.app(["tui", "STUDY-A", "--study-key", "STUDY-B"])
+    assert exc_info.value.code == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "conflicting values provided for study_key" in err

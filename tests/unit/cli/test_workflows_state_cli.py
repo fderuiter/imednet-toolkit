@@ -745,6 +745,115 @@ def test_set_state_force_flag_overrides_stuck_stream(runner: CliRunner, tmp_path
     assert ledger.get_last_status("STUDY-STUCK", "records") == StreamExecutionStatus.SUCCESS
 
 
+def test_show_state_json_envelope_and_hybrid_study_key(runner: CliRunner, tmp_path) -> None:
+    """workflows state show --format json emits v1 ledger_state envelope and supports positional study_key."""
+    import json
+
+    from imednet.cli import app as main_app
+
+    ledger_path = str(tmp_path / "ledger.json")
+    state = _make_ledger_state("STUDY-01", "records")
+    state.studies["STUDY-02"] = _make_ledger_state("STUDY-02", "visits").studies["STUDY-02"]
+
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        mock_ledger.return_value.read_state.return_value = state
+        res_standalone = runner.invoke(
+            state_app, ["show", "STUDY-01", "--ledger-path", ledger_path, "--format", "json"]
+        )
+        res_main = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "show",
+                "--study-key",
+                "STUDY-01",
+                "--ledger-path",
+                ledger_path,
+                "--format",
+                "json",
+            ],
+        )
+
+    for res in (res_standalone, res_main):
+        assert res.exit_code == 0
+        assert res.stderr == ""
+        payload = json.loads(res.stdout)
+        assert payload["schemaVersion"] == "1.0"
+        assert payload["resource"] == "ledger_state"
+        assert payload["status"] == "complete"
+        assert payload["count"] == 1
+        assert payload["items"] == [
+            {
+                "studyKey": "STUDY-01",
+                "streamName": "records",
+                "lastTimestamp": "2026-05-22T12:00:00+00:00",
+                "recordsProcessed": 42,
+                "status": "success",
+                "errorMessage": None,
+            }
+        ]
+
+
+def test_show_state_rejects_interactive_json_and_conflicting_study_keys(
+    runner: CliRunner, tmp_path
+) -> None:
+    """workflows state show rejects --interactive --format json (exit 1) and conflicting study keys (exit 2)."""
+    from imednet.cli import app as main_app
+
+    ledger_path = str(tmp_path / "ledger.json")
+    conflict_fmt = runner.invoke(
+        main_app,
+        ["workflows", "state", "show", "--interactive", "--format", "json", "-l", ledger_path],
+    )
+    assert conflict_fmt.exit_code == 1
+    assert conflict_fmt.stdout == ""
+    assert "Cannot combine --interactive with --format json" in conflict_fmt.stderr
+
+    conflict_study = runner.invoke(
+        main_app,
+        ["workflows", "state", "show", "STUDY-A", "--study-key", "STUDY-B", "-l", ledger_path],
+    )
+    assert conflict_study.exit_code == 2
+    assert conflict_study.stdout == ""
+    assert "conflicting values provided for study_key" in conflict_study.stderr
+
+
+def test_show_state_output_format_env_and_explicit_table_override(
+    runner: CliRunner, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IMEDNET_CLI_OUTPUT_FORMAT=json selects JSON unless --format table explicitly overrides it."""
+    import json
+    import os
+
+    from imednet.cli import app as main_app
+
+    ledger_path = str(tmp_path / "ledger.json")
+    state = _make_ledger_state("STUDY-01", "records")
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        mock_ledger.return_value.read_state.return_value = state
+        env_json_standalone = runner.invoke(state_app, ["show", "-l", ledger_path])
+        env_json_main = runner.invoke(main_app, ["workflows", "state", "show", "-l", ledger_path])
+        override_standalone = runner.invoke(
+            state_app, ["show", "-l", ledger_path, "--format", "table"]
+        )
+        override_main = runner.invoke(
+            main_app, ["workflows", "state", "show", "-l", ledger_path, "--format", "table"]
+        )
+
+    for res in (env_json_standalone, env_json_main):
+        assert res.exit_code == 0
+        payload = json.loads(res.stdout)
+        assert payload["resource"] == "ledger_state"
+
+    for res in (override_standalone, override_main):
+        assert res.exit_code == 0
+        assert "STUDY-01 | records" in res.stdout
+    assert os.environ.get("IMEDNET_CLI_OUTPUT_FORMAT") == "json"
+
+
 @pytest.mark.parametrize("initial_status", ["failed", "pending"])
 def test_headless_state_set_recovers_airflow_variable_streams(
     runner: CliRunner,

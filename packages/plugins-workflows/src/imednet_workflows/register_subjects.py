@@ -58,6 +58,8 @@ class RegisterSubjectsWorkflow:
     (:class:`AsyncImednetFacade`) clients.
     """
 
+    supports_async = True
+
     def __init__(
         self,
         sdk: "FacadeLike",
@@ -75,6 +77,15 @@ class RegisterSubjectsWorkflow:
         self._sdk = sdk
         self._batch_size = batch_size
         self._filter_enrolled = filter_enrolled
+
+    def _ensure_sync_mode(self, method_name: str, async_counterpart: str) -> None:
+        """Raise TypeError when synchronous registration methods are called on an async SDK."""
+        if _is_async_facade(self._sdk):
+            raise TypeError(
+                f"RegisterSubjectsWorkflow.{method_name}() requires a synchronous ImednetSDK "
+                f"(ImednetFacade). With AsyncImednetSDK, await "
+                f"workflow.{async_counterpart}(...) instead."
+            )
 
     def _poll_single(
         self,
@@ -169,6 +180,7 @@ class RegisterSubjectsWorkflow:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
+        self._ensure_sync_mode("register_subjects_batch", "async_register_subjects_batch")
         sdk = cast("ImednetFacade", self._sdk)
         sites = sdk.get_sites(study_key=study_key)
         normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
@@ -245,6 +257,7 @@ class RegisterSubjectsWorkflow:
         collect_errors: bool = False,
     ) -> Job:
         """Registers multiple subjects in the specified study synchronously."""
+        self._ensure_sync_mode("register_subjects", "async_register_subjects")
         summary = self.register_subjects_batch(
             study_key=study_key,
             subjects=subjects,
