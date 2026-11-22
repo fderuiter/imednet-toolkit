@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, overload
 
 from pydantic import Field, field_validator, model_validator
 
@@ -20,23 +20,71 @@ class RecordRevision(ImednetBaseModel):
     record_revision: int | None = Field(default=None, alias="recordRevision")
     data_revision: int | None = Field(default=None, alias="dataRevision")
     record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
-    study_key: str | None = None
-    record_revision_id: int | None = None
-    record_id: int | None = None
-    subject_id: int | None = None
-    subject_key: str | None = None
-    site_id: int | None = None
-    form_key: str | None = None
-    interval_id: int | None = None
-    deleted: bool | None = None
-    date_created: str | None = None
-    reason_for_change: str | None = None
-    record_oid: str | None = None
-    role: str | None = None
-    subject_oid: str | None = None
-    user: str | None = None
-    last_updated: str | None = None
+    study_key: str | None = Field(default=None, alias="studyKey")
+    record_revision_id: int | None = Field(default=None, alias="recordRevisionId")
+    record_id: int | None = Field(default=None, alias="recordId")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    site_id: int | None = Field(default=None, alias="siteId")
+    form_key: str | None = Field(default=None, alias="formKey")
+    interval_id: int | None = Field(default=None, alias="intervalId")
+    deleted: bool | None = Field(default=None, alias="deleted")
+    date_created: str | None = Field(default=None, alias="dateCreated")
+    reason_for_change: str | None = Field(default=None, alias="reasonForChange")
+    record_oid: str | None = Field(default=None, alias="recordOid")
+    role: str | None = Field(default=None, alias="role")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    user: str | None = Field(default=None, alias="user")
+    last_updated: str | None = Field(default=None, alias="lastUpdated")
 
+    @overload
+    def __init__(
+        self,
+        *,
+        record_revision: int | None = None,
+        data_revision: int | None = None,
+        record_status: RecordStatus | str | None = None,
+        study_key: str | None = None,
+        record_revision_id: int | None = None,
+        record_id: int | None = None,
+        subject_id: int | None = None,
+        subject_key: str | None = None,
+        site_id: int | None = None,
+        form_key: str | None = None,
+        interval_id: int | None = None,
+        deleted: bool | None = None,
+        date_created: str | None = None,
+        reason_for_change: str | None = None,
+        record_oid: str | None = None,
+        role: str | None = None,
+        subject_oid: str | None = None,
+        user: str | None = None,
+        last_updated: str | None = None,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self,
+        *,
+        recordRevision: int | None = None,
+        dataRevision: int | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        studyKey: str | None = None,
+        recordRevisionId: int | None = None,
+        recordId: int | None = None,
+        subjectId: int | None = None,
+        subjectKey: str | None = None,
+        siteId: int | None = None,
+        formKey: str | None = None,
+        intervalId: int | None = None,
+        deleted: bool | None = None,
+        dateCreated: str | None = None,
+        reasonForChange: str | None = None,
+        recordOid: str | None = None,
+        role: str | None = None,
+        subjectOid: str | None = None,
+        user: str | None = None,
+        lastUpdated: str | None = None,
+    ) -> None: ...
     @model_validator(mode="before")
     @classmethod
     def _validate_bounds(cls, data: Any) -> Any: ...
