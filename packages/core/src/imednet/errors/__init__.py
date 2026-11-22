@@ -11,10 +11,10 @@ from .api import (
     ServerError,
     UnauthorizedError,
 )
-from .base import ImednetError
+from .base import DiagnosticContext, ImednetError
 from .client import ClientError, PaginationError
 from .export import ExportBatchError, ExportConfigurationError, ExportError
-from .network import RequestError
+from .network import CircuitBreakerError, RequestError
 from .orchestration import FilterConflictError, OrchestratorError
 from .plugin import PluginLoadError
 from .registry import get_error_class
@@ -33,9 +33,11 @@ __all__ = [
     "AuthenticationError",
     "AuthorizationError",
     "BadRequestError",
+    "CircuitBreakerError",
     "ClientError",
     "ConfigurationError",
     "ConflictError",
+    "DiagnosticContext",
     "EvaluationError",
     "ExportBatchError",
     "ExportConfigurationError",

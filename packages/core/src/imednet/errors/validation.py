@@ -3,6 +3,7 @@
 from typing import Any
 
 from .api import ApiError
+from .base import DiagnosticContext
 from .client import ClientError
 
 
@@ -15,9 +16,14 @@ class ValidationError(ApiError):
         status_code: int | None = 400,
         *,
         validation_report: Any | None = None,
+        diagnostic_context: DiagnosticContext | None = None,
     ) -> None:
         """Initialize validation error, preserving upstream status when present."""
-        super().__init__(response, status_code=status_code)
+        super().__init__(
+            response,
+            status_code=status_code,
+            diagnostic_context=diagnostic_context,
+        )
         if not self.status:
             self.status = "validation_error"
         self.validation_report = validation_report
@@ -31,7 +37,7 @@ class UnknownVariableTypeError(ValidationError):
     """Raised when an unrecognized variable type is encountered."""
 
 
-class ConfigurationError(ClientError):
+class ConfigurationError(ClientError, ValueError):
     """Raised when required SDK/client configuration is missing."""
 
 
