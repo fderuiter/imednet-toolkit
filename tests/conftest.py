@@ -4,6 +4,7 @@ This module provides common fixtures for mocking network requests, managing stud
 and simulating API responses across unit and integration tests.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -23,10 +24,6 @@ for source_root in (
     ROOT / "packages" / "providers-airflow" / "src",
 ):
     sys.path.insert(0, str(source_root))
-
-from imednet.core.async_client import AsyncClient
-from imednet.core.client import Client
-from imednet.core.context import clear_study_context
 
 
 def pytest_addoption(parser):
@@ -95,6 +92,8 @@ def _is_live_test(node: object) -> bool:
 @pytest.fixture(autouse=True)
 def reset_study_context_between_tests():
     """Reset the global study context before and after each test to ensure isolation."""
+    from imednet.core.context import clear_study_context
+
     clear_study_context()
     yield
     clear_study_context()
@@ -108,6 +107,46 @@ def reset_circuit_breaker_between_tests():
     get_global_circuit_breaker().reset()
     yield
     get_global_circuit_breaker().reset()
+
+
+def _is_closed_stream_handler(handler: logging.Handler) -> bool:
+    """Return True when *handler* is a non-file StreamHandler bound to a closed stream."""
+    return (
+        isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+        and bool(getattr(handler.stream, "closed", False))
+    )
+
+
+def _prune_closed_stream_handlers() -> None:
+    """Detach non-file StreamHandlers bound to closed ephemeral capture streams."""
+    root = logging.getLogger()
+    root.handlers = [h for h in root.handlers if not _is_closed_stream_handler(h)]
+    for logger_obj in list(logging.Logger.manager.loggerDict.values()):
+        if isinstance(logger_obj, logging.Logger) and logger_obj.handlers:
+            logger_obj.handlers = [
+                h for h in logger_obj.handlers if not _is_closed_stream_handler(h)
+            ]
+
+
+@pytest.fixture(autouse=True)
+def isolate_logging_handlers_between_tests():
+    """Prevent lazy third-party imports (e.g., Airflow) from leaking root or closed StreamHandlers."""
+    _prune_closed_stream_handlers()
+    root = logging.getLogger()
+    baseline_non_pytest_handlers = [
+        h for h in root.handlers if not type(h).__module__.startswith("_pytest.")
+    ]
+    baseline_level = root.level
+    yield
+    current_pytest_handlers = [
+        h for h in root.handlers if type(h).__module__.startswith("_pytest.")
+    ]
+    root.handlers = [
+        h for h in baseline_non_pytest_handlers if not _is_closed_stream_handler(h)
+    ] + current_pytest_handlers
+    root.setLevel(baseline_level)
+    _prune_closed_stream_handlers()
 
 
 class DummyResponse:
@@ -317,6 +356,8 @@ def patch_build_filter(monkeypatch):
 @pytest.fixture
 def http_client():
     """Provide a synchronous Client instance configured for testing."""
+    from imednet.core.client import Client
+
     return Client("key", "secret", base_url="https://api.test")
 
 
@@ -326,6 +367,8 @@ async def async_http_client():
 
     This fixture ensures the client is properly closed after use.
     """
+    from imednet.core.async_client import AsyncClient
+
     client = AsyncClient("key", "secret", base_url="https://api.test")
     try:
         yield client

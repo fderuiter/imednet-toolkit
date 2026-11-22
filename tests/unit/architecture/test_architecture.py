@@ -2,6 +2,9 @@
 
 import ast
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -251,3 +254,195 @@ def test_plugin_discovery_failure(monkeypatch):
         match="Workflow 'some_workflow' not found. Please install the required package.",
     ):
         sdk.workflows.some_workflow
+
+
+def _run_python_probe(code: str) -> subprocess.CompletedProcess[str]:
+    """Execute *code* in a fresh Python subprocess rooted at the repository."""
+    repo_root = Path(__file__).resolve().parents[3]
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_import_imednet_startup_module_budget() -> None:
+    """Verify `import imednet` leaves optional data, crypto, and model stacks unloaded."""
+    probe = "import json, sys\nimport imednet\nprint(json.dumps(sorted(sys.modules)))\n"
+    proc = _run_python_probe(probe)
+    assert proc.returncode == 0, proc.stderr
+    loaded = set(json.loads(proc.stdout))
+
+    forbidden_prefixes = (
+        "pandas",
+        "numpy",
+        "pyarrow",
+        "cryptography",
+        "imednet.models",
+    )
+    leaked = sorted(
+        mod
+        for mod in loaded
+        if any(mod == prefix or mod.startswith(f"{prefix}.") for prefix in forbidden_prefixes)
+    )
+    assert leaked == [], f"Unexpected heavy modules loaded on `import imednet`: {leaked}"
+
+
+def test_sdk_instantiation_lazy_endpoint_resolution() -> None:
+    """Verify SDK instantiation defers endpoint and model modules until first attribute access."""
+    probe = (
+        "import json, sys\n"
+        "from imednet import ImednetSDK\n"
+        "sdk = ImednetSDK(api_key='k', security_key='s', base_url='https://edc.example.test')\n"
+        "before_access = sorted(sys.modules)\n"
+        "_ = sdk.studies\n"
+        "after_studies = sorted(sys.modules)\n"
+        "sdk.close()\n"
+        "print(json.dumps({'before': before_access, 'after': after_studies}))\n"
+    )
+    proc = _run_python_probe(probe)
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    before = set(payload["before"])
+    after = set(payload["after"])
+
+    assert not any(m.startswith("imednet.models.") for m in before)
+    assert "imednet.endpoints.studies" not in before
+    assert "imednet.endpoints.studies" in after
+    assert "imednet.models.studies" in after
+    assert "imednet.models.records" not in after
+
+
+def test_cli_help_startup_module_budget() -> None:
+    """Verify `imednet --help` lists all 18 commands without loading TUI, export, or workflows."""
+    probe = (
+        "import contextlib, io, json, sys\n"
+        "from imednet.cli import app\n"
+        "buf = io.StringIO()\n"
+        "exit_code = None\n"
+        "with contextlib.redirect_stdout(buf):\n"
+        "    try:\n"
+        "        app(['--help'])\n"
+        "    except SystemExit as exc:\n"
+        "        exit_code = exc.code\n"
+        "print(json.dumps({'exit_code': exit_code, 'help': buf.getvalue(), 'modules': sorted(sys.modules)}))\n"
+    )
+    proc = _run_python_probe(probe)
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["exit_code"] == 0
+
+    help_text: str = payload["help"]
+    expected_commands = (
+        "datadict",
+        "studies",
+        "queries",
+        "variables",
+        "record-revisions",
+        "sites",
+        "export",
+        "subjects",
+        "intervals",
+        "jobs",
+        "records",
+        "forms",
+        "visits",
+        "codings",
+        "users",
+        "tui",
+        "subject-data",
+        "workflows",
+    )
+    for cmd in expected_commands:
+        assert cmd in help_text, f"Missing CLI command '{cmd}' in --help output"
+
+    loaded = set(payload["modules"])
+    forbidden_prefixes = (
+        "textual",
+        "imednet.integrations.export",
+        "imednet_workflows",
+    )
+    leaked = sorted(
+        mod
+        for mod in loaded
+        if any(mod == prefix or mod.startswith(f"{prefix}.") for prefix in forbidden_prefixes)
+    )
+    assert leaked == [], f"Unexpected modules loaded during `imednet --help`: {leaked}"
+
+
+def test_sinks_plugin_namespace_defers_backend_modules() -> None:
+    """Verify `imednet_sinks.plugin:create_sinks` constructs SinksNamespace without backend imports."""
+    if importlib.util.find_spec("imednet_sinks") is None:
+        pytest.skip("imednet_sinks not installed")
+
+    probe = (
+        "import json, sys\n"
+        "from unittest.mock import MagicMock\n"
+        "from imednet_sinks.plugin import SinksNamespace, create_sinks\n"
+        "ns = create_sinks(MagicMock())\n"
+        "assert isinstance(ns, SinksNamespace)\n"
+        "print(json.dumps(sorted(sys.modules)))\n"
+    )
+    proc = _run_python_probe(probe)
+    assert proc.returncode == 0, proc.stderr
+    loaded = set(json.loads(proc.stdout))
+
+    for backend_mod in (
+        "imednet_sinks.document",
+        "imednet_sinks.graph",
+        "imednet_sinks.warehouse",
+    ):
+        assert backend_mod not in loaded, f"{backend_mod} eagerly imported by create_sinks"
+
+
+def test_pytest_collect_only_security_tests_avoids_airflow_and_sqlalchemy() -> None:
+    """Verify `pytest --collect-only` on security path-traversal tests avoids Airflow and SQLAlchemy."""
+    probe = (
+        "import contextlib, io, json, sys, pytest\n"
+        "out, err = io.StringIO(), io.StringIO()\n"
+        "with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):\n"
+        "    rc = pytest.main([\n"
+        "        '--collect-only',\n"
+        "        '-q',\n"
+        "        'tests/integration/test_security_loopback_path_traversal.py',\n"
+        "        'tests/unit/test_security_path_traversal.py',\n"
+        "    ])\n"
+        "print(json.dumps({'rc': rc, 'modules': sorted(sys.modules), 'err': err.getvalue()}))\n"
+    )
+    proc = _run_python_probe(probe)
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["rc"] == 0, payload["err"]
+
+    loaded = set(payload["modules"])
+    leaked = sorted(
+        mod
+        for mod in loaded
+        if mod in {"airflow", "sqlalchemy"} or mod.startswith(("airflow.", "sqlalchemy."))
+    )
+    assert leaked == [], f"Unexpected Airflow/SQLAlchemy modules loaded during collection: {leaked}"
+
+
+def test_deferred_airflow_import_under_capfd_does_not_leak_closed_stream_handlers() -> None:
+    """Verify first-time Airflow import inside capfd does not poison subsequent capsys CLI runs."""
+    if (
+        importlib.util.find_spec("airflow") is None
+        or importlib.util.find_spec("apache_airflow_providers_imednet") is None
+    ):
+        pytest.skip("airflow provider not installed")
+
+    probe = (
+        "import pytest\n"
+        "rc = pytest.main([\n"
+        "    '-q',\n"
+        "    '-o', 'addopts=-ra',\n"
+        "    'tests/integration/test_security_loopback_path_traversal.py',\n"
+        "    'tests/unit/cli/test_spi_cli_helpers.py::'\n"
+        "    'test_simulation_mode_offline_json_reads_and_env_restoration[argv0-studies]',\n"
+        "])\n"
+        "raise SystemExit(rc)\n"
+    )
+    proc = _run_python_probe(probe)
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"

@@ -4499,3 +4499,15 @@ def export_to_long_sql(
         quality_gate_fn=apply_quality_gate,
         iter_batches_fn=iter_batches,
     )
+
+
+_UNPATCHED_EXPORTS: dict[str, Callable[..., Any]] = {
+    "export_to_csv": export_to_csv,
+    "export_to_duckdb": export_to_duckdb,
+    "export_to_excel": export_to_excel,
+    "export_to_json": export_to_json,
+    "export_to_long_sql": export_to_long_sql,
+    "export_to_parquet": export_to_parquet,
+    "export_to_sql": export_to_sql,
+    "export_to_sql_by_form": export_to_sql_by_form,
+}

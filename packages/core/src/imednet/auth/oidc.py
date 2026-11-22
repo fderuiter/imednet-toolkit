@@ -7,26 +7,61 @@ import json
 import logging
 import os
 import time
+from types import SimpleNamespace
 from typing import Any
 
-try:
-    from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec, padding
-    from cryptography.hazmat.primitives.asymmetric.ec import (
-        SECP256R1,
-        SECP384R1,
-        SECP521R1,
-        EllipticCurvePublicKey,
-        EllipticCurvePublicNumbers,
-    )
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey, RSAPublicNumbers
-    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+_CRYPTOGRAPHY_AVAILABLE: bool | None = None
+_CRYPTO_MODULES: SimpleNamespace | None = None
 
-    _CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _CRYPTOGRAPHY_AVAILABLE = False
+
+def _get_crypto() -> SimpleNamespace | None:
+    """Lazily load cryptography primitives when asymmetric JWT verification is used."""
+    global _CRYPTOGRAPHY_AVAILABLE, _CRYPTO_MODULES
+    if _CRYPTOGRAPHY_AVAILABLE is False:
+        return None
+    if _CRYPTO_MODULES is not None:
+        return _CRYPTO_MODULES
+    try:
+        from cryptography import x509
+        from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, padding
+        from cryptography.hazmat.primitives.asymmetric.ec import (
+            SECP256R1,
+            SECP384R1,
+            SECP521R1,
+            EllipticCurvePublicKey,
+            EllipticCurvePublicNumbers,
+        )
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey, RSAPublicNumbers
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+        _CRYPTO_MODULES = SimpleNamespace(
+            InvalidSignature=InvalidSignature,
+            UnsupportedAlgorithm=UnsupportedAlgorithm,
+            hashes=hashes,
+            serialization=serialization,
+            ec=ec,
+            padding=padding,
+            SECP256R1=SECP256R1,
+            SECP384R1=SECP384R1,
+            SECP521R1=SECP521R1,
+            EllipticCurvePublicKey=EllipticCurvePublicKey,
+            EllipticCurvePublicNumbers=EllipticCurvePublicNumbers,
+            Ed25519PublicKey=Ed25519PublicKey,
+            RSAPublicKey=RSAPublicKey,
+            RSAPublicNumbers=RSAPublicNumbers,
+            encode_dss_signature=encode_dss_signature,
+            x509=x509,
+            asymmetric_key_types=(RSAPublicKey, EllipticCurvePublicKey, Ed25519PublicKey),
+        )
+        _CRYPTOGRAPHY_AVAILABLE = True
+        return _CRYPTO_MODULES
+    except ImportError:  # pragma: no cover
+        _CRYPTOGRAPHY_AVAILABLE = False
+        return None
+
 
 logger = logging.getLogger(__name__)
 
@@ -111,30 +146,33 @@ def _load_jwk_key(jwk: dict[str, Any]) -> Any:
     kty = jwk.get("kty")
     try:
         if kty == "RSA":
-            if not _CRYPTOGRAPHY_AVAILABLE:
+            crypto = _get_crypto()
+            if crypto is None:
                 raise ValueError("Cryptography library is required to load RSA JWK.")
             e = _b64url_to_int(str(jwk["e"]))
             n = _b64url_to_int(str(jwk["n"]))
-            return RSAPublicNumbers(e=e, n=n).public_key()
+            return crypto.RSAPublicNumbers(e=e, n=n).public_key()
         if kty == "EC":
-            if not _CRYPTOGRAPHY_AVAILABLE:
+            crypto = _get_crypto()
+            if crypto is None:
                 raise ValueError("Cryptography library is required to load EC JWK.")
             crv_map = {
-                "P-256": SECP256R1(),
-                "P-384": SECP384R1(),
-                "P-521": SECP521R1(),
+                "P-256": crypto.SECP256R1(),
+                "P-384": crypto.SECP384R1(),
+                "P-521": crypto.SECP521R1(),
             }
             crv = str(jwk.get("crv"))
             if crv not in crv_map:
                 raise ValueError(f"Unsupported EC curve: {crv}")
             x = _b64url_to_int(str(jwk["x"]))
             y = _b64url_to_int(str(jwk["y"]))
-            return EllipticCurvePublicNumbers(x=x, y=y, curve=crv_map[crv]).public_key()
+            return crypto.EllipticCurvePublicNumbers(x=x, y=y, curve=crv_map[crv]).public_key()
         if kty == "OKP" and jwk.get("crv") == "Ed25519":
-            if not _CRYPTOGRAPHY_AVAILABLE:
+            crypto = _get_crypto()
+            if crypto is None:
                 raise ValueError("Cryptography library is required to load Ed25519 JWK.")
             raw = _base64url_decode(str(jwk["x"]))
-            return Ed25519PublicKey.from_public_bytes(raw)
+            return crypto.Ed25519PublicKey.from_public_bytes(raw)
         if kty == "oct":
             return _base64url_decode(str(jwk["k"]))
     except KeyError as exc:
@@ -144,29 +182,25 @@ def _load_jwk_key(jwk: dict[str, Any]) -> Any:
 
 def _can_parse_as_asymmetric_key(data: bytes) -> bool:
     """Return True if bytes can be parsed as a PEM public key, SSH key, or X.509 certificate."""
-    if not _CRYPTOGRAPHY_AVAILABLE:
+    crypto = _get_crypto()
+    if crypto is None:
         return False
-    from cryptography import x509
 
     for loader in (
-        serialization.load_pem_public_key,
-        serialization.load_ssh_public_key,
-        x509.load_pem_x509_certificate,
+        crypto.serialization.load_pem_public_key,
+        crypto.serialization.load_ssh_public_key,
+        crypto.x509.load_pem_x509_certificate,
     ):
         try:
             loader(data)
             return True
-        except (ValueError, TypeError, UnsupportedAlgorithm):
+        except (ValueError, TypeError, crypto.UnsupportedAlgorithm):
             continue
     return False
 
 
 def _is_symmetric_key_input(key_data: Any) -> bool:
     """Return True only when key_data represents a symmetric secret or 'oct' JWK."""
-    if _CRYPTOGRAPHY_AVAILABLE and isinstance(
-        key_data, (RSAPublicKey, EllipticCurvePublicKey, Ed25519PublicKey)
-    ):
-        return False
     if isinstance(key_data, dict):
         return key_data.get("kty") == "oct"
     if not isinstance(key_data, (str, bytes)):
@@ -212,10 +246,6 @@ def _load_public_key_or_secret(key_data: Any, alg: str) -> Any:
         ValueError: If key_data is malformed or incompatible with alg.
     """
     if alg.startswith("HS"):
-        if _CRYPTOGRAPHY_AVAILABLE and isinstance(
-            key_data, (RSAPublicKey, EllipticCurvePublicKey, Ed25519PublicKey)
-        ):
-            raise ValueError("Asymmetric public key object cannot be used as an HMAC secret.")
         if isinstance(key_data, dict):
             _validate_jwk_constraints(key_data, alg)
             loaded_dict_key = _load_jwk_key(key_data)
@@ -249,12 +279,16 @@ def _load_public_key_or_secret(key_data: Any, alg: str) -> Any:
                     raise ValueError("Only 'oct' JWK keys are permitted for HMAC verification.")
                 return loaded_str_key
             return raw_bytes
+        crypto_hs = _get_crypto()
+        if crypto_hs is not None and isinstance(key_data, crypto_hs.asymmetric_key_types):
+            raise ValueError("Asymmetric public key object cannot be used as an HMAC secret.")
         raise ValueError("HMAC secret must be str, bytes, or oct JWK dict.")
 
-    if not _CRYPTOGRAPHY_AVAILABLE:
+    crypto = _get_crypto()
+    if crypto is None:
         raise ValueError(f"Cryptography library is required for algorithm {alg}")
 
-    if isinstance(key_data, (RSAPublicKey, EllipticCurvePublicKey, Ed25519PublicKey)):
+    if isinstance(key_data, crypto.asymmetric_key_types):
         return key_data
 
     if isinstance(key_data, dict):
@@ -274,13 +308,11 @@ def _load_public_key_or_secret(key_data: Any, alg: str) -> Any:
             return _load_jwk_key(parsed_asym_jwk)
         pem_bytes = pem_stripped.encode("utf-8")
         if b"BEGIN CERTIFICATE" in pem_bytes:
-            from cryptography import x509
-
-            cert = x509.load_pem_x509_certificate(pem_bytes)
+            cert = crypto.x509.load_pem_x509_certificate(pem_bytes)
             return cert.public_key()
         if pem_bytes.startswith(_SSH_KEY_PREFIXES):
-            return serialization.load_ssh_public_key(pem_bytes)
-        return serialization.load_pem_public_key(pem_bytes)
+            return crypto.serialization.load_ssh_public_key(pem_bytes)
+        return crypto.serialization.load_pem_public_key(pem_bytes)
 
     raise ValueError(f"Unsupported key format: {type(key_data)}")
 
@@ -332,55 +364,56 @@ def _verify_token_signature(
         expected = hmac.new(key, signing_input, hash_func).digest()
         return hmac.compare_digest(signature, expected)
 
-    if not _CRYPTOGRAPHY_AVAILABLE:
+    crypto = _get_crypto()
+    if crypto is None:
         return False
 
     if alg.startswith("RS"):
         hash_algo = {
-            "RS256": hashes.SHA256(),
-            "RS384": hashes.SHA384(),
-            "RS512": hashes.SHA512(),
+            "RS256": crypto.hashes.SHA256(),
+            "RS384": crypto.hashes.SHA384(),
+            "RS512": crypto.hashes.SHA512(),
         }.get(alg)
-        if not hash_algo or not isinstance(key, RSAPublicKey):
+        if not hash_algo or not isinstance(key, crypto.RSAPublicKey):
             return False
         try:
-            key.verify(signature, signing_input, padding.PKCS1v15(), hash_algo)
+            key.verify(signature, signing_input, crypto.padding.PKCS1v15(), hash_algo)
             return True
-        except (InvalidSignature, Exception):
+        except (crypto.InvalidSignature, Exception):
             return False
 
     if alg.startswith("ES"):
         hash_algo = {
-            "ES256": hashes.SHA256(),
-            "ES384": hashes.SHA384(),
-            "ES512": hashes.SHA512(),
+            "ES256": crypto.hashes.SHA256(),
+            "ES384": crypto.hashes.SHA384(),
+            "ES512": crypto.hashes.SHA512(),
         }.get(alg)
         key_size = {
             "ES256": 32,
             "ES384": 48,
             "ES512": 66,
         }.get(alg)
-        if not hash_algo or not key_size or not isinstance(key, EllipticCurvePublicKey):
+        if not hash_algo or not key_size or not isinstance(key, crypto.EllipticCurvePublicKey):
             return False
         try:
             if len(signature) == 2 * key_size:
                 r = int.from_bytes(signature[:key_size], "big")
                 s = int.from_bytes(signature[key_size:], "big")
-                der_sig = encode_dss_signature(r, s)
-                key.verify(der_sig, signing_input, ec.ECDSA(hash_algo))
+                der_sig = crypto.encode_dss_signature(r, s)
+                key.verify(der_sig, signing_input, crypto.ec.ECDSA(hash_algo))
             else:
-                key.verify(signature, signing_input, ec.ECDSA(hash_algo))
+                key.verify(signature, signing_input, crypto.ec.ECDSA(hash_algo))
             return True
-        except (InvalidSignature, Exception):
+        except (crypto.InvalidSignature, Exception):
             return False
 
     if alg == "EdDSA":
-        if not isinstance(key, Ed25519PublicKey):
+        if not isinstance(key, crypto.Ed25519PublicKey):
             return False
         try:
             key.verify(signature, signing_input)
             return True
-        except (InvalidSignature, Exception):
+        except (crypto.InvalidSignature, Exception):
             return False
 
     return False

@@ -20,8 +20,6 @@ from threading import RLock
 from typing import Any
 from urllib.parse import urlparse
 
-from cryptography.fernet import Fernet, InvalidToken
-
 from imednet.spi.models import StudyConfiguration
 from imednet.spi.utils import (
     PathTraversalValidationError,
@@ -87,6 +85,8 @@ def _get_fernet_key() -> bytes:
 
 def _encrypt_payload(payload: str) -> str:
     """Encrypt payload string using AES-256 Fernet encryption."""
+    from cryptography.fernet import Fernet
+
     key = _get_fernet_key()
     f = Fernet(key)
     return f.encrypt(payload.encode("utf-8")).decode("utf-8")
@@ -94,6 +94,8 @@ def _encrypt_payload(payload: str) -> str:
 
 def _decrypt_payload(encrypted_payload: str) -> str:
     """Decrypt Fernet encrypted payload or raise clear ValueError if key is incorrect or missing."""
+    from cryptography.fernet import Fernet, InvalidToken
+
     try:
         key = _get_fernet_key()
     except Exception as exc:

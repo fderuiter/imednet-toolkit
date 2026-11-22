@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from imednet.cli.decorators import validate_cli_path_segment, with_sdk
-from imednet.endpoints.registry import ENDPOINT_REGISTRY
-from imednet.sdk import ImednetSDK
 
 from .args import (
     add_list_query_args,
@@ -23,6 +21,9 @@ from .args import (
 )
 from .context import fetching_status, simulation_mode_context
 from .output import display_list
+
+if TYPE_CHECKING:
+    from imednet.sdk import ImednetSDK
 
 
 def get_model_value(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -107,15 +108,24 @@ def register_list_command(
     preflight_query: bool = True,
 ) -> None:
     """Attach a standard ``list`` command to parser."""
-    endpoint_cls = ENDPOINT_REGISTRY.get(attr)
-    resolved_model = model
-    if resolved_model is None and endpoint_cls is not None:
-        resolved_model = getattr(endpoint_cls, "MODEL", None)
+    metadata_resolved = False
+    resolved_model: type[Any] | None = model
     allowed_attributes: frozenset[str] | None = None
-    if endpoint_cls is not None:
-        raw_attrs = getattr(endpoint_cls, "FILTER_ATTRIBUTES", None)
-        if isinstance(raw_attrs, frozenset):
-            allowed_attributes = raw_attrs
+
+    def _ensure_query_metadata() -> tuple[type[Any] | None, frozenset[str] | None]:
+        nonlocal metadata_resolved, resolved_model, allowed_attributes
+        if not metadata_resolved:
+            from imednet.endpoints.registry import ENDPOINT_REGISTRY
+
+            endpoint_cls = ENDPOINT_REGISTRY.get(attr)
+            if resolved_model is None and endpoint_cls is not None:
+                resolved_model = getattr(endpoint_cls, "MODEL", None)
+            if endpoint_cls is not None:
+                raw_attrs = getattr(endpoint_cls, "FILTER_ATTRIBUTES", None)
+                if isinstance(raw_attrs, frozenset):
+                    allowed_attributes = raw_attrs
+            metadata_resolved = True
+        return resolved_model, allowed_attributes
 
     subparsers: argparse._SubParsersAction[Any] | None = None
     for action in parser._actions:
@@ -144,6 +154,7 @@ def register_list_command(
         no_interactive: bool,
         disallow_study_key: bool,
     ) -> tuple[dict[str, Any], int | None]:
+        target_model, target_allowed_attrs = _ensure_query_metadata()
         return prepare_list_query(
             filter_args=filter_values,
             sort=sort,
@@ -151,8 +162,8 @@ def register_list_command(
             fetch_all=fetch_all,
             output_format=resolved_format,
             no_interactive=no_interactive,
-            model=resolved_model,
-            allowed_attributes=allowed_attributes,
+            model=target_model,
+            allowed_attributes=target_allowed_attrs,
             disallow_study_key=disallow_study_key,
         )
 
