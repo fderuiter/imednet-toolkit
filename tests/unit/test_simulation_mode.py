@@ -271,12 +271,37 @@ def test_simulation_filter_operators_quotes_and_connectors():
         assert len(north_sites) == 1
         assert north_sites[0].site_id == 102
 
-        # Comparison operators (<, <=, >, >=, !=) on numeric formId
+        # Comparison operators (<, <=, >, >=, !=) on numeric formId and distinct AND attributes
         gt_forms = list(sdk.forms.list(study_key="STUDY", form_id=(">", 301)))
         assert [f.form_key for f in gt_forms] == ["F_VS"]
 
-        ge_lt_forms = list(sdk.forms.list(study_key="STUDY", form_id=[(">=", 301), ("<", 302)]))
-        assert [f.form_key for f in ge_lt_forms] == ["F_DM"]
+        ge_and_key_forms = list(
+            sdk.forms.list(study_key="STUDY", form_id=(">=", 301), form_key="F_DM")
+        )
+        assert [f.form_key for f in ge_and_key_forms] == ["F_DM"]
+
+        with pytest.raises(ValueError, match="Duplicate filter attribute 'formId' in AND clause"):
+            list(sdk.forms.list(study_key="STUDY", form_id=[(">=", 301), ("<", 302)]))
+
+        dup_filter_resp = client.get(
+            "/api/v1/edc/studies/STUDY/forms",
+            params={"filter": "formId>=301;formId<302"},
+        )
+        assert dup_filter_resp.status_code == 400
+        assert (
+            "Duplicate filter attribute 'formId'"
+            in dup_filter_resp.json()["metadata"]["error"]["message"]
+        )
+
+        dup_rec_data_resp = client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"recordDataFilter": "SYSBP>=100;SYSBP<=140"},
+        )
+        assert dup_rec_data_resp.status_code == 400
+        assert (
+            "Duplicate filter attribute 'SYSBP'"
+            in dup_rec_data_resp.json()["metadata"]["error"]["message"]
+        )
 
         le_forms = list(sdk.forms.list(study_key="STUDY", form_id=("<=", 301)))
         assert [f.form_key for f in le_forms] == ["F_DM"]

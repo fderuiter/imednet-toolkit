@@ -207,11 +207,12 @@ def export_to_hive_parquet(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     chunk_size: int = 5_000,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     max_buffered_records: int | None = None,
     **kwargs: Any,
 ) -> None:
-    """Export study records to a Hive-partitioned Parquet directory layout."""
+    """Export Study Records to a Hive-partitioned Parquet directory layout."""
     pyarrow_module = _ensure_pyarrow()
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
@@ -219,6 +220,7 @@ def export_to_hive_parquet(
     validate_partition_key(study_key)
 
     extra_kwargs = dict(kwargs)
+    extra_kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     extra_kwargs.setdefault("batch_size", chunk_size)
     if max_buffered_records is not None:
         extra_kwargs["max_buffered_records"] = max_buffered_records
@@ -230,6 +232,7 @@ def export_to_hive_parquet(
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
     if config.pandas_kwargs:
@@ -238,11 +241,16 @@ def export_to_hive_parquet(
             f"export_to_hive_parquet() got an unexpected keyword argument {unexpected!r}"
         )
 
-    effective_mask_phi = config.mask_phi
-    mapper = _build_record_mapper(sdk, chunk_size=config.batch_size, mask_phi=effective_mask_phi)
-    if hasattr(mapper, "_active_study_key"):
-        mapper._active_study_key = study_key
-    pipeline = resolve_enrichment_pipeline(study_key)
+    from imednet.core.context import sdk_governance_context
+
+    with sdk_governance_context(sdk):
+        effective_mask_phi = config.mask_phi
+        mapper = _build_record_mapper(
+            sdk, chunk_size=config.batch_size, mask_phi=effective_mask_phi
+        )
+        if hasattr(mapper, "_active_study_key"):
+            mapper._active_study_key = study_key
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     storage_engine = PyArrowDatasetPartitionedStorageEngine()

@@ -886,6 +886,8 @@ def _build_filter_part(
                 op, val = item
                 validate_filter_operator(op)
                 tuple_parts.append(f"{camel_key}{op}{_format_filter_value(val)}")
+            if len(tuple_parts) > 1 and and_connector.strip() in (";", "and"):
+                raise ValueError(f"Duplicate filter attribute '{camel_key}' in AND clause")
             return and_connector.join(tuple_parts)
         subparts = [f"{camel_key}=={_format_filter_value(v)}" for v in value]
         return or_connector.join(subparts)
