@@ -359,8 +359,9 @@ def _plan_validation(
     skip_validation: bool,
     dry_run: bool,
     collect_errors: bool,
+    sdk: Any = None,
     reject_async: bool = False,
-) -> tuple[BatchValidationReport | None, dict[str, Any] | None]:
+) -> tuple[BatchValidationReport | None, dict[str, Any] | None, bool]:
     if (
         reject_async
         and validate_batch_fn is not None
@@ -377,24 +378,49 @@ def _plan_validation(
             if dry_run or collect_errors
             else None
         )
-        return report, None
+        return report, None, False
     if validate_batch_fn is not None:
         if (dry_run or collect_errors) and _accepts_kwarg(validate_batch_fn, "collect_errors"):
-            return None, {"collect_errors": True}
+            return None, {"collect_errors": True}, False
         ensure_no_masked_sentinel(records_data)
-        return None, {}
+        return None, {}, False
     if not dry_run and not collect_errors:
         ensure_no_masked_sentinel(records_data)
         if schema is not None:
             _validate_records_with_schema(schema, records_data, study_key=study_key)
-        return None, None
-    report = (
-        validate_records_batch(schema, records_data, study_key=study_key, collect_errors=True)
-        if schema is not None
-        else _masked_only_report(records_data)
+        return None, None, False
+
+    report = _masked_only_report(records_data)
+    if schema is not None:
+        if report.is_valid:
+            report = validate_records_batch(
+                schema, records_data, study_key=study_key, collect_errors=True
+            )
+    elif report.is_valid and dry_run and sdk is not None:
+        from imednet.datadict.loaders.api import can_load_from_api
+
+        if can_load_from_api(sdk):
+            return report, None, True
+    _handle_validation_report(report, dry_run=dry_run, collect_errors=collect_errors)
+    return report, None, False
+
+
+def _validate_loaded_api_schema(
+    loaded_schema: ValidationSchemaProtocol,
+    records_data: list[dict[str, Any]],
+    *,
+    study_key: str,
+    dry_run: bool,
+    collect_errors: bool,
+) -> BatchValidationReport:
+    report = validate_records_batch(
+        loaded_schema,
+        records_data,
+        study_key=study_key,
+        collect_errors=True,
     )
     _handle_validation_report(report, dry_run=dry_run, collect_errors=collect_errors)
-    return report, None
+    return report
 
 
 def _complete_custom_validation(
@@ -477,9 +503,15 @@ def _finalize_submission(
 class BatchCoordinator:
     """Coordinate single-pass validation, bounded chunking, and job polling."""
 
-    def __init__(self, chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE) -> None:
+    def __init__(
+        self,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        *,
+        sdk: Any = None,
+    ) -> None:
         """Initialize the synchronous batch coordinator."""
         self.chunk_size = _validate_chunk_size(chunk_size)
+        self._sdk = sdk
 
     @staticmethod
     def _call_sync_validate_batch(
@@ -514,9 +546,11 @@ class BatchCoordinator:
         raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
+        sdk: Any = None,
     ) -> BatchSubmissionSummary:
         """Validate once, submit in bounded chunks, and optionally poll to completion."""
-        report, call_kwargs = _plan_validation(
+        effective_sdk = sdk if sdk is not None else self._sdk
+        report, call_kwargs, needs_api_schema = _plan_validation(
             study_key,
             records_data,
             schema=schema,
@@ -524,6 +558,7 @@ class BatchCoordinator:
             skip_validation=skip_validation,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            sdk=effective_sdk,
             reject_async=True,
         )
         if call_kwargs is not None and validate_batch_fn is not None:
@@ -534,6 +569,16 @@ class BatchCoordinator:
                 raw_result,
                 records_data,
                 used_collect_errors=bool(call_kwargs),
+                dry_run=dry_run,
+                collect_errors=collect_errors,
+            )
+        elif needs_api_schema:
+            from imednet.datadict.loaders.api import load_from_api
+
+            report = _validate_loaded_api_schema(
+                load_from_api(effective_sdk, study_key),
+                records_data,
+                study_key=study_key,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
             )
@@ -593,9 +638,15 @@ class BatchCoordinator:
 class AsyncBatchCoordinator:
     """Asynchronously coordinate single-pass validation, bounded chunking, and job polling."""
 
-    def __init__(self, chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE) -> None:
+    def __init__(
+        self,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        *,
+        sdk: Any = None,
+    ) -> None:
         """Initialize the asynchronous batch coordinator."""
         self.chunk_size = _validate_chunk_size(chunk_size)
+        self._sdk = sdk
 
     async def submit(
         self,
@@ -615,9 +666,11 @@ class AsyncBatchCoordinator:
         raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
+        sdk: Any = None,
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit bounded chunks, and optionally poll."""
-        report, call_kwargs = _plan_validation(
+        effective_sdk = sdk if sdk is not None else self._sdk
+        report, call_kwargs, needs_api_schema = _plan_validation(
             study_key,
             records_data,
             schema=schema,
@@ -625,6 +678,7 @@ class AsyncBatchCoordinator:
             skip_validation=skip_validation,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            sdk=effective_sdk,
         )
         if call_kwargs is not None and validate_batch_fn is not None:
             raw_result = await validate_batch_fn(study_key, records_data, **call_kwargs)
@@ -632,6 +686,16 @@ class AsyncBatchCoordinator:
                 raw_result,
                 records_data,
                 used_collect_errors=bool(call_kwargs),
+                dry_run=dry_run,
+                collect_errors=collect_errors,
+            )
+        elif needs_api_schema:
+            from imednet.datadict.loaders.api import async_load_from_api
+
+            report = _validate_loaded_api_schema(
+                await async_load_from_api(effective_sdk, study_key),
+                records_data,
+                study_key=study_key,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
             )
@@ -769,6 +833,7 @@ def _submit_records_batch_sync(
     validate_study_key_fn: Callable[[str], None] | None = None,
     poll_single_fn: Callable[..., JobStatus] | None = None,
     poll_many_fn: Callable[..., JobPollSummary] | None = None,
+    sdk: Any = None,
     **options: Unpack[_RecordsBatchOptions],
 ) -> BatchSubmissionSummary:
     chunk_size, normalized, submit_chunk, submit_kwargs = _prepare_records_batch_execution(
@@ -781,7 +846,7 @@ def _submit_records_batch_sync(
         poll_many_fn,
         options,
     )
-    return BatchCoordinator(chunk_size=chunk_size).submit(
+    return BatchCoordinator(chunk_size=chunk_size, sdk=sdk).submit(
         study_key, normalized, submit_chunk, **submit_kwargs
     )
 
@@ -795,6 +860,7 @@ async def _submit_records_batch_async(
     validate_study_key_fn: Callable[[str], None] | None = None,
     poll_single_fn: Callable[..., Awaitable[JobStatus]] | None = None,
     poll_many_fn: Callable[..., Awaitable[JobPollSummary]] | None = None,
+    sdk: Any = None,
     **options: Unpack[_RecordsBatchOptions],
 ) -> BatchSubmissionSummary:
     chunk_size, normalized, submit_chunk, submit_kwargs = _prepare_records_batch_execution(
@@ -807,7 +873,7 @@ async def _submit_records_batch_async(
         poll_many_fn,
         options,
     )
-    return await AsyncBatchCoordinator(chunk_size=chunk_size).submit(
+    return await AsyncBatchCoordinator(chunk_size=chunk_size, sdk=sdk).submit(
         study_key, normalized, submit_chunk, **submit_kwargs
     )
 

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from unittest.mock import NonCallableMock
 
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.core.endpoint.operations.record_create import RecordCreateOperation
 from imednet.core.endpoint.strategies import MappingParamProcessor
+from imednet.endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
 from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
+from imednet.endpoints.variables import AsyncVariablesEndpoint, VariablesEndpoint
 from imednet.models.jobs import Job
 from imednet.models.records import Record
 from imednet.utils.batch_coordinator import (
@@ -24,6 +28,32 @@ from imednet.validation.cache import ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     import pandas as pd
+
+
+@dataclass(frozen=True)
+class _EndpointSchemaAdapter:
+    """Lightweight forms/variables adapter for schema-aware dry-run in create_batch."""
+
+    forms: Any
+    variables: Any
+
+
+def _build_sync_schema_adapter(client: Any) -> _EndpointSchemaAdapter | None:
+    if client is None or isinstance(client, NonCallableMock):
+        return None
+    return _EndpointSchemaAdapter(
+        forms=FormsEndpoint(client=client),
+        variables=VariablesEndpoint(client=client),
+    )
+
+
+def _build_async_schema_adapter(async_client: Any) -> _EndpointSchemaAdapter | None:
+    if async_client is None or isinstance(async_client, NonCallableMock):
+        return None
+    return _EndpointSchemaAdapter(
+        forms=AsyncFormsEndpoint(async_client=async_client),
+        variables=AsyncVariablesEndpoint(async_client=async_client),
+    )
 
 
 class RecordsOperationDef:
@@ -128,6 +158,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
             poll_many_fn=lambda sk, bids, **kw: JobsEndpoint(
                 client=self._require_sync_client()
             ).poll_many(sk, bids, **kw),
+            sdk=_build_sync_schema_adapter(getattr(self, "_client", None)),
             schema=schema,
             chunk_size=chunk_size,
             skip_validation=skip_validation,
@@ -200,6 +231,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
             poll_many_fn=lambda sk, bids, **kw: AsyncJobsEndpoint(
                 async_client=self._require_async_client()
             ).poll_many(sk, bids, **kw),
+            sdk=_build_async_schema_adapter(getattr(self, "_async_client", None)),
             schema=schema,
             chunk_size=chunk_size,
             skip_validation=skip_validation,
