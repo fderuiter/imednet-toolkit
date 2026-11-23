@@ -89,11 +89,14 @@ class DuckDBIngestionWorkflow:
                 [study_key],
             )
 
-        rows = self._deduplicate_rows(self._to_rows(study_key, revisions))
-        if not rows:
+        deduped_rows = self._deduplicate_rows(self._to_rows(study_key, revisions))
+        if not deduped_rows:
             return 0
 
-        staging_relation = self._build_staging_relation(rows)
+        before_row = self._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()
+        before_count = int(before_row[0]) if before_row is not None else 0
+
+        staging_relation = self._build_staging_relation(deduped_rows)
         view_name = f"_staging_bronze_revisions_{uuid4().hex}"
         self._connection.register(view_name, staging_relation)
         try:
@@ -135,8 +138,8 @@ class DuckDBIngestionWorkflow:
                     date_created,
                     last_updated
             """
-            has_keyed = any(row[1] is not None for row in rows)
-            has_unkeyed = any(row[1] is None for row in rows)
+            has_keyed = any(row[1] is not None for row in deduped_rows)
+            has_unkeyed = any(row[1] is None for row in deduped_rows)
 
             if has_keyed:
                 upsert_query = f"""
@@ -173,10 +176,13 @@ class DuckDBIngestionWorkflow:
                 self._connection.execute(insert_null_query)  # nosem
         finally:
             self._connection.unregister(view_name)
-        return len(rows)
+
+        after_row = self._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()
+        after_count = int(after_row[0]) if after_row is not None else before_count
+        return max(0, after_count - before_count)
 
     def build_silver_view(self, study_key: str | None = None) -> None:
-        """Create or replace the silver_current_state and silver_records_history views."""
+        """Create or replace record_revisions, silver_current_state, and silver_records_history views."""
         where_clause = ""
         if study_key is not None:
             if not isinstance(study_key, str) or not _SAFE_STUDY_KEY_PATTERN.fullmatch(study_key):
@@ -263,8 +269,8 @@ class DuckDBIngestionWorkflow:
                 deleted,
                 date_created,
                 last_updated,
-                date_created AS valid_from,
-                LEAD(date_created) OVER (
+                COALESCE(date_created, last_updated) AS valid_from,
+                LEAD(COALESCE(date_created, last_updated)) OVER (
                     PARTITION BY study_key, COALESCE(CAST(record_id AS VARCHAR), record_oid)
                     ORDER BY
                         record_revision ASC NULLS LAST,
@@ -290,7 +296,7 @@ class DuckDBIngestionWorkflow:
         self._connection.execute(history_query)  # nosem
 
     def _ensure_bronze_table(self) -> None:
-        """Ensure the bronze_revisions table exists in DuckDB with a composite unique key."""
+        """Ensure the bronze_revisions table and record_revisions view exist in DuckDB."""
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS bronze_revisions (
                 study_key VARCHAR,
@@ -312,6 +318,28 @@ class DuckDBIngestionWorkflow:
                 last_updated TIMESTAMP,
                 UNIQUE (study_key, record_revision_id)
             )
+            """)
+        self._connection.execute("""
+            CREATE OR REPLACE VIEW record_revisions AS
+            SELECT
+                study_key,
+                record_revision_id,
+                record_id,
+                record_oid,
+                form_key,
+                subject_key,
+                site_id,
+                interval_id,
+                record_status,
+                record_revision,
+                data_revision,
+                "user",
+                role,
+                reason_for_change,
+                deleted,
+                date_created,
+                last_updated
+            FROM bronze_revisions
             """)
 
     @staticmethod

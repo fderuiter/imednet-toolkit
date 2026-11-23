@@ -137,7 +137,9 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
         ]
     )
 
+    fernet_key = conf.get("core", "fernet_key")
     monkeypatch.setenv("AIRFLOW_HOME", str(af_home))
+    monkeypatch.setenv("AIRFLOW__CORE__FERNET_KEY", fernet_key)
     monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", db_uri)
     monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC", async_db_uri)
     monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED", "False")
@@ -171,6 +173,7 @@ def airflow3_sqlite_env(monkeypatch, tmp_path):
         "env": {
             **{k: v for k, v in os.environ.items() if not k.startswith("AIRFLOW_CTX_")},
             "AIRFLOW_HOME": str(af_home),
+            "AIRFLOW__CORE__FERNET_KEY": fernet_key,
             "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": db_uri,
             "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC": async_db_uri,
             "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED": "False",
@@ -1058,3 +1061,278 @@ def test_export_operator_executes_sql_by_form_and_long_sql_destinations(
         ).fetchall()
         assert (101, "age", "48") in [(r[0], r[1], str(r[2])) for r in long_rows]
         assert (201, "hr", "72") in [(r[0], r[1], str(r[2])) for r in long_rows]
+
+
+def test_airflow3_db_connection_templated_sensor_xcom_parity_and_soft_fail(
+    airflow3_sqlite_env,
+    monkeypatch,
+):
+    """Verify DB-only Connection fallback, templated imednet_conn_id, PHI-free XCom parity, and soft_fail."""
+    import asyncio
+    import json
+    from datetime import timezone
+
+    import httpx
+    from airflow import settings
+    from airflow.models.connection import Connection as OrmConnection
+    from airflow.models.xcom import XComModel
+    from airflow.sdk import DAG, DagRunState, Param
+    from airflow.utils.state import TaskInstanceState
+    from sqlalchemy import select
+
+    from apache_airflow_providers_imednet import ImednetHook, ImednetJobSensor
+
+    monkeypatch.delenv("AIRFLOW_CONN_IMEDNET_DB_ONLY", raising=False)
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    # Persist Connection exclusively in the Airflow SQLite metadata database with /api suffix
+    session = settings.Session()
+    try:
+        db_conn = OrmConnection(
+            conn_id="imednet_db_only",
+            conn_type="imednet",
+            login="db-api-key",
+            password="db-sec-key",  # pragma: allowlist secret
+            extra=json.dumps({"base_url": "https://edc.trn.imednetapi.com/api"}),
+        )
+        session.add(db_conn)
+        session.commit()
+    finally:
+        session.close()
+
+    # Verify ImednetHook.get_conn(), get_async_conn(), and test_connection() outside SUPERVISOR_COMMS
+    hook = ImednetHook("imednet_db_only")
+    sync_sdk = hook.get_conn()
+    try:
+        assert sync_sdk.config.api_key == "db-api-key"  # pragma: allowlist secret
+        assert str(sync_sdk.config.base_url).rstrip("/") == "https://edc.trn.imednetapi.com"
+    finally:
+        sync_sdk.close()
+
+    async def _check_async_conn() -> None:
+        async_sdk = await hook.get_async_conn()
+        async with async_sdk:
+            assert async_sdk.config.api_key == "db-api-key"  # pragma: allowlist secret
+            assert str(async_sdk.config.base_url).rstrip("/") == "https://edc.trn.imednetapi.com"
+
+    asyncio.run(_check_async_conn())
+
+    def _mock_http_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/studies"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"studyKey": "STUDY_AF3"}],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 25,
+                        "totalPages": 1,
+                        "totalElements": 1,
+                    },
+                },
+            )
+        if path.endswith("/jobs/BATCH_OK"):
+            return httpx.Response(
+                200,
+                json={
+                    "batchId": "BATCH_OK",
+                    "studyKey": "STUDY_AF3",
+                    "state": "COMPLETED",
+                    "progress": 100,
+                    "patient_name": "Jane Clinical",
+                    "resultUrl": "https://edc.trn.imednetapi.com/results/BATCH_OK.json",
+                },
+            )
+        if path == "/results/BATCH_OK.json":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "recordKey": "REC-1",
+                        "subjectKey": "SUBJ-001",
+                        "patient_name": "Jane Clinical",
+                        "dob": "1985-04-12",
+                        "status": "SUCCESS",
+                    }
+                ],
+            )
+        if path.endswith("/jobs/BATCH_SLOW"):
+            return httpx.Response(
+                200,
+                json={"batchId": "BATCH_SLOW", "studyKey": "STUDY_AF3", "state": "PROCESSING"},
+            )
+        if path.endswith("/jobs/BATCH_FAIL_STATE"):
+            return httpx.Response(
+                200,
+                json={"batchId": "BATCH_FAIL_STATE", "studyKey": "STUDY_AF3", "state": "FAILED"},
+            )
+        if path.endswith("/jobs/BATCH_FAIL_RECORDS"):
+            return httpx.Response(
+                200,
+                json={
+                    "batchId": "BATCH_FAIL_RECORDS",
+                    "studyKey": "STUDY_AF3",
+                    "state": "COMPLETED",
+                    "resultUrl": "https://edc.trn.imednetapi.com/results/BATCH_FAIL_RECORDS.json",
+                },
+            )
+        if path == "/results/BATCH_FAIL_RECORDS.json":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "recordKey": "REC-ERR",
+                        "subjectKey": "SUBJ-999",
+                        "patient_name": "John Clinical",
+                        "status": "FAILED",
+                        "error": "Mandatory Variable missing",
+                    }
+                ],
+            )
+        return httpx.Response(404, json={"message": "Not found"})
+
+    orig_get_conn = ImednetHook.get_conn
+    orig_get_async_conn = ImednetHook.get_async_conn
+
+    def _patched_get_conn(self_hook: ImednetHook):
+        from imednet import ImednetSDK
+
+        cfg = self_hook._resolved_config()
+        return ImednetSDK(config=cfg, transport=httpx.MockTransport(_mock_http_handler))
+
+    async def _patched_get_async_conn(self_hook: ImednetHook):
+        from imednet import AsyncImednetSDK
+
+        conn_obj = await self_hook._aget_airflow_connection(self_hook.imednet_conn_id)
+        cfg = self_hook._config_from_connection(conn_obj)
+        return AsyncImednetSDK(config=cfg, transport=httpx.MockTransport(_mock_http_handler))
+
+    monkeypatch.setattr(ImednetHook, "get_conn", _patched_get_conn)
+    monkeypatch.setattr(ImednetHook, "get_async_conn", _patched_get_async_conn)
+
+    ok, msg = hook.test_connection()
+    assert ok is True
+    assert msg == "Connection successfully tested"
+
+    # 1. DAG with templated {{ params.conn_id }}, sync + deferrable success + soft_fail timeouts
+    with DAG(
+        dag_id="imednet_af3_sensor_parity_and_soft_timeout",
+        schedule=None,
+        start_date=datetime(2026, 4, 1, tzinfo=timezone.utc),
+        catchup=False,
+        params={"conn_id": Param("imednet_db_only", type="string")},
+    ) as dag_ok:
+        s_sync = ImednetJobSensor(
+            task_id="sensor_sync_ok",
+            study_key="STUDY_AF3",
+            batch_id="BATCH_OK",
+            imednet_conn_id="{{ params.conn_id }}",
+            poke_interval=0.01,
+            timeout=5,
+            deferrable=False,
+        )
+        s_def = ImednetJobSensor(
+            task_id="sensor_def_ok",
+            study_key="STUDY_AF3",
+            batch_id="BATCH_OK",
+            imednet_conn_id="{{ params.conn_id }}",
+            poke_interval=0.01,
+            timeout=5,
+            deferrable=True,
+        )
+        s_sync_to = ImednetJobSensor(
+            task_id="sensor_sync_soft_timeout",
+            study_key="STUDY_AF3",
+            batch_id="BATCH_SLOW",
+            imednet_conn_id="{{ params.conn_id }}",
+            poke_interval=0.01,
+            timeout=0.02,
+            soft_fail=True,
+            deferrable=False,
+        )
+        s_def_to = ImednetJobSensor(
+            task_id="sensor_def_soft_timeout",
+            study_key="STUDY_AF3",
+            batch_id="BATCH_SLOW",
+            imednet_conn_id="{{ params.conn_id }}",
+            poke_interval=0.01,
+            timeout=0.02,
+            soft_fail=True,
+            deferrable=True,
+        )
+        _ = (s_sync, s_def, s_sync_to, s_def_to)
+
+    _register_dag_for_airflow3_test(dag_ok, airflow3_sqlite_env["dags_dir"])
+    dr_ok = dag_ok.test(
+        logical_date=datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+        run_after=datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    assert dr_ok.state == DagRunState.SUCCESS
+
+    ti_states = {ti.task_id: ti.state for ti in dr_ok.get_task_instances()}
+    assert ti_states["sensor_sync_ok"] == TaskInstanceState.SUCCESS
+    assert ti_states["sensor_def_ok"] == TaskInstanceState.SUCCESS
+    assert ti_states["sensor_sync_soft_timeout"] == TaskInstanceState.SKIPPED
+    assert ti_states["sensor_def_soft_timeout"] == TaskInstanceState.SKIPPED
+
+    session = settings.Session()
+    try:
+        rows = session.execute(
+            select(XComModel.task_id, XComModel.value).where(
+                XComModel.dag_id == "imednet_af3_sensor_parity_and_soft_timeout",
+                XComModel.run_id == dr_ok.run_id,
+                XComModel.key == "return_value",
+            )
+        ).all()
+        xcoms = {tid: XComModel.deserialize_value(SimpleNamespace(value=val)) for tid, val in rows}
+    finally:
+        session.close()
+
+    assert xcoms["sensor_sync_ok"] == xcoms["sensor_def_ok"]
+    summary = xcoms["sensor_sync_ok"]
+    assert isinstance(summary, dict)
+    assert "results" not in summary
+    assert summary["batch_id"] == "BATCH_OK"
+    assert summary["state"] == "COMPLETED"
+    assert "Jane Clinical" not in repr(summary)
+    assert "SUBJ-001" not in repr(summary)
+    assert "1985-04-12" not in repr(summary)
+
+    # 2. Terminal FAILED Job state and failedRecords > 0 mark DagRun FAILED even with soft_fail=True
+    for idx, (batch_id, is_def) in enumerate(
+        [
+            ("BATCH_FAIL_STATE", False),
+            ("BATCH_FAIL_STATE", True),
+            ("BATCH_FAIL_RECORDS", False),
+            ("BATCH_FAIL_RECORDS", True),
+        ]
+    ):
+        dag_id = f"imednet_af3_soft_fail_broken_job_{idx}"
+        with DAG(
+            dag_id=dag_id,
+            schedule=None,
+            start_date=datetime(2026, 4, 1, tzinfo=timezone.utc),
+            catchup=False,
+        ) as dag_fail:
+            ImednetJobSensor(
+                task_id="broken_job_sensor",
+                study_key="STUDY_AF3",
+                batch_id=batch_id,
+                imednet_conn_id="imednet_db_only",
+                poke_interval=0.01,
+                timeout=5,
+                soft_fail=True,
+                deferrable=is_def,
+            )
+        _register_dag_for_airflow3_test(dag_fail, airflow3_sqlite_env["dags_dir"])
+        dr_fail = dag_fail.test(
+            logical_date=datetime(2026, 4, 11 + idx, 0, 0, tzinfo=timezone.utc),
+            run_after=datetime(2026, 4, 11 + idx, 0, 0, tzinfo=timezone.utc),
+        )
+        assert dr_fail.state == DagRunState.FAILED, (
+            f"Expected FAILED DagRun for batch={batch_id} deferrable={is_def}, got {dr_fail.state}"
+        )
+
+    _ = (orig_get_conn, orig_get_async_conn)

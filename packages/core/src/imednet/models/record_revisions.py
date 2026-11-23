@@ -88,7 +88,7 @@ def _validate_revision_attribution_and_timestamp(revision: RecordRevision) -> da
             "RecordRevision chain validation requires non-empty 'date_created' timestamp."
         )
 
-    dt = parse_iso_datetime(str(raw_ts).strip())
+    dt = raw_ts if isinstance(raw_ts, datetime) else parse_iso_datetime(str(raw_ts).strip())
     if dt.tzinfo is None or dt.utcoffset() is None:
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
@@ -140,7 +140,7 @@ class RecordRevision(ImednetBaseModel):
         super().__setattr__(name, value)
 
     def validate_follows(self, previous: RecordRevision) -> bool:
-        """Validate that this revision contiguously and monotonically follows *previous*."""
+        """Validate that this revision contiguously and chronologically follows *previous*."""
         if previous.record_revision is None or self.record_revision is None:
             raise ValueError("RecordRevision chain validation requires non-null record_revision.")
         if self.record_revision <= previous.record_revision:
@@ -162,7 +162,6 @@ class RecordRevision(ImednetBaseModel):
                 f"Decreasing data_revision: {self.data_revision} cannot be less than "
                 f"previous {previous.data_revision}."
             )
-
         if _is_revision_deleted(previous):
             target_status = (
                 self.record_status
@@ -180,8 +179,8 @@ class RecordRevision(ImednetBaseModel):
         curr_dt = _validate_revision_attribution_and_timestamp(self)
         if curr_dt < prev_dt:
             raise ValueError(
-                f"Regressed UTC date_created timestamp: {curr_dt.isoformat()} precedes "
-                f"previous {prev_dt.isoformat()}."
+                f"Backdated date_created (Regressed UTC date_created): "
+                f"{curr_dt.isoformat()} precedes previous {prev_dt.isoformat()}."
             )
         return True
 
@@ -220,7 +219,7 @@ def validate_record_revision_chain(
     ]
     chains: dict[tuple[str, str, Any], list[RecordRevision]] = {}
     for rev in parsed:
-        study_scope = (getattr(rev, "study_key", None) or "").strip()
+        study_scope = str(getattr(rev, "study_key", None) or "").strip()
         rec_id = getattr(rev, "record_id", None)
         rec_oid = getattr(rev, "record_oid", None)
         if rec_id is not None:

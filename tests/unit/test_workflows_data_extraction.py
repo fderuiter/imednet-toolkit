@@ -219,6 +219,7 @@ def test_extract_audit_trail_emits_single_date_created_http_filter_and_filters_l
     import respx
 
     from imednet.sdk import ImednetSDK
+    from imednet.utils.filters import validate_filter_syntax
 
     with respx.mock(assert_all_called=True) as router:
         route = router.get("https://api.test/api/v1/edc/studies/STUDY/recordRevisions").respond(
@@ -229,19 +230,31 @@ def test_extract_audit_trail_emits_single_date_created_http_filter_and_filters_l
                         "recordRevisionId": 5,
                         "recordId": 10,
                         "recordRevision": 1,
-                        "dateCreated": "2026-02-01T23:59:59.500000Z",
+                        "dateCreated": "2026-01-20 09:30:00",
                     },
                     {
                         "recordRevisionId": 6,
                         "recordId": 10,
                         "recordRevision": 2,
-                        "dateCreated": "2026-02-01T17:30:00-06:00",
+                        "dateCreated": "2026-02-01T23:59:59.500000Z",
                     },
                     {
                         "recordRevisionId": 7,
                         "recordId": 10,
                         "recordRevision": 3,
+                        "dateCreated": "2026-02-01T17:30:00-06:00",
+                    },
+                    {
+                        "recordRevisionId": 8,
+                        "recordId": 10,
+                        "recordRevision": 4,
                         "dateCreated": "2026-02-02T00:00:00Z",
+                    },
+                    {
+                        "recordRevisionId": 9,
+                        "recordId": 10,
+                        "recordRevision": 5,
+                        "dateCreated": "2026-02-03 10:00:00",
                     },
                 ]
             },
@@ -256,11 +269,12 @@ def test_extract_audit_trail_emits_single_date_created_http_filter_and_filters_l
         )
 
         sent_filter = route.calls.last.request.url.params["filter"]
+        validate_filter_syntax(sent_filter)
         assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z"
         assert "studyKey" not in sent_filter
         assert "startDate" not in sent_filter
         assert "endDate" not in sent_filter
-        assert [r.record_revision_id for r in revisions] == [5, 6]
+        assert [r.record_revision_id for r in revisions] == [5, 6, 7]
 
 
 def test_extract_audit_trail_end_only_and_user_filter_date_created() -> None:

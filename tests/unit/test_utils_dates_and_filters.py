@@ -436,13 +436,13 @@ def test_ordered_filter_operators_and_expression_parsing() -> None:
             parse_filter_expression(malformed)
 
 
-def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None:
+def test_build_filter_string_rejects_duplicate_operator_tuples_in_and_clause() -> None:
     """Test duplicate AND rejection in build_filter_string, endpoints, and SimulationTransport."""
     import httpx
 
     from imednet.simulation.transport import SimulationTransport
 
-    with pytest.raises(ValueError, match="Duplicate filter attribute 'dateCreated'"):
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'dateCreated' in AND clause"):
         parse_filter_expressions(
             [
                 "dateCreated>=2026-01-01T00:00:00Z",
@@ -458,10 +458,10 @@ def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None
         ],
         "studyKey": ("==", "STUDY"),
     }
-    with pytest.raises(ValueError, match="Duplicate filter attribute 'dateCreated'"):
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'dateCreated' in AND clause"):
         build_filter_string(programmatic_bounds)
 
-    # Single-tuple list and OR-connected lists remain valid
+    # Single-element operator tuple list and OR-connected lists remain valid
     assert (
         build_filter_string(
             {

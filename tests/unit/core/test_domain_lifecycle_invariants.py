@@ -412,6 +412,81 @@ def test_record_revision_bounds_and_monotonic_chain_validation() -> None:
     with pytest.raises(ValueError, match="requires non-null record_revision"):
         validate_record_revision_chain([missing_rev])
 
+    # Revision gap (1 -> 3) within the same study fails
+    gap_rev = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=3,
+        dataRevision=2,
+        user="crc1",
+        reasonForChange="Skipped rev 2",
+        dateCreated="2026-11-15 18:40:00",
+    )
+    r1_study_a = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=1,
+        dataRevision=1,
+        user="crc1",
+        reasonForChange="Initial entry",
+        dateCreated="2026-11-15 18:10:00",
+    )
+    with pytest.raises(ValueError, match="Missing record_revision in chain"):
+        validate_record_revision_chain([r1_study_a, gap_rev])
+    assert is_valid_record_revision_chain([r1_study_a, gap_rev]) is False
+
+    # Backdated date_created within the same study fails
+    backdated_r2 = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=2,
+        dataRevision=1,
+        user="crc1",
+        reasonForChange="Backdated update",
+        dateCreated="2026-11-15 18:05:00",
+    )
+    with pytest.raises(ValueError, match="Backdated date_created"):
+        validate_record_revision_chain([r1_study_a, backdated_r2])
+    assert is_valid_record_revision_chain([r1_study_a, backdated_r2]) is False
+
+    # Shared recordId / recordOid across distinct Studies validate independently
+    r2_study_a = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=2,
+        dataRevision=1,
+        user="pi1",
+        reasonForChange="Verified Study A",
+        dateCreated="2026-11-15 18:20:00",
+    )
+    r1_study_b = RecordRevision(
+        studyKey="STUDY_B",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=1,
+        dataRevision=1,
+        user="crc2",
+        reasonForChange="Initial Study B",
+        dateCreated="2026-11-15 18:00:00",
+    )
+    r2_study_b = RecordRevision(
+        studyKey="STUDY_B",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=2,
+        dataRevision=2,
+        user="crc2",
+        reasonForChange="Updated Study B",
+        dateCreated="2026-11-15 18:15:00",
+    )
+    cross_study = validate_record_revision_chain([r1_study_a, r1_study_b, r2_study_a, r2_study_b])
+    assert len(cross_study) == 4
+    assert is_valid_record_revision_chain([r1_study_a, r1_study_b, r2_study_a, r2_study_b]) is True
+
     # Verify fake_record_revision always satisfies bounds invariants
     for _ in range(50):
         sample = RecordRevision.model_validate(fake_record_revision())

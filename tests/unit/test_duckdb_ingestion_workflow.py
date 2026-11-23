@@ -466,8 +466,8 @@ def test_duckdb_cst_timestamps_upsert_study_scoped_replace_and_silver_views() ->
         side_effect=[study_a_batch_1, study_a_batch_1, study_b_batch],
     ):
         assert workflow.ingest_revisions("STUDY_A", mode="append") == 6
-        # Re-appending identical revisions upserts without duplicating rows
-        assert workflow.ingest_revisions("STUDY_A", mode="append") == 6
+        # Re-appending identical keyed revisions upserts in place with 0 net new rows
+        assert workflow.ingest_revisions("STUDY_A", mode="append") == 0
         assert workflow.ingest_revisions("STUDY_B", mode="append") == 1
 
     # CST -06:00 string is stored as naive UTC (2024-05-02 04:30:00)

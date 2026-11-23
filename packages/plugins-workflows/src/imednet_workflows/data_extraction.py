@@ -1,7 +1,7 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Record, RecordRevision
@@ -13,9 +13,11 @@ if TYPE_CHECKING:
 
 
 def _to_utc_datetime(value: Any) -> datetime | None:
-    """Parse an ISO-8601 string or datetime into a timezone-aware UTC datetime."""
+    """Parse an ISO-8601 string, date, or datetime into a timezone-aware UTC datetime."""
     if isinstance(value, datetime):
         dt = value
+    elif isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=UTC)
     elif isinstance(value, str):
         stripped = value.strip()
         if not stripped:
@@ -33,17 +35,20 @@ def _to_utc_datetime(value: Any) -> datetime | None:
 
 def _matches_date_bound(actual_raw: Any, op: str, expected_raw: Any) -> bool:
     """Evaluate a UTC dateCreated comparison predicate locally."""
+    if op not in ("==", "=", "!=", "<>", "<", "<=", ">", ">="):
+        raise ValueError(f"Unsupported dateCreated filter operator: {op!r}")
+
     actual_dt = _to_utc_datetime(actual_raw)
     if actual_dt is None:
-        return op == "!="
+        return op in ("!=", "<>")
 
     expected_dt = _to_utc_datetime(expected_raw)
     if expected_dt is None:
         actual_text = str(actual_raw)
         expected_text = str(expected_raw)
-        if op == "==":
+        if op in ("==", "="):
             return actual_text == expected_text
-        if op == "!=":
+        if op in ("!=", "<>"):
             return actual_text != expected_text
         if op == "<":
             return actual_text < expected_text
@@ -51,13 +56,11 @@ def _matches_date_bound(actual_raw: Any, op: str, expected_raw: Any) -> bool:
             return actual_text <= expected_text
         if op == ">":
             return actual_text > expected_text
-        if op == ">=":
-            return actual_text >= expected_text
-        return False
+        return actual_text >= expected_text
 
-    if op == "==":
+    if op in ("==", "="):
         return actual_dt == expected_dt
-    if op == "!=":
+    if op in ("!=", "<>"):
         return actual_dt != expected_dt
     if op == "<":
         return actual_dt < expected_dt
@@ -65,9 +68,7 @@ def _matches_date_bound(actual_raw: Any, op: str, expected_raw: Any) -> bool:
         return actual_dt <= expected_dt
     if op == ">":
         return actual_dt > expected_dt
-    if op == ">=":
-        return actual_dt >= expected_dt
-    return False
+    return actual_dt >= expected_dt
 
 
 class DataExtractionWorkflow:
