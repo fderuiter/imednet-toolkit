@@ -857,21 +857,77 @@ def _before_process_endpoint_signature(app: Any, obj: Any, bound_method: bool) -
     """Normalize endpoint Operation return annotations before sphinx_autodoc_typehints runs."""
     if not callable(obj) or inspect.isclass(obj):
         return
-    anns = getattr(obj, "__annotations__", None)
+    target: Any = obj.__func__ if inspect.ismethod(obj) else obj
+    anns = getattr(target, "__annotations__", None)
     if not isinstance(anns, dict) or "return" not in anns:
         return
-    resolved_ret = _resolve_callable_return_hint(obj)
+    resolved_ret = _resolve_callable_return_hint(target)
     owner_cls = _resolve_owner_class(app)
     normalized = _normalize_operation_return_type(resolved_ret, owner_cls)
-    if normalized is not anns["return"]:
+    if normalized is not resolved_ret:
         updated_anns = dict(anns)
         updated_anns["return"] = normalized
-        obj.__annotations__ = updated_anns
+        target.__annotations__ = updated_anns
         try:
-            sig = inspect.signature(obj)
-            obj.__signature__ = sig.replace(return_annotation=normalized)
+            sig = inspect.signature(target)
+            target.__signature__ = sig.replace(return_annotation=normalized)
         except (TypeError, ValueError):
             pass
+
+
+def _process_shadowed_method_signature(
+    app: Any,
+    what: str,
+    name: str,
+    obj: Any,
+    options: Any,
+    signature: str | None,
+    return_annotation: str | None,
+) -> tuple[str | None, str | None] | None:
+    """Format signatures cleanly when ModelEngine subclasses shadow base class methods."""
+    import sphinx_autodoc_typehints
+    from sphinx.util.inspect import signature as sphinx_signature
+    from sphinx.util.inspect import stringify_signature
+
+    try:
+        return sphinx_autodoc_typehints.process_signature(
+            app,
+            what,
+            name,
+            obj,
+            options,
+            signature or "",
+            return_annotation or "",
+        )
+    except KeyError:
+        if what != "method" or not callable(obj):
+            return None
+        target = inspect.unwrap(obj)
+        if not getattr(target, "__annotations__", None):
+            return None
+        sph_signature = sphinx_signature(target)
+        if getattr(app.config, "typehints_use_signature", False):
+            parameters = list(sph_signature.parameters.values())
+        else:
+            parameters = [
+                param.replace(annotation=inspect.Parameter.empty)
+                for param in sph_signature.parameters.values()
+            ]
+        start = 0
+        if parameters:
+            owner_cls = _resolve_owner_class(app, name)
+            method_name = getattr(target, "__name__", name.rsplit(".", 1)[-1])
+            raw_descriptor = (
+                inspect.getattr_static(owner_cls, method_name, target)
+                if owner_cls is not None
+                else target
+            )
+            if not isinstance(raw_descriptor, (classmethod, staticmethod)):
+                start = 1
+        sph_signature = sph_signature.replace(parameters=parameters[start:])
+        if not getattr(app.config, "typehints_use_signature_return", False):
+            sph_signature = sph_signature.replace(return_annotation=inspect.Signature.empty)
+        return stringify_signature(sph_signature).replace("\\", "\\\\"), None
 
 
 def _process_endpoint_signature(
@@ -1059,15 +1115,17 @@ def _resolve_reexport_candidates(
 
 
 def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: Any) -> Any:
-    """Resolve re-exported imednet / core / errors / utils / spi references to canonical anchors."""
+    """Resolve re-exported imednet, core, errors, utils, spi, and first-party py references to canonical anchors."""
     if node.get("refdomain") != "py" or not hasattr(app.builder, "get_relative_uri"):
         return None
     reftarget = node.get("reftarget", "")
     if not isinstance(reftarget, str) or not reftarget:
         return None
 
-    py_objects = env.domaindata.get("py", {}).get("objects", {})
-    if not py_objects:
+    py_domain = env.domaindata.get("py", {})
+    py_objects = py_domain.get("objects", {})
+    py_modules = py_domain.get("modules", {})
+    if not py_objects and not py_modules:
         return None
 
     alias_rewrites = {
@@ -1079,10 +1137,22 @@ def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: An
     candidates: list[str] = []
     if reftarget == "imednet.core.context.study_context":
         candidates.append("imednet.sdk.ImednetSDK.study_context")
+    elif reftarget == "write_batch":
+        candidates.append("imednet.integrations.sink_base.ExportSink.write_batch")
     elif reftarget.startswith("imednet.core.paginator."):
         tail = reftarget.removeprefix("imednet.core.paginator.")
         candidates.extend([f"imednet.pagination.{tail}", f"imednet.core.{tail}"])
     elif reftarget.startswith("imednet.core."):
+        if node.get("reftype") == "mod" and "imednet.core" in py_modules:
+            mod_entry = py_modules["imednet.core"]
+            return make_refnode(
+                app.builder,
+                node["refdoc"],
+                mod_entry.docname,
+                mod_entry.node_id,
+                contnode,
+                "imednet.core",
+            )
         parts = reftarget.split(".")
         for idx in range(2, len(parts)):
             tail_parts = list(parts[idx:])
@@ -1094,13 +1164,67 @@ def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: An
         head, dot, rest = reftarget.partition(".")
         mapped_head = alias_rewrites.get(head, head)
         norm_target = f"{mapped_head}{dot}{rest}"
-        for prefix in ("imednet.core", "imednet.pagination", "imednet.sdk", "imednet.endpoints"):
+        for prefix in (
+            "imednet.core",
+            "imednet.pagination",
+            "imednet.sdk",
+            "imednet.endpoints",
+            "imednet.auth",
+            "imednet.models",
+            "imednet.integrations.sink_base",
+        ):
             candidates.append(f"{prefix}.{norm_target}")
 
     if "." in reftarget:
-        for cand in _resolve_reexport_candidates(reftarget, _get_documented_modules()):
+        documented_modules = _get_documented_modules()
+        for cand in _resolve_reexport_candidates(reftarget, documented_modules):
             if cand not in candidates:
                 candidates.append(cand)
+        if reftarget.split(".")[0] in _FIRST_PARTY_ROOTS:
+            parts = reftarget.split(".")
+            for idx in range(len(parts) - 1, 0, -1):
+                mod_name = ".".join(parts[:idx])
+                attr_chain = parts[idx:]
+                sym_name = attr_chain[0]
+                rest_attrs = attr_chain[1:]
+
+                canon_mod, canon_name = _resolve_canonical_origin(mod_name, sym_name)
+                if canon_mod != mod_name or canon_name != sym_name:
+                    cand_canon = ".".join([canon_mod, canon_name, *rest_attrs])
+                    if cand_canon not in candidates:
+                        candidates.append(cand_canon)
+                    doc_home = _find_canonical_documented_module(
+                        canon_mod, canon_name, documented_modules
+                    )
+                    if doc_home is not None:
+                        cand_canon_doc = ".".join([doc_home, canon_name, *rest_attrs])
+                        if cand_canon_doc not in candidates:
+                            candidates.append(cand_canon_doc)
+
+                mod_obj: Any = None
+                try:
+                    mod_obj = importlib.import_module(mod_name)
+                except Exception:
+                    mod_obj = None
+                if mod_obj is None:
+                    continue
+                sym_obj = getattr(mod_obj, sym_name, None)
+                if sym_obj is None:
+                    continue
+                obj_mod = getattr(sym_obj, "__module__", None)
+                obj_qual = getattr(sym_obj, "__qualname__", getattr(sym_obj, "__name__", sym_name))
+                if isinstance(obj_mod, str) and obj_mod:
+                    cand_obj = ".".join([obj_mod, obj_qual, *rest_attrs])
+                    if cand_obj not in candidates:
+                        candidates.append(cand_obj)
+                    doc_home = _find_canonical_documented_module(
+                        obj_mod, obj_qual.split(".")[0], documented_modules
+                    )
+                    if doc_home is not None:
+                        cand_obj_doc = ".".join([doc_home, obj_qual, *rest_attrs])
+                        if cand_obj_doc not in candidates:
+                            candidates.append(cand_obj_doc)
+                break
 
     for cand in candidates:
         entry = py_objects.get(cand)
@@ -1484,6 +1608,8 @@ def setup(app: Any) -> None:  # pragma: no cover
     _get_documented_modules.cache_clear()
     _analyze_module_symbols.cache_clear()
 
+    import sphinx_autodoc_typehints
+
     app.set_translator("html", _AccessibleHTML5Translator)
     app.set_translator("dirhtml", _AccessibleHTML5Translator)
     app.add_autodocumenter(_AsyncAwareMethodDocumenter, override=True)
@@ -1491,6 +1617,12 @@ def setup(app: Any) -> None:  # pragma: no cover
     app.connect(
         "autodoc-before-process-signature", _before_process_endpoint_signature, priority=400
     )
+    events = getattr(app, "events", None)
+    if events is not None:
+        for listener in list(events.listeners.get("autodoc-process-signature", [])):
+            if listener.handler is sphinx_autodoc_typehints.process_signature:
+                app.disconnect(listener.id)
+    app.connect("autodoc-process-signature", _process_shadowed_method_signature, priority=500)
     app.connect("autodoc-process-signature", _process_endpoint_signature, priority=600)
     app.connect("autodoc-process-docstring", _emit_pydantic_model_fields, priority=600)
     app.connect("autodoc-skip-member", _skip_non_canonical_or_internal)
@@ -1538,6 +1670,7 @@ html_js_files: list[str] = ["code_blocks.js"]
 
 doctest_global_setup = """
 import builtins
+import contextlib
 import logging
 import os
 import sys
@@ -1547,6 +1680,10 @@ from unittest.mock import MagicMock, patch
 
 for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")]:
     del sys.modules[_mod]
+
+with contextlib.suppress(ImportError):
+    from airflow.sdk.bases.operator import ExecutorSafeguard
+    ExecutorSafeguard.test_mode = True
 
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")

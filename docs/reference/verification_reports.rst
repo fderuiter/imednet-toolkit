@@ -26,6 +26,6 @@ To add new fields or structures specific to your testing, use the standard Pydan
 Writing Reports in CI
 ---------------------
 
-Your testing suite should generate a JSON file matching ``*_report.json`` in the workspace directory (e.g., ``fuzzing_report.json``).
+Verification suites use ``tests/utils/verification_reporter.py`` (``VerificationReporter``) to emit validated JSON files matching ``reports/verification/*_report.json`` (for example, ``reports/verification/performance_report.json``, ``reports/verification/fuzzing_report.json``, and ``reports/verification/drift_report.json``), even when test assertions fail.
 
-The CI pipeline uses ``scripts/aggregate_verification.py`` to aggregate all ``*_report.json`` files, validate them against the schema, and automatically construct human-readable PR comments or fail the job if a report is malformed or violations are found.
+The CI pipeline runs ``python scripts/aggregate_verification.py --report-dir reports/verification --expect-track <track>`` to validate all ``*_report.json`` files against ``VerificationReport``, publish ``drift_detected`` and ``drift_count`` outputs (plus ``reports/verification/drift_report.txt`` when violations occur), and exit ``1`` whenever reports are missing, expected ``--expect-track`` tracks are absent, JSON payloads are malformed, or any report has ``status == "failed"``.
