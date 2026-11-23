@@ -8,7 +8,7 @@ synchronously or asynchronously across both ImednetFacade and AsyncImednetFacade
 import asyncio
 import functools
 import inspect
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Union, cast
 
 from imednet.spi.models import Job, RegisterSubjectRequest
@@ -20,15 +20,15 @@ from imednet.spi.utils import (
     JobPollSummary,
     JobProgressHandler,
     RecordsInput,
+    build_site_validation_hook,
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
     poll_facade_many_async,
     poll_facade_many_sync,
     poll_facade_single_async,
     poll_facade_single_sync,
-    validate_subject_registration_sites,
 )
-from imednet.spi.validation import ValidationSchemaProtocol
+from imednet.spi.validation import RecordValidationIssue, ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
@@ -161,6 +161,51 @@ class RegisterSubjectsWorkflow:
             on_progress=on_progress,
         )
 
+    @staticmethod
+    def _prepare_registration_payload(
+        study_key: str,
+        subjects: SubjectInputs,
+        sites: Sequence[Any],
+        existing_subjects: Sequence[Any] | None,
+        *,
+        should_filter: bool,
+        subject_key_field: str | None,
+        default_form_key: str | None,
+        default_site_name: str | None,
+        schema: ValidationSchemaProtocol | None,
+        collect_errors: bool,
+    ) -> tuple[
+        list[dict[str, Any]],
+        int,
+        list[RecordValidationIssue],
+        Callable[..., Any],
+    ]:
+        """Normalize subject inputs, filter enrolled subjects, and build the site hook."""
+        norm_issues: list[RecordValidationIssue] = []
+        normalized_pairs = normalize_subject_registration_inputs(
+            subjects,
+            default_form_key=default_form_key,
+            default_site_name=default_site_name,
+            schema=schema,
+            study_key=study_key,
+            collect_errors=collect_errors,
+            issues=norm_issues,
+        )
+        subjects_data, skipped_count = filter_existing_subject_registrations(
+            normalized_pairs,
+            existing_subjects,
+            should_filter=should_filter,
+            subject_key_field=subject_key_field,
+            issues=norm_issues,
+        )
+        invalid_site_indices = {
+            iss.record_index
+            for iss in norm_issues
+            if iss.rule_id == "invalid_identifier" and iss.variable_name in {"siteId", "site_id"}
+        }
+        site_hook = build_site_validation_hook(sites, skip_indices=invalid_site_indices)
+        return subjects_data, skipped_count, norm_issues, site_hook
+
     def register_subjects_batch(
         self,
         study_key: str,
@@ -174,6 +219,8 @@ class RegisterSubjectsWorkflow:
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
+        default_form_key: str | None = None,
+        default_site_name: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -182,19 +229,22 @@ class RegisterSubjectsWorkflow:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
         self._ensure_sync_mode("register_subjects_batch", "async_register_subjects_batch")
         sdk = cast("ImednetFacade", self._sdk)
-        sites = sdk.get_sites(study_key=study_key)
-        normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
-        validate_subject_registration_sites(normalized_pairs, sites)
-
+        sites = list(sdk.get_sites(study_key=study_key))
         should_filter = (
             self._filter_enrolled if filter_enrolled is None else filter_enrolled
         ) or skip_existing
-        existing_subjects = sdk.get_subjects(study_key=study_key) if should_filter else None
-        subjects_data, skipped_count = filter_existing_subject_registrations(
-            normalized_pairs,
+        existing_subjects = list(sdk.get_subjects(study_key=study_key)) if should_filter else None
+        subjects_data, skipped_count, norm_issues, site_hook = self._prepare_registration_payload(
+            study_key,
+            subjects,
+            sites,
             existing_subjects,
             should_filter=should_filter,
             subject_key_field=subject_key_field,
+            default_form_key=default_form_key,
+            default_site_name=default_site_name,
+            schema=schema,
+            collect_errors=collect_errors,
         )
 
         def _submit_chunk(chunk: list[dict[str, Any]]) -> Job:
@@ -217,6 +267,8 @@ class RegisterSubjectsWorkflow:
             subjects_data,
             _submit_chunk,
             schema=schema,
+            validate_batch_fn=site_hook,
+            precollected_issues=norm_issues,
             skipped_count=skipped_count,
             wait_for_completion=wait_for_completion,
             poll_single=lambda bid, *, on_progress=None: self._poll_single(
@@ -290,6 +342,8 @@ class RegisterSubjectsWorkflow:
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
+        default_form_key: str | None = None,
+        default_site_name: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -309,6 +363,8 @@ class RegisterSubjectsWorkflow:
                 filter_enrolled=filter_enrolled,
                 skip_existing=skip_existing,
                 subject_key_field=subject_key_field,
+                default_form_key=default_form_key,
+                default_site_name=default_site_name,
                 schema=schema,
                 on_progress=on_progress,
                 dry_run=dry_run,
@@ -317,21 +373,24 @@ class RegisterSubjectsWorkflow:
             return await asyncio.to_thread(sync_call)
 
         sdk = cast("AsyncImednetFacade", self._sdk)
-        sites = await sdk.async_get_sites(study_key=study_key)
-        normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
-        validate_subject_registration_sites(normalized_pairs, sites)
-
+        sites = list(await sdk.async_get_sites(study_key=study_key))
         should_filter = (
             self._filter_enrolled if filter_enrolled is None else filter_enrolled
         ) or skip_existing
         existing_subjects = (
-            await sdk.async_get_subjects(study_key=study_key) if should_filter else None
+            list(await sdk.async_get_subjects(study_key=study_key)) if should_filter else None
         )
-        subjects_data, skipped_count = filter_existing_subject_registrations(
-            normalized_pairs,
+        subjects_data, skipped_count, norm_issues, site_hook = self._prepare_registration_payload(
+            study_key,
+            subjects,
+            sites,
             existing_subjects,
             should_filter=should_filter,
             subject_key_field=subject_key_field,
+            default_form_key=default_form_key,
+            default_site_name=default_site_name,
+            schema=schema,
+            collect_errors=collect_errors,
         )
 
         async def _submit_chunk_async(chunk: list[dict[str, Any]]) -> Job:
@@ -354,6 +413,8 @@ class RegisterSubjectsWorkflow:
             subjects_data,
             _submit_chunk_async,
             schema=schema,
+            validate_batch_fn=site_hook,
+            precollected_issues=norm_issues,
             skipped_count=skipped_count,
             wait_for_completion=wait_for_completion,
             poll_single=lambda bid, *, on_progress=None: self._async_poll_single(

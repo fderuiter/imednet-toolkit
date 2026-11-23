@@ -345,7 +345,9 @@ def test_spi_reexports_all_tabular_enrollment_and_validation_helpers() -> None:
     """Req 9: spi.utils and spi.validation expose all new helpers."""
     expected_utils = {
         "MASKED_SENTINEL",
+        "NormalizedRecordBatch",
         "RecordsInput",
+        "build_site_validation_hook",
         "csv_to_records",
         "dataframe_to_records",
         "import_records_csv",
@@ -369,3 +371,218 @@ def test_spi_reexports_all_tabular_enrollment_and_validation_helpers() -> None:
     }
     for name in expected_validation:
         assert hasattr(spi_validation, name), f"Missing {name} in imednet.spi.validation"
+
+
+@pytest.mark.asyncio
+async def test_two_masked_records_dry_run_collect_errors_returns_error_count_two(
+    tmp_path: Path,
+) -> None:
+    """AC 1: Sync and async batch entrypoints return errorCount == 2 for two masked records."""
+    sdk, _state, sync_requests = _make_sim_sdk()
+    async_sdk, _astate, async_requests = _make_async_sim_sdk()
+
+    two_masked_dicts = [
+        {"formKey": "F_DM", "subjectKey": "SUB1", "data": {"V_AGE": 40, "NOTES": MASKED_SENTINEL}},
+        {"formKey": "F_DM", "subjectKey": "SUB2", "data": {"V_AGE": 41, "NOTES": MASKED_SENTINEL}},
+    ]
+    csv_path = tmp_path / "two_masked.csv"
+    csv_path.write_text(
+        "form_key,subject_key,site_name,V_AGE,NOTES\n"
+        f"F_DM,SUB1,SITE,40,{MASKED_SENTINEL}\n"
+        f"F_DM,SUB2,SITE,41,{MASKED_SENTINEL}\n",
+        encoding="utf-8",
+    )
+    dd = DataDictionary.model_validate(
+        {
+            "forms": [
+                {
+                    "formKey": "F_DM",
+                    "variables": [
+                        {"variableName": "V_AGE", "variableType": "integer"},
+                        {"variableName": "NOTES", "variableType": "text"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    try:
+        for schema_arg in (None, dd):
+            s1 = sdk.records.create_batch(
+                "STUDY",
+                two_masked_dicts,
+                schema=schema_arg,
+                dry_run=True,
+                collect_errors=True,
+            )
+            assert s1.validation_report is not None
+            assert s1.validation_report.to_dict()["errorCount"] == 2
+
+            s2 = sdk.create_records_batch(
+                "STUDY",
+                two_masked_dicts,
+                schema=schema_arg,
+                dry_run=True,
+                collect_errors=True,
+            )
+            assert s2.validation_report is not None
+            assert s2.validation_report.to_dict()["errorCount"] == 2
+
+            s3 = import_records_csv(
+                sdk,
+                "STUDY",
+                csv_path,
+                schema=schema_arg,
+                dry_run=True,
+                collect_errors=True,
+            )
+            assert s3.validation_report is not None
+            assert s3.validation_report.to_dict()["errorCount"] == 2
+
+            a1 = await async_sdk.records.create_batch(
+                "STUDY",
+                two_masked_dicts,
+                schema=schema_arg,
+                dry_run=True,
+                collect_errors=True,
+            )
+            assert a1.validation_report is not None
+            assert a1.validation_report.to_dict()["errorCount"] == 2
+
+            a2 = await async_sdk.async_create_records_batch(
+                "STUDY",
+                csv_path,
+                schema=schema_arg,
+                dry_run=True,
+                collect_errors=True,
+            )
+            assert a2.validation_report is not None
+            assert a2.validation_report.to_dict()["errorCount"] == 2
+
+        assert not any(r.method == "POST" for r in sync_requests)
+        assert not any(r.method == "POST" for r in async_requests)
+    finally:
+        sdk.close()
+        await async_sdk.aclose()
+
+
+def test_csv_without_form_header_with_default_form_key_preserves_text_strings(
+    tmp_path: Path,
+) -> None:
+    """AC 3 & Req 2/3: default_form_key/default_form_id resolve text types before scalar coercion."""
+    dd = DataDictionary.model_validate(
+        {
+            "forms": [
+                {
+                    "formKey": "F_DM",
+                    "formId": "301",
+                    "variables": [
+                        {"variableName": "LOT_CODE", "variableType": "text"},
+                        {"variableName": "FLAG_TEXT", "variableType": "text"},
+                        {"variableName": "V_AGE", "variableType": "integer"},
+                    ],
+                }
+            ]
+        }
+    )
+    csv_no_form = tmp_path / "no_form.csv"
+    csv_no_form.write_text(
+        "subject_key,site_name,LOT_CODE,FLAG_TEXT,V_AGE\nSUB1,SITE,12345,true,42.0\n",
+        encoding="utf-8",
+    )
+
+    by_key = csv_to_records(csv_no_form, schema=dd, default_form_key="F_DM")
+    assert by_key == [
+        {
+            "formKey": "F_DM",
+            "subjectKey": "SUB1",
+            "siteName": "SITE",
+            "data": {"LOT_CODE": "12345", "FLAG_TEXT": "true", "V_AGE": 42},
+        }
+    ]
+    assert isinstance(by_key[0]["data"]["LOT_CODE"], str)
+    assert isinstance(by_key[0]["data"]["FLAG_TEXT"], str)
+
+    by_id = csv_to_records(csv_no_form, schema=dd, default_form_id=301)
+    assert by_id[0]["formId"] == 301
+    assert by_id[0]["data"]["LOT_CODE"] == "12345"
+    assert by_id[0]["data"]["FLAG_TEXT"] == "true"
+
+    sdk, _state, captured = _make_sim_sdk()
+    try:
+        summary = import_records_csv(
+            sdk,
+            "STUDY",
+            csv_no_form,
+            schema=dd,
+            default_form_key="F_DM",
+        )
+        assert summary.total_records == 1
+        post_reqs = [r for r in captured if r.method == "POST"]
+        sent = json.loads(post_reqs[0].content)
+        assert sent[0]["formKey"] == "F_DM"
+        assert sent[0]["data"]["LOT_CODE"] == "12345"
+        assert sent[0]["data"]["FLAG_TEXT"] == "true"
+    finally:
+        sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_multi_study_schema_cache_disambiguates_forms_during_normalization() -> None:
+    """AC 4 & Req 5: dataframe_to_records, records.create_batch, and RecordUpdateWorkflow pass study_key."""
+    from imednet.models.variables import Variable
+    from imednet.validation.cache import AsyncSchemaCache, SchemaCache
+
+    vars_multi = [
+        Variable(
+            studyKey="STUDY",
+            formId=301,
+            formKey="F_DM",
+            variableName="LOT_CODE",
+            variableType="text",
+        ),
+        Variable(
+            studyKey="OTHER_STUDY",
+            formId=301,
+            formKey="F_DM",
+            variableName="LOT_CODE",
+            variableType="integer",
+        ),
+    ]
+    cache = SchemaCache()
+    cache.populate(vars_multi)
+    async_cache = AsyncSchemaCache()
+    async_cache.populate(vars_multi)
+
+    # Sanity check: without study_key, BaseSchemaCache raises Ambiguous form
+    with pytest.raises(ValidationError, match="Ambiguous form"):
+        cache.variables_for_form("F_DM")
+
+    df = pd.DataFrame(
+        [{"form_key": "F_DM", "subject_key": "SUB1", "site_name": "SITE", "LOT_CODE": 12345.0}]
+    )
+    study_a_records = dataframe_to_records(df, schema=cache, study_key="STUDY")
+    assert study_a_records[0]["data"]["LOT_CODE"] == "12345"
+
+    study_b_records = dataframe_to_records(df, schema=cache, study_key="OTHER_STUDY")
+    assert study_b_records[0]["data"]["LOT_CODE"] == 12345
+
+    sdk, _state, _req = _make_sim_sdk()
+    async_sdk, _astate, _areq = _make_async_sim_sdk()
+    try:
+        batch_res = sdk.records.create_batch("STUDY", df, schema=cache)
+        assert batch_res.total_records == 1
+
+        abatch_res = await async_sdk.records.create_batch("STUDY", df, schema=async_cache)
+        assert abatch_res.total_records == 1
+
+        wf = RecordUpdateWorkflow(sdk, schema=cache)
+        wf_res = wf.create_or_update_records_batch("STUDY", df)
+        assert wf_res.total_records == 1
+
+        awf = RecordUpdateWorkflow(async_sdk, schema=async_cache)
+        awf_res = await awf.async_create_or_update_records_batch("STUDY", df)
+        assert awf_res.total_records == 1
+    finally:
+        sdk.close()
+        await async_sdk.aclose()

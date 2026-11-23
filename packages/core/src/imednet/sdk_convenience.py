@@ -395,20 +395,17 @@ class SyncSDKConvenienceMixin:
         skip_validation: bool = False,
     ) -> Job:
         """Create records in the specified study."""
-        from imednet.utils.tabular import normalize_records_input
-
-        normalized = normalize_records_input(records_data, schema=schema)
         if skip_validation:
             return self.records.create(
                 study_key,
-                normalized,
+                records_data,
                 email_notify=email_notify,
                 schema=schema,
                 skip_validation=True,
             )
         return self.records.create(
             study_key,
-            normalized,
+            records_data,
             email_notify=email_notify,
             schema=schema,
         )
@@ -421,6 +418,8 @@ class SyncSDKConvenienceMixin:
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
         wait_for_completion: bool = False,
@@ -431,33 +430,19 @@ class SyncSDKConvenienceMixin:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
-        from imednet.utils.batch_coordinator import BatchCoordinator
-        from imednet.utils.tabular import normalize_records_input
-
-        normalized = normalize_records_input(records_data, schema=schema)
-        coordinator = BatchCoordinator(chunk_size=chunk_size)
-        return coordinator.submit(
+        return self.records.create_batch(
             study_key,
-            normalized,
-            lambda chunk: self.records.create(
-                study_key,
-                chunk,
-                email_notify=email_notify,
-                schema=schema,
-                skip_validation=True,
-            ),
+            records_data,
+            email_notify=email_notify,
             schema=schema,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+            chunk_size=chunk_size,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
-            poll_many=lambda batch_ids, *, on_progress=None: self.poll_jobs(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-            ),
+            timeout=timeout,
+            interval=interval,
             on_progress=on_progress,
-            require_batch_id=wait_for_completion,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -560,20 +545,17 @@ class AsyncSDKConvenienceMixin:
         skip_validation: bool = False,
     ) -> Job:
         """Asynchronously create records in the specified study."""
-        from imednet.utils.tabular import normalize_records_input
-
-        normalized = normalize_records_input(records_data, schema=schema)
         if skip_validation:
             return await self.records.create(
                 study_key,
-                normalized,
+                records_data,
                 email_notify=email_notify,
                 schema=schema,
                 skip_validation=True,
             )
         return await self.records.create(
             study_key,
-            normalized,
+            records_data,
             email_notify=email_notify,
             schema=schema,
         )
@@ -586,6 +568,8 @@ class AsyncSDKConvenienceMixin:
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
         wait_for_completion: bool = False,
@@ -596,33 +580,19 @@ class AsyncSDKConvenienceMixin:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once and submit records in bounded chunks."""
-        from imednet.utils.batch_coordinator import AsyncBatchCoordinator
-        from imednet.utils.tabular import normalize_records_input
-
-        normalized = normalize_records_input(records_data, schema=schema)
-        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
-        return await coordinator.submit(
+        return await self.records.create_batch(
             study_key,
-            normalized,
-            lambda chunk: self.records.create(
-                study_key,
-                chunk,
-                email_notify=email_notify,
-                schema=schema,
-                skip_validation=True,
-            ),
+            records_data,
+            email_notify=email_notify,
             schema=schema,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+            chunk_size=chunk_size,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
-            poll_many=lambda batch_ids, *, on_progress=None: self.async_poll_jobs(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-            ),
+            timeout=timeout,
+            interval=interval,
             on_progress=on_progress,
-            require_batch_id=wait_for_completion,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )

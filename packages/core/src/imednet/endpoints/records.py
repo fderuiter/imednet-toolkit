@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from imednet.core.endpoint.dispatch import execute_operation
@@ -20,7 +21,7 @@ from imednet.utils.batch_coordinator import (
 from imednet.utils.job_poller import JobProgressHandler
 from imednet.utils.tabular import normalize_records_input
 from imednet.utils.typing import RecordsInput
-from imednet.validation.cache import ValidationSchemaProtocol
+from imednet.validation.cache import RecordValidationIssue, ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -69,6 +70,8 @@ class RecordsOperationDef:
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
         skip_validation: bool = False,
     ) -> RecordCreateOperation[Job]:
         """Create one or more records in a study.
@@ -78,13 +81,21 @@ class RecordsOperationDef:
             records_data: Record dicts, a pandas DataFrame, or a CSV file path.
             email_notify: Whether to send email notifications.
             schema: Optional validation schema (SchemaCache or DataDictionary).
+            default_form_key: Optional default formKey when omitted from rows.
+            default_form_id: Optional default formId when omitted from rows.
             skip_validation: Whether to skip schema validation if already validated.
 
         Returns:
             The background job for the creation operation.
         """
         self._validate_study_key(study_key)  # type: ignore
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(
+            records_data,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
         path = self._get_endpoint_path(study_key)  # type: ignore
         return RecordCreateOperation[Job](
             path=path,
@@ -106,6 +117,11 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
+        validate_batch_fn: Callable[..., Any] | None = None,
+        precollected_issues: Sequence[RecordValidationIssue] | None = None,
+        skipped_count: int = 0,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
         wait_for_completion: bool = False,
@@ -117,7 +133,6 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and optionally poll jobs."""
         self._validate_study_key(study_key)
-        normalized = normalize_records_input(records_data, schema=schema)
         coordinator = BatchCoordinator(chunk_size=chunk_size)
 
         def _poll_single(
@@ -150,7 +165,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
 
         return coordinator.submit(
             study_key,
-            normalized,
+            records_data,
             lambda chunk: self.create(
                 study_key,
                 chunk,
@@ -159,7 +174,12 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
                 skip_validation=True,
             ),
             schema=schema,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+            validate_batch_fn=validate_batch_fn,
+            precollected_issues=precollected_issues,
             skip_validation=skip_validation,
+            skipped_count=skipped_count,
             wait_for_completion=wait_for_completion,
             poll_single=_poll_single if wait_for_completion else None,
             poll_many=_poll_many if wait_for_completion else None,
@@ -208,6 +228,11 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         email_notify: bool | str | None = None,
         *,
         schema: ValidationSchemaProtocol | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
+        validate_batch_fn: Callable[..., Any] | None = None,
+        precollected_issues: Sequence[RecordValidationIssue] | None = None,
+        skipped_count: int = 0,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
         wait_for_completion: bool = False,
@@ -219,7 +244,6 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
         self._validate_study_key(study_key)
-        normalized = normalize_records_input(records_data, schema=schema)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
 
         async def _poll_single(
@@ -252,7 +276,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
 
         return await coordinator.submit(
             study_key,
-            normalized,
+            records_data,
             lambda chunk: self.create(
                 study_key,
                 chunk,
@@ -261,7 +285,12 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
                 skip_validation=True,
             ),
             schema=schema,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+            validate_batch_fn=validate_batch_fn,
+            precollected_issues=precollected_issues,
             skip_validation=skip_validation,
+            skipped_count=skipped_count,
             wait_for_completion=wait_for_completion,
             poll_single=_poll_single if wait_for_completion else None,
             poll_many=_poll_many if wait_for_completion else None,

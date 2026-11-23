@@ -501,3 +501,144 @@ def test_sdk_create_records_batch_with_data_dictionary_prevalidates_once() -> No
         assert post_chunks == [100, 5]
     finally:
         sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_sdk_convenience_validates_study_key_and_normalizes_once() -> None:
+    """AC 5 & Req 8: '../evil' raises PathTraversalValidationError and create_record normalizes once."""
+    from unittest.mock import patch
+
+    import imednet.endpoints.records as records_ep_mod
+    from imednet.errors import PathTraversalValidationError
+    from imednet.utils.tabular import normalize_records_input
+
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            return httpx.Response(200, json={"jobId": "J1", "batchId": "B1", "state": "QUEUED"})
+        return httpx.Response(404)
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            return httpx.Response(200, json={"jobId": "AJ1", "batchId": "AB1", "state": "QUEUED"})
+        return httpx.Response(404)
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(sync_handler),
+    )
+    async_sdk = AsyncImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(async_handler),
+    )
+    try:
+        with pytest.raises(PathTraversalValidationError):
+            sdk.create_records_batch("../evil", [{"formKey": "F1", "data": {}}])
+
+        with pytest.raises(PathTraversalValidationError):
+            await async_sdk.async_create_records_batch("../evil", [{"formKey": "F1", "data": {}}])
+
+        with patch.object(
+            records_ep_mod,
+            "normalize_records_input",
+            wraps=normalize_records_input,
+        ) as spy_norm:
+            job = sdk.create_record("STUDY", [{"formKey": "F1", "data": {"age": 30}}])
+            assert job.batch_id == "B1"
+            assert spy_norm.call_count == 1
+
+            ajob = await async_sdk.async_create_record(
+                "STUDY", [{"formKey": "F1", "data": {"age": 31}}]
+            )
+            assert ajob.batch_id == "AB1"
+            assert spy_norm.call_count == 2
+    finally:
+        sdk.close()
+        await async_sdk.aclose()
+
+
+@pytest.mark.asyncio
+async def test_batch_coordinators_aggregate_tabular_json_identifier_masked_and_schema_errors(
+    tmp_path: Any,
+) -> None:
+    """Req 1 & 2: Coordinators accept RecordsInput directly and aggregate all error classes."""
+    from imednet.datadict import DataDictionary, Form, Variable
+    from imednet.errors import ValidationError
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="F_DM",
+                formName="Demographics",
+                variables=[
+                    Variable(variableName="AGE", variableType="Integer", required="Yes"),
+                    Variable(variableName="NOTES", variableType="Text"),
+                ],
+            )
+        ]
+    )
+
+    csv_file = tmp_path / "mixed_errors.csv"
+    csv_file.write_text(
+        "form_id,subject_id,data,AGE,NOTES\n"
+        f'not_an_int,bad_subj,"{{malformed",not_int,{MASKED_SENTINEL}\n',
+        encoding="utf-8",
+    )
+
+    sync_coord = BatchCoordinator()
+    summary = sync_coord.submit(
+        "STUDY",
+        csv_file,
+        lambda _chunk: Job(jobId="j", batchId="b", state="QUEUED"),
+        schema=dd,
+        default_form_key="F_DM",
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert summary.validation_report is not None
+    assert summary.validation_report.is_valid is False
+    rule_ids = {err.rule_id for err in summary.validation_report.errors}
+    assert "invalid_identifier" in rule_ids
+    assert "malformed_json" in rule_ids
+    assert "masked_phi" in rule_ids
+
+    async def _never_submit(_chunk: list[dict[str, Any]]) -> Job:
+        raise AssertionError("submit_chunk must not be called in dry_run or invalid live writes")
+
+    async_coord = AsyncBatchCoordinator()
+    async_summary = await async_coord.submit(
+        "STUDY",
+        csv_file,
+        _never_submit,
+        schema=dd,
+        default_form_key="F_DM",
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert async_summary.validation_report is not None
+    assert async_summary.validation_report.to_dict()["errorCount"] == len(
+        summary.validation_report.errors
+    )
+
+    # Guardrail 2: Live writes reject ***MASKED*** before HTTP POST even when skip_validation=True
+    masked_batch = [{"formKey": "F_DM", "data": {"NOTES": MASKED_SENTINEL}}]
+    with pytest.raises(ValidationError, match=r"\*\*\*MASKED\*\*\*"):
+        sync_coord.submit(
+            "STUDY",
+            masked_batch,
+            lambda _chunk: Job(jobId="j", batchId="b", state="QUEUED"),
+            skip_validation=True,
+            dry_run=False,
+        )
+    with pytest.raises(ValidationError, match=r"\*\*\*MASKED\*\*\*"):
+        await async_coord.submit(
+            "STUDY",
+            masked_batch,
+            _never_submit,
+            skip_validation=True,
+            dry_run=False,
+        )

@@ -7,7 +7,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, overload
 
-from pydantic import Field, RootModel, field_validator
+from pydantic import (
+    Field,
+    RootModel,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 from imednet.models.base import ImednetBaseModel
 
@@ -195,24 +201,52 @@ class BaseRecordRequest(ImednetBaseModel):
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Per the API documentation, registering a subject only requires ``formKey``
-    and ``siteName``.  The system assigns the subject identifier upon creation.
-    Do **not** include a ``subjectKey`` here — doing so causes the server to
-    treat the request as an update and reject it when the key is unknown.
+    Supports ``formKey``/``formId``, ``siteName``/``siteId``, and optional
+    ``subjectKey``, ``subjectOid``, and ``subjectId`` fields. Unset optional
+    fields are omitted during serialization so the EDC server continues to
+    auto-assign ``subjectKey`` when omitted.
     """
 
+    form_id: int | None = Field(default=None, alias="formId")
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
     )
+    site_id: int | None = Field(default=None, alias="siteId")
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    subject_id: int | None = Field(default=None, alias="subjectId")
 
     @overload
     def __init__(
-        self, *, form_key: str = "", data: RecordData = ..., site_name: str = ""
+        self,
+        *,
+        form_key: str = "",
+        data: RecordData = ...,
+        form_id: int | None = None,
+        site_name: str = "",
+        site_id: int | None = None,
+        subject_key: str | None = None,
+        subject_oid: str | None = None,
+        subject_id: int | None = None,
     ) -> None: ...
     @overload
     def __init__(
-        self, *, formKey: str = "", data: RecordData = ..., siteName: str = ""
+        self,
+        *,
+        formKey: str = "",
+        data: RecordData = ...,
+        formId: int | None = None,
+        siteName: str = "",
+        siteId: int | None = None,
+        subjectKey: str | None = None,
+        subjectOid: str | None = None,
+        subjectId: int | None = None,
     ) -> None: ...
+    @field_validator("form_id", "site_id", "subject_id", mode="before")
+    @classmethod
+    def _validate_optional_int_id(cls, value: Any, info: Any) -> int | None: ...
+    @model_serializer(mode="wrap")
+    def _serialize_request(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]: ...
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):
     """Payload for updating an existing scheduled record."""

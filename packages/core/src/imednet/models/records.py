@@ -3,12 +3,19 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, RootModel, field_validator
+from pydantic import (
+    Field,
+    RootModel,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
@@ -255,15 +262,54 @@ class BaseRecordRequest(ImednetBaseModel):
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Per the API documentation, registering a subject only requires ``formKey``
-    and ``siteName``.  The system assigns the subject identifier upon creation.
-    Do **not** include a ``subjectKey`` here — doing so causes the server to
-    treat the request as an update and reject it when the key is unknown.
+    Supports ``formKey``/``formId``, ``siteName``/``siteId``, and optional
+    ``subjectKey``, ``subjectOid``, and ``subjectId`` fields. Unset optional
+    fields are omitted during serialization so the EDC server continues to
+    auto-assign ``subjectKey`` when omitted.
     """
 
+    form_id: int | None = Field(default=None, alias="formId")
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
     )
+    site_id: int | None = Field(default=None, alias="siteId")
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+
+    @field_validator("form_id", "site_id", "subject_id", mode="before")
+    @classmethod
+    def _validate_optional_int_id(cls, value: Any, info: Any) -> int | None:
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            return None
+        field_label = info.field_name or "identifier"
+        if isinstance(value, bool):
+            raise ValueError(f"Identifier '{field_label}' must be an integer.")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if re.match(r"^-?(?:0|[1-9]\d*)$", stripped):
+                return int(stripped)
+            if re.match(r"^-?(?:0|[1-9]\d*)\.\d+$", stripped):
+                fval = float(stripped)
+                if math.isfinite(fval) and fval.is_integer():
+                    return int(fval)
+        raise ValueError(f"Identifier '{field_label}' must be an integer.")
+
+    @model_serializer(mode="wrap")
+    def _serialize_request(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        dumped: dict[str, Any] = handler(self)
+        cleaned = {k: v for k, v in dumped.items() if v is not None}
+        if self.form_id is not None and not self.form_key:
+            cleaned.pop("formKey", None)
+            cleaned.pop("form_key", None)
+        if self.site_id is not None and not self.site_name:
+            cleaned.pop("siteName", None)
+            cleaned.pop("site_name", None)
+        return cleaned
 
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):

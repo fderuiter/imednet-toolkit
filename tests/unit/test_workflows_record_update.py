@@ -822,3 +822,53 @@ async def test_all_record_update_workflow_methods_accept_clinical_variable_types
         "STUDY", [{"formKey": "F_CLIN", "data": clinical_data}]
     )
     assert async_job.batch_id == "B-ASYNC-CLIN"
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_collects_unknown_form_and_masked_errors_in_dry_run() -> None:
+    """RecordUpdateWorkflow aggregates unknown form and masked sentinel issues when collect_errors=True."""
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    var = Variable(
+        studyKey="STUDY",
+        variableName="age",
+        variableType="integer",
+        formId=101,
+        formKey="F1",
+    )
+    sdk = MagicMock()
+    del sdk.async_create_record
+    sdk.get_variables.return_value = [var]
+    wf = RecordUpdateWorkflow(sdk)
+
+    summary = wf.create_or_update_records_batch(
+        "STUDY",
+        [
+            {"formKey": "UNKNOWN_FORM", "data": {"age": 30}},
+            {"formKey": "F1", "data": {"age": MASKED_SENTINEL}},
+        ],
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert summary.validation_report is not None
+    assert summary.validation_report.is_valid is False
+    assert summary.validation_report.to_dict()["errorCount"] == 2
+    sdk.create_record.assert_not_called()
+
+    async_sdk = MagicMock()
+    async_sdk.async_get_variables = AsyncMock(return_value=[var])
+    async_sdk.async_create_record = AsyncMock()
+    async_wf = RecordUpdateWorkflow(async_sdk)
+
+    async_summary = await async_wf.async_create_or_update_records_batch(
+        "STUDY",
+        [
+            {"formKey": "UNKNOWN_FORM", "data": {"age": 30}},
+            {"formKey": "F1", "data": {"age": MASKED_SENTINEL}},
+        ],
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert async_summary.validation_report is not None
+    assert async_summary.validation_report.to_dict()["errorCount"] == 2
+    async_sdk.async_create_record.assert_not_called()

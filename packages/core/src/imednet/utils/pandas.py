@@ -34,7 +34,7 @@ from .typing import JsonDict
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
     from ..sdk import ImednetSDK
-    from ..validation.cache import ValidationSchemaProtocol
+    from ..validation.cache import RecordValidationIssue, ValidationSchemaProtocol
 
 
 def check_pandas(feature_name: str | None = None) -> None:
@@ -214,6 +214,11 @@ def dataframe_to_records(
     df: pd.DataFrame,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+    collect_errors: bool = False,
+    issues: list[RecordValidationIssue] | None = None,
 ) -> list[JsonDict]:
     """Convert a ``pandas.DataFrame`` into REST create-records payload dicts.
 
@@ -222,10 +227,19 @@ def dataframe_to_records(
     ``subjectKey``/``subjectOid``/``subjectId``, ``siteName``/``siteId``,
     ``intervalName``/``intervalId``), drops ``NaN`` and blank cells, coerces
     integer-valued floats (``45.0 -> 45``), and raises
-    :class:`~imednet.errors.ValidationError` if any cell contains ``***MASKED***``.
+    :class:`~imednet.errors.ValidationError` (or records validation issues when
+    ``collect_errors=True``) if any cell contains ``***MASKED***``.
     """
     check_pandas("dataframe_to_records")
-    return dataframe_rows_to_records(df, schema=schema)
+    return dataframe_rows_to_records(
+        df,
+        schema=schema,
+        study_key=study_key,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+        collect_errors=collect_errors,
+        issues=issues,
+    )
 
 
 def import_records_csv(
@@ -235,6 +249,8 @@ def import_records_csv(
     *,
     email_notify: bool | str | None = None,
     schema: ValidationSchemaProtocol | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
     chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
     skip_validation: bool = False,
     wait_for_completion: bool = False,
@@ -249,12 +265,13 @@ def import_records_csv(
     Works in ``packages/core`` even when ``pandas`` is not installed. Rejects
     ``***MASKED***`` sentinels before any HTTP request is sent.
     """
-    records = csv_to_records(file_path, schema=schema)
     return sdk.records.create_batch(
         study_key,
-        records,
+        file_path,
         email_notify=email_notify,
         schema=schema,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
         chunk_size=chunk_size,
         skip_validation=skip_validation,
         wait_for_completion=wait_for_completion,

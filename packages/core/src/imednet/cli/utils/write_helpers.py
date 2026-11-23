@@ -17,13 +17,20 @@ from imednet.sdk import ImednetSDK
 from imednet.utils.batch_coordinator import DEFAULT_BATCH_CHUNK_SIZE, BatchSubmissionSummary
 from imednet.utils.job_poller import JobProgressHandler
 from imednet.utils.tabular import (
+    _BOOL_LIKE_TYPES,
+    _TEXT_LIKE_TYPES,
     MASKED_SENTINEL,
     _coerce_clinical_value,
     _contains_masked_sentinel,
+    _resolve_expected_var_type,
     csv_to_records,
     ensure_no_masked_sentinel,
 )
-from imednet.validation.cache import SchemaCache, ValidationSchemaProtocol
+from imednet.validation.cache import (
+    RecordValidationIssue,
+    SchemaCache,
+    ValidationSchemaProtocol,
+)
 
 from ..decorators import _redact_secrets
 from .args import add_output_format, add_simulation_arg, resolve_output_format
@@ -150,46 +157,149 @@ def resolve_cli_schema(
     return load_offline_schema(schema_source, study_key=study_key)
 
 
-def parse_key_value_pairs(pairs: Sequence[str] | None) -> dict[str, Any]:
+_CLI_BOOL_TYPES: frozenset[str] = _BOOL_LIKE_TYPES | frozenset({"checkbox", "check box"})
+
+
+def parse_key_value_pairs(
+    pairs: Sequence[str] | None,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    form_key: str | None = None,
+    form_id: int | None = None,
+    collect_errors: bool = False,
+    issues: list[RecordValidationIssue] | None = None,
+    record_index: int = 0,
+) -> dict[str, Any]:
     """Parse repeatable ``KEY=VALUE`` pairs from ``-d/--data`` flags."""
     if not pairs:
         return {}
     parsed: dict[str, Any] = {}
     for item in pairs:
         if "=" not in item:
-            raise ValueError(f"Invalid --data entry '{item}': expected KEY=VALUE format.")
+            msg = f"Invalid --data entry '{item}': expected KEY=VALUE format."
+            if not collect_errors:
+                raise ValueError(msg)
+            if issues is not None:
+                issues.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=form_key,
+                        variable_name=None,
+                        message=msg,
+                        rule_id="invalid_data_pair",
+                    )
+                )
+            continue
         raw_key, _, raw_val = item.partition("=")
         key = raw_key.strip()
         if not key:
-            raise ValueError(f"Invalid --data entry '{item}': variable name cannot be empty.")
+            msg = f"Invalid --data entry '{item}': variable name cannot be empty."
+            if not collect_errors:
+                raise ValueError(msg)
+            if issues is not None:
+                issues.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=form_key,
+                        variable_name=None,
+                        message=msg,
+                        rule_id="invalid_data_pair",
+                    )
+                )
+            continue
         if _contains_masked_sentinel(raw_val):
-            raise ValueError(
-                f"Variable '{key}' contains masked PHI sentinel '{MASKED_SENTINEL}' and cannot be submitted."
+            msg = (
+                f"Variable '{key}' contains masked PHI sentinel '{MASKED_SENTINEL}' "
+                "and cannot be submitted."
             )
+            if not collect_errors:
+                raise ValueError(msg)
+            if issues is not None:
+                issues.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=form_key,
+                        variable_name=key,
+                        message=msg,
+                        rule_id="masked_phi",
+                    )
+                )
+            parsed[key] = raw_val
+            continue
+
+        expected_var_type = _resolve_expected_var_type(
+            schema,
+            form_key,
+            form_id,
+            key,
+            study_key=study_key,
+        )
         val_stripped = raw_val.strip()
-        if val_stripped.lower() in {"true", "false"}:
+        if expected_var_type in _TEXT_LIKE_TYPES:
+            parsed[key] = _coerce_clinical_value(
+                raw_val, from_csv_str=True, expected_var_type=expected_var_type
+            )
+        elif (
+            expected_var_type is None or expected_var_type in _CLI_BOOL_TYPES
+        ) and val_stripped.lower() in {"true", "false"}:
             parsed[key] = val_stripped.lower() == "true"
         else:
-            parsed[key] = _coerce_clinical_value(raw_val, from_csv_str=True)
+            parsed[key] = _coerce_clinical_value(
+                raw_val, from_csv_str=True, expected_var_type=expected_var_type
+            )
     return parsed
 
 
-def parse_json_records_text(raw_text: str, *, source_label: str) -> list[dict[str, Any]]:
+def parse_json_records_text(
+    raw_text: str,
+    *,
+    source_label: str,
+    default_form_key: str | None = None,
+    collect_errors: bool = False,
+    issues: list[RecordValidationIssue] | None = None,
+) -> list[dict[str, Any]]:
     """Parse a JSON object or JSON array of record payload dicts."""
     try:
         loaded = json.loads(raw_text)
     except ValueError as exc:
-        raise ValueError(f"Invalid JSON in {source_label}: {exc}") from exc
+        msg = f"Invalid JSON in {source_label}: {exc}"
+        if not collect_errors:
+            raise ValueError(msg) from exc
+        if issues is not None:
+            issues.append(
+                RecordValidationIssue(
+                    record_index=0,
+                    form_key=default_form_key,
+                    variable_name=None,
+                    message=msg,
+                    rule_id="malformed_json",
+                )
+            )
+        return []
 
     if isinstance(loaded, dict):
         items = [loaded]
     elif isinstance(loaded, list) and all(isinstance(x, dict) for x in loaded):
         items = list(loaded)
     else:
-        raise ValueError(
-            f"JSON payload in {source_label} must be a JSON object or array of objects."
-        )
-    ensure_no_masked_sentinel(items)
+        msg = f"JSON payload in {source_label} must be a JSON object or array of objects."
+        if not collect_errors:
+            raise ValueError(msg)
+        if issues is not None:
+            issues.append(
+                RecordValidationIssue(
+                    record_index=0,
+                    form_key=default_form_key,
+                    variable_name=None,
+                    message=msg,
+                    rule_id="malformed_json",
+                )
+            )
+        return []
+    sentinel_issues = ensure_no_masked_sentinel(items, collect_errors=collect_errors)
+    if issues is not None and sentinel_issues:
+        issues.extend(sentinel_issues)
     return items
 
 
@@ -197,18 +307,41 @@ def load_records_from_path_or_stdin(
     file_arg: str,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+    collect_errors: bool = False,
+    issues: list[RecordValidationIssue] | None = None,
 ) -> list[dict[str, Any]]:
     """Load record payloads from ``'-'`` (stdin JSON), ``.json``, or ``.csv``."""
     if file_arg == "-":
-        return parse_json_records_text(sys.stdin.read(), source_label="stdin")
+        return parse_json_records_text(
+            sys.stdin.read(),
+            source_label="stdin",
+            default_form_key=default_form_key,
+            collect_errors=collect_errors,
+            issues=issues,
+        )
     file_path = Path(file_arg)
     if not file_path.exists():
         raise ValueError(f"Input file not found: '{file_arg}'")
     if file_path.suffix.lower() == ".json":
         return parse_json_records_text(
-            file_path.read_text(encoding="utf-8"), source_label=str(file_path)
+            file_path.read_text(encoding="utf-8"),
+            source_label=str(file_path),
+            default_form_key=default_form_key,
+            collect_errors=collect_errors,
+            issues=issues,
         )
-    return csv_to_records(file_path, schema=schema)
+    return csv_to_records(
+        file_path,
+        schema=schema,
+        study_key=study_key,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+        collect_errors=collect_errors,
+        issues=issues,
+    )
 
 
 @contextmanager

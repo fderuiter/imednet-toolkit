@@ -13,6 +13,7 @@ from ...models.records import Record
 from ...sdk import ImednetSDK
 from ...utils.pandas import import_records_csv
 from ...utils.tabular import ensure_no_masked_sentinel
+from ...validation.cache import RecordValidationIssue
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import display_list, fetching_status, print_error, simulation_mode_context
 from ..utils.args import (
@@ -45,38 +46,60 @@ def _assemble_create_records_payload(
     args: argparse.Namespace,
     *,
     schema: Any = None,
+    collect_errors: bool = False,
+    issues: list[RecordValidationIssue] | None = None,
 ) -> list[dict[str, Any]]:
     """Build record creation payload(s) from ``--file``, ``--json``, or inline flags."""
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
-    inline_data = parse_key_value_pairs(args.data_pairs)
+    study_key = getattr(args, "study_key", None)
     records: list[dict[str, Any]]
     if args.input_file:
-        records = load_records_from_path_or_stdin(args.input_file, schema=schema)
+        records = load_records_from_path_or_stdin(
+            args.input_file,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=args.form_key,
+            default_form_id=args.form_id,
+            collect_errors=collect_errors,
+            issues=issues,
+        )
     elif args.json_payload:
-        records = parse_json_records_text(args.json_payload, source_label="--json")
+        records = parse_json_records_text(
+            args.json_payload,
+            source_label="--json",
+            default_form_key=args.form_key,
+            collect_errors=collect_errors,
+            issues=issues,
+        )
     else:
         if not args.form_key and args.form_id is None:
             raise ValueError(
                 "Provide --file, --json, or at least --form-key / --form-id to create a record."
             )
-        single: dict[str, Any] = {"data": dict(inline_data)}
-        records = [single]
+        records = [{"data": {}}]
 
     resolved: list[dict[str, Any]] = []
-    for item in records:
+    for idx, item in enumerate(records):
         rec = dict(item)
-        if args.form_key and not (rec.get("formKey") or rec.get("form_key")):
-            rec["formKey"] = args.form_key
-        elif args.form_id is not None and rec.get("formId") is None and rec.get("form_id") is None:
-            rec["formId"] = args.form_id
+        has_form = bool(
+            rec.get("formKey")
+            or rec.get("form_key")
+            or rec.get("formId") is not None
+            or rec.get("form_id") is not None
+        )
+        if not has_form:
+            if args.form_key:
+                rec["formKey"] = args.form_key
+            elif args.form_id is not None:
+                rec["formId"] = args.form_id
 
         if args.subject_key and not (rec.get("subjectKey") or rec.get("subject_key")):
             rec["subjectKey"] = args.subject_key
-        elif args.subject_oid and not (rec.get("subjectOid") or rec.get("subject_oid")):
+        if args.subject_oid and not (rec.get("subjectOid") or rec.get("subject_oid")):
             rec["subjectOid"] = args.subject_oid
-        elif (
+        if (
             args.subject_id is not None
             and rec.get("subjectId") is None
             and rec.get("subject_id") is None
@@ -85,26 +108,49 @@ def _assemble_create_records_payload(
 
         if args.site_name and not (rec.get("siteName") or rec.get("site_name")):
             rec["siteName"] = args.site_name
-        elif args.site_id is not None and rec.get("siteId") is None and rec.get("site_id") is None:
+        if args.site_id is not None and rec.get("siteId") is None and rec.get("site_id") is None:
             rec["siteId"] = args.site_id
 
         if args.interval_name and not (rec.get("intervalName") or rec.get("interval_name")):
             rec["intervalName"] = args.interval_name
-        elif (
+        if (
             args.interval_id is not None
             and rec.get("intervalId") is None
             and rec.get("interval_id") is None
         ):
             rec["intervalId"] = args.interval_id
 
-        if inline_data and (args.input_file or args.json_payload):
+        if args.data_pairs:
+            raw_fk = rec.get("formKey") or rec.get("form_key")
+            rec_form_key = str(raw_fk) if raw_fk else None
+            raw_fid = rec.get("formId") if rec.get("formId") is not None else rec.get("form_id")
+            rec_form_id = (
+                raw_fid if isinstance(raw_fid, int) and not isinstance(raw_fid, bool) else None
+            )
+            inline_data = parse_key_value_pairs(
+                args.data_pairs,
+                schema=schema,
+                study_key=study_key,
+                form_key=rec_form_key,
+                form_id=rec_form_id,
+                collect_errors=collect_errors,
+                issues=issues,
+                record_index=idx,
+            )
             existing_data = dict(rec.get("data") or {})
             existing_data.update(inline_data)
             rec["data"] = existing_data
 
         resolved.append(rec)
 
-    ensure_no_masked_sentinel(resolved)
+    sentinel_issues = ensure_no_masked_sentinel(resolved, collect_errors=collect_errors)
+    if issues is not None:
+        seen_masked = {
+            (iss.record_index, iss.variable_name) for iss in issues if iss.rule_id == "masked_phi"
+        }
+        for s_iss in sentinel_issues or ():
+            if (s_iss.record_index, s_iss.variable_name) not in seen_masked:
+                issues.append(s_iss)
     return resolved
 
 
@@ -300,9 +346,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     @with_sdk
     def create_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
+        collect_errors = bool(args.dry_run)
+        issues: list[RecordValidationIssue] = []
         try:
             resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
-            payload = _assemble_create_records_payload(args, schema=resolved_schema)
+            payload = _assemble_create_records_payload(
+                args,
+                schema=resolved_schema,
+                collect_errors=collect_errors,
+                issues=issues,
+            )
             email_notify = parse_email_notify(args.email_notify)
             with write_progress_context(
                 "record submission",
@@ -315,13 +368,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     payload,
                     email_notify=email_notify,
                     schema=resolved_schema,
+                    default_form_key=args.form_key,
+                    default_form_id=args.form_id,
+                    precollected_issues=issues,
                     chunk_size=args.chunk_size,
                     wait_for_completion=args.wait,
                     timeout=args.timeout,
                     interval=args.interval,
                     on_progress=on_progress,
                     dry_run=args.dry_run,
-                    collect_errors=True,
+                    collect_errors=collect_errors,
                 )
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(exc)
@@ -369,12 +425,26 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
     add_study_key_args(import_parser)
     import_parser.add_argument("file", help="Path to CSV or JSON file to import.")
+    import_parser.add_argument(
+        "--form-key",
+        default=None,
+        help="Default form key (formKey) when omitted from imported rows.",
+    )
+    import_parser.add_argument(
+        "--form-id",
+        type=int,
+        default=None,
+        help="Default form ID (formId) when omitted from imported rows.",
+    )
     add_write_common_args(import_parser)
 
     @with_sdk
     def import_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
         input_path = Path(args.file)
+        collect_errors = bool(args.dry_run)
+        default_form_key = getattr(args, "form_key", None)
+        default_form_id = getattr(args, "form_id", None)
         try:
             resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
             email_notify = parse_email_notify(args.email_notify)
@@ -385,21 +455,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 output_format=args.output_format,
             ) as on_progress:
                 if input_path.suffix.lower() == ".json":
-                    payload = load_records_from_path_or_stdin(args.file, schema=resolved_schema)
                     raw_summary = sdk.records.create_batch(
                         args.study_key,
-                        payload,
+                        input_path,
                         email_notify=email_notify,
                         schema=resolved_schema,
+                        default_form_key=default_form_key,
+                        default_form_id=default_form_id,
                         chunk_size=args.chunk_size,
                         wait_for_completion=args.wait,
                         timeout=args.timeout,
                         interval=args.interval,
                         on_progress=on_progress,
                         dry_run=args.dry_run,
-                        collect_errors=True,
+                        collect_errors=collect_errors,
                     )
-                    total_count = len(payload)
                 else:
                     raw_summary = import_records_csv(
                         sdk,
@@ -407,15 +477,17 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                         input_path,
                         email_notify=email_notify,
                         schema=resolved_schema,
+                        default_form_key=default_form_key,
+                        default_form_id=default_form_id,
                         chunk_size=args.chunk_size,
                         wait_for_completion=args.wait,
                         timeout=args.timeout,
                         interval=args.interval,
                         on_progress=on_progress,
                         dry_run=args.dry_run,
-                        collect_errors=True,
+                        collect_errors=collect_errors,
                     )
-                    total_count = getattr(raw_summary, "total_records", 0)
+                total_count = getattr(raw_summary, "total_records", 0)
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(exc)
 
