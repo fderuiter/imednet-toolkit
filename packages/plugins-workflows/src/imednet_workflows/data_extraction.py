@@ -1,12 +1,65 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
 from collections.abc import Callable
+from datetime import UTC, date, datetime
 from typing import Any
 
 from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import Record, RecordRevision
 from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import normalize_utc_timestamp_bound
+
+
+def _parse_date_created_utc(raw: Any) -> datetime | None:
+    """Parse a revision timestamp or date into a UTC-aware datetime."""
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.replace(tzinfo=UTC) if raw.tzinfo is None else raw.astimezone(UTC)
+    if isinstance(raw, date):
+        return datetime(raw.year, raw.month, raw.day, tzinfo=UTC)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    return None
+
+
+def _matches_local_date_bound(rev_dt: datetime | None, op: str, bound_val: Any) -> bool:
+    """Evaluate a local dateCreated comparison operator against a parsed UTC timestamp."""
+    if rev_dt is None:
+        return False
+    if isinstance(bound_val, datetime):
+        bound_dt = _parse_date_created_utc(bound_val)
+    elif isinstance(bound_val, (str, date)):
+        bound_str = bound_val if isinstance(bound_val, str) else bound_val.isoformat()
+        try:
+            norm_str = normalize_utc_timestamp_bound(bound_str, is_end=op in ("<=", "<"))
+            bound_dt = _parse_date_created_utc(norm_str)
+        except ValueError:
+            bound_dt = _parse_date_created_utc(bound_val)
+    else:
+        bound_dt = None
+    if bound_dt is None:
+        return False
+    if op in ("==", "="):
+        return rev_dt == bound_dt
+    if op in ("!=", "<>"):
+        return rev_dt != bound_dt
+    if op == "<":
+        return rev_dt < bound_dt
+    if op == "<=":
+        return rev_dt <= bound_dt
+    if op == ">":
+        return rev_dt > bound_dt
+    if op == ">=":
+        return rev_dt >= bound_dt
+    raise ValueError(f"Unsupported dateCreated filter operator: {op!r}")
 
 
 class DataExtractionWorkflow:
@@ -141,7 +194,14 @@ class DataExtractionWorkflow:
         final_filter_dict: dict[str, Any] = dict(user_filter) if user_filter else {}
         final_filter_dict.update(filters)
 
-        if start_date is not None or end_date is not None:
+        local_date_bounds: list[tuple[str, Any]] = []
+        has_existing_tuple_list = any(
+            isinstance(final_filter_dict.get(k), list)
+            and any(isinstance(item, tuple) for item in final_filter_dict[k])
+            for k in ("date_created", "dateCreated")
+            if k in final_filter_dict
+        )
+        if start_date is not None or end_date is not None or has_existing_tuple_list:
             date_bounds: list[tuple[str, Any]] = []
             for key_variant in ("date_created", "dateCreated"):
                 if key_variant in final_filter_dict:
@@ -161,15 +221,30 @@ class DataExtractionWorkflow:
                 end_utc = normalize_utc_timestamp_bound(end_date, is_end=True)
                 date_bounds.append(("<=", end_utc))
 
-            final_filter_dict["dateCreated"] = (
-                date_bounds[0] if len(date_bounds) == 1 else date_bounds
-            )
+            if date_bounds:
+                final_filter_dict["dateCreated"] = date_bounds[0]
+                local_date_bounds = date_bounds[1:]
 
-        revisions = self._sdk.get_record_revisions(
-            study_key,
-            **final_filter_dict,
+        revisions = list(
+            self._sdk.get_record_revisions(
+                study_key,
+                **final_filter_dict,
+            )
         )
-        return list(revisions)
+        if local_date_bounds:
+            revisions = [
+                rev
+                for rev in revisions
+                if all(
+                    _matches_local_date_bound(
+                        _parse_date_created_utc(getattr(rev, "date_created", None)),
+                        op,
+                        bound_val,
+                    )
+                    for op, bound_val in local_date_bounds
+                )
+            ]
+        return revisions
 
 
 # Integration:

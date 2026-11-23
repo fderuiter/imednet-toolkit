@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, TypedDict, cast
 
@@ -17,6 +18,60 @@ from imednet.spi.models import (
     Variable,
     is_site_enrollment_eligible,
 )
+
+_NON_SUBJECT_FORM_TYPES = frozenset({"site", "study", "admin"})
+_LEGACY_ENROLLMENT_FORM_TYPES = frozenset({"enrollment", "registration"})
+_SUBJECT_ENROLLMENT_FORM_TYPES = frozenset({"subject", "crf", ""})
+
+
+def _is_true_flag(obj: Any, *attrs: str) -> bool:
+    """Return True only when an attribute or mapping key on ``obj`` is literally ``True``."""
+    for attr in attrs:
+        val = obj.get(attr) if isinstance(obj, Mapping) else getattr(obj, attr, None)
+        if val is True:
+            return True
+    return False
+
+
+def _normalized_form_type(form: Any) -> str:
+    """Extract lowercase ``form_type`` / ``formType`` string when available."""
+    raw = (
+        (form.get("form_type") or form.get("formType"))
+        if isinstance(form, Mapping)
+        else (getattr(form, "form_type", None) or getattr(form, "formType", None))
+    )
+    return raw.strip().lower() if isinstance(raw, str) else ""
+
+
+def is_disabled_form(form: Any) -> bool:
+    """Return True when ``form`` has ``disabled=True``."""
+    return _is_true_flag(form, "disabled")
+
+
+def is_non_subject_form(form: Any) -> bool:
+    """Return True when ``form`` is an ``otherForms`` or Site/Study/Admin form."""
+    return (
+        _is_true_flag(form, "other_forms", "otherForms")
+        or _normalized_form_type(form) in _NON_SUBJECT_FORM_TYPES
+    )
+
+
+def is_enrollment_form(form: Any) -> bool:
+    """Return True when ``form`` is an active Subject registration/enrollment form."""
+    if is_disabled_form(form) or is_non_subject_form(form):
+        return False
+    ft = _normalized_form_type(form)
+    if ft in _LEGACY_ENROLLMENT_FORM_TYPES:
+        return True
+    return (
+        _is_true_flag(form, "subject_record_report", "subjectRecordReport")
+        and ft in _SUBJECT_ENROLLMENT_FORM_TYPES
+    )
+
+
+def is_unscheduled_form(form: Any) -> bool:
+    """Return True when ``form`` has ``unscheduledVisit=True``."""
+    return _is_true_flag(form, "unscheduled_visit", "unscheduledVisit")
 
 
 class FormVariableMap(TypedDict):
@@ -55,21 +110,30 @@ class StudySnapshot(ImednetBaseModel):
         }
 
     def enrollment_forms(self) -> list[Form]:
-        """Return forms with form_type indicating subject registration."""
-        return [form for form in self.forms if form.form_type in ("Enrollment", "Registration")]
+        """Return active subject registration forms."""
+        return [form for form in self.forms if is_enrollment_form(form)]
 
     def scheduled_forms(self) -> list[Form]:
-        """Return scheduled (non-enrollment, non-unscheduled) forms."""
+        """Return active scheduled subject forms (excluding enrollment, unscheduled, and non-subject)."""
         return [
             form
             for form in self.forms
-            if not getattr(form, 'unscheduled_visit', False)
-            and form.form_type not in ("Enrollment", "Registration")
+            if not is_disabled_form(form)
+            and not is_non_subject_form(form)
+            and not is_enrollment_form(form)
+            and not is_unscheduled_form(form)
         ]
 
     def unscheduled_forms(self) -> list[Form]:
-        """Return unscheduled forms."""
-        return [form for form in self.forms if getattr(form, 'unscheduled_visit', False)]
+        """Return active unscheduled subject forms."""
+        return [
+            form
+            for form in self.forms
+            if not is_disabled_form(form)
+            and not is_non_subject_form(form)
+            and not is_enrollment_form(form)
+            and is_unscheduled_form(form)
+        ]
 
     def active_sites(self) -> list[Site]:
         """Return sites that are actively enrolling."""
