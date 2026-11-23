@@ -55,22 +55,39 @@ def test_retired_smoke_helpers_are_not_executable_workflow_steps() -> None:
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is needed for workflow scripts")
 @pytest.mark.parametrize(
-    "pytest_exit_code,outcome,expected",
-    [("0", "success", 0), ("1", "success", 1), ("0", "failure", 1), ("", "skipped", 1)],
+    "pytest_exit_code,outcome,drift_detected,expected",
+    [
+        ("0", "success", "", 0),
+        ("0", "success", "false", 0),
+        ("0", "success", "true", 1),
+        ("1", "success", "false", 1),
+        ("0", "failure", "false", 1),
+        ("", "skipped", "", 1),
+    ],
 )
 def test_live_workflow_propagates_test_and_aggregation_failures(
-    tmp_path, pytest_exit_code, outcome, expected
+    tmp_path, pytest_exit_code, outcome, drift_detected, expected
 ) -> None:
-    """Aggregation errors must not be hidden by a passing pytest exit code."""
+    """Aggregation errors and drift_detected=true must not be hidden by a passing pytest exit code."""
     workflow = yaml.load(
         (WORKFLOWS / "live-tests.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader
     )
     step = workflow["jobs"]["live-validation"]["steps"][-1]
     assert step["if"] == "always()"
+    assert step["env"]["DRIFT_DETECTED"] == "${{ steps.live_tests.outputs.drift_detected }}"
+    env = {
+        **os.environ,
+        "PYTEST_EXIT_CODE": pytest_exit_code,
+        "VALIDATION_OUTCOME": outcome,
+    }
+    if drift_detected:
+        env["DRIFT_DETECTED"] = drift_detected
+    else:
+        env.pop("DRIFT_DETECTED", None)
     result = subprocess.run(
         [shutil.which("bash"), "-e", "-c", step["run"]],
         cwd=tmp_path,
-        env={**os.environ, "PYTEST_EXIT_CODE": pytest_exit_code, "VALIDATION_OUTCOME": outcome},
+        env=env,
         capture_output=True,
         text=True,
         check=False,
