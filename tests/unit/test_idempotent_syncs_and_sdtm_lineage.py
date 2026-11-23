@@ -91,6 +91,7 @@ def _build_sdtm_sdk(
             variable_type="text",
             form_id=301,
             form_key="AE",
+            required=True,
         ),
         Variable(
             variable_id=2,
@@ -99,6 +100,7 @@ def _build_sdtm_sdk(
             variable_type="text",
             form_id=301,
             form_key="AE",
+            required=True,
         ),
         Variable(
             variable_id=3,

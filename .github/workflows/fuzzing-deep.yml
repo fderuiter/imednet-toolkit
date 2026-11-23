@@ -1,0 +1,94 @@
+name: Deep Coverage-Guided Fuzzing
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deep-fuzzing:
+    name: Run Deep Coverage-Guided Fuzzing (1,000,000 iterations)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Restore Workspace Dependencies
+        id: cache-uv
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-venv-${{ runner.os }}-"3.12"-
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
+
+      - name: Install Dependencies
+        run: |
+          uv sync --locked --all-packages --all-extras
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Save Workspace Dependencies
+        if: github.ref == 'refs/heads/main' && steps.cache-uv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
+
+      - name: Restore Fuzzing Corpus Cache
+        id: restore-fuzz-corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/verification/fuzz_corpus/
+          key: fuzz-corpus-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-
+
+      - name: Run Coverage-Guided Fuzzing (1,000,000 iterations)
+        env:
+          IMEDNET_FUZZ_RUNS: "1000000"
+        run: pytest tests/core/test_fuzz.py -m fuzzing -v
+
+      - name: Aggregate Verification Report
+        if: always()
+        run: python scripts/aggregate_verification.py --report-dir reports/verification --expect-track fuzzing
+
+      - name: Save Verification Artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deep-fuzzing-report
+          path: reports/verification/fuzzing_report.json
+          if-no-files-found: error
+
+      - name: Save Fuzzing Corpus Cache
+        if: github.ref == 'refs/heads/main' && steps.restore-fuzz-corpus.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/verification/fuzz_corpus/
+          key: fuzz-corpus-${{ runner.os }}-${{ github.sha }}

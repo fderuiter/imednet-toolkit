@@ -51,7 +51,10 @@ Usage
     from imednet.spi.sink_base import iter_batches
     from imednet_sinks import SnowflakeExportSink, SnowflakeSinkConfig
 
-    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+    sdk = ImednetSDK(
+        api_key=os.environ["IMEDNET_API_KEY"],
+        security_key=os.environ["IMEDNET_SECURITY_KEY"],
+    )
     records = list(sdk.records.list(study_key="MYSTUDY"))
 
     config = SnowflakeSinkConfig(

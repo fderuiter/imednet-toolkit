@@ -44,7 +44,10 @@ Usage
     from imednet_sinks import Neo4jExportSink, Neo4jSinkConfig
     from imednet_workflows.data_extraction import DataExtractionWorkflow
 
-    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+    sdk = ImednetSDK(
+        api_key=os.environ["IMEDNET_API_KEY"],
+        security_key=os.environ["IMEDNET_SECURITY_KEY"],
+    )
     records = DataExtractionWorkflow(sdk).extract_records_by_criteria(
         study_key="MYSTUDY",
     )
@@ -64,6 +67,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -88,10 +92,16 @@ from imednet.spi.sinks import (
     build_sink_mapper,
     extract_record_id,
     normalize_sink_value,
+    resolve_sdtm_domain,
     run_streaming_export,
 )
 
 logger = logging.getLogger(__name__)
+
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
+_CYPHER_PROP_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SDTM_DOMAIN_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_SDTM_SEQ_PROP_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*SEQ$")
 
 
 @dataclass
@@ -199,6 +209,16 @@ def _build_convention_cypher(
     visit_prop: str,
 ) -> tuple[str, str]:
     """Build MERGE and CREATE Cypher statements aligned to a naming convention."""
+    for prop_name, prop_val in (
+        ("study_prop", study_prop),
+        ("subject_prop", subject_prop),
+        ("record_prop", record_prop),
+        ("visit_prop", visit_prop),
+    ):
+        if not isinstance(prop_val, str) or not _CYPHER_PROP_PATTERN.fullmatch(prop_val):
+            raise ExportConfigurationError(
+                f"Neo4j Cypher property {prop_name} contains invalid characters: {prop_val!r}"
+            )
     merge_cypher = (
         "UNWIND $rows AS row\n"
         f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
@@ -241,6 +261,12 @@ def _build_sdtm_cypher(
     has_record_id: bool = False,
 ) -> tuple[str, str]:
     """Build MERGE and CREATE Cypher statements for SDTM domain rows."""
+    if seq_prop is not None and (
+        not isinstance(seq_prop, str) or not _SDTM_SEQ_PROP_PATTERN.fullmatch(seq_prop)
+    ):
+        raise ExportConfigurationError(
+            f"Neo4j SDTM sequence property contains invalid characters: {seq_prop!r}"
+        )
     if has_record_id:
         record_key_props = "STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID"
     elif seq_prop:
@@ -324,8 +350,12 @@ def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _post_process_graph_sdtm(row: dict[str, Any]) -> dict[str, Any]:
-    """Serialize any non-primitive SDTM row values for Neo4j property compatibility."""
+    """Validate SDTM property keys and serialize non-primitive values for Neo4j."""
     for key, val in list(row.items()):
+        if not isinstance(key, str) or not _IDENTIFIER_PATTERN.fullmatch(key):
+            raise ExportConfigurationError(
+                f"Neo4j SDTM property key contains invalid characters: {key!r}"
+            )
         if val is None or isinstance(val, NonCallableMock):
             continue
         if isinstance(val, Enum):
@@ -426,52 +456,57 @@ class Neo4jExportSink(ExportSink):
             record_seqs=self._record_seqs,
         )
         database = getattr(self.config, "database", "neo4j")
-        mapped_rows: list[dict[str, Any]] | None = None
-        cypher: str | None = None
+        try:
+            mapped_rows = [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
+        except ExportConfigurationError:
+            raise
+        except Exception:
+
+            def _raise_malformed() -> int:
+                raise TypeError("Malformed Neo4j record batch payload.") from None
+
+            return self._execute_with_retry("export_graph", batch_id, _raise_malformed)
+
+        if not mapped_rows:
+            return 0
+
+        if self.config.as_sdtm:
+            sample_row = mapped_rows[0]
+            raw_domain = (
+                resolve_sdtm_domain(self.config.sdtm_domain)
+                if isinstance(self.config.sdtm_domain, str) and self.config.sdtm_domain.strip()
+                else sample_row.get("DOMAIN")
+            )
+            domain = raw_domain if isinstance(raw_domain, str) else ""
+            candidate_seq = f"{domain}SEQ"
+            seq_prop = (
+                candidate_seq
+                if domain != "DM"
+                and _SDTM_DOMAIN_PATTERN.fullmatch(domain) is not None
+                and candidate_seq in sample_row
+                else None
+            )
+            has_visit = any("VISITNUM" in r for r in mapped_rows)
+            has_record_id = "RECORD_ID" in sample_row
+            merge_cypher, create_cypher = _build_sdtm_cypher(
+                seq_prop,
+                has_visit,
+                has_record_id=has_record_id,
+            )
+        elif self.config.naming_convention == "camelCase":
+            merge_cypher, create_cypher = _build_convention_cypher(
+                "studyKey", "subjectKey", "recordId", "visitId"
+            )
+        elif self.config.naming_convention == "sdtm":
+            merge_cypher, create_cypher = _build_convention_cypher(
+                "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
+            )
+        else:
+            merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
+        cypher = merge_cypher if self.config.idempotent else create_cypher
 
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
-            nonlocal mapped_rows, cypher
-            if mapped_rows is None:
-                try:
-                    mapped_rows = [
-                        _record_to_row(r, self._study_key, mapper=mapper) for r in records
-                    ]
-                except ExportConfigurationError:
-                    raise
-                except Exception:
-                    raise TypeError("Malformed Neo4j record batch payload.") from None
-            if not mapped_rows:
-                return 0
-            if cypher is None:
-                if self.config.as_sdtm:
-                    sample_row = mapped_rows[0]
-                    seq_prop = next(
-                        (
-                            k
-                            for k in sample_row
-                            if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
-                        ),
-                        None,
-                    )
-                    has_visit = any("VISITNUM" in r for r in mapped_rows)
-                    has_record_id = "RECORD_ID" in sample_row
-                    merge_cypher, create_cypher = _build_sdtm_cypher(
-                        seq_prop,
-                        has_visit,
-                        has_record_id=has_record_id,
-                    )
-                elif self.config.naming_convention == "camelCase":
-                    merge_cypher, create_cypher = _build_convention_cypher(
-                        "studyKey", "subjectKey", "recordId", "visitId"
-                    )
-                elif self.config.naming_convention == "sdtm":
-                    merge_cypher, create_cypher = _build_convention_cypher(
-                        "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
-                    )
-                else:
-                    merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
-                cypher = merge_cypher if self.config.idempotent else create_cypher
             with self._driver.session(database=database) as session:
                 session.run(cypher, rows=mapped_rows)
             logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))

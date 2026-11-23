@@ -1285,3 +1285,210 @@ def test_submission_workflow_api_error_transitions_to_failed_before_propagating(
     assert workflow.phase == SubmissionPhase.FAILED
     with pytest.raises(InvalidSubmissionPhaseTransitionError):
         workflow.transition_to(SubmissionPhase.DATA)
+
+
+def test_submit_binds_placeholders_to_server_assigned_uat_subjects_and_registers_only_missing():
+    """Bind synthetic UAT-TEST-* placeholders to server-assigned UAT subjectKeys without duplicate enrollment."""
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+
+    state = SimulationState()
+    state.subjects.extend(
+        [
+            {
+                "subjectId": 601,
+                "subjectKey": "SUBJ-601",
+                "studyKey": "STUDY",
+                "siteId": 101,
+                "siteName": "SITE",
+                "subjectStatus": "Enrolled",
+                "deleted": False,
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+            },
+            {
+                "subjectId": 602,
+                "subjectKey": "SUBJ-602",
+                "studyKey": "STUDY",
+                "siteId": 101,
+                "siteName": "SITE",
+                "subjectStatus": "Enrolled",
+                "deleted": False,
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+            },
+        ]
+    )
+    sim_transport = create_simulation_transport(state)
+    sdk = ImednetSDK(
+        transport=httpx.MockTransport(sim_transport.handle_request),
+        simulation_mode=True,
+    )
+
+    # 1. Sufficient existing UAT subjects (2 needed, 2 server-assigned exist): 0 registrations
+    rs_reg_2 = GeneratedRecordSet(
+        form_key="F_DM",
+        form_name="Demographics",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[
+            {
+                "formKey": "F_DM",
+                "siteName": "SITE",
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+                "data": {"V_AGE": 30},
+            },
+            {
+                "formKey": "F_DM",
+                "siteName": "SITE",
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+                "data": {"V_AGE": 35},
+            },
+        ],
+        subject_keys=["UAT-TEST-001", "UAT-TEST-002"],
+    )
+    rs_data_2 = GeneratedRecordSet(
+        form_key="F_VS",
+        form_name="Vital Signs",
+        test_type=RecordTestType.UPDATE_SCHEDULED_RECORD,
+        payloads=[
+            {
+                "formKey": "F_VS",
+                "subjectKey": "UAT-TEST-001",
+                "intervalName": "Baseline",
+                "data": {"V_WEIGHT": 70.0},
+            },
+            {
+                "formKey": "F_VS",
+                "subjectKey": "UAT-TEST-002",
+                "intervalName": "Baseline",
+                "data": {"V_WEIGHT": 75.5},
+            },
+        ],
+        subject_keys=["UAT-TEST-001", "UAT-TEST-002"],
+    )
+
+    pre_count = len(state.subjects)
+    res_reuse = BulkRecordSubmissionWorkflow(sdk, skip_existing_subjects=True).submit(
+        "STUDY", [rs_reg_2, rs_data_2]
+    )
+    assert len(res_reuse.registration_batches) == 0
+    assert "F_DM" in res_reuse.skipped_forms
+    assert res_reuse.enrolled_subject_keys == ["SUBJ-601", "SUBJ-602"]
+    assert [p["subjectKey"] for p in rs_data_2.payloads] == ["SUBJ-601", "SUBJ-602"]
+    assert len(state.subjects) == pre_count
+
+    # 2. Partial existing UAT subjects (3 needed, 2 exist): registers only 1 missing subject
+    rs_reg_3 = GeneratedRecordSet(
+        form_key="F_DM",
+        form_name="Demographics",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[
+            {
+                "formKey": "F_DM",
+                "siteName": "SITE",
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+                "data": {"V_AGE": 30},
+            },
+            {
+                "formKey": "F_DM",
+                "siteName": "SITE",
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+                "data": {"V_AGE": 35},
+            },
+            {
+                "formKey": "F_DM",
+                "siteName": "SITE",
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+                "data": {"V_AGE": 41},
+            },
+        ],
+        subject_keys=["UAT-TEST-001", "UAT-TEST-002", "UAT-TEST-003"],
+    )
+    rs_data_3 = GeneratedRecordSet(
+        form_key="F_VS",
+        form_name="Vital Signs",
+        test_type=RecordTestType.UPDATE_SCHEDULED_RECORD,
+        payloads=[
+            {
+                "formKey": "F_VS",
+                "subjectKey": "UAT-TEST-001",
+                "intervalName": "Baseline",
+                "data": {"V_WEIGHT": 70.0},
+            },
+            {
+                "formKey": "F_VS",
+                "subjectKey": "UAT-TEST-002",
+                "intervalName": "Baseline",
+                "data": {"V_WEIGHT": 75.5},
+            },
+            {
+                "formKey": "F_VS",
+                "subjectKey": "UAT-TEST-003",
+                "intervalName": "Baseline",
+                "data": {"V_WEIGHT": 80.2},
+            },
+        ],
+        subject_keys=["UAT-TEST-001", "UAT-TEST-002", "UAT-TEST-003"],
+    )
+
+    res_partial = BulkRecordSubmissionWorkflow(sdk, skip_existing_subjects=True).submit(
+        "STUDY", [rs_reg_3, rs_data_3]
+    )
+    assert len(res_partial.registration_batches) == 1
+    assert res_partial.registration_batches[0].record_count == 1
+    assert len(state.subjects) == pre_count + 1
+    assert res_partial.enrolled_subject_keys[:2] == ["SUBJ-601", "SUBJ-602"]
+    assert len(res_partial.enrolled_subject_keys) == 3
+    assert [p["subjectKey"] for p in rs_data_3.payloads] == res_partial.enrolled_subject_keys
+
+
+def test_submit_forwards_schema_to_sdk_create_record(mock_sdk):
+    """BulkRecordSubmissionWorkflow._submit_batch forwards schema into sdk.create_record."""
+    from imednet.datadict import DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="REG",
+                variables=[DDVariable(variableName="AGE", variableType="Integer")],
+            ),
+            DDForm(
+                formKey="DATA",
+                variables=[DDVariable(variableName="BP", variableType="Integer")],
+            ),
+        ]
+    )
+
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+    mock_sdk.create_record.side_effect = [
+        Job(batch_id="reg_1", state="PENDING"),
+        Job(batch_id="data_1", state="PENDING"),
+    ]
+    mock_sdk.get_job.return_value = JobStatus(
+        batch_id="reg_1",
+        state="COMPLETED",
+        results=[{"subjectKey": "SUBJ-001"}],
+    )
+    mock_sdk.get_subjects.return_value = []
+
+    rs_reg = GeneratedRecordSet(
+        form_key="REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[{"formKey": "REG", "siteName": "Site1", "data": {"AGE": 30}}],
+        subject_keys=["UAT-TEST-001"],
+    )
+    rs_data = GeneratedRecordSet(
+        form_key="DATA",
+        form_name="Data",
+        test_type=RecordTestType.CREATE_NEW_RECORD,
+        payloads=[{"formKey": "DATA", "subjectKey": "UAT-TEST-001", "data": {"BP": 120}}],
+        subject_keys=["UAT-TEST-001"],
+    )
+
+    workflow.submit("study1", [rs_reg, rs_data], schema=dd)
+    assert mock_sdk.create_record.call_count == 2
+    assert mock_sdk.create_record.call_args_list[0].kwargs["schema"] is dd
+    assert mock_sdk.create_record.call_args_list[1].kwargs["schema"] is dd
