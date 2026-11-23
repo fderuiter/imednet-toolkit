@@ -3,7 +3,7 @@
 **Note:** Authoritative instructions for AI agents and human contributors working across **OpenAI Codex / ChatGPT**, **Claude Code**, and **Google Antigravity** in `imednet-toolkit`.
 
 1. **Stack & Rules:** Follow dependencies, credential redaction, testing boundaries, and PR rules in `docs/reference/agent_rules.rst`.
-2. **Verification:** Bootstrap with `uv sync --locked --all-packages --all-extras`, then run local CI gates per `docs/how-to/verification.rst`: `uvx pre-commit run --all-files`, `hatch run verify` (`>=90%` coverage across all five packages), `hatch run docs`, `hatch run validate-package-consumption`, and `uvx hatch run quality:all packages` before opening PRs.
+2. **Verification:** Bootstrap with `uv sync --locked --all-packages --all-extras`, then run local CI gates per `docs/how-to/verification.rst`: `uvx pre-commit run --all-files`, `hatch run verify` (`>=90%` coverage across all five packages), `hatch run docs`, `hatch run validate-package-consumption`, and `uvx hatch run quality:all packages` before opening PRs. When touching verification tracks, also run `pytest tests/core/test_performance.py -m performance` (`--update-perf-baseline` to refresh `tests/core/baselines/performance_baseline.json`), `pytest tests/core/test_fuzz.py -m fuzzing` (`IMEDNET_FUZZ_RUNS=25000` default), and `python scripts/aggregate_verification.py --report-dir reports/verification --expect-track <track>` (exits `1` on missing tracks or `status == "failed"`).
 3. **Architecture:** Adhere to package layering in `docs/explanation/architecture.rst` and `tests/unit/architecture/import_rules.py`.
 
 ## Cross-Harness Agent Skills Workflow
@@ -19,7 +19,7 @@ All canonical skills live under `.agents/skills/` (`.agents/skills/README.md`, r
 ## Project Overrides & Governance Precedence
 
 - **Environment Setup:** Use `uv sync --locked --all-packages --all-extras` (never `poetry`, unpinned `pip`, or unlisted deps). On Windows PowerShell, use `pwsh` with `scripts/env.ps1` / `.venv`, and prefer Git Bash (`C:\Program Files\Git\bin\bash.exe`) over WSL `bash.exe`.
-- **Workspace & Root Hygiene:** Use native harness worktrees or `.worktrees/`; save ephemeral artifacts, questionnaires, and handoffs under `.scratch/` or OS temp—never repo root (`scripts/check_root_files.py`).
+- **Workspace & Root Hygiene:** Use native harness worktrees or `.worktrees/`; save ephemeral artifacts, questionnaires, and handoffs under `.scratch/` or OS temp, and emit verification reports and fuzzing corpora under gitignored `reports/verification/` and `.cache/verification/`—never repo root (`scripts/check_root_files.py`).
 - **Specs & Domain Model:** Store single-PR specs/plans in `docs/superpowers/{specs,plans}/` (excluded in `docs/conf.py`). Maintain `CONTEXT.md` + `docs/adr/` via `domain-modeling` and regenerate `docs/adr/index.rst` via `hatch run docs` (`docs/agents/domain.md`).
 - **Triage Label Precedence:** `docs/agents/triage-labels.md` is authoritative for live GitHub labels and overrides legacy label spellings in frozen `docs/reference/{issue_management,triage_playbook}.rst` and `.github/ISSUE_TEMPLATE/*.yml`.
 - **PRs & Merging:** PR titles must satisfy Conventional Commits (`Semantic PR Title` CI check) and integrate via **Squash and merge** (`release-please`).

@@ -79,9 +79,9 @@ Commit Messages and Pull Requests
 - PR titles must follow Conventional Commits. Permitted prefixes: ``feat:``, ``fix:``, ``chore:``, ``docs:``, ``ci:``, ``test:``, ``refactor:``, ``perf:``, ``revert:``. The ``Semantic PR Title`` CI check enforces this.
 - Security updates and CVE remediations must use the ``fix:`` prefix (e.g. ``fix(deps):`` or ``fix(security):``), which directly maps to patch releases in ``release-please``. Do not use unpermitted prefixes such as ``security:``.
 - Merge to ``main`` via **Squash and merge** so the PR title becomes the commit message.
-- Changes that affect the public API, CLI interface, or environment variables must be noted in the ``Surface Impact`` section of ``.github/PULL_REQUEST_TEMPLATE.md`` for release and documentation review.
+- Changes that affect the public API, CLI interface, environment variables, or documentation portal (published via GitHub Pages) must be noted in the PR description (including the ``Surface Impact`` section of ``.github/PULL_REQUEST_TEMPLATE.md``).
 
 Release Process
 ^^^^^^^^^^^^^^^
-- Do **not** manually edit package versions in ``packages/*/pyproject.toml``. Versions are managed automatically by ``release-please``.
-- Releases are fully automated. After merging a Release PR, ``release-please`` creates a package-specific Git tag and the ``Pipeline`` workflow publishes the tagged package to PyPI.
+- Do **not** manually edit package versions in ``packages/*/pyproject.toml``. Versions are managed automatically by ``release-please`` (``Automated Release`` workflow).
+- Releases are fully automated. After merging a Release PR opened by ``release-please``, the ``Release`` workflow (``.github/workflows/release.yml``) builds and publishes impacted workspace packages to PyPI from the release commit or package-specific Git tag.

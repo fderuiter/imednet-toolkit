@@ -46,7 +46,7 @@ Examples:
 
 - ``bug(http): delegate URL path construction to httpx``
 - ``refactor(core): decouple async and sync client hierarchies``
-- ``docs(governance): document issue triage workflow``
+- ``docs(github): document issue triage workflow``
 - ``epic(core): architecture modernization and thread-safety``
 
 Avoid the following title patterns:
@@ -106,15 +106,15 @@ Area labels
 - ``area:ci``
 - ``area:release``
 - ``area:github``
+- ``area:streamlit``
 - ``area:mapping``
 - ``area:records``
 - ``area:standards``
+- ``area:dashboard``
+- ``area:review-workbench``
 - ``area:terminology``
 - ``area:governance``
 - ``area:performance``
-- ``area:dashboard``
-- ``area:review-workbench``
-- ``area:streamlit``
 
 Status and triage labels
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -123,13 +123,13 @@ Status and triage labels
 - ``status:needs-design``
 - ``status:ready``
 - ``status:in-progress``
-- ``status:blocked``
 - ``status:review``
+- ``status:blocked``
 - ``status:done``
-- ``question`` (waiting on reporter or maintainer clarification)
-- ``ready-for-agent`` (fully specified brief ready for automated execution, paired with ``status:ready``)
-- ``help wanted``
-- ``wontfix`` / ``duplicate`` / ``invalid``
+- ``ready-for-agent`` — pair with ``status:ready`` when fully specified for automated execution
+- ``help wanted`` — pair with ``status:ready`` (without ``ready-for-agent``) for manual human work
+- ``question`` — waiting on reporter or maintainer clarification
+- ``wontfix``, ``duplicate``, ``invalid`` — resolution labels recorded with closing rationale
 
 Size labels
 ^^^^^^^^^^^
@@ -143,7 +143,10 @@ Size labels
 Risk labels
 ^^^^^^^^^^^
 
-- ``risk:low`` (only ``risk:low`` exists on GitHub; document medium or high risk explicitly in the issue body alongside ``priority:*`` rather than applying non-existent risk labels)
+- ``risk:low``
+
+Only ``risk:low`` exists as a GitHub label; document elevated compatibility, security,
+or transport risk directly in the issue body and reflect urgency in ``priority:*``.
 
 Required issue content
 ----------------------

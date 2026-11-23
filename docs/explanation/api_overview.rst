@@ -33,19 +33,101 @@ private deployment. See :doc:`/reference/configuration` for details.
 Authentication
 --------------
 
-Requests authenticate using either an API/security key pair
-(``x-api-key`` and ``x-imn-security-key`` headers) or an OIDC bearer token
-(``oidc_token``, sent via ``Authorization: Bearer <token>``).
-:class:`~imednet.core.base_client.BaseClient` initializes the configured
-:class:`~imednet.auth.strategy.AuthStrategy`, while
-:class:`~imednet.core.client.Client` and
-:class:`~imednet.core.async_client.AsyncClient` call
-:func:`imednet.config.load_config` (and :class:`~imednet.config.Config` /
-:class:`~imednet.config.CredentialSource`) to resolve ``IMEDNET_API_KEY`` +
-``IMEDNET_SECURITY_KEY`` or ``IMEDNET_OIDC_TOKEN`` from explicit arguments or
-environment variables. Supplying both an incomplete key pair and ambiguous
-credentials raises :class:`~imednet.errors.ConfigurationError`. See
-:doc:`/reference/configuration` for precedence details.
+Authentication and request header generation are owned by
+:class:`~imednet.auth.strategy.AuthStrategy` implementations initialized on
+:class:`~imednet.core.base_client.BaseClient` rather than hardcoded client
+headers (see ADR 0005):
+
+* :class:`~imednet.auth.api_key.ApiKeyAuth` – populates ``x-api-key`` and
+  ``x-imn-security-key`` headers for static Mednet API/security key pairs.
+* :class:`~imednet.auth.oidc.OIDCAuth` – verifies JWT signatures and claims
+  (``exp``, ``nbf`` with optional ``leeway``, ``aud``, and ``iss``), emits
+  ``Authorization: Bearer <token>``, and extracts ``sub`` /
+  ``preferred_username`` user identifiers plus ``roles`` / ``groups`` RBAC
+  claims (``admin``, ``manager``, ``reviewer``, ``viewer``). ``OIDCAuth``
+  defaults to asymmetric JWS algorithms (``RS*``, ``PS*``, ``ES*``, ``EdDSA``),
+  enforces strict key-type separation (rejecting ``alg: "none"`` and symmetric
+  ``oct`` JWKs), and reads verification settings from
+  ``IMEDNET_OIDC_PUBLIC_KEY``, ``IMEDNET_OIDC_JWKS_URL``,
+  ``IMEDNET_OIDC_AUDIENCE``, ``IMEDNET_OIDC_ALGORITHMS``, and
+  ``IMEDNET_OIDC_ISSUER``.
+* **Custom** :class:`~imednet.auth.strategy.AuthStrategy` – passing an explicit
+  ``auth=...`` strategy initializes :class:`~imednet.sdk.ImednetSDK`,
+  :class:`~imednet.sdk.AsyncImednetSDK`, :class:`~imednet.core.client.Client`,
+  and :class:`~imednet.core.async_client.AsyncClient` directly without requiring
+  placeholder API or security keys. Supplying ``auth`` alongside an already
+  constructed ``client`` or ``async_client`` raises ``ValueError`` because the
+  injected client owns its transport headers.
+
+When ``auth`` is not passed explicitly, :func:`imednet.config.load_config`
+resolves each credential field in strict precedence order:
+
+1. Explicit constructor or ``load_config(...)`` keyword arguments (explicit
+   empty strings suppress fallback and fail validation with
+   :class:`~imednet.errors.ConfigurationError`).
+2. A caller-owned :class:`~imednet.auth.credentials.CredentialSource` snapshot
+   such as :class:`~imednet.auth.credentials.MemoryCredentialStore` returning
+   :class:`~imednet.auth.credentials.Credentials` in memory without touching
+   filesystem state. Lookup errors fail closed as ``ConfigurationError`` without
+   echoing raw secret text, and ``Config``, ``Credentials``,
+   ``MemoryCredentialStore``, ``ApiKeyAuth``, and ``OIDCAuth`` redact secrets in
+   ``repr()``.
+3. Environment variables (``IMEDNET_OIDC_TOKEN``, ``IMEDNET_API_KEY``, and
+   ``IMEDNET_SECURITY_KEY``).
+
+Once resolved, ``oidc_token`` takes precedence over static ``api_key`` and
+``security_key`` pairs. Updating or clearing a ``MemoryCredentialStore`` affects
+subsequent client initializations without mutating live client instances. See
+:doc:`/reference/configuration` for all authentication environment variables.
+
+.. testcode::
+
+   import jwt
+   from cryptography.hazmat.primitives import serialization
+   from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+   from imednet import ImednetSDK
+   from imednet.auth import Credentials, MemoryCredentialStore, OIDCAuth
+   from imednet.simulation import SimulationTransport
+
+   signing_key = Ed25519PrivateKey.generate()
+   public_pem = signing_key.public_key().public_bytes(
+       encoding=serialization.Encoding.PEM,
+       format=serialization.PublicFormat.SubjectPublicKeyInfo,
+   )
+   signed_jwt = jwt.encode(
+       {
+           "sub": "auditor@study.example",
+           "iss": "https://idp.study.example",
+           "aud": "imednet-edc",
+           "roles": ["admin"],
+       },
+       signing_key,
+       algorithm="EdDSA",
+   )
+
+   oidc_auth = OIDCAuth(
+       signed_jwt,
+       public_key=public_pem,
+       issuer="https://idp.study.example",
+       audience="imednet-edc",
+   )
+   assert oidc_auth.get_user_roles() == ["admin"]
+   assert "Bearer " in oidc_auth.get_headers()["Authorization"]
+
+   with ImednetSDK(auth=oidc_auth, transport=SimulationTransport()) as sdk:
+       studies = list(sdk.studies.list())
+       assert len(studies) >= 1
+
+   cred_store = MemoryCredentialStore(
+       Credentials(
+           api_key="mem-api-key",  # pragma: allowlist secret
+           security_key="mem-security-key",  # pragma: allowlist secret
+       )
+   )
+   assert "<redacted>" in repr(cred_store)
+   with ImednetSDK(credential_source=cred_store, transport=SimulationTransport()) as sdk:
+       assert sdk.auth is not None
 
 HTTP methods and errors
 -----------------------

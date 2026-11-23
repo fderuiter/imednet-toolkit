@@ -20,12 +20,16 @@ For each new issue:
 1. Confirm the title follows ``<type>(<area>): <concise outcome>``. Rewrite it if needed.
 2. Confirm the issue body includes a problem statement, outcome, acceptance criteria,
    and test/docs impact.
-3. Apply labels across the required dimensions: type, area, priority, and status.
-4. Add size and risk labels when they improve planning clarity.
+3. Apply labels across the required dimensions: type, area, priority, and status (starting at ``status:triage`` for unreviewed intake).
+4. Add size labels (and ``risk:low`` where applicable; record elevated risk in the issue body and ``priority:*``) when they improve planning clarity.
 5. Link the issue to an epic or initiative when the work is part of a larger stream.
 
 If the issue lacks enough information to schedule work, apply ``question``
-(optionally paired with ``status:blocked``) and request the missing details.
+(optionally paired with ``status:blocked``) and request the missing details. Use
+``status:needs-design`` when architectural judgment is required, ``ready-for-agent``
+with ``status:ready`` when fully specified for automated execution, or
+``status:ready`` with ``help wanted`` (without ``ready-for-agent``) when manual
+human work is needed.
 
 Required maintainer checks
 --------------------------
@@ -72,10 +76,10 @@ Use the following guidance when assigning priority:
 ``priority:p3``
    Nice-to-have work, backlog grooming, or longer-range improvements.
 
-Assign ``priority:p0`` or ``priority:p1`` and document elevated risk explicitly
-in the issue body for work that could affect public API compatibility, credential
-handling, concurrency, or critical transport logic (only ``risk:low`` exists as a
-GitHub label).
+Assign ``priority:p0`` or ``priority:p1`` and capture elevated risk (such as changes
+affecting public API compatibility, credential handling, concurrency, or critical
+transport logic) directly in the issue body; ``risk:low`` is the only ``risk:*`` label
+defined on GitHub.
 
 Epic and sub-issue management
 -----------------------------
@@ -108,7 +112,8 @@ Blocked and stale issues
 ------------------------
 
 - Use ``status:blocked`` when an issue cannot proceed because of an upstream dependency.
-- Use ``question`` (optionally paired with ``status:blocked``) when the reporter or maintainer must provide more detail.
+- Use ``question`` (optionally paired with ``status:blocked``) when the reporter or maintainer must provide more detail before work can proceed.
+- Close non-actionable issues with ``wontfix``, ``duplicate``, or ``invalid`` and record the rationale in the closing comment.
 - Revisit ``status:blocked`` and ``question`` issues during backlog review instead of leaving them unlabeled.
 
 Definition of done for triage

@@ -342,6 +342,21 @@ def test_uat_execution_engine_routes_polling_through_facade_poll_jobs() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "edc.synthetic.imednet.test":
+            if request.method == "GET" and request.url.path.endswith(
+                ("/forms", "/variables", "/intervals", "/sites", "/subjects")
+            ):
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [],
+                        "pagination": {
+                            "currentPage": 0,
+                            "size": 100,
+                            "totalPages": 0,
+                            "totalElements": 0,
+                        },
+                    },
+                )
             if request.method == "POST" and request.url.path.endswith("/records"):
                 return httpx.Response(
                     200,

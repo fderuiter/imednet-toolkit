@@ -2,7 +2,7 @@
 
 **Status:** Accepted (pytest path boundaries updated in `pyproject.toml`)
 
-> **Supersession Note:** The test-boundary isolation model, `scripts/env.ps1`, `fix:` security commit semantics, and Dependabot grouping remain accepted. Item 1 below is **updated** to match `pyproject.toml`: the separate `tests/browser/` directory was retired and `packages/plugins-tui/tests` was added, so `[tool.pytest.ini_options]` now sets `addopts = "--junitxml=reports/junit.xml -ra --ignore=tests/live"` and `testpaths = ["tests", "packages/plugins-sinks/tests", "packages/plugins-tui/tests"]`.
+> **Supersession Note:** The test-boundary isolation model, `scripts/env.ps1`, `fix:` security commit semantics, and Dependabot grouping remain accepted. Item 1 below is **updated** to match `pyproject.toml`: `[tool.pytest.ini_options]` now sets `addopts = "--junitxml=reports/junit.xml -ra --ignore=tests/live"` and `testpaths = ["tests", "packages/plugins-sinks/tests", "packages/plugins-tui/tests"]`, while the historical `tests/browser/` directory was retired in favor of standalone Playwright verification via `scripts/verify_pyodide_tutorials.py`.
 
 ## Context and Decision
 
