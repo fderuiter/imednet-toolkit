@@ -41,7 +41,10 @@ from imednet_sinks import (
     export_to_snowflake,
 )
 
-sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+sdk = ImednetSDK(
+    api_key=os.environ["IMEDNET_API_KEY"],
+    security_key=os.environ["IMEDNET_SECURITY_KEY"],
+)
 
 config = MongoDbSinkConfig(
     study_key="STUDY-123",

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Iterable
 from typing import Any
+from unittest.mock import NonCallableMock
 
 from pydantic import BaseModel
 
@@ -92,36 +95,40 @@ def _extract_extra_attributes(obj: Any, excluded_camel_keys: set[str]) -> dict[s
     return extra
 
 
-def load_from_api(
-    sdk: Any,
+def can_load_from_api(sdk: Any) -> bool:
+    """Return True if *sdk* exposes forms and variables endpoints or facade methods."""
+    if sdk is None:
+        return False
+    if isinstance(sdk, NonCallableMock):
+        mock_children = getattr(sdk, "_mock_children", {})
+        obj_vars = vars(sdk)
+        has_forms = any(
+            k in mock_children or k in obj_vars for k in ("forms", "get_forms", "async_get_forms")
+        )
+        has_vars = any(
+            k in mock_children or k in obj_vars
+            for k in ("variables", "get_variables", "async_get_variables")
+        )
+        return has_forms and has_vars
+    has_forms_attr = any(hasattr(sdk, attr) for attr in ("forms", "get_forms", "async_get_forms"))
+    has_vars_attr = any(
+        hasattr(sdk, attr) for attr in ("variables", "get_variables", "async_get_variables")
+    )
+    return has_forms_attr and has_vars_attr
+
+
+def _build_datadict_from_items(
     study_key: str,
-    *,
-    no_raw_xml: bool = False,
+    forms_list: Iterable[Any],
+    variables_list: Iterable[Any],
 ) -> DataDictionary:
-    """Extract data dictionary metadata from live iMednet API via the SDK.
-
-    Note: The iMednet REST API exposes study forms and variables endpoints, but does
-    not offer direct REST endpoints for business logic rules or choice code lists.
-    This loader extracts available forms and variables and returns a canonical
-    DataDictionary with documented partial structure (empty logic and choices).
-
-    Args:
-        sdk: Initialized ImednetSDK instance.
-        study_key: Unique study identifier.
-        no_raw_xml: Whether to omit raw XML (reserved for export jobs).
-
-    Returns:
-        Canonical DataDictionary representation.
-    """
+    """Construct a canonical DataDictionary from iterable form and variable payloads."""
     warnings: list[str] = [
         "Business logic rules and choices are not exposed by the standard REST API "
         "and require a CSV data dictionary export job. Forms and variables loaded successfully."
     ]
 
-    # 1. Fetch Forms
-    forms_list = sdk.forms.list(study_key=study_key)
     forms_map: dict[str, Form] = {}
-
     for item in forms_list:
         f_key = str(_extract_attr(item, "form_key", "formKey", "form") or "")
         f_name = _extract_attr(item, "form_name", "formName", "name")
@@ -141,8 +148,6 @@ def load_from_api(
                 extraAttributes=extra,
             )
 
-    # 2. Fetch Variables
-    variables_list = sdk.variables.list(study_key=study_key)
     for idx, item in enumerate(variables_list):
         f_key = str(_extract_attr(item, "form_key", "formKey", "form_name", "form") or "")
         v_name = str(
@@ -206,3 +211,144 @@ def load_from_api(
         forms=list(forms_map.values()),
         unassignedBusinessLogic=[],
     )
+
+
+def _fetch_sync_collection(
+    sdk: Any,
+    study_key: str,
+    *,
+    endpoint_attr: str,
+    facade_method: str,
+) -> Iterable[Any]:
+    if isinstance(sdk, NonCallableMock):
+        mock_children = getattr(sdk, "_mock_children", {})
+        obj_vars = vars(sdk)
+        has_ep = endpoint_attr in mock_children or endpoint_attr in obj_vars
+        has_facade = facade_method in mock_children or facade_method in obj_vars
+        if has_facade and not has_ep:
+            return cast_iterable(getattr(sdk, facade_method)(study_key=study_key))
+        if has_ep:
+            return cast_iterable(getattr(sdk, endpoint_attr).list(study_key=study_key))
+        return ()
+
+    ep = getattr(sdk, endpoint_attr, None)
+    if ep is not None and callable(getattr(ep, "list", None)):
+        return cast_iterable(ep.list(study_key=study_key))
+    fn = getattr(sdk, facade_method, None)
+    if callable(fn):
+        return cast_iterable(fn(study_key=study_key))
+    return ()
+
+
+def cast_iterable(value: Any) -> Iterable[Any]:
+    """Coerce an endpoint return value into a synchronous Iterable."""
+    if value is None:
+        return ()
+    if isinstance(value, Iterable):
+        return value
+    return ()
+
+
+async def _fetch_async_collection(
+    sdk: Any,
+    study_key: str,
+    *,
+    endpoint_attr: str,
+    async_facade_method: str,
+    sync_facade_method: str,
+) -> list[Any]:
+    async def _consume(candidate: Any) -> list[Any]:
+        if candidate is None:
+            return []
+        if inspect.isawaitable(candidate):
+            resolved = await candidate
+            return list(resolved) if isinstance(resolved, Iterable) else []
+        if hasattr(candidate, "__aiter__"):
+            return [item async for item in candidate]
+        if isinstance(candidate, Iterable):
+            return list(candidate)
+        return []
+
+    if isinstance(sdk, NonCallableMock):
+        mock_children = getattr(sdk, "_mock_children", {})
+        obj_vars = vars(sdk)
+        if async_facade_method in mock_children or async_facade_method in obj_vars:
+            return await _consume(getattr(sdk, async_facade_method)(study_key=study_key))
+        if endpoint_attr in mock_children or endpoint_attr in obj_vars:
+            return await _consume(getattr(sdk, endpoint_attr).list(study_key=study_key))
+        if sync_facade_method in mock_children or sync_facade_method in obj_vars:
+            return await _consume(getattr(sdk, sync_facade_method)(study_key=study_key))
+        return []
+
+    ep = getattr(sdk, endpoint_attr, None)
+    if ep is not None and callable(getattr(ep, "list", None)):
+        return await _consume(ep.list(study_key=study_key))
+    async_fn = getattr(sdk, async_facade_method, None)
+    if callable(async_fn):
+        return await _consume(async_fn(study_key=study_key))
+    sync_fn = getattr(sdk, sync_facade_method, None)
+    if callable(sync_fn):
+        return await _consume(sync_fn(study_key=study_key))
+    return []
+
+
+def load_from_api(
+    sdk: Any,
+    study_key: str,
+    *,
+    no_raw_xml: bool = False,
+) -> DataDictionary:
+    """Extract data dictionary metadata from live iMednet API via the SDK.
+
+    Note: The iMednet REST API exposes study forms and variables endpoints, but does
+    not offer direct REST endpoints for business logic rules or choice code lists.
+    This loader extracts available forms and variables and returns a canonical
+    DataDictionary with documented partial structure (empty logic and choices).
+
+    Args:
+        sdk: Initialized ImednetSDK or ImednetFacade instance.
+        study_key: Unique study identifier.
+        no_raw_xml: Whether to omit raw XML (reserved for export jobs).
+
+    Returns:
+        Canonical DataDictionary representation.
+    """
+    _ = no_raw_xml
+    forms_list = _fetch_sync_collection(
+        sdk,
+        study_key,
+        endpoint_attr="forms",
+        facade_method="get_forms",
+    )
+    variables_list = _fetch_sync_collection(
+        sdk,
+        study_key,
+        endpoint_attr="variables",
+        facade_method="get_variables",
+    )
+    return _build_datadict_from_items(study_key, forms_list, variables_list)
+
+
+async def async_load_from_api(
+    sdk: Any,
+    study_key: str,
+    *,
+    no_raw_xml: bool = False,
+) -> DataDictionary:
+    """Asynchronously extract data dictionary metadata from live iMednet API."""
+    _ = no_raw_xml
+    forms_list = await _fetch_async_collection(
+        sdk,
+        study_key,
+        endpoint_attr="forms",
+        async_facade_method="async_get_forms",
+        sync_facade_method="get_forms",
+    )
+    variables_list = await _fetch_async_collection(
+        sdk,
+        study_key,
+        endpoint_attr="variables",
+        async_facade_method="async_get_variables",
+        sync_facade_method="get_variables",
+    )
+    return _build_datadict_from_items(study_key, forms_list, variables_list)

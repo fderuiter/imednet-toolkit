@@ -140,34 +140,48 @@ accounts, ``Site`` identifiers, or ``Form`` keys, use
 :meth:`DataExtractionWorkflow.extract_audit_trail <imednet_workflows.data_extraction.DataExtractionWorkflow.extract_audit_trail>`
 alongside synchronous or asynchronous SDK endpoints:
 
-.. code-block:: python
+.. testcode::
 
+   import asyncio
    from imednet import AsyncImednetSDK, ImednetSDK
    from imednet.models.record_revisions import RecordRevision
+   from imednet.simulation import reset_default_simulation_state
    from imednet_workflows.data_extraction import DataExtractionWorkflow
 
 
    def extract_verified_audit_trail(study_key: str) -> list[RecordRevision]:
-       with ImednetSDK() as sdk:
+       with ImednetSDK(simulation_mode=True) as sdk:
            workflow = DataExtractionWorkflow(sdk)
            revisions = workflow.extract_audit_trail(
                study_key=study_key,
-               start_date="2026-11-01",
-               end_date="2026-11-30",
-               user="pi_site201",
+               start_date="2026-01-01",
+               end_date="2026-01-31",
+               user="sim_user",
+               sort="recordRevision,asc",
            )
            return RecordRevision.validate_chain(revisions)
 
 
    async def stream_form_revisions_async(study_key: str) -> list[RecordRevision]:
-       async with AsyncImednetSDK() as async_sdk:
+       async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
            revisions = [
                rev
                async for rev in async_sdk.record_revisions.list(
-                   study_key, formKey="F_VS"
+                   study_key,
+                   formKey="F_VS",
+                   sort="recordRevision,asc",
                )
            ]
            return RecordRevision.validate_chain(revisions)
+
+
+   reset_default_simulation_state()
+   audit_trail = extract_verified_audit_trail("STUDY")
+   form_revisions = asyncio.run(stream_form_revisions_async("STUDY"))
+   assert len(audit_trail) == 2
+   assert all(rev.user == "sim_user" for rev in audit_trail)
+   assert len(form_revisions) == 1
+   assert form_revisions[0].form_key == "F_VS"
 
 ``extract_audit_trail`` automatically normalizes ISO-8601 ``start_date`` and
 ``end_date`` inputs to inclusive UTC bounds on ``dateCreated`` while preserving

@@ -116,6 +116,46 @@ commands (which also accept ``--no-interactive`` to suppress live spinners) and 
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
 
+Path segment validation and exit codes
+--------------------------------------
+
+Every Study- or resource-scoped CLI command (decorated with ``@with_sdk``, calling
+``validate_cli_path_segment``, or dispatched through ``imednet workflows`` subcommands
+such as ``extract-records`` and ``uat run``) validates dynamic URL segments
+(``study_key``, ``batch_id``, and ``item_id`` across ``Study``, ``Subject``, ``Site``,
+``Form``, ``Record``, ``Visit``, ``Interval``, ``Variable``, ``Query``,
+``Data Dictionary``, and ``Job`` targets) with
+:func:`~imednet.utils.validate_path_segment` and :func:`~imednet.utils.build_safe_path`
+before issuing HTTP requests.
+
+When an argument contains path traversal sequences (``..``, ``%2e%2e``), path
+separators (``/`` or ``\``), query/fragment delimiters (``?`` or ``#``), or control
+characters, :class:`~imednet.errors.PathTraversalValidationError` is caught at the CLI
+boundary: a redacted diagnostic is written to ``stderr``, ``stdout`` remains empty (no
+partial JSON envelope or table rows), and the process exits with status code ``1``:
+
+.. testcode::
+
+   import contextlib
+   import io
+   from imednet.cli import app
+
+   for bad_argv in (
+       ["records", "list", "../secret", "--simulation", "--format", "json"],
+       ["workflows", "extract-records", "../secret", "--simulation", "--format", "json"],
+   ):
+       out_buf = io.StringIO()
+       err_buf = io.StringIO()
+       exit_code: int | str | None = None
+       with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+           try:
+               app(bad_argv)
+           except SystemExit as cli_exit:
+               exit_code = cli_exit.code
+       assert exit_code == 1
+       assert out_buf.getvalue() == ""
+       assert "Error:" in err_buf.getvalue()
+
 Data Dictionary commands
 ------------------------
 
