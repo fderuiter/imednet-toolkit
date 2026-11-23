@@ -21,6 +21,8 @@ from scripts.build_docs import (
     scope_apidoc_inherited_members,
 )
 from scripts.validate_docs import (
+    RETIRED_GITHUB_LABELS,
+    WORKSPACE_PACKAGE_IDS,
     _verify_airflow_provider_html,
     _verify_core_html,
     _verify_pagination_html,
@@ -30,6 +32,7 @@ from scripts.validate_docs import (
     check_diataxis_sidebar_isolation,
     check_documented_extras,
     check_examples_index_parity,
+    check_governance_and_issue_templates,
     check_no_duplicate_suppression,
     check_package_docs,
     check_packages_registered,
@@ -578,6 +581,138 @@ def test_sphinx_airflow_provider_html_and_parity_gates(tmp_path: Path) -> None:
     )
 
 
+def test_repo_package_docs_and_governance_validators_pass() -> None:
+    """Repository manifests, docs, and issue templates pass check_package_docs and governance checks."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_package_docs(repo_root) is False
+    assert check_governance_and_issue_templates(repo_root) is False
+
+
+def test_check_package_docs_detects_manifest_and_changelog_drift(tmp_path: Path) -> None:
+    """check_package_docs flags missing readme/license/classifiers and obsolete CHANGELOG tokens."""
+    pkg_dir = tmp_path / "packages" / "sample"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "README.md").write_text("# Sample\n", encoding="utf-8")
+    (pkg_dir / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
+    valid_manifest = (
+        '[project]\nname = "imednet-sample"\nversion = "0.1.0"\n'
+        'readme = "README.md"\nlicense = "MIT"\n'
+        "classifiers = [\n"
+        '  "Programming Language :: Python :: 3.11",\n'
+        '  "Programming Language :: Python :: 3.12",\n'
+        '  "Programming Language :: Python :: 3.13",\n'
+        "]\n"
+    )
+    (pkg_dir / "pyproject.toml").write_text(valid_manifest, encoding="utf-8")
+    changelogs_dir = tmp_path / "docs" / "reference" / "changelogs"
+    changelogs_dir.mkdir(parents=True)
+    (changelogs_dir / "index.rst").write_text(
+        "Changelogs\n==========\n\n.. toctree::\n\n   sample\n",
+        encoding="utf-8",
+    )
+    (changelogs_dir / "sample.md").write_text(
+        "```{include} ../../../packages/sample/CHANGELOG.md\n```\n",
+        encoding="utf-8",
+    )
+    ref_dir = tmp_path / "docs" / "reference"
+    (ref_dir / "compatibility.rst").write_text(
+        "See :doc:`changelogs/index`.\n",
+        encoding="utf-8",
+    )
+    (ref_dir / "contributing.rst").write_text(
+        "See :doc:`changelogs/index`.\n",
+        encoding="utf-8",
+    )
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text("# Changelog\n\nSee packages/sample/CHANGELOG.md.\n", encoding="utf-8")
+
+    assert check_package_docs(tmp_path) is False
+
+    # Obsolete token in root CHANGELOG.md
+    changelog.write_text(
+        "# Changelog\n\nSee packages/sample/CHANGELOG.md and docs/contributing.rst.\n",
+        encoding="utf-8",
+    )
+    assert check_package_docs(tmp_path) is True
+    changelog.write_text("# Changelog\n\nSee packages/sample/CHANGELOG.md.\n", encoding="utf-8")
+
+    # Missing readme / license / classifiers in pyproject.toml
+    (pkg_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-sample"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+    assert check_package_docs(tmp_path) is True
+
+
+def test_check_governance_and_issue_templates_detects_retired_urls_labels_and_dropdowns(
+    tmp_path: Path,
+) -> None:
+    """check_governance_and_issue_templates rejects retired URLs, nonexistent labels, and stale dropdowns."""
+    templates_dir = tmp_path / ".github" / "ISSUE_TEMPLATE"
+    templates_dir.mkdir(parents=True)
+    docs_ref = tmp_path / "docs" / "reference"
+    docs_ref.mkdir(parents=True)
+    docs_agents = tmp_path / "docs" / "agents"
+    docs_agents.mkdir(parents=True)
+
+    # Excluded docs/agents/ directory may mention legacy labels in translation tables
+    (docs_agents / "triage-labels.md").write_text(
+        "Legacy status:needs-info maps to question.\n",
+        encoding="utf-8",
+    )
+
+    pkg_opts = "\n".join(f"        - {pkg}" for pkg in WORKSPACE_PACKAGE_IDS)
+    valid_form = (
+        "name: Bug Report\n"
+        "description: Report a bug\n"
+        "body:\n"
+        "  - type: dropdown\n"
+        "    id: area\n"
+        "    attributes:\n"
+        "      label: Area\n"
+        "      options:\n"
+        "        - core\n"
+        "        - workflows\n"
+        "  - type: dropdown\n"
+        "    id: package\n"
+        "    attributes:\n"
+        "      label: Package\n"
+        "      options:\n"
+        f"{pkg_opts}\n"
+    )
+    form_path = templates_dir / "bug_report.yml"
+    form_path.write_text(valid_form, encoding="utf-8")
+    (templates_dir / "config.yml").write_text(
+        "blank_issues_enabled: false\n",
+        encoding="utf-8",
+    )
+    issue_doc = docs_ref / "issue_management.rst"
+    issue_doc.write_text("Use ``question`` and ``area:workflows``.\n", encoding="utf-8")
+    coc = tmp_path / "CODE_OF_CONDUCT.md"
+    coc.write_text("https://github.com/fderuiter/imednet-toolkit/issues\n", encoding="utf-8")
+
+    assert check_governance_and_issue_templates(tmp_path) is False
+
+    # Retired repo URL
+    coc.write_text("https://github.com/fderuiter/imednet-python-sdk/issues\n", encoding="utf-8")
+    assert check_governance_and_issue_templates(tmp_path) is True
+    coc.write_text("https://github.com/fderuiter/imednet-toolkit/issues\n", encoding="utf-8")
+
+    # Every retired GitHub label is blocked in docs/reference/
+    for retired_label in RETIRED_GITHUB_LABELS:
+        issue_doc.write_text(f"Do not apply ``{retired_label}``.\n", encoding="utf-8")
+        assert check_governance_and_issue_templates(tmp_path) is True
+    issue_doc.write_text("Use ``question`` and ``area:workflows``.\n", encoding="utf-8")
+
+    # Invalid area option in issue template
+    form_path.write_text(valid_form.replace("- workflows", "- workflows-plugin"), encoding="utf-8")
+    assert check_governance_and_issue_templates(tmp_path) is True
+
+    # Missing workspace package in issue template
+    form_path.write_text(valid_form.replace("        - plugins-tui\n", ""), encoding="utf-8")
+    assert check_governance_and_issue_templates(tmp_path) is True
+
+
 def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_dirs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -588,6 +723,7 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_cli_snippets() is False
     assert check_packages_registered() is False
     assert check_package_docs() is False
+    assert check_governance_and_issue_templates() is False
     assert check_release_please_parity() is False
     assert check_examples_index_parity() is False
     assert check_diataxis_sidebar_isolation() is False
@@ -600,6 +736,7 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_cli_snippets(empty_root) is True
     assert check_packages_registered(empty_root) is True
     assert check_package_docs(empty_root) is True
+    assert check_governance_and_issue_templates(empty_root) is True
     assert check_release_please_parity(empty_root) is True
     assert check_examples_index_parity(empty_root) is True
     assert check_diataxis_sidebar_isolation(empty_root) is True

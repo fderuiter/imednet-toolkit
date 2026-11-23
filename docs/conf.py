@@ -1539,6 +1539,7 @@ html_js_files: list[str] = ["code_blocks.js"]
 doctest_global_setup = """
 import builtins
 import contextlib
+import io
 import logging
 import os
 import sys
@@ -1552,6 +1553,7 @@ for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_provid
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
+logging.getLogger("snowflake").setLevel(logging.WARNING)
 logging.captureWarnings(True)
 
 os.environ["IMEDNET_SIMULATION_MODE"] = "true"
@@ -1561,9 +1563,6 @@ os.environ["SNOWFLAKE_PASSWORD"] = "dummy_password"  # pragma: allowlist secret
 os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
 os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
 os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
-with contextlib.suppress(ImportError):
-    from airflow.sdk.bases.operator import ExecutorSafeguard
-    ExecutorSafeguard.test_mode = True
 
 _doctest_orig_cwd = os.getcwd()
 _doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
@@ -1574,14 +1573,19 @@ get_default_simulation_state().reset()
 
 __file__ = "/a/b/c/d/e/dummy.py"
 
-_mongo_client_patcher = patch("pymongo.MongoClient", return_value=MagicMock())
-_mongo_client_patcher.start()
+with contextlib.redirect_stdout(io.StringIO()):
+    _mongo_client_patcher = patch("pymongo.MongoClient", return_value=MagicMock())
+    _mongo_client_patcher.start()
 
-_neo4j_driver_patcher = patch("neo4j.GraphDatabase.driver", return_value=MagicMock())
-_neo4j_driver_patcher.start()
+    _neo4j_driver_patcher = patch("neo4j.GraphDatabase.driver", return_value=MagicMock())
+    _neo4j_driver_patcher.start()
 
-_snowflake_connect_patcher = patch("snowflake.connector.connect", return_value=MagicMock())
-_snowflake_connect_patcher.start()
+    _snowflake_connect_patcher = patch("snowflake.connector.connect", return_value=MagicMock())
+    _snowflake_connect_patcher.start()
+
+    with contextlib.suppress(ImportError):
+        from airflow.sdk.bases.operator import ExecutorSafeguard
+        ExecutorSafeguard.test_mode = True
 
 _original_print = builtins.print
 

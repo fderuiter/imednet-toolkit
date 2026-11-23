@@ -32,21 +32,47 @@ def report(status="passed", violations=None):
     }
 
 
-def test_no_reports_publishes_explicit_empty_result(aggregator, tmp_path, capsys):
-    aggregator.main()
+def test_no_reports_publishes_explicit_empty_result_and_exits_nonzero(aggregator, tmp_path, capsys):
+    report_dir = tmp_path / "reports" / "verification"
+    with pytest.raises(SystemExit) as exc:
+        aggregator.main(["--report-dir", str(report_dir)])
+    assert exc.value.code == 1
     assert "No verification reports found" in capsys.readouterr().out
+    assert (tmp_path / "outputs.txt").read_text() == "drift_detected=false\ndrift_count=0\n"
+
+
+def test_missing_expected_track_exits_nonzero(aggregator, tmp_path, capsys):
+    report_dir = tmp_path / "reports" / "verification"
+    report_dir.mkdir(parents=True)
+    perf_report = report("passed")
+    perf_report["track"] = "performance"
+    (report_dir / "performance_report.json").write_text(json.dumps(perf_report))
+
+    with pytest.raises(SystemExit) as exc:
+        aggregator.main(["--report-dir", str(report_dir), "--expect-track", "drift"])
+    assert exc.value.code == 1
+    assert "Missing expected verification track(s): drift" in capsys.readouterr().out
     assert (tmp_path / "outputs.txt").read_text() == "drift_detected=false\ndrift_count=0\n"
 
 
 @pytest.mark.parametrize("failed", [False, True])
 def test_aggregates_valid_reports_and_metrics(aggregator, tmp_path, failed):
+    report_dir = tmp_path / "reports" / "verification"
+    report_dir.mkdir(parents=True)
     data = report(
         "failed" if failed else "passed",
         [{"violation_type": "additive", "message": "Unexpected field"}] if failed else [],
     )
     data["metrics"] = [{"name": "duration", "value": 1.25, "unit": "seconds"}]
-    (tmp_path / "drift_report.json").write_text(json.dumps(data))
-    aggregator.main()
+    (report_dir / "drift_report.json").write_text(json.dumps(data))
+
+    if failed:
+        with pytest.raises(SystemExit) as exc:
+            aggregator.main(["--report-dir", str(report_dir), "--expect-track", "drift"])
+        assert exc.value.code == 1
+    else:
+        aggregator.main(["--report-dir", str(report_dir), "--expect-track", "drift"])
+
     expected = (
         "drift_detected=true\ndrift_count=1\n"
         if failed
@@ -56,22 +82,28 @@ def test_aggregates_valid_reports_and_metrics(aggregator, tmp_path, failed):
     if failed:
         assert (
             "additive in track `drift`: Unexpected field"
-            in (tmp_path / "drift_report.txt").read_text()
+            in (report_dir / "drift_report.txt").read_text()
         )
 
 
 @pytest.mark.parametrize("contents", ['{', '{"status":"passed"}'])
 def test_malformed_report_fails_closed(aggregator, tmp_path, contents):
-    (tmp_path / "invalid_report.json").write_text(contents)
+    report_dir = tmp_path / "reports" / "verification"
+    report_dir.mkdir(parents=True)
+    (report_dir / "invalid_report.json").write_text(contents)
     with pytest.raises(SystemExit) as exc:
-        aggregator.main()
+        aggregator.main(["--report-dir", str(report_dir)])
     assert exc.value.code == 1
     assert not (tmp_path / "outputs.txt").exists()
 
 
-def test_failed_report_without_violations_is_still_failed(aggregator, tmp_path):
-    (tmp_path / "failed_report.json").write_text(json.dumps(report("failed")))
-    aggregator.main()
+def test_failed_report_without_violations_still_exits_nonzero(aggregator, tmp_path):
+    report_dir = tmp_path / "reports" / "verification"
+    report_dir.mkdir(parents=True)
+    (report_dir / "failed_report.json").write_text(json.dumps(report("failed")))
+    with pytest.raises(SystemExit) as exc:
+        aggregator.main(["--report-dir", str(report_dir), "--expect-track", "drift"])
+    assert exc.value.code == 1
     assert (tmp_path / "outputs.txt").read_text() == "drift_detected=true\ndrift_count=0\n"
 
 
@@ -85,6 +117,8 @@ def test_report_rejects_unsupported_contract_values(field, value):
 
 def test_aggregation_without_github_outputs(aggregator, tmp_path, monkeypatch):
     monkeypatch.delenv("GITHUB_OUTPUT")
-    (tmp_path / "valid_report.json").write_text(json.dumps(report()))
+    report_dir = tmp_path / "reports" / "verification"
+    report_dir.mkdir(parents=True)
+    (report_dir / "valid_report.json").write_text(json.dumps(report()))
     aggregator.main()
     assert not (tmp_path / "outputs.txt").exists()
