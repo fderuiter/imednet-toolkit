@@ -51,6 +51,92 @@ def test_study_snapshot_builds_indexes_and_filters() -> None:
     assert [site.site_name for site in snapshot.active_sites()] == ["Main"]
 
 
+def test_study_snapshot_upstream_subject_record_report_and_exclusions() -> None:
+    """Verify upstream subjectRecordReport, otherForms, disabled, and Site/Study/Admin filters."""
+    subj_reg = Form(
+        form_key="F_DM",
+        form_name="Demographics",
+        form_type="Subject",
+        subject_record_report=True,
+    )
+    crf_reg = Form(
+        form_key="F_ENR",
+        form_name="CRF Registration",
+        form_type="CRF",
+        subject_record_report=True,
+    )
+    subj_sched = Form(
+        form_key="F_VS",
+        form_name="Vital Signs",
+        form_type="Subject",
+    )
+    subj_unsched = Form(
+        form_key="F_AE",
+        form_name="Adverse Events",
+        form_type="Subject",
+        unscheduled_visit=True,
+    )
+    other_form = Form(
+        form_key="F_LOG",
+        form_name="Other Log",
+        form_type="Subject",
+        other_forms=True,
+    )
+    disabled_reg = Form(
+        form_key="F_DIS_REG",
+        form_name="Disabled Reg",
+        form_type="Subject",
+        subject_record_report=True,
+        disabled=True,
+    )
+    disabled_sched = Form(
+        form_key="F_DIS_SCH",
+        form_name="Disabled Scheduled",
+        form_type="Subject",
+        disabled=True,
+    )
+    site_form = Form(
+        form_key="F_SITE",
+        form_name="Site Form",
+        form_type="Site",
+        subject_record_report=True,
+    )
+    study_form = Form(
+        form_key="F_STUDY",
+        form_name="Study Form",
+        form_type="Study",
+    )
+    admin_form = Form(
+        form_key="F_ADMIN",
+        form_name="Admin Form",
+        form_type="Admin",
+        unscheduled_visit=True,
+    )
+
+    snapshot = StudySnapshot(
+        study_key="ST",
+        forms=[
+            subj_reg,
+            crf_reg,
+            subj_sched,
+            subj_unsched,
+            other_form,
+            disabled_reg,
+            disabled_sched,
+            site_form,
+            study_form,
+            admin_form,
+        ],
+        variables=[],
+        intervals=[],
+        sites=[],
+    )
+
+    assert snapshot.enrollment_forms() == [subj_reg, crf_reg]
+    assert snapshot.scheduled_forms() == [subj_sched]
+    assert snapshot.unscheduled_forms() == [subj_unsched]
+
+
 def test_inspect_uses_cache_and_force_refresh() -> None:
     """Test that inspect uses cache and force refresh."""
     sdk = MagicMock()

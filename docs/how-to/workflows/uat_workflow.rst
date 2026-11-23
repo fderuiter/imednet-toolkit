@@ -142,6 +142,42 @@ REST ``/variables`` metadata exposes basic Variable types (such as ``Number``, `
         ).run("STUDY", subject_count=2)
         assert uat_result.overall_success is True
 
+Stateful Dry Runs, Saved Specifications, and CLI Safeguards
+-----------------------------------------------------------
+
+To preview constrained UAT payloads before writing ``Record`` batches to an active ``Site``, pass ``dry_run=True`` to :meth:`~imednet_workflows.uat.UATWorkflow.run` (or ``--dry-run`` on the CLI). Dry-run execution runs ``INSPECTING``, ``BUILDING_SPEC``, and ``GENERATING``, validates every generated payload locally via :func:`~imednet.spi.validation.validate_records_batch` against the supplied ``schema`` / ``data_dictionary`` (or ``StudySnapshot`` variables), transitions ``GENERATING -> COMPLETED`` with zero API writes, and attaches a :class:`~imednet.spi.validation.BatchValidationReport` to :attr:`~imednet_workflows.uat.UATRunResult.validation_report`.
+
+Both Python ``UATWorkflow`` and ``imednet workflows uat`` enforce strict pre-write safeguards:
+
+- Explicit ``site_name`` / ``--site-name`` arguments and custom ``UATSpecification`` ``Site`` entries must exist in the ``Study`` and be enrollment-eligible (no silent fallback to another active ``Site``).
+- Explicit ``enabled_form_keys`` / ``--form-key`` filters reject unknown or disabled ``Form`` keys, and zero-Form or zero-Record live runs fail instead of reporting a vacuous pass.
+- ``--subject-count`` is validated within ``1..100`` and ``--email-notify`` is normalized and header-checked during CLI preflight (and interactive prompts) before ``StudySchemaInspector`` sends network requests.
+
+.. testcode::
+
+    with ImednetSDK(
+        simulation_mode=True,
+        transport=SimulationTransport(SimulationState()),
+    ) as dry_sdk:
+        dry_result = UATWorkflow(
+            dry_sdk,
+            seed=42,
+            data_dictionary=uat_dd,
+        ).run("STUDY", subject_count=2, dry_run=True)
+        assert dry_result.dry_run is True
+        assert dry_result.overall_success is True
+        assert dry_result.validation_report.is_valid is True
+        assert dry_result.submission_result is None
+
+From the terminal, export a customizable ``UATSpecification`` plan with ``build-spec`` (supporting JSON, CDISC ODM XML, REDCap CSV, and CSV directory Data Dictionaries) and execute dry or live runs with ``imednet workflows uat run``:
+
+.. code-block:: bash
+
+   imednet workflows uat build-spec STUDY --data-dictionary study_dd.json --seed 42 -o uat_spec.json
+   imednet workflows uat run STUDY --spec uat_spec.json --data-dictionary study_dd.json --seed 42 --dry-run
+   imednet workflows uat run STUDY --schema study_dd.json --dry-run --format json
+   imednet workflows uat run STUDY --site-name SITE --form-key F_DM --subject-count 2 --email-notify ops@example.com
+
 Automated Edit Check Verification (``UATExecutionEngine``)
 ----------------------------------------------------------
 

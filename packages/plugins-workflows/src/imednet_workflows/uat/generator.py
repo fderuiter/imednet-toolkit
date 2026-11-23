@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -22,6 +23,61 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+_TYPE_SEP_RE = re.compile(r"[\s_-]+")
+_SLASH_SPACE_RE = re.compile(r"\s*/\s*")
+
+_INT_TYPES = frozenset({"number", "integer", "int"})
+_FLOAT_TYPES = frozenset({"float", "decimal", "double", "numeric", "slider"})
+_BOOL_TYPES = frozenset({"boolean", "bool"})
+_YES_NO_TYPES = frozenset({"yes/no", "yesno", "yes no", "true/false", "truefalse", "true false"})
+_SINGLE_CHOICE_TYPES = frozenset(
+    {
+        "coded",
+        "radio",
+        "radiobutton",
+        "radio button",
+        "single select",
+        "singleselect",
+        "dropdown",
+        "drop down",
+        "dropdownlist",
+        "dropdown list",
+        "select",
+        "sql",
+    }
+)
+_MULTI_CHOICE_TYPES = frozenset({"checkbox", "check box", "multi select", "multiselect"})
+_TEXT_TYPES = frozenset({"text", "string", "alphanumeric"})
+_MEMO_TYPES = frozenset({"textarea", "text area", "memo", "notes", "note"})
+_CALC_TYPES = frozenset({"calculation", "calc", "calculated"})
+_DATE_TYPES = frozenset(
+    {
+        "date",
+        "date ymd",
+        "date mdy",
+        "date dmy",
+        "date/time precision",
+        "datetime precision",
+        "date time precision",
+    }
+)
+_DATETIME_TYPES = frozenset(
+    {"datetime", "date/time", "date time", "durationdatetime", "intervaldatetime"}
+)
+_SKIP_EMPTY_TYPES = frozenset(
+    {"signature", "file", "upload", "fileupload", "file upload", "descriptive", "label"}
+)
+
+
+def _normalize_var_type(var_type: str | None) -> str:
+    """Normalize variable type string for canonical taxonomy matching."""
+    if not var_type:
+        return ""
+    cleaned = _TYPE_SEP_RE.sub(" ", var_type.strip().lower())
+    if "/" in cleaned:
+        cleaned = _SLASH_SPACE_RE.sub("/", cleaned)
+    return cleaned
 
 
 class GeneratedRecordSet(ImednetBaseModel):
@@ -103,6 +159,22 @@ class SyntheticRecordGenerator:
                 continue
             constraints = extract_variable_constraints(dd_var)
             updates: dict[str, Any] = {}
+            dd_type = getattr(dd_var, "variable_type", getattr(dd_var, "variableType", None))
+            snap_norm = _normalize_var_type(v.variable_type)
+            dd_norm = _normalize_var_type(dd_type)
+            if dd_type and (
+                not snap_norm
+                or (
+                    snap_norm == "coded"
+                    and (
+                        dd_norm in _SINGLE_CHOICE_TYPES
+                        or dd_norm in _MULTI_CHOICE_TYPES
+                        or dd_norm in _YES_NO_TYPES
+                    )
+                )
+                or (snap_norm == "text" and dd_norm != "text")
+            ):
+                updates["variable_type"] = dd_type
             if not v.coded_values and constraints.choices:
                 updates["coded_values"] = list(constraints.choices)
             if v.min_value is None and constraints.min_value is not None:
@@ -232,85 +304,159 @@ class SyntheticRecordGenerator:
             pool = ["UAT-TEST-001"]
         return pool
 
-    def _generate_value(self, var_spec: UATVariableSpec, spec: UATSpecification) -> str | None:
+    @staticmethod
+    def _coerce_fixed_value(var_spec: UATVariableSpec) -> Any:
+        """Coerce a FIXED strategy value to match the variable's canonical scalar type."""
+        raw = var_spec.fixed_value
+        if raw is None:
+            return ""
+        v_norm = _normalize_var_type(var_spec.variable_type)
+        if v_norm in _INT_TYPES:
+            if isinstance(raw, bool):
+                return int(raw)
+            if isinstance(raw, int):
+                return raw
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                return raw
+        if v_norm in _FLOAT_TYPES:
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                return float(raw)
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return raw
+        if v_norm in _BOOL_TYPES:
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, (int, float)):
+                return bool(raw)
+            if isinstance(raw, str):
+                low = raw.strip().lower()
+                if low in {"true", "1", "yes"}:
+                    return True
+                if low in {"false", "0", "no"}:
+                    return False
+            return raw
+        if isinstance(raw, (int, float, bool)) and v_norm in _CALC_TYPES:
+            return int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else float(raw)
+        return str(raw)
+
+    @staticmethod
+    def _boundary_scalar(var_spec: UATVariableSpec, *, is_max: bool) -> int | float:
+        """Compute a typed min or max boundary scalar for numeric variables."""
+        v_norm = _normalize_var_type(var_spec.variable_type)
+        if v_norm in _INT_TYPES or v_norm in _CALC_TYPES:
+            min_i = int(var_spec.min_value) if var_spec.min_value is not None else 1
+            if not is_max:
+                return min_i
+            return int(var_spec.max_value) if var_spec.max_value is not None else max(100, min_i)
+        min_f = float(var_spec.min_value) if var_spec.min_value is not None else 1.0
+        if not is_max:
+            return min_f
+        return float(var_spec.max_value) if var_spec.max_value is not None else max(100.0, min_f)
+
+    def _generate_value(self, var_spec: UATVariableSpec, spec: UATSpecification) -> Any:
         """Generate a single value for a variable according to its strategy."""
         if var_spec.strategy == VariableTestStrategy.SKIP:
             return None
         if var_spec.strategy == VariableTestStrategy.FIXED:
-            return str(var_spec.fixed_value) if var_spec.fixed_value is not None else ""
+            return self._coerce_fixed_value(var_spec)
 
         return self._synthesize_value(var_spec, spec)
 
-    def _synthesize_value(self, var_spec: UATVariableSpec, spec: UATSpecification) -> str:
+    def _synthesize_value(self, var_spec: UATVariableSpec, spec: UATSpecification) -> Any:
         """Return a mocked value appropriate for the canonical variable type."""
         v_type = var_spec.variable_type
-        v_norm = (v_type or "").strip().lower()
+        v_norm = _normalize_var_type(v_type)
 
-        if v_norm in ("coded", "radio", "single select"):
+        if v_norm in _SINGLE_CHOICE_TYPES:
             if var_spec.coded_values:
                 return self._rng.choice(var_spec.coded_values)
-            return ""
+            return "1" if var_spec.required else ""
 
-        if v_norm in ("checkbox", "multi select"):
+        if v_norm in _MULTI_CHOICE_TYPES:
             if var_spec.coded_values:
                 count = self._rng.randint(1, min(3, len(var_spec.coded_values)))
                 choices = self._rng.sample(var_spec.coded_values, count)
                 return "`".join(choices)
-            return ""
+            return True if var_spec.required else ""
 
-        if v_norm in ("boolean", "bool", "yes/no", "yesno"):
+        if v_norm in _BOOL_TYPES:
+            return self._rng.choice([True, False])
+
+        if v_norm in _YES_NO_TYPES:
             if var_spec.coded_values:
                 return self._rng.choice(var_spec.coded_values)
             return self._rng.choice(["Yes", "No"])
 
-        if v_norm in ("text", "string"):
+        if v_norm in _TEXT_TYPES:
             if var_spec.coded_values:
                 return self._rng.choice(var_spec.coded_values)
             max_len = var_spec.max_length or spec.global_text_length or 10
             return self._lexify("?" * max_len)
 
-        if v_norm in ("number", "integer", "int"):
+        if v_norm in _INT_TYPES:
             if var_spec.coded_values:
-                return self._rng.choice(var_spec.coded_values)
+                chosen = self._rng.choice(var_spec.coded_values)
+                try:
+                    return int(float(chosen))
+                except (TypeError, ValueError):
+                    return chosen
             min_i = int(var_spec.min_value) if var_spec.min_value is not None else 1
             max_i = int(var_spec.max_value) if var_spec.max_value is not None else max(100, min_i)
             max_i = max(max_i, min_i)
-            return str(self._rng.randint(min_i, max_i))
+            return self._rng.randint(min_i, max_i)
 
-        if v_norm in ("float", "decimal", "slider"):
+        if v_norm in _FLOAT_TYPES:
             if var_spec.coded_values:
-                return self._rng.choice(var_spec.coded_values)
-            min_f = var_spec.min_value if var_spec.min_value is not None else 1.0
-            max_f = var_spec.max_value if var_spec.max_value is not None else max(100.0, min_f)
+                chosen_f = self._rng.choice(var_spec.coded_values)
+                try:
+                    return float(chosen_f)
+                except (TypeError, ValueError):
+                    return chosen_f
+            min_f = float(var_spec.min_value) if var_spec.min_value is not None else 1.0
+            max_f = (
+                float(var_spec.max_value) if var_spec.max_value is not None else max(100.0, min_f)
+            )
             max_f = max(max_f, min_f)
-            val = self._rng.uniform(min_f, max_f)
-            return f"{val:.2f}"
+            val = round(self._rng.uniform(min_f, max_f), 2)
+            return float(min(max(val, min_f), max_f))
 
-        if v_norm in ("date", "date/time precision"):
+        if v_norm in _DATE_TYPES:
             if spec.global_date_value:
                 return spec.global_date_value.isoformat()
             return date.today().isoformat()
 
-        if v_norm == "datetime":
+        if v_norm in _DATETIME_TYPES:
             return datetime.now(UTC).isoformat()
 
         if v_norm == "time":
             return "12:00:00"
 
-        if v_norm == "textarea":
+        if v_norm in _MEMO_TYPES:
+            if var_spec.coded_values:
+                return self._rng.choice(var_spec.coded_values)
             text = self._paragraph(nb_sentences=3)
-            if var_spec.max_length is not None:
-                return text[: var_spec.max_length]
-            return text
+            max_memo_len = var_spec.max_length if var_spec.max_length is not None else 200
+            return text[:max_memo_len]
 
-        if v_norm == "calculation":
-            min_c = var_spec.min_value if var_spec.min_value is not None else 1.0
-            max_c = var_spec.max_value if var_spec.max_value is not None else max(100.0, min_c)
+        if v_norm in _CALC_TYPES:
+            min_c = float(var_spec.min_value) if var_spec.min_value is not None else 1.0
+            max_c = (
+                float(var_spec.max_value) if var_spec.max_value is not None else max(100.0, min_c)
+            )
             max_c = max(max_c, min_c)
-            return str(int(self._rng.uniform(min_c, max_c)))
+            min_ci = int(min_c) if min_c.is_integer() else int(min_c) + 1
+            max_ci = int(max_c)
+            if min_ci <= max_ci:
+                return self._rng.randint(min_ci, max_ci)
+            val_c = round(self._rng.uniform(min_c, max_c), 2)
+            return float(min(max(val_c, min_c), max_c))
 
-        if v_norm in ("signature", "file", "descriptive"):
-            return ""
+        if v_norm in _SKIP_EMPTY_TYPES:
+            return "example" if var_spec.required else ""
 
         logger.warning(
             f"Unrecognized variable type '{v_type}' for variable '{var_spec.variable_name}'. "
@@ -355,15 +501,13 @@ class SyntheticRecordGenerator:
             payloads = []
             used_subjects = []
             # Min boundary
-            data_min = {}
+            data_min: dict[str, Any] = {}
             for v in form_spec.variables:
-                if v.strategy == VariableTestStrategy.BOUNDARY and v.variable_type in (
-                    "Number",
-                    "Integer",
-                    "Float",
-                    "Decimal",
+                v_norm = _normalize_var_type(v.variable_type)
+                if v.strategy == VariableTestStrategy.BOUNDARY and (
+                    v_norm in _INT_TYPES or v_norm in _FLOAT_TYPES or v_norm in _CALC_TYPES
                 ):
-                    data_min[v.variable_name] = str(v.min_value) if v.min_value is not None else "1"
+                    data_min[v.variable_name] = self._boundary_scalar(v, is_max=False)
                 else:
                     val = self._generate_value(v, spec)
                     if val is not None:
@@ -372,17 +516,13 @@ class SyntheticRecordGenerator:
             used_subjects.append(subject_pool[0])
 
             # Max boundary
-            data_max = {}
+            data_max: dict[str, Any] = {}
             for v in form_spec.variables:
-                if v.strategy == VariableTestStrategy.BOUNDARY and v.variable_type in (
-                    "Number",
-                    "Integer",
-                    "Float",
-                    "Decimal",
+                v_norm = _normalize_var_type(v.variable_type)
+                if v.strategy == VariableTestStrategy.BOUNDARY and (
+                    v_norm in _INT_TYPES or v_norm in _FLOAT_TYPES or v_norm in _CALC_TYPES
                 ):
-                    data_max[v.variable_name] = (
-                        str(v.max_value) if v.max_value is not None else "100"
-                    )
+                    data_max[v.variable_name] = self._boundary_scalar(v, is_max=True)
                 else:
                     val = self._generate_value(v, spec)
                     if val is not None:
@@ -423,12 +563,18 @@ class SyntheticRecordGenerator:
                 snapshot.active_sites()[0].site_name if snapshot.active_sites() else "Default Site"
             )
         )
+        keyword_tag = (subj_spec.keyword_tag if subj_spec is not None else "UAT").strip()
 
         final_payloads = []
         for data in data_payloads:
-            final_payloads.append(
-                {"formKey": form_spec.form_key, "siteName": site_name, "data": data}
-            )
+            reg_payload: dict[str, Any] = {
+                "formKey": form_spec.form_key,
+                "siteName": site_name,
+                "data": data,
+            }
+            if keyword_tag:
+                reg_payload["keywords"] = [{"keywordName": keyword_tag, "keywordKey": keyword_tag}]
+            final_payloads.append(reg_payload)
 
         return GeneratedRecordSet(
             form_key=form_spec.form_key,
