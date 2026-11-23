@@ -8,8 +8,10 @@ This module provides the ImednetSDK class which:
 
 from __future__ import annotations
 
+import importlib.metadata as _importlib_metadata
 import inspect
-from collections.abc import Iterator
+import sys
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from importlib.metadata import EntryPoint, entry_points
 from typing import TYPE_CHECKING, Any, Never, Self, cast
@@ -72,6 +74,68 @@ _SYNC_ONLY_WORKFLOW_NAMES: frozenset[str] = frozenset(
 )
 
 
+_EntryPointsLoader = Callable[..., Iterable[EntryPoint]]
+_ORIGINAL_ENTRY_POINTS: _EntryPointsLoader = entry_points
+_CACHE_MAX_ENTRIES = 16
+_MISSING_PLUGIN_ENTRY_POINT = object()
+_WORKFLOW_ENTRY_POINTS_CACHE: dict[tuple[str, ...], dict[str, EntryPoint]] = {}
+_PLUGIN_ENTRY_POINT_CACHE: dict[tuple[tuple[str, ...], str], EntryPoint | None] = {}
+
+
+def _active_entry_points_loader() -> tuple[_EntryPointsLoader, bool]:
+    """Return the active entry_points callable and whether the default loader is unpatched."""
+    if entry_points is not _ORIGINAL_ENTRY_POINTS:
+        return entry_points, False
+    if _importlib_metadata.entry_points is not _ORIGINAL_ENTRY_POINTS:
+        return _importlib_metadata.entry_points, False
+    return entry_points, True
+
+
+def _scan_workflow_entry_points(loader: _EntryPointsLoader) -> dict[str, EntryPoint]:
+    """Scan ``imednet.workflows`` entry points and reject duplicate workflow names."""
+    discovered: dict[str, EntryPoint] = {}
+    for ep in loader(group="imednet.workflows"):
+        if ep.name in discovered:
+            raise PluginLoadError(
+                f"Multiple workflows registered under the name '{ep.name}'. "
+                "Please resolve the conflict."
+            )
+        discovered[ep.name] = ep
+    return discovered
+
+
+def _get_workflow_entry_points() -> dict[str, EntryPoint]:
+    """Return discovered workflow entry points, caching per ``sys.path`` when unpatched."""
+    loader, cacheable = _active_entry_points_loader()
+    if not cacheable:
+        return _scan_workflow_entry_points(loader)
+
+    path_key = tuple(sys.path)
+    cached = _WORKFLOW_ENTRY_POINTS_CACHE.get(path_key)
+    if cached is None:
+        cached = _scan_workflow_entry_points(loader)
+        if len(_WORKFLOW_ENTRY_POINTS_CACHE) >= _CACHE_MAX_ENTRIES:
+            _WORKFLOW_ENTRY_POINTS_CACHE.clear()
+        _WORKFLOW_ENTRY_POINTS_CACHE[path_key] = cached
+    return dict(cached)
+
+
+def _scan_plugin_entry_point(loader: _EntryPointsLoader, name: str) -> EntryPoint | None:
+    """Scan ``imednet.plugins`` for *name* and reject duplicate plugin registrations."""
+    plugin_entry_points: list[EntryPoint] = list(loader(group="imednet.plugins", name=name))
+    if not plugin_entry_points:
+        return None
+    if len(plugin_entry_points) > 1:
+        discovered_plugins = ", ".join(
+            sorted(entry_point.value for entry_point in plugin_entry_points)
+        )
+        raise PluginLoadError(
+            f"Multiple '{name}' plugins were found in the 'imednet.plugins' entry-point "
+            f"group ({discovered_plugins}). Please keep only one {name} plugin installed."
+        )
+    return plugin_entry_points[0]
+
+
 def _factory_supports_async(target: Any) -> bool:
     """Return True if a workflow class, factory, or instance supports AsyncImednetSDK."""
     explicit = getattr(target, "supports_async", None)
@@ -95,14 +159,7 @@ class WorkflowRegistry:
     def __init__(self, sdk_instance: Any) -> None:
         """Initialize the registry with an SDK instance."""
         self._sdk = sdk_instance
-        self._entry_points: dict[str, EntryPoint] = {}
-        for ep in entry_points(group="imednet.workflows"):
-            if ep.name in self._entry_points:
-                raise PluginLoadError(
-                    f"Multiple workflows registered under the name '{ep.name}'. "
-                    "Please resolve the conflict."
-                )
-            self._entry_points[ep.name] = ep
+        self._entry_points: dict[str, EntryPoint] = _get_workflow_entry_points()
         self._loaded_workflows: dict[str, Any] = {}
 
     def _is_async_sdk(self) -> bool:
@@ -284,20 +341,20 @@ class _BaseSDK:
         return None
 
     def _get_plugin_entry_point(self, name: str) -> EntryPoint | None:
-        """Return the configured plugin entry point."""
-        plugin_entry_points = list(entry_points(group="imednet.plugins", name=name))
+        """Return the configured plugin entry point, caching metadata when unpatched."""
+        loader, cacheable = _active_entry_points_loader()
+        if not cacheable:
+            return _scan_plugin_entry_point(loader, name)
 
-        if not plugin_entry_points:
-            return None
-        if len(plugin_entry_points) > 1:
-            discovered_plugins = ", ".join(
-                sorted(entry_point.value for entry_point in plugin_entry_points)
-            )
-            raise PluginLoadError(
-                f"Multiple '{name}' plugins were found in the 'imednet.plugins' entry-point "
-                f"group ({discovered_plugins}). Please keep only one {name} plugin installed."
-            )
-        return plugin_entry_points[0]
+        cache_key = (tuple(sys.path), name)
+        cached = _PLUGIN_ENTRY_POINT_CACHE.get(cache_key, _MISSING_PLUGIN_ENTRY_POINT)
+        if cached is _MISSING_PLUGIN_ENTRY_POINT:
+            resolved = _scan_plugin_entry_point(loader, name)
+            if len(_PLUGIN_ENTRY_POINT_CACHE) >= _CACHE_MAX_ENTRIES:
+                _PLUGIN_ENTRY_POINT_CACHE.clear()
+            _PLUGIN_ENTRY_POINT_CACHE[cache_key] = resolved
+            return resolved
+        return cast("EntryPoint | None", cached)
 
     def _init_workflows(self) -> WorkflowRegistry:
         """Initialize and return the dynamic workflow registry."""
@@ -350,6 +407,16 @@ class _BaseSDK:
             finally:
                 if token_base is not None:
                     reset_base_url_context(token_base)
+
+    if not TYPE_CHECKING:
+
+        def __getattr__(self, name: str) -> Any:
+            """Lazily initialize optional plugin namespaces on first access."""
+            if name == "sinks":
+                sinks = self._init_sinks()
+                self.__dict__["sinks"] = sinks
+                return sinks
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute {name!r}")
 
 
 class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
@@ -450,7 +517,6 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
 
         self._init_endpoints()
         self.workflows = cast(SyncWorkflowsNamespaceProtocol, self._init_workflows())
-        self.sinks = cast("SinksNamespaceProtocol | None", self._init_sinks())
 
     @property
     def auth(self) -> AuthStrategy | None:
@@ -475,25 +541,24 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
         )
         for attr in ENDPOINT_REGISTRY:
             self.__dict__.pop(attr, None)
+        self.__dict__.pop("sinks", None)
 
     if not TYPE_CHECKING:
 
         def __getattr__(self, name: str) -> Any:
-            """Lazily instantiate synchronous endpoint clients on first access."""
+            """Lazily instantiate synchronous endpoint clients and plugins on first access."""
             try:
                 endpoint_cls = ENDPOINT_REGISTRY[name]
             except KeyError:
-                raise AttributeError(
-                    f"'{type(self).__name__}' object has no attribute {name!r}"
-                ) from None
+                return super().__getattr__(name)
             endpoint = endpoint_cls(self._client)
             endpoint._strict_mode = getattr(self, "_endpoint_strict_mode", None)
             setattr(self, name, endpoint)
             return endpoint
 
         def __dir__(self) -> list[str]:
-            """Include lazy endpoint attributes in dir()."""
-            return sorted(set(super().__dir__()) | set(ENDPOINT_REGISTRY))
+            """Include lazy endpoint and plugin attributes in dir()."""
+            return sorted(set(super().__dir__()) | set(ENDPOINT_REGISTRY) | {"sinks"})
 
     def __enter__(self) -> ImednetSDK:
         """Support for context manager protocol."""
@@ -616,7 +681,6 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
 
         self._init_endpoints()
         self.workflows = cast(AsyncWorkflowsNamespaceProtocol, self._init_workflows())
-        self.sinks = cast("AsyncSinksNamespaceProtocol | None", self._init_sinks())
 
     @property
     def auth(self) -> AuthStrategy | None:
@@ -643,25 +707,24 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
         )
         for attr in ASYNC_ENDPOINT_REGISTRY:
             self.__dict__.pop(attr, None)
+        self.__dict__.pop("sinks", None)
 
     if not TYPE_CHECKING:
 
         def __getattr__(self, name: str) -> Any:
-            """Lazily instantiate asynchronous endpoint clients on first access."""
+            """Lazily instantiate asynchronous endpoint clients and plugins on first access."""
             try:
                 endpoint_cls = ASYNC_ENDPOINT_REGISTRY[name]
             except KeyError:
-                raise AttributeError(
-                    f"'{type(self).__name__}' object has no attribute {name!r}"
-                ) from None
+                return super().__getattr__(name)
             endpoint = endpoint_cls(self._async_client)
             endpoint._strict_mode = getattr(self, "_endpoint_strict_mode", None)
             setattr(self, name, endpoint)
             return endpoint
 
         def __dir__(self) -> list[str]:
-            """Include lazy asynchronous endpoint attributes in dir()."""
-            return sorted(set(super().__dir__()) | set(ASYNC_ENDPOINT_REGISTRY))
+            """Include lazy asynchronous endpoint and plugin attributes in dir()."""
+            return sorted(set(super().__dir__()) | set(ASYNC_ENDPOINT_REGISTRY) | {"sinks"})
 
     def close(self) -> None:
         """Raise TypeError as sync close is not supported."""

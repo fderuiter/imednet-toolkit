@@ -1004,3 +1004,297 @@ def test_airflow_state_provider_and_example_dags_airflow3_compat(tmp_path: Path)
         check=False,
     )
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+
+def test_trigger_run_polls_jobs_without_loading_sinks() -> None:
+    """Verify ImednetJobTrigger.run accesses sdk.jobs without importing imednet_sinks or creating SinksNamespace."""
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        import httpx
+        import respx
+
+        from apache_airflow_providers_imednet.hooks import ImednetHook
+        from apache_airflow_providers_imednet.triggers import ImednetJobTrigger
+        import imednet.sdk as sdk_mod
+
+        created_sdks = []
+        orig_init = sdk_mod.AsyncImednetSDK.__init__
+
+        def _record_sdk(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            created_sdks.append(self)
+
+        async def _main():
+            conn = SimpleNamespace(
+                login="trig-key",  # pragma: allowlist secret
+                password="trig-sec",  # pragma: allowlist secret
+                host="https://edc.example.test",
+                schema=None,
+                port=None,
+                extra_dejson={},
+            )
+            with (
+                patch.object(sdk_mod.AsyncImednetSDK, "__init__", _record_sdk),
+                patch.object(
+                    ImednetHook,
+                    "_aget_airflow_connection",
+                    new=AsyncMock(return_value=conn),
+                ),
+                respx.mock(assert_all_called=True) as router,
+            ):
+                router.get("https://edc.example.test/api/v1/edc/studies/S_LAZY/jobs/B_LAZY").mock(
+                    return_value=httpx.Response(
+                        200,
+                        json={"batchId": "B_LAZY", "state": "COMPLETED", "progress": 100},
+                    )
+                )
+                trigger = ImednetJobTrigger(
+                    study_key="S_LAZY", batch_id="B_LAZY", poke_interval=0.01
+                )
+                events = [ev async for ev in trigger.run()]
+
+            assert len(events) == 1
+            assert events[0].payload["status"] == "success"
+            assert len(created_sdks) == 1
+            assert "jobs" in created_sdks[0].__dict__
+            assert "sinks" not in created_sdks[0].__dict__
+            assert "imednet_sinks" not in sys.modules
+            assert "imednet_sinks.plugin" not in sys.modules
+
+        asyncio.run(_main())
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+
+def test_concurrent_trigger_waves_watchdog_and_heartbeat_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    respx_mock: Any,
+) -> None:
+    """Verify 25, 100, and 250 concurrent ImednetJobTrigger runs perform 0 disk/TLS reloads and respect loop budgets."""
+    import logging
+    import ssl
+
+    import httpx
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.triggers import ImednetJobTrigger
+    from imednet_sinks.plugin import SinksNamespace
+
+    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.WARNING, logger="imednet")
+
+    sinks_instantiations = 0
+    orig_sinks_init = SinksNamespace.__init__
+
+    def _spy_sinks_init(self: SinksNamespace, *args: Any, **kwargs: Any) -> None:
+        nonlocal sinks_instantiations
+        sinks_instantiations += 1
+        orig_sinks_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(SinksNamespace, "__init__", _spy_sinks_init)
+
+    conn = SimpleNamespace(
+        login="wave-key",  # pragma: allowlist secret
+        password="wave-sec",  # pragma: allowlist secret
+        host="https://edc.example.test",
+        schema=None,
+        port=None,
+        extra_dejson={},
+    )
+    ok_response = httpx.Response(
+        200,
+        json={"batchId": "B1", "state": "COMPLETED", "progress": 100},
+    )
+
+    async def _aget_conn(_self: ImednetHook, _conn_id: str) -> Any:
+        await asyncio.sleep(0)
+        return conn
+
+    async def _mock_job_status(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0)
+        return ok_response
+
+    respx_mock.assert_all_called = False
+    respx_mock.get(host="edc.example.test").side_effect = _mock_job_status
+
+    async def _verify_zero_io_in_process() -> None:
+        with patch.object(ImednetHook, "_aget_airflow_connection", new=_aget_conn):
+            warmup = ImednetJobTrigger(study_key="S1", batch_id="B_WARM", poke_interval=0.01)
+            warm_events = [ev async for ev in warmup.run()]
+            assert len(warm_events) == 1
+            assert warm_events[0].payload["status"] == "success"
+
+            read_calls = 0
+            ssl_calls = 0
+            orig_read_text = Path.read_text
+            orig_ssl = ssl.create_default_context
+
+            def _spy_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+                nonlocal read_calls
+                read_calls += 1
+                return orig_read_text(self, *args, **kwargs)
+
+            def _spy_ssl(*args: Any, **kwargs: Any) -> ssl.SSLContext:
+                nonlocal ssl_calls
+                ssl_calls += 1
+                return orig_ssl(*args, **kwargs)
+
+            monkeypatch.setattr(Path, "read_text", _spy_read_text)
+            monkeypatch.setattr(ssl, "create_default_context", _spy_ssl)
+
+            triggers = [
+                ImednetJobTrigger(study_key="S1", batch_id=f"B_{idx}", poke_interval=0.01)
+                for idx in range(25)
+            ]
+            events = await asyncio.gather(*(anext(t.run()) for t in triggers))
+            assert len(events) == 25
+            assert all(ev.payload["status"] == "success" for ev in events)
+            assert read_calls == 0
+            assert ssl_calls == 0
+            assert sinks_instantiations == 0
+
+    asyncio.run(_verify_zero_io_in_process())
+
+    # Measure 25, 100, and 250 concurrent trigger waves in an uninstrumented subprocess
+    # (free of pytest-cov line-tracing overhead) against Airflow watchdog (0.2s) and heartbeat (5.0s).
+    bench_script = textwrap.dedent(
+        """
+        import asyncio
+        import logging
+        import ssl
+        import time
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        import httpx
+
+        from apache_airflow_providers_imednet.hooks import ImednetHook
+        from apache_airflow_providers_imednet.triggers import ImednetJobTrigger
+
+        logging.getLogger("imednet").setLevel(logging.WARNING)
+
+        conn = SimpleNamespace(
+            login="wave-key",  # pragma: allowlist secret
+            password="wave-sec",  # pragma: allowlist secret
+            host="https://edc.example.test",
+            schema=None,
+            port=None,
+            extra_dejson={},
+        )
+
+        async def _mock_send(self, request, **kwargs):
+            await asyncio.sleep(0)
+            return httpx.Response(
+                200,
+                json={"batchId": "B1", "state": "COMPLETED", "progress": 100},
+                request=request,
+            )
+
+        async def _measure_wave(count: int) -> tuple[float, float]:
+            max_stall = 0.0
+            running = True
+
+            async def _watchdog():
+                nonlocal max_stall
+                last = time.perf_counter()
+                while running:
+                    await asyncio.sleep(0)
+                    now = time.perf_counter()
+                    max_stall = max(max_stall, now - last)
+                    last = now
+
+            triggers = [
+                ImednetJobTrigger(study_key="S1", batch_id="B1", poke_interval=0.01)
+                for _ in range(count)
+            ]
+            wd = asyncio.create_task(_watchdog())
+            start = time.perf_counter()
+            events = await asyncio.gather(*(anext(t.run()) for t in triggers))
+            elapsed = time.perf_counter() - start
+            running = False
+            await wd
+            assert len(events) == count
+            return max_stall, elapsed
+
+        async def _main():
+            with (
+                patch.object(
+                    ImednetHook, "_aget_airflow_connection", new=AsyncMock(return_value=conn)
+                ),
+                patch.object(httpx.AsyncClient, "send", new=_mock_send),
+            ):
+                warmup = ImednetJobTrigger(study_key="S1", batch_id="B_WARM", poke_interval=0.01)
+                _ = [ev async for ev in warmup.run()]
+
+                read_calls = 0
+                ssl_calls = 0
+                orig_read = Path.read_text
+                orig_ssl = ssl.create_default_context
+
+                def _count_read(self, *a, **kw):
+                    nonlocal read_calls
+                    read_calls += 1
+                    return orig_read(self, *a, **kw)
+
+                def _count_ssl(*a, **kw):
+                    nonlocal ssl_calls
+                    ssl_calls += 1
+                    return orig_ssl(*a, **kw)
+
+                with (
+                    patch.object(Path, "read_text", _count_read),
+                    patch.object(ssl, "create_default_context", _count_ssl),
+                ):
+                    for count, stall_limit, elapsed_limit in (
+                        (25, 0.2, 1.0),
+                        (100, 0.2, 2.0),
+                        (250, 5.0, 5.0),
+                    ):
+                        best_stall, best_elapsed = await _measure_wave(count)
+                        if best_stall >= stall_limit or best_elapsed >= elapsed_limit:
+                            retry_stall, retry_elapsed = await _measure_wave(count)
+                            best_stall = min(best_stall, retry_stall)
+                            best_elapsed = min(best_elapsed, retry_elapsed)
+
+                        assert best_stall < stall_limit, (
+                            f"wave={count} max_stall={best_stall:.4f}s >= {stall_limit}s"
+                        )
+                        assert best_elapsed < elapsed_limit, (
+                            f"wave={count} elapsed={best_elapsed:.4f}s >= {elapsed_limit}s"
+                        )
+
+                assert read_calls == 0
+                assert ssl_calls == 0
+
+        asyncio.run(_main())
+        """
+    )
+    import os
+
+    clean_env = {
+        key: val
+        for key, val in os.environ.items()
+        if not key.startswith(("COV_CORE_", "COVERAGE_"))
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", bench_script],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"

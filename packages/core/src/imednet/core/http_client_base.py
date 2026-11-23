@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 import socket
+import ssl
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Mapping, Sequence
+from functools import lru_cache
 from typing import Any, Generic, TypeVar, cast
 from urllib.parse import urlsplit
 
@@ -53,6 +56,25 @@ _BLOCKED_EXTERNAL_HOSTS: frozenset[str] = frozenset(
 _OBFUSCATED_IP_LABEL_RE = re.compile(r"^(?:0x[0-9a-f]+|\d+)$", re.IGNORECASE)
 _MAX_EXTERNAL_REDIRECTS = 5
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
+
+@lru_cache(maxsize=16)
+def _build_tls_context(cert_file: str | None, cert_dir: str | None) -> ssl.SSLContext:
+    """Create and cache a default TLS context for the configured certificate paths."""
+    if cert_file and cert_dir:
+        return ssl.create_default_context(cafile=cert_file, capath=cert_dir)
+    if cert_file:
+        return ssl.create_default_context(cafile=cert_file)
+    if cert_dir:
+        return ssl.create_default_context(capath=cert_dir)
+    return httpx.create_ssl_context(trust_env=False)
+
+
+def _get_shared_tls_context() -> ssl.SSLContext:
+    """Return a cached TLS context keyed by SSL_CERT_FILE and SSL_CERT_DIR in the environment."""
+    cert_file = os.environ.get("SSL_CERT_FILE") or None
+    cert_dir = os.environ.get("SSL_CERT_DIR") or None
+    return _build_tls_context(cert_file, cert_dir)
 
 
 def _url_origin(url: httpx.URL | str) -> tuple[str, str, int | None]:
@@ -227,6 +249,8 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
         }
         if getattr(self, "_transport", None) is not None:
             client_kwargs["transport"] = self._transport
+        else:
+            client_kwargs["verify"] = _get_shared_tls_context()
 
         client: Any = client_cls(**client_kwargs)
         return cast(ClientT, client)

@@ -239,3 +239,120 @@ def test_performance_suite():
             fcntl.flock(f, getattr(fcntl, "LOCK_UN"))
 
     assert not degradations, "Performance Regressions Detected:\n" + "\n".join(degradations)
+
+
+def test_concurrent_airflow_trigger_waves_performance(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Benchmark concurrent waves of 25, 100, and 250 ImednetJobTrigger.run coroutines after warmup."""
+    import asyncio
+    import ssl
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.triggers import ImednetJobTrigger
+
+    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.WARNING, logger="imednet")
+
+    conn = SimpleNamespace(
+        login="perf-key",  # pragma: allowlist secret
+        password="perf-sec",  # pragma: allowlist secret
+        host="https://edc.example.test",
+        schema=None,
+        port=None,
+        extra_dejson={},
+    )
+
+    async def _mock_send(
+        _self: httpx.AsyncClient, request: httpx.Request, **kwargs
+    ) -> httpx.Response:
+        await asyncio.sleep(0)
+        return httpx.Response(
+            200,
+            json={"batchId": "B1", "state": "COMPLETED", "progress": 100},
+            request=request,
+        )
+
+    async def _measure_wave(wave_size: int) -> tuple[float, float]:
+        max_stall = 0.0
+        running = True
+
+        async def _watchdog() -> None:
+            nonlocal max_stall
+            last = time.perf_counter()
+            while running:
+                await asyncio.sleep(0)
+                now = time.perf_counter()
+                max_stall = max(max_stall, now - last)
+                last = now
+
+        triggers = [
+            ImednetJobTrigger(
+                study_key="S1",
+                batch_id=f"B_PERF_{wave_size}_{i}",
+                poke_interval=0.01,
+            )
+            for i in range(wave_size)
+        ]
+        wd = asyncio.create_task(_watchdog())
+        start = time.perf_counter()
+        events = await asyncio.gather(*(anext(t.run()) for t in triggers))
+        elapsed = time.perf_counter() - start
+        running = False
+        await wd
+        assert len(events) == wave_size
+        return max_stall, elapsed
+
+    async def _run() -> None:
+        with (
+            patch.object(ImednetHook, "_aget_airflow_connection", new=AsyncMock(return_value=conn)),
+            patch.object(httpx.AsyncClient, "send", new=_mock_send),
+        ):
+            warmup = ImednetJobTrigger(study_key="S1", batch_id="B_WARM", poke_interval=0.01)
+            _ = [ev async for ev in warmup.run()]
+
+            read_calls = 0
+            ssl_calls = 0
+            orig_read = Path.read_text
+            orig_ssl = ssl.create_default_context
+
+            def _count_read(self: Path, *a, **kw) -> str:
+                nonlocal read_calls
+                read_calls += 1
+                return orig_read(self, *a, **kw)
+
+            def _count_ssl(*a, **kw) -> ssl.SSLContext:
+                nonlocal ssl_calls
+                ssl_calls += 1
+                return orig_ssl(*a, **kw)
+
+            monkeypatch.setattr(Path, "read_text", _count_read)
+            monkeypatch.setattr(ssl, "create_default_context", _count_ssl)
+
+            for wave_size, stall_budget, elapsed_budget in (
+                (25, 0.2, 1.0),
+                (100, 0.2, 2.0),
+                (250, 5.0, 5.0),
+            ):
+                best_stall, best_elapsed = await _measure_wave(wave_size)
+                if best_stall >= stall_budget or best_elapsed >= elapsed_budget:
+                    retry_stall, retry_elapsed = await _measure_wave(wave_size)
+                    best_stall = min(best_stall, retry_stall)
+                    best_elapsed = min(best_elapsed, retry_elapsed)
+
+                assert best_stall < stall_budget, (
+                    f"Wave {wave_size} max event-loop stall {best_stall:.4f}s >= {stall_budget}s"
+                )
+                assert best_elapsed < elapsed_budget, (
+                    f"Wave {wave_size} elapsed {best_elapsed:.4f}s >= {elapsed_budget}s"
+                )
+
+            assert read_calls == 0
+            assert ssl_calls == 0
+
+    asyncio.run(_run())

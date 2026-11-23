@@ -400,3 +400,278 @@ def test_poll_job_convenience_sync(monkeypatch) -> None:
 
     assert sdk.poll_job("S1", "B1", interval=10, timeout=100) == "JOBOBJ"
     assert calls["run"] == ("S1", "B1", 10, 100)
+
+
+@pytest.mark.asyncio
+async def test_steady_state_sdk_init_executes_zero_metadata_or_tls_file_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify warmed ImednetSDK and AsyncImednetSDK builds perform 0 Path.read_text and 0 SSL context builds."""
+    import ssl
+    from pathlib import Path
+
+    warm_sync = _create_sdk()
+    warm_sync.close()
+    async with sdk_mod.AsyncImednetSDK(
+        api_key="key",
+        security_key="secret",
+        base_url="https://example.com",
+    ):
+        pass
+
+    read_text_calls = 0
+    ssl_calls = 0
+    orig_read_text = Path.read_text
+    orig_create_default_context = ssl.create_default_context
+
+    def _spy_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        nonlocal read_text_calls
+        read_text_calls += 1
+        return orig_read_text(self, *args, **kwargs)
+
+    def _spy_ssl_context(*args: Any, **kwargs: Any) -> ssl.SSLContext:
+        nonlocal ssl_calls
+        ssl_calls += 1
+        return orig_create_default_context(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _spy_read_text)
+    monkeypatch.setattr(ssl, "create_default_context", _spy_ssl_context)
+
+    sync_sdk = _create_sdk()
+    try:
+        assert "sinks" not in sync_sdk.__dict__
+        assert "sinks" in dir(sync_sdk)
+    finally:
+        sync_sdk.close()
+
+    async with sdk_mod.AsyncImednetSDK(
+        api_key="key",
+        security_key="secret",
+        base_url="https://example.com",
+    ) as async_sdk:
+        assert "sinks" not in async_sdk.__dict__
+        assert "sinks" in dir(async_sdk)
+
+    assert read_text_calls == 0
+    assert ssl_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_sinks_lazy_discovery_instance_cache_direct_assignment_and_metadata_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify sdk.sinks defers discovery until read, caches per instance, reuses metadata, and allows assignment."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    init_sinks_calls = 0
+    orig_init_sinks = sdk_mod._BaseSDK._init_sinks
+
+    def _spy_init_sinks(self: sdk_mod._BaseSDK) -> Any:
+        nonlocal init_sinks_calls
+        init_sinks_calls += 1
+        return orig_init_sinks(self)
+
+    monkeypatch.setattr(sdk_mod._BaseSDK, "_init_sinks", _spy_init_sinks)
+
+    sdk1 = _create_sdk()
+    sdk2 = _create_sdk()
+    assigned_sdk = _create_sdk()
+    try:
+        assert init_sinks_calls == 0
+
+        # Direct assignment before first read skips _init_sinks completely
+        custom_sinks = SimpleNamespace(marker="custom")
+        assigned_sdk.sinks = custom_sinks  # type: ignore[assignment]
+        assert assigned_sdk.sinks is custom_sinks
+        assert init_sinks_calls == 0
+
+        # First read on sdk1 resolves and caches per instance
+        sinks1 = sdk1.sinks
+        assert sinks1 is not None
+        assert init_sinks_calls == 1
+        assert sdk1.sinks is sinks1
+        assert init_sinks_calls == 1
+
+        # Second SDK instance reuses cached sinks plugin metadata with 0 Path.read_text calls
+        read_text_calls = 0
+        orig_read_text = Path.read_text
+
+        def _spy_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            nonlocal read_text_calls
+            read_text_calls += 1
+            return orig_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _spy_read_text)
+        sinks2 = sdk2.sinks
+        assert sinks2 is not None
+        assert sinks2 is not sinks1
+        assert getattr(sinks1, "_sdk", None) is sdk1
+        assert getattr(sinks2, "_sdk", None) is sdk2
+        assert read_text_calls == 0
+
+        # Direct assignment after read overrides cached instance attribute
+        replacement_sinks = SimpleNamespace(marker="replacement")
+        sdk1.sinks = replacement_sinks  # type: ignore[assignment]
+        assert sdk1.sinks is replacement_sinks
+
+        # Missing attribute still raises standard AttributeError
+        with pytest.raises(AttributeError, match="'ImednetSDK' object has no attribute 'unknown'"):
+            _ = sdk1.unknown
+    finally:
+        sdk1.close()
+        sdk2.close()
+        assigned_sdk.close()
+
+    async with sdk_mod.AsyncImednetSDK(
+        api_key="key",
+        security_key="secret",
+        base_url="https://example.com",
+    ) as async_sdk:
+        with pytest.raises(
+            AttributeError, match="'AsyncImednetSDK' object has no attribute 'unknown'"
+        ):
+            _ = async_sdk.unknown
+
+
+def test_sinks_missing_and_duplicate_plugin_entry_points(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify None sinks caching when uninstalled and PluginLoadError on duplicate sinks plugins."""
+    plugin_scans = 0
+
+    def _empty_eps(*, group: str, name: str | None = None) -> list[Any]:
+        nonlocal plugin_scans
+        if group == "imednet.plugins":
+            plugin_scans += 1
+        return []
+
+    monkeypatch.setattr(sdk_mod, "entry_points", _empty_eps)
+    sdk = _create_sdk()
+    try:
+        assert plugin_scans == 0
+        assert sdk.sinks is None
+        assert plugin_scans == 1
+        # Cached None in instance __dict__ avoids re-scanning on second read
+        assert sdk.sinks is None
+        assert plugin_scans == 1
+    finally:
+        sdk.close()
+
+    monkeypatch.setattr(
+        sdk_mod,
+        "entry_points",
+        lambda *, group, name=None: (
+            [
+                _FakeEntryPoint(lambda: object(), value="b.plugin:create_sinks", name="sinks"),
+                _FakeEntryPoint(lambda: object(), value="a.plugin:create_sinks", name="sinks"),
+            ]
+            if group == "imednet.plugins" and name == "sinks"
+            else []
+        ),
+    )
+    dup_sdk = _create_sdk()
+    try:
+        with pytest.raises(
+            PluginLoadError,
+            match=(
+                r"Multiple 'sinks' plugins were found in the 'imednet\.plugins' entry-point "
+                r"group \(a\.plugin:create_sinks, b\.plugin:create_sinks\)\. "
+                r"Please keep only one sinks plugin installed\."
+            ),
+        ):
+            _ = dup_sdk.sinks
+    finally:
+        dup_sdk.close()
+
+
+def test_entry_point_cache_respects_sys_path_mutations_and_importlib_patches(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify unpatched entry-point cache refreshes on sys.path changes and importlib.metadata patches."""
+    import importlib.metadata as importlib_metadata
+
+    pkg_dir = tmp_path / "site_pkgs"
+    mod_file = pkg_dir / "temp_wf_mod.py"
+    pkg_dir.mkdir(parents=True)
+    mod_file.write_text(
+        "class TempWorkflow:\n"
+        "    supports_async = True\n"
+        "    def __init__(self, sdk):\n"
+        "        self.sdk = sdk\n",
+        encoding="utf-8",
+    )
+    dist_info = pkg_dir / "temp_wf_pkg-0.1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: temp-wf-pkg\nVersion: 0.1.0\n",
+        encoding="utf-8",
+    )
+    (dist_info / "entry_points.txt").write_text(
+        "[imednet.workflows]\ntemp_custom_wf = temp_wf_mod:TempWorkflow\n",
+        encoding="utf-8",
+    )
+
+    # Warm default sys.path cache first
+    base_sdk = _create_sdk()
+    base_sdk.close()
+
+    monkeypatch.syspath_prepend(str(pkg_dir))
+    ext_sdk = _create_sdk()
+    try:
+        wf = ext_sdk.workflows.temp_custom_wf
+        assert wf.sdk is ext_sdk
+    finally:
+        ext_sdk.close()
+
+    # Duplicate builtin workflow name via sys.path still raises PluginLoadError on SDK creation
+    dup_dir = tmp_path / "dup_pkgs"
+    dup_info = dup_dir / "dup_wf_pkg-0.1.0.dist-info"
+    dup_info.mkdir(parents=True)
+    (dup_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: dup-wf-pkg\nVersion: 0.1.0\n",
+        encoding="utf-8",
+    )
+    (dup_info / "entry_points.txt").write_text(
+        "[imednet.workflows]\ndata_extraction = temp_wf_mod:TempWorkflow\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(dup_dir))
+    with pytest.raises(
+        PluginLoadError, match="Multiple workflows registered under the name 'data_extraction'"
+    ):
+        _create_sdk()
+
+    # Patching importlib.metadata.entry_points directly also bypasses the cache
+    monkeypatch.setattr(
+        importlib_metadata,
+        "entry_points",
+        lambda *, group, name=None: (
+            [_FakeEntryPoint(lambda: lambda s: ("patched", s), name="meta_wf")]
+            if group == "imednet.workflows"
+            else []
+        ),
+    )
+    meta_sdk = _create_sdk()
+    try:
+        assert meta_sdk.workflows.meta_wf == ("patched", meta_sdk)
+        assert meta_sdk.sinks is None
+    finally:
+        meta_sdk.close()
+
+    # Exercise bounded cache eviction for both workflow and plugin entry-point caches
+    monkeypatch.undo()
+    monkeypatch.setattr(sdk_mod, "_CACHE_MAX_ENTRIES", 1)
+    sdk_mod._WORKFLOW_ENTRY_POINTS_CACHE.clear()
+    sdk_mod._PLUGIN_ENTRY_POINT_CACHE.clear()
+
+    evict_sdk_1 = _create_sdk()
+    _ = evict_sdk_1.sinks
+    evict_sdk_1.close()
+    assert len(sdk_mod._WORKFLOW_ENTRY_POINTS_CACHE) == 1
+    assert len(sdk_mod._PLUGIN_ENTRY_POINT_CACHE) == 1
+
+    monkeypatch.syspath_prepend(str(pkg_dir))
+    evict_sdk_2 = _create_sdk()
+    _ = evict_sdk_2.sinks
+    evict_sdk_2.close()
+    assert len(sdk_mod._WORKFLOW_ENTRY_POINTS_CACHE) == 1
+    assert len(sdk_mod._PLUGIN_ENTRY_POINT_CACHE) == 1
