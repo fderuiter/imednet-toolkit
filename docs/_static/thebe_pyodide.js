@@ -6,9 +6,9 @@
   "use strict";
 
   const PYODIDE_INDEX_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
-  const PYODIDE_CDN_URL = `${PYODIDE_INDEX_URL}pyodide.js`;
+  const PYODIDE_CDN_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js";
   const PYODIDE_SRI_BASE64 =
-    "i3R37b3tF+HWudsUf1VSEOY2YxwSNMqY8DQa9Z0O3xh+NkJ9o+yjcGyIi5huj+nB";
+    "i3R37b3tF+HWudsUf1VSEOY2YxwSNMqY8DQa9Z0O3xh+NkJ9o+yjcGyIi5huj+nB"; // pragma: allowlist secret
   const PYODIDE_SRI_SHA384 = `sha384-${PYODIDE_SRI_BASE64}`;
 
   const EXCLUDED_WHEEL_PREFIXES = [
@@ -58,7 +58,7 @@
 
   function getConfig() {
     const defaultWheels = [
-      "_static/wheels/imednet-1.1.0-py3-none-any.whl",
+      "_static/wheels/imednet-1.1.0-py3-none-any.whl", // x-release-please-version
       "_static/wheels/imednet_workflows-1.1.0-py3-none-any.whl",
       "_static/wheels/imednet_plugins_sinks-1.0.1-py3-none-any.whl",
     ];
@@ -83,7 +83,7 @@
       IMEDNET_API_KEY: "dummy_api_key", // pragma: allowlist secret
       IMEDNET_SECURITY_KEY: "dummy_security_key", // pragma: allowlist secret
       SNOWFLAKE_PASSWORD: "dummy_password", // pragma: allowlist secret
-      IMEDNET_STUDY_KEY: "MY_STUDY",
+      IMEDNET_STUDY_KEY: "STUDY",
     };
 
     let rawConfig = null;

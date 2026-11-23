@@ -146,6 +146,7 @@ def test_export_operator_dispatches_duckdb(monkeypatch: pytest.MonkeyPatch) -> N
         "STUDY-123",
         "/tmp/test_study.duckdb",
         "clinical_records",
+        quality_gate_enabled=False,
     )
     assert result == "/tmp/test_study.duckdb"
 
@@ -169,7 +170,9 @@ def test_operator_csv_export_without_sinks_plugin(monkeypatch: pytest.MonkeyPatc
 
     result = op.execute({})
     assert result == "/tmp/output.csv"
-    mock_csv_export.assert_called_once_with(mock_sdk, "STUDY-CSV", "/tmp/output.csv")
+    mock_csv_export.assert_called_once_with(
+        mock_sdk, "STUDY-CSV", "/tmp/output.csv", quality_gate_enabled=False
+    )
 
 
 @pytest.mark.parametrize("destination", ["snowflake", "neo4j", "mongodb"])
@@ -506,7 +509,9 @@ def test_resolve_sink_direct_fallbacks_and_legacy_export_func(
     monkeypatch.setattr(csv_op, "_get_sdk", lambda: mock_sdk)
     monkeypatch.setattr(export, "export_to_csv", mock_csv)
     assert csv_op.execute({}) == "/tmp/default.csv"
-    mock_csv.assert_called_once_with(mock_sdk, "STUDY-FALLBACK", "/tmp/default.csv")
+    mock_csv.assert_called_once_with(
+        mock_sdk, "STUDY-FALLBACK", "/tmp/default.csv", quality_gate_enabled=False
+    )
 
     # 2. Legacy tabular export_func not in _TABULAR_EXPORTS (export_to_sql_by_form)
     sql_by_form_op = ImednetExportOperator(
@@ -519,7 +524,9 @@ def test_resolve_sink_direct_fallbacks_and_legacy_export_func(
     monkeypatch.setattr(sql_by_form_op, "_get_sdk", lambda: mock_sdk)
     monkeypatch.setattr(export, "export_to_sql_by_form", mock_sql_by_form)
     assert sql_by_form_op.execute({}) == "sqlite:///:memory:"
-    mock_sql_by_form.assert_called_once_with(mock_sdk, "STUDY-FALLBACK", "sqlite:///:memory:")
+    mock_sql_by_form.assert_called_once_with(
+        mock_sdk, "STUDY-FALLBACK", "sqlite:///:memory:", quality_gate_enabled=False
+    )
 
     # 3. _resolve_sink with export_func='export_to_neo4j' and sdk=None resolves via _get_sdk()
     mock_sink_cls = MagicMock()
@@ -699,6 +706,7 @@ def test_operator_resolves_sql_and_sql_by_form_via_destination_conn_id(
         "STUDY-SQL",
         "postgresql://etl_user:pg_secret_password@pg.internal:5432/clinical_wh",  # pragma: allowlist secret
         batch_size=150,
+        quality_gate_enabled=False,
     )
 
 
@@ -867,7 +875,11 @@ def test_operator_propagates_mask_phi_opt_out_to_tabular_and_plugin_sinks(
     monkeypatch.setattr(op_csv, "_get_sdk", lambda: mock_sdk_tab)
     op_csv.execute({})
     mock_csv.assert_called_once_with(
-        mock_sdk_tab, "STUDY-PHI", "/tmp/authorized.csv", mask_phi=False
+        mock_sdk_tab,
+        "STUDY-PHI",
+        "/tmp/authorized.csv",
+        mask_phi=False,
+        quality_gate_enabled=False,
     )
 
     # 2. Neo4j sink opt-out via operator parameter and MongoDB via export_kwargs
@@ -1555,7 +1567,6 @@ def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and
             incremental=True,
             stream_name=f"stream_{label}",
             ledger_path=str(ledger_file),
-            quality_gate_enabled=False,
             export_kwargs=extra_kw,
         )
         monkeypatch.setattr(op, "_get_sdk", lambda: sdk)
@@ -1613,7 +1624,6 @@ def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and
             incremental=True,
             stream_name=f"stream_{label}",
             ledger_path=str(ledger_file),
-            quality_gate_enabled=False,
             export_kwargs=extra_kw,
         )
         monkeypatch.setattr(op3, "_get_sdk", lambda: sdk)
@@ -1691,6 +1701,7 @@ def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.Monkey
         mock_sdk,
         "STUDY-SQL",
         sql_uri,
+        quality_gate_enabled=False,
     )
     assert res_by_form is not None
     assert "sql_secret_password" not in res_by_form
@@ -1712,5 +1723,6 @@ def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.Monkey
         "override_long_records",
         conn_str=sql_uri,
         if_exists="append",
+        quality_gate_enabled=False,
     )
     assert res_long == "override_long_records"

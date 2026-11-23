@@ -32,13 +32,18 @@ dashboard for browsing studies, sites, subjects, and background jobs:
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
 ``Enter`` to select a study or site (re-selecting the active site clears the site filter)
-or to register batch IDs in the Jobs tab input, ``Esc`` to move focus from the Jobs batch
-input to the Jobs table or clear an active site filter, ``q`` to quit, ``d`` to toggle
-dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh active study data, and
-``a`` to load all pages when a panel is truncated. Single-key shortcuts are suppressed
-automatically while typing batch IDs in the Jobs tab input. Pass ``--study`` and
-repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
-immediately, and pass ``--force`` only when intentionally bypassing TTY stream checks.
+or to register validated batch IDs in the Jobs tab input, ``Enter`` or ``Space`` on the
+Jobs table to toggle the inline ``#job_detail_panel`` (displaying sanitized ``resultUrl``
+and per-``Record`` diagnostics), ``Esc`` to move focus from the Jobs batch input to the
+Jobs table, close an open ``#job_detail_panel``, or clear an active site filter, ``q`` to
+quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh
+active study data, and ``a`` to load all pages when a panel is truncated. Single-key
+shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input, and
+``LogViewer`` masks ``Subject`` PHI fields to ``***MASKED***`` by default. Pass ``--study``
+and repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
+immediately (or pass ``--batch`` without ``--study`` to stage ``QUEUED`` batches until a
+``Study`` is selected), and pass ``--force`` only when intentionally bypassing TTY stream
+checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
@@ -92,13 +97,14 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
    imednet jobs wait STUDY BATCH --timeout 60 --format json
    imednet workflows extract-records STUDY --format json
    imednet workflows state show --study-key STUDY --format json
+   imednet workflows uat run STUDY --dry-run --simulation --format json
    imednet subject-data STUDY SUBJ-001 --format json
    IMEDNET_CLI_OUTPUT_FORMAT=json imednet studies list
 
 Supported core list resources are studies, queries, variables, record-revisions,
 sites, forms, records, subjects, intervals, visits, codings, and users, alongside
 ``workflows extract-records``, ``workflows state show`` (resource ``ledger_state``),
-and ``subject-data`` (plus write batch summaries for ``records create``, ``records import``,
+``workflows uat run`` (resource ``uat_run``), and ``subject-data`` (plus write batch summaries for ``records create``, ``records import``,
 and ``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
@@ -108,13 +114,56 @@ Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
 Usage failures exit 2, SDK-command interruption exits 130, and success/help exits 0.
 
-Legacy ``records list -o/--output json|csv`` still writes ``records.json`` or ``records.csv``
-and emits a ``stderr`` deprecation warning (prefer ``--format json`` for stdout or
-``imednet export`` for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
+Legacy ``records list -o/--output`` accepts ``json``, ``csv``, or an explicit ``.json`` /
+``.csv`` destination path (preserving ``./records.json`` and ``./records.csv`` for
+``-o json`` and ``-o csv``), flattens ``recordData`` variables, masks ``Subject`` PHI to
+``***MASKED***`` by default (``--mask-phi``; opt out with ``--no-mask-phi``), and emits a
+``stderr`` deprecation warning (prefer ``--format json`` for stdout or ``imednet export``
+for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
 commands (which also accept ``--no-interactive`` to suppress live spinners) and ``datadict`` JSON/schema/diff outputs
 (see :doc:`/how-to/data_dictionary`) retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
+
+Path segment validation and exit codes
+--------------------------------------
+
+Every Study- or resource-scoped CLI command (decorated with ``@with_sdk``, calling
+``validate_cli_path_segment``, or dispatched through ``imednet workflows`` subcommands
+such as ``extract-records`` and ``uat run``) validates dynamic URL segments
+(``study_key``, ``batch_id``, and ``item_id`` across ``Study``, ``Subject``, ``Site``,
+``Form``, ``Record``, ``Visit``, ``Interval``, ``Variable``, ``Query``,
+``Data Dictionary``, and ``Job`` targets) with
+:func:`~imednet.utils.validate_path_segment` and :func:`~imednet.utils.build_safe_path`
+before issuing HTTP requests.
+
+When an argument contains path traversal sequences (``..``, ``%2e%2e``), path
+separators (``/`` or ``\``), query/fragment delimiters (``?`` or ``#``), or control
+characters, :class:`~imednet.errors.PathTraversalValidationError` is caught at the CLI
+boundary: a redacted diagnostic is written to ``stderr``, ``stdout`` remains empty (no
+partial JSON envelope or table rows), and the process exits with status code ``1``:
+
+.. testcode::
+
+   import contextlib
+   import io
+   from imednet.cli import app
+
+   for bad_argv in (
+       ["records", "list", "../secret", "--simulation", "--format", "json"],
+       ["workflows", "extract-records", "../secret", "--simulation", "--format", "json"],
+   ):
+       out_buf = io.StringIO()
+       err_buf = io.StringIO()
+       exit_code: int | str | None = None
+       with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+           try:
+               app(bad_argv)
+           except SystemExit as cli_exit:
+               exit_code = cli_exit.code
+       assert exit_code == 1
+       assert out_buf.getvalue() == ""
+       assert "Error:" in err_buf.getvalue()
 
 Data Dictionary commands
 ------------------------
@@ -206,9 +255,12 @@ out explicitly with ``--no-mask-phi``.
 Exports also support native CDISC SDTM transformation (``--as-sdtm`` and
 ``--sdtm-domain``), batch-level CDISC standards readiness gating via
 ``StandardsReadinessValidator`` (``--standards-profile`` and
-``--min-standards-score``), raw variable casing alignment
-(``--naming-convention snake_case|camelCase|sdtm``), and pre-write ``Record``
-schema readiness filtering (``--quality-gate`` and ``--min-readiness-score``):
+``--min-standards-score``), raw ``Variable`` casing alignment
+(``--naming-convention snake_case|camelCase|sdtm``), and opt-in pre-write
+``Record`` schema readiness filtering (disabled by default across all nine
+subcommands, including SQLite per-``Form``, ``--single-table``, and
+``--long-format`` SQL exports; enable with ``--quality-gate`` and optional
+``--min-readiness-score``):
 
 .. code-block:: bash
 
