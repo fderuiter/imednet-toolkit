@@ -11,7 +11,7 @@ adding dependencies without a concrete missing capability. The old contributor s
 declaration did not justify that cost. Revisit only for a measured user-facing requirement.
 
 Add opt-in `--format json` to core list reads, core write commands (`records create`,
-`records import`, `subjects register`), job status/wait, and workflow commands
+`records update`, `records import`, `subjects register`), job status/wait, and workflow commands
 (`extract-records`, `subject-data`, `state show`, `validate-standards`). Explicit
 `--format` flags always take precedence; otherwise setting `IMEDNET_CLI_OUTPUT_FORMAT=json`
 defaults `--format`-capable commands (and `datadict diff`) to JSON output while suppressing
@@ -35,7 +35,7 @@ third-party commands.
 Human progress and diagnostics go to stderr; stdout carries the selected result.
 Core list, job, and write machine responses contain schemaVersion `1.0`, resource, status
 `complete`, count and items. Empty read results are successful count=0/items=[]. Write
-commands (`records_create`, `records_import`, `subjects_register`) emit `count: 1` with a
+commands (`records_create`, `records_update`, `records_import`, `subjects_register`) emit `count: 1` with a
 single `BatchSubmissionSummary` item containing `studyKey`, `dryRun`, `totalRecords`,
 `skippedCount`, `chunkCount`, `batchIds`, `allSuccessful`, `jobs` (alias-serialized `Job`
 models), and `validationReport`; when `validationReport.is_valid` is `false`, JSON mode

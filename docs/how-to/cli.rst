@@ -82,10 +82,10 @@ step-by-step wizard prompts for study keys, filters, and state ledger updates:
 Core write commands and batch validation
 ----------------------------------------
 
-Use ``imednet records create``, ``imednet records import``, and ``imednet subjects register``
-to validate and submit chunked ``Record`` writes or ``Subject`` enrollments from inline
-``-d`` / ``--data KEY=VALUE`` pairs, JSON payloads (``--json`` or ``--file -`` on ``stdin``),
-or CSV/JSON files:
+Use ``imednet records create``, ``imednet records update``, ``imednet records import``,
+and ``imednet subjects register`` to validate and submit chunked ``Record`` writes or
+``Subject`` enrollments from inline ``-d`` / ``--data KEY=VALUE`` pairs, JSON payloads
+(``--json`` or ``--file -`` on ``stdin``), or CSV/JSON files:
 
 .. code-block:: bash
 
@@ -93,6 +93,8 @@ or CSV/JSON files:
        --interval-name Baseline -d V_WEIGHT=71.4 --schema study_dd.json --dry-run
    imednet records create STUDY --file ./records_batch.json --schema api --chunk-size 100 \
        --wait --timeout 300 --interval 5 --format json
+   imednet records update STUDY --record-id 1042 --form-key F_VS -d V_WEIGHT=72.0 \
+       --reason-for-change "Source data verification" --schema study_dd.json --dry-run
    imednet records import STUDY ./records_batch.csv --schema study_dd.json --wait --format json
    imednet subjects register STUDY --file ./registrations.json --form-key F_DM \
        --site-name SITE --skip-existing --subject-key-field SUBJID --schema study_dd.json \
@@ -100,14 +102,15 @@ or CSV/JSON files:
    imednet subjects register STUDY --form-key F_DM --site-name SITE --subject-key SUBJ-002 \
        -d V_AGE=42 -d V_GENDER=F --dry-run
 
-All three write commands share pre-submission validation and polling controls:
+All four write commands share pre-submission validation and polling controls:
 
 * ``--schema``: Validate payloads before submission against a canonical ``.json`` Data Dictionary,
   CDISC ODM ``.xml``, REDCap ``.csv``, a 4-file CSV export directory, or ``api`` (which refreshes
   live ``Form`` and ``Variable`` definitions via ``SchemaCache``). Payloads containing the
   redacted ``***MASKED***`` sentinel are rejected before any HTTP write occurs.
 * ``--dry-run``: Execute local schema, ``Site`` eligibility, and deduplication checks without
-  sending HTTP write requests.
+  sending HTTP write requests (pairing ``--dry-run`` with a local ``--schema`` file runs completely
+  offline without requiring API credentials).
 * ``--wait``, ``--timeout`` (default ``300`` seconds), ``--interval`` (default ``5`` seconds),
   ``--chunk-size``, and ``--email-notify``: Split large batches into bounded POST chunks and
   optionally poll submitted background ``Job`` batch IDs to a terminal state.
@@ -116,8 +119,8 @@ All three write commands share pre-submission validation and polling controls:
   or duplicate cohort entries (reporting the skipped count in ``skippedCount``), and inspect a
   custom ``Variable`` inside ``data`` (such as ``SUBJID``) when top-level ``subjectKey`` is omitted.
 * ``--format json`` (or ``IMEDNET_CLI_OUTPUT_FORMAT=json``): Emit a ``schemaVersion: "1.0"``
-  envelope for ``records_create``, ``records_import``, or ``subjects_register`` wrapping a
-  ``BatchSubmissionSummary`` item (exiting ``1`` if ``validationReport.is_valid`` is ``false``).
+  envelope for ``records_create``, ``records_update``, ``records_import``, or ``subjects_register``
+  wrapping a ``BatchSubmissionSummary`` item (exiting ``1`` if ``validationReport.is_valid`` is ``false``).
 
 Machine-readable core reads
 ---------------------------
@@ -143,8 +146,8 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
 Supported core list resources are studies, queries, variables, record-revisions,
 sites, forms, records, subjects, intervals, visits, codings, and users, alongside
 ``workflows extract-records``, ``workflows state show`` (resource ``ledger_state``),
-and ``subject-data`` (plus write batch summaries for ``records create``, ``records import``,
-and ``subjects register``). JSON reads emit one envelope
+and ``subject-data`` (plus write batch summaries for ``records create``, ``records update``,
+``records import``, and ``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
 and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it). Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
@@ -160,6 +163,46 @@ commands (which also accept ``--no-interactive`` to suppress live spinners) and 
 (see :doc:`/how-to/data_dictionary`) retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
 error/partial-output policy and compatibility inventory.
+
+Path segment validation and exit codes
+--------------------------------------
+
+Every Study- or resource-scoped CLI command (decorated with ``@with_sdk``, calling
+``validate_cli_path_segment``, or dispatched through ``imednet workflows`` subcommands
+such as ``extract-records`` and ``uat run``) validates dynamic URL segments
+(``study_key``, ``batch_id``, and ``item_id`` across ``Study``, ``Subject``, ``Site``,
+``Form``, ``Record``, ``Visit``, ``Interval``, ``Variable``, ``Query``,
+``Data Dictionary``, and ``Job`` targets) with
+:func:`~imednet.utils.validate_path_segment` and :func:`~imednet.utils.build_safe_path`
+before issuing HTTP requests.
+
+When an argument contains path traversal sequences (``..``, ``%2e%2e``), path
+separators (``/`` or ``\``), query/fragment delimiters (``?`` or ``#``), or control
+characters, :class:`~imednet.errors.PathTraversalValidationError` is caught at the CLI
+boundary: a redacted diagnostic is written to ``stderr``, ``stdout`` remains empty (no
+partial JSON envelope or table rows), and the process exits with status code ``1``:
+
+.. testcode::
+
+   import contextlib
+   import io
+   from imednet.cli import app
+
+   for bad_argv in (
+       ["records", "list", "../secret", "--simulation", "--format", "json"],
+       ["workflows", "extract-records", "../secret", "--simulation", "--format", "json"],
+   ):
+       out_buf = io.StringIO()
+       err_buf = io.StringIO()
+       exit_code: int | str | None = None
+       with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+           try:
+               app(bad_argv)
+           except SystemExit as cli_exit:
+               exit_code = cli_exit.code
+       assert exit_code == 1
+       assert out_buf.getvalue() == ""
+       assert "Error:" in err_buf.getvalue()
 
 Data Dictionary commands
 ------------------------

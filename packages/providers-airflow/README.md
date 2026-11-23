@@ -99,18 +99,18 @@ def my_task_logic() -> None:
 ## Features
 
 - **Airflow 3 Provider Metadata & UI Form**: Registers the `imednet` connection type with typed UI form widgets (`base_url`, password-masked `oidc_token`, `timeout`, `strict_mode`, `simulation_mode`), `get_ui_field_behaviour()`, and redacted `test_connection()`.
-- **Connection Hook Management**: Resolves sync (`get_conn()`) and async (`get_async_conn()`) SDK clients via `ImednetHook`, masking sensitive values (`api_key`, `security_key`, `oidc_token`, `token`) as `***`.
-- **Dynamic Task Mapping & Watermark Templating**: Supports Jinja-templated runtime fields (`study_key`, `output_path`, `export_kwargs`, `modified_since`, `record_filter`, `record_data_filter`, `stream_name`) while rejecting inline credentials.
-- **Deferrable Job Polling**: `ImednetJobSensor(deferrable=True)` yields worker slots to `ImednetJobTrigger`, polling asynchronously via `AsyncImednetSDK` and `AsyncJobPoller` without persisting secrets in trigger serialization.
+- **Connection Hook & Destination Credential Management**: Resolves sync (`get_conn()`) and async (`get_async_conn()`) SDK clients via `ImednetHook`, resolves sink/storage credentials at runtime via `destination_conn_id`, and masks sensitive values (`api_key`, `security_key`, `oidc_token`, `token`) as `***`.
+- **Dynamic Task Mapping, Watermark Templating & SDTM Projection**: Supports Jinja-templated runtime options (`study_key`, `output_path`, `export_kwargs`, `modified_since`, `record_filter`, `record_data_filter`, `stream_name`), CDISC SDTM projection (`as_sdtm`), and inline credential rejection.
+- **Deferrable Job Polling & Terminal `resultUrl` Verification**: `ImednetJobSensor` verifies terminal `Job` `resultUrl` payloads in poke/reschedule mode and yields worker slots to `ImednetJobTrigger` when `deferrable=True`, polling asynchronously via `AsyncImednetSDK` and `AsyncJobPoller` without persisting secrets in trigger serialization.
 - **OpenLineage Dataset Facets**: Emits `OperatorLineage` inputs and outputs across `snowflake`, `duckdb`, `sql` / `sql_by_form` / `long_sql`, `mongodb`, `neo4j`, cloud object URIs (`s3://`, `gs://`, `abfss://`), and local files.
-- **Lazy Database Ingestion & Tabular Exporters**: Lazily resolves database sinks (`imednet_sinks`) and tabular serialization adapters for CSV, Parquet, JSON, DuckDB, and SQL (`sql`, `sql_by_form`, `long_sql`) formats.
+- **Lazy Database Ingestion & Tabular Exporters**: Lazily resolves database sinks (`imednet_sinks`) and tabular `Record` serialization adapters for `csv`, `parquet`, `excel`, `json`, `duckdb`, and SQL (`sql`, `sql_by_form`, `long_sql`) destinations.
 
 ## Component Description Table
 
 | Component | Description |
 |-----------|-------------|
 | `ImednetHook` | Resolves sync/async SDK clients, UI form behaviour, connection testing, and credential redaction. |
-| `ImednetExportOperator` | Airflow operator for streaming/tabular data exports with Jinja templating and OpenLineage facets. |
-| `ImednetJobSensor` | Monitors asynchronous iMednet jobs in synchronous poke/reschedule or deferrable triggerer mode. |
-| `ImednetJobTrigger` | Async Airflow trigger polling iMednet jobs via `AsyncImednetSDK` and `AsyncJobPoller`. |
+| `ImednetExportOperator` | Airflow operator for streaming/tabular `Study` `Record` exports (`destination_conn_id`, `as_sdtm`, Jinja templating, and OpenLineage facets). |
+| `ImednetJobSensor` | Monitors asynchronous iMednet `Job` runs and verifies terminal `resultUrl` payloads in poke/reschedule or deferrable triggerer mode. |
+| `ImednetJobTrigger` | Async Airflow trigger polling iMednet `Job` runs via `AsyncImednetSDK` and `AsyncJobPoller`. |
 | `_airflow_compat` | Compatibility layer for Airflow 3 Task SDK and offline unit testing environments. |
