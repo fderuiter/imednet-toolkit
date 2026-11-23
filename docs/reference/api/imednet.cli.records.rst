@@ -2,6 +2,9 @@ imednet.cli.records package
 ===========================
 
 .. automodule:: imednet.cli.records
-   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
-   :members:
-   :show-inheritance:
+   :no-members:
+
+.. seealso::
+
+   For ``imednet records`` command-line usage, flags, output formats, and
+   examples, see the :doc:`Command Line Interface (CLI) guide </how-to/cli>`.

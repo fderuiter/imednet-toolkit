@@ -6,6 +6,7 @@ import ast
 import glob
 import importlib.resources
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -14,7 +15,7 @@ import types
 from enum import Enum
 from typing import Any, ClassVar, TypeVar, Union, get_args, get_origin
 
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, RootModel, create_model
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.contract import APIContract, ContractBuilder
@@ -812,16 +813,53 @@ class ModelEngine:
         return model
 
     @classmethod
+    def _forward_domain_methods(cls, model: type[Any], base_cls: type[Any]) -> None:
+        """Bind inherited domain methods from base_cls onto dynamic model __dict__.
+
+        Args:
+            model: Dynamically generated Pydantic model subclass.
+            base_cls: Domain base class passed to ModelEngine.get_model.
+        """
+        stop_bases = (ImednetBaseModel, BaseModel, RootModel, object)
+        pydantic_attrs = {
+            "model_config",
+            "model_fields",
+            "model_computed_fields",
+            "model_extra",
+            "model_fields_set",
+        }
+        model_fields = getattr(model, "model_fields", {})
+
+        for ancestor in base_cls.__mro__:
+            if ancestor in stop_bases or getattr(ancestor, "__name__", "") == "ImednetBaseModel":
+                break
+            for attr_name, raw_attr in ancestor.__dict__.items():
+                if (
+                    attr_name.startswith("_")
+                    or attr_name in pydantic_attrs
+                    or attr_name in model.__dict__
+                    or attr_name in model_fields
+                    or hasattr(raw_attr, "__pydantic_decorators__")
+                ):
+                    continue
+                if inspect.isfunction(raw_attr) or isinstance(
+                    raw_attr, (classmethod, staticmethod)
+                ):
+                    type.__setattr__(model, attr_name, raw_attr)
+
+    @classmethod
     def _get_model(cls, model_name: str, base_cls: type[Any] = ImednetBaseModel) -> type[Any]:
         """Internal implementation for dynamic model creation."""
         contract = get_contract()
         if model_name not in contract.models:
-            return create_model(
+            fallback_model = create_model(
                 model_name,
                 __base__=base_cls,
                 __module__=base_cls.__module__,
                 __doc__=base_cls.__doc__,
             )
+            cls._forward_domain_methods(fallback_model, base_cls)
+            return fallback_model
 
         model_def = contract.models[model_name]
         fields: dict[str, Any] = {}
@@ -856,7 +894,8 @@ class ModelEngine:
             __doc__=base_cls.__doc__,
             **fields,
         )
-        return model  # noqa: RET504
+        cls._forward_domain_methods(model, base_cls)
+        return model
 
     @classmethod
     def generate_stubs(cls, output_dir: str) -> None:

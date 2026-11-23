@@ -109,6 +109,50 @@ SCOPED_INHERITED_MEMBERS = (
     "BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object"
 )
 
+CLI_SUBCOMMAND_MODULES: dict[str, str] = {
+    "codings": "codings",
+    "datadict": "datadict",
+    "export": "export",
+    "forms": "forms",
+    "intervals": "intervals",
+    "jobs": "jobs",
+    "queries": "queries",
+    "record_revisions": "record-revisions",
+    "records": "records",
+    "sites": "sites",
+    "studies": "studies",
+    "subjects": "subjects",
+    "users": "users",
+    "variables": "variables",
+    "visits": "visits",
+}
+
+
+def emit_curated_cli_subcommand_pages(api_dir: Path) -> None:
+    """Replace bare setup_parser CLI subcommand RST stubs with curated links to /how-to/cli.
+
+    Args:
+        api_dir: Target API RST directory containing generated apidoc files.
+    """
+    api_dir.mkdir(parents=True, exist_ok=True)
+    for mod_suffix, cli_name in sorted(CLI_SUBCOMMAND_MODULES.items()):
+        mod_full = f"imednet.cli.{mod_suffix}"
+        rst_path = api_dir / f"{mod_full}.rst"
+        if not rst_path.exists():
+            continue
+        title = f"{mod_full} package"
+        underline = "=" * len(title)
+        rst_path.write_text(
+            f"{title}\n"
+            f"{underline}\n\n"
+            f".. automodule:: {mod_full}\n"
+            f"   :no-members:\n\n"
+            f".. seealso::\n\n"
+            f"   For ``imednet {cli_name}`` command-line usage, flags, output formats, and\n"
+            f"   examples, see the :doc:`Command Line Interface (CLI) guide </how-to/cli>`.\n",
+            encoding="utf-8",
+        )
+
 
 def emit_curated_core_reference(api_dir: Path) -> None:
     """Emit curated imednet.core.rst for imednet.core.__all__ and register it in imednet.rst."""
@@ -216,6 +260,7 @@ def generate_api_reference(api_dir: Path | None = None) -> None:
             env=env,
         )
         emit_curated_core_reference(staging_dir)
+        emit_curated_cli_subcommand_pages(staging_dir)
 
         # Other packages
         packages_dir = Path("packages")

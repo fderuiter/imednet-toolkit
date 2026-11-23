@@ -1085,3 +1085,64 @@ VitalSigns(subject_key="S1")
         f"Expected 12 [call-overload] errors (one per invalid call), got {len(call_overload_lines)}:\n"
         f"{neg_out}\n{neg_err}"
     )
+
+
+def test_dynamic_models_forward_all_14_lifecycle_and_audit_methods():
+    """Verify ModelEngine.get_model retains all 14 inherited domain methods in class __dict__."""
+    from imednet.models.jobs import Job, JobState, JobStatus
+    from imednet.models.queries import Query, QueryStatus
+    from imednet.models.record_revisions import RecordRevision
+    from imednet.models.records import RecordStatus
+    from imednet.models.subjects import SubjectStatus
+
+    expected_methods = (
+        (Record, ("can_transition_to", "transition_to", "update_status")),
+        (Subject, ("can_transition_to", "transition_to", "update_status")),
+        (Query, ("can_transition_to", "transition_to", "update_status")),
+        (RecordRevision, ("validate_follows", "can_follow", "validate_chain")),
+        (Job, ("transition_to",)),
+        (JobStatus, ("transition_to",)),
+    )
+
+    total = 0
+    for model_cls, method_names in expected_methods:
+        for method_name in method_names:
+            assert method_name in model_cls.__dict__, (
+                f"{model_cls.__name__}.__dict__ omitted forwarded method '{method_name}'"
+            )
+            total += 1
+    assert total == 14
+
+    # Verify instance lifecycle transitions (including zero-arg super() inside methods)
+    rec = Record(record_id=1, record_status=RecordStatus.COMPLETE.value)
+    assert rec.can_transition_to(RecordStatus.LOCKED) is True
+    rec.transition_to(RecordStatus.LOCKED)
+    assert rec.record_status == RecordStatus.LOCKED.value
+
+    subj = Subject(subject_id=1, subject_status=SubjectStatus.SCREENED.value)
+    assert subj.can_transition_to(SubjectStatus.ENROLLED) is True
+    subj.transition_to(SubjectStatus.ENROLLED)
+
+    qry = Query(annotation_id=1)
+    assert isinstance(qry.can_transition_to(QueryStatus.OPEN), bool)
+
+    job = JobStatus(batch_id="B1", state=JobState.PROCESSING.value)
+    job.transition_to(JobState.COMPLETED)
+    assert job.state == JobState.COMPLETED.value
+
+    # Verify bound @classmethod execution on RecordRevision.validate_chain
+    rev1 = RecordRevision(
+        record_id=10,
+        record_revision=1,
+        data_revision=1,
+        date_created="2026-01-01T00:00:00Z",
+    )
+    rev2 = RecordRevision(
+        record_id=10,
+        record_revision=2,
+        data_revision=2,
+        reason_for_change="Corrected vitals",
+        date_created="2026-01-01T00:05:00Z",
+    )
+    assert rev2.can_follow(rev1) is True
+    RecordRevision.validate_chain([rev1, rev2])

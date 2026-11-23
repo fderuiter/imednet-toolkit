@@ -1,7 +1,10 @@
-imednet.cli.record\_revisions package
-=====================================
+imednet.cli.record_revisions package
+====================================
 
 .. automodule:: imednet.cli.record_revisions
-   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
-   :members:
-   :show-inheritance:
+   :no-members:
+
+.. seealso::
+
+   For ``imednet record-revisions`` command-line usage, flags, output formats, and
+   examples, see the :doc:`Command Line Interface (CLI) guide </how-to/cli>`.

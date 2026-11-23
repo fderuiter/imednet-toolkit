@@ -159,6 +159,7 @@ class SensitivityRegistry:
         return norm_key in self._sensitive_keys or collapsed in self._collapsed_sensitive
 
 
+#: Default process-wide :class:`SensitivityRegistry` instance for PHI redaction.
 global_sensitivity_registry = SensitivityRegistry()
 
 

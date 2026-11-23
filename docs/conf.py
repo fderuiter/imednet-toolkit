@@ -2,6 +2,7 @@
 
 # Configuration file for the Sphinx documentation builder.
 import ast
+import contextlib
 import functools
 import html
 import importlib
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Generic, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import pydantic._internal._utils as _pydantic_internal_utils
+from docutils import nodes
 from pydantic import BaseModel, RootModel
 from sphinx.ext.autodoc import MethodDocumenter
 from sphinx.util.nodes import make_refnode
@@ -345,11 +347,7 @@ autodoc_mock_imports = [
     "opentelemetry",
 ]
 
-suppress_warnings = [
-    "autodoc.import",
-    "autodoc",
-    "sphinx_autodoc_typehints",
-]
+suppress_warnings: list[str] = []
 
 _DOCS_PATH = Path(_DOCS_DIR).resolve()
 _FIRST_PARTY_ROOTS = frozenset(
@@ -427,6 +425,34 @@ def _resolve_relative_module(mod_name: str, is_pkg: bool, module: str | None, le
     return ".".join(base)
 
 
+def _extract_lazy_dict_imports(
+    dict_node: ast.expr | None,
+    imported: dict[str, tuple[str, str]],
+) -> bool:
+    """Populate imported symbol mappings from _LAZY_ATTRS or _LAZY_SUBMODULES AST dicts."""
+    if not isinstance(dict_node, ast.Dict):
+        return False
+    matched = False
+    for key_node, val_node in zip(dict_node.keys, dict_node.values, strict=False):
+        if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+            continue
+        export_name = key_node.value
+        if (
+            isinstance(val_node, ast.Tuple)
+            and len(val_node.elts) == 2
+            and isinstance(val_node.elts[0], ast.Constant)
+            and isinstance(val_node.elts[0].value, str)
+            and isinstance(val_node.elts[1], ast.Constant)
+            and isinstance(val_node.elts[1].value, str)
+        ):
+            imported[export_name] = (val_node.elts[0].value, val_node.elts[1].value)
+            matched = True
+        elif isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
+            imported[export_name] = (val_node.value, "")
+            matched = True
+    return matched
+
+
 def _collect_ast_symbols(
     stmts: list[ast.stmt],
     mod_name: str,
@@ -457,11 +483,31 @@ def _collect_ast_symbols(
         elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             defined.add(node.name)
         elif isinstance(node, ast.Assign):
+            lazy_names = {t.id for t in node.targets if isinstance(t, ast.Name)} & {
+                "_LAZY_ATTRS",
+                "_LAZY_SUBMODULES",
+            }
+            if lazy_names and _extract_lazy_dict_imports(node.value, imported):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        defined.add(target.id)
+                continue
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    defined.add(target.id)
+                    if isinstance(node.value, ast.Name) and node.value.id in imported:
+                        imported[target.id] = imported[node.value.id]
+                    else:
+                        defined.add(target.id)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            defined.add(node.target.id)
+            if node.target.id in {"_LAZY_ATTRS", "_LAZY_SUBMODULES"} and _extract_lazy_dict_imports(
+                node.value, imported
+            ):
+                defined.add(node.target.id)
+                continue
+            if isinstance(node.value, ast.Name) and node.value.id in imported:
+                imported[node.target.id] = imported[node.value.id]
+            else:
+                defined.add(node.target.id)
         elif hasattr(ast, "TypeAlias") and isinstance(node, ast.TypeAlias):
             defined.add(node.name.id)
         elif isinstance(node, ast.If):
@@ -658,6 +704,19 @@ def _unwrap_shadowed_bases(app: Any, name: str, obj: Any, options: Any, bases: l
                 return
             if _is_undocumented_internal_type(base):
                 return
+            base_mod = getattr(base, "__module__", "") or ""
+            if (
+                base_mod.split(".")[0] in _FIRST_PARTY_ROOTS
+                and not base_mod.startswith("imednet.core.")
+                and _find_canonical_documented_module(
+                    base_mod, base.__name__, _get_documented_modules()
+                )
+                is None
+            ):
+                for parent in base.__bases__:
+                    if parent is not object:
+                        _expand(parent)
+                return
         _add(base)
 
     for b in list(bases):
@@ -698,6 +757,128 @@ def _format_rst_annotation(annotation: Any) -> str:
         return annotation.__name__
 
     return str(annotation).replace("typing.", "").replace("NoneType", "None")
+
+
+def _describe_export_kind(mod_name: str, sym_name: str) -> str:
+    """Classify a documented public export for barrel export tables."""
+    with contextlib.suppress(Exception):
+        mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+        val = getattr(mod, sym_name)
+        if isinstance(val, types.ModuleType):
+            return "module"
+        if isinstance(val, type):
+            return "exception" if issubclass(val, BaseException) else "class"
+        if callable(val):
+            return "function"
+    return "attribute"
+
+
+def _emit_barrel_export_table(
+    app: Any,  # noqa: ARG001
+    what: str,
+    name: str,
+    obj: Any,
+    options: Any,
+    lines: list[str],
+) -> None:
+    """Append a clickable Public Exports table to package barrel modules."""
+    if what != "module" or name == "imednet.core":
+        return
+    if isinstance(options, Mapping) and options.get("no-members"):
+        return
+    mod_file = getattr(obj, "__file__", "") or ""
+    if os.path.basename(mod_file) != "__init__.py":
+        return
+
+    documented_modules = _get_documented_modules()
+    if name not in documented_modules:
+        return
+
+    raw_all = getattr(obj, "__all__", None)
+    export_names = (
+        [s for s in raw_all if isinstance(s, str) and not s.startswith("_")]
+        if isinstance(raw_all, (list, tuple, set, frozenset))
+        else [k for k in vars(obj) if not k.startswith("_")]
+    )
+    if not export_names:
+        return
+
+    imported_map, _, _ = _analyze_module_symbols(name)
+    child_doc_mods = sorted(m for m in documented_modules if m.startswith(f"{name}."))
+
+    rows: list[tuple[str, str, str]] = []
+    seen_exports: set[str] = set()
+    for sym in export_names:
+        if sym in seen_exports:
+            continue
+        seen_exports.add(sym)
+
+        # 1. Submodule re-exports (e.g. imednet.spi)
+        submod_candidate: str | None = None
+        imp_entry = imported_map.get(sym)
+        if imp_entry is not None and not imp_entry[1] and imp_entry[0] in documented_modules:
+            submod_candidate = imp_entry[0]
+        elif f"{name}.{sym}" in documented_modules:
+            submod_candidate = f"{name}.{sym}"
+
+        if submod_candidate is not None:
+            rows.append(
+                (f":mod:`{sym} <{submod_candidate}>`", "module", f":mod:`{submod_candidate}`")
+            )
+            continue
+
+        # 2. Symbol re-exports whose canonical home is another documented module
+        canon_mod, canon_sym = _resolve_canonical_origin(name, sym)
+        if (canon_mod, canon_sym) == (name, sym):
+            val = getattr(obj, sym, None) if hasattr(obj, sym) else None
+            val_mod = getattr(val, "__module__", None)
+            if (
+                isinstance(val_mod, str)
+                and val_mod != name
+                and val_mod.split(".")[0] in _FIRST_PARTY_ROOTS
+            ):
+                canon_mod = val_mod
+                canon_sym = getattr(val, "__name__", sym)
+            else:
+                for child_mod in child_doc_mods:
+                    if _is_exposed_by_documented_module(child_mod, sym):
+                        canon_mod, canon_sym = child_mod, sym
+                        break
+
+        doc_home = _find_canonical_documented_module(canon_mod, canon_sym, documented_modules)
+        if doc_home is None and canon_mod.startswith("imednet.core."):
+            doc_home = _find_canonical_documented_module(
+                "imednet.core", canon_sym, documented_modules
+            )
+        if doc_home is None or doc_home == name:
+            continue
+
+        kind = _describe_export_kind(doc_home, canon_sym)
+        target_qname = f"{doc_home}.{canon_sym}"
+        rows.append((f":obj:`{sym} <{target_qname}>`", kind, f":mod:`{doc_home}`"))
+
+    if not rows:
+        return
+
+    lines.extend(
+        [
+            "",
+            ".. rubric:: Public Exports",
+            "",
+            ".. list-table::",
+            "   :header-rows: 1",
+            "   :widths: 40 20 40",
+            "",
+            "   * - Symbol",
+            "     - Kind",
+            "     - Canonical Module",
+        ]
+    )
+    for sym_ref, kind_label, mod_ref in rows:
+        lines.append(f"   * - {sym_ref}")
+        lines.append(f"     - {kind_label}")
+        lines.append(f"     - {mod_ref}")
+    lines.append("")
 
 
 def _emit_pydantic_model_fields(
@@ -826,9 +1007,15 @@ def _normalize_operation_return_type(ret: Any, owner_cls: type | None) -> Any:
     return inner
 
 
+def _unwrap_callable_target(obj: Any) -> Any:
+    """Return the underlying function object when obj is a bound method."""
+    return obj.__func__ if inspect.ismethod(obj) else obj
+
+
 def _resolve_callable_return_hint(obj: Any) -> Any:
     """Resolve PEP 563 stringified return annotations (including closure TypeVars) on callables."""
-    anns = getattr(obj, "__annotations__", None)
+    target = _unwrap_callable_target(obj)
+    anns = getattr(target, "__annotations__", None)
     if not isinstance(anns, dict) or "return" not in anns:
         return None
     raw_ret = anns["return"]
@@ -836,8 +1023,8 @@ def _resolve_callable_return_hint(obj: Any) -> Any:
         return raw_ret
 
     localns: dict[str, Any] = {}
-    code = getattr(obj, "__code__", None)
-    closure = getattr(obj, "__closure__", None)
+    code = getattr(target, "__code__", None)
+    closure = getattr(target, "__closure__", None)
     if code is not None and closure is not None:
         for var_name, cell in zip(code.co_freevars, closure, strict=False):
             try:
@@ -846,7 +1033,7 @@ def _resolve_callable_return_hint(obj: Any) -> Any:
                 continue
 
     try:
-        return get_type_hints(obj, localns=localns or None).get("return", raw_ret)
+        return get_type_hints(target, localns=localns or None).get("return", raw_ret)
     except Exception:
         return raw_ret
 
@@ -855,21 +1042,20 @@ def _before_process_endpoint_signature(app: Any, obj: Any, bound_method: bool) -
     """Normalize endpoint Operation return annotations before sphinx_autodoc_typehints runs."""
     if not callable(obj) or inspect.isclass(obj):
         return
-    anns = getattr(obj, "__annotations__", None)
+    target = _unwrap_callable_target(obj)
+    anns = getattr(target, "__annotations__", None)
     if not isinstance(anns, dict) or "return" not in anns:
         return
-    resolved_ret = _resolve_callable_return_hint(obj)
+    resolved_ret = _resolve_callable_return_hint(target)
     owner_cls = _resolve_owner_class(app)
     normalized = _normalize_operation_return_type(resolved_ret, owner_cls)
-    if normalized is not anns["return"]:
+    if normalized is not resolved_ret and normalized != resolved_ret:
         updated_anns = dict(anns)
         updated_anns["return"] = normalized
-        obj.__annotations__ = updated_anns
-        try:
-            sig = inspect.signature(obj)
-            obj.__signature__ = sig.replace(return_annotation=normalized)
-        except (TypeError, ValueError):
-            pass
+        with contextlib.suppress(AttributeError, TypeError, ValueError):
+            target.__annotations__ = updated_anns
+            sig = inspect.signature(target)
+            target.__signature__ = sig.replace(return_annotation=normalized)
 
 
 def _process_endpoint_signature(
@@ -887,7 +1073,11 @@ def _process_endpoint_signature(
     for op_name in _OPERATION_TYPE_NAMES:
         if op_name in return_annotation:
             owner_cls = _resolve_owner_class(app, name)
-            resolved_ret = _resolve_callable_return_hint(obj) if callable(obj) else None
+            resolved_ret = (
+                _resolve_callable_return_hint(_unwrap_callable_target(obj))
+                if callable(obj)
+                else None
+            )
             if resolved_ret is not None:
                 normalized = _normalize_operation_return_type(resolved_ret, owner_cls)
                 return signature, _format_rst_annotation(normalized)
@@ -913,56 +1103,462 @@ class _AsyncAwareMethodDocumenter(MethodDocumenter):
             self.add_line("   :async:", self.get_sourcename())
 
 
+_STDLIB_ROOTS = frozenset(sys.stdlib_module_names)
+_PYTHON_DOCS_BASE = "https://docs.python.org/3/library"
+_BUILTIN_TYPES = frozenset(
+    {
+        "bool",
+        "bytearray",
+        "bytes",
+        "complex",
+        "dict",
+        "float",
+        "frozenset",
+        "int",
+        "list",
+        "memoryview",
+        "range",
+        "set",
+        "slice",
+        "str",
+        "tuple",
+    }
+)
+_BUILTIN_FUNCTIONS_AND_CLASSES = frozenset(
+    {
+        "classmethod",
+        "object",
+        "property",
+        "staticmethod",
+        "super",
+        "type",
+    }
+)
+_BUILTIN_EXCEPTIONS = frozenset(
+    {
+        "ArithmeticError",
+        "AssertionError",
+        "AttributeError",
+        "BaseException",
+        "BlockingIOError",
+        "BufferError",
+        "ConnectionError",
+        "EOFError",
+        "Exception",
+        "FileExistsError",
+        "FileNotFoundError",
+        "ImportError",
+        "IndexError",
+        "IOError",
+        "KeyError",
+        "KeyboardInterrupt",
+        "LookupError",
+        "MemoryError",
+        "ModuleNotFoundError",
+        "NameError",
+        "NotImplementedError",
+        "OSError",
+        "OverflowError",
+        "PermissionError",
+        "RuntimeError",
+        "StopAsyncIteration",
+        "StopIteration",
+        "SyntaxError",
+        "SystemExit",
+        "TimeoutError",
+        "TypeError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "UnicodeError",
+        "ValueError",
+        "ZeroDivisionError",
+    }
+)
+_BARE_STDLIB_ALIASES: dict[str, tuple[str, str]] = {
+    "ABC": ("abc", "abc.ABC"),
+    "AbstractContextManager": ("contextlib", "contextlib.AbstractContextManager"),
+    "Action": ("argparse", "argparse.Action"),
+    "Any": ("typing", "typing.Any"),
+    "ArgumentParser": ("argparse", "argparse.ArgumentParser"),
+    "AST": ("ast", "ast.AST"),
+    "AsyncIterator": ("collections.abc", "collections.abc.AsyncIterator"),
+    "Awaitable": ("collections.abc", "collections.abc.Awaitable"),
+    "BinaryIO": ("typing", "typing.BinaryIO"),
+    "Callable": ("collections.abc", "collections.abc.Callable"),
+    "ClassVar": ("typing", "typing.ClassVar"),
+    "Collection": ("collections.abc", "collections.abc.Collection"),
+    "Connection": ("sqlite3", "sqlite3.Connection"),
+    "date": ("datetime", "datetime.date"),
+    "datetime": ("datetime", "datetime.datetime"),
+    "Enum": ("enum", "enum.Enum"),
+    "Event": ("threading", "threading.Event"),
+    "Final": ("typing", "typing.Final"),
+    "Generator": ("collections.abc", "collections.abc.Generator"),
+    "Generic": ("typing", "typing.Generic"),
+    "Handler": ("logging", "logging.Handler"),
+    "Iterable": ("collections.abc", "collections.abc.Iterable"),
+    "Iterator": ("collections.abc", "collections.abc.Iterator"),
+    "Literal": ("typing", "typing.Literal"),
+    "Logger": ("logging", "logging.Logger"),
+    "LoggerAdapter": ("logging", "logging.LoggerAdapter"),
+    "LogRecord": ("logging", "logging.LogRecord"),
+    "Mapping": ("collections.abc", "collections.abc.Mapping"),
+    "MutableMapping": ("collections.abc", "collections.abc.MutableMapping"),
+    "Namespace": ("argparse", "argparse.Namespace"),
+    "Never": ("typing", "typing.Never"),
+    "Optional": ("typing", "typing.Optional"),
+    "ParamSpec": ("typing", "typing.ParamSpec"),
+    "Path": ("pathlib", "pathlib.Path"),
+    "PathLike": ("os", "os.PathLike"),
+    "Protocol": ("typing", "typing.Protocol"),
+    "Self": ("typing", "typing.Self"),
+    "Semaphore": ("asyncio-sync", "asyncio.Semaphore"),
+    "Sequence": ("collections.abc", "collections.abc.Sequence"),
+    "StrEnum": ("enum", "enum.StrEnum"),
+    "TemporaryDirectory": ("tempfile", "tempfile.TemporaryDirectory"),
+    "TextIO": ("typing", "typing.TextIO"),
+    "Token": ("contextvars", "contextvars.Token"),
+    "TypeAlias": ("typing", "typing.TypeAlias"),
+    "TypedDict": ("typing", "typing.TypedDict"),
+    "TypeVar": ("typing", "typing.TypeVar"),
+    "Union": ("typing", "typing.Union"),
+    "UnionType": ("types", "types.UnionType"),
+}
+_FIRST_PARTY_DIRECT_REWRITES: dict[str, str] = {
+    "imednet.core.context.study_context": "imednet.sdk.ImednetSDK.study_context",
+    "imednet.core.endpoint.base.GenericEndpoint": "imednet.core.EdcSyncListGetEndpoint",
+    "imednet.core.endpoint.base.GenericListGetEndpoint": "imednet.core.EdcSyncListGetEndpoint",
+    "imednet.core.protocols.RequesterProtocol": "imednet.core.Client",
+    "imednet.core.protocols.AsyncRequesterProtocol": "imednet.core.AsyncClient",
+    "EdcGenericListGetEndpoint": "EdcSyncListGetEndpoint",
+    "EdcGenericGetEndpoint": "EdcSyncGetEndpoint",
+    "EdcGenericListEndpoint": "EdcSyncListEndpoint",
+}
+_TYPEVAR_PLACEHOLDERS = frozenset(
+    {
+        "T",
+        "R",
+        "P",
+        "K",
+        "V",
+        "ClientT",
+        "_TClient",
+        "T_Output",
+    }
+)
+_PY_INDEX_CACHE: dict[tuple[int, int, int], dict[str, list[str]]] = {}
+
+
+def _get_py_suffix_index(py_objects: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Build or retrieve a cached suffix lookup index over env.domaindata['py']['objects']."""
+    cache_key = (id(py_objects), len(py_objects), hash(next(iter(py_objects), "")))
+    cached = _PY_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    _PY_INDEX_CACHE.clear()
+    suffix_map: dict[str, list[str]] = {}
+    for qname in sorted(py_objects):
+        parts = qname.split(".")
+        if parts:
+            suffix_map.setdefault(parts[-1], []).append(qname)
+        if len(parts) >= 2:
+            suffix_map.setdefault(f"{parts[-2]}.{parts[-1]}", []).append(qname)
+    _PY_INDEX_CACHE[cache_key] = suffix_map
+    return suffix_map
+
+
+def _select_best_py_candidate(candidates: list[str], node: Any) -> str:
+    """Disambiguate multiple canonical py_objects matches using module and refdoc affinity."""
+    if len(candidates) == 1:
+        return candidates[0]
+
+    py_mod = node.get("py:module") or ""
+    if isinstance(py_mod, str) and py_mod:
+        for cand in candidates:
+            if cand.startswith(f"{py_mod}."):
+                return cand
+        py_root = py_mod.split(".")[0]
+        for cand in candidates:
+            if cand.split(".")[0] == py_root:
+                return cand
+
+    refdoc = node.get("refdoc") or ""
+    if isinstance(refdoc, str):
+        for root_pkg in _FIRST_PARTY_ROOTS:
+            if root_pkg in refdoc:
+                for cand in candidates:
+                    if cand.split(".")[0] == root_pkg:
+                        return cand
+
+    return min(candidates, key=lambda item: (item.count("."), item))
+
+
+def _resolve_offline_external_url(target: str, reftype: str) -> str | None:
+    """Resolve stdlib and third-party Python type targets to canonical URLs without network I/O."""
+    clean = target.split("[", 1)[0].lstrip("~").strip()
+    if not clean:
+        return None
+
+    if clean in ("None", "NoneType"):
+        return f"{_PYTHON_DOCS_BASE}/constants.html#None"
+    if clean in ("Ellipsis", "..."):
+        return f"{_PYTHON_DOCS_BASE}/constants.html#Ellipsis"
+    if clean in _BUILTIN_TYPES:
+        return f"{_PYTHON_DOCS_BASE}/stdtypes.html#{clean}"
+    if clean in _BUILTIN_FUNCTIONS_AND_CLASSES:
+        return f"{_PYTHON_DOCS_BASE}/functions.html#{clean}"
+    if clean in _BUILTIN_EXCEPTIONS:
+        return f"{_PYTHON_DOCS_BASE}/exceptions.html#{clean}"
+
+    if clean in _BARE_STDLIB_ALIASES and reftype != "mod":
+        page, anchor = _BARE_STDLIB_ALIASES[clean]
+        return f"{_PYTHON_DOCS_BASE}/{page}.html#{anchor}"
+
+    if clean == "argparse._SubParsersAction":
+        return f"{_PYTHON_DOCS_BASE}/argparse.html#argparse.ArgumentParser.add_subparsers"
+    if clean == "asyncio.locks.Semaphore":
+        return f"{_PYTHON_DOCS_BASE}/asyncio-sync.html#asyncio.Semaphore"
+    if clean.startswith("_contextvars."):
+        tail = clean.removeprefix("_contextvars.")
+        return f"{_PYTHON_DOCS_BASE}/contextvars.html#contextvars.{tail}"
+    if clean.startswith("typing_extensions."):
+        tail = clean.removeprefix("typing_extensions.")
+        return f"{_PYTHON_DOCS_BASE}/typing.html#typing.{tail}"
+
+    if clean in _STDLIB_ROOTS and reftype == "mod":
+        return f"{_PYTHON_DOCS_BASE}/{clean}.html#module-{clean}"
+
+    root = clean.split(".", 1)[0]
+    if root in _STDLIB_ROOTS and "." in clean:
+        if clean.startswith("collections.abc."):
+            return f"{_PYTHON_DOCS_BASE}/collections.abc.html#{clean}"
+        return f"{_PYTHON_DOCS_BASE}/{root}.html#{clean}"
+
+    # Third-party ecosystem types resolved deterministically offline
+    if root == "pydantic" or clean in ("BaseModel", "RootModel"):
+        if "RootModel" in clean:
+            return "https://docs.pydantic.dev/latest/api/root_model/"
+        if "ValidationError" in clean:
+            return (
+                "https://docs.pydantic.dev/latest/api/pydantic_core/#pydantic_core.ValidationError"
+            )
+        return "https://docs.pydantic.dev/latest/api/base_model/"
+
+    if root == "pandas" or clean == "DataFrame":
+        if clean.endswith("to_csv"):
+            return "https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_csv.html"
+        if clean.endswith("json_normalize"):
+            return "https://pandas.pydata.org/docs/reference/api/pandas.json_normalize.html"
+        if clean.endswith("DataFrame"):
+            return "https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html"
+        return "https://pandas.pydata.org/docs/reference/index.html"
+
+    if root == "httpx":
+        return "https://www.python-httpx.org/api/"
+    if root == "tenacity":
+        return "https://tenacity.readthedocs.io/en/latest/api.html"
+    if root == "pyarrow":
+        leaf = clean.rsplit(".", 1)[-1]
+        if leaf in {"Schema", "Table", "RecordBatch"}:
+            return f"https://arrow.apache.org/docs/python/generated/pyarrow.{leaf}.html"
+        return "https://arrow.apache.org/docs/python/api.html"
+    if root == "textual":
+        return "https://textual.textualize.io/api/"
+    if root == "rich":
+        return "https://rich.readthedocs.io/en/stable/reference.html"
+    if root == "filelock":
+        return "https://py-filelock.readthedocs.io/en/latest/api/file_lock.html"
+    if root == "airflow":
+        return "https://airflow.apache.org/docs/apache-airflow/stable/public-airflow-interface.html"
+    if root == "opentelemetry":
+        return "https://opentelemetry-python.readthedocs.io/en/latest/api/trace.html"
+    if root == "dotenv":
+        return "https://saurabh-kumar.com/python-dotenv/"
+    if root == "defusedxml" or clean == "DefusedXmlException":
+        return "https://pypi.org/project/defusedxml/"
+
+    return None
+
+
+def _make_non_xref_literal(contnode: Any) -> nodes.literal:
+    """Wrap unresolved TypeVar or private helper text in a non-xref literal code node."""
+    text = contnode.astext() if hasattr(contnode, "astext") else str(contnode)
+    return nodes.literal("", text, classes=["docutils", "literal", "notranslate"])
+
+
 def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: Any) -> Any:
-    """Resolve internal imednet.core.* cross-references to curated imednet.core or imednet.pagination anchors."""
+    """Route re-exported first-party symbols and offline stdlib/external types to canonical targets."""
     if node.get("refdomain") != "py" or not hasattr(app.builder, "get_relative_uri"):
         return None
-    reftarget = node.get("reftarget", "")
-    if not isinstance(reftarget, str) or not reftarget:
+    raw_reftarget = node.get("reftarget", "")
+    if not isinstance(raw_reftarget, str) or not raw_reftarget:
         return None
 
-    py_objects = env.domaindata.get("py", {}).get("objects", {})
-    if not py_objects:
+    reftype = str(node.get("reftype", ""))
+    reftarget = raw_reftarget.lstrip("~").strip()
+    if not reftarget:
         return None
 
-    alias_rewrites = {
-        "EdcGenericListGetEndpoint": "EdcSyncListGetEndpoint",
-        "EdcGenericGetEndpoint": "EdcSyncGetEndpoint",
-        "EdcGenericListEndpoint": "EdcSyncListEndpoint",
-    }
+    py_domain = env.domaindata.get("py", {})
+    py_objects = py_domain.get("objects", {})
+    py_modules = py_domain.get("modules", {})
 
-    candidates: list[str] = []
-    if reftarget == "imednet.core.context.study_context":
-        candidates.append("imednet.sdk.ImednetSDK.study_context")
-    elif reftarget.startswith("imednet.core.paginator."):
-        tail = reftarget.removeprefix("imednet.core.paginator.")
-        candidates.extend([f"imednet.pagination.{tail}", f"imednet.core.{tail}"])
-    elif reftarget.startswith("imednet.core."):
-        parts = reftarget.split(".")
-        for idx in range(2, len(parts)):
-            tail_parts = list(parts[idx:])
-            if tail_parts[0] in alias_rewrites:
-                tail_parts[0] = alias_rewrites[tail_parts[0]]
-            tail = ".".join(tail_parts)
-            candidates.extend([f"imednet.core.{tail}", f"imednet.pagination.{tail}"])
-    elif "." not in reftarget or reftarget.split(".")[0][0].isupper():
-        head, dot, rest = reftarget.partition(".")
-        mapped_head = alias_rewrites.get(head, head)
-        norm_target = f"{mapped_head}{dot}{rest}"
-        for prefix in ("imednet.core", "imednet.pagination", "imednet.sdk", "imednet.endpoints"):
-            candidates.append(f"{prefix}.{norm_target}")
+    # 1. Module cross-references (including internal imednet.core.* modules)
+    if reftype == "mod":
+        mod_candidates = [reftarget]
+        if reftarget.startswith("imednet.core."):
+            mod_candidates.append("imednet.core")
+        elif reftarget == "imednet.spi.export":
+            mod_candidates.append("imednet.integrations.export")
+        for mod_cand in mod_candidates:
+            mod_entry = py_modules.get(mod_cand)
+            if mod_entry is not None:
+                return make_refnode(
+                    app.builder,
+                    node["refdoc"],
+                    mod_entry.docname,
+                    mod_entry.node_id,
+                    contnode,
+                    mod_cand,
+                )
 
-    for cand in candidates:
-        entry = py_objects.get(cand)
-        if entry is not None:
-            return make_refnode(
-                app.builder,
-                node["refdoc"],
-                entry.docname,
-                entry.node_id,
-                contnode,
-                cand,
-            )
+    # 2. First-party symbol and re-export routing across all five workspace packages
+    if py_objects:
+        suffix_index = _get_py_suffix_index(py_objects)
+        documented_modules = _get_documented_modules()
+        candidates: list[str] = []
+
+        direct_mapped = _FIRST_PARTY_DIRECT_REWRITES.get(reftarget)
+        if direct_mapped is not None:
+            candidates.extend([direct_mapped, f"imednet.core.{direct_mapped}"])
+
+        if reftarget.startswith("imednet.core.paginator."):
+            tail = reftarget.removeprefix("imednet.core.paginator.")
+            candidates.extend([f"imednet.pagination.{tail}", f"imednet.core.{tail}"])
+        elif reftarget.startswith("imednet.core."):
+            parts = reftarget.split(".")
+            for idx in range(2, len(parts)):
+                tail_parts = list(parts[idx:])
+                tail_parts[0] = _FIRST_PARTY_DIRECT_REWRITES.get(tail_parts[0], tail_parts[0])
+                tail = ".".join(tail_parts)
+                candidates.extend([f"imednet.core.{tail}", f"imednet.pagination.{tail}"])
+
+        root_pkg = reftarget.split(".", 1)[0]
+        if root_pkg in _FIRST_PARTY_ROOTS and "." in reftarget:
+            parts = reftarget.split(".")
+            for idx in range(len(parts) - 1, 0, -1):
+                mod_part = ".".join(parts[:idx])
+                sym_part = parts[idx]
+                member_tail = parts[idx + 1 :]
+                canon_mod, canon_sym = _resolve_canonical_origin(mod_part, sym_part)
+                tail_suffix = f".{'.'.join(member_tail)}" if member_tail else ""
+                candidates.append(f"{canon_mod}.{canon_sym}{tail_suffix}")
+                doc_home = _find_canonical_documented_module(
+                    canon_mod, canon_sym, documented_modules
+                )
+                if doc_home is not None:
+                    candidates.append(f"{doc_home}.{canon_sym}{tail_suffix}")
+                elif canon_mod.startswith("imednet.core."):
+                    candidates.extend(
+                        [
+                            f"imednet.core.{canon_sym}{tail_suffix}",
+                            f"imednet.pagination.{canon_sym}{tail_suffix}",
+                        ]
+                    )
+                suffix_key = ".".join([canon_sym, *member_tail])
+                if suffix_key in suffix_index:
+                    candidates.append(_select_best_py_candidate(suffix_index[suffix_key], node))
+
+        if "." not in reftarget or reftarget.split(".")[0][0].isupper():
+            head, dot, rest = reftarget.partition(".")
+            mapped_head = _FIRST_PARTY_DIRECT_REWRITES.get(head, head)
+            norm_target = f"{mapped_head}{dot}{rest}"
+            for prefix in (
+                "imednet.core",
+                "imednet.pagination",
+                "imednet.sdk",
+                "imednet.endpoints",
+            ):
+                candidates.append(f"{prefix}.{norm_target}")
+            if norm_target in suffix_index:
+                candidates.append(_select_best_py_candidate(suffix_index[norm_target], node))
+
+        for cand in candidates:
+            entry = py_objects.get(cand)
+            if entry is not None:
+                return make_refnode(
+                    app.builder,
+                    node["refdoc"],
+                    entry.docname,
+                    entry.node_id,
+                    contnode,
+                    cand,
+                )
+
+        # Private helper or TypeVar inside a documented first-party module: link module or literal
+        leaf_name = reftarget.rsplit(".", 1)[-1]
+        if leaf_name in _TYPEVAR_PLACEHOLDERS:
+            return _make_non_xref_literal(contnode)
+        if root_pkg in _FIRST_PARTY_ROOTS and "." in reftarget:
+            parent_mod = reftarget.rsplit(".", 1)[0]
+            mod_entry = py_modules.get(parent_mod)
+            if mod_entry is not None:
+                return make_refnode(
+                    app.builder,
+                    node["refdoc"],
+                    mod_entry.docname,
+                    mod_entry.node_id,
+                    contnode,
+                    parent_mod,
+                )
+        if "." not in reftarget:
+            cur_mod = node.get("py:module") or ""
+            if isinstance(cur_mod, str) and cur_mod:
+                canon_mod, canon_sym = _resolve_canonical_origin(cur_mod, reftarget)
+                canon_qname = f"{canon_mod}.{canon_sym}"
+                if canon_qname in py_objects:
+                    entry = py_objects[canon_qname]
+                    return make_refnode(
+                        app.builder,
+                        node["refdoc"],
+                        entry.docname,
+                        entry.node_id,
+                        contnode,
+                        canon_qname,
+                    )
+                mod_entry = py_modules.get(canon_mod) or py_modules.get(cur_mod)
+                if mod_entry is not None and (
+                    canon_mod != cur_mod
+                    or leaf_name.startswith("_")
+                    or hasattr(sys.modules.get(cur_mod), reftarget)
+                ):
+                    return make_refnode(
+                        app.builder,
+                        node["refdoc"],
+                        mod_entry.docname,
+                        mod_entry.node_id,
+                        contnode,
+                        mod_entry.node_id.removeprefix("module-"),
+                    )
+            if leaf_name.startswith("_"):
+                return _make_non_xref_literal(contnode)
+
+    elif reftarget.rsplit(".", 1)[-1] in _TYPEVAR_PLACEHOLDERS:
+        return _make_non_xref_literal(contnode)
+
+    # 3. Offline stdlib and external ecosystem type references (zero network requests)
+    external_url = _resolve_offline_external_url(reftarget, reftype)
+    if external_url is not None:
+        if getattr(app.builder, "name", "") == "linkcheck":
+            return _make_non_xref_literal(contnode)
+        text = contnode.astext() if hasattr(contnode, "astext") else reftarget
+        ref_node = nodes.reference("", "", internal=False, refuri=external_url, reftitle=reftarget)
+        ref_node += nodes.literal(
+            "", text, classes=["xref", "py", "docutils", "literal", "notranslate"]
+        )
+        return ref_node
+
     return None
 
 
@@ -988,6 +1584,13 @@ def _skip_non_canonical_or_internal(
             if getattr(obj, "__name__", None) != current_mod:
                 return True
             return None
+
+        if (
+            current_mod.startswith("imednet.cli.")
+            and current_mod not in {"imednet.cli.decorators", "imednet.cli.utils"}
+            and not current_mod.startswith("imednet.cli.utils.")
+        ):
+            return True
 
         documented_modules = _get_documented_modules()
         canon_mod, canon_name = _resolve_canonical_origin(current_mod, name)
@@ -1086,6 +1689,9 @@ def _sanitize_viewcode_modules(app: Any) -> list[Any]:
             obj_entry = py_objects.get(full_id)
             if obj_entry is not None and obj_entry.node_id == full_id:
                 clean_used[tag_name] = obj_entry.docname
+        if not clean_used:
+            vm.pop(modname, None)
+            continue
         vm[modname] = (code, tags, clean_used, canonical_ref)
 
     return []
@@ -1307,6 +1913,7 @@ def setup(app: Any) -> None:  # pragma: no cover
         "autodoc-before-process-signature", _before_process_endpoint_signature, priority=400
     )
     app.connect("autodoc-process-signature", _process_endpoint_signature, priority=600)
+    app.connect("autodoc-process-docstring", _emit_barrel_export_table, priority=550)
     app.connect("autodoc-process-docstring", _emit_pydantic_model_fields, priority=600)
     app.connect("autodoc-skip-member", _skip_non_canonical_or_internal)
     app.connect("missing-reference", _resolve_reexported_py_reference)
@@ -1337,6 +1944,7 @@ set_type_checking_flag = True
 napoleon_google_docstring = True
 napoleon_numpy_docstring = False
 napoleon_include_init_with_doc = True
+napoleon_use_rtype = False
 
 # Templates and static paths
 templates_path: list[str] = []

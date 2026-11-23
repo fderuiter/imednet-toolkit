@@ -23,8 +23,10 @@ if TYPE_CHECKING:
     import pandas as pd
 
     DataFrame: TypeAlias = pd.DataFrame
+    #: Tabular record payload accepted by batch write and registration helpers.
     RecordsInput: TypeAlias = list[JsonDict] | pd.DataFrame | str | os.PathLike[str]
 else:
+    #: Tabular record payload accepted by batch write and registration helpers.
     RecordsInput = list[JsonDict] | _TabularDataFrameLike | str | os.PathLike[str]
     globals().pop("DataFrame", None)
 
@@ -54,6 +56,7 @@ ItemId = Union[str, int]  # noqa: UP007
 #: * A :class:`list` of two-element ``(operator, scalar)`` tuples – generates ``AND``-joined filters.  # noqa: RUF003
 #: * A :class:`list` of scalars – generates ``OR``-joined equality filters.  # noqa: RUF003
 FilterScalar = Union[str, int, float, bool, None]  # noqa: UP007
+#: Composite filter expression (scalar, operator tuple, or list of scalars/tuples).
 FilterValue = Union[  # noqa: UP007
     FilterScalar,
     tuple[str, FilterScalar],

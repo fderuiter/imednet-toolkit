@@ -665,7 +665,7 @@ def check_sphinx_html_baseurl() -> bool:
 
 
 class _ApiHtmlExtractor(HTMLParser):
-    """Lightweight stdlib HTML parser collecting IDs, dl blocks, dt text, and viewcode backlinks."""
+    """Lightweight stdlib HTML parser collecting IDs, dl blocks, dt text, links, and xrefs."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -673,9 +673,16 @@ class _ApiHtmlExtractor(HTMLParser):
         self.dt_text: dict[str, str] = {}
         self.dl_text_by_dt_id: dict[str, str] = {}
         self.backlinks: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self.dead_py_xrefs: list[str] = []
+        self.table_count: int = 0
         self._dl_stack: list[tuple[list[str], list[str]]] = []
         self._cur_dt_id: str | None = None
         self._cur_dt_chunks: list[str] = []
+        self._anchor_depth: int = 0
+        self._cur_link_href: str | None = None
+        self._cur_link_chunks: list[str] = []
+        self._cur_dead_xref_chunks: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = dict(attrs)
@@ -690,15 +697,29 @@ class _ApiHtmlExtractor(HTMLParser):
             self._cur_dt_chunks = []
             if elem_id and self._dl_stack:
                 self._dl_stack[-1][0].append(elem_id)
+        elif tag == "table":
+            self.table_count += 1
         elif tag == "a":
+            self._anchor_depth += 1
             classes = (attr_map.get("class") or "").split()
             href = attr_map.get("href")
             if "viewcode-back" in classes and href:
                 self.backlinks.append(href)
+            if href and self._cur_link_href is None:
+                self._cur_link_href = href
+                self._cur_link_chunks = []
+        elif tag == "code" and self._anchor_depth == 0:
+            classes = set((attr_map.get("class") or "").split())
+            if "xref" in classes and "py" in classes:
+                self._cur_dead_xref_chunks = []
 
     def handle_data(self, data: str) -> None:
         if self._cur_dt_id is not None:
             self._cur_dt_chunks.append(data)
+        if self._cur_link_href is not None:
+            self._cur_link_chunks.append(data)
+        if self._cur_dead_xref_chunks is not None:
+            self._cur_dead_xref_chunks.append(data)
         for _dt_ids, chunks in self._dl_stack:
             chunks.append(data)
 
@@ -712,6 +733,18 @@ class _ApiHtmlExtractor(HTMLParser):
             text = " ".join("".join(chunks).split())
             for dt_id in dt_ids:
                 self.dl_text_by_dt_id.setdefault(dt_id, text)
+        elif tag == "a":
+            if self._anchor_depth > 0:
+                self._anchor_depth -= 1
+            if self._anchor_depth == 0 and self._cur_link_href is not None:
+                link_text = " ".join("".join(self._cur_link_chunks).split())
+                self.links.append((self._cur_link_href, link_text))
+                self._cur_link_href = None
+                self._cur_link_chunks = []
+        elif tag == "code" and self._cur_dead_xref_chunks is not None:
+            xref_text = " ".join("".join(self._cur_dead_xref_chunks).split())
+            self.dead_py_xrefs.append(xref_text)
+            self._cur_dead_xref_chunks = None
 
 
 def _parse_html_file(path: Path) -> _ApiHtmlExtractor:
@@ -721,8 +754,8 @@ def _parse_html_file(path: Path) -> _ApiHtmlExtractor:
 
 
 def check_no_duplicate_suppression(conf_py_path: Path | None = None) -> bool:
-    """Verify _SuppressDuplicateDescriptions and duplicate warning filters are absent from docs/conf.py."""
-    print("Checking docs/conf.py for absence of duplicate warning suppression...")
+    """Verify duplicate and autodoc/typehints warning suppressions are absent from docs/conf.py."""
+    print("Checking docs/conf.py for absence of duplicate and autodoc warning suppression...")
     if conf_py_path is None:
         conf_py_path = Path(__file__).resolve().parents[1] / "docs" / "conf.py"
     if not conf_py_path.exists():
@@ -737,8 +770,40 @@ def check_no_duplicate_suppression(conf_py_path: Path | None = None) -> bool:
     if "duplicate object description" in content:
         print("Error: 'duplicate object description' warning suppression found in docs/conf.py.")
         has_errors = True
+
+    forbidden_suppress_entries = {"autodoc", "autodoc.import", "sphinx_autodoc_typehints"}
+    try:
+        tree = ast.parse(content, filename=str(conf_py_path))
+        for node in ast.walk(tree):
+            val_node: ast.expr | None = None
+            if isinstance(node, ast.Assign):
+                if any(
+                    isinstance(t, ast.Name) and t.id == "suppress_warnings" for t in node.targets
+                ):
+                    val_node = node.value
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "suppress_warnings"
+            ):
+                val_node = node.value
+            if isinstance(val_node, (ast.List, ast.Tuple, ast.Set)):
+                for elt in val_node.elts:
+                    if (
+                        isinstance(elt, ast.Constant)
+                        and isinstance(elt.value, str)
+                        and elt.value in forbidden_suppress_entries
+                    ):
+                        print(
+                            f"Error: Forbidden suppress_warnings entry '{elt.value}' in docs/conf.py."
+                        )
+                        has_errors = True
+    except SyntaxError as exc:
+        print(f"Error parsing {conf_py_path}: {exc}")
+        has_errors = True
+
     if not has_errors:
-        print("No duplicate warning suppression found in docs/conf.py.")
+        print("No duplicate or autodoc warning suppression found in docs/conf.py.")
     return has_errors
 
 
@@ -910,6 +975,147 @@ def _verify_core_html(core_page: Path) -> bool:
     return has_errors
 
 
+EXPECTED_MODEL_LIFECYCLE_METHODS: tuple[tuple[str, bool, bool], ...] = (
+    ("imednet.models.records.Record.can_transition_to", False, True),
+    ("imednet.models.records.Record.transition_to", False, True),
+    ("imednet.models.records.Record.update_status", False, True),
+    ("imednet.models.subjects.Subject.can_transition_to", False, True),
+    ("imednet.models.subjects.Subject.transition_to", False, True),
+    ("imednet.models.subjects.Subject.update_status", False, True),
+    ("imednet.models.queries.Query.can_transition_to", False, True),
+    ("imednet.models.queries.Query.transition_to", False, True),
+    ("imednet.models.queries.Query.update_status", False, True),
+    ("imednet.models.record_revisions.RecordRevision.validate_follows", False, True),
+    ("imednet.models.record_revisions.RecordRevision.can_follow", False, True),
+    ("imednet.models.record_revisions.RecordRevision.validate_chain", True, True),
+    ("imednet.models.jobs.Job.transition_to", False, True),
+    ("imednet.models.jobs.JobStatus.transition_to", False, False),
+)
+
+
+def _verify_model_lifecycle_methods_html(models_parsed: _ApiHtmlExtractor) -> bool:
+    """Verify all 14 lifecycle and audit methods render anchors and typed signatures."""
+    has_errors = False
+    for method_id, expect_classmethod, expect_source in EXPECTED_MODEL_LIFECYCLE_METHODS:
+        if method_id not in models_parsed.ids:
+            print(f"Error: Lifecycle/audit method '{method_id}' missing from imednet.models.html.")
+            has_errors = True
+            continue
+        dt_str = models_parsed.dt_text.get(method_id, "")
+        dl_str = models_parsed.dl_text_by_dt_id.get(method_id, "")
+        if expect_classmethod and not dt_str.startswith("classmethod "):
+            print(f"Error: Classmethod '{method_id}' missing 'classmethod' signature prefix.")
+            has_errors = True
+        if expect_source and "[source]" not in dt_str:
+            print(f"Error: Method '{method_id}' missing '[source]' link in imednet.models.html.")
+            has_errors = True
+        if "Parameters" not in dl_str and "Return type" not in dl_str:
+            print(
+                f"Error: Method '{method_id}' missing typed Parameters/Return type in imednet.models.html."
+            )
+            has_errors = True
+    return has_errors
+
+
+def _verify_barrel_cli_and_xrefs_html(html_dir: Path, api_html_dir: Path) -> bool:
+    """Verify barrel export tables, CLI guide links, and resolved cross-references across HTML."""
+    has_errors = False
+
+    # 1. Zero unresolved Python cross-reference spans across generated pages
+    for html_page in sorted(html_dir.rglob("*.html")):
+        if "_modules" in html_page.parts:
+            continue
+        parsed_page = _parse_html_file(html_page)
+        if parsed_page.dead_py_xrefs:
+            rel_path = html_page.relative_to(html_dir)
+            sample = ", ".join(parsed_page.dead_py_xrefs[:5])
+            print(
+                f"Error: {rel_path} contains {len(parsed_page.dead_py_xrefs)} unresolved "
+                f"py xref(s): {sample}"
+            )
+            has_errors = True
+
+    # 2. Barrel pages render clickable Public Exports tables
+    barrel_pages = (
+        "imednet.datadict.html",
+        "imednet.errors.html",
+        "imednet.spi.html",
+        "imednet.testing.html",
+        "imednet_workflows.html",
+        "imednet_sinks.html",
+        "imednet_tui.html",
+        "apache_airflow_providers_imednet.html",
+    )
+    for barrel_name in barrel_pages:
+        barrel_path = api_html_dir / barrel_name
+        if not barrel_path.exists():
+            continue
+        barrel_text = barrel_path.read_text(encoding="utf-8")
+        barrel_parsed = _parse_html_file(barrel_path)
+        if "Public Exports" not in barrel_text or barrel_parsed.table_count < 1:
+            print(f"Error: Barrel page '{barrel_name}' missing clickable Public Exports table.")
+            has_errors = True
+
+    # 3. CLI subcommand pages link to CLI guide instead of bare setup_parser stubs
+    for cli_html in sorted(api_html_dir.glob("imednet.cli.*.html")):
+        if cli_html.name == "imednet.cli.utils.html":
+            continue
+        cli_parsed = _parse_html_file(cli_html)
+        mod_stem = cli_html.stem
+        if f"{mod_stem}.setup_parser" in cli_parsed.ids:
+            print(f"Error: CLI page '{cli_html.name}' still renders bare setup_parser stub.")
+            has_errors = True
+        if not any("how-to/cli.html" in href for href, _ in cli_parsed.links):
+            print(f"Error: CLI page '{cli_html.name}' missing link to how-to/cli.html.")
+            has_errors = True
+
+    # 4. Guide cross-reference and contract drift checks
+    audit_html = html_dir / "how-to" / "audit_compliance.html"
+    if audit_html.exists():
+        audit_parsed = _parse_html_file(audit_html)
+        if not any(
+            "#imednet.models.record_revisions.RecordRevision.validate_chain" in href
+            for href, _ in audit_parsed.links
+        ):
+            print(
+                "Error: how-to/audit_compliance.html does not link RecordRevision.validate_chain."
+            )
+            has_errors = True
+
+    pag_guide_html = html_dir / "how-to" / "pagination.html"
+    if pag_guide_html.exists():
+        pag_text = pag_guide_html.read_text(encoding="utf-8")
+        pag_parsed = _parse_html_file(pag_guide_html)
+        if "MAX_PAGE_SIZE" not in pag_text or "does not enforce a maximum page size" in pag_text:
+            print("Error: how-to/pagination.html does not document MAX_PAGE_SIZE = 500.")
+            has_errors = True
+        if not any(
+            "#imednet.errors.client.PaginationError" in href for href, _ in pag_parsed.links
+        ):
+            print("Error: how-to/pagination.html does not link PaginationError.")
+            has_errors = True
+
+    arch_html = html_dir / "explanation" / "architecture.html"
+    if arch_html.exists():
+        arch_text = arch_html.read_text(encoding="utf-8")
+        arch_parsed = _parse_html_file(arch_html)
+        if re.search(r"(?<![A-Z0-9])_ENDPOINT_REGISTRY\b", arch_text):
+            print("Error: explanation/architecture.html still cites stale _ENDPOINT_REGISTRY.")
+            has_errors = True
+        for expected_frag in (
+            "ENDPOINT_REGISTRY",
+            "ASYNC_ENDPOINT_REGISTRY",
+            "#imednet.core.EdcSyncListGetEndpoint",
+        ):
+            if not any(
+                expected_frag in href or expected_frag == txt for href, txt in arch_parsed.links
+            ):
+                print(f"Error: explanation/architecture.html missing link for '{expected_frag}'.")
+                has_errors = True
+
+    return has_errors
+
+
 def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
     """Verify rendered HTML model fields, endpoint methods, _modules/index.html, and [docs] backlinks."""
     print("Checking rendered Sphinx HTML API reference and viewcode backlinks...")
@@ -1067,6 +1273,9 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
         )
         has_errors = True
 
+    if _verify_model_lifecycle_methods_html(models_parsed):
+        has_errors = True
+
     # 2. Verify all 26 endpoints and sync/async method signatures
     from imednet.endpoints.registry import ASYNC_ENDPOINT_REGISTRY, ENDPOINT_REGISTRY
 
@@ -1160,6 +1369,8 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
     if _verify_pagination_html(pagination_page):
         has_errors = True
     if _verify_core_html(core_page):
+        has_errors = True
+    if _verify_barrel_cli_and_xrefs_html(html_dir, api_html_dir):
         has_errors = True
 
     # 3. Verify _modules/index.html omits builtins.html and all [docs] backlinks resolve

@@ -45,6 +45,7 @@ class _LazyEndpointRegistry(Mapping[str, "type[GenericEndpoint[Any]]"]):
         return key in self._specs
 
 
+#: Mapping of synchronous SDK attribute names to lazy endpoint classes.
 ENDPOINT_REGISTRY: Mapping[str, type[GenericEndpoint[Any]]] = _LazyEndpointRegistry(
     {
         "codings": ("imednet.endpoints.codings", "CodingsEndpoint"),
@@ -63,6 +64,7 @@ ENDPOINT_REGISTRY: Mapping[str, type[GenericEndpoint[Any]]] = _LazyEndpointRegis
     }
 )
 
+#: Mapping of asynchronous SDK attribute names to lazy endpoint classes.
 ASYNC_ENDPOINT_REGISTRY: Mapping[str, type[GenericEndpoint[Any]]] = _LazyEndpointRegistry(
     {
         "codings": ("imednet.endpoints.codings", "AsyncCodingsEndpoint"),

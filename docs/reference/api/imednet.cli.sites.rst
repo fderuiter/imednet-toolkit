@@ -2,6 +2,9 @@ imednet.cli.sites package
 =========================
 
 .. automodule:: imednet.cli.sites
-   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
-   :members:
-   :show-inheritance:
+   :no-members:
+
+.. seealso::
+
+   For ``imednet sites`` command-line usage, flags, output formats, and
+   examples, see the :doc:`Command Line Interface (CLI) guide </how-to/cli>`.

@@ -9,10 +9,10 @@ from imednet.sdk import ImednetSDK
 
 logger = logging.getLogger(__name__)
 
-# Site enrollment statuses treated as eligible for smoke/live use.
-# ``Enrollment Open`` / ``ENROLLMENT_OPEN`` is the primary write-path status in the
-# observed DEV environment.  ``Active`` / ``active`` is kept for backward
-# compatibility with environments that use a simpler vocabulary.
+#: Site enrollment statuses treated as eligible for smoke/live use.
+#: ``Enrollment Open`` / ``ENROLLMENT_OPEN`` is the primary write-path status in the
+#: observed DEV environment. ``Active`` / ``active`` is kept for backward
+#: compatibility with environments that use a simpler vocabulary.
 ELIGIBLE_SITE_STATUSES: frozenset[str] = frozenset(
     {
         "active",
@@ -21,9 +21,9 @@ ELIGIBLE_SITE_STATUSES: frozenset[str] = frozenset(
     }
 )
 
-# Subject workflow statuses treated as eligible for smoke/live use.
-# ``Registered``, ``Baseline``, and ``Enrolled`` are the observed DEV values;
-# ``active`` is kept for backward compatibility.
+#: Subject workflow statuses treated as eligible for smoke/live use.
+#: ``Registered``, ``Baseline``, and ``Enrolled`` are the observed DEV values;
+#: ``active`` is kept for backward compatibility.
 ELIGIBLE_SUBJECT_STATUSES: frozenset[str] = frozenset(
     {"active", "registered", "baseline", "enrolled"}
 )

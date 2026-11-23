@@ -462,3 +462,131 @@ def test_generate_api_reference_preserves_existing_docs_on_staging_failure(
     with pytest.raises(FileNotFoundError):
         monkeypatch.setattr(build_docs_mod.shutil, "which", lambda _t: None)
         require_sphinx_tools("sphinx-apidoc", "sphinx-build")
+
+
+def test_conf_bound_classmethod_signature_hook_and_cross_package_routing(tmp_path: Path) -> None:
+    """Bound @classmethod objects do not crash _before_process_endpoint_signature and xrefs route."""
+    from scripts.build_docs import emit_curated_cli_subcommand_pages
+    from scripts.validate_docs import (
+        EXPECTED_MODEL_LIFECYCLE_METHODS,
+        _parse_html_file,
+        _verify_model_lifecycle_methods_html,
+    )
+
+    from imednet.models.record_revisions import RecordRevision
+
+    conf = _load_docs_conf()
+    assert conf.suppress_warnings == []
+    assert conf.set_type_checking_flag is True
+
+    fake_app = SimpleNamespace(
+        env=SimpleNamespace(
+            temp_data={
+                "autodoc:module": "imednet.models.record_revisions",
+                "autodoc:class": "RecordRevision",
+            }
+        ),
+        builder=SimpleNamespace(name="html", get_relative_uri=lambda _from, to: f"{to}.html"),
+    )
+
+    # Bound classmethod must not raise AttributeError when inspected by signature hook
+    conf._before_process_endpoint_signature(fake_app, RecordRevision.validate_chain, True)
+
+    # Verify check_no_duplicate_suppression rejects autodoc/typehint warning suppression
+    suppressed_autodoc = tmp_path / "autodoc_suppressed_conf.py"
+    suppressed_autodoc.write_text('suppress_warnings = ["autodoc"]\n', encoding="utf-8")
+    assert check_no_duplicate_suppression(suppressed_autodoc) is True
+
+    # Verify curated CLI subcommand page replaces setup_parser stub with /how-to/cli link
+    cli_api_dir = tmp_path / "api"
+    cli_api_dir.mkdir()
+    records_cli_rst = cli_api_dir / "imednet.cli.records.rst"
+    records_cli_rst.write_text("Stub\n====\n", encoding="utf-8")
+    emit_curated_cli_subcommand_pages(cli_api_dir)
+    rendered_cli_rst = records_cli_rst.read_text(encoding="utf-8")
+    assert ":no-members:" in rendered_cli_rst
+    assert "</how-to/cli>" in rendered_cli_rst
+
+    # Verify barrel export table emission on lazy package barrels
+    import imednet.errors as errors_pkg
+
+    barrel_lines: list[str] = []
+    conf._emit_barrel_export_table(
+        fake_app, "module", "imednet.errors", errors_pkg, {}, barrel_lines
+    )
+    barrel_rst = "\n".join(barrel_lines)
+    assert ".. rubric:: Public Exports" in barrel_rst
+    assert ":obj:`PaginationError <imednet.errors.client.PaginationError>`" in barrel_rst
+
+    # Verify cross-package and offline stdlib/external reference resolution without network I/O
+    obj_entry = SimpleNamespace(
+        docname="reference/api/imednet.errors",
+        node_id="imednet.errors.client.PaginationError",
+    )
+    wf_entry = SimpleNamespace(
+        docname="reference/api/imednet_workflows",
+        node_id="imednet_workflows.state_ledger.ExtractionStateLedger",
+    )
+    fake_env = SimpleNamespace(
+        domaindata={
+            "py": {
+                "objects": {
+                    "imednet.errors.client.PaginationError": obj_entry,
+                    "imednet_workflows.state_ledger.ExtractionStateLedger": wf_entry,
+                },
+                "modules": {},
+            }
+        }
+    )
+    cont = SimpleNamespace(astext=lambda: "PaginationError")
+    from docutils import nodes as docutils_nodes
+
+    resolved_err = conf._resolve_reexported_py_reference(
+        fake_app,
+        fake_env,
+        {
+            "refdomain": "py",
+            "reftype": "class",
+            "reftarget": "imednet.errors.PaginationError",
+            "refdoc": "how-to/pagination",
+        },
+        docutils_nodes.literal("", "PaginationError"),
+    )
+    assert resolved_err is not None
+    assert "imednet.errors.client.PaginationError" in resolved_err["refuri"]
+
+    resolved_wf = conf._resolve_reexported_py_reference(
+        fake_app,
+        fake_env,
+        {
+            "refdomain": "py",
+            "reftype": "class",
+            "reftarget": "imednet_workflows.ExtractionStateLedger",
+            "refdoc": "how-to/workflows/data_extraction",
+        },
+        docutils_nodes.literal("", "ExtractionStateLedger"),
+    )
+    assert resolved_wf is not None
+    assert "imednet_workflows.state_ledger.ExtractionStateLedger" in resolved_wf["refuri"]
+
+    resolved_stdlib = conf._resolve_reexported_py_reference(
+        fake_app,
+        fake_env,
+        {
+            "refdomain": "py",
+            "reftype": "class",
+            "reftarget": "pathlib.Path",
+            "refdoc": "reference/api/imednet",
+        },
+        cont,
+    )
+    assert resolved_stdlib is not None
+    assert (
+        resolved_stdlib["refuri"] == "https://docs.python.org/3/library/pathlib.html#pathlib.Path"
+    )
+
+    # Verify _verify_model_lifecycle_methods_html validates all 14 methods
+    assert len(EXPECTED_MODEL_LIFECYCLE_METHODS) == 14
+    empty_models_html = tmp_path / "empty_models.html"
+    empty_models_html.write_text("<html><body></body></html>", encoding="utf-8")
+    assert _verify_model_lifecycle_methods_html(_parse_html_file(empty_models_html)) is True

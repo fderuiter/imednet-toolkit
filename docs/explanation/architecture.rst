@@ -116,11 +116,12 @@ Endpoints
 
 Each endpoint, such as :class:`~imednet.endpoints.studies.StudiesEndpoint`,
 wraps a related set of API operations. Endpoints now use **composition**:
-`GenericListGetEndpoint` composes operation classes (for example
-``ListOperation`` and ``FilterGetOperation``) rather than inheriting deep
-operation mixin chains. This keeps method resolution straightforward, improves
-IDE autocomplete, and avoids MRO-related typing ambiguity. Endpoints expose
-``list``/``get`` methods that return typed models.
+:class:`~imednet.core.EdcSyncListGetEndpoint` and
+:class:`~imednet.core.EdcAsyncListGetEndpoint` compose operation classes (for
+example ``ListOperation`` and ``FilterGetOperation``) rather than inheriting
+deep operation mixin chains. This keeps method resolution straightforward,
+improves IDE autocomplete, and avoids MRO-related typing ambiguity. Endpoints
+expose ``list``/``get`` methods that return typed models.
 
 Workflows
 ---------
@@ -157,10 +158,19 @@ Extension Points
 Adding New Endpoints
 --------------------
 
-* Subclass :class:`~imednet.core.endpoint.base.GenericEndpoint` or
-  :class:`~imednet.core.endpoint.base.GenericListGetEndpoint`.
-* Register the class in ``_ENDPOINT_REGISTRY`` within
-  :mod:`imednet.sdk` so ``ImednetSDK`` exposes it.
+* Subclass the appropriate synchronous and asynchronous EDC endpoint base
+  classes in :mod:`imednet.core` (such as
+  :class:`~imednet.core.EdcSyncListGetEndpoint` and
+  :class:`~imednet.core.EdcAsyncListGetEndpoint`,
+  :class:`~imednet.core.EdcSyncListEndpoint` and
+  :class:`~imednet.core.EdcAsyncListEndpoint`, or
+  :class:`~imednet.core.EdcSyncGetEndpoint` and
+  :class:`~imednet.core.EdcAsyncGetEndpoint`).
+* Register the synchronous and asynchronous classes in
+  :data:`~imednet.endpoints.registry.ENDPOINT_REGISTRY` and
+  :data:`~imednet.endpoints.registry.ASYNC_ENDPOINT_REGISTRY` within
+  :mod:`imednet.endpoints.registry` so :class:`~imednet.sdk.ImednetSDK` and
+  :class:`~imednet.sdk.AsyncImednetSDK` expose them.
 * Document the endpoint in ``docs/endpoints/`` and add tests.
 
 Adding New Workflows
