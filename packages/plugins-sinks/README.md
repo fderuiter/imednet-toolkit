@@ -25,7 +25,10 @@ Depending on your target backend, you can install the required drivers using opt
 
 ## Launch via CLI
 
-The package provides a unified SDK namespace integration (`SinksNamespace`) directly registered with the core SDK client via entry points (`imednet.plugins`).
+The package provides a unified SDK namespace integration (`SinksNamespace`) directly registered with the core SDK client via Python entry points:
+- **SDK Namespace (`imednet.plugins`)**: `sinks` (`imednet_sinks.plugin:create_sinks`).
+- **Export Sinks (`imednet.sinks`)**: `mongodb`, `neo4j`, `snowflake`.
+- **Sink Configs (`imednet.sink_configs`)**: `mongodb`, `neo4j`, `snowflake`.
 
 You can initialize and execute sinks programmatically:
 

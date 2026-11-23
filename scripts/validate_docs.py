@@ -247,9 +247,8 @@ def _split_shell_pipeline(cmd: str) -> list[list[str]]:
     return segments
 
 
-def check_cli_snippets(repo_root: Path = Path(".")) -> bool:
-    """Parse documented `imednet ...` CLI invocations against imednet.cli.get_parser()."""
-    print("Checking documented imednet CLI commands against CLI argument parser...")
+def _ensure_workspace_src_on_path(repo_root: Path) -> None:
+    """Ensure monorepo package src directories are importable in sys.path."""
     default_root = Path(__file__).resolve().parent.parent
     for root in (repo_root, default_root):
         for pkg_sub in (
@@ -263,11 +262,9 @@ def check_cli_snippets(repo_root: Path = Path(".")) -> bool:
             if src_dir.is_dir() and str(src_dir) not in sys.path:
                 sys.path.insert(0, str(src_dir))
 
-    from imednet.cli import get_parser
 
-    parser = get_parser()
-    _patch_cli_parser_errors(parser)
-
+def _collect_doc_files(repo_root: Path) -> list[Path]:
+    """Collect non-excluded Markdown and reStructuredText documentation files."""
     candidates: list[Path] = []
     root_readme = repo_root / "README.md"
     if root_readme.is_file():
@@ -279,6 +276,32 @@ def check_cli_snippets(repo_root: Path = Path(".")) -> bool:
     if docs_dir.exists():
         candidates.extend(sorted(docs_dir.rglob("*.rst")))
         candidates.extend(sorted(docs_dir.rglob("*.md")))
+
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        rel_parts = path.relative_to(repo_root).parts
+        if any(part in _DOC_EXCLUDED_PARTS for part in rel_parts):
+            continue
+        result.append(path)
+    return result
+
+
+def check_cli_snippets(repo_root: Path = Path(".")) -> bool:
+    """Parse documented `imednet ...` CLI invocations against imednet.cli.get_parser()."""
+    print("Checking documented imednet CLI commands against CLI argument parser...")
+    _ensure_workspace_src_on_path(repo_root)
+
+    from imednet.cli import get_parser
+
+    parser = get_parser()
+    _patch_cli_parser_errors(parser)
+
+    candidates = list(_collect_doc_files(repo_root))
     examples_dir = repo_root / "examples"
     if examples_dir.exists():
         candidates.extend(sorted(examples_dir.rglob("*.md")))
@@ -354,6 +377,529 @@ def check_cli_snippets(repo_root: Path = Path(".")) -> bool:
 
     if not has_errors:
         print(f"CLI command validation passed ({checked_count} command(s) verified).")
+    return has_errors
+
+
+def _extra_mentioned_in_text(pkg_name: str, extra: str, text: str) -> bool:
+    """Return True if ``pkg_name[...extra...]`` appears in ``text``."""
+    for match in _DOCUMENTED_EXTRA_RE.finditer(text):
+        if match.group(1) != pkg_name:
+            continue
+        extras = {item.strip() for item in match.group(2).split(",") if item.strip()}
+        if extra in extras:
+            return True
+    return False
+
+
+def check_package_extras_parity(repo_root: Path = Path(".")) -> bool:
+    """Ensure every declared [project.optional-dependencies] extra in packages/* is documented."""
+    print("Checking reverse parity of declared package extras in documentation...")
+    pyproject_files = sorted((repo_root / "packages").glob("*/pyproject.toml"))
+    if not pyproject_files:
+        print(f"Warning: No package pyproject.toml files found under {repo_root / 'packages'}.")
+        return False
+
+    doc_texts = {path: path.read_text(encoding="utf-8") for path in _collect_doc_files(repo_root)}
+    combined_docs = "\n".join(doc_texts.values())
+    install_ext_path = repo_root / "docs" / "_includes" / "install_extensions.rst"
+    install_ext_text = (
+        install_ext_path.read_text(encoding="utf-8") if install_ext_path.is_file() else None
+    )
+    root_readme_path = repo_root / "README.md"
+    root_readme_text = (
+        root_readme_path.read_text(encoding="utf-8") if root_readme_path.is_file() else None
+    )
+
+    has_errors = False
+    for pyproject_path in pyproject_files:
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        project = data.get("project", {})
+        pkg_name = project.get("name")
+        opt_deps = project.get("optional-dependencies", {})
+        if not isinstance(pkg_name, str) or not isinstance(opt_deps, dict):
+            continue
+        for extra in sorted(opt_deps):
+            if not _extra_mentioned_in_text(pkg_name, extra, combined_docs):
+                print(
+                    f"Error: Declared extra '{pkg_name}[{extra}]' in {pyproject_path} "
+                    "is not documented in README or docs/."
+                )
+                has_errors = True
+            if pkg_name == "imednet":
+                if install_ext_text is not None and not _extra_mentioned_in_text(
+                    pkg_name, extra, install_ext_text
+                ):
+                    print(
+                        f"Error: Core extra 'imednet[{extra}]' is missing from {install_ext_path}."
+                    )
+                    has_errors = True
+                if (
+                    extra in {"cli", "export", "tui"}
+                    and root_readme_text is not None
+                    and not _extra_mentioned_in_text(pkg_name, extra, root_readme_text)
+                ):
+                    print(
+                        f"Error: Primary extra 'imednet[{extra}]' is missing from {root_readme_path}."
+                    )
+                    has_errors = True
+
+    if not has_errors:
+        print("All declared package extras are documented.")
+    return has_errors
+
+
+def check_entry_points_parity(repo_root: Path = Path(".")) -> bool:
+    """Ensure every declared [project.entry-points] group and entry in packages/* is documented."""
+    print("Checking reverse parity of declared package entry points in documentation...")
+    pyproject_files = sorted((repo_root / "packages").glob("*/pyproject.toml"))
+    if not pyproject_files:
+        print(f"Warning: No package pyproject.toml files found under {repo_root / 'packages'}.")
+        return False
+
+    docs_dir = repo_root / "docs"
+    docs_chunks: list[str] = []
+    if docs_dir.exists():
+        for doc_path in sorted([*docs_dir.rglob("*.rst"), *docs_dir.rglob("*.md")]):
+            if not doc_path.is_file():
+                continue
+            rel_parts = doc_path.relative_to(repo_root).parts
+            if any(part in _DOC_EXCLUDED_PARTS for part in rel_parts):
+                continue
+            docs_chunks.append(doc_path.read_text(encoding="utf-8"))
+    shared_docs_text = "\n".join(docs_chunks)
+
+    has_errors = False
+    for pyproject_path in pyproject_files:
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        project = data.get("project", {})
+        pkg_name = project.get("name", pyproject_path.parent.name)
+        entry_points = project.get("entry-points", {})
+        if not isinstance(entry_points, dict) or not entry_points:
+            continue
+
+        pkg_readme_path = pyproject_path.parent / "README.md"
+        pkg_readme_text = (
+            pkg_readme_path.read_text(encoding="utf-8") if pkg_readme_path.is_file() else ""
+        )
+        searchable_text = f"{pkg_readme_text}\n{shared_docs_text}"
+
+        for group_name, group_entries in sorted(entry_points.items()):
+            if group_name not in searchable_text:
+                print(
+                    f"Error: Entry-point group '{group_name}' declared in {pyproject_path} "
+                    f"for '{pkg_name}' is not documented in {pkg_readme_path} or docs/."
+                )
+                has_errors = True
+            if not isinstance(group_entries, dict):
+                continue
+            for ep_name, ep_target in sorted(group_entries.items()):
+                candidates = [ep_name]
+                if group_name == "imednet.cli_plugins" and "_" in ep_name:
+                    candidates.append(ep_name.replace("_", "-"))
+                if group_name == "apache_airflow_provider" and isinstance(ep_target, str):
+                    candidates.append(ep_target.split(":")[-1])
+                if not any(
+                    re.search(
+                        rf"(?<![A-Za-z0-9_]){re.escape(tok)}(?![A-Za-z0-9_])", searchable_text
+                    )
+                    for tok in candidates
+                ):
+                    print(
+                        f"Error: Entry point '{ep_name}' in group '{group_name}' ({pyproject_path}) "
+                        f"is not documented in {pkg_readme_path} or docs/."
+                    )
+                    has_errors = True
+
+    if not has_errors:
+        print("All declared package entry points are documented.")
+    return has_errors
+
+
+_RUNTIME_ENV_VAR_RE = re.compile(r"^IMEDNET_[A-Z0-9_]+$")
+
+
+def _collect_runtime_env_vars(packages_root: Path) -> set[str]:
+    """Extract runtime IMEDNET_* environment variable names from package source ASTs."""
+    discovered: set[str] = set()
+    for py_file in sorted(packages_root.glob("*/src/**/*.py")):
+        if not py_file.is_file():
+            continue
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        docstring_node_ids: set[int] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            ):
+                docstring_node_ids.add(id(node.body[0].value))
+
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and id(node) not in docstring_node_ids
+                and isinstance(node.value, str)
+                and _RUNTIME_ENV_VAR_RE.match(node.value)
+            ):
+                discovered.add(node.value)
+    return discovered
+
+
+def check_env_var_parity(repo_root: Path = Path(".")) -> bool:
+    """Verify all runtime IMEDNET_* variables in packages/*/src appear in configuration.rst and .env.example."""
+    print("Checking reverse parity of runtime IMEDNET_* environment variables...")
+    packages_root = repo_root / "packages"
+    if not packages_root.exists():
+        print(f"Warning: {packages_root} not found.")
+        return False
+
+    runtime_vars = sorted(_collect_runtime_env_vars(packages_root))
+    if not runtime_vars:
+        print(f"Warning: No runtime IMEDNET_* variables found under {packages_root}.")
+        return False
+
+    config_rst = repo_root / "docs" / "reference" / "configuration.rst"
+    env_example = repo_root / ".env.example"
+    has_errors = False
+
+    if not config_rst.is_file():
+        print(f"Error: Missing {config_rst}.")
+        has_errors = True
+        config_text = ""
+    else:
+        config_text = config_rst.read_text(encoding="utf-8")
+
+    if not env_example.is_file():
+        print(f"Error: Missing {env_example}.")
+        has_errors = True
+        env_text = ""
+    else:
+        env_text = env_example.read_text(encoding="utf-8")
+
+    for var_name in runtime_vars:
+        if config_text and not re.search(
+            rf"^\s*\*\s*-\s*{re.escape(var_name)}\s*$", config_text, re.MULTILINE
+        ):
+            print(f"Error: Runtime env var '{var_name}' is missing from {config_rst}.")
+            has_errors = True
+        if env_text and not re.search(rf"^\s*#?\s*{re.escape(var_name)}=", env_text, re.MULTILINE):
+            print(f"Error: Runtime env var '{var_name}' is missing from {env_example}.")
+            has_errors = True
+
+    if not has_errors:
+        print(f"All {len(runtime_vars)} runtime IMEDNET_* environment variable(s) are documented.")
+    return has_errors
+
+
+def _walk_parser_leaves(
+    parser: argparse.ArgumentParser,
+    prefix: tuple[str, ...] = (),
+) -> dict[tuple[str, ...], set[str]]:
+    """Collect leaf CLI subcommand paths mapped to their long option flags."""
+    sub_actions = [
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    ]
+    if not sub_actions:
+        long_opts = {
+            opt
+            for action in parser._actions
+            for opt in action.option_strings
+            if opt.startswith("--") and opt != "--help"
+        }
+        return {prefix: long_opts} if prefix else {}
+
+    leaves: dict[tuple[str, ...], set[str]] = {}
+    for sub_action in sub_actions:
+        for sub_name, sub_parser in sub_action.choices.items():
+            leaves.update(_walk_parser_leaves(sub_parser, (*prefix, sub_name)))
+    return leaves
+
+
+def _extract_documented_cli_leaves(
+    doc_path: Path,
+    leaf_paths: set[tuple[str, ...]],
+) -> set[tuple[str, ...]]:
+    """Extract leaf CLI subcommands invoked inside shell blocks of ``doc_path``."""
+    matched: set[tuple[str, ...]] = set()
+    sorted_leaves = sorted(leaf_paths, key=len, reverse=True)
+    for _, block in _extract_shell_code_blocks(doc_path):
+        logical_lines: list[str] = []
+        acc = ""
+        for raw_line in block.splitlines():
+            stripped = raw_line.strip()
+            if stripped.endswith("\\") and not stripped.startswith("#"):
+                acc += stripped[:-1] + " "
+            else:
+                acc += stripped
+                logical_lines.append(acc.strip())
+                acc = ""
+        if acc:
+            logical_lines.append(acc.strip())
+
+        for cmd_line in logical_lines:
+            if not cmd_line or cmd_line.startswith("#"):
+                continue
+            normalized = cmd_line[2:].strip() if cmd_line.startswith("$ ") else cmd_line
+            try:
+                segments = _split_shell_pipeline(normalized)
+            except ValueError:
+                continue
+            for seg in segments:
+                tokens = list(seg)
+                while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+                    tokens = tokens[1:]
+                if tokens[:2] == ["uv", "run"]:
+                    tokens = tokens[2:]
+                if not tokens or tokens[0] != "imednet":
+                    continue
+                sub_tokens = [tok for tok in tokens[1:] if not tok.startswith("-")]
+                for leaf in sorted_leaves:
+                    if tuple(sub_tokens[: len(leaf)]) == leaf:
+                        matched.add(leaf)
+                        break
+    return matched
+
+
+def check_cli_subcommand_parity(
+    repo_root: Path = Path("."),
+    parser: argparse.ArgumentParser | None = None,
+) -> bool:
+    """Verify all CLI subcommands and shared export flags are documented in CLI and plugin guides."""
+    print("Checking reverse parity of CLI subcommands and shared export flags...")
+    if parser is None:
+        _ensure_workspace_src_on_path(repo_root)
+        from imednet.cli import get_parser
+
+        parser = get_parser()
+
+    leaves = _walk_parser_leaves(parser)
+    leaf_set = set(leaves)
+    cli_rst = repo_root / "docs" / "how-to" / "cli.rst"
+    if not cli_rst.is_file():
+        print(f"Error: Missing {cli_rst}.")
+        return True
+
+    cli_text = cli_rst.read_text(encoding="utf-8")
+    cli_invocations = _extract_documented_cli_leaves(cli_rst, leaf_set)
+    has_errors = False
+
+    for leaf in sorted(leaf_set):
+        if len(leaf) == 2 and leaf[1] == "list":
+            if not re.search(rf"\b{re.escape(leaf[0])}\b", cli_text):
+                print(f"Error: CLI list resource '{leaf[0]} list' is missing from {cli_rst}.")
+                has_errors = True
+        elif len(leaf) == 2 and leaf[0] == "export":
+            if not re.search(rf"\b{re.escape(leaf[1])}\b", cli_text):
+                print(f"Error: CLI exporter 'export {leaf[1]}' is missing from {cli_rst}.")
+                has_errors = True
+        elif leaf not in cli_invocations:
+            print(
+                f"Error: CLI subcommand 'imednet {' '.join(leaf)}' has no shell example in {cli_rst}."
+            )
+            has_errors = True
+
+    export_opt_sets = [
+        opts for path, opts in leaves.items() if len(path) == 2 and path[0] == "export"
+    ]
+    if export_opt_sets:
+        shared_export_opts = sorted(set.intersection(*export_opt_sets))
+        for opt in shared_export_opts:
+            if opt not in cli_text:
+                print(f"Error: Shared export option '{opt}' is missing from {cli_rst}.")
+                has_errors = True
+
+    required_write_flags = (
+        "--schema",
+        "--dry-run",
+        "--wait",
+        "--skip-existing",
+        "--subject-key-field",
+    )
+    declared_write_flags = {
+        opt
+        for path, opts in leaves.items()
+        if path in {("records", "create"), ("records", "import"), ("subjects", "register")}
+        for opt in opts
+    }
+    for flag in required_write_flags:
+        if flag in declared_write_flags and flag not in cli_text:
+            print(f"Error: Core write CLI option '{flag}' is missing from {cli_rst}.")
+            has_errors = True
+
+    workflows_readme = repo_root / "packages" / "plugins-workflows" / "README.md"
+    if workflows_readme.is_file():
+        wf_invocations = _extract_documented_cli_leaves(workflows_readme, leaf_set)
+        for leaf in sorted(leaf_set):
+            if leaf[0] in ("workflows", "subject-data") and leaf not in wf_invocations:
+                print(
+                    f"Error: Workflow CLI subcommand 'imednet {' '.join(leaf)}' has no shell example in {workflows_readme}."
+                )
+                has_errors = True
+
+    tui_readme = repo_root / "packages" / "plugins-tui" / "README.md"
+    if tui_readme.is_file():
+        tui_invocations = _extract_documented_cli_leaves(tui_readme, leaf_set)
+        for leaf in sorted(leaf_set):
+            if leaf[0] == "tui" and leaf not in tui_invocations:
+                print(
+                    f"Error: TUI CLI subcommand 'imednet {' '.join(leaf)}' has no shell example in {tui_readme}."
+                )
+                has_errors = True
+
+    if not has_errors:
+        print(
+            f"CLI subcommand and export flag parity passed ({len(leaf_set)} leaf command(s) verified)."
+        )
+    return has_errors
+
+
+def _extract_tui_ast_metadata(app_py: Path) -> tuple[dict[str, list[str]], int | None]:
+    """Extract per-class BINDINGS keys and MAX_CONCURRENT_POLLS from imednet_tui/app.py."""
+    tree = ast.parse(app_py.read_text(encoding="utf-8"), filename=str(app_py))
+    class_bindings: dict[str, list[str]] = {}
+    max_polls: int | None = None
+
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            target_name: str | None = None
+            value_node: ast.AST | None = None
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                target_name = stmt.target.id
+                value_node = stmt.value
+            elif isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        target_name = target.id
+                        value_node = stmt.value
+                        break
+
+            if target_name == "BINDINGS" and isinstance(value_node, (ast.List, ast.Tuple)):
+                keys: list[str] = []
+                for elt in value_node.elts:
+                    key_raw: str | None = None
+                    if (
+                        isinstance(elt, ast.Tuple)
+                        and elt.elts
+                        and isinstance(elt.elts[0], ast.Constant)
+                        and isinstance(elt.elts[0].value, str)
+                    ):
+                        key_raw = elt.elts[0].value
+                    elif (
+                        isinstance(elt, ast.Call)
+                        and elt.args
+                        and isinstance(elt.args[0], ast.Constant)
+                        and isinstance(elt.args[0].value, str)
+                    ):
+                        key_raw = elt.args[0].value
+                    if key_raw:
+                        for part in key_raw.split(","):
+                            cleaned = part.strip().lower()
+                            if cleaned:
+                                keys.append(cleaned)
+                class_bindings[node.name] = keys
+            elif (
+                target_name == "MAX_CONCURRENT_POLLS"
+                and isinstance(value_node, ast.Constant)
+                and isinstance(value_node.value, int)
+            ):
+                max_polls = value_node.value
+
+    return class_bindings, max_polls
+
+
+def _binding_key_documented(key: str, text: str) -> bool:
+    """Return True if a Textual binding key is documented in Markdown or RST text."""
+    aliases = ["esc", "escape"] if key == "escape" else [key]
+    return any(
+        re.search(
+            rf"`+{re.escape(alias)}`+|\*\*[^*\n]*\b{re.escape(alias)}\b[^*\n]*\*\*",
+            text,
+            re.IGNORECASE,
+        )
+        for alias in aliases
+    )
+
+
+def check_tui_bindings_parity(
+    repo_root: Path = Path("."),
+    parser: argparse.ArgumentParser | None = None,
+) -> bool:
+    """Verify TUI keybindings, poll concurrency, layout behavior, and CLI flags match documentation."""
+    print("Checking reverse parity of TUI keybindings and launch options...")
+    app_py = repo_root / "packages" / "plugins-tui" / "src" / "imednet_tui" / "app.py"
+    tui_readme = repo_root / "packages" / "plugins-tui" / "README.md"
+    cli_rst = repo_root / "docs" / "how-to" / "cli.rst"
+
+    if not app_py.is_file():
+        print(f"Warning: {app_py} not found.")
+        return False
+
+    has_errors = False
+    if not tui_readme.is_file():
+        print(f"Error: Missing {tui_readme}.")
+        return True
+
+    tui_text = tui_readme.read_text(encoding="utf-8")
+    cli_text = cli_rst.read_text(encoding="utf-8") if cli_rst.is_file() else ""
+    class_bindings, max_polls = _extract_tui_ast_metadata(app_py)
+
+    required_keys: list[str] = []
+    for cls_name in ("ImednetTuiApp", "JobTable"):
+        required_keys.extend(class_bindings.get(cls_name, []))
+
+    for key in required_keys:
+        if not _binding_key_documented(key, tui_text):
+            print(f"Error: TUI keybinding '{key}' from {app_py} is missing from {tui_readme}.")
+            has_errors = True
+        if cli_text and not _binding_key_documented(key, cli_text):
+            print(f"Error: TUI keybinding '{key}' from {app_py} is missing from {cli_rst}.")
+            has_errors = True
+
+    list_bound_keys = set(class_bindings.get("StudyList", [])) | set(
+        class_bindings.get("SiteList", [])
+    )
+    if "space" not in list_bound_keys and re.search(
+        r"`Enter`\s*/\s*`Space`|\*\*Enter\s*/\s*Space\*\*|`Space`\s*\|\s*Select",
+        tui_text,
+        re.IGNORECASE,
+    ):
+        print(
+            f"Error: {tui_readme} claims Space selection on StudyList/SiteList, "
+            "but Space is not bound in imednet_tui/app.py."
+        )
+        has_errors = True
+
+    if max_polls is not None and not re.search(rf"\b{max_polls}\b", tui_text):
+        print(f"Error: TUI MAX_CONCURRENT_POLLS ({max_polls}) is not documented in {tui_readme}.")
+        has_errors = True
+
+    for token in ("Logs", "compact"):
+        if token not in tui_text:
+            print(f"Error: TUI '{token}' capability is missing from {tui_readme}.")
+            has_errors = True
+
+    if parser is None:
+        _ensure_workspace_src_on_path(repo_root)
+        from imednet.cli import get_parser
+
+        parser = get_parser()
+
+    leaves = _walk_parser_leaves(parser)
+    for flag in sorted(leaves.get(("tui",), set())):
+        if flag not in tui_text:
+            print(f"Error: TUI CLI flag '{flag}' is missing from {tui_readme}.")
+            has_errors = True
+
+    if not has_errors:
+        print("TUI keybinding and launch flag parity passed.")
     return has_errors
 
 
@@ -1419,7 +1965,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     todos_failed = check_todos_in_init()
     extras_failed = check_documented_extras()
+    extras_parity_failed = check_package_extras_parity()
+    entry_points_parity_failed = check_entry_points_parity()
+    env_vars_parity_failed = check_env_var_parity()
     cli_failed = check_cli_snippets()
+    cli_parity_failed = check_cli_subcommand_parity()
+    tui_parity_failed = check_tui_bindings_parity()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
     adr_failed = check_adr_records()
@@ -1434,7 +1985,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     if (
         todos_failed
         or extras_failed
+        or extras_parity_failed
+        or entry_points_parity_failed
+        or env_vars_parity_failed
         or cli_failed
+        or cli_parity_failed
+        or tui_parity_failed
         or packages_failed
         or docs_failed
         or adr_failed

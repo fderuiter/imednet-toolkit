@@ -31,13 +31,17 @@ dashboard for browsing studies, sites, subjects, and background jobs:
    IMEDNET_HIGH_CONTRAST=1 imednet --high-contrast tui
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
-``Enter`` to select a study or site (re-selecting the active site clears the site filter)
-or to register batch IDs in the Jobs tab input, ``Esc`` to move focus from the Jobs batch
-input to the Jobs table or clear an active site filter, ``q`` to quit, ``d`` to toggle
-dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh active study data, and
-``a`` to load all pages when a panel is truncated. Single-key shortcuts are suppressed
-automatically while typing batch IDs in the Jobs tab input. Pass ``--study`` and
-repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
+``Enter`` to select a Study or Site (re-selecting the active Site clears the Site filter;
+``Space`` is not bound on ``StudyList`` or ``SiteList``) or to register batch IDs in the
+Jobs tab input, ``Delete`` or ``Backspace`` on a highlighted row in the Jobs table to
+untrack that Job, ``Esc`` to move focus from the Jobs batch input to the Jobs table or
+clear an active Site filter, ``q`` to quit, ``d`` to toggle dark mode, ``h`` to toggle
+high-contrast mode, ``r`` to refresh active Study data, and ``a`` to load all pages when
+a panel is truncated. Switch between the ``Jobs`` (bounded to ``5`` concurrent status
+polls) and ``Logs`` tabs in the bottom pane to audit redacted SDK/TUI events; viewports narrower
+than ``100`` columns automatically reflow into the 2-column ``compact`` layout. Single-key shortcuts are suppressed
+automatically while typing batch IDs in the Jobs tab input. Pass ``--study`` / ``--study-key`` and
+repeatable ``--batch`` / ``--batch-id`` flags at launch to open a Study and monitor specific batch Jobs
 immediately, and pass ``--force`` only when intentionally bypassing TTY stream checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
@@ -73,6 +77,47 @@ step-by-step wizard prompts for study keys, filters, and state ledger updates:
    imednet workflows state set --interactive
    imednet workflows state reset --interactive
    imednet workflows uat run --interactive
+   imednet workflows sync-worker STUDY --interval 900 --once
+
+Core write commands and batch validation
+----------------------------------------
+
+Use ``imednet records create``, ``imednet records import``, and ``imednet subjects register``
+to validate and submit chunked ``Record`` writes or ``Subject`` enrollments from inline
+``-d`` / ``--data KEY=VALUE`` pairs, JSON payloads (``--json`` or ``--file -`` on ``stdin``),
+or CSV/JSON files:
+
+.. code-block:: bash
+
+   imednet records create STUDY --form-key F_VS --subject-key SUBJ-001 --site-name SITE \
+       --interval-name Baseline -d V_WEIGHT=71.4 --schema study_dd.json --dry-run
+   imednet records create STUDY --file ./records_batch.json --schema api --chunk-size 100 \
+       --wait --timeout 300 --interval 5 --format json
+   imednet records import STUDY ./records_batch.csv --schema study_dd.json --wait --format json
+   imednet subjects register STUDY --file ./registrations.json --form-key F_DM \
+       --site-name SITE --skip-existing --subject-key-field SUBJID --schema study_dd.json \
+       --wait --format json
+   imednet subjects register STUDY --form-key F_DM --site-name SITE --subject-key SUBJ-002 \
+       -d V_AGE=42 -d V_GENDER=F --dry-run
+
+All three write commands share pre-submission validation and polling controls:
+
+* ``--schema``: Validate payloads before submission against a canonical ``.json`` Data Dictionary,
+  CDISC ODM ``.xml``, REDCap ``.csv``, a 4-file CSV export directory, or ``api`` (which refreshes
+  live ``Form`` and ``Variable`` definitions via ``SchemaCache``). Payloads containing the
+  redacted ``***MASKED***`` sentinel are rejected before any HTTP write occurs.
+* ``--dry-run``: Execute local schema, ``Site`` eligibility, and deduplication checks without
+  sending HTTP write requests.
+* ``--wait``, ``--timeout`` (default ``300`` seconds), ``--interval`` (default ``5`` seconds),
+  ``--chunk-size``, and ``--email-notify``: Split large batches into bounded POST chunks and
+  optionally poll submitted background ``Job`` batch IDs to a terminal state.
+* ``--skip-existing`` (alias ``--filter-enrolled``) and ``--subject-key-field`` on
+  ``subjects register``: Query active ``Study`` ``Subject`` keys/OIDs first, skip already-enrolled
+  or duplicate cohort entries (reporting the skipped count in ``skippedCount``), and inspect a
+  custom ``Variable`` inside ``data`` (such as ``SUBJID``) when top-level ``subjectKey`` is omitted.
+* ``--format json`` (or ``IMEDNET_CLI_OUTPUT_FORMAT=json``): Emit a ``schemaVersion: "1.0"``
+  envelope for ``records_create``, ``records_import``, or ``subjects_register`` wrapping a
+  ``BatchSubmissionSummary`` item (exiting ``1`` if ``validationReport.is_valid`` is ``false``).
 
 Machine-readable core reads
 ---------------------------
@@ -192,8 +237,23 @@ capped at 500 per page) or ``--all`` to retrieve larger batches. Non-interactive
 file exports (``--output json|csv``) continue to fetch all matching pages unless
 ``--limit`` is explicitly specified.
 
-Export PHI masking, SDTM, and quality-gate controls
----------------------------------------------------
+CDISC standards validation and export controls
+----------------------------------------------
+
+When ``imednet-workflows`` is installed, ``imednet workflows validate-standards`` audits
+live or simulated ``Study`` ``Form``, ``Variable``, and non-deleted ``Record`` payloads
+against CDISC CDASH variable naming heuristics and SDTM readiness rules without writing
+export files. Pass ``--profile`` / ``--standards-profile`` (``general``, ``drug``,
+``biologic``, ``vaccine``, or ``device``), optional ``--domain`` / ``--sdtm-domain``,
+``--min-score`` / ``--min-standards-score`` (exiting ``1`` when the ``Study`` score is
+below threshold), ``--mask-phi`` / ``--no-mask-phi``, and ``--format json``:
+
+.. code-block:: bash
+
+   imednet workflows validate-standards STUDY --profile drug --domain AE --min-score 85
+   imednet workflows validate-standards --study-key STUDY --standards-profile device \
+       --format json --simulation
+   imednet workflows validate-standards STUDY --no-mask-phi --format json
 
 Every ``imednet export`` subcommand (``csv``, ``parquet``, ``excel``, ``json``,
 ``duckdb``, ``sql``, ``mongodb``, ``neo4j``, and ``snowflake``) masks sensitive
@@ -203,17 +263,31 @@ domain outputs, even when ``--use-labels`` or ``--hierarchical`` is active.
 Authorized compliance workflows operating inside a restricted enclave can opt
 out explicitly with ``--no-mask-phi``.
 
-Exports also support native CDISC SDTM transformation (``--as-sdtm`` and
-``--sdtm-domain``), batch-level CDISC standards readiness gating via
-``StandardsReadinessValidator`` (``--standards-profile`` and
-``--min-standards-score``), raw variable casing alignment
-(``--naming-convention snake_case|camelCase|sdtm``), and pre-write ``Record``
-schema readiness filtering (``--quality-gate`` and ``--min-readiness-score``):
+All nine ``imednet export`` subcommands also share incremental checkpointing,
+watermark filtering, CDISC SDTM transformation, and quality-gate flags:
+
+* ``--since``: Export ``Record`` items modified on or after an ISO-8601 timestamp or date.
+* ``--incremental``, ``--stream-name``, and ``--ledger-path``: Read and commit
+  transactional high-water mark checkpoints via ``imednet.state_providers`` (defaulting to
+  ``IMEDNET_WORKFLOW_LEDGER_PATH`` or ``~/.imednet/pipeline_ledger.json`` for file ledgers).
+* ``--include-deleted``: Include voided (``deleted=True``) ``Record`` items in export batches.
+* ``--quality-gate``, ``--no-quality-gate``, and ``--min-readiness-score``: Explicitly enable
+  or disable pre-write ``Record`` schema readiness filtering and set the minimum ``0-100`` threshold.
+* ``--as-sdtm``, ``--sdtm-domain`` (alias ``--domain``), ``--standards-profile``
+  (``general``, ``drug``, or ``device``), ``--min-standards-score``, and
+  ``--naming-convention snake_case|camelCase|sdtm``: Transform exports into CDISC SDTM
+  domains, enforce batch-level ``StandardsReadinessValidator`` thresholds, or normalize raw
+  ``Variable`` column naming.
 
 .. code-block:: bash
 
    imednet export csv STUDY ./ae_sdtm.csv --sdtm-domain AE --standards-profile drug \
        --min-standards-score 85
+   imednet export parquet STUDY ./incremental_records.parquet --incremental \
+       --since 2026-01-01T00:00:00Z --stream-name vitals_parquet \
+       --ledger-path ./export_ledger.json --include-deleted
+   imednet export duckdb STUDY clinical_records ./study.duckdb --incremental \
+       --stream-name duckdb_sync --no-quality-gate
    imednet export parquet STUDY ./aligned_study.parquet --naming-convention snake_case
    imednet export json STUDY ./study_tree.json --hierarchical --use-labels
    imednet export neo4j STUDY bolt://localhost:7687 neo4j "$NEO4J_PASSWORD" \

@@ -27,23 +27,35 @@ environments before upgrading. UAT commands are included; there is no separate
 The package provides CLI commands mapped to registered `imednet.cli_plugins` subcommands.
 
 ```bash
-# Extract clinical records (positional STUDY_KEY or -s/--study-key; supports --simulation)
+# Extract clinical records (positional STUDY_KEY or -s/--study-key; supports --simulation, --interactive, and --no-mask-phi)
 imednet workflows extract-records <STUDY_KEY>
 imednet workflows extract-records --study-key <STUDY_KEY> --simulation --format json
+imednet workflows extract-records <STUDY_KEY> --no-mask-phi --format json
+imednet workflows extract-records --interactive
 
 # Continuous synchronization loop
 imednet workflows sync-worker <STUDY_KEY> --interval 900
 
-# Administrative state checkpoint management (human table or v1 JSON envelope)
+# Administrative state checkpoint management (human table, --interactive wizard, or v1 JSON envelope)
 imednet workflows state show --study-key <STUDY_KEY>
 imednet workflows state show <STUDY_KEY> --format json
 imednet workflows state set --study-key <STUDY_KEY> --stream records --timestamp "2023-10-27T12:00:00Z"
+imednet workflows state reset --study-key <STUDY_KEY> --stream records
+imednet workflows state reset --interactive
 
-# Single subject profile data (supports flags, positionals, hybrids, and --simulation)
+# End-to-end synthetic UAT pipeline (batch or --interactive wizard)
+imednet workflows uat run <STUDY_KEY> --subject-count 2 --simulation
+imednet workflows uat run --interactive
+
+# CDISC CDASH and SDTM standards readiness audit (supports --profile, --domain, --min-score, --no-mask-phi, and --format json)
+imednet workflows validate-standards <STUDY_KEY> --profile drug --domain AE --min-score 85
+imednet workflows validate-standards --study-key <STUDY_KEY> --no-mask-phi --format json
+
+# Single subject profile data (supports flags, positionals, hybrids, --no-mask-phi, and --simulation)
 imednet subject-data --study-key <STUDY_KEY> --subject-key <SUBJECT_KEY>
 imednet subject-data <STUDY_KEY> <SUBJECT_KEY>
 imednet subject-data --study-key <STUDY_KEY> <SUBJECT_KEY>
-imednet subject-data <STUDY_KEY> --subject-key <SUBJECT_KEY>
+imednet subject-data <STUDY_KEY> --subject-key <SUBJECT_KEY> --no-mask-phi
 ```
 
 **Registered Entry Points:**
@@ -54,6 +66,7 @@ The following components are exposed via Python entry points:
 - **Custom Mappers (`imednet.mappers`)**: `RecordMapper`.
 - **Data Loaders (`imednet.loaders`)**: `CachedRecordsLoader`.
 - **Config Stores (`imednet.stores`)**: `ConfigVersionStore`, `TriageStore`.
+- **State Providers (`imednet.state_providers`)**: `default`, `file`, `airflow`.
 
 ## Features
 

@@ -75,6 +75,7 @@ pip install imednet
 
 For extended integrations, you can install optional dependencies:
 ```bash
+pip install "imednet[cli]"
 pip install "imednet[export]"
 pip install "imednet[tui]"
 pip install imednet-workflows

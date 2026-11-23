@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import subprocess
 import sys
@@ -24,10 +25,15 @@ from scripts.validate_docs import (
     _verify_pagination_html,
     _verify_sdk_html,
     check_cli_snippets,
+    check_cli_subcommand_parity,
     check_documented_extras,
+    check_entry_points_parity,
+    check_env_var_parity,
     check_no_duplicate_suppression,
+    check_package_extras_parity,
     check_rendered_api_reference,
     check_todos_in_init,
+    check_tui_bindings_parity,
 )
 
 import imednet.core as core_pkg
@@ -462,3 +468,285 @@ def test_generate_api_reference_preserves_existing_docs_on_staging_failure(
     with pytest.raises(FileNotFoundError):
         monkeypatch.setattr(build_docs_mod.shutil, "which", lambda _t: None)
         require_sphinx_tools("sphinx-apidoc", "sphinx-build")
+
+
+def test_reverse_parity_gates_pass_on_clean_repository() -> None:
+    """All reverse parity gates pass against the synchronized monorepo documentation."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_package_extras_parity(repo_root) is False
+    assert check_entry_points_parity(repo_root) is False
+    assert check_env_var_parity(repo_root) is False
+    assert check_cli_subcommand_parity(repo_root) is False
+    assert check_tui_bindings_parity(repo_root) is False
+
+
+def test_check_package_extras_parity_detects_missing_extra(tmp_path: Path) -> None:
+    """check_package_extras_parity fails when declared extras are omitted from install docs."""
+    core_dir = tmp_path / "packages" / "core"
+    core_dir.mkdir(parents=True)
+    (core_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet"\n'
+        "[project.optional-dependencies]\ncli = []\nexport = []\ntui = []\n",
+        encoding="utf-8",
+    )
+    inc_dir = tmp_path / "docs" / "_includes"
+    inc_dir.mkdir(parents=True)
+    install_rst = inc_dir / "install_extensions.rst"
+    readme_md = tmp_path / "README.md"
+
+    install_rst.write_text(
+        'pip install "imednet[cli]"\npip install "imednet[export]"\npip install "imednet[tui]"\n',
+        encoding="utf-8",
+    )
+    readme_md.write_text(
+        'pip install "imednet[cli]"\npip install "imednet[export]"\npip install "imednet[tui]"\n',
+        encoding="utf-8",
+    )
+    assert check_package_extras_parity(tmp_path) is False
+
+    # Drift: omit imednet[cli] from install_extensions.rst
+    install_rst.write_text(
+        'pip install "imednet[export]"\npip install "imednet[tui]"\n',
+        encoding="utf-8",
+    )
+    assert check_package_extras_parity(tmp_path) is True
+
+    # Restore install_extensions.rst, omit imednet[cli] from root README.md
+    install_rst.write_text(
+        'pip install "imednet[cli]"\npip install "imednet[export]"\npip install "imednet[tui]"\n',
+        encoding="utf-8",
+    )
+    readme_md.write_text(
+        'pip install "imednet[export]"\npip install "imednet[tui]"\n',
+        encoding="utf-8",
+    )
+    assert check_package_extras_parity(tmp_path) is True
+
+
+def test_check_entry_points_parity_detects_missing_group_or_entry(tmp_path: Path) -> None:
+    """check_entry_points_parity fails when pyproject entry points are undocumented."""
+    wf_dir = tmp_path / "packages" / "plugins-workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-workflows"\n'
+        '[project.entry-points."imednet.state_providers"]\n'
+        'default = "imednet_workflows.state_ledger:get_state_provider"\n'
+        'file = "imednet_workflows.state_ledger:FileStateProvider"\n'
+        'airflow = "imednet_workflows.state_ledger:AirflowStateProvider"\n',
+        encoding="utf-8",
+    )
+    wf_readme = wf_dir / "README.md"
+    wf_readme.write_text(
+        "Registers `imednet.state_providers` (`default`, `file`, `airflow`).\n",
+        encoding="utf-8",
+    )
+    assert check_entry_points_parity(tmp_path) is False
+
+    # Drift: omit 'airflow' entry point name
+    wf_readme.write_text(
+        "Registers `imednet.state_providers` (`default`, `file`).\n",
+        encoding="utf-8",
+    )
+    assert check_entry_points_parity(tmp_path) is True
+
+    # Drift: omit group name
+    wf_readme.write_text(
+        "Providers: `default`, `file`, `airflow`.\n",
+        encoding="utf-8",
+    )
+    assert check_entry_points_parity(tmp_path) is True
+
+
+def test_check_env_var_parity_detects_missing_runtime_var(tmp_path: Path) -> None:
+    """check_env_var_parity extracts runtime IMEDNET_* AST constants and flags drift."""
+    src_dir = tmp_path / "packages" / "core" / "src" / "imednet"
+    src_dir.mkdir(parents=True)
+    (src_dir / "cfg.py").write_text(
+        '"""Docstring mentioning IMEDNET_DOCSTRING_ONLY."""\n'
+        "import os\n"
+        'API_KEY = os.getenv("IMEDNET_API_KEY")\n'
+        'STRICT = os.environ.get("IMEDNET_STRICT_MODE", "0")\n',
+        encoding="utf-8",
+    )
+    ref_dir = tmp_path / "docs" / "reference"
+    ref_dir.mkdir(parents=True)
+    config_rst = ref_dir / "configuration.rst"
+    env_example = tmp_path / ".env.example"
+
+    config_rst.write_text(
+        ".. list-table::\n\n"
+        "   * - IMEDNET_API_KEY\n"
+        "     - None\n"
+        "     - Key\n"
+        "   * - IMEDNET_STRICT_MODE\n"
+        "     - 0\n"
+        "     - Strict\n",
+        encoding="utf-8",
+    )
+    env_example.write_text(
+        "IMEDNET_API_KEY=placeholder\n# IMEDNET_STRICT_MODE=0\n",
+        encoding="utf-8",
+    )
+    assert check_env_var_parity(tmp_path) is False
+
+    # Drift in configuration.rst
+    config_rst.write_text(
+        ".. list-table::\n\n   * - IMEDNET_API_KEY\n     - None\n     - Key\n",
+        encoding="utf-8",
+    )
+    assert check_env_var_parity(tmp_path) is True
+
+    # Restore configuration.rst, introduce drift in .env.example
+    config_rst.write_text(
+        ".. list-table::\n\n"
+        "   * - IMEDNET_API_KEY\n"
+        "     - None\n"
+        "     - Key\n"
+        "   * - IMEDNET_STRICT_MODE\n"
+        "     - 0\n"
+        "     - Strict\n",
+        encoding="utf-8",
+    )
+    env_example.write_text("IMEDNET_API_KEY=placeholder\n", encoding="utf-8")
+    assert check_env_var_parity(tmp_path) is True
+
+
+def test_check_cli_subcommand_parity_detects_missing_subcommands_and_export_flags(
+    tmp_path: Path,
+) -> None:
+    """check_cli_subcommand_parity enforces shell examples and shared export flags."""
+    parser = argparse.ArgumentParser(prog="imednet")
+    top = parser.add_subparsers(dest="command")
+
+    studies = top.add_parser("studies")
+    studies_sub = studies.add_subparsers(dest="sub")
+    studies_sub.add_parser("list")
+
+    records = top.add_parser("records")
+    records_sub = records.add_subparsers(dest="sub")
+    rec_create = records_sub.add_parser("create")
+    rec_create.add_argument("--schema")
+    rec_create.add_argument("--dry-run", action="store_true")
+    rec_create.add_argument("--wait", action="store_true")
+
+    export = top.add_parser("export")
+    export_sub = export.add_subparsers(dest="dest")
+    for dest in ("csv", "parquet"):
+        p = export_sub.add_parser(dest)
+        p.add_argument("--since")
+        p.add_argument("--no-quality-gate", action="store_true")
+
+    workflows = top.add_parser("workflows")
+    wf_sub = workflows.add_subparsers(dest="wf_cmd")
+    wf_sub.add_parser("validate-standards")
+
+    howto_dir = tmp_path / "docs" / "how-to"
+    howto_dir.mkdir(parents=True)
+    cli_rst = howto_dir / "cli.rst"
+    wf_dir = tmp_path / "packages" / "plugins-workflows"
+    wf_dir.mkdir(parents=True)
+    wf_readme = wf_dir / "README.md"
+
+    valid_cli_rst = (
+        "CLI Guide\n=========\n\n"
+        "Resources: ``studies``. Exporters: ``csv``, ``parquet``.\n"
+        "Flags: ``--since``, ``--no-quality-gate``, ``--schema``, ``--dry-run``, ``--wait``.\n\n"
+        ".. code-block:: bash\n\n"
+        "   imednet records create <STUDY_KEY> --schema s.json --dry-run --wait\n"
+        "   imednet workflows validate-standards <STUDY_KEY>\n"
+    )
+    cli_rst.write_text(valid_cli_rst, encoding="utf-8")
+    wf_readme.write_text(
+        "```bash\nimednet workflows validate-standards <STUDY_KEY>\n```\n",
+        encoding="utf-8",
+    )
+    assert check_cli_subcommand_parity(tmp_path, parser=parser) is False
+
+    # Drift 1: prose mention of 'records create' without a shell snippet fails
+    cli_rst.write_text(
+        "CLI Guide\n=========\n\n"
+        "Resources: ``studies``. Exporters: ``csv``, ``parquet``.\n"
+        "Write command ``records create`` supports ``--schema``, ``--dry-run``, ``--wait``.\n"
+        "Export flags: ``--since``, ``--no-quality-gate``.\n\n"
+        ".. code-block:: bash\n\n"
+        "   imednet workflows validate-standards <STUDY_KEY>\n",
+        encoding="utf-8",
+    )
+    assert check_cli_subcommand_parity(tmp_path, parser=parser) is True
+
+    # Drift 2: missing shared export flag (--no-quality-gate) fails
+    cli_rst.write_text(
+        valid_cli_rst.replace("``--no-quality-gate``, ", ""),
+        encoding="utf-8",
+    )
+    assert check_cli_subcommand_parity(tmp_path, parser=parser) is True
+
+    # Drift 3: missing workflow subcommand from plugins-workflows/README.md fails
+    cli_rst.write_text(valid_cli_rst, encoding="utf-8")
+    wf_readme.write_text("# Workflows\n", encoding="utf-8")
+    assert check_cli_subcommand_parity(tmp_path, parser=parser) is True
+
+
+def test_check_tui_bindings_parity_detects_missing_bindings_flags_and_false_space_claim(
+    tmp_path: Path,
+) -> None:
+    """check_tui_bindings_parity flags missing bindings/flags and false Space selection claims."""
+    parser = argparse.ArgumentParser(prog="imednet")
+    sub = parser.add_subparsers(dest="command")
+    tui_p = sub.add_parser("tui")
+    tui_p.add_argument("--study-key")
+    tui_p.add_argument("--force", action="store_true")
+    tui_p.add_argument("--simulation", action="store_true")
+
+    app_dir = tmp_path / "packages" / "plugins-tui" / "src" / "imednet_tui"
+    app_dir.mkdir(parents=True)
+    (app_dir / "app.py").write_text(
+        "class StudyList:\n    pass\n\n"
+        "class JobTable:\n"
+        '    BINDINGS = [("delete,backspace", "untrack_selected_job", "Untrack Job")]\n\n'
+        "class JobMonitor:\n"
+        "    MAX_CONCURRENT_POLLS = 5\n\n"
+        "class ImednetTuiApp:\n"
+        '    BINDINGS = [("q", "quit", "Quit"), ("escape", "handle_escape", "Clear Filter")]\n',
+        encoding="utf-8",
+    )
+    tui_readme = tmp_path / "packages" / "plugins-tui" / "README.md"
+    howto_dir = tmp_path / "docs" / "how-to"
+    howto_dir.mkdir(parents=True)
+    cli_rst = howto_dir / "cli.rst"
+
+    valid_readme = (
+        "| `Enter` | Select item in `StudyList` |\n"
+        "| `Delete` / `Backspace` | Untrack Job |\n"
+        "| `Esc` | Clear Filter |\n"
+        "| `q` | Quit |\n"
+        "Polls up to 5 concurrent jobs, shows `Logs`, and switches to `compact` layout.\n"
+        "Flags: `--study-key`, `--force`, `--simulation`.\n"
+    )
+    tui_readme.write_text(valid_readme, encoding="utf-8")
+    cli_rst.write_text(
+        "Keys: ``Delete``, ``Backspace``, ``Esc``, ``q``.\n",
+        encoding="utf-8",
+    )
+    assert check_tui_bindings_parity(tmp_path, parser=parser) is False
+
+    # Drift 1: false Enter / Space selection claim when Space is not bound
+    tui_readme.write_text(
+        valid_readme.replace("| `Enter` |", "| `Enter` / `Space` |"),
+        encoding="utf-8",
+    )
+    assert check_tui_bindings_parity(tmp_path, parser=parser) is True
+
+    # Drift 2: omit Delete keybinding
+    tui_readme.write_text(
+        valid_readme.replace("`Delete` / ", ""),
+        encoding="utf-8",
+    )
+    assert check_tui_bindings_parity(tmp_path, parser=parser) is True
+
+    # Drift 3: omit --force CLI flag
+    tui_readme.write_text(
+        valid_readme.replace("`--force`, ", ""),
+        encoding="utf-8",
+    )
+    assert check_tui_bindings_parity(tmp_path, parser=parser) is True

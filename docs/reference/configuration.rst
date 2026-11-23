@@ -19,17 +19,68 @@ Environment Variables
      - API key used for authentication.
      - None
    * - IMEDNET_SECURITY_KEY
-     - Security key used for authentication.
+     - Security key used for authentication (also used as fallback key material for ``ConfigVersionStore`` when ``IMEDNET_ENCRYPTION_KEY`` is unset).
      - None
    * - IMEDNET_OIDC_TOKEN
      - Optional OIDC bearer token used instead of API/security key pairs.
      - None
+   * - IMEDNET_OIDC_PUBLIC_KEY
+     - Optional PEM public key or shared secret used by ``OIDCAuth`` to verify JWT signatures locally.
+     - None
+   * - IMEDNET_OIDC_JWKS_URL
+     - Optional JWKS endpoint URL queried by ``OIDCAuth`` to resolve signing keys dynamically.
+     - None
+   * - IMEDNET_OIDC_AUDIENCE
+     - Optional expected ``aud`` claim enforced by ``OIDCAuth`` during JWT validation.
+     - None
+   * - IMEDNET_OIDC_ALGORITHMS
+     - Optional comma-separated allowlist of JWS signing algorithms (for example ``RS256,ES256``) accepted by ``OIDCAuth``.
+     - None (key-matched defaults)
+   * - IMEDNET_OIDC_ISSUER
+     - Optional expected ``iss`` claim enforced by ``OIDCAuth`` during JWT validation.
+     - None
+   * - IMEDNET_BASE_URL
+     - Optional base URL override for private or regional deployments (client defaults to ``https://edc.prod.imednetapi.com`` when unset).
+     - None
+   * - IMEDNET_TIMEOUT
+     - Default HTTP request timeout in seconds loaded by :func:`imednet.config.load_config`.
+     - ``30.0``
    * - IMEDNET_SIMULATION_MODE
      - Set to ``true`` / ``1`` (or pass ``--simulation``) to run offline against ``SimulationTransport``.
      - ``false``
-   * - IMEDNET_BASE_URL
-     - Optional base URL for private deployments.
+   * - IMEDNET_STRICT_MODE
+     - Set to ``true`` / ``1`` to raise validation errors on unexpected upstream response drift or untyped scalar coercion.
+     - ``false``
+   * - IMEDNET_STRICT_CDASH
+     - Set to ``true`` / ``1`` to enable opt-in CDASH Variable naming/prefix heuristics on ``MappingRule`` and ``StudyConfiguration``.
+     - ``false``
+   * - IMEDNET_NON_INTERACTIVE
+     - Set to ``1`` / ``true`` / ``yes`` (or pass ``--no-interactive``) to disable full-screen curses grids, ``imednet tui``, live ``stderr`` spinners, and interactive ``stdin`` prompts.
+     - ``false``
+   * - IMEDNET_CLI_OUTPUT_FORMAT
+     - Set to ``json`` to default ``--format``-capable CLI commands and ``datadict diff`` to JSON output unless an explicit ``--format`` flag overrides it.
+     - ``table``
+   * - IMEDNET_HIGH_CONTRAST
+     - Set to ``1`` (or pass ``--high-contrast``) to enable high-contrast palettes across CLI tables, ``InteractiveDataGrid``, and ``imednet tui``.
+     - ``0`` (disabled)
+   * - IMEDNET_OPENAPI_PATH
+     - Optional filesystem path to an OpenAPI specification file overriding bundled contract models in ``imednet.models.engine``.
      - None
+   * - IMEDNET_POSTMAN_PATH
+     - Optional filesystem path to a Postman collection JSON file overriding bundled contract models when ``IMEDNET_OPENAPI_PATH`` is unset.
+     - None
+   * - IMEDNET_CONFIG_DB_PATH
+     - SQLite database file path storing append-only ``StudyConfiguration`` history for ``ConfigVersionStore``.
+     - ``~/.imednet/config_versions.sqlite3``
+   * - IMEDNET_ENCRYPTION_KEY
+     - Optional AES-256 Fernet key or passphrase encrypting ``ConfigVersionStore`` payloads (falls back to ``IMEDNET_SECURITY_KEY`` when unset).
+     - None
+   * - IMEDNET_WORKFLOW_LEDGER_PATH
+     - Default JSON file path storing incremental high-water mark checkpoints for ``FileStateProvider`` / ``ExtractionStateLedger``.
+     - ``~/.imednet/pipeline_ledger.json``
+   * - IMEDNET_TRIAGE_DB_PATH
+     - Default SQLite database file path storing ``Record`` triage items and history for ``TriageStore``.
+     - ``~/.imednet/triage.sqlite3``
    * - IMEDNET_STUDY_KEY
      - Study identifier used by examples and some tests.
      - None

@@ -16,6 +16,7 @@ Install optional destination, lineage, or cloud extras as needed:
 pip install "apache-airflow-providers-imednet[export]"
 pip install "apache-airflow-providers-imednet[duckdb]"
 pip install "apache-airflow-providers-imednet[sinks]"
+pip install "apache-airflow-providers-imednet[workflows]"
 pip install "apache-airflow-providers-imednet[snowflake,mongodb,neo4j]"
 pip install "apache-airflow-providers-imednet[openlineage,amazon]"
 pip install "apache-airflow-providers-imednet[all]"
