@@ -56,6 +56,32 @@ Timeouts
 * You can pass either a float (single timeout applied to all phases) or
   ``httpx.Timeout`` for per-phase timeouts.
 
+Circuit breaker and probe leases
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* ``HTTPClientBase`` initializes a dedicated ``CircuitBreaker`` per client instance
+  (``failure_threshold=5``, ``recovery_timeout=10.0`` seconds,
+  ``half_open_max_probes=1``), isolating ``CircuitState`` across independent
+  ``Study`` clients.
+* ``CircuitState`` progresses through ``CLOSED``, ``OPEN``, and ``HALF_OPEN``:
+  five consecutive ``httpx.RequestError`` or HTTP ``5xx`` outcomes via
+  ``record_failure()`` open the breaker, causing new requests to fail immediately with
+  :class:`imednet.errors.CircuitBreakerError` (subclassing
+  :class:`imednet.errors.ImednetError` directly with ``attempt_count=0`` on
+  :class:`imednet.errors.DiagnosticContext`).
+* After ``recovery_timeout`` elapses, the next request transitions the breaker to
+  ``HALF_OPEN`` and acquires a ``ProbeLease`` (enforcing ``half_open_max_probes=1``).
+  A ``2xx`` response calls ``record_success()`` and returns the breaker to ``CLOSED``;
+  a ``5xx`` or network error re-opens it; and early exits (task cancellation or
+  non-429 ``4xx`` responses) invoke ``ProbeLease.release_if_unsettled()`` so in-flight
+  probe capacity is never leaked.
+* HTTP ``429`` responses invoke ``record_rate_limit()`` rather than
+  ``record_failure()``: in ``CLOSED`` state they leave the consecutive failure counter
+  untouched so rate-limited ``Subject``, ``Site``, ``Form``, ``Record``, ``Visit``,
+  ``Interval``, ``Variable``, ``Query``, ``Data Dictionary``, and ``Job`` traffic is
+  paced by ``Retry-After`` without opening the circuit, whereas in ``HALF_OPEN`` state
+  an HTTP ``429`` immediately re-opens the breaker.
+
 Status-code error mapping
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -372,14 +398,23 @@ Error propagation
   execution, and two means at most three executions. Sink backoff starts at
   ``retry_backoff`` and doubles for each retry. Negative/non-integral retry
   counts and non-finite/negative backoff values are rejected at configuration.
-* Sink configuration and input validation errors are not replayed. Driver
-  exception messages are replaced before entering operation telemetry, because
-  they may contain connection strings or payloads. Export errors report the
-  actual number of destination calls, including zero when a breaker blocks
-  execution, and retain ``batch_id`` without copying the driver message.
-* After all retries are exhausted, sinks raise
-  :class:`~imednet.errors.ExportBatchError` (carries ``batch_id``) so
-  that callers can log and resume partial exports.
+* Every :class:`~imednet.spi.sink_base.ExportSink` instance owns an isolated
+  per-sink ``CircuitBreaker`` (``failure_threshold=5``,
+  ``recovery_timeout=10.0`` seconds, ``half_open_max_probes=1``) passed to
+  ``UniversalExecutor`` inside ``ExportSink._execute_with_retry``, ensuring a
+  failing warehouse or document target never trips sibling sinks or HTTP API
+  clients.
+* Sink configuration and input validation errors are not replayed and do not
+  poison the sink ``CircuitBreaker``. Driver exception messages are replaced
+  before entering operation telemetry, because they may contain connection
+  strings or payloads. Export errors report the actual number of destination
+  calls—including ``0`` attempts when an open sink ``CircuitBreaker`` blocks
+  execution before invoking the driver—and retain ``batch_id`` while chaining
+  the sanitized :class:`~imednet.errors.CircuitBreakerError` without copying
+  the raw driver message.
+* After all retries are exhausted (or when blocked by an open sink breaker),
+  sinks raise :class:`~imednet.errors.ExportBatchError` (carries ``batch_id``)
+  so that callers can log and resume partial exports.
 * Misconfiguration (missing credentials, invalid URIs) raises
   :class:`~imednet.errors.ExportConfigurationError` immediately before
   any data is written.
@@ -437,6 +472,77 @@ Adding New Export Sinks
 5. Expose it through :mod:`imednet_sinks` and its plugin entry points without adding
    static plugin imports to core.
 6. Add unit tests; run the canonical verification tasks in :doc:`/how-to/verification`.
+
+Restricted AST Business Logic Sandbox
+-------------------------------------
+
+User-authored :class:`~imednet.models.study_config.MappingRule` ``business_logic``
+expressions run inside :class:`~imednet.utils.RestrictedAstEvaluator` (via
+:func:`~imednet.utils.parse_expression`, :func:`~imednet.utils.evaluator.validate_ast`,
+and :func:`~imednet.utils.evaluate_expression`) rather than Python ``eval``:
+
+* **Explicit AST node allowlist:** Only pure scalar, arithmetic, boolean, comparison,
+  ternary ``IfExp``, container literal, subscript/slice, public attribute read, and
+  allowlisted call nodes are permitted; statements, lambdas, comprehensions, ``await``,
+  and f-strings (``JoinedStr`` / ``FormattedValue``) raise
+  :class:`~imednet.errors.RestrictedEvaluationError`.
+* **Bounded call surface:** Free function calls are restricted to
+  ``DEFAULT_SAFE_FUNCTIONS`` (``float``, ``int``, ``str``, ``bool``, ``len``), and
+  method calls are restricted to ``DEFAULT_SAFE_METHODS`` (read-only string, ``dict``,
+  ``list``/``tuple``, and ``set`` inspection helpers). Private ``_`` attributes,
+  ``.format`` / ``.format_map`` (which could otherwise traverse object attributes via
+  format strings), and mutating methods (such as ``clear``, ``pop``, ``update``, or
+  ``append``) are rejected before execution so rule evaluation cannot escape the
+  sandbox or mutate shared ``Record`` payloads.
+* **Non-fatal pipeline fallback:** ``EnrichmentPipeline``,
+  :func:`~imednet.spi.models.transform_records_to_sdtm_rows`, and
+  ``extract_canonical_records`` catch :class:`~imednet.errors.RestrictedEvaluationError`
+  (and runtime :class:`~imednet.errors.EvaluationError`) per rule, log a warning, and
+  preserve the raw or configured fallback ``Variable`` value.
+
+.. testcode::
+
+   from imednet.errors import EvaluationError, RestrictedEvaluationError
+   from imednet.utils import (
+       RestrictedAstEvaluator,
+       evaluate_expression,
+       parse_expression,
+   )
+   from imednet.utils.evaluator import (
+       DEFAULT_SAFE_FUNCTIONS,
+       DEFAULT_SAFE_METHODS,
+       validate_ast,
+   )
+
+   assert set(DEFAULT_SAFE_FUNCTIONS) == {"float", "int", "str", "bool", "len"}
+   assert "format" not in DEFAULT_SAFE_METHODS
+   assert "format_map" not in DEFAULT_SAFE_METHODS
+   assert "clear" not in DEFAULT_SAFE_METHODS
+
+   parsed_tree = parse_expression("float(value.strip()) * 2.2")
+   validate_ast(parsed_tree)
+   evaluator = RestrictedAstEvaluator("float(value.strip()) * 2.2")
+   assert round(evaluator.evaluate({"value": " 70.0 "}), 1) == 154.0
+   assert evaluate_expression("payload.get('UNIT', 'kg').upper()", {"payload": {"UNIT": "kg"}}) == "KG"
+
+   for blocked_expr in ("'{0.__class__}'.format(value)", "f'{value}'", "payload.clear()"):
+       blocked = False
+       try:
+           evaluate_expression(
+               blocked_expr,
+               {"value": "70", "payload": {"UNIT": "kg"}},
+               raise_on_error=True,
+           )
+       except RestrictedEvaluationError:
+           blocked = True
+       assert blocked
+
+   runtime_failed = False
+   try:
+       evaluate_expression("int(value)", {"value": "bad"}, raise_on_error=True)
+   except EvaluationError:
+       runtime_failed = True
+   assert runtime_failed
 
 Static boundary checks
 ----------------------
