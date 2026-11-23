@@ -76,9 +76,10 @@ Release acceptance checklist
 ----------------------------
 
 The repository maintainer owns acceptance and any documented exception. Before
-merging a release PR, review each package's changelog, dependency bounds, install
-recipes and compatibility notes; run the verification and package-consumption
-gates. Preserve OIDC trusted publishing, pinned Actions and existing permissions.
+merging a release PR, review each package's :doc:`changelog <changelogs/index>`,
+dependency bounds, install recipes and compatibility notes; run the verification
+and package-consumption gates. Preserve OIDC trusted publishing, pinned Actions
+and existing permissions.
 Release-please remains the sole version authority; never manually change versions
 or publish from a feature PR.
 

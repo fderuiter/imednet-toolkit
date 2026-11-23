@@ -48,8 +48,11 @@ def test_spi_cli_exports_shared_helpers() -> None:
         "add_simulation_arg",
         "add_study_key_args",
         "cli_execution_guard",
+        "load_offline_schema",
+        "parse_email_notify",
         "positive_int",
         "redact_cli_secrets",
+        "resolve_cli_schema",
         "resolve_hybrid_study_and_key",
         "resolve_study_key",
         "simulation_mode_context",
@@ -473,3 +476,139 @@ def test_validate_standards_supports_simulation_and_study_key_flag(
     assert payload["study_key"] == "STUDY"
     assert payload["passed"] is False
     assert "score" in payload
+
+
+def test_spi_parse_email_notify_normalizes_and_rejects_invalid_headers() -> None:
+    """Verify spi_cli.parse_email_notify normalizes booleans/emails and rejects header injection."""
+    assert spi_cli.parse_email_notify(None) is None
+    assert spi_cli.parse_email_notify(True) is True
+    assert spi_cli.parse_email_notify(" TRUE ") is True
+    assert spi_cli.parse_email_notify("false") is False
+    assert spi_cli.parse_email_notify("  ops@example.com  ") == "ops@example.com"
+
+    for bad_input in (
+        "",
+        "   ",
+        "ops@example.com\n",
+        "ops@example.com\r\nX-Injected: 1",
+        "not-an-email",
+        "tru",
+        "bad email@example.com",
+        "@example.com",
+        "user@",
+        "user@localhost",
+    ):
+        with pytest.raises(ValueError, match="email-notify"):
+            spi_cli.parse_email_notify(bad_input)
+
+
+def test_spi_load_offline_schema_supports_json_odm_redcap_and_csv_dir(tmp_path: Path) -> None:
+    """Verify spi_cli.load_offline_schema loads JSON, ODM XML, REDCap CSV, CSV dirs, and ZIP bundles."""
+    import zipfile
+
+    from imednet import ImednetSDK
+    from imednet.datadict import Choice, DataDictionary, Form, Metadata, Variable
+
+    dd = DataDictionary(
+        metadata=Metadata.create(study_key="STUDY"),
+        forms=[
+            Form(
+                formKey="F_DM",
+                formName="Demographics",
+                variables=[
+                    Variable(
+                        variableName="V_SEX",
+                        variableType="Radio",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceValue="F", choiceText="Female"),
+                            Choice(choiceValue="M", choiceText="Male"),
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+
+    # 1. JSON DataDictionary
+    json_path = tmp_path / "dd.json"
+    json_path.write_text(dd.model_dump_json(indent=2), encoding="utf-8")
+    loaded_json = spi_cli.load_offline_schema(str(json_path), study_key="STUDY")
+    assert "V_SEX" in loaded_json.variables_for_form("F_DM")
+
+    # 2. CSV directory (4-file package) + .zip archive
+    csv_dir = tmp_path / "csv_bundle"
+    csv_dir.mkdir()
+    (csv_dir / "FORMS.csv").write_text(
+        "formId,formKey,formType,formName\n1,F_DM,DataEntry,Demographics\n",
+        encoding="utf-8",
+    )
+    (csv_dir / "QUESTIONS.csv").write_text(
+        "formKey,variableName,variableType,label,required\nF_DM,V_SEX,Radio,Sex,Yes\n",
+        encoding="utf-8",
+    )
+    (csv_dir / "CHOICES.csv").write_text(
+        "formKey,variableName,choiceValue,choiceText\nF_DM,V_SEX,F,Female\nF_DM,V_SEX,M,Male\n",
+        encoding="utf-8",
+    )
+    (csv_dir / "BUSINESS_LOGIC.csv").write_text(
+        "id,name,status,formKey,logic\n",
+        encoding="utf-8",
+    )
+    loaded_dir = spi_cli.load_offline_schema(str(csv_dir), study_key="STUDY")
+    assert "V_SEX" in loaded_dir.variables_for_form("F_DM")
+
+    zip_path = tmp_path / "csv_bundle.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for csv_name in ("FORMS.csv", "QUESTIONS.csv", "CHOICES.csv", "BUSINESS_LOGIC.csv"):
+            zf.write(csv_dir / csv_name, arcname=csv_name)
+    loaded_zip = spi_cli.load_offline_schema(str(zip_path), study_key="STUDY")
+    assert "V_SEX" in loaded_zip.variables_for_form("F_DM")
+
+    # 3. CDISC ODM XML
+    odm_path = tmp_path / "study.xml"
+    odm_path.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3.2">
+  <Study OID="S.STUDY">
+    <GlobalVariables>
+      <StudyName>Study</StudyName>
+      <StudyDescription>Desc</StudyDescription>
+      <ProtocolName>Proto</ProtocolName>
+    </GlobalVariables>
+    <MetaDataVersion OID="MDV.1" Name="v1">
+      <FormDef OID="F_DM" Name="Demographics" Repeating="No">
+        <ItemGroupRef ItemGroupOID="IG_DM" Mandatory="Yes"/>
+      </FormDef>
+      <ItemGroupDef OID="IG_DM" Name="Demographics" Repeating="No">
+        <ItemRef ItemOID="IT_AGE" Mandatory="Yes"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT_AGE" Name="V_AGE" DataType="integer"/>
+    </MetaDataVersion>
+  </Study>
+</ODM>""",
+        encoding="utf-8",
+    )
+    loaded_odm = spi_cli.load_offline_schema(str(odm_path), study_key="STUDY")
+    assert "IT_AGE" in loaded_odm.variables_for_form("F_DM")
+
+    # 4. REDCap CSV
+    redcap_path = tmp_path / "redcap_dd.csv"
+    redcap_path.write_text(
+        "Variable / Field Name,Form Name,Section Header,Field Type,Field Label,"
+        "Choices, Calculations, OR Slider Labels,Field Note,Text Validation Type OR Show Slider Number,"
+        "Text Validation Min,Text Validation Max,Identifier?,Branching Logic (Show field only if...),"
+        "Required Field?,Custom Alignment,Question Number (surveys only),Matrix Group Name,"
+        "Matrix Ranking?,Field Annotation\n"
+        "v_age,f_dm,,text,Age,,,integer,18,90,,,y,,,,,\n",
+        encoding="utf-8",
+    )
+    loaded_redcap = spi_cli.load_offline_schema(str(redcap_path), study_key="STUDY")
+    assert len(loaded_redcap.forms) >= 1  # type: ignore[attr-defined]
+
+    # 5. resolve_cli_schema with 'api' and None
+    with ImednetSDK(simulation_mode=True) as sdk:
+        assert spi_cli.resolve_cli_schema(sdk, "STUDY", None) is None
+        api_cache = spi_cli.resolve_cli_schema(sdk, "STUDY", "api")
+        assert api_cache is not None
+        assert len(api_cache.variables_for_form("F_DM", study_key="STUDY")) >= 1

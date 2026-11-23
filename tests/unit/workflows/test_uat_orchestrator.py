@@ -74,12 +74,123 @@ def test_builder_builds_spec(snapshot):
 def test_builder_builds_spec_with_no_active_sites(snapshot):
     snapshot.sites[0].site_enrollment_status = "Closed"
     builder = UATSpecificationBuilder()
-    spec = builder.build(snapshot)
-    assert spec.subject_specs[0].site_name == "Site1"
+    with pytest.raises(ValueError, match="open sites"):
+        builder.build(snapshot)
+
+    with pytest.raises(ValueError, match="not eligible for enrollment"):
+        builder.build(snapshot, site_name="Site1")
+
+    with pytest.raises(ValueError, match="not found"):
+        builder.build(snapshot, site_name="UnknownSite")
 
     snapshot.sites = []
     spec = builder.build(snapshot)
     assert spec.subject_specs[0].site_name == "Default Site"
+
+
+def test_builder_upstream_subject_forms_exclusions_and_active_intervals():
+    snap = StudySnapshot(
+        study_key="UPSTREAM_STUDY",
+        forms=[
+            Form(
+                form_key="F_DM",
+                form_name="Demographics",
+                form_type="Subject",
+                subject_record_report=True,
+            ),
+            Form(form_key="F_VS", form_name="Vital Signs", form_type="Subject"),
+            Form(
+                form_key="F_AE",
+                form_name="Adverse Events",
+                form_type="Subject",
+                unscheduled_visit=True,
+            ),
+            Form(
+                form_key="F_LOG",
+                form_name="Other Log",
+                form_type="Subject",
+                other_forms=True,
+            ),
+            Form(form_key="F_SITE", form_name="Site Setup", form_type="Site"),
+            Form(form_key="F_STUDY", form_name="Study Setup", form_type="Study"),
+            Form(form_key="F_ADMIN", form_name="Admin Log", form_type="Admin"),
+            Form(
+                form_key="F_DISABLED",
+                form_name="Disabled Form",
+                form_type="Subject",
+                disabled=True,
+            ),
+        ],
+        variables=[
+            Variable(
+                form_key="F_DM",
+                variable_name="AGE",
+                variable_key="VK_AGE",
+                variable_type="Number",
+            ),
+            Variable(
+                form_key="F_DM",
+                variable_name="COUNTRY",
+                variable_key="VK_COUNTRY",
+                variable_type="Dropdown",
+            ),
+            Variable(
+                form_key="F_DM",
+                variable_name="DEL_VAR",
+                variable_key="VK_DEL",
+                variable_type="Text",
+                deleted=True,
+            ),
+            Variable(
+                form_key="F_DM",
+                variable_name="DIS_VAR",
+                variable_key="VK_DIS",
+                variable_type="Text",
+                disabled=True,
+            ),
+            Variable(
+                form_key="F_VS",
+                variable_name="SYSBP",
+                variable_key="VK_BP",
+                variable_type="Number",
+            ),
+        ],
+        intervals=[
+            Interval(
+                interval_name="DisabledVisit",
+                disabled=True,
+                forms=[{"form_id": 2, "form_key": "F_VS", "form_name": "Vital Signs"}],
+            ),
+            Interval(
+                interval_name="ActiveBaseline",
+                disabled=False,
+                forms=[{"form_id": 2, "form_key": "F_VS", "form_name": "Vital Signs"}],
+            ),
+        ],
+        sites=[
+            Site(site_name="ClosedSite", site_enrollment_status="Enrollment Closed"),
+            Site(site_name="OpenSite", site_enrollment_status="Enrollment Open"),
+        ],
+    )
+
+    spec = UATSpecificationBuilder().build(snap, subject_count=2)
+    assert spec.spec_version == "1.0"
+    assert spec.subject_specs[0].site_name == "OpenSite"
+    assert [f.form_key for f in spec.form_specs] == ["F_DM", "F_VS", "F_AE"]
+
+    dm_spec = next(f for f in spec.form_specs if f.form_key == "F_DM")
+    assert dm_spec.test_type == RecordTestType.REGISTER_SUBJECT
+    assert [v.variable_name for v in dm_spec.variables] == ["AGE", "COUNTRY"]
+    country_spec = next(v for v in dm_spec.variables if v.variable_name == "COUNTRY")
+    assert country_spec.variable_type == "Dropdown"
+
+    vs_spec = next(f for f in spec.form_specs if f.form_key == "F_VS")
+    assert vs_spec.test_type == RecordTestType.UPDATE_SCHEDULED_RECORD
+    assert vs_spec.interval_name == "ActiveBaseline"
+
+    ae_spec = next(f for f in spec.form_specs if f.form_key == "F_AE")
+    assert ae_spec.test_type == RecordTestType.CREATE_NEW_RECORD
+    assert ae_spec.interval_name is None
 
 
 def test_workflow_run_pipeline(mock_sdk, snapshot):
@@ -482,23 +593,199 @@ def test_builder_and_workflow_consume_data_dictionary(mock_sdk):
 
     res = workflow.run("TEST_STUDY")
     assert res.overall_success is True
+    workflow.submit.assert_called_once()
+    assert workflow.submit.call_args.kwargs["schema"] is dd
     payload = res.record_sets[0].payloads[0]
     assert payload["data"]["SEX"] in {"M", "F"}
-    assert 21 <= int(payload["data"]["AGE"]) <= 65
-    # Generated string choices validate cleanly when numeric AGE is coerced or checked
+    assert isinstance(payload["data"]["AGE"], int)
+    assert 21 <= payload["data"]["AGE"] <= 65
     for token in payload["data"]["RACE"].split("`"):
         assert token in {"ASIAN", "WHITE"}
     validate_record_entry(
         dd,
         {
             "formKey": "F_DM",
-            "data": {
-                "SEX": payload["data"]["SEX"],
-                "AGE": int(payload["data"]["AGE"]),
-                "RACE": payload["data"]["RACE"],
-            },
+            "data": payload["data"],
         },
     )
+
+
+def test_workflow_run_tags_subjects_forwards_schema_and_reuses_uat_subjects_on_rerun():
+    """Repeated UATWorkflow.run calls with skip_existing_subjects=True enroll zero duplicate subjects."""
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.datadict import Choice, DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+    from imednet.simulation import SimulationState, create_simulation_transport
+    from imednet_workflows.uat.submission import subject_has_keyword
+
+    state = SimulationState()
+    state.forms = [
+        {
+            "studyKey": "STUDY",
+            "formId": 1,
+            "formKey": "F_DM",
+            "formName": "Demographics",
+            "formType": "Subject",
+            "subjectRecordReport": True,
+            "unscheduledVisit": False,
+            "otherForms": False,
+            "disabled": False,
+        },
+        {
+            "studyKey": "STUDY",
+            "formId": 2,
+            "formKey": "F_VS",
+            "formName": "Vital Signs",
+            "formType": "Subject",
+            "subjectRecordReport": False,
+            "unscheduledVisit": False,
+            "otherForms": False,
+            "disabled": False,
+        },
+        {
+            "studyKey": "STUDY",
+            "formId": 3,
+            "formKey": "F_OTHER",
+            "formName": "Other Form",
+            "formType": "Subject",
+            "subjectRecordReport": False,
+            "unscheduledVisit": False,
+            "otherForms": True,
+            "disabled": False,
+        },
+        {
+            "studyKey": "STUDY",
+            "formId": 4,
+            "formKey": "F_SITE",
+            "formName": "Site Form",
+            "formType": "Site",
+            "subjectRecordReport": False,
+            "unscheduledVisit": False,
+            "otherForms": False,
+            "disabled": False,
+        },
+    ]
+    state.variables = [
+        {
+            "studyKey": "STUDY",
+            "variableId": 10,
+            "formId": 1,
+            "formKey": "F_DM",
+            "variableName": "AGE",
+            "variableType": "Number",
+            "deleted": False,
+            "disabled": False,
+        },
+        {
+            "studyKey": "STUDY",
+            "variableId": 11,
+            "formId": 1,
+            "formKey": "F_DM",
+            "variableName": "COUNTRY",
+            "variableType": "Dropdown",
+            "deleted": False,
+            "disabled": False,
+        },
+        {
+            "studyKey": "STUDY",
+            "variableId": 12,
+            "formId": 1,
+            "formKey": "F_DM",
+            "variableName": "OBS_DELETED",
+            "variableType": "Text",
+            "deleted": True,
+            "disabled": False,
+        },
+        {
+            "studyKey": "STUDY",
+            "variableId": 20,
+            "formId": 2,
+            "formKey": "F_VS",
+            "variableName": "WEIGHT",
+            "variableType": "Float",
+            "deleted": False,
+            "disabled": False,
+        },
+    ]
+    state.intervals = [
+        {
+            "studyKey": "STUDY",
+            "intervalId": 1,
+            "intervalName": "DisabledVisit",
+            "disabled": True,
+            "forms": [{"formId": 2, "formKey": "F_VS", "formName": "Vital Signs"}],
+        },
+        {
+            "studyKey": "STUDY",
+            "intervalId": 2,
+            "intervalName": "Baseline",
+            "disabled": False,
+            "forms": [{"formId": 2, "formKey": "F_VS", "formName": "Vital Signs"}],
+        },
+    ]
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_DM",
+                variables=[
+                    DDVariable(
+                        variableName="AGE",
+                        variableType="Integer",
+                        required="Yes",
+                        extraAttributes={"minValue": 18, "maxValue": 80},
+                    ),
+                    DDVariable(
+                        variableName="COUNTRY",
+                        variableType="Dropdown",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="United States", choiceValue="US"),
+                            Choice(choiceText="Canada", choiceValue="CA"),
+                        ],
+                    ),
+                ],
+            ),
+            DDForm(
+                formKey="F_VS",
+                variables=[
+                    DDVariable(variableName="WEIGHT", variableType="Float", required="Yes"),
+                ],
+            ),
+        ]
+    )
+
+    sim_transport = create_simulation_transport(state)
+    sdk = ImednetSDK(
+        transport=httpx.MockTransport(sim_transport.handle_request),
+        simulation_mode=True,
+    )
+
+    pre_run_count = len(list(sdk.subjects.list("STUDY")))
+    wf = UATWorkflow(sdk, poll_interval=0.01, seed=11, data_dictionary=dd)
+
+    res1 = wf.run("STUDY", subject_count=2)
+    assert res1.overall_success is True
+    assert res1.submission_result is not None
+    assert len(res1.submission_result.registration_batches) == 1
+    assert len(res1.submission_result.enrolled_subject_keys) == 2
+
+    subjects_after_first = list(sdk.subjects.list("STUDY"))
+    assert len(subjects_after_first) == pre_run_count + 2
+    uat_subjects = [s for s in subjects_after_first if subject_has_keyword(s, "UAT")]
+    assert len(uat_subjects) == 2
+
+    res2 = wf.run("STUDY", subject_count=2)
+    assert res2.overall_success is True
+    assert res2.submission_result is not None
+    assert len(res2.submission_result.registration_batches) == 0
+    assert "F_DM" in res2.submission_result.skipped_forms
+
+    subjects_after_second = list(sdk.subjects.list("STUDY"))
+    assert len(subjects_after_second) == len(subjects_after_first)
 
 
 def test_sdk_singleton_consecutive_uat_runs_without_reset():
@@ -607,3 +894,206 @@ def test_workflow_run_monitoring_poll_summary_any_failed_transitions_to_failed(m
     assert result2.failure_phase == UATWorkflowState.MONITORING
     assert result2.overall_success is False
     assert "batch-rec-err" in (result2.error_message or "")
+
+
+def test_builder_and_workflow_reject_missing_or_ineligible_sites(mock_sdk, snapshot):
+    """Explicit missing/ineligible site_name and custom spec Sites raise ValueError without fallback."""
+    from imednet.spi.models import Site
+    from imednet_workflows.uat.models import UATSubjectSpec, UATWorkflowState
+
+    snapshot.sites = [
+        Site(site_name="ActiveSite", site_enrollment_status="Active"),
+        Site(site_name="ClosedSite", site_enrollment_status="Closed"),
+    ]
+    builder = UATSpecificationBuilder()
+
+    # Default selection still chooses ActiveSite when site_name is None
+    default_spec = builder.build(snapshot)
+    assert default_spec.subject_specs[0].site_name == "ActiveSite"
+
+    # Explicit unmatched site_name raises ValueError instead of falling back to ActiveSite
+    with pytest.raises(ValueError, match="not found"):
+        builder.build(snapshot, site_name="GhostSite")
+
+    # Explicit closed site_name raises ValueError
+    with pytest.raises(ValueError, match="not eligible for enrollment"):
+        builder.build(snapshot, site_name="ClosedSite")
+
+    # UATWorkflow.run also raises ValueError for explicit missing/closed site and custom spec Site
+    workflow = UATWorkflow(mock_sdk)
+    workflow.inspect = MagicMock(return_value=snapshot)
+    workflow.submit = MagicMock()
+
+    with pytest.raises(ValueError, match="not found"):
+        workflow.run("TEST_STUDY", site_name="GhostSite")
+    assert workflow.state == UATWorkflowState.FAILED
+    workflow.submit.assert_not_called()
+
+    bad_custom_spec = default_spec.model_copy(
+        update={"subject_specs": [UATSubjectSpec(site_name="ClosedSite", subject_count=1)]}
+    )
+    with pytest.raises(ValueError, match="not eligible for enrollment"):
+        workflow.run("TEST_STUDY", spec=bad_custom_spec)
+    assert workflow.state == UATWorkflowState.FAILED
+    workflow.submit.assert_not_called()
+
+
+def test_builder_rejects_unknown_or_disabled_form_keys_and_stores_seed(snapshot):
+    """UATSpecificationBuilder.build raises ValueError on unknown/disabled form keys and stores seed."""
+    snapshot_with_disabled = StudySnapshot(
+        study_key="TEST_STUDY",
+        forms=[
+            *snapshot.forms,
+            Form(form_key="DIS", form_name="Disabled Form", form_type="DataEntry", disabled=True),
+        ],
+        variables=snapshot.variables,
+        intervals=snapshot.intervals,
+        sites=snapshot.sites,
+    )
+    builder = UATSpecificationBuilder()
+
+    with pytest.raises(ValueError, match="unknown form key"):
+        builder.build(snapshot_with_disabled, enabled_form_keys=["NO_SUCH_FORM"])
+
+    with pytest.raises(ValueError, match="disabled form key"):
+        builder.build(snapshot_with_disabled, enabled_form_keys=["DIS"])
+
+    with pytest.raises(ValueError, match="at least one active form"):
+        builder.build(snapshot_with_disabled, enabled_form_keys=[])
+
+    seeded = builder.build(snapshot_with_disabled, enabled_form_keys=["F1"], seed=99)
+    assert seeded.seed == 99
+    assert [f.form_key for f in seeded.form_specs] == ["F1"]
+
+
+def test_uat_run_result_overall_success_false_on_vacuous_zero_form_live_run(mock_sdk, snapshot):
+    """Zero-Form live UATRunResult and UATWorkflow.run report overall_success=False despite vacuous JobPollSummary."""
+    from imednet.spi.utils import JobPollSummary
+    from imednet_workflows.uat.models import UATSubjectSpec, UATWorkflowState
+
+    vacuous_poll = JobPollSummary(
+        study_key="TEST_STUDY", results={}, failures={}, elapsed_total=0.0
+    )
+    assert vacuous_poll.all_successful is True
+
+    empty_spec = UATSpecification(
+        study_key="TEST_STUDY",
+        study_name="TEST_STUDY",
+        subject_specs=[UATSubjectSpec(site_name="Site1", subject_count=1)],
+        form_specs=[],
+    )
+    empty_sub = SubmissionResult(study_key="TEST_STUDY", started_at=datetime.now(timezone.utc))
+    vacuous_result = UATRunResult(
+        study_key="TEST_STUDY",
+        started_at=datetime.now(timezone.utc),
+        spec=empty_spec,
+        record_sets=[],
+        submission_result=empty_sub,
+        poll_summary=vacuous_poll,
+    )
+    assert vacuous_result.overall_success is False
+    assert "Overall: FAIL" in vacuous_result.summary()
+
+    workflow = UATWorkflow(mock_sdk)
+    workflow.inspect = MagicMock(return_value=snapshot)
+    workflow.submit = MagicMock()
+    workflow.monitor = MagicMock()
+
+    run_res = workflow.run("TEST_STUDY", spec=empty_spec)
+    assert run_res.state == UATWorkflowState.FAILED
+    assert run_res.overall_success is False
+    workflow.submit.assert_not_called()
+    workflow.monitor.assert_not_called()
+
+
+def test_workflow_dry_run_validates_payloads_without_submitting(mock_sdk):
+    """UATWorkflow.run(dry_run=True) validates generated records via validate_records_batch with zero writes."""
+    from imednet.datadict import Choice, DataDictionary, Metadata
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVar
+    from imednet_workflows.uat.models import UATWorkflowState, VariableTestStrategy
+
+    reg_snapshot = StudySnapshot(
+        study_key="TEST_STUDY",
+        forms=[Form(form_key="REG", form_name="Registration", form_type="Enrollment")],
+        variables=[
+            Variable(
+                form_key="REG", variable_name="AGE", variable_key="VK_AGE", variable_type="Integer"
+            ),
+            Variable(
+                form_key="REG", variable_name="GENDER", variable_key="VK_GEN", variable_type="Radio"
+            ),
+        ],
+        intervals=[],
+        sites=[Site(site_name="Site1", site_enrollment_status="Active")],
+    )
+
+    dd = DataDictionary(
+        metadata=Metadata.create(study_key="TEST_STUDY"),
+        forms=[
+            DDForm(
+                formKey="REG",
+                formName="Registration",
+                variables=[
+                    DDVar(
+                        variableName="AGE",
+                        variableType="Integer",
+                        required="Yes",
+                        extraAttributes={"minValue": 21, "maxValue": 65},
+                    ),
+                    DDVar(
+                        variableName="GENDER",
+                        variableType="Radio",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceValue="F", choiceText="Female"),
+                            Choice(choiceValue="M", choiceText="Male"),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    observed_phases: list[UATWorkflowState] = []
+    workflow = UATWorkflow(
+        mock_sdk, seed=11, data_dictionary=dd, on_phase_change=observed_phases.append
+    )
+    workflow.inspect = MagicMock(return_value=reg_snapshot)
+    workflow.submit = MagicMock()
+    workflow.monitor = MagicMock()
+
+    dry_res = workflow.run(
+        "TEST_STUDY",
+        subject_count=2,
+        enabled_form_keys=["REG"],
+        dry_run=True,
+    )
+    assert dry_res.dry_run is True
+    assert dry_res.state == UATWorkflowState.COMPLETED
+    assert dry_res.overall_success is True
+    assert dry_res.validation_report is not None
+    assert dry_res.validation_report.is_valid is True
+    assert dry_res.validation_report.valid_records == 2
+    assert observed_phases == [
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.BUILDING_SPEC,
+        UATWorkflowState.GENERATING,
+        UATWorkflowState.COMPLETED,
+    ]
+    workflow.submit.assert_not_called()
+    workflow.monitor.assert_not_called()
+
+    # Violating numeric min_value via a custom FIXED strategy transitions dry_run to FAILED
+    bad_spec = dry_res.spec.model_copy(deep=True)
+    for var_spec in bad_spec.form_specs[0].variables:
+        if var_spec.variable_name == "AGE":
+            var_spec.strategy = VariableTestStrategy.FIXED
+            var_spec.fixed_value = 10  # below minValue=21
+    bad_dry_res = workflow.run("TEST_STUDY", spec=bad_spec, schema=dd, dry_run=True)
+    assert bad_dry_res.dry_run is True
+    assert bad_dry_res.state == UATWorkflowState.FAILED
+    assert bad_dry_res.overall_success is False
+    assert bad_dry_res.validation_report.is_valid is False
+    assert bad_dry_res.validation_report.error_count >= 1
+    workflow.submit.assert_not_called()

@@ -55,7 +55,10 @@ Usage
     from imednet_sinks import MongoDbExportSink, MongoDbSinkConfig
     from imednet_workflows.data_extraction import DataExtractionWorkflow
 
-    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+    sdk = ImednetSDK(
+        api_key=os.environ["IMEDNET_API_KEY"],
+        security_key=os.environ["IMEDNET_SECURITY_KEY"],
+    )
     records = DataExtractionWorkflow(sdk).extract_records_by_criteria(
         study_key="MYSTUDY",
     )

@@ -44,7 +44,10 @@ Usage
     from imednet_sinks import Neo4jExportSink, Neo4jSinkConfig
     from imednet_workflows.data_extraction import DataExtractionWorkflow
 
-    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+    sdk = ImednetSDK(
+        api_key=os.environ["IMEDNET_API_KEY"],
+        security_key=os.environ["IMEDNET_SECURITY_KEY"],
+    )
     records = DataExtractionWorkflow(sdk).extract_records_by_criteria(
         study_key="MYSTUDY",
     )
@@ -64,6 +67,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -73,7 +77,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import NonCallableMock
 
-from imednet.errors import ExportConfigurationError
+from imednet.errors import ExportBatchError, ExportConfigurationError
 from imednet.sdk import ImednetSDK
 from imednet.spi.sink_base import (
     _redact_uri,
@@ -90,10 +94,16 @@ from imednet.spi.sinks import (
     extract_record_id,
     iter_staged_sdtm_records,
     normalize_sink_value,
+    resolve_sdtm_domain,
     run_streaming_export,
 )
 
 logger = logging.getLogger(__name__)
+
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
+_CYPHER_PROP_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SDTM_DOMAIN_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_SDTM_SEQ_PROP_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*SEQ$")
 
 
 @dataclass
@@ -201,6 +211,16 @@ def _build_convention_cypher(
     visit_prop: str,
 ) -> tuple[str, str]:
     """Build MERGE and CREATE Cypher statements aligned to a naming convention."""
+    for prop_name, prop_val in (
+        ("study_prop", study_prop),
+        ("subject_prop", subject_prop),
+        ("record_prop", record_prop),
+        ("visit_prop", visit_prop),
+    ):
+        if not isinstance(prop_val, str) or not _CYPHER_PROP_PATTERN.fullmatch(prop_val):
+            raise ExportConfigurationError(
+                f"Neo4j Cypher property {prop_name} contains invalid characters: {prop_val!r}"
+            )
     merge_cypher = (
         "UNWIND $rows AS row\n"
         f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
@@ -238,6 +258,12 @@ def _build_convention_cypher(
 
 def _build_sdtm_cypher(seq_prop: str | None, has_visit: bool) -> tuple[str, str]:
     """Build MERGE and CREATE Cypher statements for SDTM domain rows."""
+    if seq_prop is not None and (
+        not isinstance(seq_prop, str) or not _SDTM_SEQ_PROP_PATTERN.fullmatch(seq_prop)
+    ):
+        raise ExportConfigurationError(
+            f"Neo4j SDTM sequence property contains invalid characters: {seq_prop!r}"
+        )
     record_key_props = (
         f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, {seq_prop}: row.{seq_prop}"
         if seq_prop
@@ -317,8 +343,12 @@ def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _post_process_graph_sdtm(row: dict[str, Any]) -> dict[str, Any]:
-    """Serialize any non-primitive SDTM row values for Neo4j property compatibility."""
+    """Validate SDTM property keys and serialize non-primitive values for Neo4j."""
     for key, val in list(row.items()):
+        if not isinstance(key, str) or not _IDENTIFIER_PATTERN.fullmatch(key):
+            raise ExportConfigurationError(
+                f"Neo4j SDTM property key contains invalid characters: {key!r}"
+            )
         if val is None or isinstance(val, NonCallableMock):
             continue
         if isinstance(val, Enum):
@@ -407,9 +437,16 @@ class Neo4jExportSink(ExportSink):
             max_buf = resolve_max_buffered_records(
                 self.config.batch_size, self.config.max_buffered_records
             )
+            config_error: ExportConfigurationError | None = None
+            configured_dom = (
+                resolve_sdtm_domain(self.config.sdtm_domain)
+                if isinstance(self.config.sdtm_domain, str) and self.config.sdtm_domain.strip()
+                else None
+            )
 
             def execute_sdtm_export() -> int:
                 """Stage SDTM sequences transactionally and commit only after Neo4j write succeeds."""
+                nonlocal config_error
                 with self._sdtm_sequencer.stage():
                     sdtm_mapper = build_sink_mapper(
                         self.config,
@@ -433,7 +470,8 @@ class Neo4jExportSink(ExportSink):
                             for r in staged_records
                             if (row := _record_to_row(r, self._study_key, mapper=sdtm_mapper))
                         ]
-                    except ExportConfigurationError:
+                    except ExportConfigurationError as cfg_exc:
+                        config_error = cfg_exc
                         raise
                     except Exception:
                         raise TypeError("Malformed Neo4j record batch payload.") from None
@@ -442,26 +480,43 @@ class Neo4jExportSink(ExportSink):
 
                     grouped_rows: dict[str | None, list[dict[str, Any]]] = {}
                     for row in sdtm_rows:
-                        seq_prop = next(
-                            (
-                                k
-                                for k in row
-                                if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
-                            ),
-                            None,
+                        raw_domain = (
+                            configured_dom if configured_dom is not None else row.get("DOMAIN")
+                        )
+                        domain = raw_domain if isinstance(raw_domain, str) else ""
+                        candidate_seq = f"{domain}SEQ"
+                        seq_prop = (
+                            candidate_seq
+                            if domain != "DM"
+                            and _SDTM_DOMAIN_PATTERN.fullmatch(domain) is not None
+                            and candidate_seq in row
+                            else None
                         )
                         grouped_rows.setdefault(seq_prop, []).append(row)
 
-                    with self._driver.session(database=database) as session:
+                    prepared_statements: list[tuple[str, list[dict[str, Any]]]] = []
+                    try:
                         for seq_prop, group in grouped_rows.items():
                             has_visit = any("VISITNUM" in r for r in group)
                             merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
                             stmt = merge_cypher if self.config.idempotent else create_cypher
+                            prepared_statements.append((stmt, group))
+                    except ExportConfigurationError as cfg_exc:
+                        config_error = cfg_exc
+                        raise
+
+                    with self._driver.session(database=database) as session:
+                        for stmt, group in prepared_statements:
                             session.run(stmt, rows=group)
                     logger.debug("Wrote batch %s (%d records)", batch_id, len(sdtm_rows))
                     return len(sdtm_rows)
 
-            return self._execute_with_retry("export_graph", batch_id, execute_sdtm_export)
+            try:
+                return self._execute_with_retry("export_graph", batch_id, execute_sdtm_export)
+            except ExportBatchError:
+                if config_error is not None:
+                    raise config_error from None
+                raise
 
         mapper = build_sink_mapper(
             self.config,
@@ -469,35 +524,34 @@ class Neo4jExportSink(ExportSink):
             post_processor=_post_process_graph,
             seq_counters=self._sdtm_sequencer,
         )
-        mapped_rows: list[dict[str, Any]] | None = None
-        cypher: str | None = None
+        try:
+            mapped_rows = [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
+        except ExportConfigurationError:
+            raise
+        except Exception:
+
+            def _raise_malformed() -> int:
+                raise TypeError("Malformed Neo4j record batch payload.") from None
+
+            return self._execute_with_retry("export_graph", batch_id, _raise_malformed)
+
+        if not mapped_rows:
+            return 0
+
+        if self.config.naming_convention == "camelCase":
+            merge_cypher, create_cypher = _build_convention_cypher(
+                "studyKey", "subjectKey", "recordId", "visitId"
+            )
+        elif self.config.naming_convention == "sdtm":
+            merge_cypher, create_cypher = _build_convention_cypher(
+                "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
+            )
+        else:
+            merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
+        cypher = merge_cypher if self.config.idempotent else create_cypher
 
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
-            nonlocal mapped_rows, cypher
-            if mapped_rows is None:
-                try:
-                    mapped_rows = [
-                        _record_to_row(r, self._study_key, mapper=mapper) for r in records
-                    ]
-                except ExportConfigurationError:
-                    raise
-                except Exception:
-                    raise TypeError("Malformed Neo4j record batch payload.") from None
-            if not mapped_rows:
-                return 0
-            if cypher is None:
-                if self.config.naming_convention == "camelCase":
-                    merge_cypher, create_cypher = _build_convention_cypher(
-                        "studyKey", "subjectKey", "recordId", "visitId"
-                    )
-                elif self.config.naming_convention == "sdtm":
-                    merge_cypher, create_cypher = _build_convention_cypher(
-                        "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
-                    )
-                else:
-                    merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
-                cypher = merge_cypher if self.config.idempotent else create_cypher
             with self._driver.session(database=database) as session:
                 session.run(cypher, rows=mapped_rows)
             logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))

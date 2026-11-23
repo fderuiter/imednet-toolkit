@@ -128,27 +128,36 @@ synchronisation in a background thread so that the main application thread
 
 SQLite is opened in WAL mode (``PRAGMA journal_mode=WAL``) so multiple reader
 connections can query ``record_cache`` while a single writer commits changes.
+Both ``record_cache`` and ``study_sync_state`` are partitioned by normalized
+``(base_url, study_key)`` keys (migrating pre-existing unpartitioned caches in
+place) so training and production SDK instances can safely share a cache
+directory without cross-origin contamination.
 :class:`~imednet_workflows.cached_loader.CachedRecordsLoader` executes all
-remote SDK HTTP calls (delta fetches, active-ID projections, and missing-ID
-backfills) completely outside :class:`filelock.FileLock` so network latency
-never blocks readers or concurrent writers.
+remote SDK HTTP calls (active-only initial loads, incremental delta fetches,
+lightweight metadata projections, and missing or stale record backfills)
+completely outside :class:`filelock.FileLock` so network latency never blocks
+readers or concurrent writers.
 
-Write transactions acquire :class:`filelock.FileLock` only for brief SQLite
-commits:
+Write transactions acquire :class:`filelock.FileLock` once after remote calls
+finish for a single atomic SQLite commit:
 
-* Each ``_upsert_records`` batch increments the per-study ``sync_epoch`` in
-  ``study_sync_state`` and stamps updated rows with ``upserted_epoch`` (storing
-  ``date_modified=None`` as SQL ``NULL``).
+* Active delta and backfill batches increment the per-origin, per-study
+  ``sync_epoch`` in ``study_sync_state`` and stamp updated rows with
+  ``upserted_epoch`` (storing ``date_modified=None`` as SQL ``NULL``), while
+  deleting any newly voided ``Record`` IDs without persisting ``deleted=True``
+  payloads.
 * During reconciliation, ``sync_records`` captures the pre-reconcile
-  ``sync_epoch`` before fetching upstream active IDs, backfills any missing
-  active ``Record`` payloads, and fences ``reconcile_cache`` deletions to
-  ``upserted_epoch <= max_epoch`` so concurrent :class:`~imednet_workflows.record_mapper.RecordMapper`,
+  ``sync_epoch`` before fetching upstream active metadata projections,
+  backfills missing or newly completed ``Record`` payloads, and fences
+  ``reconcile_cache`` deletions to ``upserted_epoch <= max_epoch`` so concurrent
+  :class:`~imednet_workflows.record_mapper.RecordMapper`,
   :class:`~imednet_workflows.schema_profiler.SchemaProfiler`, or
   :class:`~imednet_workflows.sync_worker.SyncWorker` writes are never pruned by
   a stale snapshot.
-* ``study_sync_state`` advances ``high_water_mark`` monotonically only after
-  delta, backfill, and reconciliation steps succeed, preserving the previous
-  watermark whenever a step fails.
+* ``study_sync_state`` advances ``high_water_mark`` monotonically in the same
+  atomic commit only after delta, backfill, and reconciliation succeed, rolling
+  back partial changes and preserving the previous watermark whenever a step
+  fails.
 
 **Worker lifecycle and health states**
 
@@ -158,6 +167,8 @@ unchanged and tracks health across
 ``RUNNING``, ``DEGRADED``, ``STOPPED``, ``FAILED``), exposing
 ``consecutive_failures``, ``last_error``, ``on_error`` callbacks, and
 ``max_consecutive_failures`` to stop automatically during persistent outages.
+Permanent client API errors (HTTP ``400``, ``401``, ``403``, ``404``) transition
+the worker immediately into terminal ``FAILED`` state without retrying.
 
 Usage example
 ~~~~~~~~~~~~~
