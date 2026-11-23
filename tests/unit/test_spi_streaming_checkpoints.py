@@ -596,7 +596,8 @@ def test_airflow_state_provider_incremental_checkpoint_and_failure_rollback(
     assert provider.get_last_timestamp("STUDY-AF-INC", "mongo_af") == datetime(
         2026, 3, 1, 14, 0, tzinfo=timezone.utc
     )
-    state_payload = json.loads(var_store[provider._get_variable_key("STUDY-AF-INC", "mongo_af")])
+    study_payload = json.loads(var_store[provider._get_variable_key("STUDY-AF-INC")])
+    state_payload = study_payload["streams"]["mongo_af"]
     assert state_payload["status"] == "failed"
 
 
@@ -718,9 +719,8 @@ def test_initial_streaming_failure_and_empty_run_do_not_skip_historical_records(
     with pytest.raises(ExportBatchError):
         op_fail.execute({})
 
-    hist_payload = json.loads(
-        var_store_hist[af_provider._get_variable_key("STUDY-AF-HIST", "mongo_hist")]
-    )
+    hist_study_payload = json.loads(var_store_hist[af_provider._get_variable_key("STUDY-AF-HIST")])
+    hist_payload = hist_study_payload["streams"]["mongo_hist"]
     assert hist_payload["status"] == "failed"
     assert hist_payload["last_timestamp"] is None
     assert af_provider.get_last_timestamp("STUDY-AF-HIST", "mongo_hist") is None

@@ -6,7 +6,9 @@ import json
 import os
 import socket
 import sys
+from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -14,6 +16,7 @@ import pytest
 
 from imednet_workflows.state_ledger import (
     AirflowStateProvider,
+    BaseStateProvider,
     FileStateProvider,
     InvalidStateTransitionError,
     LedgerState,
@@ -111,7 +114,8 @@ def test_airflow_variable_roundtrip_and_read_state(sdk_variable_store: dict[str,
     assert state.studies["STUDY:01_A"].streams["records_main"].records_processed == 12
     assert state.studies["STUDY:01_A"].streams["records_main"].metadata == {"batch": 1}
     assert state.studies["STUDY:01_A"].streams["queries"].records_processed == 3
-    assert len(sdk_variable_store) == 2
+    assert len(sdk_variable_store) == 1
+    assert provider._get_variable_key("STUDY:01_A") in sdk_variable_store
 
 
 def test_airflow_delete_entry_stream_and_study(sdk_variable_store: dict[str, Any]) -> None:
@@ -239,17 +243,17 @@ def test_airflow_initial_failure_and_empty_run_keep_none_watermark(
 ) -> None:
     """Airflow provider keeps last_timestamp as None on failed or zero-record initial syncs."""
     provider = AirflowStateProvider()
-    var_key = provider._get_variable_key("ST-INIT", "recs")
+    var_key = provider._get_variable_key("ST-INIT")
 
     with pytest.raises(RuntimeError, match="initial airflow failure"):
         with provider.transaction("ST-INIT", "recs") as tx:
             assert tx["last_timestamp"] is None
-            running_payload = json.loads(sdk_variable_store[var_key])
+            running_payload = json.loads(sdk_variable_store[var_key])["streams"]["recs"]
             assert running_payload["status"] == "running"
             assert running_payload["last_timestamp"] is None
             raise RuntimeError("initial airflow failure")
 
-    failed_payload = json.loads(sdk_variable_store[var_key])
+    failed_payload = json.loads(sdk_variable_store[var_key])["streams"]["recs"]
     assert failed_payload["status"] == "failed"
     assert failed_payload["last_timestamp"] is None
     assert provider.get_last_timestamp("ST-INIT", "recs") is None
@@ -259,7 +263,7 @@ def test_airflow_initial_failure_and_empty_run_keep_none_watermark(
         assert retry_tx["last_timestamp"] is None
         retry_tx["records_processed"] = 0
 
-    ok_payload = json.loads(sdk_variable_store[var_key])
+    ok_payload = json.loads(sdk_variable_store[var_key])["streams"]["recs"]
     assert ok_payload["status"] == "success"
     assert ok_payload["last_timestamp"] is None
     assert provider.get_last_timestamp("ST-INIT", "recs") is None
@@ -270,19 +274,19 @@ def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
 ) -> None:
     """Airflow provider recovers expired/dead-PID RUNNING Variable leases via FAILED -> RUNNING."""
     provider = AirflowStateProvider()
-    var_key = provider._get_variable_key("ST1", "recs")
+    legacy_var_key = provider._get_variable_key("ST1", "recs")
     pushed_statuses: list[str] = []
 
     orig_write = provider._write_variable
 
     def _tracking_write(key: str, payload: dict[str, Any]) -> None:
-        pushed_statuses.append(str(payload["status"]))
+        pushed_statuses.append(str(payload["streams"]["recs"]["status"]))
         orig_write(key, payload)
 
     provider._write_variable = _tracking_write  # type: ignore[method-assign]
 
     # Active lease on current PID blocks concurrent transaction
-    sdk_variable_store[var_key] = json.dumps(
+    sdk_variable_store[legacy_var_key] = json.dumps(
         {
             "last_timestamp": None,
             "status": "running",
@@ -295,8 +299,8 @@ def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
         with provider.transaction("ST1", "recs"):
             pass
 
-    # Expired remote lease transitions RUNNING -> FAILED -> RUNNING -> SUCCESS
-    sdk_variable_store[var_key] = json.dumps(
+    # Expired remote lease transitions RUNNING -> FAILED -> RUNNING -> SUCCESS and deletes legacy key
+    sdk_variable_store[legacy_var_key] = json.dumps(
         {
             "last_timestamp": None,
             "status": "running",
@@ -312,4 +316,299 @@ def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
         tx["records_processed"] = 4
 
     assert pushed_statuses == ["failed", "running", "success"]
+    assert legacy_var_key not in sdk_variable_store
+    assert provider._get_variable_key("ST1") in sdk_variable_store
     assert provider.get_last_timestamp("ST1", "recs") == committed
+
+
+def test_batch_transaction_single_write_per_phase_and_rollback(
+    tmp_path: Path,
+    sdk_variable_store: dict[str, Any],
+) -> None:
+    """FileStateProvider and AirflowStateProvider batch_transaction write once per study phase."""
+    _ = sdk_variable_store
+    file_provider = FileStateProvider(tmp_path / "batch_ledger.json")
+    airflow_provider = AirflowStateProvider()
+
+    file_writes: list[int] = []
+    orig_file_write = file_provider.write_state
+    file_provider.write_state = lambda st: (  # type: ignore[method-assign]
+        file_writes.append(1),
+        orig_file_write(st),
+    )[1]
+
+    af_writes: list[str] = []
+    orig_af_write = airflow_provider._write_variable
+    airflow_provider._write_variable = lambda k, v: (  # type: ignore[method-assign]
+        af_writes.append(k),
+        orig_af_write(k, v),
+    )[1]
+
+    for prov, counter in ((file_provider, file_writes), (airflow_provider, af_writes)):
+        # Empty stream list performs zero writes
+        with prov.batch_transaction("ST_BATCH", []) as empty_tx:
+            assert empty_tx == {}
+        assert len(counter) == 0
+
+        # Seed one SUCCESS stream before running batch_transaction
+        t_seed = datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
+        prov.set_last_timestamp("ST_BATCH", "form_a", t_seed, records_processed=3)
+        counter.clear()
+
+        # BaseException rollback writes once on lease acquisition and once on rollback
+        class SimulatedCancel(BaseException):
+            pass
+
+        with pytest.raises(SimulatedCancel, match="worker interrupted"):
+            with prov.batch_transaction("ST_BATCH", ["form_a", "form_b", "form_c"]) as tx_map:
+                assert len(counter) == 1
+                assert tx_map["form_a"]["last_timestamp"] == t_seed
+                assert tx_map["form_b"]["last_timestamp"] is None
+                tx_map["form_a"]["new_timestamp"] = datetime(2026, 5, 2, 0, 0, tzinfo=timezone.utc)
+                tx_map["form_b"]["records_processed"] = 7
+                raise SimulatedCancel("worker interrupted")
+
+        assert len(counter) == 2
+        assert prov.get_last_timestamp("ST_BATCH", "form_a") == t_seed
+        assert prov.get_last_timestamp("ST_BATCH", "form_b") is None
+        assert prov.get_last_status("ST_BATCH", "form_a") == StreamExecutionStatus.FAILED
+        assert prov.get_last_status("ST_BATCH", "form_b") == StreamExecutionStatus.FAILED
+
+        # Active RUNNING lease on form_c blocks batch_transaction without mutating form_a
+        prov.set_last_timestamp(
+            "ST_BATCH",
+            "form_c",
+            None,
+            status=StreamExecutionStatus.RUNNING,
+            force=True,
+        )
+        if isinstance(prov, AirflowStateProvider):
+            prov.set_last_timestamp(
+                "ST_BATCH",
+                "form_c",
+                None,
+                status=StreamExecutionStatus.RUNNING,
+                force=True,
+                owner_pid=os.getpid(),
+                owner_host=socket.gethostname(),
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+        else:
+            raw_state = prov.read_state()
+            raw_state.studies["ST_BATCH"].streams["form_c"].owner_pid = os.getpid()
+            raw_state.studies["ST_BATCH"].streams["form_c"].owner_host = socket.gethostname()
+            raw_state.studies["ST_BATCH"].streams["form_c"].lease_expires_at = datetime.now(
+                timezone.utc
+            ) + timedelta(minutes=10)
+            orig_file_write(raw_state)
+
+        counter.clear()
+        with pytest.raises(InvalidStateTransitionError):
+            with prov.batch_transaction("ST_BATCH", ["form_a", "form_c"]):
+                pass
+        assert len(counter) == 0
+        assert prov.get_last_status("ST_BATCH", "form_a") == StreamExecutionStatus.FAILED
+
+        # Expire form_c lease -> batch_transaction recovers stale lease & commits in 2 writes total
+        if isinstance(prov, AirflowStateProvider):
+            prov.set_last_timestamp(
+                "ST_BATCH",
+                "form_c",
+                None,
+                status=StreamExecutionStatus.RUNNING,
+                force=True,
+                owner_pid=1,
+                owner_host="dead-worker",
+                lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=10),
+            )
+        else:
+            raw_state = prov.read_state()
+            raw_state.studies["ST_BATCH"].streams["form_c"].owner_pid = 1
+            raw_state.studies["ST_BATCH"].streams["form_c"].owner_host = "dead-worker"
+            raw_state.studies["ST_BATCH"].streams["form_c"].lease_expires_at = datetime.now(
+                timezone.utc
+            ) - timedelta(seconds=10)
+            orig_file_write(raw_state)
+
+        counter.clear()
+        t_commit = datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc)
+        with prov.batch_transaction("ST_BATCH", ["form_a", "form_b", "form_c"]) as tx_map:
+            assert len(counter) == 1
+            tx_map["form_a"]["new_timestamp"] = t_commit
+            tx_map["form_a"]["records_processed"] = 10
+            tx_map["form_c"]["records_processed"] = 2
+        assert len(counter) == 2
+        assert prov.get_last_timestamp("ST_BATCH", "form_a") == t_commit
+        assert prov.get_last_timestamp("ST_BATCH", "form_c") is None
+        assert prov.get_last_status("ST_BATCH", "form_c") == StreamExecutionStatus.SUCCESS
+
+
+def test_base_state_provider_default_batch_transaction_delegates() -> None:
+    """Custom BaseStateProvider subclasses inherit working ExitStack batch_transaction default."""
+    entered: list[str] = []
+
+    class _MinimalSubclass(BaseStateProvider):
+        def get_last_timestamp(self, study_key: str, stream_name: str) -> datetime | None:
+            return None
+
+        def set_last_timestamp(
+            self, study_key: str, stream_name: str, timestamp: Any, **kw: Any
+        ) -> None:
+            pass
+
+        def transaction(  # type: ignore[override]
+            self,
+            study_key: str,
+            stream_name: str,
+            fallback_timestamp: datetime | None = None,
+            *,
+            lease_ttl_seconds: float | None = None,
+        ) -> Generator[dict[str, Any], None, None]:
+            import contextlib
+
+            @contextlib.contextmanager
+            def _cm() -> Generator[dict[str, Any], None, None]:
+                entered.append(f"in:{study_key}:{stream_name}")
+                yield {"last_timestamp": fallback_timestamp, "records_processed": 0}
+                entered.append(f"out:{study_key}:{stream_name}")
+
+            return _cm()
+
+        def delete_entry(self, study_key: str, stream_name: str | None = None) -> bool:
+            return False
+
+        def read_state(self) -> LedgerState:
+            return LedgerState()
+
+    sub = _MinimalSubclass()
+    with sub.batch_transaction("S1", ["f1", "f2", "f1"]) as tx_map:
+        assert set(tx_map) == {"f1", "f2"}
+    assert entered == ["in:S1:f1", "in:S1:f2", "out:S1:f2", "out:S1:f1"]
+
+
+def test_airflow_legacy_keys_migrate_cleanly_and_sdk_rpc_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify legacy key migration, 6-RPC read_state for 5x50 studies, and 2-RPC delete_entry."""
+    store: dict[str, str] = {}
+    ops: list[tuple[str, str]] = []
+
+    class CountingSdkVariable:
+        @staticmethod
+        def get(key: str, default: Any = None, deserialize_json: bool = False) -> Any:
+            ops.append(("get", key))
+            if key not in store:
+                return default
+            raw = store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(
+            key: str,
+            value: Any,
+            description: str | None = None,
+            serialize_json: bool = False,
+        ) -> None:
+            _ = description
+            ops.append(("set", key))
+            store[key] = json.dumps(value) if serialize_json else str(value)
+
+        @staticmethod
+        def delete(key: str) -> None:
+            ops.append(("delete", key))
+            store.pop(key, None)
+
+        @staticmethod
+        def keys(prefix: str | None = None) -> list[str]:
+            ops.append(("keys", prefix or ""))
+            if prefix is None:
+                return sorted(store.keys())
+            return sorted(k for k in store if k.startswith(prefix))
+
+    airflow_mod = ModuleType("airflow")
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.Variable = CountingSdkVariable  # type: ignore[attr-defined]
+    airflow_mod.sdk = sdk_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+    monkeypatch.delitem(sys.modules, "airflow.sdk.execution_time", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.sdk.execution_time.task_runner", raising=False)
+
+    provider = AirflowStateProvider()
+    t1 = datetime(2026, 3, 1, 9, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 3, 2, 9, 0, tzinfo=timezone.utc)
+
+    # 1. Seed two legacy per-stream keys for LEGACY_ST and one sibling study
+    legacy_k1 = provider._get_variable_key("LEGACY_ST", "sql_DM")
+    legacy_k2 = provider._get_variable_key("LEGACY_ST", "sql_VS")
+    sibling_legacy = provider._get_variable_key("LEGACY_ST_SIBLING", "sql_DM")
+    store[legacy_k1] = json.dumps(
+        {
+            "study_key": "LEGACY_ST",
+            "stream_name": "sql_DM",
+            "last_timestamp": t1.isoformat(),
+            "records_processed": 11,
+            "status": "success",
+        }
+    )
+    store[legacy_k2] = json.dumps(
+        {
+            "study_key": "LEGACY_ST",
+            "stream_name": "sql_VS",
+            "last_timestamp": t2.isoformat(),
+            "records_processed": 22,
+            "status": "success",
+        }
+    )
+    store[sibling_legacy] = json.dumps(
+        {
+            "study_key": "LEGACY_ST_SIBLING",
+            "stream_name": "sql_DM",
+            "last_timestamp": t1.isoformat(),
+            "records_processed": 5,
+            "status": "success",
+        }
+    )
+
+    assert provider.get_last_timestamp("LEGACY_ST", "sql_DM") == t1
+    assert provider.get_last_timestamp("LEGACY_ST", "sql_VS") == t2
+    pre_state = provider.read_state()
+    assert set(pre_state.studies["LEGACY_ST"].streams) == {"sql_DM", "sql_VS"}
+
+    # Next study write consolidates BOTH streams into imednet_state:LEGACY_ST and deletes legacy keys
+    t3 = datetime(2026, 3, 5, 12, 0, tzinfo=timezone.utc)
+    provider.set_last_timestamp("LEGACY_ST", "sql_DM", t3, records_processed=30)
+    assert provider._get_variable_key("LEGACY_ST") in store
+    assert legacy_k1 not in store
+    assert legacy_k2 not in store
+    assert sibling_legacy in store
+    assert provider.get_last_timestamp("LEGACY_ST", "sql_DM") == t3
+    assert provider.get_last_timestamp("LEGACY_ST", "sql_VS") == t2
+
+    # 2. Seed 5 studies x 50 form streams (= 250 streams) and verify 6 RPCs in read_state
+    store.clear()
+    for s_idx in range(1, 6):
+        study_name = f"STUDY_{s_idx}"
+        with provider.batch_transaction(
+            study_name, [f"sql_FORM_{f_idx:02d}" for f_idx in range(1, 51)]
+        ) as tx_map:
+            for f_idx in range(1, 51):
+                tx_map[f"sql_FORM_{f_idx:02d}"]["new_timestamp"] = t3
+                tx_map[f"sql_FORM_{f_idx:02d}"]["records_processed"] = f_idx
+
+    ops.clear()
+    full_state = provider.read_state()
+    assert len(full_state.studies) == 5
+    assert sum(len(s.streams) for s in full_state.studies.values()) == 250
+    assert [op for op, _ in ops] == ["keys", "get", "get", "get", "get", "get"]
+    assert len(ops) == 6
+
+    # 3. Verify delete_entry(study_key) executes 2 RPCs (keys + delete, 0 get) & preserves sibling
+    provider.set_last_timestamp("STUDY_1_OTHER", "sql_FORM_01", t3)
+    ops.clear()
+    assert provider.delete_entry("STUDY_1") is True
+    assert ops == [
+        ("keys", provider._get_variable_key("STUDY_1")),
+        ("delete", provider._get_variable_key("STUDY_1")),
+    ]
+    assert provider.get_last_timestamp("STUDY_1_OTHER", "sql_FORM_01") == t3

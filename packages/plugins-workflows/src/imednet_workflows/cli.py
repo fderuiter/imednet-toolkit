@@ -339,7 +339,12 @@ def _execute_set_state(
     )
 
     ensure_interactive_stdin(force_non_interactive=no_interactive)
-    display_ledger_streams(ledger_path=ledger_path, study_key=study_key)
+    ledger = _resolve_attr("get_state_provider")(ledger_path)
+    current_state = display_ledger_streams(
+        ledger_path=ledger_path,
+        study_key=study_key,
+        state_provider=ledger,
+    )
     study_key = prompt_study_key(study_key)
     stream = prompt_stream_name(stream)
 
@@ -361,20 +366,19 @@ def _execute_set_state(
         "Enter number of records processed", default=records_processed
     )
 
-    ledger = _resolve_attr("get_state_provider")(ledger_path)
     current_status = "None"
     current_ts_str = "None"
-    try:
-        current_state = ledger.read_state()
-        if (
-            study_key in current_state.studies
-            and stream in current_state.studies[study_key].streams
-        ):
-            st = current_state.studies[study_key].streams[stream]
-            current_status = str(st.last_run_status)
-            current_ts_str = st.last_timestamp.isoformat() if st.last_timestamp else "None"
-    except Exception as exc:
-        print_progress(f"Notice: unable to read stream state from ledger: {exc}")
+    if current_state is not None:
+        try:
+            if (
+                study_key in current_state.studies
+                and stream in current_state.studies[study_key].streams
+            ):
+                st = current_state.studies[study_key].streams[stream]
+                current_status = str(st.last_run_status)
+                current_ts_str = st.last_timestamp.isoformat() if st.last_timestamp else "None"
+        except Exception as exc:
+            print_progress(f"Notice: unable to read stream state from ledger: {exc}")
 
     print_progress("\nProposed State Transition:")
     print_progress(f"  Study:             {study_key}")

@@ -210,15 +210,20 @@ and tabular export helpers while maintaining ``mask_phi=True`` by default:
 - ``incremental``: Enable transactional high-water mark reads and commits.
 - ``stream_name``: Stream key used to isolate checkpoints per destination or ``Form``.
 - ``state_provider``: Explicit checkpoint provider such as
-  :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (persisting JSON
-  watermarks via ``airflow.sdk.Variable`` under
-  ``imednet_state:<study_key>:<stream_name>``, preserving per-``Study`` state
-  across dynamic task mapping order changes and rolling ``RUNNING`` checkpoints
-  back to ``FAILED`` on ``BaseException`` interrupts such as ``AirflowTaskTimeout``)
+  :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (persisting all
+  stream JSON watermarks for a ``Study`` inside one Airflow ``Variable`` map under
+  ``imednet_state:<study_key>`` via ``airflow.sdk.Variable``, transparently reading
+  and consolidating legacy ``imednet_state:<study_key>:<stream_name>`` keys on the
+  next study write, preserving per-``Study`` state across dynamic task mapping order
+  changes, and rolling ``RUNNING`` checkpoints back to ``FAILED`` on
+  ``BaseException`` interrupts such as ``AirflowTaskTimeout``)
   or :class:`~imednet_workflows.ExtractionStateLedger`
   (:class:`~imednet_workflows.state_ledger.FileStateProvider`). When omitted on an
   ``incremental=True`` run, ``ImednetExportOperator`` defaults to the ``airflow``
-  provider entry point automatically unless ``ledger_path`` is specified.
+  provider entry point automatically unless ``ledger_path`` is specified. Because
+  ``Variable.set`` performs last-writer-wins upserts on the consolidated study key,
+  configure distinct ``AirflowStateProvider(variable_prefix=...)`` values when
+  concurrent operators export the same ``Study`` in parallel.
 - ``ledger_path``: Shared filesystem path used when persisting checkpoints with
   ``ExtractionStateLedger`` instead of Airflow ``Variable`` storage.
 - ``modified_since``: Initial UTC lower-bound watermark when no prior checkpoint exists.
