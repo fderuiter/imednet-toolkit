@@ -16,6 +16,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+import yaml
 from defusedxml import ElementTree as DefusedET
 
 
@@ -469,17 +470,70 @@ def check_packages_registered() -> bool:
     return has_errors
 
 
-def check_package_docs() -> bool:
-    """Validate that all packages have README.md, CHANGELOG.md, and are mentioned in root CHANGELOG.md."""
-    print(
-        "Checking if all packages have local documentation and are mentioned in root CHANGELOG.md..."
-    )
-    packages_dir = Path("packages")
+REQUIRED_PYTHON_CLASSIFIERS = (
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+)
+WORKSPACE_PACKAGE_IDS = (
+    "core",
+    "plugins-workflows",
+    "plugins-sinks",
+    "plugins-tui",
+    "providers-airflow",
+)
+LIVE_GITHUB_AREA_NAMES = frozenset(
+    {
+        "core",
+        "http",
+        "models",
+        "auth",
+        "pagination",
+        "cli",
+        "workflows",
+        "airflow",
+        "docs",
+        "tests",
+        "release",
+        "github",
+        "ci",
+        "testing",
+        "streamlit",
+        "mapping",
+        "records",
+        "standards",
+        "dashboard",
+        "review-workbench",
+        "terminology",
+        "governance",
+        "performance",
+    }
+)
+RETIRED_GITHUB_LABELS = (
+    "type:maintenance",
+    "area:workflows-plugin",
+    "area:airflow-provider",
+    "area:contributing",
+    "status:needs-info",
+    "risk:medium",
+    "risk:high",
+)
+RETIRED_REPO_SLUG = "imednet-python-sdk"
+OBSOLETE_CHANGELOG_TOKENS = (
+    "docs/contributing.rst",
+    "imednet.compat.v1",
+)
+
+
+def check_package_docs(repo_root: Path = Path(".")) -> bool:
+    """Validate package README/CHANGELOG files, root CHANGELOG pointers, and wheel manifest metadata."""
+    print("Checking package local documentation, manifest metadata, and root CHANGELOG pointers...")
+    packages_dir = repo_root / "packages"
     if not packages_dir.exists():
         print(f"Warning: Path {packages_dir} not found.")
         return False
 
-    root_changelog = Path("CHANGELOG.md")
+    root_changelog = repo_root / "CHANGELOG.md"
     if not root_changelog.exists():
         print("Error: Root CHANGELOG.md not found.")
         return True
@@ -488,7 +542,12 @@ def check_package_docs() -> bool:
 
     has_errors = False
 
-    for pkg_dir in packages_dir.iterdir():
+    for token in OBSOLETE_CHANGELOG_TOKENS:
+        if token in root_changelog_content:
+            print(f"Error: Root CHANGELOG.md contains obsolete reference '{token}'.")
+            has_errors = True
+
+    for pkg_dir in sorted(packages_dir.iterdir()):
         if not pkg_dir.is_dir() or pkg_dir.name.startswith("."):
             continue
 
@@ -511,8 +570,199 @@ def check_package_docs() -> bool:
             print(f"Error: Package {pkg_name} is not mentioned in the root CHANGELOG.md.")
             has_errors = True
 
+        # Check pyproject.toml wheel metadata fields
+        manifest_path = pkg_dir / "pyproject.toml"
+        if not manifest_path.is_file():
+            print(f"Error: Package {pkg_name} is missing pyproject.toml.")
+            has_errors = True
+            continue
+
+        manifest_data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        project = manifest_data.get("project", {})
+
+        readme_decl = project.get("readme")
+        readme_rel = (
+            readme_decl
+            if isinstance(readme_decl, str)
+            else readme_decl.get("file")
+            if isinstance(readme_decl, dict)
+            else None
+        )
+        if not isinstance(readme_rel, str) or not readme_rel.strip():
+            print(f"Error: {manifest_path} is missing [project].readme.")
+            has_errors = True
+        else:
+            declared_readme = pkg_dir / readme_rel
+            if (
+                not declared_readme.is_file()
+                or not declared_readme.read_text(encoding="utf-8").strip()
+            ):
+                print(
+                    f"Error: {manifest_path} [project].readme points to missing or empty file '{readme_rel}'."
+                )
+                has_errors = True
+
+        if project.get("license") != "MIT":
+            print(
+                f"Error: {manifest_path} must declare license = \"MIT\" (got {project.get('license')!r})."
+            )
+            has_errors = True
+
+        classifiers = set(project.get("classifiers", []))
+        for required_classifier in REQUIRED_PYTHON_CLASSIFIERS:
+            if required_classifier not in classifiers:
+                print(f"Error: {manifest_path} is missing classifier '{required_classifier}'.")
+                has_errors = True
+
     if not has_errors:
-        print("All package docs checks passed.")
+        print("All package docs and manifest metadata checks passed.")
+    return has_errors
+
+
+def check_governance_and_issue_templates(repo_root: Path = Path(".")) -> bool:
+    """Validate governance URLs, live GitHub triage labels, issue templates, and README package/extra listings."""
+    print("Checking governance files, issue templates, and triage label vocabulary...")
+    has_errors = False
+
+    url_scan_files: list[Path] = []
+    for root_file in (
+        "README.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "AGENTS.md",
+        "CHANGELOG.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+    ):
+        candidate = repo_root / root_file
+        if candidate.is_file():
+            url_scan_files.append(candidate)
+
+    issue_template_dir = repo_root / ".github" / "ISSUE_TEMPLATE"
+    if issue_template_dir.is_dir():
+        url_scan_files.extend(sorted(p for p in issue_template_dir.iterdir() if p.is_file()))
+
+    packages_dir = repo_root / "packages"
+    if packages_dir.is_dir():
+        url_scan_files.extend(sorted(packages_dir.glob("*/pyproject.toml")))
+        url_scan_files.extend(sorted(packages_dir.glob("*/README.md")))
+
+    public_doc_files: list[Path] = []
+    docs_dir = repo_root / "docs"
+    if docs_dir.is_dir():
+        for doc_path in sorted([*docs_dir.rglob("*.rst"), *docs_dir.rglob("*.md")]):
+            rel_parts = doc_path.relative_to(repo_root).parts
+            if any(part in _DOC_EXCLUDED_PARTS for part in rel_parts):
+                continue
+            public_doc_files.append(doc_path)
+
+    seen_url_files: set[Path] = set()
+    for path in [*url_scan_files, *public_doc_files]:
+        resolved = path.resolve()
+        if resolved in seen_url_files or not path.is_file():
+            continue
+        seen_url_files.add(resolved)
+        text = path.read_text(encoding="utf-8")
+        if RETIRED_REPO_SLUG in text:
+            print(
+                f"Error: Retired repository slug '{RETIRED_REPO_SLUG}' found in {path.relative_to(repo_root)}."
+            )
+            has_errors = True
+
+    label_scan_files = list(public_doc_files)
+    if issue_template_dir.is_dir():
+        label_scan_files.extend(sorted(p for p in issue_template_dir.iterdir() if p.is_file()))
+
+    label_patterns = {
+        label: re.compile(rf"(?<![a-z0-9:-]){re.escape(label)}(?![a-z0-9-])")
+        for label in RETIRED_GITHUB_LABELS
+    }
+    for path in label_scan_files:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for label, pattern in label_patterns.items():
+            if pattern.search(text):
+                print(
+                    f"Error: Nonexistent GitHub label '{label}' found in {path.relative_to(repo_root)}."
+                )
+                has_errors = True
+
+    if issue_template_dir.is_dir():
+        for yml_path in sorted(issue_template_dir.glob("*.yml")):
+            if yml_path.name == "config.yml":
+                continue
+            data = yaml.safe_load(yml_path.read_text(encoding="utf-8")) or {}
+            body = data.get("body", [])
+            fields_by_id = {
+                item.get("id"): item
+                for item in body
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+
+            area_field = fields_by_id.get("area")
+            area_options = (
+                area_field.get("attributes", {}).get("options", [])
+                if isinstance(area_field, dict)
+                else []
+            )
+            if not area_options:
+                print(
+                    f"Error: Issue template {yml_path.relative_to(repo_root)} is missing 'area' dropdown options."
+                )
+                has_errors = True
+            else:
+                invalid_areas = [
+                    opt for opt in area_options if str(opt) not in LIVE_GITHUB_AREA_NAMES
+                ]
+                if invalid_areas:
+                    print(
+                        f"Error: Issue template {yml_path.relative_to(repo_root)} contains non-live area options: {invalid_areas}."
+                    )
+                    has_errors = True
+
+            pkg_field = fields_by_id.get("package")
+            pkg_options = (
+                {
+                    str(opt).split(" ", 1)[0]
+                    for opt in pkg_field.get("attributes", {}).get("options", [])
+                }
+                if isinstance(pkg_field, dict)
+                else set()
+            )
+            missing_pkgs = [pkg for pkg in WORKSPACE_PACKAGE_IDS if pkg not in pkg_options]
+            if missing_pkgs:
+                print(
+                    f"Error: Issue template {yml_path.relative_to(repo_root)} 'package' dropdown is missing workspace packages: {missing_pkgs}."
+                )
+                has_errors = True
+
+    root_readme = repo_root / "README.md"
+    core_manifest = repo_root / "packages" / "core" / "pyproject.toml"
+    if root_readme.is_file() and core_manifest.is_file():
+        readme_text = root_readme.read_text(encoding="utf-8")
+        core_data = tomllib.loads(core_manifest.read_text(encoding="utf-8"))
+        core_extras = sorted(core_data.get("project", {}).get("optional-dependencies", {}).keys())
+        for extra in core_extras:
+            if not re.search(rf"\b{re.escape(extra)}\b", readme_text):
+                print(f"Error: Core extra '{extra}' is not documented in root README.md.")
+                has_errors = True
+        for pkg_dist in ("imednet-plugins-sinks", "imednet-tui"):
+            if pkg_dist not in readme_text:
+                print(f"Error: Workspace package '{pkg_dist}' is missing from root README.md.")
+                has_errors = True
+
+    core_readme = repo_root / "packages" / "core" / "README.md"
+    if core_readme.is_file():
+        core_readme_text = core_readme.read_text(encoding="utf-8")
+        for pkg_dist in ("imednet-plugins-sinks", "imednet-tui"):
+            if pkg_dist not in core_readme_text:
+                print(
+                    f"Error: Workspace package '{pkg_dist}' is missing from packages/core/README.md."
+                )
+                has_errors = True
+
+    if not has_errors:
+        print("Governance, issue template, and triage label checks passed.")
     return has_errors
 
 
@@ -1422,6 +1672,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     cli_failed = check_cli_snippets()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
+    governance_failed = check_governance_and_issue_templates()
     adr_failed = check_adr_records()
     githubpages_failed = check_sphinx_githubpages_extension()
     baseurl_failed = check_sphinx_html_baseurl()
@@ -1437,6 +1688,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         or cli_failed
         or packages_failed
         or docs_failed
+        or governance_failed
         or adr_failed
         or githubpages_failed
         or baseurl_failed

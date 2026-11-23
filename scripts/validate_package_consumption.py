@@ -1,13 +1,20 @@
+import email
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.resolve()
 PACKAGES_DIR = ROOT / "packages"
+REQUIRED_PYTHON_CLASSIFIERS = (
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+)
 
 
 def run(cmd, **kwargs):
@@ -20,6 +27,54 @@ def _resolve_uv() -> str:
     if uv_bin is None:
         raise FileNotFoundError("Required tool 'uv' was not found on PATH.")
     return uv_bin
+
+
+def verify_wheel_metadata(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
+    """Verify built workspace wheels expose Markdown descriptions, MIT license, and Python 3.11-3.13 classifiers."""
+    all_wheels = sorted(dist_dir.glob("*.whl"))
+    for pkg_path in sorted(packages_dir.iterdir()):
+        manifest = pkg_path / "pyproject.toml"
+        if not (pkg_path.is_dir() and manifest.exists()):
+            continue
+
+        pkg_name = tomllib.loads(manifest.read_text(encoding="utf-8"))["project"]["name"]
+        normalized_pkg = pkg_name.replace("-", "_")
+        matching = [w for w in all_wheels if w.name.startswith(normalized_pkg + "-")]
+        if not matching:
+            raise ValueError(
+                f"Missing built wheel for workspace package '{pkg_name}' in {dist_dir}"
+            )
+
+        wheel_path = max(matching)
+        with zipfile.ZipFile(wheel_path) as zf:
+            meta_entries = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+            if not meta_entries:
+                raise ValueError(f"Wheel '{wheel_path.name}' is missing .dist-info/METADATA")
+            msg = email.message_from_bytes(zf.read(meta_entries[0]))
+
+        content_type = (msg.get("Description-Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "text/markdown":
+            raise ValueError(
+                f"Wheel '{wheel_path.name}' expected Description-Content-Type 'text/markdown', "
+                f"got {msg.get('Description-Content-Type')!r}"
+            )
+
+        payload = msg.get_payload()
+        if not isinstance(payload, str) or not payload.strip():
+            raise ValueError(f"Wheel '{wheel_path.name}' has an empty METADATA description body")
+
+        license_expr = (msg.get("License-Expression") or "").strip()
+        if license_expr != "MIT":
+            raise ValueError(
+                f"Wheel '{wheel_path.name}' expected License-Expression 'MIT', got {license_expr!r}"
+            )
+
+        classifiers = set(msg.get_all("Classifier", []))
+        missing_classifiers = [c for c in REQUIRED_PYTHON_CLASSIFIERS if c not in classifiers]
+        if missing_classifiers:
+            raise ValueError(
+                f"Wheel '{wheel_path.name}' is missing classifiers: {missing_classifiers}"
+            )
 
 
 def build_wheels(dist_dir: Path):
@@ -44,6 +99,8 @@ def build_wheels(dist_dir: Path):
                 run([*build_cmd, "--offline"])
             except subprocess.CalledProcessError:
                 run(build_cmd)
+
+    verify_wheel_metadata(dist_dir)
 
 
 def validate_scenario(name, install_items, smoke_checks, dist_dir: Path):
