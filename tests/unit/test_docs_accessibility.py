@@ -179,6 +179,50 @@ def test_code_block_keyboard_accessibility() -> None:
 
 
 @pytest.mark.unit
+def test_navigation_keyboard_css_and_controller_contracts() -> None:
+    """Verify conf.py, custom.css, and navigation.js contracts for switches, drawers, and modindex."""
+    from docs import conf as docs_conf
+
+    assert "navigation.js" in docs_conf.html_js_files
+
+    css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
+    nav_js = (REPO_ROOT / "docs/_static/navigation.js").read_text(encoding="utf-8")
+
+    # 1. .toctree-checkbox transparent 32px switch override & Enter key handler
+    assert "input.toctree-checkbox" in css_content
+    assert "appearance: none" in css_content
+    assert "32px" in css_content
+    assert ".toctree-checkbox:focus-visible" in css_content
+    assert "input.toctree-checkbox" in nav_js
+    assert '"Enter"' in nav_js
+    assert '"switch"' in nav_js
+
+    # 2. Responsive drawer visibility guards (<= 82em TOC, <= 63em sidebar) & inert syncing
+    assert "@media (max-width: 82em)" in css_content
+    assert "#__toc:not(:checked) ~ .page .toc-drawer" in css_content
+    assert "@media (max-width: 63em)" in css_content
+    assert "#__navigation:not(:checked) ~ .page .sidebar-drawer" in css_content
+    assert "visibility: hidden" in css_content
+    assert "(max-width: 63em)" in nav_js
+    assert "(max-width: 82em)" in nav_js
+    assert ".inert" in nav_js
+    assert ".nav-overlay-icon" in nav_js
+    assert ".toc-header-icon:not(.no-toc)" in nav_js
+    assert ".toc-content-icon:not(.no-toc)" in nav_js
+    assert "aria-controls" in nav_js
+    assert "aria-expanded" in nav_js
+    assert '"Escape"' in nav_js
+
+    # 3. py-modindex img.toggler upgrade & focus-visible / forced-colors rules
+    assert "img.toggler" in nav_js
+    assert "plus.png" in nav_js
+    assert "img.toggler:focus-visible" in css_content
+    assert ".nav-overlay-icon:focus-visible" in css_content
+    assert ".toc-header-icon:focus-visible" in css_content
+    assert ".toc-content-icon:focus-visible" in css_content
+
+
+@pytest.mark.unit
 def test_vpat_document_conformance() -> None:
     """Ensure VPAT document and showcase mock reflect community ownership and verified capabilities."""
     from imednet_tui.app import ImednetTuiApp
@@ -2375,6 +2419,577 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     assert hash_state["integrationHidden"] is True
 
                 idx_page.close()
+
+                # --------------------------------------------------------------
+                # 5. Keyboard navigation: .toctree-checkbox switches, responsive
+                #    drawers (1280x900, 375x812, 320x640, >82em), py-modindex
+                #    img.toggler controls, and 4-mode :focus-visible outlines
+                # --------------------------------------------------------------
+                nav_page = context.new_page()
+                nav_page.set_viewport_size({"width": 1280, "height": 900})
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+
+                # 5a. Sequential Tab order & .toctree-checkbox switches on index.html
+                first_tab_stop = None
+                index_tabbed_switches: list[str] = []
+                index_toc_drawer_stops = 0
+                for step_idx in range(90):
+                    nav_page.keyboard.press("Tab")
+                    stop = nav_page.evaluate(
+                        """() => {
+                            const el = document.activeElement;
+                            if (!el || el === document.body) return null;
+                            return {
+                                id: el.id || '',
+                                cls: String(el.className || ''),
+                                inToc: !!el.closest('.toc-drawer')
+                            };
+                        }"""
+                    )
+                    if step_idx == 0:
+                        first_tab_stop = stop
+                    if stop:
+                        if stop["inToc"]:
+                            index_toc_drawer_stops += 1
+                        if (
+                            "toctree-checkbox" in stop["cls"]
+                            and stop["id"] not in index_tabbed_switches
+                        ):
+                            index_tabbed_switches.append(stop["id"])
+
+                assert first_tab_stop is not None and "skip-to-content" in first_tab_stop["cls"], (
+                    f"Expected .skip-to-content as first Tab stop, got {first_tab_stop}"
+                )
+                assert index_toc_drawer_stops == 0, (
+                    f"Closed .toc-drawer at 1280x900 trapped {index_toc_drawer_stops} Tab stops"
+                )
+
+                expected_index_switches = nav_page.evaluate(
+                    """() => Array.from(document.querySelectorAll('.toctree-checkbox'))
+                        .filter((el) => el.getClientRects().length > 0)
+                        .map((el) => ({
+                            id: el.id,
+                            role: el.getAttribute('role'),
+                            label: el.getAttribute('aria-label') || '',
+                            w: el.getBoundingClientRect().width,
+                            h: el.getBoundingClientRect().height
+                        }))"""
+                )
+                assert len(expected_index_switches) >= 9
+                for sw_meta in expected_index_switches:
+                    assert sw_meta["role"] == "switch"
+                    assert sw_meta["label"]
+                    assert sw_meta["w"] >= 32.0 and sw_meta["h"] >= 32.0
+                assert index_tabbed_switches == [s["id"] for s in expected_index_switches]
+
+                # Space and Enter toggle child <ul> and expose/hide nested switches in Tab order
+                nested_parent = nav_page.locator("#toctree-checkbox-5")
+                nested_parent.focus()
+                assert (
+                    nav_page.evaluate("document.getElementById('toctree-checkbox-5').checked")
+                    is False
+                )
+                assert (
+                    nav_page.evaluate(
+                        "getComputedStyle(document.querySelector('#toctree-checkbox-5 ~ ul')).display"
+                    )
+                    == "none"
+                )
+                nav_page.keyboard.press("Enter")
+                assert (
+                    nav_page.evaluate("document.getElementById('toctree-checkbox-5').checked")
+                    is True
+                )
+                assert (
+                    nav_page.evaluate(
+                        "getComputedStyle(document.querySelector('#toctree-checkbox-5 ~ ul')).display"
+                    )
+                    == "block"
+                )
+                assert (
+                    nav_page.evaluate(
+                        "document.querySelector('#toctree-checkbox-5 ~ ul .toctree-checkbox').getClientRects().length > 0"
+                    )
+                    is True
+                )
+                nav_page.keyboard.press("Space")
+                assert (
+                    nav_page.evaluate("document.getElementById('toctree-checkbox-5').checked")
+                    is False
+                )
+                assert (
+                    nav_page.evaluate(
+                        "getComputedStyle(document.querySelector('#toctree-checkbox-5 ~ ul')).display"
+                    )
+                    == "none"
+                )
+
+                # Verify sequential Tab reaches every visible .toctree-checkbox on reference/api/imednet.html
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/reference/api/imednet.html",
+                    wait_until="load",
+                )
+                api_visible_switches = nav_page.evaluate(
+                    """() => Array.from(document.querySelectorAll('.toctree-checkbox'))
+                        .filter((el) => el.getClientRects().length > 0)
+                        .map((el) => el.id)"""
+                )
+                assert len(api_visible_switches) >= 10
+                api_tabbed_switches: list[str] = []
+                for _ in range(130):
+                    nav_page.keyboard.press("Tab")
+                    sw_id = nav_page.evaluate(
+                        """() => {
+                            const el = document.activeElement;
+                            return el && el.classList.contains('toctree-checkbox') ? el.id : '';
+                        }"""
+                    )
+                    if sw_id and sw_id not in api_tabbed_switches:
+                        api_tabbed_switches.append(sw_id)
+                assert api_tabbed_switches == api_visible_switches
+
+                # 5b. Responsive drawers & triggers across 1280x900, 375x812, 320x640, and 1400x900
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+
+                drawer_1280 = nav_page.evaluate(
+                    """() => {
+                        const sd = document.querySelector('.sidebar-drawer');
+                        const td = document.querySelector('.toc-drawer');
+                        const tocTrigger = document.querySelector('.toc-content-icon');
+                        return {
+                            sdVis: getComputedStyle(sd).visibility,
+                            sdInert: sd.inert,
+                            tdVis: getComputedStyle(td).visibility,
+                            tdInert: td.inert,
+                            tocRole: tocTrigger.getAttribute('role'),
+                            tocTabIndex: tocTrigger.tabIndex,
+                            tocControls: tocTrigger.getAttribute('aria-controls'),
+                            tocExpanded: tocTrigger.getAttribute('aria-expanded'),
+                            tocLabel: tocTrigger.getAttribute('aria-label') || ''
+                        };
+                    }"""
+                )
+                assert drawer_1280["sdVis"] == "visible" and drawer_1280["sdInert"] is False
+                assert drawer_1280["tdVis"] == "hidden" and drawer_1280["tdInert"] is True
+                assert drawer_1280["tocRole"] == "button"
+                assert drawer_1280["tocTabIndex"] == 0
+                assert drawer_1280["tocControls"] == "furo-toc-drawer"
+                assert drawer_1280["tocExpanded"] == "false"
+                assert drawer_1280["tocLabel"]
+
+                # Open .toc-drawer via Enter, verify focus moves inside, close via Escape -> focus returns
+                nav_page.locator(".toc-content-icon").focus()
+                nav_page.keyboard.press("Enter")
+                toc_open_state = nav_page.evaluate(
+                    """() => {
+                        const td = document.querySelector('.toc-drawer');
+                        const trigger = document.querySelector('.toc-content-icon');
+                        return {
+                            checked: document.getElementById('__toc').checked,
+                            vis: getComputedStyle(td).visibility,
+                            inert: td.inert,
+                            expanded: trigger.getAttribute('aria-expanded'),
+                            focusInside: td.contains(document.activeElement)
+                        };
+                    }"""
+                )
+                assert toc_open_state == {
+                    "checked": True,
+                    "vis": "visible",
+                    "inert": False,
+                    "expanded": "true",
+                    "focusInside": True,
+                }
+                nav_page.keyboard.press("Escape")
+                nav_page.wait_for_timeout(280)
+                toc_closed_state = nav_page.evaluate(
+                    """() => {
+                        const td = document.querySelector('.toc-drawer');
+                        const trigger = document.querySelector('.toc-content-icon');
+                        return {
+                            checked: document.getElementById('__toc').checked,
+                            vis: getComputedStyle(td).visibility,
+                            inert: td.inert,
+                            expanded: trigger.getAttribute('aria-expanded'),
+                            focusRestored: document.activeElement === trigger
+                        };
+                    }"""
+                )
+                assert toc_closed_state == {
+                    "checked": False,
+                    "vis": "hidden",
+                    "inert": True,
+                    "expanded": "false",
+                    "focusRestored": True,
+                }
+
+                # Reopen via Space and verify TOC link click closes drawer & restores trigger focus
+                nav_page.keyboard.press("Space")
+                assert nav_page.evaluate("document.getElementById('__toc').checked") is True
+                nav_page.locator(".toc-drawer .toc-tree a").nth(1).click()
+                nav_page.wait_for_timeout(30)
+                assert nav_page.evaluate("document.getElementById('__toc').checked") is False
+                assert nav_page.evaluate("document.querySelector('.toc-drawer').inert") is True
+                assert (
+                    nav_page.evaluate(
+                        "document.activeElement === document.querySelector('.toc-content-icon')"
+                    )
+                    is True
+                )
+
+                # Mobile viewports (375x812 and 320x640): both drawers closed, 0 off-screen Tab stops
+                for vp_w, vp_h in ((375, 812), (320, 640)):
+                    nav_page.set_viewport_size({"width": vp_w, "height": vp_h})
+                    nav_page.wait_for_timeout(280)
+                    closed_mobile = nav_page.evaluate(
+                        """() => {
+                            const sd = document.querySelector('.sidebar-drawer');
+                            const td = document.querySelector('.toc-drawer');
+                            return {
+                                sdVis: getComputedStyle(sd).visibility,
+                                sdInert: sd.inert,
+                                tdVis: getComputedStyle(td).visibility,
+                                tdInert: td.inert
+                            };
+                        }"""
+                    )
+                    assert closed_mobile == {
+                        "sdVis": "hidden",
+                        "sdInert": True,
+                        "tdVis": "hidden",
+                        "tdInert": True,
+                    }, f"{vp_w}x{vp_h} closed drawers mismatch: {closed_mobile}"
+
+                    # Press Tab 15 times and confirm 0 stops land inside closed drawers
+                    nav_page.evaluate("document.activeElement && document.activeElement.blur()")
+                    for _ in range(15):
+                        nav_page.keyboard.press("Tab")
+                        in_closed = nav_page.evaluate(
+                            """() => {
+                                const el = document.activeElement;
+                                return !!(
+                                    el && (el.closest('.sidebar-drawer') || el.closest('.toc-drawer'))
+                                );
+                            }"""
+                        )
+                        assert in_closed is False, (
+                            f"Closed drawer trapped Tab stop at {vp_w}x{vp_h}"
+                        )
+
+                    # Keyboard toggle #__navigation and #__toc and restore on Escape
+                    for trig_sel, input_id, drawer_sel in (
+                        (".nav-overlay-icon", "__navigation", ".sidebar-drawer"),
+                        (".toc-header-icon", "__toc", ".toc-drawer"),
+                    ):
+                        nav_page.locator(trig_sel).focus()
+                        nav_page.keyboard.press("Space")
+                        opened = nav_page.evaluate(
+                            f"""() => {{
+                                const dr = document.querySelector('{drawer_sel}');
+                                const tr = document.querySelector('{trig_sel}');
+                                return {{
+                                    checked: document.getElementById('{input_id}').checked,
+                                    vis: getComputedStyle(dr).visibility,
+                                    inert: dr.inert,
+                                    expanded: tr.getAttribute('aria-expanded'),
+                                    focusInside: dr.contains(document.activeElement)
+                                }};
+                            }}"""
+                        )
+                        assert opened == {
+                            "checked": True,
+                            "vis": "visible",
+                            "inert": False,
+                            "expanded": "true",
+                            "focusInside": True,
+                        }
+                        nav_page.keyboard.press("Escape")
+                        assert (
+                            nav_page.evaluate(f"document.getElementById('{input_id}').checked")
+                            is False
+                        )
+                        assert (
+                            nav_page.evaluate(f"document.querySelector('{drawer_sel}').inert")
+                            is True
+                        )
+                        assert (
+                            nav_page.evaluate(
+                                f"document.activeElement === document.querySelector('{trig_sel}')"
+                            )
+                            is True
+                        )
+
+                # Wide desktop (> 82em = 1400x900) leaves both drawers visible and non-inert
+                nav_page.set_viewport_size({"width": 1400, "height": 900})
+                nav_page.wait_for_timeout(50)
+                wide_drawers = nav_page.evaluate(
+                    """() => {
+                        const sd = document.querySelector('.sidebar-drawer');
+                        const td = document.querySelector('.toc-drawer');
+                        return {
+                            sdVis: getComputedStyle(sd).visibility,
+                            sdInert: sd.inert,
+                            tdVis: getComputedStyle(td).visibility,
+                            tdInert: td.inert
+                        };
+                    }"""
+                )
+                assert wide_drawers == {
+                    "sdVis": "visible",
+                    "sdInert": False,
+                    "tdVis": "visible",
+                    "tdInert": False,
+                }
+
+                # 5c. py-modindex.html: .no-toc triggers skipped & 5 img.toggler controls
+                nav_page.set_viewport_size({"width": 1280, "height": 900})
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/py-modindex.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+
+                no_toc_audit = nav_page.evaluate(
+                    """() => {
+                        const hdr = document.querySelector('.toc-header-icon');
+                        const cnt = document.querySelector('.toc-content-icon');
+                        return {
+                            hdrNoToc: hdr.classList.contains('no-toc'),
+                            cntNoToc: cnt.classList.contains('no-toc'),
+                            hdrDisplay: getComputedStyle(hdr).display,
+                            cntDisplay: getComputedStyle(cnt).display,
+                            hdrHasTabindex: hdr.hasAttribute('tabindex'),
+                            cntHasTabindex: cnt.hasAttribute('tabindex')
+                        };
+                    }"""
+                )
+                assert no_toc_audit == {
+                    "hdrNoToc": True,
+                    "cntNoToc": True,
+                    "hdrDisplay": "none",
+                    "cntDisplay": "none",
+                    "hdrHasTabindex": False,
+                    "cntHasTabindex": False,
+                }
+
+                togglers_meta = nav_page.evaluate(
+                    """() => Array.from(document.querySelectorAll('img.toggler')).map((img) => {
+                        const num = img.id.replace(/^toggle-/, '');
+                        return {
+                            id: img.id,
+                            tabIndex: img.tabIndex,
+                            role: img.getAttribute('role'),
+                            expanded: img.getAttribute('aria-expanded'),
+                            label: img.getAttribute('aria-label') || '',
+                            alt: img.getAttribute('alt'),
+                            rowCount: document.querySelectorAll('tr.cg-' + num).length
+                        };
+                    })"""
+                )
+                assert len(togglers_meta) == 5
+                total_toggled_rows = sum(item["rowCount"] for item in togglers_meta)
+                assert total_toggled_rows >= 191, (
+                    f"Expected >= 191 module rows across 5 img.toggler groups, got {total_toggled_rows}"
+                )
+                expected_pkgs = {
+                    "apache_airflow_providers_imednet",
+                    "imednet",
+                    "imednet_sinks",
+                    "imednet_tui",
+                    "imednet_workflows",
+                }
+                assert {item["label"] for item in togglers_meta} == {
+                    f"Toggle {pkg} submodules" for pkg in expected_pkgs
+                }
+
+                for item in togglers_meta:
+                    tid = item["id"]
+                    num = tid.replace("toggle-", "")
+                    assert item["tabIndex"] == 0
+                    assert item["role"] == "button"
+                    assert item["expanded"] == "true"
+                    assert item["alt"] == "-"
+
+                    loc = nav_page.locator(f"#{tid}")
+                    loc.focus()
+                    nav_page.keyboard.press("Enter")
+                    collapsed_check = nav_page.evaluate(
+                        f"""() => {{
+                            const img = document.getElementById('{tid}');
+                            const rows = Array.from(document.querySelectorAll('tr.cg-{num}'));
+                            return {{
+                                expanded: img.getAttribute('aria-expanded'),
+                                alt: img.getAttribute('alt'),
+                                allHidden: rows.length > 0 && rows.every((r) => getComputedStyle(r).display === 'none')
+                            }};
+                        }}"""
+                    )
+                    assert collapsed_check == {
+                        "expanded": "false",
+                        "alt": "+",
+                        "allHidden": True,
+                    }
+
+                    nav_page.keyboard.press("Space")
+                    expanded_check = nav_page.evaluate(
+                        f"""() => {{
+                            const img = document.getElementById('{tid}');
+                            const rows = Array.from(document.querySelectorAll('tr.cg-{num}'));
+                            return {{
+                                expanded: img.getAttribute('aria-expanded'),
+                                alt: img.getAttribute('alt'),
+                                allVisible: rows.length > 0 && rows.every((r) => getComputedStyle(r).display !== 'none')
+                            }};
+                        }}"""
+                    )
+                    assert expanded_check == {
+                        "expanded": "true",
+                        "alt": "-",
+                        "allVisible": True,
+                    }
+
+                # 5d. 4-mode :focus-visible outlines (light, dark, prefers-contrast: more, forced-colors)
+                outline_helper_js = """
+                window.__checkToggleOutline = (sel) => {
+                    const h = window.__wcagHelpers;
+                    const el = document.querySelector(sel);
+                    const cs = getComputedStyle(el);
+                    const oc = h.parseRgb(cs.outlineColor);
+                    const bg = h.effectiveBg(el);
+                    return {
+                        matches: el.matches(':focus-visible'),
+                        style: cs.outlineStyle,
+                        width: cs.outlineWidth,
+                        color: cs.outlineColor,
+                        contrast: oc ? h.ratio(oc, bg) : 0
+                    };
+                };
+                """
+                nav_page.add_script_tag(content=outline_helper_js)
+                for theme in ("light", "dark"):
+                    nav_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    nav_page.locator("#toggle-1").focus()
+                    nav_page.keyboard.press("Shift")
+                    mod_out = nav_page.evaluate("window.__checkToggleOutline('#toggle-1')")
+                    assert mod_out["matches"] is True
+                    assert mod_out["style"] == "solid" and mod_out["width"] == "2px"
+                    assert mod_out["contrast"] >= 4.5
+
+                nav_page.emulate_media(contrast="more")
+                for theme in ("light", "dark"):
+                    nav_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    nav_page.locator("#toggle-1").focus()
+                    nav_page.keyboard.press("Shift")
+                    mod_hc = nav_page.evaluate("window.__checkToggleOutline('#toggle-1')")
+                    assert mod_hc["matches"] is True
+                    assert mod_hc["style"] == "solid" and mod_hc["width"] == "2px"
+                    assert mod_hc["contrast"] >= 7.0
+                nav_page.emulate_media(contrast="no-preference")
+
+                nav_page.emulate_media(forced_colors="active")
+                sys_hl_mod = nav_page.evaluate(
+                    """() => {
+                        const p = document.createElement('span');
+                        p.style.cssText = 'forced-color-adjust: none !important; outline: 2px solid Highlight !important; display: none;';
+                        document.body.appendChild(p);
+                        const c = getComputedStyle(p).outlineColor;
+                        p.remove();
+                        return c;
+                    }"""
+                )
+                nav_page.locator("#toggle-1").focus()
+                nav_page.keyboard.press("Shift")
+                mod_fc = nav_page.evaluate("window.__checkToggleOutline('#toggle-1')")
+                assert mod_fc["matches"] is True
+                assert mod_fc["style"] == "solid" and mod_fc["width"] == "2px"
+                assert mod_fc["color"] == sys_hl_mod
+                nav_page.emulate_media(forced_colors="none")
+
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+                nav_page.add_script_tag(content=outline_helper_js)
+
+                for theme in ("light", "dark"):
+                    nav_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    nav_page.set_viewport_size({"width": 1280, "height": 900})
+                    for sel in ("#toctree-checkbox-1", ".toc-content-icon"):
+                        nav_page.locator(sel).focus()
+                        nav_page.keyboard.press("Shift")
+                        res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert res["matches"] is True
+                        assert res["style"] == "solid" and res["width"] == "2px"
+                        assert res["contrast"] >= 4.5
+                    nav_page.set_viewport_size({"width": 375, "height": 812})
+                    for sel in (".nav-overlay-icon", ".toc-header-icon"):
+                        nav_page.locator(sel).focus()
+                        nav_page.keyboard.press("Shift")
+                        res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert res["matches"] is True
+                        assert res["style"] == "solid" and res["width"] == "2px"
+                        assert res["contrast"] >= 4.5
+
+                nav_page.emulate_media(contrast="more")
+                for theme in ("light", "dark"):
+                    nav_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    nav_page.set_viewport_size({"width": 1280, "height": 900})
+                    for sel in ("#toctree-checkbox-1", ".toc-content-icon"):
+                        nav_page.locator(sel).focus()
+                        nav_page.keyboard.press("Shift")
+                        res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert res["matches"] is True
+                        assert res["style"] == "solid" and res["width"] == "2px"
+                        assert res["contrast"] >= 7.0
+                    nav_page.set_viewport_size({"width": 375, "height": 812})
+                    for sel in (".nav-overlay-icon", ".toc-header-icon"):
+                        nav_page.locator(sel).focus()
+                        nav_page.keyboard.press("Shift")
+                        res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert res["matches"] is True
+                        assert res["style"] == "solid" and res["width"] == "2px"
+                        assert res["contrast"] >= 7.0
+                nav_page.emulate_media(contrast="no-preference")
+
+                nav_page.emulate_media(forced_colors="active")
+                sys_hl_idx = nav_page.evaluate(
+                    """() => {
+                        const p = document.createElement('span');
+                        p.style.cssText = 'forced-color-adjust: none !important; outline: 2px solid Highlight !important; display: none;';
+                        document.body.appendChild(p);
+                        const c = getComputedStyle(p).outlineColor;
+                        p.remove();
+                        return c;
+                    }"""
+                )
+                nav_page.set_viewport_size({"width": 1280, "height": 900})
+                for sel in ("#toctree-checkbox-1", ".toc-content-icon"):
+                    nav_page.locator(sel).focus()
+                    nav_page.keyboard.press("Shift")
+                    res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                    assert res["matches"] is True
+                    assert res["style"] == "solid" and res["width"] == "2px"
+                    assert res["color"] == sys_hl_idx
+                nav_page.set_viewport_size({"width": 375, "height": 812})
+                for sel in (".nav-overlay-icon", ".toc-header-icon"):
+                    nav_page.locator(sel).focus()
+                    nav_page.keyboard.press("Shift")
+                    res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                    assert res["matches"] is True
+                    assert res["style"] == "solid" and res["width"] == "2px"
+                    assert res["color"] == sys_hl_idx
+                nav_page.emulate_media(forced_colors="none")
+
+                nav_page.close()
                 context.close()
             finally:
                 browser.close()
