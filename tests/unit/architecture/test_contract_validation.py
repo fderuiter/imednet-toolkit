@@ -1,6 +1,7 @@
 """Tests for contract validation across namespaces and plugins."""
 
 import dataclasses
+import importlib.util
 import inspect
 import re
 import sys
@@ -8,13 +9,28 @@ import tomllib
 from collections.abc import Iterable, Mapping
 from importlib.metadata import entry_points
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+import imednet.utils.evaluator as evaluator_mod
+from imednet.core.operations.circuit_breaker import CircuitBreaker, CircuitState, ProbeLease
+from imednet.errors import (
+    ApiError,
+    CircuitBreakerError,
+    DiagnosticContext,
+    EvaluationError,
+    ExportBatchError,
+    PathTraversalValidationError,
+    RequestError,
+    RestrictedEvaluationError,
+)
 from imednet.integrations.sink_base import SinkConfig
+from imednet.models.study_config import MappingRule
 from imednet.plugins import WorkflowsNamespaceProtocol
 from imednet.sdk import ImednetSDK
+from imednet.utils.url import build_safe_path, validate_path_segment
 from imednet_sinks.plugin import SinksNamespace
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
@@ -32,6 +48,37 @@ STREAMING_CHECKPOINT_OPTIONS: tuple[str, ...] = (
     "stream_name",
     "ledger_path",
     "state_provider",
+)
+
+RESILIENCE_SYMBOLS: tuple[str, ...] = (
+    CircuitBreaker.__name__,
+    CircuitState.__name__,
+    ProbeLease.__name__,
+    CircuitBreaker.record_rate_limit.__name__,
+    ExportBatchError.__name__,
+)
+
+DIAGNOSTIC_ERROR_SYMBOLS: tuple[str, ...] = (
+    DiagnosticContext.__name__,
+    RequestError.__name__,
+    CircuitBreakerError.__name__,
+    ApiError.__name__,
+    "errors",
+    "field_attribute",
+    "field_value",
+)
+
+PATH_VALIDATION_SYMBOLS: tuple[str, ...] = (
+    validate_path_segment.__name__,
+    build_safe_path.__name__,
+    PathTraversalValidationError.__name__,
+)
+
+AST_SANDBOX_SYMBOLS: tuple[str, ...] = (
+    *tuple(evaluator_mod.__all__),
+    RestrictedEvaluationError.__name__,
+    EvaluationError.__name__,
+    MappingRule.__name__,
 )
 
 
@@ -349,6 +396,279 @@ def validate_workflow_interactions_sections(workflow_interactions_rst: Path) -> 
     return errors
 
 
+def validate_resilience_and_error_narrative_coverage(
+    docs_dir: Path,
+    resilience_symbols: Iterable[str] = RESILIENCE_SYMBOLS,
+    error_symbols: Iterable[str] = DIAGNOSTIC_ERROR_SYMBOLS,
+) -> list[str]:
+    """Verify retry_policy.rst, api_overview.rst, and architecture.rst document resilience and error contracts."""
+    errors: list[str] = []
+    retry_rst = docs_dir / "how-to" / "retry_policy.rst"
+    api_rst = docs_dir / "explanation" / "api_overview.rst"
+    arch_rst = docs_dir / "explanation" / "architecture.rst"
+
+    for rst_path in (retry_rst, api_rst, arch_rst):
+        if not rst_path.exists():
+            errors.append(f"Missing narrative guide: {rst_path}")
+    if errors:
+        return errors
+
+    retry_text = retry_rst.read_text(encoding="utf-8")
+    api_text = api_rst.read_text(encoding="utf-8")
+    arch_text = arch_rst.read_text(encoding="utf-8")
+
+    for rst_path, text in ((retry_rst, retry_text), (api_rst, api_text)):
+        if ".. testcode::" not in text:
+            errors.append(f"{rst_path}: Missing runnable '.. testcode::' coverage")
+
+    for sym in resilience_symbols:
+        for rst_path, text in ((retry_rst, retry_text), (arch_rst, arch_text)):
+            if not re.search(rf"\b{re.escape(sym)}\b", text):
+                errors.append(
+                    f"{rst_path}: Missing narrative documentation for resilience symbol '{sym}'"
+                )
+
+    for sym in error_symbols:
+        for rst_path, text in ((retry_rst, retry_text), (api_rst, api_text)):
+            if not re.search(rf"\b{re.escape(sym)}\b", text):
+                errors.append(
+                    f"{rst_path}: Missing narrative documentation for diagnostic/error symbol '{sym}'"
+                )
+
+    return errors
+
+
+def validate_path_validation_narrative_coverage(
+    docs_dir: Path,
+    path_symbols: Iterable[str] = PATH_VALIDATION_SYMBOLS,
+) -> list[str]:
+    """Verify SDK, CLI, workflow, and Airflow guides document dynamic URL path validation."""
+    errors: list[str] = []
+    target_guides = (
+        docs_dir / "explanation" / "api_overview.rst",
+        docs_dir / "how-to" / "cli.rst",
+        docs_dir / "how-to" / "workflows" / "uat_workflow.rst",
+        docs_dir / "how-to" / "airflow.rst",
+    )
+
+    for rst_path in target_guides:
+        if not rst_path.exists():
+            errors.append(f"Missing path-validation narrative guide: {rst_path}")
+            continue
+        text = rst_path.read_text(encoding="utf-8")
+        if ".. testcode::" not in text:
+            errors.append(f"{rst_path}: Missing runnable '.. testcode::' coverage")
+        for sym in path_symbols:
+            if not re.search(rf"\b{re.escape(sym)}\b", text):
+                errors.append(
+                    f"{rst_path}: Missing narrative documentation for path-validation symbol '{sym}'"
+                )
+
+    return errors
+
+
+def validate_ast_evaluator_narrative_coverage(
+    docs_dir: Path,
+    evaluator_symbols: Iterable[str] = AST_SANDBOX_SYMBOLS,
+) -> list[str]:
+    """Verify record_mapping.rst, data_extraction.rst, and architecture.rst document AST sandbox symbols."""
+    errors: list[str] = []
+    target_guides = (
+        docs_dir / "how-to" / "record_mapping.rst",
+        docs_dir / "how-to" / "workflows" / "data_extraction.rst",
+        docs_dir / "explanation" / "architecture.rst",
+    )
+
+    for rst_path in target_guides:
+        if not rst_path.exists():
+            errors.append(f"Missing AST sandbox narrative guide: {rst_path}")
+            continue
+        text = rst_path.read_text(encoding="utf-8")
+        if ".. testcode::" not in text:
+            errors.append(f"{rst_path}: Missing runnable '.. testcode::' coverage")
+        for sym in evaluator_symbols:
+            if not re.search(rf"\b{re.escape(sym)}\b", text):
+                errors.append(
+                    f"{rst_path}: Missing narrative documentation for AST sandbox symbol '{sym}'"
+                )
+
+    return errors
+
+
+def _load_docs_conf_module():
+    """Load docs/conf.py as an isolated module for Sphinx xref unit testing."""
+    conf_path = DOCS_DIR / "conf.py"
+    spec = importlib.util.spec_from_file_location("_test_docs_conf", conf_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    docs_ext = str(DOCS_DIR / "_ext")
+    added_ext = False
+    if docs_ext not in sys.path:
+        sys.path.insert(0, docs_ext)
+        added_ext = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if added_ext and docs_ext in sys.path:
+            sys.path.remove(docs_ext)
+    return module
+
+
+def test_resilience_and_error_narrative_parity() -> None:
+    """Assert circuit breaker, probe lease, rate-limit, and diagnostic/API error contracts are documented."""
+    assert hasattr(ApiError, "field_attribute")
+    assert hasattr(ApiError, "field_value")
+    errors = validate_resilience_and_error_narrative_coverage(DOCS_DIR)
+    assert not errors, f"Resilience/error narrative parity failed: {errors}"
+
+
+def test_path_validation_narrative_parity() -> None:
+    """Assert validate_path_segment, build_safe_path, and PathTraversalValidationError are documented across guides."""
+    errors = validate_path_validation_narrative_coverage(DOCS_DIR)
+    assert not errors, f"Path validation narrative parity failed: {errors}"
+
+
+def test_ast_evaluator_narrative_parity() -> None:
+    """Assert RestrictedAstEvaluator allowlists, errors, and MappingRule fallbacks are documented across guides."""
+    errors = validate_ast_evaluator_narrative_coverage(DOCS_DIR)
+    assert not errors, f"AST evaluator narrative parity failed: {errors}"
+
+
+def test_sphinx_reexported_py_reference_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Assert _resolve_reexported_py_reference resolves imednet, errors, utils, and spi re-exports."""
+    conf = _load_docs_conf_module()
+    resolved_targets: list[tuple[str, str, str]] = []
+
+    def fake_make_refnode(
+        _builder: object,
+        _fromdocname: str,
+        todocname: str,
+        targetid: str,
+        _child: object,
+        title: str,
+    ) -> tuple[str, str, str]:
+        hit = (todocname, targetid, title)
+        resolved_targets.append(hit)
+        return hit
+
+    monkeypatch.setattr(conf, "make_refnode", fake_make_refnode)
+
+    canonical_inventory = {
+        "imednet.errors.base.ImednetError": SimpleNamespace(
+            docname="api/generated/imednet.errors.base",
+            node_id="imednet.errors.base.ImednetError",
+        ),
+        "imednet.errors.base.DiagnosticContext": SimpleNamespace(
+            docname="api/generated/imednet.errors.base",
+            node_id="imednet.errors.base.DiagnosticContext",
+        ),
+        "imednet.errors.network.RequestError": SimpleNamespace(
+            docname="api/generated/imednet.errors.network",
+            node_id="imednet.errors.network.RequestError",
+        ),
+        "imednet.errors.network.CircuitBreakerError": SimpleNamespace(
+            docname="api/generated/imednet.errors.network",
+            node_id="imednet.errors.network.CircuitBreakerError",
+        ),
+        "imednet.errors.validation.ConfigurationError": SimpleNamespace(
+            docname="api/generated/imednet.errors.validation",
+            node_id="imednet.errors.validation.ConfigurationError",
+        ),
+        "imednet.errors.api.ApiError": SimpleNamespace(
+            docname="api/generated/imednet.errors.api",
+            node_id="imednet.errors.api.ApiError",
+        ),
+        "imednet.errors.api.ApiError.errors": SimpleNamespace(
+            docname="api/generated/imednet.errors.api",
+            node_id="imednet.errors.api.ApiError.errors",
+        ),
+        "imednet.errors.api.ApiError.field_attribute": SimpleNamespace(
+            docname="api/generated/imednet.errors.api",
+            node_id="imednet.errors.api.ApiError.field_attribute",
+        ),
+        "imednet.errors.api.ApiError.field_value": SimpleNamespace(
+            docname="api/generated/imednet.errors.api",
+            node_id="imednet.errors.api.ApiError.field_value",
+        ),
+        "imednet.errors.validation.BadRequestError": SimpleNamespace(
+            docname="api/generated/imednet.errors.validation",
+            node_id="imednet.errors.validation.BadRequestError",
+        ),
+        "imednet.errors.registry.get_error_class": SimpleNamespace(
+            docname="api/generated/imednet.errors.registry",
+            node_id="imednet.errors.registry.get_error_class",
+        ),
+        "imednet.errors.validation.PathTraversalValidationError": SimpleNamespace(
+            docname="api/generated/imednet.errors.validation",
+            node_id="imednet.errors.validation.PathTraversalValidationError",
+        ),
+        "imednet.errors.validation.RestrictedEvaluationError": SimpleNamespace(
+            docname="api/generated/imednet.errors.validation",
+            node_id="imednet.errors.validation.RestrictedEvaluationError",
+        ),
+        "imednet.sdk.ImednetSDK": SimpleNamespace(
+            docname="api/generated/imednet.sdk",
+            node_id="imednet.sdk.ImednetSDK",
+        ),
+        "imednet.utils.url.validate_path_segment": SimpleNamespace(
+            docname="api/generated/imednet.utils.url",
+            node_id="imednet.utils.url.validate_path_segment",
+        ),
+        "imednet.utils.url.build_safe_path": SimpleNamespace(
+            docname="api/generated/imednet.utils.url",
+            node_id="imednet.utils.url.build_safe_path",
+        ),
+        "imednet.utils.evaluator.RestrictedAstEvaluator": SimpleNamespace(
+            docname="api/generated/imednet.utils.evaluator",
+            node_id="imednet.utils.evaluator.RestrictedAstEvaluator",
+        ),
+        "imednet.integrations.sink_base.SinkConfig": SimpleNamespace(
+            docname="api/generated/imednet.integrations.sink_base",
+            node_id="imednet.integrations.sink_base.SinkConfig",
+        ),
+        "imednet.integrations.sink_base.StateProviderProtocol": SimpleNamespace(
+            docname="api/generated/imednet.integrations.sink_base",
+            node_id="imednet.integrations.sink_base.StateProviderProtocol",
+        ),
+    }
+
+    fake_app = SimpleNamespace(builder=SimpleNamespace(get_relative_uri=lambda _a, _b: ""))
+    fake_env = SimpleNamespace(domaindata={"py": {"objects": canonical_inventory}})
+
+    expected_resolutions = {
+        "imednet.errors.ImednetError": "imednet.errors.base.ImednetError",
+        "imednet.errors.DiagnosticContext": "imednet.errors.base.DiagnosticContext",
+        "imednet.errors.RequestError": "imednet.errors.network.RequestError",
+        "imednet.errors.CircuitBreakerError": "imednet.errors.network.CircuitBreakerError",
+        "imednet.errors.ConfigurationError": "imednet.errors.validation.ConfigurationError",
+        "imednet.errors.BadRequestError": "imednet.errors.validation.BadRequestError",
+        "imednet.errors.ApiError.errors": "imednet.errors.api.ApiError.errors",
+        "imednet.errors.ApiError.field_attribute": "imednet.errors.api.ApiError.field_attribute",
+        "imednet.errors.ApiError.field_value": "imednet.errors.api.ApiError.field_value",
+        "imednet.errors.get_error_class": "imednet.errors.registry.get_error_class",
+        "imednet.errors.PathTraversalValidationError": (
+            "imednet.errors.validation.PathTraversalValidationError"
+        ),
+        "imednet.errors.RestrictedEvaluationError": (
+            "imednet.errors.validation.RestrictedEvaluationError"
+        ),
+        "imednet.ImednetSDK": "imednet.sdk.ImednetSDK",
+        "imednet.utils.validate_path_segment": "imednet.utils.url.validate_path_segment",
+        "imednet.utils.build_safe_path": "imednet.utils.url.build_safe_path",
+        "imednet.utils.RestrictedAstEvaluator": "imednet.utils.evaluator.RestrictedAstEvaluator",
+        "imednet.spi.sink_base.SinkConfig": "imednet.integrations.sink_base.SinkConfig",
+        "imednet.spi.sink_base.StateProviderProtocol": (
+            "imednet.integrations.sink_base.StateProviderProtocol"
+        ),
+    }
+
+    for reftarget, expected_canonical in expected_resolutions.items():
+        node = {"refdomain": "py", "reftarget": reftarget, "refdoc": "explanation/architecture"}
+        res = conf._resolve_reexported_py_reference(fake_app, fake_env, node, object())
+        assert res is not None, f"Failed to resolve re-exported xref '{reftarget}'"
+        assert res[2] == expected_canonical
+
+
 def test_sink_config_and_streaming_checkpoints_narrative_parity() -> None:
     """Assert all SinkConfig fields and streaming checkpoint options are documented in narrative guides."""
     sink_field_names = [f.name for f in dataclasses.fields(SinkConfig)]
@@ -424,3 +744,51 @@ def test_narrative_parity_gates_fail_on_undocumented_additions(tmp_path: Path) -
     sec_errs = validate_workflow_interactions_sections(bare_rst)
     assert any("lacks explanatory prose" in err for err in sec_errs)
     assert any("lacks a '.. testcode::' example" in err for err in sec_errs)
+
+    resilience_errs = validate_resilience_and_error_narrative_coverage(
+        DOCS_DIR,
+        resilience_symbols=(*RESILIENCE_SYMBOLS, "UndocumentedBreakerSymbolXYZ"),
+        error_symbols=(*DIAGNOSTIC_ERROR_SYMBOLS, "UndocumentedDiagnosticSymbolXYZ"),
+    )
+    assert any("UndocumentedBreakerSymbolXYZ" in err for err in resilience_errs)
+    assert any("UndocumentedDiagnosticSymbolXYZ" in err for err in resilience_errs)
+
+    path_errs = validate_path_validation_narrative_coverage(
+        DOCS_DIR,
+        path_symbols=(*PATH_VALIDATION_SYMBOLS, "undocumented_path_guard_xyz"),
+    )
+    assert len([err for err in path_errs if "undocumented_path_guard_xyz" in err]) == 4
+
+    ast_errs = validate_ast_evaluator_narrative_coverage(
+        DOCS_DIR,
+        evaluator_symbols=(*AST_SANDBOX_SYMBOLS, "UndocumentedAstEvaluatorSymbolXYZ"),
+    )
+    assert len([err for err in ast_errs if "UndocumentedAstEvaluatorSymbolXYZ" in err]) == 3
+
+    empty_docs = tmp_path / "empty_docs"
+    (empty_docs / "explanation").mkdir(parents=True)
+    (empty_docs / "how-to" / "workflows").mkdir(parents=True)
+    for rel in (
+        "explanation/api_overview.rst",
+        "explanation/architecture.rst",
+        "how-to/retry_policy.rst",
+        "how-to/cli.rst",
+        "how-to/airflow.rst",
+        "how-to/record_mapping.rst",
+        "how-to/workflows/uat_workflow.rst",
+        "how-to/workflows/data_extraction.rst",
+    ):
+        (empty_docs / rel).write_text("Title\n=====\n\nProse without testcode.\n", encoding="utf-8")
+
+    assert any(
+        "Missing runnable '.. testcode::'" in err
+        for err in validate_resilience_and_error_narrative_coverage(empty_docs)
+    )
+    assert any(
+        "Missing runnable '.. testcode::'" in err
+        for err in validate_path_validation_narrative_coverage(empty_docs)
+    )
+    assert any(
+        "Missing runnable '.. testcode::'" in err
+        for err in validate_ast_evaluator_narrative_coverage(empty_docs)
+    )
