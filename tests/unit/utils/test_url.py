@@ -5,6 +5,7 @@ import pytest
 from imednet.errors.validation import PathTraversalValidationError
 from imednet.utils.url import (
     build_safe_path,
+    normalize_cache_origin,
     redact_sensitive_text,
     redact_url_query,
     sanitize_base_url,
@@ -233,3 +234,29 @@ def test_validate_path_segment_rejects_unsafe(unsafe_segment: object) -> None:
     """Test validate_path_segment raises PathTraversalValidationError on unsafe tokens."""
     with pytest.raises(PathTraversalValidationError):
         validate_path_segment(unsafe_segment)
+
+
+@pytest.mark.parametrize(
+    ("raw_origin", "expected_origin"),
+    [
+        (
+            "https://CANARY_PAT@edc.trn.imednetapi.com:443/api/v1/edc?X-Amz-Signature=CANARY_SIG",  # pragma: allowlist secret
+            "https://edc.trn.imednetapi.com",
+        ),
+        (
+            "/local/custom?api_key=CANARY_KEY&mode=rw",  # pragma: allowlist secret
+            "/local/custom?api_key=***&mode=rw",
+        ),
+        (
+            "sqlite:///local.db?mode=rw&key=CANARY_SQL_KEY",  # pragma: allowlist secret
+            "sqlite:///local.db?mode=rw&key=***",
+        ),
+    ],
+)
+def test_normalize_cache_origin_strips_or_redacts_credentials(
+    raw_origin: str, expected_origin: str
+) -> None:
+    """Test normalize_cache_origin never preserves userinfo or query secrets."""
+    result = normalize_cache_origin(raw_origin)
+    assert result == expected_origin
+    assert "CANARY_" not in result

@@ -1796,7 +1796,66 @@ async def test_pilot_async_simulation_sdk_selection_logs_refresh_and_zero_to_thr
         assert remaining_textual_handlers == []
         assert imednet_logger.level == logging.WARNING
     finally:
+        from imednet.simulation import reset_default_simulation_state
+
+        reset_default_simulation_state()
         imednet_logger.setLevel(saved_level)
+
+
+@pytest.mark.asyncio
+async def test_pilot_simulation_my_study_site_filter_and_cross_study_job_isolation() -> None:
+    """Selecting Main Site (103) in MY_STUDY keeps matching Subjects and isolates cross-Study Jobs."""
+    from imednet.simulation import SimulationState, SimulationTransport
+
+    sim_state = SimulationState()
+    transport = SimulationTransport(state=sim_state)
+
+    async with AsyncImednetSDK(simulation_mode=True, transport=transport) as sdk:
+        study_batch = await sdk.async_create_record(
+            "STUDY",
+            [{"subjectKey": "SUB1", "formKey": "F_VS", "data": {"V_WEIGHT": 71.0}}],
+        )
+        assert study_batch.batch_id is not None
+
+        # Advance JOB-1002 to COMPLETED in DEMO-STUDY before inspecting MY_STUDY
+        polled_demo = await sdk.jobs.poll("DEMO-STUDY", "JOB-1002", interval=0.001, timeout=5.0)
+        assert str(polled_demo.state) == "COMPLETED"
+
+        app = ImednetTuiApp(sdk, study_key="MY_STUDY")
+        async with app.run_test() as pilot:
+            await _settle(pilot)
+            assert isinstance(app.screen, DashboardScreen)
+            dashboard = app.screen
+            site_list = dashboard.query_one(SiteList)
+            subject_table = dashboard.query_one(SubjectTable)
+            job_monitor = dashboard.query_one(JobMonitor)
+
+            assert dashboard.selected_study_key == "MY_STUDY"
+            assert len(site_list.children) == 1
+            assert subject_table.row_count == 1
+
+            # Select Main Site (103) via Enter -> retains matching MY_STUDY subject
+            site_list.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await _settle(pilot)
+            assert dashboard.selected_site_id == "103"
+            assert subject_table.row_count == 1
+            assert str(subject_table.get_row_at(0)[1]) == "103"
+
+            # Foreign STUDY BATCH-* job resolves to NOT_FOUND in MY_STUDY, while JOB-1002 stays RUNNING (50%)
+            job_monitor.track_job(study_batch.batch_id)
+            job_monitor.track_job("JOB-1002")
+            await _settle(pilot)
+
+            job_table = job_monitor.query_one(JobTable)
+            rows_by_batch = {
+                str(job_table.get_row_at(idx)[0]): [str(cell) for cell in job_table.get_row_at(idx)]
+                for idx in range(job_table.row_count)
+            }
+            assert rows_by_batch[study_batch.batch_id][1] == "NOT_FOUND"
+            assert rows_by_batch["JOB-1002"][1] == "RUNNING"
+            assert rows_by_batch["JOB-1002"][2] == "50%"
 
 
 @pytest.mark.asyncio

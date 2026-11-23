@@ -63,7 +63,11 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
 
     first_delta_call = sdk.get_records.call_args_list[0]
     second_delta_call = sdk.records.list.call_args_list[0]
-    assert first_delta_call.kwargs == {"study_key": "STUDY", "record_data_filter": None}
+    assert first_delta_call.kwargs == {
+        "study_key": "STUDY",
+        "record_data_filter": None,
+        "deleted": False,
+    }
     assert second_delta_call.kwargs == {
         "study_key": "STUDY",
         "filter": 'dateModified>="2024-01-02 00:00:00+00:00"',
@@ -456,7 +460,7 @@ def test_cached_loader_http_contract_iso_timestamp_and_lowercase_bool(tmp_path: 
         loader.sync_records("STUDY", reconcile=True)
         loader.sync_records("STUDY", reconcile=False)
 
-        assert "filter" not in calls[0]
+        assert calls[0]["filter"] == "deleted==false"
         assert calls[1]["filter"] == "deleted==false"
         assert calls[1]["recordDataFilter"] == "none"
         assert calls[2]["filter"] == "dateModified>=2024-01-02T00:00:00Z"
@@ -625,6 +629,7 @@ def test_study_with_only_null_timestamps_uses_lightweight_reconcile_after_initia
     assert sdk.get_records.call_args_list[0].kwargs == {
         "study_key": "STUDY",
         "record_data_filter": None,
+        "deleted": False,
     }
     assert sdk.get_records.call_args_list[2].kwargs == {
         "study_key": "STUDY",
@@ -923,6 +928,10 @@ def test_fail_study_sync_redacts_userinfo_presigned_file_keys_and_bearer_tokens(
     from imednet_workflows.cached_loader import StudySyncStatus
 
     sdk = MagicMock()
+    sdk.base_url = (
+        "https://CANARY_ORIGIN_PAT_000@edc.example.test/api/v1/edc"  # pragma: allowlist secret
+        "?X-Amz-Signature=CANARY_ORIGIN_SIG_000"  # pragma: allowlist secret
+    )
     sdk.get_records.side_effect = RuntimeError(
         "Sync failed for https://CANARY_SYNC_PAT_111@edc.example.test/api/v1/edc/records"  # pragma: allowlist secret
         "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=CANARY_SYNC_SIG_222"  # pragma: allowlist secret
@@ -932,13 +941,23 @@ def test_fail_study_sync_redacts_userinfo_presigned_file_keys_and_bearer_tokens(
     )
 
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "redact-cache")
+    assert loader.base_url == "https://edc.example.test"
     with pytest.raises(RuntimeError):
         loader.sync_records("STUDY_SECRET")
 
     state = loader.get_study_sync_state("STUDY_SECRET")
     assert state.status == StudySyncStatus.FAILED
     assert state.error_message is not None
+    with get_sqlite_connection(loader.db_path) as conn:
+        stored_row = conn.execute(
+            "SELECT base_url, error_message FROM study_sync_state WHERE study_key = ?",
+            ("STUDY_SECRET",),
+        ).fetchone()
+    assert stored_row is not None
+    assert stored_row["base_url"] == "https://edc.example.test"
     for canary in (
+        "CANARY_ORIGIN_PAT_000",
+        "CANARY_ORIGIN_SIG_000",
         "CANARY_SYNC_PAT_111",
         "CANARY_SYNC_SIG_222",
         "CANARY_SYNC_SAS_333",
@@ -946,6 +965,7 @@ def test_fail_study_sync_redacts_userinfo_presigned_file_keys_and_bearer_tokens(
         "CANARY_SYNC_BEARER_555",
     ):
         assert canary not in state.error_message
+        assert canary not in str(stored_row["base_url"])
     assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in state.error_message
     assert "mode=rw" in state.error_message
     assert "https://***@edc.example.test" in state.error_message
