@@ -1040,6 +1040,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
     uat_run_parser.set_defaults(func=_handle_uat_run)
 
+    from imednet.spi.models import PROFILE_REGISTRY
+
     validate_std_parser = sub.add_parser(
         "validate-standards",
         help="Validate study records and schema against CDISC CDASH and SDTM readiness rules.",
@@ -1049,7 +1051,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--profile",
         "--standards-profile",
         dest="standards_profile",
-        choices=("general", "drug", "biologic", "vaccine", "device"),
+        choices=tuple(PROFILE_REGISTRY.list_profiles()),
         default="general",
         help="Regulatory CDISC standards profile (default: general).",
     )

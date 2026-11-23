@@ -35,12 +35,14 @@ from imednet.integrations.sink_base import (
 )
 from imednet.models.sdtm import (
     SDTM_DOMAIN_SPECS,
+    extract_suppqual_rows,
     format_variable_name,
     get_sdtm_domain_variables,
     normalize_naming_convention,
     resolve_sdtm_domain,
     transform_records_to_sdtm,
     transform_records_to_sdtm_rows,
+    transform_records_to_suppqual,
 )
 
 __all__ = [
@@ -59,6 +61,7 @@ __all__ = [
     "extract_record_form_ref",
     "extract_record_id",
     "extract_record_timestamp",
+    "extract_suppqual_rows",
     "format_variable_name",
     "get_sdtm_domain_variables",
     "get_state_provider",
@@ -77,6 +80,7 @@ __all__ = [
     "run_streaming_export",
     "transform_records_to_sdtm",
     "transform_records_to_sdtm_rows",
+    "transform_records_to_suppqual",
     "validate_max_buffered_records",
 ]
 

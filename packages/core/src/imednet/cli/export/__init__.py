@@ -139,10 +139,12 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Target CDISC SDTM domain code (e.g. AE, DM, VS, CM, DV, DD); implies --as-sdtm.",
     )
+    from ...models.standards import PROFILE_REGISTRY
+
     parser.add_argument(
         "--standards-profile",
         dest="standards_profile",
-        choices=["general", "drug", "device"],
+        choices=PROFILE_REGISTRY.list_profiles(),
         default=None,
         help="CDISC standards readiness profile used to validate study batches.",
     )

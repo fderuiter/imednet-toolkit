@@ -383,7 +383,7 @@ class CentralizedMapper:
                 study_key=sk,
                 include_deleted=True,
                 mask_phi=self.mask_phi,
-                seq_counters=self._seq_counters,
+                seq_counters=self._seq_counters if target_domain != "DM" else None,
                 phi_keys=pipeline_phi_keys or None,
                 pipeline=active_pipeline if has_active_rules else None,
             )

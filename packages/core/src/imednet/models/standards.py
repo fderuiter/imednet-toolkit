@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 from imednet.core.context import is_strict_mode
 from imednet.models.base import ImednetBaseModel
 from imednet.models.sdtm import (
+    _MASKED_SENTINEL,
     _SDTM_RECORDS_SORT,
     _UNSET_PIPELINE,
     SDTM_DOMAIN_SPECS,
@@ -18,12 +20,14 @@ from imednet.models.sdtm import (
     _collapse_alnum_key,
     _extract_stream_usubjid_and_id,
     _format_sdtm_flag,
+    _format_usubjid,
     _get_model_consumed_keys,
     _get_model_field_aliases,
     _iter_sorted_sdtm_frames,
     _normalize_key,
     _PreparedSdtmRow,
     _SdtmNormalizer,
+    extract_suppqual_rows,
     format_iso8601_dtc,
     format_variable_name,
     get_sdtm_domain_variables,
@@ -31,6 +35,7 @@ from imednet.models.sdtm import (
     resolve_sdtm_domain,
     transform_records_to_sdtm,
     transform_records_to_sdtm_rows,
+    transform_records_to_suppqual,
 )
 from imednet.utils.dates import normalize_iso_date
 from imednet.utils.validators import (
@@ -74,8 +79,35 @@ _CANONICAL_DOMAINS: dict[str, str] = {
     "CONCOMITANT_MEDICATIONS": "CM",
     "CONCOMITANT MEDICATION": "CM",
     "CONCOMITANT_MEDICATION": "CM",
+    "CONMEDS": "CM",
+    "LB": "LB",
+    "LAB": "LB",
+    "LABS": "LB",
+    "LABORATORY": "LB",
+    "EX": "EX",
+    "EXPOSURE": "EX",
+    "MH": "MH",
+    "MEDICAL HISTORY": "MH",
+    "MEDICAL_HISTORY": "MH",
+    "MEDICALHISTORY": "MH",
+    "MEDHIST": "MH",
 }
 
+_STANDARD_AE_SEVERITY_VALUES: list[Any] = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "MILD",
+    "MODERATE",
+    "SEVERE",
+]
 _STANDARD_SEX_VALUES: list[str] = ["M", "F", "U", "UNDIFFERENTIATED"]
 _STANDARD_VITAL_SIGNS_UNITS: list[str] = [
     "mmHg",
@@ -95,10 +127,217 @@ _STANDARD_VITAL_SIGNS_UNITS: list[str] = [
 ]
 
 
+_ISO_KNOWN_PREFIX_RE = re.compile(
+    r"^(\d{4})"
+    r"(?:-(0[1-9]|1[0-2])"
+    r"(?:-(0[1-9]|[12]\d|3[01])"
+    r"(?:[T ]([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?)?)?)?"
+)
+
+
 def _canonical_domain(domain: str) -> str:
     """Normalize a clinical domain identifier to its standard 2-letter code."""
     normalized = domain.strip().upper().replace("-", "_")
     return _CANONICAL_DOMAINS.get(normalized, normalized)
+
+
+def _canonicalize_domain_record(
+    domain: str,
+    data: Mapping[str, Any],
+    *,
+    normalized_lookups: dict[str, dict[str, str]] | None = None,
+    canonical_terms: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Project both uppercase SDTM variables and camelCase/snake_case EDC aliases onto *data*."""
+    resolved: dict[str, Any] = dict(data)
+    lower_map: dict[str, Any] = {
+        str(k).lower(): v for k, v in data.items() if not is_missing_value(v)
+    }
+
+    if is_missing_value(resolved.get("subjectKey")):
+        for subj_cand in (
+            "subject_key",
+            "USUBJID",
+            "usubjid",
+            "SUBJID",
+            "subjid",
+            "subjectId",
+            "subject_id",
+        ):
+            cand_val = resolved.get(subj_cand)
+            if is_missing_value(cand_val):
+                cand_val = lower_map.get(subj_cand.lower())
+            if not is_missing_value(cand_val):
+                resolved["subjectKey"] = cand_val.strip() if isinstance(cand_val, str) else cand_val
+                break
+
+    sdtm_domain = resolve_sdtm_domain(domain, fallback="")
+    spec = SDTM_DOMAIN_SPECS.get(sdtm_domain)
+    if spec is None:
+        return resolved
+
+    flag_vars: set[str] = spec.get("flags", set())
+    for sdtm_var, aliases in spec["aliases"].items():
+        found_val: Any = None
+        has_val = False
+        for cand in (sdtm_var, *aliases):
+            cand_val = resolved.get(cand)
+            if is_missing_value(cand_val):
+                cand_val = lower_map.get(cand.lower())
+            if not is_missing_value(cand_val):
+                found_val = cand_val
+                has_val = True
+                break
+        if not has_val:
+            continue
+
+        if is_missing_value(resolved.get(sdtm_var)):
+            resolved[sdtm_var] = found_val
+
+        for alias in aliases:
+            if not is_missing_value(resolved.get(alias)):
+                continue
+            alias_val = found_val
+            if (
+                sdtm_var in flag_vars
+                and alias != sdtm_var
+                and isinstance(alias_val, str)
+                and is_boolean_token(alias_val.strip())
+            ):
+                alias_val = parse_bool(alias_val.strip())
+            if (
+                normalized_lookups
+                and alias in normalized_lookups
+                and normalized_lookups[alias]
+                and isinstance(alias_val, str)
+            ):
+                lk = alias_val.strip().upper()
+                if lk in normalized_lookups[alias]:
+                    alias_val = normalized_lookups[alias][lk]
+            elif canonical_terms and alias in canonical_terms and isinstance(alias_val, str):
+                lk = alias_val.strip().upper()
+                if lk in canonical_terms[alias]:
+                    alias_val = canonical_terms[alias][lk]
+            resolved[alias] = alias_val
+
+    return resolved
+
+
+def _is_chronological_dtc_inverted(start_raw: Any, end_raw: Any) -> bool:
+    """Return True strictly when *start_raw* represents a later timestamp/date than *end_raw*."""
+    if is_missing_value(start_raw) or is_missing_value(end_raw):
+        return False
+    if _MASKED_SENTINEL in (start_raw, end_raw):
+        return False
+
+    start_iso = format_iso8601_dtc(start_raw, mask_phi=False)
+    end_iso = format_iso8601_dtc(end_raw, mask_phi=False)
+    if not start_iso or not end_iso:
+        return False
+
+    if ("T" in start_iso or " " in start_iso) and ("T" in end_iso or " " in end_iso):
+        try:
+            s_dt = datetime.fromisoformat(
+                f"{start_iso[:-1]}+00:00" if start_iso.endswith("Z") else start_iso
+            )
+            e_dt = datetime.fromisoformat(
+                f"{end_iso[:-1]}+00:00" if end_iso.endswith("Z") else end_iso
+            )
+            if (s_dt.tzinfo is None) == (e_dt.tzinfo is None):
+                return s_dt > e_dt
+        except ValueError:
+            pass
+
+    s_match = _ISO_KNOWN_PREFIX_RE.match(start_iso)
+    e_match = _ISO_KNOWN_PREFIX_RE.match(end_iso)
+    if not s_match or not e_match:
+        return False
+
+    s_parts = tuple(int(g) for g in s_match.groups() if g is not None)
+    e_parts = tuple(int(g) for g in e_match.groups() if g is not None)
+    if not s_parts or not e_parts:
+        return False
+    common_len = min(len(s_parts), len(e_parts))
+    return s_parts[:common_len] > e_parts[:common_len]
+
+
+def _collect_chronological_dtc_violations(
+    domain: str,
+    raw_record: Mapping[str, Any],
+    canonical_record: Mapping[str, Any],
+) -> list[ValidationViolation]:
+    """Validate ``--STDTC <= --ENDTC`` pairs across SDTM and camelCase/snake_case fields."""
+    violations: list[ValidationViolation] = []
+    checked_pairs: set[tuple[str, str]] = set()
+    sdtm_dom = resolve_sdtm_domain(domain, fallback="")
+
+    for key in list(canonical_record.keys()):
+        key_upper = str(key).upper()
+        if key_upper.endswith("STDTC") and len(key_upper) > 5:
+            prefix = key_upper[:-5]
+            start_var = f"{prefix}STDTC"
+            end_var = f"{prefix}ENDTC"
+            if (start_var, end_var) in checked_pairs:
+                continue
+            start_val = canonical_record.get(key)
+            end_val = canonical_record.get(end_var)
+            if is_missing_value(end_val):
+                for k_cand, v_cand in canonical_record.items():
+                    if str(k_cand).upper() == end_var and not is_missing_value(v_cand):
+                        end_val = v_cand
+                        break
+            checked_pairs.add((start_var, end_var))
+            if _is_chronological_dtc_inverted(start_val, end_val):
+                violations.append(
+                    ValidationViolation(
+                        field=end_var,
+                        message=(
+                            f"Chronological order violation: {start_var} must be less than or "
+                            f"equal to {end_var}."
+                        ),
+                        severity="ERROR",
+                    )
+                )
+
+    lower_raw = {str(k).lower(): (str(k), v) for k, v in raw_record.items()}
+    for low_k, (orig_k, start_val) in lower_raw.items():
+        end_lookup: str | None = None
+        if low_k.endswith("startdate"):
+            prefix_low = low_k[:-9]
+            end_lookup = f"{prefix_low}enddate"
+        elif low_k.endswith("_start_date"):
+            prefix_low = low_k[:-11]
+            end_lookup = f"{prefix_low}_end_date"
+        elif low_k == "start_date":
+            end_lookup = "end_date"
+        if end_lookup is None or end_lookup not in lower_raw:
+            continue
+        end_orig_k, end_val = lower_raw[end_lookup]
+        inferred_prefix = sdtm_dom if len(sdtm_dom) == 2 else ""
+        if (
+            inferred_prefix
+            and (f"{inferred_prefix}STDTC", f"{inferred_prefix}ENDTC") in checked_pairs
+        ):
+            continue
+        pair_id = (orig_k.upper(), end_orig_k.upper())
+        if pair_id in checked_pairs:
+            continue
+        checked_pairs.add(pair_id)
+        target_field = f"{inferred_prefix}ENDTC" if inferred_prefix else end_orig_k
+        start_label = f"{inferred_prefix}STDTC" if inferred_prefix else orig_k
+        if _is_chronological_dtc_inverted(start_val, end_val):
+            violations.append(
+                ValidationViolation(
+                    field=target_field,
+                    message=(
+                        f"Chronological order violation: {start_label} must be less than or "
+                        f"equal to {target_field}."
+                    ),
+                    severity="ERROR",
+                )
+            )
+
+    return violations
 
 
 class _DomainDict(dict[str, Any]):
@@ -177,9 +416,21 @@ class StandardsProfile:
             _DomainDict(value_constraints) if value_constraints else _DomainDict()
         )
 
+    def _resolve_profile_domain(self, domain: str) -> str:
+        """Resolve canonical domain key, mapping 'DV' to 'PD' when 'DV' is not explicitly defined."""
+        domain_key = _canonical_domain(domain)
+        if (
+            domain_key == "DV"
+            and "DV" not in self.required_fields
+            and "DV" not in self.recommended_fields
+            and ("PD" in self.required_fields or "PD" in self.recommended_fields)
+        ):
+            return "PD"
+        return domain_key
+
     def expected_fields(self, domain: str) -> list[str]:
         """Return the list of expected (required + recommended) fields for a domain."""
-        domain_key = _canonical_domain(domain)
+        domain_key = self._resolve_profile_domain(domain)
         required = self.required_fields.get(domain_key, [])
         recommended = self.recommended_fields.get(domain_key, [])
         return [*required, *recommended]
@@ -188,17 +439,18 @@ class StandardsProfile:
         """Validate a data dictionary against the profile for a specific domain.
 
         Args:
-            domain: The domain name (e.g., 'AE', 'PD', 'DM', 'VS').
+            domain: The domain name (e.g., 'AE', 'PD', 'DM', 'VS', 'CM', 'LB', 'EX', 'MH').
             data: The data dictionary to validate.
 
         Returns:
             A list of ValidationViolation objects.
         """
-        domain_key = _canonical_domain(domain)
+        domain_key = self._resolve_profile_domain(domain)
+        canonical_data = _canonicalize_domain_record(domain_key, data)
         violations: list[ValidationViolation] = []
 
         for field_name in self.required_fields.get(domain_key, []):
-            if is_missing_value(data.get(field_name)):
+            if is_missing_value(canonical_data.get(field_name)):
                 violations.append(
                     ValidationViolation(
                         field=field_name,
@@ -210,7 +462,7 @@ class StandardsProfile:
                 )
 
         for field_name in self.recommended_fields.get(domain_key, []):
-            if is_missing_value(data.get(field_name)):
+            if is_missing_value(canonical_data.get(field_name)):
                 violations.append(
                     ValidationViolation(
                         field=field_name,
@@ -224,12 +476,12 @@ class StandardsProfile:
         for constraint_key, allowed_values in self.value_constraints.items():
             if "." in constraint_key:
                 constraint_domain, field_name = constraint_key.split(".", 1)
-                if _canonical_domain(constraint_domain) != domain_key:
+                if self._resolve_profile_domain(constraint_domain) != domain_key:
                     continue
             else:
                 field_name = constraint_key
 
-            value = data.get(field_name)
+            value = canonical_data.get(field_name)
             if is_missing_value(value):
                 continue
             if value not in allowed_values:
@@ -245,7 +497,7 @@ class StandardsProfile:
 
 
 class GeneralClinicalProfile(StandardsProfile):
-    """General clinical profile with basic AE, PD, DM, and VS requirements."""
+    """General clinical profile with core CDISC domain requirements."""
 
     def __init__(self) -> None:
         """Initialize the general clinical profile."""
@@ -256,12 +508,20 @@ class GeneralClinicalProfile(StandardsProfile):
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "CM": ["subjectKey", "cmTerm"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "EX": ["subjectKey", "exTrt", "exDose", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm"],
             },
             recommended_fields={
                 "AE": ["aeDecod", "aeRelationship"],
                 "PD": ["dvStatus"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                "CM": ["cmDose", "cmDoseUnit", "cmRoute", "cmStartDate"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "EX": ["exDoseUnit", "exRoute"],
+                "MH": ["mhCategory", "mhStartDate"],
             },
             optional_fields={
                 "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
@@ -270,7 +530,7 @@ class GeneralClinicalProfile(StandardsProfile):
 
 
 class DrugSafetyProfile(StandardsProfile):
-    """Drug safety profile with stricter requirements for AE data."""
+    """Drug safety profile with stricter requirements for AE and safety domains."""
 
     def __init__(self) -> None:
         """Initialize the drug safety profile."""
@@ -281,15 +541,102 @@ class DrugSafetyProfile(StandardsProfile):
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "CM": ["subjectKey", "cmTerm"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "EX": ["subjectKey", "exTrt", "exDose", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm"],
             },
             recommended_fields={
                 "AE": ["aeActionTaken", "aeOutcome"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                "CM": ["cmDose", "cmDoseUnit", "cmRoute", "cmStartDate"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "EX": ["exDoseUnit", "exRoute"],
+                "MH": ["mhCategory", "mhStartDate"],
             },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
             value_constraints={
-                "AE.aeSeverity": [1, 2, 3, 4, 5, "1", "2", "3", "4", "5"],
+                "AE.aeSeverity": _STANDARD_AE_SEVERITY_VALUES,
+                "DM.sex": _STANDARD_SEX_VALUES,
+                "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
+            },
+        )
+
+
+class BiologicSafetyProfile(StandardsProfile):
+    """Biologic safety profile with parenteral administration and safety readiness rules."""
+
+    def __init__(self) -> None:
+        """Initialize the biologic safety profile."""
+        super().__init__(
+            profile_name="biologic",
+            required_fields={
+                "AE": [
+                    "subjectKey",
+                    "aeTerm",
+                    "aeSeverity",
+                    "aeDecod",
+                    "aeRelationship",
+                    "aeSerious",
+                ],
+                "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
+                "DM": ["subjectKey", "sex"],
+                "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "CM": ["subjectKey", "cmTerm"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "EX": ["subjectKey", "exTrt", "exDose", "exRoute", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm"],
+            },
+            recommended_fields={
+                "AE": ["aeActionTaken", "aeOutcome", "aeStartDate"],
+                "PD": ["dvStatus"],
+                "DM": ["birthDate", "age", "race", "ethnicity"],
+                "VS": ["vsTestCd", "vsUnit"],
+                "CM": ["cmDose", "cmDoseUnit", "cmRoute", "cmStartDate"],
+                "LB": ["lbTestCd", "lbUnit", "lbCategory"],
+                "EX": ["exDoseUnit", "exDoseForm"],
+                "MH": ["mhDecod", "mhCategory", "mhStartDate"],
+            },
+            optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
+            value_constraints={
+                "AE.aeSeverity": _STANDARD_AE_SEVERITY_VALUES,
+                "DM.sex": _STANDARD_SEX_VALUES,
+                "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
+            },
+        )
+
+
+class VaccineSafetyProfile(StandardsProfile):
+    """Vaccine safety profile with immunization exposure and reactogenicity rules."""
+
+    def __init__(self) -> None:
+        """Initialize the vaccine safety profile."""
+        super().__init__(
+            profile_name="vaccine",
+            required_fields={
+                "AE": ["subjectKey", "aeTerm", "aeSeverity", "aeSerious", "aeStartDate"],
+                "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
+                "DM": ["subjectKey", "sex", "age"],
+                "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "CM": ["subjectKey", "cmTerm"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "EX": ["subjectKey", "exTrt", "exDose", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm"],
+            },
+            recommended_fields={
+                "AE": ["aeDecod", "aeRelationship", "aeOutcome"],
+                "PD": ["dvStatus"],
+                "DM": ["birthDate", "race", "ethnicity"],
+                "VS": ["vsTestCd", "vsUnit"],
+                "CM": ["cmDose", "cmDoseUnit", "cmRoute", "cmStartDate", "cmIndication"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "EX": ["exDoseUnit", "exRoute"],
+                "MH": ["mhCategory", "mhStartDate"],
+            },
+            optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
+            value_constraints={
+                "AE.aeSeverity": _STANDARD_AE_SEVERITY_VALUES,
                 "DM.sex": _STANDARD_SEX_VALUES,
                 "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
             },
@@ -309,11 +656,19 @@ class DeviceSafetyProfile(StandardsProfile):
                 "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "CM": ["subjectKey", "cmTerm"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "EX": ["subjectKey", "exTrt", "exDose", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm"],
             },
             recommended_fields={
                 "DD": ["ddRelationship", "ddActionTaken"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                "CM": ["cmDose", "cmDoseUnit", "cmRoute", "cmStartDate"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "EX": ["exDoseUnit", "exRoute"],
+                "MH": ["mhCategory", "mhStartDate"],
             },
             optional_fields={},
             value_constraints={
@@ -325,14 +680,15 @@ class DeviceSafetyProfile(StandardsProfile):
     def validate(self, domain: str, data: dict[str, Any]) -> list[ValidationViolation]:
         """Validate device-specific constraints for DD and other domains."""
         violations = super().validate(domain=domain, data=data)
-        domain_key = _canonical_domain(domain)
+        domain_key = self._resolve_profile_domain(domain)
 
         if domain_key != "DD":
             return violations
 
-        deficiency_occurred = data.get("ddOccurred")
+        canonical_data = _canonicalize_domain_record(domain_key, data)
+        deficiency_occurred = canonical_data.get("ddOccurred")
         if deficiency_occurred is True and all(
-            is_missing_value(data.get(field_name))
+            is_missing_value(canonical_data.get(field_name))
             for field_name in ("ddTerm", "ddCategory", "ddDate")
         ):
             violations.append(
@@ -343,7 +699,7 @@ class DeviceSafetyProfile(StandardsProfile):
                 )
             )
 
-        dd_serious = data.get("ddSerious")
+        dd_serious = canonical_data.get("ddSerious")
         if not is_missing_value(dd_serious) and not isinstance(dd_serious, bool):
             violations.append(
                 ValidationViolation(
@@ -379,6 +735,8 @@ class StandardsProfileRegistry:
 PROFILE_REGISTRY = StandardsProfileRegistry()
 PROFILE_REGISTRY.register(GeneralClinicalProfile())
 PROFILE_REGISTRY.register(DrugSafetyProfile())
+PROFILE_REGISTRY.register(BiologicSafetyProfile())
+PROFILE_REGISTRY.register(VaccineSafetyProfile())
 PROFILE_REGISTRY.register(DeviceSafetyProfile())
 
 
@@ -719,6 +1077,10 @@ def resolve_standards_profile(profile: str | StandardsProfile | None) -> Standar
     aliases = {
         "drug_safety": "drug",
         "drugsafety": "drug",
+        "biologic_safety": "biologic",
+        "biologicsafety": "biologic",
+        "vaccine_safety": "vaccine",
+        "vaccinesafety": "vaccine",
         "device_safety": "device",
         "devicesafety": "device",
         "general_clinical": "general",
@@ -744,6 +1106,76 @@ def _normalize_lookups(
         field_name: {str(key).strip().upper(): value for key, value in lookup.items()}
         for field_name, lookup in terminology_lookups.items()
     }
+
+
+_NON_BOOLEAN_CDISC_FIELDS: frozenset[str] = frozenset(
+    {
+        "sex",
+        "gender",
+        "vsorresu",
+        "vsunit",
+        "vs_unit",
+        "lborresu",
+        "lbunit",
+        "lb_unit",
+        "lbstresu",
+        "lbstdunit",
+        "lb_std_unit",
+        "cmdosu",
+        "cmdoseunit",
+        "cm_dose_unit",
+        "exdosu",
+        "exdoseunit",
+        "ex_dose_unit",
+        "ageu",
+        "age_unit",
+        "unit",
+        "aesev",
+        "aeseverity",
+        "ae_severity",
+        "dvsev",
+        "dvseverity",
+        "dv_severity",
+        "pdseverity",
+        "severity",
+        "vsorres",
+        "vsresult",
+        "vs_result",
+        "lborres",
+        "lbresult",
+        "lb_result",
+        "lbstresc",
+        "lbstresn",
+        "result",
+        "cmdose",
+        "cm_dose",
+        "exdose",
+        "ex_dose",
+        "dose",
+        "age",
+        "arm",
+        "armcd",
+        "actarm",
+        "actarmcd",
+        "subjid",
+        "subjectid",
+        "subject_id",
+        "siteid",
+        "site_id",
+        "sitekey",
+        "site_key",
+        "vstestcd",
+        "vs_test_cd",
+        "lbtestcd",
+        "lb_test_cd",
+        "lbnrind",
+        "lbnormalrangeind",
+        "lb_normal_range_ind",
+        "studyid",
+        "study_id",
+        "domain",
+    }
+)
 
 
 class CategoricalNormalizer:
@@ -879,7 +1311,12 @@ class CategoricalNormalizer:
         if field_name in self._date_fields:
             return normalize_iso_date(raw_value, date_order=self._date_order), None
 
-        if isinstance(raw_value, str):
+        lower_field = field_name.lower()
+        if (
+            isinstance(raw_value, str)
+            and lower_field not in _NON_BOOLEAN_CDISC_FIELDS
+            and not lower_field.endswith("seq")
+        ):
             stripped_value = raw_value.strip()
             if stripped_value and is_boolean_token(stripped_value):
                 return parse_bool(stripped_value), None
@@ -974,15 +1411,37 @@ class StandardsReadinessValidator:
             for field, terms in getattr(self._normalizer, "cdisc_ct", {}).items()
         }
 
+        canonical_terms: dict[str, dict[str, str]] = getattr(
+            self._normalizer, "_canonical_terms", {}
+        )
+
         for domain, records in records_by_domain.items():
-            effective_domain = (
-                "PD"
-                if domain.strip().upper() == "DV" and not self._profile.expected_fields("DV")
-                else domain
-            )
+            effective_domain = self._profile._resolve_profile_domain(domain)
             expected_fields = self._profile.expected_fields(effective_domain)
+            scoring_fields = expected_fields or list(
+                self._profile.optional_fields.get(effective_domain, [])
+            )
+            is_dm_domain = _canonical_domain(effective_domain) == "DM"
+            seen_dm_subjects: set[str] = set()
             dom_valid_fields = 0
             dom_expected_fields = 0
+            dom_violations: list[ValidationViolation] = []
+
+            if records and not scoring_fields:
+                checked_records += len(records)
+                unprofiled_violation = ValidationViolation(
+                    field="DOMAIN",
+                    message=(
+                        f"Domain '{domain}' has no defined profile variables in "
+                        f"'{self._profile.profile_name}'."
+                    ),
+                    severity="ERROR",
+                )
+                violations.append(unprofiled_violation)
+                total_expected_fields += len(records)
+                domain_scores[domain] = 0.0
+                continue
+
             for record in records:
                 checked_records += 1
                 normalization_result = self._normalizer.normalize_record(
@@ -990,10 +1449,15 @@ class StandardsReadinessValidator:
                 )
                 warnings.extend(normalization_result.warnings)
 
+                canonical_record = _canonicalize_domain_record(
+                    effective_domain,
+                    normalization_result.normalized_record,
+                    normalized_lookups=normalized_lookups,
+                    canonical_terms=canonical_terms,
+                )
+
                 record_violations = list(
-                    self._profile.validate(
-                        domain=effective_domain, data=normalization_result.normalized_record
-                    )
+                    self._profile.validate(domain=effective_domain, data=canonical_record)
                 )
 
                 existing_error_fields = {
@@ -1001,8 +1465,8 @@ class StandardsReadinessValidator:
                     for violation in record_violations
                     if violation.severity.upper() == "ERROR"
                 }
-                for field_name in expected_fields:
-                    val = normalization_result.normalized_record.get(field_name)
+                for field_name in scoring_fields:
+                    val = canonical_record.get(field_name)
                     if is_missing_value(val):
                         continue
                     if (
@@ -1022,30 +1486,90 @@ class StandardsReadinessValidator:
                             )
                         )
 
+                structural_violations = _collect_chronological_dtc_violations(
+                    effective_domain,
+                    record,
+                    canonical_record,
+                )
+                if is_dm_domain:
+                    raw_dm_subj = (
+                        canonical_record.get("USUBJID")
+                        or canonical_record.get("usubjid")
+                        or canonical_record.get("subjectKey")
+                        or canonical_record.get("subject_key")
+                        or canonical_record.get("SUBJID")
+                        or canonical_record.get("subjid")
+                    )
+                    if not is_missing_value(raw_dm_subj):
+                        dm_subj = str(raw_dm_subj).strip()
+                        study_id = (
+                            canonical_record.get("STUDYID")
+                            or canonical_record.get("studyKey")
+                            or canonical_record.get("study_key")
+                            or ""
+                        )
+                        if study_id and dm_subj != _MASKED_SENTINEL:
+                            dm_subj = _format_usubjid(dm_subj, str(study_id))
+                        if dm_subj and dm_subj != _MASKED_SENTINEL:
+                            if dm_subj in seen_dm_subjects:
+                                structural_violations.append(
+                                    ValidationViolation(
+                                        field="USUBJID",
+                                        message=(
+                                            "Duplicate USUBJID detected in DM domain; "
+                                            "DM requires one record per subject."
+                                        ),
+                                        severity="ERROR",
+                                    )
+                                )
+                            else:
+                                seen_dm_subjects.add(dm_subj)
+
+                record_violations.extend(structural_violations)
+                dom_violations.extend(record_violations)
                 violations.extend(record_violations)
 
-                total_expected_fields += len(expected_fields)
-                dom_expected_fields += len(expected_fields)
+                structural_error_count = sum(
+                    1 for v in structural_violations if v.severity.upper() == "ERROR"
+                )
+                total_expected_fields += len(scoring_fields) + structural_error_count
+                dom_expected_fields += len(scoring_fields) + structural_error_count
                 error_fields = {
                     violation.field
                     for violation in record_violations
                     if violation.severity.upper() == "ERROR"
                 }
-                for field_name in expected_fields:
-                    value = normalization_result.normalized_record.get(field_name)
+                for field_name in scoring_fields:
+                    value = canonical_record.get(field_name)
                     if field_name in error_fields or is_missing_value(value):
                         continue
                     successfully_validated_fields += 1
                     dom_valid_fields += 1
 
+            if (
+                records
+                and dom_valid_fields == 0
+                and not any(v.severity.upper() == "ERROR" for v in dom_violations)
+            ):
+                violations.append(
+                    ValidationViolation(
+                        field="DOMAIN",
+                        message=(
+                            f"Domain '{domain}' batch matched zero profile variables in "
+                            f"'{self._profile.profile_name}'."
+                        ),
+                        severity="ERROR",
+                    )
+                )
+
             domain_scores[domain] = (
-                100.0
+                0.0
                 if dom_expected_fields == 0
                 else (dom_valid_fields / dom_expected_fields) * 100.0
             )
 
         score = (
-            100.0
+            0.0
             if total_expected_fields == 0
             else (successfully_validated_fields / total_expected_fields) * 100
         )
@@ -1072,6 +1596,7 @@ __all__ = [
     "VALID_NAMING_CONVENTIONS",
     "_SDTM_RECORDS_SORT",
     "_UNSET_PIPELINE",
+    "BiologicSafetyProfile",
     "CategoricalNormalizer",
     "DeviceSafetyProfile",
     "DrugSafetyProfile",
@@ -1081,16 +1606,19 @@ __all__ = [
     "StandardsProfileRegistry",
     "StandardsReadinessReport",
     "StandardsReadinessValidator",
+    "VaccineSafetyProfile",
     "ValidationViolation",
     "_PreparedSdtmRow",
     "_SdtmNormalizer",
     "_collapse_alnum_key",
     "_extract_stream_usubjid_and_id",
     "_format_sdtm_flag",
+    "_format_usubjid",
     "_get_model_consumed_keys",
     "_get_model_field_aliases",
     "_iter_sorted_sdtm_frames",
     "_normalize_key",
+    "extract_suppqual_rows",
     "format_iso8601_dtc",
     "format_variable_name",
     "get_sdtm_domain_variables",
@@ -1100,5 +1628,6 @@ __all__ = [
     "resolve_standards_profile",
     "transform_records_to_sdtm",
     "transform_records_to_sdtm_rows",
+    "transform_records_to_suppqual",
     "validate_cdash_variable",
 ]

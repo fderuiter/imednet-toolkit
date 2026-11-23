@@ -35,7 +35,9 @@ from imednet.spi.models import (
     _normalize_key,
     _PreparedSdtmRow,
     _SdtmNormalizer,
+    extract_suppqual_rows,
     format_iso8601_dtc,
+    transform_records_to_suppqual,
 )
 from imednet.spi.models import (
     transform_records_to_sdtm as _core_transform_records_to_sdtm,
@@ -71,13 +73,14 @@ def transform_records_to_sdtm(
     seq_counters: dict[str, int] | None = None,
     phi_keys: Iterable[str] | None = None,
     registry: Any | None = None,
+    include_unmapped: bool = False,
 ) -> pd.DataFrame:
     """Transform clinical records into a normalized CDISC SDTM domain DataFrame.
 
     Delegates normalization, ISO 8601 ``BRTHDTC`` year redaction, subject-group
-    sorting, and ``<DOM>SEQ`` assignment (omitting ``DMSEQ`` on ``DM``) to the
-    core ``imednet.spi.models`` SDTM engine while resolving study enrichment
-    rules through ``resolve_enrichment_pipeline`` when not explicitly provided.
+    sorting, ``DM`` deduplication, and ``<DOM>SEQ`` assignment (omitting ``DMSEQ``
+    on ``DM``) to the core ``imednet.spi.models`` SDTM engine while resolving study
+    enrichment rules through ``resolve_enrichment_pipeline`` when not explicitly provided.
     """
     resolved_pipeline = (
         enrichment_pipeline
@@ -96,6 +99,7 @@ def transform_records_to_sdtm(
         phi_keys=phi_keys,
         registry=registry,
         pipeline=resolved_pipeline,
+        include_unmapped=include_unmapped,
     )
 
 
@@ -746,6 +750,7 @@ class RecordMapper:
         domain: str | None = None,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        include_unmapped: bool = False,
     ) -> Iterator[pd.DataFrame]:
         """Yield mapped record DataFrames in bounded chunks."""
         if as_sdtm:
@@ -758,6 +763,7 @@ class RecordMapper:
                 form_whitelist=form_whitelist,
                 mask_phi=mask_phi,
                 include_deleted=include_deleted,
+                include_unmapped=include_unmapped,
             )
             return
 
@@ -994,6 +1000,7 @@ class RecordMapper:
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         seq_counters: dict[str, int] | None = None,
+        include_unmapped: bool = False,
     ) -> pd.DataFrame:
         """Transform an iterable of records into a normalized SDTM domain DataFrame."""
         effective_include_deleted = (
@@ -1009,6 +1016,7 @@ class RecordMapper:
             mask_phi=should_mask,
             enrichment_pipeline=pipeline,
             seq_counters=seq_counters,
+            include_unmapped=include_unmapped,
         )
 
     def sdtm_dataframe(
@@ -1021,6 +1029,7 @@ class RecordMapper:
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        include_unmapped: bool = False,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset."""
         if pd is None:
@@ -1038,6 +1047,7 @@ class RecordMapper:
                 form_whitelist=form_whitelist,
                 mask_phi=should_mask,
                 include_deleted=include_deleted,
+                include_unmapped=include_unmapped,
             )
         )
         if not frames:
@@ -1047,6 +1057,7 @@ class RecordMapper:
                 study_key=study_key,
                 mask_phi=should_mask,
                 enrichment_pipeline=self._get_enrichment_pipeline(study_key),
+                include_unmapped=include_unmapped,
             )
         return pd.concat(frames, ignore_index=True)
 
@@ -1082,6 +1093,7 @@ class RecordMapper:
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        include_unmapped: bool = False,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked pandas DataFrames transformed into an SDTM domain dataset."""
         if pd is None:
@@ -1141,6 +1153,8 @@ class RecordMapper:
             include_deleted=effective_include_deleted,
             mask_phi=should_mask,
             pipeline=pipeline,
+            include_unmapped=include_unmapped,
+            allowed_unmapped_keys=allowed_vars,
         )
         if normalizer.remaps_usubjid:
             source_is_ordered = False
@@ -1167,6 +1181,7 @@ class RecordMapper:
         domain: str | None = None,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        include_unmapped: bool = False,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` of records for a study."""
         if as_sdtm:
@@ -1179,6 +1194,7 @@ class RecordMapper:
                 form_whitelist=form_whitelist,
                 mask_phi=mask_phi,
                 include_deleted=include_deleted,
+                include_unmapped=include_unmapped,
             )
 
         if pd is None:
@@ -1213,6 +1229,8 @@ __all__ = [
     "_get_model_field_aliases",
     "_iter_sorted_sdtm_frames",
     "_normalize_key",
+    "extract_suppqual_rows",
     "format_iso8601_dtc",
     "transform_records_to_sdtm",
+    "transform_records_to_suppqual",
 ]

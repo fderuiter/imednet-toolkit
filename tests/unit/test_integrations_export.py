@@ -2520,12 +2520,13 @@ def test_export_to_csv_and_tabular_sinks_as_sdtm_domain_ae_without_batch_error(
     df = pd.read_csv(csv_path)
     assert list(df["STUDYID"]) == ["TRIAL_AE", "TRIAL_AE"]
     assert list(df["DOMAIN"]) == ["AE", "AE"]
-    assert list(df["USUBJID"]) == ["SUBJ-01", "SUBJ-01"]
+    assert list(df["USUBJID"]) == ["TRIAL_AE-SUBJ-01", "TRIAL_AE-SUBJ-01"]
     assert list(df["AESEQ"]) == [1, 2]
     assert list(df["AETERM"]) == ["Headache", "Dizziness"]
     assert list(df["AESTDTC"]) == ["2026-03-01T09:15:00", "2026-03-02"]
     assert list(df["AESER"]) == ["Y", "N"]
-    assert list(df["patientName"]) == ["***MASKED***", "***MASKED***"]
+    assert "patientName" not in df.columns
+    assert "date_created" not in df.columns
 
     # Parquet and JSON SDTM exports also succeed with identical domain semantics
     pq_path = tmp_path / "ae_sdtm.parquet"
@@ -2583,6 +2584,97 @@ def test_standards_profile_and_min_standards_score_gate_non_conforming_export(
             domain="AE",
             standards_profile="drug",
             min_standards_score=90.0,
+        )
+    assert not out_csv.exists()
+
+
+def test_sink_base_evaluate_standards_readiness_dates_duplicates_and_new_profiles(
+    tmp_path: Path,
+) -> None:
+    """evaluate_standards_readiness checks empty CM/LB/EX/MH, dates, DM duplicates, and profiles."""
+    from imednet.errors import ExportError
+    from imednet.integrations.sink_base import SinkConfig, evaluate_standards_readiness
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    # Biologic and vaccine profiles are accepted by SinkConfig
+    for profile_name in ("biologic", "vaccine"):
+        cfg = SinkConfig(
+            study_key="STUDY1", standards_profile=profile_name, min_standards_score=0.0
+        )
+        assert cfg.standards_profile == profile_name
+
+    # Empty CM, LB, EX, MH records score 0.0% with is_ready=False
+    cfg_strict = SinkConfig(study_key="STUDY1", standards_profile="drug", min_standards_score=80.0)
+    for dom in ("CM", "LB", "EX", "MH"):
+        report = evaluate_standards_readiness(
+            [{"formKey": dom, "subjectKey": "S01", "recordData": {}}],
+            study_key="STUDY1",
+            config=cfg_strict,
+        )
+        assert report.score == 0.0, f"Expected 0.0% for empty {dom}"
+        assert report.is_ready is False
+        assert any(v.severity == "ERROR" for v in report.violations)
+
+    # Duplicate DM USUBJID values produce ERROR violations in evaluate_standards_readiness
+    dup_dm_report = evaluate_standards_readiness(
+        [
+            {"DOMAIN": "DM", "USUBJID": "STUDY1-S01", "SEX": "F", "AGE": 35, "ARMCD": "A"},
+            {"DOMAIN": "DM", "USUBJID": "STUDY1-S01", "SEX": "F", "AGE": 35, "ARMCD": "A"},
+        ],
+        study_key="STUDY1",
+        config=cfg_strict,
+        sdtm_domain="DM",
+    )
+    assert dup_dm_report.is_ready is False
+    assert any(
+        v.severity == "ERROR" and v.field == "USUBJID" and "Duplicate" in v.message
+        for v in dup_dm_report.violations
+    )
+
+    # Inverted --STDTC > --ENDTC blocks export_to_csv via ERROR violation even with 100% completeness
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [Form(form_id=10, form_key="AE", form_name="Adverse Events")]
+    sdk.variables.list.return_value = [
+        Variable(variable_id=1, form_id=10, form_key="AE", variable_name="aeTerm"),
+        Variable(variable_id=2, form_id=10, form_key="AE", variable_name="aeDecod"),
+        Variable(variable_id=3, form_id=10, form_key="AE", variable_name="aeSeverity"),
+        Variable(variable_id=4, form_id=10, form_key="AE", variable_name="aeRelationship"),
+        Variable(variable_id=5, form_id=10, form_key="AE", variable_name="aeSerious"),
+        Variable(variable_id=6, form_id=10, form_key="AE", variable_name="aeStartDate"),
+        Variable(variable_id=7, form_id=10, form_key="AE", variable_name="aeEndDate"),
+    ]
+    inverted_records = [
+        Record(
+            record_id=1,
+            study_key="CHRONO_STUDY",
+            form_id=10,
+            form_key="AE",
+            subject_key="S01",
+            record_data={
+                "aeTerm": "Headache",
+                "aeDecod": "Headache",
+                "aeSeverity": "MILD",
+                "aeRelationship": "RELATED",
+                "aeSerious": "N",
+                "aeStartDate": "2025-05-10",
+                "aeEndDate": "2025-05-01",
+            },
+        )
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(inverted_records)
+
+    out_csv = tmp_path / "chrono_ae.csv"
+    with pytest.raises(ExportError, match="Standards readiness check failed"):
+        export_mod.export_to_csv(
+            sdk,
+            "CHRONO_STUDY",
+            str(out_csv),
+            as_sdtm=True,
+            domain="AE",
+            standards_profile="drug",
+            min_standards_score=80.0,
         )
     assert not out_csv.exists()
 

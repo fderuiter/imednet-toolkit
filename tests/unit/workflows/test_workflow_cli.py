@@ -899,3 +899,21 @@ def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
     assert res_gated.exit_code == 1
     assert "Standards Readiness Report" in res_gated.stdout
     assert "Violations" in res_gated.stdout
+
+    for dynamic_prof in ("biologic", "vaccine"):
+        res_prof = runner.invoke(
+            cli.app,
+            [
+                "workflows",
+                "validate-standards",
+                "STUDY_STD",
+                "--profile",
+                dynamic_prof,
+                "--domain",
+                "AE",
+                "--format",
+                "json",
+            ],
+        )
+        assert res_prof.exit_code == 0, res_prof.output
+        assert json.loads(res_prof.stdout)["profile"] == dynamic_prof

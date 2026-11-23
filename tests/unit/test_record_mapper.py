@@ -552,7 +552,7 @@ def test_record_mapper_sdtm_ae_domain() -> None:
     # Row 1 assertions
     assert df.iloc[0]["STUDYID"] == "STUDY_ONCO_01"
     assert df.iloc[0]["DOMAIN"] == "AE"
-    assert df.iloc[0]["USUBJID"] == "SUBJ-001"
+    assert df.iloc[0]["USUBJID"] == "STUDY_ONCO_01-SUBJ-001"
     assert df.iloc[0]["AESEQ"] == 1
     assert df.iloc[0]["AETERM"] == "Headache"
     assert df.iloc[0]["AESEV"] == "MILD"
@@ -591,7 +591,9 @@ def test_record_mapper_dataframe_mode_as_sdtm() -> None:
     df = mapper.dataframe(study_key="STUDY_TEST", as_sdtm=True, domain="AE")
 
     assert df.iloc[0]["STUDYID"] == "STUDY_TEST"
-    assert df.iloc[0]["USUBJID"] == "SUBJ-002"
+    assert df.iloc[0]["USUBJID"] == "STUDY_TEST-SUBJ-002"
+    assert "date_created" not in df.columns
+    assert "dateCreated" not in df.columns
     assert df.iloc[0]["AETERM"] == "Dizziness"
     assert df.iloc[0]["AESEV"] == "MODERATE"
     assert df.iloc[0]["AESER"] == "N"
@@ -614,7 +616,7 @@ def test_record_mapper_reporting_models_transformation() -> None:
     )
     df_ae = transform_records_to_sdtm([ae], domain="AE", study_key="STUDY_REP_01")
     assert df_ae.iloc[0]["STUDYID"] == "STUDY_REP_01"
-    assert df_ae.iloc[0]["USUBJID"] == "SUBJ-AE-10"
+    assert df_ae.iloc[0]["USUBJID"] == "STUDY_REP_01-SUBJ-AE-10"
     assert df_ae.iloc[0]["DOMAIN"] == "AE"
     assert df_ae.iloc[0]["AETERM"] == "Rash"
     assert df_ae.iloc[0]["AEDECOD"] == "Dermatitis"
@@ -649,7 +651,7 @@ def test_record_mapper_reporting_models_transformation() -> None:
     )
     df_pd = transform_records_to_sdtm([pd_item], domain="DV", study_key="STUDY_REP_01")
     assert df_pd.iloc[0]["STUDYID"] == "STUDY_REP_01"
-    assert df_pd.iloc[0]["USUBJID"] == "SUBJ-PD-20"
+    assert df_pd.iloc[0]["USUBJID"] == "STUDY_REP_01-SUBJ-PD-20"
     assert df_pd.iloc[0]["DOMAIN"] == "DV"
     assert df_pd.iloc[0]["DVTERM"] == "Eligibility criteria violation"
     assert df_pd.iloc[0]["DVCAT"] == "ELIGIBILITY"
@@ -683,7 +685,7 @@ def test_record_mapper_reporting_models_transformation() -> None:
     )
     df_dd = transform_records_to_sdtm([dd_item], domain="DD", study_key="STUDY_REP_01")
     assert df_dd.iloc[0]["STUDYID"] == "STUDY_REP_01"
-    assert df_dd.iloc[0]["USUBJID"] == "SUBJ-DD-30"
+    assert df_dd.iloc[0]["USUBJID"] == "STUDY_REP_01-SUBJ-DD-30"
     assert df_dd.iloc[0]["DOMAIN"] == "DD"
     assert df_dd.iloc[0]["DDTERM"] == "Software freeze"
     assert df_dd.iloc[0]["DDCAT"] == "SOFTWARE"
@@ -719,7 +721,7 @@ def test_record_mapper_concomitant_medications_domain() -> None:
     df_cm = transform_records_to_sdtm(raw_records, domain="CM", study_key="STUDY_CM_01")
     assert df_cm.iloc[0]["STUDYID"] == "STUDY_CM_01"
     assert df_cm.iloc[0]["DOMAIN"] == "CM"
-    assert df_cm.iloc[0]["USUBJID"] == "SUBJ-CM-01"
+    assert df_cm.iloc[0]["USUBJID"] == "STUDY_CM_01-SUBJ-CM-01"
     assert df_cm.iloc[0]["CMSEQ"] == 1
     assert df_cm.iloc[0]["CMTRT"] == "Aspirin"
     assert df_cm.iloc[0]["CMDECOD"] == "Acetylsalicylic acid"
@@ -745,7 +747,7 @@ def test_record_mapper_vital_signs_domain() -> None:
     df_model = transform_records_to_sdtm([vs_item], domain="VS", study_key="STUDY_VS_01")
     assert df_model.iloc[0]["STUDYID"] == "STUDY_VS_01"
     assert df_model.iloc[0]["DOMAIN"] == "VS"
-    assert df_model.iloc[0]["USUBJID"] == "SUBJ-VS-01"
+    assert df_model.iloc[0]["USUBJID"] == "STUDY_VS_01-SUBJ-VS-01"
     assert df_model.iloc[0]["VSSEQ"] == 1
     assert df_model.iloc[0]["VSTESTCD"] == "DIABP"
     assert df_model.iloc[0]["VSTEST"] == "Diastolic Blood Pressure"
@@ -778,7 +780,7 @@ def test_record_mapper_vital_signs_domain() -> None:
     df_raw = transform_records_to_sdtm(raw_records, domain="VS", study_key="STUDY_VS_01")
     assert df_raw.iloc[0]["STUDYID"] == "STUDY_VS_01"
     assert df_raw.iloc[0]["DOMAIN"] == "VS"
-    assert df_raw.iloc[0]["USUBJID"] == "SUBJ-VS-02"
+    assert df_raw.iloc[0]["USUBJID"] == "STUDY_VS_01-SUBJ-VS-02"
     assert df_raw.iloc[0]["VSSEQ"] == 1
     assert df_raw.iloc[0]["VSTESTCD"] == "SYSBP"
     assert df_raw.iloc[0]["VSTEST"] == "Systolic Blood Pressure"
@@ -794,7 +796,7 @@ def test_record_mapper_vital_signs_domain() -> None:
         vsDate=datetime(2026, 3, 12, 8, 40),
     )
     df_partial = transform_records_to_sdtm([vs_partial], domain="VS", study_key="STUDY_VS_01")
-    assert df_partial.iloc[0]["USUBJID"] == "SUBJ-VS-03"
+    assert df_partial.iloc[0]["USUBJID"] == "STUDY_VS_01-SUBJ-VS-03"
     assert df_partial.iloc[0]["VSTEST"] == "Heart Rate"
     assert df_partial.iloc[0]["VSTESTCD"] is None
     assert df_partial.iloc[0]["VSORRESU"] is None
@@ -922,14 +924,20 @@ def test_sdtm_transformation_deduplicates_model_aliases() -> None:
     ):
         assert raw_attr not in df_pd.columns
 
-    # Verify custom unmapped fields are retained
+    # Verify custom unmapped fields are stripped by default and retained with include_unmapped=True
     raw_with_custom = {
         "subjectKey": "SUBJ-002",
         "aeTerm": "Fatigue",
         "custom_note": "Patient reported after lunch",
         "custom_score": 5,
     }
-    df_custom = transform_records_to_sdtm([raw_with_custom], domain="AE", study_key="STUDY01")
+    df_default = transform_records_to_sdtm([raw_with_custom], domain="AE", study_key="STUDY01")
+    assert "custom_note" not in df_default.columns
+    assert "custom_score" not in df_default.columns
+
+    df_custom = transform_records_to_sdtm(
+        [raw_with_custom], domain="AE", study_key="STUDY01", include_unmapped=True
+    )
     assert "custom_note" in df_custom.columns
     assert "custom_score" in df_custom.columns
     assert df_custom.iloc[0]["custom_note"] == "Patient reported after lunch"
@@ -964,8 +972,10 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         onset="2026-05-01T10:00:00",
         customExtra="keep_this",
     )
-    df_alias = transform_records_to_sdtm([rec_alias], domain="AE", study_key="STUDY01")
-    assert df_alias.iloc[0]["USUBJID"] == "S100"
+    df_alias = transform_records_to_sdtm(
+        [rec_alias], domain="AE", study_key="STUDY01", include_unmapped=True
+    )
+    assert df_alias.iloc[0]["USUBJID"] == "STUDY01-S100"
     assert df_alias.iloc[0]["AETERM"] == "Headache"
     assert df_alias.iloc[0]["AESEV"] == "MILD"
     assert df_alias.iloc[0]["AESTDTC"] == "2026-05-01T10:00:00"
@@ -996,8 +1006,10 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         ae_severity="MODERATE",
         extra_metric=99.1,
     )
-    df_serialized = transform_records_to_sdtm([rec_serialized], domain="AE", study_key="STUDY01")
-    assert df_serialized.iloc[0]["USUBJID"] == "S200"
+    df_serialized = transform_records_to_sdtm(
+        [rec_serialized], domain="AE", study_key="STUDY01", include_unmapped=True
+    )
+    assert df_serialized.iloc[0]["USUBJID"] == "STUDY01-S200"
     assert df_serialized.iloc[0]["AETERM"] == "Dizziness"
     assert df_serialized.iloc[0]["AESEV"] == "MODERATE"
     assert df_serialized.iloc[0]["extra_metric"] == 99.1
@@ -1020,7 +1032,7 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         aeStartDate=datetime(2026, 4, 1, 12, 0),
     )
     df_sdk = transform_records_to_sdtm([ae_sdk], domain="AE", study_key="STUDY01")
-    assert df_sdk.iloc[0]["USUBJID"] == "SUBJ-SDK"
+    assert df_sdk.iloc[0]["USUBJID"] == "STUDY01-SUBJ-SDK"
     assert df_sdk.iloc[0]["AETERM"] == "Fever"
     assert df_sdk.iloc[0]["AESEV"] == "SEVERE"
     assert df_sdk.iloc[0]["AESER"] == "Y"
@@ -1044,8 +1056,10 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         "aeSeverity": "MILD",
         "extra_note": "Post-dose",
     }
-    df_dict_camel = transform_records_to_sdtm([dict_camel], domain="AE", study_key="STUDY01")
-    assert df_dict_camel.iloc[0]["USUBJID"] == "DICT-01"
+    df_dict_camel = transform_records_to_sdtm(
+        [dict_camel], domain="AE", study_key="STUDY01", include_unmapped=True
+    )
+    assert df_dict_camel.iloc[0]["USUBJID"] == "STUDY01-DICT-01"
     assert df_dict_camel.iloc[0]["AETERM"] == "Nausea"
     assert df_dict_camel.iloc[0]["AESEV"] == "MILD"
     assert df_dict_camel.iloc[0]["extra_note"] == "Post-dose"
@@ -1060,8 +1074,10 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
         "ae_severity": "MILD",
         "unmapped_val": 42,
     }
-    df_dict_snake = transform_records_to_sdtm([dict_snake], domain="AE", study_key="STUDY01")
-    assert df_dict_snake.iloc[0]["USUBJID"] == "DICT-02"
+    df_dict_snake = transform_records_to_sdtm(
+        [dict_snake], domain="AE", study_key="STUDY01", include_unmapped=True
+    )
+    assert df_dict_snake.iloc[0]["USUBJID"] == "STUDY01-DICT-02"
     assert df_dict_snake.iloc[0]["AETERM"] == "Cough"
     assert df_dict_snake.iloc[0]["AESEV"] == "MILD"
     assert df_dict_snake.iloc[0]["unmapped_val"] == 42
@@ -1110,15 +1126,14 @@ def test_sdtm_transformation_large_batch_benchmark() -> None:
     assert "AESEV" in df.columns
     assert "AESTDTC" in df.columns
     assert "AEENDTC" in df.columns
-    assert "extra_score" in df.columns
+    assert "extra_score" not in df.columns
 
     # Verify first row transformations
-    assert df.iloc[0]["USUBJID"] == "SUBJ-0"
+    assert df.iloc[0]["USUBJID"] == "STUDY01-SUBJ-0"
     assert df.iloc[0]["AETERM"] == "Headache"
     assert df.iloc[0]["AESEV"] == "MILD"
     assert df.iloc[0]["AESTDTC"] == "2026-01-15T09:30:00"
     assert df.iloc[0]["AEENDTC"] == "2026-01-16T18:00:00"
-    assert df.iloc[0]["extra_score"] == 100
 
     # Verify model aliases and normalized keys were effectively cached
     alias_cache = _get_model_field_aliases.cache_info()
@@ -1339,18 +1354,18 @@ def test_sdtm_streaming_and_full_export_produce_identical_unique_seq_across_chun
     key_tuples = list(full_df[["STUDYID", "USUBJID", "AESEQ"]].itertuples(index=False, name=None))
     assert len(key_tuples) == len(set(key_tuples))
     assert key_tuples == [
-        ("STUDY-SEQ", "SUBJ-01", 1),
-        ("STUDY-SEQ", "SUBJ-01", 2),
-        ("STUDY-SEQ", "SUBJ-01", 3),
-        ("STUDY-SEQ", "SUBJ-01", 4),
-        ("STUDY-SEQ", "SUBJ-02", 1),
-        ("STUDY-SEQ", "SUBJ-02", 2),
+        ("STUDY-SEQ", "STUDY-SEQ-SUBJ-01", 1),
+        ("STUDY-SEQ", "STUDY-SEQ-SUBJ-01", 2),
+        ("STUDY-SEQ", "STUDY-SEQ-SUBJ-01", 3),
+        ("STUDY-SEQ", "STUDY-SEQ-SUBJ-01", 4),
+        ("STUDY-SEQ", "STUDY-SEQ-SUBJ-02", 1),
+        ("STUDY-SEQ", "STUDY-SEQ-SUBJ-02", 2),
     ]
-    subj1 = full_df[full_df["USUBJID"] == "SUBJ-01"]
+    subj1 = full_df[full_df["USUBJID"] == "STUDY-SEQ-SUBJ-01"]
     # Tie-broken by (--DTC, AETERM, recordId), with missing --DTC last
     assert list(subj1["AETERM"]) == ["Fatigue", "Fatigue", "Headache", "Cough"]
     assert list(subj1["AESER"]) == ["Y", "N", "N", "N"]
-    subj2 = full_df[full_df["USUBJID"] == "SUBJ-02"]
+    subj2 = full_df[full_df["USUBJID"] == "STUDY-SEQ-SUBJ-02"]
     assert list(subj2["AETERM"]) == ["Dizziness", "Nausea"]
 
 
@@ -1469,10 +1484,10 @@ def test_sdtm_sort_query_simulation_transport_multi_form_and_cached_loader_parit
     assert list(
         sdk_sdtm_df[["USUBJID", "AESEQ", "AETERM", "AESTDTC"]].itertuples(index=False, name=None)
     ) == [
-        ("SUBJ-01", 1, "Headache", "2026-03-01"),
-        ("SUBJ-01", 2, "Nausea", "2026-03-05"),
-        ("SUBJ-02", 1, "Chills", "2026-03-01"),
-        ("SUBJ-02", 2, "Rash", "2026-03-02"),
+        ("STUDY-SIM-SUBJ-01", 1, "Headache", "2026-03-01"),
+        ("STUDY-SIM-SUBJ-01", 2, "Nausea", "2026-03-05"),
+        ("STUDY-SIM-SUBJ-02", 1, "Chills", "2026-03-01"),
+        ("STUDY-SIM-SUBJ-02", 2, "Rash", "2026-03-02"),
     ]
 
     # Legacy/ungrouped custom loader without order_by_subject still sorts before assigning <DOM>SEQ
@@ -1571,22 +1586,34 @@ def test_dm_exports_enforce_iso_brthdtc_omit_dmseq_and_apply_study_config(
     sdk.records.list.side_effect = lambda **_kw: iter(records)
 
     mapper = RecordMapper(sdk, chunk_size=1)
+    default_dm = mapper.sdtm_dataframe("STUDY-DM", domain="DM")
+    assert "SUBJINIT" not in default_dm.columns
+    assert "site_chart_code" not in default_dm.columns
+    assert list(default_dm["INVESTIGATOR_NOTE"]) == ["***MASKED***", "***MASKED***"]
+
     dfs_masked = [
-        mapper.sdtm_dataframe("STUDY-DM", domain="DM"),
-        pd.concat(list(mapper.iter_sdtm_dataframes("STUDY-DM", domain="DM")), ignore_index=True),
-        mapper.dataframe("STUDY-DM", as_sdtm=True, domain="DM"),
+        mapper.sdtm_dataframe("STUDY-DM", domain="DM", include_unmapped=True),
         pd.concat(
-            list(mapper.iter_dataframes("STUDY-DM", as_sdtm=True, domain="DM")),
+            list(mapper.iter_sdtm_dataframes("STUDY-DM", domain="DM", include_unmapped=True)),
             ignore_index=True,
         ),
-        mapper.transform_to_sdtm(records, domain="DM", study_key="STUDY-DM"),
-        transform_records_to_sdtm(records, domain="DM", study_key="STUDY-DM"),
+        mapper.dataframe("STUDY-DM", as_sdtm=True, domain="DM", include_unmapped=True),
+        pd.concat(
+            list(
+                mapper.iter_dataframes("STUDY-DM", as_sdtm=True, domain="DM", include_unmapped=True)
+            ),
+            ignore_index=True,
+        ),
+        mapper.transform_to_sdtm(records, domain="DM", study_key="STUDY-DM", include_unmapped=True),
+        transform_records_to_sdtm(
+            records, domain="DM", study_key="STUDY-DM", include_unmapped=True
+        ),
     ]
 
     for df in dfs_masked:
         assert "DMSEQ" not in df.columns
         assert list(df["STUDYID"]) == ["STUDY-DM", "STUDY-DM"]
-        assert list(df["USUBJID"]) == ["SUBJ-01", "SUBJ-02"]
+        assert list(df["USUBJID"]) == ["STUDY-DM-SUBJ-01", "STUDY-DM-SUBJ-02"]
         assert list(df["SUBJID"]) == ["001", "002"]
         assert list(df["BRTHDTC"]) == ["1985", None]
         assert list(df["SEX"]) == ["F", "M"]
@@ -1605,19 +1632,39 @@ def test_dm_exports_enforce_iso_brthdtc_omit_dmseq_and_apply_study_config(
     # Explicit mask_phi=False per call and via constructor preserves full BRTHDTC and PHI text
     sdk.records.list.side_effect = lambda **_kw: iter(records)
     opt_out_dfs = [
-        mapper.sdtm_dataframe("STUDY-DM", domain="DM", mask_phi=False),
+        mapper.sdtm_dataframe("STUDY-DM", domain="DM", mask_phi=False, include_unmapped=True),
         pd.concat(
-            list(mapper.iter_sdtm_dataframes("STUDY-DM", domain="DM", mask_phi=False)),
+            list(
+                mapper.iter_sdtm_dataframes(
+                    "STUDY-DM", domain="DM", mask_phi=False, include_unmapped=True
+                )
+            ),
             ignore_index=True,
         ),
-        mapper.dataframe("STUDY-DM", as_sdtm=True, domain="DM", mask_phi=False),
+        mapper.dataframe(
+            "STUDY-DM", as_sdtm=True, domain="DM", mask_phi=False, include_unmapped=True
+        ),
         pd.concat(
-            list(mapper.iter_dataframes("STUDY-DM", as_sdtm=True, domain="DM", mask_phi=False)),
+            list(
+                mapper.iter_dataframes(
+                    "STUDY-DM",
+                    as_sdtm=True,
+                    domain="DM",
+                    mask_phi=False,
+                    include_unmapped=True,
+                )
+            ),
             ignore_index=True,
         ),
-        mapper.transform_to_sdtm(records, domain="DM", study_key="STUDY-DM", mask_phi=False),
-        transform_records_to_sdtm(records, domain="DM", study_key="STUDY-DM", mask_phi=False),
-        RecordMapper(sdk, mask_phi=False).sdtm_dataframe("STUDY-DM", domain="DM"),
+        mapper.transform_to_sdtm(
+            records, domain="DM", study_key="STUDY-DM", mask_phi=False, include_unmapped=True
+        ),
+        transform_records_to_sdtm(
+            records, domain="DM", study_key="STUDY-DM", mask_phi=False, include_unmapped=True
+        ),
+        RecordMapper(sdk, mask_phi=False).sdtm_dataframe(
+            "STUDY-DM", domain="DM", include_unmapped=True
+        ),
     ]
     for df_raw in opt_out_dfs:
         assert "DMSEQ" not in df_raw.columns
@@ -1705,9 +1752,9 @@ def test_sdtm_generator_streams_and_form_whitelist_variants() -> None:
     assert list(
         ungrouped_df[["USUBJID", "AESEQ", "AETERM"]].itertuples(index=False, name=None)
     ) == [
-        ("SUBJ-01", 1, "A1"),
-        ("SUBJ-02", 1, "B1"),
-        ("SUBJ-02", 2, "B2"),
+        ("STUDY-GEN-SUBJ-01", 1, "A1"),
+        ("STUDY-GEN-SUBJ-02", 1, "B1"),
+        ("STUDY-GEN-SUBJ-02", 2, "B2"),
     ]
 
     # 3. Legacy sdk.get_records returning lists for multi-form, single-form, and empty form_whitelist
@@ -1743,15 +1790,15 @@ def test_sdtm_generator_streams_and_form_whitelist_variants() -> None:
     assert empty_whitelist_df.empty
 
     single_form_df = legacy_mapper.sdtm_dataframe("STUDY-LEG", domain="AE", form_whitelist=[10])
-    assert list(single_form_df["USUBJID"]) == ["SUBJ-01", "SUBJ-02"]
+    assert list(single_form_df["USUBJID"]) == ["STUDY-LEG-SUBJ-01", "STUDY-LEG-SUBJ-02"]
 
     multi_form_df = legacy_mapper.sdtm_dataframe("STUDY-LEG", domain="AE", form_whitelist=[10, 20])
     assert list(
         multi_form_df[["USUBJID", "AESEQ", "AETERM"]].itertuples(index=False, name=None)
     ) == [
-        ("SUBJ-01", 1, "Form20-S1"),
-        ("SUBJ-01", 2, "Form10-S1"),
-        ("SUBJ-02", 1, "Form10-S2"),
+        ("STUDY-LEG-SUBJ-01", 1, "Form20-S1"),
+        ("STUDY-LEG-SUBJ-01", 2, "Form10-S1"),
+        ("STUDY-LEG-SUBJ-02", 1, "Form10-S2"),
     ]
 
 

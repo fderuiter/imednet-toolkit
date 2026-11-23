@@ -3410,11 +3410,12 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         t2 = pq.read_table(sf_stage_dir / "b2.parquet").to_pylist()
         assert t1[0]["STUDYID"] == "SDTM_STUDY"
         assert t1[0]["DOMAIN"] == "AE"
-        assert t1[0]["USUBJID"] == "SUBJ-9"
+        assert t1[0]["USUBJID"] == "SDTM_STUDY-SUBJ-9"
         assert t1[0]["AESEQ"] == 1
         assert t1[0]["AESTDTC"] == "2026-02-01T10:00:00"
         assert t1[0]["AESER"] == "Y"
-        assert t1[0]["patientName"] == "***MASKED***"
+        assert "patientName" not in t1[0]
+        assert "date_created" not in t1[0]
         assert "record_data" not in t1[0]
         assert t2[0]["AESEQ"] == 2
         executed_sql = "\n".join(c.args[0] for c in cursor.execute.call_args_list)
@@ -3440,8 +3441,10 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         doc_1 = ops_1[0][1]["$set"]
         doc_2 = ops_2[0][1]["$set"]
         assert doc_1["_id"] == "SDTM_STUDY/1"
+        assert doc_1["USUBJID"] == "SDTM_STUDY-SUBJ-9"
         assert doc_1["AESEQ"] == 1
-        assert doc_1["patientName"] == "***MASKED***"
+        assert "patientName" not in doc_1
+        assert "date_created" not in doc_1
         assert doc_2["_id"] == "SDTM_STUDY/2"
         assert doc_2["AESEQ"] == 2
 

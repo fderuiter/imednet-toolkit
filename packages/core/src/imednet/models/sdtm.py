@@ -300,6 +300,8 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
             "DDCAT": ["ddCategory", "dd_category", "DDCAT", "ddcat", "category"],
             "DDSER": ["ddSerious", "dd_serious", "DDSER", "ddser", "DDSPID", "ddspid", "serious"],
             "DDSTDTC": ["ddDate", "dd_date", "DDSTDTC", "ddstdtc", "deficiency_date", "date"],
+            "DDREL": ["ddRelationship", "dd_relationship", "DDREL", "ddrel"],
+            "DDACN": ["ddActionTaken", "dd_action_taken", "DDACN", "ddacn"],
         },
         "flags": {"DDSER"},
         "dtc": {"DDSTDTC"},
@@ -325,6 +327,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         "aliases": {
             "CMTRT": [
                 "cmTerm",
+                "cmTrt",
                 "cm_term",
                 "CMTRT",
                 "cmtrt",
@@ -335,7 +338,15 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
             ],
             "CMDECOD": ["cmDecod", "cm_decod", "CMDECOD", "cmdecod"],
             "CMDOSE": ["cmDose", "cm_dose", "CMDOSE", "cmdose", "dose"],
-            "CMDOSU": ["cmDoseUnit", "cm_dose_unit", "CMDOSU", "cmdosu", "dose_unit", "unit"],
+            "CMDOSU": [
+                "cmDoseUnit",
+                "cmDosU",
+                "cm_dose_unit",
+                "CMDOSU",
+                "cmdosu",
+                "dose_unit",
+                "unit",
+            ],
             "CMROUTE": ["cmRoute", "cm_route", "CMROUTE", "cmroute", "route"],
             "CMSTDTC": ["cmStartDate", "cm_start_date", "CMSTDTC", "cmstdtc", "start_date"],
             "CMENDTC": ["cmEndDate", "cm_end_date", "CMENDTC", "cmendtc", "end_date"],
@@ -353,6 +364,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
             "DOMAIN",
             "USUBJID",
             "SUBJID",
+            "SITEID",
             "BRTHDTC",
             "AGE",
             "AGEU",
@@ -363,6 +375,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
         ],
         "aliases": {
             "SUBJID": ["subjid", "SUBJID", "subject_id", "subjectId", "subjectKey", "subject_key"],
+            "SITEID": ["siteid", "SITEID", "site_id", "siteId", "site_key", "siteKey"],
             "BRTHDTC": [
                 "brthdat",
                 "birthDate",
@@ -462,9 +475,17 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
             "EXENDTC",
         ],
         "aliases": {
-            "EXTRT": ["exTrt", "ex_trt", "EXTRT", "extrt", "study_drug", "treatment"],
+            "EXTRT": ["exTrt", "exTerm", "ex_trt", "EXTRT", "extrt", "study_drug", "treatment"],
             "EXDOSE": ["exDose", "ex_dose", "EXDOSE", "exdose", "dose"],
-            "EXDOSU": ["exDoseUnit", "ex_dose_unit", "EXDOSU", "exdosu", "dose_unit", "unit"],
+            "EXDOSU": [
+                "exDoseUnit",
+                "exDosU",
+                "ex_dose_unit",
+                "EXDOSU",
+                "exdosu",
+                "dose_unit",
+                "unit",
+            ],
             "EXDOSFRM": ["exDoseForm", "ex_dose_form", "EXDOSFRM", "exdosfrm", "dose_form"],
             "EXDOSFRQ": ["exDoseFreq", "ex_dose_freq", "EXDOSFRQ", "exdosfrq", "frequency"],
             "EXROUTE": ["exRoute", "ex_route", "EXROUTE", "exroute", "route"],
@@ -600,7 +621,7 @@ _METADATA_SDTM_KEYS: dict[str, str] = {
 _GLOBAL_UNAMBIGUOUS_SDTM_ALIASES: dict[str, str] = {}
 for _dom_code, _dom_spec in SDTM_DOMAIN_SPECS.items():
     for _sdtm_var, _aliases in _dom_spec["aliases"].items():
-        if _dom_code == "DM" and _sdtm_var == "SUBJID":
+        if _dom_code == "DM" and _sdtm_var in {"SUBJID", "SITEID"}:
             continue
         for _alias in _aliases:
             _norm_alias = _normalize_key(_alias)
@@ -726,21 +747,51 @@ def format_variable_name(
 _BASE_SDTM_CONSUMED_KEYS: frozenset[str] = frozenset(
     {
         "USUBJID",
+        "usubjid",
         "subjectKey",
         "subject_key",
+        "subjectId",
+        "subject_id",
+        "subjectOid",
+        "subject_oid",
         "study_key",
         "studyKey",
         "STUDYID",
+        "studyid",
         "DOMAIN",
         "domain",
+        "formKey",
+        "form_key",
         "recordId",
         "record_id",
+        "recordOid",
+        "record_oid",
+        "recordType",
+        "record_type",
         "formId",
         "form_id",
         "visitId",
         "visit_id",
+        "intervalId",
+        "interval_id",
+        "parentRecordId",
+        "parent_record_id",
+        "siteId",
+        "site_id",
+        "siteKey",
+        "site_key",
+        "SITEID",
+        "siteid",
         "recordStatus",
         "record_status",
+        "dateCreated",
+        "date_created",
+        "dateModified",
+        "date_modified",
+        "lastUpdated",
+        "last_updated",
+        "deleted",
+        "keywords",
     }
 )
 
@@ -877,10 +928,26 @@ def _topic_sort_key(topic_values: tuple[Any, ...]) -> tuple[tuple[int, str], ...
     )
 
 
+def _format_usubjid(
+    raw_subject: str,
+    study_key: str,
+    *,
+    preserve_explicit: bool = False,
+) -> str:
+    """Format a non-masked subject identifier as ``<STUDYID>-<SUBJID>`` when unprefixed."""
+    if not raw_subject or raw_subject == _MASKED_SENTINEL or preserve_explicit:
+        return raw_subject
+    prefix = study_key.strip() if isinstance(study_key, str) else ""
+    if not prefix or raw_subject.startswith(f"{prefix}-"):
+        return raw_subject
+    return f"{prefix}-{raw_subject}"
+
+
 def _extract_stream_usubjid_and_id(rec: Any) -> tuple[str, tuple[int, int, str]]:
     """Extract (usubjid, record_id_sort_key) from a raw Record, model, or dict for stream merging."""
     rec_data = getattr(rec, "record_data", None)
     usubjid: Any = None
+    study_val: Any = getattr(rec, "study_key", None) or getattr(rec, "studyKey", None)
     raw_id: Any = getattr(rec, "record_id", None)
     if raw_id is None:
         raw_id = getattr(rec, "recordId", None)
@@ -888,11 +955,19 @@ def _extract_stream_usubjid_and_id(rec: Any) -> tuple[str, tuple[int, int, str]]
     if isinstance(rec_data, dict):
         usubjid = rec_data.get("USUBJID") or rec_data.get("usubjid")
     if isinstance(rec, dict):
+        if not study_val:
+            study_val = rec.get("STUDYID") or rec.get("studyKey") or rec.get("study_key")
         rd = rec.get("record_data") or rec.get("recordData")
         if isinstance(rd, dict) and not usubjid:
             usubjid = rd.get("USUBJID") or rd.get("usubjid")
         if not usubjid:
-            usubjid = rec.get("USUBJID") or rec.get("subjectKey") or rec.get("subject_key")
+            usubjid = (
+                rec.get("USUBJID")
+                or rec.get("subjectKey")
+                or rec.get("subject_key")
+                or rec.get("SUBJID")
+                or rec.get("subjid")
+            )
         if raw_id is None:
             raw_id = rec.get("recordId") if "recordId" in rec else rec.get("record_id")
     if not usubjid:
@@ -901,7 +976,8 @@ def _extract_stream_usubjid_and_id(rec: Any) -> tuple[str, tuple[int, int, str]]
         raw_id = getattr(rec, "record_oid", None) or (
             rec.get("recordOid") if isinstance(rec, dict) else None
         )
-    return str(usubjid), _record_id_sort_key(raw_id)
+    formatted_usubjid = _format_usubjid(str(usubjid), str(study_val or ""))
+    return formatted_usubjid, _record_id_sort_key(raw_id)
 
 
 @dataclass
@@ -911,6 +987,7 @@ class _PreparedSdtmRow:
     usubjid: str
     sort_key: tuple[tuple[int, str], tuple[tuple[int, str], ...], tuple[int, int, str], int]
     row: dict[str, Any]
+    unmapped: dict[str, Any] | None = None
 
 
 class _SdtmNormalizer:
@@ -926,6 +1003,8 @@ class _SdtmNormalizer:
         pipeline: Any | None = None,
         phi_keys: Iterable[str] | None = None,
         registry: SensitivityRegistry | None = None,
+        include_unmapped: bool = False,
+        allowed_unmapped_keys: Iterable[str] | None = None,
     ) -> None:
         domain_clean = resolve_sdtm_domain(domain)
         self.domain_clean = domain_clean
@@ -933,6 +1012,7 @@ class _SdtmNormalizer:
         self.include_deleted = include_deleted
         self.mask_phi = mask_phi
         self.pipeline = pipeline
+        self.include_unmapped = include_unmapped
         self.registry: SensitivityRegistry = (
             global_sensitivity_registry if registry is None else registry
         )
@@ -985,12 +1065,22 @@ class _SdtmNormalizer:
         self._sens_cache: dict[str, bool] = {}
         self.sensitive_mapped_targets: frozenset[str] = frozenset()
         sensitive_targets: set[str] = set()
+        explicit_domain_targets: set[str] = (
+            set(allowed_unmapped_keys) if allowed_unmapped_keys is not None else set()
+        )
         remaps_usubjid = False
         mappings = getattr(pipeline, "mappings", None) if pipeline is not None else None
         if mappings:
             for src_var, rule in mappings.items():
                 if rule.target_field and rule.target_field.strip().upper() == "USUBJID":
                     remaps_usubjid = True
+                rule_dom = getattr(rule, "domain", None)
+                if (
+                    rule.target_field
+                    and rule_dom
+                    and resolve_sdtm_domain(str(rule_dom)) == domain_clean
+                ):
+                    explicit_domain_targets.add(rule.target_field)
                 if (
                     rule.target_field
                     and not self._is_exempt_key(rule.target_field)
@@ -998,18 +1088,25 @@ class _SdtmNormalizer:
                 ):
                     sensitive_targets.add(_collapse_alnum_key(rule.target_field))
         self.sensitive_mapped_targets = frozenset(sensitive_targets)
+        self.allowed_unmapped_keys: frozenset[str] = frozenset(explicit_domain_targets)
         self._sens_cache.clear()
         self.remaps_usubjid = remaps_usubjid
         self._usubjid_is_sensitive = self._is_sensitive_key("USUBJID")
         self._subject_key_is_sensitive = self._is_sensitive_key(
             "subject_key"
         ) or self._is_sensitive_key("subjectKey")
+        self._subjid_is_sensitive = self._is_sensitive_key("SUBJID") or self._is_sensitive_key(
+            "subjid"
+        )
         self._topic_set = frozenset(self.topic_vars)
+        std_var_set = frozenset(self.std_vars)
+        target_vars = [*self.std_vars, *(v for v in self.alias_map if v not in std_var_set)]
         self._compiled_std_vars: tuple[
             tuple[
                 str,
                 str,
                 tuple[tuple[str, str], ...],
+                bool,
                 bool,
                 bool,
                 bool,
@@ -1029,8 +1126,9 @@ class _SdtmNormalizer:
                 self._is_exempt_key(vname),
                 self._is_sensitive_key(vname),
                 vname in self._topic_set,
+                vname not in std_var_set,
             )
-            for vname in self.std_vars
+            for vname in target_vars
             if vname not in ("STUDYID", "DOMAIN", "USUBJID", self.seq_var)
         )
 
@@ -1093,8 +1191,12 @@ class _SdtmNormalizer:
             if getattr(rec, "subject_key", None):
                 rec_dict["subject_key"] = rec.subject_key
                 rec_dict["subjectKey"] = rec.subject_key
-            if getattr(rec, "date_created", None):
-                rec_dict["date_created"] = rec.date_created
+            rec_site = getattr(rec, "site_id", None)
+            if rec_site is None:
+                rec_site = getattr(rec, "siteId", None)
+            if rec_site is not None and not isinstance(rec_site, bool):
+                rec_dict.setdefault("site_id", str(rec_site))
+                rec_dict.setdefault("siteId", str(rec_site))
         elif isinstance(rec, BaseModel):
             rec_dict = rec.model_dump(by_alias=True)
             model_cls = type(rec)
@@ -1140,18 +1242,31 @@ class _SdtmNormalizer:
             )
             or getattr(rec, "subject_key", None)
             or getattr(rec, "subjectKey", None)
+            or rec_dict.get("SUBJID")
+            or rec_dict.get("subjid")
+            or rec_dict.get("subjectId")
+            or rec_dict.get("subject_id")
             or ""
         )
-        usubjid = str(usubjid_raw)
+        usubjid = str(usubjid_raw).strip() if isinstance(usubjid_raw, str) else str(usubjid_raw)
         if (
             self.mask_phi
             and usubjid
             and (
                 self._usubjid_is_sensitive
-                or (not explicit_usubjid and self._subject_key_is_sensitive)
+                or (
+                    not explicit_usubjid
+                    and (self._subject_key_is_sensitive or self._subjid_is_sensitive)
+                )
             )
         ):
             usubjid = _MASKED_SENTINEL
+        else:
+            usubjid = _format_usubjid(
+                usubjid,
+                self.study_key,
+                preserve_explicit=bool(explicit_usubjid and self.remaps_usubjid),
+            )
 
         row: dict[str, Any] = {
             "STUDYID": self.study_key,
@@ -1180,6 +1295,7 @@ class _SdtmNormalizer:
             is_var_exempt,
             is_var_sensitive,
             is_topic,
+            emit_only_when_present,
         ) in self._compiled_std_vars:
             val = None
             found_key = None
@@ -1245,6 +1361,11 @@ class _SdtmNormalizer:
                         consumed_keys.update(all_field_aliases.get(cand, ()))
                         consumed_keys.update(all_field_aliases.get(cand_lower, ()))
 
+            if emit_only_when_present and found_key is None and val is None:
+                continue
+
+            if var_name == "SITEID" and val is not None and not isinstance(val, bool):
+                val = str(val)
             if self.terminology:
                 val = self._apply_var_terminology(var_name, val)
             if is_topic:
@@ -1284,39 +1405,46 @@ class _SdtmNormalizer:
                 row[var_name] = val
 
         normalized_consumed = {_normalize_key(c) for c in consumed_keys}
+        unmapped_extras: dict[str, Any] = {}
         for k, raw_v in rec_dict.items():
             if k not in consumed_keys and _normalize_key(k) not in normalized_consumed:
                 extra_val = self._apply_var_terminology(k, raw_v) if self.terminology else raw_v
                 if k in self._topic_set and k not in unmasked_topic_map:
                     unmasked_topic_map[k] = extra_val
+                emit_extra = self.include_unmapped or k in self.allowed_unmapped_keys
+                formatted_out: Any = extra_val
+                handled_mask = False
                 if self.mask_phi and not self._is_exempt_key(k):
                     if _is_birth_dtc_key(k):
                         if canonical_dtc_for_sort is None:
                             canonical_dtc_for_sort = format_iso8601_dtc(extra_val, mask_phi=False)
-                        row[k] = format_iso8601_dtc(extra_val, mask_phi=True)
-                        continue
-                    if self._is_sensitive_key(k):
-                        row[k] = _MASKED_SENTINEL
-                        continue
-                    if isinstance(extra_val, (dict, list, tuple)):
+                        formatted_out = format_iso8601_dtc(extra_val, mask_phi=True)
+                        handled_mask = True
+                    elif self._is_sensitive_key(k):
+                        formatted_out = _MASKED_SENTINEL
+                        handled_mask = True
+                    elif isinstance(extra_val, (dict, list, tuple)):
                         extra_val = _mask_value_recursive(
                             extra_val,
                             registry=self.registry,
                             collapsed_phi_keys=self.collapsed_phi_keys,
                         )
-                k_lower = k.lower()
-                if "date" in k_lower or "time" in k_lower or "dtc" in k_lower:
-                    formatted_extra_dtc = format_iso8601_dtc(extra_val, mask_phi=False)
-                    k_upper = k.upper()
-                    if k_upper == self.primary_dtc or (
-                        canonical_dtc_for_sort is None
-                        and k_upper.endswith("DTC")
-                        and formatted_extra_dtc is not None
-                    ):
-                        canonical_dtc_for_sort = formatted_extra_dtc
-                    row[k] = formatted_extra_dtc
-                else:
-                    row[k] = extra_val
+                        formatted_out = extra_val
+                if not handled_mask:
+                    k_lower = k.lower()
+                    if "date" in k_lower or "time" in k_lower or "dtc" in k_lower:
+                        formatted_extra_dtc = format_iso8601_dtc(extra_val, mask_phi=False)
+                        k_upper = k.upper()
+                        if k_upper == self.primary_dtc or (
+                            canonical_dtc_for_sort is None
+                            and k_upper.endswith("DTC")
+                            and formatted_extra_dtc is not None
+                        ):
+                            canonical_dtc_for_sort = formatted_extra_dtc
+                        formatted_out = formatted_extra_dtc
+                unmapped_extras[k] = formatted_out
+                if emit_extra:
+                    row[k] = formatted_out
 
         topic_vals = tuple(unmasked_topic_map.get(tv) for tv in self.topic_vars)
         sort_key = (
@@ -1325,21 +1453,38 @@ class _SdtmNormalizer:
             _record_id_sort_key(raw_record_id),
             orig_idx,
         )
-        return _PreparedSdtmRow(usubjid=usubjid, sort_key=sort_key, row=row)
+        return _PreparedSdtmRow(
+            usubjid=usubjid,
+            sort_key=sort_key,
+            row=row,
+            unmapped=unmapped_extras or None,
+        )
 
     def finalize_subject_group(
         self,
         group: list[_PreparedSdtmRow],
         seq_counters: dict[str, int],
     ) -> list[dict[str, Any]]:
-        """Sort a Subject's normalized rows and stamp sequential <DOM>SEQ values."""
+        """Sort a Subject's normalized rows, deduplicate DM, and stamp <DOM>SEQ values."""
+        if not group:
+            return []
         group.sort(key=lambda item: item.sort_key)
+        if not self.include_seq:
+            subj_id = group[0].usubjid
+            if seq_counters.get(subj_id, 0) >= 1:
+                return []
+            merged = dict(group[0].row)
+            for item in group[1:]:
+                for k, v in item.row.items():
+                    if v is not None and (not isinstance(v, str) or v.strip() != ""):
+                        merged[k] = v
+            seq_counters[subj_id] = 1
+            return [merged]
         rows: list[dict[str, Any]] = []
         for item in group:
-            if self.include_seq:
-                next_seq = seq_counters.get(item.usubjid, 0) + 1
-                seq_counters[item.usubjid] = next_seq
-                item.row[self.seq_var] = next_seq
+            next_seq = seq_counters.get(item.usubjid, 0) + 1
+            seq_counters[item.usubjid] = next_seq
+            item.row[self.seq_var] = next_seq
             rows.append(item.row)
         return rows
 
@@ -1492,7 +1637,7 @@ def get_sdtm_domain_variables(domain: str) -> list[str]:
     return ["STUDYID", "DOMAIN", "USUBJID", f"{domain_clean}SEQ"]
 
 
-def transform_records_to_sdtm_rows(
+def _build_normalizer_and_rows(
     records: Iterable[Any],
     domain: str,
     study_key: str,
@@ -1504,16 +1649,10 @@ def transform_records_to_sdtm_rows(
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
     enrichment_pipeline: Any = _UNSET_PIPELINE,
-) -> list[dict[str, Any]]:
-    """Transform clinical records into normalized CDISC SDTM row dictionaries.
-
-    Applies ``SensitivityRegistry`` and custom ``phi_keys`` / ``EnrichmentPipeline``
-    masking *before* constructing ``USUBJID`` or mapping SDTM domain variables,
-    redacts masked ``BRTHDTC`` values to 4-digit ISO 8601 years or ``None``, sorts
-    records per subject by ``(--DTC, topic_vars, recordId)``, omits ``DMSEQ`` on
-    ``DM``, and maintains per-``USUBJID`` sequence counters across streaming batches
-    when ``seq_counters`` is supplied.
-    """
+    include_unmapped: bool = False,
+    allowed_unmapped_keys: Iterable[str] | None = None,
+) -> tuple[_SdtmNormalizer, list[dict[str, Any]], dict[str, list[_PreparedSdtmRow]]]:
+    """Build an ``_SdtmNormalizer`` and transform ``records`` into finalized SDTM rows."""
     resolved_pipeline = _resolve_sdtm_pipeline(study_key, pipeline, enrichment_pipeline)
     normalizer = _SdtmNormalizer(
         domain=domain,
@@ -1523,6 +1662,8 @@ def transform_records_to_sdtm_rows(
         pipeline=resolved_pipeline,
         phi_keys=phi_keys,
         registry=registry,
+        include_unmapped=include_unmapped,
+        allowed_unmapped_keys=allowed_unmapped_keys,
     )
     counters = seq_counters if seq_counters is not None else {}
 
@@ -1535,6 +1676,47 @@ def transform_records_to_sdtm_rows(
     rows: list[dict[str, Any]] = []
     for usubjid in sorted(grouped):
         rows.extend(normalizer.finalize_subject_group(grouped[usubjid], counters))
+    return normalizer, rows, grouped
+
+
+def transform_records_to_sdtm_rows(
+    records: Iterable[Any],
+    domain: str,
+    study_key: str,
+    *,
+    include_deleted: bool = False,
+    mask_phi: bool = True,
+    seq_counters: dict[str, int] | None = None,
+    phi_keys: Iterable[str] | None = None,
+    registry: SensitivityRegistry | None = None,
+    pipeline: Any = _UNSET_PIPELINE,
+    enrichment_pipeline: Any = _UNSET_PIPELINE,
+    include_unmapped: bool = False,
+    allowed_unmapped_keys: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Transform clinical records into normalized CDISC SDTM row dictionaries.
+
+    Applies ``SensitivityRegistry`` and custom ``phi_keys`` / ``EnrichmentPipeline``
+    masking *before* constructing ``<STUDYID>-<SUBJID>`` ``USUBJID`` values,
+    populates ``DM.SITEID``, deduplicates ``DM`` to one record per ``USUBJID``,
+    excludes ``date_created`` and unmapped variables unless ``include_unmapped=True``,
+    redacts masked ``BRTHDTC`` values to 4-digit ISO 8601 years or ``None``, and
+    maintains per-``USUBJID`` sequence counters across streaming batches.
+    """
+    _, rows, _ = _build_normalizer_and_rows(
+        records,
+        domain=domain,
+        study_key=study_key,
+        include_deleted=include_deleted,
+        mask_phi=mask_phi,
+        seq_counters=seq_counters,
+        phi_keys=phi_keys,
+        registry=registry,
+        pipeline=pipeline,
+        enrichment_pipeline=enrichment_pipeline,
+        include_unmapped=include_unmapped,
+        allowed_unmapped_keys=allowed_unmapped_keys,
+    )
     return rows
 
 
@@ -1550,14 +1732,16 @@ def transform_records_to_sdtm(
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
     enrichment_pipeline: Any = _UNSET_PIPELINE,
+    include_unmapped: bool = False,
+    allowed_unmapped_keys: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     """Transform clinical records into a normalized CDISC SDTM domain DataFrame.
 
-    Maps subject keys to USUBJID, study keys to STUDYID, sorts records per
-    subject by canonical ``--DTC`` timestamp, domain topic variable, and record
-    identifier, sequences records per subject (omitting ``DMSEQ`` on ``DM``),
-    enforces PHI redaction and ``StudyConfiguration`` rules, and converts event
-    timestamps to standard ISO 8601 DTC string formats.
+    Formats ``USUBJID`` as ``<STUDYID>-<SUBJID>`` after PHI masking, populates
+    ``DM.SITEID``, deduplicates ``DM`` to one record per ``USUBJID``, excludes
+    ``date_created`` and unmapped keys by default (opt in via ``include_unmapped=True``
+    or :func:`transform_records_to_suppqual`), and stamps per-subject ``<DOM>SEQ``
+    values (omitting ``DMSEQ`` on ``DM``).
     """
     if pd is None:
         raise ImportError(
@@ -1565,29 +1749,153 @@ def transform_records_to_sdtm(
             "'pip install \"imednet[export]\"'."
         )
 
-    resolved_pipeline = _resolve_sdtm_pipeline(study_key, pipeline, enrichment_pipeline)
-    normalizer = _SdtmNormalizer(
+    normalizer, rows, _ = _build_normalizer_and_rows(
+        records,
         domain=domain,
         study_key=study_key,
         include_deleted=include_deleted,
         mask_phi=mask_phi,
-        pipeline=resolved_pipeline,
+        seq_counters=seq_counters,
         phi_keys=phi_keys,
         registry=registry,
+        pipeline=pipeline,
+        enrichment_pipeline=enrichment_pipeline,
+        include_unmapped=include_unmapped,
+        allowed_unmapped_keys=allowed_unmapped_keys,
     )
-    counters = seq_counters if seq_counters is not None else {}
-
-    grouped: dict[str, list[_PreparedSdtmRow]] = {}
-    for idx, rec in enumerate(records):
-        prepared = normalizer.prepare_record(rec, idx)
-        if prepared is not None:
-            grouped.setdefault(prepared.usubjid, []).append(prepared)
-
-    rows: list[dict[str, Any]] = []
-    for usubjid in sorted(grouped):
-        rows.extend(normalizer.finalize_subject_group(grouped[usubjid], counters))
-
     return normalizer.rows_to_dataframe(rows)
+
+
+_SUPPQUAL_COLUMNS: tuple[str, ...] = (
+    "STUDYID",
+    "RDOMAIN",
+    "USUBJID",
+    "IDVAR",
+    "IDVARVAL",
+    "QNAM",
+    "QLABEL",
+    "QVAL",
+    "QORIG",
+    "QEVAL",
+)
+
+
+def extract_suppqual_rows(
+    records: Iterable[Any],
+    domain: str,
+    study_key: str,
+    *,
+    include_deleted: bool = False,
+    mask_phi: bool = True,
+    seq_counters: dict[str, int] | None = None,
+    phi_keys: Iterable[str] | None = None,
+    registry: SensitivityRegistry | None = None,
+    pipeline: Any = _UNSET_PIPELINE,
+    enrichment_pipeline: Any = _UNSET_PIPELINE,
+) -> list[dict[str, Any]]:
+    """Extract unmapped custom eCRF variables into CDISC ``SUPP--`` row dictionaries."""
+    normalizer, _, grouped = _build_normalizer_and_rows(
+        records,
+        domain=domain,
+        study_key=study_key,
+        include_deleted=include_deleted,
+        mask_phi=mask_phi,
+        seq_counters=seq_counters,
+        phi_keys=phi_keys,
+        registry=registry,
+        pipeline=pipeline,
+        enrichment_pipeline=enrichment_pipeline,
+        include_unmapped=False,
+    )
+    idvar = normalizer.seq_var if normalizer.include_seq else ""
+    supp_rows: list[dict[str, Any]] = []
+    for usubjid in sorted(grouped):
+        subject_items = grouped[usubjid]
+        if not normalizer.include_seq:
+            merged_unmapped: dict[str, Any] = {}
+            for item in subject_items:
+                for k, v in (item.unmapped or {}).items():
+                    if k not in normalizer.allowed_unmapped_keys and v is not None:
+                        merged_unmapped[k] = v
+            for k, v in merged_unmapped.items():
+                if isinstance(v, str) and not v.strip():
+                    continue
+                qnam = re.sub(r"[^A-Za-z0-9]", "", str(k)).upper()[:8] or "CUSTOM"
+                supp_rows.append(
+                    {
+                        "STUDYID": study_key,
+                        "RDOMAIN": normalizer.domain_clean,
+                        "USUBJID": usubjid,
+                        "IDVAR": "",
+                        "IDVARVAL": "",
+                        "QNAM": qnam,
+                        "QLABEL": str(k)[:40],
+                        "QVAL": str(v),
+                        "QORIG": "CRF",
+                        "QEVAL": "",
+                    }
+                )
+            continue
+
+        for item in subject_items:
+            seq_val = item.row.get(normalizer.seq_var, "")
+            for k, v in (item.unmapped or {}).items():
+                if k in normalizer.allowed_unmapped_keys or v is None:
+                    continue
+                if isinstance(v, str) and not v.strip():
+                    continue
+                qnam = re.sub(r"[^A-Za-z0-9]", "", str(k)).upper()[:8] or "CUSTOM"
+                supp_rows.append(
+                    {
+                        "STUDYID": study_key,
+                        "RDOMAIN": normalizer.domain_clean,
+                        "USUBJID": usubjid,
+                        "IDVAR": idvar,
+                        "IDVARVAL": str(seq_val),
+                        "QNAM": qnam,
+                        "QLABEL": str(k)[:40],
+                        "QVAL": str(v),
+                        "QORIG": "CRF",
+                        "QEVAL": "",
+                    }
+                )
+    return supp_rows
+
+
+def transform_records_to_suppqual(
+    records: Iterable[Any],
+    domain: str,
+    study_key: str,
+    *,
+    include_deleted: bool = False,
+    mask_phi: bool = True,
+    seq_counters: dict[str, int] | None = None,
+    phi_keys: Iterable[str] | None = None,
+    registry: SensitivityRegistry | None = None,
+    pipeline: Any = _UNSET_PIPELINE,
+    enrichment_pipeline: Any = _UNSET_PIPELINE,
+) -> pd.DataFrame:
+    """Transform unmapped custom eCRF variables into a CDISC ``SUPP--`` DataFrame."""
+    if pd is None:
+        raise ImportError(
+            "pandas is required for SUPPQUAL transformations. Install with "
+            "'pip install \"imednet[export]\"'."
+        )
+    supp_rows = extract_suppqual_rows(
+        records,
+        domain=domain,
+        study_key=study_key,
+        include_deleted=include_deleted,
+        mask_phi=mask_phi,
+        seq_counters=seq_counters,
+        phi_keys=phi_keys,
+        registry=registry,
+        pipeline=pipeline,
+        enrichment_pipeline=enrichment_pipeline,
+    )
+    if not supp_rows:
+        return pd.DataFrame(columns=list(_SUPPQUAL_COLUMNS))
+    return pd.DataFrame(supp_rows, columns=list(_SUPPQUAL_COLUMNS))
 
 
 __all__ = [
@@ -1600,10 +1908,12 @@ __all__ = [
     "_collapse_alnum_key",
     "_extract_stream_usubjid_and_id",
     "_format_sdtm_flag",
+    "_format_usubjid",
     "_get_model_consumed_keys",
     "_get_model_field_aliases",
     "_iter_sorted_sdtm_frames",
     "_normalize_key",
+    "extract_suppqual_rows",
     "format_iso8601_dtc",
     "format_variable_name",
     "get_sdtm_domain_variables",
@@ -1611,4 +1921,5 @@ __all__ = [
     "resolve_sdtm_domain",
     "transform_records_to_sdtm",
     "transform_records_to_sdtm_rows",
+    "transform_records_to_suppqual",
 ]

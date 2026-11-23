@@ -2,6 +2,7 @@
 
 import importlib.util
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -969,3 +970,36 @@ def test_cli_export_json_hierarchical_honors_incremental_filters_ledger_and_qual
     data2 = json.loads(out_file.read_text(encoding="utf-8"))
     assert len(data2) == 1
     assert data2[0]["visits"][0]["forms"][0]["records"][0]["recordId"] == 1
+
+
+@pytest.mark.parametrize("profile_name", ["biologic", "vaccine"])
+def test_export_cli_accepts_biologic_and_vaccine_standards_profiles_dynamically(
+    runner: CliRunner,
+    sdk: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile_name: str,
+) -> None:
+    """imednet export csv --standards-profile accepts registered biologic and vaccine profiles."""
+    seen_kwargs: dict[str, Any] = {}
+
+    def _fake_export_csv(_sdk: Any, study_key: str, output_path: str, **kwargs: Any) -> None:
+        seen_kwargs["study_key"] = study_key
+        seen_kwargs["output_path"] = output_path
+        seen_kwargs.update(kwargs)
+
+    monkeypatch.setattr(cli, "export_to_csv", _fake_export_csv)
+    out_csv = tmp_path / f"{profile_name}.csv"
+    res = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "csv",
+            "STUDY_PROF",
+            str(out_csv),
+            "--standards-profile",
+            profile_name,
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert seen_kwargs["standards_profile"] == profile_name

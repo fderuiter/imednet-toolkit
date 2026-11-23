@@ -2188,6 +2188,7 @@ class _TabularTransformSink(ExportSink):
                 seq_counters=self._seq_counters,
                 phi_keys=self._phi_keys,
                 pipeline=self._pipeline,
+                allowed_unmapped_keys=self._cfg.variable_whitelist,
             )
             if df.empty:
                 return 0

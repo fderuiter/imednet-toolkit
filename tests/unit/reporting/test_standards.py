@@ -1,31 +1,74 @@
 """Unit tests for standards."""
 
+import pytest
+
 from imednet.models.standards import (
     PROFILE_REGISTRY,
+    BiologicSafetyProfile,
     DeviceSafetyProfile,
     DrugSafetyProfile,
     GeneralClinicalProfile,
     StandardsProfile,
+    StandardsReadinessValidator,
+    VaccineSafetyProfile,
     _canonical_domain,
+    extract_suppqual_rows,
     is_valid_cdash_variable,
+    resolve_standards_profile,
+    transform_records_to_sdtm,
+    transform_records_to_suppqual,
     validate_cdash_variable,
 )
 
 
 def test_profile_registry_contains_general_drug_and_device_profiles() -> None:
-    """Test that profile registry contains general drug and device profiles."""
-    assert PROFILE_REGISTRY.list_profiles() == ["device", "drug", "general"]
+    """Test that profile registry contains all five regulatory clinical profiles."""
+    assert PROFILE_REGISTRY.list_profiles() == [
+        "biologic",
+        "device",
+        "drug",
+        "general",
+        "vaccine",
+    ]
 
 
 def test_drug_profile_enforces_ae_decod_relationship_and_ctcae_grades() -> None:
-    """Test that drug profile enforces ae decod relationship and ctcae grades."""
+    """Test that drug profile accepts CDISC AESEV terms and grades 1-5 and flags invalid values."""
     profile = DrugSafetyProfile()
+    for allowed_sev in ("MILD", "MODERATE", "SEVERE", 1, 2, 3, 4, 5, "1", "2", "3", "4", "5"):
+        valid_res = profile.validate(
+            domain="AE",
+            data={
+                "subjectKey": "S001",
+                "aeTerm": "Headache",
+                "aeSeverity": allowed_sev,
+                "aeDecod": "Headache",
+                "aeRelationship": "RELATED",
+                "aeActionTaken": "NONE",
+                "aeOutcome": "RECOVERED",
+            },
+        )
+        assert valid_res == []
+        valid_sdtm_res = profile.validate(
+            domain="AE",
+            data={
+                "USUBJID": "S1-S001",
+                "AETERM": "Headache",
+                "AESEV": allowed_sev,
+                "AEDECOD": "Headache",
+                "AEREL": "RELATED",
+                "AEACN": "NONE",
+                "AEOUT": "RECOVERED",
+            },
+        )
+        assert valid_sdtm_res == []
+
     violations = profile.validate(
         domain="AE",
         data={
             "subjectKey": "S001",
             "aeTerm": "Headache",
-            "aeSeverity": "SEVERE",
+            "aeSeverity": "EXTREME",
         },
     )
 
@@ -352,11 +395,21 @@ def test_core_sdtm_transform_enforces_pre_usubjid_phi_masking_and_cross_batch_se
     assert rec1.model_dump() == original_dump_1
     assert batch1[0]["STUDYID"] == "ONCO1"
     assert batch1[0]["DOMAIN"] == "AE"
-    assert batch1[0]["USUBJID"] == "SUBJ-101"
+    assert batch1[0]["USUBJID"] == "ONCO1-SUBJ-101"
     assert batch1[0]["AESEQ"] == 1
     assert batch1[0]["AESTDTC"] == "2026-01-10T08:30:00"
     assert batch1[0]["AESER"] == "Y"
-    assert batch1[0]["patientName"] == "***MASKED***"
+    assert "patientName" not in batch1[0]
+    assert "date_created" not in batch1[0]
+
+    batch1_with_unmapped = transform_records_to_sdtm_rows(
+        [rec1],
+        domain="AE",
+        study_key="ONCO1",
+        mask_phi=True,
+        include_unmapped=True,
+    )
+    assert batch1_with_unmapped[0]["patientName"] == "***MASKED***"
 
     assert batch2[0]["AESEQ"] == 2
     assert batch2[0]["AETERM"] == "Fatigue"
@@ -395,3 +448,401 @@ def test_core_sdtm_transform_enforces_pre_usubjid_phi_masking_and_cross_batch_se
     )
     assert ready_report.score == 100.0
     assert ready_report.is_ready is True
+
+
+def test_transform_records_to_sdtm_scores_100_percent_in_readiness_validator() -> None:
+    """SDTM outputs across AE, DM, VS, DV, CM, DD, LB, EX, and MH score 100.0% with is_ready=True."""
+    from imednet.models.records import Record
+
+    study = "TRIAL01"
+    dm_df = transform_records_to_sdtm(
+        [
+            Record(
+                record_id=1,
+                study_key=study,
+                site_id=101,
+                subject_key="S01",
+                form_key="DM",
+                record_data={
+                    "subjid": "S01",
+                    "sex": "F",
+                    "birthDate": "1985-06-15",
+                    "age": 40,
+                    "race": "ASIAN",
+                    "ethnicity": "NOT HISPANIC OR LATINO",
+                },
+            )
+        ],
+        domain="DM",
+        study_key=study,
+    )
+    assert list(dm_df["USUBJID"]) == ["TRIAL01-S01"]
+    assert list(dm_df["SITEID"]) == ["101"]
+    assert list(dm_df["BRTHDTC"]) == ["1985"]
+
+    ae_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "S01",
+                "aeTerm": "Nausea",
+                "aeDecod": "Nausea",
+                "aeSeverity": "MODERATE",
+                "aeSerious": False,
+                "aeRelationship": "RELATED",
+                "aeActionTaken": "NONE",
+                "aeOutcome": "RECOVERED",
+                "aeStartDate": "2026-02-01",
+                "aeEndDate": "2026-02-03",
+            }
+        ],
+        domain="AE",
+        study_key=study,
+    )
+    vs_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "S01",
+                "vsTest": "Heart Rate",
+                "vsTestCd": "HR",
+                "vsResult": 72,
+                "vsUnit": "bpm",
+                "vsDate": "2026-02-01",
+            }
+        ],
+        domain="VS",
+        study_key=study,
+    )
+    cm_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "S01",
+                "cmTerm": "Ibuprofen",
+                "cmDose": 200,
+                "cmDoseUnit": "mg",
+                "cmRoute": "ORAL",
+                "cmStartDate": "2026-02-01",
+                "cmEndDate": "2026-02-02",
+                "cmIndication": "Headache",
+            }
+        ],
+        domain="CM",
+        study_key=study,
+    )
+    lb_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "S01",
+                "lbTest": "Hemoglobin",
+                "lbTestCd": "HGB",
+                "lbCategory": "HEMATOLOGY",
+                "lbResult": 13.8,
+                "lbUnit": "g/dL",
+                "lbDate": "2026-02-01",
+            }
+        ],
+        domain="LB",
+        study_key=study,
+    )
+    ex_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "S01",
+                "exTrt": "IMP-100",
+                "exDose": 50,
+                "exDoseUnit": "mg",
+                "exDoseForm": "INJECTION",
+                "exRoute": "SUBCUTANEOUS",
+                "exStartDate": "2026-02-01",
+                "exEndDate": "2026-02-01",
+            }
+        ],
+        domain="EX",
+        study_key=study,
+    )
+    mh_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "S01",
+                "mhTerm": "Seasonal Allergy",
+                "mhDecod": "Seasonal allergy",
+                "mhCategory": "GENERAL",
+                "mhStartDate": "2020-04-01",
+            }
+        ],
+        domain="MH",
+        study_key=study,
+    )
+    dv_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "S01",
+                "dvTerm": "Visit out of window",
+                "dvCategory": "VISIT SCHEDULE",
+                "dvSeverity": "MINOR",
+                "dvDate": "2026-02-04",
+                "dvStatus": "RESOLVED",
+            }
+        ],
+        domain="DV",
+        study_key=study,
+    )
+    dd_df = transform_records_to_sdtm(
+        [
+            {
+                "subjectKey": "S01",
+                "ddTerm": "Battery depleted",
+                "ddCategory": "BATTERY",
+                "ddSerious": False,
+                "ddDate": "2026-02-05",
+                "ddRelationship": "NOT RELATED",
+                "ddActionTaken": "REPLACED",
+            }
+        ],
+        domain="DD",
+        study_key=study,
+    )
+    assert "DDREL" in dd_df.columns
+    assert "DDACN" in dd_df.columns
+
+    sdtm_batches = {
+        "DM": dm_df.to_dict(orient="records"),
+        "AE": ae_df.to_dict(orient="records"),
+        "VS": vs_df.to_dict(orient="records"),
+        "DV": dv_df.to_dict(orient="records"),
+        "CM": cm_df.to_dict(orient="records"),
+        "DD": dd_df.to_dict(orient="records"),
+        "LB": lb_df.to_dict(orient="records"),
+        "EX": ex_df.to_dict(orient="records"),
+        "MH": mh_df.to_dict(orient="records"),
+    }
+
+    for profile_name in ("general", "drug", "biologic", "vaccine", "device"):
+        validator = StandardsReadinessValidator(profile=profile_name)
+        report = validator.score_records(records_by_domain=sdtm_batches)
+        assert report.score == 100.0, f"Profile {profile_name} failed: {report.violations}"
+        assert report.is_ready is True
+        assert report.violations == []
+
+
+@pytest.mark.parametrize("domain", ["CM", "LB", "EX", "MH"])
+@pytest.mark.parametrize("profile_name", ["general", "drug", "biologic", "vaccine", "device"])
+def test_empty_cm_lb_ex_mh_records_return_zero_readiness(domain: str, profile_name: str) -> None:
+    """Scoring empty CM, LB, EX, or MH records returns 0.0% readiness with is_ready=False."""
+    prof = resolve_standards_profile(profile_name)
+    assert prof.required_fields.get(domain), f"{profile_name} missing required {domain}"
+    assert prof.recommended_fields.get(domain), f"{profile_name} missing recommended {domain}"
+
+    validator = StandardsReadinessValidator(profile=prof)
+    report = validator.score_records(records_by_domain={domain: [{}]})
+    assert report.score == 0.0
+    assert report.domain_scores[domain] == 0.0
+    assert report.is_ready is False
+    assert any(v.severity == "ERROR" for v in report.violations)
+
+
+def test_unprofiled_and_zero_matching_domain_batches_emit_error_and_zero_score() -> None:
+    """Non-empty domain batches matching zero profile variables return 0.0 and an ERROR violation."""
+    validator = StandardsReadinessValidator(profile="general")
+    unprofiled_report = validator.score_records(
+        records_by_domain={"FA": [{"USUBJID": "S1-01", "FATEST": "Pain"}]}
+    )
+    assert unprofiled_report.score == 0.0
+    assert unprofiled_report.domain_scores["FA"] == 0.0
+    assert unprofiled_report.is_ready is False
+    assert any(v.field == "DOMAIN" and v.severity == "ERROR" for v in unprofiled_report.violations)
+
+    rec_only_profile = StandardsProfile(
+        profile_name="rec_only",
+        recommended_fields={"CM": ["cmDose", "cmRoute"]},
+    )
+    zero_match_report = StandardsReadinessValidator(profile=rec_only_profile).score_records(
+        records_by_domain={"CM": [{"unrelatedKey": "foo"}]}
+    )
+    assert zero_match_report.score == 0.0
+    assert zero_match_report.is_ready is False
+    assert any(v.severity == "ERROR" for v in zero_match_report.violations)
+
+    empty_batch_report = validator.score_records(records_by_domain={})
+    assert empty_batch_report.score == 0.0
+    assert empty_batch_report.is_ready is False
+
+
+def test_biologic_and_vaccine_profile_resolution_and_rules() -> None:
+    """BiologicSafetyProfile and VaccineSafetyProfile resolve by name/alias and enforce rules."""
+    assert isinstance(resolve_standards_profile("biologic"), BiologicSafetyProfile)
+    assert isinstance(resolve_standards_profile("biologic_safety"), BiologicSafetyProfile)
+    assert isinstance(resolve_standards_profile("vaccine"), VaccineSafetyProfile)
+    assert isinstance(resolve_standards_profile("vaccine_safety"), VaccineSafetyProfile)
+
+    bio_violations = BiologicSafetyProfile().validate(
+        "EX",
+        {"USUBJID": "S1-01", "EXTRT": "MAB-1", "EXDOSE": 100, "EXSTDTC": "2026-01-01"},
+    )
+    assert ("exRoute", "ERROR") in {(v.field, v.severity) for v in bio_violations}
+
+    vac_violations = VaccineSafetyProfile().validate(
+        "AE",
+        {"USUBJID": "S1-01", "AETERM": "Injection site pain", "AESEV": "MILD"},
+    )
+    assert ("aeSerious", "ERROR") in {(v.field, v.severity) for v in vac_violations}
+    assert ("aeStartDate", "ERROR") in {(v.field, v.severity) for v in vac_violations}
+
+
+def test_chronological_stdtc_endtc_and_duplicate_dm_usubjid_validation() -> None:
+    """StandardsReadinessValidator flags --STDTC > --ENDTC and duplicate DM USUBJIDs as ERRORs."""
+    validator = StandardsReadinessValidator(profile="general")
+
+    # Inverted SDTM dates and duplicate DM USUBJIDs
+    bad_report = validator.score_records(
+        records_by_domain={
+            "AE": [
+                {
+                    "USUBJID": "S1-001",
+                    "AETERM": "Headache",
+                    "AEDECOD": "Headache",
+                    "AESEV": "MILD",
+                    "AEREL": "NOT RELATED",
+                    "AESTDTC": "2026-03-10",
+                    "AEENDTC": "2026-03-05",
+                }
+            ],
+            "DM": [
+                {
+                    "USUBJID": "S1-001",
+                    "SEX": "F",
+                    "BRTHDTC": "1990",
+                    "AGE": 35,
+                    "RACE": "WHITE",
+                    "ETHNIC": "NOT HISPANIC OR LATINO",
+                },
+                {
+                    "USUBJID": "S1-001",
+                    "SEX": "F",
+                    "BRTHDTC": "1990",
+                    "AGE": 35,
+                    "RACE": "WHITE",
+                    "ETHNIC": "NOT HISPANIC OR LATINO",
+                },
+            ],
+        }
+    )
+    assert bad_report.is_ready is False
+    assert bad_report.score < 100.0
+    error_fields = {(v.field, v.severity) for v in bad_report.violations}
+    assert ("AEENDTC", "ERROR") in error_fields
+    assert ("USUBJID", "ERROR") in error_fields
+
+    # Equal dates and partial ISO 8601 end dates with matching prefix do NOT false-positive
+    ok_report = validator.score_records(
+        records_by_domain={
+            "AE": [
+                {
+                    "USUBJID": "S1-001",
+                    "AETERM": "Headache",
+                    "AEDECOD": "Headache",
+                    "AESEV": "MILD",
+                    "AEREL": "NOT RELATED",
+                    "AESTDTC": "2026-03-15",
+                    "AEENDTC": "2026-03",
+                },
+                {
+                    "USUBJID": "S1-002",
+                    "AETERM": "Nausea",
+                    "AEDECOD": "Nausea",
+                    "AESEV": "MODERATE",
+                    "AEREL": "POSSIBLE",
+                    "AESTDTC": "2026-03-15T12:00:00+05:00",
+                    "AEENDTC": "2026-03-15T09:00:00Z",
+                },
+            ]
+        }
+    )
+    assert ok_report.is_ready is True
+    assert ok_report.score == 100.0
+    assert ok_report.violations == []
+
+
+def test_dm_deduplication_siteid_unmapped_stripping_and_suppqual_helpers() -> None:
+    """DM outputs populate SITEID, deduplicate USUBJID, strip unmapped/date_created, and emit SUPP--."""
+    from datetime import datetime
+
+    from imednet.models.records import Record
+
+    dm_records = [
+        Record(
+            record_id=1,
+            study_key="STUDY99",
+            site_id=42,
+            subject_key="001",
+            form_key="DM",
+            date_created=datetime(2026, 1, 10, 9, 0),
+            record_data={
+                "subjid": "001",
+                "sex": "M",
+                "birthDate": "1978-11-22",
+                "customSponsorCode": "SP-A",
+                "patientName": "John Doe",
+            },
+        ),
+        Record(
+            record_id=2,
+            study_key="STUDY99",
+            site_id=42,
+            subject_key="001",
+            form_key="DM",
+            date_created=datetime(2026, 1, 11, 9, 0),
+            record_data={
+                "subjid": "001",
+                "race": "WHITE",
+                "arm": "ARM A",
+                "customSponsorCode": "SP-B",
+            },
+        ),
+    ]
+
+    dm_df = transform_records_to_sdtm(dm_records, domain="DM", study_key="STUDY99")
+    assert len(dm_df) == 1
+    assert dm_df.iloc[0]["USUBJID"] == "STUDY99-001"
+    assert dm_df.iloc[0]["SUBJID"] == "001"
+    assert dm_df.iloc[0]["SITEID"] == "42"
+    assert dm_df.iloc[0]["BRTHDTC"] == "1978"
+    assert dm_df.iloc[0]["SEX"] == "M"
+    assert dm_df.iloc[0]["RACE"] == "WHITE"
+    assert dm_df.iloc[0]["ARM"] == "ARM A"
+    assert "DMSEQ" not in dm_df.columns
+    assert "date_created" not in dm_df.columns
+    assert "dateCreated" not in dm_df.columns
+    assert "customSponsorCode" not in dm_df.columns
+    assert "patientName" not in dm_df.columns
+
+    supp_dm = transform_records_to_suppqual(dm_records, domain="DM", study_key="STUDY99")
+    assert list(supp_dm["RDOMAIN"].unique()) == ["DM"]
+    assert list(supp_dm["USUBJID"].unique()) == ["STUDY99-001"]
+    qval_by_qlabel = dict(zip(supp_dm["QLABEL"], supp_dm["QVAL"], strict=True))
+    assert qval_by_qlabel["customSponsorCode"] == "SP-B"
+    assert qval_by_qlabel["patientName"] == "***MASKED***"
+
+    ae_records = [
+        Record(
+            record_id=10,
+            study_key="STUDY99",
+            site_id=42,
+            subject_key="001",
+            form_key="AE",
+            date_created=datetime(2026, 2, 1, 12, 0),
+            record_data={
+                "aeTerm": "Rash",
+                "aeStartDate": "2026-02-01",
+                "customGradeScale": "CTCAE-v5",
+            },
+        )
+    ]
+    supp_ae_rows = extract_suppqual_rows(ae_records, domain="AE", study_key="STUDY99")
+    assert len(supp_ae_rows) == 1
+    assert supp_ae_rows[0]["RDOMAIN"] == "AE"
+    assert supp_ae_rows[0]["USUBJID"] == "STUDY99-001"
+    assert supp_ae_rows[0]["IDVAR"] == "AESEQ"
+    assert supp_ae_rows[0]["IDVARVAL"] == "1"
+    assert supp_ae_rows[0]["QNAM"] == "CUSTOMGR"
+    assert supp_ae_rows[0]["QLABEL"] == "customGradeScale"
+    assert supp_ae_rows[0]["QVAL"] == "CTCAE-v5"

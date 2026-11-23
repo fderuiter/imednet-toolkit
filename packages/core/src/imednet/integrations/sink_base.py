@@ -98,10 +98,13 @@ from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
 from imednet.models.standards import (
+    PROFILE_REGISTRY,
     SDTM_DOMAIN_SPECS,
     StandardsProfile,
     StandardsReadinessReport,
     StandardsReadinessValidator,
+    ValidationViolation,
+    _format_usubjid,
     normalize_naming_convention,
     resolve_sdtm_domain,
     resolve_standards_profile,
@@ -129,6 +132,7 @@ from imednet.utils.security import (
 )
 from imednet.utils.tabular import MASKED_SENTINEL
 from imednet.utils.url import redact_url_query
+from imednet.utils.validators import is_missing_value
 
 logger = logging.getLogger(__name__)
 
@@ -371,9 +375,10 @@ class SinkConfig:
             try:
                 resolved_prof = resolve_standards_profile(self.standards_profile)
             except KeyError as exc:
+                expected_names = ", ".join(f"'{p}'" for p in PROFILE_REGISTRY.list_profiles())
                 raise ValueError(
                     f"Unknown standards_profile '{self.standards_profile}'. "
-                    "Expected 'general', 'drug', 'device', or a StandardsProfile instance."
+                    f"Expected {expected_names}, or a StandardsProfile instance."
                 ) from exc
             if isinstance(self.standards_profile, str):
                 self.standards_profile = resolved_prof.profile_name
@@ -959,6 +964,10 @@ _STANDARDS_ENVELOPE_KEYS: frozenset[str] = frozenset(
         "formKey",
         "study_key",
         "studyKey",
+        "STUDYID",
+        "studyid",
+        "DOMAIN",
+        "domain",
         "visit_id",
         "visitId",
         "site_id",
@@ -976,8 +985,9 @@ def _extract_record_for_standards(
     record: Any,
     *,
     configured_domain: str | None = None,
-) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    """Return ``(domain, raw_data, canonical_data)`` without mutating ``record``."""
+    study_key: str = "",
+) -> tuple[str, dict[str, Any], dict[str, Any], str | None]:
+    """Return ``(domain, raw_data, canonical_data, subject_id)`` without mutating ``record``."""
     raw_domain: str | None = None
     subject_val: Any = None
     raw_data: dict[str, Any] = {}
@@ -1041,14 +1051,24 @@ def _extract_record_for_standards(
     domain = resolve_sdtm_domain(configured_domain or raw_domain, fallback="AE")
     canonical: dict[str, Any] = dict(raw_data)
 
+    has_payload_values = any(
+        not is_missing_value(v) for k, v in raw_data.items() if not str(k).upper().endswith("SEQ")
+    )
     resolved_subject = (
         canonical.get("subjectKey")
         or canonical.get("subject_key")
         or canonical.get("USUBJID")
+        or canonical.get("usubjid")
+        or canonical.get("SUBJID")
+        or canonical.get("subjid")
         or subject_val
     )
-    if resolved_subject is not None:
-        canonical.setdefault("subjectKey", resolved_subject)
+    normalized_subject: str | None = None
+    if not is_missing_value(resolved_subject):
+        normalized_subject = _format_usubjid(str(resolved_subject).strip(), study_key)
+        if has_payload_values:
+            canonical.setdefault("subjectKey", resolved_subject)
+            canonical.setdefault("USUBJID", normalized_subject)
 
     spec = SDTM_DOMAIN_SPECS.get(domain)
     if spec is not None:
@@ -1074,12 +1094,13 @@ def _extract_record_for_standards(
                         break
             if has_val:
                 canonical.setdefault(primary_key, found_val)
+                canonical.setdefault(sdtm_var, found_val)
                 if domain == "DM" and sdtm_var == "BRTHDTC":
                     canonical.setdefault("birthDate", found_val)
                 elif domain == "DM" and sdtm_var == "ETHNIC":
                     canonical.setdefault("ethnicity", found_val)
 
-    return domain, raw_data, canonical
+    return domain, raw_data, canonical, normalized_subject
 
 
 def evaluate_standards_readiness(
@@ -1116,12 +1137,29 @@ def evaluate_standards_readiness(
     records_by_domain: dict[str, list[dict[str, Any]]] = {}
     cdash_warnings: list[str] = []
     seen_cdash: set[tuple[str, str]] = set()
+    seen_empty_dm_subjects: set[str] = set()
+    extra_dm_violations: list[ValidationViolation] = []
 
     for rec in records:
-        domain, raw_data, canonical = _extract_record_for_standards(
+        domain, raw_data, canonical, subj_id = _extract_record_for_standards(
             rec,
             configured_domain=cfg_domain,
+            study_key=study_key,
         )
+        if domain == "DM" and subj_id and subj_id != MASKED_SENTINEL and "USUBJID" not in canonical:
+            if subj_id in seen_empty_dm_subjects:
+                extra_dm_violations.append(
+                    ValidationViolation(
+                        field="USUBJID",
+                        message=(
+                            "Duplicate USUBJID detected in DM domain; "
+                            "DM requires one record per subject."
+                        ),
+                        severity="ERROR",
+                    )
+                )
+            else:
+                seen_empty_dm_subjects.add(subj_id)
         records_by_domain.setdefault(domain, []).append(canonical)
         for field_key in raw_data:
             pair = (domain, str(field_key))
@@ -1136,6 +1174,8 @@ def evaluate_standards_readiness(
         records_by_domain=records_by_domain,
         terminology_lookups=lookups,
     )
+    if extra_dm_violations:
+        report.violations = [*report.violations, *extra_dm_violations]
     if cdash_warnings:
         report.warnings = [*report.warnings, *cdash_warnings]
     return report
@@ -1162,8 +1202,8 @@ def apply_quality_gate(
     if not config.quality_gate_enabled:
         seen_cdash: set[tuple[str, str]] = set()
         for record in records:
-            domain, raw_data, _ = _extract_record_for_standards(
-                record, configured_domain=cfg_domain
+            domain, raw_data, _, _ = _extract_record_for_standards(
+                record, configured_domain=cfg_domain, study_key=study_key
             )
             for field_key in raw_data:
                 pair = (domain, str(field_key))
@@ -1287,8 +1327,10 @@ def apply_quality_gate(
                         logger.warning("CDASH naming warning (%s): %s", domain_for_cdash, cdash_msg)
 
         if std_validator is not None and cfg_min_std is None:
-            dom, _, canonical = _extract_record_for_standards(
-                record, configured_domain=cfg_domain or str(fk)
+            dom, _, canonical, _ = _extract_record_for_standards(
+                record,
+                configured_domain=cfg_domain or str(fk),
+                study_key=study_key,
             )
             rec_report = std_validator.score_records(records_by_domain={dom: [canonical]})
             if rec_report.score < config.min_schema_readiness_score:
